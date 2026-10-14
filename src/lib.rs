@@ -66,6 +66,7 @@ pub(crate) mod audio_thumbnail;
 pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod bake_stage;
+pub(crate) mod book_append_undo;
 pub mod book_bookmarks;
 pub mod book_composition;
 mod book_fs_journal;

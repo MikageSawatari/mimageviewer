@@ -45,6 +45,33 @@ tooltipはその表示中textureの票を参照する。旧snapshotをUIで複�
 スレッド生成のまれな失敗はログを残し、生成できた本数で続ける。再試行や回復機構は追加しない。
 ベース結果のLRU保存も行わない。
 
+## 実Folderの自動観測（§1.375 R10）
+
+前回走査の行記録、watch購読、dirty／cutoff、ExternalRescanPending、一覧復帰時の
+FolderRefreshRequestは既存viewer bundleに属する。OS購読の登録と登録後の確認scan、
+行投影・利用可能な精度のstamp取得・比較は既存rescan workerで実行する。
+Equal応答は軽い行記録と観測値だけを返し、不要な走査・準備済み一覧はworkerで破棄する。
+UIはowner／source／generation／投影条件／記録revision／購読epochを確認し、受理した
+cutoffまでだけをackする。走査中に届いた後続通知は元ownerのdirtyと既存restartへ残す。
+park／mountでは元購読と要求を保持し、forkでは記録だけを共有して独立購読を開始する。
+旧記録の大きなpayloadは既存retirement workerへ渡す。
+
+Differentは走査済み入力とworker準備済み投影を既存load／hydrationへ渡す。
+自動originをdefer／restart／Resumedでも維持し、sidecar取込を行わない。
+page identityと通常のDB hydrationは継続し、全体設定を一時変更しない。
+Stackの二度目のhydrationには既存GroupingSourceとInternalHydrationで同じ取込policyを渡し、
+既消費のcursor／Append receipt／local searchを再適用しない。
+明示GridReload／通常openでは設定どおりsidecarを取り込む。
+operation IDの自己通知照合、代表保持、cache形式変更、新しいpending ownerは追加しない。
+自己Delete時のStack member／対応表と保持aggregateの準備も既存delete workerに属する。
+purge lease解放後にStack candidateを読み、同じ削除終端でowner／世代／元view Arcを照合して
+表示行除去と同時に受理する。背景Stack採用とclose reconcileはこの既存modalの終端まで延期する。
+共有された兄弟view Arcは変更せず、UIの全件clone・sort・同期I/Oは増やさない。
+初回Stack分類の入力変更では、元のtyped pendingの所有資格を確認して取消・workerへ退役させる。
+通常Folderは観測不明から既存rescanで再準備し、サブ展開は現在行とsnapshot／tombstoneから
+元のhydration intentを持つ既存分類入口へ戻す。成功ゼロは元要求を保持する。
+詳細は [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md)。
+
 ## EffeTuneのタスクバー設定・通常矩形（§1.378、未リリース）
 
 Preferences OKと起動時は`effetune-host-control`へ設定を配送するだけで、UIはIPCを送信しない。
@@ -2015,3 +2042,11 @@ request/result channelは有界で、UIからの送信は非blocking。decode/�
 元ページを表示するために、通常viewerのthumbnail queueをresetしたりhidden許可を書き換えたりしない。
 viewのページ名/状態/unitの投影はdraft変更時に更新し、静止中のUI frameではcacheを読む。
 詳細な受入条件・未実施の確認は[本の構成計画 G4](book-composition-plan.md)に記録する。
+
+### master統合時の変換stateの格納（2026-10-14）
+
+書庫／EPUB変換の既存stateは`Option<Box<State>>`で格納する。両側の機能追加を統合した
+`App`のサイズが既存上限を超えたため、開始時の一回のallocationへ寄せる。
+poll、context退避／復帰、変換終端は同じBoxを移し、owner、modal、receiver、lease、
+取消・Dropの境界は変更しない。新しいpending stateや受付の排他は追加しない。
+Appサイズ上限と通常stackでのcapture回帰を維持し、poll／context移譲のallocation保持も検査する。

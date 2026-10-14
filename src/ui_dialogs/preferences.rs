@@ -2130,6 +2130,50 @@ fn ui_font_settings_key(settings: &crate::settings::UiFontSettings) -> String {
     serde_json::to_string(settings).unwrap_or_else(|_| format!("{settings:?}"))
 }
 
+/// Compare the settings that select a book target, change its editing/reading
+/// policy, or are captured by book_page_source / book_baked_edit_snapshot.
+/// Appearance and unrelated output preferences do not end append Undo.
+fn preferences_change_book_append_write_settings(live: &Settings, edited: &Settings) -> bool {
+    live.books_root_path() != edited.books_root_path()
+        || live.active_book_name_or_default() != edited.active_book_name_or_default()
+        || live.capture_format != edited.capture_format
+        || live.bake_stage_book != edited.bake_stage_book
+        || live.raw_brightness != edited.raw_brightness
+        || live.global_preset != edited.global_preset
+        || crate::conceal::ConcealPreset::from_settings(live)
+            != crate::conceal::ConcealPreset::from_settings(edited)
+        || live.erase_inpaint_mono_tolerance != edited.erase_inpaint_mono_tolerance
+        || live.ai_feature_mode != edited.ai_feature_mode
+        || live.ai_upscale_limit() != edited.ai_upscale_limit()
+        || live.ai_denoise_limit() != edited.ai_denoise_limit()
+        || ((live.bake_stage_book.includes_display_adjust()
+            || edited.bake_stage_book.includes_display_adjust())
+            && live.creative_luts != edited.creative_luts)
+        || (
+            live.default_spread_mode,
+            live.default_reading_flow,
+            live.default_reading_direction,
+            live.follow_document_reading_direction,
+            live.final_cover_spread_enabled,
+            live.singleton_spread_first_enabled,
+            live.singleton_spread_last_enabled,
+            live.page_after_cover_alone_enabled,
+            live.last_page_alone_enabled,
+            live.remember_spread_shift_per_book,
+        ) != (
+            edited.default_spread_mode,
+            edited.default_reading_flow,
+            edited.default_reading_direction,
+            edited.follow_document_reading_direction,
+            edited.final_cover_spread_enabled,
+            edited.singleton_spread_first_enabled,
+            edited.singleton_spread_last_enabled,
+            edited.page_after_cover_alone_enabled,
+            edited.last_page_alone_enabled,
+            edited.remember_spread_shift_per_book,
+        )
+}
+
 fn advance_preferences_scroll_generation(
     previous: PreferencesPage,
     current: PreferencesPage,
@@ -2380,6 +2424,13 @@ fn merge_video_media_memory_for_preferences(
 
 impl App {
     pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
+        // This is the accepted boundary, before executor reconfiguration,
+        // reader-policy changes, settings replacement, or index submission.
+        if preferences_change_book_append_write_settings(&self.settings, &settings)
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         // A legacy favorite's missing value follows the newly edited common
         // setting. Read presence from the existing state owner, not effective values.
         if settings.active_favorite_view_id().is_some()
@@ -2633,6 +2684,23 @@ impl App {
     }
 
     pub(crate) fn apply_preferences_dialog(&mut self, ctx: &egui::Context) {
+        if self.book_append_undo_in_progress()
+            && let Some(state) = self.pref_state.as_ref()
+        {
+            // Project the same merge without consuming live state or the
+            // dialog's asset transaction. A rejected Apply keeps its draft.
+            let mut edited = state.settings.clone();
+            let mut live = self.settings.clone();
+            prepare_preferences_edited_settings_for_commit(
+                &mut edited,
+                state.initial_video_normal_wheel_action,
+                &mut live,
+            );
+            if preferences_change_book_append_write_settings(&self.settings, &edited) {
+                self.show_feedback_toast("本への追加を取り消しています".into());
+                return;
+            }
+        }
         name_colors::clear_hex_editor(ctx);
         if let Some(mut state) = self.pref_state.take() {
             let old_dup = (
@@ -3343,7 +3411,9 @@ impl App {
             .is_some_and(|state| std::mem::take(&mut state.favorite_view_state_clear_requested));
         if clear_favorite_view_states_requested {
             let deleted = self.clear_all_favorite_view_states();
-            if let Some(state) = self.pref_state.as_mut() {
+            if !self.book_append_undo_in_progress()
+                && let Some(state) = self.pref_state.as_mut()
+            {
                 state.favorite_view_state_entry_count = self.favorite_view_states.len();
                 state.favorite_view_state_clear_result =
                     Some(format!("保存済みの表示状態を {deleted} 件クリアしました。"));
@@ -3408,7 +3478,7 @@ impl App {
                 clear_reading_history_requested = true;
             }
         }
-        if clear_reading_history_requested {
+        if clear_reading_history_requested && self.admit_book_append_followup_mutation() {
             let result = match self.reading_history_db.as_ref() {
                 Some(db) => match db.clear_all() {
                     Ok(deleted) => {
@@ -4132,6 +4202,85 @@ pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preferences_append_receipt(
+        app: &crate::app::AppTestEnvForTest,
+    ) -> crate::book_append_undo::BookAppendUndoReceipt {
+        let root = app.tmp.path().join("preferences-receipt-books");
+        let folder = root.join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                .unwrap();
+        let page = folder.join("0001_page.jpg");
+        std::fs::write(&page, b"generated page").unwrap();
+        builder.record(&page).unwrap();
+        crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 1,
+            source_context: app.virtual_list_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        }
+    }
+
+    #[test]
+    fn section1373_preferences_root_change_expires_receipt_but_same_root_and_appearance_do_not() {
+        let mut app = crate::app::setup_app_for_test();
+        app.book_append_undo_receipt = Some(preferences_append_receipt(&app));
+        let revision = app.book_append_undo_revision;
+        let mut same = app.settings.clone();
+        same.book_root = Some(app.settings.books_root_path());
+        same.show_toolbar_bookshelf = !same.show_toolbar_bookshelf;
+        app.install_preferences_settings(same);
+        assert_eq!(app.book_append_undo_revision, revision);
+        assert!(app.book_append_undo_receipt.is_some());
+
+        let mut changed = app.settings.clone();
+        let new_root = app.tmp.path().join("new-preferences-books");
+        changed.book_root = Some(new_root.clone());
+        app.install_preferences_settings(changed);
+        assert_eq!(app.settings.books_root_path(), new_root);
+        assert_eq!(app.book_append_undo_revision, revision + 1);
+        assert!(app.book_append_undo_receipt.is_none());
+    }
+
+    #[test]
+    fn section1373_preferences_output_change_rejects_only_pending_undo_without_installing() {
+        for undo_pending in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let receipt = preferences_append_receipt(&app);
+            app.book_append_undo_receipt = Some(receipt.clone());
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx,
+                intent: if undo_pending {
+                    crate::books::BookOpIntent::UndoAppend { receipt }
+                } else {
+                    crate::books::BookOpIntent::SourceMutation
+                },
+            });
+            let before = app.settings.clone();
+            let revision = app.book_append_undo_revision;
+            let mut changed = before.clone();
+            changed.capture_format = crate::capture::CaptureFormat::Jpeg75;
+            changed.book_root = Some(app.tmp.path().join("changed-settings-books"));
+            app.install_preferences_settings(changed.clone());
+            if undo_pending {
+                assert_eq!(
+                    ui_font_settings_key(&app.settings.ui_font),
+                    ui_font_settings_key(&before.ui_font)
+                );
+                assert!(settings_equal_for_close_prompt(&app.settings, &before));
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.book_append_undo_receipt.is_some());
+            } else {
+                assert_eq!(app.settings.capture_format, changed.capture_format);
+                assert_eq!(app.settings.books_root_path(), changed.books_root_path());
+                assert_eq!(app.book_append_undo_revision, revision + 1);
+                assert!(app.book_append_undo_receipt.is_none());
+            }
+        }
+    }
 
     #[test]
     fn file_type_visibility_page_edits_draft_and_all_show_reset() {

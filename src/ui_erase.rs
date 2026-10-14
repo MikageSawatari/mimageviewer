@@ -522,6 +522,9 @@ impl App {
         let Some(current) = self.current_erase_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(prev) = self.erase_undo_stack.pop_back() else {
             return false;
         };
@@ -538,6 +541,9 @@ impl App {
         let Some(current) = self.current_erase_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(next) = self.erase_redo_stack.pop_back() else {
             return false;
         };
@@ -549,6 +555,12 @@ impl App {
 
     /// 現在のマスク (ビットマップ + ベクタ) をスロットに保存する。
     pub(crate) fn save_mask_to_slot(&mut self, slot: usize) {
+        if self.erase_mask.is_some()
+            && self.mask_db.is_some()
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         let [w, h] = self.erase_mask_size;
         let saved = if let (Some(mask), Some(db)) = (&self.erase_mask, &self.mask_db) {
             db.set_slot(slot, mask, &self.erase_shapes, w, h).is_ok()
@@ -577,6 +589,9 @@ impl App {
         };
         if !slot_mask.iter().any(|&m| m) && slot_vectors.is_empty() {
             self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.push_undo_snapshot();
@@ -671,7 +686,11 @@ impl App {
         // Ctrl+Z: Undo
         let ctrl_z = self.keymap.consume_action(ctx, KeyAction::EraseUndo);
         if ctrl_z {
-            if self.erase_tool == EraseTool::Polygon && self.erase_lasso_points.pop().is_some() {
+            if self.erase_tool == EraseTool::Polygon && !self.erase_lasso_points.is_empty() {
+                if !self.admit_book_append_followup_mutation() {
+                    return action;
+                }
+                self.erase_lasso_points.pop();
                 self.show_feedback_toast("[頂点を戻す]".to_string());
                 return action;
             }
@@ -687,6 +706,9 @@ impl App {
         if key_del {
             if let Some(idx) = self.erase_selected_shape {
                 if idx < self.erase_shapes.len() {
+                    if !self.admit_book_append_followup_mutation() {
+                        return action;
+                    }
                     self.push_undo_snapshot();
                     self.erase_shapes.remove(idx);
                     self.erase_selected_shape = None;
@@ -888,6 +910,18 @@ impl App {
     /// マスクをシフトする。選択中ベクタがあればそれだけ、無ければビットマップとすべての
     /// ベクタを移動する。
     fn nudge_mask(&mut self, dx: f32, dy: f32) {
+        if (dx == 0.0 && dy == 0.0)
+            || (self.erase_shapes.is_empty()
+                && !self
+                    .erase_mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.iter().any(|value| *value)))
+        {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot_throttled();
         match self.erase_selected_shape {
             Some(idx) if idx < self.erase_shapes.len() => {
@@ -914,6 +948,18 @@ impl App {
 
     /// マスクを回転する。選択中ベクタがあればそれだけ、無ければ全体を画像中心周りに回転する。
     fn rotate_mask(&mut self, angle_rad: f32) {
+        if angle_rad == 0.0
+            || (self.erase_shapes.is_empty()
+                && !self
+                    .erase_mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.iter().any(|value| *value)))
+        {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot_throttled();
         match self.erase_selected_shape {
             Some(idx) if idx < self.erase_shapes.len() => {
@@ -984,6 +1030,10 @@ impl App {
 
     /// 円形ブラシで from → to を線で塗る。paint=true で描画、false で消去。
     fn paint_brush_line(&mut self, from: (f32, f32), to: (f32, f32), paint: bool) {
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
         let radius = self.erase_brush_radius;
         let [w, h] = self.erase_mask_size;
         let mask = match self.erase_mask.as_mut() {
@@ -994,6 +1044,8 @@ impl App {
             .and_then(|(x0, y0, x1, y1)| MaskDirtyRect::new(x0, y0, x1, y1));
 
         if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
+            // No yield or save occurs between the bitmap mutation and this boundary.
+            self.invalidate_book_append_undo();
             self.mark_erase_mask_texture_dirty(dirty);
             // mask 変化 → preview cache を破棄。
             if let Some(fs_idx) = self.fullscreen_idx {
@@ -1005,6 +1057,12 @@ impl App {
     /// 多角形の内部をビットマップに塗る/消す。`mask_db::scanline_fill_polygon` の薄いラッパ。
     fn paint_polygon(&mut self, points: &[(f32, f32)], paint: bool) {
         let [w, h] = self.erase_mask_size;
+        if points.len() < 3 || w == 0 || h == 0 || self.erase_mask.is_none() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let Some(mask) = self.erase_mask.as_mut() else {
             return;
         };
@@ -1027,6 +1085,9 @@ impl App {
             return;
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot();
         self.erase_mask = Some(next);
         self.mark_erase_mask_texture_dirty(None);
@@ -1109,6 +1170,9 @@ impl App {
             | crate::mask_db::BucketFillOutcome::Invalid => return,
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot();
         self.erase_mask = Some(next);
         self.mark_erase_mask_texture_dirty(None);
@@ -1330,6 +1394,11 @@ impl App {
                 let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
                 let drag_idx = drag.idx();
                 if drag_idx < self.erase_shapes.len() {
+                    if self.erase_shapes[drag_idx] != new_shape
+                        && !self.admit_book_append_followup_mutation()
+                    {
+                        return true;
+                    }
                     self.erase_shapes[drag_idx] = new_shape;
                 }
                 // R5: ドラッグ中の毎フレ再描画 (= ハンドル / Pan を動かすたびに
@@ -1413,6 +1482,9 @@ impl App {
             return;
         }
         let new_shape = vector_edit::apply_drag(&drag, cur, &modifiers);
+        if self.erase_shapes[idx] != new_shape && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.erase_shapes[idx] = new_shape;
         // R5: ドラッグ中もマスクを毎フレ再生成する (実機 FB: 「ハンドルのドラッグでも
         // 楕円は再描画されません。性能的に問題なければリアルタイムにマスクを表示」)。
@@ -1520,6 +1592,13 @@ impl App {
         }
 
         if pointer_over_panel && !primary_released {
+            return;
+        }
+
+        if self.book_append_undo_in_progress() {
+            if primary_down || primary_pressed || primary_released || secondary_pressed {
+                self.admit_book_append_followup_mutation();
+            }
             return;
         }
 
@@ -1638,10 +1717,13 @@ impl App {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
                             // サンプリング間引き
-                            crate::manual_mask_tools::push_freehand_point(
+                            let changed = crate::manual_mask_tools::push_freehand_point(
                                 &mut self.erase_lasso_points,
                                 img_pos,
                             );
+                            if changed {
+                                self.invalidate_book_append_undo();
+                            }
                         }
                     }
                 }
@@ -1682,11 +1764,14 @@ impl App {
                             self.show_feedback_toast("[多角形を確定]".to_string());
                         }
                     } else {
-                        crate::manual_mask_tools::push_polygon_vertex(
+                        let changed = crate::manual_mask_tools::push_polygon_vertex(
                             &mut self.erase_lasso_points,
                             img_pos,
                             scale,
                         );
+                        if changed {
+                            self.invalidate_book_append_undo();
+                        }
                     }
                 }
             }
@@ -1718,6 +1803,13 @@ impl App {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
+                            if self.erase_line_start.is_none()
+                                || self.erase_line_end != Some(img_pos)
+                            {
+                                if !self.admit_book_append_followup_mutation() {
+                                    return;
+                                }
+                            }
                             if self.erase_line_start.is_none() {
                                 self.erase_line_start = Some(img_pos);
                             }
@@ -1756,6 +1848,13 @@ impl App {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
+                            if self.erase_shape_drag_start.is_none()
+                                || self.erase_shape_drag_end != Some(img_pos)
+                            {
+                                if !self.admit_book_append_followup_mutation() {
+                                    return;
+                                }
+                            }
                             if self.erase_shape_drag_start.is_none() {
                                 self.erase_shape_drag_start = Some(img_pos);
                             }
@@ -1816,6 +1915,11 @@ impl App {
         if primary_down {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
+                    if self.erase_line_start.is_none() || self.erase_line_end != Some(img_pos) {
+                        if !self.admit_book_append_followup_mutation() {
+                            return;
+                        }
+                    }
                     if self.erase_line_start.is_none() {
                         self.erase_line_start = Some(img_pos);
                         self.erase_line_tilt = 0.0;
@@ -1871,6 +1975,9 @@ impl App {
     /// そのため消去モードの矩形/楕円/線は既存 Shape を丸ごと削除せず、上から
     /// 削り取るベクターオブジェクトとして残る。
     fn commit_erase_shape(&mut self, shape: Shape, paint: bool) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         // マスクが変わるので preview cache を破棄 (= 次回 preview 押下で再投入)。
         if let Some(fs_idx) = self.fullscreen_idx {
             self.clear_erase_preview(fs_idx);
@@ -2724,7 +2831,7 @@ impl App {
         if let Some(target) = switch_to {
             self.switch_erase_target_in_spread(ctx, target);
         }
-        if mask_delete_clicked {
+        if mask_delete_clicked && self.admit_book_append_followup_mutation() {
             let [w, h] = self.erase_mask_size;
             self.push_undo_snapshot();
             self.erase_mask = Some(vec![false; w * h]);
@@ -4319,6 +4426,25 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 #[cfg(test)]
 mod book_erase_tests {
     use super::*;
+
+    #[test]
+    fn section1373_erase_draft_changes_invalidate_but_noop_and_history_capture_do_not() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask_size = [4, 4];
+        app.erase_mask = Some(vec![false; 16]);
+        app.erase_brush_radius = 1.0;
+        let before = app.book_append_undo_revision;
+        app.push_undo_snapshot();
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line((1.0, 1.0), (1.0, 1.0), false);
+        app.apply_erase_bitmap_morph_1px(false);
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+        assert!(app.erase_mask.as_ref().unwrap().iter().any(|value| *value));
+        app.paint_brush_line((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+    }
 
     /// 純グレースケール原稿は残差ちょうど 0 なので、`is_near_monochrome_residual` に
     /// 0 をそのまま渡すと通ってしまう。0 = 無効が「切ったのに効く」にならないこと。

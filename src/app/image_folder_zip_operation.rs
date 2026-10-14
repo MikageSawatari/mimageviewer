@@ -684,6 +684,12 @@ impl App {
         manifest: zip::ImageFolderManifest,
         columns: Vec<Arc<Vec<String>>>,
     ) -> Result<Phase, String> {
+        // Preparation has accepted a valid manifest. The metadata worker also
+        // supplements source data before confirmation, so admission belongs
+        // before its resource/queue handoff rather than the Convert button.
+        if !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".into());
+        }
         let mut trims = Vec::new();
         for id in self.viewer_context_ids() {
             if let Ok(Some(pending)) =
@@ -1114,6 +1120,88 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::same_name_folder_book::SameNameFolderBookPolicy as SameNameFolderBook;
 
+    #[test]
+    fn section1373_folder_zip_admits_metadata_before_confirmation_and_rejects_undo_busy() {
+        for busy in [false, true] {
+            let mut app = setup_app_for_test();
+            let source = app.tmp.path().join("conversion-source");
+            std::fs::create_dir_all(&source).unwrap();
+            image::RgbaImage::new(8, 16)
+                .save(source.join("page.png"))
+                .unwrap();
+            let root = app.tmp.path().join("append-books");
+            let folder = root.join("book");
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut builder =
+                crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                    .unwrap();
+            let page = folder.join("0001_page.jpg");
+            std::fs::write(&page, b"generated page").unwrap();
+            builder.record(&page).unwrap();
+            let receipt = crate::book_append_undo::BookAppendUndoReceipt {
+                files: builder.finish().unwrap(),
+                operation_id: 1373,
+                source_context: app.projected_viewer_context_id(),
+                accepted_revision: app.book_append_undo_revision,
+            };
+            app.book_append_undo_receipt = Some(receipt.clone());
+            let ctx = egui::Context::default();
+            let revision = app.book_append_undo_revision;
+            assert!(app.start_image_folder_zip(&ctx, source.clone(), false));
+            assert_eq!(
+                app.book_append_undo_revision, revision,
+                "manifest preparation is readonly"
+            );
+            let mut op = app.image_folder_zip_operation.take().unwrap();
+            let manifest = zip::prepare_manifest(&source, None, &op.control).unwrap();
+            if busy {
+                let (_tx, rx) = mpsc::channel();
+                app.book_op_pending = Some(crate::books::BookOpPending {
+                    rx,
+                    intent: crate::books::BookOpIntent::UndoAppend { receipt },
+                });
+                let had_tags = app.tags_db.is_some();
+                let sidecars = app.sidecars.len();
+                assert!(
+                    app.start_image_zip_worker(&ctx, &op, manifest, vec![])
+                        .is_err()
+                );
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.book_append_undo_receipt.is_some());
+                assert_eq!(app.tags_db.is_some(), had_tags);
+                assert_eq!(app.sidecars.len(), sidecars);
+            } else {
+                op.phase = app
+                    .start_image_zip_worker(&ctx, &op, manifest, vec![])
+                    .unwrap();
+                assert!(app.book_append_undo_revision > revision);
+                assert!(app.book_append_undo_receipt.is_none());
+                let Phase::Worker { worker, .. } = &mut op.phase else {
+                    panic!("accepted worker");
+                };
+                assert!(matches!(
+                    worker
+                        .events
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap(),
+                    job::Event::Confirm(_)
+                ));
+                // Confirm has not been accepted: metadata admission already
+                // invalidated the receipt, and cancellation cannot revive it.
+                op.control.cancel();
+                worker.commands.send(job::Command::Cancel).unwrap();
+                assert!(matches!(
+                    worker
+                        .events
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap(),
+                    job::Event::Finished { .. }
+                ));
+                assert!(app.book_append_undo_receipt.is_none());
+            }
+        }
+    }
+
     fn pump_until(app: &mut App, ctx: &egui::Context, ready: impl Fn(&App) -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !ready(app) {
@@ -1214,6 +1302,7 @@ mod tests {
                         .recv_timeout(std::time::Duration::from_secs(30))
                         .unwrap();
                     if event
+                        .1
                         .as_ref()
                         .is_ok_and(App::current_folder_watch_event_relevant)
                     {

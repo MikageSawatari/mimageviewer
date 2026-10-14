@@ -7,6 +7,15 @@
 use super::*;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+#[cfg(test)]
+thread_local! {
+    static IMPORT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(super) fn import_starts_for_test() -> usize {
+    IMPORT_STARTS.with(std::cell::Cell::get)
+}
+
 const SIDECAR_WRITER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const SIDECAR_RESTORE_MODAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 const SIDECAR_REUSE_MAX_FOLDERS: usize = 4;
@@ -1216,8 +1225,13 @@ impl App {
         continuation: SidecarLoadContinuation,
         has_prepared_aggregate: bool,
     ) -> Result<(), SidecarLoadContinuation> {
-        let restore_sidecar =
-            self.sidecar_restore_eligible(&continuation.source_path, has_prepared_aggregate);
+        let restore_sidecar = self
+            .sidecar_restore_eligible(&continuation.source_path, has_prepared_aggregate)
+            && continuation.restore_intent.imports_sidecars();
+        #[cfg(test)]
+        if restore_sidecar {
+            IMPORT_STARTS.with(|calls| calls.set(calls.get() + 1));
+        }
         if self.sidecar_restore.is_some() {
             crate::logger::log(
                 "sidecar restore request rejected: another restore already owns the App"

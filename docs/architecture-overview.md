@@ -115,6 +115,15 @@ I/Oなしhelperで比較し、`archive_cache::is_under_cache_root`とcache対応
 sourceの種類採否と派生動画判定後、producer既存のsort／走査順で採用し、画像種類の非表示で
 採用候補を変えない。候補metadataを既存signatureへ含め、追加I/Oやcontext ownerを作らない。
 
+実Folderの自動観測は、前回走査の軽い行記録、購読、dirty／cutoff、走査中要求を
+同じViewerContextBundleで所有する。既存rescan workerで種類採否・同名除去・順序を投影して
+前回記録と比較し、一致なら一覧install・世代更新・install起因のthumbnail再要求を省く。
+採用時はcontext／exact source／一覧世代／投影条件／記録revisionを照合する。
+forkはimmutableな行記録だけを継承し、購読・dirty・要求を共有しない。
+自動originは既存RefreshList intentからhydrationまで運び、sidecar取込だけを外す。
+明示GridReload／通常openは従来の取込とreloadを行う。
+契約と受入記録は [§1.375 R10](section375-operation-reconcile-plan.md)。
+
 
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
 `metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。
@@ -200,6 +209,30 @@ volatileを反映する。非resident ownerも対象とし、同keyの未確定d
 **鉄則**: 上位レイヤーから下位レイヤーへの呼び出しは OK。逆方向（ワーカーが UI を直接触るなど）は禁止。
 ワーカーから UI への通知は必ず mpsc チャネルで行う。
 
+本追加の直後一回取消（[§1.373、R7実装・検証中](section373-book-append-undo-plan.md#77-r7-metadata初期化をファイル公開前へ移す設計担当決定2026-10-13)）も、
+実行中のownerは既存の `book_op_pending: Option<BookOpPending>` 一つだけ。
+`BookOpIntent::Append` がoperation ID・source context・受付revision・対象folderを捕捉し、
+ファイル追加、edit/semantic metadata copy、必要な一覧refreshの終端まで同じ要求を保持する。
+本rootや追加先の後続変更は元の出力先を付け替えず、受付時にreceiptを失効させrevisionを進める。
+処理の遅い成功が古いrevisionのreceiptを復活させることはない。
+R7では同じAppend workerが各destinationの八metadata storeを同期初期化し、commit／epoch終端後に
+画像を作成する。ファイルの出現が公開点で、後続ユーザー編集は常に初期化より後になる。
+copy reportの値でcontext cacheを上書きせず、global存在集合は既存stable readerで現在DBから
+worker再取得し、既存Append receiverが対象keyだけ更新する。context値・draftは変更しない。
+
+source contextは取消receiptの資格を決める。refreshの一覧採用資格は別に、各受け手の
+`BookAppendRefresh.adoption_owner`・items世代・folder・scan設定と同一operationへの所属で決める。
+同じ本を表示する別contextも既存のscan/refresh ownerで更新し、一覧採用先へreceiptを移さない。
+受付済みのmetadata copyや自分のrefreshだけをoperation同一性で区別し、通常のsource置換や
+後続mutationは失効境界を通す。追加中の対象folderの自動観測はAppend終端へ配送するR4方針であり、
+別のpending receiver、Undo中bool、refresh再開ownerは設けない。
+
+`UndoAppend` は同じ本操作ownerでworkerの検証・ごみ箱移動・成功pathのmetadata purge・UI終端を保持する。
+新しいローカルmutation／Remote書込みのBusyはこのintentだけを条件とし、既存のSourceMutationや
+本改名・削除中の通常タグ／評価の受付は変更しない。Ctrl+Zは `UndoLastAction` からreceiptを先に扱い、
+処理中・不一致による拒否でも同じ入力を古いmetadata Undoへ渡さない。ファイル取消をmetadataの
+`UndoStack`へ積まず、追加のRedoも作らない。検証・Shell操作・DB purgeはworker上で行う。
+
 F11中の固定chrome一時抑制は `ui_helpers::{ViewerChromeSurface, ResolvedViewerChrome}` の純投影で解く。
 保存ロックはSettings / viewer contextが所有し、eguiの正確なwindow bindingとnative coreのplacement・既存host identityが
 実際の表示先を所有する。nativeのraw policyとhost factを一つのsnapshotで運び、適用先でdraw / layout / hitを揃える。
@@ -274,6 +307,8 @@ fit 基準へ戻さない。連結の基準 unit と PDF の絶対需要比較�
 | `settings_transfer.rs` | 環境設定の持ち運び。全 Settings field の一つの分類 policy から転送対象 projection / 検証 / draft 適用を生成し、形式 v1 の JSON だけを処理する。App 内の環境設定・操作カスタマイズの大きな draft はそれぞれ Box に収納し、既存の寿命を保つ。設定の復元画面が一つの転送状態を所有し、worker は App / DB を持たない。確定済み設定を書き出し、取り込みは検証成功後に環境設定の draft へ反映し、既存 OK で確定する。分類・所有・既存 OK の限界は [settings-export-import-plan.md](settings-export-import-plan.md) |
 | `settings_restore.rs` | 設定全体の世代復元に加え、過去世代を一時ディレクトリへ読み取り専用展開して操作カスタマイズだけを抽出し、取り込み前の `.mivkeys.json` 自動退避を管理 |
 | `books.rs` | 製本機能と source-based headless compositor。製本ルート直下の通常フォルダを本として扱い、`0001_元名.ext` のページ保存、通常画像/ZIP 内画像の無加工コピー、補正/PDF/動画フレームの焼き込み追加、2 パス temp rename による並べ替えフラッシュを担当する。`CompositeSource` + `BakedEditSnapshot` の適用順、Ctrl+E の conceal / crop override、合成寸法予測は単枚・一括・製本・外部ツールで共有する |
+| `book_append_undo.rs` / `app/book_append_undo.rs` | §1.373の追加出力receipt・本全体の構成と出力stampの照合・exact generated pathsだけのごみ箱取消を担当する。App側は既存BookOpPendingの受付／metadata copy／Undo終端へ接続し、後続mutationの受付revisionでreceipt資格を管理する。ごみ箱移動成功は各pathのPostDeleteItem結果で判定し、成功分だけ既存guarded purgeへ渡す |
+| `app/book_append_refresh.rs` | §1.373 R4の自動観測配送と同一operationのrefresh annotation。source contextによる取消資格と、adoption owner・items世代・scan設定による一覧採用資格を分離し、既存folder scan / refreshのownerで完了結果を配送する |
 | `clipboard_capture/` | App が process に 1 つ所有する画像・HTML の取り込み。`mod.rs` が不変設定・最新通知・検出時の HTML snapshot・typed event と手動要求を所有し、`native.rs` が listener / reader / 自動画像保存 worker、`popup.rs` が非アクティブ Win32 / GDI 小窓を担当する。`data.rs` は形式分類・上限付き画像デコード・ファイル名・保存公開・Zone.Identifier、`html.rs` は CF_HTML の context / fragment 分離と候補抽出、`fetch.rs` は App 所有 `CaptureFetchService` の固定 4 worker、session ごとの Agent / resolver / pool、原本ハッシュ・一時予算・背景保存・cleanup を所有する。既定保存先は起動後に背景解決し、通知は reader 上で 300 ms 合流して sequence / 世代を検査する。DIB 解釈は製本と共有し、寸法制限は取り込み入口だけで適用する。切り取り表示や viewer bundle から独立する。詳細は [clipboard-capture-plan.md](clipboard-capture-plan.md) |
 | `ui_dialogs/clipboard_capture.rs` | App 所有の `CaptureSelection` と `Fetching` → `Saving` のモーダル。監視小窓・Ctrl+V の HTML snapshot を同じ受付へ集約し、現在の実フォルダ / 自動取り込みの月別フォルダを intent で区別する。原本内容による統合・最小サイズ・選択・取得失敗の表示・1 frame 最大 2 枚の texture upload・保存中の閉じる操作拒否を担当し、背景サービスの完了をメインのトーストへ返す。最小サイズは live Settings へ反映し、既存の設定保存境界で永続化する |
 | `window_activation.rs` | トレイ・2 重起動・取り込み event を受理した App が共有するメイン HWND の前面化。小窓 thread は前面化しない。配置スロットの lock を外してから、非表示・通常の最小化・表示中を分けて復帰する。App の `sync_after_restore` と viewer の経路は既存の所有者に残す |

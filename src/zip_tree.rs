@@ -381,6 +381,37 @@ impl ZipNavState {
         Some(nav)
     }
 
+    /// Refresh against the new tree, falling back only when the requested node disappeared.
+    /// Invalid member paths never participate in ancestor lookup.
+    pub(crate) fn refresh_prefix(tree: Arc<ZipTree>, prefix: &str) -> (Self, ZipRefreshPosition) {
+        if let Some(nav) = Self::restore_prefix(tree.clone(), prefix) {
+            return (nav, ZipRefreshPosition::Preserved);
+        }
+        if !prefix.starts_with('/')
+            && !prefix.contains('\\')
+            && !split_prefix(prefix)
+                .iter()
+                .any(|part| part == "." || part == "..")
+        {
+            let mut parts = split_prefix(prefix);
+            while parts.pop().is_some() {
+                if let Some(nav) = Self::restore_prefix(tree.clone(), &parts.join("/")) {
+                    return (nav, ZipRefreshPosition::Ancestor);
+                }
+            }
+        }
+        (Self::new(tree), ZipRefreshPosition::Ancestor)
+    }
+
+    pub(crate) fn effective_levels(&self) -> Vec<Vec<String>> {
+        // Facet return routes follow accepted display levels. The raw book scope
+        // remains in the same navigation owner and is never substituted here.
+        self.stack
+            .iter()
+            .map(|level| level.display.clone())
+            .collect()
+    }
+
     /// 現在描画すべき実効 prefix。
     pub fn current(&self) -> &[String] {
         &self
@@ -474,6 +505,13 @@ impl ZipNavState {
     pub fn materialize_current(&self, sort: SortOrder) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         self.tree.materialize_level(self.current(), sort)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ZipRefreshPosition {
+    Open,
+    Preserved,
+    Ancestor,
 }
 
 /// `node` の子ディレクトリ名を表示 sort 順 (= `materialize_level` の ZipDir 並び) で返す。
@@ -684,6 +722,21 @@ mod tests {
         )
     }
 
+    #[test]
+    fn section1353_effective_levels_keep_filtered_display_and_raw_book_scope_separate() {
+        let source = tree(&["root.png", "A/1.jpg"]);
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        let nav = ZipNavState::new(Arc::new(source.project(&policy)));
+        assert_eq!(nav.current(), &["A".to_owned()]);
+        assert!(nav.current_raw().is_empty());
+        let mut levels = nav.effective_levels();
+        assert_eq!(levels, vec![vec!["A".to_owned()]]);
+        levels[0].clear();
+        assert_eq!(nav.current(), &["A".to_owned()]);
+        assert!(nav.current_raw().is_empty());
+    }
+
     fn img_names(node: &ZipTreeNode) -> Vec<&str> {
         node.images.iter().map(|i| i.entry_name.as_str()).collect()
     }
@@ -706,6 +759,62 @@ mod tests {
         assert_eq!(dir_keys(&t.root), vec!["work1"]);
         let sub = t.root.dirs.get("work1").unwrap();
         assert_eq!(img_names(sub), vec!["work1/a.jpg", "work1/b.jpg"]);
+    }
+
+    #[test]
+    fn section1353_refresh_restores_nested_level_or_nearest_existing_ancestor() {
+        for (names, requested, expected, reason) in [
+            (
+                vec!["root.jpg", "A/cover.jpg", "A/sub/1.jpg", "A/sub/2.png"],
+                "A/sub/",
+                vec!["A", "sub"],
+                ZipRefreshPosition::Preserved,
+            ),
+            (
+                vec!["root.jpg", "A/cover.jpg", "A/other.jpg"],
+                "A/sub/deep/",
+                vec!["A"],
+                ZipRefreshPosition::Ancestor,
+            ),
+            (
+                vec!["root.jpg", "B/1.jpg"],
+                "A/sub/",
+                vec![],
+                ZipRefreshPosition::Ancestor,
+            ),
+            (
+                vec!["root.jpg", "A/sub/1.jpg"],
+                "A/",
+                vec!["A", "sub"],
+                ZipRefreshPosition::Preserved,
+            ),
+            (
+                vec!["root.jpg", "inner.zip/cover.jpg", "inner.zip/sub/1.jpg"],
+                "inner.zip/sub/",
+                vec!["inner.zip", "sub"],
+                ZipRefreshPosition::Preserved,
+            ),
+        ] {
+            let (mut restored, actual) =
+                ZipNavState::refresh_prefix(Arc::new(tree(&names)), requested);
+            assert_eq!(restored.current(), s(&expected));
+            assert_eq!(actual, reason);
+            while restored.back() {}
+            assert!(restored.at_root());
+        }
+    }
+
+    #[test]
+    fn section1353_refresh_rebuilds_parents_when_same_level_survives() {
+        let old = Arc::new(tree(&["root.jpg", "A/sub/1.jpg"]));
+        let before = ZipNavState::restore_prefix(old, "A/sub/").unwrap();
+        let fresh = Arc::new(tree(&["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]));
+        let (mut after, reason) = ZipNavState::refresh_prefix(fresh, "A/sub/");
+        assert_eq!(before.current(), after.current());
+        assert_ne!(before.effective_levels(), after.effective_levels());
+        assert_eq!(reason, ZipRefreshPosition::Preserved);
+        assert!(after.back());
+        assert_eq!(after.current(), s(&["A"]));
     }
 
     #[test]
