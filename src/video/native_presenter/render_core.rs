@@ -9858,12 +9858,8 @@ impl NativeEguiOverlayState {
                 //   commit 直後は通常通り Ctrl+V を取り込む (Codex P3)。
                 // - クリップボードが空 / 非テキスト形式でも intercept は **成立とみなす**
                 //   (= 'V' 文字を typing 扱いで挿入してしまうのを防ぐ)。
-                // IME 関連の判定は **composition 中のみ** (= plugin state に pending
-                // event を投影する `ime_composing()`) で
-                // 行う。`ime_input_active()` の 300ms grace は Enter/Escape (確定キー
-                // ハイジャック) 対策のもので、Ctrl+V/C/X に適用すると IME 確定直後の
-                // 素早いペーストが落ちる (Codex P3 2026-05-24: composition 中だけ抑止し、
-                // commit 後の通常ショートカットは通す)。
+                // plugin state に pending event を最終状態まで投影する
+                // `ime_composing()` で判定し、commit 後の通常ショートカットは通す。
                 let is_clipboard_shortcut = key.ctrl
                     && !key.alt
                     && self.text_input_active()
@@ -11770,20 +11766,12 @@ impl NativeEguiOverlayState {
 
     fn can_open_shortcut_help(&self) -> bool {
         !self.text_input_active()
-            && !self.ime_input_active()
+            && !self.ime_composing()
             && !self.shortcut_help_open
             && !matches!(
                 self.normalize_state.ui_state,
                 crate::video::normalize_types::NormalizeUiState::Scanning
             )
-    }
-
-    fn ime_input_active(&self) -> bool {
-        crate::ime_focus::ime_input_active_with_pending_events(
-            &self.egui_ctx,
-            egui::ViewportId::ROOT,
-            &self.pending_events,
-        )
     }
 
     fn ime_composing(&self) -> bool {
@@ -12510,6 +12498,10 @@ impl NativeEguiOverlayState {
             );
             frame_step_hold = None;
         }
+        // Sample before transferring the queue to RawInput: the plugin still holds the
+        // previous pass's state, so Commit/Disabled must be projected from this queue.
+        // Only ongoing composition suppresses the tag picker's Enter/Escape handlers.
+        let tag_picker_enter_allowed = !self.ime_composing();
         let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -12524,10 +12516,6 @@ impl NativeEguiOverlayState {
         if let Some(viewport) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
             viewport.native_pixels_per_point = Some(ppp);
         }
-        // IME 変換中 (`ime_input_active`) は Enter/Escape を確定/キャンセルキーとして扱わない
-        // (変換の確定・取り消しをタグピッカーが奪わないため、静止画側 `dialog_*_pressed` と同方針)。
-        let tag_picker_ime_active = self.ime_input_active();
-        let tag_picker_enter_allowed = !tag_picker_ime_active;
         let mut seek_strip_area_ran = false;
         let mut seek_strip_preview_hover = NativeSeekStripPreviewHover::Outside;
         let egui_run_t0 = Instant::now();
@@ -14954,6 +14942,116 @@ mod chrome_suppression_interaction_tests {
         NativeVideoTouchEvent, NativeVideoTouchPhase, NativeVideoWindowEvent,
         NativeVideoWindowSource,
     };
+
+    fn tag_picker_ime_fixture() -> NativeEguiOverlayState {
+        let (mut overlay, _) = fixture(false);
+        crate::ime_focus::install_ime_input_policy(&overlay.egui_ctx);
+        let metadata = native_hud_multitrack_fixture_metadata();
+        overlay.tag_panel_sticky_item_key = Some(metadata.item_key.clone());
+        overlay.set_metadata(Some(metadata));
+        overlay.tag_picker_open = true;
+        overlay.tag_picker_focus_request = true;
+        for _ in 0..4 {
+            frame(&mut overlay);
+        }
+        overlay.pending_events.extend([
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("かな".to_owned())),
+        ]);
+        let output = frame(&mut overlay);
+        assert!(overlay.ime_composing());
+        assert!(overlay.tag_picker_open);
+        assert!(
+            !output
+                .commands
+                .iter()
+                .any(|command| { matches!(command, NativeOverlayCommand::AddTag { .. }) })
+        );
+        overlay
+    }
+
+    fn tag_picker_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn tag_picker_after_ime_commit(key: egui::Key, same_pass: bool) {
+        let mut overlay = tag_picker_ime_fixture();
+        overlay.pending_events.extend([
+            egui::Event::Ime(egui::ImeEvent::Commit("かな".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ]);
+        if !same_pass {
+            let output = frame(&mut overlay);
+            assert!(overlay.tag_picker_open);
+            assert!(!overlay.ime_composing());
+            assert!(
+                !output
+                    .commands
+                    .iter()
+                    .any(|command| { matches!(command, NativeOverlayCommand::AddTag { .. }) })
+            );
+        }
+        overlay.pending_events.push(tag_picker_key(key));
+        let output = frame(&mut overlay);
+        let added_tags: Vec<_> = output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                NativeOverlayCommand::AddTag { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            added_tags,
+            if key == egui::Key::Enter {
+                vec!["かな"]
+            } else {
+                Vec::new()
+            }
+        );
+        assert!(!overlay.tag_picker_open);
+        assert!(overlay.tag_picker_input.is_empty());
+        assert!(!overlay.ime_composing());
+    }
+
+    #[test]
+    fn native_tag_picker_enter_after_ime_commit_same_pass_adds_tag() {
+        tag_picker_after_ime_commit(egui::Key::Enter, true);
+    }
+
+    #[test]
+    fn native_tag_picker_enter_after_ime_commit_next_pass_adds_tag() {
+        tag_picker_after_ime_commit(egui::Key::Enter, false);
+    }
+
+    #[test]
+    fn native_tag_picker_escape_after_ime_commit_closes_same_and_next_pass() {
+        tag_picker_after_ime_commit(egui::Key::Escape, true);
+        tag_picker_after_ime_commit(egui::Key::Escape, false);
+    }
+
+    #[test]
+    fn native_tag_picker_enter_during_composition_keeps_picker_open() {
+        let mut overlay = tag_picker_ime_fixture();
+        overlay
+            .pending_events
+            .push(tag_picker_key(egui::Key::Enter));
+        let output = frame(&mut overlay);
+        assert!(overlay.tag_picker_open);
+        assert!(overlay.ime_composing());
+        assert!(
+            !output
+                .commands
+                .iter()
+                .any(|command| { matches!(command, NativeOverlayCommand::AddTag { .. }) })
+        );
+    }
 
     #[test]
     fn native_tracks_hud_frame_hold_terminates_on_scan_and_outside_release() {

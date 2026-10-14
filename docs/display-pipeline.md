@@ -8,6 +8,10 @@ accepted構成は方向・表紙・可視実列・ページ指定を渡し、通
 自動強制単独の白紙置換は通常本と同じ。facet外の現在ページは単独の同builder入力として保持する。
 Blankはsource/readinessを持たず、補助はNavigation/resume/exportの実列へ追加しない。
 提示候補はcontext/世代/source/role/slot/sliceをworkerで確認し、相方はunit内でatomicに採用する。
+通常open／navigation／slideshowは、採用済みsource投影と現在のservice token／identity indexを
+証明でき、初期化済み・保守外・先行mutationなしなら、同じ提示許可owner内で新しいunitの
+全occurrenceを即許可する。不明source／旧token／Checking／Hiddenは従来のworker照合へ渡す。
+表示済みepisodeの許可を新規要求へ流用せず、UIのI/Oや別許可ownerは増やさない（紙めくり計画§26.18）。
 Checking/Hiddenはcached processed/raw/thumbnail/holdoverからもtexture選択・paint・transform/hit・読了traceへ渡さない。
 連結の測定extentと画像許可を分離し、bounded cacheの既知寸法だけで未許可画像を復活させない。
 scroll/reanchor/resizeで探索を更新しても、画面に残るoccurrenceの許可とChecking要求は保持する。
@@ -34,6 +38,44 @@ UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[
 「どのテクスチャを画面に出すか」を巡って絡み合う。修正前にこのドキュメントを読むこと。
 
 ---
+
+### 紙めくりpresentationのA0実装 (§1.341、2026-10-11、受入れ待ち)
+
+ページ間の紙めくりは`ui_fullscreen/page_turn.rs`のcontext単位presentationと、
+`page_turn_animation.rs`のcanonical unit projectionへ分離する。既存navigation target、
+ready判定、captureのfit/UV/occurrenceを正本にし、unit全体の通常prepare後にflat/curlを選ぶ。
+保持する旧画素は提出済みimmutable paint resourceで、別のdecode/upload/resample経路を作らない。
+共有weak lease inventoryはsource/outputのVRAM会計を担い、兄弟readerの状態を所有しない。
+ONはeguiの最終output hookで破棄passを除外して実occurrence/source/nativeの提示receiptを採用し、
+当該contextの次のpre-drawで既存ready observerへ届ける。配送時には元画像/通常final/passthroughの
+既存選択、unit/layout、items/input generationを照合する。OFFは従来の同pass通知を保つ。
+OFFは従来の瞬時切替、ONは単発手動/slideshowの即ready時を対象にする。連打・読込待ち・
+連結・媒体境界は通常切替を保つ。時間は評価用100〜600ms・既定200msで、最終採択は未了。
+
+projectionのstable geometryは描画先transformのeffective pppで比較する。独立に物理pxへ
+丸めたpaint矩形の辺/見開き幅は1物理px以内の差を許容し、float完全一致を要求しない。
+実際のpaint矩形/UVと終端の通常画素は保持し、clip変更、1pxを超える配置/寸法変更、
+不完全なprepared ROI、可視面積不足は引き続きunit全体を同pass flatへ戻す。
+skipは`sub_check`と両unitのpaint/clip/viewport/ppp/ROIをperf有効時だけ記録する。
+
+この記録はA0差分の接続方針であり、実GPU提示・画質・速度・native lease・多窓受入れの証明ではない。
+2026-10-12追補: native ROI端の丸めは元source texelの0.001以内だけを許容し、actual ROIへ
+clampしてnative UVへ写像する。単頁は一leafだけが動き、下頁は自身のcanonical rect全体で静止。
+自身の背（既定の案A）と見開きと同じ補間で移動する背を、環境設定の暫定項目で比較できる。
+正本と検証記録はpage-turn plan §25。比較後は一方を削除し、実機motionの採択は利用者へ残す。
+実装の独立完了レビュー、実機とOFF/ON性能比較は未完了。
+正本は[page-turn-animation-plan.md](page-turn-animation-plan.md)、detached範囲は同rework plan §11。
+既存`analyze_perf.py page-turn --check`のI1〜I5は維持し、専用`page-turn-animation --check`で
+機会・開始/完走・skip率と可視提示/保持量を別集計する。合成ログの成功を製品性能受入れと扱わない。
+
+2026-10-11 Stage 1実機追補: 単頁は読書方向で背を固定し（LTR左／RTL右）、forwardのoutgoing departureとbackwardのincoming arrivalを同じ側で描く。
+実機ログと既存goldenは既にこの向きで、新goldenは固定端を明示する。終端RTLの背座標診断だけを訂正し、未再現の見え方を修正済みとは扱わない。
+子viewportで捕捉しcallback外ROOTで受理するnavigationは、明示operation IDと現在destinationを照合して元factを保持する。
+ambient frame stampは既存fieldの(ViewportId, frame_nr)で、viewportの違うcounterを比較して消さない。
+固定矢印／FsPageNext/Prevはtyped consumerのIDを直接渡す。Repeat・境界のinstant規則、設定OFFは維持する。final-onlyは2026-10-11利用者決定で撤回（page-turn plan §22）。
+根因・実機取消3件・回帰の詳細は[page-turn-animation-plan.md §21](page-turn-animation-plan.md)を正本とする。
+
+2026-10-11 resident readiness追補: acceptは現在keyのresident complete/incomplete final、対応comic、既存faithful rendition、通常元画像/RAW preview、許可thumbnailを品質順に選ぶ。acceptでproducer/I/O/uploadは呼ばない。incomingもtyped resourceとしてpin会計へ入り、thumbnailのDirect属性をcache失効後も保持する。通常producer/poll/prepareは継続し、turnとcanonical flatは最初の素材・geometryに固定する。source品質publicationのinput epoch更新はcancelしないが、item/edit/params/comic/view/context bindingの失効は維持する。実素材のIDでnavigator/receiptを作り、flat採用後は通常selectorへ戻る。§22を過去のfinal-only記録より優先する。
 
 PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
 （未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
@@ -2658,6 +2700,17 @@ raw source を選ぶ frame で元画像も無ければ `Awaiting` を維持す�
 一度だけ sample し、producer gate / readiness / draw が同じ値を共有する。ページ送りの物理レベルも
 `(frame_nr, viewport)` 単位で一度だけ sample し、元画像判定と page-turn burst 判定が共有する。
 
+§1.341のbook leaf（[page-turn-animation-plan.md §19](page-turn-animation-plan.md)）も、このnormal prepare/source選択を一回だけ使用する。
+leafのvisible receiptは一部のincoming頁がまだ裏にあるため、通常`page_turn_ready`/navigation sequenceの完了証拠にはしない。
+各頁の初出はpolygon可視面積で記録し、全実頁のcanonical flatがoutput hookで採用された後のowning frameで完了する。
+割込みでも同じflat採用を先に行い、close→継続commit→fresh drawing/input snapshotを共有する。
+normal layoutのH/gと各頁のprepared rect/UVをprojectionへ渡し、異寸法のscanを同じrectへ揃えない。
+効果専用decode/upload・UI thread I/Oを追加せず、設定OFFの通常flat経路は維持する。
+演出の入力観測も通常key handlerと同じpassのkeyboard ownerを先に選択する。
+gamepadのneutral pollは操作factを発行せず、sampled analog factだけが演出を取り消す。
+設定ONの受理済み移動は、候補欠落/複数入力やinstant経路でも既存transactionで一回の理由付きskipを記録する
+（[page-turn-animation-plan.md §20](page-turn-animation-plan.md)）。
+
 通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
 から求める。PDF は thumbnail / fullscreen の各 raster 寸法が別々に整数丸めされるため、PDFium が
 読む page box を `layout_width/layout_height` に 1/1000 point の固定小数点レイアウト寸法として
@@ -2966,6 +3019,13 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   直前・直後の表示単位を両ページとも範囲へ含める。v3.7.0 では旧既定の前方 2 だけを版境界で
   一度 3 へ移行し、保存済みの後方値は変更しない。表紙ありモードの末尾から先頭への循環は
   この範囲計算へ含めない。
+  未リリース§1.341のlocal pagedアニメーションONでは、source/AI先読みとも通常navigationの
+  表示unitから対象を選び、予算境界の組を分割しない。現在の相方は予算を消費せず、末尾unitの
+  実画像である補助表紙も同unitの需要へ含める。source/AI双方の需要をlive keepに合流し、
+  indicatorの方向もunit位置で示す。Retained PDF FinalAiのみ残る隣頁は、既存final-effect workerと
+  paced pollでGPU素材を準備する（AI先読みゼロでも既存結果の再利用は可能）。Retained pageの
+  entries/bytes共有LRU上限は維持し、受理までに素材が間に合わなければinstantとする。
+  OFF・連結・Split・Remoteの既存範囲計算は変更しない。詳細はページめくり設計§26.8。
   ⚠️ **退行注意**: Pipeline P1 リファクタ (be05cfef) で旧 `prefetch_ai_upscale` が
   dead code 化され、新版が未実装のまま 1 リリース過ごした。`App::update` の
   「フルスクリーン work セクション」(= `// AI 先読み (新パイプライン)` コメント) を
@@ -3052,3 +3112,38 @@ projected contextのwindow bindingとexact active hostのapplied borderlessか�
 通常content・holdover・navigation gapは同じresolverで上・下・右の予約を解放する。
 strip表示選択とresource ownerは変更せず、一時表示のrectだけをhit / sinkへ渡す。
 [設計](fullscreen-locked-chrome-suppression-plan.md) §4・5を参照。
+
+
+### §1.341 Pairの移動背（2026-10-11利用者option A）
+
+[page-turn plan §23](page-turn-animation-plan.md)が固定静止面の2%loss省略を置換する。
+leafと同じsmooth progressで背をold→newへ移し、旧Tは旧背から、新Sは新背からのdeltaを自身のrectへ平行移動する。
+UV/寸法は保持し、reveal gate・終端の差分退役・shadow/visibilityは移動後のgeometryを消費する。
+projectionのdestination clipはpainter scissorとtransform viewportの交差で、任意のtrim有無をcanvas変更と誤認しない。
+初回incomingが不可視でもvalid Pairを開始し、first_visibleは実面積、完了は全canonical flat採用で保証する。
+有限pin枠はfullscreenの10%（固定128 MiB cap撤去）、VRAM無制限時は1 GiB。実測737.47 MiB/準備後推計756.02 MiBが根拠で、会計/dedup/leaseと低VRAM・memory_pressure gateを維持する。
+
+
+### §1.341 見開きの横長一画像とVacant（2026-10-12）
+
+[page-turn plan §24](page-turn-animation-plan.md)により、見開きで単独表示する横長は通常paint_rect
+の中央を背にして二つの投影faceへ正規化する。sourceの回転後サイズで判定し、quarter rotationを
+適用済みのquad UV/underlay UVを表示左右へ分ける。追加decode/upload・texture・navigation stepは無い。
+Pair↔横長・横長↔横長は同じBookLeaf/移動背時計で着地し、形状由来のgap0↔Pair gapを扱う。
+単頁表示の横長は従来の一枚。通常の縦長singletonは既存のCenter/Left/Right rectを保持し、
+空slotは明示Vacant（surface/occurrence無し）。Vacant側のleafは描かず、90度arrival/departureを使う。
+提示receiptは横長二面の実面積を一つのsource occurrenceへ合算し、面ごとの保守的short spanを使う。
+pin/lease/dedupはactual resourceのまま。OFFの通常layout・page count/seek/historyは変更しない。
+
+### §1.341 共通の黒い紙と両端の実効配置（2026-10-13）
+
+[page-turn plan §26](page-turn-animation-plan.md)が単頁の暫定spine比較を置換する。
+old/newの画像rectを覆う共通paperに黒余白を加え、紙端の固定背で一leafをめくる。
+画像rect/UV/underlayは保持し、下頁は静止する。紙全体の遮蔽と画像自身のvisibilityを区別する。
+黒paddingは新textureやsource occurrenceを作らず、終端は保存背景色の通常canonical描画へ戻る。
+local paged見開きのcompositionは演出ON時だけ先頭・末尾配置を実効ONにする。保存値・本別指定、
+連結読み・Remoteは保持する。環境設定とlocal pagedの本別HUDは実効値を表示して両端指定を
+無効化し、OFFで保存値の表示・操作へ戻る。末尾Navigation＋FrontCoverSupplementの実画像Pairは
+通常Pairと同じtexture/role付きreceiptでめくり、白companionの拒否は維持する。
+ON/OFFによるgeometry変更では同じpresentation ownerの
+旧flat/ready/receiptを失効し、一件のcontinuationを新canonical採用まで保持する。

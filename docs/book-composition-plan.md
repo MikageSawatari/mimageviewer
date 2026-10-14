@@ -739,6 +739,13 @@ Eのfit参照再選択や初回layoutの自動reanchorも、adoptionから発生
 (現在のscroll/layout所有: `src/app/viewer_context_registry.rs:991`, `:1054`, swap `:2646`, `:2693`)。
 App共通bool、anchor専用許可、texture cacheに付ける許可の別ownerは作らない。
 
+通常open／navigation／slideshow／seekのindexed受付では、採用済みAutomatic／Composedの
+source投影と現在のscope token・identity index・context／世代を証明できる場合、既存serviceの
+初期化済み・Running・先行mutationなしのsnapshotから同じowner内で新しい許可を確定する。
+新しい要求IDと全occurrenceをatomicに公開し、旧episodeやtextureの保持を許可証として流用しない。
+不明source／旧token／Checking／Hiddenは従来のFIFO workerへ渡し、後着で紙めくりを再offerしない。
+identity-only／初回可視候補／preview／Remoteのworker照合は維持する（紙めくり計画§26.18）。
+
 責務と確定順:
 
 1. `draw_fs_continuous_reading` が `continuous_reading_layout` の可視候補を受け取った時、
@@ -1560,6 +1567,24 @@ UI thread-local RotationDb読取カウンターが増えないことを直接検
 | build-dev | 未実行。最終確認でも別ツリー`C:\home\mimageviewer-musicvideo\target\dev-runtime\mimageviewer-core.exe`、PID 74036が稼働中。利用者指示に従いビルドを保留し、processを停止していない |
 
 アプリ起動・コミットは行っていない。確認用binaryはこの差分で更新していない。
+
+#### B2 ACCEPT後のmaster統合（2026-10-14）
+
+基点 `4eb172a15` は独立レビューACCEPT。masterの§1.341・§1.373・§1.375との競合を、
+新しい保存形式と共通builderへ接続して解消する。§1.341の旧units専用cache／resolverを戻さず、
+形成理由と構成優先配置でcanonical／先読みを判定する。詳細と検証は
+[ページめくり計画 §26.20](page-turn-animation-plan.md#2620-next-book新形式とmasterの統合2026-10-14)。
+§1.373の保存受付・Append終端／presence／Undo receiptを保持し、hidden除外通知を共通終端へ移す。
+構成のmode／flow、直接draft変更、回転リセットは同じ後続mutation受付を通す。
+回転cacheの値取り出しは旧readerと確認memoを失効させ、worker返信の失効revisionも進める。
+§1.375の物理走査記録・Stack対応表は組とは別の入力層に属し、元のcontext所有と採用順を維持する。
+旧形式への移行・読替えは追加しない。アプリ起動・停止、git add／commitは行わない。
+
+通常／portable check・fmt・機械監査・glyph・関連回帰・UI snapshotは成功。
+今回のtest-fullは一回でPASS、本体13,165成功・0失敗・59既存ignored、vendor4まで完了。
+PNG更新は不要。統合接点と監査登録の限定独立静的レビューはACCEPT。
+通常build-dev `-PreserveRuntime`も成功（core／Remote／EPUB worker、runtime4／PE3）。
+検証ログと生成物の詳細は上記§26.20へ集約する。
 
 ### 旧G段階の実装・採択・検証履歴
 

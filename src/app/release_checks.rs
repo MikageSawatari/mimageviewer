@@ -333,7 +333,7 @@ mod tests {
         app.video_thumb_overrides_dirty_paths.insert(path.clone());
         assert!(!app.release_check_interaction_ready());
         app.video_thumb_overrides_dirty_paths.clear();
-        app.folder_refresh_pending = Some(path);
+        app.folder_refresh_pending = Some(path.into());
         assert!(!app.release_check_interaction_ready());
         app.folder_refresh_pending = None;
         assert!(app.release_check_interaction_ready());

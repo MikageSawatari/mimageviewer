@@ -27,7 +27,7 @@ pub struct BookPageEntry {
     pub display_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BookAppendSummary {
     pub book_name: String,
     pub folder: PathBuf,
@@ -37,6 +37,8 @@ pub struct BookAppendSummary {
     pub semantic_copies: Vec<BookPathMapping>,
     pub erase_fallback_pages: usize,
     pub skipped_hidden: usize,
+    pub(crate) undo_files: Option<crate::book_append_undo::AppendFilesReceipt>,
+    pub(crate) metadata_copy: crate::book_append_undo::BookAppendMetadataCopySummary,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +71,17 @@ pub struct BookTransferSummary {
 #[derive(Debug)]
 pub enum BookOpResult {
     Append(BookAppendSummary),
+    AppendPresencePrepared {
+        summary: BookAppendSummary,
+        presence: Result<Option<BookAppendEditPresence>, String>,
+    },
+    AppendRefreshPrepared {
+        summary: BookAppendSummary,
+        scan: crate::app::folder_scan::ScannedDir,
+        composition: crate::book_append_undo::BookCompositionStamp,
+        request: crate::app::book_append_refresh::BookAppendRefresh,
+    },
+    UndoAppend(crate::book_append_undo::BookAppendUndoResult),
     Transfer(BookTransferSummary),
     List(Vec<BookInfo>),
     Created {
@@ -96,6 +109,18 @@ pub enum BookOpResult {
         edit_moves: Vec<BookPathMapping>,
         bookmark_migration_journal_id: Option<String>,
     },
+}
+
+pub(crate) struct BookAppendEditPresence(
+    pub(crate) crate::app::page_edit_snapshot::StablePageEditProjection,
+);
+
+impl std::fmt::Debug for BookAppendEditPresence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BookAppendEditPresence")
+            .field("stamp", &self.0.stamp)
+            .finish()
+    }
 }
 
 /// Filesystem と SQLite を跨ぐ本ページ移動の phase-aware journal owner。
@@ -208,6 +233,7 @@ pub struct BookOpPending {
 
 /// The physical operation owned by a pending book worker. A delete retains its
 /// exact requested root until the success result supplies the removed path.
+#[derive(Clone)]
 pub enum BookOpIntent {
     Unrelated,
     /// A manager refresh can also carry one read-only, cancelable grid-navigation request.
@@ -218,11 +244,24 @@ pub enum BookOpIntent {
     Delete {
         path: PathBuf,
     },
+    Append {
+        operation_id: u64,
+        source_context: crate::app::ViewerContextId,
+        accepted_revision: u64,
+        target_folder: PathBuf,
+        observations: crate::book_append_undo::AppendObservations,
+    },
+    UndoAppend {
+        receipt: crate::book_append_undo::BookAppendUndoReceipt,
+    },
 }
 
 impl BookOpIntent {
     pub fn blocks_rename_migration(&self) -> bool {
-        matches!(self, Self::SourceMutation | Self::Delete { .. })
+        matches!(
+            self,
+            Self::SourceMutation | Self::Delete { .. } | Self::UndoAppend { .. }
+        )
     }
 }
 
@@ -802,7 +841,9 @@ pub fn append_pages(
     sources: Vec<BookPageSource>,
     raw: &crate::raw::RawDecodeContext,
 ) -> Result<BookOpResult, String> {
-    append_pages_at_with_raw(crate::data_dir::get(), root, book_name, sources, Some(raw))
+    let data_dir = crate::data_dir::get();
+    let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data_dir);
+    append_pages_at_with_raw(data_dir, root, book_name, sources, stores, Some(raw))
 }
 
 pub(crate) fn append_pages_at(
@@ -811,7 +852,8 @@ pub(crate) fn append_pages_at(
     book_name: String,
     sources: Vec<BookPageSource>,
 ) -> Result<BookOpResult, String> {
-    append_pages_at_with_raw(data_dir, root, book_name, sources, None)
+    let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data_dir);
+    append_pages_at_with_raw(data_dir, root, book_name, sources, stores, None)
 }
 
 pub(crate) fn append_pages_at_with_raw(
@@ -819,7 +861,27 @@ pub(crate) fn append_pages_at_with_raw(
     root: PathBuf,
     book_name: String,
     sources: Vec<BookPageSource>,
+    stores: crate::book_append_undo::AppendMetadataStores,
     raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<BookOpResult, String> {
+    append_pages_at_with_raw_observed(data_dir, root, book_name, sources, stores, raw, |_, _| {})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppendPageBoundary {
+    BeforeMetadata,
+    BeforeFileCreate,
+    AfterFileCreate,
+}
+
+fn append_pages_at_with_raw_observed(
+    data_dir: PathBuf,
+    root: PathBuf,
+    book_name: String,
+    sources: Vec<BookPageSource>,
+    stores: crate::book_append_undo::AppendMetadataStores,
+    raw: Option<&crate::raw::RawDecodeContext>,
+    mut observe: impl FnMut(AppendPageBoundary, &Path),
 ) -> Result<BookOpResult, String> {
     if sources.is_empty() {
         return Err("追加するページがありません".to_string());
@@ -846,6 +908,13 @@ pub(crate) fn append_pages_at_with_raw(
         .map_err(|e| format!("本フォルダを作成できません: {}: {e}", folder.display()))?;
     ensure_direct_book_target(&root, &folder)?;
 
+    let mut receipt_builder =
+        crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, book_name.clone())
+            .map_err(|error| {
+                crate::logger::log(format!("[book-append-undo] initial receipt: {error}"))
+            })
+            .ok();
+
     let start = next_page_number(&folder)?;
     if start + sources.len() - 1 > MAX_BOOK_PAGES {
         return Err(format!(
@@ -856,6 +925,7 @@ pub(crate) fn append_pages_at_with_raw(
         ));
     }
 
+    let mut metadata = crate::book_append_undo::AppendMetadataWriter::open_at(&data_dir, stores)?;
     let mut first_path = None;
     let mut edit_copies = Vec::new();
     let mut semantic_copies = Vec::new();
@@ -869,7 +939,15 @@ pub(crate) fn append_pages_at_with_raw(
             BookPageSource::File { src, .. } => Some(src.clone()),
             _ => None,
         };
-        if let Some(copy) = source_edit_copy_path(&root, &folder, &source) {
+        observe(AppendPageBoundary::BeforeMetadata, &dest);
+        let copy = source_edit_copy_path(&root, &folder, &source);
+        let (full, semantic) = match &copy {
+            Some(BookSourceCopy::Full(path)) => (Some(*path), None),
+            Some(BookSourceCopy::Semantic(path)) => (None, Some(*path)),
+            None => (None, None),
+        };
+        metadata.prepare_destination(&dest, full, semantic)?;
+        if let Some(copy) = copy {
             let mapping = BookPathMapping {
                 from: copy.path().to_path_buf(),
                 to: dest.clone(),
@@ -879,8 +957,23 @@ pub(crate) fn append_pages_at_with_raw(
                 BookSourceCopy::Semantic(_) => semantic_copies.push(mapping),
             }
         }
-        if write_source(source, &dest, raw)? {
-            erase_fallback_pages += 1;
+        observe(AppendPageBoundary::BeforeFileCreate, &dest);
+        match write_source(source, &dest, raw) {
+            Ok(true) => erase_fallback_pages += 1,
+            Ok(false) => {}
+            Err(error) => {
+                // Initialized rows for a failed output are deliberately retained.
+                // The error is logged and returned for the existing notification.
+                crate::logger::log(format!("[book-append-undo] output creation: {error}"));
+                return Err(error);
+            }
+        }
+        observe(AppendPageBoundary::AfterFileCreate, &dest);
+        if let Some(builder) = receipt_builder.as_mut()
+            && let Err(error) = builder.record(&dest)
+        {
+            crate::logger::log(format!("[book-append-undo] output receipt: {error}"));
+            receipt_builder = None;
         }
         if let Some(source_path) = byte_copy_source {
             restore_declines.record(&source_path, &dest);
@@ -900,7 +993,15 @@ pub(crate) fn append_pages_at_with_raw(
         restore_declines.errors.len(),
     ));
 
-    Ok(BookOpResult::Append(BookAppendSummary {
+    let undo_files = receipt_builder.and_then(|builder| {
+        builder
+            .finish()
+            .map_err(|error| {
+                crate::logger::log(format!("[book-append-undo] file terminal receipt: {error}"))
+            })
+            .ok()
+    });
+    let mut summary = BookAppendSummary {
         book_name,
         folder,
         added,
@@ -909,7 +1010,17 @@ pub(crate) fn append_pages_at_with_raw(
         semantic_copies,
         erase_fallback_pages,
         skipped_hidden,
-    }))
+        undo_files,
+        metadata_copy: metadata.finish(),
+    };
+    crate::book_append_undo::finalize_append_receipt(&mut summary);
+    crate::logger::log(format!(
+        "[book-append-undo] metadata pages={} database_ms={:.3} database_us_per_page={:.3}",
+        summary.added,
+        summary.metadata_copy.database_elapsed.as_secs_f64() * 1_000.0,
+        summary.metadata_copy.database_elapsed.as_secs_f64() * 1_000_000.0 / summary.added as f64,
+    ));
+    Ok(BookOpResult::Append(summary))
 }
 
 pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<BookOpResult, String> {
@@ -2524,6 +2635,161 @@ fn sanitize_filename(input: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1373_append_metadata_precedes_file_and_later_eight_store_edits_win() {
+        use crate::book_append_undo::append_test_support::TestMetadata;
+        use std::sync::mpsc;
+        // Freeze the real Append worker before metadata, before publication and
+        // after publication. The final result stays unpolled during user writes.
+        for clear in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("books");
+            let source_folder = root.join("source");
+            fs::create_dir_all(&source_folder).unwrap();
+            let source = source_folder.join("0001_source.jpg");
+            fs::write(&source, b"source image").unwrap();
+            let data = tmp.path().join("data");
+            let mut dbs = TestMetadata::open(&data);
+            let source_key = crate::adjustment_db::normalize_path(&source);
+            dbs.set_all(&source_key, 4);
+            let unrelated = root.join("other/0001_other.jpg");
+            let unrelated_key = crate::adjustment_db::normalize_path(&unrelated);
+            dbs.set_all(&unrelated_key, 2);
+            let destination = root.join("destination/0001_0001_source.jpg");
+            let destination_key = crate::adjustment_db::normalize_path(&destination);
+            dbs.set_all(&destination_key, 2);
+            let stores = dbs.stores();
+            let (boundary_tx, boundary_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = append_pages_at_with_raw_observed(
+                    data,
+                    root,
+                    "destination".into(),
+                    vec![BookPageSource::File {
+                        src: source,
+                        original_name: "0001_source.jpg".into(),
+                    }],
+                    stores,
+                    None,
+                    |boundary, path| {
+                        boundary_tx.send((boundary, path.to_path_buf())).unwrap();
+                        resume_rx.recv().unwrap();
+                    },
+                );
+                result_tx.send(result).unwrap();
+            });
+            let next = |expected| {
+                let (actual, path) = boundary_rx
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(path, destination);
+            };
+            next(AppendPageBoundary::BeforeMetadata);
+            assert!(!destination.exists());
+            dbs.assert_all(&destination_key, Some(2));
+            // Source edits committed before initialization are copied.
+            dbs.set_all(&source_key, 5);
+            resume_tx.send(()).unwrap();
+            next(AppendPageBoundary::BeforeFileCreate);
+            assert!(!destination.exists());
+            dbs.assert_all(&destination_key, Some(5));
+            resume_tx.send(()).unwrap();
+            next(AppendPageBoundary::AfterFileCreate);
+            assert_eq!(fs::read(&destination).unwrap(), b"source image");
+            dbs.assert_all(&destination_key, Some(5));
+            // A manual reload/open can now expose the destination. All normal
+            // metadata writes, including tag remove/all-clear, must win.
+            if clear {
+                dbs.clear_all(&destination_key);
+            } else {
+                dbs.set_all(&destination_key, 3);
+                dbs.tags
+                    .set_item_tags(&destination_key, ["v3", "added"], "test")
+                    .unwrap();
+                dbs.tags.toggle_item_tag(&destination_key, "added").unwrap();
+            }
+            // Editing the source after publication cannot mutate the output.
+            dbs.set_all(&source_key, 4);
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap();
+            // The terminal report is delivered only after those user writes.
+            let BookOpResult::Append(summary) = result_rx.recv().unwrap().unwrap() else {
+                panic!("expected final Append");
+            };
+            assert!(summary.undo_files.is_some());
+            assert!(summary.metadata_copy.errors.is_empty());
+            assert_eq!(summary.metadata_copy.ratings, [destination_key.clone()]);
+            assert_eq!(summary.metadata_copy.tags, [destination_key.clone()]);
+            dbs.assert_all(&destination_key, (!clear).then_some(3));
+            dbs.assert_all(&unrelated_key, Some(2));
+            dbs.assert_all(&source_key, Some(4));
+        }
+    }
+
+    #[test]
+    fn section1373_append_initialization_failure_never_creates_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("books");
+        let source = tmp.path().join("source.jpg");
+        fs::write(&source, b"source").unwrap();
+        let result = append_pages_at_with_raw(
+            tmp.path().join("missing-data"),
+            root.clone(),
+            "destination".into(),
+            vec![BookPageSource::File {
+                src: source.clone(),
+                original_name: "source.jpg".into(),
+            }],
+            crate::book_append_undo::AppendMetadataStores {
+                adjustment: true,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(result.is_err());
+        assert!(!root.join("destination/0001_source.jpg").exists());
+        assert!(!tmp.path().join("missing-data").exists());
+        assert_eq!(fs::read(source).unwrap(), b"source");
+    }
+
+    #[test]
+    fn section1373_failed_file_creation_retains_initialized_rows_without_rollback() {
+        use crate::book_append_undo::append_test_support::TestMetadata;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("books");
+        let source = root.join("source/0001_source.jpg");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"source").unwrap();
+        let data = tmp.path().join("data");
+        let mut dbs = TestMetadata::open(&data);
+        let source_key = crate::adjustment_db::normalize_path(&source);
+        dbs.set_all(&source_key, 4);
+        let stores = dbs.stores();
+        let result = append_pages_at_with_raw_observed(
+            data,
+            root.clone(),
+            "destination".into(),
+            vec![BookPageSource::File {
+                src: source.clone(),
+                original_name: "0001_source.jpg".into(),
+            }],
+            stores,
+            None,
+            |boundary, _| {
+                if boundary == AppendPageBoundary::BeforeFileCreate {
+                    fs::remove_file(&source).unwrap();
+                }
+            },
+        );
+        assert!(result.is_err());
+        let destination = root.join("destination/0001_0001_source.jpg");
+        assert!(!destination.exists());
+        dbs.assert_all(&crate::adjustment_db::normalize_path(&destination), Some(4));
+    }
 
     #[cfg(windows)]
     #[test]

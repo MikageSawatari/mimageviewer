@@ -1,5 +1,19 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+`FsPageTurnAnimationToggle` は `FsImage` / `Press`、既定キーなしの操作。
+静止画フルスクリーンの「その他の機能」の他のON/OFF行と同様にKeyActionを持ち、
+操作カスタマイズでキーを割り当てられる。HUD行には割り当てた先頭chordを表示する。
+通常窓/F12から環境設定と同じ全体設定 `page_turn_animation_enabled` を変更する。
+メニューの並びは固定で、toolbar/HUDの表示項目カスタマイズ対象ではない。
+動画・音楽には適用せず、新しい既定キーやリング操作は追加しない。
+
+音楽ビュー上部の「…」→「音名の色」はマウス・タッチの固定入力で、keymap対象外。
+低頻度の見た目の好み設定なので専用キーを追加しない。開いたメニューは次のキー押下で閉じ、
+そのキー本来の操作を続ける。パネル内のホイール・Ctrl+ホイール・タッチ、および外側クリックで
+閉じる入力は背面のタイムラインへ渡さず、閉じたフレームもその入力の所有を保つ。
+パネル表示中に開始したドラッグやタッチは、キーで閉じた後もボタンの解放／接点の終了まで
+パネル側が所有する。キー本来の操作は続け、新しく開始した操作は通常どおり受け付ける。
+
 ## 構成のある本の表示キー（§1.242 B2）
 
 `FsViewSpread` / `FsViewLandscapeSplit`は閲覧方法だけを切り替える。既定キーなしでカスタム割当の対象。
@@ -17,7 +31,6 @@
 `FsReadingDirectionToggle`と見開きずらしは無効。Single/Split時のずらしキーは従来のページ送りfallbackを保つ。
 キー/リング/パッドは既存KeyActionと共通表示setterを通し、結果の表示設定を記憶しない。
 新Action・既定割当は追加しない。通常の本・通常一覧の既存キーは変更しない。
-
 
 `GridOrganizeFiles` はサムネイル一覧のカーソル項目／チェック済み項目の「ファイル整理先」を開く。
 既定キーはなし。操作カスタマイズからキー、リング（マウス／パッド）、マウスジェスチャ、
@@ -70,6 +83,15 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
 
 `ToggleAlwaysOnTop` は Global / Press の操作で、既定キーはない。操作カスタマイズでキーを割り当てると、main・egui フルスクリーン・native 動画の発火面から同じ設定を切り替える。設定メニュー先頭のチェック項目からも操作でき、ON/OFF の通知は発火した面だけに表示する。
+
+`UndoLastAction` は Global / Press、既定 `Ctrl+Z`。グリッド・画像ビューアでは、本への追加直後の
+一回取消を先に扱い、有効な追加がなければ従来の評価・タグ・補正Undoへ進む。取消は今回作った
+コピーだけをごみ箱へ移し、元ファイル・既存ページ・本フォルダを残す。追加のRedoはない。
+後続の編集・ファイル操作・場所切替で失効する。選択・チェック・スクロールだけでは失効しない。
+処理中または本の変更検出で取消を拒否した入力では、古いメタデータUndoを続けて実行しない。
+消しゴム・隠蔽・テキスト等の編集専用Undoと、TextEdit / IME / ダイアログの入力所有を優先する。
+メタデータRedoの `Ctrl+Y` / `Ctrl+Shift+Z` は固定入力のまま維持する。
+
 ゲームパッド全体は `Settings::gamepad_enabled` で無効にできる (操作カスタマイズ →
 設定 → ゲームパッド)。これは割り当ての変更ではなく**デバイスを読むかどうか**の設定で、
 無効の間は `GamepadRuntime` が読み取りスレッドごと止まる。読み捨てるだけにすると、
@@ -241,21 +263,28 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
-ただし IME composition 中の <kbd>Esc</kbd> press だけは、各 egui Context の input plugin が
-`Memory::begin_pass` より前に RawInput から除去する。これは変換キャンセルを egui の focus
-navigation に見せず未確定文字の選択を保つためで、release は残す。続く `Disabled` に
-`Commit` が無い場合だけ、同じ plugin が空の `Preedit("")` を直前へ 1 回補う。
-非 composing 時と 300ms grace 中だけの Esc は除去せず、通常のパネル / モーダル操作へ渡す。
+Windows の `allow_ime` が true のとき、IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
+clipboard event にしない。native presenter は `VK_PROCESSKEY` を egui key にしない。
+本体 Win32 queue と native 生キー公開も 0xE5 の press / repeat を捨てるため、JIS 記号の
+scan-code shortcut に IME 処理済みキーが一致することはない。
+egui-winit は物理キーの押下を Hidden（press 未配送）/ Forwarded（配送済み）として所有し、Process repeat でも Forwarded を保持する。
+本家 0.34.0 #7967 の HashSet との差分はこの型付き状態、allow_ime にかかわらない release の状態除去・Hidden のみ遮断、focus 喪失時の全消去。
+Win32 queue / native 生キー経路の release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
+取消の `Disabled` / 空 `Commit` に非空 `Commit` が無い場合だけ、input plugin が
+空の `Preedit("")` を補い、未確定文字を取り消す。アプリ操作の抑止は今 pass の Ime 列を
+反映した後の composing だけで決まり、Commit 後の通常 Enter / Escape / shortcut は即座に通る。
 composition state は viewport ごとに独立し、main / fullscreen / detached を共有する App Context と
-native presenter Context の両方へ同じ plugin を登録する。
+native presenter Context の両方へ同じ plugin を登録する。viewport 消滅・focus 喪失は当該状態を終了する。
 IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が一時的に外れる場合があるため、
 `ime_focus` が直前 pass の helper-managed field を 1 pass の `FocusRecovery` owner として保持する。
-この owner は TextEdit の再描画前から keymap を抑止し、同じ pass で field の focus を復帰する。
-pointer 入力を伴う focus 移動は優先して復帰しない。アプリ全体の Tab traversal 無効化、IME field の
+この owner は TextEdit の再描画前から keymap を抑止する。focus 復帰は別判定で、`lost_focus()`、
+pointer 無しの key press、他 widget の focus 無し、かつ composing または Enter / Escape press 無しの場合だけ行う。
+helper の retry は同条件（`lost_focus()` 以外）で次 pass 限り有効で、初回要求用の呼び出し側 latch には書かない。
+pointer 入力や他 widget への focus 移動を優先する。アプリ全体の Tab traversal 無効化、IME field の
 focus 保持、keymap の操作発火抑止は別責務であり、同じ event をそれぞれの ownership 境界で扱う。
 Hover で出す side panel 内の helper-managed field が実際に focus を持つ間は、その field を次 pass
 にも登録できるよう panel lifetime を keyboard focus でも維持する。これは focus を取り戻す処理ではなく、
-pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻る。IME を条件にした 1-pass
+pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻る。1-pass
 `FocusRecovery` の条件と上限は変更しない。
 
 診断は通常 logger の `[text-input-key]` として恒久的に残す。helper field が focused または直前 pass で

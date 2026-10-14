@@ -885,6 +885,7 @@ mod tests {
                     bg: 0,
                 },
                 crate::app::RetainedFinalAiEntry {
+                    canonical_dims: None,
                     pixels: std::sync::Arc::clone(&pixels),
                     used_upscale: false,
                     bytes: 4,
@@ -894,6 +895,7 @@ mod tests {
             app.retained_pdf_page_cache.insert(
                 crate::app::RetainedPdfPageKey { item_key },
                 crate::app::RetainedPdfPageEntry {
+                    canonical_dims: None,
                     metadata: None,
                     kind: crate::app::RetainedPdfPageCacheKind::Raster {
                         pixels: std::sync::Arc::clone(&pixels),

@@ -1,4 +1,16 @@
-# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+﻿# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+
+§1.353 の全再読込は [承認設計](section353-zip-refresh-location-plan.md) に従い、
+`RefreshList` に現在の論理 source・実効 ZIP prefix・カーソルを固定する。
+新ツリーで同階層を復元し、階層が消失した場合だけ直近の存在する祖先へ戻る。
+collapse で実効階層／親 stack が変わっても、存在する階層の active facet を保持し、
+Backspace の帰路だけ新ツリーへ合わせる。Collection／Smart／検索等の物理子は
+親の root へ配送せず、その子を既存 owner で更新する。変換済み書庫は論理 source と
+mounted backing を保持する。PDF の page cursor と履歴再入場の root 規則は維持する。
+検索 hit drill は途中 batch のヒット不足では戻さず、完全な結果の確定後だけ祖先／一覧へ戻す。
+facet の手動復元は有効な帰路 frame 一件だけを消費し、新しい実効親の無条件 frame は残す。
+階層消失と wrapper collapse が重なる場合、実際の祖先 scope に保存した条件を復元し、
+route の位置番号によって外側の条件まで復元しない。
 
 ## 画像folder→Stored ZIP（§1.242 G、実装中・検証待ち）
 

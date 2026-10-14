@@ -889,6 +889,7 @@ pub enum FullscreenOverflowItemId {
     SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
+    PageTurnAnimationToggle,
     ImageAnalysis,
     PixelGrid,
     LoupeLock,
@@ -900,6 +901,7 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
+            Self::PageTurnAnimationToggle,
             Self::ImageAnalysis,
             Self::PixelGrid,
             Self::LoupeLock,
@@ -911,6 +913,7 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
+            Self::PageTurnAnimationToggle => "ページめくりアニメーション",
             Self::ImageAnalysis => "分析ツール",
             Self::PixelGrid => "ピクセルグリッド",
             Self::LoupeLock => "ルーペ固定",
@@ -5141,6 +5144,12 @@ pub struct Settings {
     /// 本ごとの見開き1ページずらしを記憶する。OFFでも保存済み調整は保持する。
     #[serde(default = "default_true")]
     pub remember_spread_shift_per_book: bool,
+    /// 単発のページ送りとスライドショーで紙めくり効果を使う。
+    #[serde(default)]
+    pub page_turn_animation_enabled: bool,
+    /// 動きを評価するための仮の演出時間 (ms)。100..=600 に制限する。
+    #[serde(default = "default_page_turn_animation_duration_ms")]
+    pub page_turn_animation_duration_ms: u32,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -5897,6 +5906,9 @@ pub struct Settings {
     /// (位置復元マトリクス「音声 × 移動」。既定 = 最初から。誤って別曲へ行って戻っても頭から)
     #[serde(default = "default_resume_from_start")]
     pub music_nav_resume: ResumeMode,
+    /// Pitch-class palette selected from the music HUD.
+    #[serde(default)]
+    pub music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     /// ユーザーが開いた本 / 動画 / 音声を閲覧履歴に記録するか。
     #[serde(default = "default_true")]
     pub reading_history_enabled: bool,
@@ -7386,6 +7398,10 @@ fn default_slideshow_continuous_scroll_percent() -> u32 {
 fn default_spread_page_gap_px() -> u32 {
     4
 }
+
+fn default_page_turn_animation_duration_ms() -> u32 {
+    200
+}
 fn default_continuous_reading_gap_px() -> u32 {
     20
 }
@@ -7688,6 +7704,8 @@ impl Default for Settings {
             default_spread_mode: SpreadMode::default(),
             follow_document_reading_direction: false,
             remember_spread_shift_per_book: true,
+            page_turn_animation_enabled: false,
+            page_turn_animation_duration_ms: default_page_turn_animation_duration_ms(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -7927,6 +7945,7 @@ impl Default for Settings {
             book_nav_resume: ResumeMode::FromStart,
             music_open_resume: ResumeMode::FromStart,
             music_nav_resume: ResumeMode::FromStart,
+            music_note_color_scheme: Default::default(),
             reading_history_enabled: true,
             reading_history_limit: default_reading_history_limit(),
             video_hw_decode: true,
@@ -9989,6 +10008,7 @@ impl Settings {
                 FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS,
             );
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
+        self.page_turn_animation_duration_ms = self.page_turn_animation_duration_ms.clamp(100, 600);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
         self.fullscreen_fixed_bar_gap_px = self
             .fullscreen_fixed_bar_gap_px
@@ -10291,6 +10311,8 @@ impl Settings {
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
         self.ui_scale_factor = src.ui_scale_factor;
+        // Music HUD edits must survive an older preferences snapshot.
+        self.music_note_color_scheme = src.music_note_color_scheme;
         // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
         // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
         // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
@@ -10913,6 +10935,39 @@ mod tests {
             stored.image_ext_priority,
             loaded.settings.image_ext_priority
         );
+    }
+
+    #[test]
+    fn music_note_color_defaults_roundtrips_and_survives_preferences_merge() {
+        use crate::music_note_color::MusicNoteColorScheme;
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.music_note_color_scheme, MusicNoteColorScheme::Fifths);
+        assert_eq!(
+            Settings::default().music_note_color_scheme,
+            MusicNoteColorScheme::Fifths
+        );
+        for scheme in [
+            MusicNoteColorScheme::Fifths,
+            MusicNoteColorScheme::Chromatic,
+        ] {
+            let mut live = Settings {
+                music_note_color_scheme: scheme,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+            assert_eq!(restored.music_note_color_scheme, scheme);
+            let mut stale_draft = Settings {
+                music_note_color_scheme: if scheme == MusicNoteColorScheme::Fifths {
+                    MusicNoteColorScheme::Chromatic
+                } else {
+                    MusicNoteColorScheme::Fifths
+                },
+                ..Settings::default()
+            };
+            stale_draft.overwrite_non_preferences_from(&mut live);
+            assert_eq!(stale_draft.music_note_color_scheme, scheme);
+        }
     }
 
     #[test]
@@ -14702,6 +14757,79 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(disabled).unwrap()).unwrap();
         assert!(!restored.remember_spread_shift_per_book);
+    }
+
+    #[test]
+    fn page_turn_animation_defaults_off_and_preserves_explicit_values() {
+        for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
+            assert!(!settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, 200);
+        }
+        let settings: Settings = serde_json::from_str(
+            r#"{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":350}"#,
+        )
+        .unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.page_turn_animation_enabled);
+        assert_eq!(restored.page_turn_animation_duration_ms, 350);
+        let snapshot = restored.preferences_snapshot();
+        assert!(snapshot.page_turn_animation_enabled);
+        assert_eq!(snapshot.page_turn_animation_duration_ms, 350);
+    }
+
+    #[test]
+    fn removed_single_page_turn_spine_is_ignored_and_not_saved() {
+        for legacy_value in [
+            serde_json::json!("OwnPage"),
+            serde_json::json!("Moving"),
+            serde_json::json!("FutureMode"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "page_turn_animation_enabled": true,
+                "page_turn_animation_duration_ms": 350,
+                "page_turn_single_spine": legacy_value,
+            }))
+            .unwrap();
+            assert!(settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, 350);
+            assert!(
+                serde_json::to_value(&settings)
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_value(settings.preferences_snapshot())
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn page_turn_animation_duration_sanitizes_to_provisional_range() {
+        for (input, expected) in [
+            (0, 100),
+            (99, 100),
+            (100, 100),
+            (350, 350),
+            (600, 600),
+            (601, 600),
+            (u32::MAX, 600),
+        ] {
+            let mut settings = Settings {
+                page_turn_animation_enabled: true,
+                page_turn_animation_duration_ms: input,
+                ..Settings::default()
+            };
+            settings.sanitize();
+            assert!(settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, expected);
+        }
     }
 
     #[test]

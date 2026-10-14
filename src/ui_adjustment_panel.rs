@@ -2376,6 +2376,137 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_page_layers[&0][0].name.clone()
     }
 
+    fn seam_append_receipt(
+        app: &crate::app::AppTestEnvForTest,
+    ) -> crate::book_append_undo::BookAppendUndoReceipt {
+        static NEXT_RECEIPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT_RECEIPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = app
+            .tmp
+            .path()
+            .join(format!("adjustment-append-books-{serial}"));
+        let folder = root.join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                .unwrap();
+        let page = folder.join("0001_page.jpg");
+        std::fs::write(&page, b"generated page").unwrap();
+        builder.record(&page).unwrap();
+        crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 1,
+            source_context: app.virtual_list_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        }
+    }
+
+    fn seam_install_undo_append(app: &mut crate::app::AppTestEnvForTest) {
+        let receipt = seam_append_receipt(app);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::UndoAppend { receipt },
+        });
+    }
+
+    #[test]
+    fn section1372_1373_slider_draft_admission_precedes_release_and_busy_is_unchanged() {
+        for scope in [AdjustScopeSelection::Page, AdjustScopeSelection::Standard] {
+            for busy in [false, true] {
+                let mut app = seam_test_app();
+                app.book_append_undo_receipt = Some(seam_append_receipt(&app));
+                if busy {
+                    seam_install_undo_append(&mut app);
+                }
+                let revision = app.book_append_undo_revision;
+                let original = app.effective_params(0).clone();
+                let mut edited = original.clone();
+                edited.brightness += 0.1;
+                app.apply_adjustment_panel_edit_frame(
+                    0,
+                    scope,
+                    original.clone(),
+                    edited,
+                    true,
+                    true,
+                    false,
+                );
+                if busy {
+                    assert_eq!(app.book_append_undo_revision, revision);
+                    assert!(app.book_append_undo_receipt.is_some());
+                    assert!(!app.adjustment_dragging);
+                    assert!(app.adjustment_drag_session.is_none());
+                    assert!(app.adjustment_standard_drag_session.is_none());
+                    assert_eq!(app.effective_params(0), &original);
+                } else {
+                    assert!(app.book_append_undo_revision > revision);
+                    assert!(app.book_append_undo_receipt.is_none());
+                    assert!(app.adjustment_dragging);
+                    assert_eq!(app.meta_undo.undo_len(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1372_1373_nonresident_local_write_uses_stable_target_admission() {
+        let mut app = seam_test_app();
+        let target = app.page_adjustment_target_for_idx(0).unwrap();
+        let layers = app.local_adjust_page_layers[&0].clone();
+        app.items.clear();
+        app.local_adjust_page_layers.clear();
+        app.book_append_undo_receipt = Some(seam_append_receipt(&app));
+        let revision = app.book_append_undo_revision;
+        app.set_local_adjust_layers_for_target(&target, layers.clone());
+        assert!(app.book_append_undo_revision > revision);
+        assert!(app.book_append_undo_receipt.is_none());
+        assert_eq!(
+            app.local_adjust_write_pending[&target.page_key].layers,
+            layers
+        );
+        app.finish_local_adjust_writes();
+
+        seam_install_undo_append(&mut app);
+        let revision = app.book_append_undo_revision;
+        app.set_local_adjust_layers_for_target(&target, Arc::new(Vec::new()));
+        assert_eq!(app.book_append_undo_revision, revision);
+        assert!(app.local_adjust_write_pending.is_empty());
+    }
+
+    #[test]
+    fn section1372_1373_pending_key_undo_commits_before_pop_but_busy_changes_nothing() {
+        for busy in [false, true] {
+            let mut app = seam_app_with_shape();
+            let before = app.local_adjust_page_layers[&0].clone();
+            assert!(app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.01, 0.0));
+            let after = app.local_adjust_page_layers[&0].clone();
+            assert_eq!(app.meta_undo.undo_len(), 0);
+            if busy {
+                seam_install_undo_append(&mut app);
+            }
+            let revision = app.book_append_undo_revision;
+            app.apply_meta_undo();
+            if busy {
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.local_adjust_shape_key_edit.is_some());
+                assert_eq!(app.local_adjust_page_layers[&0], after);
+                assert_eq!(app.meta_undo.redo_len(), 0);
+                assert!(app.local_adjust_write_pending.is_empty());
+                app.apply_meta_redo();
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.local_adjust_shape_key_edit.is_some());
+            } else {
+                assert!(app.local_adjust_shape_key_edit.is_none());
+                assert_eq!(app.local_adjust_page_layers[&0], before);
+                assert_eq!(app.meta_undo.redo_len(), 1);
+                app.apply_meta_redo();
+                assert_eq!(app.local_adjust_page_layers[&0], after);
+                assert_eq!(app.meta_undo.undo_len(), 1);
+            }
+        }
+    }
+
     /// 保存経路を通ったか。`set_local_adjust_layers_for_idx` が presence を立てるので、
     /// DB を開けたかどうかに依らず判定できる。
     fn seam_took_the_save_path(app: &App) -> bool {
@@ -2386,6 +2517,7 @@ mod local_adjust_canvas_edit_contract_tests {
     fn a_prepare_only_edit_updates_memory_without_saving_or_pushing_undo() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
             layer.name = "prepared".to_string();
@@ -2393,6 +2525,7 @@ mod local_adjust_canvas_edit_contract_tests {
         });
 
         assert!(!applied, "PreparedOnly は「編集が効いた」ではない");
+        assert_eq!(app.book_append_undo_revision, append_revision);
         assert_eq!(
             seam_layer_name(&app),
             "prepared",
@@ -2413,12 +2546,14 @@ mod local_adjust_canvas_edit_contract_tests {
     fn an_untouched_edit_leaves_everything_alone() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |_layer| {
             LocalAdjustCanvasEdit::Untouched
         });
 
         assert!(!applied);
+        assert_eq!(app.book_append_undo_revision, append_revision);
         assert!(!seam_took_the_save_path(&app));
         assert_eq!(app.meta_undo.undo_len(), undo_before);
     }
@@ -2427,6 +2562,7 @@ mod local_adjust_canvas_edit_contract_tests {
     fn an_applied_edit_with_persist_saves_and_pushes_undo() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
             layer.name = "applied".to_string();
@@ -2434,6 +2570,7 @@ mod local_adjust_canvas_edit_contract_tests {
         });
 
         assert!(applied);
+        assert!(app.book_append_undo_revision > append_revision);
         assert_eq!(seam_layer_name(&app), "applied");
         assert!(seam_took_the_save_path(&app));
         assert_eq!(
@@ -10928,7 +11065,7 @@ impl App {
     /// 左パネルのボタンと画像フルスクリーンのショートカットは、表示初期状態を
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
-    pub(crate) fn enter_local_adjust_mode(&mut self) {
+    pub(crate) fn enter_local_adjust_mode(&mut self, ctx: &egui::Context) {
         if self
             .fullscreen_idx
             .is_some_and(|fs_idx| !self.fullscreen_edit_mode_entry_allowed(fs_idx))
@@ -10941,6 +11078,20 @@ impl App {
         if let Some(fs_idx) = self.fullscreen_idx {
             let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
             if !self.raw_edit_target_entry_allowed(target_idx) {
+                return;
+            }
+            self.cancel_original_material_entry_intents(None);
+            if self
+                .current_local_adjust_source_pixels(target_idx)
+                .is_none()
+                && !self.ensure_erase_stage_for_entry(
+                    ctx,
+                    target_idx,
+                    crate::app::OriginalMaterialEntry::LocalAdjustment {
+                        requested_fs_idx: fs_idx,
+                    },
+                )
+            {
                 return;
             }
             if let Some(pivot) = pivot {
@@ -11051,6 +11202,14 @@ impl App {
         defer_render: bool,
         mutate: impl FnOnce(&mut local_adjust_core::LocalAdjustmentLayer) -> LocalAdjustCanvasEdit,
     ) -> bool {
+        // The closure can report hydration-only or a genuine edit only after
+        // examining the document. It is non-reentrant and cannot publish jobs.
+        // Reject UndoAppend before lending the document, then invalidate only
+        // an Applied edit in this same call, before any render/save publication.
+        if self.book_append_undo_in_progress() {
+            self.show_feedback_toast("本への追加を取り消しています".to_string());
+            return false;
+        }
         if !self.begin_local_page_edit(fs_idx) {
             return false;
         }
@@ -11090,6 +11249,9 @@ impl App {
         if !outcome.touched_document() {
             self.restore_local_page_edit_document_projection();
             return false;
+        }
+        if outcome.did_apply() {
+            self.admit_book_append_followup_mutation();
         }
         self.note_local_page_edit_document_changed();
         self.project_local_page_edit_document(fs_idx);
@@ -13687,6 +13849,20 @@ impl App {
         reset_all_params: bool,
     ) {
         let was_dragging = self.adjustment_dragging;
+        if (changed || is_dragging || was_dragging) && self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
+        if changed {
+            if effective_scope_selection_after == AdjustScopeSelection::Page
+                && self.capture_page_edit_owner(fs_idx).is_none()
+            {
+                return;
+            }
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
+        }
         // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
         let drag_just_started = is_dragging && !was_dragging;
         if drag_just_started || (changed && !is_dragging && !was_dragging) {
@@ -14123,6 +14299,9 @@ impl App {
             .unwrap_or("3D LUT")
             .to_string();
         let worker_path = path.clone();
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.prepare_page_edit_history_boundary();
         if !self.begin_local_page_edit(fs_idx) {
             return;
@@ -14327,6 +14506,9 @@ impl App {
             self.show_feedback_toast("被写体マスク生成用の画像を取得できません".to_string());
             return;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.prepare_page_edit_history_boundary();
         if !self.begin_local_page_edit(fs_idx) {
             return;
@@ -14410,6 +14592,9 @@ impl App {
         };
         if scope.requires_subject() && subject.is_none() {
             self.show_feedback_toast("利用できる被写体マスクがありません".to_string());
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         let color_tolerance = self.local_adjust_region_color_tolerance;
@@ -15255,6 +15440,7 @@ impl App {
         );
 
         if close_clicked {
+            self.cancel_original_material_entry_intents(None);
             self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
             self.fold_local_adjust_edit_state();
@@ -15335,7 +15521,7 @@ impl App {
         // 左右ボタンで対象ページを切り替える。退避は触らないので、ボタンはそのまま
         // トグルとして使い続けられる (消しゴムの `switch_erase_target_in_spread` と同じ約束)。
         if let Some(new_idx) = switch_target_to {
-            self.switch_local_adjust_target_in_spread(new_idx);
+            self.switch_local_adjust_target_in_spread(ctx, new_idx);
         }
     }
 
@@ -15352,11 +15538,29 @@ impl App {
     ///
     /// `local_adjust_edge_preview_cache` は `source_key` で keyed なので消さない。
     /// `local_adjust_selected_layers` はページごとの `HashMap` なので消さない。
-    pub(crate) fn switch_local_adjust_target_in_spread(&mut self, new_idx: usize) {
+    pub(crate) fn switch_local_adjust_target_in_spread(
+        &mut self,
+        ctx: &egui::Context,
+        new_idx: usize,
+    ) {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
         if self.fullscreen_idx == Some(new_idx) {
+            return;
+        }
+        let Some(request) = self.page_edit_target_switch_request(
+            crate::app::PageEditTargetSwitchTool::LocalAdjustment,
+            new_idx,
+        ) else {
+            return;
+        };
+        self.cancel_original_material_entry_intents(None);
+        if !self.ensure_erase_stage_for_entry(
+            ctx,
+            new_idx,
+            crate::app::OriginalMaterialEntry::Switch { request },
+        ) {
             return;
         }
         // 保留中のブラシ再計算は捨てずに確定させる。捨てると旧ページの cache が
@@ -15530,13 +15734,25 @@ impl App {
                                     let edit = title_edit
                                         .as_mut()
                                         .expect("matching book bookmark title edit");
-                                    let (_, submit_title) = draw_bookmark_title_edit(
-                                        ui,
-                                        bookmark.id,
-                                        &mut edit.title,
-                                        &mut edit.request_focus,
-                                        enter_pressed,
-                                    );
+                                    let (response, submit_title) = ui
+                                        .add_enabled_ui(
+                                            !self.book_append_undo_in_progress(),
+                                            |ui| {
+                                                draw_bookmark_title_edit(
+                                                    ui,
+                                                    bookmark.id,
+                                                    &mut edit.title,
+                                                    &mut edit.request_focus,
+                                                    enter_pressed,
+                                                )
+                                            },
+                                        )
+                                        .inner;
+                                    if response.changed() {
+                                        // The local TextEdit draft is published back to App
+                                        // below. Opening/canceling an unchanged field is read-only.
+                                        self.invalidate_book_append_undo();
+                                    }
                                     if submit_title {
                                         save_title = Some((bookmark.id, edit.title.clone()));
                                         control_clicked = true;
@@ -16146,7 +16362,8 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_local_adjust",
                 );
-                self.enter_local_adjust_mode();
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+                self.enter_local_adjust_mode(child.ctx());
                 return;
             }
             if activate_erase {
@@ -16170,7 +16387,7 @@ impl App {
                     "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
                 );
                 self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-                self.enter_conceal_mode(fs_root_idx);
+                self.enter_conceal_mode(child.ctx(), fs_root_idx);
                 return;
             }
             if activate_crop {

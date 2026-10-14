@@ -29,6 +29,53 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 
 ---
 
+## 音楽タイムラインのベース計算（鍵盤設計 §13）
+
+`run_music_analysis` はデコード成功と取消なしを確認し、必要な `TimelineComplete` の送信後に
+独立したベース計算を始める。LRUヒットでも実行し、失敗／取消時の `MusicPcm::mark_complete`
+を成功の印には使わない。スコープ付きスレッドは最大 `min(4, available_parallelism)` 本、
+Windowsでは `THREAD_PRIORITY_BELOW_NORMAL`。atomicの次区間番号を取得し、20秒ごとの区間に
+58フレームの助走を付け、各推論フレームで既存の取消トークンを確認する。
+
+区間workerは番号と区間の値だけをmpscで持ち主へ返す。持ち主が `TimelineBassTrack` へ結合して
+計算済みの印を立て、全体のimmutable snapshotを `MusicAnalysisMsg::Bass` で公開する唯一の
+公開者になる。送信間隔は最短250ms、最後の区間は必ず公開する。大きな配列のcloneは持ち主の
+workerでのみ行う。UIはsource一致の内側で1 drainの最新Bassだけを採用し、Timelineと共通の
+`music_analysis_version` を1回進める。row raster要求はBassのArcも共有し、計算済みbinだけで
+リズム区間の投票を行う。未計算binの色は既定値のまま。結果と同じ票をtextureへ持たせ、
+tooltipはその表示中textureの票を参照する。旧snapshotをUIで複製したり投票し直したりしない。
+
+曲／適用済み音声トラックの変更・closeではBassを破棄し、park／復帰は同じsourceの状態を保持する。
+スレッド生成のまれな失敗はログを残し、生成できた本数で続ける。再試行や回復機構は追加しない。
+ベース結果のLRU保存も行わない。
+
+## 実Folderの自動観測（§1.375 R10）
+
+前回走査の行記録、watch購読、dirty／cutoff、ExternalRescanPending、一覧復帰時の
+FolderRefreshRequestは既存viewer bundleに属する。OS購読の登録と登録後の確認scan、
+行投影・利用可能な精度のstamp取得・比較は既存rescan workerで実行する。
+Equal応答は軽い行記録と観測値だけを返し、不要な走査・準備済み一覧はworkerで破棄する。
+UIはowner／source／generation／投影条件／記録revision／購読epochを確認し、受理した
+cutoffまでだけをackする。走査中に届いた後続通知は元ownerのdirtyと既存restartへ残す。
+park／mountでは元購読と要求を保持し、forkでは記録だけを共有して独立購読を開始する。
+旧記録の大きなpayloadは既存retirement workerへ渡す。
+
+Differentは走査済み入力とworker準備済み投影を既存load／hydrationへ渡す。
+自動originをdefer／restart／Resumedでも維持し、sidecar取込を行わない。
+page identityと通常のDB hydrationは継続し、全体設定を一時変更しない。
+Stackの二度目のhydrationには既存GroupingSourceとInternalHydrationで同じ取込policyを渡し、
+既消費のcursor／Append receipt／local searchを再適用しない。
+明示GridReload／通常openでは設定どおりsidecarを取り込む。
+operation IDの自己通知照合、代表保持、cache形式変更、新しいpending ownerは追加しない。
+自己Delete時のStack member／対応表と保持aggregateの準備も既存delete workerに属する。
+purge lease解放後にStack candidateを読み、同じ削除終端でowner／世代／元view Arcを照合して
+表示行除去と同時に受理する。背景Stack採用とclose reconcileはこの既存modalの終端まで延期する。
+共有された兄弟view Arcは変更せず、UIの全件clone・sort・同期I/Oは増やさない。
+初回Stack分類の入力変更では、元のtyped pendingの所有資格を確認して取消・workerへ退役させる。
+通常Folderは観測不明から既存rescanで再準備し、サブ展開は現在行とsnapshot／tombstoneから
+元のhydration intentを持つ既存分類入口へ戻す。成功ゼロは元要求を保持する。
+詳細は [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md)。
+
 ## EffeTuneのタスクバー設定・通常矩形（§1.378、未リリース）
 
 Preferences OKと起動時は`effetune-host-control`へ設定を配送するだけで、UIはIPCを送信しない。
@@ -560,9 +607,9 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | 物理フォルダ open 事前走査 | `std::thread` + mpsc | viewer context ごとに最大 1 | フォルダペイン / detached open と、お気に入り表示状態の OFF・リセットでカテゴリ順または一覧ソートが変わった通常フォルダの再構築に使う。`FolderOpenScanPurpose` が用途を型で所有し、後者は path と並び設定 snapshot が現在値に一致するときだけ pre-scan 付きロードへ戻す。別 navigation / 後続要求は同じ pending を cancel するため、UI スレッドで `read_dir` / metadata scan を追加しない |
 | メディア前後送り候補の存在確認 | 常駐 `std::thread` (`media-nav-resolver`) + mpsc mailbox | App-global 0 or 1 (初回要求時に lazy 起動) | EOF / 手動前後送り時、UI が bundle items から抽出した方向付き候補列の実ファイルだけを `Path::exists` で順次検証する。worker は受信時に mailbox を drain して最新 request だけを処理し、キャンセル不能な `Path::exists` 中の新要求も同じ 1 thread に滞留させる。結果は単調増加 request id が最新 pending と一致する場合だけ検討し、`items_generation` / owner window / 開始時 `fullscreen_idx` を context-local stale 条件とする。App-global `input_seq` の一致は owner なしの mounted context だけで要求し、ParkedLive では無関係な main 入力を stale 理由にしない。owner 不一致中は結果を受信せず保留する。EOF action を stale / superseded / context close・load / resolver 切断 / apply 拒否のいずれかで捨てる場合は、対応する `(fs_idx, seek_serial)` と現在値が一致するときだけ video / 動画音声モード / music 共通 dedup latch を解除して次 tick の再試行を許す。ZIP/PDF 仮想 entry は I/O せず候補に残す。App drop で request sender が drop され、in-flight I/O が戻った後に receiver disconnect で自然終了する (終了時 join なし)。 |
 | ファイル名スタック分類 | `std::thread` (`stack-script`) + mpsc | スタックモード ON かつスクリプト有効時、フォルダ読込ごとに最大 1 本 | ユーザー定義 Rhai スクリプト ([`filename_stack_script`](../src/filename_stack_script.rs)) でフォルダ内画像のグループキーを算出する。重くなり得る (実測 10 万件 ~1 秒) ので UI スレッドから外す。通常フォルダを先に表示し、完了後 `poll_stack_script` が `start_loading_items` 経由で集約ビューへ差し替える。`StackScriptPending` の cancel + folder 一致で stale 判定、別フォルダ移動 / スタック OFF / 再ロードで cancel、失敗は組み込み既定へフォールバック。組み込み既定 (separator) ルールは軽量なので同期構築のまま。詳細 [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
-| 音楽ビュー解析 | `std::thread` (`miv-music-analysis`) + mpsc | 音楽ビューを開くごとに最大 1 本 | `run_music_analysis` が FFmpeg 全尺 decode + `analyze_stereo_timeline` を**全て UI スレッド外**で行う (Inc 3b)。**永続 DB (`audio_analysis.db`) はやめ in-memory LRU に置換 (2026-07-03)**: 結果は UI スレッドが `music_analysis_lru` (直近 N 曲、path+stream index+size+mtime キー) に保持し、`ensure_music_analysis` が `image_metas` の (mtime,size) で LRU を楽観的に lookup (UI スレッド stat しない) してヒットならタイムラインを即セット + ワーカーを `want_analysis=false` で起動、miss なら `want_analysis=true`。ワーカーは DB は触らないが背景で実ファイルを **fresh stat** し、ヒットに使った `hit_meta` と食い違えば (外部更新) 解析し直す + LRU 挿入キーに検証済み (mtime,size) を返す (`TimelineComplete{analysis,meta}`、image_metas スナップショットが stale でも正しい key)。**Inc 4**: 同ワーカーが spectrum 用に全尺 PCM も**1 回だけ**デコードし (timeline と共有)、`MusicAnalysisMsg::{Timeline(progressive 部分), TimelineComplete(全尺確定=LRU 挿入), Pcm, Probe}` を送る。`poll_music_analysis` が届いた分を Disconnected まで drain (pending は取り出して末尾で戻す)、pending 中は `request_repaint_after(50ms)`。新ファイル / `close_fullscreen` で cancel。decode ループは cancel を確認するが post-decode の解析パスは単一 pass で cancel 不可 (支配的コストの decode はキャンセル可)。**progressive spectrum PCM (2026-07-07)**: `Pcm` は**デコード開始前**に空の共有バッファ (`Arc<MusicPcm>` = `RwLock<Vec<f32>>` 追記式) として送り、デコードは新 API `audio_decode::decode_audio_file_progressive` (差分 `on_delta` を渡す) で回して差分を `append` (write)。timeline partial / 最終確定は同じ共有バッファのプレフィックス (`with_prefix` = read ロック下解析) から作る。これで下段スペクトラムが全尺デコード完了を待たず出る (§5.6)。**`RwLock`** なのは、長い解析 read (`with_prefix`) と spectrum の窓コピー read (`copy_window`) を並行させて spectrum を固まらせないため (`Mutex` だと解析中フリーズの実機 FB → RwLock で解消)。共通セットアップ `open_audio_decode` / partial スケジュール `PartialEmitSchedule` は既存 streaming decode と共有 |
+| 音楽ビュー解析 | `std::thread` (`miv-music-analysis`) + 区間worker最大4本 + mpsc | 音楽sourceにつき解析owner 1本、デコード後のみ区間並列 | `run_music_analysis` がFFmpeg progressive decode、取消可能な部分／確定timeline解析、独立Bass計算を全てUI外で行う。`TimelineComplete`のみをin-memory LRU（path+applied stream+size+mtime）へ保存し、UIの楽観ヒットはworkerのfresh statで検証する。PCMはデコード開始前に空の追記式 `Arc<MusicPcm>` を送り、以降appendする。`RwLock`のreadによりtimeline／Bassの長い読取とspectrumの短い窓コピーを並行できる。メッセージは `MusicAnalysisMsg::{Probe,Pcm,Timeline,TimelineComplete,Bass}`。デコード成功・取消なし→必要なTimelineComplete送信→最大 `min(4,available_parallelism)` 本のBELOW_NORMAL区間workerによるBass計算（LRUヒットでも実行）。各推論フレームで既存cancelを確認し、唯一の公開者である解析ownerが区間を結合し、全体snapshotを最短250ms間隔と完了時に公開する。UIは既存source一致内でdrainし最新Bassだけを採用、共有版数更新は1回。新source／closeでcancelとBass破棄、同じ音源のpark／復帰では保持。詳細は本書冒頭と鍵盤設計§13。 |
 | 音楽ビュー row raster | `std::thread` (`miv-music-timeline-raster`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`TimelineTextureCache`) | `TimelineAnalysis` から DJ 風波形タイムラインを **1 行 (row) ずつ** `egui::ColorImage` にラスタライズ。UI は request に `Arc<TimelineAnalysis>` を渡すだけ (行ウィンドウ切り出しは worker 側で zero-copy) で、結果は generation / row_version / key が現要求と一致するものだけを 1 フレーム 1 枚 `load_texture` する。旧 key / generation の結果は採用側で破棄。`ensure` (key 変更) / `clear` (ファイル変更・close) で worker を作り直す。詳細は [`src/ui_music_timeline.rs`](../src/ui_music_timeline.rs) |
-| 音楽ビュー spectrum | `std::thread` (`miv-music-spectrum`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`MusicSpectrumState`) | 常駐 `SpectrumAnalyzer` (E0-C#10 の MIDI 半音バー、多解像度 FFT) を所有し、UI から `Arc<MusicPcm>` + `center_secs` を受けて再生位置周辺 **±1 秒**の窓を worker 側でスライス (`copy_window`、lock 下で ~1MB 未満コピー) → `analyze_moving_window`。cpal ring buffer は約 100ms 分しか無く ±1s 窓に足りないため、ラボと同じく展開済み PCM をスライスする (案A、[music-integration-plan.md](music-integration-plan.md) §11)。**`MusicPcm` は追記式共有バッファ (`RwLock<Vec<f32>>` + `complete: AtomicBool`)**: 解析ワーカーがデコード進行に合わせて末尾 `append` (write) し、spectrum worker は現デコード済み範囲から窓を read で取る (未デコード領域が中心なら `None`)。`RwLock` = 長い解析 read と spectrum 窓コピー read を並行させ spectrum を固まらせない。高々 1 リクエスト in-flight + 溜まった分は最新へ coalesce。UI (`update`) は playing / 位置変化時に throttle (16ms) 付きで送り、pending / 再生中は `request_repaint_after(16ms)`。窓がまだ取れない間は空バンド = 鍵盤ベースライン + 「解析中…」表示 (`source_complete` で抑制)。新ファイル / close で `clear`。詳細は [`src/ui_music_spectrum.rs`](../src/ui_music_spectrum.rs) |
+| 音楽ビュー spectrum | `std::thread` (`miv-music-spectrum`) + mpsc | App 全体で 1 本 (`MusicSpectrumState`) | 常駐 `SpectrumAnalyzer` と `HarmNetTracker` を所有する。UI から `Arc<MusicPcm>` + `center_secs` を受け、棒グラフ／倍音比率は再生位置周辺 **±1 秒**を `copy_window` で短くコピーして `analyze_moving_window`、鍵盤中央は HarmNet L の基音確率から求める。tracker は PCM の `Arc::ptr_eq` と絶対フレーム番号で継続を判断し、別 PCM・後退・58 フレームを超える移動なら約 1 秒の助走から作り直す。20ms hop・160ms 先読みの推定を同じ要求の `SpectrumAnalysis` に入れ、既存の 1 本の結果チャネルで返す。助走／先読みの PCM は `copy_range` で取得し、デコード完了後の末尾より後は 0 埋め、未デコードの先端は未取得 (`pitch_probabilities: None`) とする。UI は確率未取得を入力 0 として残光を減衰し、一時停止中も直近の確率が `None` なら 16ms 間引きで再要求／repaint を予約する (有効な全 0 の `Some` と区別)。in-flight は高々 1 件で最新へ coalesce、曲全体の事前計算・保存や別 pending は追加しない。追記式 `MusicPcm` の `RwLock` により timeline の長い read と窓コピーの短い read を並行させる。新ファイル／close の既存 `clear` は worker ごと捨て、park／復帰は同じ PCM を保持する。棒グラフの窓も取れない間は空バンドと「解析中…」表示。詳細は [鍵盤の基音推定設計](music-keyboard-harmnet-plan.md) と [`src/ui_music_spectrum.rs`](../src/ui_music_spectrum.rs) |
 
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
 | EPUB 変換結果の管理 | `epub-cache-maint` + `mpsc` | 管理画面で最大 1 本 | 開く・再読込で現在の変換結果を DB から読み、選択・全件・元ファイル消失の削除は対象ごとにその場で実行する。本ごとの読取リースがあれば待たずに使用中として残し、無ければ排他的な削除境界を取る。PDF worker の文書解放だけ総 10 秒を上限に待ち、応答なしの対象は残して理由を返す。`App::epub_cache_maint_pending` が受信まで所有し、UI は一覧 snapshot と結果だけを描画する。内部廃止世代の起動時回収は残す。RAR/7z の容量集計とは別 DB・別 pending |
@@ -2005,3 +2052,11 @@ request/result channelは有界で、UIからの送信は非blocking。decode/�
 元ページを表示するために、通常viewerのthumbnail queueをresetしたりhidden許可を書き換えたりしない。
 viewのページ名/状態/unitの投影はdraft変更時に更新し、静止中のUI frameではcacheを読む。
 詳細な受入条件・未実施の確認は[本の構成計画 G4](book-composition-plan.md)に記録する。
+
+### master統合時の変換stateの格納（2026-10-14）
+
+書庫／EPUB変換の既存stateは`Option<Box<State>>`で格納する。両側の機能追加を統合した
+`App`のサイズが既存上限を超えたため、開始時の一回のallocationへ寄せる。
+poll、context退避／復帰、変換終端は同じBoxを移し、owner、modal、receiver、lease、
+取消・Dropの境界は変更しない。新しいpending stateや受付の排他は追加しない。
+Appサイズ上限と通常stackでのcapture回帰を維持し、poll／context移譲のallocation保持も検査する。

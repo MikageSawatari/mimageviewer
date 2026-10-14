@@ -1215,9 +1215,9 @@ impl App {
                 .map_or(false, |c| c.0 == zoom && c.1 == pan && c.2 == fs_idx);
             if !hist_valid {
                 let (h, s, v) = compute_hsv_histograms(pix, &zc, image_rect);
-                self.analysis_hist_cache = Some((zoom, pan, fs_idx, h, s, v));
+                self.analysis_hist_cache = Some(Box::new((zoom, pan, fs_idx, h, s, v)));
             }
-            let (_, _, _, h_hist, s_hist, v_hist) = self.analysis_hist_cache.as_ref().unwrap();
+            let (_, _, _, h_hist, s_hist, v_hist) = self.analysis_hist_cache.as_deref().unwrap();
 
             small_label(ui.painter(), egui::pos2(x0, y), "色相 (H)");
             y += 11.0;

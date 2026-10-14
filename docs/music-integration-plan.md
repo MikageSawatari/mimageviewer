@@ -235,11 +235,20 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - 再生制御は §2.2 の公開メソッドをそのまま呼ぶ。`step_frame` は音声では使わない（seek で代替）。
 
 ### 5.3 解析ワーカー + in-memory LRU（UI スレッド外）
+- タイムラインのベースと調は、ベース推定と12音名のchromaを持つ `TimelineBassTrack` を独立して計算する
+  ([鍵盤設計 §13〜14](music-keyboard-harmnet-plan.md))。chromaはhead 3の全88鍵の基音確率を音名ごとに合計する。
+  デコード成功・取消なしを確認し、必要な
+  `TimelineComplete` を送った後、最大 `min(4, available_parallelism)` 本の BELOW_NORMAL
+  スレッドで20秒ごとの区間を助走付きで計算する。スコープの持ち主だけが結果を結合し、
+  `MusicAnalysisMsg::Bass(Arc<TimelineBassTrack>)` を250ms以上の間隔と完了時に公開する。
+  ベースとchromaは同じ計算済み印を共有する。LRUヒットでも毎回計算し、この結果はLRUへ保存しない。UIは既存のsource一致判定内で
+  1 drainの最新結果だけを採用し、タイムラインと共通の版数を1回進める。
+  曲・適用済みトラックの変更とcloseで破棄し、同じ音源のpark／復帰では保持する。
 - `docs/async-architecture.md` のワーカーテンプレ（`XxxPending { cancel, rx }` + `start_xxx` /
   `poll_xxx` + cancel 3 箇所）で **解析ワーカー**を新設。入力 = path + cancel + `want_analysis` +
   `hit_meta`、出力 = `Probe` / `Timeline`（progressive 部分解析、display 専用）/
   `TimelineComplete { analysis, meta }`（全尺確定・LRU に載せる。`meta` = ワーカー検証済み
-  (mtime,size)）/ `Pcm`（spectrum 用）。
+  (mtime,size)）/ `Pcm`（spectrum 用）/ `Bass`（独立計算の部分／全尺snapshot）。
 - ワーカー内: **FFmpeg で PCM decode → インターリーブ stereo f32 → `analyze_stereo_timeline`**。
   decode = `src/audio_decode.rs`（`decode_audio_file_to_stereo_f32_streaming`、48kHz stereo）。
 - **永続化はしない（2026-07-03 方針転換、D8）**。旧 `src/audio_analysis_db.rs`（SQLite）は削除。
@@ -268,6 +277,10 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - **row raster worker**: `TimelineAnalysis` + row index + row secs + cache key + generation +
   row version → row `ColorImage`。ラボの raster worker をそのまま移植（`docs/async-architecture.md`
   テンプレ）。古い key / generation / row version の結果は UI 採用側で捨てる（最終防衛線）。
+
+音楽ビューの「…」パネル上では、入力所有判定と同じ矩形で左右パネルの端ホバーによる
+表示・維持を抑止する。矩形の外では従来の端ホバーを使い、固定中の右パネルや明示表示は維持する。
+Keyレーンの説明は `Height confidence, color key`（高さは確信度、色はキー）とする。
 
 #### §1.352: 上下HUDと中央コンテンツの幅（利用者決定2026-10-08）
 
@@ -500,19 +513,41 @@ cargo fmt / fmt --check、通常 / portable core check、glyph lint（危険glyp
     左パネルは同じブックマークデータを一覧描画するだけ（動画はシークバー/HUD 上に出す差だけ）。
 
 ### 5.6 MIDI 半音 spectrum（下段アナライザ）
-- `SpectrumAnalyzer` 常駐 worker。解析ワーカーが保持する PCM から、再生位置周辺 ±1 秒の
-  window をスライスして取得する（`src/video/audio.rs` の playback ring buffer は窓幅不足のため
-  使わない。§11 参照）。
+- 鍵盤上の▼も鍵盤と同じ基音確率から、A0〜G3の範囲で確率0.5以上の最低音を選ぶ。
+  タイムラインと選択関数を共用し、絶対MIDI鍵へ直接描く。スペクトルによるオクターブの
+  再選択は行わず、残光は維持する。タイムラインはリズム区間ごとの音量・低域エネルギー付き
+  投票で色を決め、ツールチップにも描画済みの同じ票を使う。未計算部分は既定色のままで、
+  計算済み側の票を未計算側へ広げない。鍵盤と全曲解析の助走履歴が異なるため完全一致は保証しない。
+- 音名の配色は `music_note_color` に集約する（[鍵盤設計 §15](music-keyboard-harmnet-plan.md)）。
+  C=赤、5度圏順（既定）／半音順の2方式とし、暗い音名だけ同じ強さの明度中央値へ上げる。
+  上部「…」の共有overflowパネルから変更し、`music_note_color_scheme` を保存する。
+  環境設定draft適用時も最新の配色を保持する。鍵盤は次の描画、タイムラインは既存
+  `music_analysis_version` の進行による再ラスタで反映し、要求ごとに方式を値で渡す。
+  再ラスタ中は表示中textureを保持する。parked-liveのボタンは非表示で、配色は共有設定から参照する。
+- 常駐 spectrum worker が `SpectrumAnalyzer` と music-core の `pitch::HarmNetTracker` を所有する。
+  棒グラフと倍音比率は従来どおり再生位置周辺 ±1 秒の PCM 窓から FFT で求め、鍵盤の中央は
+  **HarmNet L の基音確率 × 既存の音量ゲート（Norm ゲイン反映）**で光る。上下端は中央の明るさに
+  奇数倍音比／偶数倍音比を掛ける。倍音加点・局所正規化による間引きは使わず、色相と残光は維持する。
+  `src/video/audio.rs` の playback ring buffer は窓幅不足のため使わない（§11）。
+- 推論は 20ms hop で順に進め、160ms 先読みの head 3（age 8）を再生位置に対応させる。
+  worker は PCM の `Arc::ptr_eq` と絶対フレーム番号で継続を判定し、別 PCM・後退・58 フレームを
+  超える移動ではリセットして表示位置の約 1 秒前から助走する。曲全体の事前計算・保存はしない。
+  棒グラフと確率は既存の 1 本の結果チャネルで同じ要求から返す。曲切替／close は既存の `clear()` が
+  worker ごと捨てる。音楽 PCM／spectrum は App 全体で 1 つで、park／復帰は同じ PCM を保持する。
 - **progressive PCM（長尺の下段グラフ出現遅延対策、2026-07-07）**: `MusicPcm` は
   `RwLock<Vec<f32>>` の**追記式共有バッファ**。解析ワーカーは**デコード開始前に空の
   `Arc<MusicPcm>` を `Pcm` メッセージで UI へ渡し**、以降デコード差分を末尾 `append`（write）する。
-  spectrum worker は再生位置 ±1 秒窓だけを read でコピー（`copy_window`、~1MB 未満）して FFT に
+  spectrum worker は再生位置 ±1 秒窓を短い read でコピー（`copy_window`、~1MB 未満）して FFT に
   渡すので、**全尺デコード完了を待たず、再生位置がデコード済み範囲にあれば下段グラフが即描く**。
   `RwLock` にするのは、timeline の partial/最終確定解析（`with_prefix` = `analyze_stereo_timeline`
   を回す**長い read**）と spectrum の窓コピー（**短い read**）を**同時に走らせて spectrum を固まらせ
   ない**ため（`Mutex` だと解析中に spectrum がフリーズする実機 FB → RwLock で解消）。追記（write）は
   解析と同じデコードスレッド上で逐次なので競合しない。
-  未デコード領域が中心のときは窓 `None` = 鍵盤ベースライン + 「解析中」表示。以前は全尺デコード
+  HarmNet 用の助走・先読み範囲は `copy_range` で取得し、先頭より前とデコード完了後の末尾より後は
+  0 埋めする。未デコードの先端より後は計算を進めず、確率 `None`（未取得）を返す。鍵盤は入力 0 と
+  して残光を減衰させ、一時停止中も直近の確率が `None` なら既存の 16ms 間引き・in-flight 1 件で
+  再要求する。有効な全 0（`Some`）とは区別し、デコード完了を先に観測しても再要求は止めない。
+  棒グラフの窓も取れない間は空バンドと「解析中」表示。以前は全尺デコード
   完了後に PCM を 1 回だけ送っていたため、74 分級で下段グラフが数十秒出なかった（timeline は
   progressive 先出しで早いのに下段だけ遅れる不整合）。バッファ容量は probe duration から先取り
   （追記中の数百 MB 級 realloc memcpy 回避、bogus probe の OOM 予防に上限クランプ）。常駐は
@@ -1183,8 +1218,14 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   `WaveformBin` に `peak_l/rms_l/peak_r/rms_r` を additive 追加（music-core §2.1、`#[serde(default)]`）。
   mono 素材は L==R で従来どおり対称。L/R が全ゼロの既定/旧 bin は mono にフォールバック描画。
   in-memory 化 (§6/D8) 済みなのでディスク増はゼロ。
-- [x] loudness+bass root レーン（高さ=loudness、色=`bass_pitch_class` 五度圏）（Inc 3b）
-- [x] key レーン（`key_pitch_class` / `key_confidence`、低 confidence は淡色）（Inc 3b）
+- [x] loudness+bass root レーン（高さ=250Hz以下の低域音量を既存の音量正規化へ。
+  `loudness_db + 10·log10(band_energy[0])`、低域エネルギー0は高さ0。
+  色=`TimelineBassTrack` の計算済みbinのリズム投票。
+  未計算は既定色、tooltipは描画済みの同じ票）（鍵盤設計§13、旧binのbass値は本体表示に使わない）
+- [x] key レーン（上記trackのchromaを全幅6秒・左右3秒で集計し、24調のプロファイルと既存の信頼度式で推定。
+  窓はPCM実尺へ切り詰め、重みを省略する前に全フレームの計算済みを確認する。
+  未計算は灰色・tooltipなし、計算済みの調なしも灰色。推定と未計算状態はrow textureと一緒に保持し、
+  hoverは表示中の値だけを読む。旧binのchroma・調信頼度は表示に使わない。高さは既存の新hint信頼度式を維持）
 - [x] 歌声目安レーンはキャンセル済み。`center_ratio` は汎用の stereo center metric として残す。
 - [x] Row 秒数切替（解析キャッシュ再生成せず raster のみ作り直し）（Inc 3b、上バー巡回）
 - [x] メトリクスレーンのホバー（レーン名/値/時刻/推定音名）（Inc 3b）
@@ -1192,9 +1233,10 @@ placement に作り直す経路。headless→native の「presenter 無し→有
 
 ### 7.2 MIDI 半音 spectrum（下段）
 - [x] E0–C#10 / MIDI 半音ごとのバー、多解像度 FFT（`SpectrumAnalyzer`）（Inc 4、常駐ワーカー。2026-07-05 に 20Hz–18kHz の等比分割から変更）
-- [x] 鍵盤ハイライト（相対突出評価、A0–C8 明色/範囲外グレー）（Inc 4、`draw_pitch_keyboard`）
+- [x] 88 鍵の中央は HarmNet L の基音確率 × 音量ゲート、上／下は奇数／偶数倍音比のグラデーション（`draw_pitch_keyboard`。色相・残光は維持）
 - [x] ホバーで周波数 Hz + 近似音名（Inc 4、`draw_spectrum_hover`）
 - [x] 再生位置周辺 ±1s の PCM 窓を tap（Inc 4、案A = 展開済み PCM をスライス。§11 参照）
+- [x] 状態を持つ推論は spectrum worker 内で連続計算し、PCM 同一性とフレーム番号で継続／助走を判定（[鍵盤の基音推定設計](music-keyboard-harmnet-plan.md)）
 
 ### 7.3 beat/bar grid
 - [x] `BeatGrid` 表示（低 confidence は非表示 or 淡色、`BeatTrackingStatus`）（Inc 3b、draw_beat_grid）

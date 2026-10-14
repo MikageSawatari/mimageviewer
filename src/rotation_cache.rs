@@ -109,6 +109,13 @@ impl RotationCache {
         self.values = values;
     }
 
+    pub(crate) fn take_values(&mut self) -> HashMap<usize, Rotation> {
+        self.invalidation_revision = self.invalidation_revision.wrapping_add(1);
+        self.cancel_still_seek_rotations();
+        self.verified_nav = None;
+        std::mem::take(&mut self.values)
+    }
+
     pub(crate) fn clear(&mut self) {
         self.invalidation_revision = self.invalidation_revision.wrapping_add(1);
         self.cancel_still_seek_rotations();

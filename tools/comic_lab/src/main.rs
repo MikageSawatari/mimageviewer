@@ -490,11 +490,6 @@ struct ComicLab {
     /// panel. Global across objects (補正レイヤー convention).
     prop_tab: PropTab,
 
-    /// True while a Japanese IME conversion is in progress. Used by
-    /// `consume_ime_enter` to drop the Enter that confirms a conversion (so it
-    /// doesn't leak into the multiline TextEdit as a newline).
-    ime_composing: bool,
-
     // ----- Stamp (image sticker) state -----
     /// Decoded stamp pixels keyed by object id, handed to the baker. Rebuilt when
     /// stamp objects/sources change (see `ensure_stamp_images`).
@@ -690,7 +685,6 @@ impl ComicLab {
             font_script: HashMap::new(),
             font_script_rx,
             prop_tab: PropTab::Serifu,
-            ime_composing: false,
             stamp_images: StampImages::new(),
             stamp_source_cache: HashMap::new(),
             stamp_textures: HashMap::new(),
@@ -2773,49 +2767,6 @@ fn color32_to_rgba(c: Color32) -> Rgba {
 }
 
 impl ComicLab {
-    /// Drop the Enter event that confirms a Japanese IME conversion, so it does
-    /// not leak into the multiline TextEdit as a stray newline. Normal Enter
-    /// (not during composition) is left intact so it still inserts a newline.
-    /// Mirrors the main app's `update_ime_state` + `events.retain` idiom.
-    fn consume_ime_enter(&mut self, ctx: &egui::Context) {
-        ctx.input_mut(|i| {
-            // Was an IME composition active when this frame's events arrived?
-            let mut active = self.ime_composing;
-            for e in &i.events {
-                if let egui::Event::Ime(ime) = e {
-                    match ime {
-                        egui::ImeEvent::Enabled => active = true,
-                        egui::ImeEvent::Preedit(s) => active = !s.is_empty(),
-                        egui::ImeEvent::Commit(_) => active = true,
-                        egui::ImeEvent::Disabled => {}
-                    }
-                }
-            }
-            // Update the persistent composing flag from the latest IME event.
-            for e in &i.events {
-                if let egui::Event::Ime(ime) = e {
-                    self.ime_composing = match ime {
-                        egui::ImeEvent::Enabled => true,
-                        egui::ImeEvent::Preedit(s) => !s.is_empty(),
-                        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => false,
-                    };
-                }
-            }
-            if active {
-                i.events.retain(|e| {
-                    !matches!(
-                        e,
-                        egui::Event::Key {
-                            key: egui::Key::Enter,
-                            pressed: true,
-                            ..
-                        }
-                    )
-                });
-            }
-        });
-    }
-
     /// Drain background font classifications into `font_script`. Requests a
     /// repaint while results are still streaming so the filtered lists refine.
     fn drain_font_scripts(&mut self, ctx: &egui::Context) {
@@ -2843,7 +2794,6 @@ impl ComicLab {
 
 impl eframe::App for ComicLab {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.consume_ime_enter(ctx);
         self.drain_font_scripts(ctx);
         self.handle_dropped_files(ctx);
         self.draw_menu_bar(ctx);
@@ -8100,6 +8050,87 @@ fn recent_files_path() -> PathBuf {
 #[cfg(test)]
 mod sample_tests {
     use super::*;
+
+    fn text_body_pass(ctx: &egui::Context, tb: &mut TextBlock, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = draw_text_body(ui, tb, 1);
+                });
+            },
+        );
+    }
+
+    fn enter_event(pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn text_body_ime_commit_then_normal_enter_inserts_one_newline() {
+        for same_pass in [true, false] {
+            let ctx = egui::Context::default();
+            let field_id = egui::Id::new(("comic_text_edit", 1_u64));
+            let mut tb = TextBlock {
+                text: String::new(),
+                ..Default::default()
+            };
+            text_body_pass(&ctx, &mut tb, Vec::new());
+            ctx.memory_mut(|memory| memory.request_focus(field_id));
+            text_body_pass(&ctx, &mut tb, Vec::new());
+            text_body_pass(
+                &ctx,
+                &mut tb,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                ],
+            );
+            assert_eq!(tb.text, "あ");
+
+            // egui-winit excludes the Process press and its physical release,
+            // preserving only the Commit / Disabled sequence.
+            let mut events = vec![
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+            ];
+            if same_pass {
+                events.push(enter_event(true));
+            }
+            text_body_pass(&ctx, &mut tb, events);
+            if !same_pass {
+                assert_eq!(tb.text, "あ", "confirmation must not insert a newline");
+                text_body_pass(&ctx, &mut tb, vec![enter_event(true)]);
+            }
+            assert_eq!(tb.text, "あ\n", "same_pass={same_pass}");
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+        }
+    }
+
+    #[test]
+    fn text_body_normal_enter_inserts_a_newline_without_ime() {
+        let ctx = egui::Context::default();
+        let field_id = egui::Id::new(("comic_text_edit", 1_u64));
+        let mut tb = TextBlock {
+            text: String::new(),
+            ..Default::default()
+        };
+        text_body_pass(&ctx, &mut tb, Vec::new());
+        ctx.memory_mut(|memory| memory.request_focus(field_id));
+        text_body_pass(&ctx, &mut tb, Vec::new());
+        text_body_pass(&ctx, &mut tb, vec![enter_event(true)]);
+        assert_eq!(tb.text, "\n");
+    }
 
     /// The shipped verification scene (docs/comic-lab-sample-scene.comic.json)
     /// must keep loading through the lab's real `SidecarDoc` path, with the IVS /

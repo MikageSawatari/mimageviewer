@@ -170,8 +170,8 @@ mod tests {
             );
             let _ = ctx.end_pass();
             if ime {
-                // IME focus recovery uses the same latch as opening. It must
-                // keep the preedit selection rather than select the whole query.
+                // Even an explicit caller focus request during composition must
+                // preserve the preedit selection. Recovery retries are helper-owned.
                 app.global_search.focus_request = true;
                 ctx.begin_pass(egui::RawInput {
                     events: vec![
@@ -275,13 +275,13 @@ mod tests {
         assert_eq!(ctx.input(|input| input.events.len()), 1);
         let _ = ctx.end_pass();
         app.address_has_focus = false;
-        // IME preedit/commit grace and focus recovery are pass-owned claims; the
+        // IME composition and focus recovery are pass-owned claims; the
         // real dispatcher must retain their edge for the field, not just skip open.
         for phase in [
             TextInputPhase::PendingFocus,
             TextInputPhase::Focused,
             TextInputPhase::FocusRecovery,
-            TextInputPhase::ImeGrace,
+            TextInputPhase::ImeComposing,
         ] {
             key_pass(
                 &ctx,

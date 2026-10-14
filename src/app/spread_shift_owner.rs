@@ -806,9 +806,10 @@ impl App {
         {
             return false;
         }
-        self.spread_shift.projection = None;
-        self.spread_shift.scope = self.current_spread_shift_scope();
-        if let Some(scope) = &self.spread_shift.scope {
+        // Resolve the accepted target before changing the live draft. Hydration
+        // and readoption use their separate read-only owners above.
+        let scope = self.current_spread_shift_scope();
+        let reference = if let Some(scope) = &scope {
             let reference = self
                 .items
                 .get(anchor_idx)
@@ -816,22 +817,29 @@ impl App {
                     crate::book_resume_db::PageIdentity::for_item(item, Some(&scope.logical_root))
                 })
                 .and_then(|identity| SpreadShiftPageRef::from_identity(scope, &identity).ok());
-            if let Some(anchor_ref) = reference {
-                self.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
-                    anchor_ref,
-                    resolution: ShiftResolution::Resolved(anchor_idx),
-                    persistence: ShiftPersistence::SessionOnly,
-                });
-                if self.settings.remember_spread_shift_per_book {
-                    self.persist_live_shift(false);
-                } else {
-                    self.show_feedback_toast(
-                        "見開きを1ページずらしました（この閲覧中のみ）".into(),
-                    );
-                }
-            } else {
+            let Some(reference) = reference else {
                 self.show_feedback_toast("見開き調整の基点を保存できませんでした".into());
                 return false;
+            };
+            Some(reference)
+        } else {
+            None
+        };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
+        self.spread_shift.projection = None;
+        self.spread_shift.scope = scope;
+        if let Some(anchor_ref) = reference {
+            self.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
+                anchor_ref,
+                resolution: ShiftResolution::Resolved(anchor_idx),
+                persistence: ShiftPersistence::SessionOnly,
+            });
+            if self.settings.remember_spread_shift_per_book {
+                self.persist_live_shift(false);
+            } else {
+                self.show_feedback_toast("見開きを1ページずらしました（この閲覧中のみ）".into());
             }
         } else {
             self.spread_shift.state = ViewerShift::Ordinary(anchor_idx);
@@ -853,12 +861,15 @@ impl App {
                 .and_then(|service| service.observed_row(scope))
                 .is_some()
         });
+        let persists_clear = self.spread_shift.scope.is_some()
+            && (had_shift || has_saved)
+            && (explicit_clear || self.settings.remember_spread_shift_per_book);
+        if (had_shift || persists_clear) && !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         self.spread_shift.state = ViewerShift::None;
         self.spread_shift.projection = None;
-        if self.spread_shift.scope.is_some()
-            && (had_shift || has_saved)
-            && (explicit_clear || self.settings.remember_spread_shift_per_book)
-        {
+        if persists_clear {
             self.persist_live_shift(true);
         } else if had_shift {
             self.show_feedback_toast("見開き調整を解除しました".into());
@@ -872,6 +883,9 @@ impl App {
             return;
         }
         let availability = self.pairing_edit_availability();
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.spread_shift_settings_generation =
             self.spread_shift_settings_generation.wrapping_add(1);
         self.settings.remember_spread_shift_per_book = enabled;

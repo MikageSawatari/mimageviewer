@@ -1,4 +1,4 @@
-# 次リリース検討バックログ
+﻿# 次リリース検討バックログ
 
 このファイルは、**いま着手できる**作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -32,6 +32,38 @@
 
 ## 1. 優先候補
 
+### 1.383 parked-live の音楽ウィンドウで Norm のゲインが鍵盤の明るさに反映されない — HarmNet 鍵盤の設計レビューで判明 (2026-10-12)
+
+音楽ビューの鍵盤は、Norm (ラウドネス正規化) の適用ゲインを明るさ (presence) に反映する。通常のフルスクリーンの描画
+(`src/ui_fullscreen.rs` の音楽ビュー) は `normalize_ui_state_for_player(...).applied_gain_db()` を渡すが、
+parked-live の音楽ウィンドウ (`draw_parked_live_music_window`) は `music_spectrum.draw(ui, rect, 0.0, ...)` で 0dB を
+渡しており、park / 復帰で鍵盤の明るさが変わる (設計レビュー GPT-6.1 Sol の指摘、コードの参照のみで実機未確認)。
+HarmNet 化の前から同じ式なので、今回の変更で生じた差ではない。
+- 直し方の案: parked-live でも既存の `info.normalize_ui_state.applied_gain_db()` を渡す。detached の描画経路に触れるので、
+  凍結ルールの手続き (双方の合意と `docs/detached-rework-plan.md` §11 への記録) が要る。
+- 経緯: `docs/music-keyboard-harmnet-plan.md` §10 / §12 (P4)。
+
+### 1.382 egui / eframe / egui-wgpu を 0.33.3 から 0.36 系へ上げる — 次の版の次の最初の作業 (2026-10-14 利用者決定)
+
+依存物の更新確認で 3 段階遅れと判明。本家の更新履歴で見た主な差: 0.34 で文字描画の仕組みの交換 (ab_glyph から Skrifa + vello_cpu)、`App::update` から `App::ui`、`Panel` への統一、Area/Window/ScrollArea がフォーカスを取らない、MSRV 1.92。0.35 で非推奨 API の削除、IME の下線・カーソル表示と `owns_ime_events`、harfrust のシェーピング、Window はタイトルバーだけで移動。0.36 で `Modifiers` が入力イベント化、MSRV 1.95 (開発機は 1.94.1)。
+- 影響の見込み: UI snapshot (約 350 枚) の描き直し、`ui_fonts` の baseline 補正 (ab_glyph の外形計測) と `ime_focus` の作り直し、vendor の egui/eframe/egui-wgpu の変更の付け直し、wgpu 27 から上がる場合の動画表示部分。
+- 別セッションの日本語入力修正 (次の版に入る) は、`vendor/egui-winit` を本家 0.34 以降と同じ形に揃えてあり、上げるときは `vendor/egui-winit` を消すだけで済む見込み。
+
+### 1.381 自動テストが一時フォルダーを消せずに %TEMP% へ大量に残す — Everything が応答しなくなった件の調査で判明 (2026-10-14)
+
+利用者の Everything (約 2,860 万件) が頻繁に応答しなくなった件を調べたところ、`%LOCALAPPDATA%\Temp` に 1,475 万件 (全体の約半分) があり、大半が mIV のテストが残した `.tmpXXXXXX` フォルダー (約 77 万個、中身は設定 DB 一式や `cache`・`logs`) と `mimageviewer_*_test_*.db` (約 8 千個) だった (Everything の検索で設計担当が確認)。9 月より前 19.7 万、9 月中 約 18 万、10 月に入って約 40 万と、テストを流すたびに増えていた。
+- 推定原因 (未確認): テスト終了時の一時フォルダー削除は走るが、DB やログのファイルが開いたまま (process 全体の共有 handle、worker、logger 等) だと Windows では消せず、`TempDir` の削除失敗が黙って無視される。
+- 2026-10-14 に利用者の了承を得て、1 日以上前で中身が mIV のテスト用データに見えるもの (フォルダー 691,724 個、ファイル 7,281 個) を削除した。Everything の除外に Temp を追加済み (利用者)。
+- 対応案: 開いたままの handle を閉じてから消す、テスト終了時に削除できたことを検査する、test-full の後に残った一時フォルダーを数えて増えていれば知らせる。
+
+### 1.380 計算した高さと実際の中身の高さが食い違うパネルの残り — 再発防止の監査で判明・コード調査 (2026-10-13)
+
+静止画 HUD の「…」でスクロールバーが出た件 (利用者の報告) を受けた全パネルの監査で、直さずに残したもの。根拠と式は [docs/calculated-panel-height-audit.md](calculated-panel-height-audit.md) の残件節。いずれも実機での発生は未確認。
+- クリップボード取り込みの画像選択: 失敗カードのエラー文が折り返すと、固定の仮想行の高さを超える。
+- 見開きの調整メニュー: 保存した基点の名前がとても長いと、固定の本文の高さに収まらない。
+- テキスト注釈の右の詳細: 小さい画面でクリック吸収の範囲と本文の高さが食い違う。左の一覧の最低の高さ、切り取り・表示トリムの枠の予算も候補。
+- 本の構成の編集画面の右側の行の重なりは、§1.242 の組の作り直しの中で直す (ここでは扱わない)。
+
 ### 1.379 補正レイヤーで、マウスで図形を動かしている間にキーで動かすと、取り消し・Esc・保存の順序が食い違う — §1.372 の実装前調査 (2026-10-12)
 - 状態: **未着手 (時期未定)**。§1.372 の範囲外として分けた (coordinator 判断 2026-10-12)。
 - 内容 (コードの参照、実機での再現の主張ではない): 補正レイヤー (ローカル調整) の図形をポインタで操作している最中に、キーで移動・回転すると、(1) 履歴に別操作が混ざる (key entry が S0→S2、pointer entry が S1→S2)、(2) 次のポインタ更新が開始時の DragState.base から結果を作るのでキーの変更が上書きされる、(3) Esc で確定済みのキー変更が画面だけ消える、が起こり得る。経路: `ui_adjustment_panel.rs` の `update_selected_local_adjust_shape` / `apply_local_adjust_shape_drag_from_canvas` / Esc 処理、`undo_ops.rs` の `set_local_adjust_layers_for_idx_with_undo`。
@@ -53,9 +85,11 @@
 
 ### 1.375 フォルダで Delete キーで削除すると、正しく消えた一覧がもう一度丸ごと読み直されてちらつく — 利用者の実機報告 (2026-10-12)
 - **次の版に入れる (利用者 2026-10-12)**。
+- 独立設計レビュー `001a0dabf`: **REVISE**、指摘をR2/R3へ反映しR3はACCEPT。第一段Delete／第二段改名・move・copyの受入範囲を分ける。
+- 状態 (2026-10-14、next-list): **R10はLISTrev13独立設計レビューACCEPT・実装／独立コードレビュー／自動検証完了（2026-10-14）、実機確認待ち**（targeted406実行／391件、fmt・通常／portable check・最新dev成功、full最終13,531成功／0失敗／ignored63）。[設計書](section375-operation-reconcile-plan.md)のとおり、前回／今回の走査の行signature（名前・種類・サイズ・更新日時・投影後順序）一致時だけinstall・世代・thumb再要求を省く。記録不明は通常reload。sidecar stampと別context／RemoteのDB反映資格は判定外、自動sidecar取込は行差分reloadでもしない。未反映のDB値・外部sidecarは明示GridReload／開き直しで反映する利用者許容。代表保持・cache変更／移行・共有表示storage・自己操作ID／provenanceは撤回。§1.314、context別購読・dirty／cutoff、forkの記録継承と独立購読、§1.373のAppend／Undo契約を維持。LISTrev13 P3のdefer→一覧復帰／restart／Resumedの自動取込0回と、その直後の明示GridReload／通常openで設定どおり取込む対照、実Delete handler、1万／10万行perf、描画／scrollの同期DB query数を検証済み。最初のfullの3失敗は原因修正と元assert維持で補完し、最終gateを完走。過去の方式の試験をR10の受入証拠に流用しない。
 - 観測 (利用者): 一覧で Delete キーでファイルを削除すると、削除した項目がすぐ消えた一覧になるが、その後にもう一度一覧全体が再表示される。遅れて起きるのでちらついて見える。
 - 見込み (利用者・未確認): mIV 自身の削除をフォルダ監視が外部の変更として検知し、読み直している。自分で削除して既に正しい状態なので、余分な読み直しになっている。
-- 着手時: 削除の経路 (ごみ箱 / 完全削除、通常フォルダ / ZIP・PDF の中 / 検索結果 / コレクション) と、フォルダ監視の通知から読み直しまでの経路を列挙する。自分の操作の通知を時間で握りつぶす方法 (delay / 時間窓) ではなく、自分の操作を一意に表す印で「既に反映済み」と判定できるかを設計する。外部で同時に起きた変更を見落とさないこと。改名・移動・コピーにも同じ形がないか確認する。
+- 調査済みの経路: 削除（ごみ箱／完全削除、通常フォルダ／ZIP・PDF本体／検索結果／Collection）と監視→再走査→一覧採用、改名・move・copyの同型を設計書へ列挙。R10は自己由来を判定せず、走査層の行signatureだけで比較する。元owner・source・世代・投影条件と前回記録の有効性を採用直前に照合し、時間窓で通知を握りつぶさない。
 
 ### 1.374 Everything IPC を使う任意のファイル名検索を試験的に検討する — mIV スレ >>546 (2026-10-11)
 - **master 統合済み (420b38a14、2026-10-12)**。既定キー Ctrl+R、計画 `docs/everything-search-plan.md`。coordinator が隔離データで実機確認 (案内 3 種・取消・取得 10,000 件・開いて戻る)。
@@ -67,9 +101,9 @@
 
 ### 1.373 本棚ツールバーの右クリックで本棚へ追加した操作を Ctrl+Z で取り消す — 利用者の要望 (2026-10-11)
 - **次の版に入れる (利用者 2026-10-12)**。
-- 状態: **未着手。v4.6.0 より後の版で検討 (利用者 2026-10-11)**。
+- 状態 (2026-10-13、next-list): [設計書](section373-book-append-undo-plan.md) **R7実装・通常rescan退行修正済み、独立実装レビューACCEPT（§7.7–7.10）、最終full gate成功**。各destinationの八store初期化を同じAppend workerで画像作成前に同期完了し、ファイルの出現を公開点にする。stagingなし。独立metadata worker／後着copy reportの値採用を撤去し、global存在集合は既存receiverの現在DB再取得へ接続する。初期化後の作成失敗のorphan行はログ・通知で割り切り、rollbackを追加しない。R4自動観測配送、ごみ箱実移動確認・UndoAppend限定排他は維持。§1.373のRefreshList導入が操作／明示選択を後から旧cursorへ戻す退行を起こしたため、既存hydrationで一度だけ優先解決する。★固定の物理子はstartup資格と分離してsource／prefixを照合する。回帰4件追加、最終targeted279実行／237件、fmt・通常／portable check・確認用build成功。追加findingによるfull中断一回を別記録にし、最終完走一回でworkspace 13,439件＋vendor 54件＝13,493成功・0失敗・既存ignored63件。§1.375設計・manualは変更していない。詳細・証跡は§7.10。先のDB時間計測／release buildの履歴は§7.9に残す。瞬間的な同bytes差し替えは既定の割り切り方針による。membership DB／登録済みバッジは今回追加しない。
 - 要望 (利用者): 本棚ツールバーで項目を右クリックして本棚 (製本) へ追加したとき、たまに違う本棚に入れてしまう。今は本棚を開いてファイルを消すしかないので、Ctrl+Z で取り消したい。実ファイルの削除を伴うので、状態管理が大変なら「間違えた直後の 1 回だけ」の取り消しでもよい。
-- 調べること: 追加は本のフォルダへの番号付きページのコピー (必要なら焼き込み・再エンコード) と登録済みバッジ (`book_membership_db`) の更新 ([compile-book-plan.md](compile-book-plan.md)、`src/bake_stage.rs` / `src/books.rs`)。取り消しで消すのは今回追加したファイルだけにし、その後に本の中身が変わっていたら (並べ替え・追加・編集・外部での変更) 取り消さずに案内する。既存のメタ操作の Undo (`src/undo_stack.rs`) と同じ Ctrl+Z に載せるか、直後 1 回だけの専用の取り消しにするか。ファイルはごみ箱へ送るかどうか。並べ替えモード中の番号の詰め直し、登録済みバッジ、複数ページを一度に追加した場合、追加の途中で失敗した場合 (まれな失敗は既定で割り切る)。
+- 着手時の調査範囲: 追加は本のフォルダへの番号付きページのコピー (必要なら焼き込み・再エンコード) ([compile-book-plan.md](compile-book-plan.md)、`src/bake_stage.rs` / `src/books.rs`)。登録済みバッジ (`book_membership_db`) の更新という起票時の前提は、現基点では未実装と確認済み。今回追加したコピーだけを直後一回の既存Ctrl+Z経路でごみ箱へ移す (利用者決定済み)。その後に本の中身が変わっていたら取り消さずに案内する。番号の詰め直しは行わない。複数ページ、並べ替えdraft、後続編集、外部変更、途中失敗とmetadata Undoの扱いは設計書を正本とする (まれな失敗は既定で割り切る)。
 - 規模 / 優先度: Small〜Medium / P3。
 
 ### 1.372 検索結果の更新で並びが変わると、画像補正の取り消し・編集途中の内容が別の画像に書かれる恐れ — §1.371 の実装中に判明・コード調査 (2026-10-11)
@@ -213,9 +247,10 @@
 
 ### 1.353 ZIP の中の階層で「最新の情報に更新」(Ctrl+F5) すると、ZIP の最上位の階層に戻る — 利用者の実機確認 (2026-10-08)
 - **次の版に入れる (利用者 2026-10-12)**。
-- **状態: 今後検討 (利用者 2026-10-08)**。
+- 独立設計レビュー `001a0dabf` の **REVISE** を反映し、R2設計はACCEPT。`3bfbf1989` 実装レビューのfacet帰路P2二件と、今回のSmart／Collection synthetic rootの追加P2を修正。follow-upコードレビューACCEPT。
+- **状態 (2026-10-12、next-list): [設計書](section353-zip-refresh-location-plan.md) は R2 ACCEPT、facet帰路・起動復元を修正、追加回帰9件、独立最終ACCEPT。targeted618実行／596件・vendor54件・fmt・通常／portable check・最新dev成功。release入力四段成功、full一回exit101の失敗48件を全補完、再実行なし**。全再読込要求に現在 ZIP prefix が入らず root で materialize する。承認設計に従い RefreshList で現在位置を要求・準備・採用まで保持する。現基点の既定 F5 は★5、GridReload は既定キーなしで、Ctrl+F5 専用経路はない。
 - 出典: 利用者が次の版 (next-nav) の §1.339 の実機確認で観測。確認用 ZIP (`表紙.jpg`、`A/01.jpg`〜`A/04.png`、`A/sub/05.jpg`、`B/06.jpg`・`B/07.png`) を使った確認手順の途中で、ZIP 内の階層 (`A`) を表示した状態から Ctrl+F5 で最新の情報に更新すると、ZIP の最上位の階層に戻ったように見えた (スクリーンショットあり)。続く手順は、`A` に入り直してやり直すと意図どおりに動いた。
-- リリース済みの版でも同じかは未確認。原因は未調査 (ZIP 内の現在の階層が、再読み込みの経路で保持されていない可能性がある)。
+- リリース済みの版での実機比較は未確認。next-list 基点で現在階層が要求から欠落する原因をコードで特定 (上記設計書)。
 - 期待: 再読み込みの後も、同じ ZIP 内の階層と絞り込みを保つ。階層が消えた (ZIP が書き換えられた) 場合だけ、残っている最も近い階層へ戻る。
 - 着手時の確認: F5 と Ctrl+F5 の経路の違い、PDF / 変換済み書庫 / ZIP in ZIP の中の階層でも同じかどうか、`docs/virtual-folders.md` の現在位置の扱い。
 - 規模 / 優先度: Small〜Medium / P3。
@@ -230,14 +265,25 @@
 - 規模 / 優先度: 未見積もり / P3。
 
 ### 1.341 ページめくりのアニメーションを追加する — mIV スレ >>520 (2026-10-07)
-- **次の版に入れたい (利用者 2026-10-12)**: nextview で作業を続け、進み具合を見て判断する。残り = 見開き中の横長画像を中央で折る (設計書 §3.1 の 2026-10-12 決定) と、`C:/tmp/miv-spread-test/03_landscape_mid_10` で一部しかめくれない件。
-- **2026-10-11 利用者決定 (表示の完成を待たない)**: 通常のページ送りと同じく、めくる先の AI アップスケールなどが終わっていなければ、アップスケール前の画像やサムネイル画質でめくりのアニメーションを行い、その後にきれいな画像へ差し替える。「完成した画像だけをめくる」(final only) の規則はやめる。また、単ページでは綴じを読む向きごとに片側へ固定する (前へ・後ろへで綴じの左右が入れ替わらない)。
-- **2026-10-11 利用者決定: 次の次の版へ回す (v4.5.0 の次の版には入れない)**。A0 (nextview `532635fdd` 〜 `e3a328ff6`) を実機で確認したところ、スキャンした PDF はページごとの数ピクセルの差で毎回省かれ (`page_placement_changed`)、画像では「黒い帯が横に動くだけ」に見え、見開きは全体が 1 枚のように動いた (観測: 利用者)。要望: **実際の本のページをめくる動き** (見開きで左へ読むなら左ページだけが持ち上がって右へめくれる、背の軸で回る 1 枚の紙)。設計 R4 を nextview で作成中。初期設定 OFF、スライドショーでも動く、フルスクリーンの「…」から ON/OFF、Remote は対象外は維持。
-- **次の版の決定 (利用者 2026-10-07)**: ライン E (3 番目)。他アプリでも対応が多いので実装したい。
+
+- **2026-10-13 末尾・UI追補**: 共通黒paperの実機観測は「アニメーションよさそう」。local paged/演出ON中は先頭・末尾を実効ON、環境設定とpaged本別HUDの両端指定は実効表示で無効化する。保存値・OFF復帰・連結/Remoteを保持。末尾Navigation＋FrontCoverSupplementの二実画像Pairは通常素材/lease/receiptを再利用して前後にめくり、白companionの拒否は維持する。末尾補助の既存適格条件は変更しない。関連182件・singleton11件・設定181件・UI163件とfmt/glyph/check/context監査、normal確認buildが成功し、独立最終レビューACCEPT。最後の全体gate一回は未変更の音声テスト1件の3秒待機失敗でexit101（単独一回は成功）、全体PASSとは扱わない。現行仕様と検証記録は[plan §26](page-turn-animation-plan.md)、台帳は`target/A-1341-terminal-msg.txt`。以下の先頭のみ実効ONという記録は先行実装時点の履歴。
+- **2026-10-13 検証完了**: 下記採用改訂は独立レビューACCEPT。`test-full`はjobs1で一回PASS（本体12,379件・57ignored・失敗0、UI snapshot162件、vendor54件）。通常build-devはcore/remote/EPUBとruntime/PE検査まで成功し、隔離環境で確認できる。コミット・アプリ起動・実データ変更は行わず、motion/性能の実機採択をcoordinator/利用者へ残す。
+- **2026-10-13 採用改訂**: 単頁の案A/Moving比較を撤去し、前後画像を覆う固定サイズの黒い紙と固定背へ統一した。画像rect/UVと静止下頁を保持する。local paged見開きは演出ONの間だけ先頭配置を実効ONにし、全体/本別保存値・連結・Remote・末尾を維持する。表紙は中央/sideの双方が旧cover guardで拒否されていたため、実builderが側を確定した表紙を許可した。実builderの表紙/末尾/設定切替、dense pose・黒余白・会計の回帰と独立レビューを実施。関連179件・設定転送26件・normal/portable check・fmt/glyph・context監査成功、全体gate/buildは今回の記録へ追記する。実機採択はcoordinator/利用者へ残す。[plan §26](page-turn-animation-plan.md)、`target/A-1341-black-paper-msg.txt`。
+- **2026-10-12 実装追補**: `787b4bf74`の横長見開き中央折りに加え、`a7155f674`で設定gap変更後の古いoutgoingの受理拒否、native ROI端の浮動小数丸め修正、単頁の静止下頁と綴じ目移動の暫定比較設定を実装。案A（自身の綴じ目）が既定で、両案とも動くのは一leaf、下頁は最終rect全体で静止する。master `d357fd5ae`取り込みの6競合を解消し、ratingのClosed/Rebased・grid cursor・spread shift・PDF/Everything所有を維持。独立レビューACCEPT、取り込み後focused167件・関連回帰・normal/portable check・fmt/glyph・viewer_context_audit成功。full初回のscroll thumb golden差を対象1枚の更新で解消し、jobs1の再実行は本体12,367件・UI snapshot162件・vendor54件を含めPASS。normalのbuild-dev（core/remote/EPUB・PE検査）成功、git add/commit・アプリ起動は未実施。実機motion/性能と最終案/時間の採択は未了。[plan §24–25](page-turn-animation-plan.md)、`target/A-1341-merge-msg.txt`。
+- **2026-10-12 利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断**。2026-10-11の次の次の版への延期を改訂した。A0（`next-viewer` / `532635fdd`〜`e3a328ff6`）は利用者のnormal profile実機評価で不合格。PDF scanの数px差で`page_placement_changed`となる、画像では黒い帯に見える、spread全体を一枚として動かすように見える、という評価を受けた。本のように一枚の頁を背から返す動きが必要（RTL forwardは旧左頁だけを右へ返す）。
+- **設計改訂（2026-10-11）**: R4 `afc474d8d`、R5 `c73f0d857`、R6 `29291d496`の独立設計レビューはREVISE、R7 `fa5119c19`はACCEPT。[page-turn-animation-plan.md §19](page-turn-animation-plan.md)のStage 1は実装・自動検証・normal確認用build済、利用者の実機motion評価待ち。通常単頁・Pair間の背回転、頁ごとの異寸法、紙・陰影・影を先に評価できる形へ接続した。取消targetのcanonical flat採用、close→継続commit→fresh snapshot、commit後の描画owner再判定を維持する。cover/中央単頁/横長splitはこの段階では理由付きinstant、継続操作もflat採用後instant。F12 independent stillの既存動画拒否を維持する。R7の別source Half/Full最小対応（全landscape N頁で2N−1操作中N−1が候補）は後続stage。Stage 1ではsplit候補率0%であり、通常scanの実開始率・motion品質・性能受入れは未了。
+- **Stage 1実機追補（2026-10-11）**: `0d1b1f99f`では利用者が演出を確認できなかった。初回key観測のkeyboard owner未確定による候補消失と、入力ゼロgamepad pollが作る偽Continuousによる初回描画後取消を修正した。実handlerで初回key/click→開始→完了、neutral poll保持、理由付きskip一回の回帰を追加（[plan §20](page-turn-animation-plan.md)）。focused回帰・normal/portable check・ui_snapshot・normal確認用build済。修正後の実機motion評価と独立完了レビューは未了。
+- **Stage 1評価追補（2026-10-11）**: `52cd5a15f`の見開き・単頁motionは利用者から良いとの評価。単頁の固定背（LTR左／RTL右、戻りは前頁のarrival）を再確認し、固定端を明示した4枚のgoldenと連続pose回帰を追加する。実機ログの背は既に往復で同じ位置のため、見え方の症状は未再現。missing fact 18件はchild→ROOT受理時に別viewportのframe counterを比較して元factを消した問題で、元ID/source/phaseを保持する構造修正を行う。取消3件は終了直前の別native矢印入力で既存flat-first規則に従っていた（[plan §21](page-turn-animation-plan.md)）。最終受入れ・独立レビューは未了。
+- **2026-10-11 利用者決定（readiness）**: final-onlyを撤回。受理時のresident非AI画像・preview・thumbnailなど表示可能素材で即演出し、演出後は通常品質更新へ戻す。無素材は理由付き省略、受理時の待機・追加decode/uploadは禁止。[plan §22](page-turn-animation-plan.md)に素材・pin・取消・回帰を記録。実機と独立完了レビューは未了。
+- **2026-10-11 利用者評価とoption A**: `49e2b0911`で開始率が改善し単頁の背も良好。異寸法Pairは背と静止頁を同じleaf progressで平行移動し、canonical incomingへsnap無しで着地させる（[plan §23](page-turn-animation-plan.md)）。trim有無のpainter clip差は同canvasとして扱う。pin_budget 11件はbyte合計に余剰無しで固定128 MiB capが原因、実測737.47 MiB/準備後推計756.02 MiBに基づき有限fullscreen10%枠を維持してcapを撤去。独立完了レビュー・実機評価は未了。
+- PC/F12限定・Remote不要、既定OFF、slideshow、Preferencesとfullscreen HUD overflowの同じ全体設定は維持。時間は実際の動きを見てから利用者が決めるため、100〜600ms・既定200msは引き続き仮設定。過去の自動検証成功はmotion品質の合格を意味しない。最終時間・実機/性能受入れは未了。
+- 旧予定（利用者2026-10-07）: 次版ラインE（3番目）。2026-10-11の延期決定で置換済み。他アプリでも対応が多いので実装したい、という要求は維持。
 
 - 返信済み: まずはシンプルなアニメーションから実装を試す。方式・長さ・ON/OFF は設計時に決める。
 - 連続ページ送り、見開き、連結表示、複数ウィンドウで既存の表示速度や入力応答を落とさないことを先に確認する。
-- 規模 / 優先度: 未見積もり / P3。
+- 規模 / 優先度: R7再実装概算14〜21作業日（約3〜5週）+独立レビュー・修正・実機枠、別sourceの最小half対応を含む / P3。
+
+- 2026-10-12利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断。見開きの横長一画像を中央の背で片側めくりにする（単頁表示は従来一枚）。Pair↔横長・末尾単独・回転素材の対応/検証はpage-turn-animation-plan §24。
 
 ### 1.334 `zip_loader::tests::shared_directory_cache_reparses_when_the_archive_identity_changes` が全体実行でまれに落ちる — テスト側の共有キャッシュ (2026-10-05)
 

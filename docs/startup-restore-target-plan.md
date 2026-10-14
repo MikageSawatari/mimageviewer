@@ -233,7 +233,7 @@ hydration 自体は reducer へ通知せず、logical source と surface が確�
 | `FolderOpenScanPurpose::JumpToPhysicalFolder` | `:49703` → `apply_jump_to_physical_folder_ready :49136`。元の場所へ一覧移動する ExplicitList。`JumpToFolderSelection::{None,ExactPath}` (`src/ui_dialogs/context_menu.rs:62`) は**一覧の選択**であり required fullscreen ではない。selection適用後の適格 main 一覧を通知 |
 | `FolderOpenScanPurpose::RequiredFullscreenTarget` | `:49707` → exact-page の上記 owner。ExplicitList に落とさない |
 | `FolderOpenScanPurpose::CurrentViewOrderRefresh` | `:49722` → `apply_current_view_order_refresh :49732`。order snapshot / typed reload owner に PreservePresentation を運ばせる。通常 Navigation owner を再利用していても新一覧要求ではない |
-| 現在一覧の reload / sort / pin / preferences / placeholder verification / sidecar continuation | `current_folder_reload_owner :22886`、`reload_current_view_in_place :22907`、`reload_top_level_grid` (`src/app/top_level_grid_view.rs:1246`) は PreservePresentation。未完了の同一 open の PDF verification／sidecar deferred fullscreen (`src/app/sidecar_restore.rs:145`) は元 request の意図を引き継ぐ。再buildだから ExplicitList を生成することも、deferred-page が残る間に commit することもしない。F5 は評価操作であり reload shortcut とは扱わない |
+| 現在一覧の reload / sort / pin / preferences / placeholder verification / sidecar continuation | `current_folder_reload_owner :22886`、`reload_current_view_in_place :22907`、`reload_top_level_grid` (`src/app/top_level_grid_view.rs:1246`) は PreservePresentation。§1.353 の物理一覧再列挙は現在 ZIP prefix／cursor／search を運ぶ RefreshList を使い、起動復元記録には PreservePresentation と同じく新 target 採用を発行しない。未完了の同一 open の PDF verification／sidecar deferred fullscreen (`src/app/sidecar_restore.rs:145`) は元 request の意図を引き継ぐ。再buildだから ExplicitList を生成することも、deferred-page が残る間に commit することもしない。F5 は評価操作であり reload shortcut とは扱わない |
 | explicit 一覧復帰 / search close / A/B / history / default restore | ユーザーの一覧復帰操作と既存 navigation owner が ExplicitList を所有する。最終的に合成一覧なら §5.3.2 で通知しない。Previous の ZIP prefix 復元は §5.3.1 の最終 cursor 適用後が commit。内部 close・F12・tray・quit は一覧復帰 intent を生成しない |
 
 この inventory の各 loader / adoption 呼出しは、Phase 2 で intent の投影と受け渡しをテストする。
@@ -252,7 +252,7 @@ cursor として捨てる問題が残る。新 record は親一覧の名前／�
 synthetic list、ページ表示、内部 loader の途中状態では target と保存済み cursor をともに保持する。
 independent context を一時 mount 中でも、cursor と target をその viewer に差し替えない。
 
-`PreservePresentation` は新 target の採用を発行せず、reload の途中は保存 cursor も保持する。
+`PreservePresentation` と§1.353 の `RefreshList` は新 target の採用を発行せず、reload の途中は保存 cursor も保持する。
 既存の released reload が完了して、既に明示・保存した同じ target の一覧を実際に表示している
 場合は、通常の exit／tray／departure がその一覧の最新 cursor を捕捉できる。
 直接読書で一度も明示していない別本の reload は新 target に昇格しない。

@@ -78,6 +78,7 @@ fn accepted(
     (projection, record, *generation)
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn batch_removal_reindexes_flat_order_targets_resume_and_export_before_reload() {
@@ -168,6 +169,7 @@ fn batch_removal_reindexes_flat_order_targets_resume_and_export_before_reload() 
     );
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn removal_preserves_hidden_reference_and_empty_projection_without_repairing_record() {
@@ -199,6 +201,7 @@ fn removal_preserves_hidden_reference_and_empty_projection_without_repairing_rec
     assert!(env.get_nav_indices().is_empty());
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn removal_adoption_invalidates_permission_proof_and_same_slot_cache() {
@@ -275,6 +278,7 @@ fn removal_adoption_invalidates_permission_proof_and_same_slot_cache() {
     process.shutdown_and_join();
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn invalid_removal_preparation_leaves_owner_and_rows_unchanged() {
@@ -296,6 +300,7 @@ fn invalid_removal_preparation_leaves_owner_and_rows_unchanged() {
 }
 
 #[cfg(windows)]
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn removal_updates_only_mounted_composed_context() {
@@ -340,6 +345,7 @@ fn removal_updates_only_mounted_composed_context() {
         .unwrap();
 }
 
+#[cfg(test)]
 #[test]
 fn removal_adoption_remaps_page_directive_and_preserves_its_saved_identity() {
     let mut env = setup_app();
@@ -376,6 +382,7 @@ fn removal_adoption_remaps_page_directive_and_preserves_its_saved_identity() {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn all_selected_book_output_uses_composed_real_order_without_hidden_blank_or_cover_copy_sources() {
     let mut env = setup_app();
@@ -418,6 +425,7 @@ fn all_selected_book_output_uses_composed_real_order_without_hidden_blank_or_cov
     assert_eq!(accepted(&env).1.composition, book);
 }
 
+#[cfg(test)]
 #[test]
 fn all_selected_ordinary_book_output_keeps_original_real_page_order() {
     let mut env = setup_app();

@@ -1260,6 +1260,149 @@ impl App {
             BookTargetRoute::DeferredBook(Box::new(deferred)),
         )
     }
+    /// Qualify a new episode from the source manifest already validated by the
+    /// projection worker. This is a fresh permission read, not an old episode's
+    /// receipt: admission must be idle and its scope publication still current.
+    /// No archive lookup, row scan, filesystem access or worker wait runs here.
+    fn qualify_book_unit_from_current_projection(
+        &mut self,
+        intent: &OpenIntent,
+        demand: &[PresentationOccurrence],
+    ) -> Option<Vec<OpenCandidate>> {
+        use super::book_composition_runtime::{BookCompositionSource, ViewerBookComposition};
+        use crate::book_resume_db::{PageIdentity, ReadingPosition};
+        let service = self.book_composition_service.as_ref()?;
+        let snapshot = service.current_candidate_snapshot()?;
+        let ViewerBookComposition::Accepted {
+            scope,
+            token,
+            record,
+            layout,
+            source,
+            generation,
+            ..
+        } = &self.book_composition
+        else {
+            return None;
+        };
+        if *generation != self.items_generation
+            || intent.context_id != self.spread_shift_context_id().serial()
+            || intent.items_generation != self.items_generation
+            || snapshot.token_for(scope) != *token
+        {
+            return None;
+        }
+        let domain = match source {
+            BookCompositionSource::Archive { prefix, .. }
+                if crate::book_scope::BookScopeKey::archive(&scope.logical_root, prefix)
+                    .ok()
+                    .as_ref()
+                    == Some(scope) =>
+            {
+                PageDomain::ArchiveLevel {
+                    prefix: scope.level_prefix.clone(),
+                }
+            }
+            BookCompositionSource::Document { .. } => PageDomain::Document,
+            _ => return None,
+        };
+        match layout {
+            CompositionProjectionOutcome::Automatic if record.is_none() => {}
+            CompositionProjectionOutcome::Composed(projection)
+                if projection.scope == *scope && projection.token == *token => {}
+            _ => return None,
+        }
+        let mut candidates = Vec::with_capacity(demand.len());
+        for occurrence in demand {
+            if matches!(
+                self.book_composition_permission.occurrences.get(occurrence),
+                Some(
+                    OccurrencePermission::Checking { .. }
+                        | OccurrencePermission::Blocked
+                        | OccurrencePermission::Complete(
+                            CandidatePermission::Hidden(_) | CandidatePermission::Checking
+                        )
+                )
+            ) {
+                return None;
+            }
+            let candidate = self.presentation_candidate(occurrence.item_index)?;
+            let position = ReadingPosition {
+                page: occurrence.item_index,
+                identity: Some(candidate.identity.clone()),
+            };
+            if self.page_identity_index.resolve(&position)
+                != super::file_type_resume::PositionResolution::Restored(occurrence.item_index)
+            {
+                return None;
+            }
+            let page = match (&candidate.identity, source) {
+                (
+                    PageIdentity::Document {
+                        container,
+                        page_num,
+                    },
+                    BookCompositionSource::Document {
+                        count,
+                        physical_source,
+                        ..
+                    },
+                ) if container == &crate::path_key::normalize_keep_drive(&scope.logical_root)
+                    && *page_num < *count as usize
+                    && matches!(self.items.get(occurrence.item_index),
+                            Some(crate::grid_item::GridItem::PdfPage { pdf_path, .. })
+                                if crate::folder_tree::path_eq(pdf_path, physical_source)) =>
+                {
+                    CompositionPageRef::PdfPage {
+                        page_num: u32::try_from(*page_num).ok()?,
+                    }
+                }
+                (
+                    PageIdentity::Archive {
+                        container,
+                        entry_name,
+                    },
+                    BookCompositionSource::Archive { tree, .. },
+                ) if container == &crate::path_key::normalize_keep_drive(&scope.logical_root)
+                    && candidate.physical_archive.as_ref().is_some_and(|physical| {
+                        crate::folder_tree::path_eq(physical, &tree.zip_path)
+                    })
+                    && candidate
+                        .raw_tree
+                        .as_ref()
+                        .is_some_and(|raw| std::ptr::eq(raw.raw_source(), tree.raw_source())) =>
+                {
+                    CompositionPageRef::ArchiveEntry {
+                        entry_name: entry_name.clone(),
+                    }
+                }
+                _ => return None,
+            };
+            domain.validate_page(&page).ok()?;
+            if let CompositionProjectionOutcome::Composed(projection) = layout
+                && projection.resolve_position(&position)
+                    != (PageStatus::Visible {
+                        item_index: occurrence.item_index,
+                    })
+            {
+                return None;
+            }
+            let permission = CandidatePermission::Allowed(Some(ScopePermissionToken {
+                scope: scope.clone(),
+                token: *token,
+            }));
+            let correlation = self
+                .book_composition_permission
+                .correlation(*occurrence, &candidate);
+            candidates.push(OpenCandidate {
+                correlation,
+                candidate,
+                state: OpenCandidateState::Complete(permission),
+            });
+        }
+        (!candidates.is_empty()).then_some(candidates)
+    }
+
     fn begin_qualified_book_unit(
         &mut self,
         intent: OpenIntent,
@@ -1360,7 +1503,15 @@ impl App {
             if self.book_composition.is_pending() {
                 return true;
             }
-            let snapshot = self.book_composition_service.as_ref().unwrap().snapshot();
+            let Some(snapshot) = self
+                .book_composition_service
+                .as_ref()
+                .unwrap()
+                .current_candidate_snapshot()
+            else {
+                self.begin_qualified_book_unit(intent, demand);
+                return true;
+            };
             let current = matches!(&self.book_composition_permission.open, OpenPermission::Ready { candidates, .. } | OpenPermission::Resuming { candidates, .. } if candidates.iter().all(|candidate| candidate.is_current(&snapshot)));
             if !current {
                 self.begin_qualified_book_unit(intent, demand);
@@ -1380,6 +1531,16 @@ impl App {
         if matches!(&self.book_composition_permission.open, OpenPermission::Checking { intent: pending, candidates } if *pending == intent && candidates.iter().map(|candidate| candidate.occurrence()).eq(demand.iter().copied()))
         {
             return true;
+        }
+        if let Some(candidates) = self.qualify_book_unit_from_current_projection(&intent, &demand) {
+            self.publish_qualified_book_candidates(&candidates);
+            self.book_composition_permission.open = match intent.route {
+                BookTargetRoute::FullscreenOpen(_) | BookTargetRoute::ContinuousSeek => {
+                    OpenPermission::Idle
+                }
+                _ => OpenPermission::Resuming { intent, candidates },
+            };
+            return false;
         }
         self.begin_qualified_book_unit(intent, demand);
         true

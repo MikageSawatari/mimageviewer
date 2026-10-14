@@ -217,6 +217,7 @@ impl App {
         if !self.raw_edit_target_entry_allowed(target_idx) {
             return;
         }
+        self.cancel_original_material_entry_intents(None);
         if let Some(pivot) = pivot {
             self.export_crop_spread_ctx = Some(pivot);
             self.enter_page_edit_single_view(target_idx);
@@ -229,6 +230,7 @@ impl App {
     /// 切り取りモードを終了する。crop 矩形はドラッグ確定ごとに DB / サイドカーへ
     /// 保存済みなので、ここでは flag / ドラッグ状態のクリアと spread 復元だけ行う。
     pub(crate) fn reset_export_crop_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
@@ -423,7 +425,7 @@ impl App {
                 self.set_export_crop_for_idx(fs_idx, None, image_size);
             }
         });
-        let auto_enabled = self.current_raw_source_pixels(fs_idx).is_some();
+        let auto_enabled = self.source_dims_for_idx(fs_idx).is_some();
         let auto_resp = ui.add_enabled(
             auto_enabled,
             egui::Button::new("自動クロップ").min_size(egui::vec2(ui.available_width(), 24.0)),
@@ -431,7 +433,7 @@ impl App {
         if auto_resp.clicked() {
             if self.apply_auto_export_crop_for_idx(fs_idx) {
                 self.show_feedback_toast("[自動クロップ]".to_string());
-            } else {
+            } else if self.current_raw_source_pixels(fs_idx).is_some() {
                 self.show_feedback_toast("[余白を検出できません]".to_string());
             }
         }
@@ -474,6 +476,11 @@ impl App {
     }
 
     pub(crate) fn apply_auto_export_crop_for_idx(&mut self, fs_idx: usize) -> bool {
+        if !self
+            .ensure_original_material_for_entry(fs_idx, crate::app::OriginalMaterialEntry::AutoCrop)
+        {
+            return false;
+        }
         let Some(source) = self.current_raw_source_pixels(fs_idx) else {
             return false;
         };

@@ -588,29 +588,39 @@ impl App {
     }
 
     pub(crate) fn persist_fullscreen_view_mode(
-        &self,
+        &mut self,
         mode: crate::settings::SpreadMode,
     ) -> Result<(), String> {
         let (scope, _) = self
             .composition_scope_domain()
             .ok_or("本が開かれていません")?;
-        self.book_composition_service
+        let service = self
+            .book_composition_service
             .as_ref()
             .ok_or("本の構成を準備できません")?
-            .set_view_mode(scope, mode)
-            .map(drop)
+            .clone();
+        if !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".to_owned());
+        }
+        service.set_view_mode(scope, mode).map(drop)
     }
 
     pub(crate) fn persist_fullscreen_reading_flow(
-        &self,
+        &mut self,
         flow: crate::settings::ReadingFlow,
     ) -> Result<(), String> {
         let (scope, _) = self
             .composition_scope_domain()
             .ok_or("本が開かれていません")?;
-        self.book_composition_service
+        let service = self
+            .book_composition_service
             .as_ref()
             .ok_or("本の構成を準備できません")?
+            .clone();
+        if !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".to_owned());
+        }
+        service
             .set_view_flow(scope, self.spread_mode, flow)
             .map(drop)
     }

@@ -526,8 +526,17 @@ C:\home\mimageviewer_vendor_backup\
   ScrollArea 内へ戻すと、縦スクロールバーが × ボタンに重なる退行を起こす。
 - パネルが下端近くまで伸びる場合、クリック吸収 sink とキャンバス入力抑制 rect も
   同じ高さから動的に作る。固定 1000px は 1440p / 4K / 縦長ウィンドウで不足する。
+- 高さを行数などの計算で決めるなら、item_spacing・separator・padding・Frame の margin を
+  計算に含めるか、該当する間隔を 0 にする。`show_rows` は行間を内部で足すので、行高に
+  含めて二重に数えない。行内を `scope_builder` で描くと親カーソルが子の自然高へ戻るので、
+  仮想行の高さと実際の行の位置がずれないか確かめる。
+- 収まる画面ではスクロールバーが出ないこと、高さ不足では末尾まで届くことを
+  `tests/support/scroll_layout.rs` の共通 helper で検査する。snapshot は見た目の記録であり、
+  スクロールの要否の検査にはならない。監査と残件は
+  [docs/calculated-panel-height-audit.md](docs/calculated-panel-height-audit.md)。
 
 ### IME 対応 (日本語入力) ⚠️ 重要
+設計・先行実機記録・移植検証は [IME 処理済みキーの計画](docs/ime-process-keys-plan.md) を参照。
 TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
 直接 `ctx.input(|i| i.key_pressed(Key::Enter/Escape))` を呼ぶと、**日本語 IME 変換中の Enter
 (変換確定) や Escape (変換キャンセル) をダイアログが奪ってしまい、変換が破壊される**。
@@ -536,16 +545,23 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
 - **キャンセル用**: `self.dialog_escape_pressed(ctx)` — IME 変換中は常に false
 - **判定ロジック**: 各 egui Context に登録した `ime_focus` の input plugin が
   `ViewportId` ごとの composition 状態を単一 ownership で保持する。
-  `App::ime_input_active(ctx)` は現在 composing、または同じ viewport で直近 300ms 以内に
-  Ime event があった場合に true。300ms グレースは App shortcut 抑止専用であり、
-  Esc event の除去条件には使わない。
+  `App::ime_input_active(ctx)` は今 pass の Ime 列を反映した後も composing のときだけ true。
+  Commit / Disabled 後の通常 Enter / Escape / shortcut は同じ pass から直ちに通す。
+  native presenter の pass 前判定は `ime_composing_with_pending_events` で最終状態を射影する。
+  viewport 消滅・focus 喪失では、その viewport の composing を落とす。
+  focus 喪失後も IME の終端待ち状態は保持し、後続の Disabled / 空 Commit による取消の空 preedit 補完を保つ。
 
 上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
 single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
-キー処理由来の一時的な focus loss の復帰と IME 候補選択中の Tab traversal 抑止を所有する。
+キー処理由来の一時的な focus loss の復帰と矢印の focus lock を所有する。
+Tab traversal はアプリ全体の Tab 方針が所有し、helper へ IME 専用 Tab lock は重ねない。
 helper-managed field が直前の pass で持っていた focus は 1 pass の typed recovery claim として
 keyboard owner にも渡し、TextEdit の復帰前に同じキーがアプリ shortcut へ漏れるのを防ぐ。
-pointer 入力を伴う正当な focus 移動は復帰しない。
+focus 復帰は `lost_focus()`、pointer 無しの key press、他 widget の focus 無し、かつ
+「今 pass 反映後も composing、または Enter / Escape press 無し」のときだけ行う。
+helper の retry は viewport / widget ごとに次 pass 限りで、`lost_focus()` 以外の同条件を満たし
+欄が focus を持たない場合だけ使う。初回要求用の呼び出し側 latch には書き込まない。
+pointer 入力や他 widget への正当な focus 移動を優先する。
 raw TextEdit は理由付き allowlist を検査する unit test で禁止している。TSF を採用しない理由、
 IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](src/ime_focus.rs) の helper doc comment を参照。
 
@@ -562,11 +578,18 @@ viewport ごとに追跡する。`App::update_ime_state(ctx)` は helper-field �
 `ime_focus::ime_input_active_in_viewport` から共有 snapshot を読む。これは read-only の入口であり、
 対象 viewport の event queue や composition state を更新しない。更新は必ず所有 viewport の pass に残す。
 
-変換中の Esc press は同 plugin が RawInput から除去し、egui の `Focus::begin_pass` に
-見せない。release は残す。これにより TextEdit の未確定文字選択を保ったまま、Windows が
-空の `Preedit("")` を送らず `Disabled` だけを送る経路では、Commit の無い composing
-`Disabled` の直前だけ空 preedit を補える。composition が無い `Disabled` へは挿入せず、
-非 composing Esc と 300ms grace 中だけの Esc は通常入力として残す。
+Windows の `allow_ime` が true の場合、vendored egui-winit は IME が処理した
+`NamedKey::Process` の press（repeat を含む）を Key / Text / Cut / Copy / Paste にしない。
+本家 0.34.0 #7967 の HashSet を、物理キーごとの Hidden（press 未配送）/ Forwarded（配送済み）の型付き状態へ置換する。
+後続の Process repeat でも Forwarded を保持する。release は allow_ime にかかわらず状態を除去し Hidden のみ遮断する。
+focus 喪失時は全状態を消す（egui も keys_down を消去する）。
+それ以外の release と Ime event は残す。native presenter も
+`VK_PROCESSKEY` に egui key を割り当てない。本体 Win32 queue と native 生キー公開も
+同じく 0xE5 の press / repeat を捨て、release は残す。通常のキーを composition だけで
+取り除かない。TextEdit の未確定文字選択を保ったまま、Windows が
+空の `Preedit("")` を送らず `Disabled` だけを送る経路では、非空 Commit の無い composition の
+終端直前に空 preedit を補う（focus 喪失後の終端待ちも含む）。composition が無い `Disabled` へは挿入せず、
+非 composing Esc は通常入力として残す。
 
 **借用の注意**:
 `egui::Window::show(ctx, |ui| {...})` の closure 内で `self` 経由のメソッド呼び出しは
@@ -2012,6 +2035,13 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      いなかったので、腐る以外の道が無かった。
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
+
+6.3. **依存物の更新確認**: `.\scripts\check-dependency-updates.ps1` を実行し、
+   標準出力と `target/dependency-updates/<日付>.md` の一覧を見て、上げるかを判断する。
+   問い合わせ専用で依存物の取得・変更・インストールは行わない。手を入れているクレートを
+   上げるときは、表にある変更記録 (`PATCHES.md` / `MIV-PATCH.md` / README の patch 節等) に
+   従って変更を付け直す。月 1 回の自動実行もある。既存の PDFium 等の個別手順も引き続き行う。
+   詳細は [リリース運用メモ](docs/release-operations.md#依存物の更新確認) を参照。
 
 6.4. **記録済みクラッシュの棚卸し (最初に回す)**:
 

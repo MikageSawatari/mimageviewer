@@ -248,6 +248,8 @@ fn resolve_delete_confirm_action(
     enter_pressed: bool,
     ime_active: bool,
 ) -> DeleteConfirmAction {
+    // Y/N are dialog shortcuts too: suppress them only while composing.
+    // Process presses never arrive here; ordinary presses after Commit act immediately.
     if ime_active {
         DeleteConfirmAction::None
     } else if n_pressed || escape_pressed {
@@ -1212,7 +1214,9 @@ impl crate::app::App {
                 self.settings.show_windows_context_menu_inline,
             ),
         };
-        let native_result = crate::native_context_menu::show_native_context_menu(request);
+        let native_result = crate::native_context_menu::show_native_context_menu(request, || {
+            self.admit_book_append_followup_mutation()
+        });
         Self::resync_egui_modifiers_from_os(ctx);
         #[cfg(windows)]
         if matches!(&native_result, NativeContextMenuResult::Canceled)
@@ -1646,6 +1650,9 @@ impl crate::app::App {
                     && let (Some(hwnd), Some(folder)) =
                         (self.main_hwnd, target.folder_command_target.clone())
                 {
+                    if !self.admit_book_append_followup_mutation() {
+                        return None;
+                    }
                     // Ctrl+V と同じ約束。Shell が何を作るかは分からないので、呼ぶ前の
                     // 一覧を控えて差分で拾う ([`crate::post_operation_selection`])。
                     self.request_post_operation_selection_for_added_items(folder.clone());
@@ -4675,6 +4682,67 @@ mod delete_confirm_tests {
         assert_eq!(response.action, DeleteConfirmAction::None);
         assert!(!keymap.consume_action(&ctx, crate::keymap::KeyAction::GridPin));
         let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn delete_confirm_y_n_enter_act_immediately_after_ime_commit() {
+        for same_pass in [true, false] {
+            for (key, expected) in [
+                (egui::Key::Y, DeleteConfirmAction::Delete),
+                (egui::Key::N, DeleteConfirmAction::Cancel),
+                (egui::Key::Enter, DeleteConfirmAction::Delete),
+            ] {
+                let ctx = egui::Context::default();
+                crate::ime_focus::install_ime_input_policy(&ctx);
+                let mut app = crate::app::setup_app_for_test();
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events: vec![egui::Event::Ime(egui::ImeEvent::Preedit("preedit".into()))],
+                        ..Default::default()
+                    },
+                    |ctx| app.update_ime_state(ctx),
+                );
+                let press = egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                let mut events = vec![
+                    egui::Event::Ime(egui::ImeEvent::Commit("committed".into())),
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                ];
+                if !same_pass {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            events: std::mem::take(&mut events),
+                            ..Default::default()
+                        },
+                        |ctx| app.update_ime_state(ctx),
+                    );
+                }
+                events.push(press);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.update_ime_state(ctx);
+                        let response = consume_delete_confirm_action(
+                            ctx,
+                            DeleteConfirmSelection::Delete,
+                            app.ime_input_active(ctx),
+                            app.dialog_escape_pressed(ctx),
+                            app.dialog_enter_pressed(ctx),
+                        );
+                        assert_eq!(response.action, expected, "{key:?}, same_pass={same_pass}");
+                        assert!(!ctx.input(|input| input.key_pressed(key)));
+                    },
+                );
+            }
+        }
     }
 
     #[test]

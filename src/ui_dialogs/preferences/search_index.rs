@@ -821,10 +821,39 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["表紙", "末尾", "見開き", "本ごとの設定"]
     ),
     entry!(
+        "spread/page-turn-animation",
+        SpreadMode,
+        "ページめくりアニメーション",
+        [
+            "紙めくり",
+            "スライドショー",
+            "時間",
+            "演出",
+            "animation",
+            "先頭",
+            "末尾",
+            "実効配置"
+        ]
+    ),
+    entry!(
         "spread/singleton-placement",
         SpreadMode,
         "見開き先頭の単ページを片側に配置",
-        ["単ページ", "先頭", "末尾", "片側", "本ごとの設定"]
+        [
+            "単ページ",
+            "先頭",
+            "末尾",
+            "片側",
+            "本ごとの設定",
+            "ページめくり",
+            "アニメーション",
+            "本来の側",
+            "実効配置",
+            "無効化",
+            "保存済み設定",
+            "連結読み",
+            "mIV Remote"
+        ]
     ),
     entry!(
         "spread/page-alone",
@@ -1723,6 +1752,26 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn page_turn_endpoint_effective_placement_is_searchable() {
+        for query in [
+            "先頭 アニメーション 実効配置",
+            "末尾 アニメーション 無効化",
+            "保存済み設定 連結読み",
+            "本来の側 mIV Remote",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| {
+                        entry.page == PreferencesPage::SpreadMode
+                            && entry.anchor == "spread/singleton-placement"
+                    }),
+                "missing endpoint setting for {query}"
+            );
+        }
     }
 
     #[test]

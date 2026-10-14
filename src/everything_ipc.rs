@@ -67,6 +67,7 @@ pub enum EverythingError {
     UnsupportedVersion,
     DatabaseNotLoaded,
     Rejected,
+    NotResponding,
     Busy,
     SendFailed,
     Timeout,
@@ -98,6 +99,9 @@ impl EverythingError {
                 "Everything の検索結果が大きすぎます。検索条件を絞ってください。"
             }
             Self::Cancelled => "検索を取り消しました。",
+            Self::NotResponding => {
+                "Everything が応答していません。起動直後の索引の読み込みや更新などの処理が終わるまで待ってから、もう一度検索してください。"
+            }
             Self::Busy | Self::Timeout => {
                 "Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください。"
             }
@@ -349,6 +353,7 @@ pub fn query_with_endpoint(
             | EverythingError::Timeout
             | EverythingError::Disconnected
             | EverythingError::Busy
+            | EverythingError::NotResponding
             | EverythingError::SendFailed)
     ) {
         let cancellation = encode_query("nothing:", endpoint.reply_hwnd(), cancel_id)?;

@@ -1984,6 +1984,7 @@ impl App {
         let Some(key) = self.page_path_key(target_idx) else {
             return;
         };
+        self.cancel_original_material_entry_intents(None);
 
         if let Some(pivot) = pivot {
             self.text_spread_ctx = Some(pivot);
@@ -2075,6 +2076,7 @@ impl App {
     }
 
     pub(crate) fn reset_text_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         let was_text_mode = self.text_mode;
         self.commit_text_page();
 
@@ -2182,6 +2184,11 @@ impl App {
             return;
         }
         let cur = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if (cur != self.comic_undo_baseline || !self.comic_undo_stack.is_empty())
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         if let Some(prev) = comic_undo_step(
             &mut self.comic_undo_stack,
             &mut self.comic_redo_stack,
@@ -2203,6 +2210,9 @@ impl App {
             return;
         }
         let cur = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if !self.comic_redo_stack.is_empty() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         if let Some(next) = comic_redo_step(
             &mut self.comic_undo_stack,
             &mut self.comic_redo_stack,
@@ -2351,6 +2361,14 @@ impl App {
         let Some(key) = self.page_path_key(fs_idx) else {
             return;
         };
+        let has_selected = self.comic_docs.get(&key).is_some_and(|objects| {
+            objects
+                .iter()
+                .any(|object| self.text_selected_ids.contains(&object.id))
+        });
+        if !has_selected || !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let Some(objs) = self.comic_docs.get_mut(&key) else {
             return;
         };
@@ -2405,6 +2423,9 @@ impl App {
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
     ) {
+        if self.book_append_undo_in_progress() {
+            return;
+        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
@@ -2628,6 +2649,10 @@ impl App {
                             .unwrap_or(false)
                     };
                     if changed {
+                        // Geometry edits are non-reentrant, document-only calls.
+                        // Expire in this call before bake/save publication, while
+                        // a selection press or unchanged drag remains read-only.
+                        self.invalidate_book_append_undo();
                         drag.moved = true;
                         self.mark_comic_dirty();
                     }
@@ -3037,6 +3062,7 @@ impl App {
         let mut preview_scale_req: Option<u32> = None;
         let initial_smart_snap_enabled = self.settings.text_smart_snap_enabled;
         let mut smart_snap_enabled = initial_smart_snap_enabled;
+        let append_undo_pending = self.book_append_undo_in_progress();
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::new("text_panel"))
@@ -3044,6 +3070,9 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if append_undo_pending {
+                    ui.disable();
+                }
                 ui.interact(
                     sink_rect,
                     egui::Id::new("text_panel_click_sink"),
@@ -3294,6 +3323,9 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if append_undo_pending {
+                    ui.disable();
+                }
                 ui.interact(
                     detail_rect,
                     egui::Id::new("text_detail_panel_click_sink"),
@@ -3435,6 +3467,9 @@ impl App {
         // 解決は冪等なので、配置と無関係な編集で呼んでも同じ pivot になる (Free はドラッグで
         // 置いた位置を保持)。プリセット適用で位置が変わった直後にも効く。
         if changed {
+            // The panel edits a local document removed from comic_docs. Admit
+            // its first changed draft before publishing it back to the owner.
+            self.invalidate_book_append_undo();
             if let Some(id) = selected {
                 let is_positioned_window = objects.iter().any(|o| {
                     o.id == id
@@ -3565,6 +3600,9 @@ impl App {
 
         self.text_add_bubble_dialog = open;
         if let Some(preset) = chosen {
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
             let mut objs = self.comic_docs.remove(&key).unwrap_or_default();
             let id = next_id(&objs);
             let z = objs.len() as i32;
@@ -3662,6 +3700,9 @@ impl App {
         }
         self.text_add_annotation_dialog = open;
         if !add_requested || cancel_requested {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
 
@@ -3763,6 +3804,9 @@ impl App {
 
         self.text_add_window_dialog = open;
         if let Some(i) = chosen {
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
             let p = &WIN_PRESETS[i];
             let mut objs = self.comic_docs.remove(&key).unwrap_or_default();
             let id = next_id(&objs);
@@ -3998,6 +4042,9 @@ impl App {
         sw: f32,
         sh: f32,
     ) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.ensure_comic_font_registry();
         let font_key = self.resolve_onomatopoeia_font(preset.font_candidate);
         let mut tb = preset.build_text(&font_key);
@@ -4102,8 +4149,7 @@ impl App {
         selected: bool,
         allow_build: bool,
     ) -> bool {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), egui::Sense::click());
+        let (rect, resp) = allocate_font_card(ui);
         let hovered = resp.hovered();
         let painter = ui.painter_at(rect);
         let bg = if selected {
@@ -4292,39 +4338,37 @@ impl App {
                 let mut build_budget = 4i32;
                 let mut need_repaint = false;
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, FONT_CARD_H + 8.0, rows, |ui, row_range| {
-                        for row in row_range {
-                            ui.horizontal(|ui| {
-                                for col in 0..cols {
-                                    let idx = row * cols + col;
-                                    let Some(key) = visible.get(idx) else {
-                                        break;
-                                    };
-                                    let selected = key == &current_key;
-                                    // 構築済み (テクスチャ有) か失敗済みなら予算を消費しない。
-                                    let settled = self.font_sample_cache.contains_key(&(
-                                        key.clone(),
-                                        self.text_font_dialog_sample.clone(),
-                                    )) || self.font_sample_failed.contains(key);
-                                    let allow = settled || build_budget > 0;
-                                    if !settled && allow {
-                                        build_budget -= 1;
-                                    }
-                                    if !settled && !allow {
-                                        need_repaint = true;
-                                    }
-                                    if self.draw_font_card(ui, ctx, key, selected, allow) {
-                                        chosen = Some(key.clone());
-                                    }
+                show_font_card_rows(ui, rows, |ui, row_range| {
+                    for row in row_range {
+                        ui.horizontal(|ui| {
+                            for col in 0..cols {
+                                let idx = row * cols + col;
+                                let Some(key) = visible.get(idx) else {
+                                    break;
+                                };
+                                let selected = key == &current_key;
+                                // 構築済み (テクスチャ有) か失敗済みなら予算を消費しない。
+                                let settled = self.font_sample_cache.contains_key(&(
+                                    key.clone(),
+                                    self.text_font_dialog_sample.clone(),
+                                )) || self.font_sample_failed.contains(key);
+                                let allow = settled || build_budget > 0;
+                                if !settled && allow {
+                                    build_budget -= 1;
                                 }
-                            });
-                        }
-                        if need_repaint {
-                            ui.ctx().request_repaint();
-                        }
-                    });
+                                if !settled && !allow {
+                                    need_repaint = true;
+                                }
+                                if self.draw_font_card(ui, ctx, key, selected, allow) {
+                                    chosen = Some(key.clone());
+                                }
+                            }
+                        });
+                    }
+                    if need_repaint {
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
 
         self.text_font_dialog = open;
@@ -4339,6 +4383,14 @@ impl App {
             }
         }
         if let Some(font_key) = chosen {
+            let has_target = self.comic_docs.get(&page_key).is_some_and(|objects| {
+                objects
+                    .iter()
+                    .any(|object| object.id == target && object.text_block().is_some())
+            });
+            if !has_target || !self.admit_book_append_followup_mutation() {
+                return;
+            }
             let mut objs = self.comic_docs.remove(&page_key).unwrap_or_default();
             if let Some(tb) = objs
                 .iter_mut()
@@ -4365,6 +4417,9 @@ impl App {
     /// 選んだフォントファイルをユーザーフォントディレクトリへコピーし、レジストリを
     /// 再列挙して、その表示ラベル (= font_key) を返す。失敗時は `None`。
     fn add_user_font_file(&mut self, path: &std::path::Path) -> Option<String> {
+        if !self.admit_book_append_followup_mutation() {
+            return None;
+        }
         let dir = crate::font_assets::user_fonts_dir();
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
@@ -4446,6 +4501,9 @@ impl App {
                 let Some(tb) = objects[idx].text_block() else {
                     return false;
                 };
+                if !self.admit_book_append_followup_mutation() {
+                    return false;
+                }
                 let preset = TextStylePreset::from_text(id.clone(), name, tb);
                 self.comic_text_presets.push(preset);
                 if let Some(tbm) = objects[idx].text_block_mut() {
@@ -4456,6 +4514,9 @@ impl App {
                 let AnnotationKind::Bubble(b) = &objects[idx].kind else {
                     return false;
                 };
+                if !self.admit_book_append_followup_mutation() {
+                    return false;
+                }
                 let id = self.next_user_preset_id("s");
                 let preset = ShapeStylePreset::from_bubble(id.clone(), name, b);
                 self.comic_shape_presets.push(preset);
@@ -4469,6 +4530,9 @@ impl App {
                 let AnnotationKind::MessageWindow(w) = &objects[idx].kind else {
                     return false;
                 };
+                if !self.admit_book_append_followup_mutation() {
+                    return false;
+                }
                 let id = self.next_user_preset_id("w");
                 let preset = WindowStylePreset::from_window(id.clone(), name, w);
                 self.comic_window_presets.push(preset);
@@ -4501,6 +4565,29 @@ impl App {
             return false;
         };
         // 更新先の種別は target で決める (オブジェクト種別ではない。Codex P2)。
+        let valid_target = match target {
+            PresetTarget::Text => {
+                objects[idx].text_block().is_some()
+                    && self.comic_text_presets.iter().any(|preset| preset.id == id)
+            }
+            PresetTarget::Shape => {
+                matches!(objects[idx].kind, AnnotationKind::Bubble(_))
+                    && self
+                        .comic_shape_presets
+                        .iter()
+                        .any(|preset| preset.id == id)
+            }
+            PresetTarget::Window => {
+                matches!(objects[idx].kind, AnnotationKind::MessageWindow(_))
+                    && self
+                        .comic_window_presets
+                        .iter()
+                        .any(|preset| preset.id == id)
+            }
+        };
+        if !valid_target || !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let mut updated = false;
         match target {
             PresetTarget::Text => {
@@ -4582,6 +4669,18 @@ impl App {
     /// ユーザープリセット `id` を削除し、リンクしていたオブジェクトのリンクを外す。
     fn delete_user_preset(&mut self, objects: &mut [AnnotationObject], id: &str) -> bool {
         if crate::comic_presets::is_system_preset(id) {
+            return false;
+        }
+        let exists = self.comic_text_presets.iter().any(|preset| preset.id == id)
+            || self
+                .comic_shape_presets
+                .iter()
+                .any(|preset| preset.id == id)
+            || self
+                .comic_window_presets
+                .iter()
+                .any(|preset| preset.id == id);
+        if !exists || !self.admit_book_append_followup_mutation() {
             return false;
         }
         let before = self.comic_text_presets.len()
@@ -4928,6 +5027,9 @@ impl App {
         path: std::path::PathBuf,
     ) {
         use std::sync::atomic::AtomicBool;
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         // 既存の進行中 worker があれば破棄 (連打対策)。
         if let Some(prev) = self.stamp_embed_pending.take() {
             prev.cancel
@@ -5075,6 +5177,19 @@ impl App {
         source: comic_core::StampSource,
         replace_target: Option<u64>,
     ) {
+        if let Some(id) = replace_target
+            && !self.comic_docs.get(key).is_some_and(|objects| {
+                objects.iter().any(|object| {
+                    object.id == id && matches!(object.kind, AnnotationKind::Stamp(_))
+                })
+            })
+        {
+            self.show_feedback_toast("差し替え対象のスタンプが見つかりませんでした".to_string());
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         // ソースをデコードしてアスペクト (w/h) を得る (キャッシュ経由)。
         let skey = crate::comic_stamp::stamp_source_key(&source);
         let aspect = {
@@ -6172,6 +6287,22 @@ const ONOMATO_CELL_W: f32 = 184.0;
 /// フォント選択ダイアログの 1 カード寸法 (見本ストリップ + フォント名)。
 const FONT_CARD_W: f32 = 220.0;
 const FONT_CARD_H: f32 = 70.0;
+
+fn allocate_font_card(ui: &mut egui::Ui) -> (egui::Rect, egui::Response) {
+    ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), egui::Sense::click())
+}
+
+fn show_font_card_rows<R>(
+    ui: &mut egui::Ui,
+    rows: usize,
+    draw: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    // Each horizontal row allocates exactly FONT_CARD_H; show_rows adds
+    // the parent's vertical item spacing once.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, FONT_CARD_H, rows, draw)
+}
 
 #[derive(Clone, Copy)]
 struct OnomatopoeiaPreset {
@@ -9598,6 +9729,117 @@ fn shape_half(shape: &BubbleShape) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
+
+    #[test]
+    fn comic_noop_history_selection_and_presets_preserve_append_revision() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("comic-noop.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        let key = app.page_path_key(0).unwrap();
+        app.comic_undo_key = Some(key.clone());
+        app.comic_docs.insert(key, Vec::new());
+        let revision = app.book_append_undo_revision;
+        app.do_comic_undo();
+        app.do_comic_redo();
+        app.text_selected_ids = vec![999];
+        app.delete_selected_text_object();
+        assert!(!app.delete_user_preset(&mut [], "user:missing"));
+        assert_eq!(app.book_append_undo_revision, revision);
+    }
+
+    #[test]
+    fn accepted_comic_delete_retires_append_before_document_save() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("comic-delete.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        let key = app.page_path_key(0).unwrap();
+        app.comic_docs.insert(
+            key.clone(),
+            vec![AnnotationObject::new_text(
+                7,
+                (10.0, 10.0),
+                TextBlock::default(),
+            )],
+        );
+        app.text_selected_ids = vec![7];
+        let revision = app.book_append_undo_revision;
+        app.delete_selected_text_object();
+        assert!(app.book_append_undo_revision > revision);
+        assert!(app.comic_docs[&key].is_empty());
+    }
+
+    #[test]
+    fn calculated_font_card_rows_match_allocation_and_reach_end() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        for height in [220.0, 110.0] {
+            let ctx = egui::Context::default();
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, height));
+            let draw = |events| {
+                let mut measured = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let output = show_font_card_rows(ui, 3, |ui, rows| {
+                                    for _ in rows {
+                                        ui.horizontal(|ui| {
+                                            for _ in 0..2 {
+                                                allocate_font_card(ui);
+                                            }
+                                        });
+                                    }
+                                });
+                                measured = Some(ScrollLayout::from_output(&output));
+                            });
+                    },
+                );
+                measured.unwrap()
+            };
+            let mut before = draw(vec![]);
+            for _ in 0..3 {
+                before = draw(vec![]);
+            }
+            assert_eq!(
+                before.content.y,
+                3.0 * FONT_CARD_H + 2.0 * ctx.style().spacing.item_spacing.y
+            );
+            before.assert_height(
+                if height > 200.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                viewport,
+                ctx.pixels_per_point(),
+            );
+            if height < 200.0 {
+                let mut after = before;
+                for frame in 0..40 {
+                    after = draw(if frame == 0 {
+                        vec![
+                            egui::Event::PointerMoved(before.inner.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -4000.0),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    });
+                }
+                after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+            }
+        }
+    }
 
     #[test]
     fn annotation_color_pickers_do_not_use_egui_additive_default() {

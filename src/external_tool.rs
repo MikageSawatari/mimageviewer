@@ -3653,6 +3653,86 @@ impl crate::app::App {
 mod tests {
     use super::*;
 
+    #[test]
+    fn retained_material_entry_external_tool_snapshots_canonical_metadata_without_raw_reload() {
+        use crate::app::composite_pixels_revision_tests::{evict_pair_cpu, warm_final_pair};
+        use crate::materializer::{MaterializePageEdits, MaterializeSource};
+        use crate::page_dims::{CanonicalPageDimensions, PagePixelDimensions};
+
+        let ctx = egui::Context::default();
+        let (mut app, keys) = warm_final_pair(&ctx);
+        app.final_composite_cache
+            .get_mut(&keys[1])
+            .unwrap()
+            .canonical_dims = Some(CanonicalPageDimensions::new(1200, 1800));
+        app.page_dims_cache.clear();
+        let generation = app.items_generation;
+        app.page_dims_cache
+            .record(generation, 0, PagePixelDimensions::Thumbnail((160, 240)));
+        evict_pair_cpu(&mut app);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.viewer_navigation_caches.invalidate();
+        let mut tool = ExternalTool::defaults_for_editing();
+        tool.payload = PayloadPolicy::TempEdited;
+        let snapshots = app.external_request_snapshots();
+        let crate::grid_item::GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } = &app.items[0]
+        else {
+            panic!("retained fixture is a PDF page");
+        };
+        let pdf_path = pdf_path.clone();
+        let page_num = *page_num;
+        let request = app
+            .materialize_target(
+                &tool,
+                &LaunchTarget::PdfPage {
+                    pdf_path: pdf_path.clone(),
+                    page_num,
+                },
+                Some(0),
+                &snapshots,
+            )
+            .expect("external-tool entry must prepare a source snapshot after Retained eviction");
+        assert!(
+            matches!(request.source, MaterializeSource::PdfPage { pdf_path: path, page_num: page, .. }
+            if path == pdf_path && page == page_num)
+        );
+        let Some(MaterializePageEdits::Single(edits)) = request.page_edits else {
+            panic!("PDF materialization must preserve its page edits");
+        };
+        assert_eq!(edits.comic_source_dims, Some([1200, 1800]));
+        assert!(!edits.load_page_params_from_db);
+        assert_eq!(edits.page_key, app.page_path_key(0).unwrap());
+
+        // The existing physical-file route still carries the original path;
+        // preparation does not turn an ordinary file into displayed-page pixels.
+        let file = app.tmp.path().join("external-original.png");
+        let request = app
+            .materialize_target(
+                &tool,
+                &LaunchTarget::ImagePage(file.clone()),
+                None,
+                &snapshots,
+            )
+            .unwrap();
+        assert!(
+            matches!(request.source, MaterializeSource::File { path, image_page: true } if path == file)
+        );
+        assert!(!app.fs_cache.contains_key(&0));
+        assert!(!app.fs_pending.contains_key(&0));
+        assert!(!app.fs_upload_backlog_contains(0));
+        assert_eq!(
+            app.final_composite_cache.get(&keys[1]).unwrap().pixels.size,
+            [8, 12]
+        );
+        assert!(matches!(
+            app.external_tool_operation,
+            ExternalOperation::Idle
+        ));
+    }
+
     fn finish_picker_preparation(app: &mut crate::app::App) {
         for _ in 0..1000 {
             if !matches!(app.external_tool_operation, ExternalOperation::Preparing(_)) {

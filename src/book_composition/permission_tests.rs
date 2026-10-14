@@ -882,3 +882,80 @@ fn output_source_acceptance_reads_publication_after_archive_index_preparation() 
     assert_eq!(resolver.prepared_sources, 1);
     owner.shutdown_and_join();
 }
+
+#[test]
+fn current_permission_snapshot_waits_for_initialization_mutations_maintenance_and_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let lease = maintenance_at(temp.path()).unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    assert!(service.current_candidate_snapshot().is_none());
+    drop(lease);
+    let scope = crate::book_scope::BookScopeKey::document("C:/current-permission.pdf").unwrap();
+    service
+        .prepare(scope.clone(), PageDomain::Document)
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(service.current_candidate_snapshot().is_some());
+    for operation in ["remove", "mode", "flow", "maintain"] {
+        let (entered, release) = service.hold_worker_for_test();
+        entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        match operation {
+            "remove" => {
+                let _ = service.remove(scope.clone(), PageDomain::Document);
+            }
+            "mode" => {
+                let _ = service
+                    .set_view_mode(scope.clone(), crate::settings::SpreadMode::Single)
+                    .unwrap();
+            }
+            "flow" => {
+                let _ = service
+                    .set_view_flow(
+                        scope.clone(),
+                        crate::settings::SpreadMode::Single,
+                        crate::settings::ReadingFlow::Paged,
+                    )
+                    .unwrap();
+            }
+            _ => service
+                .purge_book_root(std::path::Path::new("C:/irrelevant-folder"))
+                .unwrap(),
+        }
+        assert!(
+            service.current_candidate_snapshot().is_none(),
+            "{operation} admission precedes the check"
+        );
+        release.send(()).unwrap();
+        service
+            .prepare(scope.clone(), PageDomain::Document)
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(
+            service.current_candidate_snapshot().is_some(),
+            "{operation} retires its admission"
+        );
+    }
+    let lease = maintenance_at(temp.path()).unwrap();
+    assert!(service.current_candidate_snapshot().is_none());
+    let pending = service.prepare(scope, PageDomain::Document);
+    assert!(matches!(
+        pending.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    drop(lease);
+    pending
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(service.current_candidate_snapshot().is_some());
+    service.close_admission();
+    assert!(service.current_candidate_snapshot().is_none());
+    owner.shutdown_and_join();
+}

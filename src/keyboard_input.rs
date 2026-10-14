@@ -14,8 +14,8 @@ pub enum TextInputPhase {
     /// A helper-managed field owned focus in the previous pass and begin-pass
     /// key processing caused a transient keyboard-driven focus loss here.
     FocusRecovery,
-    /// The existing 300 ms IME event grace is active.
-    ImeGrace,
+    /// The viewport is composing, even without a focused text field.
+    ImeComposing,
 }
 
 /// The single text-input claim considered by the pass owner.
@@ -255,7 +255,9 @@ impl KeyboardOwner {
             Self::Modal => true,
             Self::TextInput {
                 phase:
-                    TextInputPhase::Focused | TextInputPhase::FocusRecovery | TextInputPhase::ImeGrace,
+                    TextInputPhase::Focused
+                    | TextInputPhase::FocusRecovery
+                    | TextInputPhase::ImeComposing,
                 ..
             } => true,
             Self::ApplicationShortcut { scope } => {
@@ -283,7 +285,7 @@ impl KeyboardOwner {
             Self::TextInput {
                 phase: TextInputPhase::Focused
                     | TextInputPhase::FocusRecovery
-                    | TextInputPhase::ImeGrace,
+                    | TextInputPhase::ImeComposing,
                 ..
             } | Self::FocusedUi { .. }
         )
@@ -534,14 +536,14 @@ mod tests {
         let mut input = snapshot();
         input.text_input = Some(TextInputClaim::new(
             egui::Id::NULL,
-            TextInputPhase::ImeGrace,
+            TextInputPhase::ImeComposing,
         ));
         assert_eq!(
             decide_keyboard_owner(input),
             KeyboardOwner::TextInput {
                 viewport: egui::ViewportId::ROOT,
                 widget_id: egui::Id::NULL,
-                phase: TextInputPhase::ImeGrace,
+                phase: TextInputPhase::ImeComposing,
             }
         );
 
@@ -582,17 +584,17 @@ mod tests {
     }
 
     #[test]
-    fn ime_grace_is_text_input_even_with_generic_focused_ui() {
+    fn ime_composing_is_text_input_even_with_generic_focused_ui() {
         let mut input = snapshot();
         input.text_input = Some(TextInputClaim::new(
             egui::Id::new("ime-widget"),
-            TextInputPhase::ImeGrace,
+            TextInputPhase::ImeComposing,
         ));
         input.focused_ui = Some(egui::Id::new("ime-widget"));
         assert!(matches!(
             decide_keyboard_owner(input),
             KeyboardOwner::TextInput {
-                phase: TextInputPhase::ImeGrace,
+                phase: TextInputPhase::ImeComposing,
                 ..
             }
         ));
@@ -755,7 +757,7 @@ mod tests {
             TextInputPhase::PendingFocus,
             TextInputPhase::Focused,
             TextInputPhase::FocusRecovery,
-            TextInputPhase::ImeGrace,
+            TextInputPhase::ImeComposing,
         ] {
             let owner = KeyboardOwner::TextInput {
                 viewport: egui::ViewportId::ROOT,
@@ -828,9 +830,9 @@ mod tests {
         for viewport_focused in [false, true] {
             for modal in [false, true] {
                 for tracked_text_focus in [false, true] {
-                    for ime_grace in [false, true] {
+                    for ime_composing in [false, true] {
                         for wants_keyboard_input in [false, true] {
-                            let old_answer = modal || tracked_text_focus || ime_grace;
+                            let old_answer = modal || tracked_text_focus || ime_composing;
                             let mut input = snapshot();
                             input.viewport_focused = viewport_focused;
                             input.modal = modal;
@@ -842,10 +844,10 @@ mod tests {
                                     )
                                 })
                                 .or_else(|| {
-                                    ime_grace.then(|| {
+                                    ime_composing.then(|| {
                                         TextInputClaim::new(
                                             egui::Id::new("ime-text"),
-                                            TextInputPhase::ImeGrace,
+                                            TextInputPhase::ImeComposing,
                                         )
                                     })
                                 });
@@ -856,7 +858,7 @@ mod tests {
                             assert_eq!(
                                 decide_keyboard_owner(input).blocks_legacy_main_shortcuts(),
                                 old_answer,
-                                "focused={viewport_focused} modal={modal} tracked={tracked_text_focus} ime={ime_grace} wants={wants_keyboard_input}"
+                                "focused={viewport_focused} modal={modal} tracked={tracked_text_focus} ime={ime_composing} wants={wants_keyboard_input}"
                             );
                         }
                     }
@@ -891,7 +893,7 @@ mod tests {
         for phase in [
             TextInputPhase::Focused,
             TextInputPhase::FocusRecovery,
-            TextInputPhase::ImeGrace,
+            TextInputPhase::ImeComposing,
         ] {
             let mut input = snapshot();
             input.focused_ui = Some(egui::Id::new("egui-text-owner"));

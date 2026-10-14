@@ -1455,6 +1455,108 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.341 黒paperと先頭配置の設定採用
+
+利用者採用の[page-turn plan §26](page-turn-animation-plan.md)に従い、local pagedの演出ON時だけ
+先頭配置を実効ONにする。保存値・連結・Remoteは保持する。ON/OFF geometry変更は既存の
+全context設定取消に集約し、各mounted/parked ownerの未配送ready・旧Flat・採用済completion
+receiptを退役する。一件のcontinuationは同ownerに保持し、新canonical flat採用まで解放しない。
+単頁はrect/UVを保った共通黒paperに揃える。品質変更だけのfreezeは保持し、
+Center/Side等のplacement変更をreal geometry変更として通常prepareへ再bindする。
+独立GPT-6.1 Sol / xhighは既存owner境界での構造修正として合意。新pending/state owner、
+viewport/host述語、mount/deposit/worker世代、native focus/placement経路は追加・変更しない。
+通常mountの兄弟取消は行わない。実機採択はcoordinator/利用者へ残す。
+
+### 2026-10-11 §1.341 Pairの移動背とpin枠（構造確認待ち）
+
+利用者option Aによりprojectionのframe-local H/static poseを共通progressで移す。canonical destination clipは既存transform viewportとpainter clipの交差から捕捉する。context resource、normal mount/deposit/fork、native viewport dispatch/placementは変更しない。pin gateを共通helperへまとめ、測定に基づき固定128 MiB capを撤去（有限fullscreen10%、無制限1 GiB）。shared weak inventory/dedup/batch leaseとcontext別退役を維持し、兄弟contextを消さない。これはprojectionと既存pin admissionの構造変更であり、独立確認・実機受入れは未了。
+
+
+### 2026-10-11 §1.341 resident素材でのturn開始（構造確認待ち）
+
+利用者決定のfinal-only撤回に従い、contextのAcceptedOfferがincoming typed resident resourceとlogical content bindingを所有する。共有weak inventoryへaccept source pinを加え、通常prepare後のnative ROIもdedup会計する。turnとcanonical flat採用までは保持素材・最初のplacementを使い、通常producer/upgradeは止めない。source品質publicationのinput epoch更新と実編集を分け、当該contextのitem/edit/params/comic/view/layout bindingを維持する。既存close→continuation commit→captureとflat-firstで保持を解く。fork、park/mount/deposit、兄弟cancel、F12動画拒否、viewport/native生成経路は変更しない。変更範囲はui_fullscreen.rsの通常selector/prepare済素材束縛、page_turn.rs/barrier.rsのowner/lease/採用照合、回帰fixture。新pending・queue・wait・producerを作らない。詳細はpage-turn plan §22。独立構造確認・完了レビューや実窓受入れの合格は主張しない。
+
+### 2026-10-11 §1.341 A0: context単位の紙めくりpresentationと共有会計（確認待ち）
+
+2026-10-11 HUD追補（`bf3b2fae0`）: 既存PC静止画HUDに全体設定のON/OFF行を追加し、Preferencesのadoption処理へ合流する。既存`deactivate_all_page_turn_presentations`を設定変更時に再利用するだけで、detached述語・viewport routing・bundle/workerの所有契約は変更しない。F12からの変更が全体設定と各presentationに反映し、兄弟のitems/idx/input sequenceを変えないことを既存context test内で検査する。設計担当ClaudeCodeの判断で既存overflowの`Settings::save()`へ保存を接続し、DB再読込を同testへ追加する（判断者の訂正は`e3a328ff6`。HUDへON/OFFを追加する利用者要求とは別の保存経路判断）。projection追補は描画先transformのeffective pppをpure geometryへ渡し、独立に丸められたpaint矩形の比較を物理1px以内へ定義する。viewport origin/clipの正本、destination binding、resource/context所有者は変更しない。構造的なgeometryの比較単位修正として記録し、独立構造合意・実機確認を主張しない。詳細と範囲はpage-turn plan §14。
+
+R3は利用者からACCEPTと伝達され`0f6ad9f19`へ統合済み。今回のA0未コミット差分は、
+`src/ui_fullscreen/page_turn.rs`のtyped `PageTurnPresentation`を既存`ViewerContextBundle`へ接続する。
+Inactive/Flat/Offered/Turningは当該contextの提出済みunitとimmutable paint resourceを所有し、
+operation factは配送先context/window/viewportとstable operation IDを保持する。
+通常swap/deposit/mount/pause/parkで兄弟のpresentationを取り消さず、forkはInactive、実際のclose/非表示/取消は
+対象ownerだけを退役させる。共有input_seqを操作identityや配送先の代用にしない。
+
+Appの`PageTurnLeaseInventory`はweak参照の共有VRAM会計一覧で、保持textureのownerではない。
+既存`vram_accounting`/`vram_budget`へsource/outputの保持量を接続し、parked/in-flightも会計する。
+共有予算は新しいeffectのadmissionだけを制約し、兄弟のnavigation・load/cache/workerを止めない。
+触れる範囲は`app.rs`、`app/viewer_context_registry.rs`、`app/vram_accounting.rs`、`vram_budget.rs`、
+`ui_fullscreen.rs`とその`page_turn`moduleのpresentation・入力・提出境界。
+新しいdetached述語、rect捕捉、HWND/viewport生成、placement/focus再生成、grace/debounceは追加しない。
+
+これは既存context所有へpresentationを追加し、会計をweak inventoryへ分離する構造的拡張という
+実装方針の記録であり、症状guardや待機による修正ではない。
+R3採択からA0具体的接続の独立構造合意・完了レビューを推定しない。
+複数窓の取消・park/mount・native batch lifetime/実解放、GPU/実present、性能/実用性の受入れは確認待ち。
+詳細と実績/未完了gateは[page-turn-animation-plan.md §12](page-turn-animation-plan.md#12-a0実装差分検証状況2026-10-11)。
+
+### 2026-10-14 音楽ビューの音名配色メニュー（鍵盤設計 §15）
+
+[鍵盤設計 §15.5 D7](music-keyboard-harmnet-plan.md) に記録された独立設計レビューと
+設計担当（ClaudeCode）の合意に基づく。実装側も症状パッチではなく構造的に妥当な追加であることに同意する。
+`draw_music_top_chrome` の呼出側からメニューボタン表示の引数を渡し、通常の音楽ビューは表示、
+parked-live は非表示とする。鍵盤へは保存された配色方式を値で渡す。
+detachedの述語、viewport所有、park／復帰、配置・フォーカス・再生成の経路は変更しない。
+通常ビューのメニューは既存の排他的 `FsOverflowPanelState` と閉じる経路を使う。
+独立実装レビューと検証結果は鍵盤設計の今回の検証記録へ集約する。
+
+### 2026-10-14 next-list／masterの既存所有境界の統合
+
+利用者指示のno-commit mergeで、§1.375のcontext別Folder観測とmasterのPDF render owner／
+BookCompositionReadを同じ既存bundleへ保持する。両ownerのcreate／fork／mount／park／終端を
+独立に維持し、direct-readerのmain basis復元では観測世代の再束縛とmainだけのPDF失効を行う。
+§1.373のmutation受付はmasterの安定PageAdjustmentTargetへ接続し、readonly mountでは失効させない。
+両側の承認済み構造を接続する統合であり、detached症状へのguard／時間窓／再openを追加しない。
+viewport／geometry／HWND／focus／recreate述語は変更しない。境界のread-only照合でも追加の設計選択はなく、
+統合差分の検証は[§1.375 §8.5](section375-operation-reconcile-plan.md#85-masterとの統合2026-10-14)へ記録する。
+
+### 2026-10-13 §1.375: Folder観測を一覧と同じcontextへ揃える
+
+設計担当のR10と独立設計再レビューLISTrev13 ACCEPTに従い、App-globalだった
+watch／rescan／一覧復帰要求を既存ViewerContextBundleへ移す構造修正である。
+前回行記録を両fork入口で継承し、新contextのsource／世代／投影条件へ束縛し直す。
+元contextの購読・dirty・cutoff・pendingは元ownerに残し、新ownerは独立購読を開始する。
+park／mount／closeもそのownerの資源だけに作用し、Aの一致でBの通知をackしない。
+症状を隠すguard・時間窓や新しいdetached stateを足す修正ではなく、一覧と観測の所有境界を
+一致させる。viewport、geometry、HWND同定、placement、focus／recreate機構は変更しない。
+§1.373のAppendへの自動観測配送は捕捉済みcontextごとの既存要求へ接続し、
+専用owner／新しい配送台帳を作らない。実装・検証の記録は
+[§1.375の設計書](section375-operation-reconcile-plan.md)へ残す。アプリ起動は行わない。
+
+fullで検索画像が閉じた根因は、正規化前scanの `/` と登録後scanの `\` を生文字列hashで
+別row keyにしたこと。共通Path hashへ統一し、既存paint試験と実scan／Delete表記回帰で検証する。
+新しい独立physical観測の実差分も、そのownerがfullscreenを持つ間は既存FolderRefreshRequestへ
+deferする。Mainの別窓動画／音声中の一覧更新は従来どおり採用する。既存のMain-blocking述語を
+変更せず、自動一覧採用の所有資格だけをDetachedPhysicalへ接続する構造修正として独立レビューで合意。
+新pending／再open／時間窓を追加せず、一覧復帰で消費、元contextのcloseで破棄する。
+
+### 2026-10-13 §1.373: 本追加Undoの終端と既存context境界
+
+利用者が提示したR4案1の独立設計レビューACCEPTに従い、既存BookOpPendingへ
+Append／UndoAppendを接続する。追加元のcontextとRoot pollのMain投影を混同せず、
+捕捉したownerの通常終端へ配送する。独立実装レビューで、operationと採用先ownerを分けた
+型付きrefresh資格（ID・受付revision、owner、exact folder、generation/options、worker構成stamp）
+を既存payloadへ載せる方針にも合意した。詳細は
+[section373-book-append-undo-plan.md §7.6](section373-book-append-undo-plan.md#76-実装時の所有資格の具体化2026-10-13)。
+
+既存の窓activation受付で本追加receiptを失効させ、一時的なreadonly mountでは失効させない。
+UndoAppend中だけ既存modal gateで拒否し、他の本操作の受付規則は変えない。
+同operationのrefresh／Undo前readonly解放だけ`FsMetadataBoundary::BookAppend`を使い、
+元receiptの失効と既存metadata Undoの掃除を区別する。detached述語、viewport配置、HWND同定、
+focus/recreate機構には変更を加えず、無関係な兄弟のitems・cache・generation・scanを触らない。
+source ownerのF12終端、Mainへの同本refresh、旧generation／設定のscan拒否、source close後の
+成功通知・draft保持をheadless回帰で検査する。実機起動は行わない。
+
 ### 2026-10-13 §1.242 G: 画像folder→ZIPのprocess modalとcontext限定採用（実装中）
 
 画像folder→ZIP設計R3の独立ACCEPTは利用者報告（対象`7346683c6`）として記録済み。
@@ -1489,6 +1591,18 @@ ZIPrev3修正（2026-10-13、設計担当の今回指示に基づく構造変更
 source補充の採用だけを実際のitem keyとcontext世代で行う。closeは同operationの保存/返却境界を
 維持し、rootの既存終了/トレイ設定へ終端後に渡す。兄弟の退役・items/cacheへの一括変更はしない。
 詳細と実worker順序fixtureは画像folder→ZIP計画§11.3と修正検証記録へ記載する。
+
+### 2026-10-12 音楽ベース表示の共通基音推定への移行 (§13、第2段階)
+
+[鍵盤設計 §13.7 P4](music-keyboard-harmnet-plan.md) と利用者の実装指示による。
+`src/ui_fullscreen.rs::draw_parked_live_music_window` の `MusicSpectrumState::draw` 呼出から、
+旧タイムライン解析由来の▼引数を除去した。通常表示も同じ変更を行い、spectrum自身が
+鍵盤と同じ再生中の確率から絶対MIDI鍵を選んで▼へ渡す。
+これは▼のデータの出どころを鍵盤と揃える機能変更であり、detachedの症状パッチではない。
+detached述語、viewport経路、park／復帰の所有・遷移、Norm引数は変更していない。
+既存のpark／復帰回帰にはBass結果の保持・採用の検査を加えた。
+設計側の判断は§13.7末尾に記録済み。実装側も上記主張に合意する。
+独立実装レビューの合意・自動検証は鍵盤設計の今回の検証記録へ追記する。
 
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 
@@ -4715,6 +4829,42 @@ QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
 
+### 2026-10-11 §1.341 Stage 1: book leafとcanonical flat完了のcontext所有
+
+§2を確認し、利用者指定の段階実装としてR7 `fa5119c19`（独立設計ACCEPT）の通常Single/Pair投影を接続する。
+各頁のnormal prepared geometry/素材とlayoutのH/gを同じpassへ提出し、leafのpartial receiptは全頁navigation完了に使わない。
+割込み/自然終端は既存context所有presenterの`Completing`へ移り、取消targetのcanonical flat accepted receiptを採用してから
+一つの解決済み通常navigationをcommitする。root入力はframe-localにowning callbackへ委譲し、
+終了入力→commit→fresh page snapshotを共有する。媒体/host経路が変われば旧canvas/footerを終了して既存media-switchへ戻す。
+F12 independent stillの既存動画拒否を通し、callbackから同viewportを再showしない。
+
+create/mutate/adopt/cancel/dropはmounted presenterと同じViewerContext bundleに留める。
+normal mount/depositでは取消せず、forkは新しいInactive presenterを作る。兄弟窓のread-only open/closeは元contextを失効させない。
+全体設定変更時のeffect取消は各contextを回る既存ownerで行い、既に必要なflat完了を残す。
+outputのbatch lease/VRAM dedupを保ち、normal cacheの素材を追加decode/uploadしない。
+cover/中央単頁/splitと継続操作はStage 1では理由付きinstant、native/navigation機能は通常handlerを維持する。
+
+この変更はcontextの提示証拠と入力・描画捕捉の順序を揃える構造修正であり、症状guard・sleep・別pending queueによる修正ではない。
+変更範囲は`src/page_turn_animation.rs`、`src/ui_fullscreen/page_turn.rs`と同`barrier.rs`、`src/ui_fullscreen.rs`、
+`src/app.rs`、`src/app/gamepad_input.rs`、`src/app/viewer_context_registry.rs`と関連tests/goldens/docs。
+R7の独立設計ACCEPTを根拠とし、この実装差分の独立完了レビュー・実機motion/性能受入れは未了。
+検証証拠は[page-turn-animation-plan.md §19](page-turn-animation-plan.md#19-stage-1--通常頁の実装と早期motion評価2026-10-11)と
+`target/A-1341-stage1-msg.txt`へ記録する。
+
+### 2026-10-11 §1.341 Stage 1実機追補: 入力factと受理診断の所有境界（確認待ち）
+
+§2を再確認した。fullscreen/F12共通の`page_turn_pre_draw`で同じpassのkeyboard ownerを先に確定し、
+owner不在を抑止と誤認してkey factだけ捨てる順序を修正する。rootに限らず同じ観測入口へ適用する。
+gamepadは既存mounted destinationとsampled batchを維持し、入力ゼロpollからContinuous factを作る処理を除く。
+通常analog終了/reset、normal mount/deposit/fork、兄弟context、viewport/HWND/placementは変更しない。
+受理済みnavigationのoffer/exclusionは実producerのIDを受け、既存transactionで理由付きskipを一回記録する。
+診断用の欠落IDはExcluded状態に留め、新input/pending/queueやfreshness時間窓へ使わない。
+
+これは入力所有と受理の同じ境界に戻す構造修正であり、release無視・取消抑止・追加waitによる症状パッチではない。
+変更範囲は`src/ui_fullscreen/page_turn.rs`/`barrier.rs`、`src/ui_fullscreen.rs`、`src/app/gamepad_input.rs`と実handler回帰。
+利用者指定のbug fixとして実装し、独立完了レビューによる構造確認は未了とする。
+詳細・実機反証は[page-turn-animation-plan.md §20](page-turn-animation-plan.md)、検証は`target/A-1341-stage1-fix-msg.txt`。
+
 ### 2026-10-11 §1.364 D2f: import取消の失効を既存maintenance ownerへ集約
 
 利用者指定の構造修正として、import workerがすべてのErrからglobal失効を作る経路を撤去する。
@@ -4739,6 +4889,19 @@ detached述語/viewport/registry、改名待機、live-follow、新しいcontext
 失効とrow不在の組合せを採用ownerの型とscope所有で除く構造修正であり、症状パッチではない。
 詳細は[spread-shift-memory-plan.md §11.8](spread-shift-memory-plan.md#118-d2e-retained保持とscope単位のmaintenance資格2026-10-11)。
 本記録は独立構造合意・完了レビュー、製品起動や実機受入を表さない。
+
+### 2026-10-11 §1.341 Stage 1追補: resolved入力handoffのviewport/frame所有
+
+§2を再確認し、利用者指定の実機入力修正としてui_fullscreen/page_turn.rsの既存transaction境界を変更する。
+子callbackで捕捉したoperation IDと現在destinationが一致する場合は、callback外ROOTでの受理まで元factを保持する。
+裸のframe番号を別viewport間で比較せず、既存observed_frameを(ViewportId, frame_nr)にする。
+固定矢印とFsPageNext/Prevは実typed consumerが選択したIDをそのままhandoffする。
+新pending/queue/bool、detached述語、viewport生成・focus・配置・mount/deposit/fork、通常navigationを変更しない。
+単頁の固定背を明示し、終端RTLの背座標診断を直すが、既存の四方向投影goldenは不変。
+同じcontext所有の受付でsource/phaseを失っていた根因を除く構造修正であり、時間窓・待機・症状guardではない。
+child handler→ROOT受付→child提出と、元factを保持したskip一回の回帰を追加する。
+利用者の構造修正指示を根拠とする。本記録は独立レビュー合格や実機の見え方受入れを表さない。
+詳細は[page-turn-animation-plan.md §21](page-turn-animation-plan.md)、検証は`target/A-1341-stage1-fb-msg.txt`。
 
 ### 2026-10-11 §1.364 D2d: Commonの独立resume依存保持
 
@@ -4785,6 +4948,32 @@ snapshot PNGは変更せず、既存の実metadata観測とsnapshot harnessを�
 vendorのAPI実装自体は変更せず、台帳へ破棄対象・呼出境界・更新時の保持差分を補う。
 snapshot PNG、runtime、metadata製品処理は変更しない。
 
+### 2026-10-12 §1.341 見開きの横長素材正規化
+
+§2を読み、利用者指定の構造変更として既存context単位page-turn presentationのshape admission、
+canonical projectionと実occurrence receiptの境界を揃える。横長の二faceは一つの通常resourceを
+共有し、Vacantはsurface/occurrenceを持たない。lease/pin/context bundle、通常mount/deposit、
+viewport生成・host選択・focus・close/continuationのownerは増やさない。F12も同じ投影境界を使う。
+src/ui_fullscreen.rsの変更はtest-only描画fixtureの寸法/回転を通常素材から取る部分のみ。
+この実装指定を根拠とし、独立レビュー合格・実機受入れを先取りしない。
+
+2026-10-12独立レビューP2の追補: contextに保持したoutgoing flatのcontentを受理境界で
+現content（設定gapを含む）と照合し、古ければpin/offer前に理由付きinstantとする。
+形状由来gutter差の投影許可は維持する。既存contextの素材有効性検査のみで、owner・
+lease lifecycle・mount/deposit・viewport経路や待機stateは変更しない。再レビューは別途。
+
+2026-10-12実機追補（page-turn plan §25）: 同じcanonical captureでnative ROI端の
+float丸めを小さいsource texel許容で扱い、許容した端をclampしてnative UVへ写像する。
+本当に不足するROIは引き続き拒否する。単頁の静止下頁は常に自身の通常rect全体を使い、
+leafだけが自身の背で回転する。F12も同じcapture/projectionを消費し、context owner、
+viewport述語/生成・mount/deposit、batch lease・VRAM dedup、終了/continuation経路は変えない。
+利用者指定の素材/投影境界修正として記録し、独立レビュー・実機受入れを先取りしない。
+
+同日の比較案追補（page-turn plan §25.3）: 単頁のleaf自身の背と、旧→新へ移動する背を
+暫定設定で比較する。移動背の補間だけを見開きoption Aと共用し、単頁の下頁は両案とも
+canonical rect全体で静止する。選択は既存TurnRecipeへ固定し、設定変更は既存全context
+取消を共用する。独立設計レビューはこの素材/投影境界の構成へ合意し、症状パッチではないと確認。
+detachedのviewport述語・生成・mount/deposit、素材leaseとcompletion ownerは追加・変更しない。
 
 ### 2026-10-10 §1.242 本の構成 — context投影・提示許可の所有拡張 (設計)
 
@@ -4976,6 +5165,59 @@ cfg(test) でない製品コード、detached 述語 / viewport / mount / drop �
 test cfg 追加だけ、監査側は `PUBLIC_API_ALLOWLIST` 内だけの差分であることも機械照合した。
 別セッションの `docs/next-release-backlog.md` は変更せず、アプリ起動・コミットは行っていない。
 
+### 2026-10-12 §1.341 master取り込み時の入力・描画境界の合成
+
+利用者の取り込み指示に基づき、`a7155f674`とmaster `d357fd5ae`の競合を解消する。
+§1.371のrating publication後のClosed/Rebasedを通常root、委譲root、childで扱い、
+same-routeのRebasedは既存prepareからstate/compositionとframe末尾のidx snapshotを更新する。
+経路が変わった場合はcontinuationと共通の既存predicateでframe-localに終了し、通常dispatcherへ返す。
+child CentralPanel後のvisibility処理も同じframe終了に従う。native viewport/host同定・
+placement/focus/再生成、contextのmount/deposit/worker/ticket所有は変更しない。
+
+ManualとRatingMembershipの共通metadata closeへpage-turn終了と未配送readyの退役を置き、
+rating Undo/toastの保持はmasterのboundary policyへ従う。manual navigationのrating復帰取消は
+flat-firstのdeferより前で行い、古いRestoreOriginを遅着採用で復活させない。
+gamepadのoperation witness/replay判定とrating picker終端型を共存させる。
+§1.370のGridCursorIntent、§1.364のspread shift、PDF ticket・Everythingのmaster契約を維持する。
+
+独立GPT-6.1 Sol / xhighの設計レビューは、既存context/frameの所有境界を接続する構造修正であり
+症状パッチではないことに合意。新たなpending/state owner/時間窓/生成述語は追加しない。
+限定merge差分の検証・build結果はpage-turn planの今回追補と`target/A-1341-merge-msg.txt`へ記録する。
+この合意を一般master新機能の完了受入や実機motion評価へ読み替えない。
+
+### 2026-10-14 §1.341 隣の表示unitの素材需要
+
+§2を再確認。通常navigation unit/compositionから補助表紙を含む隣unitの素材を導出し、
+既存source/final workerの需要とlive keepへ接続する。rootとactive detachedのfullscreen workは
+同じpage-turn非target作業admission内で不足をreconcileする。mount/deposit、cancel/poll、
+PDF ticket、native host/viewportのownerやpredicateは変更しない。共有Retained CPU LRUの
+entries/bytes上限を維持し、別contextのlive cache/pendingは変更しない。
+独立GPT-6.1 Sol / xhigh設計レビューは、需要の所有境界で直す構造修正であり症状パッチではない
+ことに合意。詳細・回帰・検証はpage-turn plan §26.8へ記録する。
+同日の§26.10では完成CPU画素の取得と、通常描画/先読みの共通unit cache・派生位置索引を
+同context owner内で修正する。main/F12のviewport/predicateは変えず、独立レビューも構造修正に合意。
+
+### 2026-10-14 §1.341 スライドショーと非フォーカスの受信入力
+
+§2を再確認。旧頁deadlineを新頁のめくりadmissionへ流用せず、既存slideshow anchorを採用済み
+canonical flatから数える。非フォーカスwheelの元viewport配送を通常handlerと一致させ、
+既存PointerDeliveryで実focus-loss edgeを一度だけ処理する。ROOT lossはchildへ転送せず、
+continuationは既存の宛先/世代/receipt ownerでcommitする。host/placement/rect捕捉/生成述語を
+変更せず、新pending/bool/queue/時間窓を追加しない。独立GPT-6.1 Sol/xhigh事前レビューは
+所有境界を揃える構造修正でありdetached症状パッチではないことに合意した。詳細は§26.12。
+
+### 2026-10-14 §1.341 完成素材表示と元画素の取得
+
+§2を再確認。寸法の来歴を型で区別し、元画素を必要とする操作だけを既存fsロードownerへ
+Original purposeとして接続する。入場anchor／source target／items世代は同context内で確認し、
+取得は同sourceのmaterializationとして完成表示のkeyを維持する。新pending／queue／bool、
+viewport／host／生成述語を追加せず、RAW編集受付も変更しない。独立GPT-6.1 Sol/xhighの
+事前レビューはこの所有境界の修正に構造合意した。詳細・入口一覧はpage-turn plan §26.14。
+保存消しゴムstageと左右頁切替も同じ既存fs／inpaint／materializer ownerのtyped purposeへ
+接続し、準備中は旧編集targetを保持する。worker素材identityと単回操作を区別して通常Display
+への合流／取消を保ち、main/F12のviewport・host条件は変更しない。追加の構造合意と最終
+独立レビューACCEPTを得た。実context mount往復と入口／切替の回帰、viewer_context_auditが成功。
+
 ### 2026-10-13 §1.378 利用者決定による前面判定の撤去（EV19）
 
 利用者が音響調整ボタンを「表示・前面化だけ」へ変更し、HideはEffeTuneの×/Shell操作へ限定した。
@@ -4986,3 +5228,42 @@ main subclassの表示・最小化通知は維持し、Close/capture/通常矩�
 detached predicate/registry/viewport/scheduler/placementは変更せず、vendor egui/eframeも変更しない。
 設計担当の利用者決定と実装premise確認に基づく範囲を記録し、独立実装レビューACCEPTとは区別する。
 仕様と検証は音響調整計画§17.12、target/ET-1378-impl-msg.txtへ記録する。
+
+### 2026-10-14 §1.341とmaster旧形式の構成・編集ownerの統合
+
+master `0d79f5077`の構成提示許可を、next-viewerの既存child context内paged準備へ接続する。
+フレーム・operationの配送先をROOTへ戻さず、各ownerのHidden／Checking／許可済みcompositionと
+source準備・ready採用を同じcontextで扱う。registryには両側の状態・G1／page-turn回帰を保持し、
+auditの明示API許可も両側を保持する。slideshowの延期完了は既存typed intentから同じpermission／
+grid／deadline ownerへ戻す。局所補正の新しい内容identity pivotは既存入口のpair読取へ投影する。
+新しいviewport／host／placement条件、待機状態、ownerやqueueを追加する症状パッチではない。
+設計担当の両意図保存の統合指示・実装premise確認と、独立GPT-6.1 Sol/xhighの構造レビューで合意。
+検証記録と新形式の残件はpage-turn plan §26.17および`target/A-1341-merge-r3-msg.txt`へ記録する。
+
+統合によるApp stack上限超過の修正では、既存解析histogram cacheの固定長tupleを
+App／bundleともBoxで持つ。context間のswap／無効化／dropを変えず、viewportや入力ownerは
+追加しない。実context mount往復でcacheの値とheap所有先が保存される回帰を追加し、独立
+GPT-6.1 Sol/xhighのACCEPTとregistry89件・監査実行の成功を得た。
+
+### §11 追補: I2 段 2a の IME 入力境界修正（2026-10-14、未コミット）
+
+設計 lead のブリーフと独立設計レビュー ACCEPT に従い、vendored egui-winit が
+`NamedKey::Process` の press / repeat を Key / Text / clipboard event にしない規則へ揃えた。
+実機記録で誤配送を確認した入力変換境界の修正で、native presenter の `VK_PROCESSKEY` 規則と一致する。
+`src/ui_fullscreen.rs` の既存 fullscreen closure から text_mode 中の Enter 除去だけを撤去し、
+確定後の通常 Enter を本文 TextEdit へ渡す。同じ実 fullscreen 経路の同一 / 別 pass 回帰を追加した。
+§2 を再読し、detached predicate、viewport 生成 / registry、host / placement / focus owner は変更しない。
+新しい状態・時間窓・geometry guard を足す症状パッチではなく、不要となった対症療法の撤去である。
+段 2a 時点の規則（grace は後の段 2b で撤去）と自動検証結果は [I2 段 2a の記録](ime-process-keys-plan.md) に集約する。
+実機確認と設計 lead の検収は未実施。
+
+### §11 追補: I2 段 2b の共有 IME 所有境界（2026-10-14、未コミット）
+
+設計 lead の第5版と独立設計レビュー ACCEPT、および brief の小範囲修正許可に従い、
+共有 `egui-ime` の時刻 grace を撤去し、今 pass 反映後の composing に統一した。
+終端 event を失ったまま同じ viewport ID を再利用すると composing が残ることを回帰テストで確認したため、
+plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状態を落とし、所有 viewport の focus 喪失では shortcut claim を終了する。終端待ちは `UnfocusedComposition` として保持し、後続の取消補完を保つ。
+生存する兄弟 viewport の read-only 参照では変更しない。helper retry は既存 latch を pass 番号へ置換し、
+欄が消えた後へ復帰要求を持ち越さない。detached predicate / registry / 生成 / placement は変更しない。
+§2 の所有境界に沿う修正であり、遅延・時間窓・geometry guard を足す症状パッチではないことを実装側でも確認した。
+自動検証結果は [I2 段 2b の記録](ime-process-keys-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。

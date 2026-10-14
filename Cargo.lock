@@ -1921,6 +1921,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-ime"
+version = "0.1.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.33.3"
 dependencies = [
@@ -1941,8 +1948,6 @@ dependencies = [
 [[package]]
 name = "egui-winit"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec6687e5bb551702f4ad10ac428bab12acf9d53047ebb1082d4a0ed8c6251a29"
 dependencies = [
  "accesskit_winit",
  "arboard",
@@ -4062,6 +4067,7 @@ dependencies = [
  "delharc",
  "eframe",
  "egui",
+ "egui-ime",
  "egui-wgpu",
  "egui_kittest",
  "encoding_rs",
@@ -4282,6 +4288,7 @@ version = "0.1.0"
 dependencies = [
  "rustfft",
  "serde",
+ "sha2",
 ]
 
 [[package]]
