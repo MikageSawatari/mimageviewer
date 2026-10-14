@@ -170,8 +170,8 @@ mod tests {
             );
             let _ = ctx.end_pass();
             if ime {
-                // IME focus recovery uses the same latch as opening. It must
-                // keep the preedit selection rather than select the whole query.
+                // Even an explicit caller focus request during composition must
+                // preserve the preedit selection. Recovery retries are helper-owned.
                 app.global_search.focus_request = true;
                 ctx.begin_pass(egui::RawInput {
                     events: vec![
