@@ -278,6 +278,10 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   row version → row `ColorImage`。ラボの raster worker をそのまま移植（`docs/async-architecture.md`
   テンプレ）。古い key / generation / row version の結果は UI 採用側で捨てる（最終防衛線）。
 
+音楽ビューの「…」パネル上では、入力所有判定と同じ矩形で左右パネルの端ホバーによる
+表示・維持を抑止する。矩形の外では従来の端ホバーを使い、固定中の右パネルや明示表示は維持する。
+Keyレーンの説明は `Height confidence, color key`（高さは確信度、色はキー）とする。
+
 #### §1.352: 上下HUDと中央コンテンツの幅（利用者決定2026-10-08）
 
 - 上部情報バーと下部HUDは、右情報パネルの固定・F11抑制にかかわらず、描画対象viewportの全幅を使う。

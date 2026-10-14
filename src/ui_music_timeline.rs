@@ -1900,7 +1900,7 @@ fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
 fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
     match kind {
         TimelineMetricKind::LoudnessBassRoot => "Height low-band loudness, color bass root",
-        TimelineMetricKind::Key => "Transient-suppressed chroma profile",
+        TimelineMetricKind::Key => "Height confidence, color key",
     }
 }
 
@@ -2577,6 +2577,10 @@ mod tests {
         assert_eq!(
             timeline_metric_description(TimelineMetricKind::LoudnessBassRoot),
             "Height low-band loudness, color bass root"
+        );
+        assert_eq!(
+            timeline_metric_description(TimelineMetricKind::Key),
+            "Height confidence, color key"
         );
     }
 

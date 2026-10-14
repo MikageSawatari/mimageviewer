@@ -50321,6 +50321,11 @@ impl App {
         // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
         let music_modal_open =
             self.music_bookmark_modal_open() || self.music_normalize_modal_active(fs_idx);
+        // The foreground music menu owns hover within the same rectangle used by input
+        // routing. Filter only passive hover; explicit and locked panels retain their state.
+        let overflow_rect = (self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor)
+            .then(|| fs_overflow_panel_rect(full_rect, FsOverflowPanelState::MusicNoteColor))
+            .flatten();
         let hover_pos = ctx.input(|i| {
             if self.cursor_hidden() {
                 None
@@ -50328,6 +50333,8 @@ impl App {
                 i.pointer.hover_pos()
             }
         });
+        let panel_hover_pos =
+            hover_pos.filter(|pos| !overflow_rect.is_some_and(|rect| rect.contains(*pos)));
         // Hover は左右パネルの二段判定 (実機 FB 2026-07):
         //  - 開くトリガ = 画面端の細いストリップ (PANEL_EDGE_TRIGGER_WIDTH)。パネル幅ぶんの
         //    広い当たり判定にすると中央の全幅波形 seek の左右端 (left_w / right_w) が押せなく
@@ -50350,14 +50357,16 @@ impl App {
         );
         let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
         if side_panel_mode == crate::settings::FsSidePanelMode::Hover && !music_modal_open {
-            let left_open =
-                hover_pos.is_some_and(|p| p.x <= content_rect.left() + trigger_w && in_band(p));
+            let left_open = panel_hover_pos
+                .is_some_and(|p| p.x <= content_rect.left() + trigger_w && in_band(p));
             let right_open =
-                hover_pos.is_some_and(|p| p.x >= panel_right_edge - trigger_w && in_band(p));
+                panel_hover_pos.is_some_and(|p| p.x >= panel_right_edge - trigger_w && in_band(p));
             let left_sustain = self.music_left_panel_active
-                && hover_pos.is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
+                && panel_hover_pos
+                    .is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
             let right_sustain = self.music_right_panel_active
-                && hover_pos.is_some_and(|p| right_panel_rect.expand(sustain_margin).contains(p));
+                && panel_hover_pos
+                    .is_some_and(|p| right_panel_rect.expand(sustain_margin).contains(p));
             self.music_left_panel_active = left_open || left_sustain;
             self.music_right_panel_active = right_open || right_sustain;
         } else {
@@ -83490,6 +83499,126 @@ mod music_overflow_tests {
                 modifiers,
             },
         ]
+    }
+
+    fn side_panel_hover_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        pos: egui::Pos2,
+    ) -> MusicViewFrameUiState {
+        let mut state = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let full = ui.max_rect();
+                        let reserved = if app.resolved_still_chrome().info_locked {
+                            crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full.width() * 0.5)
+                        } else {
+                            0.0
+                        };
+                        let content = egui::Rect::from_min_max(
+                            full.min,
+                            full.max - egui::vec2(reserved, 0.0),
+                        );
+                        let input = app.begin_music_overflow_frame_input(ctx, full, 0);
+                        state =
+                            Some(app.draw_fs_music_view(
+                                ui, ctx, full, content, reserved, 0, false, input,
+                            ));
+                        app.draw_music_overflow_panel(ui, ctx, full);
+                    });
+            },
+        );
+        state.expect("actual music view handler returned panel visibility")
+    }
+
+    #[test]
+    fn music_overflow_hover_blocks_both_side_panels_only_inside_menu() {
+        // At 320pt the menu overlaps both edge triggers, so also exercise the left side.
+        for width in [320.0, 820.0] {
+            let (mut app, ctx) = fixture();
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+            app.fs_overflow_panel_state = FsOverflowPanelState::MusicNoteColor;
+            let size = egui::vec2(width, 600.0);
+            let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let menu = fs_overflow_panel_rect(full, FsOverflowPanelState::MusicNoteColor).unwrap();
+            for right in [false, true] {
+                let edge_x = if right { width - 1.0 } else { 1.0 };
+                let outside = egui::pos2(edge_x, menu.center().y);
+                assert!(!menu.contains(outside));
+                let state = side_panel_hover_frame(&mut app, &ctx, size, outside);
+                assert_eq!(state.left_panel_visible, !right);
+                assert_eq!(state.right_panel_visible, right);
+
+                let inside_x = if right {
+                    menu.right() - 2.0
+                } else {
+                    menu.left() + 2.0
+                };
+                let inside = egui::pos2(inside_x, menu.center().y);
+                assert!(menu.contains(inside));
+                let state = side_panel_hover_frame(&mut app, &ctx, size, inside);
+                assert!(!state.left_panel_visible && !state.right_panel_visible);
+                assert!(!app.music_left_panel_active && !app.music_right_panel_active);
+                assert_eq!(
+                    app.fs_overflow_panel_state,
+                    FsOverflowPanelState::MusicNoteColor
+                );
+
+                let state = side_panel_hover_frame(&mut app, &ctx, size, outside);
+                assert_eq!(state.left_panel_visible, !right);
+                assert_eq!(state.right_panel_visible, right);
+
+                // Being at an edge below the menu must keep the usual hover behavior too.
+                let below = egui::pos2(edge_x, menu.bottom() + 20.0);
+                assert!(!menu.contains(below));
+                let state = side_panel_hover_frame(&mut app, &ctx, size, below);
+                assert_eq!(state.left_panel_visible, !right);
+                assert_eq!(state.right_panel_visible, right);
+            }
+        }
+    }
+
+    #[test]
+    fn music_overflow_hover_preserves_locked_and_explicit_side_panels() {
+        use crate::ui_helpers::MetadataPanelOpenState::{ByTouchHandle, Closed};
+        for locked in [false, true] {
+            let (mut app, ctx) = fixture();
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+            app.fs_info_panel.locked = locked;
+            app.fs_overflow_panel_state = FsOverflowPanelState::MusicNoteColor;
+            let size = egui::vec2(820.0, 600.0);
+            let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let menu = fs_overflow_panel_rect(full, FsOverflowPanelState::MusicNoteColor).unwrap();
+            for pos in [egui::pos2(819.0, menu.center().y), menu.center()] {
+                let state = side_panel_hover_frame(&mut app, &ctx, size, pos);
+                assert_eq!(state.right_panel_visible, locked || !menu.contains(pos));
+                assert_eq!(app.fs_info_panel.locked, locked);
+            }
+            app.music_left_panel_open = ByTouchHandle;
+            app.fs_info_panel.open = ByTouchHandle;
+            let state = side_panel_hover_frame(&mut app, &ctx, size, menu.center());
+            assert!(state.left_panel_visible && state.right_panel_visible);
+            assert_eq!(app.music_left_panel_open, ByTouchHandle);
+            assert_eq!(app.fs_info_panel.open, ByTouchHandle);
+            app.music_left_panel_open = Closed;
+            app.fs_info_panel.open = Closed;
+            app.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            let pos = egui::pos2(menu.right() - 2.0, menu.center().y);
+            let state = side_panel_hover_frame(&mut app, &ctx, size, pos);
+            assert!(
+                state.right_panel_visible,
+                "closed menu leaves edge hover unchanged"
+            );
+        }
     }
 
     #[test]
