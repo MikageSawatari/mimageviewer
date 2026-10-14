@@ -296,10 +296,6 @@ fn press(key_code: Key) -> Event {
     key(key_code, Modifiers::NONE, true, false)
 }
 
-fn release(key_code: Key) -> Event {
-    key(key_code, Modifiers::NONE, false, false)
-}
-
 fn ime(event: egui::ImeEvent) -> Event {
     Event::Ime(event)
 }
@@ -347,7 +343,8 @@ fn actual_modulator_name_cancel_keeps_field_identity_across_preedit_passes() {
     h.frame(start_preedit());
     assert_eq!(h.body(), "ime-modulator未確定");
     h.assert_focus(id);
-    h.frame(vec![release(Key::Escape)]);
+    // egui-winit hides both halves of the IME-processed Escape pair.
+    h.frame(vec![]);
     h.assert_focus(id);
     h.frame(vec![ime(egui::ImeEvent::Disabled)]);
     h.assert_focus(id);
@@ -371,14 +368,15 @@ fn actual_five_singlelines_and_lyrics_cancel_preedit_without_changing_committed_
             if !matches!(field, Field::LowNote | Field::HighNote) {
                 assert!(h.body().ends_with("未確定"), "preedit reached {field:?}");
             }
-            h.frame(vec![release(Key::Escape)]);
+            // egui-winit hides both halves of the IME-processed Escape pair.
+            h.frame(vec![]);
             h.assert_focus(id);
-            assert!(!h.events_after_shortcut.contains(&press(Key::Escape)));
-            assert!(h.events_after_shortcut.contains(&key(
-                Key::Escape,
-                Modifiers::NONE,
-                false,
-                false
+            assert!(!h.events_after_shortcut.iter().any(|event| matches!(
+                event,
+                Event::Key {
+                    key: Key::Escape,
+                    ..
+                }
             )));
             let cancel = if windows_cancel_burst {
                 vec![
@@ -448,38 +446,40 @@ fn tab_in_start_and_commit_passes_keeps_the_real_text_field_owner() {
     for field in [Field::Text, Field::Lyrics] {
         let mut h = Harness::new(field);
         let id = h.focus();
-        let mut events = start_preedit();
-        // Candidate selection is consumed by the IME before egui; only the
-        // release and the updated preedit reach these widgets.
-        events.push(release(Key::Tab));
-        h.frame(events);
+        // egui-winit hides candidate Tab's Process press and physical release;
+        // only IME events reach the text widgets.
+        h.frame(start_preedit());
         h.assert_focus(id);
-        h.frame(vec![
-            ime(egui::ImeEvent::Commit("確定".into())),
-            release(Key::Tab),
-        ]);
+        h.frame(vec![ime(egui::ImeEvent::Commit("確定".into()))]);
         h.assert_focus(id);
         assert_eq!(h.body(), format!("{}確定", field.initial_text()));
     }
 }
 
 #[test]
-fn singleline_enter_commit_is_once_and_keeps_focus_with_same_or_later_release() {
-    for same_pass in [false, true] {
+fn singleline_enter_commit_is_once_and_keeps_focus_with_same_or_later_disabled() {
+    for terminal_same_pass in [false, true] {
         let mut h = Harness::new(Field::Text);
         let id = h.focus();
         h.frame(start_preedit());
         let mut events = vec![
             ime(egui::ImeEvent::Disabled),
             ime(egui::ImeEvent::Commit("確定".into())),
-            ime(egui::ImeEvent::Disabled),
         ];
-        if same_pass {
-            events.push(release(Key::Enter));
+        // The Process press and its physical release never reach this queue.
+        if terminal_same_pass {
+            events.push(ime(egui::ImeEvent::Disabled));
         }
         h.frame(events);
-        if !same_pass {
-            h.frame(vec![release(Key::Enter)]);
+        assert!(!h.events_after_shortcut.iter().any(|event| matches!(
+            event,
+            Event::Key {
+                key: Key::Enter,
+                ..
+            }
+        )));
+        if !terminal_same_pass {
+            h.frame(vec![ime(egui::ImeEvent::Disabled)]);
         }
         assert_eq!(h.body(), "ime-body確定");
         h.assert_focus(id);
@@ -490,24 +490,31 @@ fn singleline_enter_commit_is_once_and_keeps_focus_with_same_or_later_release() 
 
 #[test]
 fn raw_lyrics_enter_keeps_native_newline_semantics_and_commits_only_once() {
-    for same_pass in [false, true] {
+    for terminal_same_pass in [false, true] {
         let mut h = Harness::new(Field::Lyrics);
         let id = h.focus();
         h.frame(start_preedit());
         let mut events = vec![
             ime(egui::ImeEvent::Disabled),
             ime(egui::ImeEvent::Commit("確定".into())),
-            ime(egui::ImeEvent::Disabled),
         ];
-        if same_pass {
-            events.push(release(Key::Enter));
+        // The Process press and its physical release never reach this queue.
+        if terminal_same_pass {
+            events.push(ime(egui::ImeEvent::Disabled));
         }
         h.frame(events);
-        if !same_pass {
-            h.frame(vec![release(Key::Enter)]);
+        assert!(!h.events_after_shortcut.iter().any(|event| matches!(
+            event,
+            Event::Key {
+                key: Key::Enter,
+                ..
+            }
+        )));
+        if !terminal_same_pass {
+            h.frame(vec![ime(egui::ImeEvent::Disabled)]);
         }
         h.assert_focus(id);
-        // Process presses never reach the raw multiline widget. The commit
+        // Process presses and their releases never reach the multiline widget. The commit
         // confirms text once without adding a newline.
         assert_eq!(h.body(), "original\n\nsecond確定");
         assert_eq!(h.body().matches("確定").count(), 1);
@@ -643,7 +650,8 @@ fn lyrics_cancel_keeps_widget_identity_cues_and_native_undo_ownership() {
     h.idle_for_native_undo();
     let committed = h.project.clone();
     h.frame(start_preedit());
-    h.frame(vec![release(Key::Escape)]);
+    // egui-winit hides both halves of the IME-processed Escape pair.
+    h.frame(vec![]);
     h.frame(vec![ime(egui::ImeEvent::Disabled)]);
     assert_eq!(h.project, committed);
     assert_eq!(h.state.lyrics_editors[&h.layer].widget_id(h.layer), id);

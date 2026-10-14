@@ -5,10 +5,12 @@
 //! to these small contracts without pulling lab-only code into the hot path.
 
 pub mod analysis;
+pub mod bass;
 pub mod beat;
 pub mod color;
 pub mod effects;
 pub mod keyboard;
+pub mod pitch;
 pub mod playback;
 pub mod spectrum_visual;
 pub mod timeline;
@@ -22,17 +24,22 @@ pub use analysis::{
     analyze_stereo_waveform_cancellable, apply_display_gain_db, resample_linear_stereo,
     spectrum_analysis_from_stereo_window, spectrum_bands_from_stereo_window,
 };
+pub use bass::{
+    BassEstimate, TIMELINE_BASS_SEGMENT_FRAMES, TimelineBassSegment, TimelineBassTrack,
+    calculate_timeline_bass_segment, pitch_frame_at_secs, select_bass,
+};
 pub use beat::{BarMarker, BeatGrid, BeatMarker, BeatTrackingStatus};
 pub use color::{
-    VisualizationColor, brighten_color, hsv_to_rgb, key_color, key_fill, lerp_color,
-    spectrum_color, unlit_key_base, with_alpha,
+    VisualizationColor, brighten_color, hsv_to_rgb, key_color, key_fill, key_fill_with_color,
+    lerp_color, spectrum_color, unlit_key_base, with_alpha,
 };
 pub use effects::{AudioProcessBlock, EffectChain, EffectChainStats, EffectError, NoopEffectChain};
 pub use keyboard::{
-    BassMarkerPlacement, KEYBOARD_NOTE_COUNT, KeyPlacement, KeyboardAnimationState, KeyboardFrame,
-    KeyboardLayout, KeyboardLayoutCache, KeyboardLevels, KeyboardPoint, KeyboardRect,
-    layout_bass_markers, layout_bass_markers_into, layout_keyboard, layout_keyboard_cached,
-    prepare_keyboard_frame, prepare_keyboard_frame_into,
+    BassMarkerPlacement, KEYBOARD_NOTE_COUNT, KeyPlacement, KeyboardAnimationState,
+    KeyboardBassInput, KeyboardCenterInput, KeyboardFrame, KeyboardLayout, KeyboardLayoutCache,
+    KeyboardLevels, KeyboardPoint, KeyboardRect, layout_bass_markers, layout_bass_markers_into,
+    layout_bass_markers_with_input_into, layout_keyboard, layout_keyboard_cached,
+    prepare_keyboard_frame, prepare_keyboard_frame_into, prepare_keyboard_frame_with_input_into,
 };
 pub use playback::{PlaybackIntent, PlaybackSnapshot};
 pub use spectrum_visual::{

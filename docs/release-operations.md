@@ -36,6 +36,28 @@
   対象差分・環境が変わった場合は [検証結果の再利用条件](development-build-and-test.md#検証の担当と結果の再利用)
   に従って必要な検証をやり直す。公開手順にない追加レビューを慣例で増やさない。
 
+## 依存物の更新確認
+
+リポジトリルートで `.\scripts\check-dependency-updates.ps1` を実行する。
+Cargo.toml の `[patch.crates-io]` と変更記録を持つ直接 path 依存 (unrar 等) の版・変更記録、
+PDFium / FFmpeg / LibRaw の既存 check、ONNX Runtime DirectML (NuGet)、EffeTune Mixwright、
+VST3 SDK、Rust stable、VC++ ランタイムの版、`cargo update --dry-run` の更新可能件数と
+主要なクレートを ASCII の Markdown 表で標準出力と `target/dependency-updates/YYYY-MM-DD.md` に出す。
+README の mImageViewer patch 節も変更記録として扱う。
+
+依存物のダウンロード・更新・インストールは行わず、Cargo.lock や vendor は変更しない。
+書き込む成果物は日付別レポートのみ (同日再実行は上書き)。Cargo は問い合わせ用の registry
+メタデータキャッシュを更新する場合がある。ネットワーク失敗は行ごとに `unavailable`、
+bash が無ければ既存 check は `skipped (bash not found)`、VC++ の最新版は `manual check` とする。
+Git for Windows の bash は標準配置、`git --exec-path` からの相対配置、`where.exe bash` の
+順に探すため、PowerShell の PATH に無くても使える。Windows 配下の WSL bash は選ばない。
+VST3 SDK は `vX.Y.Z_build_N` の版・build 番号を比較して最大のタグ 1 つだけを表示し、旧形式は除く。
+通信不要の模擬応答テストは `.\scripts\test-check-dependency-updates.ps1` で実行できる。
+`CARGO_NET_OFFLINE=true` の環境では Cargo の結果がローカルキャッシュに基づく旨を明記する。
+終了コードは常に 0 で、更新の採否は人が判断する。月 1 回の自動実行もある。
+更新を採用した場合は変更記録に従ってローカル変更を付け直し、個別の互換性・ライセンス・
+リリース確認手順を続ける。
+
 ## 1. 全体の位置づけ
 
 - **配布ビルドは `scripts/build-dist.ps1` 一発**。Rust 全体テスト → idle-health 解析テスト

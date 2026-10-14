@@ -285,10 +285,29 @@ P1/P2 では `music-core` の既存 API（最大 128 バンド）をそのまま
 書き出し側はレイヤごとにカスタム Fill / mIV 配色を選択できる。鍵盤の表示ゲインはプロジェクトに
 `display_gain_db`（既定 0 dB）として持ち、音声波形そのものを変えず `prepare_keyboard_frame` に渡す。
 
+2026-10-14 の master (`edcc26578`) 統合では、この共有境界を保ったまま入力の意味を明示する。
+本体は `KeyboardCenterInput::FundamentalProbabilities` で HarmNet 確率（未取得は入力 0）を渡し、
+Bass は `KeyboardBassInput::AbsoluteMidi` で選択済み MIDI をそのまま描く。書き出しの既存 API は
+`SpectrumEnergy` / `PitchClass` を選び、倍音加点・低域整理・エネルギーからの octave 選択を維持する。
+本体の設定配色は選択した `music_note_color` の色を共有 `key_fill_with_color` の blend に渡す。
+書き出しの既存五度圏配色・カスタム Fill は維持し、HarmNet や本体の設定配色へ暗黙に変更しない。
+配置・sustain・残光・倍音比・blend・Bass 三角形は同じ core の判断を通し、ホストに local 鍵盤を戻さない。
+非同期状態を増やす代わりに既存の単一 worker / 結果チャネルと typed 入力で差を表現する。
+
+同じ統合でエディタの IME fixture は master の処理済みキー配送モデルへ適応した。
+現行の正本は [IME 処理済みキー設計](ime-process-keys-plan.md) とする。Windows の winit 経路は
+`allow_ime=true` の Process press を遮断し、`KeyHold` の Hidden / Forwarded で配送済み press を記録する。
+release は状態を除去して Hidden だけ遮断、Forwarded / 未登録は配送し、focus 喪失で全状態を消去する。
+native 生キー経路の release 保持とは区別する。エディタ fixture は Process press と対応する Hidden
+release の両方を除き、Enter 確定の終端 Disabled は同 pass / 別 pass の両方を検査する。
+
 横長スペクトラムも同じ共有方針とする。対数周波数軸、trail / onset の状態遷移、ghost → trail →
 現在値 → onset の描画プリミティブ列は `music-core::spectrum_visual` が所有し、本体の egui 描画と
-書き出しの CPU ラスタライザはその同じ結果を描く。状態は音声時刻の前進時だけ更新し、シーク時に
-リセットする。書き出し側の従来の等間隔 Bars は別の選択肢として維持する。
+書き出しの CPU ラスタライザはその同じ結果を描く。export の `frame_at` は音声時刻の前進時にだけ
+更新し、同時刻は cache を返す。本体は `poll` の新結果採用で `adopt_analysis_at` を1回呼ぶため、
+progressive PCM の一時停止中再解析も同時刻の新 bands を反映する。描画は読み取り専用 `frame()` を使い、
+描画回数で残光を進めない。双方とも後退／250ms超の移動で共有 seek 判定が状態をリセットする。
+書き出し側の従来の等間隔 Bars は別の選択肢として維持する。
 
 ### D6a. 初回リリースではビート同期を作らない
 

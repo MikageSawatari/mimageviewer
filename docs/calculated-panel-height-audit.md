@@ -27,9 +27,18 @@ lib は `crate::test_ui::scroll_layout`、integration は `test_ui::scroll_layou
 - 実 egui で48pt行を5個割り当てる負対照を持つ。計算240ptへ未算入の行間3ptを加えると
   helper は失敗する。snapshot の期待画像を更新しても、この検査は通らない。
 
-十分な高さの画面で全状態を描く `fs_overflow_panel` 検査と、高さ200ptでの末尾到達を追加した。
-状態は Root / NavigatorPosition / SpreadAdjustment。Root は製品の fixed_order 全項目と
+十分な高さの画面で全状態を描く `fs_overflow_panel` 検査と、高さ200pt／180ptでの末尾到達を持つ。
+状態は Root / NavigatorPosition / SpreadAdjustment / MusicNoteColor。Root は製品の fixed_order 全項目と
 本の構成入口、SpreadAdjustment は未解決の基点文面と全体checkboxを含む。
+2026-10-14のマージ後レビューで、180pt画面の本文52ptよりScrollAreaの既定最小高64ptが大きく、
+スクロール終端でも末尾12ptが実クリップ外へ残る退行を確認した。
+行間0・共通高さ式を維持して`min_scrolled_height(0.0)`を復元し、全4状態×3画面の検査で
+実ScrollArea本文のclip内にinner_rectが収まることと、実wheel後の内容下端がclip内へ届くことを確認する。
+同日の修正確認は全Cargoへ`MSBUILDDISABLENODEREUSE=1`を設定して実行。
+共通検査1件（12条件）、overflow 54件（ignored 1）、ui_fullscreen 746件（ignored 1）、
+ui_snapshot 176件、`cargo fmt --check`がすべてexit0。PNGは通常比較に一致し、更新なし。
+初回の検査用リンクは別テストが実行体を使用中で失敗し、終了を待って修正後の検査を実行した。
+実行履歴は`target/overflow-180-validation/`に保存。git add／commitとdev-runtime操作は行っていない。
 表示モード popup は通常／抽出一覧／本の構成状態を、1800pt／260ptの高さで描く。
 既存のズーム／フィット popup の検査も共通 helper へ接続し、実枠の自然高検査を維持した。
 

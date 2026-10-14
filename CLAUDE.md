@@ -536,6 +536,7 @@ C:\home\mimageviewer_vendor_backup\
   [docs/calculated-panel-height-audit.md](docs/calculated-panel-height-audit.md)。
 
 ### IME 対応 (日本語入力) ⚠️ 重要
+設計・先行実機記録・移植検証は [IME 処理済みキーの計画](docs/ime-process-keys-plan.md) を参照。
 TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
 直接 `ctx.input(|i| i.key_pressed(Key::Enter/Escape))` を呼ぶと、**日本語 IME 変換中の Enter
 (変換確定) や Escape (変換キャンセル) をダイアログが奪ってしまい、変換が破壊される**。
@@ -577,8 +578,12 @@ viewport ごとに追跡する。`App::update_ime_state(ctx)` は helper-field �
 `ime_focus::ime_input_active_in_viewport` から共有 snapshot を読む。これは read-only の入口であり、
 対象 viewport の event queue や composition state を更新しない。更新は必ず所有 viewport の pass に残す。
 
-IME が処理した `NamedKey::Process` の press（repeat を含む）は vendored egui-winit が
-Key / Text / Cut / Copy / Paste にしない。release と Ime event は残す。native presenter も
+Windows の `allow_ime` が true の場合、vendored egui-winit は IME が処理した
+`NamedKey::Process` の press（repeat を含む）を Key / Text / Cut / Copy / Paste にしない。
+本家 0.34.0 #7967 の HashSet を、物理キーごとの Hidden（press 未配送）/ Forwarded（配送済み）の型付き状態へ置換する。
+後続の Process repeat でも Forwarded を保持する。release は allow_ime にかかわらず状態を除去し Hidden のみ遮断する。
+focus 喪失時は全状態を消す（egui も keys_down を消去する）。
+それ以外の release と Ime event は残す。native presenter も
 `VK_PROCESSKEY` に egui key を割り当てない。本体 Win32 queue と native 生キー公開も
 同じく 0xE5 の press / repeat を捨て、release は残す。通常のキーを composition だけで
 取り除かない。TextEdit の未確定文字選択を保ったまま、Windows が
@@ -2030,6 +2035,13 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      いなかったので、腐る以外の道が無かった。
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
+
+6.3. **依存物の更新確認**: `.\scripts\check-dependency-updates.ps1` を実行し、
+   標準出力と `target/dependency-updates/<日付>.md` の一覧を見て、上げるかを判断する。
+   問い合わせ専用で依存物の取得・変更・インストールは行わない。手を入れているクレートを
+   上げるときは、表にある変更記録 (`PATCHES.md` / `MIV-PATCH.md` / README の patch 節等) に
+   従って変更を付け直す。月 1 回の自動実行もある。既存の PDFium 等の個別手順も引き続き行う。
+   詳細は [リリース運用メモ](docs/release-operations.md#依存物の更新確認) を参照。
 
 6.4. **記録済みクラッシュの棚卸し (最初に回す)**:
 

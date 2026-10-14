@@ -22,6 +22,18 @@ const GET_MINOR: usize = 1;
 const GET_REVISION: usize = 2;
 const IS_DB_LOADED: usize = 401;
 
+/// Classify the failed send using Windows' observation at that failure, not
+/// elapsed time alone. A timeout can also occur while the target is responsive.
+pub(super) fn classify_send_failure(error: u32, hung: bool) -> EverythingError {
+    if hung {
+        EverythingError::NotResponding
+    } else if error == ERROR_TIMEOUT.0 {
+        EverythingError::Busy
+    } else {
+        EverythingError::SendFailed
+    }
+}
+
 /// The search/prepare worker waits on two events, not the synchronous native send.
 /// The detached IPC run owns its entire packet, HWND and callback lifetime until
 /// its bounded send returns. Its caller thread stays alive through reply parsing
@@ -300,20 +312,18 @@ impl WindowsEndpoint {
             timeout.as_millis()
         );
         if sent.0 == 0 {
+            // GetLastError was captured before this observation. No extra send,
+            // wait or polling: status and query share this failure boundary.
+            let hung = unsafe { IsHungAppWindow(self.target) }.as_bool();
+            let failure = classify_send_failure(last_error.0, hung);
             crate::logger::log(format!(
-                "everything IPC send failed: message={message:#x}, status_code={}, win32_error={}, timeout_ms={}, elapsed_ms={:.3}",
+                "everything IPC send failed: classification={failure:?}, message={message:#x}, status_code={}, win32_error={}, timeout_ms={}, elapsed_ms={:.3}",
                 if message == WM_USER { wp.0 } else { 0 },
                 last_error.0,
                 timeout.as_millis(),
                 send_started.elapsed().as_secs_f64() * 1000.0
             ));
-            if last_error == ERROR_TIMEOUT
-                || (last_error.0 == 0 && unsafe { IsHungAppWindow(self.target) }.as_bool())
-            {
-                Err(EverythingError::Busy)
-            } else {
-                Err(EverythingError::SendFailed)
-            }
+            Err(failure)
         } else {
             Ok(response)
         }

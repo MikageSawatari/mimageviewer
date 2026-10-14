@@ -1,5 +1,12 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+音楽ビュー上部の「…」→「音名の色」はマウス・タッチの固定入力で、keymap対象外。
+低頻度の見た目の好み設定なので専用キーを追加しない。開いたメニューは次のキー押下で閉じ、
+そのキー本来の操作を続ける。パネル内のホイール・Ctrl+ホイール・タッチ、および外側クリックで
+閉じる入力は背面のタイムラインへ渡さず、閉じたフレームもその入力の所有を保つ。
+パネル表示中に開始したドラッグやタッチは、キーで閉じた後もボタンの解放／接点の終了まで
+パネル側が所有する。キー本来の操作は続け、新しく開始した操作は通常どおり受け付ける。
+
 ## 構成のある本の表示キー（§1.242 G3）
 
 `FsViewSpread` / `FsViewLandscapeSplit`は閲覧方法だけを切り替える。既定キーなしでカスタム割当の対象。
@@ -15,7 +22,6 @@
 `FsReadingDirectionToggle`と見開きずらしは無効。Single/Split時のずらしキーは従来のページ送りfallbackを保つ。
 キー/リング/パッドは既存KeyActionと共通表示setterを通し、結果の表示設定を記憶しない。
 新Action・既定割当は追加しない。通常の本・通常一覧の既存キーは変更しない。
-
 
 `GridOrganizeFiles` はサムネイル一覧のカーソル項目／チェック済み項目の「ファイル整理先」を開く。
 既定キーはなし。操作カスタマイズからキー、リング（マウス／パッド）、マウスジェスチャ、
@@ -239,11 +245,13 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
-IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
-clipboard event にせず、native presenter も `VK_PROCESSKEY` を egui key にしない。
+Windows の `allow_ime` が true のとき、IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
+clipboard event にしない。native presenter は `VK_PROCESSKEY` を egui key にしない。
 本体 Win32 queue と native 生キー公開も 0xE5 の press / repeat を捨てるため、JIS 記号の
 scan-code shortcut に IME 処理済みキーが一致することはない。
-release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
+egui-winit は物理キーの押下を Hidden（press 未配送）/ Forwarded（配送済み）として所有し、Process repeat でも Forwarded を保持する。
+本家 0.34.0 #7967 の HashSet との差分はこの型付き状態、allow_ime にかかわらない release の状態除去・Hidden のみ遮断、focus 喪失時の全消去。
+Win32 queue / native 生キー経路の release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
 取消の `Disabled` / 空 `Commit` に非空 `Commit` が無い場合だけ、input plugin が
 空の `Preedit("")` を補い、未確定文字を取り消す。アプリ操作の抑止は今 pass の Ime 列を
 反映した後の composing だけで決まり、Commit 後の通常 Enter / Escape / shortcut は即座に通る。

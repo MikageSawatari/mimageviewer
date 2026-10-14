@@ -53,7 +53,7 @@ impl ImeFocusState {
 /// Pre-`Memory::begin_pass` owner of IME composition state and input repair.
 ///
 /// The host input bridge excludes key presses handled by the IME (winit's
-/// `NamedKey::Process`); their releases and IME events still arrive here. Windows
+/// `NamedKey::Process`); IME events still arrive here. Windows
 /// can finish cancellation with `Disabled` but no empty preedit. In that case
 /// this plugin inserts the `Preedit("")` expected by `TextEdit` while its
 /// composition selection is still intact. Ordinary key events are preserved.

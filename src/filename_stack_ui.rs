@@ -49,7 +49,7 @@ pub(crate) enum StackPreparePending {
 pub(crate) enum StackReturnState {
     Ready {
         view: Arc<StackView>,
-        prepared: StackPreparedItems,
+        prepared: Box<StackPreparedItems>,
     },
     Refreshing {
         view: Arc<StackView>,
@@ -1437,7 +1437,9 @@ impl crate::app::App {
             StackSwitchTarget::Flat { index } => {
                 self.stack_return_state = Some(StackReturnState::Ready {
                     view,
-                    prepared: retained_aggregate.expect("flat switch has accepted aggregate"),
+                    prepared: Box::new(
+                        retained_aggregate.expect("flat switch has accepted aggregate"),
+                    ),
                 });
                 self.stack_showing_flat = true;
                 self.fs_open_intent_from_grid = true;
@@ -1885,7 +1887,7 @@ impl crate::app::App {
                 .and_then(|flat| view.group_of_flat_index(flat))
                 .map(|group| view.aggregated_index_of_group(group));
             let current = Self::stack_prepared_stamps_current(&prepared);
-            self.swap_stack_view_items(prepared, &view.folder, select);
+            self.swap_stack_view_items(*prepared, &view.folder, select);
             self.stack_showing_flat = false;
             if !current {
                 self.stack_return_state = Some(StackReturnState::Refreshing {

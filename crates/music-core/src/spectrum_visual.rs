@@ -78,15 +78,39 @@ impl MivSpectrumState {
     /// 同じ時刻はキャッシュを返し、後退または 250ms を超える飛びはシークとして状態を
     /// リセットする。したがって結果は実時間や描画回数ではなく、入力と `t_secs` の列だけで決まる。
     pub fn frame_at(&mut self, bands: &[f32], t_secs: f64) -> &MivSpectrumFrame {
-        let t = if t_secs.is_finite() {
+        let t = self.normalize_time(t_secs);
+        if self.last_t == Some(t) {
+            return &self.frame;
+        }
+        self.advance_at(bands, t);
+        &self.frame
+    }
+
+    /// Adopt one newly completed live analysis, including revised input at the same time.
+    ///
+    /// The live result owner calls this once per accepted result; painting reads `frame()`.
+    /// Export callers keep `frame_at()`'s repeated-time cache contract.
+    pub fn adopt_analysis_at(&mut self, bands: &[f32], t_secs: f64) -> &MivSpectrumFrame {
+        let t = self.normalize_time(t_secs);
+        self.advance_at(bands, t);
+        &self.frame
+    }
+
+    /// Read the accepted visual snapshot without advancing afterglow or onset state.
+    pub fn frame(&self) -> &MivSpectrumFrame {
+        &self.frame
+    }
+
+    fn normalize_time(&mut self, t_secs: f64) -> f64 {
+        if t_secs.is_finite() {
             t_secs.max(0.0)
         } else {
             self.clear();
             0.0
-        };
-        if self.last_t == Some(t) {
-            return &self.frame;
         }
+    }
+
+    fn advance_at(&mut self, bands: &[f32], t: f64) {
         if self
             .last_t
             .is_some_and(|last| t < last || t - last > MIV_SPECTRUM_MAX_SEQUENTIAL_GAP_SECS)
@@ -95,7 +119,6 @@ impl MivSpectrumState {
         }
         self.advance(bands);
         self.last_t = Some(t);
-        &self.frame
     }
 
     fn advance(&mut self, bands: &[f32]) {
@@ -365,6 +388,25 @@ mod tests {
         let after_seek = state.frame_at(&[0.1], 0.5).clone();
         let mut fresh = MivSpectrumState::default();
         assert_eq!(after_seek, *fresh.frame_at(&[0.1], 0.5));
+    }
+
+    #[test]
+    fn live_same_time_adoption_updates_values_and_preserves_afterglow() {
+        let mut state = MivSpectrumState::default();
+        state.adopt_analysis_at(&[0.8, 0.1], 1.0);
+        let revised = state.adopt_analysis_at(&[0.1, 0.7], 1.0).clone();
+        assert_eq!(revised.bands[0].value, 0.1);
+        assert_eq!(revised.bands[0].trail, 0.8 * SPECTRUM_TRAIL_DECAY);
+        assert_eq!(revised.bands[1].value, 0.7);
+        assert_eq!(revised.bands[1].onset, 1.0);
+        assert_eq!(state.frame(), &revised);
+        assert_eq!(state.frame_at(&[0.9, 0.9], 1.0), &revised);
+        assert_eq!(state.frame(), &revised);
+        let after_seek = state.adopt_analysis_at(&[0.2], 0.5).clone();
+        let mut fresh = MivSpectrumState::default();
+        assert_eq!(after_seek, *fresh.frame_at(&[0.2], 0.5));
+        let after_gap = state.adopt_analysis_at(&[0.3], 2.0).clone();
+        assert_eq!(after_gap, *fresh.frame_at(&[0.3], 2.0));
     }
 
     #[test]

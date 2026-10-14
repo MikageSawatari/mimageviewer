@@ -1455,6 +1455,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-14 音楽ビューの音名配色メニュー（鍵盤設計 §15）
+
+[鍵盤設計 §15.5 D7](music-keyboard-harmnet-plan.md) に記録された独立設計レビューと
+設計担当（ClaudeCode）の合意に基づく。実装側も症状パッチではなく構造的に妥当な追加であることに同意する。
+`draw_music_top_chrome` の呼出側からメニューボタン表示の引数を渡し、通常の音楽ビューは表示、
+parked-live は非表示とする。鍵盤へは保存された配色方式を値で渡す。
+detachedの述語、viewport所有、park／復帰、配置・フォーカス・再生成の経路は変更しない。
+通常ビューのメニューは既存の排他的 `FsOverflowPanelState` と閉じる経路を使う。
+独立実装レビューと検証結果は鍵盤設計の今回の検証記録へ集約する。
+
 ### 2026-10-13 §1.242 G: 画像folder→ZIPのprocess modalとcontext限定採用（実装中）
 
 画像folder→ZIP設計R3の独立ACCEPTは利用者報告（対象`7346683c6`）として記録済み。
@@ -1489,6 +1499,18 @@ ZIPrev3修正（2026-10-13、設計担当の今回指示に基づく構造変更
 source補充の採用だけを実際のitem keyとcontext世代で行う。closeは同operationの保存/返却境界を
 維持し、rootの既存終了/トレイ設定へ終端後に渡す。兄弟の退役・items/cacheへの一括変更はしない。
 詳細と実worker順序fixtureは画像folder→ZIP計画§11.3と修正検証記録へ記載する。
+
+### 2026-10-12 音楽ベース表示の共通基音推定への移行 (§13、第2段階)
+
+[鍵盤設計 §13.7 P4](music-keyboard-harmnet-plan.md) と利用者の実装指示による。
+`src/ui_fullscreen.rs::draw_parked_live_music_window` の `MusicSpectrumState::draw` 呼出から、
+旧タイムライン解析由来の▼引数を除去した。通常表示も同じ変更を行い、spectrum自身が
+鍵盤と同じ再生中の確率から絶対MIDI鍵を選んで▼へ渡す。
+これは▼のデータの出どころを鍵盤と揃える機能変更であり、detachedの症状パッチではない。
+detached述語、viewport経路、park／復帰の所有・遷移、Norm引数は変更していない。
+既存のpark／復帰回帰にはBass結果の保持・採用の検査を加えた。
+設計側の判断は§13.7末尾に記録済み。実装側も上記主張に合意する。
+独立実装レビューの合意・自動検証は鍵盤設計の今回の検証記録へ追記する。
 
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 
@@ -4996,7 +5018,7 @@ detached predicate/registry/viewport/scheduler/placementは変更せず、vendor
 確定後の通常 Enter を本文 TextEdit へ渡す。同じ実 fullscreen 経路の同一 / 別 pass 回帰を追加した。
 §2 を再読し、detached predicate、viewport 生成 / registry、host / placement / focus owner は変更しない。
 新しい状態・時間窓・geometry guard を足す症状パッチではなく、不要となった対症療法の撤去である。
-300ms grace 等の残す規則と自動検証結果は [I2 段 2a の記録](music-video-export-plan.md) に集約する。
+段 2a 時点の規則（grace は後の段 2b で撤去）と自動検証結果は [I2 段 2a の記録](ime-process-keys-plan.md) に集約する。
 実機確認と設計 lead の検収は未実施。
 
 ### §11 追補: I2 段 2b の共有 IME 所有境界（2026-10-14、未コミット）
@@ -5004,8 +5026,8 @@ detached predicate/registry/viewport/scheduler/placementは変更せず、vendor
 設計 lead の第5版と独立設計レビュー ACCEPT、および brief の小範囲修正許可に従い、
 共有 `egui-ime` の時刻 grace を撤去し、今 pass 反映後の composing に統一した。
 終端 event を失ったまま同じ viewport ID を再利用すると composing が残ることを回帰テストで確認したため、
-plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状態を落とし、所有 viewport の focus 喪失でも終了する。
+plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状態を落とし、所有 viewport の focus 喪失では shortcut claim を終了する。終端待ちは `UnfocusedComposition` として保持し、後続の取消補完を保つ。
 生存する兄弟 viewport の read-only 参照では変更しない。helper retry は既存 latch を pass 番号へ置換し、
 欄が消えた後へ復帰要求を持ち越さない。detached predicate / registry / 生成 / placement は変更しない。
 §2 の所有境界に沿う修正であり、遅延・時間窓・geometry guard を足す症状パッチではないことを実装側でも確認した。
-自動検証結果は [I2 段 2b の記録](music-video-export-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。
+自動検証結果は [I2 段 2b の記録](ime-process-keys-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。

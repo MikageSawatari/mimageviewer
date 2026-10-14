@@ -33,6 +33,9 @@
   write stamp を確認してから install する。flat の実ページは synthetic folder prefix で再照会しない。
   `Stack` セルは引き続きコンテナであり編集キーを持たない。サムネとバッジの意味は変えない。
   flat 受理時に aggregate の順と投影を同じ bundle に保持し、fullscreen を閉じたら即座に戻す。
+  復帰用の大きな `StackPreparedItems` は `StackReturnState::Ready` 内でBoxへ収納する。
+  Appを直置きで肥大化させず、同じbundleの所有・stamp照合・一度の値移譲を維持する。
+  復帰時はBoxから取り出して既存の一覧採用へ渡し、取消・別viewへの移動では既存の状態破棄に従う。
   保持 stamp が古い場合は aggregate の入力を抑止して worker で再読込する。読込再試行では
   grouping を再実行せず候補順を使い、書込中は guard の repaint を待つ。失敗時の wake は
   100 ms–4 s の bounded backoff とする。separator・script・sort・カテゴリ表示順の変更は

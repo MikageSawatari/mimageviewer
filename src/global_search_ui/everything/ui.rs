@@ -153,3 +153,43 @@ pub fn draw_everything_search_snapshot_fixture(ui: &mut egui::Ui) {
 pub fn draw_everything_progress_snapshot_fixture(ctx: &egui::Context) {
     draw_everything_progress(ctx);
 }
+
+#[cfg(test)]
+mod tests {
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn everything_search_bar_not_responding_narrow_dark() {
+        let mut fonts_ready = false;
+        let size = egui::vec2(320.0, 400.0);
+        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
+            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
+                let mut focus = false;
+                super::draw_everything_controls(ui, &mut query, &mut focus);
+                // Production renders a failed search via the same error label.
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    crate::everything_ipc::EverythingError::NotResponding.user_message(),
+                );
+            });
+        });
+        harness.run();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for label in [
+            "検索",
+            "×",
+            crate::everything_ipc::EverythingError::NotResponding.user_message(),
+        ] {
+            assert!(viewport.contains_rect(harness.get_by_label(label).rect()));
+        }
+        harness.snapshot("everything_search_bar_not_responding_narrow_dark");
+    }
+}

@@ -1,17 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum BeatTrackingStatus {
+    #[default]
     NotRun,
     Estimated,
     LowConfidence,
     UserCorrected,
-}
-
-impl Default for BeatTrackingStatus {
-    fn default() -> Self {
-        Self::NotRun
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

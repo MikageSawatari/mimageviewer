@@ -525,6 +525,10 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 ### 10.1 ポータブル版 (利用者決定 2026-09-28、UI方針追記 2026-10-01)
 
 - ポータブル版は **ユーザー VST も音響調整 (EffeTune) も無効のまま** (vst3-host.exe を同梱しない現状を維持)。
+- 非同梱なのは **Mixwright bundle とその音響調整用 host／通知**。音楽ビューの鍵盤に使う
+  Note Spectrogram の HarmNet L 推論・重みは music-core に埋め込み、ポータブル版を含む全形態で
+  使う。外部 bundle／WebView や保存領域を必要とせず、MIT 本文は全形態のバージョン情報に表示する
+  （`third_party/effetune-harmnet/`、[鍵盤の基音推定設計 §7](music-keyboard-harmnet-plan.md#7-ライセンス表記)）。
 - **利用者決定 2026-10-01**: portable は EffeTune のツールバーボタンとカスタマイズ候補を表示しない。
   v4.3.0 の「重要な変更点」からも、同ボタン追加の必読告知と EffeTune 新機能の紹介を除く。
   通常版の表示・告知は維持し、Remote 接続・音声トラック選択・長さ表示の告知は両版に残す。
@@ -590,8 +594,9 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 3種類の通知全文を `third_party/effetune-mixwright/v0.12.0/` に原文のまま追跡し、about の
   EffeTune Mixwright / Steinberg VST3 SDK (MIT) 一覧と折り畳み全文表示に使用する。
   `.gitattributes` の `third_party/effetune-mixwright/** -text` で Windows の `core.autocrlf=true`
-  でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は EffeTune
-  一覧・通知の埋め込みを行わない。bundle 内の元通知も省略せず配布する。
+  でもバイト列を保持する。Gitの保存内容もLF。vendor が存在するテストでは VERSION と通知全文の完全一致を確認する。portable は Mixwright
+  一覧・bundle 通知の埋め込みを行わない。HarmNet L の MIT notice は別に core へ埋め込み、全形態で
+  一覧・全文を表示する（§10.1）。bundle 内の元通知も省略せず配布する。
   2026-10-03 の公開前レビュー対応で、JSZip 内の lie / immediate / setImmediate と
   pako の zlib 由来コードの原文を `supplemental/NOTICES.txt` として第4の折り畳み通知に
   埋め込む。これは mIV 独自の補足であり、承認済み bundle と manifest は変更しない。

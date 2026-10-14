@@ -44,8 +44,17 @@ pub fn key_color(midi: u8, value: f32) -> VisualizationColor {
 
 /// 本体鍵盤と同じ、消灯色から点灯色までの最終ブレンド色を返す。
 pub fn key_fill(midi: u8, value: f32, black: bool) -> VisualizationColor {
-    let base = unlit_key_base(black, true);
     let active = key_color(midi, value);
+    key_fill_with_color(value, black, active)
+}
+
+/// Blend an explicitly selected note palette with the shared unlit key base.
+pub fn key_fill_with_color(
+    value: f32,
+    black: bool,
+    active: VisualizationColor,
+) -> VisualizationColor {
+    let base = unlit_key_base(black, true);
     let blend = (value * if black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
     lerp_color(base, active, blend)
 }

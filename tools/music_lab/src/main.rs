@@ -2734,7 +2734,7 @@ fn timeline_metric_name(kind: TimelineMetricKind) -> &'static str {
 fn timeline_metric_description(kind: TimelineMetricKind) -> &'static str {
     match kind {
         TimelineMetricKind::LoudnessBassRoot => "Height RMS, color bass root",
-        TimelineMetricKind::Key => "Transient-suppressed chroma profile",
+        TimelineMetricKind::Key => "Height confidence, color key",
     }
 }
 

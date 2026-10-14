@@ -13,6 +13,7 @@
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
+| [ime-process-keys-plan.md](ime-process-keys-plan.md) | IME 処理済みキーの根本修正。I1 共有化、I2 の経緯・Google / MS-IME の先行実機記録、300ms grace 撤去、focus 所有、egui 本家 #7967 との整合と移植検証 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。利用者決定・G1〜G5の契約、G2のmodel/store/lifecycle、G3の共通projection・表示許可・mode-only・E接続。G4Fは2026-10-12に切り離し、画像folderは構成対象外。画像folder→Stored ZIP変換は独立計画で実装中。次々回リリース向けnext-bookで開発 |
 | [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）、実装中。画像タグのZIP本体集約、XMP評価補充、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。2026-10-12利用者決定でCollectionは元参照を保持し、型拡張・容量検査・複製を除外。同名3択と旧ON→本表示/旧OFF→両方表示は決定済み |

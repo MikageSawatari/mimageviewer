@@ -13,6 +13,7 @@ use crate::{
 
 const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
 const KEY_HIGHLIGHT_MIN_PEAK: f32 = 0.035;
+const KEY_PITCH_GAMMA: f32 = 1.0;
 const KEY_SUSTAIN_ATTACK: f32 = 0.18;
 const KEY_SUSTAIN_RELEASE: f32 = 0.965;
 const KEY_HARMONIC_BOOST: f32 = 0.9;
@@ -46,6 +47,23 @@ const KEYBOARD_DISPLAY_MAX_MIDI: u8 = 143;
 
 pub const KEYBOARD_NOTE_COUNT: usize =
     (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
+
+/// The caller explicitly chooses the meaning of the center brightness.
+/// Export keeps its spectral-energy contract; the live viewer supplies HarmNet probabilities.
+#[derive(Clone, Copy, Debug)]
+pub enum KeyboardCenterInput<'a> {
+    SpectrumEnergy,
+    /// Missing probabilities are zero input and decay through the existing afterglow.
+    FundamentalProbabilities(Option<&'a [f32]>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum KeyboardBassInput {
+    /// Legacy export picks an octave from spectral energy.
+    PitchClass(Option<(u8, f32)>),
+    /// HarmNet's selected absolute MIDI must not be moved to a stronger harmonic.
+    AbsoluteMidi(crate::BassEstimate),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct KeyboardRect {
@@ -249,6 +267,25 @@ pub fn prepare_keyboard_frame_into(
     state: &mut KeyboardAnimationState,
     frame: &mut KeyboardFrame,
 ) {
+    prepare_keyboard_frame_with_input_into(
+        notes,
+        note_min_midi,
+        norm_gain_db,
+        KeyboardCenterInput::SpectrumEnergy,
+        state,
+        frame,
+    );
+}
+
+/// Shared animation/layout path with an explicit center input model.
+pub fn prepare_keyboard_frame_with_input_into(
+    notes: &[f32],
+    note_min_midi: u8,
+    norm_gain_db: f32,
+    input: KeyboardCenterInput<'_>,
+    state: &mut KeyboardAnimationState,
+    frame: &mut KeyboardFrame,
+) {
     let note_count = KEYBOARD_NOTE_COUNT;
     for slot in [
         &mut state.sustain,
@@ -279,6 +316,7 @@ pub fn prepare_keyboard_frame_into(
         note_count,
         note_min_midi,
         norm_gain_db,
+        input,
         &mut state.raw,
         &mut state.even_energy,
         &mut state.odd_energy,
@@ -287,12 +325,15 @@ pub fn prepare_keyboard_frame_into(
         &mut state.visual_even,
         &mut state.visual_odd,
     );
+    update_level_trails(
+        &state.visual_center,
+        &state.visual_even,
+        &state.visual_odd,
+        &mut state.trail,
+        &mut state.even,
+        &mut state.odd,
+    );
     for idx in 0..note_count {
-        state.trail[idx] = (state.trail[idx] * KEY_HIGHLIGHT_DECAY).max(state.visual_center[idx]);
-        state.even[idx] = state.even[idx] * (1.0 - KEY_HARMONIC_SMOOTH)
-            + state.visual_even[idx] * KEY_HARMONIC_SMOOTH;
-        state.odd[idx] = state.odd[idx] * (1.0 - KEY_HARMONIC_SMOOTH)
-            + state.visual_odd[idx] * KEY_HARMONIC_SMOOTH;
         frame.levels[idx] = KeyboardLevels {
             center: state.trail[idx],
             even: state.even[idx].clamp(0.0, KEY_GRADIENT_SPREAD),
@@ -300,6 +341,22 @@ pub fn prepare_keyboard_frame_into(
         };
     }
     frame.note_min_midi = note_min_midi;
+}
+
+fn update_level_trails(
+    center: &[f32],
+    visual_even: &[f32],
+    visual_odd: &[f32],
+    trail: &mut [f32],
+    even: &mut [f32],
+    odd: &mut [f32],
+) {
+    for idx in 0..trail.len() {
+        trail[idx] = (trail[idx] * KEY_HIGHLIGHT_DECAY).max(center[idx]);
+        even[idx] =
+            even[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visual_even[idx] * KEY_HARMONIC_SMOOTH;
+        odd[idx] = odd[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visual_odd[idx] * KEY_HARMONIC_SMOOTH;
+    }
 }
 
 /// 鍵盤の座標と描画順を計算する。座標は `rect` と同じ座標系で返す。
@@ -414,6 +471,27 @@ pub fn layout_bass_markers_into(
     layout: Option<&KeyboardLayout>,
     markers: &mut Vec<BassMarkerPlacement>,
 ) {
+    layout_bass_markers_with_input_into(
+        notes,
+        note_min_midi,
+        keyboard_rect,
+        state,
+        KeyboardBassInput::PitchClass(bass_marker),
+        layout,
+        markers,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn layout_bass_markers_with_input_into(
+    notes: &[f32],
+    note_min_midi: u8,
+    keyboard_rect: KeyboardRect,
+    state: &mut KeyboardAnimationState,
+    input: KeyboardBassInput,
+    layout: Option<&KeyboardLayout>,
+    markers: &mut Vec<BassMarkerPlacement>,
+) {
     let note_count = KEYBOARD_NOTE_COUNT;
     let trail = &mut state.bass_marker_trail;
     if trail.len() != note_count {
@@ -423,7 +501,16 @@ pub fn layout_bass_markers_into(
     for value in trail.iter_mut() {
         *value *= BASS_MARKER_DECAY;
     }
-    if let Some((pitch_class, confidence)) = bass_marker
+    if let KeyboardBassInput::AbsoluteMidi(estimate) = input
+        && (21..=55).contains(&estimate.midi)
+        && estimate.confidence >= 0.5
+        && let Some(idx) = estimate.midi.checked_sub(note_min_midi).map(usize::from)
+        && idx < note_count
+    {
+        let target = (estimate.confidence * BASS_MARKER_CONF_GAIN).clamp(0.0, 1.0);
+        trail[idx] = trail[idx].max(target);
+    }
+    if let KeyboardBassInput::PitchClass(Some((pitch_class, confidence))) = input
         && confidence >= BASS_MARKER_MIN_CONF
     {
         let pc = pitch_class % 12;
@@ -519,6 +606,7 @@ fn compute_keyboard_visuals(
     note_count: usize,
     note_min_midi: u8,
     norm_gain_db: f32,
+    input: KeyboardCenterInput<'_>,
     raw: &mut [f32],
     even_energy: &mut [f32],
     odd_energy: &mut [f32],
@@ -542,6 +630,25 @@ fn compute_keyboard_visuals(
         let (even_value, odd_value) = harmonic_energies(raw, idx);
         even_energy[idx] = even_value;
         odd_energy[idx] = odd_value;
+    }
+
+    if let KeyboardCenterInput::FundamentalProbabilities(probabilities) = input {
+        let presence_peak = apply_display_gain_db(peak, norm_gain_db);
+        let presence = ((presence_peak - KEY_HIGHLIGHT_MIN_PEAK) / 0.28)
+            .clamp(0.0, 1.0)
+            .powf(0.7);
+        for idx in 0..note_count {
+            center[idx] = probabilities
+                .and_then(|p| p.get(idx))
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0)
+                .powf(KEY_PITCH_GAMMA)
+                * presence;
+            even[idx] = (even_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
+            odd[idx] = (odd_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
+        }
+        return;
     }
 
     for idx in 0..note_count {
@@ -692,6 +799,96 @@ fn is_black_key(midi: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_center_inputs_preserve_export_and_gate_live_keyboard() {
+        let notes = vec![0.9; KEYBOARD_NOTE_COUNT];
+        let mut legacy_state = KeyboardAnimationState::default();
+        let mut explicit_state = KeyboardAnimationState::default();
+        let mut explicit = KeyboardFrame::default();
+        let mut live_state = KeyboardAnimationState::default();
+        let mut live = KeyboardFrame::default();
+        let mut probabilities = vec![0.0; KEYBOARD_NOTE_COUNT];
+        probabilities[40] = 0.8;
+        for _ in 0..30 {
+            let legacy =
+                prepare_keyboard_frame(&notes, SPECTRUM_NOTE_MIN_MIDI, 0.0, &mut legacy_state);
+            prepare_keyboard_frame_with_input_into(
+                &notes,
+                SPECTRUM_NOTE_MIN_MIDI,
+                0.0,
+                KeyboardCenterInput::SpectrumEnergy,
+                &mut explicit_state,
+                &mut explicit,
+            );
+            assert_eq!(legacy, explicit);
+            prepare_keyboard_frame_with_input_into(
+                &notes,
+                SPECTRUM_NOTE_MIN_MIDI,
+                0.0,
+                KeyboardCenterInput::FundamentalProbabilities(Some(&probabilities)),
+                &mut live_state,
+                &mut live,
+            );
+        }
+        assert_eq!(live.levels[40].center, 0.8);
+        assert!(
+            live.levels
+                .iter()
+                .enumerate()
+                .all(|(i, level)| i == 40 || level.center == 0.0)
+        );
+        for input in [None, Some(&vec![0.0; KEYBOARD_NOTE_COUNT][..])] {
+            let previous = live.levels[40].center;
+            prepare_keyboard_frame_with_input_into(
+                &notes,
+                SPECTRUM_NOTE_MIN_MIDI,
+                0.0,
+                KeyboardCenterInput::FundamentalProbabilities(input),
+                &mut live_state,
+                &mut live,
+            );
+            assert_eq!(live.levels[40].center, previous * KEY_HIGHLIGHT_DECAY);
+        }
+    }
+
+    #[test]
+    fn absolute_bass_uses_selected_octave_and_shared_afterglow() {
+        let rect = KeyboardRect::new(0.0, 50.0, 1200.0, 84.0);
+        let mut notes = vec![0.0; KEYBOARD_NOTE_COUNT];
+        notes[(45 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 1.0;
+        for midi in [21, 33, 40, 55] {
+            let mut state = KeyboardAnimationState::default();
+            let mut markers = Vec::new();
+            layout_bass_markers_with_input_into(
+                &notes,
+                SPECTRUM_NOTE_MIN_MIDI,
+                rect,
+                &mut state,
+                KeyboardBassInput::AbsoluteMidi(crate::BassEstimate {
+                    midi,
+                    confidence: 0.5,
+                }),
+                None,
+                &mut markers,
+            );
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].midi, midi);
+            let previous = markers[0].intensity;
+            layout_bass_markers_with_input_into(
+                &notes,
+                SPECTRUM_NOTE_MIN_MIDI,
+                rect,
+                &mut state,
+                KeyboardBassInput::AbsoluteMidi(crate::BassEstimate::default()),
+                None,
+                &mut markers,
+            );
+            assert_eq!(markers.len(), 1);
+            assert_eq!(markers[0].midi, midi);
+            assert_eq!(markers[0].intensity, previous * BASS_MARKER_DECAY);
+        }
+    }
 
     #[test]
     fn silence_is_flat() {
@@ -878,5 +1075,158 @@ mod tests {
         for (pc, want) in expected.iter().enumerate() {
             assert_eq!(is_black_key(60 + pc as u8), *want, "pc={pc}");
         }
+    }
+
+    struct KeyboardVisuals {
+        center: Vec<f32>,
+        even: Vec<f32>,
+        odd: Vec<f32>,
+    }
+
+    fn pitch_visuals(
+        notes: &[f32],
+        probabilities: Option<&[f32]>,
+        count: usize,
+        gain: f32,
+    ) -> KeyboardVisuals {
+        let mut raw = vec![0.0; count];
+        let mut even_energy = vec![0.0; count];
+        let mut odd_energy = vec![0.0; count];
+        let mut boosted = vec![0.0; count];
+        let mut visuals = KeyboardVisuals {
+            center: vec![0.0; count],
+            even: vec![0.0; count],
+            odd: vec![0.0; count],
+        };
+        super::compute_keyboard_visuals(
+            notes,
+            count,
+            SPECTRUM_NOTE_MIN_MIDI,
+            gain,
+            KeyboardCenterInput::FundamentalProbabilities(probabilities),
+            &mut raw,
+            &mut even_energy,
+            &mut odd_energy,
+            &mut boosted,
+            &mut visuals.center,
+            &mut visuals.even,
+            &mut visuals.odd,
+        );
+        visuals
+    }
+
+    fn update_keyboard_trails(
+        visuals: &KeyboardVisuals,
+        trail: &mut [f32],
+        even: &mut [f32],
+        odd: &mut [f32],
+    ) {
+        update_level_trails(
+            &visuals.center,
+            &visuals.even,
+            &visuals.odd,
+            trail,
+            even,
+            odd,
+        );
+    }
+
+    #[test]
+    fn keyboard_visuals_silence_is_flat() {
+        let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
+        let visuals = pitch_visuals(
+            &vec![0.0; note_count],
+            Some(&vec![1.0; note_count]),
+            note_count,
+            0.0,
+        );
+        assert_eq!(visuals.center.len(), note_count);
+        assert!(visuals.center.iter().all(|v| *v == 0.0));
+        assert!(visuals.even.iter().all(|v| *v == 0.0));
+        assert!(visuals.odd.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn keyboard_visuals_detect_even_harmonics() {
+        // 基音 + 2倍音 (オクターブ, +12) + 4倍音 (+24) の偶数倍音構成 → even サポートが odd を上回り、
+        // 加点で基音の center が点灯する。
+        let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
+        let mut notes = vec![0.0_f32; note_count];
+        let fundamental = 24usize; // +24 が範囲内に収まる位置。
+        notes[fundamental] = 0.8;
+        notes[fundamental + 12] = 0.5;
+        notes[fundamental + 24] = 0.3;
+        let mut probabilities = vec![0.0; note_count];
+        probabilities[fundamental] = 0.9;
+        let visuals = pitch_visuals(&notes, Some(&probabilities), note_count, 0.0);
+        assert!(visuals.center[fundamental] > 0.0);
+        assert!(
+            visuals.even[fundamental] > visuals.odd[fundamental],
+            "even {} should exceed odd {}",
+            visuals.even[fundamental],
+            visuals.odd[fundamental]
+        );
+    }
+
+    #[test]
+    fn keyboard_visuals_probabilities_gate_center_and_both_edges() {
+        let notes = vec![0.9; 88];
+        let mut probabilities = vec![0.0; 88];
+        probabilities[40] = 0.8;
+        let visuals = pitch_visuals(&notes, Some(&probabilities), 88, 0.0);
+        assert_eq!(visuals.center[40], 0.8);
+        for idx in (0..88).filter(|&idx| idx != 40) {
+            assert_eq!(visuals.center[idx], 0.0);
+            assert_eq!(visuals.center[idx] * visuals.even[idx], 0.0);
+            assert_eq!(visuals.center[idx] * visuals.odd[idx], 0.0);
+        }
+        assert!(
+            pitch_visuals(&notes, None, 88, 0.0)
+                .center
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+    }
+
+    #[test]
+    fn keyboard_visuals_norm_changes_presence_only() {
+        let notes = vec![0.12; 88];
+        let probabilities = vec![0.8; 88];
+        let normal = pitch_visuals(&notes, Some(&probabilities), 88, 0.0);
+        let louder = pitch_visuals(&notes, Some(&probabilities), 88, 12.0);
+        assert!(louder.center[0] > normal.center[0]);
+        assert_eq!(normal.even, louder.even);
+        assert_eq!(normal.odd, louder.odd);
+        let presence = ((0.12 - KEY_HIGHLIGHT_MIN_PEAK) / 0.28)
+            .clamp(0.0, 1.0)
+            .powf(0.7);
+        assert!((normal.center[0] - 0.8 * presence).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn keyboard_visuals_missing_and_zero_pitch_decay_existing_trail() {
+        let notes = vec![0.9; 88];
+        let probabilities = vec![1.0; 88];
+        let lit = pitch_visuals(&notes, Some(&probabilities), 88, 0.0);
+        let mut trail = vec![0.0; 88];
+        let mut even = vec![0.0; 88];
+        let mut odd = vec![0.0; 88];
+        update_keyboard_trails(&lit, &mut trail, &mut even, &mut odd);
+        assert_eq!(trail[0], 1.0);
+        for pitch in [None, Some(vec![0.0; 88])] {
+            let unlit = pitch_visuals(&notes, pitch.as_deref(), 88, 0.0);
+            let previous = trail[0];
+            update_keyboard_trails(&unlit, &mut trail, &mut even, &mut odd);
+            assert_eq!(trail[0], previous * KEY_HIGHLIGHT_DECAY);
+        }
+        for _ in 0..100 {
+            update_keyboard_trails(
+                &pitch_visuals(&notes, None, 88, 0.0),
+                &mut trail,
+                &mut even,
+                &mut odd,
+            );
+        }
+        assert!(trail[0] < 0.001);
     }
 }
