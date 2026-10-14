@@ -520,7 +520,9 @@ append_spread_display_units_untilをページ指定の境界入力へ拡張す�
 3. 指定なしは通常規則。明示境界→自動page_alone→横長/non-pairable→隣接Pairの優先で確定。
    横長に隣接する余りも通常の原因/中央配置。cover自身は先頭Singleを一度だけ作る。
 4. 基礎配置は明示Aloneが表紙と同じ配置規則、BlankOppositeが指定側+白紙。自動after-cover/lastと重複しても一Singleで明示基礎配置を優先。
-   明示境界直前の余りは中央（自然な本の先頭/末尾なら通常endpoint規則）。
+   明示指定直前の縦長の余りは形成理由を区別し、末尾単ページの配置規則へ通す（Q30）。
+   PCのpaged見開きでアニメONはLTR左／RTL右、OFFは末尾の全体／本別実効設定。横長は中央。
+   これは本全体の末尾や表紙ではなくsegmentの末尾なので、先頭配置・末尾表紙の証明に混ぜない。
    自動page_alone直前の余りは既存ForcedBoundary配置。残りは通常presentation resolverの端/強制単独を適用。
 5. 最後に、通常本と同じ実効final_coverと適格条件で末尾Singleへ表紙を添える。
    Navigation membership/組数/anchorは変更せず、表示だけにSpreadPageRole::FrontCoverSupplementを加える。
@@ -1162,12 +1164,12 @@ Unreadableを構成なしと扱わない。抽出A2は引き続きbinding/shift�
 | --- | --- |
 | 一ページずらし（Spread）、§1.364保存/解除 | 引き続き不可。order/指定と別の組境界ownerを増やさない。必要な境界は右の単独/白紙指定と左の順序で編集。保存shiftは休眠保持 |
 | Ctrl左右等のSingle/Split branch | 従来の一ページ移動を維持。shift拒否の前に通常navへ分離してhidden許可へ |
-| 読む方向切替、HUD方向/表紙、方向/表紙を含むSpread/Split KeyAction | 引き続きeditorへ案内。recordを第二閲覧値でoverrideせず上部へ集約。editor外の小編集writerを増やさない |
+| 読む方向切替、HUD方向/表紙、方向/表紙を含むSpread/Split KeyAction | direction/coverを変更する要求は引き続きeditorへ案内。既存Spread要求のうち構成と方向・表紙が一致するものは見開き表示への切替として受付（Q31）。Splitの旧方向付きキーは従来どおり拒否。recordを第二閲覧値でoverrideせず、小編集writerを増やさない |
 | 単ページ/見開き/横長分割、連結読み、Remote端末single強制 | 維持。view-mode/flow/orientationだけ、同可視実列/directionを投影。構成writeなし |
 | 先頭/末尾端配置（HUD、本別preference、Remote SetSingletonSpreadEndpointPreference等） | **許可へ変更**。共通presentation resolverの規則でunitsと競合しない。既存spread.db ownerへ保存し当該本の規則/cache更新。Aloneは先頭設定へ追従、BlankOppositeは指定側優先 |
 | 表紙次/最終単独（HUD、FsTogglePageAfterCoverAlone/FsToggleLastPageAlone、Remote SetPageAlonePreference） | **許可へ変更**。共通builderへ既存本別preferenceの実効値を渡す。coverなし/subsetは通常と同じ不適用。明示override優先、record変更なし |
 | 末尾表紙（HUD、Remote SetFinalCoverSpreadPreference） | **許可**。通常本と同じ既存preference ownerへ保存し、実効値/共通presentationを更新。構成record/revisionは変更せず手動の組補助は作らない |
-| Remote SetSpreadのページ構成/方向変更 | direction/coverを書こうとする結合要求は拒否。modeはSetViewModeで維持。order/hidden/overrideのRemote editor/APIは追加しない（PC限定Q6維持） |
+| Remote SetSpreadのページ構成/方向変更 | 最新構成のdirection/coverと一致するSpread要求だけmode-onlyとして既存SetViewMode ownerへ渡す。不一致は戻せるWebキーとPC editorを案内して拒否。order/hidden/overrideのRemote editor/APIは追加しない（PC限定Q6維持） |
 
 組を保存しなくてもshift/record小編集を自動的に許す必要はない。既存PairingEditAvailabilityの一律拒否を
 action種別ごとのpure資格へ改訂し、HUD/キー/カスタムキー/gamepad/IPC widgetと実setter/write admissionへ同じ判定を渡す。
@@ -1190,8 +1192,31 @@ A2は元本設定を借りない固定資格で、既存Spread/Splitキーは表
 Spreadへ戻れば現在構成+実効自動規則で共通builder。Singleはcover解除なし、Splitも同direction。
 旧結合SpreadMode enumのdirection/coverビットを構成の正本にしない。
 FsViewSpread/FsViewLandscapeSplit/FsSpreadSingle、HUD表示方法はmode-only。
-方向/coverを含むキーは§9.1拒否、A2は分類だけの既存routing。旧Single/Vertical、exact/fallback/文書方向/flowの復元を維持。
-Remote orientation/force_singleも投影だけ。結合SetSpreadのbinding部分を黙って無視して成功としない。
+方向/coverを含むSpreadキーは構成と一致すればmode-only、不一致は§9.1拒否。A2は分類だけの既存routing。
+旧Single/Vertical、exact/fallback/文書方向/flowの復元を維持。Remote orientation/force_singleも投影だけ。
+結合SetSpreadのbinding部分を黙って無視せず、最新snapshotの一致を型付き受付で検証してからmode-onlyへ通す。
+
+#### Q31の共通受付と表示（2026-10-14）
+
+変更前のlegacy setterは構成との一致も一律拒否し、画面のfeedback toastに
+「本の構成で設定されています。組を変えるには本の構成を編集してください」と表示していた。
+戻せるキーを示さず、HUDの見開き行はcoverなしのmodeからshortcutを作るため、実際の受付と食い違っていた。
+
+既定2=LTR/表紙なし、3=LTR/表紙あり、4=RTL/表紙なし、5=RTL/表紙あり（NumPadも同じ）。
+既存KeyAction名・既定割当は変更しない。構成から期待SpreadModeを返すpure helperをPC/Remoteで共有する。
+PCのlegacy setterは一致するSpreadとSingleを既存mode-only setterへ送り、方向/表紙/revision/休眠shiftを書かない。
+不一致は受付失敗を返し、呼出側が同値を成功と誤認して拒否toastを上書きしない。
+通知は現在のkeymapの一致Actionの割当を表示し、未割当ならFsViewSpreadの割当、
+それも未割当ならHUDの「見開き」を案内する。
+読む方向と表紙を変える場所は本の構成の編集と明記する。Unreadableは既存の読込不能案内を維持する。
+HUDは構成の表紙あり/なしを含む期待modeから見開き行の選択状態・shortcutを作る。
+横長分割行はFsViewLandscapeSplitの割当を使い、拒否される旧8/9を表示しない。hoverも有効なActionだけを案内する。
+Pad Selectは構成本だけSingleと期待Spreadを巡回し、pickerの同じ要求は共通setterで判断する。
+通常本の五種類の巡回とA2の既存Single/Spread巡回は変更しない。
+Remoteの書込資格はLegacySpread(requested mode)として意図を保持し、workerの最新構成で一致を確認する。
+一致後は既存ViewSetting受付へ渡し、旧SetSpreadのbinding保存・shift Clearへ進まない。IPC形状は変更しない。
+Remote取得時には§1.373の追加Undo票が失効し、取得中Undoも拒否されるため、no-op判定用の別worker応答は追加しない。
+既存SetViewModeの後続mutation受付・FIFO・SQL保存を再利用し、新しいpending state/ownerを作らない。
 
 ### 9.3 saved shiftとの接続
 
@@ -1436,6 +1461,8 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 | 全pairing禁止 + 自動規則追従の矛盾 | record編集はeditor、自動端/単独は既存設定owner、modeは閲覧owner。資格をactionで判定 |
 | 組ごとの手動補助指定 + final_cover自動追加 | 手動補助は保存しない。明示BlankOppositeの由来が白紙を優先、それ以外は通常final_cover条件で派生 |
 | 明示白紙と自動白紙の同一placement化 | 単独形成理由に由来を保持しresolverへ。明示Blankは添付禁止、自動白紙は既存置換を維持。別boolなし |
+| 指定境界の余りとAutomatic端の同一形成理由 | OverrideBoundaryRemainderで指定直前のsegment末尾を保持し、共通resolverのlast規則へ。画面側の独自判定や配置boolを追加しない |
+| 一致するSpread要求にもbinding拒否を適用 | 構成から期待modeを派生し、一致要求は既存mode-only ownerへ。不一致はrequested modeを保持して最新構成で拒否し、第二writerを作らない |
 | Remote切詰め + 全本組生成/省略ページ寸法取得 | order/hidden後に既存範囲制限、返却itemsだけ既存寸法/組生成へ。PCとの差は§1.368へ分離 |
 | mode/orientation/Splitのrecord変更 | 同実列のview projection。mode-only/端末強制は非構成write |
 | 編集/保存中のopen/history/F12/sibling操作 | 既存process modal。常時モデルレス/割込みdraft退避/再開なし |
@@ -1464,6 +1491,14 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 組立て統一とmodalを先に採用し、rollback/supersession/resumeを網羅する新しい機械を足さない。
 
 ## 13. 段階・担当範囲・受入テスト
+
+2026-10-14 Q30/Q31追補: 保存構成のPage 15（raw14）を実投影／builder／通常viewport／画像primitiveで検査する。
+指定直前の余りのlast規則とAlone本体のfirst規則、LTR/RTL・アニメON/OFF・全体／本別のmatrix、
+横長と構成なしの同形境界の不変、Remote制限付き列と連結の保存値を含める。
+Q31は方向×表紙4組×既存要求4組、Single→一致Spread復帰、不一致の拒否・keymap通知・未割当、
+既存mode-only保存／構成revision／休眠shift／追加Undo票の不変を検査する。
+HUDの実選択状態・shortcut、Pad Select／picker、Remote最新snapshotの資格と非構成本／unsupportedの不変、
+通常UIと構成本4種類のsnapshotを確認する。fmt／通常・portable check／関連テスト／test-full一回／build-dev。
 
 2026-10-14の追加受入: AloneのLTR／RTL×アニメON／OFF×先頭全体／本別Center・Place・FollowGlobal、
 先頭／途中／末尾、横長／保存回転／末尾表紙on-offを実builder→通常描画→canonicalへ通す。
@@ -2304,6 +2339,8 @@ shift/direction/coverのeditor外変更も許す意図があれば実装前に�
 | --- | --- | --- |
 | Q28 Aloneの配置 | 途中のAloneがアニメONでも中央になる観測。Aloneは組み直しの起点なので表紙と同じ規則へ。アニメONは本来の側（LTR右／RTL左）、OFFは先頭単ページの全体／本別実効設定へ追従。横長の単独は中央。末尾表紙の適格時は既存実2頁presentation | §4.2／§5.1／§8／§9.1／§13、ページめくり§26.21、manual |
 | Q29 白い相方のページめくり | 明示白紙でアニメが出ない観測。白い側を通常の白紙と同色の紙として描画し普通の見開きと同じくめくる。構成なしの自動白紙と末尾明示白紙も対象。新texture／decodeなし。split等のinstantは維持 | §5.1／§13、ページめくり§26.21、manual |
+| Q30 指定直前の余り（2026-10-14、案A） | 実機の中央ページはAloneでなくPage 15（raw14）。Page 16の白紙指定直前の余りだった。指定直前の縦長余りは末尾規則：アニメONはLTR左／RTL右、OFFは末尾の全体／本別実効設定。横長は中央。Alone本体は表紙規則。通常本の類似境界は変更しない | §5.1／§12／§13、ページめくり§26.23、manual |
+| Q31 一致する見開き操作（2026-10-14） | 単ページから2〜5で戻れない観測。構成の方向×表紙と一致する既存Spread操作は表示分類のみ変更として受ける。不一致は戻せるキーと構成編集を通知。HUD/メニュー/Pad/Remoteも共通受付へ、keymapの再割当を尊重 | §9.1／§9.2／§12／§13、keymap-spec、manual |
 
 この改訂は86b06c232の独立ACCEPTと部分的な利用者実機確認後の追加決定。
 まれなI/O失敗の復旧機構・新保存値・別の提示許可ownerは足さない。

@@ -2537,30 +2537,47 @@ impl crate::app::App {
             ctx.request_repaint();
             return;
         }
-        if let Some(service) = &self.book_composition_service
-            && let Err(error) = pending
-                .composition_admission()
-                .validate(&service.snapshot())
-        {
-            pending.complete(UiWriteOutcome::Write(write_error(
-                RemoteWriteErrorCode::Unsupported,
-                error,
-            )));
-            return;
-        }
-        if let RemoteWriteRequest::SetViewMode { address, mode } = pending.request() {
-            let result = remote_shift_scope(address).and_then(|scope| {
-                let service = self
-                    .book_composition_service
-                    .clone()
-                    .ok_or("composition service unavailable")?;
-                let mode = match mode {
+        let legacy_view_mode = if let Some(service) = &self.book_composition_service {
+            let snapshot = service.snapshot();
+            let admission = pending.composition_admission();
+            match admission
+                .validate(&snapshot)
+                .and_then(|()| admission.legacy_spread_view_mode(&snapshot))
+            {
+                Ok(mode) => mode,
+                Err(error) => {
+                    pending.complete(UiWriteOutcome::Write(write_error(
+                        RemoteWriteErrorCode::Unsupported,
+                        error,
+                    )));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let view_setting = match pending.request() {
+            RemoteWriteRequest::SetViewMode { address, mode } => Some((
+                address,
+                match mode {
                     mimageviewer_ipc::RemoteViewMode::Single => crate::settings::SpreadMode::Single,
                     mimageviewer_ipc::RemoteViewMode::Spread => crate::settings::SpreadMode::Ltr,
                     mimageviewer_ipc::RemoteViewMode::LandscapeSplit => {
                         crate::settings::SpreadMode::SplitLtr
                     }
-                };
+                },
+            )),
+            RemoteWriteRequest::SetSpread { address, .. } => {
+                legacy_view_mode.map(|mode| (address, mode))
+            }
+            _ => None,
+        };
+        if let Some((address, mode)) = view_setting {
+            let result = remote_shift_scope(address).and_then(|scope| {
+                let service = self
+                    .book_composition_service
+                    .clone()
+                    .ok_or("composition service unavailable")?;
                 if !self.admit_book_append_followup_mutation() {
                     return Err("本への追加を取り消しています".to_owned());
                 }
@@ -2771,8 +2788,15 @@ impl crate::app::App {
                 | RemoteWriteRequest::SetPageAlonePreference { .. }
         ) {
             if let Some(service) = self.book_composition_service.as_ref() {
-                if let Err(error) = qualified.validate(&service.snapshot()) {
+                let snapshot = service.snapshot();
+                if let Err(error) = qualified.validate(&snapshot) {
                     return write_error(RemoteWriteErrorCode::Unsupported, error);
+                }
+                if matches!(qualified.legacy_spread_view_mode(&snapshot), Ok(Some(_))) {
+                    return write_error(
+                        RemoteWriteErrorCode::Internal,
+                        "表示モードの非同期経路が使われませんでした",
+                    );
                 }
             }
         }
@@ -5846,6 +5870,226 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn composition_matching_legacy_remote_spread_uses_mode_only_and_preserves_dormant_shift() {
+        use crate::book_composition::*;
+        use crate::settings::{ReadingDirection as BindingDirection, ReadingFlow, SpreadMode};
+        use crate::spread_shift::{ShiftOperation, SpreadShiftPageRef, SpreadShiftService};
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            for cover in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                let data = tempfile::tempdir().unwrap();
+                let book = data.path().join("matching-book.pdf");
+                std::fs::write(&book, b"binding qualification does not decode pages").unwrap();
+                let scope = crate::book_scope::BookScopeKey::document(&book).unwrap();
+                let mut db =
+                    crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap();
+                db.set_mode_and_direction(
+                    &book,
+                    None,
+                    SpreadMode::RtlCover,
+                    BindingDirection::Rtl,
+                    (
+                        SpreadMode::Single,
+                        ReadingFlow::Paged,
+                        BindingDirection::Ltr,
+                    ),
+                )
+                .unwrap();
+                app.spread_db = Ok(db);
+                let (service, process) =
+                    BookCompositionService::spawn_at(data.path().into(), None).unwrap();
+                let mut composition = fixtures::four_page_book(direction);
+                composition.cover_enabled = cover;
+                service
+                    .save(scope.clone(), PageDomain::Document, composition.clone())
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+                app.install_book_composition_runtime(service.clone());
+                let (shifts, shift_owner) =
+                    SpreadShiftService::spawn_at(data.path().into(), None).unwrap();
+                let cutoff = shifts
+                    .set_shift(
+                        scope.clone(),
+                        SpreadShiftPageRef::DocumentPageIdentity(2),
+                        ShiftOperation {
+                            context_id: crate::app::ViewerContextId::for_test(903),
+                            items_generation: 1,
+                            operation_sequence: 1,
+                        },
+                    )
+                    .unwrap();
+                let shift_before = shifts.read_after(scope.clone(), cutoff).recv().unwrap();
+                shift_before.status.clone().unwrap();
+                let watermarks = shifts.watermarks();
+                app.spread_shift_service = Some(shifts.clone());
+                app.settings.remember_spread_shift_per_book = true;
+                let (handle, session_owner, _) = active_session();
+                app.set_remote_session_handle(handle.clone());
+                let address =
+                    mimageviewer_ipc::RemoteAddress::file(book.to_string_lossy().into_owned());
+                let expected = composition_spread_mode(direction, cover);
+                let remote_mode = match expected {
+                    SpreadMode::Ltr => RemoteSpreadMode::Ltr,
+                    SpreadMode::LtrCover => RemoteSpreadMode::LtrCover,
+                    SpreadMode::Rtl => RemoteSpreadMode::Rtl,
+                    SpreadMode::RtlCover => RemoteSpreadMode::RtlCover,
+                    _ => unreachable!(),
+                };
+                let request = RemoteWriteRequest::SetSpread {
+                    address,
+                    spread_mode: remote_mode,
+                    reading_direction: RemoteReadingDirection::Ltr,
+                };
+                let snapshot = service.snapshot();
+                // The last iteration is an identical resend while already in Spread.
+                for initial in [SpreadMode::Single, SpreadMode::SplitLtr, expected] {
+                    service
+                        .set_view_mode(scope.clone(), initial)
+                        .unwrap()
+                        .recv()
+                        .unwrap()
+                        .unwrap();
+                    let before = app
+                        .spread_db
+                        .as_ref()
+                        .unwrap()
+                        .get_state_with_fallback(&book, None);
+                    let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                    let outcome = composition_apply_qualified_remote_write_fixture(
+                        &mut app,
+                        &handle,
+                        &session_owner,
+                        request.clone(),
+                        admission,
+                        true,
+                    );
+                    assert!(matches!(
+                        outcome,
+                        UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                    ));
+                    let after = app
+                        .spread_db
+                        .as_ref()
+                        .unwrap()
+                        .get_state_with_fallback(&book, None);
+                    assert_eq!(
+                        after.view_mode,
+                        Some(crate::spread_db::StoredViewMode::Spread)
+                    );
+                    assert_eq!(
+                        (after.mode, after.flow, after.direction),
+                        (before.mode, before.flow, before.direction)
+                    );
+                    assert_eq!(service.snapshot().rows, snapshot.rows);
+                    assert_eq!(
+                        service.snapshot().token_for(&scope),
+                        snapshot.token_for(&scope)
+                    );
+                    assert_eq!(shifts.watermarks(), watermarks);
+                }
+                assert_eq!(
+                    shifts.read_after(scope.clone(), cutoff).recv().unwrap(),
+                    shift_before
+                );
+
+                // A matching worker qualification becomes stale before UI claim.
+                let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                composition.cover_enabled = !cover;
+                service
+                    .save(scope.clone(), PageDomain::Document, composition)
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+                let before = app
+                    .spread_db
+                    .as_ref()
+                    .unwrap()
+                    .get_state_with_fallback(&book, None);
+                app.book_append_undo_receipt = Some(section1373_remote_receipt(&app));
+                let revision = app.book_append_undo_revision;
+                let outcome = composition_apply_qualified_remote_write_fixture(
+                    &mut app,
+                    &handle,
+                    &session_owner,
+                    request,
+                    admission,
+                    false,
+                );
+                assert!(matches!(
+                    outcome,
+                    UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                        code: RemoteWriteErrorCode::Unsupported,
+                        ..
+                    }))
+                ));
+                assert_eq!(
+                    app.spread_db
+                        .as_ref()
+                        .unwrap()
+                        .get_state_with_fallback(&book, None),
+                    before
+                );
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.book_append_undo_receipt.is_some());
+                assert_eq!(shifts.watermarks(), watermarks);
+                process.shutdown_and_join();
+                shift_owner.shutdown_and_join();
+            }
+        }
+    }
+
+    fn composition_apply_qualified_remote_write_fixture(
+        app: &mut crate::app::App,
+        handle: &SessionHandle,
+        owner: &RemoteSessionIdentity,
+        request: RemoteWriteRequest,
+        admission: crate::book_composition::CompositionWriteAdmission,
+        mode_only: bool,
+    ) -> UiWriteOutcome {
+        let operation = handle
+            .begin_operation(owner, "qualified-legacy-spread".into())
+            .unwrap();
+        let producer = handle.clone();
+        let worker = std::thread::spawn(move || {
+            producer.submit_write_with_composition(request, operation, admission)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let pending = loop {
+            if let Some(ClaimedRemoteUiRequest::Write(pending)) =
+                handle.take_pending_ui_requests().pop()
+            {
+                break pending;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qualified write did not enqueue"
+            );
+            std::thread::yield_now();
+        };
+        app.apply_pending_remote_write(pending, &egui::Context::default());
+        if mode_only {
+            assert!(matches!(
+                app.remote_session_ui.pending_reading_writes.as_slice(),
+                [PendingRemoteReadingWrite::ViewSetting { .. }]
+            ));
+        } else {
+            assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+        }
+        while !worker.is_finished() {
+            app.poll_remote_reading_writes();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qualified write did not complete"
+            );
+            std::thread::yield_now();
+        }
+        worker.join().unwrap()
     }
 
     #[test]

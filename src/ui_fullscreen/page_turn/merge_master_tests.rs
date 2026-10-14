@@ -878,7 +878,7 @@ fn paint_saved_pdf_viewport(
     crate::app::paint_record_test_support::paint_records(egui::ViewportId::ROOT, &output)
 }
 
-fn assert_saved_pdf_alone_paint(
+fn assert_saved_pdf_singleton_paint(
     app: &mut App,
     ctx: &egui::Context,
     raw_page: u32,
@@ -978,8 +978,11 @@ fn page_turn_saved_coverless_alone_actual_viewport_placement() {
     // ordinary viewport draw for consecutive Alone and later Alone pages.
     app.spread_display_composition_for_anchor(0);
     for raw_page in [10, 11, 17] {
-        assert_saved_pdf_alone_paint(&mut app, &ctx, raw_page, SingletonSpreadPlacement::Right);
+        assert_saved_pdf_singleton_paint(&mut app, &ctx, raw_page, SingletonSpreadPlacement::Right);
     }
+    // Page 15 (raw 14) is the reported middle singleton: the leading white
+    // override on Page 16 prevents it from acquiring a partner.
+    assert_saved_pdf_singleton_paint(&mut app, &ctx, 14, SingletonSpreadPlacement::Left);
     let next = saved_pdf_index(&app, 12);
     assert_eq!(
         app.spread_display_composition_for_anchor(next)
@@ -1031,11 +1034,84 @@ fn page_turn_saved_coverless_alone_viewport_endpoint_matrix() {
                             SingletonSpreadPlacement::Center
                         };
                         for raw_page in [10, 11, 17, 39] {
-                            assert_saved_pdf_alone_paint(&mut app, &ctx, raw_page, side);
+                            assert_saved_pdf_singleton_paint(&mut app, &ctx, raw_page, side);
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn page_turn_saved_coverless_boundary_remainder_actual_viewport_matrix() {
+    use crate::settings::SingletonSpreadPlacementPreference as Pref;
+    let _serial = crate::key_input::lock_test_input();
+    let _pdf_rerender = crate::app::PdfRerenderRequestProbe::start();
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for cover in [false, true] {
+            let mut book = saved_coverless_book();
+            book.direction = direction;
+            book.cover_enabled = cover;
+            let ctx = egui::Context::default();
+            install(&ctx);
+            install_fs_navigator_input_tracking(&ctx);
+            let mut app = saved_pdf_viewer(&ctx, &book);
+            app.settings.final_cover_spread_enabled = false;
+            app.singleton_spread_endpoint_preferences.first = Pref::Center;
+            for animation in [true, false] {
+                app.settings.page_turn_animation_enabled = animation;
+                for global in [false, true] {
+                    app.settings.singleton_spread_last_enabled = global;
+                    for preference in [Pref::FollowGlobal, Pref::Center, Pref::Place] {
+                        app.singleton_spread_endpoint_preferences.last = preference;
+                        let side = if animation || preference.effective(global) {
+                            if direction == CompositionDirection::Ltr {
+                                SingletonSpreadPlacement::Left
+                            } else {
+                                SingletonSpreadPlacement::Right
+                            }
+                        } else {
+                            SingletonSpreadPlacement::Center
+                        };
+                        assert_saved_pdf_singleton_paint(&mut app, &ctx, 14, side);
+                        let nav = app.get_nav_indices();
+                        let units = app.build_spread_display_units_for_nav(&nav);
+                        let idx = saved_pdf_index(&app, 14);
+                        let unit = units.iter().find(|unit| unit.contains_idx(idx)).unwrap();
+                        assert_eq!(
+                            unit.formation,
+                            SpreadDisplayUnitFormation::Singleton(
+                                SpreadDisplaySingletonCause::OverrideBoundaryRemainder
+                            )
+                        );
+                    }
+                }
+            }
+            // A genuinely landscape page stays centered before the directive.
+            let idx = saved_pdf_index(&app, 14);
+            let pixels = Arc::new(egui::ColorImage::filled([113, 80], egui::Color32::GREEN));
+            let tex = ctx.load_texture(
+                "wide-boundary",
+                pixels.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: Some([816, 576]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            app.record_page_dims_for_spread(idx, (816, 576));
+            app.record_page_layout_dims_for_spread(idx, (816, 576));
+            app.settings.page_turn_animation_enabled = true;
+            app.settings.singleton_spread_last_enabled = true;
+            app.singleton_spread_endpoint_preferences.last = Pref::Place;
+            assert_saved_pdf_singleton_paint(&mut app, &ctx, 14, SingletonSpreadPlacement::Center);
         }
     }
 }

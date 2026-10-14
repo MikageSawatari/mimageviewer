@@ -8,6 +8,38 @@ pub const MAX_PAGES: usize = 100_000;
 pub const MAX_REFERENCE_BYTES: usize = 32_768;
 pub const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
 
+/// The composition owns binding; a matching legacy request only selects Spread viewing.
+pub(crate) fn composition_spread_mode(
+    direction: ReadingDirection,
+    cover_enabled: bool,
+) -> crate::settings::SpreadMode {
+    use crate::settings::SpreadMode;
+    match (direction, cover_enabled) {
+        (ReadingDirection::Ltr, false) => SpreadMode::Ltr,
+        (ReadingDirection::Ltr, true) => SpreadMode::LtrCover,
+        (ReadingDirection::Rtl, false) => SpreadMode::Rtl,
+        (ReadingDirection::Rtl, true) => SpreadMode::RtlCover,
+    }
+}
+
+#[cfg(test)]
+mod legacy_spread_mode_tests {
+    use super::*;
+
+    #[test]
+    fn composition_spread_mode_uses_direction_and_cover_only() {
+        use crate::settings::SpreadMode;
+        for (direction, cover, expected) in [
+            (ReadingDirection::Ltr, false, SpreadMode::Ltr),
+            (ReadingDirection::Ltr, true, SpreadMode::LtrCover),
+            (ReadingDirection::Rtl, false, SpreadMode::Rtl),
+            (ReadingDirection::Rtl, true, SpreadMode::RtlCover),
+        ] {
+            assert_eq!(composition_spread_mode(direction, cover), expected);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompositionError {
     UnknownSchema(u32),

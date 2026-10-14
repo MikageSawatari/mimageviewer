@@ -7799,10 +7799,12 @@ fn draw_spread_mode_rows(
     spread_popup_open: &mut bool,
     extracted_result: bool,
     composition_owned: bool,
+    composition_spread_mode: Option<SpreadMode>,
 ) {
     let result_modes = [
         SpreadMode::Single,
-        SpreadMode::Ltr.with_reading_direction(*reading_direction),
+        composition_spread_mode
+            .unwrap_or_else(|| SpreadMode::Ltr.with_reading_direction(*reading_direction)),
         SpreadMode::SplitLtr.with_reading_direction(*reading_direction),
     ];
     let modes = if extracted_result || composition_owned {
@@ -7817,7 +7819,13 @@ fn draw_spread_mode_rows(
             egui::Id::new(format!("spread_popup_{}", mode.to_int())),
             egui::Sense::click(),
         );
-        let is_current = *spread_mode == mode;
+        let is_current = if composition_owned && mode.is_spread() {
+            spread_mode.is_spread()
+        } else if composition_owned && mode.is_split() {
+            spread_mode.is_split()
+        } else {
+            *spread_mode == mode
+        };
         let bg = if is_current {
             egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
         } else if item_resp.hovered() {
@@ -7847,7 +7855,7 @@ fn draw_spread_mode_rows(
         );
 
         if let Some(shortcut_label) =
-            spread_mode_key_action(mode).and_then(|action| keymap.first_chord_label(action))
+            spread_mode_row_shortcut(keymap, mode, composition_owned, composition_spread_mode)
         {
             scroll_ui.painter().text(
                 egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
@@ -7868,6 +7876,24 @@ fn draw_spread_mode_rows(
             *spread_popup_open = false;
         }
     }
+}
+
+fn spread_mode_row_shortcut(
+    keymap: &Keymap,
+    mode: SpreadMode,
+    composition_owned: bool,
+    composition_spread_mode: Option<SpreadMode>,
+) -> Option<String> {
+    if composition_owned && mode.is_split() {
+        return keymap.first_chord_label(KeyAction::FsViewLandscapeSplit);
+    }
+    if composition_owned && mode.is_spread() {
+        return composition_spread_mode
+            .and_then(spread_mode_key_action)
+            .and_then(|action| keymap.first_chord_label(action))
+            .or_else(|| keymap.first_chord_label(KeyAction::FsViewSpread));
+    }
+    spread_mode_key_action(mode).and_then(|action| keymap.first_chord_label(action))
 }
 
 fn draw_extracted_result_view_notice(ui: &mut egui::Ui) {
@@ -7893,8 +7919,40 @@ pub fn draw_fs_extracted_result_view_snapshot_fixture(ui: &mut egui::Ui) {
                 &mut true,
                 true,
                 false,
+                None,
             );
             draw_extracted_result_view_notice(ui);
+        });
+}
+
+#[doc(hidden)]
+pub fn draw_fs_composed_view_snapshot_fixture(ui: &mut egui::Ui, rtl: bool, cover: bool) {
+    let direction = if rtl {
+        crate::book_composition::ReadingDirection::Rtl
+    } else {
+        crate::book_composition::ReadingDirection::Ltr
+    };
+    let expected = crate::book_composition::composition_spread_mode(direction, cover);
+    let mut selected = expected;
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240))
+        .inner_margin(4.0)
+        .show(ui, |ui| {
+            ui.set_width(230.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            draw_spread_popup_heading(ui, "ページ構成");
+            draw_spread_mode_rows(
+                ui,
+                &Keymap::default(),
+                &mut selected,
+                &mut composition_view_direction(direction),
+                &mut true,
+                false,
+                true,
+                Some(expected),
+            );
+            ui.label("構成あり");
+            ui.label("読む方向と表紙は構成を編集してください");
         });
 }
 
@@ -15421,6 +15479,8 @@ enum SpreadDisplaySingletonCause {
     /// Page-specific boundary, independent of automatic complete-book settings.
     ExplicitAlone,
     ExplicitBlankOpposite(SingletonSpreadPlacement),
+    /// The preceding segment ends because the next real page has a directive.
+    OverrideBoundaryRemainder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15824,6 +15884,20 @@ fn compose_spread_navigation_unit(
             SingletonSpreadPlacement::Left
         } else {
             SingletonSpreadPlacement::Right
+        };
+    }
+    if spread_mode.is_spread()
+        && base.pages.len() == 1
+        && unit.formation
+            == SpreadDisplayUnitFormation::Singleton(
+                SpreadDisplaySingletonCause::OverrideBoundaryRemainder,
+            )
+        && singleton_placement_enabled.last
+    {
+        base.singleton_placement = if spread_mode.is_rtl() {
+            SingletonSpreadPlacement::Right
+        } else {
+            SingletonSpreadPlacement::Left
         };
     }
     if spread_mode.is_spread()
@@ -16974,7 +17048,7 @@ fn append_spread_display_units_until(
                 units.push(SpreadDisplayUnit::singleton(
                     *pos,
                     current,
-                    SpreadDisplaySingletonCause::UnpairedSlot,
+                    SpreadDisplaySingletonCause::OverrideBoundaryRemainder,
                 ));
             } else if !is_pairable_idx(partner) {
                 units.push(SpreadDisplayUnit::singleton(
@@ -16997,7 +17071,16 @@ fn append_spread_display_units_until(
             units.push(SpreadDisplayUnit::singleton(
                 *pos,
                 current,
-                SpreadDisplaySingletonCause::UnpairedSlot,
+                if nav
+                    .get(*pos + 1)
+                    .is_some_and(|partner| overrides.contains_key(partner))
+                {
+                    // A forced-last segment can stop just before the directive;
+                    // its unfilled slot still belongs to the explicit boundary.
+                    SpreadDisplaySingletonCause::OverrideBoundaryRemainder
+                } else {
+                    SpreadDisplaySingletonCause::UnpairedSlot
+                },
             ));
         }
         *pos += 1;
@@ -27050,6 +27133,7 @@ impl App {
                             }
                             let extracted_result = self.extracted_result_surface().is_some();
                             let pairing_availability = self.pairing_edit_availability();
+                            let composition_spread_mode = self.composed_spread_mode();
                             let shift_view = self.spread_shift_hud_view();
                             Self::draw_fs_hover_bar(
                                 ui,
@@ -27078,6 +27162,7 @@ impl App {
                                 &mut panorama_projection_choice,
                                 extracted_result,
                                 pairing_availability,
+                                composition_spread_mode,
                                 &mut self.spread_mode,
                                 &mut self.reading_flow,
                                 &mut self.reading_direction,
@@ -33631,11 +33716,12 @@ impl App {
         };
 
         if let Some(mode) = new_spread {
-            if mode == SpreadMode::Single {
+            let accepted = if mode == SpreadMode::Single {
                 self.apply_fullscreen_view_mode(ctx, fs_idx, FullscreenViewMode::Single);
+                self.spread_mode == mode
             } else {
-                self.apply_fullscreen_spread_mode(ctx, fs_idx, mode);
-            }
+                self.apply_fullscreen_spread_mode(ctx, fs_idx, mode)
+            };
             // Report only the state actually applied after persistence.
             let key_num = if key_1 {
                 1
@@ -33652,7 +33738,7 @@ impl App {
             } else {
                 9
             };
-            if self.spread_mode == mode {
+            if accepted && self.spread_mode == mode {
                 self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
             }
         }
@@ -41783,17 +41869,34 @@ impl App {
 
     /// 見開きモード (`SpreadMode`) を適用する。キーボードのショートカット 1〜5 と
     /// ゲームパッド Select の両方から呼ぶ共通処理 (連結方式 `reading_flow` の切替とは別物)。
-    /// トースト表示は呼び出し側で行う。
+    /// Returns acceptance, so a refused already-current request cannot emit a success toast.
     pub(crate) fn apply_fullscreen_spread_mode(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
         mode: SpreadMode,
-    ) {
-        // This legacy API is a binding edit even when the requested value is
-        // unchanged. Refuse before persistence, shift clears or normalization.
+    ) -> bool {
+        if self.composition_owns_view_settings() {
+            if mode == SpreadMode::Single || self.composed_spread_mode() == Some(mode) {
+                self.apply_fullscreen_view_mode(ctx, fs_idx, FullscreenViewMode::from_legacy(mode));
+                return self.spread_mode == mode;
+            }
+            if let Some(expected) = self.composed_spread_mode() {
+                let shortcut =
+                    spread_mode_row_shortcut(&self.keymap, expected, true, Some(expected));
+                let entry = shortcut.map_or_else(
+                    || "表示モードの「見開き」".to_owned(),
+                    |key| format!("[{key}]"),
+                );
+                self.show_feedback_toast(format!(
+                    "この本の見開きは{entry}で表示できます。読む方向と表紙を変えるには本の構成を編集してください"
+                ));
+                return false;
+            }
+        }
+        // Unreadable and unsupported composition owners retain the binding refusal.
         if self.refuse_composition_pairing_edit() {
-            return;
+            return false;
         }
         let mode = if self.extracted_result_surface().is_some() {
             crate::app::book_materialization::extracted_view_mode(mode, self.reading_direction)
@@ -41804,13 +41907,13 @@ impl App {
             if self.reset_live_spread_shift(false) {
                 self.normalize_spread_position(ctx);
             }
-            return;
+            return true;
         }
         let previous_surface = self.capture_book_mode_transition(mode);
         let direction = mode.reading_direction().unwrap_or(self.reading_direction);
         if let Err(error) = self.persist_spread_presentation(mode, self.reading_flow, direction) {
             crate::logger::log(format!("spread: failed to save mode: {error}"));
-            return;
+            return false;
         }
         self.invalidate_similar_preview();
         self.spread_mode = mode;
@@ -41837,6 +41940,21 @@ impl App {
                 ContinuousAdmissionEpisode::ModeTransition(previous);
         }
         self.normalize_spread_position(ctx);
+        true
+    }
+
+    pub(crate) fn composed_spread_mode(&self) -> Option<SpreadMode> {
+        if self.pairing_edit_availability()
+            != crate::spread_shift::PairingEditAvailability::Composed
+        {
+            return None;
+        }
+        self.composed_book_layout().map(|layout| {
+            crate::book_composition::composition_spread_mode(
+                layout.direction,
+                self.composed_book_has_cover(),
+            )
+        })
     }
 
     fn refuse_composition_automatic_rule_edit(&mut self) -> bool {
@@ -47585,6 +47703,7 @@ impl App {
         panorama_projection_choice: &mut Option<crate::panorama::PanoProjection>,
         extracted_result: bool,
         pairing_availability: crate::spread_shift::PairingEditAvailability,
+        composition_spread_mode: Option<SpreadMode>,
         spread_mode: &mut SpreadMode,
         reading_flow: &mut ReadingFlow,
         reading_direction: &mut ReadingDirection,
@@ -48452,10 +48571,27 @@ impl App {
                 spread_active,
                 |p, c, r| draw_spread_icon(p, c, r, sm),
             );
-            let spread_keys = SpreadMode::all()
+            let managed_modes = [
+                SpreadMode::Single,
+                composition_spread_mode
+                    .unwrap_or_else(|| SpreadMode::Ltr.with_reading_direction(*reading_direction)),
+                SpreadMode::SplitLtr.with_reading_direction(*reading_direction),
+            ];
+            let advertised_modes = if composition_owned {
+                managed_modes.as_slice()
+            } else {
+                SpreadMode::all()
+            };
+            let spread_keys = advertised_modes
                 .iter()
-                .filter_map(|&mode| spread_mode_key_action(mode))
-                .filter_map(|action| keymap.first_chord_label(action))
+                .filter_map(|&mode| {
+                    spread_mode_row_shortcut(
+                        keymap,
+                        mode,
+                        composition_owned,
+                        composition_spread_mode,
+                    )
+                })
                 .collect::<Vec<_>>();
             let mut spread_tip_parts = Vec::new();
             if spread_keys.is_empty() {
@@ -48468,7 +48604,11 @@ impl App {
             } else {
                 spread_tip_parts.push("連結方式".to_owned());
             }
-            if let Some(key_label) = keymap.first_chord_label(KeyAction::FsReadingDirectionToggle) {
+            if composition_owned {
+                spread_tip_parts.push("読む方向と表紙は構成を編集".to_owned());
+            } else if let Some(key_label) =
+                keymap.first_chord_label(KeyAction::FsReadingDirectionToggle)
+            {
                 spread_tip_parts.push(format!("横方向 [{key_label}]"));
             } else {
                 spread_tip_parts.push("横方向".to_owned());
@@ -48556,6 +48696,7 @@ impl App {
                                 spread_popup_open,
                                 extracted_result,
                                 composition_owned,
+                                composition_spread_mode,
                             );
 
                             draw_spread_popup_heading(scroll_ui, "連結方式");
@@ -60818,6 +60959,7 @@ mod tests {
                         &mut panorama_projection_choice,
                         false,
                         crate::spread_shift::PairingEditAvailability::Automatic,
+                        None,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,
@@ -61059,6 +61201,7 @@ mod tests {
                         } else {
                             crate::spread_shift::PairingEditAvailability::Automatic
                         },
+                        state.composition_owned.then_some(SpreadMode::Ltr),
                         &mut state.spread_mode,
                         &mut state.reading_flow,
                         &mut state.reading_direction,
@@ -85296,6 +85439,7 @@ mod specified_scale_consumer_tests {
                         &mut panorama_projection_choice,
                         false,
                         crate::spread_shift::PairingEditAvailability::Automatic,
+                        None,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,

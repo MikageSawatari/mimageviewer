@@ -24,6 +24,88 @@ fn document(root: &str, page_num: usize) -> CandidatePage {
 }
 
 #[test]
+fn legacy_spread_admission_matches_all_composition_bindings_and_rechecks_latest_record() {
+    use crate::settings::SpreadMode;
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let scope = crate::book_scope::BookScopeKey::document("C:/legacy-spread.pdf").unwrap();
+    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+        for cover in [false, true] {
+            let mut book = fixtures::four_page_book(direction);
+            book.cover_enabled = cover;
+            service
+                .save(scope.clone(), PageDomain::Document, book)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let snapshot = service.snapshot();
+            let expected = composition_spread_mode(direction, cover);
+            let key = match (direction, cover) {
+                (ReadingDirection::Ltr, false) => "[2]",
+                (ReadingDirection::Ltr, true) => "[3]",
+                (ReadingDirection::Rtl, false) => "[4]",
+                (ReadingDirection::Rtl, true) => "[5]",
+            };
+            for mode in [
+                SpreadMode::Single,
+                SpreadMode::Ltr,
+                SpreadMode::LtrCover,
+                SpreadMode::Rtl,
+                SpreadMode::RtlCover,
+                SpreadMode::SplitLtr,
+                SpreadMode::SplitRtl,
+            ] {
+                let admission = CompositionWriteAdmission {
+                    binding_scope: Some(scope.clone()),
+                    binding_kind: CompositionBindingWriteKind::LegacySpread(mode),
+                    ..Default::default()
+                };
+                if mode == expected {
+                    admission.validate(&snapshot).unwrap();
+                    assert_eq!(
+                        admission.legacy_spread_view_mode(&snapshot).unwrap(),
+                        Some(expected)
+                    );
+                } else {
+                    let error = admission.validate(&snapshot).unwrap_err();
+                    assert!(error.contains("本の構成"));
+                    assert!(error.contains("方向・表紙"));
+                    assert!(error.contains(key), "{error}");
+                }
+            }
+            let admission = CompositionWriteAdmission {
+                binding_scope: Some(scope.clone()),
+                binding_kind: CompositionBindingWriteKind::LegacySpread(expected),
+                ..Default::default()
+            };
+            let mut changed = fixtures::four_page_book(direction);
+            changed.cover_enabled = !cover;
+            service
+                .save(scope.clone(), PageDomain::Document, changed)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            assert!(admission.validate(&service.snapshot()).is_err());
+            service
+                .remove(scope.clone(), PageDomain::Document)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            assert_eq!(
+                admission
+                    .legacy_spread_view_mode(&service.snapshot())
+                    .unwrap(),
+                None
+            );
+        }
+    }
+    owner.shutdown_and_join();
+}
+
+#[test]
 fn empty_write_admission_ignores_unavailable_store_but_protected_resources_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("book_composition.db");

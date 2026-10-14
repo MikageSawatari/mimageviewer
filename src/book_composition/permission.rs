@@ -108,11 +108,13 @@ pub(crate) struct CompositionTarget {
     pub(crate) scope: BookScopeKey,
     pub(crate) page: CompositionPageRef,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) enum CompositionBindingWriteKind {
     #[default]
     Binding,
     AutomaticRule,
+    /// Retain the requested binding so a later composition change is rechecked.
+    LegacySpread(crate::settings::SpreadMode),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -125,6 +127,49 @@ pub(crate) struct CompositionWriteAdmission {
     pub(crate) unsupported_pages: Vec<PageIdentity>,
 }
 impl CompositionWriteAdmission {
+    /// A qualified legacy Spread request can reuse the mode-only writer only when
+    /// it matches the latest active composition. Unsupported source proofs retain
+    /// their existing binding-write behavior instead of consuming a saved record.
+    pub(crate) fn legacy_spread_view_mode(
+        &self,
+        snapshot: &CompositionSnapshot,
+    ) -> Result<Option<crate::settings::SpreadMode>, String> {
+        let CompositionBindingWriteKind::LegacySpread(requested) = self.binding_kind else {
+            return Ok(None);
+        };
+        let Some(scope) = &self.binding_scope else {
+            return Ok(None);
+        };
+        snapshot.status.clone()?;
+        if self
+            .unsupported_scopes
+            .iter()
+            .any(|proof| &proof.scope == scope)
+        {
+            return Ok(None);
+        }
+        let Some(row) = snapshot.rows.get(&scope.storage_key()) else {
+            return Ok(None);
+        };
+        let expected = super::composition_spread_mode(
+            row.composition.direction,
+            row.composition.cover_enabled,
+        );
+        if requested == expected {
+            return Ok(Some(expected));
+        }
+        let key = match expected {
+            crate::settings::SpreadMode::Ltr => "2",
+            crate::settings::SpreadMode::LtrCover => "3",
+            crate::settings::SpreadMode::Rtl => "4",
+            crate::settings::SpreadMode::RtlCover => "5",
+            _ => unreachable!("a composition always derives a Spread binding"),
+        };
+        Err(format!(
+            "この本の見開き表示は [{key}] キーです。読む方向・表紙を変えるにはPCで本の構成を編集してください"
+        ))
+    }
+
     pub(crate) fn validate(&self, snapshot: &CompositionSnapshot) -> Result<(), String> {
         // An outside-scope write has no composition resource to protect.
         if self.targets.is_empty()
@@ -140,6 +185,7 @@ impl CompositionWriteAdmission {
                 return Err("本の構成が更新されました。もう一度操作してください".into());
             }
         }
+        self.legacy_spread_view_mode(snapshot)?;
         if self.binding_kind == CompositionBindingWriteKind::Binding
             && self.binding_scope.as_ref().is_some_and(|scope| {
                 snapshot.rows.contains_key(&scope.storage_key())

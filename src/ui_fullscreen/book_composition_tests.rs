@@ -219,13 +219,13 @@ fn composed_blank_trim_uses_physical_slot_and_single_projection_uses_single_marg
 }
 
 #[test]
-fn legacy_binding_same_value_refuses_before_state_and_single_split_nudge_stays_navigation() {
+fn legacy_matching_same_value_preserves_state_and_single_split_nudge_stays_navigation() {
     let ctx = egui::Context::default();
     let mut app = composed_app(&fixtures::four_page_book(CompositionDirection::Ltr));
     app.fullscreen_idx = Some(0);
     let settings = serde_json::to_value(&app.settings).unwrap();
     let units = app.build_spread_display_units_for_nav(&[0, 1, 2, 3]);
-    app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Ltr);
+    assert!(app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Ltr));
     app.set_reading_direction_for_fullscreen(&ctx, 0, ReadingDirection::Ltr);
     let final_cover = app.final_cover_spread_preference;
     let page_alone = app.page_alone_preferences;
@@ -2491,5 +2491,268 @@ fn book_composition_facet_excluded_alone_keeps_first_policy_and_prepared_rotatio
             SingletonSpreadPlacement::Center
         );
         assert_eq!(units[at].presentation.len(), 1);
+    }
+}
+
+#[test]
+fn book_composition_legacy_spread_keys_match_binding_and_preserve_record() {
+    let _serial = crate::key_input::lock_test_input();
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for cover in [false, true] {
+            let mut book = fixtures::four_page_book(direction);
+            book.cover_enabled = cover;
+            let expected = composition_spread_mode(direction, cover);
+            for (key, requested) in [
+                (egui::Key::Num2, SpreadMode::Ltr),
+                (egui::Key::Num3, SpreadMode::LtrCover),
+                (egui::Key::Num4, SpreadMode::Rtl),
+                (egui::Key::Num5, SpreadMode::RtlCover),
+            ] {
+                let ctx = egui::Context::default();
+                let mut app = composed_app(&book);
+                app.fullscreen_idx = Some(0);
+                let data = tempfile::tempdir().unwrap();
+                let (service, owner) =
+                    BookCompositionService::spawn_at(data.path().to_path_buf(), None).unwrap();
+                let scope = crate::book_scope::BookScopeKey::document("c:/g3-display.pdf").unwrap();
+                service
+                    .save(scope.clone(), PageDomain::Document, book.clone())
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap()
+                    .status
+                    .unwrap();
+                app.install_book_composition_runtime(service.clone());
+                let token = app.composed_layout_token();
+                let record = app.composed_book_layout().unwrap().clone();
+                app.apply_fullscreen_view_mode(&ctx, 0, FullscreenViewMode::Single);
+                app.spread_shift.state = crate::app::spread_shift_owner::ViewerShift::Ordinary(2);
+                let revision_before = app.book_append_undo_revision;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        focused: true,
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.handle_fs_key_input(ctx, 0, false);
+                    },
+                );
+                assert_eq!(
+                    app.spread_mode,
+                    if requested == expected {
+                        expected
+                    } else {
+                        SpreadMode::Single
+                    },
+                    "{direction:?}/{cover}/{key:?}"
+                );
+                assert_eq!(app.reading_direction, composition_view_direction(direction));
+                assert_eq!(app.composed_layout_token(), token);
+                assert_eq!(app.composed_book_layout().unwrap(), &record);
+                assert!(matches!(
+                    app.spread_shift.state,
+                    crate::app::spread_shift_owner::ViewerShift::Ordinary(2)
+                ));
+                if requested != expected {
+                    assert_eq!(app.book_append_undo_revision, revision_before);
+                    let toast = &app.fs_feedback_toast.as_ref().unwrap().0;
+                    let label = spread_mode_key_action(expected)
+                        .and_then(|a| app.keymap.first_chord_label(a))
+                        .unwrap();
+                    assert!(toast.contains(&format!("[{label}]")), "{toast}");
+                    assert!(
+                        toast.contains("\u{672c}\u{306e}\u{69cb}\u{6210}"),
+                        "editor guidance: {toast}"
+                    );
+                } else {
+                    let after = app.book_append_undo_revision;
+                    assert!(app.apply_fullscreen_spread_mode(&ctx, 0, expected));
+                    assert_eq!(
+                        app.book_append_undo_revision, after,
+                        "matching no-op must not admit a followup mutation"
+                    );
+                    assert!(matches!(
+                        app.spread_shift.state,
+                        crate::app::spread_shift_owner::ViewerShift::Ordinary(2)
+                    ));
+                }
+                owner.shutdown_and_join();
+                let db = crate::spread_db::SpreadDb::open_existing_read_only_at(
+                    &data.path().join("spread.db"),
+                )
+                .unwrap()
+                .unwrap();
+                let saved = db.get_state_with_fallback(
+                    &crate::spread_db::container_key(&scope.logical_root, &[]),
+                    None,
+                );
+                assert_eq!(
+                    saved.view_mode,
+                    Some(if requested == expected {
+                        crate::spread_db::StoredViewMode::Spread
+                    } else {
+                        crate::spread_db::StoredViewMode::Single
+                    })
+                );
+                assert_eq!(saved.mode, None, "mode-only has no new binding");
+                assert_eq!(saved.direction, None);
+                assert_eq!(saved.flow, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn book_composition_spread_guidance_and_hud_respect_keymap_and_split_action() {
+    let ctx = egui::Context::default();
+    let mut book = fixtures::four_page_book(CompositionDirection::Rtl);
+    book.cover_enabled = true;
+    let mut app = composed_app(&book);
+    app.fullscreen_idx = Some(0);
+    for (ini, label) in [
+        ("FsSpreadRtlCover=Ctrl+K", Some("Ctrl+K")),
+        ("FsSpreadRtlCover=none\nFsViewSpread=S", Some("S")),
+        ("FsSpreadRtlCover=none", None),
+    ] {
+        app.keymap = Keymap::from_ini_str(ini);
+        assert!(!app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Ltr));
+        let toast = &app.fs_feedback_toast.as_ref().unwrap().0;
+        if let Some(label) = label {
+            assert!(toast.contains(&format!("[{label}]")), "{toast}");
+        } else {
+            assert!(
+                !toast.contains("[5]"),
+                "unassigned shortcut must not be advertised: {toast}"
+            );
+        }
+        assert_eq!(
+            spread_mode_row_shortcut(
+                &app.keymap,
+                SpreadMode::RtlCover,
+                true,
+                Some(SpreadMode::RtlCover)
+            )
+            .as_deref(),
+            label
+        );
+        assert_eq!(
+            spread_mode_row_shortcut(
+                &app.keymap,
+                SpreadMode::SplitRtl,
+                true,
+                Some(SpreadMode::RtlCover)
+            ),
+            None
+        );
+    }
+    app.keymap = Keymap::from_ini_str("FsViewLandscapeSplit=Ctrl+L");
+    assert_eq!(
+        spread_mode_row_shortcut(
+            &app.keymap,
+            SpreadMode::SplitRtl,
+            true,
+            Some(SpreadMode::RtlCover)
+        )
+        .as_deref(),
+        Some("Ctrl+L")
+    );
+}
+
+#[test]
+fn book_composition_boundary_remainder_at_forced_last_keeps_last_preference() {
+    for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+        for directive in [
+            PageOverride::Alone,
+            PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            },
+        ] {
+            let overrides = HashMap::from([(4, directive)]);
+            let units = build_spread_display_units_with_overrides(
+                &[0, 1, 2, 3, 4],
+                mode,
+                None,
+                PageAloneSettings {
+                    after_cover: false,
+                    last: true,
+                },
+                &overrides,
+                |_, _| false,
+                |_| true,
+            );
+            let at = units.iter().position(|u| u.pages == [3]).unwrap();
+            assert_eq!(
+                units[at].formation,
+                SpreadDisplayUnitFormation::Singleton(
+                    SpreadDisplaySingletonCause::OverrideBoundaryRemainder
+                )
+            );
+            let p = resolve_spread_display_composition(
+                &units,
+                at,
+                mode,
+                true,
+                SingletonSpreadEndpointSettings {
+                    first: false,
+                    last: true,
+                },
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                p.singleton_placement(),
+                if mode.is_rtl() {
+                    SingletonSpreadPlacement::Right
+                } else {
+                    SingletonSpreadPlacement::Left
+                }
+            );
+            assert_eq!(p.pages_in_reading_order().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn book_composition_empty_override_boundaries_keep_automatic_placement() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        for kind in 0..3 {
+            let units = build_spread_display_units_with_overrides(
+                &[0, 1, 2, 3, 4],
+                mode,
+                (kind == 2).then_some(3),
+                PageAloneSettings::default(),
+                &HashMap::new(),
+                |_, idx| kind == 0 && idx == 3,
+                |idx| kind != 1 || idx != 3,
+            );
+            let at = units.iter().position(|u| u.pages == [2]).unwrap();
+            assert_eq!(
+                units[at].formation,
+                SpreadDisplayUnitFormation::Singleton(match kind {
+                    0 => SpreadDisplaySingletonCause::LandscapeBoundary,
+                    1 => SpreadDisplaySingletonCause::NonPairableBoundary,
+                    _ => SpreadDisplaySingletonCause::UnpairedSlot,
+                })
+            );
+            let p = resolve_spread_display_composition(
+                &units,
+                at,
+                mode,
+                false,
+                SingletonSpreadEndpointSettings {
+                    first: true,
+                    last: true,
+                },
+                true,
+            )
+            .unwrap();
+            assert_eq!(p.singleton_placement(), SingletonSpreadPlacement::Center);
+        }
     }
 }

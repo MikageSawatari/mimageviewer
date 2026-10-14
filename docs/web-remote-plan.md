@@ -25,7 +25,10 @@ Webの既存方向/表紙付きキーは抽出一覧では表示種別だけへr
 件数/byte上限、policy、navigationのexact snapshot proofは保持する。通常ZIP一覧の子container位置も維持する。
 構成本の`SetViewMode`/binding拒否契約はbook-composition-plan §9.2を参照する。
 2026-10-11 G3でstrict protocolを**v70**へ更新し、`SetViewMode`とderived `composition_managed`を追加した。
-構成あり本の結合`SetSpread`はworkerの最新snapshotで拒否し、Webは表示分類だけ切り替える。
+構成あり本の結合`SetSpread`はworkerの最新snapshotで方向・表紙が一致する見開き要求のみ
+既存`SetViewMode` ownerへ渡す（2026-10-14 Q31）。不一致は一致するWebキー2/3/4/5とPC構成編集を案内して拒否する。
+requested modeはtyped LegacySpread資格に保持し、UIの最新snapshotでも再確認する。
+mode-only書込はbinding保存／休眠shift Clearへ進まず、Webの表示分類menuは従来どおり。
 mode-onlyの本別保存は既存spread.db worker、抽出結果は非永続の表示投影。構成/shift writerを呼ばない。
 mode-onlyの読取は休眠bindingと閲覧分類を分離し、親/全体と文書由来の既定方向・表紙を解決してから分類を適用する。
 表示分類は文書方向の読取を止めず、Single/Spread/Splitとも同じ解決済み方向を使う。

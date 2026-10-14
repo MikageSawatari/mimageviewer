@@ -3181,7 +3181,12 @@ impl ContainerEngine {
                 | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
                 | RemoteWriteRequest::SetPageAlonePreference { .. }
         );
-        if binding && !matches!(request, RemoteWriteRequest::SetSpread { .. }) {
+        if let RemoteWriteRequest::SetSpread { spread_mode, .. } = request {
+            admission.binding_kind =
+                crate::book_composition::CompositionBindingWriteKind::LegacySpread(
+                    core_spread_mode(*spread_mode),
+                );
+        } else if binding {
             admission.binding_kind =
                 crate::book_composition::CompositionBindingWriteKind::AutomaticRule;
         }
@@ -10645,6 +10650,84 @@ mod tests {
                 })
                 .is_err()
         );
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn composition_legacy_spread_admission_retains_matching_intent_for_effective_zip_scope() {
+        use crate::book_composition::*;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        zip.start_file("chapter/a.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"qualification fixture without decoding")
+            .unwrap();
+        zip.finish().unwrap();
+        let scope = crate::book_scope::BookScopeKey::new(&root, "chapter").unwrap();
+        let domain = PageDomain::ArchiveLevel {
+            prefix: "chapter".into(),
+        };
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: "chapter/a.png".into(),
+        };
+        let (service, owner) =
+            BookCompositionService::spawn_at(temp.path().join("composition"), None).unwrap();
+        let session = super::super::session::SessionHandle::new();
+        session.install_book_composition_service(Some(service.clone()));
+        let engine = ContainerEngine::new_with_session(Default::default(), session);
+        let address = RemoteAddress {
+            path: root.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: "chapter/".into(),
+            },
+        };
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            for cover in [false, true] {
+                let mut book = BookComposition::new(direction, vec![page.clone()]);
+                book.cover_enabled = cover;
+                service
+                    .save(scope.clone(), domain.clone(), book)
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+                let expected = composition_spread_mode(direction, cover);
+                for mode in [
+                    RemoteSpreadMode::Ltr,
+                    RemoteSpreadMode::LtrCover,
+                    RemoteSpreadMode::Rtl,
+                    RemoteSpreadMode::RtlCover,
+                ] {
+                    let request = RemoteWriteRequest::SetSpread {
+                        address: address.clone(),
+                        spread_mode: mode,
+                        reading_direction: RemoteReadingDirection::Ltr,
+                    };
+                    let admission = engine.composition_write_admission(&request);
+                    if core_spread_mode(mode) == expected {
+                        let admission = admission.unwrap();
+                        assert_eq!(admission.binding_scope.as_ref(), Some(&scope));
+                        assert_eq!(
+                            admission.binding_kind,
+                            CompositionBindingWriteKind::LegacySpread(expected)
+                        );
+                        assert_eq!(
+                            admission
+                                .legacy_spread_view_mode(&service.snapshot())
+                                .unwrap(),
+                            Some(expected)
+                        );
+                    } else {
+                        assert_eq!(
+                            admission.unwrap_err().code,
+                            RemoteWriteErrorCode::Unsupported
+                        );
+                    }
+                }
+            }
+        }
         owner.shutdown_and_join();
     }
 

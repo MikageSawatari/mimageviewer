@@ -6941,7 +6941,13 @@ impl App {
         if !self.vertical_reading_supported_idx(fs_idx) {
             return None;
         }
-        let next = if self.extracted_result_surface().is_some() {
+        let next = if let Some(expected) = self.composed_spread_mode() {
+            if self.spread_mode.is_spread() {
+                crate::settings::SpreadMode::Single
+            } else {
+                expected
+            }
+        } else if self.extracted_result_surface().is_some() {
             if self.spread_mode.is_spread() {
                 crate::settings::SpreadMode::Single
             } else {
@@ -6950,9 +6956,9 @@ impl App {
         } else {
             self.spread_mode.next_in_spread_cycle()
         };
-        self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
+        let accepted = self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
         // Report only the state actually applied: a rejected write keeps the old mode.
-        if self.spread_mode == next {
+        if accepted && self.spread_mode == next {
             self.show_feedback_toast(format!("[Pad:{}]", next.label()));
         }
         None
@@ -8888,6 +8894,81 @@ mod tests {
         GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
         draw_gamepad_list_picker_overlay_layout, draw_gamepad_ring_picker_overlay_layout,
     };
+
+    #[test]
+    fn book_composition_gamepad_select_cycles_only_matching_spread_and_single() {
+        use crate::book_composition::*;
+        use crate::settings::{ReadingDirection as ViewDirection, SpreadMode};
+        use std::path::{Path, PathBuf};
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            for cover in [false, true] {
+                let path = Path::new("c:/pad-composed.pdf");
+                let scope = crate::book_scope::BookScopeKey::document(path).unwrap();
+                let mut book = fixtures::four_page_book(direction);
+                book.cover_enabled = cover;
+                let data = tempfile::tempdir().unwrap();
+                let (service, owner) =
+                    BookCompositionService::spawn_at(data.path().to_path_buf(), None).unwrap();
+                service
+                    .save(scope.clone(), PageDomain::Document, book.clone())
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap()
+                    .status
+                    .unwrap();
+                let raw = (0..4)
+                    .map(|page| CanonicalRawPage {
+                        page: fixtures::document_page(page),
+                        raw_index: page as usize,
+                    })
+                    .collect::<Vec<_>>();
+                let projected = project_composition(
+                    scope.clone(),
+                    &PageDomain::Document,
+                    service.snapshot().token_for(&scope),
+                    Some(&book),
+                    &raw,
+                    &fixtures::document_manifest(4),
+                    4,
+                )
+                .unwrap();
+                let CompositionProjectionOutcome::Composed(layout) = projected.outcome else {
+                    panic!("composed")
+                };
+                let mut app = crate::app::setup_app_for_test();
+                app.current_folder = Some(PathBuf::from(path));
+                app.projection_recipe = crate::app::book_materialization::ProjectionRecipe::Book(
+                    crate::app::book_materialization::BookScope::Document(path.to_path_buf()),
+                );
+                app.items = (0..4)
+                    .map(|page| crate::app::book_materialization::document_page_item(path, page))
+                    .collect();
+                app.items_generation = 42;
+                app.visible_indices = (0..4).collect();
+                app.details_order = app.visible_indices.clone();
+                app.thumbnails = vec![crate::app::ThumbnailState::Pending; 4];
+                app.image_metas = vec![None; 4];
+                app.viewer_navigation_caches.invalidate();
+                app.reading_direction = if direction == ReadingDirection::Ltr {
+                    ViewDirection::Ltr
+                } else {
+                    ViewDirection::Rtl
+                };
+                app.fullscreen_idx = Some(0);
+                app.spread_mode = SpreadMode::Single;
+                app.install_book_composition_runtime(service);
+                app.install_composition_for_test(layout);
+                let token = app.composed_layout_token();
+                let ctx = egui::Context::default();
+                let expected = composition_spread_mode(direction, cover);
+                for mode in [expected, SpreadMode::Single, expected] {
+                    assert!(app.handle_gamepad_select(&ctx).is_none());
+                    assert_eq!(app.spread_mode, mode, "{direction:?}/{cover}");
+                    assert_eq!(app.composed_layout_token(), token);
+                }
+                owner.shutdown_and_join();
+            }
+        }
+    }
 
     #[test]
     fn calculated_gamepad_list_picker_siblings_fit_and_selected_end_is_reachable() {

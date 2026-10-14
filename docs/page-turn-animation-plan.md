@@ -2953,3 +2953,73 @@ test-fullは今回の指示どおり実行していない。build-devはPreserve
 当初はcore 6プロセスの稼働を確認したが、ビルド直前の再確認では0件だった。
 初回buildはPowerShell内のstderrリダイレクトがCargoの警告を終了エラー化して中断。
 同じscriptを別PowerShellプロセスで直接呼び、外側でログを捕捉して正常完了した（build-dev.exit=0）。
+
+### 26.23 指定直前の余りの末尾配置と見開きへの復帰（2026-10-14）
+
+§26.22の実機問題は、利用者スクリーンショットと保存構成から設計担当がPage 15（raw14）と特定した。
+このページはAloneではなく、次のPage 16（raw15）のBlankOpposite leading直前で余った単ページ。
+現builderは相方のoverrideを見てUnpairedSlotを生成し、resolverが本の途中なので中央としていた。
+前回のAlone raw10/11/17の回帰が成功したことと矛盾しない。
+
+利用者決定Q30（案A）: 指定直前の余りを単独形成理由OverrideBoundaryRemainderで区別する。
+本来の側は末尾単ページと同じLTR左／RTL右。local pagedアニメONは実効last=trueを渡し、
+OFFはsingleton_spread_last_enabledと本別last preference。連結／Remoteは既存保存実効値を使う。
+横長のcurrentは先行するLandscapeBoundaryのまま中央。Alone本体のLTR右／RTL左・先頭設定は維持。
+segment末尾を本全体の末尾に数えず、末尾表紙添付やAutomaticの表紙証明には使わない。
+通常本の空overrideで出る横長前LandscapeBoundary・非pairable前NonPairableBoundary・shift終端UnpairedSlotは
+似た形の余りだが明示指定によるものではない。今回の決定を拡張せず、その配置・原因・cache条件を維持する。
+builderの同じ境界走査（相方override検出と強制末尾segmentの終端）と共通resolverに集約し、
+描画側にページ番号による判定を足さない。
+回帰は保存構成raw14の実投影→builder→viewport→画像primitive、LTR/RTL×ON/OFF×全体/本別last、
+直後の白紙・Alone本体・末尾・連続指定、横長と通常本の上記境界を含める。
+
+利用者決定Q31は本構成計画§9.2に記録。一致する既存Spread要求をmode-onlyとして共通受付し、
+復帰後の通常builder・許可・preparation・Flat/turn ownerをそのまま使用する。
+旧形式のunits・移行・第二binding writerは追加しない。まれな失敗は既定方針で扱う。
+
+#### Q30/Q31の実装・検証（2026-10-15、未コミット差分）
+
+修正前の保存構成回帰はraw14のbuilder配置でCenterとLeftの不一致を検出した
+（`target/boundary-baseline.log`）。修正後は実投影・共通builder・実viewportの画像primitiveまで検査。
+raw14は方向×表紙×アニメ×全体last×本別lastの48ケースと横長4ケース、
+Aloneは既存192ケースを維持する。通常本の類似境界は原因・中央配置の据置きを検査した。
+
+| gate | 結果 / 証跡 |
+| --- | --- |
+| fmt / normal・portable core check | exit 0。`target/boundary-fmt.log`、`boundary-check.log`、`boundary-check-portable.log` |
+| 本の構成 / ページめくり | 219 / 214成功、0失敗。`target/boundary-composition.log`、`boundary-page-turn.log` |
+| 一致キー・Remote UI・Remote scope | 各target 1成功、0失敗。キーtarget内で4 binding×4キー、Remote UIはSingle/Split/同値からのmode-only・最新構成再検証・休眠shift保持を検査 |
+| UI glyph | 危険glyph 0。`target/boundary-glyph.log` |
+| UI snapshot | 181成功、0失敗。追加4 PNGの2/3/4/5、拒否される8/9の非表示、説明全文を目視。`target/boundary-snapshot.log` |
+
+test-fullはjobs1／threads1／SuppressCrashDialogsで一回実行し、exit 101。
+本体は13,185成功／1失敗／59既存ignored。唯一の失敗は
+`video::native_window_pump::tests::hud_focus_claim_uses_registered_editor_and_preserves_presenter_return`で、
+`native_window_pump.rs:2012`の子プロセスHWND通知待ち10秒がTimeoutになった。
+同じ実行バイナリを単独実行しても0成功／1失敗、exit 101で同じTimeoutだった。
+該当ソースはHEADから変更しておらず、原因は未確定。待機延長・テスト除外・native実装変更では回避しない。
+証跡は`target/boundary-full.log`／`.exit`、`boundary-native-focus-exact.log`／`.exit`。
+
+他のworkspace target・integration・doc-testsは成功。編集画面snapshot 11、UI snapshot 181も成功。
+scriptが未実行にしたvendor4を同じ引数で補完し、egui25／egui-winit29／egui-wgpu11／eframe18が成功
+（`target/boundary-vendor-*.log`／`.exit`）。全体scriptをPASSとは扱わず、native失敗の切り分けを残す。
+
+`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`はexit 1。
+runtime DLL検査4は成功したが、このworktreeのcoreが6プロセス
+（PID62480／65936／77056／80208／92772／93344）起動中で、PID62480のguardによりCargo build前に中断した。
+`target/boundary-build-dev.log`／`.exit`。新しい確認用binaryは作成していない。
+実アプリの起動・停止、git add／commitは行っていない。
+
+**利用者の実機確認**: nativeテストの失敗を切り分け、確認用coreとインストール済み／tray常駐mIVを閉じ、
+`scripts/build-dev.ps1 -PreserveRuntime`の成功後、利用者が次を実行する。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir G:\miv-iso\book\data'
+```
+
+引数なしの通常coreは実APPDATAのsettings/dataを使うため、今回は指定済み隔離data-dirで確認する。
+本は`G:\miv-iso\media\book_pdf.pdf`、保存構成はLTR・表紙なしのまま使う。
+アニメONのpaged見開きでPage 15を左、AloneのPage 11／12／18を右に置く。
+OFFでは末尾の全体／本別設定でPage 15だけ中央／左を切り替え、Alone本体は先頭設定で別に決まることを確認する。
+`1`の後に`2`で見開きへ復帰し、`3`〜`5`は`2`と構成編集の案内を出す。HUDは`[2]`、
+Pad Selectは単ページ／一致見開き、Remoteの`2`も同じ復帰。方向／表紙を編集した場合は一致キーも3／4／5へ変わる。
