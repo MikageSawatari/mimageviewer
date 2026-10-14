@@ -61,7 +61,7 @@ pub(crate) struct CompositionWriteReply {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Running,
+    Running { outstanding_mutations: u64 },
     Maintenance,
     Closed,
 }
@@ -72,6 +72,34 @@ struct Admission {
     snapshot: Arc<CompositionSnapshot>,
     changed: Vec<String>,
     errors: Vec<String>,
+}
+
+impl Admission {
+    fn admit_mutation(&mut self) {
+        let Mode::Running {
+            outstanding_mutations,
+        } = &mut self.mode
+        else {
+            unreachable!("mutations are admitted only while running");
+        };
+        *outstanding_mutations = outstanding_mutations
+            .checked_add(1)
+            .expect("composition mutation admission exhausted");
+    }
+}
+
+/// Retirement follows the mutation's final publication and precedes its reply.
+/// Maintenance rejects new mutations and its Begin is FIFO behind all admitted ones.
+fn finish_mutation(shared: &Shared) {
+    let mut admission = shared.admission.lock().unwrap();
+    if let Mode::Running {
+        outstanding_mutations,
+    } = &mut admission.mode
+    {
+        *outstanding_mutations = outstanding_mutations
+            .checked_sub(1)
+            .expect("composition mutation completion without admission");
+    }
 }
 
 struct Shared {
@@ -198,7 +226,9 @@ impl BookCompositionService {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             admission: Mutex::new(Admission {
-                mode: Mode::Running,
+                mode: Mode::Running {
+                    outstanding_mutations: 0,
+                },
                 tx: Some(tx),
                 snapshot: Arc::new(CompositionSnapshot {
                     status: Err("composition store initializing".into()),
@@ -254,6 +284,19 @@ impl BookCompositionService {
 
     pub(crate) fn snapshot(&self) -> Arc<CompositionSnapshot> {
         Arc::clone(&self.shared.admission.lock().unwrap().snapshot)
+    }
+    /// A new presentation can consult this immutable snapshot only after every
+    /// earlier mutation has completed. Reads retain the worker FIFO when unknown.
+    /// This lock contains only admission/publication operations, never worker I/O.
+    pub(crate) fn current_candidate_snapshot(&self) -> Option<Arc<CompositionSnapshot>> {
+        let admission = self.shared.admission.lock().unwrap();
+        (matches!(
+            admission.mode,
+            Mode::Running {
+                outstanding_mutations: 0
+            }
+        ) && admission.snapshot.status.is_ok())
+        .then(|| Arc::clone(&admission.snapshot))
     }
     pub(crate) fn drain_errors(&self) -> Vec<String> {
         std::mem::take(&mut self.shared.admission.lock().unwrap().errors)
@@ -330,13 +373,16 @@ impl BookCompositionService {
         batch: crate::view_trim_db::ViewTrimWriteBatch,
     ) -> mpsc::Receiver<Result<(), String>> {
         let (reply, rx) = mpsc::channel();
-        let admission = self.shared.admission.lock().unwrap();
-        let sent = admission.mode == Mode::Running
+        let mut admission = self.shared.admission.lock().unwrap();
+        let sent = matches!(admission.mode, Mode::Running { .. })
             && admission.tx.as_ref().is_some_and(|tx| {
                 let write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
                 tx.send(Command::ViewTrim(batch, write, reply.clone()))
                     .is_ok()
             });
+        if sent {
+            admission.admit_mutation();
+        }
         if !sent {
             let _ = reply.send(Err(
                 "view trim writes unavailable during maintenance or exit".into(),
@@ -346,13 +392,16 @@ impl BookCompositionService {
     }
     pub(crate) fn remove_view_trim_page(&self, key: String) -> mpsc::Receiver<Result<(), String>> {
         let (reply, rx) = mpsc::channel();
-        let admission = self.shared.admission.lock().unwrap();
-        let sent = admission.mode == Mode::Running
+        let mut admission = self.shared.admission.lock().unwrap();
+        let sent = matches!(admission.mode, Mode::Running { .. })
             && admission.tx.as_ref().is_some_and(|tx| {
                 let write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
                 tx.send(Command::RemoveViewTrimPage(key, write, reply.clone()))
                     .is_ok()
             });
+        if sent {
+            admission.admit_mutation();
+        }
         if !sent {
             let _ = reply.send(Err(
                 "view trim writes unavailable during maintenance or exit".into(),
@@ -365,7 +414,7 @@ impl BookCompositionService {
         let (entered, receiver) = mpsc::channel();
         let (release, wait) = mpsc::channel();
         let admission = self.shared.admission.lock().unwrap();
-        assert!(admission.mode == Mode::Running);
+        assert!(matches!(admission.mode, Mode::Running { .. }));
         admission
             .tx
             .as_ref()
@@ -381,8 +430,8 @@ impl BookCompositionService {
         admission_proof: super::CompositionWriteAdmission,
     ) -> mpsc::Receiver<Result<crate::view_trim::ViewTrimBookState, String>> {
         let (reply, rx) = mpsc::channel();
-        let admission = self.shared.admission.lock().unwrap();
-        let sent = admission.mode == Mode::Running
+        let mut admission = self.shared.admission.lock().unwrap();
+        let sent = matches!(admission.mode, Mode::Running { .. })
             && admission.tx.as_ref().is_some_and(|tx| {
                 let write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
                 tx.send(Command::ViewTrimBook(
@@ -394,6 +443,9 @@ impl BookCompositionService {
                 ))
                 .is_ok()
             });
+        if sent {
+            admission.admit_mutation();
+        }
         if !sent {
             let _ = reply.send(Err(
                 "view trim writes unavailable during maintenance or exit".into(),
@@ -412,8 +464,8 @@ impl BookCompositionService {
         Ok(rx)
     }
     fn send_view_command(&self, command: Command) -> Result<(), String> {
-        let admission = self.shared.admission.lock().unwrap();
-        if admission.mode != Mode::Running {
+        let mut admission = self.shared.admission.lock().unwrap();
+        if !matches!(admission.mode, Mode::Running { .. }) {
             return Err("view mode writes unavailable during maintenance or exit".into());
         }
         admission
@@ -421,7 +473,9 @@ impl BookCompositionService {
             .as_ref()
             .ok_or("composition worker stopped")?
             .send(command)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        admission.admit_mutation();
+        Ok(())
     }
 
     pub(crate) fn save(
@@ -458,8 +512,8 @@ impl BookCompositionService {
         self.maintain(MaintenanceAction::Pages(mappings))
     }
     fn maintain(&self, action: MaintenanceAction) -> Result<(), String> {
-        let admission = self.shared.admission.lock().unwrap();
-        if admission.mode != Mode::Running {
+        let mut admission = self.shared.admission.lock().unwrap();
+        if !matches!(admission.mode, Mode::Running { .. }) {
             return Err("composition writes unavailable during maintenance or exit".into());
         }
         admission
@@ -467,7 +521,9 @@ impl BookCompositionService {
             .as_ref()
             .ok_or("composition worker stopped")?
             .send(Command::Maintain(action))
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        admission.admit_mutation();
+        Ok(())
     }
 
     fn write(
@@ -477,8 +533,8 @@ impl BookCompositionService {
         mutation: Mutation,
     ) -> mpsc::Receiver<CompositionWriteReply> {
         let (reply, rx) = mpsc::channel();
-        let admission = self.shared.admission.lock().unwrap();
-        let sent = admission.mode == Mode::Running
+        let mut admission = self.shared.admission.lock().unwrap();
+        let sent = matches!(admission.mode, Mode::Running { .. })
             && admission.tx.as_ref().is_some_and(|tx| {
                 tx.send(Command::Write(
                     scope.clone(),
@@ -488,6 +544,9 @@ impl BookCompositionService {
                 ))
                 .is_ok()
             });
+        if sent {
+            admission.admit_mutation();
+        }
         if !sent {
             let _ = reply.send(CompositionWriteReply {
                 token: admission.snapshot.token_for(&scope),
@@ -723,6 +782,7 @@ fn run_worker(
                 if let Err(error) = &result {
                     publish(&shared, &state, Vec::new(), Some(error.clone()));
                 }
+                finish_mutation(&shared);
                 let _ = reply.send(result);
             }
             Command::RemoveViewTrimPage(key, write, reply) => {
@@ -734,6 +794,7 @@ fn run_worker(
                 if let Err(error) = &result {
                     publish(&shared, &state, Vec::new(), Some(error.clone()));
                 }
+                finish_mutation(&shared);
                 let _ = reply.send(result);
             }
             Command::ViewTrimBook(key, mut value, admission, write, reply) => {
@@ -769,6 +830,7 @@ fn run_worker(
                 if let Err(error) = &result {
                     publish(&shared, &state, Vec::new(), Some(error.clone()));
                 }
+                finish_mutation(&shared);
                 let _ = reply.send(result);
             }
             Command::ViewMode(scope, mode, reply) => {
@@ -789,6 +851,7 @@ fn run_worker(
                 if let Err(error) = &result {
                     publish(&shared, &state, Vec::new(), Some(error.clone()));
                 }
+                finish_mutation(&shared);
                 let _ = reply.send(result);
             }
             Command::ViewFlow(scope, mode, flow, reply) => {
@@ -809,6 +872,7 @@ fn run_worker(
                 if let Err(error) = &result {
                     publish(&shared, &state, Vec::new(), Some(error.clone()));
                 }
+                finish_mutation(&shared);
                 let _ = reply.send(result);
             }
             Command::Begin(reply) => {
@@ -830,7 +894,9 @@ fn run_worker(
                 {
                     let mut admission = shared.admission.lock().unwrap();
                     if admission.mode != Mode::Closed {
-                        admission.mode = Mode::Running;
+                        admission.mode = Mode::Running {
+                            outstanding_mutations: 0,
+                        };
                     }
                 }
                 let _ = reply.send(result.map(|_| ()));
@@ -894,6 +960,7 @@ fn run_worker(
                         publish(&shared, &state, Vec::new(), Some(error));
                     }
                 }
+                finish_mutation(&shared);
             }
             Command::Write(scope, mut domain, mutation, reply) => {
                 let key = scope.storage_key();
@@ -969,6 +1036,7 @@ fn run_worker(
                         (false, Err(error))
                     }
                 };
+                finish_mutation(&shared);
                 let _ = reply.send(CompositionWriteReply {
                     scope,
                     changed,

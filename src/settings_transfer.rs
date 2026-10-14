@@ -339,6 +339,8 @@ preferences_policy! {
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
         remember_spread_shift_per_book: bool => ("見開きの調整を本ごとに記憶する", |_, _| true, plain, plain);
+        page_turn_animation_enabled: bool => ("ページめくりアニメーション", |_, _| true, plain, plain);
+        page_turn_animation_duration_ms: u32 => ("ページめくりアニメーションの時間（仮）", |v, _| (100..=600).contains(v), plain, plain);
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
@@ -1187,6 +1189,8 @@ mod tests {
         );
         settings.follow_document_reading_direction = !settings.follow_document_reading_direction;
         settings.remember_spread_shift_per_book = !settings.remember_spread_shift_per_book;
+        settings.page_turn_animation_enabled = true;
+        settings.page_turn_animation_duration_ms = 600;
         settings.default_reading_flow = different_enum(
             &settings.default_reading_flow,
             &[
@@ -1907,13 +1911,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 459);
+        assert_eq!(entries.len(), 461);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            144
+            146
         );
         assert_eq!(
             entries
@@ -1930,7 +1934,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 142);
+        assert_eq!(wire.len(), 144);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1944,6 +1948,92 @@ mod tests {
                 .map(String::as_str)
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_transfer_roundtrip_missing_and_invalid_values() {
+        let source = Settings {
+            page_turn_animation_enabled: true,
+            page_turn_animation_duration_ms: 350,
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert!(destination.page_turn_animation_enabled);
+        assert_eq!(destination.page_turn_animation_duration_ms, 350);
+        parse_preferences(INITIAL_V1)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(destination.page_turn_animation_enabled);
+        assert_eq!(destination.page_turn_animation_duration_ms, 350);
+
+        for duration in [
+            json!(99),
+            json!(601),
+            json!(-1),
+            json!(200.5),
+            json!("200"),
+            Value::Null,
+        ] {
+            let report = parse_preferences(&document(
+                json!({"page_turn_animation_duration_ms": duration}),
+            ))
+            .unwrap()
+            .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1);
+            assert_eq!(destination.page_turn_animation_duration_ms, 350);
+        }
+        let report = parse_preferences(&document(json!({"page_turn_animation_enabled": "true"})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(report.issues.len(), 1);
+        assert!(destination.page_turn_animation_enabled);
+        for duration in [100, 600] {
+            let report = parse_preferences(&document(
+                json!({"page_turn_animation_duration_ms": duration}),
+            ))
+            .unwrap()
+            .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.page_turn_animation_duration_ms, duration);
+        }
+    }
+
+    #[test]
+    fn removed_single_page_turn_spine_transfer_is_ignored_and_not_exported() {
+        let mut destination = Settings {
+            page_turn_animation_enabled: true,
+            page_turn_animation_duration_ms: 350,
+            ..Settings::default()
+        };
+        for legacy_value in [
+            json!("OwnPage"),
+            json!("Moving"),
+            json!("FutureMode"),
+            json!(true),
+            Value::Null,
+        ] {
+            let report =
+                parse_preferences(&document(json!({"page_turn_single_spine": legacy_value})))
+                    .unwrap()
+                    .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(report.unknown_count, 1);
+            assert_eq!(report.accepted_count, 0);
+            assert!(report.changed_fields.is_empty());
+            assert!(destination.page_turn_animation_enabled);
+            assert_eq!(destination.page_turn_animation_duration_ms, 350);
+        }
+        assert!(
+            !export_preferences(&destination)
+                .unwrap()
+                .json
+                .contains("page_turn_single_spine")
         );
     }
 

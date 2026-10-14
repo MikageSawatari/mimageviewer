@@ -11065,7 +11065,7 @@ impl App {
     /// 左パネルのボタンと画像フルスクリーンのショートカットは、表示初期状態を
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
-    pub(crate) fn enter_local_adjust_mode(&mut self) {
+    pub(crate) fn enter_local_adjust_mode(&mut self, ctx: &egui::Context) {
         if self
             .fullscreen_idx
             .is_some_and(|fs_idx| !self.fullscreen_edit_mode_entry_allowed(fs_idx))
@@ -11078,6 +11078,20 @@ impl App {
         if let Some(fs_idx) = self.fullscreen_idx {
             let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
             if !self.raw_edit_target_entry_allowed(target_idx) {
+                return;
+            }
+            self.cancel_original_material_entry_intents(None);
+            if self
+                .current_local_adjust_source_pixels(target_idx)
+                .is_none()
+                && !self.ensure_erase_stage_for_entry(
+                    ctx,
+                    target_idx,
+                    crate::app::OriginalMaterialEntry::LocalAdjustment {
+                        requested_fs_idx: fs_idx,
+                    },
+                )
+            {
                 return;
             }
             if let Some(pivot) = pivot {
@@ -15426,6 +15440,7 @@ impl App {
         );
 
         if close_clicked {
+            self.cancel_original_material_entry_intents(None);
             self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
             self.fold_local_adjust_edit_state();
@@ -15506,7 +15521,7 @@ impl App {
         // 左右ボタンで対象ページを切り替える。退避は触らないので、ボタンはそのまま
         // トグルとして使い続けられる (消しゴムの `switch_erase_target_in_spread` と同じ約束)。
         if let Some(new_idx) = switch_target_to {
-            self.switch_local_adjust_target_in_spread(new_idx);
+            self.switch_local_adjust_target_in_spread(ctx, new_idx);
         }
     }
 
@@ -15523,11 +15538,29 @@ impl App {
     ///
     /// `local_adjust_edge_preview_cache` は `source_key` で keyed なので消さない。
     /// `local_adjust_selected_layers` はページごとの `HashMap` なので消さない。
-    pub(crate) fn switch_local_adjust_target_in_spread(&mut self, new_idx: usize) {
+    pub(crate) fn switch_local_adjust_target_in_spread(
+        &mut self,
+        ctx: &egui::Context,
+        new_idx: usize,
+    ) {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
         if self.fullscreen_idx == Some(new_idx) {
+            return;
+        }
+        let Some(request) = self.page_edit_target_switch_request(
+            crate::app::PageEditTargetSwitchTool::LocalAdjustment,
+            new_idx,
+        ) else {
+            return;
+        };
+        self.cancel_original_material_entry_intents(None);
+        if !self.ensure_erase_stage_for_entry(
+            ctx,
+            new_idx,
+            crate::app::OriginalMaterialEntry::Switch { request },
+        ) {
             return;
         }
         // 保留中のブラシ再計算は捨てずに確定させる。捨てると旧ページの cache が
@@ -16329,7 +16362,8 @@ impl App {
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_local_adjust",
                 );
-                self.enter_local_adjust_mode();
+                self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+                self.enter_local_adjust_mode(child.ctx());
                 return;
             }
             if activate_erase {
@@ -16353,7 +16387,7 @@ impl App {
                     "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
                 );
                 self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-                self.enter_conceal_mode(fs_root_idx);
+                self.enter_conceal_mode(child.ctx(), fs_root_idx);
                 return;
             }
             if activate_crop {

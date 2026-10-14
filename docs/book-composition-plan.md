@@ -635,6 +635,13 @@ Eのfit参照再選択や初回layoutの自動reanchorも、adoptionから発生
 (現在のscroll/layout所有: `src/app/viewer_context_registry.rs:991`, `:1054`, swap `:2646`, `:2693`)。
 App共通bool、anchor専用許可、texture cacheに付ける許可の別ownerは作らない。
 
+通常open／navigation／slideshow／seekのindexed受付では、採用済みAutomatic／Composedの
+source投影と現在のscope token・identity index・context／世代を証明できる場合、既存serviceの
+初期化済み・Running・先行mutationなしのsnapshotから同じowner内で新しい許可を確定する。
+新しい要求IDと全occurrenceをatomicに公開し、旧episodeやtextureの保持を許可証として流用しない。
+不明source／旧token／Checking／Hiddenは従来のFIFO workerへ渡し、後着で紙めくりを再offerしない。
+identity-only／初回可視候補／preview／Remoteのworker照合は維持する（紙めくり計画§26.18）。
+
 責務と確定順:
 
 1. `draw_fs_continuous_reading` が `continuous_reading_layout` の可視候補を受け取った時、

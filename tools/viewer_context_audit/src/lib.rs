@@ -145,6 +145,29 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    // 1.372/1.376 already-reviewed master page-edit ownership APIs. History/Exit
+    // take owner commits; producers validate context/target/document, and accepted
+    // publication/eviction touches matching page keys in each owning bundle only.
+    // Keep exact fingerprints so A4 still rejects any unreviewed API expansion.
+    "inherent fn    App ::  pub (super) fn take_parked_page_edit_commits (& mut self) -> Vec < page_edit_owner :: PageEditCommit >",
+    "inherent fn    App ::  pub (super) fn take_parked_page_edit_exit_commits (& mut self ,) -> Vec < page_edit_owner :: PageEditCommit >",
+    "inherent fn    App ::  pub (crate) fn has_page_edit_producers (& self) -> bool",
+    "inherent fn    App ::  pub (crate) fn poll_all_page_edit_producers (& mut self , ctx : & egui :: Context)",
+    "inherent fn    App ::  pub (super) fn cancel_superseded_page_edit_producers (& mut self , key : & str , layers : & local_adjust_core :: LocalAdjustmentLayers , accepted : bool ,)",
+    "inherent fn    App ::  pub (crate) fn publish_accepted_adjustment_page_edits (& mut self , documents : & HashMap < String , Option < crate :: adjustment :: AdjustParams > > ,)",
+    "inherent fn    App ::  pub (crate) fn invalidate_thumb_adjust_for_page_key (& mut self , key : & str)",
+    "inherent fn    App ::  pub (super) fn evict_pinned_adjustment_materializations (& mut self , keys : & std :: collections :: HashSet < String > ,)",
+    "inherent fn    App ::  pub (super) fn publish_finished_adjustment_page_edit (& mut self , owner : & PageEditOwner , params : & Option < crate :: adjustment :: AdjustParams > ,)",
+    "inherent fn    App ::  pub (super) fn publish_accepted_local_page_edits (& mut self , documents : & HashMap < String , local_adjust_core :: LocalAdjustmentLayers > ,)",
+    "inherent fn    App ::  pub (super) fn refresh_pending_page_edit_projections (& mut self)",
+    // 1.341 reads mounted/at-rest readiness and addresses the existing owning
+    // context/viewport. Only explicit settings/tray operations visit all owners;
+    // normal mount/deposit never invalidates a sibling's presentation.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pending_fs_page_turn_ready (self ,) -> Option < & 'a crate :: ui_fullscreen :: PendingFsPageTurnReady >",
+    "inherent fn    crate :: app :: App ::  pub (crate) fn page_turn_destination (& self) -> crate :: ui_fullscreen :: PresentationDestination",
+    "inherent fn    App ::  pub (crate) fn page_turn_operation_tracking_needed (& self) -> bool",
+    "inherent fn    App ::  pub (crate) fn deactivate_all_page_turn_presentations (& mut self , reason : & 'static str)",
+    "inherent fn    App ::  pub (crate) fn cancel_all_page_turn_effects_for_settings (& mut self)",
     // 1.242 G2B polls only pending or changed-scope retained owners; no sibling mutation.
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn book_composition_contexts_to_poll (& self , changed : & [String] ,) -> Vec < ViewerContextId >",
     // 1.364 D2 routes write replies by context ID and validates the owning command/scope.

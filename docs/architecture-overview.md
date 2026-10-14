@@ -245,6 +245,18 @@ fit 基準へ戻さない。連結の基準 unit と PDF の絶対需要比較�
 移送する。共通指定値と favorite 専用値は既存 overlay / 保存 worker を使い、欠落継承だけで
 専用値を書き込まない。実装・検証状況は [指定サイズfit計画 §15](fullscreen-specified-scale-plan.md#15-実装接続と検証結果2026-10-09) を参照。
 
+紙めくり（§1.341、2026-10-11）はA0の実機不合格を受け、R7設計のStage 1を実装する。
+`ui_fullscreen/page_turn.rs` の `PageTurnPresentation` を既存 viewer bundleで所有し、
+各頁のnormal geometryとlayoutの背を `page_turn_animation.rs` のpure book-leaf projectionへ渡す。
+通常prepareの全unitをflat/leafのどちらか一度だけ同passへ提出する。部分leaf receiptは頁ごとの
+可視性だけを表し、ready/navigation完了にはcanonical flatの採用を必要とする。割込み時の
+一つの解決済み操作は同じpresenterのCompletingで保持し、close→採用通知/commit→fresh snapshotの
+共通境界へ渡す。commit後の媒体/描画owner変更は旧canvas/footerを終了して既存経路へ戻す。
+navigation/load admission、配送先とstable operation ID、F12の既存動画拒否は通常ownerを維持する。
+旧素材のleaseは実draw batchまで保持し、App共有のweak一覧はparked/in-flightを含むVRAM会計だけを担う。
+既定OFF、時間は利用者評価用の仮値。次の次の版へ延期し、実装の独立完了レビュー・実機/性能受入れは別gate。
+範囲と検証の正本は [紙めくり計画 §19](page-turn-animation-plan.md#19-stage-1--通常頁の実装と早期motion評価2026-10-11)。
+
 ---
 
 ## 2. モジュールマップ

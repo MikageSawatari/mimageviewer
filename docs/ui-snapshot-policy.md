@@ -109,6 +109,10 @@ App、変換worker、製品起動、実IME入力はこの純描画検査に含�
 
 ## ディレクトリ構成
 
+§1.341の両端配置は環境設定`preferences_singleton_spread_placement_setting*`と本別HUDの
+`singleton_spread_endpoint_popup_{on,off}_{light,dark}`でON/OFFの実効表示・灰色・説明を保持する。
+操作時の保存値非変更とOFF復帰はheadless入力回帰で検査し、PNGを機能証明の代わりにしない。
+
 ```
 tests/
 ├── ui_snapshot.rs              # 全スナップショットテストの定義

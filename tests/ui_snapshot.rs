@@ -2106,6 +2106,36 @@ fn fullscreen_specified_scale_live_popup_snapshots() {
 }
 
 #[test]
+fn singleton_spread_endpoint_popup_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (state, animation) in [("on", true), ("off", false)] {
+            snapshots.extend(snapshot_with_theme_options_collect(
+                &format!("singleton_spread_endpoint_popup_{state}_{theme_name}"),
+                theme,
+                mimageviewer::settings::TextContrast::Standard,
+                egui::vec2(320.0, 400.0),
+                None,
+                move |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_gray(28))
+                        .show(ui, |ui| {
+                            ui.set_width(230.0);
+                            mimageviewer::draw_singleton_spread_endpoint_popup_snapshot_fixture(
+                                ui, animation,
+                            );
+                        });
+                },
+                |_| {},
+            ));
+        }
+    }
+}
+
+#[test]
 fn spread_shift_hud_snapshots() {
     use egui_kittest::kittest::NodeT;
     use std::{cell::RefCell, collections::HashSet, rc::Rc};

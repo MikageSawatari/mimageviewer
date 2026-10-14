@@ -39,6 +39,10 @@ lib は `crate::test_ui::scroll_layout`、integration は `test_ui::scroll_layou
 ui_snapshot 176件、`cargo fmt --check`がすべてexit0。PNGは通常比較に一致し、更新なし。
 初回の検査用リンクは別テストが実行体を使用中で失敗し、終了を待って修正後の検査を実行した。
 実行履歴は`target/overflow-180-validation/`に保存。git add／commitとdev-runtime操作は行っていない。
+同日の§1.341結合では、本文spacing0・行数×48の高さ式・min_scrolled_height(0)を保持した。
+共通検査をambient spacing0／13の24条件へ拡張し、固定行のRoot／Navigator／Musicでは
+実content高と十分なviewport高の両方が行数×48に一致することも検査した。
+これにより、Fitsだけでは検出できない高さ予算への行間の二重加算も検出する。関連overflow検査58件成功（1ignored）。
 表示モード popup は通常／抽出一覧／本の構成状態を、1800pt／260ptの高さで描く。
 既存のズーム／フィット popup の検査も共通 helper へ接続し、実枠の自然高検査を維持した。
 

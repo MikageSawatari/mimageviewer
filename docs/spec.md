@@ -1785,6 +1785,16 @@ jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は�
 keymap 対象にする。最近開いたフォルダ履歴と A/B の記憶した場所 + 一覧位置のクリア、および
 ピン留めタグ 1〜20 番の付与/解除も、標準キーなしのサムネイル一覧コマンドとして割り当てできる。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+Shift+←/→、
 Ctrl+ホイールなど固定扱いの入力は従来どおり。
+
+ページめくりアニメーションのON/OFFも「その他の機能」の固定順に表示する。
+環境設定と同じ `Settings.page_turn_animation_enabled` が唯一の設定ownerで、通常/F12から即反映・保存する。
+HUD/任意キーの保存は既存overflowのナビゲータ設定と同じ同期 `Settings::save()` を再利用する（2026-10-11設計担当ClaudeCodeの判断）。専用async保存や別のdirty stateは追加しない。
+`FsPageTurnAnimationToggle` は `FsImage` / Press、既定キーなし。操作カスタマイズで割り当てるとHUDに先頭chordを表示する。
+overflowの表示項目カスタマイズや別のtoolbar/HUD設定は追加しない。
+評価用Stage 1では、通常単ページと二実頁の見開きの一枚を背から回し、perspective・頁の明暗・柔らかい影を付ける。LTR/RTL・進む/戻るに対応し、頁ごとの通常rect/UVを維持する。異寸法Pairはleafと同じprogressで背と各静止頁を平行移動し、incomingの通常配置へsnap無しで着地する。通常scanの背差だけで省略しない（2026-10-11利用者option A、page-turn plan §23）。紙の未知の裏はneutral paperで、画面背景を流用しない。有限pin枠はfullscreen予算10%（固定128 MiB cap撤去）、VRAM無制限時は1 GiBで、全資源のdedup/lease・memory_pressure省略は維持する。
+表紙のSideSingleと末尾Navigation＋FrontCoverSupplementの実画像Pairも対象にする。相方白紙とsplitのstepは理由付きinstant。local paged見開きではON中だけ先頭・末尾の単頁を本来の側に置き、環境設定と本別HUDの両端指定を実効値で無効化する。全体・本別の保存値は変更せず、OFFで表示・操作を復帰し、連結読み・Remoteには保存値を使う。通常の末尾・境界単独頁も配置と空slotを保持してめくる。単頁のサイズ差はold/new画像rectのunionを共通の黒paperとし、画像rect/UVを保持、下頁は静止、紙端の背を固定する（page-turn plan §26）。受理時の表示可能なresident素材（非AI通常画像・preview・thumbnailを含む）で開始し、final-onlyは撤回する。無素材・faithful表示制約・ROI不足・予算不足は理由付き瞬時切替。演出と着地flat採用までは同じ素材・geometryを保持し、その後通常表示のAI/高品質更新へ戻る。追加decode/uploadや品質待ちは行わない。見開きの新under-pageの外周は同じ時計の拡張clipで連続的に露出する。
+部分leafの採用は各頁のfirst-visible計測だけでnavigationを完了しない。自然終了/割込みはtarget全頁のcanonical flat採用後に完了し、割込みの一件は次の有効frameでinstant navigationする。通常一〜二frameの費用を持ち、turn完走待ちやOFF時の新queueは作らない。終了入力を先に解決し、commit後の正本から描画/入力情報と描画ownerを捕捉する。動画継続は旧canvas/footerを終了して既存媒体切替へ戻し、F12 independent stillの動画拒否を維持する。
+
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
 表示する。keymap 化済み操作は現在の実割り当てで表示し、Esc / 矢印など当面固定扱いの
 操作は固定キーとして補助表示する。キー未設定または明示無効化中の割り当て可能操作は、
@@ -2369,6 +2379,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 先読み枚数の設定上限が前後とも 10 枚なので、上限まで増やしても行が伸び続けない。ホバー時は全対象の状態別件数を表示する。OFF にしても先読み処理は続ける。処理状況も OFF のとき、表示する行も点表示もなければ左下の枠自体を描画しない |
 | `downscale_smoothing_percent` | u32 | 0 | 通常静止画の「縮小時のなめらかさ」。0〜100・10刻みに正規化し、Lanczos3 の blur 1.00〜1.30 へ対応させる。全画像・全ウィンドウ共通 |
 | `anime_upscale_source_limit` | AnimeUpscaleSourceLimit | Px4096 | 「アニメ塗り拡大」を適用する可視元領域の長辺上限。2048px / 4096px / 制限なし。上限ちょうどは処理し、超過時は標準拡大へフォールバックする |
+| `page_turn_animation_enabled` | bool | false | 評価中のPC静止画ページめくり。環境設定 → 表示 → 閲覧表示と上部HUDの「その他の機能」で同じ値を変更する。通常/F12共通で即反映・保存。単発の表示可能なresident隣接単ページ/LTR・RTL見開きとslideshowが対象。見開きの横長一画像は中央を背に左右の半面をめくり、通常の末尾・境界単独頁は配置と空slotを保持する。ON中のlocal pagedでは先頭・末尾を本来の側へ実効配置し、環境設定と本別HUDの両端指定は実効値で無効化、保存値は変更しない。OFFで保存値の表示・操作へ戻る。補助表紙付き末尾の二実画像Pairも対象。連打・読込待ち・連結読み、動画・音楽・Remoteには適用しない |
+| `page_turn_animation_duration_ms` | u32 | 200 | 評価用の「時間（仮）」、100〜600ms。最終時間は動きを見てから採択する。HUDのON/OFFはこの値を変更しない。slideshowのintervalまたはdeadline残時間が選択時間より短ければ演出を省略し、intervalを延長しない |
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |
 | `still_seek_strip_locked` | bool | false | 静止画のサムネイル列を固定表示する。ON は下部ページシークバー固定を含意し、列表示中はバーと列を画像フィット範囲から除外する。列を閉じると OFF になる |
 | `still_seek_strip_visible` | bool | false | 静止画ページシークバーの source page サムネイル列を表示する |

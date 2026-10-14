@@ -15,6 +15,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     latency             seq ごとに input → *.ready / *.paint のレイテンシを集計
     page-turn [--check] キーリピート中の通過/実体化ページ数を集計。
                         --check でページ送りの不変条件を検査
+    page-turn-animation [--check] 紙めくりの開始率・完走率・可視提示・保持量を集計
     test-script-input [--check]
                         合成 hold の振動・repeat 蓄積の観測事実を検査
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
@@ -360,6 +361,260 @@ def cmd_latency(events: list[dict]) -> None:
 # -----------------------------------------------------------------------
 # page-turn
 # -----------------------------------------------------------------------
+
+PAGE_TURN_ANIMATION_PROFILES = (
+    "single", "spread_ltr", "spread_rtl", "f12_single", "f12_spread_ltr", "f12_spread_rtl",
+)
+PAGE_TURN_ANIMATION_KINDS = {
+    "opportunity", "offered", "start", "skip", "cancel", "finish",
+    "first_visible", "fully_visible", "frame",
+}
+
+
+def _animation_number(value) -> float | None:
+    return float(value) if type(value) in (float, int) and math.isfinite(value) and value >= 0 else None
+
+
+def analyze_page_turn_animation(
+    events: list[dict], *, profile: str | None = None, run_id: str | None = None,
+    required_profiles: tuple[str, ...] = PAGE_TURN_ANIMATION_PROFILES,
+    delivery: dict | None = None,
+) -> dict:
+    """Separate usability evidence from the existing page-turn I1--I5 gate.
+
+    A replay does not create another operation: context/window/operation_id own
+    one set of lifecycle receipts. run_id is a measurement label, never input_seq.
+    Profiles absent from a trace remain required unless explicitly scoped by CLI.
+    """
+    rows = [e for e in events if e.get("cat") == "page_turn_animation"]
+    delivery = delivery if delivery is not None else validate_delivery(events)
+    incomplete = list(delivery["reasons"])
+    failures = []
+    # Delivery identities are globally minted at the input owner. Destination
+    # is bound later; input_seq and the accepted-navigation timestamp cannot
+    # reconstruct an arrival. Replay retains the first original ingress.
+    ingress = {}
+    for event in events:
+        if event.get("cat") != "input" or event.get("kind") != "key_edge_ingress":
+            continue
+        operation_id = event.get("operation_id")
+        timestamp = _animation_number(event.get("t"))
+        if not isinstance(operation_id, str) or not operation_id or timestamp is None:
+            incomplete.append("Missing finite application-ingress timestamp/operation_id")
+            continue
+        if event.get("phase") == "release":
+            continue
+        ingress[operation_id] = min(timestamp, ingress.get(operation_id, timestamp))
+    operations = {}
+    for event in rows:
+        kind = event.get("kind")
+        if kind not in PAGE_TURN_ANIMATION_KINDS:
+            incomplete.append(f"Unknown animation event kind: {kind}")
+            continue
+        if _animation_number(event.get("t")) is None:
+            incomplete.append("Missing finite animation event timestamp")
+            continue
+        identity = tuple(event.get(field) for field in ("context", "window", "operation_id"))
+        if any(not isinstance(value, str) or not value for value in identity):
+            incomplete.append("Missing string context/window/operation_id correlation")
+            continue
+        operation = operations.setdefault(identity, {"events": defaultdict(list)})
+        operation["events"][kind].append(event)
+
+    groups = {}
+    excluded = Counter()
+    for identity, operation in operations.items():
+        phases = operation["events"]
+        opportunity = phases.get("opportunity", [])
+        if not opportunity:
+            if phases.get("start"):
+                incomplete.append(f"{identity}: start without opportunity")
+            for event in phases.get("skip", [])[:1]:
+                reason = event.get("reason")
+                excluded[reason if isinstance(reason, str) and reason else "unknown"] += 1
+                if not isinstance(reason, str) or not reason:
+                    incomplete.append(f"{identity}: excluded skip without reason")
+            continue
+        first = opportunity[0]
+        operation_profile = first.get("profile", profile)
+        operation_run = first.get("run_id", run_id)
+        if not isinstance(operation_profile, str) or not operation_profile:
+            incomplete.append(f"{identity}: missing measurement profile")
+            operation_profile = "unknown"
+        if not isinstance(operation_run, str) or not operation_run:
+            incomplete.append(f"{identity}: missing measurement run_id")
+            operation_run = "unknown"
+        group_key = (operation_profile, identity[0], identity[1])
+        group = groups.setdefault(group_key, {
+            "profile": operation_profile, "context": identity[0], "window": identity[1],
+            "counts": Counter(), "runs": Counter(), "skip_reasons": Counter(),
+            "metrics": defaultdict(list),
+        })
+        counts = group["counts"]
+        group["runs"][operation_run] += 1
+        counts["opportunities"] += 1
+        for kind, label in (("offered", "offered"), ("start", "started"), ("finish", "finished"),
+                            ("cancel", "cancelled"), ("skip", "skipped")):
+            counts[label] += bool(phases.get(kind))
+        started, finished, cancelled, skipped = [bool(phases.get(kind)) for kind in ("start", "finish", "cancel", "skip")]
+        if started and not (finished or cancelled):
+            failures.append(f"{identity}: unfinished start")
+        if finished and cancelled or skipped and started:
+            failures.append(f"{identity}: conflicting terminal receipts")
+        if started:
+            start_t = min(event["t"] for event in phases["start"])
+            if phases.get("offered") and min(event["t"] for event in phases["offered"]) > start_t:
+                failures.append(f"{identity}: start before offered receipt")
+            terminal = phases.get("finish", []) + phases.get("cancel", [])
+            if terminal:
+                terminal_t = min(event["t"] for event in terminal)
+                if terminal_t < start_t:
+                    failures.append(f"{identity}: terminal before start")
+                if any(event["t"] > terminal_t for event in phases.get("frame", [])):
+                    failures.append(f"{identity}: animation frame after terminal")
+        if (finished or cancelled) and not started:
+            incomplete.append(f"{identity}: terminal receipt without start")
+        if not (started or skipped or cancelled):
+            incomplete.append(f"{identity}: opportunity without admission outcome")
+        if started and not phases.get("offered"):
+            incomplete.append(f"{identity}: start without offered receipt")
+        if finished and any(not phases.get(kind) for kind in ("first_visible", "fully_visible")):
+            incomplete.append(f"{identity}: finish without both visibility receipts")
+        if skipped:
+            reason = phases["skip"][0].get("reason")
+            if not isinstance(reason, str) or not reason:
+                incomplete.append(f"{identity}: skip without reason")
+                reason = "unknown"
+            group["skip_reasons"][reason] += 1
+
+        # Lifecycle timings are counted once per operation. Frame timings use the
+        # emitted frame identity, or exact timestamp for older diagnostic builds.
+        ready = _animation_number(first.get("resource_ready_t", first.get("t")))
+        for kind in ("first_visible", "fully_visible"):
+            if phases.get(kind):
+                receipt = phases[kind][0]
+                visible = _animation_number(receipt.get("t"))
+                elapsed = None
+                if ready is not None and visible is not None:
+                    # Output-hook receipt time is the submission boundary.
+                    # Runtime elapsed_ms starts at accepted navigation, so it
+                    # must never override known ready/submission timestamps.
+                    if visible >= ready:
+                        elapsed = (visible - ready) * 1000
+                elif receipt.get("clock_origin") == "resource_ready":
+                    elapsed = _animation_number(receipt.get("elapsed_ms"))
+                elif ready is None and receipt.get("clock_origin") is None:
+                    # Older ready-relative diagnostic receipts without an
+                    # original timestamp remain compatible. An explicitly
+                    # accepted-navigation origin is never a ready duration.
+                    elapsed = _animation_number(receipt.get("elapsed_ms"))
+                if elapsed is None:
+                    incomplete.append(f"{identity}: missing {kind} timing")
+                else:
+                    group["metrics"][f"ready_to_{kind}_ms"].append(elapsed)
+        accepted = _animation_number(first.get("accepted_t", first.get("t")))
+        if accepted is not None and ready is not None and ready >= accepted:
+            group["metrics"]["accepted_to_resource_ready_ms"].append((ready - accepted) * 1000)
+        input_t = ingress.get(identity[2])
+        if input_t is None or ready is None or ready < input_t:
+            incomplete.append(f"{identity}: missing valid application-ingress-to-ready timing")
+        else:
+            group["metrics"]["application_ingress_to_resource_ready_ms"].append((ready - input_t) * 1000)
+            for kind in ("first_visible", "fully_visible"):
+                if phases.get(kind):
+                    visible = _animation_number(phases[kind][0].get("t"))
+                    if visible is None or visible < input_t:
+                        incomplete.append(f"{identity}: missing valid application-ingress-to-{kind} timing")
+                    else:
+                        group["metrics"][f"application_ingress_to_{kind}_ms"].append((visible - input_t) * 1000)
+        frame_rows = phases.get("frame", [])
+        seen_frames = set()
+        samples = []
+        for event in frame_rows:
+            frame_key = event.get("frame_id", event.get("n", event.get("t")))
+            if not isinstance(frame_key, (str, int, float)):
+                incomplete.append(f"{identity}: frame without identity/time")
+                continue
+            if frame_key in seen_frames:
+                continue
+            seen_frames.add(frame_key)
+            samples.append(event)
+        if not samples:
+            samples = phases.get("start", [])[:1]
+        for event in samples:
+            for metric in ("mesh_cpu_ms", "retain_bytes"):
+                value = _animation_number(event.get(metric))
+                if value is None:
+                    incomplete.append(f"{identity}: missing {metric}")
+                else:
+                    group["metrics"][metric].append(value)
+
+    profiles_present = {key[0] for key in groups}
+    for required in required_profiles:
+        if required not in profiles_present:
+            incomplete.append(f"Missing required warm profile: {required}")
+        if required.startswith("f12_") and sum(key[0] == required for key in groups) < 2:
+            incomplete.append(f"{required}: requires two reader contexts/windows")
+    reports = []
+    for key, group in sorted(groups.items()):
+        counts = {label: group["counts"][label] for label in
+                  ("opportunities", "offered", "started", "finished", "cancelled", "skipped")}
+        opportunities, started = counts["opportunities"], counts["started"]
+        start_ratio = started / opportunities
+        finish_ratio = counts["finished"] / started if started else None
+        if not started or not counts["finished"]:
+            failures.append(f"{key}: no actual start/finish (all-skip is not success)")
+        if start_ratio < 0.90 or finish_ratio is not None and finish_ratio < 0.95:
+            failures.append(f"{key}: start/finish ratio below 90%/95%")
+        complete_runs = [run for run, count in group["runs"].items() if run != "unknown" and count >= 30]
+        if len(complete_runs) < 3:
+            incomplete.append(f"{key}: need three runs with at least 30 opportunities each")
+        if any(count < 30 for count in group["runs"].values()):
+            incomplete.append(f"{key}: a measured run has fewer than 30 opportunities")
+        reports.append({
+            "profile": group["profile"], "context": group["context"], "window": group["window"],
+            **counts, "started_ratio": start_ratio, "finished_ratio": finish_ratio,
+            "runs": dict(group["runs"]),
+            "skip_reasons": {reason: {"count": count, "ratio": count / opportunities}
+                             for reason, count in sorted(group["skip_reasons"].items())},
+            "metrics": {metric: {"samples": len(values), "p50": percentile(values, .50),
+                                  "p95": percentile(values, .95), "p99": percentile(values, .99),
+                                  "max": max(values)}
+                        for metric, values in group["metrics"].items()},
+        })
+    if not groups:
+        incomplete.append("No animation opportunities")
+    # Incomplete delivery cannot prove an unfinished product operation; proven
+    # lifecycle/usability failures otherwise take precedence over sample coverage.
+    status = "CannotJudge" if delivery["reasons"] else "fail" if failures else "CannotJudge" if incomplete else "pass"
+    return {"status": status, "profiles": reports, "excluded_reasons": dict(excluded),
+            "failures": failures, "incomplete": list(dict.fromkeys(incomplete)),
+            "required_profiles": list(required_profiles), "delivery": delivery,
+            "input_time_basis": "application_ingress",
+            "visibility_time_basis": "accepted_egui_output_submission_not_os_present"}
+
+
+def cmd_page_turn_animation(events: list[dict], args, delivery: dict | None = None) -> int:
+    report = analyze_page_turn_animation(events, profile=args.profile, run_id=args.run_id,
+                                        required_profiles=tuple(args.required_profile or PAGE_TURN_ANIMATION_PROFILES),
+                                        delivery=delivery)
+    print(f"page-turn-animation: status={report['status']}")
+    print("  timing: application ingress -> accepted egui output submission (not hardware input/OS present)")
+    for group in report["profiles"]:
+        print(f"  {group['profile']} context={group['context']} window={group['window']}: "
+              + " ".join(f"{key}={group[key]}" for key in
+                         ("opportunities", "offered", "started", "finished", "cancelled", "skipped")))
+        print(f"    started/opportunities={group['started_ratio']:.1%} "
+              + (f"finished/started={group['finished_ratio']:.1%}" if group['finished_ratio'] is not None else "finished/started=N/A")
+              + f" runs={group['runs']}")
+        print(f"    skips={group['skip_reasons']} metrics={group['metrics']}")
+    print(f"  excluded (outside opportunity denominator): {report['excluded_reasons']}")
+    for reason in report["failures"] + report["incomplete"]:
+        print(f"  {reason}")
+    if args.json_out is not None:
+        args.json_out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return (2 if report["status"] == "CannotJudge" else 1 if report["status"] == "fail" else 0) if args.check else 0
+
 
 def analyze_page_turn(events: list[dict]) -> dict:
     """Group pass-through readiness events into keyboard-hold bursts.
@@ -3676,6 +3931,13 @@ def main() -> None:
         action="store_true",
         help="ページ送りのトレース不変条件 I1-I5 を検査する",
     )
+    p_animation = subs.add_parser("page-turn-animation")
+    p_animation.add_argument("--check", action="store_true", help="失敗は1、証拠不足は2を返す")
+    p_animation.add_argument("--profile", default=None, help="ログにprofileがない場合の測定条件名")
+    p_animation.add_argument("--run-id", default=None, help="ログにrun_idがない場合の測定run名")
+    p_animation.add_argument("--required-profile", action="append", default=None,
+                             help="明示する評価範囲（複数指定可）。省略時は全必須warm profile")
+    p_animation.add_argument("--json-out", type=Path, default=None)
     p_test_script_input = subs.add_parser("test-script-input")
     p_test_script_input.add_argument(
         "--check",
@@ -3746,7 +4008,7 @@ def main() -> None:
     p_tl = subs.add_parser("timeline")
     p_tl.add_argument("seq", type=int, nargs="?", default=None)
     p_scroll = subs.add_parser("scroll")
-    for gate_parser in (p_startup, p_scroll, p_hit, p_idle):
+    for gate_parser in (p_startup, p_scroll, p_hit, p_idle, p_animation):
         gate_parser.add_argument("--checkpoint-id", default=None)
         gate_parser.add_argument("--coverage-end-t", type=float, default=None)
         gate_parser.add_argument("--delivery-ack", type=Path, default=None)
@@ -3765,7 +4027,7 @@ def main() -> None:
 
     if not args.jsonl.is_file():
         print(f"ファイルが見つかりません: {args.jsonl}", file=sys.stderr)
-        if args.cmd in ("idle-health", "hitches", "scroll", "startup"):
+        if args.cmd in ("idle-health", "hitches", "scroll", "startup", "page-turn-animation"):
             print("CannotJudge: missing perf evidence")
             sys.exit(2)
         sys.exit(1)
@@ -3773,7 +4035,7 @@ def main() -> None:
     events = load_events(args.jsonl)
     delivery = None
     delivery_ack = None
-    if args.cmd in ("idle-health", "hitches", "scroll", "startup"):
+    if args.cmd in ("idle-health", "hitches", "scroll", "startup", "page-turn-animation"):
         if args.delivery_manifest is not None:
             try:
                 manifest = json.loads(args.delivery_manifest.read_text(encoding="utf-8-sig"))
@@ -3840,6 +4102,8 @@ def main() -> None:
         cmd_page_turn(events)
         if args.check:
             sys.exit(cmd_page_turn_check(events))
+    elif args.cmd == "page-turn-animation":
+        sys.exit(cmd_page_turn_animation(events, args, delivery))
     elif args.cmd == "display-integrity":
         sys.exit(cmd_display_integrity(events, args.check))
     elif args.cmd == "test-script-input":

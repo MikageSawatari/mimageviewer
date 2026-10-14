@@ -7324,11 +7324,23 @@ fn spread_cache_token_tracks_every_pairing_input() {
 fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
     let mut app = phase_c_support::setup_app();
     app.items_generation = 5;
-    app.page_dims_cache.record(5, 0, (1800, 1100));
+    app.page_dims_cache.record(
+        5,
+        0,
+        crate::page_dims::PagePixelDimensions::Canonical(
+            crate::page_dims::CanonicalPageDimensions::new(1800, 1100),
+        ),
+    );
 
     app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
         detached.items_generation = 5;
-        detached.page_dims_cache.record(5, 0, (900, 1400));
+        detached.page_dims_cache.record(
+            5,
+            0,
+            crate::page_dims::PagePixelDimensions::Canonical(
+                crate::page_dims::CanonicalPageDimensions::new(900, 1400),
+            ),
+        );
     });
 
     let detached_dims = app
@@ -17367,6 +17379,7 @@ mod phase_c_key_tests {
     #[cfg(windows)]
     fn root_right_edge(pressed: bool) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x27,
@@ -39086,7 +39099,14 @@ mod favorite_adjustment_defaults_tests {
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
         app.local_adjust_spread_ctx = None;
-        app.enter_local_adjust_mode();
+        insert_export_static_source(
+            &mut app,
+            &egui::Context::default(),
+            target_idx,
+            [4, 6],
+            "page-edit-pivot-original",
+        );
+        app.enter_local_adjust_mode(&egui::Context::default());
         assert!(app.local_adjust_mode, "モードは立つ");
         assert_eq!(
             app.spread_mode,
@@ -48086,7 +48106,7 @@ mod favorite_adjustment_defaults_tests {
         app.post_filter_bypassed = true;
         app.input_generation.insert(idx, 7);
 
-        let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let (_tx, rx) = std::sync::mpsc::channel::<crate::ui_erase::EraseInpaintResult>();
         let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let key = EraseInpaintPendingKey {
@@ -48108,8 +48128,7 @@ mod favorite_adjustment_defaults_tests {
                 started_at: std::time::Instant::now(),
                 input_generation: 7,
                 mask_generation: 0,
-                log_prefix: "test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit { origin: "test" },
             },
         );
 
@@ -48141,7 +48160,7 @@ mod favorite_adjustment_defaults_tests {
         app.post_filter_bypassed = true;
         app.input_generation.insert(idx, 11);
 
-        let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let (_tx, rx) = std::sync::mpsc::channel::<crate::ui_erase::EraseInpaintResult>();
         let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let key = EraseInpaintPendingKey {
@@ -48163,8 +48182,7 @@ mod favorite_adjustment_defaults_tests {
                 started_at: std::time::Instant::now(),
                 input_generation: 11,
                 mask_generation: 0,
-                log_prefix: "test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit { origin: "test" },
             },
         );
 
@@ -48218,7 +48236,7 @@ mod favorite_adjustment_defaults_tests {
         let erase_pixels =
             insert_current_erase_result_cache(&mut app, &ctx, idx, "conceal_enter_erase_result");
 
-        app.enter_conceal_mode(idx);
+        app.enter_conceal_mode(&egui::Context::default(), idx);
 
         for _ in 0..200 {
             app.poll_local_adjust_render(&ctx);
@@ -50241,6 +50259,7 @@ mod favorite_adjustment_defaults_tests {
         let _owner = app.keyboard_owner_for_pass(&ctx);
         crate::key_input::set_test_frame(vec![
             crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
@@ -50253,6 +50272,7 @@ mod favorite_adjustment_defaults_tests {
                 alt: false,
             },
             crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
@@ -50650,7 +50670,7 @@ mod favorite_adjustment_defaults_tests {
         let mut app = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {
-            let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+            let (_tx, rx) = std::sync::mpsc::channel::<crate::ui_erase::EraseInpaintResult>();
             let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
             EraseInpaintPending {
                 idx,
@@ -50663,8 +50683,7 @@ mod favorite_adjustment_defaults_tests {
                 started_at: std::time::Instant::now(),
                 input_generation: 0,
                 mask_generation: 0,
-                log_prefix: "test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit { origin: "test" },
             }
         };
         let commit_key = |idx| EraseInpaintPendingKey {
@@ -50726,6 +50745,11 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
         app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
+        let source_ctx = egui::Context::default();
+        insert_export_static_source(&mut app, &source_ctx, 1, [4, 6], "switch_ready_source");
+        app.show_whats_new = false;
+        app.show_mouse_nav_migration_prompt = false;
+        app.network_data_dir_notice = None;
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single;
         app.local_adjust_mode = true;
@@ -50747,7 +50771,7 @@ mod favorite_adjustment_defaults_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(Vec::new()));
         app.local_adjust_selective_color_pick_active = true;
 
-        app.switch_local_adjust_target_in_spread(1);
+        app.switch_local_adjust_target_in_spread(&egui::Context::default(), 1);
 
         assert_eq!(app.fullscreen_idx, Some(1), "右ページへ切り替わる");
         assert_eq!(
@@ -50785,7 +50809,7 @@ mod favorite_adjustment_defaults_tests {
 
         // 同じページへの切替は何もしない。
         app.local_adjust_selected_shape = Some(2);
-        app.switch_local_adjust_target_in_spread(1);
+        app.switch_local_adjust_target_in_spread(&egui::Context::default(), 1);
         assert_eq!(
             app.local_adjust_selected_shape,
             Some(2),
@@ -50804,6 +50828,11 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
         app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
+        let source_ctx = egui::Context::default();
+        insert_export_static_source(&mut app, &source_ctx, 1, [4, 6], "switch_ready_source");
+        app.show_whats_new = false;
+        app.show_mouse_nav_migration_prompt = false;
+        app.network_data_dir_notice = None;
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single; // 消しゴム中
         app.erase_spread_ctx = Some(crate::app::PageEditSpreadPivot {
@@ -50864,8 +50893,14 @@ mod favorite_adjustment_defaults_tests {
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
         app.thumbnails = vec![ThumbnailState::Pending; 2];
+        let source_ctx = egui::Context::default();
+        insert_export_static_source(&mut app, &source_ctx, 1, [4, 6], "switch_ready_source");
+        app.show_whats_new = false;
+        app.show_mouse_nav_migration_prompt = false;
+        app.network_data_dir_notice = None;
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single;
+        app.conceal_mode = true;
         app.conceal_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
@@ -50885,7 +50920,14 @@ mod favorite_adjustment_defaults_tests {
             }),
         }));
 
-        app.switch_conceal_target_in_spread(1);
+        app.switch_conceal_target_in_spread(&source_ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.local_adjust_pending.is_empty() {
+            app.frame_counter += 1;
+            app.poll_local_adjust_render(&source_ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
 
         assert_eq!(app.fullscreen_idx, Some(1));
         assert_eq!(app.spread_mode, SpreadMode::Single);
@@ -52023,6 +52065,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: pixels.size,
                 pixels: Arc::clone(&pixels),
                 texture,
@@ -52159,6 +52202,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: pixels.size,
                 pixels,
                 texture: final_tex,
@@ -52172,6 +52216,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new(
                     [1, 1],
@@ -52987,6 +53032,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: edit_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
                 texture: provisional,
@@ -53001,6 +53047,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(ai_key, pending);
         final_ai_tx
             .send(FinalAiResult::Ready {
+                canonical_dims: None,
                 job_id: 0,
                 key: ai_key,
                 retained_key: None,
@@ -53059,6 +53106,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                canonical_dims: None,
                 source_size: edit_pixels.size,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: final_effect_rx,
@@ -53136,6 +53184,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: cached_pixels.size,
                 pixels: cached_pixels,
                 texture: cached_texture,
@@ -53164,6 +53213,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                canonical_dims: None,
                 source_size: source.size,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: prefetch_rx,
@@ -53224,6 +53274,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: provisional_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
                 texture: provisional,
@@ -53241,6 +53292,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: final_effect_rx,
@@ -53293,6 +53345,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: complete_pixels.size,
                 pixels: complete_pixels,
                 texture: complete,
@@ -53369,6 +53422,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
@@ -53414,6 +53468,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
@@ -56175,6 +56230,7 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(ready_key, pending);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key: ready_key,
             retained_key: None,
@@ -56199,6 +56255,7 @@ mod pipeline_cache_refactor_tests {
         // (3) Unknown: pending に無い key の Ready → 捨てる (cache に入らない)
         let unknown_key = mk_key(2);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key: unknown_key,
             retained_key: None,
@@ -56313,6 +56370,7 @@ mod pipeline_cache_refactor_tests {
         };
         app.retained_final_ai_orphans.insert(key, 0);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key,
             retained_key: Some(retained_key.clone()),
@@ -56370,6 +56428,7 @@ mod pipeline_cache_refactor_tests {
         let (new_pending, _cancel) = make_fake_final_ai_pending_with_job_id(2);
         app.final_ai_pending.insert(key, new_pending);
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 1,
             key,
             retained_key: Some(retained_key.clone()),
@@ -56433,6 +56492,7 @@ mod pipeline_cache_refactor_tests {
         app.retained_final_ai_orphans.insert(key, 0);
         app.clear_retained_final_ai_cache("test_epoch_bump");
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 0,
             key,
             retained_key: Some(retained_key.clone()),
@@ -56737,6 +56797,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             effect_key,
             FinalEffectPending {
+                canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::clone(&effect_cancel),
                 rx: effect_rx,
@@ -56793,6 +56854,7 @@ mod pipeline_cache_refactor_tests {
             app.final_effect_pending.insert(
                 key,
                 FinalEffectPending {
+                    canonical_dims: None,
                     source_size: [1, 1],
                     cancel: Arc::new(AtomicBool::new(false)),
                     rx,
@@ -57296,6 +57358,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: monochrome.size,
                 pixels: Arc::clone(&monochrome),
                 texture: final_texture,
@@ -58831,6 +58894,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             base_key,
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
                 used_upscale: true,
@@ -58867,6 +58931,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
                 texture: tex.clone(),
@@ -58979,6 +59044,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                canonical_dims: None,
                 source_size: pending.source_size,
                 cancel: pending.cancel,
                 rx,
@@ -59093,6 +59159,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             current_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: current_pixels.size,
                 pixels: current_pixels,
                 texture: current_texture,
@@ -59141,6 +59208,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             target_final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: prefetched_pixels.size,
                 pixels: prefetched_pixels,
                 texture: prefetched_texture,
@@ -59684,6 +59752,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             ai_key,
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(ai_image.clone()),
                 used_upscale: true,
@@ -59723,6 +59792,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             dn_key,
             FinalAiEntry {
+                canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(dn_image.clone()),
                 used_upscale: false,
@@ -60140,6 +60210,7 @@ mod pipeline_display_edit_split_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size: image.size,
                 pixels: Arc::new(image),
                 texture,
@@ -65859,18 +65930,24 @@ mod still_window_mode_key_tests {
         repeat: bool,
         modifiers: egui::Modifiers,
     ) {
+        // Backend delivery enters RawInput before egui begins the pass. Seed
+        // the existing level for explicit-repeat fixtures; egui normalizes
+        // repeat from that level rather than trusting the event flag.
+        if repeat {
+            ctx.input_mut(|input| {
+                input.keys_down.insert(key);
+            });
+        }
         ctx.begin_pass(egui::RawInput {
             modifiers,
-            ..Default::default()
-        });
-        ctx.input_mut(|i| {
-            i.events.push(egui::Event::Key {
+            events: vec![egui::Event::Key {
                 key,
                 physical_key: None,
                 pressed: true,
                 repeat,
                 modifiers,
-            });
+            }],
+            ..Default::default()
         });
     }
 
@@ -71206,8 +71283,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 started_at: std::time::Instant::now(),
                 input_generation: 0,
                 mask_generation: 0,
-                log_prefix: "context-retire-test",
-                is_preview: false,
+                purpose: crate::ui_erase::EraseInpaintPurpose::Commit {
+                    origin: "context-retire-test",
+                },
             },
         );
     }
@@ -80432,6 +80510,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             );
         });
         tx.send(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 99,
             key,
             retained_key: None,
@@ -98089,6 +98168,7 @@ fn fullscreen_test_key_edge(
     repeat: bool,
 ) -> crate::key_input::KeyEdge {
     crate::key_input::KeyEdge {
+        operation_id: crate::key_input::KeyOperationId::unassigned(),
         source_hwnd: 1,
         source_viewport: egui::ViewportId::ROOT,
         virtual_key,

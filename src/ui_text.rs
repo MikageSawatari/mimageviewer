@@ -1984,6 +1984,7 @@ impl App {
         let Some(key) = self.page_path_key(target_idx) else {
             return;
         };
+        self.cancel_original_material_entry_intents(None);
 
         if let Some(pivot) = pivot {
             self.text_spread_ctx = Some(pivot);
@@ -2075,6 +2076,7 @@ impl App {
     }
 
     pub(crate) fn reset_text_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         let was_text_mode = self.text_mode;
         self.commit_text_page();
 

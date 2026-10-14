@@ -31,8 +31,8 @@ use std::time::Instant;
 use crate::final_composite::FinalCompositeTiming;
 use crate::final_composite::{
     FinalCompositePlan, FinalCompositeResult, active_favorite_default_id_for_path,
-    build_final_composite_plan_without_ai, execute_final_composite,
-    final_composite_colorize_applies, resolve_effective_params,
+    build_final_composite_plan_after_ai, build_final_composite_plan_without_ai,
+    execute_final_composite, final_composite_colorize_applies, resolve_effective_params,
 };
 use crate::keymap::{
     CommandScope, EXTERNAL_TOOL_ACTIONS, KeyAction, LOCATION_NAVIGATION_ACTIONS,
@@ -5444,13 +5444,35 @@ pub(crate) enum LocalAdjustRenderResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalMaterializeContinuation {
     Display,
-    EnterConceal { requested_fs_idx: usize },
+    EnterConceal {
+        requested_fs_idx: usize,
+    },
+    SwitchConceal {
+        request: PageEditTargetSwitchRequest,
+    },
+    ResumeAfterDisplaySwitchConceal {
+        request: PageEditTargetSwitchRequest,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConcealMaterializePurpose {
     Display,
-    EnterMode { requested_fs_idx: usize },
+    EnterMode {
+        requested_fs_idx: usize,
+    },
+    Switch {
+        request: PageEditTargetSwitchRequest,
+    },
+    ResumeAfterDisplaySwitch {
+        request: PageEditTargetSwitchRequest,
+    },
+}
+
+impl ConcealMaterializePurpose {
+    fn entry_mask(self) -> bool {
+        matches!(self, Self::EnterMode { .. } | Self::Switch { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5470,6 +5492,32 @@ pub(crate) struct EditMaterializeRequest {
     pub(crate) items_generation: u64,
     pub(crate) input_seq: u64,
     pub(crate) kind: EditMaterializeKind,
+}
+
+impl EditMaterializeRequest {
+    /// Operation continuations belong to the pending owner. The worker retains immutable
+    /// source/output identity, including its original input_seq, while a same-input join occurs.
+    fn same_worker_input(self, other: Self) -> bool {
+        self.items_generation == other.items_generation
+            && self.input_seq == other.input_seq
+            && match (self.kind, other.kind) {
+                (
+                    EditMaterializeKind::Local { key: a, .. },
+                    EditMaterializeKind::Local { key: b, .. },
+                ) => a == b,
+                (
+                    EditMaterializeKind::Conceal {
+                        key: a,
+                        purpose: ap,
+                    },
+                    EditMaterializeKind::Conceal {
+                        key: b,
+                        purpose: bp,
+                    },
+                ) => a == b && ap.entry_mask() == bp.entry_mask(),
+                _ => false,
+            }
+    }
 }
 
 pub(crate) enum EditMaterializePayload {
@@ -6041,7 +6089,8 @@ fn run_conceal_materialize(
     if matches!(
         request.kind,
         EditMaterializeKind::Conceal {
-            purpose: ConcealMaterializePurpose::EnterMode { .. },
+            purpose: ConcealMaterializePurpose::EnterMode { .. }
+                | ConcealMaterializePurpose::Switch { .. },
             ..
         }
     ) {
@@ -8563,13 +8612,122 @@ const ANIMATION_EXPANSION_PROGRESS_DELAY: std::time::Duration =
 pub(crate) enum FsLoadPurpose {
     Display,
     Prefetch,
+    Original {
+        entry: OriginalMaterialEntry,
+    },
+    ResumeAfterNormalLoad {
+        entry: OriginalMaterialEntry,
+        normal: FsNormalLoadPurpose,
+    },
     AnimationPromotion {
         target_idx: usize,
         started_at: std::time::Instant,
     },
 }
 
+/// The immutable worker contract of a load already issued before an operation joined it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsNormalLoadPurpose {
+    Display,
+    Prefetch,
+    AnimationPromotion {
+        target_idx: usize,
+        started_at: std::time::Instant,
+    },
+}
+
+impl FsNormalLoadPurpose {
+    const fn purpose(self) -> FsLoadPurpose {
+        match self {
+            Self::Display => FsLoadPurpose::Display,
+            Self::Prefetch => FsLoadPurpose::Prefetch,
+            Self::AnimationPromotion {
+                target_idx,
+                started_at,
+            } => FsLoadPurpose::AnimationPromotion {
+                target_idx,
+                started_at,
+            },
+        }
+    }
+}
+
+/// The existing load owns both materialization and the operation awaiting its pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginalMaterialEntry {
+    MaterialOnly,
+    Erase {
+        requested_fs_idx: usize,
+    },
+    Conceal {
+        requested_fs_idx: usize,
+    },
+    AutoCrop,
+    LocalAdjustment {
+        requested_fs_idx: usize,
+    },
+    ApplyEraseSlot {
+        requested_fs_idx: usize,
+        slot: usize,
+    },
+    ViewTrim {
+        request: crate::ui_view_trim::OriginalViewTrimRequest,
+    },
+    Switch {
+        request: PageEditTargetSwitchRequest,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageEditTargetSwitchTool {
+    Erase,
+    LocalAdjustment,
+    Conceal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PageEditTargetSwitchRequest {
+    pub(crate) tool: PageEditTargetSwitchTool,
+    pub(crate) from_idx: usize,
+    pub(crate) target_idx: usize,
+    pub(crate) pair: (usize, usize),
+}
+
 impl FsLoadPurpose {
+    const fn original_entry(self) -> Option<OriginalMaterialEntry> {
+        match self {
+            Self::Original { entry } | Self::ResumeAfterNormalLoad { entry, .. } => Some(entry),
+            _ => None,
+        }
+    }
+
+    fn with_original_entry(self, entry: OriginalMaterialEntry) -> Self {
+        match self {
+            Self::Original { .. } => Self::Original { entry },
+            Self::ResumeAfterNormalLoad { normal, .. } => {
+                Self::ResumeAfterNormalLoad { entry, normal }
+            }
+            Self::Display => Self::ResumeAfterNormalLoad {
+                entry,
+                normal: FsNormalLoadPurpose::Display,
+            },
+            Self::Prefetch => Self::ResumeAfterNormalLoad {
+                entry,
+                normal: FsNormalLoadPurpose::Prefetch,
+            },
+            Self::AnimationPromotion {
+                target_idx,
+                started_at,
+            } => Self::ResumeAfterNormalLoad {
+                entry,
+                normal: FsNormalLoadPurpose::AnimationPromotion {
+                    target_idx,
+                    started_at,
+                },
+            },
+        }
+    }
+
     pub(crate) fn for_page(is_current: bool) -> Self {
         if is_current {
             Self::Display
@@ -8580,8 +8738,11 @@ impl FsLoadPurpose {
 
     const fn animation_policy(self) -> AnimationPolicy {
         match self {
+            Self::ResumeAfterNormalLoad { normal, .. } => normal.purpose().animation_policy(),
             Self::Prefetch => AnimationPolicy::FirstFrameOnly,
-            Self::Display | Self::AnimationPromotion { .. } => AnimationPolicy::FullFrames,
+            Self::Display | Self::Original { .. } | Self::AnimationPromotion { .. } => {
+                AnimationPolicy::FullFrames
+            }
         }
     }
 
@@ -8590,16 +8751,25 @@ impl FsLoadPurpose {
         idx: usize,
     ) -> Option<std::time::Instant> {
         match self {
+            Self::ResumeAfterNormalLoad { normal, .. } => {
+                normal.purpose().animation_expansion_started_at_for(idx)
+            }
             Self::AnimationPromotion {
                 target_idx,
                 started_at,
             } if target_idx == idx => Some(started_at),
-            Self::Display | Self::Prefetch | Self::AnimationPromotion { .. } => None,
+            Self::Display
+            | Self::Prefetch
+            | Self::Original { .. }
+            | Self::AnimationPromotion { .. } => None,
         }
     }
 
     pub(crate) const fn promotion_started_at_for(self, idx: usize) -> Option<std::time::Instant> {
         match self {
+            Self::ResumeAfterNormalLoad { normal, .. } => {
+                normal.purpose().promotion_started_at_for(idx)
+            }
             Self::AnimationPromotion {
                 target_idx,
                 started_at,
@@ -10110,12 +10280,14 @@ pub(crate) struct RetainedFinalAiKey {
 
 #[derive(Clone)]
 pub(crate) struct FinalAiEntry {
+    pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) source_size: [usize; 2],
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) used_upscale: bool,
 }
 
 pub(crate) struct RetainedFinalAiEntry {
+    pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) used_upscale: bool,
     pub(crate) bytes: u64,
@@ -10151,6 +10323,7 @@ pub(crate) struct PdfPageMetadataSnapshot {
 }
 
 pub(crate) struct RetainedPdfPageEntry {
+    pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) metadata: Option<PdfPageMetadataSnapshot>,
     pub(crate) kind: RetainedPdfPageCacheKind,
     pub(crate) bytes: u64,
@@ -10176,6 +10349,7 @@ pub(crate) enum FsPageLoadState {
 pub(crate) enum FsPageDisplaySource {
     LiveCache,
     RetainedPdfFinalAi,
+    ResidentFinalComposite,
 }
 
 /// Which full-resolution work an explicit fullscreen open may start. A materialized page-turn
@@ -10396,6 +10570,7 @@ pub(crate) enum FinalAiResult {
     Ready {
         job_id: u64,
         key: FinalAiKey,
+        canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
         retained_key: Option<RetainedFinalAiKey>,
         retained_epoch: u64,
         source_size: [usize; 2],
@@ -10427,6 +10602,7 @@ pub(crate) enum AiJobPriority {
 /// 「UI THREAD HANG (推論ロック飢餓)」の止血になる (旧 per-job spawn 設計では
 /// UI スレッドが `is_loaded` / `load_model` を呼んでロックを待っていた)。
 pub(crate) struct AiJob {
+    pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) job_id: u64,
     pub(crate) key: FinalAiKey,
     pub(crate) priority: AiJobPriority,
@@ -11256,6 +11432,7 @@ impl<'a> IntoIterator for &'a FinalCompositeCache {
 }
 
 pub(crate) struct FinalCompositeEntry {
+    pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) source_size: [usize; 2],
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) texture: egui::TextureHandle,
@@ -12084,6 +12261,7 @@ pub(crate) struct ColorizeMonoSummary {
 }
 
 pub(crate) struct FinalEffectPending {
+    canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     source_size: [usize; 2],
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<FinalCompositeResult>,
@@ -17096,6 +17274,11 @@ pub struct App {
     pub(crate) fs_seek_overlay_visible: bool,
     /// 連結読み描画で最後に計算した raw/final/comic cache の保持対象。
     pub(crate) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    /// Accepted-output proof to notify the existing observer, owned by this context.
+    pub(crate) pending_fs_page_turn_ready: Option<crate::ui_fullscreen::PendingFsPageTurnReady>,
+    pub(crate) page_turn_presentation: crate::ui_fullscreen::PageTurnPresentation,
+    /// Process-wide weak resource inventory; never swapped with a viewer payload.
+    pub(crate) page_turn_leases: crate::ui_fullscreen::PageTurnLeaseInventory,
     /// 連結読みのページ別更新中表示。raw source 再読込や incomplete → complete の
     /// 再合成で live final が一時的に消えても、完成済みの差し替え先が届くまで保持する。
     pub(crate) continuous_page_transitions:
@@ -17154,8 +17337,9 @@ pub struct App {
         usize,
     )>,
     /// 分析パネル: ヒストグラムキャッシュ (zoom, pan, image_idx) → 結果
+    /// Keep the rarely used arrays off App's stack, without changing cache ownership.
     pub(crate) analysis_hist_cache:
-        Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
+        Option<Box<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>>,
     /// 分析パネル: SVマップキャッシュ
     pub(crate) analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
 
@@ -19157,6 +19341,9 @@ impl App {
         load_meta: crate::settings::SettingsLoadMeta,
         notify_book_query_change: impl Fn() + Send + Sync + 'static,
     ) -> Self {
+        crate::key_input::set_page_turn_ingress_instrumentation_enabled(
+            settings.page_turn_animation_enabled,
+        );
         let executor = Arc::new(
             crate::raw::RawDevelopExecutor::new(
                 settings.raw_develop_parallelism.clamp(1, 10) as usize
@@ -20457,6 +20644,9 @@ impl App {
             fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
+            pending_fs_page_turn_ready: None,
+            page_turn_presentation: Default::default(),
+            page_turn_leases: Default::default(),
             continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
@@ -52927,7 +53117,7 @@ impl App {
                 if let Some(dims) =
                     source_dims.or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
                 {
-                    self.record_page_dims_for_spread(i, dims);
+                    self.record_thumbnail_page_dims_for_spread(i, dims);
                 }
                 if let Some(dims) = layout_dims {
                     self.record_page_layout_dims_for_spread(i, dims);
@@ -64535,7 +64725,13 @@ impl App {
                     } else {
                         app.evict_adjustment_cache(fs_idx);
                     }
-                    app.prefetch_final_ai(ctx, fs_idx);
+                    let page_turn_decision = app.fs_page_turn_decision_for_frame(ctx, fs_idx);
+                    if page_turn_decision.admits_non_target_full_resolution_work() {
+                        app.reconcile_paged_prefetch_window(fs_idx);
+                        app.prefetch_final_ai(ctx, fs_idx);
+                    } else {
+                        app.poll_final_effects(ctx);
+                    }
                 }
 
                 app.keep_fullscreen_viewport_alive(ctx);
@@ -67523,6 +67719,7 @@ impl App {
     }
 
     pub(crate) fn cancel_superseded_fs_navigation_display_target(&mut self, idx: usize) {
+        self.cancel_original_material_entry_intents(Some(idx));
         let superseded = self
             .fs_holdover_tex
             .as_ref()
@@ -67989,7 +68186,8 @@ impl App {
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
                 if materialization.admits_navigation_target_materialization() {
-                    let load_state = self.ensure_fs_page_load_with_contract(idx, load_contract);
+                    let load_state =
+                        self.ensure_fs_display_page_load_with_contract(idx, load_contract);
                     if load_state.is_display_ready() {
                         crate::logger::log(format!("  cache hit idx={idx} → instant display"));
                     }
@@ -74278,6 +74476,7 @@ impl App {
     /// フルスクリーン表示中 (隠蔽加工モード外) で F9/F10 から呼ばれる。
     /// スロット N の隠蔽マスクを現ページへ差し替えて保存する。
     pub(crate) fn apply_conceal_slot_in_viewing_mode(&mut self, slot: usize) {
+        self.cancel_original_material_entry_intents(None);
         if self.is_overlay_edit_mode_active() {
             return;
         }
@@ -74313,6 +74512,7 @@ impl App {
 
     /// フルスクリーン表示中に適用済み消しゴムマスクを削除する。
     pub(crate) fn delete_erase_mask_in_viewing_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         if self.is_overlay_edit_mode_active() {
             return;
         }
@@ -74341,6 +74541,7 @@ impl App {
 
     /// フルスクリーン表示中に適用済み隠蔽マスクを削除する。
     pub(crate) fn delete_conceal_mask_in_viewing_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         if self.is_overlay_edit_mode_active() {
             return;
         }
@@ -75192,6 +75393,340 @@ impl App {
         self.start_fs_load_with_contract(idx, FsPageLoadContract::Sequential);
     }
 
+    /// Request original pixels through the existing pending/upload owner. Completed display
+    /// material is preserved until the requested operation performs a real edit.
+    pub(crate) fn ensure_original_material_for_entry(
+        &mut self,
+        idx: usize,
+        entry: OriginalMaterialEntry,
+    ) -> bool {
+        if entry != OriginalMaterialEntry::MaterialOnly {
+            self.cancel_original_material_entry_intents(None);
+        }
+        if self.current_raw_source_pixels(idx).is_some() {
+            return true;
+        }
+        if entry == OriginalMaterialEntry::MaterialOnly
+            && matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed))
+        {
+            return false;
+        }
+        let purpose = FsLoadPurpose::Original { entry };
+        if let Some(pending) = self.fs_pending.get_mut(&idx) {
+            if entry != OriginalMaterialEntry::MaterialOnly
+                || pending.purpose.original_entry().is_none()
+            {
+                pending.purpose = pending.purpose.with_original_entry(entry);
+            }
+            return false;
+        }
+        if let Some(upload) = self
+            .fs_upload_backlog
+            .iter_mut()
+            .find(|upload| upload.idx == idx)
+        {
+            if entry != OriginalMaterialEntry::MaterialOnly
+                || upload.purpose.original_entry().is_none()
+            {
+                upload.purpose = upload.purpose.with_original_entry(entry);
+            }
+            return false;
+        }
+        if self.is_raw_page(idx) {
+            return false;
+        }
+        self.start_fs_load_with_purpose(
+            idx,
+            purpose,
+            FsPageLoadContract::Sequential,
+            crate::video::PlaybackStartOrigin::NewSource,
+        );
+        false
+    }
+
+    /// Cancel the continuation only; its context-owned hydration may still populate raw cache.
+    pub(crate) fn cancel_original_material_entry_intents(
+        &mut self,
+        keep_requested_idx: Option<usize>,
+    ) {
+        let clear = |purpose: &mut FsLoadPurpose, idx: usize| {
+            let Some(entry) = purpose.original_entry() else {
+                return;
+            };
+            let requested = match entry {
+                OriginalMaterialEntry::Erase { requested_fs_idx }
+                | OriginalMaterialEntry::Conceal { requested_fs_idx }
+                | OriginalMaterialEntry::LocalAdjustment { requested_fs_idx }
+                | OriginalMaterialEntry::ApplyEraseSlot {
+                    requested_fs_idx, ..
+                } => requested_fs_idx,
+                OriginalMaterialEntry::ViewTrim { request } => request.requested_fs_idx,
+                OriginalMaterialEntry::Switch { request } => request.from_idx,
+                OriginalMaterialEntry::AutoCrop | OriginalMaterialEntry::MaterialOnly => idx,
+            };
+            if keep_requested_idx != Some(requested) {
+                *purpose = match *purpose {
+                    FsLoadPurpose::ResumeAfterNormalLoad { normal, .. } => normal.purpose(),
+                    _ => FsLoadPurpose::Original {
+                        entry: OriginalMaterialEntry::MaterialOnly,
+                    },
+                };
+            }
+        };
+        for (&idx, pending) in self.fs_pending.iter_mut() {
+            clear(&mut pending.purpose, idx);
+        }
+        for upload in self.fs_upload_backlog.iter_mut() {
+            clear(&mut upload.purpose, upload.idx);
+        }
+        for pending in self.erase_inpaint_pending.values_mut() {
+            let Some(entry) = pending.purpose.entry() else {
+                continue;
+            };
+            let requested = match entry {
+                OriginalMaterialEntry::Erase { requested_fs_idx }
+                | OriginalMaterialEntry::Conceal { requested_fs_idx }
+                | OriginalMaterialEntry::LocalAdjustment { requested_fs_idx }
+                | OriginalMaterialEntry::ApplyEraseSlot {
+                    requested_fs_idx, ..
+                } => requested_fs_idx,
+                OriginalMaterialEntry::ViewTrim { request } => request.requested_fs_idx,
+                OriginalMaterialEntry::Switch { request } => request.from_idx,
+                OriginalMaterialEntry::MaterialOnly | OriginalMaterialEntry::AutoCrop => {
+                    pending.idx
+                }
+            };
+            if keep_requested_idx != Some(requested) {
+                pending.purpose.cancel_entry();
+            }
+        }
+        let mut cancel_entry_jobs = Vec::new();
+        for (&idx, pending) in &mut self.local_adjust_pending {
+            match &mut pending.request.kind {
+                EditMaterializeKind::Local { continuation, .. } => match *continuation {
+                    LocalMaterializeContinuation::EnterConceal { requested_fs_idx }
+                        if keep_requested_idx != Some(requested_fs_idx) =>
+                    {
+                        cancel_entry_jobs.push(idx)
+                    }
+                    LocalMaterializeContinuation::SwitchConceal { request }
+                        if keep_requested_idx != Some(request.from_idx) =>
+                    {
+                        cancel_entry_jobs.push(idx)
+                    }
+                    LocalMaterializeContinuation::ResumeAfterDisplaySwitchConceal { request }
+                        if keep_requested_idx != Some(request.from_idx) =>
+                    {
+                        *continuation = LocalMaterializeContinuation::Display
+                    }
+                    _ => {}
+                },
+                EditMaterializeKind::Conceal { purpose, .. } => match *purpose {
+                    ConcealMaterializePurpose::EnterMode { requested_fs_idx }
+                        if keep_requested_idx != Some(requested_fs_idx) =>
+                    {
+                        cancel_entry_jobs.push(idx)
+                    }
+                    ConcealMaterializePurpose::Switch { request }
+                        if keep_requested_idx != Some(request.from_idx) =>
+                    {
+                        cancel_entry_jobs.push(idx)
+                    }
+                    ConcealMaterializePurpose::ResumeAfterDisplaySwitch { request }
+                        if keep_requested_idx != Some(request.from_idx) =>
+                    {
+                        *purpose = ConcealMaterializePurpose::Display
+                    }
+                    _ => {}
+                },
+            }
+        }
+        for idx in cancel_entry_jobs {
+            self.cancel_local_adjust_pending_for_idx(idx);
+        }
+    }
+
+    pub(crate) fn resume_original_material_entry(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        entry: OriginalMaterialEntry,
+    ) {
+        if entry == OriginalMaterialEntry::MaterialOnly {
+            return;
+        }
+        if let OriginalMaterialEntry::ViewTrim { request } = entry {
+            self.resume_view_trim_after_original(ctx, idx, request);
+            return;
+        }
+        if let OriginalMaterialEntry::Switch { request } = entry {
+            if idx == request.target_idx && self.page_edit_target_switch_is_current(request) {
+                match request.tool {
+                    PageEditTargetSwitchTool::Erase => self.switch_erase_target_in_spread(ctx, idx),
+                    PageEditTargetSwitchTool::LocalAdjustment => {
+                        self.switch_local_adjust_target_in_spread(ctx, idx)
+                    }
+                    PageEditTargetSwitchTool::Conceal => {
+                        self.switch_conceal_target_in_spread(ctx, idx)
+                    }
+                }
+            }
+            return;
+        }
+        let source_ready = match entry {
+            OriginalMaterialEntry::Conceal { .. } => {
+                self.current_conceal_source_pixels(idx).is_some()
+                    || self.current_local_adjust_source_pixels(idx).is_some()
+                    || self.current_raw_source_pixels(idx).is_some()
+            }
+            OriginalMaterialEntry::LocalAdjustment { .. } => {
+                self.current_local_adjust_source_pixels(idx).is_some()
+                    || self.current_raw_source_pixels(idx).is_some()
+            }
+            _ => self.current_raw_source_pixels(idx).is_some(),
+        };
+        if !source_ready {
+            return;
+        }
+        if let OriginalMaterialEntry::ApplyEraseSlot {
+            requested_fs_idx,
+            slot,
+        } = entry
+        {
+            // Slots update a saved mask during ordinary viewing, including continuous reading
+            // and open adjustment/analysis panels. Preserve that existing entry contract.
+            if requested_fs_idx == idx
+                && self.fullscreen_idx == Some(idx)
+                && !self.any_modal_dialog_open_for_fullscreen_keys()
+                && !self.remote_session_blocks_local_control()
+                && self
+                    .detached_viewer_image_edit_tools_disabled_reason()
+                    .is_none()
+                && !self.erase_mode
+            {
+                self.apply_slot_in_viewing_mode(ctx, slot);
+            }
+            return;
+        }
+        let requested_fs_idx = match entry {
+            OriginalMaterialEntry::Erase { requested_fs_idx }
+            | OriginalMaterialEntry::Conceal { requested_fs_idx }
+            | OriginalMaterialEntry::LocalAdjustment { requested_fs_idx }
+            | OriginalMaterialEntry::ApplyEraseSlot {
+                requested_fs_idx, ..
+            } => requested_fs_idx,
+            OriginalMaterialEntry::AutoCrop | OriginalMaterialEntry::MaterialOnly => idx,
+            OriginalMaterialEntry::ViewTrim { .. } => unreachable!(),
+            OriginalMaterialEntry::Switch { .. } => unreachable!(),
+        };
+        // A request survives only while its original entry is still admissible. Keyboard focus
+        // is irrelevant to completion, but modal, viewer capability and tool exclusions are not.
+        if self.any_modal_dialog_open_for_fullscreen_keys()
+            || self.remote_session_blocks_local_control()
+            || self
+                .detached_viewer_image_edit_tools_disabled_reason()
+                .is_some()
+            || self.continuous_reading_active_for_idx(requested_fs_idx)
+            || self.is_panorama_mode_active(requested_fs_idx)
+            || self.fs_entry_is_animated(idx)
+            || matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            )
+            || self.analysis_mode
+            || self.adjustment_mode.is_open()
+            || self.erase_mode
+            || self.conceal_mode
+            || self.text_mode
+            || self.local_adjust_mode
+            || self.sns_split.is_some()
+            || (self.export_crop_mode && entry != OriginalMaterialEntry::AutoCrop)
+        {
+            return;
+        }
+        match entry {
+            OriginalMaterialEntry::Erase { requested_fs_idx }
+            | OriginalMaterialEntry::Conceal { requested_fs_idx }
+            | OriginalMaterialEntry::LocalAdjustment { requested_fs_idx } => {
+                if self.fullscreen_idx != Some(requested_fs_idx)
+                    || self.plan_page_edit_pivot(requested_fs_idx).0 != idx
+                {
+                    return;
+                }
+                match entry {
+                    OriginalMaterialEntry::Erase { .. } => self.enter_erase_mode(requested_fs_idx),
+                    OriginalMaterialEntry::Conceal { .. } => {
+                        self.enter_conceal_mode(ctx, requested_fs_idx)
+                    }
+                    OriginalMaterialEntry::LocalAdjustment { .. } => {
+                        self.enter_local_adjust_mode(ctx)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            OriginalMaterialEntry::AutoCrop if self.fullscreen_idx == Some(idx) => {
+                let message = if self.apply_auto_export_crop_for_idx(idx) {
+                    "自動クロップ"
+                } else {
+                    "余白を検出できません"
+                };
+                self.show_feedback_toast(message.to_owned());
+            }
+            OriginalMaterialEntry::ApplyEraseSlot { .. } => unreachable!(),
+            OriginalMaterialEntry::ViewTrim { .. } => unreachable!(),
+            OriginalMaterialEntry::Switch { .. } => unreachable!(),
+            OriginalMaterialEntry::MaterialOnly | OriginalMaterialEntry::AutoCrop => {}
+        }
+    }
+
+    pub(crate) fn page_edit_target_switch_request(
+        &self,
+        tool: PageEditTargetSwitchTool,
+        target_idx: usize,
+    ) -> Option<PageEditTargetSwitchRequest> {
+        let from_idx = self.fullscreen_idx?;
+        let (active, pair) = match tool {
+            PageEditTargetSwitchTool::Erase => (
+                self.erase_mode,
+                self.erase_spread_ctx.map(|pivot| pivot.pair),
+            ),
+            PageEditTargetSwitchTool::LocalAdjustment => (
+                self.local_adjust_mode,
+                self.local_adjust_spread_ctx
+                    .as_ref()
+                    .and_then(|pivot| pivot.pair()),
+            ),
+            PageEditTargetSwitchTool::Conceal => (
+                self.conceal_mode,
+                self.conceal_spread_ctx.map(|pivot| pivot.pair),
+            ),
+        };
+        let pair = pair?;
+        (active
+            && from_idx != target_idx
+            && [pair.0, pair.1].contains(&from_idx)
+            && [pair.0, pair.1].contains(&target_idx))
+        .then_some(PageEditTargetSwitchRequest {
+            tool,
+            from_idx,
+            target_idx,
+            pair,
+        })
+    }
+
+    pub(crate) fn page_edit_target_switch_is_current(
+        &self,
+        request: PageEditTargetSwitchRequest,
+    ) -> bool {
+        self.page_edit_target_switch_request(request.tool, request.target_idx) == Some(request)
+            && !self.any_modal_dialog_open_for_fullscreen_keys()
+            && !self.remote_session_blocks_local_control()
+            && self
+                .detached_viewer_image_edit_tools_disabled_reason()
+                .is_none()
+            && !self.is_panorama_mode_active(request.from_idx)
+    }
+
     fn start_media_load_with_origin(
         &mut self,
         idx: usize,
@@ -75219,6 +75754,18 @@ impl App {
         contract: FsPageLoadContract,
         playback_origin: crate::video::PlaybackStartOrigin,
     ) {
+        if !matches!(purpose, FsLoadPurpose::Original { .. })
+            && (self
+                .fs_pending
+                .get(&idx)
+                .is_some_and(|pending| pending.purpose.original_entry().is_some())
+                || self
+                    .fs_upload_backlog
+                    .iter()
+                    .any(|upload| upload.idx == idx && upload.purpose.original_entry().is_some()))
+        {
+            return;
+        }
         // 360 度パノラマビュー Phase 2a: 内部で使う tee 判定パラメータ。
         // `start_fs_load` 開始時点で App の状態をスナップショットして worker に渡す
         // (docs/panorama-360-view-plan.md §4.6.0)。
@@ -75460,24 +76007,28 @@ impl App {
             return;
         }
         let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
+        let original_pdf_dimensions = matches!(purpose, FsLoadPurpose::Original { .. })
+            .then(|| self.canonical_source_dimensions(idx))
+            .flatten();
         let pdf_display_request = if pdf_page.is_some() {
             // PDF は実際に描く viewport が確定するまで enqueue しない。専用 fullscreen、
             // detached、in-window は別々の egui context / ppp を持ち得るため、推測値で
             // 先行すると初回だけ過大・過小レンダになる。
-            let Some(viewport) = self.fs_pdf_display_target else {
+            let viewport = self.fs_pdf_display_target;
+            if viewport.is_none() && original_pdf_dimensions.is_none() {
                 return;
-            };
+            }
             let rotation = self.get_rotation(idx);
             let swap_page_axes = matches!(
                 rotation,
                 crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270
             );
-            Some((viewport, swap_page_axes))
+            viewport.map(|viewport| (viewport, swap_page_axes))
         } else {
             None
         };
 
-        if pdf_page.is_some() {
+        if pdf_page.is_some() && !matches!(purpose, FsLoadPurpose::Original { .. }) {
             // A fresh provisional load must reconcile the absolute display demand again.
             self.fs_pdf_rerender_demand.forget_absolute_page(idx);
             self.adopt_retained_pdf_page_metadata(idx);
@@ -75686,23 +76237,38 @@ impl App {
 
             // PDF ページの場合はラスタライズ
             if let Some(page_num) = pdf_page {
-                let (viewport, swap_page_axes) = pdf_display_request.unwrap();
                 let mut pdf_exit = "pdf_ok";
-                match crate::pdf_loader::render_page_for_display(
-                    &path,
-                    page_num,
-                    viewport,
-                    swap_page_axes,
-                    pdf_password.as_deref(),
-                    // PDFium cannot be interrupted once rendering begins. Keep
-                    // this scheduler permit until the IPC reply arrives.
-                    None,
-                    pdf_priority,
-                    pdf_render_validity,
-                    // フルスクリーンは fs_cache (memory) のみで永続 cache 無し。
-                    // Critical 経路は即時応答 UX 優先 → AbortOnCancel。
-                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-                ) {
+                let rendered = if let Some(dims) = original_pdf_dimensions {
+                    let (w, h) = dims.as_tuple();
+                    crate::pdf_loader::render_page(
+                        &path,
+                        page_num,
+                        w.max(h),
+                        pdf_password.as_deref(),
+                        None,
+                        pdf_priority,
+                        pdf_render_validity,
+                        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                    )
+                } else {
+                    let (viewport, swap_page_axes) = pdf_display_request.unwrap();
+                    crate::pdf_loader::render_page_for_display(
+                        &path,
+                        page_num,
+                        viewport,
+                        swap_page_axes,
+                        pdf_password.as_deref(),
+                        // PDFium cannot be interrupted once rendering begins. Keep
+                        // this scheduler permit until the IPC reply arrives.
+                        None,
+                        pdf_priority,
+                        pdf_render_validity,
+                        // フルスクリーンは fs_cache (memory) のみで永続 cache 無し。
+                        // Critical 経路は即時応答 UX 優先 → AbortOnCancel。
+                        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                    )
+                };
+                match rendered {
                     Ok(crate::pdf_loader::RenderResult {
                         image: img,
                         content_type,
@@ -76178,6 +76744,18 @@ impl App {
         required_long_edge_px: f32,
         original_floor: bool,
     ) {
+        // Do not mark an unissued display target as fulfilled while raw hydration owns this page.
+        if self
+            .fs_pending
+            .get(&idx)
+            .is_some_and(|pending| pending.purpose.original_entry().is_some())
+            || self
+                .fs_upload_backlog
+                .iter()
+                .any(|upload| upload.idx == idx && upload.purpose.original_entry().is_some())
+        {
+            return;
+        }
         let Some(GridItem::PdfPage {
             content_type: Some(content_type),
             ..
@@ -76301,6 +76879,18 @@ impl App {
     }
 
     fn request_pdf_rerender_at_target(&mut self, idx: usize, target_px: u32, priority: bool) {
+        // Viewport display demand joins the original owner; it must not replace its continuation.
+        if self
+            .fs_pending
+            .get(&idx)
+            .is_some_and(|pending| pending.purpose.original_entry().is_some())
+            || self
+                .fs_upload_backlog
+                .iter()
+                .any(|upload| upload.idx == idx && upload.purpose.original_entry().is_some())
+        {
+            return;
+        }
         let (pdf_path, page_num, password) = match self.items.get(idx) {
             Some(GridItem::PdfPage {
                 pdf_path, page_num, ..
@@ -76469,6 +77059,9 @@ impl App {
             ..=((pos + keep_forward).min(n - 1)))
             .map(|p| image_indices[p])
             .collect();
+        if let Some(keep) = self.page_turn_prefetch_keep_set(current_idx) {
+            keep_set = keep;
+        }
 
         // The final-cover supplement intentionally reuses page 0 far outside the last page's
         // positional prefetch window. Treat the actual presentation partner as display-critical
@@ -76481,8 +77074,12 @@ impl App {
             .collect::<Vec<_>>();
         keep_set.extend(self.reconcile_raw_demand(current_idx, &displayed_raw));
 
-        let prefetch_targets: Vec<usize> =
-            interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
+        let prefetch_targets: Vec<usize> = self
+            .page_turn_prefetch_targets(current_idx, pf_forward, pf_back)
+            .map(|plan| plan.targets.into_iter().map(|(_, idx)| idx).collect())
+            .unwrap_or_else(|| {
+                interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back)
+            });
 
         // 退避前に動画の再生位置を保存 (退避された Video エントリは drop で消える)
         self.save_all_video_resume_positions();
@@ -76553,7 +77150,9 @@ impl App {
         // 巻き込みキャンセルは、その commit が起きる前 (= 待機中) に先読みを止めていた。
         // 中断できない区間を短くするのが先で、それが S2 の仕事。
         // 経緯: docs/archive-page-load-scheduler-plan.md §8.1。
-        let current_loading = self.fs_page_load_state(current_idx).waiting_for_display();
+        let current_loading = self
+            .fs_display_page_load_state(current_idx)
+            .waiting_for_display();
 
         let to_cancel: Vec<usize> = self
             .fs_pending
@@ -76580,15 +77179,15 @@ impl App {
             // Paged and continuous-reading prefetch must both re-assert the
             // current producer: `NeedsLoad` may cancel siblings but must not
             // leave the display target without an in-flight request.
-            self.ensure_fs_page_load(current_idx);
+            self.ensure_fs_display_page_load(current_idx);
             return;
         }
 
         // まだキャッシュにも pending にもない先読み対象を読み込み開始
         for idx in prefetch_targets {
-            if self.fs_page_load_state(idx).needs_load_request() {
+            if self.fs_display_page_load_state(idx).needs_load_request() {
                 crate::logger::log(format!("  prefetch start idx={idx}"));
-                self.ensure_fs_page_load(idx);
+                self.ensure_fs_display_page_load(idx);
             }
         }
     }
@@ -77001,6 +77600,9 @@ impl App {
     }
 
     fn close_fullscreen_now_with_metadata_boundary(&mut self, boundary: FsMetadataBoundary) {
+        self.cancel_original_material_entry_intents(None);
+        self.pending_fs_page_turn_ready = None;
+        self.page_turn_presentation.deactivate("closed");
         // A pending editor commit may push a discarded entry and clear Redo. Only stable
         // rating history crosses an automatic close, before any fold/reset can touch it.
         let rating_history = if boundary == FsMetadataBoundary::RatingMembership {
@@ -78324,8 +78926,77 @@ impl App {
         }
     }
 
+    /// Source and AI preparation share the actual paged units' live-cache lifetime.
+    /// Cross-session retained CPU entries continue to use their global LRU budget.
+    pub(crate) fn page_turn_prefetch_policy_enabled(&self) -> bool {
+        self.settings.page_turn_animation_enabled
+            && self.reading_flow.is_paged()
+            && crate::page_split::SplitDirection::from_spread_mode(self.spread_mode).is_none()
+            && !self.remote_session_blocks_local_control()
+    }
+
+    fn page_turn_prefetch_keep_set(&mut self, current_idx: usize) -> Option<HashSet<usize>> {
+        let source = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.prefetch_forward.saturating_add(1),
+            self.settings.prefetch_back.saturating_add(1),
+        )?;
+        let ai = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.ai_upscale_prefetch_forward.saturating_add(1),
+            self.settings.ai_upscale_prefetch_back.saturating_add(1),
+        )?;
+        let mut keep = source
+            .targets
+            .into_iter()
+            .chain(ai.targets)
+            .map(|(_, idx)| idx)
+            .collect::<HashSet<_>>();
+        keep.insert(current_idx);
+        Some(keep)
+    }
+
+    /// Reconcile new unit dimensions, layout/settings, and completed current loads
+    /// through the existing source owner, without doing video-resume I/O every frame.
+    pub(crate) fn reconcile_paged_prefetch_window(&mut self, current_idx: usize) {
+        let Some(targets) = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.prefetch_forward,
+            self.settings.prefetch_back,
+        ) else {
+            return;
+        };
+        let Some(mut keep) = self.page_turn_prefetch_keep_set(current_idx) else {
+            return;
+        };
+        let displayed_partner = self.displayed_spread_partner(current_idx);
+        let displayed = [Some(current_idx), displayed_partner]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let expected_raw_demand = self.raw_demand_for_display(current_idx, &displayed);
+        let raw_demand_changed = expected_raw_demand != self.raw_pages.demand;
+        keep.extend(expected_raw_demand.keys().copied());
+        let current_state = self.fs_display_page_load_state(current_idx);
+        let needs_load = current_state.needs_load_request()
+            || (!current_state.waiting_for_display()
+                && targets
+                    .targets
+                    .iter()
+                    .any(|&(_, idx)| self.fs_display_page_load_state(idx).needs_load_request()));
+        let keep_changed = self.fs_cache.keys().any(|idx| !keep.contains(idx))
+            || self.fs_pending.keys().any(|idx| !keep.contains(idx));
+        if needs_load || keep_changed || raw_demand_changed {
+            self.update_prefetch_window(current_idx);
+        }
+    }
+
     /// 先読み範囲内の item_idx 集合を計算する。
     fn compute_keep_set(&mut self, current_idx: usize) -> std::collections::HashSet<usize> {
+        if let Some(mut keep) = self.page_turn_prefetch_keep_set(current_idx) {
+            keep.extend(self.raw_pages.demand.keys().copied());
+            return keep;
+        }
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             // フルスクリーン表示中に★/Ctrl+Fフィルタが変わり、現在ページが
@@ -78375,6 +79046,18 @@ impl App {
 
     /// AI 先読み対象の item_idx を前方優先（+1..+pf_forward, -1..-pf_back）で返す。
     pub(crate) fn ai_prefetch_targets(&mut self, current_idx: usize) -> Vec<usize> {
+        if let Some(plan) = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.ai_upscale_prefetch_forward,
+            self.settings.ai_upscale_prefetch_back,
+        ) {
+            return plan
+                .targets
+                .into_iter()
+                .map(|(_, idx)| idx)
+                .filter(|idx| !self.is_raw_page(*idx) || self.raw_pages.demand.contains_key(idx))
+                .collect();
+        }
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return Vec::new();
@@ -78419,6 +79102,9 @@ impl App {
     /// `final_ai_key_for_pixels` と同じ判定式を共有するため、skip_px や bg mode の
     /// 整合性は自動で保たれる。
     pub(crate) fn is_idx_final_ai_done_or_skipped(&self, idx: usize) -> bool {
+        if self.has_retained_pdf_final_ai_for_current_params(idx) {
+            return true;
+        }
         // source pixels が無ければ判定不能 → pending 扱い (= done 数に入れない)
         let Some(pixels) = self.current_raw_source_pixels(idx) else {
             return false;
@@ -78441,28 +79127,37 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> Option<FsPrefetchIndicator> {
-        let image_indices = self.collect_image_indices();
-        let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
-        let target_positions = interleaved_prefetch_positions(
-            current_pos,
-            image_indices.len(),
+        let paged = self.page_turn_prefetch_targets(
+            fs_idx,
             self.settings.ai_upscale_prefetch_forward,
             self.settings.ai_upscale_prefetch_back,
         );
+        let (current_pos, targets) = if let Some(plan) = paged {
+            (plan.current_position, plan.targets)
+        } else {
+            let image_indices = self.collect_image_indices();
+            let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
+            let targets = interleaved_prefetch_positions(
+                current_pos,
+                image_indices.len(),
+                self.settings.ai_upscale_prefetch_forward,
+                self.settings.ai_upscale_prefetch_back,
+            )
+            .into_iter()
+            .map(|pos| (pos, image_indices[pos]))
+            .collect();
+            (current_pos, targets)
+        };
         let active_indices: std::collections::HashSet<usize> = self
             .final_ai_pending
             .keys()
             .map(|key| key.edit_key.idx)
             .collect();
         let current_busy = active_indices.contains(&fs_idx);
-        let pages = target_positions
+        let pages = targets
             .into_iter()
-            .filter(|&pos| {
-                !self.is_raw_page(image_indices[pos])
-                    || self.raw_pages.demand.contains_key(&image_indices[pos])
-            })
-            .map(|pos| {
-                let idx = image_indices[pos];
+            .filter(|&(_, idx)| !self.is_raw_page(idx) || self.raw_pages.demand.contains_key(&idx))
+            .map(|(pos, idx)| {
                 (
                     pos,
                     fs_prefetch_page_state(
@@ -78472,6 +79167,79 @@ impl App {
                 )
             });
         build_fs_prefetch_indicator(current_pos, current_busy, pages)
+    }
+
+    /// Restore matching retained PDF AI pixels for upcoming actual occurrences.
+    /// This prepares a resident source even with an AI-inference budget of zero;
+    /// all remaining CPU effects and the paced upload use the existing owner.
+    fn prefetch_retained_paged_composites(&mut self, ctx: &egui::Context, current_idx: usize) {
+        let Some(source) = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.prefetch_forward,
+            self.settings.prefetch_back,
+        ) else {
+            return;
+        };
+        if self
+            .final_effect_pending
+            .values()
+            .any(|pending| !pending.cancel.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let mut targets = source
+            .targets
+            .into_iter()
+            .map(|(_, idx)| idx)
+            .collect::<Vec<_>>();
+        for idx in self.ai_prefetch_targets(current_idx) {
+            if !targets.contains(&idx) {
+                targets.push(idx);
+            }
+        }
+        for idx in targets {
+            let Some((ai_key, edit_size)) = self.retained_pdf_final_ai_matches_current(idx) else {
+                continue;
+            };
+            let params = self.effective_params(idx).clone();
+            let final_key =
+                self.final_composite_key_for_pixels(ai_key.edit_key, edit_size, &params);
+            if self
+                .final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete)
+                || self.final_effect_pending.contains_key(&final_key)
+            {
+                continue;
+            }
+            let Some((ai_key, entry, edit_size)) =
+                self.lookup_retained_pdf_final_ai(idx, "paged_source_prefetch")
+            else {
+                continue;
+            };
+            let mut plan = build_final_composite_plan_after_ai(
+                &params,
+                self.resolved_creative_lut(&params),
+                entry.used_upscale,
+            );
+            if self.post_filter_bypassed {
+                plan.colorize = Default::default();
+                plan.creative_lut = None;
+                plan.post_filter = crate::adjustment::PostFilter::None;
+            }
+            self.final_ai_cache.insert(ai_key, entry.clone());
+            if self.spawn_final_effect_job(
+                ctx,
+                final_key,
+                entry.pixels,
+                edit_size,
+                plan,
+                true,
+                true,
+            ) {
+                return;
+            }
+        }
     }
 
     fn record_final_effect_prefetch_admission(
@@ -78560,6 +79328,46 @@ impl App {
             if !params.colorize.is_enabled() && creative_lut.is_none() {
                 continue;
             }
+            if self.exact_complete_final_composite_entry(idx).is_some() {
+                continue;
+            }
+            if let Some(size) = self.final_ai_prefetch_input_size(idx, &params) {
+                let edit_key = self.current_edit_result_key(idx);
+                let final_key = self.final_composite_key_for_pixels(edit_key, size, &params);
+                if self.final_effect_pending.contains_key(&final_key) {
+                    continue;
+                }
+                if let Some(ai_key) = self.final_ai_key_for_pixels(edit_key, size, &params) {
+                    if let Some(entry) = self.final_ai_cache.get(&ai_key).cloned() {
+                        let plan = build_final_composite_plan_after_ai(
+                            &params,
+                            creative_lut,
+                            entry.used_upscale,
+                        );
+                        if self.spawn_final_effect_job(
+                            ctx,
+                            final_key,
+                            entry.pixels,
+                            entry.source_size,
+                            plan,
+                            true,
+                            true,
+                        ) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if !self.final_ai_failed.contains(&ai_key) {
+                        continue;
+                    }
+                }
+            } else if self.effective_upscale_request(&params).is_some()
+                || self.effective_denoise_request(&params).is_some()
+            {
+                // The AI producer must establish its input and result first.
+                // Do not hydrate an input for an effect which cannot run yet.
+                continue;
+            }
             let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
                 continue;
             };
@@ -78630,9 +79438,8 @@ impl App {
     /// - 同時起動は 1 ジョブのみ (= 旧設計の `current_done &&
     ///   ai_upscale_pending.is_empty()` 条件を踏襲)。これで一括 spawn による
     ///   ai_runtime の競合 / VRAM 不足を防ぐ。
-    /// - 各 idx ごとに `ensure_edit_result_pixels_cpu` を呼ぶため、隣接ページの source
-    ///   pixels が `fs_cache` に乗っていなければそのターゲットは skip される
-    ///   (= fs_prefetch の完了を毎フレ retry で待つ、コスト軽い)。これで **edit_result の
+    /// - ページ固有のAI・完成素材・既存job・入力寸法で先に作業要否を決める。
+    ///   必要な入力だけ既存source loaderへ要求する。これで **edit_result の
     ///   表示テクスチャ** の前倒し upload は避ける (F2、表示時に lazy upload)。
     ///   ただし編集済みページ (隠蔽 / 局所補正 / 消しゴム) は `assemble_edit_result_pixels`
     ///   内で各 layer の texture を UI スレッドで upload しうる (R2-5 既知残、別途・中規模)。
@@ -78645,6 +79452,7 @@ impl App {
         // 背景 final-effect は現在ページの ensure 経路に依存せず、fullscreen work
         // セクション自体で回収する。ensure 側の poll はコピー / 書き出し等の入口用に残す。
         self.poll_final_effects(ctx);
+        self.prefetch_retained_paged_composites(ctx, current_idx);
         // ページ送りのカラー化先読みは従来どおりここで回す。連結読みは描画レイアウトが
         // 算出した準備帯を渡す必要があるため `draw_fs_continuous_reading` から起動する。
         if self.reading_flow.is_paged() {
@@ -78663,23 +79471,45 @@ impl App {
             if self.has_uncancelled_final_ai_pending() {
                 return;
             }
+            let params = self.effective_params(idx).clone();
+            if self.effective_upscale_request(&params).is_none()
+                && self.effective_denoise_request(&params).is_none()
+            {
+                continue;
+            }
+            if let Some((key, size)) = self.retained_final_ai_matches_current(idx, &params)
+                && let Some(entry) = self.lookup_retained_final_ai(idx, key, size)
+            {
+                self.final_ai_cache.insert(key, entry);
+                continue;
+            }
             // Raster PDF の現行 display-fit 結果が AI 用 native 入力と異なるページは、
             // 現行結果に AI 先読みを流しても native 再レンダで捨てられる。
             // 代わりに native 再レンダを **通常レーンで先に起動** (visible を妨げない) し、
             // AI 先読みは native 着地まで保留する。これで画像の先読みと同様、移動時に
             // native + final AI が揃って即表示できる。
             if self.pdf_prefetch_should_defer_ai(idx) {
-                if let Some((key, entry, _)) =
-                    self.lookup_retained_pdf_final_ai(idx, "prefetch_final_ai")
-                {
-                    self.final_ai_cache.insert(key, entry);
-                    continue;
-                }
                 // 既に再レンダ中なら二重起動しない (cancel→respawn ループ防止)。
                 if !self.fs_pending.contains_key(&idx) && !self.fs_upload_backlog_contains(idx) {
                     self.request_pdf_rerender(idx, 1.0, false);
                 }
                 continue;
+            }
+            if self.exact_complete_final_composite_entry(idx).is_some() {
+                continue;
+            }
+            if let Some(size) = self.final_ai_prefetch_input_size(idx, &params) {
+                let Some(key) =
+                    self.final_ai_key_for_pixels(self.current_edit_result_key(idx), size, &params)
+                else {
+                    continue;
+                };
+                if self.final_ai_cache.contains_key(&key)
+                    || self.final_ai_pending.contains_key(&key)
+                    || self.final_ai_failed.contains(&key)
+                {
+                    continue;
+                }
             }
             // 先読みは edit_result の表示テクスチャを前倒し upload しない (F2)。AI 入力は CPU
             // ピクセルで足りる。表示に入った時に ensure_edit_result_pixels が lazy アップロード
@@ -78688,7 +79518,6 @@ impl App {
             let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
                 continue;
             };
-            let params = self.effective_params(idx).clone();
             let Some(key) = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
             else {
                 continue;
@@ -78708,6 +79537,81 @@ impl App {
             // prefetch 経路は戻り値不要 (composite を作らないので complete 判定がない)。
             let _ = self.maybe_start_final_ai(idx, key, edit_pixels, params, false);
         }
+    }
+
+    /// Query existing exact edit-canvas metadata without producing pixels. Canonical
+    /// source dimensions and thumbnail dimensions are not AI input dimensions.
+    fn final_ai_prefetch_input_size(
+        &self,
+        idx: usize,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<[usize; 2]> {
+        let edit_key = self.current_edit_result_key(idx);
+        if let Some(entry) = self.edit_result_cache.get(&edit_key) {
+            return Some(entry.pixels.size);
+        }
+        if let Some(pixels) = self.current_raw_source_pixels(idx) {
+            return Some(pixels.size);
+        }
+        if let Some(size) = self
+            .final_ai_cache
+            .iter()
+            .find_map(|(key, entry)| (key.edit_key == edit_key).then_some(entry.source_size))
+        {
+            return Some(size);
+        }
+        if let Some(size) = self
+            .final_composite_cache
+            .iter()
+            .find_map(|(key, entry)| (key.edit_key == edit_key).then_some(entry.source_size))
+        {
+            return Some(size);
+        }
+        if let Some(size) = self
+            .final_effect_pending
+            .iter()
+            .find_map(|(key, pending)| (key.edit_key == edit_key).then_some(pending.source_size))
+        {
+            return Some(size);
+        }
+        if let Some(size) = self.final_ai_pending.iter().find_map(|(key, pending)| {
+            (key.edit_key == edit_key)
+                .then(|| {
+                    pending
+                        .retained_key
+                        .as_ref()
+                        .map(|retained| retained.edit_size)
+                })
+                .flatten()
+        }) {
+            return Some(size);
+        }
+        self.retained_final_ai_matches_current(idx, params)
+            .map(|(_, size)| size)
+    }
+
+    fn retained_final_ai_matches_current(
+        &self,
+        idx: usize,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<(FinalAiKey, [usize; 2])> {
+        self.retained_final_ai_budget()?;
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return self.retained_pdf_final_ai_matches_current(idx);
+        }
+        let edit_key = self.current_edit_result_key(idx);
+        let item_key = self.metadata_cache_key(idx)?;
+        self.retained_final_ai_cache.keys().find_map(|retained| {
+            if retained.item_key != item_key {
+                return None;
+            }
+            let key = self.final_ai_key_for_pixels(edit_key, retained.edit_size, params)?;
+            (self
+                .retained_final_ai_key_for(idx, key, retained.edit_size)
+                .as_ref()
+                == Some(retained))
+            .then_some((key, retained.edit_size))
+        })
     }
 
     // ── 画像補正 ──────────────────────────────────────────────────
@@ -80082,7 +80986,7 @@ impl App {
         let settings = if settings.valid_source_size().is_some() {
             settings
         } else {
-            let first_raster_size = self.current_raw_source_pixels(idx)?.size;
+            let first_raster_size = self.canonical_source_dimensions(idx)?.as_size();
             self.ensure_export_crop_source_size(idx, first_raster_size)?
         };
         Some(settings.scaled_to(target_size).rect)
@@ -80537,6 +81441,39 @@ impl App {
             input_seq: self.input_seq,
             kind: EditMaterializeKind::Local { key, continuation },
         };
+        if let Some(pending) = self.local_adjust_pending.get_mut(&idx) {
+            if pending.request.items_generation == request.items_generation {
+                if let EditMaterializeKind::Local {
+                    key: old_key,
+                    continuation: old,
+                } = &mut pending.request.kind
+                {
+                    if *old_key == key {
+                        if let LocalMaterializeContinuation::SwitchConceal { request } =
+                            continuation
+                        {
+                            *old = match *old {
+                                LocalMaterializeContinuation::Display
+                                | LocalMaterializeContinuation::ResumeAfterDisplaySwitchConceal {
+                                    ..
+                                } => {
+                                    LocalMaterializeContinuation::ResumeAfterDisplaySwitchConceal {
+                                        request,
+                                    }
+                                }
+                                _ => continuation,
+                            };
+                            return;
+                        }
+                        if continuation == LocalMaterializeContinuation::Display
+                            && *old != LocalMaterializeContinuation::Display
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if self.local_adjust_pending.get(&idx).is_some_and(|pending| {
             pending.request.items_generation == request.items_generation
                 && pending.request.kind == request.kind
@@ -80544,6 +81481,25 @@ impl App {
             return;
         }
         let Some(source) = self.current_local_adjust_source_pixels(idx) else {
+            // Without source there is no new resize evidence. A current stage
+            // or known inactive layers require no producer or original load.
+            if self.current_local_adjust_pixels(idx).is_some()
+                || self
+                    .local_adjust_page_layers
+                    .get(&idx)
+                    .is_some_and(|layers| {
+                        !layers
+                            .iter()
+                            .any(|layer| layer.enabled && layer.opacity > 0.0)
+                    })
+            {
+                return;
+            }
+            if self.exact_complete_final_composite_entry(idx).is_none()
+                && !self.has_retained_pdf_final_ai_for_current_params(idx)
+            {
+                self.ensure_original_material_for_entry(idx, OriginalMaterialEntry::MaterialOnly);
+            }
             return;
         };
         let [width, height] = source.size;
@@ -80730,7 +81686,12 @@ impl App {
             }
         }
         for idx in disconnected {
-            self.local_adjust_pending.remove(&idx);
+            if let Some(pending) = self.local_adjust_pending.remove(&idx) {
+                if !pending.cancel.load(Ordering::Relaxed) {
+                    crate::logger::log(format!("edit_materialize: worker disconnected idx={idx}"));
+                    self.show_feedback_toast("画像素材の準備に失敗しました".to_owned());
+                }
+            }
         }
 
         let preferred = self
@@ -80766,14 +81727,14 @@ impl App {
         let Some(result) = pending.ready.take() else {
             return;
         };
-        if edit_materialize_result_request(&result) != pending.request {
+        if !edit_materialize_result_request(&result).same_worker_input(pending.request) {
             return;
         }
         if needs_upload {
             self.last_edit_materialize_upload_frame = self.frame_counter;
         }
 
-        let repaint = self.apply_edit_materialize_result(ctx, idx, result);
+        let repaint = self.apply_edit_materialize_result(ctx, idx, result, pending.request);
         if repaint {
             ctx.request_repaint();
         }
@@ -80787,8 +81748,8 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
         result: EditMaterializeResult,
+        request: EditMaterializeRequest,
     ) -> bool {
-        let request = edit_materialize_result_request(&result);
         if request.items_generation != self.items_generation {
             return false;
         }
@@ -80804,7 +81765,7 @@ impl App {
             return false;
         }
 
-        match result {
+        let applied = match result {
             EditMaterializeResult::Ready { payload, .. } => match payload {
                 EditMaterializePayload::LocalReady { layers, image } => {
                     let continuation = match request.kind {
@@ -80834,11 +81795,25 @@ impl App {
                     );
                     self.local_adjust_cache
                         .insert(key, LocalAdjustCacheEntry { pixels, texture });
-                    self.clear_conceal_caches(idx);
-                    if let LocalMaterializeContinuation::EnterConceal { requested_fs_idx } =
-                        continuation
-                    {
-                        self.enter_conceal_mode(requested_fs_idx);
+                    if !matches!(
+                        continuation,
+                        LocalMaterializeContinuation::SwitchConceal { .. }
+                    ) {
+                        self.clear_conceal_caches(idx);
+                    }
+                    match continuation {
+                        LocalMaterializeContinuation::EnterConceal { requested_fs_idx } => {
+                            self.enter_conceal_mode(ctx, requested_fs_idx)
+                        }
+                        LocalMaterializeContinuation::SwitchConceal { request }
+                        | LocalMaterializeContinuation::ResumeAfterDisplaySwitchConceal {
+                            request,
+                        } => {
+                            if self.page_edit_target_switch_is_current(request) {
+                                self.switch_conceal_target_in_spread(ctx, request.target_idx);
+                            }
+                        }
+                        LocalMaterializeContinuation::Display => {}
                     }
                     true
                 }
@@ -80857,11 +81832,25 @@ impl App {
                         );
                     }
                     self.local_adjust_cache.retain(|key, _| key.idx != idx);
-                    self.clear_conceal_caches(idx);
-                    if let LocalMaterializeContinuation::EnterConceal { requested_fs_idx } =
-                        continuation
-                    {
-                        self.enter_conceal_mode(requested_fs_idx);
+                    if !matches!(
+                        continuation,
+                        LocalMaterializeContinuation::SwitchConceal { .. }
+                    ) {
+                        self.clear_conceal_caches(idx);
+                    }
+                    match continuation {
+                        LocalMaterializeContinuation::EnterConceal { requested_fs_idx } => {
+                            self.enter_conceal_mode(ctx, requested_fs_idx)
+                        }
+                        LocalMaterializeContinuation::SwitchConceal { request }
+                        | LocalMaterializeContinuation::ResumeAfterDisplaySwitchConceal {
+                            request,
+                        } => {
+                            if self.page_edit_target_switch_is_current(request) {
+                                self.switch_conceal_target_in_spread(ctx, request.target_idx);
+                            }
+                        }
+                        LocalMaterializeContinuation::Display => {}
                     }
                     true
                 }
@@ -80939,31 +81928,51 @@ impl App {
                     source_kind,
                     mask,
                     shapes,
-                } => {
-                    let requested_fs_idx = match request.kind {
-                        EditMaterializeKind::Conceal {
-                            purpose: ConcealMaterializePurpose::EnterMode { requested_fs_idx },
-                            ..
-                        } => requested_fs_idx,
-                        _ => return false,
-                    };
-                    self.complete_conceal_mode_entry(
+                } => match request.kind {
+                    EditMaterializeKind::Conceal {
+                        purpose: ConcealMaterializePurpose::EnterMode { requested_fs_idx },
+                        ..
+                    } => self.complete_conceal_mode_entry(
                         requested_fs_idx,
                         source,
                         source_kind,
                         mask,
                         shapes,
-                    )
-                }
+                    ),
+                    EditMaterializeKind::Conceal {
+                        purpose: ConcealMaterializePurpose::Switch { request },
+                        ..
+                    } => self.complete_conceal_target_switch(
+                        request,
+                        source,
+                        source_kind,
+                        mask,
+                        shapes,
+                    ),
+                    _ => false,
+                },
             },
             EditMaterializeResult::Cancelled { .. } => false,
             EditMaterializeResult::Failed { error, .. } => {
                 crate::logger::log(format!(
                     "edit_materialize: worker failed idx={idx} error={error}"
                 ));
+                self.show_feedback_toast("画像素材の準備に失敗しました".to_owned());
                 false
             }
+        };
+        if applied {
+            if let EditMaterializeKind::Conceal {
+                purpose: ConcealMaterializePurpose::ResumeAfterDisplaySwitch { request },
+                ..
+            } = request.kind
+            {
+                if self.page_edit_target_switch_is_current(request) {
+                    self.switch_conceal_target_in_spread(ctx, request.target_idx);
+                }
+            }
         }
+        applied
     }
 
     pub(crate) fn poll_local_adjust_layer_bypass_preview(&mut self, ctx: &egui::Context) {
@@ -81567,6 +82576,10 @@ impl App {
                 ConcealMaterializePurpose::EnterMode { requested_fs_idx } => {
                     LocalMaterializeContinuation::EnterConceal { requested_fs_idx }
                 }
+                ConcealMaterializePurpose::Switch { request }
+                | ConcealMaterializePurpose::ResumeAfterDisplaySwitch { request } => {
+                    LocalMaterializeContinuation::SwitchConceal { request }
+                }
             };
             self.maybe_start_local_adjust_render_with_continuation(idx, continuation);
             return;
@@ -81578,6 +82591,10 @@ impl App {
                 ConcealMaterializePurpose::Display => LocalMaterializeContinuation::Display,
                 ConcealMaterializePurpose::EnterMode { requested_fs_idx } => {
                     LocalMaterializeContinuation::EnterConceal { requested_fs_idx }
+                }
+                ConcealMaterializePurpose::Switch { request }
+                | ConcealMaterializePurpose::ResumeAfterDisplaySwitch { request } => {
+                    LocalMaterializeContinuation::SwitchConceal { request }
                 }
             };
             self.maybe_start_local_adjust_render_with_continuation(idx, continuation);
@@ -81599,6 +82616,11 @@ impl App {
                 })
                 .flatten()
         }) else {
+            if self.exact_complete_final_composite_entry(idx).is_none()
+                && !self.has_retained_pdf_final_ai_for_current_params(idx)
+            {
+                self.ensure_original_material_for_entry(idx, OriginalMaterialEntry::MaterialOnly);
+            }
             return;
         };
         let [w, h] = source.size;
@@ -81611,6 +82633,33 @@ impl App {
             input_seq: self.input_seq,
             kind: EditMaterializeKind::Conceal { key, purpose },
         };
+        if let Some(pending) = self.local_adjust_pending.get_mut(&idx) {
+            if pending.request.items_generation == request.items_generation {
+                if let EditMaterializeKind::Conceal {
+                    key: old_key,
+                    purpose: old,
+                } = &mut pending.request.kind
+                {
+                    if *old_key == key {
+                        if let ConcealMaterializePurpose::Switch { request } = purpose {
+                            *old = match *old {
+                                ConcealMaterializePurpose::Display
+                                | ConcealMaterializePurpose::ResumeAfterDisplaySwitch { .. } => {
+                                    ConcealMaterializePurpose::ResumeAfterDisplaySwitch { request }
+                                }
+                                _ => purpose,
+                            };
+                            return;
+                        }
+                        if purpose == ConcealMaterializePurpose::Display
+                            && *old != ConcealMaterializePurpose::Display
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(pending) = self.local_adjust_pending.get(&idx) {
             if pending.request.items_generation == request.items_generation
                 && pending.request.kind == request.kind
@@ -81839,6 +82888,9 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<Arc<egui::ColorImage>> {
+        if !self.ensure_original_material_for_entry(idx, OriginalMaterialEntry::MaterialOnly) {
+            return None;
+        }
         let raw = self.current_raw_source_pixels(idx)?;
         let erase = if self.mask_pages.contains(&idx) {
             let pixels = self
@@ -82043,7 +83095,7 @@ impl App {
             .then_some((final_key, *edit_size))
     }
 
-    fn has_retained_pdf_final_ai_for_current_params(&self, idx: usize) -> bool {
+    pub(crate) fn has_retained_pdf_final_ai_for_current_params(&self, idx: usize) -> bool {
         self.retained_pdf_final_ai_matches_current(idx).is_some()
     }
 
@@ -82113,6 +83165,10 @@ impl App {
             .insert(
                 key,
                 RetainedPdfPageEntry {
+                    canonical_dims: Some(crate::page_dims::CanonicalPageDimensions::new(
+                        source_dims[0] as u32,
+                        source_dims[1] as u32,
+                    )),
                     metadata,
                     kind: RetainedPdfPageCacheKind::Raster {
                         pixels,
@@ -82322,6 +83378,7 @@ impl App {
         Some((
             final_key,
             FinalAiEntry {
+                canonical_dims: self.canonical_source_dimensions(idx),
                 source_size: edit_size,
                 pixels,
                 used_upscale,
@@ -82399,6 +83456,7 @@ impl App {
             self.retained_pdf_page_cache_bytes(),
         ));
         Some(FinalAiEntry {
+            canonical_dims: self.canonical_source_dimensions(idx),
             source_size: edit_size,
             pixels,
             used_upscale,
@@ -82421,6 +83479,27 @@ impl App {
         retained_key: RetainedFinalAiKey,
         pixels: Arc<egui::ColorImage>,
         used_upscale: bool,
+    ) -> bool {
+        let canonical_dims = (self.metadata_cache_key(idx).as_ref()
+            == Some(&retained_key.item_key))
+        .then(|| self.canonical_source_dimensions(idx))
+        .flatten();
+        self.insert_retained_pdf_final_ai_with_dimensions(
+            idx,
+            retained_key,
+            pixels,
+            used_upscale,
+            canonical_dims,
+        )
+    }
+
+    fn insert_retained_pdf_final_ai_with_dimensions(
+        &mut self,
+        idx: usize,
+        retained_key: RetainedFinalAiKey,
+        pixels: Arc<egui::ColorImage>,
+        used_upscale: bool,
+        canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     ) -> bool {
         // Filed under the page it was computed for, which travels with the job, rather than under
         // whatever `idx` means by the time it lands. An upscale outlives the document it started
@@ -82485,6 +83564,7 @@ impl App {
             .insert(
                 key,
                 RetainedPdfPageEntry {
+                    canonical_dims,
                     metadata,
                     kind: RetainedPdfPageCacheKind::FinalAi {
                         pixels,
@@ -82624,7 +83704,7 @@ impl App {
         ));
     }
 
-    fn fs_upload_backlog_contains(&self, idx: usize) -> bool {
+    pub(crate) fn fs_upload_backlog_contains(&self, idx: usize) -> bool {
         self.fs_upload_backlog.iter().any(|entry| entry.idx == idx)
     }
 
@@ -82769,6 +83849,9 @@ impl App {
         }
         if self.has_retained_pdf_final_ai_for_current_params(idx) {
             return FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi);
+        }
+        if self.exact_complete_final_composite_entry(idx).is_some() {
+            return FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite);
         }
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Failed) => return FsPageLoadState::LoadFailed,
@@ -82959,6 +84042,42 @@ impl App {
         self.ensure_fs_page_load_with_contract(idx, FsPageLoadContract::Sequential)
     }
 
+    /// Display demand may already have a complete current GPU source after the
+    /// independently budgeted retained CPU entry was evicted. Raw/edit producers
+    /// continue to use `fs_page_load_state` and `ensure_fs_page_load` directly.
+    pub(crate) fn fs_display_page_load_state(&self, idx: usize) -> FsPageLoadState {
+        if self.page_turn_prefetch_policy_enabled()
+            && self.exact_complete_final_composite_texture(idx).is_some()
+        {
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite)
+        } else {
+            self.fs_page_load_state(idx)
+        }
+    }
+
+    pub(crate) fn ensure_fs_display_page_load(&mut self, idx: usize) -> FsPageLoadState {
+        self.ensure_fs_display_page_load_with_contract(idx, FsPageLoadContract::Sequential)
+    }
+
+    pub(crate) fn ensure_fs_display_page_load_with_contract(
+        &mut self,
+        idx: usize,
+        contract: FsPageLoadContract,
+    ) -> FsPageLoadState {
+        let state = self.fs_display_page_load_state(idx);
+        if state == FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite) {
+            self.verify_display_identity(idx);
+            self.apply_fs_page_load_contract(idx, contract);
+            self.note_fs_page_load_skipped(idx, state);
+            if self.fullscreen_idx == Some(idx) {
+                self.refresh_fullscreen_pdf_promotion();
+            }
+            state
+        } else {
+            self.ensure_fs_page_load_with_contract(idx, contract)
+        }
+    }
+
     pub(crate) fn ensure_fs_page_load_with_contract(
         &mut self,
         idx: usize,
@@ -83136,6 +84255,29 @@ impl App {
         pixels: Arc<egui::ColorImage>,
         used_upscale: bool,
     ) -> bool {
+        let canonical_dims = (self.metadata_cache_key(idx).as_ref()
+            == Some(&retained_key.item_key))
+        .then(|| self.canonical_source_dimensions(idx))
+        .flatten();
+        self.insert_retained_final_ai_with_key_and_dimensions(
+            idx,
+            retained_key,
+            retained_epoch,
+            pixels,
+            used_upscale,
+            canonical_dims,
+        )
+    }
+
+    fn insert_retained_final_ai_with_key_and_dimensions(
+        &mut self,
+        idx: usize,
+        retained_key: RetainedFinalAiKey,
+        retained_epoch: u64,
+        pixels: Arc<egui::ColorImage>,
+        used_upscale: bool,
+        canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
+    ) -> bool {
         let edit_size = retained_key.edit_size;
         if let Some((source, brightness)) = &retained_key.raw_source {
             if *brightness != self.settings.raw_brightness
@@ -83163,11 +84305,12 @@ impl App {
             return false;
         }
         if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
-            let stored = self.insert_retained_pdf_final_ai_with_used_upscale(
+            let stored = self.insert_retained_pdf_final_ai_with_dimensions(
                 idx,
                 retained_key.clone(),
                 Arc::clone(&pixels),
                 used_upscale,
+                canonical_dims,
             );
             if stored {
                 self.cancel_final_ai_pending_for_retained_key(&retained_key, "pdf_retained_store");
@@ -83211,6 +84354,7 @@ impl App {
             .insert(
                 retained_key,
                 RetainedFinalAiEntry {
+                    canonical_dims,
                     pixels,
                     used_upscale,
                     bytes,
@@ -83284,6 +84428,7 @@ impl App {
         ));
         self.cancel_final_ai_pending_for_retained_key(&retained_key, "retained_hit");
         Some(FinalAiEntry {
+            canonical_dims: self.canonical_source_dimensions(idx),
             source_size: edit_size,
             pixels,
             used_upscale,
@@ -83481,7 +84626,7 @@ impl App {
         }
     }
 
-    fn final_composite_key_for_pixels(
+    pub(crate) fn final_composite_key_for_pixels(
         &self,
         edit_key: EditResultKey,
         size: [usize; 2],
@@ -83699,6 +84844,7 @@ impl App {
             let adjust_before_ai =
                 (!source_is_color_adjusted && !params.is_color_identity()).then_some(params);
             queue.enqueue(AiJob {
+                canonical_dims: self.canonical_source_dimensions(idx),
                 job_id,
                 key,
                 priority,
@@ -83839,6 +84985,7 @@ impl App {
                     self.final_composite_cache.insert(
                         key,
                         FinalCompositeEntry {
+                            canonical_dims: pending.canonical_dims,
                             source_size: pending.source_size,
                             pixels,
                             texture: texture.clone(),
@@ -84086,6 +85233,7 @@ impl App {
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        canonical_dims: self.canonical_source_dimensions(key.edit_key.idx),
                         source_size,
                         cancel,
                         rx,
@@ -84189,9 +85337,11 @@ impl App {
             tex_opts,
         );
         let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        let canonical_dims = self.canonical_source_dimensions(idx);
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims,
                 source_size: edit_size,
                 pixels: post_filtered,
                 texture: texture.clone(),
@@ -84274,6 +85424,11 @@ impl App {
         if self.fs_entry_is_animated(idx) {
             return None;
         }
+        if self.page_turn_prefetch_policy_enabled()
+            && let Some(texture) = self.exact_complete_final_composite_texture(idx)
+        {
+            return Some(texture);
+        }
         // 画像オープン時のフリーズ調査用 perf 計装 (--perf-log)。この関数の build 経路
         // (キャッシュミス時) は UI スレッドで同期実行され、AI アップスケール後の大判
         // 画像では post_filter + GPU upload が数百ms かかりうる。cat="fs" /
@@ -84284,9 +85439,10 @@ impl App {
         if matches!(
             self.fs_page_load_state(idx),
             FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
-        ) && let Some(texture) = self.restore_retained_pdf_final_ai_composite(ctx, idx)
-        {
-            return Some(texture);
+        ) {
+            // A pending effect already owns the retained AI input. Falling through
+            // would hydrate an unused original while that same output is being built.
+            return self.restore_retained_pdf_final_ai_composite(ctx, idx);
         }
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
         let fc_edit_ms = fc_build_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
@@ -84450,9 +85606,11 @@ impl App {
             let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             (texture, fc_clamp_ms, fc_upload_ms)
         };
+        let canonical_dims = self.canonical_source_dimensions(idx);
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                canonical_dims,
                 source_size: edit_pixels.size,
                 pixels: post_filtered,
                 texture: texture.clone(),
@@ -84493,15 +85651,13 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(FinalCompositeKey, Arc<egui::ColorImage>)> {
+        if let Some((key, entry)) = self.exact_complete_final_composite_entry(idx) {
+            return Some((key, Arc::clone(&entry.pixels)));
+        }
         let texture = self.ensure_final_composite_texture(ctx, idx)?;
-        let _ = texture;
-        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
-        let params = self.effective_params(idx).clone();
-        let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
-        self.final_composite_cache
-            .get(&final_key)
-            .filter(|entry| entry.complete)
-            .map(|entry| (final_key, Arc::clone(&entry.pixels)))
+        self.exact_complete_final_composite_entry(idx)
+            .filter(|(_, entry)| entry.texture.id() == texture.id())
+            .map(|(key, entry)| (key, Arc::clone(&entry.pixels)))
     }
 
     pub(crate) fn ensure_final_composite_pixels(
@@ -84527,6 +85683,42 @@ impl App {
             .iter()
             .find(|(key, _)| self.edit_key_describes_current_page(&key.edit_key, idx))
             .map(|(_, entry)| entry.texture.clone())
+    }
+
+    /// Exact params, source/edit generations, item identity, and completion are
+    /// required before a final texture can satisfy display loading without raw pixels.
+    pub(crate) fn exact_complete_final_composite_texture(
+        &self,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return None;
+        }
+        self.exact_complete_final_composite_entry(idx)
+            .map(|(_, entry)| entry.texture.clone())
+    }
+
+    /// A completed live composite owns its pixels independently of raw/edit and
+    /// retained CPU caches. Display and pixel consumers share the same exact gate.
+    fn exact_complete_final_composite_entry(
+        &self,
+        idx: usize,
+    ) -> Option<(FinalCompositeKey, &FinalCompositeEntry)> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
+        let edit_key = self.current_edit_result_key(idx);
+        let params = self.effective_params(idx);
+        self.final_composite_cache.iter().find_map(|(key, entry)| {
+            (entry.complete
+                && *key == self.final_composite_key_for_pixels(edit_key, entry.source_size, params)
+                && self.display_texture_matches_page(&entry.texture, idx))
+            .then_some((*key, entry))
+        })
+    }
+
+    pub(crate) fn exact_complete_final_pixels_available(&self, idx: usize) -> bool {
+        self.exact_complete_final_composite_entry(idx).is_some()
     }
 
     pub(crate) fn final_composite_texture_is_complete(
@@ -84769,17 +85961,21 @@ impl App {
 
     /// canonical(非回転・非アップスケール)ソース画素の寸法 `(W, H)` を返す。注釈座標
     /// (D8) と消しゴム/隠蔽/補正レイヤーのマスクは全てこの空間で保持される。fs_cache の
-    /// デコード済みピクセル寸法を用いる (PDF/ZIP はレンダ済みページ寸法)。未ロード /
-    /// アニメーション等で取れなければ `None`。
-    pub(crate) fn source_dims_for_idx(&self, idx: usize) -> Option<(f32, f32)> {
+    /// デコード元と、取得時に完成素材へ保存した正準寸法を使う。
+    /// source / retained CPU が退去しても完成素材の基準を保ち、thumbnail寸法は採用しない。
+    pub(crate) fn canonical_source_dimensions(
+        &self,
+        idx: usize,
+    ) -> Option<crate::page_dims::CanonicalPageDimensions> {
+        use crate::page_dims::CanonicalPageDimensions;
         if self.is_raw_page(idx) {
             return self
                 .raw_pages
                 .page(idx)?
                 .developed_dims
-                .map(|[w, h]| (w.max(1) as f32, h.max(1) as f32));
+                .map(|[w, h]| CanonicalPageDimensions::new(w.max(1) as u32, h.max(1) as u32));
         }
-        match self.fs_cache.get(&idx) {
+        let original = match self.fs_cache.get(&idx) {
             Some(crate::fs_animation::FsCacheEntry::Static {
                 pixels,
                 source_dims,
@@ -84789,10 +85985,64 @@ impl App {
                 // canonical ソース px で持つ (D8) ので、>8K 画像でも clamp 後の
                 // `pixels.size` ではなく真のソース寸法を使う (Codex P1)。
                 let [w, h] = source_dims.unwrap_or(pixels.size);
-                Some((w.max(1) as f32, h.max(1) as f32))
+                Some(CanonicalPageDimensions::new(
+                    w.max(1) as u32,
+                    h.max(1) as u32,
+                ))
             }
             _ => None,
-        }
+        };
+        original
+            .or_else(|| {
+                self.page_dims_cache
+                    .get_canonical(self.items_generation, idx)
+            })
+            .or_else(|| {
+                self.exact_complete_final_composite_entry(idx)
+                    .and_then(|(_, entry)| entry.canonical_dims)
+            })
+            .or_else(|| {
+                let edit_key = self.current_edit_result_key(idx);
+                let params = self.effective_params(idx);
+                self.final_ai_cache.iter().find_map(|(key, entry)| {
+                    (self.final_ai_key_for_pixels(edit_key, entry.source_size, params)
+                        == Some(*key))
+                    .then_some(entry.canonical_dims)
+                    .flatten()
+                })
+            })
+            .or_else(|| {
+                let key = self.retained_pdf_page_key_for(idx)?;
+                self.retained_pdf_page_cache.get(&key)?.canonical_dims
+            })
+            .or_else(|| {
+                let item_key = self.metadata_cache_key(idx)?;
+                let params = self.effective_params(idx);
+                let edit_key = self.current_edit_result_key(idx);
+                self.retained_final_ai_cache
+                    .iter()
+                    .find_map(|(key, entry)| {
+                        let current =
+                            self.final_ai_key_for_pixels(edit_key, key.edit_size, params)?;
+                        (key.item_key == item_key
+                            && key.raw_source.is_none()
+                            && key.color_ai_hash == current.color_ai_hash
+                            && key.bg == current.bg)
+                            .then_some(entry.canonical_dims)
+                            .flatten()
+                    })
+            })
+    }
+
+    pub(crate) fn source_dims_for_idx(&self, idx: usize) -> Option<(f32, f32)> {
+        self.canonical_source_dimensions(idx).map(|dims| {
+            let (w, h) = dims.as_tuple();
+            (w.max(1) as f32, h.max(1) as f32)
+        })
+    }
+
+    fn comic_source_dims_for_idx(&self, idx: usize) -> Option<(f32, f32)> {
+        self.source_dims_for_idx(idx)
     }
 
     /// 注釈編集を確定したときに呼ぶ。`comic_generation` を進めて comic_cache の各 entry を
@@ -84983,7 +86233,7 @@ impl App {
         // の解像度なので、ソース→base の相似スケール S を掛けてから base 解像度で焼く
         // (§5.4)。AI OFF では base==source なので S=1 (= 従来と同一、退行なし)。
         let (src_w, src_h) = self
-            .source_dims_for_idx(idx)
+            .comic_source_dims_for_idx(idx)
             .unwrap_or((w as f32, h as f32));
         self.ensure_comic_doc_loaded(&key);
         let mut objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
@@ -85216,7 +86466,7 @@ impl App {
             return None; // デモ有効でも永続注釈が無ければ export には焼かない
         }
         let (src_w, src_h) = self
-            .source_dims_for_idx(idx)
+            .comic_source_dims_for_idx(idx)
             .unwrap_or((w as f32, h as f32));
         // 参照フォントを含めてロード (Inc 4c)。objects は下で move されるので前に呼ぶ。
         let fonts = self.ensure_comic_fonts_for(&objects)?;
@@ -85321,6 +86571,7 @@ impl App {
                 FinalAiResult::Ready {
                     job_id,
                     key,
+                    canonical_dims,
                     retained_key,
                     retained_epoch,
                     source_size,
@@ -85329,26 +86580,38 @@ impl App {
                 } => {
                     let pixels = Arc::new(image);
                     let entry = FinalAiEntry {
+                        canonical_dims,
                         source_size,
                         pixels: Arc::clone(&pixels),
                         used_upscale,
                     };
                     let retained_stored = if let Some(retained_key) = retained_key {
-                        self.insert_retained_final_ai_with_key(
+                        self.insert_retained_final_ai_with_key_and_dimensions(
                             key.edit_key.idx,
                             retained_key,
                             retained_epoch,
                             Arc::clone(&pixels),
                             used_upscale,
+                            canonical_dims,
                         )
                     } else if live_pending {
-                        self.insert_retained_final_ai_with_used_upscale(
-                            key.edit_key.idx,
-                            key,
-                            source_size,
-                            Arc::clone(&pixels),
-                            used_upscale,
-                        )
+                        let idx = key.edit_key.idx;
+                        if key.edit_key.item_id != self.item_id(idx) {
+                            false
+                        } else if let Some(retained_key) =
+                            self.retained_final_ai_key_for(idx, key, source_size)
+                        {
+                            self.insert_retained_final_ai_with_key_and_dimensions(
+                                idx,
+                                retained_key,
+                                self.retained_final_ai_epoch,
+                                Arc::clone(&pixels),
+                                used_upscale,
+                                canonical_dims,
+                            )
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };
@@ -85709,6 +86972,7 @@ impl App {
     }
 
     pub(crate) fn toggle_fullscreen_pointer_adjustment_panel(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         let next = crate::ui_helpers::toggle_side_panel_by_pointer(
             self.settings.fullscreen_side_panel_mode,
             self.adjustment_mode,
@@ -85723,6 +86987,7 @@ impl App {
     }
 
     pub(crate) fn open_fullscreen_touch_adjustment_panel(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         self.adjustment_mode = crate::ui_helpers::open_side_panel_by_touch(self.adjustment_mode);
     }
 
@@ -90075,6 +91340,7 @@ impl App {
         prefetch_perf: &mut Option<PollPrefetchPerfRecorder>,
         result_kind: &'static str,
         store_retained_pdf_page_raster: bool,
+        original_materialization: bool,
         animation: StaticAnimationState,
     ) -> FsCacheEntry {
         if store_retained_pdf_page_raster {
@@ -90117,7 +91383,10 @@ impl App {
         // 表示中の画像のみ色調補正を即座に適用（チラつき防止）。
         // 先読み分は表示に入った時点で final pipeline
         // (ensure_final_composite_texture) が処理する。
-        if self.fullscreen_idx == Some(key) && animation == StaticAnimationState::Still {
+        if !original_materialization
+            && self.fullscreen_idx == Some(key)
+            && animation == StaticAnimationState::Still
+        {
             self.apply_sync_adjustment(ctx, key, &pixels);
             mark_poll_prefetch_perf(prefetch_perf, PollPrefetchPerfStage::ApplySyncAdjustment);
         }
@@ -90629,8 +91898,14 @@ impl App {
                         let still_displayed = displayed_page.is_some_and(|(current, partner)| {
                             Self::page_is_displayed(key, current, partner)
                         });
-                        if matches!(pending.purpose, FsLoadPurpose::Display)
-                            && still_displayed
+                        if matches!(
+                            pending.purpose,
+                            FsLoadPurpose::Display
+                                | FsLoadPurpose::ResumeAfterNormalLoad {
+                                    normal: FsNormalLoadPurpose::Display,
+                                    ..
+                                }
+                        ) && still_displayed
                             && animation_expansion_started_at.is_none()
                         {
                             animation_expansion_started_at = Some(started_at);
@@ -90690,6 +91965,15 @@ impl App {
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
         for (key, purpose) in disconnected {
             if let Some(mut pending) = self.fs_pending.remove(&key) {
+                if matches!(purpose, FsLoadPurpose::Original { .. })
+                    && !pending.ticket.cancel_token().load(Ordering::Relaxed)
+                {
+                    crate::logger::log(format!(
+                        "[fs] original material worker disconnected idx={key}"
+                    ));
+                    self.fs_cache.insert(key, FsCacheEntry::Failed);
+                    self.show_feedback_toast("元画像を読み込めませんでした".to_owned());
+                }
                 pending.disarm_ticket();
             }
             self.fs_early_dims.remove(&key);
@@ -90829,6 +92113,9 @@ impl App {
             || early_dims_repaint
             || animation_expansion_repaint
             || has_more_admitted_backlog;
+        // Receipts live only for this upload batch. Adopt every source before any continuation
+        // can request a spread partner that was already removed into this same batch.
+        let mut original_entry_receipts = Vec::new();
         mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
         for (items_generation, upload) in to_process {
             let FsUploadResult {
@@ -90841,9 +92128,34 @@ impl App {
             if !self.fs_cache.accepts_generation(key, items_generation) {
                 continue;
             }
+            let original_entry = purpose.original_entry();
+            let preserve_completed = matches!(purpose, FsLoadPurpose::Original { .. });
+            if preserve_completed && matches!(result, FsLoadResult::Failed) {
+                self.fs_cache
+                    .insert_for_generation(key, items_generation, FsCacheEntry::Failed);
+                self.show_feedback_toast("元画像を読み込めませんでした".to_owned());
+                continue;
+            }
             let result = match result {
                 FsLoadResult::Raw { tag, result } => {
+                    let accepted = self
+                        .raw_pages
+                        .accepts(&tag, self.fs_page_load_context_serial());
                     self.apply_raw_fs_result(ctx, tag, result, load_seq);
+                    if accepted
+                        && (self.current_raw_source_pixels(key).is_some()
+                            || matches!(
+                                self.fs_cache.get(&key),
+                                Some(FsCacheEntry::RawPreview {
+                                    preview: Some(_),
+                                    ..
+                                })
+                            ))
+                    {
+                        if let Some(entry) = original_entry {
+                            original_entry_receipts.push((items_generation, key, entry));
+                        }
+                    }
                     continue;
                 }
                 FsLoadResult::RawSourceFailed {
@@ -90886,13 +92198,15 @@ impl App {
             // static source の差し替えでは、この後の `apply_sync_adjustment` が旧世代の
             // final composite を破棄し得る。PDF Z ズーム再描画の完成表示を失わないよう、
             // raw upload / 同期補正より前に display-only holdover を確保する。
-            if matches!(
-                &result,
-                FsLoadResult::Static { .. }
-                    | FsLoadResult::StaticPdf { .. }
-                    | FsLoadResult::StaticCached { .. }
-                    | FsLoadResult::StaticPanorama { .. }
-            ) {
+            if !preserve_completed
+                && matches!(
+                    &result,
+                    FsLoadResult::Static { .. }
+                        | FsLoadResult::StaticPdf { .. }
+                        | FsLoadResult::StaticCached { .. }
+                        | FsLoadResult::StaticPanorama { .. }
+                )
+            {
                 self.capture_final_effect_source_reload_holdover(key);
             }
             mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
@@ -90939,7 +92253,8 @@ impl App {
                         upload_t0,
                         &mut prefetch_perf,
                         "static",
-                        true,
+                        !preserve_completed,
+                        preserve_completed,
                         animation,
                     )
                 }
@@ -90957,6 +92272,7 @@ impl App {
                     &mut prefetch_perf,
                     "static_cached",
                     false,
+                    preserve_completed,
                     StaticAnimationState::Still,
                 ),
                 FsLoadResult::Animated(frames) => {
@@ -91063,7 +92379,7 @@ impl App {
                         &mut prefetch_perf,
                         PollPrefetchPerfStage::UploadBacklog,
                     );
-                    if self.fullscreen_idx == Some(key) {
+                    if !preserve_completed && self.fullscreen_idx == Some(key) {
                         self.apply_sync_adjustment(ctx, key, &pixels);
                         mark_poll_prefetch_perf(
                             &mut prefetch_perf,
@@ -91092,6 +92408,14 @@ impl App {
                 .insert_for_generation(key, items_generation, entry);
             self.record_fs_cache_page_dims_for_spread(key);
             self.fs_margin_bbox_cache.remove(&key);
+            if self.current_raw_source_pixels(key).is_some() {
+                if let Some(entry) = original_entry {
+                    original_entry_receipts.push((items_generation, key, entry));
+                }
+            }
+            if preserve_completed {
+                continue;
+            }
             self.bump_input_generation_for_fs_cache_reload(key);
             // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
             // 画像が 360 候補 (XMP equirect OR aspect 2:1) かつ大画像 (>200 MP) なら
@@ -91130,6 +92454,11 @@ impl App {
                 &mut prefetch_perf,
                 PollPrefetchPerfStage::OtherPostprocessing,
             );
+        }
+        for (generation, idx, entry) in original_entry_receipts {
+            if self.fs_cache.accepts_generation(idx, generation) {
+                self.resume_original_material_entry(ctx, idx, entry);
+            }
         }
         self.start_demanded_raw_development(ctx);
         if repaint {
@@ -93433,7 +94762,10 @@ impl App {
         }
 
         #[cfg(windows)]
-        crate::key_input::begin_frame();
+        crate::key_input::begin_frame_for_context_with_tracking(
+            ctx,
+            self.settings.page_turn_animation_enabled,
+        );
 
         // タスクトレイ関連の毎フレーム処理は、設定 ON のときのみ走らせる。
         // 既定 OFF のユーザーには IsWindowVisible の syscall やイベント polling を
@@ -94125,6 +95457,7 @@ impl App {
                 // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
                 // 後継 (= ページ送り時 AI を待たされる退行を直す)。
                 if page_turn_decision.admits_non_target_full_resolution_work() {
+                    self.reconcile_paged_prefetch_window(fs_idx);
                     self.prefetch_final_ai(ctx, fs_idx);
                 } else {
                     // Target final-effect results are part of materialization; unrelated
@@ -94195,7 +95528,8 @@ impl App {
                 .iter()
                 .any(main_viewport_event_is_explicit_input)
         });
-        let fullscreen_root_key_handled = self.handle_fullscreen_root_key_input(ctx);
+        let (fullscreen_root_key_handled, fullscreen_root_input) =
+            self.fullscreen_root_input_for_frame(ctx);
 
         // ── フルスクリーン中にメインウィンドウへフォーカスが来たら閉じる ──
         // ボーダーレスウィンドウなので Alt-Tab 等でメインに戻れるが、
@@ -94382,7 +95716,7 @@ impl App {
             ),
         );
         if should_render_main_fullscreen_viewport {
-            self.render_fullscreen_viewport(ctx);
+            self.render_fullscreen_viewport_with_root_input(ctx, fullscreen_root_input);
         }
         // This span is the whole of `pre_grid` while a video plays in a detached
         // window (backlog 1.122). Name the call that owns it.
@@ -98212,6 +99546,7 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
         &crate::ai::final_pipeline::NoFinalAiProgress,
     ) {
         Ok(output) => FinalAiResult::Ready {
+            canonical_dims: job.canonical_dims,
             job_id,
             key,
             retained_key,
@@ -98414,9 +99749,17 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 // テスト専用。`ui_fullscreen` など兄弟モジュールのテストからも
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
+pub(crate) mod composite_pixels_revision_tests;
+#[cfg(test)]
 mod grid_cursor_tests;
+#[cfg(test)]
+mod material_demand_revision_tests;
 #[cfg(all(test, windows))]
 pub(crate) mod multiwindow_scenario_tests;
+#[cfg(test)]
+mod original_material_tests;
+#[cfg(test)]
+pub(crate) mod paged_prefetch_tests;
 #[cfg(test)]
 pub(crate) mod paint_record_test_support;
 #[cfg(test)]

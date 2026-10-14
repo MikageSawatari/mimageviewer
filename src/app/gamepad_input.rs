@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -28,7 +29,51 @@ use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
     ThumbAspect, format_video_volume_db, step_video_volume_by_fader_key_step,
 };
+use crate::ui_fullscreen::{OperationPhase, PresentationDestination, ViewerOperationId};
 use crate::ui_main::AddressBarNav;
+
+fn next_pad_operation_batch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+struct PadNavigationDispatch {
+    frame: u64,
+    destination: PresentationDestination,
+    operation_id: ViewerOperationId,
+}
+
+/// A synchronous dispatch witness, removed on return/unwind. It carries the
+/// consumed producer identity through existing ring/stick helpers, not a queue.
+struct PadNavigationDispatchScope {
+    ctx: egui::Context,
+    previous: Option<PadNavigationDispatch>,
+}
+
+impl Drop for PadNavigationDispatchScope {
+    fn drop(&mut self) {
+        self.ctx.data_mut(|data| {
+            let id = egui::Id::new("page_turn_pad_dispatch");
+            data.remove::<PadNavigationDispatch>(id);
+            if let Some(previous) = self.previous {
+                data.insert_temp(id, previous);
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PadBatchDelivery {
+    Fresh,
+    Replay,
+}
+
+#[derive(Clone)]
+struct SampledPadTransaction {
+    frame: u64,
+    batch: GamepadFrameBatch,
+}
 
 enum RatingPickerTermination {
     Release(crate::rating_membership::RatingAdoptionIntent),
@@ -42,7 +87,13 @@ enum RatingPickerTermination {
 /// 値として持ち回るのは、配り先が「root か、前面の別ウィンドウか」で変わるため。
 /// App へ pending フラグを足すと、どの frame のどの context 向けだったかが状態から
 /// 読めなくなる (リワーク憲法 規則 3)。
+#[derive(Clone)]
 pub(crate) struct GamepadFrameBatch {
+    operation_batch: u64,
+    delivery: PadBatchDelivery,
+    /// Continuous input observed anywhere in this poll, including a neutral
+    /// final level. Replay must still invalidate presentation without moving.
+    analog_operation: bool,
     now: Instant,
     actions: Vec<PadAction>,
     saw_input_event: bool,
@@ -63,6 +114,9 @@ impl GamepadFrameBatch {
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
         Self {
+            operation_batch: next_pad_operation_batch(),
+            delivery: PadBatchDelivery::Fresh,
+            analog_operation: false,
             now: Instant::now(),
             actions: Vec::new(),
             session_ended: false,
@@ -309,8 +363,60 @@ enum PadActionKind {
 
 #[derive(Clone, Copy, Debug)]
 struct PadAction {
+    operation_id: PadOperationId,
     button: PadButton,
     kind: PadActionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PadOperationId {
+    batch: u64,
+    ordinal: u32,
+}
+
+#[cfg(test)]
+impl PadOperationId {
+    const fn unassigned() -> Self {
+        Self {
+            batch: 0,
+            ordinal: 0,
+        }
+    }
+}
+
+impl GamepadFrameBatch {
+    fn presentation_operations(&self) -> Vec<(ViewerOperationId, OperationPhase, &'static str)> {
+        let mut operations = self
+            .actions
+            .iter()
+            .filter_map(|action| {
+                let phase = match action.kind {
+                    PadActionKind::Press => OperationPhase::Press,
+                    PadActionKind::Repeat => OperationPhase::Repeat,
+                    PadActionKind::Release => return None,
+                };
+                Some((
+                    ViewerOperationId::Pad {
+                        batch: action.operation_id.batch,
+                        ordinal: action.operation_id.ordinal,
+                    },
+                    phase,
+                    "gamepad",
+                ))
+            })
+            .collect::<Vec<_>>();
+        if self.analog_operation {
+            operations.push((
+                ViewerOperationId::Pad {
+                    batch: self.operation_batch,
+                    ordinal: self.actions.len() as u32,
+                },
+                OperationPhase::Continuous,
+                "gamepad_analog",
+            ));
+        }
+        operations
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1995,6 +2101,31 @@ impl App {
     /// [`Self::dispatch_gamepad_batch`] の仕事で、そちらは context を mount した状態で
     /// 呼ぶ (2026-08-29 レビュー R-02)。
     pub(crate) fn sample_gamepad_input(&mut self, ctx: &egui::Context) -> GamepadFrameBatch {
+        let track_presentation = self.page_turn_operation_tracking_needed();
+        let transaction_id = if track_presentation {
+            egui::Id::new("gamepad_operation_ingress")
+        } else {
+            egui::Id::NULL
+        };
+        let frame = if track_presentation {
+            ctx.cumulative_frame_nr()
+        } else {
+            0
+        };
+        if track_presentation
+            && ctx.current_pass_index() > 0
+            && let Some(mut transaction) =
+                ctx.data(|data| data.get_temp::<SampledPadTransaction>(transaction_id))
+            && transaction.frame == frame
+        {
+            transaction.batch.delivery = PadBatchDelivery::Replay;
+            return transaction.batch;
+        }
+        let operation_batch = if track_presentation {
+            next_pad_operation_batch()
+        } else {
+            0
+        };
         let now = Instant::now();
         // 無効なら読まない。runtime 側が読み取りスレッドごと止めるので、
         // 「反応しないのに UI だけ起き続ける」状態にはならない。
@@ -2008,6 +2139,9 @@ impl App {
         if !enabled {
             self.release_gamepad_input_holds(ctx);
             return GamepadFrameBatch {
+                operation_batch,
+                delivery: PadBatchDelivery::Fresh,
+                analog_operation: false,
                 now,
                 actions: Vec::new(),
                 saw_input_event: false,
@@ -2017,6 +2151,7 @@ impl App {
         let mut actions = Vec::new();
         let mut saw_input_event = false;
         let mut session_ended = false;
+        let mut analog_operation = track_presentation && self.gamepad_analog_active();
 
         for event in events {
             match event {
@@ -2024,6 +2159,10 @@ impl App {
                     saw_input_event = true;
                     if self.gamepad_state.set_button_down(button, true, now) {
                         actions.push(PadAction {
+                            operation_id: PadOperationId {
+                                batch: operation_batch,
+                                ordinal: actions.len() as u32,
+                            },
                             button,
                             kind: PadActionKind::Press,
                         });
@@ -2033,6 +2172,10 @@ impl App {
                     saw_input_event = true;
                     if self.gamepad_state.set_button_down(button, false, now) {
                         actions.push(PadAction {
+                            operation_id: PadOperationId {
+                                batch: operation_batch,
+                                ordinal: actions.len() as u32,
+                            },
                             button,
                             kind: PadActionKind::Release,
                         });
@@ -2041,6 +2184,9 @@ impl App {
                 PadEvent::AxisChanged(axis, value) => {
                     saw_input_event = true;
                     self.gamepad_state.set_axis(axis, value);
+                    if track_presentation {
+                        analog_operation |= self.gamepad_analog_active();
+                    }
                 }
                 PadEvent::Connected => {
                     saw_input_event = true;
@@ -2059,18 +2205,69 @@ impl App {
             let interval = repeat_interval_for_button(button);
             if self.gamepad_state.due_button_repeat(button, now, interval) {
                 actions.push(PadAction {
+                    operation_id: PadOperationId {
+                        batch: operation_batch,
+                        ordinal: actions.len() as u32,
+                    },
                     button,
                     kind: PadActionKind::Repeat,
                 });
             }
         }
 
-        GamepadFrameBatch {
+        let batch = GamepadFrameBatch {
+            operation_batch,
+            delivery: PadBatchDelivery::Fresh,
+            analog_operation,
             now,
             actions,
             saw_input_event,
             session_ended,
+        };
+        if track_presentation {
+            // The sampled immutable batch is the application ingress owner;
+            // dispatch/replay must not replace arrival with acceptance time.
+            for action in &batch.actions {
+                let operation_id = ViewerOperationId::Pad {
+                    batch: action.operation_id.batch,
+                    ordinal: action.operation_id.ordinal,
+                };
+                crate::key_input::trace_page_turn_operation_ingress(
+                    || format!("{operation_id:?}"),
+                    ctx.viewport_id(),
+                    None,
+                    match action.kind {
+                        PadActionKind::Press => "Press",
+                        PadActionKind::Repeat => "Repeat",
+                        PadActionKind::Release => "release",
+                    },
+                    "gamepad_sample",
+                );
+            }
+            if batch.analog_operation {
+                let operation_id = ViewerOperationId::Pad {
+                    batch: batch.operation_batch,
+                    ordinal: batch.actions.len() as u32,
+                };
+                crate::key_input::trace_page_turn_operation_ingress(
+                    || format!("{operation_id:?}"),
+                    ctx.viewport_id(),
+                    None,
+                    "Continuous",
+                    "gamepad_sample",
+                );
+            }
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    transaction_id,
+                    SampledPadTransaction {
+                        frame,
+                        batch: batch.clone(),
+                    },
+                )
+            });
         }
+        batch
     }
 
     /// 前面の context へ操作を配る。**その context を mount した状態で呼ぶこと。**
@@ -2082,11 +2279,50 @@ impl App {
         ctx: &egui::Context,
         batch: GamepadFrameBatch,
     ) -> GamepadDispatchOutcome {
+        self.dispatch_gamepad_batch_with_admission(ctx, batch, Self::gamepad_dispatch_allowed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_neutral_gamepad_poll_for_test(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> GamepadDispatchOutcome {
+        self.dispatch_gamepad_poll_for_test(ctx, false)
+    }
+
+    #[cfg(test)]
+    fn dispatch_gamepad_poll_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        analog_operation: bool,
+    ) -> GamepadDispatchOutcome {
+        let mut batch = GamepadFrameBatch::empty_for_test();
+        batch.analog_operation = analog_operation;
+        // Headless fixtures supply the input owner's admission proof, without
+        // consulting or changing the desktop's foreground window.
+        self.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true)
+    }
+
+    fn dispatch_gamepad_batch_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        batch: GamepadFrameBatch,
+        admission: impl FnOnce(&Self, &egui::Context) -> bool,
+    ) -> GamepadDispatchOutcome {
+        let operations = if self.page_turn_operation_tracking_needed() {
+            batch.presentation_operations()
+        } else {
+            Vec::new()
+        };
         let GamepadFrameBatch {
+            operation_batch,
+            delivery,
+            analog_operation,
             now,
             actions,
             saw_input_event,
             session_ended,
+            ..
         } = batch;
         // Sidecar restore is an App-global semantic-input barrier. End the physical session and
         // resolve any live picker without replaying its current row: a picker preview may already
@@ -2109,24 +2345,53 @@ impl App {
         // なる (レビュー R12)。root で確定すると保存先を間違える (レビュー N01)。
         //
         // `dispatch_allowed` より前に置く。パッドはもう無いので、抑止する相手がいない。
-        if session_ended {
+        if session_ended && delivery == PadBatchDelivery::Fresh {
             self.commit_ring_picker(ctx);
         }
-        let dispatch_allowed = self.gamepad_dispatch_allowed(ctx);
+        let dispatch_allowed = admission(self, ctx);
         let mut nav = None;
         let mut dispatched = false;
         if dispatch_allowed {
             let surface = self.current_input_surface();
             self.note_input_surface(surface);
+            if self.gamepad_targets_viewer() && !operations.is_empty() {
+                // The existing router has already mounted the delivery owner.
+                // Observe every edge before the first navigation, so a later
+                // edge also disqualifies an offer made by the first one.
+                self.page_turn_external_operations(ctx, &operations);
+            }
+            if delivery == PadBatchDelivery::Replay {
+                return GamepadDispatchOutcome {
+                    nav,
+                    dispatched,
+                    dispatch_allowed,
+                    saw_input_event,
+                };
+            }
             self.consume_gamepad_directional_neutral_gate(now);
+            let analog_ordinal = actions.len() as u32;
             for action in actions {
-                if let Some(next_nav) = self.dispatch_gamepad_button(ctx, action) {
+                if let Some(next_nav) = self.dispatch_gamepad_button_with_operation(ctx, action) {
                     nav = Some(next_nav);
                     dispatched = true;
                     break;
                 }
                 dispatched = true;
             }
+            // A neutral poll is not input. Preserve the sampled analog fact;
+            // merely entering the analog handler must not cancel a page turn.
+            let _operation_scope = analog_operation
+                .then(|| {
+                    self.gamepad_navigation_dispatch_scope(
+                        ctx,
+                        ViewerOperationId::Pad {
+                            batch: operation_batch,
+                            ordinal: analog_ordinal,
+                        },
+                        OperationPhase::Continuous,
+                    )
+                })
+                .flatten();
             if self.dispatch_gamepad_analog(ctx, now) {
                 dispatched = true;
             }
@@ -2142,6 +2407,73 @@ impl App {
             dispatch_allowed,
             saw_input_event,
         }
+    }
+
+    fn dispatch_gamepad_button_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        action: PadAction,
+    ) -> Option<AddressBarNav> {
+        let _operation_scope = (action.kind != PadActionKind::Release)
+            .then(|| {
+                self.gamepad_navigation_dispatch_scope(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: action.operation_id.batch,
+                        ordinal: action.operation_id.ordinal,
+                    },
+                    match action.kind {
+                        PadActionKind::Press | PadActionKind::Release => OperationPhase::Press,
+                        PadActionKind::Repeat => OperationPhase::Repeat,
+                    },
+                )
+            })
+            .flatten();
+        self.dispatch_gamepad_button(ctx, action)
+    }
+
+    fn gamepad_navigation_dispatch_scope(
+        &mut self,
+        ctx: &egui::Context,
+        operation_id: ViewerOperationId,
+        phase: OperationPhase,
+    ) -> Option<PadNavigationDispatchScope> {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
+            return None;
+        }
+        self.page_turn_external_operation(ctx, operation_id, phase, "gamepad_dispatch");
+        let id = egui::Id::new("page_turn_pad_dispatch");
+        let dispatch = PadNavigationDispatch {
+            frame: ctx.cumulative_frame_nr(),
+            destination: self.page_turn_destination(),
+            operation_id,
+        };
+        let previous = ctx.data_mut(|data| {
+            let previous = data.get_temp::<PadNavigationDispatch>(id);
+            data.insert_temp(id, dispatch);
+            previous
+        });
+        Some(PadNavigationDispatchScope {
+            ctx: ctx.clone(),
+            previous,
+        })
+    }
+
+    pub(crate) fn gamepad_operation_for_navigation(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<ViewerOperationId> {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
+            return None;
+        }
+        ctx.data(|data| {
+            data.get_temp::<PadNavigationDispatch>(egui::Id::new("page_turn_pad_dispatch"))
+        })
+        .filter(|dispatch| {
+            dispatch.frame == ctx.cumulative_frame_nr()
+                && dispatch.destination == self.page_turn_destination()
+        })
+        .map(|dispatch| dispatch.operation_id)
     }
 
     /// End App-owned gamepad semantics at the sidecar-restore modal boundary.
@@ -6407,7 +6739,13 @@ impl App {
             return;
         };
         let mut action = crate::ui_fullscreen::FsKeyAction::default();
-        self.queue_spread_shift_action(fs_idx, dir, &mut action);
+        self.queue_spread_shift_action_for_frame(
+            ctx,
+            fs_idx,
+            dir,
+            &mut action,
+            self.gamepad_operation_for_navigation(ctx),
+        );
         if !action.page_nav.is_none() || action.jump_to.is_some() {
             self.bump_input_seq(source, Some(&format!("spread_shift_dir={dir}")));
             self.handle_fs_navigation(
@@ -6835,7 +7173,13 @@ impl App {
             return;
         };
         let mut action = crate::ui_fullscreen::FsKeyAction::default();
-        self.queue_spread_shift_action(fs_idx, nudge_dir, &mut action);
+        self.queue_spread_shift_action_for_frame(
+            ctx,
+            fs_idx,
+            nudge_dir,
+            &mut action,
+            self.gamepad_operation_for_navigation(ctx),
+        );
         if !action.page_nav.is_none() || action.jump_to.is_some() {
             self.bump_input_seq(
                 "gamepad_fs_nudge",
@@ -9033,6 +9377,7 @@ mod tests {
                         .dispatch_gamepad_favorite_picker_button(
                             ctx,
                             PadAction {
+                                operation_id: super::PadOperationId::unassigned(),
                                 button: crate::gamepad::PadButton::South,
                                 kind: PadActionKind::Press,
                             },
@@ -9268,6 +9613,155 @@ mod tests {
     }
 
     #[test]
+    fn pad_operation_batch_preserves_multiple_press_release_edges_and_phase() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        for event in [
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::ButtonReleased(PadButton::DPadRight),
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::ButtonReleased(PadButton::DPadRight),
+        ] {
+            app.gamepad.push_for_test(event);
+        }
+        let batch = app.sample_gamepad_input(&ctx);
+        assert_eq!(batch.actions.len(), 4);
+        for (ordinal, action) in batch.actions.iter().enumerate() {
+            assert_eq!(action.operation_id.batch, batch.operation_batch);
+            assert_eq!(action.operation_id.ordinal, ordinal as u32);
+        }
+        assert_eq!(batch.actions[0].kind, super::PadActionKind::Press);
+        assert_eq!(batch.actions[1].kind, super::PadActionKind::Release);
+        let facts = batch.presentation_operations();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].1, super::OperationPhase::Press);
+        assert_eq!(facts[1].1, super::OperationPhase::Press);
+        assert_ne!(facts[0].0, facts[1].0);
+        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+        let next = app.sample_gamepad_input(&ctx);
+        assert!(next.presentation_operations().is_empty());
+        assert_ne!(next.operation_batch, batch.operation_batch);
+    }
+
+    #[test]
+    fn pad_operation_initial_press_is_not_reclassified_from_held_level() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+        let initial = app.sample_gamepad_input(&ctx);
+        assert!(app.gamepad_state.button_down(PadButton::DPadRight));
+        assert_eq!(
+            initial.presentation_operations()[0].1,
+            super::OperationPhase::Press
+        );
+        app.gamepad_state.clear();
+        app.gamepad_state.set_button_down(
+            PadButton::DPadRight,
+            true,
+            Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let repeat = app.sample_gamepad_input(&ctx);
+        assert_eq!(repeat.actions.len(), 1);
+        assert_eq!(repeat.actions[0].kind, super::PadActionKind::Repeat);
+        assert_eq!(
+            repeat.presentation_operations()[0].1,
+            super::OperationPhase::Repeat
+        );
+        assert_ne!(
+            initial.presentation_operations()[0].0,
+            repeat.presentation_operations()[0].0
+        );
+    }
+
+    #[test]
+    fn pad_operation_replay_preserves_ids_and_continuous_fact_after_neutral() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        for event in [
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::ButtonReleased(PadButton::DPadRight),
+            PadEvent::AxisChanged(crate::gamepad::PadAxis::LeftX, 0.9),
+            PadEvent::AxisChanged(crate::gamepad::PadAxis::LeftX, 0.0),
+        ] {
+            app.gamepad.push_for_test(event);
+        }
+        let mut observed = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input(ctx);
+            assert_eq!(
+                batch.delivery,
+                if ctx.current_pass_index() == 0 {
+                    super::PadBatchDelivery::Fresh
+                } else {
+                    super::PadBatchDelivery::Replay
+                }
+            );
+            assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+            assert!(!app.gamepad_analog_active());
+            let facts = batch.presentation_operations();
+            assert_eq!(facts.len(), 2);
+            assert_eq!(facts[0].1, super::OperationPhase::Press);
+            assert_eq!(facts[1].1, super::OperationPhase::Continuous);
+            assert_ne!(facts[0].0, facts[1].0);
+            observed.push(facts);
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("pad operation replay");
+            }
+        });
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0], observed[1]);
+        let _ = ctx.run(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input(ctx);
+            assert_eq!(batch.delivery, super::PadBatchDelivery::Fresh);
+            assert!(batch.presentation_operations().is_empty());
+        });
+    }
+
+    #[test]
+    fn pad_operation_off_keeps_existing_polling_on_discarded_passes() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = false;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+        let mut kinds = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input(ctx);
+            assert_eq!(batch.delivery, super::PadBatchDelivery::Fresh);
+            assert_eq!(batch.operation_batch, 0);
+            assert!(!batch.analog_operation);
+            assert_eq!(batch.actions.len(), 1);
+            kinds.push(batch.actions[0].kind);
+            assert!(
+                ctx.data(
+                    |data| data.get_temp::<super::SampledPadTransaction>(egui::Id::new(
+                        "gamepad_operation_ingress"
+                    ))
+                )
+                .is_none()
+            );
+            if ctx.current_pass_index() == 0 {
+                app.gamepad
+                    .push_for_test(PadEvent::ButtonReleased(PadButton::DPadRight));
+                ctx.request_discard("pad off retains live polling");
+            }
+        });
+        assert_eq!(
+            kinds,
+            vec![super::PadActionKind::Press, super::PadActionKind::Release]
+        );
+        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+    }
+
+    #[test]
     fn grid_collection_ring_action_rejects_a_fullscreen_route_with_a_reason() {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
@@ -9402,6 +9896,9 @@ mod tests {
         let outcome = app.dispatch_gamepad_batch(
             &ctx,
             GamepadFrameBatch {
+                operation_batch: super::next_pad_operation_batch(),
+                delivery: super::PadBatchDelivery::Fresh,
+                analog_operation: false,
                 now: Instant::now(),
                 actions: Vec::new(),
                 saw_input_event: true,
@@ -9641,7 +10138,7 @@ mod tests {
     }
 
     use crate::app::ActionSurface;
-    use crate::gamepad::{GamepadInputState, PadButton};
+    use crate::gamepad::{GamepadInputState, PadButton, PadEvent};
     use crate::ring_shortcut::{
         GamepadFavoritePickerState, GamepadFavoritePickerTab, GamepadListCursor,
         MOUSE_FLICK_MOVE_THRESHOLD_PX, MOUSE_FLICK_NEUTRAL_RADIUS_PX, MouseFlickState,
@@ -10218,6 +10715,160 @@ mod next_input_tests {
     use crate::settings::{FullscreenFitMode, ReadingFlow};
     use crate::ui_dialogs::file_organize::FileOrganizeRequest;
 
+    #[test]
+    fn page_turn_first_gamepad_navigation_skip_keeps_the_dispatched_id() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
+        use crate::ui_fullscreen::take_page_turn_test_events as take_test_events;
+        take_test_events();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.page_turn_animation_enabled = true;
+        assert!(!app.page_turn_barrier_active());
+        let batch = next_pad_operation_batch();
+        let accepted = ViewerOperationId::Pad { batch, ordinal: 0 };
+        frame(&ctx, |_, ctx| {
+            app.page_turn_external_operations(
+                ctx,
+                &[
+                    (accepted, OperationPhase::Press, "gamepad"),
+                    (
+                        ViewerOperationId::Pad { batch, ordinal: 1 },
+                        OperationPhase::Press,
+                        "gamepad",
+                    ),
+                ],
+            );
+            app.dispatch_gamepad_button_with_operation(
+                ctx,
+                PadAction {
+                    operation_id: PadOperationId { batch, ordinal: 0 },
+                    button: PadButton::DPadRight,
+                    kind: PadActionKind::Press,
+                },
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert_eq!(app.gamepad_operation_for_navigation(ctx), None);
+        });
+        let events = take_test_events();
+        assert_eq!(events.len(), 1, "one accepted navigation: {events:?}");
+        assert_eq!(events[0].0.operation_id, accepted);
+        assert_eq!((events[0].1, events[0].2), ("skip", "superseded_animation"));
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn page_turn_gamepad_neutral_poll_preserves_curl_and_sampled_analog_cancels() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app, seed_leaf};
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_leaf(&ctx, &mut app);
+        frame(&ctx, |_, ctx| {
+            app.page_turn_pre_draw(ctx);
+            let outcome = app.dispatch_neutral_gamepad_poll_for_test(ctx);
+            assert!(outcome.dispatch_allowed);
+            assert!(!outcome.dispatched);
+            assert!(app.page_turn_barrier_active());
+            assert!(!app.page_turn_completion_active());
+        });
+        frame(&ctx, |_, ctx| {
+            // A directional key-up is not a new press either. The sampled
+            // batch excludes Release, so dispatch must keep that same rule.
+            app.dispatch_gamepad_button_with_operation(
+                ctx,
+                PadAction {
+                    operation_id: PadOperationId {
+                        batch: next_pad_operation_batch(),
+                        ordinal: 0,
+                    },
+                    button: PadButton::DPadRight,
+                    kind: PadActionKind::Release,
+                },
+            );
+            assert!(app.page_turn_barrier_active());
+            assert!(!app.page_turn_completion_active());
+        });
+        frame(&ctx, |_, ctx| {
+            app.page_turn_pre_draw(ctx);
+            // An axis can return to neutral during this poll. Its sampled
+            // operation still cancels even though the final level cannot move.
+            let outcome = app.dispatch_gamepad_poll_for_test(ctx, true);
+            assert!(outcome.dispatch_allowed);
+            assert!(!outcome.dispatched);
+            assert!(app.page_turn_completion_active());
+            assert_eq!(app.fullscreen_idx, Some(1));
+        });
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn page_turn_gamepad_dispatch_keeps_the_first_consumed_id_and_removes_its_scope() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        use crate::ui_fullscreen::page_turn_submission_tests::{
+            adopt_interrupted_target, frame, ready_app, seed_leaf,
+        };
+        for enabled in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, SpreadMode::Single);
+            seed_leaf(&ctx, &mut app);
+            if !enabled {
+                app.adopt_page_turn_animation_settings(false, 600);
+            }
+            let batch = next_pad_operation_batch();
+            let actions = [
+                PadAction {
+                    operation_id: PadOperationId { batch, ordinal: 0 },
+                    button: PadButton::DPadRight,
+                    kind: PadActionKind::Press,
+                },
+                PadAction {
+                    operation_id: PadOperationId { batch, ordinal: 1 },
+                    button: PadButton::DPadLeft,
+                    kind: PadActionKind::Press,
+                },
+            ];
+            let first = ViewerOperationId::Pad { batch, ordinal: 0 };
+            frame(&ctx, |_, ctx| {
+                app.page_turn_external_operations(
+                    ctx,
+                    &[
+                        (first, OperationPhase::Press, "gamepad"),
+                        (
+                            ViewerOperationId::Pad { batch, ordinal: 1 },
+                            OperationPhase::Press,
+                            "gamepad",
+                        ),
+                    ],
+                );
+                for action in actions {
+                    assert!(
+                        app.dispatch_gamepad_button_with_operation(ctx, action)
+                            .is_none()
+                    );
+                }
+                assert_eq!(
+                    app.page_turn_presentation.continuation_operation_for_test(),
+                    Some((first, 2))
+                );
+                assert_eq!(app.fullscreen_idx, Some(1));
+                assert_eq!(app.gamepad_operation_for_navigation(ctx), None);
+            });
+            adopt_interrupted_target(&ctx, &mut app);
+            frame(&ctx, |_, ctx| {
+                assert!(app.commit_page_turn_continuation(ctx));
+            });
+            assert_eq!(app.fullscreen_idx, Some(2));
+        }
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Route {
         Ring,
@@ -10361,6 +11012,7 @@ mod next_input_tests {
         } else {
             #[cfg(windows)]
             crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x30,

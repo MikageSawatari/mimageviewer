@@ -265,14 +265,25 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 規模 / 優先度: 未見積もり / P3。
 
 ### 1.341 ページめくりのアニメーションを追加する — mIV スレ >>520 (2026-10-07)
-- **次の版に入れたい (利用者 2026-10-12)**: nextview で作業を続け、進み具合を見て判断する。残り = 見開き中の横長画像を中央で折る (設計書 §3.1 の 2026-10-12 決定) と、`C:/tmp/miv-spread-test/03_landscape_mid_10` で一部しかめくれない件。
-- **2026-10-11 利用者決定 (表示の完成を待たない)**: 通常のページ送りと同じく、めくる先の AI アップスケールなどが終わっていなければ、アップスケール前の画像やサムネイル画質でめくりのアニメーションを行い、その後にきれいな画像へ差し替える。「完成した画像だけをめくる」(final only) の規則はやめる。また、単ページでは綴じを読む向きごとに片側へ固定する (前へ・後ろへで綴じの左右が入れ替わらない)。
-- **2026-10-11 利用者決定: 次の次の版へ回す (v4.5.0 の次の版には入れない)**。A0 (nextview `532635fdd` 〜 `e3a328ff6`) を実機で確認したところ、スキャンした PDF はページごとの数ピクセルの差で毎回省かれ (`page_placement_changed`)、画像では「黒い帯が横に動くだけ」に見え、見開きは全体が 1 枚のように動いた (観測: 利用者)。要望: **実際の本のページをめくる動き** (見開きで左へ読むなら左ページだけが持ち上がって右へめくれる、背の軸で回る 1 枚の紙)。設計 R4 を nextview で作成中。初期設定 OFF、スライドショーでも動く、フルスクリーンの「…」から ON/OFF、Remote は対象外は維持。
-- **次の版の決定 (利用者 2026-10-07)**: ライン E (3 番目)。他アプリでも対応が多いので実装したい。
+
+- **2026-10-13 末尾・UI追補**: 共通黒paperの実機観測は「アニメーションよさそう」。local paged/演出ON中は先頭・末尾を実効ON、環境設定とpaged本別HUDの両端指定は実効表示で無効化する。保存値・OFF復帰・連結/Remoteを保持。末尾Navigation＋FrontCoverSupplementの二実画像Pairは通常素材/lease/receiptを再利用して前後にめくり、白companionの拒否は維持する。末尾補助の既存適格条件は変更しない。関連182件・singleton11件・設定181件・UI163件とfmt/glyph/check/context監査、normal確認buildが成功し、独立最終レビューACCEPT。最後の全体gate一回は未変更の音声テスト1件の3秒待機失敗でexit101（単独一回は成功）、全体PASSとは扱わない。現行仕様と検証記録は[plan §26](page-turn-animation-plan.md)、台帳は`target/A-1341-terminal-msg.txt`。以下の先頭のみ実効ONという記録は先行実装時点の履歴。
+- **2026-10-13 検証完了**: 下記採用改訂は独立レビューACCEPT。`test-full`はjobs1で一回PASS（本体12,379件・57ignored・失敗0、UI snapshot162件、vendor54件）。通常build-devはcore/remote/EPUBとruntime/PE検査まで成功し、隔離環境で確認できる。コミット・アプリ起動・実データ変更は行わず、motion/性能の実機採択をcoordinator/利用者へ残す。
+- **2026-10-13 採用改訂**: 単頁の案A/Moving比較を撤去し、前後画像を覆う固定サイズの黒い紙と固定背へ統一した。画像rect/UVと静止下頁を保持する。local paged見開きは演出ONの間だけ先頭配置を実効ONにし、全体/本別保存値・連結・Remote・末尾を維持する。表紙は中央/sideの双方が旧cover guardで拒否されていたため、実builderが側を確定した表紙を許可した。実builderの表紙/末尾/設定切替、dense pose・黒余白・会計の回帰と独立レビューを実施。関連179件・設定転送26件・normal/portable check・fmt/glyph・context監査成功、全体gate/buildは今回の記録へ追記する。実機採択はcoordinator/利用者へ残す。[plan §26](page-turn-animation-plan.md)、`target/A-1341-black-paper-msg.txt`。
+- **2026-10-12 実装追補**: `787b4bf74`の横長見開き中央折りに加え、`a7155f674`で設定gap変更後の古いoutgoingの受理拒否、native ROI端の浮動小数丸め修正、単頁の静止下頁と綴じ目移動の暫定比較設定を実装。案A（自身の綴じ目）が既定で、両案とも動くのは一leaf、下頁は最終rect全体で静止する。master `d357fd5ae`取り込みの6競合を解消し、ratingのClosed/Rebased・grid cursor・spread shift・PDF/Everything所有を維持。独立レビューACCEPT、取り込み後focused167件・関連回帰・normal/portable check・fmt/glyph・viewer_context_audit成功。full初回のscroll thumb golden差を対象1枚の更新で解消し、jobs1の再実行は本体12,367件・UI snapshot162件・vendor54件を含めPASS。normalのbuild-dev（core/remote/EPUB・PE検査）成功、git add/commit・アプリ起動は未実施。実機motion/性能と最終案/時間の採択は未了。[plan §24–25](page-turn-animation-plan.md)、`target/A-1341-merge-msg.txt`。
+- **2026-10-12 利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断**。2026-10-11の次の次の版への延期を改訂した。A0（`next-viewer` / `532635fdd`〜`e3a328ff6`）は利用者のnormal profile実機評価で不合格。PDF scanの数px差で`page_placement_changed`となる、画像では黒い帯に見える、spread全体を一枚として動かすように見える、という評価を受けた。本のように一枚の頁を背から返す動きが必要（RTL forwardは旧左頁だけを右へ返す）。
+- **設計改訂（2026-10-11）**: R4 `afc474d8d`、R5 `c73f0d857`、R6 `29291d496`の独立設計レビューはREVISE、R7 `fa5119c19`はACCEPT。[page-turn-animation-plan.md §19](page-turn-animation-plan.md)のStage 1は実装・自動検証・normal確認用build済、利用者の実機motion評価待ち。通常単頁・Pair間の背回転、頁ごとの異寸法、紙・陰影・影を先に評価できる形へ接続した。取消targetのcanonical flat採用、close→継続commit→fresh snapshot、commit後の描画owner再判定を維持する。cover/中央単頁/横長splitはこの段階では理由付きinstant、継続操作もflat採用後instant。F12 independent stillの既存動画拒否を維持する。R7の別source Half/Full最小対応（全landscape N頁で2N−1操作中N−1が候補）は後続stage。Stage 1ではsplit候補率0%であり、通常scanの実開始率・motion品質・性能受入れは未了。
+- **Stage 1実機追補（2026-10-11）**: `0d1b1f99f`では利用者が演出を確認できなかった。初回key観測のkeyboard owner未確定による候補消失と、入力ゼロgamepad pollが作る偽Continuousによる初回描画後取消を修正した。実handlerで初回key/click→開始→完了、neutral poll保持、理由付きskip一回の回帰を追加（[plan §20](page-turn-animation-plan.md)）。focused回帰・normal/portable check・ui_snapshot・normal確認用build済。修正後の実機motion評価と独立完了レビューは未了。
+- **Stage 1評価追補（2026-10-11）**: `52cd5a15f`の見開き・単頁motionは利用者から良いとの評価。単頁の固定背（LTR左／RTL右、戻りは前頁のarrival）を再確認し、固定端を明示した4枚のgoldenと連続pose回帰を追加する。実機ログの背は既に往復で同じ位置のため、見え方の症状は未再現。missing fact 18件はchild→ROOT受理時に別viewportのframe counterを比較して元factを消した問題で、元ID/source/phaseを保持する構造修正を行う。取消3件は終了直前の別native矢印入力で既存flat-first規則に従っていた（[plan §21](page-turn-animation-plan.md)）。最終受入れ・独立レビューは未了。
+- **2026-10-11 利用者決定（readiness）**: final-onlyを撤回。受理時のresident非AI画像・preview・thumbnailなど表示可能素材で即演出し、演出後は通常品質更新へ戻す。無素材は理由付き省略、受理時の待機・追加decode/uploadは禁止。[plan §22](page-turn-animation-plan.md)に素材・pin・取消・回帰を記録。実機と独立完了レビューは未了。
+- **2026-10-11 利用者評価とoption A**: `49e2b0911`で開始率が改善し単頁の背も良好。異寸法Pairは背と静止頁を同じleaf progressで平行移動し、canonical incomingへsnap無しで着地させる（[plan §23](page-turn-animation-plan.md)）。trim有無のpainter clip差は同canvasとして扱う。pin_budget 11件はbyte合計に余剰無しで固定128 MiB capが原因、実測737.47 MiB/準備後推計756.02 MiBに基づき有限fullscreen10%枠を維持してcapを撤去。独立完了レビュー・実機評価は未了。
+- PC/F12限定・Remote不要、既定OFF、slideshow、Preferencesとfullscreen HUD overflowの同じ全体設定は維持。時間は実際の動きを見てから利用者が決めるため、100〜600ms・既定200msは引き続き仮設定。過去の自動検証成功はmotion品質の合格を意味しない。最終時間・実機/性能受入れは未了。
+- 旧予定（利用者2026-10-07）: 次版ラインE（3番目）。2026-10-11の延期決定で置換済み。他アプリでも対応が多いので実装したい、という要求は維持。
 
 - 返信済み: まずはシンプルなアニメーションから実装を試す。方式・長さ・ON/OFF は設計時に決める。
 - 連続ページ送り、見開き、連結表示、複数ウィンドウで既存の表示速度や入力応答を落とさないことを先に確認する。
-- 規模 / 優先度: 未見積もり / P3。
+- 規模 / 優先度: R7再実装概算14〜21作業日（約3〜5週）+独立レビュー・修正・実機枠、別sourceの最小half対応を含む / P3。
+
+- 2026-10-12利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断。見開きの横長一画像を中央の背で片側めくりにする（単頁表示は従来一枚）。Pair↔横長・末尾単独・回転素材の対応/検証はpage-turn-animation-plan §24。
 
 ### 1.334 `zip_loader::tests::shared_directory_cache_reparses_when_the_archive_identity_changes` が全体実行でまれに落ちる — テスト側の共有キャッシュ (2026-10-05)
 
