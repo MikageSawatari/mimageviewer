@@ -749,11 +749,6 @@ Tab / Enter policy・Undo gate・禁止検査は段 2b まで行わない。
 | `cargo test -p mimageviewer --lib keyboard_input` | 16 passed、0 failed、0 ignored |
 | `cargo test --test ui_snapshot` | 123 passed、0 failed、0 ignored |
 | `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 |
-| `.\scripts\test-full.ps1 -SuppressCrashDialogs`（`RUST_MIN_STACK=67108864`） | exit 101。本体 12,651 passed / 57 ignored / 2 failed（1191.83秒）、他 workspace target は1,588 passed / 7 ignored / 0 failed。失敗は既知Appサイズ制限（110,600 bytes、上限110,000未満）と、生存一覧を省略したゲームパッドfixture。stack overflowは起こらず、実decoder EOFループも成功 |
-| `cargo test --manifest-path vendor/egui/Cargo.toml --lib` / `… vendor/egui-wgpu/Cargo.toml --features winit --lib` / `… vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib` | 25 / 11 / 18 passed。workspace失敗でscriptが到達しないvendor gateを別実行。egui-winit 21件の成功も再利用 |
-| `cargo test -p mimageviewer --lib gamepad_text_input_gate_unions_all_three_surfaces --features pack-build-tools`（stack 64MiB） | fixture修正後1 passed / exit 0（`target/i2b-gamepad-fixture.log`、test exe `mimageviewer-b31a6c451310338d.exe`）。最終fmt / glyph / diff checkも成功 |
-| `$env:MSBUILDDISABLENODEREUSE='1'; cargo build --release -p musicvideo_lab` | exit 0、50.04秒。`target/release/musicvideo_lab.exe`（`target/i2b-release-lab.log`）、起動なし |
-| `$env:MSBUILDDISABLENODEREUSE='1'; .\scripts\build-dev.ps1 -PreserveRuntime` | exit 0。通常featureのcore 5分02秒、Remote 0.39秒、EPUB worker 0.35秒。`target/dev-runtime/`へ生成、VCRT検査 runtime=4 / PE=3 成功。既存プロセスの停止・成果物の起動なし（`target/i2b-build-dev.stdout.log` / `.stderr.log`） |
 | `cargo tree -p egui-ime` / `cargo tree -d` | exit 0。共有も vendored egui 0.33.3 を参照。egui / epaint / eframe の重複系統なし |
 | `.\scripts\test-full.ps1 -SuppressCrashDialogs` | **PASS、exit 0**（1,400.87 秒）。workspace 12,627 passed / 58 ignored、vendor egui 25・egui-wgpu 11・eframe 18 passed。合計 12,681 passed / 0 failed / 58 ignored |
 | `cargo fmt --check` | 最終実行 exit 0 |
@@ -1150,7 +1145,7 @@ MS-IME は候補一覧での Enter を候補の選択に使い、もう一度 En
 このブランチ（musicvideo）で直すのは利用者の指示（2026-10-14）。本体側の修正も含むため、master への統合は
 音楽ビデオ機能とは別に先行させるかを、段 2a の確認後に利用者と決める。
 
-**段 2b の実施記録（2026-10-14、未コミット・正式実装レビュー／実機確認待ち）。**
+**段 2b の実施記録（2026-10-14、初回実装 `291dbf8e5`・正式レビュー REVISE 後の修正は未コミット、再レビュー待ち・設計 lead が実機確認中）。**
 
 - `last_event_at` / `IME_EVENT_GRACE` と pending-event 有無版 API を撤去し、composing と最終状態の投影に統一。
   keyboard phase は `ImeComposing` へ変更。検索バーの重複した旧 grace guard を撤去し、fullscreen Enter・
@@ -1167,7 +1162,8 @@ MS-IME は候補一覧での Enter を候補の選択に使い、もう一度 En
   旧 fixture は pass 外の owner 取得で次 pass に古い composing owner を作っていたため、pass 内検証へ修正した。
   詳細は [指定サイズ計画 §19](fullscreen-specified-scale-plan.md#19-popup再レビューの回帰利用者説明修正2026-10-10)。
   それ以外に設計判断を要する前提矛盾は無い。
-- コミット・アプリ起動は行わない。対象は brief commit `2c6e1d782` 上の未コミット差分。
+- 初回実装は brief commit `2c6e1d782` 上の差分として作成し、設計 lead が `291dbf8e5` へコミットした。
+  以下は初回実装時の検証記録。レビュー修正での再検証は後段に分ける。
 
 | コマンド（通常 feature、指定箇所以外は通常 test profile） | 結果 |
 | --- | --- |
@@ -1180,6 +1176,11 @@ MS-IME は候補一覧での Enter を候補の選択に使い、もう一度 En
 | `… --lib address_ime_commit_and_immediate_enter` / `… --lib search_ime_commit_and_immediate_enter` / `… --lib bar_focus_recovery` | 各2 passed。Alt 復帰→次 pass Enter も実 handler で決定・focus 解放 |
 | `… --lib ime_handler_tests` / `… --lib delete_confirm_y_n_enter_act_immediately_after_ime_commit` / `… --lib specified_scale_real_numeric_ime_` | 6 / 1 / 2 passed。同一／次 pass と通常 Esc の対照を含む |
 | `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs`（`RUST_MIN_STACK=67108864`） | exit 101。本体 12,651 passed / 57 ignored / 2 failed（1191.83秒）、他 workspace target は1,588 passed / 7 ignored / 0 failed。失敗は既知Appサイズ制限（110,600 bytes、上限110,000未満）と、生存一覧を省略したゲームパッドfixture。stack overflowは起こらず、実decoder EOFループも成功 |
+| `cargo test --manifest-path vendor/egui/Cargo.toml --lib` / `… vendor/egui-wgpu/Cargo.toml --features winit --lib` / `… vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib` | 25 / 11 / 18 passed。workspace失敗でscriptが到達しないvendor gateを別実行。egui-winit 21件の成功も再利用 |
+| `cargo test -p mimageviewer --lib gamepad_text_input_gate_unions_all_three_surfaces --features pack-build-tools`（stack 64MiB） | fixture修正後1 passed / exit 0（`target/i2b-gamepad-fixture.log`、test exe `mimageviewer-b31a6c451310338d.exe`）。最終fmt / glyph / diff checkも成功 |
+| `$env:MSBUILDDISABLENODEREUSE='1'; cargo build --release -p musicvideo_lab` | exit 0、50.04秒。`target/release/musicvideo_lab.exe`（`target/i2b-release-lab.log`）、起動なし |
+| `$env:MSBUILDDISABLENODEREUSE='1'; .\scripts\build-dev.ps1 -PreserveRuntime` | exit 0。通常featureのcore 5分02秒、Remote 0.39秒、EPUB worker 0.35秒。`target/dev-runtime/`へ生成、VCRT検査 runtime=4 / PE=3 成功。既存プロセスの停止・成果物の起動なし（`target/i2b-build-dev.stdout.log` / `.stderr.log`） |
 
 個別ログは `target/i2b-<filter>.log`、共有側は `i2b-egui-winit.log` / `i2b-egui-ime.log` /
 `i2b-ui-lab.log` / `i2b-comic.log`、fmt / check は `i2b-fmt.log` / `i2b-core-check.log`。
@@ -1192,6 +1193,25 @@ MS-IME は候補一覧での Enter を候補の選択に使い、もう一度 En
 fixture補完を合わせた本体の有効結果は12,652 passed / 57 ignored / 既知Appサイズ制限1 failed、
 未確認0。補完は当該fixtureとその消費経路に限定し、原full gateのexit 101は維持して成功とは扱わない。
 指定された確認用buildまで完了。コミット・アプリ起動・実機確認は行っていない。
+
+**正式レビュー第 1 回への修正（2026-10-14、未コミット）。**
+
+- P2: focus 喪失で shortcut の composing claim は終了し、既存の preedit を終端まで待つ状態を
+  同じ viewport の enum に保持する。後続の Disabled / 空 Commit で取消補完するため、追加の latch は持たない。
+  focus 喪失時に先に取消する簡素化は、まだ取消が確定していない preedit まで消してしまうので採らない。
+  WindowFocused(false) / RawInput.focused=false の各経路、終端が前／後、同一／別 pass の全組み合わせを
+  実 TextEdit の buffer で検証する。取消で元の文字列へ戻り、非空 Commit は正しく残る。
+- P3: retry の生成 pass から外部 latch の有無を切り替え、caller latch=false と helper の pass 印を確認してから
+  Enter / Esc / 他 widget / 欄の消失へ進む。video architecture と Everything の旧契約を更新し、
+  I1 段 2a 表へ混入した I2b の 5 行をこの節の初回検証表へ移した。
+- 指示により build-dev / test-full は再実行しない。起動中の dev core への操作、コミット・アプリ起動も行わない。
+
+再検証は指定の通常 feature で全件成功。`cargo fmt --check` と
+`cargo check -p mimageviewer --bin mimageviewer-core` は exit 0。
+`cargo test -p egui-ime` は 22 passed、`cargo test -p musicvideo-ui -p musicvideo_lab` は 122 / 75 passed。
+本体の `cargo test -p mimageviewer --lib ime` / `focus` / `keyboard` は 448 passed・既存 2 ignored / 118 / 39 passed。
+test stack は既知の focus テストの overflow を避けるため `RUST_MIN_STACK=67108864`。
+ログは `target/i2b-review1-{fmt,egui-ime,ui-lab,ime,focus,keyboard,core-check}.log`。
 
 ### D11. 出力の既定値
 

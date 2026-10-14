@@ -105,13 +105,24 @@ fn pending_native_events_project_without_mutating_plugin_state() {
                 .unwrap()
         })
         .unwrap();
-    let pending = vec![egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))];
-
-    assert!(!ime_composing_with_pending_events(
-        &ctx,
-        egui::ViewportId::ROOT,
-        &pending,
-    ));
+    for pending in [
+        vec![egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))],
+        vec![egui::Event::WindowFocused(false)],
+        vec![
+            egui::Event::WindowFocused(false),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ],
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+            egui::Event::WindowFocused(false),
+        ],
+    ] {
+        assert!(!ime_composing_with_pending_events(
+            &ctx,
+            egui::ViewportId::ROOT,
+            &pending,
+        ));
+    }
     let after = ctx
         .with_plugin(|plugin: &mut ImeInputPlugin| {
             plugin
@@ -439,6 +450,102 @@ fn raw_multiline_text_edit_keeps_focus_and_cancels_preedit_across_delayed_disabl
     assert_eq!(cancel_preedit_count, 1);
     assert!(body.is_empty());
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
+}
+
+fn assert_text_edit_terminal_around_focus_loss(terminal: egui::ImeEvent, expected: &str) {
+    for event_only in [false, true] {
+        for focus_first in [false, true] {
+            for delayed in [false, true] {
+                let ctx = test_context();
+                let id = egui::Id::new("focus-loss-preedit");
+                let mut text = "元".to_owned();
+                let mut request = true;
+                let _ = ctx.run(Default::default(), |ctx| {
+                    draw_recovery_field(ctx, id, &mut text, Some(&mut request), false);
+                });
+                let _ = ctx.run(
+                    viewport_raw_input(
+                        egui::ViewportId::ROOT,
+                        vec![
+                            egui::Event::Ime(egui::ImeEvent::Enabled),
+                            egui::Event::Ime(egui::ImeEvent::Preedit("あ".into())),
+                        ],
+                    ),
+                    |ctx| {
+                        draw_recovery_field(ctx, id, &mut text, None, false);
+                    },
+                );
+                assert_eq!(text, "元あ");
+                assert!(ime_input_active(&ctx));
+
+                let terminal_event = egui::Event::Ime(terminal.clone());
+                let mut focus_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
+                if event_only {
+                    focus_input.events.push(egui::Event::WindowFocused(false));
+                } else {
+                    focus_input.focused = false;
+                }
+                let inputs = if delayed {
+                    let terminal_input =
+                        viewport_raw_input(egui::ViewportId::ROOT, vec![terminal_event]);
+                    if focus_first {
+                        vec![focus_input, terminal_input]
+                    } else {
+                        vec![terminal_input, focus_input]
+                    }
+                } else {
+                    if focus_first {
+                        focus_input.events.push(terminal_event);
+                    } else {
+                        focus_input.events.insert(0, terminal_event);
+                    }
+                    vec![focus_input]
+                };
+                for input in inputs {
+                    let _ = ctx.run(input, |ctx| {
+                        assert!(!ime_input_active(ctx));
+                        draw_recovery_field(ctx, id, &mut text, None, false);
+                    });
+                }
+                assert_eq!(
+                    text, expected,
+                    "event_only={event_only}, focus_first={focus_first}, delayed={delayed}"
+                );
+                // Regaining focus and repeated terminal events must not revive
+                // the shortcut claim or delete the already finalized buffer.
+                let _ = ctx.run(
+                    viewport_raw_input(
+                        egui::ViewportId::ROOT,
+                        vec![
+                            egui::Event::WindowFocused(true),
+                            egui::Event::Ime(egui::ImeEvent::Disabled),
+                        ],
+                    ),
+                    |ctx| {
+                        assert!(!ime_input_active(ctx));
+                        assert_eq!(empty_preedit_count(ctx), 0);
+                        draw_recovery_field(ctx, id, &mut text, None, false);
+                    },
+                );
+                assert_eq!(text, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn text_edit_cancels_preedit_with_disabled_before_or_after_focus_loss() {
+    for terminal in [
+        egui::ImeEvent::Disabled,
+        egui::ImeEvent::Commit(String::new()),
+    ] {
+        assert_text_edit_terminal_around_focus_loss(terminal, "元");
+    }
+}
+
+#[test]
+fn text_edit_preserves_commit_before_or_after_focus_loss() {
+    assert_text_edit_terminal_around_focus_loss(egui::ImeEvent::Commit("確定".into()), "元確定");
 }
 
 fn draw_text_fields(
@@ -790,7 +897,12 @@ fn draw_recovery_field(
         .inner
 }
 
-fn recover_with_alt_disabled(ctx: &egui::Context, id: egui::Id, text: &mut String) {
+fn recover_with_alt_disabled(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    mut request: Option<&mut bool>,
+) {
     let mut alt_j = key_event(egui::Key::J);
     if let egui::Event::Key { modifiers, .. } = &mut alt_j {
         modifiers.alt = true;
@@ -801,8 +913,9 @@ fn recover_with_alt_disabled(ctx: &egui::Context, id: egui::Id, text: &mut Strin
             vec![egui::Event::Ime(egui::ImeEvent::Disabled), alt_j],
         ),
         |ctx| {
-            let response = draw_recovery_field(ctx, id, text, None, true);
+            let response = draw_recovery_field(ctx, id, text, request.as_deref_mut(), true);
             assert!(response.has_focus(), "transient Alt loss must be restored");
+            assert!(request.as_deref().is_none_or(|request| !request));
             assert_eq!(
                 ctx.data(|data| data.get_temp::<u64>(focus_retry_id(ctx.viewport_id(), id))),
                 Some(ctx.cumulative_pass_nr())
@@ -825,7 +938,13 @@ fn focus_retry_preserves_normal_enter_escape_and_other_widget_focus() {
             });
             assert!(!caller_request);
             assert_eq!(ctx.memory(|memory| memory.focused()), Some(id));
-            recover_with_alt_disabled(&ctx, id, &mut text);
+            recover_with_alt_disabled(
+                &ctx,
+                id,
+                &mut text,
+                external_latch.then_some(&mut caller_request),
+            );
+            assert!(!caller_request);
             let _ = ctx.run(
                 viewport_raw_input(egui::ViewportId::ROOT, vec![key_event(next)]),
                 |ctx| {
@@ -868,7 +987,13 @@ fn focus_retry_expires_when_field_is_hidden_before_next_pass() {
         let _ = ctx.run(Default::default(), |ctx| {
             draw_recovery_field(ctx, id, &mut text, Some(&mut caller_request), false);
         });
-        recover_with_alt_disabled(&ctx, id, &mut text);
+        recover_with_alt_disabled(
+            &ctx,
+            id,
+            &mut text,
+            external_latch.then_some(&mut caller_request),
+        );
+        assert!(!caller_request);
         for _ in 0..2 {
             let _ = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |_| {});

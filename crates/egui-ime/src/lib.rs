@@ -13,8 +13,41 @@ const IME_FOCUS_RETRY_ID: &str = "miv_ime_focus_retry";
 const IME_TEXT_FOCUS_CONTRACT_ID: &str = "miv_ime_text_focus_contract";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ImeFocusState {
-    composing: bool,
+enum ImeFocusState {
+    #[default]
+    Inactive,
+    Composing,
+    /// Stop claiming shortcuts, but retain the preedit cancellation obligation
+    /// until the IME sends its terminal event (possibly in a later pass).
+    UnfocusedComposition,
+}
+
+impl ImeFocusState {
+    fn composing(self) -> bool {
+        self == Self::Composing
+    }
+
+    fn lose_focus(&mut self) {
+        if self.composing() {
+            *self = Self::UnfocusedComposition;
+        }
+    }
+
+    fn apply_event(&mut self, event: &egui::Event) {
+        match event {
+            egui::Event::WindowFocused(false) => self.lose_focus(),
+            egui::Event::Ime(ime) => {
+                *self = match ime {
+                    egui::ImeEvent::Enabled => Self::Composing,
+                    egui::ImeEvent::Preedit(text) if !text.is_empty() => Self::Composing,
+                    egui::ImeEvent::Preedit(_)
+                    | egui::ImeEvent::Commit(_)
+                    | egui::ImeEvent::Disabled => Self::Inactive,
+                };
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Pre-`Memory::begin_pass` owner of IME composition state and input repair.
@@ -33,7 +66,7 @@ impl ImeInputPlugin {
     fn composing_in_viewport(&self, viewport_id: egui::ViewportId) -> bool {
         self.viewports
             .get(&viewport_id)
-            .is_some_and(|state| state.composing)
+            .is_some_and(|state| state.composing())
     }
 }
 
@@ -50,7 +83,7 @@ impl egui::Plugin for ImeInputPlugin {
         let state = self.viewports.entry(input.viewport_id).or_default();
         normalize_ime_input(&mut input.events, state);
         if !input.focused {
-            state.composing = false;
+            state.lose_focus();
         }
     }
 }
@@ -73,13 +106,9 @@ fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState)
     let commit_in_input = events.iter().any(
         |event| matches!(event, egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty()),
     );
-    let mut composing = state.composing;
     let mut normalized = Vec::with_capacity(events.len().saturating_add(1));
 
     for event in std::mem::take(events) {
-        if matches!(event, egui::Event::WindowFocused(false)) {
-            composing = false;
-        }
         if let egui::Event::Ime(ime) = &event {
             // A composition ends without text either as `Disabled` or as an empty
             // `Commit("")`, depending on the IME. Whichever arrives first is the point
@@ -87,24 +116,18 @@ fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState)
             let ends_composition_without_text =
                 matches!(ime, egui::ImeEvent::Disabled | egui::ImeEvent::Commit(_))
                     && !matches!(ime, egui::ImeEvent::Commit(text) if !text.is_empty());
-            if ends_composition_without_text && composing && !commit_in_input {
+            if ends_composition_without_text
+                && *state != ImeFocusState::Inactive
+                && !commit_in_input
+            {
                 normalized.push(egui::Event::Ime(egui::ImeEvent::Preedit(String::new())));
             }
-            apply_ime_event(&mut composing, ime);
         }
+        state.apply_event(&event);
         normalized.push(event);
     }
 
-    state.composing = composing;
     *events = normalized;
-}
-
-fn apply_ime_event(composing: &mut bool, event: &egui::ImeEvent) {
-    match event {
-        egui::ImeEvent::Enabled => *composing = true,
-        egui::ImeEvent::Preedit(text) => *composing = !text.is_empty(),
-        egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => *composing = false,
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -195,15 +218,19 @@ pub fn ime_composing_with_pending_events(
     viewport_id: egui::ViewportId,
     pending_events: &[egui::Event],
 ) -> bool {
-    let mut composing = ctx
-        .with_plugin(|plugin: &mut ImeInputPlugin| plugin.composing_in_viewport(viewport_id))
-        .unwrap_or(false);
+    let mut state = ctx
+        .with_plugin(|plugin: &mut ImeInputPlugin| {
+            plugin
+                .viewports
+                .get(&viewport_id)
+                .copied()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
     for event in pending_events {
-        if let egui::Event::Ime(ime) = event {
-            apply_ime_event(&mut composing, ime);
-        }
+        state.apply_event(event);
     }
-    composing
+    state.composing()
 }
 
 /// Return the helper-managed TextEdit that currently owns egui focus.

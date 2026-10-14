@@ -30,8 +30,8 @@ pub(super) fn draw_everything_controls(
         };
         let reserved = button_width("検索") + button_width("×") + ui.spacing().item_spacing.x * 3.0;
         let width = (ui.available_width() - reserved).clamp(80.0, 420.0);
-        // The same latch is also used by the IME helper for focus recovery.
-        // Select on opening, but preserve an active composition's selection.
+        // The caller latch requests opening focus; recovery retries belong to
+        // the helper. Explicit requests preserve an active preedit selection.
         let select_query = *focus_request && !crate::ime_focus::ime_input_active(ui.ctx());
         let mut output =
             crate::ime_focus::show_singleline(ui, query, Some(focus_request), |edit| {

@@ -548,6 +548,7 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
   Commit / Disabled 後の通常 Enter / Escape / shortcut は同じ pass から直ちに通す。
   native presenter の pass 前判定は `ime_composing_with_pending_events` で最終状態を射影する。
   viewport 消滅・focus 喪失では、その viewport の composing を落とす。
+  focus 喪失後も IME の終端待ち状態は保持し、後続の Disabled / 空 Commit による取消の空 preedit 補完を保つ。
 
 上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
 single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
@@ -581,8 +582,8 @@ Key / Text / Cut / Copy / Paste にしない。release と Ime event は残す�
 `VK_PROCESSKEY` に egui key を割り当てない。本体 Win32 queue と native 生キー公開も
 同じく 0xE5 の press / repeat を捨て、release は残す。通常のキーを composition だけで
 取り除かない。TextEdit の未確定文字選択を保ったまま、Windows が
-空の `Preedit("")` を送らず `Disabled` だけを送る経路では、Commit の無い composing
-`Disabled` の直前だけ空 preedit を補える。composition が無い `Disabled` へは挿入せず、
+空の `Preedit("")` を送らず `Disabled` だけを送る経路では、非空 Commit の無い composition の
+終端直前に空 preedit を補う（focus 喪失後の終端待ちも含む）。composition が無い `Disabled` へは挿入せず、
 非 composing Esc は通常入力として残す。
 
 **借用の注意**:

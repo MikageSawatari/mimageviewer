@@ -350,7 +350,10 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   `pending_events` を read-only 投影して Ctrl+V/C/X と Enter/Esc の gate を決め、presenter-local な
   composition bool / timestamp は持たない。IME 処理済みの `VK_PROCESSKEY` は native key
   変換で egui key にせず（winit 経路も Process press を遮断）、取消時の空 preedit 補完は
-  plugin の RawInput 境界へ一本化する。300ms grace と focus 復帰は維持する。
+  plugin の RawInput 境界へ一本化する。shortcut の抑止は今 pass の composing のみで判定し、
+  Commit / Disabled 後の通常キーは直ちに通す。focus 復帰と helper 所有の次 pass 限りの retry は
+  pointer 無しの key press・他 widget の focus 無し・composing または Enter / Esc press 無しを条件にする。
+  初回 focus 要求用の呼び出し側 latch には retry を書き込まない。
   Backspace / Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
   overlay 側がキーを保持し、Space を文字として入力できるようにする。
