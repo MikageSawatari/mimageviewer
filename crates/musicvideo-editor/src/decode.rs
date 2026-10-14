@@ -6,12 +6,7 @@ use mimageviewer::video::mvexport::default_audio_stream_index;
 
 pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 
-#[derive(Debug)]
-pub struct AudioData {
-    pub stereo_pcm: Vec<f32>,
-    pub sample_rate: u32,
-    pub duration_secs: f64,
-}
+pub use mimageviewer::video::mvexport::ExportPcm as AudioData;
 
 /// 音声読込・Project 読込の worker と診断で共有する FFmpeg 経路。
 /// 書き出しと同じ既定トラックと swresample を使い、PCM の識別は呼出側に保つ。

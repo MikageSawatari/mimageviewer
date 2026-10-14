@@ -5,6 +5,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use musicvideo_core::{Assets, Project};
@@ -50,13 +51,42 @@ impl FromStr for EncoderPreference {
     }
 }
 
-pub struct MusicVideoExportRequest {
+/// Immutable decoded PCM shared with preview. Duration is decoder metadata;
+/// calibration uses the separately supplied duration of complete source frames.
+#[derive(Debug)]
+pub struct ExportPcm {
+    pub stereo_pcm: Vec<f32>,
+    pub sample_rate: u32,
+    pub duration_secs: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportStage {
+    Calibration,
+    AudioEncoding,
+    Frames,
+    Finalizing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExportProgress {
+    pub stage: ExportStage,
+    pub completed_frames: u64,
+    pub total_frames: u64,
+}
+
+/// Pins all source data at admission. Export never opens source files.
+/// `pcm_id` identifies the supplied revision, including after Undo restoration.
+pub struct MusicVideoExportRequest<I> {
     pub project: Project,
     pub assets: Assets,
-    pub audio_path: PathBuf,
+    pub audio: Arc<ExportPcm>,
+    pub source_duration_secs: f64,
+    pub pcm_id: I,
     pub output_path: PathBuf,
     pub encoder: EncoderPreference,
     pub video_bitrate_bps: u32,
+    pub replace_existing: bool,
     /// 検証時だけ RGBA フレーム列の SHA-256 を計算する。
     pub compute_frame_hash: bool,
 }
@@ -70,7 +100,7 @@ pub struct ExportSummary {
     pub render_p95_ms: f64,
     pub convert_mean_ms: f64,
     pub encode_mean_ms: f64,
-    pub audio_decode_secs: f64,
+    pub calibration_secs: f64,
     pub aac_encode_secs: f64,
     pub mux_secs: f64,
     /// `av_write_trailer` による MP4 確定と `+faststart` の moov 移動。
@@ -140,10 +170,10 @@ impl fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
-/// 音声を全尺デコードし、CFR の RGBA フレームを逐次 H.264/AAC MP4 へ書き出す。
-pub fn export_music_video(
-    request: MusicVideoExportRequest,
-    progress: &dyn Fn(u64, u64),
+/// スナップショットから CFR の RGBA フレームを逐次 H.264/AAC MP4 へ書き出す。
+pub fn export_music_video<I: Clone + Eq>(
+    request: MusicVideoExportRequest<I>,
+    progress: &dyn Fn(ExportProgress),
     cancel: &AtomicBool,
 ) -> Result<ExportSummary, ExportError> {
     driver::export(request, progress, cancel)

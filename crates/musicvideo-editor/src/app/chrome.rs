@@ -9,6 +9,8 @@ pub(super) enum ChromeAction {
     OpenAudio,
     OpenBackground,
     Export,
+    ExportMp4,
+    ChooseMp4Output,
     TogglePlayback,
     Seek(f64),
     ResetPerf,
@@ -29,6 +31,7 @@ pub(super) struct ToolbarState {
     can_save: bool,
     can_open_material: bool,
     can_export: bool,
+    mp4_disabled_reason: Option<&'static str>,
     can_play: bool,
     pub(super) playing: bool,
     pub(super) position_secs: f64,
@@ -38,13 +41,15 @@ pub(super) struct ToolbarState {
 impl ToolbarState {
     pub(super) fn from_app(app: &MusicVideoLabApp) -> Self {
         Self {
-            can_open_project: app.export_pending.is_none() && app.lrc_save_pending.is_none(),
+            can_open_project: app.export_state.pending().is_none()
+                && app.lrc_save_pending.is_none(),
             can_save: app.project_save_pending.is_none(),
-            can_open_material: app.export_pending.is_none(),
+            can_open_material: app.export_state.pending().is_none(),
             can_export: app.audio.is_some()
                 && app.assets.has_image(&ImageId::new(BACKGROUND_ID))
                 && app.runtime_resources_ready()
-                && app.export_pending.is_none(),
+                && app.export_state.pending().is_none(),
+            mp4_disabled_reason: app.mp4_export_disabled_reason(),
             can_play: app.audio_transport_ready(),
             playing: app.playback_snapshot_for_ui().playing,
             position_secs: app.position_secs,
@@ -84,6 +89,15 @@ impl ToolbarState {
             if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                 actions.push(action);
             }
+        }
+        let response = ui.add_enabled(
+            self.mp4_disabled_reason.is_none(),
+            egui::Button::new("MP4 を書き出す"),
+        );
+        if let Some(reason) = self.mp4_disabled_reason {
+            response.on_disabled_hover_text(reason);
+        } else if response.clicked() {
+            actions.push(ChromeAction::ExportMp4);
         }
         // Pause and play have different text widths; allocate the same button in both states.
         let font = egui::TextStyle::Button.resolve(ui.style());
@@ -221,7 +235,7 @@ impl MusicVideoLabApp {
         };
         let button_width = |text: &str| text_width(text) + padding;
         let dirty = self.document.is_dirty(&self.project);
-        let cancel_export = self.export_pending.is_some();
+        let cancel_export = self.export_state.pending().is_some();
         let cancel_resources = self.pending_project_edit_in_progress();
         let cancel_count = usize::from(cancel_export) + usize::from(cancel_resources);
         let mut gap = ui.spacing().item_spacing.x.min(width / 12.0);
@@ -415,7 +429,7 @@ impl MusicVideoLabApp {
     }
 
     fn draw_export_progress(&self, ui: &mut egui::Ui) {
-        if let Some(pending) = &self.export_pending {
+        if let Some(pending) = self.export_state.pending() {
             let completed = pending.progress.load(Ordering::Relaxed);
             ui.add(
                 egui::ProgressBar::new(completed as f32 / pending.total_frames.max(1) as f32)
@@ -545,7 +559,36 @@ impl MusicVideoLabApp {
     ) -> bool {
         let mut reset_perf = false;
         for action in actions {
+            if self.mp4_export_running() && !matches!(action, ChromeAction::CancelExport) {
+                continue;
+            }
+            if self.export_state.setup_open()
+                && !(matches!(self.export_state, ExportState::Settings(_))
+                    && matches!(action, ChromeAction::ChooseMp4Output))
+            {
+                continue;
+            }
+            // A broken modal gate must fail headless tests before reaching a
+            // native file dialog. The assertion is absent from product builds.
+            #[cfg(test)]
+            assert!(
+                !self.mp4_export_running() || matches!(action, ChromeAction::CancelExport),
+                "modal input reached dispatch"
+            );
             match action {
+                ChromeAction::ExportMp4 => {
+                    if self.mp4_export_disabled_reason().is_none() {
+                        self.export_state =
+                            ExportState::Settings(crate::mp4::ExportSettings::default());
+                    }
+                }
+                ChromeAction::ChooseMp4Output => {
+                    if let ExportState::Settings(settings) = std::mem::take(&mut self.export_state)
+                        && self.mp4_export_disabled_reason().is_none()
+                    {
+                        self.choose_mp4_output(settings, ctx);
+                    }
+                }
                 ChromeAction::OpenProject => {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("mIV 音楽ビデオ", &["json"])
@@ -610,7 +653,7 @@ impl MusicVideoLabApp {
                 ChromeAction::ShowMissing => self.show_missing_resources = true,
                 ChromeAction::ShowDiagnostics => self.show_diagnostics = true,
                 ChromeAction::CancelExport => {
-                    if let Some(pending) = &self.export_pending {
+                    if let Some(pending) = self.export_state.pending() {
                         pending.cancel.store(true, Ordering::Relaxed);
                         self.status = "キャンセルを要求しました".to_owned();
                     }

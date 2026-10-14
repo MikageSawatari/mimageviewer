@@ -1,6 +1,9 @@
 mod chrome;
 #[cfg(test)]
 mod chrome_tests;
+mod mp4;
+#[cfg(test)]
+mod mp4_tests;
 
 use chrome::{ChromeAction, ToolbarState};
 
@@ -202,15 +205,15 @@ impl PreviewPerfTracker {
     }
 }
 
-struct LoadedProject {
-    path: PathBuf,
-    project: Project,
-    audio: Option<Arc<AudioData>>,
+pub(crate) struct LoadedProject {
+    pub(crate) path: PathBuf,
+    pub(crate) project: Project,
+    pub(crate) audio: Option<Arc<AudioData>>,
     waveform: Option<TimelineWaveform>,
-    images: Vec<(ImageId, Arc<ImageAsset>)>,
-    resources: ResourceManifest,
-    image_errors: HashMap<ImageId, String>,
-    audio_error: Option<String>,
+    pub(crate) images: Vec<(ImageId, Arc<ImageAsset>)>,
+    pub(crate) resources: ResourceManifest,
+    pub(crate) image_errors: HashMap<ImageId, String>,
+    pub(crate) audio_error: Option<String>,
 }
 
 struct ProjectLoadPending {
@@ -521,11 +524,64 @@ struct CalibrationPending {
     rx: mpsc::Receiver<Result<Vec<ModulatorCalibration>, String>>,
 }
 
+enum ExportCompletion {
+    Png(ExportOutcome),
+    Mp4(
+        Result<
+            mimageviewer::video::mvexport::ExportSummary,
+            mimageviewer::video::mvexport::ExportError,
+        >,
+    ),
+}
+
+enum ExportKind {
+    Png,
+    Mp4 {
+        stage: Arc<AtomicUsize>,
+        output_path: PathBuf,
+    },
+}
+
 struct ExportPending {
+    kind: ExportKind,
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicUsize>,
     total_frames: usize,
-    rx: mpsc::Receiver<Result<ExportOutcome, String>>,
+    rx: mpsc::Receiver<Result<ExportCompletion, String>>,
+}
+
+#[derive(Default)]
+enum ExportState {
+    #[default]
+    Idle,
+    Settings(crate::mp4::ExportSettings),
+    Choosing {
+        settings: crate::mp4::ExportSettings,
+        rx: mpsc::Receiver<Option<(PathBuf, bool)>>,
+    },
+    Running(ExportPending),
+}
+
+impl ExportState {
+    fn pending(&self) -> Option<&ExportPending> {
+        if let Self::Running(pending) = self {
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    fn setup_open(&self) -> bool {
+        matches!(self, Self::Settings(_) | Self::Choosing { .. })
+    }
+
+    fn take_worker(&mut self) -> Option<ExportPending> {
+        if let Self::Running(pending) = std::mem::take(self) {
+            Some(pending)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct MusicVideoLabApp {
@@ -561,7 +617,7 @@ pub struct MusicVideoLabApp {
     calibration_key: Option<CalibrationKey>,
     calibration_pending: Option<CalibrationPending>,
     preview_perf: PreviewPerfTracker,
-    export_pending: Option<ExportPending>,
+    export_state: ExportState,
     last_export: Option<ExportOutcome>,
     editor_state: EditorState,
     project_load: ProjectLoadState,
@@ -627,7 +683,7 @@ impl MusicVideoLabApp {
             calibration_key: None,
             calibration_pending: None,
             preview_perf: PreviewPerfTracker::default(),
-            export_pending: None,
+            export_state: ExportState::Idle,
             last_export: None,
             editor_state: EditorState::default(),
             project_load: ProjectLoadState::Idle,
@@ -711,6 +767,9 @@ impl MusicVideoLabApp {
     }
 
     fn start_calibration_if_needed(&mut self, ctx: &egui::Context) {
+        if self.mp4_export_running() {
+            return;
+        }
         let key = self.current_calibration_key();
         if key == self.calibration_key {
             return;
@@ -1239,13 +1298,16 @@ impl MusicVideoLabApp {
     /// Shared production frame boundary: all input and note_edit calls must
     /// precede completion admission. Headless input tests use this same entry.
     fn process_editor_frame(&mut self, ctx: &egui::Context) -> bool {
-        let input_enabled = !self.load_choice_open();
+        let input_enabled = !self.load_choice_open()
+            && !self.mp4_export_running()
+            && !self.export_state.setup_open();
         let mut actions = Vec::new();
         self.draw_status_bar(ctx, input_enabled, &mut actions);
         let (response, toolbar_actions) = self.draw_editing_panels(ctx, input_enabled);
         actions.extend(toolbar_actions);
         self.draw_tool_windows(ctx, input_enabled, &mut actions);
         actions.extend(self.draw_load_choice(ctx));
+        self.draw_mp4_dialogs(ctx, &mut actions);
         let reset_preview_perf = self.apply_chrome_actions(ctx, actions);
         let add_image_layer_requested = response.add_image_layer_requested;
         let import_lrc_requested = response.import_lrc_requested;
@@ -1280,6 +1342,7 @@ impl MusicVideoLabApp {
         // generation/pending-edit conflict check.
         self.poll_projects(ctx);
         self.poll_lrc(ctx);
+        self.poll_mp4_choice(ctx);
         self.sync_runtime_resources(ctx);
         let title = format!("{} - mIV 音楽ビデオ", self.project_caption());
         if title != self.last_sent_title {
@@ -1594,7 +1657,8 @@ impl MusicVideoLabApp {
     }
 
     fn start_preview_if_needed(&mut self, ctx: &egui::Context) {
-        if !self.preview_dirty
+        if self.mp4_export_running()
+            || !self.preview_dirty
             || self.preview_pending.is_some()
             || !self.runtime_resources_ready()
             || !self.calibration_ready()
@@ -1736,7 +1800,7 @@ impl MusicVideoLabApp {
         match result {
             Some(Ok(Ok(result))) => {
                 self.preview_pending = None;
-                if result.revision == self.preview_revision {
+                if !self.mp4_export_running() && result.revision == self.preview_revision {
                     let _analysis_identity = (&result.analysis_key, result.frame_index);
                     self.preview_render_ms = result.render_ms;
                     self.preview_report = result.report;
@@ -1777,7 +1841,7 @@ impl MusicVideoLabApp {
             }
             Some(Ok(Err(error))) => {
                 self.preview_pending = None;
-                if !self.preview_dirty {
+                if !self.mp4_export_running() && !self.preview_dirty {
                     self.status = error;
                 }
             }
@@ -1822,14 +1886,15 @@ impl MusicVideoLabApp {
                     &worker_progress,
                     || notify_ctx.request_repaint(),
                 );
-                let _ = tx.send(result);
+                let _ = tx.send(result.map(ExportCompletion::Png));
                 worker_ctx.request_repaint();
             });
         match spawned {
             Ok(_) => {
                 self.last_export = None;
                 self.status = "連番 PNG を書き出しています".to_owned();
-                self.export_pending = Some(ExportPending {
+                self.export_state = ExportState::Running(ExportPending {
+                    kind: ExportKind::Png,
                     cancel,
                     progress,
                     total_frames,
@@ -1842,12 +1907,12 @@ impl MusicVideoLabApp {
 
     fn poll_export(&mut self) {
         let result = self
-            .export_pending
-            .as_ref()
+            .export_state
+            .pending()
             .map(|pending| pending.rx.try_recv());
         match result {
-            Some(Ok(Ok(outcome))) => {
-                self.export_pending = None;
+            Some(Ok(Ok(ExportCompletion::Png(outcome)))) => {
+                self.export_state = ExportState::Idle;
                 self.status = match &outcome {
                     ExportOutcome::Completed { output_dir, .. } => {
                         format!("連番 PNG を書き出しました: {}", output_dir.display())
@@ -1862,12 +1927,15 @@ impl MusicVideoLabApp {
                 };
                 self.last_export = Some(outcome);
             }
+            Some(Ok(Ok(ExportCompletion::Mp4(result)))) => {
+                self.complete_mp4_export(result);
+            }
             Some(Ok(Err(error))) => {
-                self.export_pending = None;
+                self.export_state = ExportState::Idle;
                 self.status = error;
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                self.export_pending = None;
+                self.export_state = ExportState::Idle;
                 self.status = "書き出しワーカーが終了しました".to_owned();
             }
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
@@ -2331,7 +2399,7 @@ impl MusicVideoLabApp {
     }
 }
 
-fn load_project_bundle(
+pub(crate) fn load_project_bundle(
     path: PathBuf,
     store: &ResourceBlobStore,
     cancel: &AtomicBool,
@@ -2498,7 +2566,12 @@ impl eframe::App for MusicVideoLabApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                self.draw_preview(ui);
+                ui.add_enabled_ui(
+                    !self.mp4_export_running() && !self.export_state.setup_open(),
+                    |ui| {
+                        self.draw_preview(ui);
+                    },
+                );
             });
         let egui_layout_ms = egui_layout_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -2507,7 +2580,7 @@ impl eframe::App for MusicVideoLabApp {
         if self.audio_pending.is_some()
             || self.image_pending.is_some()
             || self.preview_pending.is_some()
-            || self.export_pending.is_some()
+            || self.export_state.pending().is_some()
             || self.project_load.is_loading()
             || self.project_save_pending.is_some()
             || self.lrc_load.is_active()
@@ -2616,7 +2689,7 @@ impl Drop for MusicVideoLabApp {
         if let Some(pending) = &self.calibration_pending {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        if let Some(pending) = &self.export_pending {
+        if let Some(pending) = self.export_state.pending() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         if let ProjectLoadState::Loading(pending) = &self.project_load {
@@ -2671,7 +2744,7 @@ impl Drop for MusicVideoLabApp {
 mod tests {
     use super::*;
 
-    fn h3a_app() -> MusicVideoLabApp {
+    pub(super) fn h3a_app() -> MusicVideoLabApp {
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         app.project = default_project(0.5);
         app.project.output.width = 16;
@@ -2993,6 +3066,28 @@ mod tests {
         );
         let restored = h3a_request(&mut app, &ctx);
         assert!(restored.analysis_key.as_ref() == Some(&initial_key));
+        let export_request = crate::mp4::snapshot(
+            &app.project,
+            &app.assets,
+            Arc::clone(app.audio.as_ref().unwrap()),
+            app.editor_state
+                .resource_manifest()
+                .audio()
+                .unwrap()
+                .revision(),
+            PathBuf::from("unused-undo-export.mp4"),
+            crate::mp4::ExportSettings::default(),
+            false,
+        );
+        assert_eq!(
+            export_request.pcm_id,
+            initial_manifest.audio().unwrap().revision()
+        );
+        assert_eq!(export_request.audio.stereo_pcm, initial_audio.stereo_pcm);
+        assert!(Arc::ptr_eq(
+            &export_request.audio,
+            app.audio.as_ref().unwrap()
+        ));
         assert!(owner.lock().unwrap().key() != Some(&replacement_key));
         let restored_bits = h3a_spectrum_bits(
             owner

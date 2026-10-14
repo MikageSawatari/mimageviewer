@@ -1,6 +1,7 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j の実装あり、P4 未実装。2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
+Status: P1〜P3j、P4b-1〜3 の実装・非対話検証あり。P4b-4 以降と H3b は未完了。
+2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
 実装済みと実機検収済みは区別する。編集整合性の修正（`4ba3b7932` / `91326ca8d` / `0c24a453e` /
@@ -2087,6 +2088,11 @@ P4b は性質の違う作業を含むので、4 段に分ける。各段で独�
 - 較正は書き出しの worker で同じ関数から計算し直す（入力が同じなので結果も同じ。エディタの較正結果を
   渡して key を照合する分岐を作らない）。5 分で数秒かかるので、進捗の段階に「反応範囲の計算」を含める。
 - CLI（`mvexport_cli`）は自分で FFmpeg デコードしてから同じ入口を呼ぶ。
+- **実測の入口（2026-10-14、設計担当判断）**: 本体の `mvexport_cli` にはエディタのプロジェクト形式の
+  読込を追加しない。エディタの開発用 bin `musicvideo-dev`（`dev-tools`）に
+  `--export-mp4 <project.mivmv.json> <output.mp4> [--encoder X] [--video-bitrate N] [--frame-hash]` を追加する。
+  エディタと同じプロジェクト読込・素材解決・FFmpeg デコード・スナップショット作成を通し、製品 GUI の
+  書き出しと同じ lib の関数を使う。実測用の編集済みプロジェクトと合成素材は `target/` 以下だけに生成する。
 - **書き出しを始められる条件**: 素材がすべて Ready、Project / LRC / 素材の読込・保存・歌詞の行対応確認が
   どれも進行中でない。満たさないときは書き出しボタンを無効にして理由を出す（書き出し中に完了した処理を
   保留・復帰させる仕組みは作らない）。
@@ -2305,6 +2311,130 @@ cold build の推測ではない。依存 DLL の配置条件は上の P4b-1 記
 
 独立実装レビュー（GPT-6.1 Sol / xhigh）: 指摘なし、**ACCEPT**。実デバイスでの音の確認は未実施（エージェントは音を聞けない）。P4b の最後に利用者へ依頼する。
 
+#### P4b-3 実装記録（2026-10-14）
+
+対象は `musicvideo` の `1bf772d5d35d7c19bffe513362f420c8b8c98150` 上の未コミット差分。
+正本は本節の P4b-3、D3 の H3a、D10、D11、D13 と
+[実装 brief](brief-musicvideo-p4b3.md)。実装・非対話検証のみを行い、本体アプリ・エディタ GUI の起動と
+コミットは行わない。P4b-4 の未保存・終了確認と H3b の製品プレビュー画素検証は対象外。
+
+- 本体 lib の要求は `MusicVideoExportRequest<I>`。Project の複製、独立した画像 bundle、プレビューと同じ
+  `Arc<ExportPcm>`、元音源の実サンプル長、PCM revision を受ける。エディタの `AudioData` は共通 PCM 型の
+  alias とし、PCM の複製を必要としない。識別を `AnalysisKey<I>` にそのまま渡し、本体 lib に
+  `musicvideo-ui` やエディタのプロジェクトファイル形式への依存を加えていない。
+- 較正は worker 内で共通 `calibrate_modulators_view` を計算し直す。AAC 入力は出力尺の PCM view から
+  最大 16,384 stereo フレームずつだけを実体化し、切り詰め・無音延長・PTS の旧入力列とのビット一致を検査する。
+  全尺 PCM の resize・複製・素材ファイルの再読込をなくした。
+- 進捗に反応範囲の計算／音声の符号化／フレームの書き出し／仕上げと frame 数を公開する。
+  同一ディレクトリの `TempPath` を最後に `persist_noclobber`／`persist` で公開し、取消・公開失敗でも既存出力を
+  先に削除しない。通常 CLI と開発用 CLI は上書きを承認しない。
+- エディタは `ExportState` 一つで未開始／設定／保存先選択／実行を排他に所有する。既定は自動エンコーダ・
+  12,000,000 bps、解像度・fps は Project の値を表示し、設定を永続化しない。保存ダイアログと選択直後の
+  存在確認を同じ chooser worker が行い、その上書き承認の bool を再判定せず要求へ渡す。
+  独立レビューで見つかった UI スレッドの `path.exists()` はこの worker 所有へ修正した。
+- 開始条件は素材 Ready・音声あり・Project／LRC／素材の読込と保存なし・歌詞の行対応確認なし。
+  開始時に P4b-2 の Pause を送り、preview revision を更新して実行中の worker を取消し、receiver は終端まで残す。
+  編集・開く・保存・再生・seek・Undo を止め、新しいプレビュー／較正 worker を起動しない。
+  中止要求や最終 frame 数でモーダルを解放せず、worker の終端結果で完了・失敗・中止を通知する。
+  ウィンドウを閉じる要求と Drop の既存取消は変更しない。
+- 当初の `mvexport_cli` にプロジェクト読込と鍵盤追加の入口がないことを報告して停止し、設計担当の判断で
+  `musicvideo-dev --export-mp4` を追加した。本体 CLI は自前デコード → 共通入口だけの変更に留める。
+  開発用コマンドは GUI の Project-open worker と同じ `load_project_bundle`（パス解決・画像・FFmpeg・resource lease）を
+  通り、GUI worker と同じ `snapshot`／`export_snapshot` 関数を使う。
+
+検証記録は `target/p4b3-verification/`。初回の指定自動テストは editor 111、core 115＋経路 2、UI 122、
+mvexport 15、合計 **365 passed / 0 failed / 0 ignored**。追加は editor 10 と mvexport 8 の **18 件**。
+既存の Undo handler にも、復元した PCM と revision を共通 snapshot に渡す検査を加えた。
+`comparison.json` で既存 editor **101 件の欠落 0** と追加 18 件すべての失敗確認を照合した。
+
+| 検査対象 | 意図的に壊した実装 | 検出ログ（同ディレクトリ） |
+| --- | --- | --- |
+| PCM view の入力列・ビット・PTS、RGBA と AAC、復元 PCM | チャンクの実サンプルをコピーせず無音にする | `library-mutation-chunk-zero.log`（3 件失敗） |
+| 公開直前の競合 | `persist_noclobber` を置換公開へ変える | `library-mutation-clobber-race.log` |
+| 置換・取消・失敗で原本を守る | 一時出力作成時に原本を先に削除する | `library-mutation-delete-original.log`（3 件失敗） |
+| 取消と最終 frame 後の取消 | cancel の確認を無視する | `library-mutation-ignore-cancel.log`（2 件失敗） |
+| 不正な PCM の拒否 | sample rate 0 の拒否を除く | `library-mutation-invalid-pcm.log` |
+| プレビューと同じ較正 | 較正結果を捨てる | `library-mutation-discard-calibration.log`（2 件失敗） |
+| revision が解析の key に届く | 毎フレーム timeline を捨てる | `library-mutation-discard-timeline.log` |
+| 全画像の snapshot と dev の共通読込 | snapshot の画像をすべて落とす | `editor-mutation-snapshot-drop-images.log`（2 件失敗） |
+| 開発用コマンドの設定 | frame-hash の引数を無視する | `editor-mutation-parser-drop-hash.log` |
+| 保存中の開始条件 | 保存中の拒否を除く | `editor-mutation-admit-during-save.log` |
+| 歌詞の行対応確認 | 確認待ちの拒否を除く | `editor-mutation-admit-lyrics-confirmation.log` |
+| 再生の停止 | Pause を送らない | `editor-mutation-skip-pause.log` |
+| モーダルの操作受付 | host action の gate を外す | `editor-mutation-modal-input-dispatch.log` |
+| 保存先選択中の編集禁止 | editor の input gate を外す | `editor-mutation-chooser-undo-input.log` |
+| worker 終端で完了 | 最後の frame 数だけで完了にする | `editor-mutation-finish-at-last-frame.log` |
+| 全段階の進捗表示 | 段階名を常に仕上げにする | `editor-mutation-wrong-stage-label.log` |
+
+16 種類の変異はすべて **コンパイル後のテスト失敗（cargo exit 101）** を検出し、毎回ソースを復元した。
+本体・エディタそれぞれの runner／集計は `library-mutations.ps1`／`library-mutation-summary.json` と
+`editor-mutations.py`／`editor-mutation-summary.json`。モーダル gate の不正実装でも、test-only の dispatch assertion が
+native file dialog に届く前に失敗させるため、検証中に GUI は起動しない。
+
+| 最終コマンド（`MSBUILDDISABLENODEREUSE=1`） | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p musicvideo-editor` | 111 passed / 0 failed / 0 ignored | `final-editor-tests.log` |
+| `cargo check -p musicvideo-editor --features dev-tools --bins` | exit 0 | `final-editor-check.log` |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core 115＋経路 2、UI 122、計 239 passed | `final-core-ui-tests.log` |
+| `cargo test -p mimageviewer --lib mvexport` | 15 passed / 0 failed / 0 ignored | `final-mvexport-tests.log` |
+| `cargo fmt`／`cargo fmt --check` | 実行済み／exit 0 | `final-fmt-check.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0 | `final-glyphs.log` |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | exit 0、164.16 秒、25,213,440 bytes | `release-editor.log` |
+| `cargo build --release --features dev-tools --bin mvexport_cli` | exit 0、175.27 秒、5,289,984 bytes | `release-mvexport-cli.log`／`.json` |
+| `cargo build --release -p musicvideo-editor --features dev-tools --bin musicvideo-dev` | exit 0、50.56 秒、25,407,488 bytes | `release-musicvideo-dev.log`／`.json` |
+
+最終の指定テストは **365 passed / 0 failed / 0 ignored**。時間・終了コードは `final-gates.json` と
+各 build の JSON。brief の `cargo build --release --bin mvexport_cli` は既存の
+`required-features = ["dev-tools"]` のため exit 101 となり、上表のように feature 指定を補って成功した。
+本体 CLI の feature gate や仕様は変更していない。FFmpeg DLL は `vendor/ffmpeg/bin/` の既存 6 DLL を
+`target/release/` へコピーし、成果物の GUI は起動していない。
+
+**5 分 1080p60 実測（参考値）。** `target/p4b3-verification/` に純生成の 3000×1687 背景と 300 秒 stereo
+48kHz PCM WAV、`edited-300s.mivmv.json` を生成した。Image／Spectrum／PitchKeyboard／Text／TimeText／ProgressBar の
+6 層を表示し、画像ズームの 3 キーフレームと Auto 較正の BandOnset → SpectrumRadius の変調を含む。
+生成手順は `prepare-edited-fixture.py`、入力と実行 exe の SHA-256 は `export-300s.json`。
+
+```powershell
+& .\target\release\musicvideo-dev.exe --export-mp4 .\target\p4b3-verification\edited-300s.mivmv.json .\target\p4b3-verification\edited-300s.mp4 --encoder nvenc --video-bitrate 12000000 --frame-hash
+```
+
+開始前に cargo／rustc はなかったが、**Codex プロセス 4 件が残っていた**（`benchmark-process-preflight.json`）。
+他プロセスを停止せず測定したため静穏条件を満たした正式値として扱わない。GUI・エディタのプレビューは起動していない。
+
+| 区間／指標 | 実測 |
+| --- | --- |
+| 完走 | exit 0、18,000 frames、300 秒、1920×1080／60fps |
+| エンコーダ／ビットレート指定 | `h264_nvenc`／12,000,000 bps |
+| 書き出し worker の wall | **184.441 秒、97.592 fps、実時間比 1.6265x**（RGBA hash 計算を含む） |
+| Project・素材読込／デコード／波形・lease 作成 | 0.328 秒 |
+| 読込＋書き出し（コマンド自身の区間） | 184.811 秒 |
+| 全尺再デコード確認を含むコマンド全体 | 202.837 秒 |
+| 較正 | 2.526 秒 |
+| AAC | 3.846 秒 |
+| 解析・scene 評価・RGBA 合成 | 合計 114.191 秒、平均 6.344 ms／p95 7.201 ms |
+| RGBA → YUV 変換 | 合計 15.264 秒、平均 0.848 ms |
+| H.264 符号化 | 合計 7.528 秒、平均 0.418 ms |
+| mux | 0.363 秒 |
+| faststart | 0.052 秒 |
+| 公開 | 0.000485 秒 |
+| RGBA SHA-256 | 40.496 秒 |
+| その他（worker の wall 内） | 0.175 秒 |
+| MP4 サイズ | 145,395,326 bytes |
+
+全尺を共通 `verify_exported_mp4` で再デコードし、映像 18,000 frames／300.000 秒、音声 14,400,512 samples/ch／
+300.010667 秒、差 **10.667 ms（60fps の 1 frame 未満）**を確認した。`ffprobe` でも H.264 **High**／yuv420p／
+bt709／60/1、AAC **LC**／48kHz／stereo を確認（`export-ffprobe.json`）。`export-20s.png` を CLI で取り出して目視し、
+背景・スペクトラム・鍵盤・文字・時刻・進捗の描画を確認した。これは H3b の製品プレビュー画素一致の検収ではない。
+RGBA SHA-256 は `1cc527f3437523a7632818bb319910596bf192898f8243edf5c1687e8eca9fd1`。
+生ログ `export-300s.log`、集計 `measurement-summary.json`、実行条件／入力 fingerprint は `export-300s.json`。
+
+正本との相違は、設計担当が追加した開発用書き出し入口と、既存 feature gate に合わせたビルドコマンドの補正のみ。
+P4b-4・H3b・実機 GUI 検収は未実施。コミットせず、既存の未追跡 `out.mp4` も変更していない。
+
+実装担当の作業内での確認（UI の存在確認 1 件を修正）。これは設計担当が依頼する正式な独立レビューではない
+（2026-10-14 設計担当注記）。正式な独立レビューは別に行う。
+5 分の実測は背景に別の処理（利用者の Codex アプリ等）が動いた状態で、参考値とする（P2c の 3.2 倍との比較には使わない）。
+
 ---
 
 ## 4. データモデル（v1）
@@ -2455,7 +2585,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **H3a** ✅ | 解析契約の確定と実装: 共通格子／PCM view／解析タイムライン（チェックポイント・型付き key）／較正入力を、プレビュー・書き出し・PNG・ベンチマークで共有 | **完了**（2026-10-14、`b473603cc` + `b913d9408`）。設計は実装前レビュー 3 回目で ACCEPT、実装は独立レビュー 1 回目 REVISE（P2 2・P3 1）を修正し 2 回目で ACCEPT。A6 は設計担当判断で 4 分位置 約 0.7 秒以内（並列）を採用、生の値のキャッシュなし。解析を使う書き出しの RGBA ハッシュは予定どおり変化、無変調ハッシュ維持。詳細は D3 の H3a 実装記録。画素の一致の確認は H3b（P4b 後） |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
-| **P4b** 設計 ACCEPT・P4b-1 / P4b-2 完了（独立レビュー ACCEPT。P4b-2 の実機の音は未確認、P4b の最後に利用者へ依頼）・P4b-3 実装中 | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
+| **P4b** 設計 ACCEPT・P4b-1〜3 実装／自動検証／独立レビュー ACCEPT・P4b-3 の 5 分完走済み・P4b-4 未実装 | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。未保存確認／保存中・書き出し中の終了は P4b-4 に残す |
 | **P4c** | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | 引数解析の単体テスト。最近使った一覧: 壊れた JSON・無いファイル・上限・取消 / 失敗 / 破棄された読込を入れない・一覧の書込失敗で保存成功が覆らない。`--data-dir` 無しで最近一覧とファイルログを永続化しないこと。mIV の設定・DB・ログに触れないこと |
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |

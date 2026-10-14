@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_the_third as ffmpeg;
+use music_core::PcmView;
 use musicvideo_core::{
     AnalysisKey, AnalysisTimeline, Frame, FrameGrid, LayerKind, RenderReport, Smoothing,
     UnresolvedAsset, calibrate_modulators_view, evaluate, pcm_view, render_frame,
@@ -23,8 +24,8 @@ use crate::video::stream::timeline::StreamTimeline;
 
 use super::mux::Mp4Muxer;
 use super::{
-    EncoderPreference, ExportError, ExportSummary, Mp4AudioVerification, Mp4Verification,
-    Mp4VideoVerification, MusicVideoExportRequest, io_error,
+    EncoderPreference, ExportError, ExportProgress, ExportStage, ExportSummary,
+    Mp4AudioVerification, Mp4Verification, Mp4VideoVerification, MusicVideoExportRequest, io_error,
 };
 
 const AUDIO_BITRATE_BPS: u32 = 192_000;
@@ -39,40 +40,67 @@ struct ExportPlan {
     spectrum_bands: usize,
 }
 
-pub(super) fn export(
-    request: MusicVideoExportRequest,
-    progress: &dyn Fn(u64, u64),
+pub(super) fn export<I: Clone + Eq>(
+    request: MusicVideoExportRequest<I>,
+    progress: &dyn Fn(ExportProgress),
     cancel: &AtomicBool,
 ) -> Result<ExportSummary, ExportError> {
     let plan = validate_request(&request)?;
-    progress(0, plan.frames);
+    let report_progress = |stage, completed_frames| {
+        progress(ExportProgress {
+            stage,
+            completed_frames,
+            total_frames: plan.frames,
+        });
+    };
+    report_progress(ExportStage::Calibration, 0);
     check_cancel(cancel)?;
     let wall_started = Instant::now();
-
-    let mut partial = PartialOutput::new(&request.output_path)?;
-    let audio_decode_started = Instant::now();
-    let audio_stream_index = default_audio_stream_index(&request.audio_path)?;
-    let mut decoded = crate::audio_decode::decode_audio_file_to_stereo_f32(
-        &request.audio_path,
-        audio_stream_index,
-        cancel,
+    let partial = PartialOutput::new(&request.output_path)?;
+    let sample_rate = request.audio.sample_rate;
+    let source_duration_secs = request.source_duration_secs;
+    let view = pcm_view(
+        &request.audio.stereo_pcm,
+        sample_rate,
+        request.project.duration_secs,
+    )
+    .map_err(|error| ExportError::InvalidRequest(error.to_string()))?;
+    let calibration_started = Instant::now();
+    let calibrations = calibrate_modulators_view(
+        view,
+        sample_rate,
+        request.project.duration_secs,
+        source_duration_secs,
+        &request.project.modulators,
+        &|| cancel.load(Ordering::Relaxed),
     )
     .map_err(|error| {
         if cancel.load(Ordering::Relaxed) {
             ExportError::Cancelled
         } else {
-            ExportError::AudioDecode(format!("音声をデコードできません: {error}"))
+            ExportError::InvalidRequest(format!(
+                "モジュレータの反応範囲を自動調整できません: {error}"
+            ))
         }
     })?;
-    let audio_decode_secs = audio_decode_started.elapsed().as_secs_f64();
+    let calibration_secs = calibration_started.elapsed().as_secs_f64();
     check_cancel(cancel)?;
-    let source_duration_secs =
-        (decoded.stereo_samples.len() / 2) as f64 / f64::from(decoded.info.sample_rate);
-    fit_audio_to_duration(
-        &mut decoded.stereo_samples,
-        decoded.info.sample_rate,
-        request.project.duration_secs,
-    )?;
+    let key = AnalysisKey::new(
+        request.pcm_id.clone(),
+        sample_rate,
+        view.logical_frames,
+        plan.grid,
+        plan.spectrum_bands,
+        Smoothing::default(),
+        &request.project.modulators,
+        &calibrations,
+        request.project.display_gain_db,
+    )
+    .map_err(|error| {
+        ExportError::InvalidRequest(format!("スペクトラム解析を初期化できません: {error}"))
+    })?;
+    report_progress(ExportStage::AudioEncoding, 0);
+    check_cancel(cancel)?;
 
     let output = StreamOutputParameters {
         dimensions: OutputDimensions {
@@ -91,7 +119,7 @@ pub(super) fn export(
     let selected_encoder = video.kind.as_str().to_owned();
     let timeline = StreamTimeline::new(0.0)
         .map_err(|error| ExportError::Encoder(format!("音声タイムラインが不正です: {error}")))?;
-    let mut audio = open_aac_encoder(decoded.info.sample_rate, AUDIO_BITRATE_BPS, 0, timeline)
+    let mut audio = open_aac_encoder(sample_rate, AUDIO_BITRATE_BPS, 0, timeline)
         .map_err(|error| ExportError::Encoder(format!("AAC エンコーダを開けません: {error}")))?;
     let mux_started = Instant::now();
     let mut muxer = Mp4Muxer::new(
@@ -103,50 +131,10 @@ pub(super) fn export(
     let mut mux_secs = mux_started.elapsed().as_secs_f64();
 
     let aac_encode_started = Instant::now();
-    let mut audio_packets = VecDeque::from(encode_audio(
-        &mut audio,
-        &decoded.stereo_samples,
-        decoded.info.sample_rate,
-        cancel,
-    )?);
+    let mut audio_packets = VecDeque::from(encode_audio(&mut audio, view, sample_rate, cancel)?);
     let aac_encode_secs = aac_encode_started.elapsed().as_secs_f64();
-    let view = pcm_view(
-        &decoded.stereo_samples,
-        decoded.info.sample_rate,
-        request.project.duration_secs,
-    )
-    .map_err(|error| ExportError::InvalidRequest(error.to_string()))?;
-    let calibrations = calibrate_modulators_view(
-        view,
-        decoded.info.sample_rate,
-        request.project.duration_secs,
-        source_duration_secs,
-        &request.project.modulators,
-        &|| cancel.load(Ordering::Relaxed),
-    )
-    .map_err(|error| {
-        if cancel.load(Ordering::Relaxed) {
-            ExportError::Cancelled
-        } else {
-            ExportError::InvalidRequest(format!(
-                "モジュレータの反応範囲を自動調整できません: {error}"
-            ))
-        }
-    })?;
-    let key = AnalysisKey::new(
-        0_u64,
-        decoded.info.sample_rate,
-        view.logical_frames,
-        plan.grid,
-        plan.spectrum_bands,
-        Smoothing::default(),
-        &request.project.modulators,
-        &calibrations,
-        request.project.display_gain_db,
-    )
-    .map_err(|error| {
-        ExportError::InvalidRequest(format!("スペクトラム解析を初期化できません: {error}"))
-    })?;
+    report_progress(ExportStage::Frames, 0);
+    check_cancel(cancel)?;
     let mut spectrum = AnalysisTimeline::default();
     let mut rgba = Frame::new(request.project.output.width, request.project.output.height)
         .map_err(|error| ExportError::Render(format!("RGBA フレームを確保できません: {error}")))?;
@@ -200,9 +188,11 @@ pub(super) fn export(
         write_video_packets(&mut muxer, &mut audio_packets, packets)?;
         mux_secs += mux_started.elapsed().as_secs_f64();
 
-        progress(frame_index + 1, plan.frames);
+        report_progress(ExportStage::Frames, frame_index + 1);
     }
 
+    check_cancel(cancel)?;
+    report_progress(ExportStage::Finalizing, plan.frames);
     check_cancel(cancel)?;
     let flush_started = Instant::now();
     video.encoder.send_eof().map_err(|error| {
@@ -221,7 +211,7 @@ pub(super) fn export(
     let faststart_secs = faststart_started.elapsed().as_secs_f64();
     check_cancel(cancel)?;
     let rename_started = Instant::now();
-    partial.commit(&request.output_path)?;
+    partial.commit(&request.output_path, request.replace_existing, cancel)?;
     let rename_secs = rename_started.elapsed().as_secs_f64();
     let hash_finalize_started = Instant::now();
     let rgba_sha256 = hasher.map(|hasher| format!("{:x}", hasher.finalize()));
@@ -235,7 +225,7 @@ pub(super) fn export(
     let accounted_secs = render_total_secs
         + convert_total_secs
         + encode_total_secs
-        + audio_decode_secs
+        + calibration_secs
         + aac_encode_secs
         + mux_secs
         + faststart_secs
@@ -251,7 +241,7 @@ pub(super) fn export(
         render_p95_ms: percentile(&render_ms, 0.95),
         convert_mean_ms: convert_total_secs * 1000.0 / frames,
         encode_mean_ms: encode_total_secs * 1000.0 / frames,
-        audio_decode_secs,
+        calibration_secs,
         aac_encode_secs,
         mux_secs,
         faststart_secs,
@@ -268,7 +258,7 @@ pub(super) fn export(
     })
 }
 
-fn validate_request(request: &MusicVideoExportRequest) -> Result<ExportPlan, ExportError> {
+fn validate_request<I>(request: &MusicVideoExportRequest<I>) -> Result<ExportPlan, ExportError> {
     let output = request.project.output;
     if output.width < 2 || output.height < 2 || output.width % 2 != 0 || output.height % 2 != 0 {
         return Err(ExportError::InvalidRequest(
@@ -295,7 +285,17 @@ fn validate_request(request: &MusicVideoExportRequest) -> Result<ExportPlan, Exp
             "映像ビットレートは 1 以上にしてください".to_owned(),
         ));
     }
-    if request.output_path.exists() {
+    if request.audio.sample_rate == 0
+        || request.audio.stereo_pcm.is_empty()
+        || request.audio.stereo_pcm.len() % 2 != 0
+        || !request.source_duration_secs.is_finite()
+        || request.source_duration_secs <= 0.0
+    {
+        return Err(ExportError::InvalidRequest(
+            "音声スナップショットが不正です".to_owned(),
+        ));
+    }
+    if !request.replace_existing && request.output_path.exists() {
         return Err(ExportError::InvalidRequest(format!(
             "出力先は既に存在します: {}",
             request.output_path.display()
@@ -359,24 +359,6 @@ fn stream_encoder_preference(preference: EncoderPreference) -> StreamEncoderPref
     }
 }
 
-fn fit_audio_to_duration(
-    pcm: &mut Vec<f32>,
-    sample_rate: u32,
-    duration_secs: f64,
-) -> Result<(), ExportError> {
-    let samples_per_channel = (duration_secs * f64::from(sample_rate)).round();
-    if !samples_per_channel.is_finite() || samples_per_channel < 1.0 {
-        return Err(ExportError::InvalidRequest(
-            "音声サンプル数を表現できません".to_owned(),
-        ));
-    }
-    let target_len = (samples_per_channel as usize)
-        .checked_mul(2)
-        .ok_or_else(|| ExportError::InvalidRequest("音声サンプル数が大きすぎます".to_owned()))?;
-    pcm.resize(target_len, 0.0);
-    Ok(())
-}
-
 /// The export has no track picker, so it takes the container's default audio stream,
 /// which is what the decoder chose on its own before it started taking a stream index.
 pub(super) fn default_audio_stream_index(path: &Path) -> Result<usize, ExportError> {
@@ -391,25 +373,14 @@ pub(super) fn default_audio_stream_index(path: &Path) -> Result<usize, ExportErr
 
 fn encode_audio(
     encoder: &mut OpenedAacEncoder,
-    pcm: &[f32],
+    pcm: PcmView<'_>,
     sample_rate: u32,
     cancel: &AtomicBool,
 ) -> Result<Vec<ffmpeg::Packet>, ExportError> {
-    let chunk_len = AUDIO_CHUNK_SAMPLES_PER_CHANNEL * 2;
     let mut packets = Vec::new();
-    for (chunk_index, samples) in pcm.chunks(chunk_len).enumerate() {
+    for first_sample in (0..pcm.logical_frames).step_by(AUDIO_CHUNK_SAMPLES_PER_CHANNEL) {
         check_cancel(cancel)?;
-        let samples_per_channel = samples.len() / 2;
-        let first_sample = chunk_index * AUDIO_CHUNK_SAMPLES_PER_CHANNEL;
-        let chunk = ProcessedChunk {
-            samples: samples.to_vec(),
-            audible_pts_secs: first_sample as f64 / f64::from(sample_rate),
-            duration_secs: samples_per_channel as f64 / f64::from(sample_rate),
-            source_secs_per_output_sec: 1.0,
-            seek_serial: 0,
-            pdc_latency_secs_at_process: 0.0,
-            effetune_generation: None,
-        };
+        let chunk = materialize_audio_chunk(pcm, sample_rate, first_sample);
         packets.extend(encoder.push_chunk(chunk).map_err(|error| {
             ExportError::Encoder(format!("AAC 音声をエンコードできません: {error}"))
         })?);
@@ -418,6 +389,32 @@ fn encode_audio(
         ExportError::Encoder(format!("AAC エンコーダを終了できません: {error}"))
     })?);
     Ok(packets)
+}
+
+/// Materializes at most one AAC input chunk, preserving source sample bits.
+fn materialize_audio_chunk(
+    pcm: PcmView<'_>,
+    sample_rate: u32,
+    first_sample: usize,
+) -> ProcessedChunk {
+    let frames = (pcm.logical_frames - first_sample).min(AUDIO_CHUNK_SAMPLES_PER_CHANNEL);
+    let mut samples = vec![0.0; frames * 2];
+    let available = (pcm.samples.len() / 2)
+        .saturating_sub(first_sample)
+        .min(frames);
+    if available > 0 {
+        samples[..available * 2]
+            .copy_from_slice(&pcm.samples[first_sample * 2..(first_sample + available) * 2]);
+    }
+    ProcessedChunk {
+        samples,
+        audible_pts_secs: first_sample as f64 / f64::from(sample_rate),
+        duration_secs: frames as f64 / f64::from(sample_rate),
+        source_secs_per_output_sec: 1.0,
+        seek_serial: 0,
+        pdc_latency_secs_at_process: 0.0,
+        effetune_generation: None,
+    }
 }
 
 struct RgbaConverter {
@@ -764,61 +761,43 @@ fn percentile(values: &[f64], quantile: f64) -> f64 {
 }
 
 struct PartialOutput {
-    path: PathBuf,
-    committed: bool,
+    path: tempfile::TempPath,
 }
 
 impl PartialOutput {
     fn new(destination: &Path) -> Result<Self, ExportError> {
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = destination
-            .file_name()
-            .ok_or_else(|| ExportError::InvalidRequest("出力ファイル名がありません".to_owned()))?
-            .to_string_lossy();
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for suffix in 0..1000_u32 {
-            let path = parent.join(format!(
-                ".{file_name}.mvexport-{}-{stamp}-{suffix}.part.mp4",
-                std::process::id()
-            ));
-            if !path.exists() {
-                return Ok(Self {
-                    path,
-                    committed: false,
-                });
-            }
-        }
-        Err(ExportError::Io(
-            "一時 MP4 ファイル名を確保できません".to_owned(),
-        ))
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temporary = tempfile::Builder::new()
+            .prefix(".mvexport-")
+            .suffix(".part.mp4")
+            .tempfile_in(parent)
+            .map_err(|error| io_error("一時 MP4 を作成できません", parent, error))?;
+        // Release the reservation handle before FFmpeg opens it on Windows.
+        Ok(Self {
+            path: temporary.into_temp_path(),
+        })
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
 
-    fn commit(&mut self, destination: &Path) -> Result<(), ExportError> {
-        if destination.exists() {
-            return Err(ExportError::Io(format!(
-                "書き出し中に出力先が作成されました: {}",
-                destination.display()
-            )));
-        }
-        std::fs::rename(&self.path, destination)
-            .map_err(|error| io_error("MP4 を出力先へ移動できません", destination, error))?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for PartialOutput {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_file(&self.path);
-        }
+    fn commit(
+        self,
+        destination: &Path,
+        replace_existing: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), ExportError> {
+        check_cancel(cancel)?;
+        let result = if replace_existing {
+            self.path.persist(destination)
+        } else {
+            self.path.persist_noclobber(destination)
+        };
+        result.map_err(|error| io_error("MP4 を出力先へ公開できません", destination, error.error))
     }
 }
 
@@ -984,6 +963,10 @@ fn drain_audio_decoder(
 }
 
 #[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1041,19 +1024,6 @@ mod tests {
             actual.color_transfer_characteristic(),
             expected.color_transfer_characteristic()
         );
-    }
-
-    #[test]
-    fn audio_is_truncated_or_zero_padded_to_project_duration() {
-        let mut long = vec![1.0; 24];
-        fit_audio_to_duration(&mut long, 4, 2.0).unwrap();
-        assert_eq!(long, vec![1.0; 16]);
-
-        let mut short = vec![1.0; 4];
-        fit_audio_to_duration(&mut short, 4, 1.0).unwrap();
-        assert_eq!(short.len(), 8);
-        assert_eq!(&short[..4], &[1.0; 4]);
-        assert_eq!(&short[4..], &[0.0; 4]);
     }
 
     #[test]
@@ -1164,8 +1134,8 @@ mod tests {
 
     #[test]
     fn uncommitted_partial_output_is_removed_on_drop() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let destination = std::env::temp_dir().join(format!(

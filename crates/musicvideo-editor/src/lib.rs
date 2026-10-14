@@ -11,6 +11,7 @@ use musicvideo_core::Assets;
 mod app;
 mod decode;
 mod export;
+mod mp4;
 mod playback;
 mod project;
 mod project_file;
@@ -20,6 +21,13 @@ mod resource_blobs;
 pub fn run_dev() {
     let mut args = std::env::args().skip(1);
     let command = args.next();
+    if command.as_deref() == Some("--export-mp4") {
+        if let Err(error) = mp4::run_dev_export(args) {
+            eprintln!("MP4 の書き出しに失敗しました: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if command.as_deref() == Some("--benchmark") {
         let frames = args
             .next()

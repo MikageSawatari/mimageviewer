@@ -15,9 +15,16 @@ fn source(relative: &str) -> String {
 }
 
 fn function<'a>(source: &'a str, name: &str) -> &'a str {
-    let signature = format!("fn {name}(");
+    let signature = format!("fn {name}");
     let start = source
-        .find(&signature)
+        .match_indices(&signature)
+        .find(|(index, _)| {
+            matches!(
+                source.as_bytes().get(index + signature.len()),
+                Some(b'(' | b'<')
+            )
+        })
+        .map(|(index, _)| index)
         .unwrap_or_else(|| panic!("missing {name}"));
     let start = start + source[start..].find('{').unwrap();
     let mut depth = 0;

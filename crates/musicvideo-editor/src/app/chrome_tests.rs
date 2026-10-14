@@ -82,7 +82,8 @@ fn pending_status_operations(h: &mut Harness, mask: usize) -> (Arc<AtomicBool>, 
     let resource_cancel = Arc::new(AtomicBool::new(false));
     if mask & 1 != 0 {
         let (_tx, rx) = mpsc::channel();
-        h.app.export_pending = Some(ExportPending {
+        h.app.export_state = ExportState::Running(ExportPending {
+            kind: ExportKind::Png,
             cancel: export_cancel.clone(),
             progress: Arc::new(AtomicUsize::new(20)),
             total_frames: 100,
@@ -312,8 +313,8 @@ fn l3_review_status_details_preserves_hidden_material_actions_and_progress() {
     assert!(h.app.show_missing_resources);
     assert!(
         !h.app
-            .export_pending
-            .as_ref()
+            .export_state
+            .pending()
             .unwrap()
             .cancel
             .load(Ordering::Relaxed)
@@ -338,7 +339,8 @@ fn l3_review_status_details_survives_async_completions_and_keeps_menu_actions() 
             // A font notice remains unresolved even when an image finishes loading.
             h.app.preview_report.unresolved_assets = vec![UnresolvedAsset::Font("missing".into())];
             let (export_tx, export_rx) = mpsc::channel();
-            h.app.export_pending = Some(ExportPending {
+            h.app.export_state = ExportState::Running(ExportPending {
+                kind: ExportKind::Png,
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: Arc::new(AtomicUsize::new(20)),
                 total_frames: 100,
@@ -374,7 +376,7 @@ fn l3_review_status_details_survives_async_completions_and_keeps_menu_actions() 
             // Loads/export keep update's pre-editor order; saving is polled after input.
             if completed & 1 != 0 {
                 export_tx
-                    .send(Ok(ExportOutcome::Completed {
+                    .send(Ok(ExportCompletion::Png(ExportOutcome::Completed {
                         output_dir: "frames".into(),
                         stats: crate::export::RenderStats {
                             frames: 100,
@@ -386,7 +388,7 @@ fn l3_review_status_details_survives_async_completions_and_keeps_menu_actions() 
                             total: Default::default(),
                             realtime_ratio: 1.0,
                         },
-                    }))
+                    })))
                     .unwrap();
             }
             if completed & 2 != 0 {
@@ -406,7 +408,7 @@ fn l3_review_status_details_survives_async_completions_and_keeps_menu_actions() 
             for _ in 0..3 {
                 h.frame(vec![]);
             }
-            assert_eq!(h.app.export_pending.is_none(), completed & 1 != 0);
+            assert_eq!(h.app.export_state.pending().is_none(), completed & 1 != 0);
             assert_eq!(h.app.image_pending.is_none(), completed & 2 != 0);
             assert_eq!(h.app.document.is_dirty(&h.app.project), completed & 4 == 0);
             assert!(
@@ -493,6 +495,66 @@ fn add_lyrics(h: &mut Harness) -> LayerId {
     id
 }
 
+#[test]
+fn p4b3_admission_blocks_lrc_loading_ready_and_real_lyrics_row_confirmation() {
+    let mut h = Harness::unstarted(1400.0);
+    h.app = super::tests::h3a_app();
+    let manifest = h.app.editor_state.resource_manifest().clone();
+    let id = add_lyrics(&mut h);
+    let LayerKind::Lyrics(lyrics) = &mut h.app.project.layers.last_mut().unwrap().kind else {
+        unreachable!()
+    };
+    lyrics.lines = vec![
+        LyricLine {
+            text: "first".into(),
+            time_secs: Some(0.1),
+        },
+        LyricLine {
+            text: "second".into(),
+            time_secs: Some(0.2),
+        },
+    ];
+    h.app
+        .editor_state
+        .reset_for_project_with_resources(&h.app.project, manifest.clone());
+    h.app
+        .editor_state
+        .select_layer(&h.app.project, h.app.project.layers.len() - 1);
+    h.app.runtime_resources = RuntimeResourceState::Ready(manifest);
+    h.app.lrc_load = ready_lrc(&h.app, id);
+    assert!(h.app.mp4_export_disabled_reason().unwrap().contains("読込"));
+    let (_tx, rx) = mpsc::channel();
+    h.app.lrc_load = LrcLoadState::Loading {
+        owner: lrc_owner(&h.app, id),
+        rx,
+    };
+    assert!(h.app.mp4_export_disabled_reason().unwrap().contains("読込"));
+    h.app.lrc_load = LrcLoadState::Idle;
+    h.click("first\nsecond");
+    let focused = h
+        .ctx
+        .memory(|memory| memory.focused())
+        .expect("lyrics text focused");
+    let mut native = egui::text_edit::TextEditState::load(&h.ctx, focused).unwrap();
+    native
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(5),
+            egui::text::CCursor::new(6),
+        )));
+    native.store(&h.ctx, focused);
+    h.frame(vec![]);
+    h.frame(vec![egui::Event::Cut]);
+    assert!(h.app.editor_state.has_pending_lyrics_edit());
+    assert!(
+        h.app
+            .mp4_export_disabled_reason()
+            .unwrap()
+            .contains("行対応")
+    );
+    assert_eq!(h.app.current_lyrics(id).unwrap().len(), 2);
+}
+
 fn lrc_owner(app: &MusicVideoLabApp, id: LayerId) -> LrcLoadOwner {
     LrcLoadOwner {
         session: app.document.id(),
@@ -548,7 +610,8 @@ fn l3_chrome_heights_are_invariant_across_all_host_states_and_widths() {
                 }
                 4 => {
                     let (_tx, rx) = mpsc::channel();
-                    h.app.export_pending = Some(ExportPending {
+                    h.app.export_state = ExportState::Running(ExportPending {
+                        kind: ExportKind::Png,
                         cancel: Arc::new(AtomicBool::new(false)),
                         progress: Arc::new(AtomicUsize::new(20)),
                         total_frames: 100,

@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use comic_core::{FontSet, LoadedFont};
 use mimageviewer::video::mvexport::{
-    EncoderPreference, MusicVideoExportRequest, export_music_video, verify_exported_mp4,
+    EncoderPreference, ExportPcm, ExportProgress, ExportStage, MusicVideoExportRequest,
+    export_music_video, verify_exported_mp4,
 };
 use musicvideo_core::{
     Assets, BandRange, DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, ImageAsset, ImageId,
@@ -36,10 +39,26 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    let cancel = AtomicBool::new(false);
+    let decode_started = Instant::now();
     let audio_stream_index = mimageviewer::video::mvexport::default_audio_stream_index(&args.audio)
         .map_err(|error| format!("音声情報を取得できません: {error}"))?;
     let probe = mimageviewer::audio_decode::probe_audio_file(&args.audio, audio_stream_index)
         .map_err(|error| format!("音声情報を取得できません: {error}"))?;
+    let decoded = mimageviewer::audio_decode::decode_audio_file_to_stereo_f32(
+        &args.audio,
+        audio_stream_index,
+        &cancel,
+    )
+    .map_err(|error| format!("音声をデコードできません: {error}"))?;
+    let audio_decode_secs = decode_started.elapsed().as_secs_f64();
+    let source_duration_secs =
+        (decoded.stereo_samples.len() / 2) as f64 / f64::from(decoded.info.sample_rate);
+    let audio = Arc::new(ExportPcm {
+        stereo_pcm: decoded.stereo_samples,
+        sample_rate: decoded.info.sample_rate,
+        duration_secs: decoded.info.duration_secs,
+    });
     let duration_secs = args.seconds.unwrap_or(probe.duration_secs);
     if !duration_secs.is_finite() || duration_secs <= 0.0 {
         return Err("書き出し秒数は 0 より大きい有限値にしてください".to_owned());
@@ -82,9 +101,14 @@ fn run() -> Result<(), String> {
         }
     }
     let output = project.output;
-    let cancel = AtomicBool::new(false);
     let last_reported = AtomicU64::new(0);
-    let progress = |completed: u64, total: u64| {
+    let progress = |progress: ExportProgress| {
+        let completed = progress.completed_frames;
+        let total = progress.total_frames;
+        if progress.stage != ExportStage::Frames {
+            eprintln!("段階: {:?}", progress.stage);
+            return;
+        }
         let last = last_reported.load(Ordering::Relaxed);
         if completed == total || completed.saturating_sub(last) >= 600 {
             last_reported.store(completed, Ordering::Relaxed);
@@ -95,7 +119,10 @@ fn run() -> Result<(), String> {
         MusicVideoExportRequest {
             project,
             assets,
-            audio_path: args.audio,
+            audio,
+            source_duration_secs,
+            pcm_id: 0_u64,
+            replace_existing: false,
             output_path: args.output.clone(),
             encoder: args.encoder,
             video_bitrate_bps: args.video_bitrate_bps,
@@ -117,13 +144,14 @@ fn run() -> Result<(), String> {
         summary.render_p95_ms,
         summary.convert_mean_ms,
         summary.encode_mean_ms,
-        summary.wall_secs,
-        summary.realtime_ratio,
+        summary.wall_secs + audio_decode_secs,
+        summary.duration_secs / (summary.wall_secs + audio_decode_secs),
         summary.rgba_sha256.as_deref().unwrap_or("未計算")
     );
     println!(
-        "区間外内訳: audio_decode_secs={:.3} aac_encode_secs={:.3} mux_secs={:.3} faststart_secs={:.3} rename_secs={:.6} frame_hash_secs={:.3} other_secs={:.3}",
-        summary.audio_decode_secs,
+        "区間外内訳: audio_decode_secs={:.3} calibration_secs={:.3} aac_encode_secs={:.3} mux_secs={:.3} faststart_secs={:.3} rename_secs={:.6} frame_hash_secs={:.3} other_secs={:.3}",
+        audio_decode_secs,
+        summary.calibration_secs,
         summary.aac_encode_secs,
         summary.mux_secs,
         summary.faststart_secs,
