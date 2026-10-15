@@ -319,10 +319,20 @@ mIV は Windows 専用。非 Windows でのコンパイル検査は行わず、2
 
 ```powershell
 cargo check -p mimageviewer --bin mimageviewer-core
-cargo test -p mimageviewer --lib <filter>
+.\scripts\test-focused.ps1          # 変更ファイルから選んだテストを nextest で実行
+cargo nextest run -p mimageviewer --lib -E 'test(/<filter>/)'
 cargo test -p mimageviewer --test <integration-test-name>
 .\scripts\build-dev.ps1
 ```
+
+**本体 lib の全件は `.\scripts\test-lib-full.ps1` 経由で実行し、filter なしの
+`cargo test -p mimageviewer --lib` を直接打たない** (2026-10-16)。cargo-nextest でテストを 1 件ずつ
+別プロセスに分けるので約 6〜7 分で終わり (cargo test では App テストが共有ロックで直列になり約 28 分)、
+同じソース・環境・DLL の状態で成功済みなら記録を返して再実行しない。レビュー担当も、同じ状態の
+成功記録があれば全件を再実行しない。`test-focused.ps1` が対応先の無い変更 (スクリプト・Cargo.lock 等) を
+見つけて exit 2 を返したら、`test-lib-full.ps1` に回す。cargo-nextest が無い環境では
+`cargo install cargo-nextest --locked` で入れる。経緯と計測は
+[docs/test-speed-report.md](docs/test-speed-report.md)。
 
 全workspace・統合・doc・pack builderテストは `.\scripts\test-full.ps1` に集約する。
 これは共有基盤を横断する変更の最終確認、リリース前、または明示的に全体確認を求められた
