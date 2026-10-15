@@ -193,12 +193,28 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use musicvideo_core::{
         Animatable, AudioRef, BandCalibration, BandRange, BandWeighting, ImageId, ImageRef, Interp,
         Keyframe, LayerKind, LyricLine, ModulationBinding, ModulationCurve, ModulationTarget,
         ModulatorSource, Smoothing, Track, default_project, new_band_energy_modulator,
         new_image_layer, new_lyrics_layer,
     };
+
+    #[test]
+    fn output_fps_load_preserves_nonstandard_project_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("custom.mivmv.json");
+        let mut project = musicvideo_core::default_project(1.0);
+        project.output.fps = 29.97;
+        // Write a fixture directly so loader normalization cannot hide behind a
+        // matching normalization in save_project.
+        std::fs::write(&path, serde_json::to_vec(&project).unwrap()).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded, project);
+        save_project(&path, &loaded).unwrap();
+        assert_eq!(load_project(&path).unwrap().output.fps, 29.97);
+    }
 
     #[test]
     fn project_round_trip_preserves_project_and_stores_relative_asset_paths() {

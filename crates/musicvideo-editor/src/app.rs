@@ -2877,6 +2877,44 @@ mod tests {
         result
     }
 
+    #[test]
+    fn output_fps_edit_and_undo_replace_preview_analysis_key() {
+        let ctx = egui::Context::default();
+        let mut app = h3a_app();
+        app.position_secs = 0.205;
+        let initial = h3a_request(&mut app, &ctx);
+        let initial_key = initial.analysis_key.unwrap();
+        assert_eq!(initial.frame_index, 12);
+        for fps in [24.0, 30.0] {
+            let checkpoint = app.editor_state.begin_external_edit(&app.project);
+            app.project.output.fps = fps;
+            assert!(
+                app.editor_state
+                    .finish_external_edit(&app.project, checkpoint)
+            );
+            app.handle_editor_response(EditorResponse {
+                project_changed: true,
+                ..Default::default()
+            });
+            let changed = h3a_request(&mut app, &ctx);
+            let key = changed.analysis_key.unwrap();
+            assert!(key != initial_key);
+            let grid = FrameGrid::new(fps, 0.5).unwrap();
+            assert_eq!(changed.frame_index, grid.index_at(0.205));
+            assert_eq!(changed.time_secs, grid.time(changed.frame_index));
+            assert!(app.preview_timeline.lock().unwrap().key() == Some(&key));
+            assert!(app.editor_state.undo(&mut app.project));
+            app.handle_editor_response(EditorResponse {
+                project_changed: true,
+                history_changed: true,
+                ..Default::default()
+            });
+            let restored = h3a_request(&mut app, &ctx);
+            assert!(restored.analysis_key.as_ref() == Some(&initial_key));
+            assert_eq!(restored.frame_index, 12);
+        }
+    }
+
     fn h3a_spectrum_bits(frame: &SpectrumFrame) -> Vec<u32> {
         let mut bits = vec![
             u32::from(frame.note_min_midi),

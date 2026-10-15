@@ -271,6 +271,27 @@ fn compare(
 }
 
 #[test]
+fn output_fps_30_preview_matches_export_after_fps_change() {
+    let mut app = fixture(SOURCE_DURATION);
+    let ctx = egui::Context::default();
+    // Prime the same timeline at 60 fps before changing the project.
+    preview(&mut app, &ctx, 1.37, true);
+    app.project.output.fps = 30.0;
+    app.handle_editor_response(EditorResponse {
+        project_changed: true,
+        ..Default::default()
+    });
+    let reference = hashes(&app);
+    let grid = FrameGrid::new(30.0, SOURCE_DURATION).unwrap();
+    assert_eq!(reference.len(), 72);
+    let mut requests = (0..grid.frames())
+        .map(|n| (grid.time(n), false))
+        .collect::<Vec<_>>();
+    requests.extend([71, 2, 29, 30, 0, 59, 59].map(|n| (grid.time(n), true)));
+    compare(&mut app, &ctx, &reference, &requests);
+}
+
+#[test]
 fn h3b_forward_every_frame_matches_export() {
     let mut app = fixture(SOURCE_DURATION);
     let ctx = egui::Context::default();

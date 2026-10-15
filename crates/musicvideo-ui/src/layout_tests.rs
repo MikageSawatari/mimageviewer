@@ -232,6 +232,68 @@ impl Harness {
 }
 
 #[test]
+fn output_fps_choices_use_project_history_and_dirty_tracking() {
+    for fps in [24.0, 30.0, 60.0] {
+        let mut h = Harness::new();
+        assert_eq!(h.project.output.fps, 60.0);
+        h.project.output.fps = if fps == 60.0 { 24.0 } else { 60.0 };
+        h.state.reset_for_project(&h.project);
+        h.state.set_inspector_tab(InspectorTab::Project);
+        let before = h.project.clone();
+        let mut document = DocumentSession::default();
+        document.replace_with_loaded("saved.mivmv.json".into(), &h.project);
+        h.frame(vec![]);
+        assert!(h.panels[2].contains_rect(h.label("解像度: 1920 × 1080")));
+        h.click(&format!("{} fps", before.output.fps));
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h.click(&format!("{fps} fps"));
+        assert!(h.response.project_changed);
+        h.frame(vec![]);
+        assert_eq!(h.project.output.fps, fps);
+        let mut expected = before.clone();
+        expected.output.fps = fps;
+        assert_eq!(h.project, expected);
+        assert!(document.is_dirty(&h.project));
+        assert_eq!(h.state.history_depths(), (1, 0));
+        assert!(h.state.undo(&mut h.project));
+        assert_eq!(h.project, before);
+        assert!(!document.is_dirty(&h.project));
+        assert!(h.state.redo(&mut h.project));
+        assert_eq!(h.project, expected);
+        assert!(document.is_dirty(&h.project));
+    }
+}
+
+#[test]
+fn output_fps_custom_value_is_displayed_and_preserved_until_selected() {
+    let mut h = Harness::new();
+    h.project.output.fps = 29.97;
+    h.state.reset_for_project(&h.project);
+    h.state.set_inspector_tab(InspectorTab::Project);
+    let before = h.project.clone();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let label = "29.97 fps（このプロジェクトの値）";
+    assert!(h.panels[2].contains_rect(h.label(label)));
+    assert_eq!(h.project, before);
+    assert!(!h.response.project_changed);
+    assert_eq!(h.state.history_depths(), (0, 0));
+    h.click(label);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    for fps in [24, 30, 60] {
+        h.label(&format!("{fps} fps"));
+    }
+    h.click("30 fps");
+    assert!(h.response.project_changed);
+    h.frame(vec![]);
+    assert_eq!(h.project.output.fps, 30.0);
+    assert!(h.state.undo(&mut h.project));
+    assert_eq!(h.project, before);
+}
+
+#[test]
 fn project_tab_paths_are_read_only_and_stay_in_the_scrollable_inspector() {
     let mut h = Harness::new();
     h.state.set_inspector_tab(InspectorTab::Project);

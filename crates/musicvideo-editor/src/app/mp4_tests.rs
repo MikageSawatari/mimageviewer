@@ -1,6 +1,7 @@
 //! Headless tests use the real admission, input frame and terminal-result paths.
 use super::*;
 use crate::mp4::{ExportSettings, snapshot};
+use mimageviewer::video::mvexport::EncoderPreference;
 
 fn ready_app() -> MusicVideoLabApp {
     super::tests::h3a_app()
@@ -398,4 +399,38 @@ fn p4b3_modal_draws_all_stages_and_exposes_only_cancel_action() {
         assert!(!text.contains("保存先を選ぶ"));
     }
     drop(tx);
+}
+
+#[test]
+fn output_fps_30_snapshot_exports_mp4_at_selected_rate() {
+    let mut app = ready_app();
+    app.project.output.width = 160;
+    app.project.output.height = 90;
+    app.project.output.fps = 30.0;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("fps30.mp4");
+    let request = crate::mp4::snapshot(
+        &app.project,
+        &app.assets,
+        app.audio.clone().unwrap(),
+        app.editor_state
+            .resource_manifest()
+            .audio()
+            .unwrap()
+            .revision(),
+        path.clone(),
+        ExportSettings {
+            encoder: EncoderPreference::OpenH264,
+            ..Default::default()
+        },
+        false,
+    );
+    assert_eq!(request.project.output.fps, 30.0);
+    // The worker owns a snapshot even if the live document changes later.
+    app.project.output.fps = 60.0;
+    let summary = crate::mp4::export_snapshot(request, &|_| {}, &AtomicBool::new(false)).unwrap();
+    assert_eq!(summary.frames, 15);
+    let verification = mimageviewer::video::mvexport::verify_exported_mp4(&path).unwrap();
+    assert_eq!(verification.video.fps, 30.0);
+    assert_eq!(verification.video.frames, 15);
 }

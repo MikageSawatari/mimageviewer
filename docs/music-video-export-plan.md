@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収は未完了。P4e は実装・非対話配布検証済み（独立レビュー・GUI 検収は未実施）。P4f は文書作成・執筆担当の静的検査済み、独立レビュー・検収待ち（末尾の実施記録）。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収は未完了。P4e は実装・非対話配布検証済み（独立レビュー・GUI 検収は未実施）。P4f は独立レビュー1回目 REVISE の P2 に対応し、利用者決定による fps 選択を追加。対応後の再レビュー・検収待ち（末尾の実施記録）。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約�
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビューは未完了。P4e は実装・非対話配布検証済み、独立レビューは未実施。P4f は文書作成・執筆担当の静的検査済み、独立レビュー・検収待ち。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビューは未完了。P4e は実装・非対話配布検証済み、独立レビューは未実施。P4f は独立レビュー1回目 REVISE の P2 に対応し、利用者決定による fps 選択を追加。対応後の再レビュー・検収待ち。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -1669,12 +1669,21 @@ test stack は既知の focus テストの overflow を避けるため `RUST_MIN
 ### D11. 出力の既定値
 
 1920x1080 / 60fps / H.264 High profile / yuv420p / bt709 / AAC-LC 48kHz。
-解像度・fps は書き出しダイアログで変更できるが、既定は上記に固定する。
+2026-10-15 利用者決定（P4f の文書作成で変更欄が未実装と判明）:
+初版の解像度は **1920x1080 固定**。fps は「プロジェクト」タブの「出力」で **24 / 30 / 60** から
+選び、既定は 60。通常の Project 編集として保存・Undo / Redo・未保存判定を通し、
+プレビューにも同じ fps を使う（H3a の解析 key の格子が変わり、タイムラインを作り直す）。
+保存済みの標準外 fps は読み込み時に丸めず、「<値> fps（このプロジェクトの値）」と表示して保持し、
+選び直したときだけ標準値へ変える。書き出しダイアログの解像度・fps は確認表示のみ。
+解像度の変更は次版以降に D12 と合わせて設計する。文字サイズなど絶対 px の値が残っており、
+解像度を変えると相対的な大きさが変わるため、正規化したレイヤー矩形だけでは保証できない。
 
 ### D12. 座標は出力解像度基準の px で入力し、内部は正規化で持つ
 
 ユーザーは 1920x1080 基準の px で考えている（§1.4）。UI は px 入力＋整列ヘルパーを提供し、
-モデルは正規化座標で保持する。これで出力解像度を変えてもレイアウトが崩れない。
+モデルは正規化座標で保持する。レイヤー矩形の配置はこの正規化で保持する。
+文字サイズ等の絶対 px は別途設計が必要であり、初版は D11 のとおり解像度を固定し、
+解像度変更時の見た目の保証は次版以降に設計する（2026-10-15）。
 
 ### D13. 書き出しは中断可能で、UI スレッドを止めない
 
@@ -3231,7 +3240,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
 | **P4e** 実装完了（独立レビュー 4 回目で ACCEPT、2026-10-15。build-dist -NoSign の通しは修正前の版で成功、最終版での通しは統合前の最終確認で行う） | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1〜3 回目は REVISE。3 回目の指摘は OUT_DIR 導出で対応し、追加発見の build-dir 分離も設計回答に従い開始前に拒否する。指定検証・release 5 段は成功、独立再検収待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
-| **P4f** 文書作成・執筆担当の静的検査済み（独立レビュー・検収待ち） | マニュアル新ページと通常33ページのサイドバー・目次、製品紹介カード、keymap-spec（固定ショートカットの理由）、privacy（通信なし・保存先） | **2026-10-15、未コミット**。カード50枚で上限違反0、glyph検査成功、33ページ各33リンクの数・順序・active一致、HTML構造とリンク検査成功。各記述のコード根拠・D11との差分は末尾「P4f 実施記録」。アプリ／エディタ未起動、独立レビュー未実施。サイトマップはhtdocsコミット後に生成するため今回は未実行 |
+| **P4f** 独立レビュー1回目 REVISE に対応（対応後の再レビュー・検収待ち） | マニュアル新ページと通常33ページのサイドバー・目次、製品紹介カード、keymap-spec（固定ショートカットの理由）、privacy（通信なし・保存先） | **2026-10-15、未コミット**。カード50枚で上限違反0、glyph検査成功、33ページ各33リンクの数・順序・active一致、HTML構造とリンク検査成功。各記述のコード根拠・D11との差分は末尾「P4f 実施記録」。アプリ／エディタ未起動。独立レビュー1回目 REVISE の起動条件の P2 を修正し、利用者決定に基づきプロジェクトの fps 選択を追加。対応後の再レビュー・検収は未実施。追補記録を参照。サイトマップはhtdocsコミット後に生成するため今回は未実行 |
 
 L1 自動検証記録（2026-10-09）:
 
@@ -4152,3 +4161,75 @@ privacyの日英の文も併記する。リンクの行番号は上記HEADのコ
 利用者／設計担当に見てほしい点は、D11との差分の扱い、モジュレータの説明の分かりやすさ、
 未保存確認と素材持ち運びの注意書き、保存先の説明である。画像を追加するなら「画面の構成」の
 配置が分かる全体図と、MP4の設定画面が候補。今回は画像がなくても操作をたどれる本文とし、撮影は未実施。
+
+#### P4f 独立レビュー1回目 REVISE と対応／fps 追加（2026-10-15）
+
+対象: [brief-musicvideo-fps.md](brief-musicvideo-fps.md)。参照 HEAD は
+`b556f4ecc4ab7226bd3c476d8f3914cb3e1efe81`、worktree／branch は上記と同じ。
+上の実施記録は初回執筆時点の履歴。本追補の独立レビュー結果の出所は設計担当の brief であり、
+以下の実装・テスト・ソース照合は実装担当自身の作業で、独立レビューではない。
+対応後の再レビュー・設計担当の検収・実機 GUI 検収は未実施。
+
+**独立レビュー指摘と利用者決定への対応**
+
+- P2（起動条件の説明不足）: マニュアルの起動節に、一覧はチェック選択を解除して音声ファイルを
+  右クリックすること（残っていると項目が出ない）、音楽ビューは音声ファイルの再生時のみで、
+  動画の音声モードは対象外であることを追記した。根拠は
+  `src/context_menu_model.rs::build_context_menu` のチェック選択時の早期 return と Audio 条件、
+  `src/ui_dialogs/context_menu.rs` の `CreateMusicVideo` の受付条件。
+- 初回記録の D11 との差分は 2026-10-15 の利用者決定で解消する。初版は 1920×1080 固定、
+  プロジェクトの出力欄で fps だけ 24 / 30 / 60（既定 60）から選ぶ。D11 本文、D12 の保証範囲、
+  `docs/spec.md`、マニュアルのプロジェクト設定・書き出し節を更新した。
+- `musicvideo-ui` の既存 inspector 内で `Project.output.fps` を編集し、通常の
+  `EditorFrame::finish` による履歴・変更通知を使う。保存形式・解析 owner・非同期状態は追加しない。
+  H3a の既存格子 key による再構築で足りるため、専用の再構築・復旧経路は不要。
+  標準外の値は「このプロジェクトの値」と表示して保持し、明示的に選び直した時だけ変える。
+  解像度・書き出しダイアログの fps は確認表示のまま。
+- 解像度変更は、文字等の絶対 px と正規化座標の関係を D12 と合わせて次版以降に設計する。
+  まれな失敗は既定の割り切り方針のまま（ログ＋通知）、追加の回復処理は作らない。
+
+**追加テストと実装担当の非対話検証**
+
+追加は UI 2 件／editor 4 件の計 6 件。UI は実 inspector の非対話 egui 入力を通し、
+解像度・標準外 fps の文字が inspector 内に収まることも shape で検査する。
+PNG snapshot は追加せず、この既存 headless harness で表示・選択・編集境界を検査した。
+
+| 新規テスト（`output_fps_` 接頭辞） | 通常実装の検査内容 | 意図的に壊した実装と失敗結果 |
+| --- | --- | --- |
+| UI `choices_use_project_history_and_dirty_tracking` | 24 / 30 / 60 の実クリック、Project の変更通知、Undo / Redo、未保存判定、解像度表示 | 選択値を fps + 1 にする → FAILED |
+| UI `custom_value_is_displayed_and_preserved_until_selected` | 29.97 の表示と描画だけでの値・履歴不変、30 の選択、Undo で元の値へ戻る | 同じ選択値破壊 → FAILED |
+| editor `load_preserves_nonstandard_project_value` | 29.97 の JSON fixture を読み、保存し直しても同じ値を保持 | loader で 60 に強制 → FAILED |
+| editor `edit_and_undo_replace_preview_analysis_key` | 60→24／30→Undo、実 preview worker の key・番号・時刻と timeline の key | preview の格子を 60 に固定 → FAILED |
+| editor `30_snapshot_exports_mp4_at_selected_rate` | 30 の snapshot を採取後 live Project を 60 に変えても、実 MP4 は 30 fps／15 frames（0.5 秒） | snapshot を 60 に強制 → FAILED |
+| editor `30_preview_matches_export_after_fps_change` | 60 で解析済みの owner を 30 に変え、72 枚すべて＋後退／checkpoint／反復 seek の RGBA と採用 texture を実 export と比較 | preview 格子固定／export snapshot 強制の両方で FAILED |
+
+変異検証はテストの assertion による失敗を検査し、各回終了後に元のコードへ復元した。
+書き出し変異の初回は検証スクリプトの CRLF 二重変換でコンパイルエラーになったため成功扱いせず、
+改行処理だけ直して再実行し、上表の assertion 失敗を得た。製品コードの障害とは区別する。
+変異ログは `target/fps-verification/mutation-{ui-selection,project-load,preview-grid,export-snapshot}.log`。
+全コマンドに `MSBUILDDISABLENODEREUSE=1` を設定した。
+
+| コマンド／検査 | 結果 |
+| --- | --- |
+| `cargo fmt`／`cargo fmt --check` | 成功 |
+| `cargo test -p musicvideo-editor` | 181 passed / 0 failed |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core 115＋integration 2、UI 126、計 243 passed / 0 failed |
+| `python scripts/check_ui_glyphs.py` | 成功、危険 glyph 0 |
+| `python scripts/check_site_cards.py` | 50 cards checked, 0 over the limit |
+| P4f の既存 HTML 静的検査 (`target/p4f-check-html.py`) | 成功。33 ページ各 33 リンクの数・順序・active、タグ対応・ID・CSS・相対リンク、流入 37 本を検査 |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | 成功（4 分 50 秒）、`target/release/mimageviewer-musicvideo.exe` を生成 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 成功。通常 feature の core／remote／EPUB worker／music-video editor を `target/dev-runtime` に生成、VC runtime／PE gate 成功 |
+| `git diff --check` | 成功 |
+
+指定テストは合計 **424 passed / 0 failed**（editor 181＋core 117＋UI 126）。
+ログ・変異の実行補助は `target/fps-verification/` に保存し、配布物・ソースには含めない。
+`results.json` は各実行の終了コードと所要時間を記録する。既存コード由来の unused／deprecated 等の
+コンパイラ警告はあるが、指定 gate はすべて exit 0。変異実行の exit 101 は上記の期待した失敗である。
+対応後の独立再レビューは別担当へ引き継ぐ。実装担当の検査で代替したとは記録しない。
+アプリ・エディタ GUI は起動せず、コミットしていない。未追跡 `out.mp4` は変更していない。
+
+利用者の実機確認シナリオ: 「プロジェクト → 出力」で 24 / 30 / 60 を選び、Undo / Redo と
+未保存表示、保存・再開、プレビューと 30 fps MP4 を確認する。起動は利用者自身が
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で行う。
+通常の `%APPDATA%\mimageviewer` を使って実設定・データを更新し得るため、共有 single-instance mutex を
+使うインストール版／トレイ常駐の mImageViewer を先に終了する。GUI 検収は未実施のまま。

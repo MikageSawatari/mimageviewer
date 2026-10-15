@@ -1145,6 +1145,30 @@ impl EditorFrame<'_> {
                     );
                 }
                 InspectorTab::Project => {
+                    ui.heading("出力");
+                    ui.label(format!(
+                        "解像度: {} × {}",
+                        project.output.width, project.output.height
+                    ));
+                    let fps_before = project.output.fps;
+                    let fps_label = if [24.0, 30.0, 60.0].contains(&fps_before) {
+                        format!("{fps_before} fps")
+                    } else {
+                        format!("{fps_before} fps（このプロジェクトの値）")
+                    };
+                    egui::ComboBox::from_id_salt("output-fps")
+                        .selected_text(fps_label)
+                        .show_ui(ui, |ui| {
+                            for fps in [24.0, 30.0, 60.0] {
+                                ui.selectable_value(
+                                    &mut project.output.fps,
+                                    fps,
+                                    format!("{fps} fps"),
+                                );
+                            }
+                        });
+                    self.response.project_changed |= project.output.fps != fps_before;
+                    ui.separator();
                     self.response.project_changed |= ui
                         .add(
                             egui::DragValue::new(&mut project.display_gain_db)
