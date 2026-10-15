@@ -53,6 +53,31 @@ function Get-MivTextHash {
     finally { $sha.Dispose() }
 }
 
+function Get-MivNestedFiles {
+    param([string] $Absolute, [string] $Relative)
+    $result = New-Object 'System.Collections.Generic.List[object]'
+    $pending = New-Object 'System.Collections.Generic.Stack[object]'
+    $pending.Push(@($Absolute, $Relative.TrimEnd('/')))
+    while ($pending.Count -gt 0) {
+        $item = $pending.Pop()
+        $dirInfo = New-Object IO.DirectoryInfo $item[0]
+        # Do not follow junctions/symlinks: their targets are outside this checkout.
+        if ($dirInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Cannot fingerprint reparse point: $($item[1])" }
+        foreach ($entry in $dirInfo.GetFileSystemInfos()) {
+            $rel = $item[1] + '/' + $entry.Name
+            if ($entry -is [IO.DirectoryInfo]) {
+                if ($entry.Name -eq '.git') { continue }
+                $pending.Push(@($entry.FullName, $rel))
+            } else {
+                $result.Add([pscustomobject] @{ Absolute = $entry.FullName; Relative = $rel })
+            }
+        }
+    }
+    $items = $result.ToArray()
+    [Array]::Sort($items, [Comparison[object]] { param($a, $b) [string]::CompareOrdinal($a.Relative, $b.Relative) })
+    return $items
+}
+
 function Get-MivSourceId {
     param([string] $RepoRoot)
     $trackedAndNew = Invoke-MivGit $RepoRoot @('ls-files', '-z', '--cached', '--others', '--exclude-standard')
@@ -74,7 +99,17 @@ function Get-MivSourceId {
     try {
         foreach ($path in $sorted) {
             $absolute = [IO.Path]::Combine($RepoRoot, $path)
-            if ([IO.Directory]::Exists($absolute)) { throw "Cannot fingerprint nested repository/directory: $path" }
+            if ([IO.Directory]::Exists($absolute)) {
+                # git lists a nested repository (e.g. a cloned reference under testdata)
+                # as one directory entry. Hash its files, excluding its .git.
+                foreach ($nested in (Get-MivNestedFiles $absolute $path)) {
+                    $stream = [IO.File]::OpenRead($nested.Absolute)
+                    try { $digest = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+                    finally { $stream.Dispose() }
+                    [void] $manifest.Append($nested.Relative).Append([char]0).Append($digest).Append("`n")
+                }
+                continue
+            }
             $digest = 'missing'
             if ([IO.File]::Exists($absolute)) {
                 $stream = [IO.File]::OpenRead($absolute)

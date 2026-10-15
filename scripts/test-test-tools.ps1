@@ -102,6 +102,19 @@ Write-Fixture 'vendor/raw-samples/input.raw' 'fixture-v1'
 $rawId = Get-MivSourceId $fixture
 Write-Fixture 'vendor/raw-samples/input.raw' 'fixture-v2'
 Assert-That ((Get-MivSourceId $fixture) -ne $rawId) 'ignored real fixture was not detected'
+# A cloned reference repository under an ignored fixture dir is listed by git as one
+# directory entry; its files (not its .git) must be fingerprinted.
+$nestedRoot = Join-Path $fixture 'vendor/nested-ref'
+[void] [IO.Directory]::CreateDirectory((Join-Path $nestedRoot 'sub'))
+[void] (Invoke-MivGit $nestedRoot @('init', '-q'))
+Write-Fixture 'vendor/nested-ref/sub/data.txt' 'nested-v1'
+$nestedId = Get-MivSourceId $fixture
+Write-Fixture 'vendor/nested-ref/sub/data.txt' 'nested-v2'
+Assert-That ((Get-MivSourceId $fixture) -ne $nestedId) 'file inside a nested repository was not detected'
+$nestedId = Get-MivSourceId $fixture
+Write-Fixture 'vendor/nested-ref/.git/description' 'git metadata only'
+Assert-That ((Get-MivSourceId $fixture) -eq $nestedId) 'nested .git metadata changed the source identity'
+Remove-Item -LiteralPath $nestedRoot -Recurse -Force
 $beforeDelete = Get-MivSourceId $fixture
 Remove-Item -LiteralPath (Join-Path $fixture 'src/foo.rs')
 Assert-That ((Get-MivSourceId $fixture) -ne $beforeDelete) 'tracked deletion was not detected'
