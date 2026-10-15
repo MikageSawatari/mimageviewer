@@ -21,8 +21,9 @@ $key = $null
 try {
     $sourceId = Get-MivSourceId $RepoRoot
     $environmentId = Get-MivEnvironmentId $RepoRoot
+    $runtimeId = Get-MivNativeRuntimeId $RepoRoot $CargoProfile
     $commandId = @('nextest-run-v1') + $selection + $featureArgs + @($CargoProfile, $NextestProfile, 'ignore-default-filter', 'run-ignored=default', 'retries=0', 'fail-fast=false')
-    $key = Get-MivTextHash (($commandId -join "`n") + "`n$sourceId`n$environmentId")
+    $key = Get-MivTextHash (($commandId -join "`n") + "`n$sourceId`n$environmentId`n$runtimeId")
     $receiptPath = Join-Path $store ($key + '.json')
     if (-not $Force -and [IO.File]::Exists($receiptPath)) {
         try {
@@ -66,11 +67,12 @@ try {
 Write-Host "[test-lib-full] PASS: $($summary.Executed) passed, $($summary.Skipped) skipped; $($summary.Seconds)s"
 if ($key) {
     try {
-        if ((Get-MivSourceId $RepoRoot) -ne $sourceId -or (Get-MivEnvironmentId $RepoRoot) -ne $environmentId) {
+        if ((Get-MivSourceId $RepoRoot) -ne $sourceId -or (Get-MivEnvironmentId $RepoRoot) -ne $environmentId -or (Get-MivNativeRuntimeId $RepoRoot $CargoProfile) -ne $runtimeId) {
             Write-Warning 'Inputs changed during execution; success is not recorded for reuse.'
         } else {
             $receipt = [ordered]@{
                 schema = 1; key = $key; source = $sourceId; environment = $environmentId
+                native_runtime = $runtimeId
                 command = $result.Command; features = $featureArgs; cargo_profile = $CargoProfile; nextest_profile = $NextestProfile
                 executed = $summary.Executed; passed = $summary.Passed; failed = $summary.Failed; skipped = $summary.Skipped
                 test_seconds = $summary.Seconds; wall_seconds = $result.WallSeconds

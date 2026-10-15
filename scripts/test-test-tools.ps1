@@ -9,6 +9,7 @@ $fixture = Join-Path $repo ('target/test-tools-regression-' + [guid]::NewGuid().
 [void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'src'))
 [void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'tests'))
 [void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'helper/src'))
+[void] [IO.Directory]::CreateDirectory((Join-Path $fixture '.cargo'))
 $utf8 = New-Object Text.UTF8Encoding($false)
 function Write-Fixture { param([string] $Path, [string] $Text); [IO.File]::WriteAllText((Join-Path $fixture $Path), $Text, $utf8) }
 function Assert-That { param([bool] $Condition, [string] $Message); if (-not $Condition) { throw "[test-test-tools] $Message" } }
@@ -48,6 +49,14 @@ Write-Fixture 'tests/sample.rs' '#[test] fn integration() { assert_eq!(4 + 4, 8)
 Write-Fixture 'helper/Cargo.toml' "[package]`nname = `"miv-test-helper`"`nversion = `"0.0.0`"`nedition = `"2021`"`n"
 Write-Fixture 'helper/src/lib.rs' '#[test] fn helper() { assert_eq!(5 + 5, 10); }'
 Write-Fixture '.gitignore' "target/`nvendor/`n"
+Write-Fixture '.cargo/config.toml' @'
+[env]
+FFMPEG_DIR = { value = "unused-fixture-directory" }
+LIBSQLITE3_FLAGS = "SQLITE_MAX_ATTACHED=20"
+"TEST_CONFIG_ENV" = "default"
+[env.TEST_CONFIG_TABLE_ENV]
+value = "default"
+'@
 [void] (Invoke-MivGit $fixture @('init', '-q'))
 [void] (Invoke-MivGit $fixture @('add', '--', '.gitignore', 'Cargo.toml', 'src', 'tests', 'helper'))
 $lock = Invoke-MivTool 'cargo' @('generate-lockfile', '--offline') $fixture
@@ -95,6 +104,45 @@ Assert-That ($run1.ExitCode -eq 0 -and $run1.StdOut.Contains('MISS')) "initial m
 $count1 = Count-Runs
 $run2 = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
 Assert-That ($run2.ExitCode -eq 0 -and $run2.StdOut.Contains('HIT') -and (Count-Runs) -eq $count1) "hit ran tests: $($run2.StdOut)"
+# Config-declared variables must be discovered, not just a hardcoded allowlist.
+foreach ($probe in @(
+    @('LIBSQLITE3_FLAGS', 'SQLITE_MAX_ATTACHED=21'), @('FFMPEG_DIR', 'other-fixture-directory'),
+    @('TEST_CONFIG_ENV', 'changed'), @('TEST_CONFIG_TABLE_ENV', 'changed'),
+    @('RUSTFLAGS', '--cfg=miv_tool_probe'), @('RUSTDOCFLAGS', '--cfg=miv_tool_probe'),
+    @('CARGO_BUILD_JOBS', '1'), @('LIBCLANG_PATH', 'unused-fixture-clang'),
+    @('MIV_TOOL_PROBE', 'changed'), @('MIMV_TOOL_PROBE', 'changed')
+)) {
+    $name = $probe[0]
+    $before = [Environment]::GetEnvironmentVariable($name)
+    $environmentBefore = Get-MivEnvironmentId $fixture
+    $runsBefore = Count-Runs
+    try {
+        [Environment]::SetEnvironmentVariable($name, $probe[1])
+        Assert-That ((Get-MivEnvironmentId $fixture) -ne $environmentBefore) "environment ID omitted $name"
+        $envMiss = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+        Assert-That ($envMiss.ExitCode -eq 0 -and $envMiss.StdOut.Contains('MISS') -and (Count-Runs) -eq ($runsBefore + 1)) "environment change did not rerun: $name $($envMiss.StdOut)"
+        $envHit = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+        Assert-That ($envHit.ExitCode -eq 0 -and $envHit.StdOut.Contains('HIT') -and (Count-Runs) -eq ($runsBefore + 1)) "environment state was not reusable: $name"
+    } finally { [Environment]::SetEnvironmentVariable($name, $before) }
+}
+# Model manually copied DLLs beside the test executable; this tiny crate does
+# not import them, so identity behavior is checked without loading fake DLLs.
+$nativeDlls = @('avcodec-61.dll', 'avfilter-10.dll', 'avformat-61.dll', 'avutil-59.dll', 'swresample-5.dll', 'swscale-8.dll')
+foreach ($dll in $nativeDlls) { Write-Fixture "target/debug/deps/$dll" 'native-fixture-v1' }
+$dllBaseline = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+Assert-That ($dllBaseline.ExitCode -eq 0 -and $dllBaseline.StdOut.Contains('MISS')) 'DLL additions did not invalidate receipt'
+foreach ($dll in $nativeDlls) {
+    $runsBefore = Count-Runs
+    Write-Fixture "target/debug/deps/$dll" 'native-fixture-v2'
+    $dllSwap = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+    Assert-That ($dllSwap.ExitCode -eq 0 -and $dllSwap.StdOut.Contains('MISS') -and (Count-Runs) -eq ($runsBefore + 1)) "DLL replacement did not rerun: $dll"
+    Remove-Item -LiteralPath (Join-Path $fixture "target/debug/deps/$dll")
+    $dllRemoved = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+    Assert-That ($dllRemoved.ExitCode -eq 0 -and $dllRemoved.StdOut.Contains('MISS') -and (Count-Runs) -eq ($runsBefore + 2)) "DLL removal did not rerun: $dll"
+    # Keep each next state distinct from every earlier successful receipt.
+    Write-Fixture "target/debug/deps/$dll" 'native-fixture-v3'
+}
+$count1 = Count-Runs
 Write-Fixture 'src/foo.rs' ($foo + "`n// source invalidates receipt`n")
 $run3 = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
 Assert-That ($run3.ExitCode -eq 0 -and $run3.StdOut.Contains('MISS') -and (Count-Runs) -eq ($count1 + 1)) "dirty source did not rerun: $($run3.StdOut)"
@@ -141,7 +189,22 @@ Assert-That ($zero.ExitCode -eq 4) "zero-match did not return nextest exit 4: $(
 $broad = Run-Script 'test-focused.ps1' @('-Path', 'src/app/tests.rs')
 Assert-That ($broad.ExitCode -eq 2 -and $broad.StdOut.Contains('test-lib-full.ps1')) 'cross-cutting tests did not require a deliberate full/filter choice'
 $docs = Run-Script 'test-focused.ps1' @('-Path', 'docs/example.md')
-Assert-That ($docs.ExitCode -eq 4) 'no selection was reported as test success'
+Assert-That ($docs.ExitCode -eq 2 -and $docs.StdOut.Contains('docs/example.md')) 'unmapped documentation was silently dropped'
+# Use a PS entry script for array arguments (powershell.exe -File does not bind
+# a multi-element string[] reliably). Mix one selectable and one unsupported path.
+$focusedRunsBefore = @(Get-ChildItem (Join-Path $fixture 'target/test-focused/runs') -Directory).Count
+foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/ort-patched/src/lib.rs', 'vendor/egui/src/lib.rs', '.config/nextest.toml', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'helper/build.rs', 'helper/Cargo.toml', 'helper/fixture.bin', 'docs/example.md')) {
+    $mixedPlan = Get-MivFocusedPlan $fixture @('src/foo.rs', $unsupported)
+    Assert-That ($mixedPlan.Entries.Count -eq 1 -and $mixedPlan.BroadPaths -contains $unsupported) "mixed plan omitted unsupported path: $unsupported"
+    $entryScript = Join-Path $fixture 'target/mixed-focused.ps1'
+    $wrapper = (Join-Path $PSScriptRoot 'test-focused.ps1').Replace("'", "''")
+    $fixtureQuoted = $fixture.Replace("'", "''")
+    [IO.File]::WriteAllText($entryScript, "& '$wrapper' -RepoRoot '$fixtureQuoted' -Path @('src/foo.rs', '$unsupported')`nexit `$LASTEXITCODE`n", $utf8)
+    $mixed = Invoke-MivTool 'powershell.exe' @('-NoProfile', '-NonInteractive', '-File', $entryScript) $repo
+    Assert-That ($mixed.ExitCode -eq 2 -and $mixed.StdOut.Contains($unsupported) -and $mixed.StdOut.Contains('test-lib-full.ps1')) "mixed changes were accepted: $unsupported $($mixed.StdOut)"
+    Assert-That (@(Get-ChildItem (Join-Path $fixture 'target/test-focused/runs') -Directory).Count -eq $focusedRunsBefore) 'focused ran a partial selection before rejecting unsupported inputs'
+    Write-Host "[test-test-tools] mixed selectable/unmapped $unsupported`: exit 2; no test run"
+}
 $escape = Run-Script 'test-focused.ps1' @('-Path', '../outside.rs')
 Assert-That ($escape.ExitCode -ne 0) 'outside path was accepted'
 Assert-That ((Get-FileHash -LiteralPath $index).Hash -eq $indexBefore) 'test tools changed the index'

@@ -87,13 +87,44 @@ function Get-MivSourceId {
     return Get-MivTextHash $manifest.ToString()
 }
 
+function Get-MivCargoEnvironmentNames {
+    param([string] $RepoRoot)
+    $config = Join-Path $RepoRoot '.cargo/config.toml'
+    if (-not [IO.File]::Exists($config)) { return }
+    $section = ''
+    foreach ($line in [IO.File]::ReadAllLines($config)) {
+        if ($line -match '^\s*(#.*)?$') { continue }
+        if ($line -match '^\s*\[([^\]]+)\]\s*(#.*)?$') {
+            $section = $Matches[1].Trim()
+            if ($section -match '^env\.([A-Za-z_][A-Za-z0-9_-]*|"[A-Za-z_][A-Za-z0-9_-]*"|''[A-Za-z_][A-Za-z0-9_-]*'')$') {
+                $Matches[1].Trim('"', "'")
+            } elseif ($section -match '^env[.\s]') { throw 'Unsupported Cargo env table syntax; cannot safely reuse results' }
+            continue
+        }
+        if ($section -eq 'env') {
+            if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_-]*|"[A-Za-z_][A-Za-z0-9_-]*"|''[A-Za-z_][A-Za-z0-9_-]*'')\s*=') {
+                throw 'Unsupported Cargo env entry syntax; cannot safely reuse results'
+            }
+            $Matches[1].Trim('"', "'")
+        }
+    }
+}
+
 function Get-MivEnvironmentId {
     param([string] $RepoRoot)
     $parts = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($entry in (Get-ChildItem Env: | Sort-Object Name)) {
-        if ($entry.Name -match '^(CARGO|RUST|NEXTEST|MIV|MIMV|CMAKE|LLVM|VCPKG|PKG_CONFIG|CC_|CXX_)' -or $entry.Name -in @('PATH', 'PATHEXT', 'FFMPEG_DIR', 'LIBCLANG_PATH', 'WGPU_BACKEND', 'UPDATE_SNAPSHOTS', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'LIB', 'INCLUDE', 'CC', 'CXX', 'AR', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'MSBUILDDISABLENODEREUSE')) {
-            $parts.Add($entry.Name + '=' + $entry.Value)
-        }
+    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @('PATH', 'PATHEXT', 'FFMPEG_DIR', 'LIBCLANG_PATH', 'WGPU_BACKEND', 'UPDATE_SNAPSHOTS', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'LIB', 'INCLUDE', 'CC', 'CXX', 'AR', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'MSBUILDDISABLENODEREUSE') + @(Get-MivCargoEnvironmentNames $RepoRoot)) {
+        [void] $names.Add($name.ToUpperInvariant())
+    }
+    foreach ($entry in (Get-ChildItem Env:)) {
+        if ($entry.Name -match '^(CARGO|RUST|NEXTEST|MIV|MIMV|CMAKE|LLVM|VCPKG|PKG_CONFIG|CC_|CXX_)') { [void] $names.Add($entry.Name.ToUpperInvariant()) }
+    }
+    $sorted = [string[]] @($names)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    foreach ($name in $sorted) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        $parts.Add($name + '=' + $(if ($null -eq $value) { 'absent' } else { $value.Length.ToString() + ':' + $value }))
     }
     foreach ($tool in @(@('cargo', '--version'), @('cargo', 'nextest', '--version'), @('rustc', '-Vv'))) {
         $result = Invoke-MivTool $tool[0] $tool[1..($tool.Length - 1)] $RepoRoot
@@ -102,6 +133,38 @@ function Get-MivEnvironmentId {
     }
     $parts.Add('logical-cpus=' + [Environment]::ProcessorCount)
     # Values may contain credentials: persist only this digest, never the values.
+    return Get-MivTextHash ($parts -join "`n")
+}
+
+function Get-MivNativeRuntimeId {
+    param([string] $RepoRoot, [string] $CargoProfile)
+    $meta = Invoke-MivTool 'cargo' @('metadata', '--no-deps', '--format-version', '1') $RepoRoot
+    if ($meta.ExitCode -ne 0) { throw "Cannot locate native runtime directory: $($meta.StdErr)" }
+    $target = (ConvertFrom-Json $meta.StdOut).target_directory
+    $profileDir = switch ($CargoProfile) { 'test' { 'debug' } 'dev' { 'debug' } 'bench' { 'release' } default { $CargoProfile } }
+    $roots = @($target)
+    # Explicit target triples put executables one directory below target_directory.
+    if ([IO.Directory]::Exists($target)) { $roots += @(Get-ChildItem -LiteralPath $target -Directory | Select-Object -ExpandProperty FullName) }
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    $parts.Add('miv-native-runtime-v1')
+    $sha = New-Object Security.Cryptography.SHA256Cng
+    try {
+        foreach ($root in ($roots | Sort-Object -Unique)) {
+            foreach ($dir in @((Join-Path $root $profileDir), (Join-Path $root "$profileDir/deps"))) {
+                if (-not [IO.Directory]::Exists($dir)) { continue }
+                foreach ($dll in (Get-ChildItem -LiteralPath $dir -File -Filter '*.dll' | Sort-Object Name)) {
+                    # Cargo's hashed Rust/proc-macro artifacts are build outputs. All other
+                    # app-local DLLs (including all six FFmpeg DLLs) are runtime inputs.
+                    if ($dll.Name -match '-[0-9a-f]{16}\.dll$') { continue }
+                    $stream = [IO.File]::OpenRead($dll.FullName)
+                    try { $digest = [BitConverter]::ToString($sha.ComputeHash($stream)) }
+                    finally { $stream.Dispose() }
+                    $parts.Add($dll.FullName + [char]0 + $digest)
+                }
+            }
+        }
+    } finally { $sha.Dispose() }
+    # The set of paths records existence as well as content: removal changes this ID.
     return Get-MivTextHash ($parts -join "`n")
 }
 
@@ -190,7 +253,7 @@ function Get-MivFocusedPlan {
         $path = $original.Replace('\', '/') -replace '^\./', ''
         $absolute = [IO.Path]::GetFullPath((Join-Path $RepoRoot $path))
         if (-not $absolute.StartsWith(($RepoRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)) { throw "Path outside repository: $original" }
-        if ($path -match '^(Cargo\.(toml|lock)|build\.rs|src/(lib|main|app)\.rs|src/app/tests\.rs)$|^(\.cargo/|\.config/|vendor/|tests/(support|snapshots)/)') {
+        if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|snapshots)/)') {
             $broad.Add($path); continue
         }
         $package = $null
@@ -198,13 +261,13 @@ function Get-MivFocusedPlan {
             $dir = [IO.Path]::GetDirectoryName($candidate.manifest_path)
             if ($absolute.StartsWith(($dir + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)) { $package = $candidate; break }
         }
-        if ($null -eq $package) { continue }
+        if ($null -eq $package) { $broad.Add($path); continue }
         $selection = @('-p', $package.name)
         $filter = 'all()'
         $packageDir = [IO.Path]::GetDirectoryName($package.manifest_path)
         if (-not $packageDir.Equals($RepoRoot, [StringComparison]::OrdinalIgnoreCase)) {
             # Select every target in a changed workspace crate, including bins/tests.
-            if ($path -notmatch '\.(rs|toml|lock|c|cpp|h|hpp)$') { continue }
+            if ($path -notmatch '\.(rs|toml|lock|c|cpp|h|hpp)$') { $broad.Add($path); continue }
         } elseif ($path -match '^src/(.+)\.rs$') {
             $module = $Matches[1] -replace '/mod$', ''
             $components = @($module -split '/')
@@ -217,7 +280,7 @@ function Get-MivFocusedPlan {
             $filter = 'kind(test)'
         } elseif ($path -match '^tests/') {
             $broad.Add($path); continue
-        } else { continue }
+        } else { $broad.Add($path); continue }
         $key = ($selection -join '|') + '|' + $filter
         if ($seen.Add($key)) { $entries.Add([pscustomobject]@{ Path = $path; Selection = $selection; Filter = $filter }) }
     }

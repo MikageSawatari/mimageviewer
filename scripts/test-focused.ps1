@@ -21,11 +21,12 @@ try {
     foreach ($changed in $paths) { Write-Host "  $changed" }
     $plan = Get-MivFocusedPlan $RepoRoot $paths
     if ($plan.BroadPaths.Count) {
-        Write-Host "[test-focused] Broad/shared inputs: $($plan.BroadPaths -join ', ')"
-        Write-Host '[test-focused] Choose an explicit reviewed filter, or run scripts/test-lib-full.ps1; final workspace/vendor/doc coverage uses scripts/test-full.ps1.'
+        Write-Host '[test-focused] Broad/shared or unmapped inputs; no selected tests will run:'
+        foreach ($unmapped in $plan.BroadPaths) { Write-Host "  $unmapped" }
+        Write-Host '[test-focused] Run scripts/test-lib-full.ps1, plus relevant tooling checks; final workspace/vendor/doc coverage uses scripts/test-full.ps1.'
         exit 2
     }
-    if (-not $plan.Entries.Count) { Write-Host '[test-focused] No test selection. For docs/scripts-only changes run the relevant tooling checks explicitly.'; exit 4 }
+    if (-not $plan.Entries.Count) { Write-Host '[test-focused] No changed paths or test selection.'; exit 4 }
     foreach ($entry in $plan.Entries) { Write-Host "[test-focused] $($entry.Path) -> $($entry.Selection -join ' ') -E $($entry.Filter)" }
     if ($PlanOnly) { Write-Host '[test-focused] Plan only; no tests executed.'; exit 0 }
     $featureArgs = @(Get-MivFeatureArguments $Features -NoDefaultFeatures:$NoDefaultFeatures)
