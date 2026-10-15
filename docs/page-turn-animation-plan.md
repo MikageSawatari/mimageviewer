@@ -1922,10 +1922,14 @@ Pairは通常gapを持つが、この形状差は設定変更ではない。各i
 通常gapからHを取り、Center配置は実頁を読書先頭slot（LTR左、RTL右）として扱い、その
 内辺をHとする。表示中の実頁を中央から別の場所へ移さない。空いたslotは明示Vacantで
 surfaceもoccurrenceもreadinessも持たない。白紙へ置き換えず、canvas背景が見える。
-Pairとの遷移も同じ二slot時計で扱う。めくる表がVacantなら90度から新裏面のarrival、
-着地する裏がVacantなら旧表のdepartureを90度で終える。Vacantのstatic/leafは描かず、
-存在しない紙や頁番号を足さない。特殊な片側配置で表/裏が共にVacantとなる方向は、実leafが無いため`vacant_leaf_on_both_sides`の理由でinstantとする。全actual incomingの通常flat採用だけがnavigation完了条件。
-実際の白紙companion・補助表紙・split・媒体継続は今回の別scopeで、理由付きinstantを維持する。
+Pairとの遷移も同じ二slot時計で扱う。2026-10-15の利用者決定により、片面だけVacantなら
+§26.24の黒paperを用いた通常の一枚めくりとする。旧仕様の90度からのarrival／90度で終わる
+departureと旧静止頁のfadeは撤去する。表がVacantなら0度の黒紙から開始し、裏がVacantなら
+180度の黒紙までめくる。Vacantのstaticは描かず、occurrence／readiness／頁番号は足さない。
+特殊な片側配置で表/裏が共にVacantとなる方向は、従来どおり`vacant_leaf_on_both_sides`でinstant。
+全actual incomingの通常flat採用だけがnavigation完了条件。
+実際の白紙companionは§26.21、補助表紙等は各採択節の既存挙動を維持する。
+このVacant改訂ではsplit・媒体継続の適格性を変更しない。
 
 ### 24.3 受付・receipt・会計と切り分け
 
@@ -3023,3 +3027,37 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList
 OFFでは末尾の全体／本別設定でPage 15だけ中央／左を切り替え、Alone本体は先頭設定で別に決まることを確認する。
 `1`の後に`2`で見開きへ復帰し、`3`〜`5`は`2`と構成編集の案内を出す。HUDは`[2]`、
 Pad Selectは単ページ／一致見開き、Remoteの`2`も同じ復帰。方向／表紙を編集した場合は一致キーも3／4／5へ変わる。
+
+### 26.24 Vacant片面を共通の黒paperでめくる（2026-10-15）
+
+利用者は本の構成のあるbook_pdf.pdf、LTR・表紙なし・ON/600msで、9|10→Vacant|11の
+10が90度で消え、後ろの9が突然消失／出現すると報告した（利用者の観測）。原因は§24.2の
+半回転の仕様と、projectionのVacant leaf省略・旧static終盤fadeがその仕様を実装していたこと。
+利用者決定により、片面Vacantを§26.1と同じ無textureの黒paperで普通にめくる。
+
+裏がVacantなら旧10を180度までめくり、後半は黒い裏面とする。旧static9はalpha1で保持し、
+黒いleafが覆うまで見せる。表がVacantなら0度の黒い表から開始し、下の新static9をleafの
+離陸によって露出させ、裏の新10を着地させる。LTR／RTL・前進／後退は同じslot対応を使う。
+表紙境界、補助表紙、余り単ページ、明示Aloneもbuilderの由来で分岐せず同じVacant規則を消費する。
+両面Vacantは既存instantを維持する。白いBlankOpposite／自動白紙の材質・構成・receiptは変更しない。
+Blankと実頁／Blankの既存めくりを保ち、Blank×Vacant境界もVacant側だけ黒くする共通規則に従う。
+
+黒い面の仮紙rectは、その面が覆う対向staticのrectを対応するspine座標へ平行移動したものを使う。
+サイズ差でも下のstaticが最初から露出したり、着地直前に外周をfadeしたりしない。
+実画像のrect／UVを変更せず、既存の角度による形状補間・moving spine・shadow・厚みを共用する。
+Vacantのcanonical材質は空のまま保持する。効果中の黒paperは遮蔽だけを持ち、印刷領域の
+可視面積／実頁receiptは空。新texture・decode・upload・素材要求・実occurrenceは作らない。
+p=1は既存の通常incoming flatだけを返し、黒paper・旧static・影を残さない。
+新しい状態／待機／ownerは足さず、既存leafとblack_paperを共用して組合せを減らす。
+
+回帰は実際の本の構成projection→共通spread builder→通常flat採取→leaf投影を通す。
+11頁・表紙なしの自然余り（LTRでは11|Vacant）と末頁Alone（LTRではVacant|11）を別に組み、
+LTR／RTL×往復で検査する。報告の保存構成そのものを取得したとの扱いにはしない。
+紙サイズが異なる純粋投影fixtureでも、静止9のrect／alpha1、離陸時の完全遮蔽、
+着地直前の完全被覆、黒紙の実頁面積0、終端の通常canonical描画を検査する。
+4方向のspread windows snapshotを再生成・目視し、終端と独立した通常描画との一致も検査する。
+
+検証（2026-10-15）: 通常coreの`cargo check --locked -p mimageviewer --bin mimageviewer-core`、
+page_turn関連216件、book_composition関連219件が成功。追加2回帰と既存正規化行列の単独実行、
+snapshot更新後の再照合、fmt／diff検査も成功。独立静的レビューはACCEPT。
+利用者指定によりtest-full／build-dev／アプリの起動・停止／git add・commitは行わない。
