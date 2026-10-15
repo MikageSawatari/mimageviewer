@@ -13215,15 +13215,68 @@ mod tests {
         let mut presenter_waiting_for_first = true;
         let callback_frames = rate as usize / 200;
         let callback_period = Duration::from_secs_f64(callback_frames as f64 / rate as f64);
-        let mut callback_samples = vec![0.0; callback_frames * 2];
+        let max_callback_frames = rate as usize / 10;
+        let mut callback_samples = Vec::with_capacity(max_callback_frames * 2);
         let deadline = Instant::now() + Duration::from_secs(20);
-        let mut next_callback = Instant::now();
+        let mut last_callback_at = Instant::now();
+        let mut fractional_frame_nanos = 0_u128;
         let mut serial = 0;
         let mut samples = Vec::new();
         let mut device_samples = Vec::new();
         let mut completed_epochs = Vec::new();
         let mut last_callback_pts = 0.0;
         while serial < 3 && Instant::now() < deadline {
+            // The real device keeps consuming while the UI is descheduled. Account for
+            // all elapsed device time before tick can decide EOF, retaining fractional
+            // frames (notably at 44.1kHz). Bound each request to 100ms and consume any
+            // longer elapsed interval in chunks without dropping its frame credit.
+            let callback_at = Instant::now();
+            let frame_nanos = callback_at.duration_since(last_callback_at).as_nanos()
+                * u128::from(rate)
+                + fractional_frame_nanos;
+            let mut due_frames = usize::try_from(frame_nanos / 1_000_000_000).unwrap();
+            fractional_frame_nanos = frame_nanos % 1_000_000_000;
+            last_callback_at = callback_at;
+            while due_frames > 0 {
+                let requested = due_frames.min(max_callback_frames);
+                callback_samples.resize(requested * 2, 0.0);
+                let (consumed, audible_end) = player
+                    .audio
+                    .as_ref()
+                    .unwrap()
+                    .fill_samples_without_device_for_test(
+                        &mut callback_samples,
+                        &player.clock,
+                        &player.engine_state_atomic,
+                    );
+                device_samples.extend_from_slice(&callback_samples);
+                if consumed > 0 {
+                    let end = audible_end.expect("real callback consumption publishes audible PTS");
+                    let start = end - consumed as f64 / rate as f64;
+                    assert!(
+                        (start - last_callback_pts).abs() < 0.002,
+                        "{name} rate={rate} serial={serial}: callback timeline gap/overlap: start={start} previous_end={last_callback_pts}"
+                    );
+                    if serial > 0 && samples.len() < rate as usize / 4 * 2 {
+                        let head_remaining = rate as usize / 4 * 2 - samples.len();
+                        let head = &callback_samples[..(consumed * 2).min(head_remaining)];
+                        let first_nonsilent = head.iter().position(|v| v.abs() >= 1e-4);
+                        let first_pcm_frame =
+                            first_nonsilent.map(|index| (samples.len() + index) / 2);
+                        let first_device_frame = first_nonsilent.map(|index| {
+                            (device_samples.len() - callback_samples.len() + index) / 2
+                        });
+                        let peak = head.iter().fold(0.0_f32, |peak, v| peak.max(v.abs()));
+                        assert!(
+                            first_nonsilent.is_none(),
+                            "{name} rate={rate} serial={serial}: post-loop callback emitted stale tail in the silent head; first_pcm_frame={first_pcm_frame:?} first_device_frame={first_device_frame:?} peak={peak}"
+                        );
+                    }
+                    last_callback_pts = end;
+                    samples.extend_from_slice(&callback_samples[..consumed * 2]);
+                }
+                due_frames -= requested;
+            }
             if player.native_output.is_some() {
                 // Substitute only the display/device side of native presentation. Real decoded
                 // frames retain their serial, pacing and FirstFrameReady engine event, without
@@ -13269,11 +13322,26 @@ mod tests {
                         }
                         super::frame_selection::PopAction::Display => {
                             if presenter_waiting_for_first {
-                                assert!(super::try_send_native_first_frame_ready(
-                                    &player.engine_event_tx,
-                                    frame.seek_serial,
-                                    frame.pts_secs,
-                                ));
+                                // The real presenter retains this notification when the
+                                // bounded event queue is full. Service its real consumer
+                                // here until delivery, rather than assuming the simulated
+                                // presenter and UI were scheduled concurrently.
+                                assert!(
+                                    loop {
+                                        if super::try_send_native_first_frame_ready(
+                                            &player.engine_event_tx,
+                                            frame.seek_serial,
+                                            frame.pts_secs,
+                                        ) {
+                                            break true;
+                                        }
+                                        if Instant::now() >= deadline {
+                                            break false;
+                                        }
+                                        player.drain_engine_events();
+                                    },
+                                    "{name} rate={rate}: first-frame notification did not reach the engine"
+                                );
                                 presenter_waiting_for_first = false;
                             }
                             player
@@ -13284,8 +13352,8 @@ mod tests {
                     }
                 }
             }
-            // Tick BEFORE the callback: the production EOF decision can see a partially
-            // drained final block. Tick alone creates every subsequent Full-loop seek serial.
+            // Only production tick creates each Full-loop seek serial. Device time
+            // has already advanced, as it would on the independent cpal callback thread.
             player.tick(&ctx);
             assert!(
                 player.error.is_none(),
@@ -13304,41 +13372,9 @@ mod tests {
                     break;
                 }
             }
-            let (consumed, audible_end) = player
-                .audio
-                .as_ref()
-                .unwrap()
-                .fill_samples_without_device_for_test(
-                    &mut callback_samples,
-                    &player.clock,
-                    &player.engine_state_atomic,
-                );
-            device_samples.extend_from_slice(&callback_samples);
-            if consumed > 0 {
-                let end = audible_end.expect("real callback consumption publishes audible PTS");
-                let start = end - consumed as f64 / rate as f64;
-                assert!(
-                    (start - last_callback_pts).abs() < 0.002,
-                    "{name} rate={rate} serial={serial}: callback timeline gap/overlap: start={start} previous_end={last_callback_pts}"
-                );
-                if serial > 0 && samples.len() < rate as usize / 4 * 2 {
-                    let head_remaining = rate as usize / 4 * 2 - samples.len();
-                    let head = &callback_samples[..(consumed * 2).min(head_remaining)];
-                    let first_nonsilent = head.iter().position(|v| v.abs() >= 1e-4);
-                    let first_pcm_frame = first_nonsilent.map(|index| (samples.len() + index) / 2);
-                    let first_device_frame = first_nonsilent
-                        .map(|index| (device_samples.len() - callback_samples.len() + index) / 2);
-                    let peak = head.iter().fold(0.0_f32, |peak, v| peak.max(v.abs()));
-                    assert!(
-                        first_nonsilent.is_none(),
-                        "{name} rate={rate} serial={serial}: post-loop callback emitted stale tail in the silent head; first_pcm_frame={first_pcm_frame:?} first_device_frame={first_device_frame:?} peak={peak}"
-                    );
-                }
-                last_callback_pts = end;
-                samples.extend_from_slice(&callback_samples[..consumed * 2]);
-            }
-            next_callback += callback_period;
-            std::thread::sleep(next_callback.saturating_duration_since(Instant::now()));
+            std::thread::sleep(
+                (callback_at + callback_period).saturating_duration_since(Instant::now()),
+            );
         }
         assert_eq!(
             serial,
