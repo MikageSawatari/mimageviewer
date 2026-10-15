@@ -4618,6 +4618,30 @@ impl Drop for DataDirOverrideGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn page_turn_animation_roundtrip_and_missing_keys() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let settings = Settings {
+            page_turn_animation_enabled: true,
+            page_turn_animation_duration_ms: 350,
+            grid_cols: 7,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.page_turn_animation_enabled);
+        assert_eq!(loaded.page_turn_animation_duration_ms, 350);
+        db.inner.lock().unwrap().conn.execute(
+            "DELETE FROM settings_kv WHERE key IN ('page_turn_animation_enabled', 'page_turn_animation_duration_ms')",
+            [],
+        ).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.page_turn_animation_enabled);
+        assert_eq!(loaded.page_turn_animation_duration_ms, 200);
+        assert_eq!(loaded.grid_cols, 7);
+    }
+
     use super::*;
     use crate::external_tool::{
         ExternalToolLaunch, PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy, next_id,

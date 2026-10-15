@@ -1,4 +1,16 @@
-# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+﻿# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+
+§1.353 の全再読込は [承認設計](section353-zip-refresh-location-plan.md) に従い、
+`RefreshList` に現在の論理 source・実効 ZIP prefix・カーソルを固定する。
+新ツリーで同階層を復元し、階層が消失した場合だけ直近の存在する祖先へ戻る。
+collapse で実効階層／親 stack が変わっても、存在する階層の active facet を保持し、
+Backspace の帰路だけ新ツリーへ合わせる。Collection／Smart／検索等の物理子は
+親の root へ配送せず、その子を既存 owner で更新する。変換済み書庫は論理 source と
+mounted backing を保持する。PDF の page cursor と履歴再入場の root 規則は維持する。
+検索 hit drill は途中 batch のヒット不足では戻さず、完全な結果の確定後だけ祖先／一覧へ戻す。
+facet の手動復元は有効な帰路 frame 一件だけを消費し、新しい実効親の無条件 frame は残す。
+階層消失と wrapper collapse が重なる場合、実際の祖先 scope に保存した条件を復元し、
+route の位置番号によって外側の条件まで復元しない。
 
 ## 画像folder→Stored ZIP（§1.242 G、実装中・検証待ち）
 
@@ -40,7 +52,9 @@ ExtractedResult。本を列挙し直して入った子階層はBook、通常のm
 抽出一覧は新規fullscreen openでSingle、全体の読む方向をsessionへsnapshotする。一時見開きは
 全結果順で隣接ページを組み、cover/shift/末尾補助/端配置/強制単独を使わず、spread keyを作らない。
 F12の表示中forkだけはcapture-time modeを保持できる。
-G2 part Aの`book_composition`はpure model/resolverを提供する。G2 part Bはその検証を共通storeへ接続する。
+B2の`book_composition`は方向・表紙・順序・hidden・ページ指定を保存し、pure resolverが可視実列を作る。
+組は通常builderで自動生成し、構成非表示は詰めて組み直す。metadata v11はschema 2のrecordを運び、
+旧unitsの移行・読み替えを持たない。Missingとhiddenの参照は転送でも保持する。
 PageRefは書庫の完全entry名、PDF/EPUBの物理0-based番号、画像folderの直下file名を区別し、
 bookmarkのcase/slash照合を共有する。EPUBのedit-key adapterは既存`edit_source::page_key_for_pdf`
 を使い、元EPUB+番号の同値をpure testで検査する。変換cache世代・内容reflowの対応表は作らない。
@@ -48,6 +62,8 @@ G2 part Bの保存は`book_composition.db`一つ、共有`book_scope::BookScopeK
 Appは単一worker handleだけを持ち、SQLite/FS処理・maintenance待機はworkerで行う。
 保存成功時のEdit観測は捕捉済みlogical outer rootへ送る。閲覧/履歴なしのPDF/EPUB/ZIP/変換元書庫も内容ID復元へ参加し、Folder ledgerは増やさない。
 個別ページ削除では構成をpurgeせず、再解決時にMissingを保つ。本/root削除はfamilyをpurgeする。
+製本/一括出力の実Source受付はworkerで最新構成を照合し、結果列のhiddenを除外・通知する。
+全選択のSource順は構成後items順。白紙・添付表紙は実Sourceへ増やさず、結果列は選択順を保つ。
 F12/固定snapshotはimmutableなaccepted recordを各context内へ運ぶ。RemoteのSessionHandleへ同じread serviceを登録し、構成write入口は作らない。
 G3の共通projectionはraw sourceを保持し、直下の実ページblockだけを構成順へ投影する。
 子containerの位置と、構成なしの従来表示prefixは維持する。resume/しおりhintはraw番号、履歴表示は実Navigationのordinal。

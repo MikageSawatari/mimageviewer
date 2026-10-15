@@ -453,6 +453,9 @@ impl App {
             self.main_hwnd,
         ) {
             Ok(Some(request)) => {
+                if !self.admit_book_append_followup_mutation() {
+                    return;
+                }
                 let rx = crate::shell_file_ops::transfer_items_async(
                     self.main_hwnd,
                     request.clone(),

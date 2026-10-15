@@ -300,6 +300,33 @@ enum StackOrderSnapshot {
 }
 
 impl StackView {
+    /// Called on the deletion worker: keep grouping/rating snapshots, remove only
+    /// confirmed outputs, and derive both navigation maps from the survivor orders.
+    pub(crate) fn without_removed_paths(&self, removed: &[PathBuf]) -> Self {
+        let roots: std::collections::HashSet<&Path> =
+            removed.iter().map(PathBuf::as_path).collect();
+        let matches = |path: &Path| path.ancestors().any(|ancestor| roots.contains(ancestor));
+        let mut view = self.clone();
+        let keep: Vec<bool> = view
+            .passthrough
+            .iter()
+            .map(|item| !item.drag_source_path().is_some_and(matches))
+            .collect();
+        let mut flags = keep.iter();
+        view.passthrough.retain(|_| *flags.next().unwrap());
+        let mut flags = keep.iter();
+        view.passthrough_metas.retain(|_| *flags.next().unwrap());
+        let mut flags = keep.iter();
+        view.passthrough_sort_metas
+            .retain(|_| *flags.next().unwrap());
+        for group in &mut view.groups {
+            group.members.retain(|member| !matches(&member.path));
+        }
+        view.groups.retain(|group| !group.members.is_empty());
+        view.rebuild_materialized_index_maps();
+        view
+    }
+
     /// メディア (画像 + 動画) を prefix でグループ化して `StackView` を作る (集約状態)。
     pub fn build(
         folder: PathBuf,
@@ -731,6 +758,55 @@ mod tests {
 
     fn keys(groups: &[StackGroup]) -> Vec<&str> {
         groups.iter().map(|g| g.key.as_str()).collect()
+    }
+
+    #[test]
+    fn deletion_prunes_custom_group_members_passthrough_and_both_maps() {
+        let view = StackView::from_groups(
+            PathBuf::from(r"C:\dl"),
+            vec![
+                GridItem::Folder(PathBuf::from(r"C:\dl\first")),
+                GridItem::Folder(PathBuf::from(r"C:\dl\keep")),
+            ],
+            vec![Some((10, 1)), Some((20, 2))],
+            '_',
+            SortOrder::FileName,
+            vec![
+                StackGroup {
+                    key: "custom-a".into(),
+                    members: vec![img("a_1.jpg")],
+                },
+                StackGroup {
+                    key: "custom-b".into(),
+                    members: vec![img("b_1.jpg"), img("c_2.jpg")],
+                },
+            ],
+        );
+        let removed = [
+            PathBuf::from(r"C:\dl\first"),
+            img("a_1.jpg").path,
+            img("b_1.jpg").path,
+        ];
+        let survivor = view.without_removed_paths(&removed);
+        assert_eq!(
+            keys(&survivor.groups),
+            ["custom-b"],
+            "do not rerun prefix grouping"
+        );
+        assert_eq!(member_names(&survivor.groups[0]), ["c_2.jpg"]);
+        assert_eq!(survivor.passthrough_metas, [Some((20, 2))]);
+        assert_eq!(survivor.passthrough_sort_metas.len(), 1);
+        let (flat, _) = survivor.materialize_flat();
+        let (aggregate, _) = survivor.materialize_aggregated();
+        assert_eq!(flat.len(), 2);
+        assert_eq!(survivor.flat_index_for_aggregated(0), None);
+        assert_eq!(survivor.flat_index_for_aggregated(1), Some(1));
+        assert_eq!(survivor.group_of_flat_index(1), Some(0));
+        assert_eq!(survivor.aggregated_index_of_group(0), 1);
+        assert_eq!(flat[1].drag_source_path(), aggregate[1].drag_source_path());
+        assert_eq!(view.groups.len(), 2);
+        assert_eq!(view.groups[1].members.len(), 2);
+        assert_eq!(view.passthrough.len(), 2);
     }
 
     fn member_names(g: &StackGroup) -> Vec<&str> {

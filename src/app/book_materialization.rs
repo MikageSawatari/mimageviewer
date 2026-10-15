@@ -411,7 +411,7 @@ pub(crate) fn materialize_document_rows(
 }
 
 use super::folder_scan::{
-    FolderRatingOrder, MaterializedFolderListing, ScanMediaKind, ScannedDir,
+    FolderRatingOrder, FolderRowRecord, MaterializedFolderListing, ScanMediaKind, ScannedDir,
     filter_convertible_archive_duplicates_with_sort_metadata,
     filter_epub_pdf_duplicates_with_sort_metadata, filter_image_ext_duplicates,
     filter_video_image_duplicates, filter_virtual_folder_duplicates_with_sort_metadata,
@@ -445,6 +445,7 @@ pub(crate) fn materialize_local_folder_listing_with_order(
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
 ) -> MaterializedFolderListing {
     let mut scan = scan;
+    let precise_stamps = std::mem::take(&mut scan.precise_stamps);
     project_scanned_directory(&mut scan, &settings.file_type_visibility);
     let mut auxiliary_media = scan.auxiliary_media;
     let mut omitted = scan.omitted;
@@ -680,7 +681,15 @@ pub(crate) fn materialize_local_folder_listing_with_order(
         FolderRatingOrder::Standard
     };
 
+    let row_record = std::sync::Arc::new(FolderRowRecord::from_projection(
+        path,
+        &items,
+        &metas,
+        &precise_stamps,
+        &video_thumb_overrides,
+    ));
     MaterializedFolderListing {
+        row_record,
         items,
         metas,
         sort_metas,

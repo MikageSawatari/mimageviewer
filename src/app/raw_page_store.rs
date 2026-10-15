@@ -1108,6 +1108,7 @@ pub(crate) mod tests {
         app.final_composite_cache.insert(
             key,
             FinalCompositeEntry {
+                canonical_dims: None,
                 source_size,
                 pixels,
                 texture,
@@ -1339,21 +1340,21 @@ pub(crate) mod tests {
         app.enter_export_crop_mode(0);
         app.enter_erase_mode(0);
         app.enter_text_mode(0);
-        app.enter_conceal_mode(0);
+        app.enter_conceal_mode(&ctx, 0);
         assert!(!app.text_mode);
         assert!(!app.erase_mode);
         assert!(!app.conceal_mode);
         assert!(app.sns_split.is_none());
         assert_eq!(app.fullscreen_idx, Some(1));
         app.fullscreen_idx = Some(0);
-        app.enter_local_adjust_mode();
+        app.enter_local_adjust_mode(&ctx);
         assert!(!app.local_adjust_mode);
         assert_eq!(app.fullscreen_idx, Some(0));
         app.fullscreen_idx = Some(1);
         app.switch_erase_target_in_spread(&ctx, 0);
-        app.switch_conceal_target_in_spread(0);
+        app.switch_conceal_target_in_spread(&egui::Context::default(), 0);
         app.switch_text_target_in_spread(0);
-        app.switch_local_adjust_target_in_spread(0);
+        app.switch_local_adjust_target_in_spread(&egui::Context::default(), 0);
         assert_eq!(app.fullscreen_idx, Some(1));
         assert!(app.raw_edit_target_gate(1));
         app.raw_pages.page_mut(0).unwrap().stage = RawInstalledStage::Developed;
@@ -1785,7 +1786,7 @@ pub(crate) mod tests {
         app.enter_export_crop_mode(1);
         app.enter_erase_mode(1);
         app.enter_text_mode(1);
-        app.enter_conceal_mode(1);
+        app.enter_conceal_mode(&ctx, 1);
         assert_eq!(app.fullscreen_idx, Some(1));
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
         assert!(!app.text_mode && !app.erase_mode && !app.conceal_mode && !app.export_crop_mode);
@@ -1858,6 +1859,7 @@ pub(crate) mod tests {
                     app.final_composite_cache.insert(
                         final_key,
                         FinalCompositeEntry {
+                            canonical_dims: None,
                             source_size: [2, 3],
                             pixels: processed,
                             texture: final_tex.clone(),
@@ -2171,11 +2173,11 @@ impl App {
         }
     }
 
-    pub(crate) fn reconcile_raw_demand(
+    pub(super) fn raw_demand_for_display(
         &mut self,
         current: usize,
         displayed: &[usize],
-    ) -> HashSet<usize> {
+    ) -> HashMap<usize, RawPriority> {
         let order = self.get_still_image_indices();
         let mut demand =
             raw_development_demand(&order, current, displayed, |idx| self.is_raw_page(idx));
@@ -2184,6 +2186,15 @@ impl App {
         {
             demand.insert(pending.source_idx, RawPriority::High);
         }
+        demand
+    }
+
+    pub(crate) fn reconcile_raw_demand(
+        &mut self,
+        current: usize,
+        displayed: &[usize],
+    ) -> HashSet<usize> {
+        let demand = self.raw_demand_for_display(current, displayed);
         for (&idx, record) in self.raw_pages.pages.iter() {
             if let RawPageRecord::Page(page) = record {
                 let mut phase = page.develop.lock().unwrap();

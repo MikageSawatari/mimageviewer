@@ -118,9 +118,40 @@ fn can_keep_miv_menu_after_shell_failure(miv_count: usize) -> bool {
     miv_count > 0
 }
 
+/// Canonical source-read/clipboard verbs do not change the selected files.
+/// Extensions without a canonical verb can execute arbitrary source changes,
+/// so their accepted invocation uses the mutation boundary conservatively.
+fn shell_verb_changes_source(verb: Option<&str>) -> bool {
+    !verb.is_some_and(|verb| {
+        matches!(
+            verb.to_ascii_lowercase().as_str(),
+            "open"
+                | "explore"
+                | "properties"
+                | "copy"
+                | "cut"
+                | "print"
+                | "preview"
+                | "openas"
+                | "openwith"
+                | "opennewwindow"
+                | "find"
+                | "search"
+                | "refresh"
+                | "view"
+                | "arrangeby"
+                | "groupby"
+                | "sortby"
+        )
+    })
+}
+
 #[cfg(windows)]
-pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeContextMenuResult {
-    windows_impl::show_native_context_menu(request)
+pub fn show_native_context_menu(
+    request: NativeContextMenuRequest,
+    mut admit_shell_mutation: impl FnMut() -> bool,
+) -> NativeContextMenuResult {
+    windows_impl::show_native_context_menu(request, &mut admit_shell_mutation)
 }
 
 #[cfg(windows)]
@@ -143,7 +174,10 @@ pub fn invoke_shell_folder_background_verb(
 }
 
 #[cfg(not(windows))]
-pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeContextMenuResult {
+pub fn show_native_context_menu(
+    request: NativeContextMenuRequest,
+    _admit_shell_mutation: impl FnMut() -> bool,
+) -> NativeContextMenuResult {
     let _ = request;
     NativeContextMenuResult::Fallback {
         reason: "native Shell context menu is available only on Windows".to_string(),
@@ -203,7 +237,7 @@ mod windows_impl {
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
         BHID_SFUIObject, CFSTR_PREFERREDDROPEFFECT, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
-        DefSubclassProc, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder,
+        DefSubclassProc, GCS_VERBA, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder,
         RemoveWindowSubclass, SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc,
         SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
     };
@@ -215,7 +249,7 @@ mod windows_impl {
         WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
-    use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref};
+    use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PSTR, PWSTR, Ref};
 
     const SUBCLASS_ID: usize = 0x6d69_7643; // "mivC"
     const SLOW_NATIVE_MENU_STAGE_LOG_MS: f64 = 120.0;
@@ -364,6 +398,7 @@ mod windows_impl {
 
     pub(super) fn show_native_context_menu(
         request: NativeContextMenuRequest,
+        admit_shell_mutation: &mut dyn FnMut() -> bool,
     ) -> NativeContextMenuResult {
         if request.hwnd == 0 {
             return NativeContextMenuResult::Fallback {
@@ -618,6 +653,24 @@ mod windows_impl {
             };
         };
 
+        let mut verb_buffer = [0u8; 256];
+        let canonical = unsafe {
+            shell_menu.GetCommandString(
+                offset as usize,
+                GCS_VERBA,
+                None,
+                PSTR(verb_buffer.as_mut_ptr()),
+                verb_buffer.len() as u32,
+            )
+        }
+        .ok()
+        .and_then(|()| {
+            let end = verb_buffer.iter().position(|byte| *byte == 0)?;
+            std::str::from_utf8(&verb_buffer[..end]).ok()
+        });
+        if shell_verb_changes_source(canonical) && !admit_shell_mutation() {
+            return NativeContextMenuResult::Canceled;
+        }
         let invoke = CMINVOKECOMMANDINFO {
             cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
             hwnd,
@@ -2000,6 +2053,34 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_mutation_admission_preserves_source_read_and_clipboard_verbs() {
+        for verb in [
+            "open",
+            "Explore",
+            "properties",
+            "copy",
+            "cut",
+            "print",
+            "openwith",
+            "refresh",
+        ] {
+            assert!(!shell_verb_changes_source(Some(verb)), "{verb}");
+        }
+        for verb in [
+            "delete",
+            "rename",
+            "paste",
+            "edit",
+            "format",
+            "extension-action",
+            "",
+        ] {
+            assert!(shell_verb_changes_source(Some(verb)), "{verb}");
+        }
+        assert!(shell_verb_changes_source(None));
+    }
 
     #[test]
     fn miv_command_ids_roundtrip_inside_custom_range() {

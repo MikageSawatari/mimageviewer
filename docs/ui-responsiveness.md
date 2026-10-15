@@ -400,6 +400,27 @@ Resumed の親 mtime ふるい、通知時のふるい bypass、走査中通知�
 新しい P2 が出続けた。mtime だけの再走査を無視する最小設計で、開いている一覧の代表も安定するため、
 session state／catalog／Remote・IPC の変更を避ける。
 
+次の版の設計変更 (利用者2026-10-13夜、R10・LISTrev13独立設計レビューACCEPT・実装／自動検証完了、2026-10-14):
+[§1.375 R10](section375-operation-reconcile-plan.md) は前回／今回の走査の行signature
+（名前・種類・サイズ・更新日時・投影後順序）をworkerで比較し、一致時だけinstall・世代更新・
+install起因thumb再要求を省く。UIは元context・source・世代・投影条件と前回記録の有効性を確認する。
+全表示snapshot・DB metadata共有storage・UI全件clone・追加同期I/Oを使わない。
+Delete成功行の除去は同じownerの前回記録へ反映し、非表示候補の繰上げは今回走査の差分として扱う。
+購読・dirty／cutoff・rescan・記録を元contextに閉じ、forkは記録を継承して新ownerへ束縛し、
+独立購読を登録後scanで始める。兄弟のdirty／要求を消さない。
+sidecar stampと別context／RemoteのDB反映資格は判定外。自動更新ではsidecarを取込まず、
+未反映のDB値・外部sidecarは明示GridReload／開き直しで反映する。defer→一覧復帰・restart・
+Resumedでも自動originを保持し、その直後の明示更新／通常openは設定どおり取込む対照試験を行う。
+実Folder mtime-onlyの観測値と表示metadata・sort・代表要求stampの分離（§1.314）は維持する。
+代表選択保持・cache key／payload変更・旧cache移行は撤回し、CPU／GPU eviction・予算・
+画像／保存両終端・request ID相関を変更しない。install省略中は現在の画像と要求が残るが、
+通常のeviction後再読込・idle upgrade等で代表は変わってよい。手動pin設定は解除しない。
+1万／10万行でUI／worker時間・割当量・install回数、Delete後の描画／scroll時の同期DB query数を
+測定済み。opt-level=2の100k行初回記録はmedian 8.353／max 10.949 ms、worker比較0.717 ms。
+Equal UI pollはdebug 0.551 ms、Delete後のheadless描画／scrollの同期DB read差分0回。
+constructor単体・headless測定であり実アプリの最大frameを示さない。自動gateと最新dev成功、
+実機確認待ち。詳しい条件・全結果は設計書§8.2へ残し、旧方式の結果をR10の受入証拠に流用しない。
+
 ## 3. GPU テクスチャアップロード
 
 `ctx.load_texture(name, ColorImage, options)` は UI スレッドで同期実行され、内部で

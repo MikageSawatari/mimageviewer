@@ -25,9 +25,10 @@ pub(crate) struct CanonicalRawPage {
 pub(crate) struct AcceptedCompositionProjection {
     pub(crate) scope: BookScopeKey,
     pub(crate) token: CompositionToken,
-    /// Exact saved designation, independent of visibility and display mode.
-    pub(crate) cover: Option<CompositionPageRef>,
+    pub(crate) cover_enabled: bool,
     pub(crate) resolved: ResolvedComposition,
+    /// Worker-prepared transient geometry inputs; never part of the saved record.
+    pub(crate) prepared_rotations: Arc<HashMap<String, crate::rotation_db::Rotation>>,
     pub(crate) raw_pages: Arc<[CanonicalRawPage]>,
     raw_by_index: Arc<HashMap<usize, CompositionPageRef>>,
     projected_positions: Arc<HashMap<usize, ReadingPosition>>,
@@ -127,7 +128,7 @@ pub(crate) fn project_composition(
                 token,
                 resolved,
                 raw_pages.to_vec().into(),
-                record.cover.clone(),
+                record.cover_enabled,
             ),
         )),
     })
@@ -195,7 +196,7 @@ impl AcceptedCompositionProjection {
         token: CompositionToken,
         resolved: ResolvedComposition,
         raw_pages: Arc<[CanonicalRawPage]>,
-        cover: Option<CompositionPageRef>,
+        cover_enabled: bool,
     ) -> Self {
         let raw_by_index = raw_pages
             .iter()
@@ -227,8 +228,9 @@ impl AcceptedCompositionProjection {
         Self {
             scope,
             token,
-            cover,
+            cover_enabled,
             resolved,
+            prepared_rotations: Default::default(),
             raw_pages,
             raw_by_index: Arc::new(raw_by_index),
             projected_positions: Arc::new(projected_positions),
@@ -298,13 +300,16 @@ impl AcceptedCompositionProjection {
             })
             .collect::<Vec<_>>()
             .into();
-        Ok(Self::new(
+        let mut remapped = Self::new(
             self.scope.clone(),
             self.token,
             resolved,
             raw_pages,
-            self.cover.clone(),
-        ))
+            self.cover_enabled,
+        );
+        // Geometry inputs are keyed by stable page identity, not dense slots.
+        remapped.prepared_rotations = Arc::clone(&self.prepared_rotations);
+        Ok(remapped)
     }
 }
 
@@ -324,33 +329,16 @@ pub(crate) fn composition_page_from_identity(
     }
 }
 
-/// Convert a captured effective automatic topology once. The caller supplies its real
-/// builder oracle's units, roles/placements and cover; this API invents no pairing rules.
+/// Capture the resolved reading binding and complete raw order. Pairing and
+/// presentation rules remain live inputs and are never frozen into this record.
 pub(crate) fn capture_initial_composition(
     domain: &PageDomain,
     direction: ReadingDirection,
-    cover: Option<CompositionPageRef>,
-    units: &[CompositionUnit],
+    cover_enabled: bool,
     pages: &[CompositionPageRef],
 ) -> CompositionResult<BookComposition> {
-    let mut record = BookComposition::new(direction, units.to_vec());
-    record.cover = cover;
+    let mut record = BookComposition::new(direction, pages.to_vec());
+    record.cover_enabled = cover_enabled;
     record.validate(domain)?;
-    let ordinary: HashSet<_> = record
-        .pages()
-        .map(CompositionPageRef::matching_key)
-        .collect();
-    let mut expected = HashSet::new();
-    for page in pages {
-        domain.validate_page(page)?;
-        if !expected.insert(page.matching_key()) {
-            return Err(CompositionError::Invalid("ambiguous initial page identity"));
-        }
-    }
-    if ordinary != expected {
-        return Err(CompositionError::Invalid(
-            "initial topology must contain every accepted real page once",
-        ));
-    }
     Ok(record)
 }

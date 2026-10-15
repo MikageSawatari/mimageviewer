@@ -46,6 +46,77 @@ pub(crate) struct EraseInpaintPendingKey {
     pub(crate) kind: EraseInpaintKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EraseInpaintPurpose {
+    Preview {
+        origin: &'static str,
+    },
+    Commit {
+        origin: &'static str,
+    },
+    ResumeAfterCommit {
+        origin: &'static str,
+        entry: crate::app::OriginalMaterialEntry,
+    },
+    MaterializeForEntry {
+        entry: crate::app::OriginalMaterialEntry,
+    },
+}
+
+impl EraseInpaintPurpose {
+    fn origin(self) -> &'static str {
+        match self {
+            Self::Preview { origin }
+            | Self::Commit { origin }
+            | Self::ResumeAfterCommit { origin, .. } => origin,
+            Self::MaterializeForEntry { .. } => "materialize-entry",
+        }
+    }
+    fn is_preview(self) -> bool {
+        matches!(self, Self::Preview { .. })
+    }
+    pub(crate) fn entry(self) -> Option<crate::app::OriginalMaterialEntry> {
+        match self {
+            Self::ResumeAfterCommit { entry, .. } | Self::MaterializeForEntry { entry } => {
+                Some(entry)
+            }
+            _ => None,
+        }
+    }
+    fn with_entry(self, entry: crate::app::OriginalMaterialEntry) -> Self {
+        match self {
+            Self::Commit { origin } | Self::ResumeAfterCommit { origin, .. } => {
+                Self::ResumeAfterCommit { origin, entry }
+            }
+            Self::MaterializeForEntry { .. } => Self::MaterializeForEntry { entry },
+            Self::Preview { .. } => self,
+        }
+    }
+    pub(crate) fn cancel_entry(&mut self) {
+        *self = match *self {
+            Self::ResumeAfterCommit { origin, .. } => Self::Commit { origin },
+            Self::MaterializeForEntry { .. } => Self::MaterializeForEntry {
+                entry: crate::app::OriginalMaterialEntry::MaterialOnly,
+            },
+            _ => *self,
+        };
+    }
+}
+
+enum EraseInpaintMaskSource {
+    Prepared(Vec<bool>),
+    Saved {
+        db_path: std::path::PathBuf,
+        page_key: String,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum EraseInpaintResult {
+    Pixels(egui::ColorImage),
+    MaskAbsent,
+}
+
 /// worker から UI へ通知する消しゴム補完の進行段階。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EraseInpaintProgress {
@@ -159,7 +230,7 @@ pub(crate) struct EraseInpaintPending {
     /// (sort 変更等の rare ケース対策)。
     pub path_key: Option<String>,
     /// worker からの結果受信。`Ok(image)` で完了、`Err(_)` でキャンセル/失敗。
-    pub rx: mpsc::Receiver<egui::ColorImage>,
+    pub rx: mpsc::Receiver<EraseInpaintResult>,
     /// worker から届くパス / タイル進捗。UI 側で全件 drain し、`progress` に最新値を保持する。
     pub progress_rx: mpsc::Receiver<EraseInpaintProgress>,
     /// 最後に受信した進捗。worker の最初の通知より前も準備中表示を出せるよう初期値を持つ。
@@ -173,17 +244,8 @@ pub(crate) struct EraseInpaintPending {
     pub input_generation: u64,
     /// 投入時の消しゴムマスク世代。commit 結果の `EraseResultKey` に使う。
     pub mask_generation: u64,
-    /// 呼び出し経路識別子 (ログ用)。
-    pub log_prefix: &'static str,
-    /// プレビュー専用ジョブか (= preview ボタン押下による起動)。
-    ///
-    /// `true` のとき完了時は **fs_cache を触らず**、
-    /// `erase_preview_cache` だけを更新する (Codex P1 R4 #1)。
-    /// プレビューは「現在のマスクで MI-GAN を試した一時結果」なので、ESC で
-    /// 抜けた / マスクを変更した / マスクを全削除した時に preview_cache を
-    /// 捨てれば残らない設計にする。`false` のときは fs_cache へ書き戻さず、
-    /// `erase_result_cache` に commit 結果を格納する。
-    pub is_preview: bool,
+    /// 表示プレビュー・通常commit・保存stage復元と、その単回入口を一体で所有する。
+    pub purpose: EraseInpaintPurpose,
 }
 
 // (Phase 2b で削除: ENDPOINT_HIT_RADIUS / ROTATE_DEG_PER_PIXEL は vector_edit::
@@ -262,6 +324,14 @@ impl App {
         // (表紙・末尾奇数・横長画像) ではピボットは要らない。
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
         if !self.raw_edit_target_entry_allowed(target_idx) {
+            return;
+        }
+        if !self.ensure_original_material_for_entry(
+            target_idx,
+            crate::app::OriginalMaterialEntry::Erase {
+                requested_fs_idx: fs_idx,
+            },
+        ) {
             return;
         }
         // 消しゴム入力取得は state mutation より前にやる。ここで取れないと erase は始められず、
@@ -358,6 +428,7 @@ impl App {
 
     /// 消しゴムモードをリセットする。
     pub(crate) fn reset_erase_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         let restore_idx = self.fullscreen_idx;
         let was_erase_mode = self.erase_mode;
         self.erase_mode = false;
@@ -445,6 +516,18 @@ impl App {
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
+        let Some(request) = self
+            .page_edit_target_switch_request(crate::app::PageEditTargetSwitchTool::Erase, new_idx)
+        else {
+            return;
+        };
+        self.cancel_original_material_entry_intents(None);
+        if !self.ensure_original_material_for_entry(
+            new_idx,
+            crate::app::OriginalMaterialEntry::Switch { request },
+        ) {
+            return;
+        }
         // 現ページの編集を確定。`apply_inpaint_only` は inpaint 投入だけ行い、
         // `erase_spread_ctx` を含む消しゴム状態は壊さない (spread 切替を意識した版)。
         // マスクが空なら inpaint も DB 書き込みも走らないので、空 toggle でも安全。
@@ -522,6 +605,9 @@ impl App {
         let Some(current) = self.current_erase_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(prev) = self.erase_undo_stack.pop_back() else {
             return false;
         };
@@ -538,6 +624,9 @@ impl App {
         let Some(current) = self.current_erase_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(next) = self.erase_redo_stack.pop_back() else {
             return false;
         };
@@ -549,6 +638,12 @@ impl App {
 
     /// 現在のマスク (ビットマップ + ベクタ) をスロットに保存する。
     pub(crate) fn save_mask_to_slot(&mut self, slot: usize) {
+        if self.erase_mask.is_some()
+            && self.mask_db.is_some()
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         let [w, h] = self.erase_mask_size;
         let saved = if let (Some(mask), Some(db)) = (&self.erase_mask, &self.mask_db) {
             db.set_slot(slot, mask, &self.erase_shapes, w, h).is_ok()
@@ -577,6 +672,9 @@ impl App {
         };
         if !slot_mask.iter().any(|&m| m) && slot_vectors.is_empty() {
             self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.push_undo_snapshot();
@@ -671,7 +769,11 @@ impl App {
         // Ctrl+Z: Undo
         let ctrl_z = self.keymap.consume_action(ctx, KeyAction::EraseUndo);
         if ctrl_z {
-            if self.erase_tool == EraseTool::Polygon && self.erase_lasso_points.pop().is_some() {
+            if self.erase_tool == EraseTool::Polygon && !self.erase_lasso_points.is_empty() {
+                if !self.admit_book_append_followup_mutation() {
+                    return action;
+                }
+                self.erase_lasso_points.pop();
                 self.show_feedback_toast("[頂点を戻す]".to_string());
                 return action;
             }
@@ -687,6 +789,9 @@ impl App {
         if key_del {
             if let Some(idx) = self.erase_selected_shape {
                 if idx < self.erase_shapes.len() {
+                    if !self.admit_book_append_followup_mutation() {
+                        return action;
+                    }
                     self.push_undo_snapshot();
                     self.erase_shapes.remove(idx);
                     self.erase_selected_shape = None;
@@ -888,6 +993,18 @@ impl App {
     /// マスクをシフトする。選択中ベクタがあればそれだけ、無ければビットマップとすべての
     /// ベクタを移動する。
     fn nudge_mask(&mut self, dx: f32, dy: f32) {
+        if (dx == 0.0 && dy == 0.0)
+            || (self.erase_shapes.is_empty()
+                && !self
+                    .erase_mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.iter().any(|value| *value)))
+        {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot_throttled();
         match self.erase_selected_shape {
             Some(idx) if idx < self.erase_shapes.len() => {
@@ -914,6 +1031,18 @@ impl App {
 
     /// マスクを回転する。選択中ベクタがあればそれだけ、無ければ全体を画像中心周りに回転する。
     fn rotate_mask(&mut self, angle_rad: f32) {
+        if angle_rad == 0.0
+            || (self.erase_shapes.is_empty()
+                && !self
+                    .erase_mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.iter().any(|value| *value)))
+        {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot_throttled();
         match self.erase_selected_shape {
             Some(idx) if idx < self.erase_shapes.len() => {
@@ -984,6 +1113,10 @@ impl App {
 
     /// 円形ブラシで from → to を線で塗る。paint=true で描画、false で消去。
     fn paint_brush_line(&mut self, from: (f32, f32), to: (f32, f32), paint: bool) {
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
         let radius = self.erase_brush_radius;
         let [w, h] = self.erase_mask_size;
         let mask = match self.erase_mask.as_mut() {
@@ -994,6 +1127,8 @@ impl App {
             .and_then(|(x0, y0, x1, y1)| MaskDirtyRect::new(x0, y0, x1, y1));
 
         if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
+            // No yield or save occurs between the bitmap mutation and this boundary.
+            self.invalidate_book_append_undo();
             self.mark_erase_mask_texture_dirty(dirty);
             // mask 変化 → preview cache を破棄。
             if let Some(fs_idx) = self.fullscreen_idx {
@@ -1005,6 +1140,12 @@ impl App {
     /// 多角形の内部をビットマップに塗る/消す。`mask_db::scanline_fill_polygon` の薄いラッパ。
     fn paint_polygon(&mut self, points: &[(f32, f32)], paint: bool) {
         let [w, h] = self.erase_mask_size;
+        if points.len() < 3 || w == 0 || h == 0 || self.erase_mask.is_none() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let Some(mask) = self.erase_mask.as_mut() else {
             return;
         };
@@ -1027,6 +1168,9 @@ impl App {
             return;
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot();
         self.erase_mask = Some(next);
         self.mark_erase_mask_texture_dirty(None);
@@ -1109,6 +1253,9 @@ impl App {
             | crate::mask_db::BucketFillOutcome::Invalid => return,
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_undo_snapshot();
         self.erase_mask = Some(next);
         self.mark_erase_mask_texture_dirty(None);
@@ -1330,6 +1477,11 @@ impl App {
                 let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
                 let drag_idx = drag.idx();
                 if drag_idx < self.erase_shapes.len() {
+                    if self.erase_shapes[drag_idx] != new_shape
+                        && !self.admit_book_append_followup_mutation()
+                    {
+                        return true;
+                    }
                     self.erase_shapes[drag_idx] = new_shape;
                 }
                 // R5: ドラッグ中の毎フレ再描画 (= ハンドル / Pan を動かすたびに
@@ -1413,6 +1565,9 @@ impl App {
             return;
         }
         let new_shape = vector_edit::apply_drag(&drag, cur, &modifiers);
+        if self.erase_shapes[idx] != new_shape && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.erase_shapes[idx] = new_shape;
         // R5: ドラッグ中もマスクを毎フレ再生成する (実機 FB: 「ハンドルのドラッグでも
         // 楕円は再描画されません。性能的に問題なければリアルタイムにマスクを表示」)。
@@ -1520,6 +1675,13 @@ impl App {
         }
 
         if pointer_over_panel && !primary_released {
+            return;
+        }
+
+        if self.book_append_undo_in_progress() {
+            if primary_down || primary_pressed || primary_released || secondary_pressed {
+                self.admit_book_append_followup_mutation();
+            }
             return;
         }
 
@@ -1638,10 +1800,13 @@ impl App {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
                             // サンプリング間引き
-                            crate::manual_mask_tools::push_freehand_point(
+                            let changed = crate::manual_mask_tools::push_freehand_point(
                                 &mut self.erase_lasso_points,
                                 img_pos,
                             );
+                            if changed {
+                                self.invalidate_book_append_undo();
+                            }
                         }
                     }
                 }
@@ -1682,11 +1847,14 @@ impl App {
                             self.show_feedback_toast("[多角形を確定]".to_string());
                         }
                     } else {
-                        crate::manual_mask_tools::push_polygon_vertex(
+                        let changed = crate::manual_mask_tools::push_polygon_vertex(
                             &mut self.erase_lasso_points,
                             img_pos,
                             scale,
                         );
+                        if changed {
+                            self.invalidate_book_append_undo();
+                        }
                     }
                 }
             }
@@ -1718,6 +1886,13 @@ impl App {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
+                            if self.erase_line_start.is_none()
+                                || self.erase_line_end != Some(img_pos)
+                            {
+                                if !self.admit_book_append_followup_mutation() {
+                                    return;
+                                }
+                            }
                             if self.erase_line_start.is_none() {
                                 self.erase_line_start = Some(img_pos);
                             }
@@ -1756,6 +1931,13 @@ impl App {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
+                            if self.erase_shape_drag_start.is_none()
+                                || self.erase_shape_drag_end != Some(img_pos)
+                            {
+                                if !self.admit_book_append_followup_mutation() {
+                                    return;
+                                }
+                            }
                             if self.erase_shape_drag_start.is_none() {
                                 self.erase_shape_drag_start = Some(img_pos);
                             }
@@ -1816,6 +1998,11 @@ impl App {
         if primary_down {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform) {
+                    if self.erase_line_start.is_none() || self.erase_line_end != Some(img_pos) {
+                        if !self.admit_book_append_followup_mutation() {
+                            return;
+                        }
+                    }
                     if self.erase_line_start.is_none() {
                         self.erase_line_start = Some(img_pos);
                         self.erase_line_tilt = 0.0;
@@ -1871,6 +2058,9 @@ impl App {
     /// そのため消去モードの矩形/楕円/線は既存 Shape を丸ごと削除せず、上から
     /// 削り取るベクターオブジェクトとして残る。
     fn commit_erase_shape(&mut self, shape: Shape, paint: bool) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         // マスクが変わるので preview cache を破棄 (= 次回 preview 押下で再投入)。
         if let Some(fs_idx) = self.fullscreen_idx {
             self.clear_erase_preview(fs_idx);
@@ -2724,7 +2914,7 @@ impl App {
         if let Some(target) = switch_to {
             self.switch_erase_target_in_spread(ctx, target);
         }
-        if mask_delete_clicked {
+        if mask_delete_clicked && self.admit_book_append_followup_mutation() {
             let [w, h] = self.erase_mask_size;
             self.push_undo_snapshot();
             self.erase_mask = Some(vec![false; w * h]);
@@ -2813,7 +3003,11 @@ impl App {
         self.erase_inpaint_pending
             .get(&pending_key)
             .is_some_and(|p| {
-                p.input_generation == key.input_gen && p.mask_generation == key.mask_gen
+                p.input_generation == key.input_gen
+                    && p.mask_generation == key.mask_gen
+                    && p.items_generation == self.items_generation
+                    && p.path_key == self.page_path_key(fs_idx)
+                    && !p.cancel.load(Ordering::Relaxed)
             })
     }
 
@@ -2832,6 +3026,16 @@ impl App {
         }
         if self.commit_pending_matches_current_erase_key(fs_idx) {
             return None;
+        }
+
+        if self.current_raw_source_pixels(fs_idx).is_none()
+            && !self.exact_complete_final_pixels_available(fs_idx)
+            && !self.has_retained_pdf_final_ai_for_current_params(fs_idx)
+        {
+            self.ensure_original_material_for_entry(
+                fs_idx,
+                crate::app::OriginalMaterialEntry::MaterialOnly,
+            );
         }
 
         let source = self.resolve_erase_input_pixels(fs_idx)?;
@@ -3046,6 +3250,16 @@ impl App {
             return;
         };
 
+        if !self.ensure_original_material_for_entry(
+            fs_idx,
+            crate::app::OriginalMaterialEntry::ApplyEraseSlot {
+                requested_fs_idx: fs_idx,
+                slot,
+            },
+        ) {
+            return;
+        }
+
         let pixels = match self.resolve_erase_input_pixels(fs_idx) {
             Some(pixels) => pixels,
             None => {
@@ -3113,6 +3327,81 @@ impl App {
         log_prefix: &'static str,
         is_preview: bool,
     ) {
+        let purpose = if is_preview {
+            EraseInpaintPurpose::Preview { origin: log_prefix }
+        } else {
+            EraseInpaintPurpose::Commit { origin: log_prefix }
+        };
+        self.start_inpaint_job(
+            ctx,
+            idx,
+            original,
+            EraseInpaintMaskSource::Prepared(composite),
+            w,
+            h,
+            purpose,
+        );
+    }
+
+    /// Rebuild the missing saved erase stage through its existing commit owner. Saved mask
+    /// reads and rasterization run on that worker; completed display material stays current.
+    pub(crate) fn ensure_erase_stage_for_entry(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        entry: crate::app::OriginalMaterialEntry,
+    ) -> bool {
+        if self.current_local_adjust_source_pixels(idx).is_some() {
+            return true;
+        }
+        if !self.mask_pages.contains(&idx) {
+            return self.ensure_original_material_for_entry(idx, entry);
+        }
+        let key = EraseInpaintPendingKey {
+            idx,
+            kind: EraseInpaintKind::Commit,
+        };
+        if self.commit_pending_matches_current_erase_key(idx) {
+            if let Some(pending) = self.erase_inpaint_pending.get_mut(&key) {
+                pending.purpose = pending.purpose.with_entry(entry);
+            }
+            return false;
+        }
+        let Some(source) = self.resolve_erase_input_pixels(idx) else {
+            self.ensure_original_material_for_entry(idx, entry);
+            return false;
+        };
+        let Some(page_key) = self.page_path_key(idx) else {
+            return false;
+        };
+        let [w, h] = source.size;
+        self.start_inpaint_job(
+            ctx,
+            idx,
+            source,
+            EraseInpaintMaskSource::Saved {
+                db_path: crate::mask_db::MaskDb::db_path(),
+                page_key,
+            },
+            w,
+            h,
+            EraseInpaintPurpose::MaterializeForEntry { entry },
+        );
+        false
+    }
+
+    fn start_inpaint_job(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        original: Arc<egui::ColorImage>,
+        mask_source: EraseInpaintMaskSource,
+        w: usize,
+        h: usize,
+        purpose: EraseInpaintPurpose,
+    ) {
+        let log_prefix = purpose.origin();
+        let is_preview = purpose.is_preview();
         if self.remote_session_blocks_local_control() {
             return;
         }
@@ -3136,7 +3425,7 @@ impl App {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = Arc::clone(&cancel);
-        let (tx, rx) = mpsc::channel::<egui::ColorImage>();
+        let (tx, rx) = mpsc::channel::<EraseInpaintResult>();
         let (progress_tx, progress_rx) = mpsc::channel::<EraseInpaintProgress>();
         let ctx_clone = ctx.clone();
         let local_ai_activity = self.local_ai_activity_lease();
@@ -3147,6 +3436,53 @@ impl App {
             .name("erase-inpaint".to_string())
             .spawn(move || {
                 let _local_ai_activity = local_ai_activity;
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                let composite = match mask_source {
+                    EraseInpaintMaskSource::Prepared(composite) => composite,
+                    EraseInpaintMaskSource::Saved { db_path, page_key } => {
+                        let db = match crate::mask_db::MaskDb::open_readonly_at(&db_path) {
+                            Ok(db) => db,
+                            Err(error) => {
+                                crate::logger::log(format!(
+                                    "erase: saved-stage read failed: {error}"
+                                ));
+                                return;
+                            }
+                        };
+                        let stored = match db.get_full_checked(&page_key) {
+                            Ok(stored) => stored,
+                            Err(error) => {
+                                crate::logger::log(format!(
+                                    "erase: saved-stage read failed: {error}"
+                                ));
+                                return;
+                            }
+                        };
+                        let Some((mut bitmap, mut shapes, [mw, mh])) = stored else {
+                            let _ = tx.send(EraseInpaintResult::MaskAbsent);
+                            ctx_clone.request_repaint();
+                            return;
+                        };
+                        if [mw, mh] != [w, h] {
+                            bitmap = crate::mask_db::rescale_mask(&bitmap, mw, mh, w, h);
+                            for shape in &mut shapes {
+                                shape.scale_xy(
+                                    w as f32 / mw.max(1) as f32,
+                                    h as f32 / mh.max(1) as f32,
+                                );
+                            }
+                        }
+                        crate::mask_db::rasterize_shapes_into(&mut bitmap, &shapes, w, h);
+                        if !bitmap.iter().any(|pixel| *pixel) {
+                            let _ = tx.send(EraseInpaintResult::MaskAbsent);
+                            ctx_clone.request_repaint();
+                            return;
+                        }
+                        bitmap
+                    }
+                };
                 let runtime = match runtime_init
                     .wait_terminal_while(|| !cancel_for_thread.load(Ordering::Acquire))
                 {
@@ -3175,7 +3511,7 @@ impl App {
                 if cancel_for_thread.load(Ordering::Relaxed) {
                     return;
                 }
-                let _ = tx.send(result);
+                let _ = tx.send(EraseInpaintResult::Pixels(result));
                 ctx_clone.request_repaint();
             });
         if let Err(e) = spawn_result {
@@ -3205,8 +3541,7 @@ impl App {
                 started_at: std::time::Instant::now(),
                 input_generation,
                 mask_generation,
-                log_prefix,
-                is_preview,
+                purpose,
             },
         );
     }
@@ -3229,7 +3564,7 @@ impl App {
         // Disconnected なら worker が死んでいるので削除して次へ進む。Empty は次へ。
         // (try_recv は &Receiver で借用するだけだが値を返すと所有権が移るので、
         //  Some を返した時点でループを抜けて map から remove する。)
-        let mut completed: Option<(EraseInpaintPendingKey, egui::ColorImage)> = None;
+        let mut completed: Option<(EraseInpaintPendingKey, EraseInpaintResult)> = None;
         let mut worker_failed = false;
         let keys: Vec<EraseInpaintPendingKey> =
             self.erase_inpaint_pending.keys().copied().collect();
@@ -3267,7 +3602,9 @@ impl App {
         {
             crate::logger::log(format!(
                 "erase: inpaint result discarded (stale: gen {} → {}, prefix={})",
-                pending.items_generation, self.items_generation, pending.log_prefix
+                pending.items_generation,
+                self.items_generation,
+                pending.purpose.origin()
             ));
             return;
         }
@@ -3278,7 +3615,7 @@ impl App {
         {
             crate::logger::log(format!(
                 "erase: {} inpaint result discarded (stale generation: input {} -> {}, mask {} -> {}, prefix={})",
-                if pending.is_preview {
+                if pending.purpose.is_preview() {
                     "preview"
                 } else {
                     "commit"
@@ -3287,15 +3624,28 @@ impl App {
                 current_input_generation,
                 pending.mask_generation,
                 current_mask_generation,
-                pending.log_prefix
+                pending.purpose.origin()
             ));
             return;
         }
         // pixels と texture で同じ ColorImage を共有することで、UI スレッド上の
         // 100MB 級 memcpy (4K 画像 RGBA) を回避する。
+        let result = match result {
+            EraseInpaintResult::Pixels(pixels) => pixels,
+            EraseInpaintResult::MaskAbsent => {
+                self.mask_pages.remove(&idx);
+                if let Some(key) = &pending.path_key {
+                    self.mask_page_keys.remove(key);
+                }
+                if let Some(entry) = pending.purpose.entry() {
+                    self.resume_original_material_entry(ctx, idx, entry);
+                }
+                return;
+            }
+        };
         let pixels = Arc::new(result);
         let tex = ctx.load_texture(
-            if pending.is_preview {
+            if pending.purpose.is_preview() {
                 format!("fs_preview_inpaint_{idx}")
             } else {
                 format!("fs_inpainted_{idx}")
@@ -3303,7 +3653,7 @@ impl App {
             egui::ImageData::Color(Arc::clone(&pixels)),
             self.display_texture_options(idx),
         );
-        if pending.is_preview {
+        if pending.purpose.is_preview() {
             // **Preview 経路**: fs_cache を一切触らず、preview_cache だけを更新する
             // (Codex P1 R4 #1)。ESC / 全削除 / mask 変更で preview_cache を捨てれば
             // commit せずに元の状態へ戻れる。
@@ -3317,7 +3667,7 @@ impl App {
             crate::logger::log(format!(
                 "erase: preview inpaint complete ({} ms, prefix={})",
                 elapsed.as_millis(),
-                pending.log_prefix
+                pending.purpose.origin()
             ));
             self.show_feedback_toast("[補完プレビュー完了]".to_string());
         } else {
@@ -3335,15 +3685,23 @@ impl App {
                     texture: tex,
                 },
             );
-            self.invalidate_compare_prepared_for_idx(idx);
-            self.clear_local_adjust_caches_for_idx(idx);
-            self.clear_conceal_caches(idx);
+            if !matches!(
+                pending.purpose,
+                EraseInpaintPurpose::MaterializeForEntry { .. }
+            ) {
+                self.invalidate_compare_prepared_for_idx(idx);
+                self.clear_local_adjust_caches_for_idx(idx);
+                self.clear_conceal_caches(idx);
+            }
             crate::logger::log(format!(
                 "erase: inpaint complete ({} ms, prefix={})",
                 elapsed.as_millis(),
-                pending.log_prefix
+                pending.purpose.origin()
             ));
             self.show_feedback_toast("[補完完了]".to_string());
+        }
+        if let Some(entry) = pending.purpose.entry() {
+            self.resume_original_material_entry(ctx, idx, entry);
         }
     }
 
@@ -4319,6 +4677,25 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 #[cfg(test)]
 mod book_erase_tests {
     use super::*;
+
+    #[test]
+    fn section1373_erase_draft_changes_invalidate_but_noop_and_history_capture_do_not() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask_size = [4, 4];
+        app.erase_mask = Some(vec![false; 16]);
+        app.erase_brush_radius = 1.0;
+        let before = app.book_append_undo_revision;
+        app.push_undo_snapshot();
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line((1.0, 1.0), (1.0, 1.0), false);
+        app.apply_erase_bitmap_morph_1px(false);
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+        assert!(app.erase_mask.as_ref().unwrap().iter().any(|value| *value));
+        app.paint_brush_line((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+    }
 
     /// 純グレースケール原稿は残差ちょうど 0 なので、`is_near_monochrome_residual` に
     /// 0 をそのまま渡すと通ってしまう。0 = 無効が「切ったのに効く」にならないこと。

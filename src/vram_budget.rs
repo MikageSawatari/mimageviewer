@@ -132,13 +132,14 @@ pub(crate) enum VramSubsystem {
     EditResultCache,
     ContinuousPageTransitions,
     LanczosOutputs,
+    PageTurnPresentation,
     Thumbnails,
     ThumbTextures,
     ThumbAdjustTex,
 }
 
 impl VramSubsystem {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::FsCache,
         Self::FinalCompositeCache,
         Self::AdjustmentCache,
@@ -150,6 +151,7 @@ impl VramSubsystem {
         Self::EditResultCache,
         Self::ContinuousPageTransitions,
         Self::LanczosOutputs,
+        Self::PageTurnPresentation,
         Self::Thumbnails,
         Self::ThumbTextures,
         Self::ThumbAdjustTex,
@@ -168,6 +170,7 @@ impl VramSubsystem {
             Self::EditResultCache => "edit_result_cache",
             Self::ContinuousPageTransitions => "continuous_page_transitions",
             Self::LanczosOutputs => "lanczos_outputs",
+            Self::PageTurnPresentation => "page_turn_presentation",
             Self::Thumbnails => "thumbnails",
             Self::ThumbTextures => "thumb_textures",
             Self::ThumbAdjustTex => "thumb_adjust_tex",

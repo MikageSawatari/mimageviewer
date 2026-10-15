@@ -256,7 +256,10 @@ fn send_and_retire(f: &mut Fixture, ctx: &egui::Context) -> mpsc::Sender<()> {
     let (entered, release) = f.service.hold_worker_for_test();
     entered.recv_timeout(WAIT).unwrap();
     f.app
-        .with_viewer_context(f.owner, |app| app.save_local_composition_editor(ctx, false))
+        .with_viewer_context(f.owner, |app| {
+            super::tests::finish_editor_results(app);
+            app.save_local_composition_editor(ctx, false);
+        })
         .unwrap();
     assert!(f.app.composition_editor_writes_pending());
     f.app

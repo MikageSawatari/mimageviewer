@@ -1,5 +1,19 @@
 # リモート閲覧 (Web) 機能 計画書
 
+## 本の構成（§1.242 B2、2026-10-13）
+
+strict IPCはv71。ContainerPayloadにaccepted `composition_revision`を持ち、実効address/generationと一緒に使う。
+ZIP/PDF/EPUBは共通pure投影で順序・hidden・新tailを適用してから既存件数/byte制限へ通す。
+寸法取得・組生成は返却itemsだけで、Singleは組のための寸法を読まない。
+不完全応答は自動表紙次/最終単独・端配置・末尾表紙を抑止し、範囲内の明示指定を保持する。
+PCとの組の差は通常本と共通の延期§1.368の制約として残す。
+明示白紙は一つのNavigation presentation slotに画面側を載せ、partnerを要求しない。
+Single/端末単ページ強制/Splitではその側を渡さず、通常本のsingleton trimも変更しない。
+構成本のWeb表示メニューは単ページ/見開き/横長分割。方向・表紙・Spread shiftはPC editorへ案内する。
+端配置・表紙次/最終単独・末尾表紙はqualified scopeのAutomaticRuleとして既存writerへ保存できる。
+構成record/revisionのwrite、全本寸法解決、省略相方の追加取得は行わない。
+以下のG段階のv70は当時の実装記録である。
+
 ## 抽出一覧の一時表示（§1.242 G1）
 
 評価・スマートフォルダ・保存コレクションの直接閲覧はA2の抽出一覧として扱う。
@@ -11,7 +25,10 @@ Webの既存方向/表紙付きキーは抽出一覧では表示種別だけへr
 件数/byte上限、policy、navigationのexact snapshot proofは保持する。通常ZIP一覧の子container位置も維持する。
 構成本の`SetViewMode`/binding拒否契約はbook-composition-plan §9.2を参照する。
 2026-10-11 G3でstrict protocolを**v70**へ更新し、`SetViewMode`とderived `composition_managed`を追加した。
-構成あり本の結合`SetSpread`はworkerの最新snapshotで拒否し、Webは表示分類だけ切り替える。
+構成あり本の結合`SetSpread`はworkerの最新snapshotで方向・表紙が一致する見開き要求のみ
+既存`SetViewMode` ownerへ渡す（2026-10-14 Q31）。不一致は一致するWebキー2/3/4/5とPC構成編集を案内して拒否する。
+requested modeはtyped LegacySpread資格に保持し、UIの最新snapshotでも再確認する。
+mode-only書込はbinding保存／休眠shift Clearへ進まず、Webの表示分類menuは従来どおり。
 mode-onlyの本別保存は既存spread.db worker、抽出結果は非永続の表示投影。構成/shift writerを呼ばない。
 mode-onlyの読取は休眠bindingと閲覧分類を分離し、親/全体と文書由来の既定方向・表紙を解決してから分類を適用する。
 表示分類は文書方向の読取を止めず、Single/Spread/Splitとも同じ解決済み方向を使う。

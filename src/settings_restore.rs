@@ -1164,8 +1164,8 @@ mod tests {
         let rows = crate::book_composition::store::load_rows(&restored).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[&scope.storage_key()].composition.units,
-            composition.units
+            rows[&scope.storage_key()].composition.page_order,
+            composition.page_order
         );
         assert!(
             crate::book_composition::store::load_rows(&Connection::open(path).unwrap())

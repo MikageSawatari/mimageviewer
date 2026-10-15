@@ -2585,8 +2585,8 @@ mod tests {
     #[test]
     fn composition_restore_uses_logical_source_family_without_cache_payload_rewrite() {
         use crate::book_composition::{
-            BookComposition, CompositionPageRef, CompositionUnit, PageDomain, ReadingDirection,
-            SingleCompanion, SinglePlacement,
+            BookComposition, CompositionPageRef, PageDomain, PageOverride, PageOverrideEntry,
+            PageSide, ReadingDirection,
         };
         let data = tempfile::tempdir().unwrap();
         let old = PathBuf::from(r"C:\Books\source.rar");
@@ -2597,16 +2597,16 @@ mod tests {
             rusqlite::Connection::open(data.path().join("book_composition.db")).unwrap();
         let source_scope = crate::book_scope::BookScopeKey::new(&old, "chapter").unwrap();
         let target_scope = crate::book_scope::BookScopeKey::new(&new, "chapter").unwrap();
-        let composition = BookComposition::new(
-            ReadingDirection::Rtl,
-            vec![CompositionUnit::Single {
-                page: CompositionPageRef::ArchiveEntry {
-                    entry_name: "chapter/Page.jpg".into(),
-                },
-                placement: SinglePlacement::Leading,
-                companion: SingleCompanion::Blank,
-            }],
-        );
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: "chapter/Page.jpg".into(),
+        };
+        let mut composition = BookComposition::new(ReadingDirection::Rtl, vec![page.clone()]);
+        composition.page_overrides.push(PageOverrideEntry {
+            page,
+            directive: PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            },
+        });
         crate::book_composition::store::replace_row_in(
             &connection,
             "book_compositions",

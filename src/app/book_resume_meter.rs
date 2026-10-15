@@ -208,6 +208,9 @@ impl App {
     }
 
     pub(crate) fn clear_book_resume_async(&mut self) {
+        if self.book_resume_writer.is_some() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         if let Some(writer) = &self.book_resume_writer {
             self.book_resume_meters.clear = Some(writer.clear());
             self.book_resume_meters.update(Delta::Clear);

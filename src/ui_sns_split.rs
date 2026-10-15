@@ -686,6 +686,7 @@ impl App {
         let Some(source_size) = self.fs_page_coordinate_source_size(target_idx) else {
             return Err(SnsSplitEntryError::ImageLoading);
         };
+        self.cancel_original_material_entry_intents(None);
         let image_size = [
             source_size.x.round().max(1.0) as usize,
             source_size.y.round().max(1.0) as usize,
@@ -712,6 +713,7 @@ impl App {
     }
 
     pub(crate) fn reset_sns_split_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         self.sns_split = None;
         self.sns_split_drag = None;
         let pivot = self.sns_split_spread_ctx.take();

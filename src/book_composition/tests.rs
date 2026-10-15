@@ -4,740 +4,258 @@ use super::*;
 fn resolve(book: &BookComposition, manifest: &[ManifestPage]) -> ResolvedComposition {
     resolve_composition(book, &PageDomain::Document, manifest).unwrap()
 }
-
-fn visible_numbers(projection: &ResolvedComposition) -> Vec<u32> {
+fn numbers(projection: &ResolvedComposition) -> Vec<u32> {
     projection
         .visible_pages
         .iter()
-        .map(|page| {
-            let CompositionPageRef::PdfPage { page_num } = page.page else {
-                panic!("document fixture")
-            };
-            page_num
+        .map(|page| match page.page {
+            CompositionPageRef::PdfPage { page_num } => page_num,
+            _ => unreachable!(),
         })
         .collect()
 }
 
-fn assert_single(
-    unit: &ResolvedUnit,
-    number: u32,
-    index: usize,
-    placement: SinglePlacement,
-    companion: ResolvedCompanion,
-) {
-    assert_eq!(
-        *unit,
-        ResolvedUnit::Single {
-            page: ResolvedPage {
-                page: document_page(number),
-                item_index: index
-            },
-            placement,
-            companion
-        }
-    );
-}
-
 #[test]
-fn all_unit_roles_and_hidden_round_trip_without_physical_keys() {
-    let book = BookComposition {
-        schema_version: SCHEMA_VERSION,
-        revision: 42,
-        direction: ReadingDirection::Rtl,
-        cover: Some(document_page(0)),
-        units: vec![
-            single(0, SinglePlacement::Center, SingleCompanion::Vacant),
-            pair(1, 2),
-            single(3, SinglePlacement::Leading, SingleCompanion::Blank),
-            single(
-                4,
-                SinglePlacement::Trailing,
-                SingleCompanion::FrontCoverSupplement {
-                    page: document_page(0),
-                },
-            ),
-        ],
-        hidden_pages: vec![document_page(2)],
-    };
-    let json = book.to_json(&PageDomain::Document).unwrap();
+fn record_round_trip_saves_only_binding_order_hidden_and_directives() {
+    let mut book = four_page_book(ReadingDirection::Rtl);
+    book.revision = 42;
+    book.cover_enabled = true;
+    book.page_order.rotate_left(2);
+    book.hidden_pages.push(document_page(1));
+    book.page_overrides = vec![
+        PageOverrideEntry {
+            page: document_page(1),
+            directive: PageOverride::Alone,
+        },
+        PageOverrideEntry {
+            page: document_page(3),
+            directive: PageOverride::BlankOpposite {
+                page_side: PageSide::Trailing,
+            },
+        },
+    ];
+    let bytes = book.to_json(&PageDomain::Document).unwrap();
     assert_eq!(
-        BookComposition::from_json(&json, &PageDomain::Document).unwrap(),
+        BookComposition::from_json(&bytes, &PageDomain::Document).unwrap(),
         book
     );
-    assert!(!String::from_utf8(json).unwrap().contains("item_index"));
-    let projection = resolve(&book, &document_manifest(5));
-    assert_eq!(visible_numbers(&projection), [0, 1, 3, 4]);
-    assert_eq!(projection.revision, 42);
-    assert_single(
-        &projection.units[1],
-        1,
-        1,
-        SinglePlacement::Leading,
-        ResolvedCompanion::Vacant,
-    );
-    assert_single(
-        &projection.units[2],
-        3,
-        3,
-        SinglePlacement::Leading,
-        ResolvedCompanion::Blank,
-    );
-    assert_eq!(
-        projection.page_status(&document_page(2)),
-        PageStatus::HiddenByComposition
-    );
-    assert_eq!(
-        projection.units.last().unwrap().anchor().page,
-        document_page(4)
-    );
-    assert_eq!(
-        projection.units.last().unwrap().navigation_pages().count(),
-        1
-    );
-}
-
-#[test]
-fn unsafe_relative_and_archive_references_are_rejected() {
-    for path in [
-        "",
-        "..",
-        "../A.png",
-        "a/../../A.png",
-        "/A.png",
-        "\\\\server\\A.png",
-        "C:\\A.png",
-        "C:A.png",
-        "a\0.png",
-        "a\n.png",
-        "a//b.png",
-        "./a.png",
-        "a./b.png",
-        "a /b.png",
-        "a.png/",
-        "\\?\\C:\\a.png",
+    let wire = String::from_utf8(bytes).unwrap();
+    for forbidden in [
+        "units",
+        "item_index",
+        "placement",
+        "supplement",
+        "dimensions",
     ] {
-        let relative = BookComposition::new(
-            ReadingDirection::Ltr,
-            vec![CompositionUnit::Single {
-                page: CompositionPageRef::RelativePath { path: path.into() },
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            }],
-        );
-        assert!(
-            relative.validate(&PageDomain::ImageFolder).is_err(),
-            "{path:?}"
-        );
-        let archive = BookComposition::new(
-            ReadingDirection::Ltr,
-            vec![CompositionUnit::Single {
-                page: CompositionPageRef::ArchiveEntry {
-                    entry_name: path.into(),
-                },
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            }],
-        );
-        assert!(
-            archive
-                .validate(&PageDomain::ArchiveLevel {
-                    prefix: String::new()
-                })
-                .is_err(),
-            "{path:?}"
-        );
+        assert!(!wire.contains(forbidden), "{forbidden}");
     }
+    let projection = resolve(&book, &document_manifest(4));
+    assert_eq!(numbers(&projection), [2, 3, 0]);
+    assert_eq!(
+        projection.page_override(3),
+        Some(PageOverride::BlankOpposite {
+            page_side: PageSide::Trailing
+        })
+    );
+    assert_eq!(projection.page_override(1), None);
+    assert!(projection.cover_enabled);
+    assert_eq!(projection.revision, 42);
 }
 
 #[test]
-fn kind_and_direct_scope_membership_are_validated_even_when_missing() {
-    let page = CompositionPageRef::ArchiveEntry {
-        entry_name: "Outer/CH01.zip/A.PNG".into(),
-    };
-    let book = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![CompositionUnit::Single {
-            page: page.clone(),
-            placement: SinglePlacement::Leading,
-            companion: SingleCompanion::Blank,
-        }],
-    );
-    let domain = PageDomain::ArchiveLevel {
-        prefix: "outer\\ch01.ZIP".into(),
-    };
-    book.validate(&domain).unwrap();
-    let projection = resolve_composition(&book, &domain, &[]).unwrap();
-    assert_eq!(projection.page_status(&page), PageStatus::Missing);
-    assert!(projection.units.is_empty());
-    for prefix in ["", "outer", "other/ch01.zip", "../outer", "outer/ch01.zip/"] {
-        assert!(
-            book.validate(&PageDomain::ArchiveLevel {
-                prefix: prefix.into()
-            })
-            .is_err()
-        );
+fn hidden_missing_policy_filtered_and_new_tail_retain_distinct_statuses() {
+    let mut book = four_page_book(ReadingDirection::Ltr);
+    book.hidden_pages.push(document_page(0));
+    book.page_overrides.push(PageOverrideEntry {
+        page: document_page(1),
+        directive: PageOverride::Alone,
+    });
+    let mut manifest = document_manifest(6);
+    manifest.remove(1);
+    manifest[1].availability = ManifestAvailability::ExcludedByPolicy;
+    manifest[2].availability = ManifestAvailability::FilteredOut;
+    let before = book.clone();
+    let projection = resolve(&book, &manifest);
+    assert_eq!(numbers(&projection), [4, 5]);
+    for (page, status) in [
+        (0, PageStatus::HiddenByComposition),
+        (1, PageStatus::Missing),
+        (2, PageStatus::ExcludedByPolicy),
+        (3, PageStatus::FilteredOut),
+    ] {
+        assert_eq!(projection.page_status(&document_page(page)), status);
     }
-    assert!(book.validate(&PageDomain::Document).is_err());
-    assert!(
-        four_page_book(ReadingDirection::Ltr)
-            .validate(&domain)
-            .is_err()
+    assert_eq!(
+        projection.new_tail,
+        vec![document_page(4), document_page(5)]
+    );
+    assert!(!projection.complete);
+    assert_eq!(book, before);
+    assert_eq!(
+        resolve(&book, &document_manifest(6)).page_override(1),
+        Some(PageOverride::Alone)
     );
 }
 
 #[test]
-fn duplicates_use_bookmark_case_slash_rules_and_preserve_read_spelling() {
+fn normalized_order_hidden_and_override_duplicates_are_rejected() {
+    let page = |path: &str| CompositionPageRef::ArchiveEntry {
+        entry_name: path.into(),
+    };
     let domain = PageDomain::ArchiveLevel {
         prefix: "chapter".into(),
     };
-    let page = CompositionPageRef::ArchiveEntry {
-        entry_name: "CHAPTER\\A.png".into(),
-    };
-    let alias = CompositionPageRef::ArchiveEntry {
-        entry_name: "chapter/a.PNG".into(),
-    };
-    let book = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![CompositionUnit::Single {
-            page: page.clone(),
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
-        }],
-    );
-    let manifest = vec![ManifestPage {
-        page: alias.clone(),
-        availability: ManifestAvailability::Present { item_index: 6 },
-    }];
-    let resolved = resolve_composition(&book, &domain, &manifest).unwrap();
-    assert_eq!(resolved.visible_pages[0].page, alias);
-    assert_eq!(
-        resolved.page_status(&page),
-        PageStatus::Visible { item_index: 6 }
-    );
-    assert!(resolved.new_tail.is_empty());
-    let mut duplicate = book.clone();
-    duplicate.units.push(CompositionUnit::Single {
-        page: alias.clone(),
-        placement: SinglePlacement::Center,
-        companion: SingleCompanion::Vacant,
-    });
-    assert!(duplicate.validate(&domain).is_err());
-    duplicate = book.clone();
-    duplicate.hidden_pages = vec![page, alias];
-    assert!(duplicate.validate(&domain).is_err());
-    let mut bad_manifest = manifest.clone();
-    bad_manifest.extend(manifest);
-    assert!(resolve_composition(&book, &domain, &bad_manifest).is_err());
-}
-
-#[test]
-fn schema_unknown_fields_and_malformed_blank_shapes_are_rejected() {
-    let domain = PageDomain::Document;
-    let book = four_page_book(ReadingDirection::Ltr);
-    let mut unknown = book.clone();
-    unknown.schema_version = 2;
-    assert_eq!(
-        unknown.validate(&domain),
-        Err(CompositionError::UnknownSchema(2))
-    );
-    let mut value = serde_json::to_value(&book).unwrap();
-    value["schema_version"] = 2.into();
-    assert_eq!(
-        BookComposition::from_json(&serde_json::to_vec(&value).unwrap(), &domain),
-        Err(CompositionError::UnknownSchema(2))
-    );
-    value["schema_version"] = 1.into();
-    for units in [
-        serde_json::json!([{"kind":"blank"}]),
-        serde_json::json!([{"kind":"pair","first":{"kind":"blank"},"second":{"kind":"blank"}}]),
-        serde_json::json!([{"kind":"single","placement":"leading","companion":{"kind":"blank"}}]),
-        serde_json::json!([{"kind":"single","page":{"kind":"pdf_page","page_num":0},"placement":"leading","companion":[{"kind":"blank"},{"kind":"blank"}]}]),
-        serde_json::json!([{"kind":"single","page":{"kind":"pdf_page","page_num":0},"placement":"leading","companion":{"kind":"blank"},"second_companion":{"kind":"blank"}}]),
-    ] {
-        value["units"] = units;
-        assert!(BookComposition::from_json(&serde_json::to_vec(&value).unwrap(), &domain).is_err());
-    }
-    let mut value = serde_json::to_value(book).unwrap();
-    value["future_field"] = true.into();
-    assert!(BookComposition::from_json(&serde_json::to_vec(&value).unwrap(), &domain).is_err());
-}
-
-#[test]
-fn all_three_model_limits_are_enforced_on_read_and_draft() {
-    let domain = PageDomain::Document;
-    let count = BookComposition::new(
-        ReadingDirection::Ltr,
-        (0..=MAX_PAGES as u32)
-            .map(|page| single(page, SinglePlacement::Center, SingleCompanion::Vacant))
-            .collect(),
-    );
-    assert_eq!(
-        count.validate(&domain),
-        Err(CompositionError::Limit("page count"))
-    );
-    let oversized = vec![b' '; MAX_JSON_BYTES + 1];
-    assert_eq!(
-        BookComposition::from_json(&oversized, &domain),
-        Err(CompositionError::Limit("JSON bytes"))
-    );
-    let path = "a".repeat(MAX_REFERENCE_BYTES + 1);
-    assert_eq!(
-        PageDomain::ImageFolder.validate_page(&CompositionPageRef::RelativePath { path }),
-        Err(CompositionError::Limit("reference bytes"))
-    );
-    let large = BookComposition::new(
-        ReadingDirection::Ltr,
-        (0..520)
-            .map(|page| CompositionUnit::Single {
-                page: CompositionPageRef::RelativePath {
-                    path: format!("{page:04}{}", "a".repeat(MAX_REFERENCE_BYTES - 4)),
-                },
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            })
-            .collect(),
-    );
-    assert_eq!(
-        large.validate(&PageDomain::ImageFolder),
-        Err(CompositionError::Limit("JSON bytes"))
-    );
-    assert_eq!(
-        large.to_json(&PageDomain::ImageFolder),
-        Err(CompositionError::Limit("JSON bytes"))
-    );
-}
-
-#[test]
-fn near_limit_document_composition_is_valid_and_linear_projection_covers_all_pages() {
-    let book = BookComposition::new(
-        ReadingDirection::Ltr,
-        (0..MAX_PAGES as u32)
-            .map(|page| single(page, SinglePlacement::Center, SingleCompanion::Vacant))
-            .collect(),
-    );
-    let projection = resolve(&book, &document_manifest(MAX_PAGES as u32));
-    assert_eq!(projection.visible_pages.len(), MAX_PAGES);
-    assert!(projection.complete);
-    assert_eq!(
-        resolve_composition(
-            &book,
-            &PageDomain::Document,
-            &[ManifestPage {
-                page: document_page(MAX_PAGES as u32),
-                availability: ManifestAvailability::Present { item_index: 0 }
-            }]
-        ),
-        Err(CompositionError::Limit("resolved page count"))
-    );
-}
-
-#[test]
-fn unit_boundary_consecutive_blanks_rejected_for_both_directions() {
-    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
-        let book = BookComposition::new(
-            direction,
-            vec![
-                single(0, SinglePlacement::Leading, SingleCompanion::Blank),
-                single(1, SinglePlacement::Trailing, SingleCompanion::Blank),
-            ],
-        );
-        assert_eq!(
-            book.validate(&PageDomain::Document),
-            Err(CompositionError::Invalid("consecutive blank slots"))
-        );
-        let mut separated = book.clone();
-        separated.units.insert(
-            1,
-            single(2, SinglePlacement::Center, SingleCompanion::Vacant),
-        );
-        separated.validate(&PageDomain::Document).unwrap();
-    }
-}
-
-#[test]
-fn second_blank_and_move_or_placement_creating_consecutive_blanks_leave_draft_unchanged() {
-    let domain = PageDomain::Document;
-    let book = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![
-            single(0, SinglePlacement::Leading, SingleCompanion::Blank),
-            single(2, SinglePlacement::Center, SingleCompanion::Vacant),
-            single(1, SinglePlacement::Trailing, SingleCompanion::Blank),
-        ],
-    );
-    let before = book.clone();
-    assert!(
-        book.edited(
-            &domain,
-            UnitEdit::InsertBlank {
-                page: document_page(0),
-                placement: SinglePlacement::Leading
-            }
-        )
-        .is_err()
-    );
-    assert!(
-        book.edited(&domain, UnitEdit::MoveUnit { from: 2, to: 1 })
-            .is_err()
-    );
-    assert!(
-        book.edited(
-            &domain,
-            UnitEdit::MovePage {
-                page: document_page(1),
-                to: 1
-            }
-        )
-        .is_err()
-    );
-    let valid = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![
-            single(0, SinglePlacement::Leading, SingleCompanion::Blank),
-            single(1, SinglePlacement::Leading, SingleCompanion::Blank),
-        ],
-    );
-    assert!(
-        valid
-            .edited(
-                &domain,
-                UnitEdit::SetSingle {
-                    page: document_page(1),
-                    placement: SinglePlacement::Trailing,
-                    companion: SingleCompanion::Blank
-                }
-            )
-            .is_err()
-    );
-    assert_eq!(book, before);
-}
-
-#[test]
-fn blank_survives_hidden_missing_and_restoration_without_a_fake_source() {
-    let book = BookComposition::new(
-        ReadingDirection::Rtl,
-        vec![single(0, SinglePlacement::Trailing, SingleCompanion::Blank)],
-    );
-    let before = book.clone();
-    let hidden = book
-        .edited(
-            &PageDomain::Document,
-            UnitEdit::SetHidden {
-                page: document_page(0),
-                hidden: true,
-            },
-        )
-        .unwrap();
-    assert!(resolve(&hidden, &document_manifest(1)).units.is_empty());
-    assert!(resolve(&book, &[]).units.is_empty());
-    assert_eq!(
-        resolve(&book, &[]).page_status(&document_page(0)),
-        PageStatus::Missing
-    );
-    assert_eq!(
-        BookComposition::from_json(
-            &hidden.to_json(&PageDomain::Document).unwrap(),
-            &PageDomain::Document
-        )
-        .unwrap(),
-        hidden
-    );
-    let shown = hidden
-        .edited(
-            &PageDomain::Document,
-            UnitEdit::SetHidden {
-                page: document_page(0),
-                hidden: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(shown, before);
-    assert_single(
-        &resolve(&shown, &document_manifest(1)).units[0],
-        0,
-        0,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::Blank,
-    );
-    assert_eq!(book, before);
-}
-
-#[test]
-fn hidden_subset_cover_and_companion_consistency_are_required() {
-    let domain = PageDomain::Document;
-    let mut book = four_page_book(ReadingDirection::Ltr);
-    book.hidden_pages.push(document_page(4));
+    let mut book = BookComposition::new(ReadingDirection::Ltr, vec![page("Chapter/Page.JPG")]);
+    book.page_order.push(page("chapter\\PAGE.jpg"));
+    assert!(book.validate(&domain).is_err());
+    book.page_order.pop();
+    book.hidden_pages = vec![page("Chapter/Page.JPG"), page("chapter/page.jpg")];
     assert!(book.validate(&domain).is_err());
     book.hidden_pages.clear();
-    book.cover = Some(document_page(0));
-    assert!(book.validate(&domain).is_err());
-    for companion in [
-        SingleCompanion::Blank,
-        SingleCompanion::FrontCoverSupplement {
-            page: document_page(0),
+    book.page_overrides = vec![
+        PageOverrideEntry {
+            page: page("Chapter/Page.JPG"),
+            directive: PageOverride::Alone,
         },
+        PageOverrideEntry {
+            page: page("chapter/page.jpg"),
+            directive: PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            },
+        },
+    ];
+    assert!(book.validate(&domain).is_err());
+    let bytes = serde_json::to_vec(&book).unwrap();
+    assert!(BookComposition::from_json(&bytes, &domain).is_err());
+    book.page_overrides.truncate(1);
+    book.validate(&domain).unwrap();
+    book.page_overrides[0].page = page("chapter/other.jpg");
+    assert!(book.validate(&domain).is_err());
+}
+
+#[test]
+fn consecutive_blank_directives_are_valid_and_hidden_override_is_retained() {
+    let mut book = four_page_book(ReadingDirection::Rtl);
+    book.page_overrides = (0..4)
+        .map(|n| PageOverrideEntry {
+            page: document_page(n),
+            directive: PageOverride::BlankOpposite {
+                page_side: if n % 2 == 0 {
+                    PageSide::Leading
+                } else {
+                    PageSide::Trailing
+                },
+            },
+        })
+        .collect();
+    book.hidden_pages.push(document_page(1));
+    book.validate(&PageDomain::Document).unwrap();
+    assert_eq!(
+        book.page_override(&document_page(1)),
+        Some(PageOverride::BlankOpposite {
+            page_side: PageSide::Trailing
+        })
+    );
+    assert_eq!(
+        resolve(&book, &document_manifest(4)).page_overrides.len(),
+        3
+    );
+}
+
+#[test]
+fn unsafe_refs_unknown_fields_schema_variants_and_limits_rejected() {
+    let domain = PageDomain::ArchiveLevel {
+        prefix: String::new(),
+    };
+    for name in [
+        "../a.jpg",
+        "/a.jpg",
+        "C:/a.jpg",
+        "a//b.jpg",
+        "a/./b.jpg",
+        "a\u{0}.jpg",
     ] {
         let book = BookComposition::new(
             ReadingDirection::Ltr,
-            vec![single(0, SinglePlacement::Center, companion)],
+            vec![CompositionPageRef::ArchiveEntry {
+                entry_name: name.into(),
+            }],
         );
-        assert!(book.validate(&domain).is_err());
+        assert!(book.validate(&domain).is_err(), "{name:?}");
     }
-    let mut book = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![
-            single(0, SinglePlacement::Center, SingleCompanion::Vacant),
-            single(
-                1,
-                SinglePlacement::Trailing,
-                SingleCompanion::FrontCoverSupplement {
-                    page: document_page(0),
-                },
-            ),
-        ],
+    let mut wire = serde_json::to_value(four_page_book(ReadingDirection::Ltr)).unwrap();
+    wire["units"] = serde_json::json!([]);
+    assert!(
+        BookComposition::from_json(&serde_json::to_vec(&wire).unwrap(), &PageDomain::Document)
+            .is_err()
     );
-    assert!(book.validate(&domain).is_err());
-    book.cover = Some(document_page(2));
-    assert!(book.validate(&domain).is_err());
-    book.cover = Some(document_page(0));
-    book.validate(&domain).unwrap();
-    book.units[0] = single(
-        0,
-        SinglePlacement::Leading,
-        SingleCompanion::FrontCoverSupplement {
-            page: document_page(0),
-        },
-    );
-    assert!(book.validate(&domain).is_err());
-}
-
-#[test]
-fn hidden_missing_policy_and_facet_never_repair_pairs() {
-    let original = four_page_book(ReadingDirection::Ltr);
-    for status in [
-        ManifestAvailability::ExcludedByPolicy,
-        ManifestAvailability::FilteredOut,
-    ] {
-        let mut manifest = document_manifest(4);
-        manifest[1].availability = status;
-        let projection = resolve(&original, &manifest);
-        assert_single(
-            &projection.units[0],
-            0,
-            0,
-            SinglePlacement::Leading,
-            ResolvedCompanion::Vacant,
-        );
-        assert!(matches!(projection.units[1], ResolvedUnit::Pair { .. }));
-        assert_eq!(visible_numbers(&projection), [0, 2, 3]);
-        assert_eq!(
-            projection.complete,
-            status != ManifestAvailability::FilteredOut
-        );
-        assert_eq!(
-            projection.page_status(&document_page(1)),
-            match status {
-                ManifestAvailability::ExcludedByPolicy => PageStatus::ExcludedByPolicy,
-                _ => PageStatus::FilteredOut,
-            }
-        );
-    }
-    let hidden = original
-        .edited(
-            &PageDomain::Document,
-            UnitEdit::SetHidden {
-                page: document_page(0),
-                hidden: true,
-            },
-        )
-        .unwrap();
-    let projection = resolve(&hidden, &document_manifest(4));
-    assert_single(
-        &projection.units[0],
-        1,
-        1,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::Vacant,
-    );
-    let shown = hidden
-        .edited(
-            &PageDomain::Document,
-            UnitEdit::SetHidden {
-                page: document_page(0),
-                hidden: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        resolve(&shown, &document_manifest(4)),
-        resolve(&original, &document_manifest(4))
+    wire.as_object_mut().unwrap().remove("units");
+    wire["schema_version"] = serde_json::json!(1);
+    assert!(matches!(
+        BookComposition::from_json(&serde_json::to_vec(&wire).unwrap(), &PageDomain::Document),
+        Err(CompositionError::UnknownSchema(1))
+    ));
+    let mut book = four_page_book(ReadingDirection::Ltr);
+    book.page_order = (0..=MAX_PAGES as u32).map(document_page).collect();
+    assert!(matches!(
+        book.validate(&PageDomain::Document),
+        Err(CompositionError::Limit(_))
+    ));
+    assert!(
+        BookComposition::from_json(&vec![b' '; MAX_JSON_BYTES + 1], &PageDomain::Document).is_err()
     );
 }
 
 #[test]
-fn deletion_remap_preserves_c_d_and_b_missing_before_reload() {
-    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
-        let book = four_page_book(direction);
-        let before = book.clone();
-        let projection = resolve(&book, &document_manifest(4));
-        let remapped = projection
-            .remap_removed_items(&[Some(0), None, Some(1), Some(2)], &[document_page(1)])
-            .unwrap();
-        assert_single(
-            &remapped.units[0],
-            0,
-            0,
-            SinglePlacement::Leading,
-            ResolvedCompanion::Vacant,
-        );
-        assert_eq!(
-            remapped.units[1],
-            ResolvedUnit::Pair {
-                first: ResolvedPage {
-                    page: document_page(2),
-                    item_index: 1
-                },
-                second: ResolvedPage {
-                    page: document_page(3),
-                    item_index: 2
-                }
-            }
-        );
-        assert_eq!(visible_numbers(&remapped), [0, 2, 3]);
-        assert_eq!(remapped.page_status(&document_page(1)), PageStatus::Missing);
-        assert_eq!(remapped.units[1].anchor().item_index, 1);
-        let mut manifest = document_manifest(4);
-        manifest.remove(1);
-        for (index, entry) in manifest.iter_mut().enumerate() {
-            entry.availability = ManifestAvailability::Present { item_index: index };
-        }
-        assert_eq!(remapped, resolve(&book, &manifest));
-        assert_eq!(book, before);
-        assert_eq!(resolve(&book, &document_manifest(4)), projection);
-    }
-}
-
-#[test]
-fn remap_covers_both_pair_sides_empty_units_helpers_and_blank_partner() {
-    let fixture = editor_unit_edits(ReadingDirection::Ltr);
-    let projection = resolve(&fixture.with_cover_helper, &document_manifest(4));
-    let mapped = projection
-        .remap_removed_items(&[None, Some(0), Some(1), Some(2)], &[document_page(0)])
+fn reindex_and_physical_deletion_remap_override_without_transferring_identity() {
+    let mut book = four_page_book(ReadingDirection::Ltr);
+    book.page_overrides.push(PageOverrideEntry {
+        page: document_page(2),
+        directive: PageOverride::Alone,
+    });
+    let projection = resolve(&book, &document_manifest(4));
+    let reordered = projection
+        .reindex_items(&[Some(3), Some(2), Some(1), Some(0)])
         .unwrap();
-    assert_single(
-        mapped.units.last().unwrap(),
-        3,
-        2,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::Vacant,
-    );
-    let blank = resolve(&fixture.blank, &document_manifest(4));
-    let mapped = blank
+    assert_eq!(reordered.page_override(1), Some(PageOverride::Alone));
+    assert_eq!(reordered.page_override(2), None);
+    let deleted = projection
         .remap_removed_items(&[Some(0), None, Some(1), Some(2)], &[document_page(1)])
         .unwrap();
-    assert!(!mapped.units.iter().any(|unit| matches!(
-        unit,
-        ResolvedUnit::Single {
-            companion: ResolvedCompanion::Blank,
-            ..
-        }
-    )));
-    assert!(matches!(
-        fixture.blank.units[1],
-        CompositionUnit::Single {
-            companion: SingleCompanion::Blank,
-            ..
-        }
-    ));
-    let pair = resolve(&fixture.original, &document_manifest(4));
-    let mapped = pair
-        .remap_removed_items(
-            &[None, Some(0), None, None],
-            &[document_page(0), document_page(2), document_page(3)],
-        )
+    assert_eq!(deleted.page_override(1), Some(PageOverride::Alone));
+    assert_eq!(deleted.page_status(&document_page(1)), PageStatus::Missing);
+    assert_eq!(numbers(&deleted), [0, 2, 3]);
+    assert_eq!(book.page_order.len(), 4);
+    let removed_override = projection
+        .remap_removed_items(&[Some(0), Some(1), None, Some(2)], &[document_page(2)])
         .unwrap();
-    assert_eq!(mapped.units.len(), 1);
-    assert_single(
-        &mapped.units[0],
-        1,
-        0,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::Vacant,
+    assert!(removed_override.page_overrides.is_empty());
+    assert_eq!(
+        book.page_override(&document_page(2)),
+        Some(PageOverride::Alone)
     );
     assert!(
-        pair.remap_removed_items(&[None; 4], &(0..4).map(document_page).collect::<Vec<_>>())
-            .unwrap()
-            .units
-            .is_empty()
+        projection
+            .remap_removed_items(&[Some(0), None, Some(1), Some(2)], &[document_page(2)])
+            .is_err()
     );
-    for map in [
-        vec![],
-        vec![Some(0)],
-        vec![Some(0), Some(0), Some(1), Some(2)],
-        vec![Some(1), Some(0), Some(2), Some(3)],
-        vec![Some(4), None, None, None],
-        vec![Some(1), Some(2), None, None],
-    ] {
-        assert!(pair.remap_removed_items(&map, &[]).is_err());
-    }
+    assert!(
+        projection
+            .reindex_items(&[Some(0), Some(0), Some(1), Some(2)])
+            .is_err()
+    );
 }
 
 #[test]
-fn physical_deletion_of_hidden_b_and_hidden_blank_b_matches_fresh_resolve() {
-    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
-        let hidden_pair = four_page_book(direction)
-            .edited(
-                &PageDomain::Document,
-                UnitEdit::SetHidden {
-                    page: document_page(1),
-                    hidden: true,
-                },
-            )
-            .unwrap();
-        for book in [hidden_pair, hidden_blank_deletion_book(direction)] {
-            let saved = book.to_json(&PageDomain::Document).unwrap();
-            let before = resolve(&book, &document_manifest(4));
-            let sibling = before.clone();
-            let map = [Some(0), None, Some(1), Some(2)];
-            assert_eq!(
-                before.page_status(&document_page(1)),
-                PageStatus::HiddenByComposition
-            );
-            let deleted = before
-                .remap_removed_items(&map, &[document_page(1)])
-                .unwrap();
-            assert_eq!(deleted.page_status(&document_page(1)), PageStatus::Missing);
-            let mut manifest = document_manifest(4);
-            manifest.remove(1);
-            for (item_index, entry) in manifest.iter_mut().enumerate() {
-                entry.availability = ManifestAvailability::Present { item_index };
-            }
-            assert_eq!(deleted, resolve(&book, &manifest));
-            assert_eq!(book.to_json(&PageDomain::Document).unwrap(), saved);
-            assert_eq!(before, sibling);
-            assert_eq!(resolve(&book, &document_manifest(4)), before);
-            if book.units.iter().any(|unit| {
-                matches!(
-                    unit,
-                    CompositionUnit::Single {
-                        companion: SingleCompanion::Blank,
-                        ..
-                    }
-                )
-            }) {
-                let shown = book
-                    .edited(
-                        &PageDomain::Document,
-                        UnitEdit::SetHidden {
-                            page: document_page(1),
-                            hidden: false,
-                        },
-                    )
-                    .unwrap();
-                assert!(resolve(&shown, &document_manifest(4)).units.iter().any(|unit| matches!(unit, ResolvedUnit::Single { page, companion: ResolvedCompanion::Blank, .. } if page.page == document_page(1))));
-            }
-        }
-    }
+fn manifest_collisions_refuse_resolution_without_changing_saved_record() {
+    let book = four_page_book(ReadingDirection::Ltr);
+    let mut manifest = document_manifest(4);
+    manifest.push(manifest[0].clone());
+    assert!(resolve_composition(&book, &PageDomain::Document, &manifest).is_err());
+    manifest.pop();
+    manifest[1].availability = ManifestAvailability::Present { item_index: 0 };
+    assert!(resolve_composition(&book, &PageDomain::Document, &manifest).is_err());
+    assert_eq!(book, four_page_book(ReadingDirection::Ltr));
 }
 
 #[test]
@@ -794,307 +312,19 @@ fn deletion_identities_cover_policy_facet_tail_and_reject_inconsistent_visible_m
 }
 
 #[test]
-fn new_tail_is_source_order_centered_and_does_not_move_helpers() {
-    let fixture = editor_unit_edits(ReadingDirection::Rtl);
-    let book = fixture.with_cover_helper;
-    let before = book.clone();
-    let mut manifest = document_manifest(6);
-    manifest.swap(4, 5);
-    let projection = resolve(&book, &manifest);
-    assert_eq!(projection.new_tail, [document_page(5), document_page(4)]);
-    assert_eq!(visible_numbers(&projection), [0, 1, 2, 3, 5, 4]);
-    assert!(matches!(
-        projection.units[3],
-        ResolvedUnit::Single {
-            companion: ResolvedCompanion::FrontCoverSupplement(_),
-            ..
-        }
-    ));
-    assert_single(
-        &projection.units[4],
-        5,
-        5,
-        SinglePlacement::Center,
-        ResolvedCompanion::Vacant,
-    );
-    assert_single(
-        &projection.units[5],
-        4,
-        4,
-        SinglePlacement::Center,
-        ResolvedCompanion::Vacant,
-    );
-    assert_eq!(book, before);
-}
-
-#[test]
-fn hidden_missing_and_excluded_cover_supplement_degrades_to_vacant_only() {
-    let fixture = editor_unit_edits(ReadingDirection::Ltr);
-    let domain = PageDomain::Document;
-    let hidden = fixture
-        .with_cover_helper
-        .edited(
-            &domain,
-            UnitEdit::SetHidden {
-                page: document_page(0),
-                hidden: true,
-            },
+fn deleting_unsaved_tail_matches_fresh_manifest_and_other_projection_is_unchanged() {
+    let book = four_page_book(ReadingDirection::Ltr);
+    let before = resolve(&book, &document_manifest(5));
+    let sibling = before.clone();
+    let deleted = before
+        .remap_removed_items(
+            &[Some(0), Some(1), Some(2), Some(3), None],
+            &[document_page(4)],
         )
         .unwrap();
-    assert_single(
-        resolve(&hidden, &document_manifest(4))
-            .units
-            .last()
-            .unwrap(),
-        3,
-        3,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::Vacant,
-    );
-    let mut manifest = document_manifest(4);
-    manifest[0].availability = ManifestAvailability::ExcludedByPolicy;
-    assert_single(
-        resolve(&fixture.with_cover_helper, &manifest)
-            .units
-            .last()
-            .unwrap(),
-        3,
-        3,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::Vacant,
-    );
-    manifest.remove(0);
-    assert_single(
-        resolve(&fixture.with_cover_helper, &manifest)
-            .units
-            .last()
-            .unwrap(),
-        3,
-        3,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::Vacant,
-    );
-    assert!(matches!(
-        resolve(&fixture.with_cover_helper, &document_manifest(4))
-            .units
-            .last()
-            .unwrap(),
-        ResolvedUnit::Single {
-            companion: ResolvedCompanion::FrontCoverSupplement(_),
-            ..
-        }
-    ));
-}
-
-#[test]
-fn all_hidden_is_valid_empty_projection_and_never_adds_registered_pages_as_tail() {
-    let mut book = four_page_book(ReadingDirection::Ltr);
-    book.hidden_pages = book.pages().cloned().collect();
-    let projection = resolve(&book, &document_manifest(4));
-    assert!(projection.visible_pages.is_empty());
-    assert!(projection.units.is_empty());
-    assert!(projection.new_tail.is_empty());
-    assert!(projection.complete);
-}
-
-#[test]
-fn reusable_editor_fixture_preserves_unedited_units_and_attaches_blank_to_real_page() {
-    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
-        let fixture = editor_unit_edits(direction);
-        assert_eq!(fixture.repaired, fixture.original);
-        assert_eq!(fixture.split.units[2], fixture.original.units[1]);
-        assert_eq!(fixture.moved.units[1], fixture.original.units[1]);
-        assert_eq!(
-            fixture.moved.units[2],
-            single(1, SinglePlacement::Leading, SingleCompanion::Blank)
-        );
-        assert_eq!(fixture.hidden.units, fixture.moved.units);
-        let shown = fixture
-            .hidden
-            .edited(
-                &PageDomain::Document,
-                UnitEdit::SetHidden {
-                    page: document_page(1),
-                    hidden: false,
-                },
-            )
-            .unwrap();
-        assert_eq!(shown, fixture.moved);
-        assert_eq!(
-            visible_numbers(&resolve(&fixture.moved, &document_manifest(4))),
-            [0, 2, 3, 1]
-        );
-    }
-}
-
-#[test]
-fn extracting_pair_page_retains_the_partner_slot_without_repairing_rest() {
-    let book = four_page_book(ReadingDirection::Rtl);
-    let moved = book
-        .edited(
-            &PageDomain::Document,
-            UnitEdit::MovePage {
-                page: document_page(1),
-                to: 2,
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        moved.units,
-        [
-            single(0, SinglePlacement::Leading, SingleCompanion::Vacant),
-            pair(2, 3),
-            single(1, SinglePlacement::Trailing, SingleCompanion::Vacant)
-        ]
-    );
-    let moved = book
-        .edited(
-            &PageDomain::Document,
-            UnitEdit::MovePage {
-                page: document_page(0),
-                to: 2,
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        moved.units,
-        [
-            single(1, SinglePlacement::Trailing, SingleCompanion::Vacant),
-            pair(2, 3),
-            single(0, SinglePlacement::Leading, SingleCompanion::Vacant)
-        ]
-    );
-}
-
-#[test]
-fn pairing_removes_blank_in_the_same_operation_and_cover_requires_explicit_clear() {
-    let domain = PageDomain::Document;
-    let fixture = editor_unit_edits(ReadingDirection::Ltr);
-    let paired = fixture
-        .blank
-        .edited(
-            &domain,
-            UnitEdit::PairSingles {
-                first_unit: 0,
-                clear_cover: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(paired, fixture.original);
-    let with_cover = fixture
-        .split
-        .edited(&domain, UnitEdit::SetCover(Some(document_page(0))))
-        .unwrap();
-    assert!(
-        with_cover
-            .edited(
-                &domain,
-                UnitEdit::PairSingles {
-                    first_unit: 0,
-                    clear_cover: false
-                }
-            )
-            .is_err()
-    );
-    assert_eq!(
-        with_cover
-            .edited(
-                &domain,
-                UnitEdit::PairSingles {
-                    first_unit: 0,
-                    clear_cover: true
-                }
-            )
-            .unwrap(),
-        fixture.original
-    );
-    let cleared = with_cover
-        .edited(&domain, UnitEdit::SetCover(None))
-        .unwrap();
-    assert_eq!(
-        cleared
-            .edited(
-                &domain,
-                UnitEdit::PairSingles {
-                    first_unit: 0,
-                    clear_cover: false
-                }
-            )
-            .unwrap(),
-        fixture.original
-    );
-    let cleared = fixture
-        .with_cover_helper
-        .edited(&domain, UnitEdit::SetCover(None))
-        .unwrap();
-    assert!(cleared.units.iter().all(|unit| !matches!(
-        unit,
-        CompositionUnit::Single {
-            companion: SingleCompanion::FrontCoverSupplement { .. },
-            ..
-        }
-    )));
-}
-
-#[test]
-fn direction_only_mirrors_screen_slots_and_does_not_change_unit_or_navigation_order() {
-    let fixture = editor_unit_edits(ReadingDirection::Ltr);
-    let rtl = fixture
-        .moved
-        .edited(
-            &PageDomain::Document,
-            UnitEdit::SetDirection(ReadingDirection::Rtl),
-        )
-        .unwrap();
-    assert_eq!(rtl.units, fixture.moved.units);
-    assert_eq!(rtl.revision, fixture.moved.revision);
-    assert_eq!(
-        visible_numbers(&resolve(&rtl, &document_manifest(4))),
-        visible_numbers(&resolve(&fixture.moved, &document_manifest(4)))
-    );
-    assert_eq!(
-        SinglePlacement::Leading.screen_slot(ReadingDirection::Ltr),
-        ScreenSlot::Left
-    );
-    assert_eq!(
-        SinglePlacement::Leading.screen_slot(ReadingDirection::Rtl),
-        ScreenSlot::Right
-    );
-    assert_eq!(
-        SinglePlacement::Trailing.screen_slot(ReadingDirection::Rtl),
-        ScreenSlot::Left
-    );
-    assert_eq!(
-        SinglePlacement::Center.screen_slot(ReadingDirection::Rtl),
-        ScreenSlot::Center
-    );
-}
-
-#[test]
-fn invalid_editor_positions_and_targets_leave_original_revision_untouched() {
-    let mut book = four_page_book(ReadingDirection::Ltr);
-    book.revision = 19;
-    let before = book.clone();
-    for edit in [
-        UnitEdit::MoveUnit { from: 0, to: 5 },
-        UnitEdit::SplitPair { unit: 4 },
-        UnitEdit::MovePage {
-            page: document_page(1),
-            to: 99,
-        },
-        UnitEdit::PairSingles {
-            first_unit: usize::MAX,
-            clear_cover: false,
-        },
-        UnitEdit::SetHidden {
-            page: document_page(8),
-            hidden: true,
-        },
-        UnitEdit::SetCover(Some(document_page(8))),
-    ] {
-        assert!(book.edited(&PageDomain::Document, edit).is_err());
-        assert_eq!(book, before);
-    }
+    assert_eq!(deleted, resolve(&book, &document_manifest(4)));
+    assert_eq!(before, sibling);
+    assert_eq!(deleted.page_status(&document_page(4)), PageStatus::Invalid);
 }
 
 #[test]
@@ -1133,10 +363,7 @@ fn epub_edit_key_equivalence_uses_original_source_and_same_page_after_reconversi
             reference.bookmark_identity(),
             crate::book_bookmarks::PageIdentity::PdfPage(7)
         );
-        let book = BookComposition::new(
-            ReadingDirection::Ltr,
-            vec![single(7, SinglePlacement::Center, SingleCompanion::Vacant)],
-        );
+        let book = BookComposition::new(ReadingDirection::Ltr, vec![document_page(7)]);
         let manifest: Vec<_> = content_by_number
             .iter()
             .enumerate()
@@ -1162,178 +389,127 @@ fn epub_edit_key_equivalence_uses_original_source_and_same_page_after_reconversi
 }
 
 #[test]
-fn image_folder_reference_round_trip_adapters_and_windows_devices() {
-    use std::path::Path;
-    let page = CompositionPageRef::RelativePath {
-        path: "Page.PNG".into(),
+fn direct_scope_kind_folder_devices_and_archive_spelling_are_validated() {
+    let folder = |name: &str| CompositionPageRef::RelativePath { path: name.into() };
+    let archive = |name: &str| CompositionPageRef::ArchiveEntry {
+        entry_name: name.into(),
     };
-    let book = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![CompositionUnit::Single {
-            page: page.clone(),
-            placement: SinglePlacement::Trailing,
-            companion: SingleCompanion::Blank,
-        }],
-    );
-    let domain = PageDomain::ImageFolder;
-    assert_eq!(
-        BookComposition::from_json(&book.to_json(&domain).unwrap(), &domain).unwrap(),
-        book
-    );
-    assert_eq!(
-        page.bookmark_identity(),
-        crate::book_bookmarks::PageIdentity::RelativePath("Page.PNG".into())
-    );
-    assert_eq!(
-        page.resume_identity(Path::new("C:/Book")),
-        crate::book_resume_db::PageIdentity::Image {
-            path: "c:/book/page.png".into()
-        }
-    );
-    assert_ne!(
-        page.resume_identity(Path::new("C:/Book")),
-        page.resume_identity(Path::new("D:/Book"))
-    );
-    for path in [
-        "CON.png",
-        "NUL.jpg",
-        "PRN.png",
-        "COM1.jpg",
-        "lpt9.png",
-        "com¹.png",
-        "A.png:stream",
-        "A?.png",
+    for name in [
+        "CON.jpg",
+        "lpt1",
+        "aux.txt",
+        "COM?.jpg",
+        "a:b.jpg",
+        "b?.jpg",
+        "tail. ",
+        "sub/a.jpg",
     ] {
         assert!(
-            domain
-                .validate_page(&CompositionPageRef::RelativePath { path: path.into() })
+            BookComposition::new(ReadingDirection::Ltr, vec![folder(name)])
+                .validate(&PageDomain::ImageFolder)
+                .is_err(),
+            "{name}"
+        );
+    }
+    let domain = PageDomain::ArchiveLevel {
+        prefix: "chapter".into(),
+    };
+    for page in [
+        folder("a.jpg"),
+        document_page(0),
+        archive("other/a.jpg"),
+        archive("chapter/sub/a.jpg"),
+    ] {
+        assert!(
+            BookComposition::new(ReadingDirection::Ltr, vec![page])
+                .validate(&domain)
                 .is_err()
         );
     }
-}
-
-#[test]
-fn archive_member_bytes_are_not_restricted_to_windows_filenames() {
-    let domain = PageDomain::ArchiveLevel {
-        prefix: "chapter.".into(),
-    };
-    let page = CompositionPageRef::ArchiveEntry {
-        entry_name: "chapter./name:*?one|.PNG".into(),
-    };
-    let book = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![CompositionUnit::Single {
-            page: page.clone(),
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
-        }],
-    );
-    assert_eq!(
-        BookComposition::from_json(&book.to_json(&domain).unwrap(), &domain).unwrap(),
-        book
-    );
-    let projection = resolve_composition(
+    let original = archive("Chapter/???:A.JPG");
+    let book = BookComposition::new(ReadingDirection::Rtl, vec![original.clone()]);
+    book.validate(&domain).unwrap();
+    let actual = archive("CHAPTER/???:a.jpg");
+    let resolved = resolve_composition(
         &book,
         &domain,
         &[ManifestPage {
-            page: page.clone(),
+            page: actual.clone(),
             availability: ManifestAvailability::Present { item_index: 0 },
         }],
     )
     .unwrap();
-    assert_eq!(projection.visible_pages[0].page, page);
+    assert_eq!(resolved.visible_pages[0].page, actual);
+    assert_eq!(book.page_order, vec![original]);
 }
 
 #[test]
-fn adoption_reindex_keeps_units_helpers_and_targets_in_one_row_space() {
-    let fixture = editor_unit_edits(ReadingDirection::Ltr);
-    let projection = resolve(&fixture.moved, &document_manifest(4));
-    let remapped = projection
-        .reindex_items(&[Some(0), Some(3), Some(1), Some(2)])
-        .unwrap();
-    assert_eq!(
-        remapped
-            .visible_pages
-            .iter()
-            .map(|page| page.item_index)
-            .collect::<Vec<_>>(),
-        [0, 1, 2, 3]
-    );
-    assert_eq!(
-        remapped.page_status(&document_page(1)),
-        PageStatus::Visible { item_index: 3 }
-    );
-    assert_single(
-        &remapped.units[2],
-        1,
-        3,
-        SinglePlacement::Leading,
-        ResolvedCompanion::Blank,
-    );
-    let helper = resolve(&fixture.with_cover_helper, &document_manifest(4))
-        .reindex_items(&[Some(3), Some(2), Some(1), Some(0)])
-        .unwrap();
-    assert_single(
-        helper.units.last().unwrap(),
-        3,
-        0,
-        SinglePlacement::Trailing,
-        ResolvedCompanion::FrontCoverSupplement(ResolvedPage {
-            page: document_page(0),
-            item_index: 3,
+fn reference_byte_limit_and_unknown_override_shapes_are_rejected() {
+    let mut book = four_page_book(ReadingDirection::Ltr);
+    let mut wire = serde_json::to_value(&book).unwrap();
+    for directive in [
+        serde_json::json!({"kind":"automatic"}),
+        serde_json::json!({"kind":"blank_opposite"}),
+        serde_json::json!({"kind":"alone","placement":"leading"}),
+        serde_json::json!({"kind":"blank_opposite","page_side":"center"}),
+    ] {
+        wire["page_overrides"] =
+            serde_json::json!([{"page":{"kind":"pdf_page","page_num":0},"directive":directive}]);
+        assert!(
+            BookComposition::from_json(&serde_json::to_vec(&wire).unwrap(), &PageDomain::Document)
+                .is_err()
+        );
+    }
+    book.page_order = vec![CompositionPageRef::ArchiveEntry {
+        entry_name: "a".repeat(MAX_REFERENCE_BYTES + 1),
+    }];
+    assert!(matches!(
+        book.validate(&PageDomain::ArchiveLevel {
+            prefix: String::new()
         }),
-    );
-    assert!(
-        projection
-            .reindex_items(&[Some(0), None, Some(1), Some(2)])
-            .is_err()
-    );
-    assert!(
-        projection
-            .reindex_items(&[Some(0), Some(0), Some(1), Some(2)])
-            .is_err()
-    );
-    let hidden = resolve(&fixture.hidden, &document_manifest(4));
-    // Filtering B must produce three dense output rows, not old indices 0/2/3.
-    assert!(
-        hidden
-            .reindex_items(&[Some(0), None, Some(2), Some(3)])
-            .is_err()
-    );
-    assert!(
-        hidden
-            .reindex_items(&[Some(1), None, Some(2), Some(3)])
-            .is_err()
-    );
-    assert_eq!(
-        hidden
-            .reindex_items(&[Some(0), None, Some(1), Some(2)])
-            .unwrap()
-            .page_status(&document_page(1)),
-        PageStatus::HiddenByComposition
-    );
+        Err(CompositionError::Limit("reference bytes"))
+    ));
 }
 
 #[test]
-fn same_cover_and_visibility_edits_preserve_helpers_hidden_order_and_revision() {
-    let fixture = editor_unit_edits(ReadingDirection::Rtl);
-    let mut book = fixture.with_cover_helper;
-    book.revision = 31;
+fn maximum_document_record_and_repeated_visibility_directive_edits_remain_valid() {
+    let book = BookComposition::new(
+        ReadingDirection::Rtl,
+        (0..MAX_PAGES as u32).map(document_page).collect(),
+    );
+    book.validate(&PageDomain::Document).unwrap();
+    let projection = resolve(&book, &document_manifest(MAX_PAGES as u32));
+    assert_eq!(projection.visible_pages.len(), MAX_PAGES);
+    assert!(projection.complete);
+    let mut book = four_page_book(ReadingDirection::Ltr);
+    book.hidden_pages = vec![document_page(1), document_page(0)];
+    book.page_overrides = vec![
+        PageOverrideEntry {
+            page: document_page(1),
+            directive: PageOverride::Alone,
+        },
+        PageOverrideEntry {
+            page: document_page(0),
+            directive: PageOverride::Alone,
+        },
+    ];
     assert_eq!(
         book.edited(
             &PageDomain::Document,
-            UnitEdit::SetCover(Some(document_page(0)))
+            CompositionEdit::SetHidden {
+                page: document_page(1),
+                hidden: true
+            }
         )
         .unwrap(),
         book
     );
-    book.hidden_pages = vec![document_page(1), document_page(0)];
     assert_eq!(
         book.edited(
             &PageDomain::Document,
-            UnitEdit::SetHidden {
+            CompositionEdit::SetOverride {
                 page: document_page(1),
-                hidden: true
+                directive: Some(PageOverride::Alone)
             }
         )
         .unwrap(),
@@ -1342,33 +518,21 @@ fn same_cover_and_visibility_edits_preserve_helpers_hidden_order_and_revision() 
 }
 
 #[test]
-fn deleting_unsaved_tail_matches_fresh_manifest_and_other_projection_is_unchanged() {
-    let book = four_page_book(ReadingDirection::Ltr);
-    let before = resolve(&book, &document_manifest(5));
-    let sibling = before.clone();
-    let deleted = before
-        .remap_removed_items(
-            &[Some(0), Some(1), Some(2), Some(3), None],
-            &[document_page(4)],
-        )
-        .unwrap();
-    assert_eq!(deleted, resolve(&book, &document_manifest(4)));
-    assert_eq!(before, sibling);
-    assert_eq!(deleted.page_status(&document_page(4)), PageStatus::Invalid);
-}
-
-#[test]
-fn manifest_index_collision_and_manifest_limit_are_rejected() {
-    let book = four_page_book(ReadingDirection::Ltr);
-    let mut manifest = document_manifest(4);
-    manifest[1].availability = ManifestAvailability::Present { item_index: 0 };
-    assert!(resolve_composition(&book, &PageDomain::Document, &manifest).is_err());
-    assert_eq!(
-        resolve_composition(
-            &book,
-            &PageDomain::Document,
-            &document_manifest(MAX_PAGES as u32 + 1)
-        ),
-        Err(CompositionError::Limit("manifest pages"))
-    );
+fn cumulative_json_byte_limit_and_hidden_subset_are_validated_before_writes() {
+    let mut book = four_page_book(ReadingDirection::Ltr);
+    book.hidden_pages = vec![document_page(9)];
+    assert!(book.validate(&PageDomain::Document).is_err());
+    let prefix = "a".repeat(MAX_REFERENCE_BYTES - 32);
+    let page_order = (0..600)
+        .map(|n| CompositionPageRef::ArchiveEntry {
+            entry_name: format!("{prefix}{n}.jpg"),
+        })
+        .collect();
+    let book = BookComposition::new(ReadingDirection::Ltr, page_order);
+    assert!(matches!(
+        book.validate(&PageDomain::ArchiveLevel {
+            prefix: String::new()
+        }),
+        Err(CompositionError::Limit("JSON bytes"))
+    ));
 }

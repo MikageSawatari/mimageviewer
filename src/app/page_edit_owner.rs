@@ -287,6 +287,13 @@ impl App {
         let Some(owner) = self.capture_page_edit_owner(idx) else {
             return false;
         };
+        // Reading/preparing a canvas document is not an accepted edit. Keep
+        // receipt invalidation at the mutation seam, but reject UndoAppend
+        // before this input can finish another context's pending history.
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return false;
+        }
         // Resuming an unfinished pointer gesture is new input too. Register
         // completed sibling edits before it can produce another completed value,
         // while retaining this context's legal pointer/key continuation.
@@ -515,6 +522,9 @@ impl App {
         target: &PageAdjustmentTarget,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         if let LocalPageEditDocument::Editing {
             owner,
             layers: draft,
@@ -536,6 +546,11 @@ impl App {
         target: &PageAdjustmentTarget,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        // The stable target also accepts nonresident writes, where no indexed
+        // projection setter is available to perform mutation admission.
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.set_local_adjust_layers_for_target_memory_only(target, layers.clone());
         self.ensure_local_adjust_write_handle();
         let revision = self

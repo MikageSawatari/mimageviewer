@@ -3,6 +3,17 @@
 2026-10-11 §1.242 G3: `FsViewSpread` / `FsViewLandscapeSplit`を通常のfullscreen Action登録へ追加。
 既定キーなし、保存済みbindingの移行なし。構成本/A2では閲覧mode-only、通常本では既存表示ownerへ渡す。
 
+2026-10-14 §1.242 Q31: 構成本の既存見開きActionは、構成の方向×表紙に一致すればmode-onlyとして受け付ける。
+既定2=`FsSpreadLtr`（左→右・表紙なし）、3=`FsSpreadLtrCover`（左→右・表紙あり）、
+4=`FsSpreadRtl`（右→左・表紙なし）、5=`FsSpreadRtlCover`（右→左・表紙あり）、NumPadも同じ。
+既存Action・既定割当を変更せず、現在のkeymapを使って一致Actionのキーを拒否通知とHUDに表示する。
+一致Actionが未割当なら`FsViewSpread`の割当、それも未割当ならHUDの「見開き」を案内し、方向/表紙変更はPCの構成編集へ案内する。
+HUDの横長分割は`FsViewLandscapeSplit`のカスタム割当だけを表示し、拒否対象の旧8/9を表示しない。
+固定Pad Selectは構成本の単ページと一致見開きを循環し、picker/キー/リングは共通setterへ通す。
+Remoteの旧`SetSpread`は型付き受付で最新構成との一致を検証し、既存mode-only保存へ通す。
+不一致はWeb固定キーの一致見開きとPC編集を案内する。IPC形状は変更せず、構成/方向/表紙/休眠shiftには書き込まない。
+構成なし本と抽出一覧の既存操作は変更しない。正本は本構成計画§9.2と`keymap-spec.md`冒頭。
+
 > ステータス: **実装済み / 保守メモ**。v1.1.0+。
 > 設計の経緯・調査・代替案は [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) に残す。
 > 簡易版の実装判断は本書を優先し、差異が出たら本書へ集約する。
@@ -599,6 +610,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
 - FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)
 - FsNavigatorToggle `Alt+N` (P) / FsNavigatorHold `Alt` (MH。修飾↔修飾のみ)
+- FsPageTurnAnimationToggle 既定なし (P、2026-10-11 §1.341追補)。その他の機能のON/OFF行と同じKeyAction経由。環境設定と共通の全体設定を通常/F12で切り替える。表示項目カスタマイズやリングActionは追加しない。
 - FsLoupeLockToggle `M` (P) ★ / FsLoupeHold `Shift` (MH, Ph6。修飾↔修飾のみ)
 - FsOriginalPreviewHold `RightCtrl` (MH。Windows は右側限定、egui fallback は Ctrl に縮退)
 - FsEraseMode `E` ★ / FsLocalAdjustMode `Ctrl+G` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
@@ -611,7 +623,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsAdjustSlot1..10 `Ctrl+1`..`Ctrl+0` (P) ★ / FsClearAdjust `Ctrl+Backspace` ★
 - FsPin `P` ★ / FsApplyErase1/2 `F7/F8` / FsApplyConceal1/2 `F9/F10`
   (family・予約候補)
-- FsMetaUndo/Redo (handle_meta_undo_keys、family・実コード確認) /
+- `UndoLastAction` (Global / Press、既定 `Ctrl+Z`) はグリッド・画像ビューア共通の本追加一回取消 / メタデータUndo入口。
+  有効な追加receiptを先に扱い、処理中・失効検出を含め同じ入力で古いメタUndoへ続けない。
+  編集専用UndoとTextEdit / IME / dialogの所有を優先する。追加自体のRedoはない。
+  メタRedo (`Ctrl+Y` / `Ctrl+Shift+Z`) は従来の固定入力を維持 /
   FsPipelineDebug `Ctrl+Alt+Shift+D` (固定)
 
 ### FsVideo (Ph5、VK 経路)

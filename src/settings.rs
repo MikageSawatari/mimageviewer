@@ -889,6 +889,7 @@ pub enum FullscreenOverflowItemId {
     SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
+    PageTurnAnimationToggle,
     ImageAnalysis,
     PixelGrid,
     LoupeLock,
@@ -900,6 +901,7 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
+            Self::PageTurnAnimationToggle,
             Self::ImageAnalysis,
             Self::PixelGrid,
             Self::LoupeLock,
@@ -911,6 +913,7 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
+            Self::PageTurnAnimationToggle => "ページめくりアニメーション",
             Self::ImageAnalysis => "分析ツール",
             Self::PixelGrid => "ピクセルグリッド",
             Self::LoupeLock => "ルーペ固定",
@@ -5141,6 +5144,12 @@ pub struct Settings {
     /// 本ごとの見開き1ページずらしを記憶する。OFFでも保存済み調整は保持する。
     #[serde(default = "default_true")]
     pub remember_spread_shift_per_book: bool,
+    /// 単発のページ送りとスライドショーで紙めくり効果を使う。
+    #[serde(default)]
+    pub page_turn_animation_enabled: bool,
+    /// 動きを評価するための仮の演出時間 (ms)。100..=600 に制限する。
+    #[serde(default = "default_page_turn_animation_duration_ms")]
+    pub page_turn_animation_duration_ms: u32,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -7389,6 +7398,10 @@ fn default_slideshow_continuous_scroll_percent() -> u32 {
 fn default_spread_page_gap_px() -> u32 {
     4
 }
+
+fn default_page_turn_animation_duration_ms() -> u32 {
+    200
+}
 fn default_continuous_reading_gap_px() -> u32 {
     20
 }
@@ -7691,6 +7704,8 @@ impl Default for Settings {
             default_spread_mode: SpreadMode::default(),
             follow_document_reading_direction: false,
             remember_spread_shift_per_book: true,
+            page_turn_animation_enabled: false,
+            page_turn_animation_duration_ms: default_page_turn_animation_duration_ms(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -9993,6 +10008,7 @@ impl Settings {
                 FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS,
             );
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
+        self.page_turn_animation_duration_ms = self.page_turn_animation_duration_ms.clamp(100, 600);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
         self.fullscreen_fixed_bar_gap_px = self
             .fullscreen_fixed_bar_gap_px
@@ -14741,6 +14757,79 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(disabled).unwrap()).unwrap();
         assert!(!restored.remember_spread_shift_per_book);
+    }
+
+    #[test]
+    fn page_turn_animation_defaults_off_and_preserves_explicit_values() {
+        for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
+            assert!(!settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, 200);
+        }
+        let settings: Settings = serde_json::from_str(
+            r#"{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":350}"#,
+        )
+        .unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.page_turn_animation_enabled);
+        assert_eq!(restored.page_turn_animation_duration_ms, 350);
+        let snapshot = restored.preferences_snapshot();
+        assert!(snapshot.page_turn_animation_enabled);
+        assert_eq!(snapshot.page_turn_animation_duration_ms, 350);
+    }
+
+    #[test]
+    fn removed_single_page_turn_spine_is_ignored_and_not_saved() {
+        for legacy_value in [
+            serde_json::json!("OwnPage"),
+            serde_json::json!("Moving"),
+            serde_json::json!("FutureMode"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "page_turn_animation_enabled": true,
+                "page_turn_animation_duration_ms": 350,
+                "page_turn_single_spine": legacy_value,
+            }))
+            .unwrap();
+            assert!(settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, 350);
+            assert!(
+                serde_json::to_value(&settings)
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_value(settings.preferences_snapshot())
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn page_turn_animation_duration_sanitizes_to_provisional_range() {
+        for (input, expected) in [
+            (0, 100),
+            (99, 100),
+            (100, 100),
+            (350, 350),
+            (600, 600),
+            (601, 600),
+            (u32::MAX, 600),
+        ] {
+            let mut settings = Settings {
+                page_turn_animation_enabled: true,
+                page_turn_animation_duration_ms: input,
+                ..Settings::default()
+            };
+            settings.sanitize();
+            assert!(settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, expected);
+        }
     }
 
     #[test]

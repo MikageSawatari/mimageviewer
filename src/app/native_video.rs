@@ -3046,6 +3046,9 @@ impl App {
                 // 判断して二度目を呼ぶと、初回 close が整えた状態を巻き戻す。
                 match metadata_boundary {
                     super::FsMetadataBoundary::Manual => self.close_fullscreen(),
+                    boundary @ super::FsMetadataBoundary::BookAppend(_) => {
+                        self.close_fullscreen_now_with_metadata_boundary(boundary)
+                    }
                     super::FsMetadataBoundary::RatingMembership => self
                         .close_fullscreen_now_with_metadata_boundary(
                             super::FsMetadataBoundary::RatingMembership,
@@ -11822,7 +11825,10 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
-        if let Some(db) = self.video_bookmark_db.as_ref() {
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        {
             if let Err(e) = db.remove(id) {
                 crate::logger::log(format!("video bookmark remove failed: {e}"));
             } else {
@@ -11849,7 +11855,11 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
             _ => None,
         };
-        if let (Some(path), Some(db)) = (path, self.video_pin_db.as_ref()) {
+        let Some(path) = path else { return };
+        let Some(db) = self.user_video_pin_db() else {
+            return;
+        };
+        {
             match db.remove(&path) {
                 Ok(()) => {
                     // P ピン直後の後追い WebP 補完 (`tick_pending_pin_thumb_refresh`) が
@@ -11902,9 +11912,6 @@ impl App {
         let Some((path, duration)) = snapshot else {
             return;
         };
-        let Some(db) = self.video_bookmark_db.as_mut() else {
-            return;
-        };
         // 動画長を超える時刻は登録しない (= 不正なリスト保護)。duration が 0 (未確定)
         // のときは range check を skip し、`finite_video_target_secs` の clamp に任せる。
         let mut prepared: Vec<(f64, Option<String>)> = Vec::with_capacity(entries.len());
@@ -11928,14 +11935,21 @@ impl App {
             .iter()
             .map(|(pts, t)| (*pts, t.as_deref()))
             .collect();
-        let (added, skipped_duplicates, errors) =
-            match db.bulk_add_if_no_duplicate(&path, &entries_ref, 1.0) {
-                Ok(summary) => (summary.added, summary.skipped_duplicates, summary.errors),
-                Err(e) => {
-                    crate::logger::log(format!("video bookmark bulk add failed: {e}"));
-                    (0, 0, prepared.len())
-                }
+        let result = if entries_ref.is_empty() {
+            Ok(crate::video_bookmarks::BulkAddSummary::default())
+        } else {
+            let Some(db) = self.user_video_bookmark_db() else {
+                return;
             };
+            db.bulk_add_if_no_duplicate(&path, &entries_ref, 1.0)
+        };
+        let (added, skipped_duplicates, errors) = match result {
+            Ok(summary) => (summary.added, summary.skipped_duplicates, summary.errors),
+            Err(e) => {
+                crate::logger::log(format!("video bookmark bulk add failed: {e}"));
+                (0, 0, prepared.len())
+            }
+        };
         if added > 0 {
             self.refresh_fullscreen_video_marker_cache(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
@@ -12019,7 +12033,7 @@ impl App {
             _ => None,
         };
         let Some(path) = path else { return };
-        let Some(db) = self.video_bookmark_db.as_ref() else {
+        let Some(db) = self.user_video_bookmark_db() else {
             return;
         };
         match db.clear_for(&path) {
@@ -12056,7 +12070,10 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
-        if let Some(db) = self.video_bookmark_db.as_ref() {
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        {
             if let Err(e) = db.update_title(id, Some(&title)) {
                 crate::logger::log(format!("video bookmark title update failed: {e}"));
             } else {
@@ -12085,7 +12102,11 @@ impl App {
             }
             _ => None,
         };
-        if let (Some((path, pts)), Some(db)) = (snapshot, self.video_bookmark_db.as_ref()) {
+        let Some((path, pts)) = snapshot else { return };
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        {
             if let Err(e) = db.add(&path, pts, None, &[]) {
                 crate::logger::log(format!("video bookmark add failed: {e}"));
             } else {
@@ -12134,10 +12155,10 @@ impl App {
         let Some((path, pts, thumb)) = snapshot else {
             return;
         };
-        let Some(db) = self.video_pin_db.as_ref() else {
+        if self.video_pin_db.is_none() {
             crate::logger::log("video pin: DB not open".to_string());
             return;
-        };
+        }
         let webp = preencoded_webp.unwrap_or_else(|| {
             thumb
                 .as_ref()
@@ -12149,6 +12170,9 @@ impl App {
         });
         let webp_len = webp.len();
         let webp_was_empty = webp.is_empty();
+        let Some(db) = self.user_video_pin_db() else {
+            return;
+        };
         match db.set_pin(&path, pts, &webp) {
             Ok(()) => {
                 self.video_thumb_overrides_dirty_paths.insert(path.clone());
@@ -16098,6 +16122,9 @@ mod rating_terminal_close_tests {
                 assert!(app.video_presentation_transition.is_transitioning());
                 app.video_presentation_transition.dispatch(match boundary {
                     FsMetadataBoundary::Manual => PresentationTransitionEvent::TerminalClose,
+                    FsMetadataBoundary::BookAppend(_) => {
+                        unreachable!("this fixture only covers manual/rating boundaries")
+                    }
                     FsMetadataBoundary::RatingMembership => {
                         PresentationTransitionEvent::TerminalCloseForRatingMembership
                     }

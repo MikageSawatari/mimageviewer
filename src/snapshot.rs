@@ -127,6 +127,8 @@ impl SnapshotEntryKind {
 pub enum SnapshotSourceLabel {
     /// External physical media owns one explicit initial page beside projected siblings.
     DirectMedia {
+        /// Generation of the unchanged saved grid, before appending the direct reader target.
+        basis_generation: u64,
         target: PathBuf,
         policy: crate::file_type_visibility::FileTypeVisibility,
         reader_order: Vec<usize>,

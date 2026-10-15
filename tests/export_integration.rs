@@ -883,14 +883,14 @@ fn batch_item(
     filename: &str,
     format: mimageviewer::capture::CaptureFormat,
 ) -> mimageviewer::export_batch::BatchExportItem {
-    mimageviewer::export_batch::BatchExportItem {
-        filename: filename.to_string(),
-        dirname: "src".to_string(),
-        source: CompositeSource::File {
+    mimageviewer::export_batch::BatchExportItem::new(
+        filename.to_string(),
+        "src".to_string(),
+        CompositeSource::File {
             path: source_path.to_path_buf(),
         },
-        edits: batch_edits(format),
-    }
+        batch_edits(format),
+    )
 }
 
 #[test]

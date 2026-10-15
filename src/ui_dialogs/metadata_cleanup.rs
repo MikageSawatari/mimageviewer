@@ -136,6 +136,9 @@ impl App {
         if scan.orphan_total() == 0 {
             return;
         }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.metadata_cleanup_result = None;
         self.metadata_cleanup_pending = Some(crate::metadata_cleanup::spawn_delete(
             crate::data_dir::get(),

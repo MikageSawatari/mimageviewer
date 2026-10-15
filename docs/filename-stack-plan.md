@@ -217,3 +217,21 @@ ZIP エントリの間接層も DB も無いぶん、ZIP ツリーよりむし�
 連続 8 回の読込失敗（4 秒上限で 2 回失敗）後は、最後に受理した集約表示で操作を再開し、
 日本語の非 modal 通知を一度表示する。候補順を再計算せず、4 秒間隔を上限に編集・★・タグ情報を
 裏側で再読込し、成功時に差し替える。遷移で旧 request は破棄する。
+
+## 成功Deleteと保持投影（2026-10-14、§1.375レビュー修正）
+
+自己Deleteの成功分は、表示行だけでなくStackViewのmember／passthroughとaggregate／flat対応表にも反映する。
+既存のdelete workerが元のgrouping／rating順snapshotからsurvivorを準備し、同じ候補順から対応表を作る。
+保持した集約投影は既存candidate読込みで準備する。2枚から単独Imageへの変更でも、生存画像の編集・★・
+タグを持つ投影を返す。maintenance lease解放後のworkerで行い、UIへ全件clone・sort・同期I/Oを足さない。
+DeletePendingの同じ終端でcontext／generation／元view Arcを確認し、表示行除去と同時に受理する。
+途中取消・部分失敗は成功分だけを採用し、共有Arcの兄弟contextは変更しない。
+削除中の背景Stack採用／close reconcileは既存modalの終端まで延期する。
+監視scanがEqualでも、この完了境界で対応表は整合済みなのでinstallを省ける。
+読込み失敗はログ＋通知し、flat survivorを保ち、観測不明＋既存の一覧復帰時refreshへ渡す。
+未採用のflat列をaggregate modeとして既存Recoveringへ渡さない。
+
+初回分類中の成功Deleteも、元のExtracting／Grouping／Retryの所有資格を照合して旧要求を
+取消・retirement workerへ渡す。通常Folderは観測不明から既存の再走査で分類をやり直し、
+サブ展開は削除後のcurrent itemsと既存snapshot／tombstoneから同じ分類入口を再開する。
+成功ゼロでは初期要求を残す。新pending owner・UIでの全件複製・同期I/Oは増やさない。

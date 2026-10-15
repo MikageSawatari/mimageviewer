@@ -78,9 +78,10 @@ fn accepted(
     (projection, record, *generation)
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
-fn batch_removal_reindexes_topology_targets_resume_and_export_before_reload() {
+fn batch_removal_reindexes_flat_order_targets_resume_and_export_before_reload() {
     let mut env = setup_app();
     let root = env.tmp.path().join("deletion.pdf");
     install(
@@ -112,14 +113,11 @@ fn batch_removal_reindexes_topology_targets_resume_and_export_before_reload() {
     assert_eq!(
         projection
             .resolved
-            .units
+            .visible_pages
             .iter()
-            .map(|unit| unit
-                .navigation_pages()
-                .map(|page| page.item_index)
-                .collect::<Vec<_>>())
+            .map(|page| page.item_index)
             .collect::<Vec<_>>(),
-        vec![vec![0], vec![1, 2]]
+        vec![0, 1, 2]
     );
     assert_eq!(
         projection.resolved.page_status(&fixtures::document_page(1)),
@@ -162,15 +160,16 @@ fn batch_removal_reindexes_topology_targets_resume_and_export_before_reload() {
     let nav = env.get_nav_indices();
     assert_eq!(
         env.spread_display_unit_pages_for_test(&nav),
-        vec![vec![0], vec![1, 2]]
+        vec![vec![0, 1], vec![2]]
     );
     assert_eq!(
         env.spread_display_composition_for_anchor(1)
             .navigation_pages(),
-        vec![1, 2]
+        vec![0, 1]
     );
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn removal_preserves_hidden_reference_and_empty_projection_without_repairing_record() {
@@ -185,7 +184,6 @@ fn removal_preserves_hidden_reference_and_empty_projection_without_repairing_rec
     assert!(Arc::ptr_eq(record, &saved));
     assert_eq!(record.composition, book);
     assert_eq!(generation, env.items_generation);
-    assert!(projection.resolved.units.is_empty());
     assert!(projection.resolved.visible_pages.is_empty());
     assert_eq!(
         projection.resolved.page_status(&fixtures::document_page(1)),
@@ -203,6 +201,7 @@ fn removal_preserves_hidden_reference_and_empty_projection_without_repairing_rec
     assert!(env.get_nav_indices().is_empty());
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn removal_adoption_invalidates_permission_proof_and_same_slot_cache() {
@@ -279,6 +278,7 @@ fn removal_adoption_invalidates_permission_proof_and_same_slot_cache() {
     process.shutdown_and_join();
 }
 
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn invalid_removal_preparation_leaves_owner_and_rows_unchanged() {
@@ -300,6 +300,7 @@ fn invalid_removal_preparation_leaves_owner_and_rows_unchanged() {
 }
 
 #[cfg(windows)]
+#[cfg(test)]
 #[test]
 #[cfg(test)]
 fn removal_updates_only_mounted_composed_context() {
@@ -342,4 +343,111 @@ fn removal_updates_only_mounted_composed_context() {
     });
     env.retire_context(sibling, "g3_item_removal_sibling_test", |_| ())
         .unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn removal_adoption_remaps_page_directive_and_preserves_its_saved_identity() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("directive.pdf");
+    let mut book = fixtures::four_page_book(ReadingDirection::Ltr);
+    book.page_overrides.push(PageOverrideEntry {
+        page: fixtures::document_page(2),
+        directive: PageOverride::Alone,
+    });
+    install(&mut env, &root, &book);
+    let saved = Arc::clone(accepted(&env).1);
+    env.remove_items_batch(&[1]);
+    let (projection, record, _) = accepted(&env);
+    assert!(Arc::ptr_eq(record, &saved));
+    assert_eq!(
+        projection.resolved.page_override(1),
+        Some(PageOverride::Alone)
+    );
+    assert_eq!(projection.resolved.page_override(2), None);
+    assert_eq!(
+        record
+            .composition
+            .page_override(&fixtures::document_page(2)),
+        Some(PageOverride::Alone)
+    );
+    assert_eq!(
+        projection.resolved.page_status(&fixtures::document_page(1)),
+        PageStatus::Missing
+    );
+    let nav = env.get_nav_indices();
+    assert_eq!(
+        env.spread_display_unit_pages_for_test(&nav),
+        vec![vec![0], vec![1], vec![2]]
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn all_selected_book_output_uses_composed_real_order_without_hidden_blank_or_cover_copy_sources() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("output.pdf");
+    let mut book = BookComposition::new(
+        ReadingDirection::Ltr,
+        [3, 0, 1, 2].map(fixtures::document_page).to_vec(),
+    );
+    book.cover_enabled = true;
+    book.hidden_pages.push(fixtures::document_page(1));
+    book.page_overrides.push(PageOverrideEntry {
+        page: fixtures::document_page(2),
+        directive: PageOverride::BlankOpposite {
+            page_side: PageSide::Trailing,
+        },
+    });
+    install(&mut env, &root, &book);
+    // Both grid book-add and batch export share this selection order; selecting
+    // every materialized row cannot restore a hidden saved reference.
+    env.checked = (0..env.items.len()).rev().collect();
+    assert_eq!(env.grid_selection_indices(), vec![0, 1, 2]);
+    let (targets, skipped) = env.grid_batch_export_targets();
+    assert_eq!(skipped, 0);
+    assert_eq!(targets.len(), 3);
+    let (items, skipped) = env.prepare_all_batch_export_items_for_test();
+    assert_eq!(skipped, 0);
+    let pages: Vec<_> = items
+        .iter()
+        .map(|item| match &item.source {
+            crate::books::CompositeSource::PdfPage {
+                pdf_path, page_num, ..
+            } => {
+                assert_eq!(pdf_path, &root);
+                *page_num
+            }
+            _ => panic!("only real document sources are exportable"),
+        })
+        .collect();
+    assert_eq!(pages, vec![3, 0, 2]);
+    assert_eq!(accepted(&env).1.composition, book);
+}
+
+#[cfg(test)]
+#[test]
+fn all_selected_ordinary_book_output_keeps_original_real_page_order() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("ordinary-output.pdf");
+    env.current_folder = Some(root.clone());
+    env.items = (0..4)
+        .map(|page| book_materialization::document_page_item(&root, page))
+        .collect();
+    env.visible_indices = (0..4).collect();
+    env.thumbnails = vec![ThumbnailState::Pending; 4];
+    env.book_composition = ViewerBookComposition::Automatic;
+    env.checked = (0..4).collect();
+    let (items, skipped) = env.prepare_all_batch_export_items_for_test();
+    assert_eq!(skipped, 0);
+    assert_eq!(
+        items
+            .into_iter()
+            .map(|item| match item.source {
+                crate::books::CompositeSource::PdfPage { page_num, .. } => page_num,
+                _ => panic!("document source expected"),
+            })
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
 }

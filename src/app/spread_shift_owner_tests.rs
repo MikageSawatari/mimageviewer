@@ -397,8 +397,12 @@ fn q3_successful_mode_repress_mode_flow_and_direction_resets_clear_in_fifo_order
         env.set_live_spread_shift(1);
         let before = service.watermarks().admitted;
         match operation {
-            0 => env.apply_fullscreen_spread_mode(&ctx, 0, crate::settings::SpreadMode::Ltr),
-            1 => env.apply_fullscreen_spread_mode(&ctx, 0, crate::settings::SpreadMode::LtrCover),
+            0 => {
+                env.apply_fullscreen_spread_mode(&ctx, 0, crate::settings::SpreadMode::Ltr);
+            }
+            1 => {
+                env.apply_fullscreen_spread_mode(&ctx, 0, crate::settings::SpreadMode::LtrCover);
+            }
             2 => {
                 env.set_reading_flow_for_fullscreen(&ctx, 0, crate::settings::ReadingFlow::Vertical)
             }
@@ -445,8 +449,12 @@ fn explicit_clear_and_q3_resets_during_real_maintenance_keep_fifo_clear_and_noti
             0 => {
                 env.reset_live_spread_shift(true);
             }
-            1 => env.apply_fullscreen_spread_mode(&ctx, 0, current_mode),
-            2 => env.apply_fullscreen_spread_mode(&ctx, 0, crate::settings::SpreadMode::LtrCover),
+            1 => {
+                env.apply_fullscreen_spread_mode(&ctx, 0, current_mode);
+            }
+            2 => {
+                env.apply_fullscreen_spread_mode(&ctx, 0, crate::settings::SpreadMode::LtrCover);
+            }
             3 => {
                 env.set_reading_flow_for_fullscreen(&ctx, 0, crate::settings::ReadingFlow::Vertical)
             }

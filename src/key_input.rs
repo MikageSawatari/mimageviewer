@@ -7,7 +7,8 @@
 //! registered `ViewportId` before it enters the queue.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -28,6 +29,48 @@ const MAX_LOGGED_UNREGISTERED_HWND: usize = 16;
 const MAX_SYNTHETIC_INPUT_ISSUES: usize = 64;
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_nanos(33_333_333);
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationInputPolicy {
+    Off,
+    Observe,
+    ObserveAndTrace,
+}
+
+static OPERATION_INPUT_POLICY: AtomicU8 = AtomicU8::new(OperationInputPolicy::Off as u8);
+
+fn operation_input_policy() -> OperationInputPolicy {
+    match OPERATION_INPUT_POLICY.load(Ordering::Relaxed) {
+        1 => OperationInputPolicy::Observe,
+        2 => OperationInputPolicy::ObserveAndTrace,
+        _ => OperationInputPolicy::Off,
+    }
+}
+
+fn operation_input_observation_enabled(_ctx: &egui::Context) -> bool {
+    // App construction/adoption can run in parallel UI tests. An explicit
+    // fixture flag controls only this test Context, never production policy.
+    #[cfg(test)]
+    if let Some(enabled) =
+        _ctx.data(|data| data.get_temp::<bool>(egui::Id::new("page_turn_input_enabled")))
+    {
+        return enabled;
+    }
+    operation_input_policy() != OperationInputPolicy::Off
+}
+
+/// Update only at startup/settings adoption, never on an OFF render pass.
+pub(crate) fn set_page_turn_ingress_instrumentation_enabled(enabled: bool) {
+    let policy = if !enabled {
+        OperationInputPolicy::Off
+    } else if crate::perf::is_enabled() {
+        OperationInputPolicy::ObserveAndTrace
+    } else {
+        OperationInputPolicy::Observe
+    };
+    OPERATION_INPUT_POLICY.store(policy as u8, Ordering::Relaxed);
+}
 
 /// A physical Windows key slot used by level-sensitive input consumers.
 ///
@@ -1173,8 +1216,47 @@ impl SyntheticPointerTransaction {
     }
 }
 
+/// Original input surface. Forwarding changes the destination, never this source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyOperationSource {
+    Native {
+        hwnd: u64,
+        viewport: egui::ViewportId,
+    },
+    Egui {
+        viewport: egui::ViewportId,
+    },
+}
+
+/// One delivery in an ingress transaction, independent of mutable event indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KeyOperationId {
+    pub batch_id: u64,
+    pub source: KeyOperationSource,
+    pub ingress_ordinal: u64,
+}
+
+impl KeyOperationId {
+    /// Unpublished fixture/diagnostic edge; queue ingress replaces this marker.
+    pub const fn unassigned() -> Self {
+        Self {
+            batch_id: 0,
+            source: KeyOperationSource::Egui {
+                viewport: egui::ViewportId::ROOT,
+            },
+            ingress_ordinal: 0,
+        }
+    }
+}
+
+fn next_key_operation_batch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyEdge {
+    pub operation_id: KeyOperationId,
     pub source_hwnd: u64,
     pub source_viewport: egui::ViewportId,
     pub virtual_key: u32,
@@ -1202,6 +1284,7 @@ struct RawKeyEdge {
 impl RawKeyEdge {
     fn with_source(self, source_hwnd: u64, source_viewport: egui::ViewportId) -> KeyEdge {
         KeyEdge {
+            operation_id: KeyOperationId::unassigned(),
             source_hwnd,
             source_viewport,
             virtual_key: self.virtual_key,
@@ -1390,6 +1473,7 @@ impl MaterializedSyntheticEvent {
     fn key_edge(self) -> KeyEdge {
         let slot = self.key.physical_slot();
         KeyEdge {
+            operation_id: KeyOperationId::unassigned(),
             source_hwnd: self.target.hwnd,
             source_viewport: self.target.viewport,
             virtual_key: slot.vk,
@@ -1940,6 +2024,10 @@ struct KeyInputState {
     installed_hwnds: HwndViewportRegistry,
     pending: VecDeque<KeyEdge>,
     frame: Vec<KeyEdge>,
+    /// Immutable delivery facts, including edges already claimed by handlers.
+    operation_frame: Vec<KeyEdge>,
+    ingress_batch: Option<u64>,
+    ingress_ordinal: u64,
     frame_active_viewports: Vec<egui::ViewportId>,
     return_keys: ViewportReturnKeyStates,
     logged_unregistered_hwnds: Vec<u64>,
@@ -1965,19 +2053,42 @@ impl KeyInputState {
         // viewport that happens to reuse the same ViewportId.
         self.pending.retain(|edge| edge.source_hwnd != hwnd_raw);
         self.frame.retain(|edge| edge.source_hwnd != hwnd_raw);
+        self.operation_frame
+            .retain(|edge| edge.source_hwnd != hwnd_raw);
         if !self.installed_hwnds.contains_viewport(viewport) {
             self.return_keys.clear_viewport(viewport);
         }
         if self.installed_hwnds.is_empty() {
             self.pending.clear();
             self.frame.clear();
+            self.operation_frame.clear();
             self.frame_active_viewports.clear();
             self.return_keys.clear();
         }
         Some(viewport)
     }
 
+    fn stamp_key_edge(&mut self, mut edge: KeyEdge) -> KeyEdge {
+        if edge.operation_id.batch_id == 0 {
+            let batch_id = *self
+                .ingress_batch
+                .get_or_insert_with(next_key_operation_batch);
+            edge.operation_id = KeyOperationId {
+                batch_id,
+                source: KeyOperationSource::Native {
+                    hwnd: edge.source_hwnd,
+                    viewport: edge.source_viewport,
+                },
+                ingress_ordinal: self.ingress_ordinal,
+            };
+            self.ingress_ordinal += 1;
+        }
+        edge
+    }
+
     fn enqueue_key_edge(&mut self, edge: KeyEdge) {
+        let edge = self.stamp_key_edge(edge);
+        trace_key_operation_ingress(KeyOperationEdge::Native(edge));
         self.return_keys.apply_edge(edge.source_viewport, &edge);
         while self.pending.len() >= MAX_PENDING_EVENTS {
             self.pending.pop_front();
@@ -1994,7 +2105,7 @@ impl KeyInputState {
             .installed_hwnds
             .viewport_for_hwnd(hwnd_raw)
             .unwrap_or(egui::ViewportId::ROOT);
-        let edge = raw.with_source(hwnd_raw, source_viewport);
+        let edge = self.stamp_key_edge(raw.with_source(hwnd_raw, source_viewport));
         self.enqueue_key_edge(edge);
 
         let unregistered = self.installed_hwnds.viewport_for_hwnd(hwnd_raw).is_none();
@@ -2594,6 +2705,297 @@ impl egui::Plugin for SyntheticInputPlugin {
 /// the same normalization order as backend-generated key events.
 pub(crate) fn install_synthetic_input_plugin(ctx: &egui::Context) {
     ctx.add_plugin(SyntheticInputPlugin::default());
+    install_operation_input_plugin(ctx);
+}
+
+/// Install in every egui Context, including non-Windows backends.
+pub(crate) fn install_operation_input_plugin(ctx: &egui::Context) {
+    ctx.add_plugin(KeyOperationInputPlugin);
+}
+
+/// Read-only operation evidence. Releases stay in the snapshot for ordered
+/// down/up attribution, but callers must not promote them to new operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyOperationEdge {
+    Native(KeyEdge),
+    Egui {
+        operation_id: KeyOperationId,
+        key: egui::Key,
+        physical_key: Option<egui::Key>,
+        pressed: bool,
+        repeat: bool,
+        modifiers: egui::Modifiers,
+    },
+}
+
+impl KeyOperationEdge {
+    pub fn operation_id(self) -> KeyOperationId {
+        match self {
+            Self::Native(edge) => edge.operation_id,
+            Self::Egui { operation_id, .. } => operation_id,
+        }
+    }
+
+    pub fn pressed(self) -> bool {
+        match self {
+            Self::Native(edge) => edge.pressed,
+            Self::Egui { pressed, .. } => pressed,
+        }
+    }
+
+    pub fn repeat(self) -> bool {
+        match self {
+            Self::Native(edge) => edge.repeat,
+            Self::Egui { repeat, .. } => repeat,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EguiKeyOperationBatch {
+    /// egui's frame transaction boundary, not an identity component. All
+    /// discarded/replayed passes of Context::run retain the allocated batch.
+    frame_nr: u64,
+    first_pass_nr: u64,
+    edges: Arc<[KeyOperationEdge]>,
+}
+
+fn egui_key_operation_batch(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+) -> Option<Arc<[KeyOperationEdge]>> {
+    let id = egui::Id::new(("key_operation_ingress", viewport));
+    let frame_nr = ctx.cumulative_frame_nr_for(viewport);
+    let first_pass_nr = ctx
+        .cumulative_pass_nr_for(viewport)
+        .saturating_sub(ctx.current_pass_index() as u64);
+    if let Some(batch) = ctx.data(|data| data.get_temp::<EguiKeyOperationBatch>(id))
+        && batch.frame_nr == frame_nr
+        && (viewport != ctx.viewport_id() || batch.first_pass_nr == first_pass_nr)
+    {
+        return Some(batch.edges);
+    }
+    let mut batch_id = None;
+    let edges = ctx.input_for(viewport, |input| {
+        input
+            .raw
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, event)| {
+                let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                } = event
+                else {
+                    return None;
+                };
+                Some(KeyOperationEdge::Egui {
+                    operation_id: KeyOperationId {
+                        batch_id: *batch_id.get_or_insert_with(next_key_operation_batch),
+                        source: KeyOperationSource::Egui { viewport },
+                        ingress_ordinal: ordinal as u64,
+                    },
+                    key: *key,
+                    physical_key: *physical_key,
+                    pressed: *pressed,
+                    repeat: *repeat,
+                    modifiers: *modifiers,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    // Keyless transactions need neither an Arc allocation nor a temp-data
+    // update. The existing transaction boundary makes any older cache stale.
+    if edges.is_empty() {
+        return None;
+    }
+    for edge in &edges {
+        trace_key_operation_ingress(*edge);
+    }
+    let edges: Arc<[KeyOperationEdge]> = edges.into();
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            id,
+            EguiKeyOperationBatch {
+                frame_nr,
+                first_pass_nr,
+                edges: edges.clone(),
+            },
+        )
+    });
+    Some(edges)
+}
+
+struct KeyOperationInputPlugin;
+
+/// Diagnostic application-ingress time, not hardware input or OS queue time.
+/// The original immutable batch is logged once; replay never restamps it.
+fn trace_key_operation_ingress(edge: KeyOperationEdge) {
+    let (source, viewport, hwnd) = match edge {
+        KeyOperationEdge::Native(edge) => (
+            "win32_enqueue",
+            edge.source_viewport,
+            Some(edge.source_hwnd),
+        ),
+        KeyOperationEdge::Egui { operation_id, .. } => match operation_id.source {
+            KeyOperationSource::Egui { viewport } => ("egui_raw_delivery", viewport, None),
+            KeyOperationSource::Native { hwnd, viewport } => {
+                ("win32_enqueue", viewport, Some(hwnd))
+            }
+        },
+    };
+    trace_page_turn_operation_ingress(
+        || format!("Key({:?})", edge.operation_id()),
+        viewport,
+        hwnd,
+        if !edge.pressed() {
+            "release"
+        } else if edge.repeat() {
+            "Repeat"
+        } else {
+            "Press"
+        },
+        source,
+    );
+}
+
+/// Records the application delivery boundary in the existing perf monotonic
+/// domain. The formatter is lazy, so OFF creates no diagnostic allocation.
+pub(crate) fn trace_page_turn_operation_ingress(
+    operation_id: impl FnOnce() -> String,
+    viewport: egui::ViewportId,
+    hwnd: Option<u64>,
+    phase: &'static str,
+    ingress_stage: &'static str,
+) {
+    if operation_input_policy() != OperationInputPolicy::ObserveAndTrace {
+        return;
+    }
+    crate::perf::event(
+        "input",
+        "key_edge_ingress",
+        None,
+        0,
+        &[
+            ("operation_id", operation_id().into()),
+            ("source_viewport", format!("{viewport:?}").into()),
+            (
+                "source_hwnd",
+                hwnd.map_or(serde_json::Value::Null, serde_json::Value::from),
+            ),
+            ("ingress_stage", ingress_stage.into()),
+            ("phase", phase.into()),
+        ],
+    );
+}
+
+impl egui::Plugin for KeyOperationInputPlugin {
+    fn debug_name(&self) -> &'static str {
+        "miv_key_operation_ingress"
+    }
+
+    fn on_begin_pass(&mut self, ctx: &egui::Context) {
+        // OFF leaves only generic ingress IDs on the native queue. An actual
+        // egui fallback consumer may still lazily request provenance below.
+        if !operation_input_observation_enabled(ctx) {
+            return;
+        }
+        // Before application consumers mutate InputState.events. egui has
+        // already normalized repeat, and the IME hook has kept its ownership.
+        if !ctx.input(|input| {
+            input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Key { .. }))
+        }) {
+            return;
+        }
+        let _ = egui_key_operation_batch(ctx, ctx.viewport_id());
+    }
+}
+
+/// Original native delivery batch, even after another handler consumes edges.
+pub fn native_operation_key_edges(viewport: egui::ViewportId) -> Vec<KeyEdge> {
+    state()
+        .lock()
+        .map(|guard| {
+            guard
+                .operation_frame
+                .iter()
+                .copied()
+                .filter(|edge| edge.source_viewport == viewport)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Original egui delivery batch. This never consumes or injects an event.
+pub fn egui_operation_key_edges(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+) -> Vec<KeyOperationEdge> {
+    egui_key_operation_batch(ctx, viewport)
+        .map(|edges| edges.to_vec())
+        .unwrap_or_default()
+}
+
+/// Select a matched delivery without cloning the immutable event batch. The
+/// original initial press wins over repeats, including normalized replay.
+pub fn egui_operation_key_id<F>(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+    mut matches: F,
+) -> Option<KeyOperationId>
+where
+    F: FnMut(KeyOperationEdge) -> bool,
+{
+    let edges = egui_key_operation_batch(ctx, viewport)?;
+    let mut first_repeat = None;
+    for edge in edges.iter().copied() {
+        if edge.pressed() && matches(edge) {
+            if !edge.repeat() {
+                return Some(edge.operation_id());
+            }
+            first_repeat.get_or_insert(edge.operation_id());
+        }
+    }
+    first_repeat
+}
+
+/// Prefer the HWND-stamped transaction whenever it contains a key-down.
+/// ROOT forwarding uses the same snapshot with ROOT as the source viewport.
+pub fn operation_key_edges(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+) -> Vec<KeyOperationEdge> {
+    let native = native_operation_key_edges(viewport);
+    if native.iter().any(|edge| edge.pressed) {
+        native.into_iter().map(KeyOperationEdge::Native).collect()
+    } else {
+        // Preserve the existing egui fallback's focus/source proof. An egui
+        // twin alone must never expose a sibling HWND's physical slot here.
+        if !ctx
+            .input_for(viewport, |input| input.viewport().focused)
+            .unwrap_or(true)
+        {
+            return Vec::new();
+        }
+        let mut egui = egui_operation_key_edges(ctx, viewport);
+        #[cfg(windows)]
+        if is_frame_active(viewport) {
+            egui.retain(|edge| match edge {
+                KeyOperationEdge::Egui { key, .. } => !crate::keymap::KeyName::from_egui(*key)
+                    .is_some_and(crate::keymap::KeyName::egui_event_cannot_identify_slot),
+                KeyOperationEdge::Native(_) => true,
+            });
+        }
+        egui
+    }
 }
 
 pub fn take_synthetic_input_issues(ctx: &egui::Context) -> Vec<SyntheticInputIssue> {
@@ -2970,11 +3372,27 @@ fn install_window_subclass(hwnd_raw: u64, viewport: egui::ViewportId, label: &'s
 }
 
 pub fn begin_frame() {
+    begin_frame_with_tracking(true);
+}
+
+fn begin_frame_with_tracking(track_operations: bool) {
     if let Ok(mut guard) = state().lock() {
         guard.frame.clear();
         while let Some(edge) = guard.pending.pop_front() {
             guard.frame.push(edge);
         }
+        let KeyInputState {
+            frame,
+            operation_frame,
+            ..
+        } = &mut *guard;
+        if track_operations {
+            operation_frame.clone_from(frame);
+        } else {
+            operation_frame.clear();
+        }
+        guard.ingress_batch = None;
+        guard.ingress_ordinal = 0;
         guard.frame_active_viewports = guard.installed_hwnds.unique_viewports();
         let edge_viewports: Vec<_> = guard
             .frame
@@ -2986,6 +3404,20 @@ pub fn begin_frame() {
                 guard.frame_active_viewports.push(viewport);
             }
         }
+    }
+}
+
+/// Open the native delivery transaction once per backend RawInput frame.
+/// egui layout replay observes the same original facts and consumed state.
+pub fn begin_frame_for_context(ctx: &egui::Context) {
+    begin_frame_for_context_with_tracking(ctx, true);
+}
+
+/// Production passes the owning App's adopted setting directly. Snapshot
+/// observation is optional; generic native consumption and replay are not.
+pub fn begin_frame_for_context_with_tracking(ctx: &egui::Context, enabled: bool) {
+    if ctx.current_pass_index() == 0 {
+        begin_frame_with_tracking(enabled);
     }
 }
 
@@ -3012,6 +3444,7 @@ pub fn frame_had_key_down(viewport: egui::ViewportId) -> bool {
 pub struct ConsumeKeyDownResult {
     pub matched_count: usize,
     pub triggered_count: usize,
+    pub operation_id: Option<KeyOperationId>,
 }
 
 /// Ordered physical-edge facts for one consumed key press stream.
@@ -3025,6 +3458,8 @@ pub struct ConsumeKeyPressEdgesResult {
     pub had_initial_press: bool,
     pub had_repeat: bool,
     pub released_after_match: bool,
+    /// First initial press, or the first repeat if there was no initial press.
+    pub operation_id: Option<KeyOperationId>,
 }
 
 /// Consume the ordered key-down stream for one chord plus any later release of
@@ -3069,6 +3504,10 @@ where
 
                 guard.frame.remove(index);
                 if matching_down {
+                    if result.operation_id.is_none() || (!result.had_initial_press && !edge.repeat)
+                    {
+                        result.operation_id = Some(edge.operation_id);
+                    }
                     result.matched_count += 1;
                     result.had_initial_press |= !edge.repeat;
                     result.had_repeat |= edge.repeat;
@@ -3131,6 +3570,10 @@ where
             while index < guard.frame.len() {
                 let edge = guard.frame[index];
                 if edge.source_viewport == viewport && edge.pressed && predicate(edge) {
+                    if result.operation_id.is_none() || (physical_press_count == 0 && !edge.repeat)
+                    {
+                        result.operation_id = Some(edge.operation_id);
+                    }
                     result.matched_count += 1;
                     if edge.repeat {
                         matched_repeat = true;
@@ -3177,7 +3620,15 @@ pub fn set_test_frame_for_viewport(viewport: egui::ViewportId, mut edges: Vec<Ke
         edge.source_viewport = viewport;
     }
     if let Ok(mut guard) = state().lock() {
-        guard.frame = edges;
+        guard.ingress_batch = None;
+        guard.ingress_ordinal = 0;
+        guard.frame = edges
+            .into_iter()
+            .map(|edge| guard.stamp_key_edge(edge))
+            .collect();
+        guard.operation_frame = guard.frame.clone();
+        guard.ingress_batch = None;
+        guard.ingress_ordinal = 0;
         guard.frame_active_viewports = vec![viewport];
     }
 }
@@ -3191,7 +3642,15 @@ pub(crate) fn set_test_routed_frame(edges: Vec<KeyEdge>) {
                 guard.frame_active_viewports.push(edge.source_viewport);
             }
         }
-        guard.frame = edges;
+        guard.ingress_batch = None;
+        guard.ingress_ordinal = 0;
+        guard.frame = edges
+            .into_iter()
+            .map(|edge| guard.stamp_key_edge(edge))
+            .collect();
+        guard.operation_frame = guard.frame.clone();
+        guard.ingress_batch = None;
+        guard.ingress_ordinal = 0;
     }
 }
 
@@ -3199,6 +3658,7 @@ pub(crate) fn set_test_routed_frame(edges: Vec<KeyEdge>) {
 pub fn clear_test_frame() {
     if let Ok(mut guard) = state().lock() {
         guard.frame.clear();
+        guard.operation_frame.clear();
         guard.frame_active_viewports.clear();
         guard.return_keys.clear();
     }
@@ -3223,6 +3683,7 @@ pub fn set_test_return_key_state(viewport: egui::ViewportId, main_down: bool, nu
                 continue;
             }
             let edge = KeyEdge {
+                operation_id: KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: viewport,
                 virtual_key: 0x0D,
@@ -3599,16 +4060,17 @@ mod tests {
     }
 
     use super::{
-        KeyEdge, KeyInputState, PhysicalKeySlot, RawKeyEdge, RegisterHwndResult, ReturnKeyState,
-        SyntheticInputFact, SyntheticInputIssue, SyntheticInputPlugin, SyntheticKeyCommand,
-        SyntheticModifiers, SyntheticNavigationKey, SyntheticRoutingTargetError, TEST_INPUT_LOCK,
-        arm_test_synthetic_input, arm_test_synthetic_input_without_registration, begin_frame,
-        clear_test_synthetic_input, consume_all_key_down_with_result, consume_key_down,
-        consume_key_edges, diagnostic_pressed_key_down_any_viewport,
-        enqueue_test_synthetic_command, lock_test_input, materialize_test_synthetic_input,
-        physical_key_down, physical_key_down_from, pressed_key_down,
-        register_test_synthetic_target, resolve_synthetic_routing_target, set_test_frame,
-        set_test_frame_for_viewport, set_test_routed_frame, set_test_synthetic_repeat, state,
+        KeyEdge, KeyInputState, KeyOperationId, PhysicalKeySlot, RawKeyEdge, RegisterHwndResult,
+        ReturnKeyState, SyntheticInputFact, SyntheticInputIssue, SyntheticInputPlugin,
+        SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey,
+        SyntheticRoutingTargetError, TEST_INPUT_LOCK, arm_test_synthetic_input,
+        arm_test_synthetic_input_without_registration, begin_frame, clear_test_synthetic_input,
+        consume_all_key_down_with_result, consume_key_down, consume_key_edges,
+        diagnostic_pressed_key_down_any_viewport, enqueue_test_synthetic_command, lock_test_input,
+        materialize_test_synthetic_input, physical_key_down, physical_key_down_from,
+        pressed_key_down, register_test_synthetic_target, resolve_synthetic_routing_target,
+        set_test_frame, set_test_frame_for_viewport, set_test_routed_frame,
+        set_test_synthetic_repeat, state,
     };
     #[cfg(windows)]
     use super::{
@@ -3659,6 +4121,7 @@ mod tests {
 
     fn return_edge(extended: bool, pressed: bool) -> KeyEdge {
         KeyEdge {
+            operation_id: KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x0D,
@@ -3670,6 +4133,362 @@ mod tests {
             shift: false,
             alt: false,
         }
+    }
+
+    #[test]
+    fn operation_ids_are_stamped_at_ingress_before_consumption() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::ROOT;
+        let (first, second, released) = {
+            let mut guard = state().lock().unwrap();
+            *guard = KeyInputState::default();
+            guard.register_hwnd(0x123, viewport);
+            (
+                guard.enqueue_raw_edge(0x123, raw_edge(0x27, true)).0,
+                guard.enqueue_raw_edge(0x123, raw_edge(0x27, true)).0,
+                guard.enqueue_raw_edge(0x123, raw_edge(0x27, false)).0,
+            )
+        };
+        assert_eq!(first.operation_id.batch_id, second.operation_id.batch_id);
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_ne!(second.operation_id, released.operation_id);
+        assert_eq!(first.operation_id.ingress_ordinal, 0);
+        assert_eq!(second.operation_id.ingress_ordinal, 1);
+        assert_eq!(released.operation_id.ingress_ordinal, 2);
+        begin_frame();
+        let snapshot = super::native_operation_key_edges(viewport);
+        assert_eq!(snapshot, vec![first, second, released]);
+        let consumed = super::consume_key_press_edges_with_result(viewport, |_| true, |_| true);
+        assert_eq!(consumed.operation_id, Some(first.operation_id));
+        assert_eq!(consumed.matched_count, 2);
+        assert!(consumed.released_after_match);
+        assert_eq!(super::native_operation_key_edges(viewport), snapshot);
+        assert!(!pressed_key_down(viewport, |_| true));
+        begin_frame();
+        assert!(super::native_operation_key_edges(viewport).is_empty());
+    }
+
+    #[test]
+    fn operation_source_and_id_survive_forwarding_and_retire_with_hwnd() {
+        let _serial = lock_test_input();
+        let source = egui::ViewportId::ROOT;
+        let destination = egui::ViewportId::from_hash_of("forwarded-reader");
+        let edge = {
+            let mut guard = state().lock().unwrap();
+            *guard = KeyInputState::default();
+            guard.register_hwnd(0x124, source);
+            guard.enqueue_raw_edge(0x124, raw_edge(0x27, true)).0
+        };
+        begin_frame();
+        let consumed = super::consume_key_press_edges_with_result(source, |_| true, |_| true);
+        let forwarded_id = consumed.operation_id.unwrap();
+        assert_eq!(forwarded_id, edge.operation_id);
+        assert_eq!(
+            forwarded_id.source,
+            super::KeyOperationSource::Native {
+                hwnd: 0x124,
+                viewport: source
+            }
+        );
+        assert_ne!(source, destination);
+        assert!(super::native_operation_key_edges(destination).is_empty());
+        state().lock().unwrap().unregister_hwnd(0x124);
+        assert!(super::native_operation_key_edges(source).is_empty());
+    }
+
+    #[test]
+    fn operation_ids_preserve_repeat_and_single_frame_cardinality() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::ROOT;
+        let mut repeat = return_edge(false, true);
+        repeat.repeat = true;
+        set_test_frame(vec![repeat, repeat, return_edge(false, false)]);
+        let snapshot = super::native_operation_key_edges(viewport);
+        assert_ne!(snapshot[0].operation_id, snapshot[1].operation_id);
+        let result = consume_all_key_down_with_result(viewport, true, |_| true);
+        assert_eq!(result.matched_count, 2);
+        assert_eq!(result.triggered_count, 1);
+        assert_eq!(result.operation_id, Some(snapshot[0].operation_id));
+        assert_eq!(super::native_operation_key_edges(viewport), snapshot);
+        set_test_frame(vec![return_edge(false, true), return_edge(false, true)]);
+        let snapshot = super::native_operation_key_edges(viewport);
+        let result = super::consume_key_press_edges_with_result(viewport, |_| true, |_| true);
+        assert_eq!(result.matched_count, 2);
+        assert_eq!(result.operation_id, Some(snapshot[0].operation_id));
+        assert!(!pressed_key_down(viewport, |_| true));
+    }
+
+    #[test]
+    fn egui_operation_snapshot_survives_consumption_replay_and_same_time_next_batch() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+        ctx.add_plugin(super::KeyOperationInputPlugin);
+        let event = |pressed| egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: Some(egui::Key::ArrowRight),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let raw = egui::RawInput {
+            time: Some(7.0),
+            events: vec![event(true), event(false), event(true), event(false)],
+            ..Default::default()
+        };
+        let mut snapshots = Vec::new();
+        let _ = ctx.run(raw.clone(), |ctx| {
+            assert!(
+                ctx.data(
+                    |data| data.get_temp::<super::EguiKeyOperationBatch>(egui::Id::new((
+                        "key_operation_ingress",
+                        egui::ViewportId::ROOT
+                    )))
+                )
+                .is_some()
+            );
+            let edges = super::egui_operation_key_edges(ctx, egui::ViewportId::ROOT);
+            assert_eq!(edges.len(), 4);
+            assert_ne!(edges[0].operation_id(), edges[2].operation_id());
+            assert!(edges[0].pressed());
+            assert!(!edges[1].pressed());
+            assert!(!edges[0].repeat());
+            ctx.input_mut(|input| input.events.clear());
+            assert_eq!(
+                super::egui_operation_key_edges(ctx, egui::ViewportId::ROOT),
+                edges
+            );
+            snapshots.push(edges);
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("operation replay regression");
+            }
+        });
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0], snapshots[1]);
+        let _ = ctx.run(raw, |ctx| {
+            let next = super::egui_operation_key_edges(ctx, egui::ViewportId::ROOT);
+            assert_ne!(next[0].operation_id(), snapshots[0][0].operation_id());
+        });
+    }
+
+    #[test]
+    fn native_operation_replay_keeps_identity_without_retriggering() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::ROOT;
+        let edge = {
+            let mut guard = state().lock().unwrap();
+            *guard = KeyInputState::default();
+            guard.register_hwnd(0x125, viewport);
+            guard.enqueue_raw_edge(0x125, raw_edge(0x27, true)).0
+        };
+        let ctx = egui::Context::default();
+        let mut triggers = 0;
+        let mut passes = 0;
+        let _ = ctx.run(Default::default(), |ctx| {
+            super::begin_frame_for_context(ctx);
+            assert_eq!(super::native_operation_key_edges(viewport), vec![edge]);
+            if consume_key_down(viewport, true, |_| true) {
+                triggers += 1;
+            }
+            passes += 1;
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("native replay regression");
+            }
+        });
+        assert_eq!(passes, 2);
+        assert_eq!(triggers, 1);
+    }
+
+    #[test]
+    fn off_native_keeps_ingress_identity_cardinality_without_eager_observer_allocation() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::ROOT;
+        let first = {
+            let mut guard = state().lock().unwrap();
+            guard.register_hwnd(0x126, viewport);
+            let first = guard.enqueue_raw_edge(0x126, raw_edge(0x27, true)).0;
+            guard.enqueue_raw_edge(0x126, raw_edge(0x27, true));
+            guard.enqueue_raw_edge(0x126, raw_edge(0x27, false));
+            first
+        };
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), false));
+        super::install_operation_input_plugin(&ctx);
+        let mut matches = 0;
+        let _ =
+            ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::ArrowRight,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    super::begin_frame_for_context_with_tracking(ctx, false);
+                    let guard = state().lock().unwrap();
+                    assert!(guard.operation_frame.is_empty());
+                    assert_eq!(guard.operation_frame.capacity(), 0);
+                    drop(guard);
+                    assert!(
+                        ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(
+                            egui::Id::new(("key_operation_ingress", viewport))
+                        ))
+                        .is_none()
+                    );
+                    let consumed =
+                        super::consume_key_press_edges_with_result(viewport, |_| true, |_| true);
+                    matches += consumed.matched_count;
+                    if ctx.current_pass_index() == 0 {
+                        assert_eq!(consumed.operation_id, Some(first.operation_id));
+                        assert!(consumed.released_after_match);
+                        ctx.request_discard("OFF native replay");
+                    } else {
+                        assert_eq!(consumed.matched_count, 0);
+                    }
+                },
+            );
+        assert_eq!(matches, 2);
+        let mut repeat = raw_edge(0x27, true);
+        repeat.repeat = true;
+        {
+            let mut guard = state().lock().unwrap();
+            guard.enqueue_raw_edge(0x126, repeat);
+            guard.enqueue_raw_edge(0x126, repeat);
+            guard.enqueue_raw_edge(0x126, raw_edge(0x27, false));
+        }
+        super::begin_frame_with_tracking(false);
+        let repeated = super::consume_key_press_edges_with_result(viewport, |_| true, |_| true);
+        assert_eq!(repeated.matched_count, 2);
+        assert!(!repeated.had_initial_press);
+        assert!(repeated.had_repeat && repeated.released_after_match);
+    }
+
+    #[test]
+    fn off_egui_observer_is_lazy_but_matched_generic_identity_survives_replay() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), false));
+        super::install_operation_input_plugin(&ctx);
+        let mut original = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                let id = egui::Id::new(("key_operation_ingress", ctx.viewport_id()));
+                if ctx.current_pass_index() == 0 {
+                    assert!(
+                        ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(id))
+                            .is_none()
+                    );
+                }
+                ctx.input_mut(|input| input.events.clear());
+                let operation =
+                    super::egui_operation_key_id(ctx, ctx.viewport_id(), |_| true).unwrap();
+                assert_ne!(operation.batch_id, 0);
+                if let Some(original) = original {
+                    assert_eq!(original, operation);
+                } else {
+                    original = Some(operation);
+                    ctx.request_discard("OFF generic egui identity replay");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn operation_observer_setting_change_retires_previous_native_facts() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::ROOT;
+        let first = state()
+            .lock()
+            .unwrap()
+            .enqueue_raw_edge(0x127, raw_edge(0x27, true))
+            .0;
+        super::begin_frame_with_tracking(true);
+        assert_eq!(super::native_operation_key_edges(viewport), vec![first]);
+        super::begin_frame_with_tracking(false);
+        assert!(super::native_operation_key_edges(viewport).is_empty());
+        let second = state()
+            .lock()
+            .unwrap()
+            .enqueue_raw_edge(0x127, raw_edge(0x27, true))
+            .0;
+        super::begin_frame_with_tracking(true);
+        assert_eq!(super::native_operation_key_edges(viewport), vec![second]);
+        assert_ne!(first.operation_id, second.operation_id);
+    }
+
+    #[test]
+    fn keyless_operation_ingress_allocates_no_batch_and_expires_previous_facts() {
+        let ctx = egui::Context::default();
+        super::install_operation_input_plugin(&ctx);
+        let viewport = egui::ViewportId::ROOT;
+        let id = egui::Id::new(("key_operation_ingress", viewport));
+        let _ = ctx.run(Default::default(), |ctx| {
+            assert!(
+                ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(id))
+                    .is_none()
+            );
+            assert!(super::egui_operation_key_edges(ctx, viewport).is_empty());
+            assert!(
+                ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(id))
+                    .is_none()
+            );
+        });
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(super::egui_operation_key_edges(&ctx, viewport).len(), 1);
+        let _ = ctx.end_pass();
+        ctx.begin_pass(Default::default());
+        assert!(super::egui_operation_key_edges(&ctx, viewport).is_empty());
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn operation_snapshot_does_not_promote_a_sibling_folded_egui_twin() {
+        let _serial = lock_test_input();
+        let sibling = egui::ViewportId::from_hash_of("folded-twin-source");
+        set_test_frame_for_viewport(sibling, vec![return_edge(true, true)]);
+        super::add_test_frame_active_viewport(egui::ViewportId::ROOT);
+        let ctx = egui::Context::default();
+        super::install_operation_input_plugin(&ctx);
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            super::egui_operation_key_edges(&ctx, egui::ViewportId::ROOT).len(),
+            1
+        );
+        assert!(super::operation_key_edges(&ctx, egui::ViewportId::ROOT).is_empty());
+        assert_eq!(super::native_operation_key_edges(sibling).len(), 1);
+        assert!(pressed_key_down(sibling, |_| true));
+        let _ = ctx.end_pass();
     }
 
     #[test]
@@ -3796,6 +4615,7 @@ mod tests {
         let _serial = lock_test_input();
         set_test_frame(vec![
             KeyEdge {
+                operation_id: KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
@@ -3808,6 +4628,7 @@ mod tests {
                 alt: false,
             },
             KeyEdge {
+                operation_id: KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,

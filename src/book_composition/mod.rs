@@ -11,9 +11,10 @@ mod resolve;
 mod service;
 pub(crate) mod store;
 
-pub use edit::UnitEdit;
+pub use edit::CompositionEdit;
 pub(crate) use editor::*;
 pub use model::*;
+pub use permission::CompositionOutputCheck;
 pub(crate) use permission::*;
 pub(crate) use projection::*;
 pub use resolve::*;

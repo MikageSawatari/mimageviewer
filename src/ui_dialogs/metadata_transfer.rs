@@ -328,6 +328,21 @@ impl App {
                 .is_some_and(|service| service.is_busy()))
     }
 
+    pub(crate) fn metadata_transfer_book_append_writers_busy(&self) -> bool {
+        self.metadata_transfer.as_ref().is_some_and(|state| {
+            matches!(state.operation, Operation::Import)
+                && matches!(
+                    state.stage,
+                    Stage::WaitingForWriters(WriterWaitTarget::Transfer)
+                        | Stage::Running
+                        | Stage::WaitingForEditPreviewClear(_)
+                        | Stage::WaitingForSpreadShiftReload
+                        | Stage::RefreshPreparing
+                        | Stage::Refreshing
+                )
+        })
+    }
+
     pub(crate) fn metadata_transfer_writers_busy(
         &mut self,
         release_tag_db_for_import: bool,
@@ -496,12 +511,20 @@ impl App {
         match action {
             DialogAction::None => {}
             DialogAction::StartExport => {
+                // Export publishes files as well as reading metadata. Its
+                // accepted write must retire a concurrent append receipt.
+                if !self.admit_book_append_followup_mutation() {
+                    return;
+                }
                 if let Some(state) = self.metadata_transfer.as_mut() {
                     state.stage = Stage::WaitingForWriters(WriterWaitTarget::Transfer);
                     state.progress = None;
                 }
             }
             DialogAction::StartImport => {
+                if !self.admit_book_append_followup_mutation() {
+                    return;
+                }
                 if let Some(state) = self.metadata_transfer.as_mut() {
                     state.stage = Stage::WaitingForWriters(WriterWaitTarget::Transfer);
                     state.progress = None;
@@ -1642,6 +1665,38 @@ pub(crate) mod save_ticket_test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_undo_writer_check_tracks_accepted_import_only() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.metadata_transfer = Some(MetadataTransferState::export(
+            app.tmp.path().to_path_buf(),
+            &app.settings,
+        ));
+        app.metadata_transfer.as_mut().unwrap().stage = Stage::Running;
+        assert!(!app.metadata_transfer_book_append_writers_busy());
+        app.metadata_transfer = Some(MetadataTransferState::import(app.tmp.path().to_path_buf()));
+        for stage in [
+            Stage::LoadingPreview,
+            Stage::WaitingForWriters(WriterWaitTarget::Preview),
+            Stage::ImportConfirm(ImportPreview::default()),
+        ] {
+            app.metadata_transfer.as_mut().unwrap().stage = stage;
+            assert!(!app.metadata_transfer_book_append_writers_busy());
+        }
+        for stage in [
+            Stage::WaitingForWriters(WriterWaitTarget::Transfer),
+            Stage::Running,
+            Stage::RefreshPreparing,
+            Stage::Refreshing,
+        ] {
+            app.metadata_transfer.as_mut().unwrap().stage = stage;
+            assert!(app.metadata_transfer_book_append_writers_busy());
+        }
+        app.metadata_transfer.as_mut().unwrap().stage =
+            Stage::Result(ResultState::Import(Err("failed".into())));
+        assert!(!app.metadata_transfer_book_append_writers_busy());
+    }
     use egui_kittest::kittest::Queryable;
 
     #[test]

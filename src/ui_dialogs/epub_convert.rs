@@ -132,11 +132,11 @@ impl EpubConvertState {
         surface_generation: u64,
         smart_transition_sequence: u64,
         restore_intent: crate::app::StartupListIntent,
-    ) -> Self {
+    ) -> Box<Self> {
         let (tx, rx) = mpsc::channel();
         tx.send(EpubConvertMsg::ConvertDone(Ok(outcome))).unwrap();
         let logical = src_path.clone();
-        Self {
+        Box::new(Self {
             src_owner: crate::pdf_loader::LeasedEpubPath::try_new(src_path.clone()).unwrap(),
             src_path,
             continuation: EpubOpenContinuation::Direct {
@@ -155,7 +155,7 @@ impl EpubConvertState {
             suppress_confirm_next_time: false,
             cancel: CancelToken::new().unwrap(),
             rx,
-        }
+        })
     }
 
     pub(crate) fn saved_for_test(
@@ -165,11 +165,11 @@ impl EpubConvertState {
         surface_generation: u64,
         smart_transition_sequence: u64,
         restore_intent: crate::app::StartupListIntent,
-    ) -> Self {
+    ) -> Box<Self> {
         let (tx, rx) = mpsc::channel();
         tx.send(EpubConvertMsg::SaveDone(Ok(saved))).unwrap();
         let logical = src_path.clone();
-        Self {
+        Box::new(Self {
             src_owner: crate::pdf_loader::LeasedEpubPath::try_new(src_path.clone()).unwrap(),
             src_path,
             continuation: EpubOpenContinuation::Direct {
@@ -188,7 +188,7 @@ impl EpubConvertState {
             suppress_confirm_next_time: false,
             cancel: CancelToken::new().unwrap(),
             rx,
-        }
+        })
     }
 }
 
@@ -429,7 +429,7 @@ impl App {
                         return PdfOpenFailureRoute::Handled;
                     }
                 };
-                let mut state = EpubConvertState {
+                let mut state = Box::new(EpubConvertState {
                     src_path: logical.to_owned(),
                     src_owner,
                     continuation,
@@ -445,7 +445,7 @@ impl App {
                     suppress_confirm_next_time: false,
                     cancel,
                     rx,
-                };
+                });
                 let started = if self.settings.epub_convert_suppresses_confirm() {
                     start_convert(&mut state)
                 } else {
@@ -527,7 +527,7 @@ impl App {
         }
     }
 
-    fn replace_epub_convert_state(&mut self, state: EpubConvertState) {
+    fn replace_epub_convert_state(&mut self, state: Box<EpubConvertState>) {
         // A different open cannot be admitted while the modal owns the current conversion.
         // This terminal only rejects a stale same-owner child completion.
         self.finish_epub_convert(EpubConvertExit::Superseded);
@@ -536,7 +536,7 @@ impl App {
 
     fn finish_epub_conversion_open(
         &mut self,
-        mut state: EpubConvertState,
+        mut state: Box<EpubConvertState>,
         path: PathBuf,
         saved_sibling: bool,
         user_data_errors: Vec<String>,
@@ -837,11 +837,15 @@ mod tests {
 
     fn fake_state(
         phase: EpubConvertPhase,
-    ) -> (EpubConvertState, mpsc::Sender<EpubConvertMsg>, CancelToken) {
+    ) -> (
+        Box<EpubConvertState>,
+        mpsc::Sender<EpubConvertMsg>,
+        CancelToken,
+    ) {
         let (tx, rx) = mpsc::channel();
         let cancel = CancelToken::new().unwrap();
         (
-            EpubConvertState {
+            Box::new(EpubConvertState {
                 src_path: PathBuf::from("C:/books/book.epub"),
                 src_owner: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
                     "C:/books/book.epub",
@@ -863,7 +867,7 @@ mod tests {
                 suppress_confirm_next_time: false,
                 cancel: cancel.clone(),
                 rx,
-            },
+            }),
             tx,
             cancel,
         )
@@ -874,6 +878,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.settings.epub_file_handling = crate::settings::EpubFileHandling::Convert;
         let (state, _sender, _cancel) = fake_state(EpubConvertPhase::Scanning);
+        let allocation = std::ptr::from_ref(state.as_ref());
         app.epub_convert = Some(state);
         assert!(app.epub_convert_dialog_visible());
         assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
@@ -881,6 +886,11 @@ mod tests {
             app.show_epub_convert_dialog(ctx);
         });
         assert!(!output.shapes.is_empty());
+        assert_eq!(
+            std::ptr::from_ref(app.epub_convert.as_deref().unwrap()),
+            allocation,
+            "dialog polling must retain the conversion allocation"
+        );
     }
 
     #[test]

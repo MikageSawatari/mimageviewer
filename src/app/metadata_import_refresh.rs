@@ -445,9 +445,13 @@ fn build_context_result(
             if let Some(db) = rotation_db {
                 let loaded = db.get_many(page_keys.iter().copied());
                 for (index, key) in &page_items {
-                    if let Some(rotation) = loaded.get(*key) {
-                        state.rotation_cache.insert(*index, *rotation);
-                    }
+                    state.rotation_cache.insert(
+                        *index,
+                        loaded
+                            .get(*key)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
+                    );
                 }
             }
             for item in chunk.iter().filter(|item| item.page_key().is_some()) {
@@ -458,7 +462,10 @@ fn build_context_result(
                     || state.mask_pages.contains(&item.index)
                     || state.conceal_pages.contains(&item.index)
                     || state.comic_pages.contains(&item.index)
-                    || state.rotation_cache.contains_key(&item.index);
+                    || state
+                        .rotation_cache
+                        .get(&item.index)
+                        .is_some_and(|rotation| !rotation.is_none());
                 if item.had_page_state || has_new_state {
                     state.thumbnail_reset_indices.push(item.index);
                 }
@@ -1128,6 +1135,18 @@ mod tests {
                         video_path: None,
                         video_size: 0,
                     },
+                    ItemKey {
+                        index: 30,
+                        key: "c:/pictures/unrotated.jpg".to_owned(),
+                        rating: false,
+                        tags: false,
+                        page: true,
+                        had_page_state: false,
+                        alternate_page_key: None,
+                        container_path: None,
+                        video_path: None,
+                        video_size: 0,
+                    },
                 ],
                 current_rating_key: None,
                 spread_container_path: None,
@@ -1146,6 +1165,14 @@ mod tests {
         .expect("refresh should complete");
         let page = result.contexts[0].page_state.as_ref().unwrap();
         assert_eq!(page.thumbnail_reset_indices, vec![10, 20]);
+        assert_eq!(
+            page.rotation_cache.get(&20),
+            Some(&crate::rotation_db::Rotation::None)
+        );
+        assert_eq!(
+            page.rotation_cache.get(&30),
+            Some(&crate::rotation_db::Rotation::None)
+        );
         assert_eq!(
             page.rotation_cache.get(&10),
             Some(&crate::rotation_db::Rotation::Cw90)

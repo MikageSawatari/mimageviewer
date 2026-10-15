@@ -1251,7 +1251,9 @@ impl App {
             self.settings.favorites.swap(a, b);
             any_setting_dirty = true;
         }
-        if let Some(i) = remove {
+        if let Some(i) = remove
+            && self.admit_book_append_followup_mutation()
+        {
             // 削除対象の favorite の索引データもクリーンアップする。
             // (フラグが OFF なら副作用なしなので害はない。ON→削除でも正しく掃除される。)
             let removed = self.settings.favorites.remove(i);

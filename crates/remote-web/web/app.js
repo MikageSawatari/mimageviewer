@@ -3278,7 +3278,7 @@ function dispatchCommand(requested, meta = {}) {
         [CommandName.SPREAD_SPLIT_LTR]: SpreadMode.SPLIT_LTR,
         [CommandName.SPREAD_SPLIT_RTL]: SpreadMode.SPLIT_RTL,
       };
-      handled = requestSpreadMode(spreadModes[requested.name], Boolean(state.container?.compositionManaged) && [CommandName.SPREAD_SINGLE, CommandName.SPREAD_SPLIT_LTR, CommandName.SPREAD_SPLIT_RTL].includes(requested.name));
+      handled = requestSpreadMode(spreadModes[requested.name], Boolean(state.container?.compositionManaged) && (requested.payload.modeOnly === true || [CommandName.SPREAD_SINGLE, CommandName.SPREAD_SPLIT_LTR, CommandName.SPREAD_SPLIT_RTL].includes(requested.name)));
     } else {
       let fitMode = null;
       if (requested.name === CommandName.FIT_CYCLE) {
@@ -4689,6 +4689,7 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     address: effectiveAddress,
     requestedAddress: address,
     compositionManaged: Boolean(data.composition_managed),
+    compositionRevision: data.composition_revision ?? null,
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
     configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
@@ -5450,9 +5451,12 @@ export function normalizePagePresentationSlots(
   const slots = presentation.map((slot) => ({
     entry: byAddress.get(addressIdentity(slot?.address)),
     role: slot?.role,
+    ...(slot?.display_slot === undefined || slot?.display_slot === null ? {} : { displaySlot: slot.display_slot }),
   }));
   if (
-    slots.some(({ entry, role }) => !entry || !PAGE_PRESENTATION_ROLES.has(role))
+    slots.some(({ entry, role, displaySlot }) => !entry || !PAGE_PRESENTATION_ROLES.has(role)
+      || (displaySlot !== undefined && (slots.length !== 1 || role !== "navigation"
+        || !["spread_left", "spread_right"].includes(displaySlot))))
   ) return null;
   const slotIdentities = slots.map(({ entry }) =>
     addressIdentity(entryAddress(entry))
@@ -5460,6 +5464,8 @@ export function normalizePagePresentationSlots(
   if (new Set(slotIdentities).size !== slotIdentities.length) return null;
   if (
     slots.filter(({ role }) => role === "front_cover_supplement").length !== 1
+    && !(slots.length === 1 && slots[0].role === "navigation"
+      && ["spread_left", "spread_right"].includes(slots[0].displaySlot))
   ) return null;
   const navigationIdentities = slots
     .filter(({ role }) => role === "navigation")
@@ -5516,7 +5522,7 @@ export function pageRenderContextForSlot(
     : entryAddress(slots[partnerIndex].entry);
   return {
     context_address: contextAddress,
-    display_slot: viewerPageDisplaySlot(slots.length, pageIndex),
+    display_slot: slots[pageIndex].displaySlot ?? viewerPageDisplaySlot(slots.length, pageIndex),
     spread_partner: spreadPartner,
   };
 }
@@ -5526,7 +5532,7 @@ export function pageGroupPresentationIdentity(group) {
   return [
     group.slice ?? PageSlice.FULL,
     ...pageGroupPresentationSlots(group).map(
-      ({ entry, role }) => `${role}:${entryIdentity(entry)}`
+      ({ entry, role, displaySlot }) => `${role}${displaySlot ? `:${displaySlot}` : ""}:${entryIdentity(entry)}`
     ),
   ].join("\n");
 }
@@ -10137,6 +10143,7 @@ export function viewerMenuDefinitions({
   hasContainer,
   barsVisible,
   extractedResult = false,
+  compositionManaged = false,
   supportsFinalCoverSetting = false,
   finalCoverPreference = "follow_global",
   finalCoverEnabled = true,
@@ -10181,7 +10188,7 @@ export function viewerMenuDefinitions({
         ["ズーム", "+ / −"],
         ["表示モード", "0 (全体 → 幅 → 原寸)"],
         ...(hasContainer
-          ? [["見開き", extractedResult ? "1: 単 / 2〜5: 一時見開き" : "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]]
+          ? [["見開き", extractedResult ? "1: 単 / 2〜5: 一時見開き" : compositionManaged ? "方向と表紙はPCの本の構成で設定" : "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]]
           : []),
         ["操作メニュー", "?"],
         ["先頭 / 最後", "Home / End"],
@@ -10212,7 +10219,7 @@ export function viewerMenuDefinitions({
       ],
     },
     spread: {
-      title: extractedResult ? "一時表示（記憶しません）" : "見開き設定",
+      title: extractedResult ? "一時表示（記憶しません）" : compositionManaged ? "本の構成を使用中（方向・表紙はPCで編集）" : "見開き設定",
       actions: extractedResult ? [
         back,
         [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
@@ -10221,12 +10228,17 @@ export function viewerMenuDefinitions({
       ] : [
         back,
         [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
-        [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
-        [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
-        [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
-        [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
-        [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
-        [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
+        ...(compositionManaged ? [
+          [CommandName.SPREAD_LTR, "見開き", "表示方法のみ", { modeOnly: true }],
+          [CommandName.SPREAD_SPLIT_LTR, "横長分割", "表示方法のみ", { modeOnly: true }],
+        ] : [
+          [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
+          [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
+          [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
+          [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
+          [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
+          [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
+        ]),
         ...(supportsFinalCoverSetting
           ? [[
               MenuPageAction.FINAL_COVER,
@@ -10384,6 +10396,7 @@ function menuDefinition(context, page = "main") {
       hasContainer: Boolean(state.container || refreshableCollectionRoute() || persistentDirectViewerContext()),
       barsVisible: state.viewerBarsVisible,
       extractedResult: extractedResultViewerContext(),
+      compositionManaged: Boolean(state.container?.compositionManaged),
       supportsFinalCoverSetting: Boolean(state.container),
       finalCoverPreference: state.finalCoverSpreadPreference,
       finalCoverEnabled: state.finalCoverSpreadEnabled,

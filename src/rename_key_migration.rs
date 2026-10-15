@@ -3179,17 +3179,12 @@ mod tests {
 
     fn insert_composition_fixture(connection: &rusqlite::Connection, key: &str, payload: &str) {
         use crate::book_composition::{
-            BookComposition, CompositionPageRef, CompositionUnit, PageDomain, ReadingDirection,
-            SingleCompanion, SinglePlacement,
+            BookComposition, CompositionPageRef, PageDomain, ReadingDirection,
         };
         let page_num = if payload == "prefix" { 1 } else { 0 };
         let composition = BookComposition::new(
             ReadingDirection::Ltr,
-            vec![CompositionUnit::Single {
-                page: CompositionPageRef::PdfPage { page_num },
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            }],
+            vec![CompositionPageRef::PdfPage { page_num }],
         );
         crate::book_composition::store::replace_row_in(
             connection,
@@ -3403,7 +3398,7 @@ mod tests {
                         .unwrap();
                     let copied = if descriptor.file == "book_composition.db" {
                         let value: serde_json::Value = serde_json::from_str(&copied).unwrap();
-                        if value["composition"]["units"][0]["page"]["page_num"] == 1 {
+                        if value["composition"]["page_order"][0]["page_num"] == 1 {
                             "prefix".to_owned()
                         } else {
                             "exact".to_owned()

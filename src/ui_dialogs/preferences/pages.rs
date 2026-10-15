@@ -10149,11 +10149,19 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });
+    anchored(ui, state, "spread/page-turn-animation", |ui, state| {
+        draw_page_turn_animation_setting(
+            ui,
+            &mut state.settings.page_turn_animation_enabled,
+            &mut state.settings.page_turn_animation_duration_ms,
+        );
+    });
     anchored(ui, state, "spread/singleton-placement", |ui, state| {
         draw_singleton_spread_placement_setting(
             ui,
             &mut state.settings.singleton_spread_first_enabled,
             &mut state.settings.singleton_spread_last_enabled,
+            state.settings.page_turn_animation_enabled,
         );
     });
     anchored(ui, state, "spread/page-alone", |ui, state| {
@@ -10492,6 +10500,147 @@ pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut b
     ui.small("表紙あり見開きで末尾が単ページになる本に適用します。本ごとの設定が優先されます。");
 }
 
+pub(super) fn draw_page_turn_animation_setting(
+    ui: &mut egui::Ui,
+    enabled: &mut bool,
+    duration_ms: &mut u32,
+) {
+    ui.checkbox(enabled, "ページめくりアニメーション");
+    ui.small("単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。");
+    ui.add_enabled_ui(*enabled, |ui| {
+        let row_width = ui.available_width();
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("時間（仮）");
+            // A wrapped row reports its full width even after the label. Reserve
+            // the label, spacing, editable value and ms suffix explicitly.
+            ui.spacing_mut().slider_width =
+                (row_width - label.rect.width() - ui.spacing().item_spacing.x - 80.0)
+                    .clamp(40.0, 200.0);
+            ui.add(egui::Slider::new(duration_ms, 100..=600).suffix(" ms"));
+        });
+    });
+    ui.small("時間は動きを確認してから決定します。");
+}
+
+#[cfg(test)]
+mod page_turn_animation_settings_tests {
+    use super::*;
+
+    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+        let mut fonts_ready = false;
+        let mut enabled = enabled;
+        let mut duration_ms = 200;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(320.0, 320.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, theme);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn page_turn_animation_settings_snapshot_light_on() {
+        snapshot(
+            "page_turn_animation_settings_light_on",
+            crate::os_theme::ResolvedTheme::Light,
+            true,
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_settings_snapshot_dark_off() {
+        snapshot(
+            "page_turn_animation_settings_dark_off",
+            crate::os_theme::ResolvedTheme::Dark,
+            false,
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_settings_toggle_preserves_singleton_preferences() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let settings = crate::settings::Settings {
+            singleton_spread_first_enabled: false,
+            singleton_spread_last_enabled: true,
+            ..crate::settings::Settings::default()
+        };
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(540.0, 320.0))
+            .build_state(
+                |ctx, (settings, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_page_turn_animation_setting(
+                            ui,
+                            &mut settings.page_turn_animation_enabled,
+                            &mut settings.page_turn_animation_duration_ms,
+                        );
+                        draw_singleton_spread_placement_setting(
+                            ui,
+                            &mut settings.singleton_spread_first_enabled,
+                            &mut settings.singleton_spread_last_enabled,
+                            settings.page_turn_animation_enabled,
+                        );
+                    });
+                },
+                (settings, false),
+            );
+        harness.run();
+        let first_label = "見開き先頭の単ページを片側に配置";
+        let last_label = "見開き末尾の単ページを片側に配置";
+        for enabled in [true, false] {
+            harness.get_by_label("ページめくりアニメーション").click();
+            harness.run();
+            assert_eq!(harness.state().0.page_turn_animation_enabled, enabled);
+            assert!(!harness.state().0.singleton_spread_first_enabled);
+            assert!(harness.state().0.singleton_spread_last_enabled);
+            for (label, saved) in [(first_label, false), (last_label, true)] {
+                let node = harness.get_by_label(label).accesskit_node();
+                assert_eq!(node.is_disabled(), enabled);
+                assert_eq!(
+                    node.toggled(),
+                    Some(if enabled || saved {
+                        egui::accesskit::Toggled::True
+                    } else {
+                        egui::accesskit::Toggled::False
+                    })
+                );
+                if enabled {
+                    // Headless pointer input still reaches the disabled widget's
+                    // location; it must not update either persisted setting.
+                    harness.get_by_label(label).click();
+                    harness.run();
+                    assert!(!harness.state().0.singleton_spread_first_enabled);
+                    assert!(harness.state().0.singleton_spread_last_enabled);
+                }
+            }
+        }
+        harness.get_by_label(first_label).click();
+        harness.run();
+        assert!(harness.state().0.singleton_spread_first_enabled);
+        assert!(harness.state().0.singleton_spread_last_enabled);
+        harness.get_by_label(last_label).click();
+        harness.run();
+        assert!(harness.state().0.singleton_spread_first_enabled);
+        assert!(!harness.state().0.singleton_spread_last_enabled);
+    }
+}
+
 enum ContextMenuLayoutEdit {
     Reset,
     ShowAll,
@@ -10745,10 +10894,34 @@ pub(super) fn draw_singleton_spread_placement_setting(
     ui: &mut egui::Ui,
     first: &mut bool,
     last: &mut bool,
+    animation_enabled: bool,
 ) {
-    ui.checkbox(first, "見開き先頭の単ページを片側に配置");
-    ui.checkbox(last, "見開き末尾の単ページを片側に配置");
-    ui.small("本の端に単独で残るページだけを、見開きで本来ある側へ配置します。本ごとの設定が優先されます。");
+    // ON displays the local paged effective placement without changing either
+    // stored preference, which continuous reading and Remote still use.
+    let mut effective_first = true;
+    let mut effective_last = true;
+    ui.add_enabled_ui(!animation_enabled, |ui| {
+        ui.checkbox(
+            if animation_enabled {
+                &mut effective_first
+            } else {
+                first
+            },
+            "見開き先頭の単ページを片側に配置",
+        );
+        ui.checkbox(
+            if animation_enabled {
+                &mut effective_last
+            } else {
+                last
+            },
+            "見開き末尾の単ページを片側に配置",
+        );
+    });
+    ui.small("ページめくりアニメーションが ON の間は、PCのページ単位の見開きで先頭・末尾を本来の側に置きます。OFFにすると保存済み設定へ戻ります。連結読みとmIV Remoteは保存済み設定に従います。");
+    ui.small(
+        "本の端に単独で残るページだけが対象です。保存済み設定では本ごとの指定が優先されます。",
+    );
 }
 
 pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesState) {

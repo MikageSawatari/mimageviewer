@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::{BookComposition, CompositionPageRef, CompositionUnit, PageDomain, SingleCompanion};
+use super::{BookComposition, CompositionPageRef, PageDomain};
 use crate::book_scope::BookScopeKey;
 
 pub(crate) const DB_FILE: &str = "book_composition.db";
@@ -176,7 +176,7 @@ pub(crate) fn initialize_database_at(path: &Path) -> Result<(), String> {
             "CREATE TABLE book_compositions (
         book_key TEXT PRIMARY KEY, revision INTEGER NOT NULL,
         schema_version INTEGER NOT NULL, composition_json TEXT NOT NULL);
-        PRAGMA user_version = 1;",
+        PRAGMA user_version = 2;",
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
@@ -186,7 +186,7 @@ pub(crate) fn validate_database_schema(connection: &Connection) -> Result<(), St
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version != 1 {
+    if version != 2 {
         return Err(format!("unsupported composition database schema {version}"));
     }
     let mut statement = connection
@@ -460,24 +460,11 @@ pub(crate) fn migrate_page_paths_at(
                 *path = name.to_owned();
             }
         };
-        for unit in &mut composition.units {
-            match unit {
-                CompositionUnit::Pair { first, second } => {
-                    rewrite(first);
-                    rewrite(second);
-                }
-                CompositionUnit::Single {
-                    page, companion, ..
-                } => {
-                    rewrite(page);
-                    if let SingleCompanion::FrontCoverSupplement { page } = companion {
-                        rewrite(page);
-                    }
-                }
-            }
+        for page in &mut composition.page_order {
+            rewrite(page);
         }
-        if let Some(cover) = &mut composition.cover {
-            rewrite(cover);
+        for entry in &mut composition.page_overrides {
+            rewrite(&mut entry.page);
         }
         for page in &mut composition.hidden_pages {
             rewrite(page);

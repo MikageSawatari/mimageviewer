@@ -7414,14 +7414,15 @@ mod tests {
         page: crate::book_composition::CompositionPageRef,
     ) -> crate::book_composition::BookComposition {
         use crate::book_composition::*;
-        BookComposition::new(
-            ReadingDirection::Rtl,
-            vec![CompositionUnit::Single {
-                page,
-                placement: SinglePlacement::Leading,
-                companion: SingleCompanion::Blank,
-            }],
-        )
+        let mut record = BookComposition::new(ReadingDirection::Rtl, vec![page.clone()]);
+        record.cover_enabled = true;
+        record.page_overrides.push(PageOverrideEntry {
+            page,
+            directive: PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            },
+        });
+        record
     }
 
     fn archive_composition(member: &str) -> crate::book_composition::BookComposition {
@@ -7660,7 +7661,16 @@ mod tests {
             );
         }
         for name in ["book.pdf", "book.epub"] {
-            let document = transfer_composition(CompositionPageRef::PdfPage { page_num: 23 });
+            let mut document = transfer_composition(CompositionPageRef::PdfPage { page_num: 23 });
+            let missing_hidden = CompositionPageRef::PdfPage { page_num: 99 };
+            document.page_order.push(missing_hidden.clone());
+            document.hidden_pages.push(missing_hidden.clone());
+            document
+                .page_overrides
+                .push(crate::book_composition::PageOverrideEntry {
+                    page: missing_hidden,
+                    directive: crate::book_composition::PageOverride::Alone,
+                });
             set_composition(
                 &source_data,
                 &source.join(name),
@@ -7720,6 +7730,21 @@ mod tests {
                 read_composition_family_at(&destination_data, root, &BookScopeCoverage::Root)
                     .unwrap();
             assert_eq!(restored[""].composition.revision, 1);
+            let original = read_composition_family_at(
+                &source_data,
+                &source.join(root.strip_prefix(&destination).unwrap()),
+                &BookScopeCoverage::Root,
+            )
+            .unwrap();
+            assert!(same_composition_content(
+                &restored[""].composition,
+                &original[""].composition
+            ));
+            let wire = serde_json::to_value(&restored[""].composition).unwrap();
+            assert!(wire.get("units").is_none());
+            assert!(wire.get("cover").is_none());
+            assert!(wire["cover_enabled"].as_bool().unwrap());
+            assert!(wire["page_overrides"].as_array().unwrap().len() >= 1);
         }
         assert!(!destination_data.join("reading_history.db").exists());
         assert!(!destination_data.join("book_resume.db").exists());

@@ -617,7 +617,7 @@ impl App {
             Arc::clone(&cancel),
         );
         let suppress_confirm = self.settings.archive_convert_suppresses_confirm();
-        self.archive_convert = Some(ArchiveConvertState {
+        self.archive_convert = Some(Box::new(ArchiveConvertState {
             src_path: src,
             input_seq: self.input_seq,
             format,
@@ -664,7 +664,7 @@ impl App {
             deferred_fullscreen: None,
             suppress_confirm,
             suppress_confirm_next_time: false,
-        });
+        }));
         true
     }
 
@@ -694,7 +694,7 @@ impl App {
             self.input_seq,
             Arc::clone(&cancel),
         );
-        self.archive_convert = Some(ArchiveConvertState {
+        self.archive_convert = Some(Box::new(ArchiveConvertState {
             src_path: src,
             input_seq: self.input_seq,
             format: ArchiveFormat::Rar,
@@ -741,7 +741,7 @@ impl App {
             deferred_fullscreen: None,
             suppress_confirm: self.settings.archive_convert_suppresses_confirm(),
             suppress_confirm_next_time: false,
-        });
+        }));
         true
     }
 
@@ -762,7 +762,7 @@ impl App {
             self.input_seq,
             Arc::clone(&cancel),
         );
-        self.archive_convert = Some(ArchiveConvertState {
+        self.archive_convert = Some(Box::new(ArchiveConvertState {
             src_path: src,
             input_seq: self.input_seq,
             format,
@@ -781,7 +781,7 @@ impl App {
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
-        });
+        }));
         true
     }
 

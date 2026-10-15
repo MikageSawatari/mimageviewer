@@ -66,6 +66,7 @@ pub(crate) mod audio_thumbnail;
 pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod bake_stage;
+pub(crate) mod book_append_undo;
 pub mod book_bookmarks;
 pub mod book_composition;
 mod book_fs_journal;
@@ -114,6 +115,7 @@ mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
+mod page_turn_animation;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
 pub(crate) mod spread_shift;
@@ -373,9 +375,10 @@ pub use ui_fullscreen::draw_composition_editor_hud_snapshot_fixture;
 pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
-    draw_fs_extracted_result_view_snapshot_fixture, draw_fs_fit_popup_snapshot_fixture,
-    draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
-    draw_music_locked_panel_snapshot_fixture, draw_music_panel_reach_snapshot_fixture,
+    draw_fs_composed_view_snapshot_fixture, draw_fs_extracted_result_view_snapshot_fixture,
+    draw_fs_fit_popup_snapshot_fixture, draw_fs_page_wait_indicator_snapshot_fixture,
+    draw_fs_prefetch_indicator_snapshot_fixture, draw_music_locked_panel_snapshot_fixture,
+    draw_music_panel_reach_snapshot_fixture, draw_singleton_spread_endpoint_popup_snapshot_fixture,
     draw_spread_shift_hud_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
     draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
@@ -1786,6 +1789,7 @@ pub fn run() -> eframe::Result {
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
+            crate::key_input::install_operation_input_plugin(&cc.egui_ctx);
             ui_fullscreen::install_fs_navigator_input_tracking(&cc.egui_ctx);
             double_click_time::configure_context(&cc.egui_ctx);
             let t = Instant::now();

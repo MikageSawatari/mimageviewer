@@ -219,6 +219,22 @@ impl App {
         #[cfg(windows)]
         self.add_detached_lanczos_textures(&mut accountant);
         self.add_thumbnail_textures(&mut accountant, None);
+        // Weak inventory includes context-local resting units and submitted
+        // batches after cache eviction. Existing stores keep attribution first;
+        // the common TextureId accountant deduplicates shared sources/outputs.
+        self.page_turn_leases.account(&mut accountant);
+        if let Some(pending) = &self.pending_fs_page_turn_ready {
+            pending.account(&mut accountant);
+        }
+        if self.settings.page_turn_animation_enabled {
+            for id in self.other_viewer_context_ids() {
+                let _ = self.with_viewer_context_ref(id, |context| {
+                    if let Some(pending) = context.pending_fs_page_turn_ready() {
+                        pending.account(&mut accountant);
+                    }
+                });
+            }
+        }
         accountant.finish()
     }
 

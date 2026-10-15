@@ -993,7 +993,30 @@ fn ready_lut_keeps_original_page_target_after_switching_editor_document() {
     let lut = ready_lut("original A result");
     tx.send(Ok(lut.clone())).unwrap();
 
-    app.switch_local_adjust_target_in_spread(1);
+    let ctx = egui::Context::default();
+    // The switch entry owns a real spread pivot and prepares its target before
+    // changing documents. Keep this LUT-delivery test on the ready path.
+    app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(PageEditSpreadPivot {
+        saved_mode: crate::settings::SpreadMode::Ltr,
+        pair: (0, 1),
+        navigation_anchor_idx: 0,
+    });
+    let pixels = egui::ColorImage::filled([1, 1], egui::Color32::GRAY);
+    app.fs_cache.insert(
+        1,
+        FsCacheEntry::Static {
+            tex: ctx.load_texture(
+                "lut-switch-ready",
+                pixels.clone(),
+                egui::TextureOptions::LINEAR,
+            ),
+            pixels: Arc::new(pixels),
+            source_dims: Some([1, 1]),
+            load_seq: 0,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    app.switch_local_adjust_target_in_spread(&ctx, 1);
     assert_eq!(app.fullscreen_idx, Some(1));
     app.local_adjust_selected_shape = Some(0);
     app.select_local_page_edit_layer(1, 0);

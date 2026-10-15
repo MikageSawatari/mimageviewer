@@ -289,7 +289,7 @@ fn g3_preparing_waits_for_classification_then_reads_original_shift_cutoff() {
     env.book_composition = ViewerBookComposition::Preparing {
         scope: scope.clone(),
         receiver,
-        origin: ProjectionOrigin::Fresh,
+        origin: Box::new(ProjectionOrigin::Fresh),
     };
     let mut restore = env.begin_book_shift_restore(30).unwrap();
     assert!(!env.poll_book_shift_restore(&mut restore).unwrap());

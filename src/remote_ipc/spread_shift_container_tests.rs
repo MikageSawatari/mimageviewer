@@ -98,6 +98,7 @@ mod spread_shift_d3 {
                     .map(|occurrence| RemotePagePresentationSlot {
                         address: grid_item_address(&container, &items[occurrence.idx]).unwrap(),
                         role: remote_page_presentation_role(occurrence.role),
+                        display_slot: None,
                     })
                     .collect::<Vec<_>>()
             });

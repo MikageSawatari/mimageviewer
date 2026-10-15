@@ -283,6 +283,14 @@ impl App {
         ctx: &egui::Context,
         action: ContentRestorePromptAction,
     ) {
+        if self.content_restore_prompt.as_ref().is_some_and(|prompt| {
+            action == ContentRestorePromptAction::Restore
+                || (prompt.dont_ask_again && self.settings.edit_restore_prompt_enabled)
+        }) && self.book_append_undo_in_progress()
+        {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
         let Some(prompt) = self.content_restore_prompt.take() else {
             return;
         };
@@ -308,6 +316,12 @@ impl App {
     }
 
     fn apply_content_restore_disable_choice_to_runtime(&mut self, disable: bool) -> bool {
+        if disable
+            && self.settings.edit_restore_prompt_enabled
+            && !self.admit_book_append_followup_mutation()
+        {
+            return false;
+        }
         let old_enabled = self.settings.edit_restore_prompt_enabled;
         if !apply_disable_choice_to_settings(&mut self.settings, disable) {
             return false;
@@ -330,6 +344,9 @@ impl App {
                 "content_identity: restore request ignored while another restore is active"
                     .to_string(),
             );
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         if crate::perf::is_enabled() {
@@ -526,6 +543,43 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn section1373_content_restore_job_admits_before_spawn_and_undo_keeps_prompt() {
+        use crate::app::book_append_producer_tests::{
+            FOLLOWUP_PHASES, assert_followup_terminal, followup_fixture,
+        };
+        for phase in FOLLOWUP_PHASES {
+            let (mut app, append, worker) = followup_fixture(phase);
+            let ctx = egui::Context::default();
+            app.start_content_identity_restore(
+                &ctx,
+                vec![],
+                vec![crate::content_identity::DeclinedRestore {
+                    full_hash: "hash".into(),
+                    target_key: "target".into(),
+                }],
+            );
+            assert_eq!(
+                app.content_identity_restore_pending.is_some(),
+                phase != "undo"
+            );
+            assert_followup_terminal(&mut app, &append, worker, phase);
+        }
+        let (mut app, append, _worker) = followup_fixture("undo");
+        app.content_restore_prompt = Some(super::ContentRestorePrompt {
+            candidates: vec![],
+            ui_rows: vec![],
+            dont_ask_again: true,
+        });
+        app.handle_content_restore_prompt_action(
+            &egui::Context::default(),
+            super::ContentRestorePromptAction::Restore,
+        );
+        assert!(app.content_restore_prompt.is_some());
+        assert!(app.settings.edit_restore_prompt_enabled);
+        assert_eq!(app.book_append_undo_revision, append.accepted_revision);
+    }
+
     use super::*;
     use std::path::{Path, PathBuf};
 

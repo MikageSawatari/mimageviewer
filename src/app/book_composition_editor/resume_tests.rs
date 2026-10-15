@@ -38,16 +38,7 @@ fn input() -> EditorSourceInput {
     }
 }
 fn rows(input: &EditorSourceInput, hidden: &[u32]) -> MaterializedBookRows {
-    let mut record = BookComposition::new(
-        ReadingDirection::Ltr,
-        (0..100)
-            .map(|n| CompositionUnit::Single {
-                page: page(n),
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            })
-            .collect(),
-    );
+    let mut record = BookComposition::new(ReadingDirection::Ltr, (0..100).map(page).collect());
     record.hidden_pages = hidden.iter().copied().map(page).collect();
     project_document_composition(
         &input.scope.logical_root,
