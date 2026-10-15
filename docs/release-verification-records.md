@@ -12,6 +12,23 @@
 
 ---
 
+## v4.7.0 (2026-10-15)
+
+- **対象**: 最終の配布ビルドは master `bf6b36993` (2026-10-15 23:55)。ReleaseChecks は `ad36b5606` で実施。その後に入った製品コードは、公開前に利用者実機で見つかったクラッシュの修正 C1 (`6c6c27fc8`、検索結果から別窓再生中に検索を閉じると plan_promote の assert で終了。§1.375 由来の v4.7.0 退行)、HUD 前面化の自己循環を止める修正 (`812ae722d`)、裏で準備中のページの AI 補完通知を出さない修正 (`b726eba70`)、空いた側を黒い紙でめくるページめくり (`ad36b5606` 以前)。ReleaseChecks は C1・HUD の後に `a00f863cf` で再実施 (run `release-checks-20261015-150147-c2c64337`、**PASS_WITH_WARNINGS**): idle 5 ケース PASS (CPU 1 コア比 0.003〜0.006)、perf cached / uncached とも 16ms 未満 99.67%、pre_grid raw p95 0.077ms、100ms 超は既知の起動直後の frame 1→2 だけ (222 / 225ms、上限 500ms、測定操作前、2026-10-11 利用者了承済みの警告)。
+- **公開前の追加確認 (ClaudeCode が実施)**: 配布物のポータブル版を `D:\miv-portable-smoke-v470b` に展開し、「動画を別ウィンドウで開く」設定で Ctrl+R (Everything) の `pikasonic` の結果から動画を別窓再生 → 検索を × で閉じる。promote 1 回、panic 0、再生継続、応答あり。修正版の dev build でも、別窓再生中のメイン移動 → 元フォルダへの外部追加で落ちず・読み直しなし、メイン側の追加は自動反映を確認 (隔離データ)。
+- **配布ビルドの全体テスト**: 最終回は 72 本 0 失敗 (lib 13,219 passed)。それまでの回で、負荷時だけ落ちるテストを 3 件直した (`3bedcd0a5` リモート AI ジョブの待ち 1 秒→10 秒、`bf6b36993` 類似検索の通知の取り違え、`fdffa62a7` Remote 見開き受付の data-dir 隔離)。いずれも製品コードの変更なし。
+- **依存**: PDFium を `chromium/8086` から **`chromium/8100` へ更新**。tantivy を 0.26.1 から **0.26.2 へ更新** (vendor 上に upstream 差分を適用、ローカル patch のファイルは無変更)。
+  LibRaw 0.22.2・EffeTune v0.13.0 は最新。FFmpeg は従来と同じ誤検知 (`n7.1.5-12` を「新版」と表示、同梱 `n7.1.5-16` の方が新しい)。
+  見送り (egui 0.36 と一緒に次の次の版で): ONNX Runtime 1.24.4 (TensorRT パックの版固定・VC runtime gate と連動)、ort rc.14、VST3 SDK 3.8.1、Rust 1.99、一般クレート 155 件。
+- **検索 bench**: tantivy 更新のため実施。初回は他の作業ツリーのビルドと重なり 5 クエリが閾値超え。同じ負荷条件で 0.26.1 / 0.26.2 を交互に測り直すと、0.26.2 は回帰なし (大半のクエリで速い)。負荷時の値で baseline は更新していない。
+- **自動テスト**: 配布ビルドの全体テストで 72 本 0 失敗 (lib 13,201 passed)。1 回目は 2 件で停止: 「重要な変更点」への v4.7.0 追加による起動画面 snapshot の更新漏れ (`044fbab7d`) と、Remote の見開き受付テストの data-dir 隔離漏れ (`fdffa62a7`、製品影響なし)。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承)**: run `release-checks-20261015-041146-6821b7a2` で **PASS / 警告なし**。1 回目は利用者が PC 操作中で前面化できず SKIPPED (環境不成立)。
+  idle 5 ケースとも CPU 1 コア比 0.003〜0.005、測定区間の frame 0。perf cached / uncached とも 256 folder load・Ctrl+Down 5・検索完了、描画 frame の 16ms 未満 99.67%、pre_grid raw p95 0.07ms、100ms 超 0 件。AI は未実施 (AI 経路の変更なし)。
+- **panic.log**: 52 件 15 種すべて disposition あり (`check-panic-log.ps1` exit 0)。
+- **署名**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa /v` で確認 (Open Source Developer Taku Sano、Certum チェーン、RFC3161)。全 PE / VC runtime gate 通過。
+- **portable smoke (ClaudeCode が実施)**: `D:\miv-portable-smoke-v470` に展開して起動。応答・`data\` 生成・APPDATA の設定が変わらないこと・終了を確認。初回は利用者が別調査で起動していた別の portable に二重起動の転送をして終了 (`second-instance-activation`、想定どおり)。
+- **当日の実機確認 (利用者)**: 本の構成の見開きキー、ページめくり (空いた側を黒い紙でめくる)。余り単ページの位置と解除確認ダイアログは ClaudeCode が隔離データで確認。
+
 ## §1.361 Phase 4 初回隔離 run（2026-10-11 JST、同日調査）
 
 - **対象・出所**: 利用者が報告した了承済みの初回 run

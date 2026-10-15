@@ -57,8 +57,15 @@ FolderRefreshRequestは既存viewer bundleに属する。OS購読の登録と登
 Equal応答は軽い行記録と観測値だけを返し、不要な走査・準備済み一覧はworkerで破棄する。
 UIはowner／source／generation／投影条件／記録revision／購読epochを確認し、受理した
 cutoffまでだけをackする。走査中に届いた後続通知は元ownerのdirtyと既存restartへ残す。
-park／mountでは元購読と要求を保持し、forkでは記録だけを共有して独立購読を開始する。
+mainのpark／mountでは元購読と要求を保持する。C1追補ではfork先は記録だけを共有し、
+独立readerの受動購読は開始しない。元mainの購読・dirtyは維持する。
 旧記録の大きなpayloadは既存retirement workerへ渡す。
+
+2026-10-15の[C1追補](detached-snapshot-reader-plan.md)により、受動観測資格はregistryのmain identityと
+採用済みProjectionRecipeから決める。非main readerはpromote時にwatch／受動scanを退役し、
+再mount／Resumed／restartでも復活させない。検索UIを閉じてもExtractedResultのitemsを物理scanで上書きしない。
+能動Operation（整理・export・Delete）／BookAppend系の由来は既存causeで保持し、
+旧購読proof付きscanは既存holdへ戻す。通常linkedの観測・最初のpromoteは維持する。
 
 Differentは走査済み入力とworker準備済み投影を既存load／hydrationへ渡す。
 自動originをdefer／restart／Resumedでも維持し、sidecar取込を行わない。

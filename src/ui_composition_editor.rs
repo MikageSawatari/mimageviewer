@@ -140,6 +140,14 @@ pub fn show_window(
             memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
         });
     }
+    // Keep Window's input lock (including its title bar), but let the modal
+    // backdrop do the dimming. Disabled Ui opacity would also fade the window
+    // fill and expose the viewer page underneath. Limit this style to the
+    // editor draw; the confirmation and other UI retain their normal style.
+    let editor_style = ctx.style();
+    if confirmation_at_start != EditorConfirmation::None {
+        ctx.style_mut(|style| style.visuals.disabled_alpha = 1.0);
+    }
     egui::Window::new("本の構成を編集")
         .id(id)
         .order(egui::Order::Foreground)
@@ -156,6 +164,9 @@ pub fn show_window(
             ui.set_max_height((screen.bottom() - ui.min_rect().top() - margin).max(80.0));
             actions = render(ui, view, state);
         });
+    if confirmation_at_start != EditorConfirmation::None {
+        ctx.set_style(editor_style);
+    }
     if state.confirmation != EditorConfirmation::None {
         // A click opening a confirmation must not also accept it with a key
         // from the same input pass. Keys are already qualified by App's IME helpers.
@@ -1190,6 +1201,123 @@ mod row_tests {
             can_remove: true,
             landing: String::new(),
             error: None,
+        }
+    }
+
+    #[test]
+    fn confirmation_keeps_editor_fill_opaque_under_modal_backdrop() {
+        fn covering_fill(
+            shape: &egui::Shape,
+            interior: egui::Rect,
+            screen: egui::Rect,
+        ) -> Option<&egui::epaint::RectShape> {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .find_map(|shape| covering_fill(shape, interior, screen)),
+                egui::Shape::Rect(rect)
+                    if rect.rect.contains_rect(interior)
+                        && rect.rect.width() < screen.width()
+                        // A translucent blurred shadow is not the window fill.
+                        && rect.blur_width == 0.0
+                        && rect.fill.a() > 0 =>
+                {
+                    Some(rect)
+                }
+                _ => None,
+            }
+        }
+        for theme in [
+            crate::os_theme::ResolvedTheme::Light,
+            crate::os_theme::ResolvedTheme::Dark,
+        ] {
+            for scale in [1.0, 2.0] {
+                for confirmation in [EditorConfirmation::Remove, EditorConfirmation::Reload] {
+                    let ctx = egui::Context::default();
+                    crate::os_theme::apply_resolved(&ctx, theme);
+                    ctx.style_mut(|style| {
+                        style.animation_time = 0.0;
+                        // A non-default alpha catches accidental resets to the default.
+                        style.visuals.disabled_alpha = 0.23;
+                    });
+                    let styles = [
+                        ctx.style_of(egui::Theme::Light),
+                        ctx.style_of(egui::Theme::Dark),
+                    ];
+                    let preference = ctx.options(|options| options.theme_preference);
+                    let screen = egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1093.0, 614.0) / scale,
+                    );
+                    let id = egui::Id::new("opaque_editor");
+                    let view = fixture(8);
+                    let mut state = EditorUiState {
+                        confirmation,
+                        ..Default::default()
+                    };
+                    let mut output = egui::FullOutput::default();
+                    for _ in 0..6 {
+                        output = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                // Stand in for the bright page behind the editor.
+                                ctx.layer_painter(egui::LayerId::background()).rect_filled(
+                                    screen,
+                                    0.0,
+                                    Color32::MAGENTA,
+                                );
+                                show_window(ctx, id, &view, &mut state, DialogKeys::default());
+                            },
+                        );
+                    }
+                    let interior = ctx
+                        .memory(|memory| memory.area_rect(id))
+                        .unwrap()
+                        .shrink(20.0);
+                    // Inspect emitted paint, not a golden PNG or the input style:
+                    // one opaque fill must cover the editor interior and hide
+                    // any page texture/color underneath it.
+                    let (window_index, window) = output
+                        .shapes
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, clipped)| {
+                            if clipped.clip_rect.contains_rect(interior)
+                                && let Some(rect) = covering_fill(&clipped.shape, interior, screen)
+                            {
+                                Some((index, rect))
+                            } else {
+                                None
+                            }
+                        })
+                        .expect("painted editor background");
+                    assert_eq!(
+                        window.fill.a(),
+                        255,
+                        "{theme:?}/{scale}/{confirmation:?}: page must not show through {window:?}"
+                    );
+                    let backdrop_index = output.shapes.iter().position(|clipped| matches!(&clipped.shape,
+                        egui::Shape::Rect(rect) if rect.rect == screen && rect.fill == Color32::from_black_alpha(100)
+                    )).expect("default modal dark backdrop");
+                    assert!(
+                        window_index < backdrop_index,
+                        "darken the opaque editor from above"
+                    );
+                    for (theme, style) in [egui::Theme::Light, egui::Theme::Dark]
+                        .into_iter()
+                        .zip(&styles)
+                    {
+                        assert!(
+                            std::sync::Arc::ptr_eq(&ctx.style_of(theme), style),
+                            "editor style must not leak"
+                        );
+                    }
+                    assert_eq!(ctx.options(|options| options.theme_preference), preference);
+                }
+            }
         }
     }
 

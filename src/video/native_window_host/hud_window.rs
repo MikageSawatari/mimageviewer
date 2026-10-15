@@ -49,7 +49,7 @@
 //! - `WM_MOUSEACTIVATE`: `MA_NOACTIVATE` を返す。
 //! - `WM_NCHITTEST`: regions に含まれれば `HTCLIENT`、それ以外は `HTTRANSPARENT`
 //!   (region 外は `SetWindowRgn` で穴になっているため通常メッセージは来ないが念のため)。
-//! - `WM_WINDOWPOSCHANGING`: `WINDOWPOS::hwndInsertAfter` が自分より前を指す変更を
+//! - `WM_WINDOWPOSCHANGING`: `SWP_NOZORDER` がなく、`hwndInsertAfter` が自分より前を指す変更を
 //!   検知したら bounded route へ `RequestRaiseHud` を流す (best-effort
 //!   safety net、主経路は z-order 操作後 hook と pump observation)。
 //! - `WM_DPICHANGED`: `DpiChanged { dpi, suggested_rect }` を発火。
@@ -70,13 +70,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
     GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow,
     MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, WINDOWPOS, WM_APPCOMMAND,
-    WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, WINDOWPOS,
+    WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 use windows::core::PCWSTR;
@@ -346,7 +346,8 @@ impl HudOverlayWindow {
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                // This geometry-preserving raise must not generate its own recovery request.
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
                 crate::presentation_observer::WindowRole::Hud,
                 "HudOverlayWindow::raise_to_top",
             );
@@ -1016,10 +1017,11 @@ unsafe extern "system" fn hud_wnd_proc(
                 if !wp.is_null() {
                     let insert_after = unsafe { (*wp).hwndInsertAfter };
                     // HWND_TOP (= 0) は「先頭に挿入」、HWND_TOPMOST (= -1) は「TOPMOST の先頭」。
-                    // どちらも HUD より前なので raise を要求。
+                    // NOZORDER がなければ、どちらも HUD より前なので raise を要求。
+                    // geometry 通知の insertAfter は NOZORDER により無視される。
                     // HWND_BOTTOM (= 1) や HWND_NOTOPMOST (= -2) は HUD を後ろに送るので除外。
                     let raw = insert_after.0 as isize;
-                    if raw == 0 || raw == -1 {
+                    if !unsafe { (*wp).flags }.contains(SWP_NOZORDER) && (raw == 0 || raw == -1) {
                         if let Some(state) = window_state(hwnd) {
                             state
                                 .event_sink
@@ -1080,5 +1082,185 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::video::native_window::{NativeWindowEventReceiver, native_window_event_route};
+    use std::sync::atomic::AtomicBool;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_HWNDNEXT, GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowRect, HWND_TOP,
+        IsWindowVisible, SetWindowPos,
+    };
+
+    // Use the production class/wndproc and methods, but never ShowWindow or activate
+    // anything. Production create() shows the HUD, so build only its hidden HWND here.
+    fn hidden_hud() -> (HudOverlayWindow, NativeWindowEventReceiver) {
+        register_window_class().expect("register HUD class");
+        let fault = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_events) = native_window_event_route(16, Arc::clone(&fault));
+        let (render_route, _render_events) = native_window_event_route(16, fault);
+        let state = Box::into_raw(Box::new(WindowState {
+            event_sink: NativeVideoWindowEventSink::new(
+                7,
+                7,
+                NativeVideoWindowSource::Hud,
+                pump_route,
+                render_route,
+            ),
+            regions: Arc::new(std::sync::Mutex::new(HudInteractiveRegions::default())),
+            held_buttons: NativeHeldMouseButtons::default(),
+            touch_ownership: NativeTouchOwnership::default(),
+            mouse_tracking: false,
+            last_mouse_move_log_at: None,
+        }));
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                HUD_CLASS_NAME,
+                w!("mIV hidden HUD regression"),
+                WS_POPUP,
+                -2000,
+                -2000,
+                320,
+                180,
+                None,
+                None,
+                Some(GetModuleHandleW(None).expect("module").into()),
+                Some(state.cast()),
+            )
+        }
+        .expect("create hidden HUD");
+        let hud = HudOverlayWindow {
+            hwnd,
+            _state_ptr: state,
+            last_regions_hash: None,
+            owner_thread: std::thread::current().id(),
+            _not_send_or_sync: std::marker::PhantomData,
+        };
+        let _ = pump_events.drain(); // Creation notifications are outside the operation under test.
+        (hud, pump_events)
+    }
+
+    fn raise_requests(events: &NativeWindowEventReceiver) -> usize {
+        events
+            .drain()
+            .iter()
+            .filter(|envelope| {
+                assert_eq!((envelope.epoch, envelope.generation), (7, 7));
+                assert_eq!(envelope.source, NativeVideoWindowSource::Hud);
+                matches!(envelope.event, NativeVideoWindowEvent::RequestRaiseHud)
+            })
+            .count()
+    }
+
+    fn precedes(front: HWND, back: HWND) -> bool {
+        let mut current = front;
+        while let Ok(next) = unsafe { GetWindow(current, GW_HWNDNEXT) } {
+            if next == back {
+                return true;
+            }
+            current = next;
+        }
+        false
+    }
+
+    #[test]
+    fn hud_self_raise_does_not_request_another_raise() {
+        let (hud, events) = hidden_hud();
+        let (editor, _editor_events) = hidden_hud(); // Hidden TOPMOST sibling, same owner (none).
+        let _ = events.drain();
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut before = RECT::default();
+        unsafe { GetWindowRect(hud.hwnd(), &mut before) }.expect("HUD rect");
+        for _ in 0..3 {
+            editor.raise_to_top();
+            assert!(precedes(editor.hwnd(), hud.hwnd()));
+            hud.raise_to_top();
+            assert_eq!(
+                raise_requests(&events),
+                0,
+                "self raise must not reseed a burst"
+            );
+            assert!(
+                precedes(hud.hwnd(), editor.hwnd()),
+                "raise still restores HUD z-order"
+            );
+        }
+        let mut after = RECT::default();
+        unsafe { GetWindowRect(hud.hwnd(), &mut after) }.expect("HUD rect after raise");
+        assert_eq!(after, before);
+        assert!(!unsafe { IsWindowVisible(hud.hwnd()) }.as_bool());
+        assert_ne!(
+            unsafe { GetWindowLongPtrW(hud.hwnd(), GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0,
+            0
+        );
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    }
+
+    #[test]
+    fn hud_geometry_ignores_nozorder_but_external_zorder_still_requests_raise() {
+        let (hud, events) = hidden_hud();
+        hud.set_geometry(-1900, -1800, 400, 240);
+        assert_eq!(
+            raise_requests(&events),
+            0,
+            "NOZORDER geometry must not raise HUD"
+        );
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(hud.hwnd(), &mut rect) }.expect("geometry applied");
+        assert_eq!(
+            rect,
+            RECT {
+                left: -1900,
+                top: -1800,
+                right: -1500,
+                bottom: -1560
+            }
+        );
+
+        // Ordinary external SetWindowPos must still reach the actual HUD wndproc.
+        for insert_after in [HWND_TOP, HWND_TOPMOST] {
+            // Test both ignored insert-after values through the production handler.
+            let mut notification = WINDOWPOS {
+                hwnd: hud.hwnd(),
+                hwndInsertAfter: insert_after,
+                flags: SWP_NOZORDER | SWP_NOACTIVATE,
+                ..Default::default()
+            };
+            unsafe {
+                hud_wnd_proc(
+                    hud.hwnd(),
+                    WM_WINDOWPOSCHANGING,
+                    WPARAM(0),
+                    LPARAM((&mut notification as *mut WINDOWPOS) as isize),
+                );
+            }
+            assert_eq!(
+                raise_requests(&events),
+                0,
+                "NOZORDER must ignore insert-after"
+            );
+            unsafe {
+                SetWindowPos(
+                    hud.hwnd(),
+                    Some(insert_after),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                )
+            }
+            .expect("external z-order notification");
+            assert_eq!(
+                raise_requests(&events),
+                1,
+                "external recovery route must remain"
+            );
+        }
+        assert!(!unsafe { IsWindowVisible(hud.hwnd()) }.as_bool());
     }
 }

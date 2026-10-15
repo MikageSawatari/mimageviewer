@@ -566,8 +566,11 @@ VST z-order 操作の各経路 (`set_all_guis_topmost` / `set_all_guis_visible_b
 `user_hide_slot_gui` / `remove_plugin` / `disable_with_reason`) の末尾で `DspBridge::fire_hud_raise_hook`
 が `AtomicBool` latest-value latch を set → App `update` が `swap(false)` → 1 件以上来てれば fullscreen 中の
 `VideoPlayer::request_hud_raise()` を 1 回呼ぶ (= coalesce) → bounded render command と pump control を経て pump が
-`NativeVideoOutputCommand::RaiseHudToTop` を受けて **即時/16ms/64ms の short retry burst** で
+`NativeVideoOutputCommand::RaiseHudToTop` を受けて **即時/16ms/50ms の short retry burst** で
 `SetWindowPos(hud, HWND_TOPMOST)` を呼ぶ (= 非同期 VST IPC の z-order 反映を確実に拾う)。
+移動・サイズ変更のない HUD 自前 raise だけに `SWP_NOSENDCHANGING` を付け、自己通知による再要求を防ぐ。
+HUD の `WM_WINDOWPOSCHANGING` は `SWP_NOZORDER` 付きの通知から raise を要求せず、外部の z-order 通知・VST hook・hover polling と既存の許可判定・burst は維持する。
+これは不要な HUD 前面化の繰り返しの修正であり、サブモニターの点滅との因果は未確定。初回表示・再表示・配置切替での HUD 復帰は実機で確認する。
 
 各 raise burst 直前で `foreground_allows_hud_raise` を通す (= command / event / polling のすべての
 raise 経路で **allowlist 判定**):

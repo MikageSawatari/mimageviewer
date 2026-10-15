@@ -16,6 +16,8 @@ pub(crate) struct BookAppendRefresh {
 pub(crate) enum FolderRefreshCause {
     #[default]
     External,
+    /// Refresh required by a user operation, independent of passive observation.
+    Operation,
     /// General refresh returned by Append; no self-operation exception.
     /// It retains the existing deferred delivery across general Delete.
     BookAppendExternal,
@@ -23,9 +25,29 @@ pub(crate) enum FolderRefreshCause {
 }
 
 impl FolderRefreshCause {
+    pub(crate) fn is_passive_observation(&self) -> bool {
+        matches!(self, Self::External)
+    }
+
+    /// Coalesce only requests for the same owner, folder and scan options.
+    /// Passive notifications cannot erase an operation's required delivery;
+    /// combining operations never invents a receipt exception.
+    pub(crate) fn merge_for_refresh(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::External, cause) | (cause, Self::External) => cause,
+            (Self::Operation, Self::Operation) => Self::Operation,
+            (Self::BookAppend(left), Self::BookAppend(right))
+                if left.operation() == right.operation() =>
+            {
+                Self::BookAppend(left)
+            }
+            _ => Self::BookAppendExternal,
+        }
+    }
+
     pub(super) fn operation(&self) -> Option<AppendOperation> {
         match self {
-            Self::External | Self::BookAppendExternal => None,
+            Self::External | Self::Operation | Self::BookAppendExternal => None,
             Self::BookAppend(receipt) => Some(receipt.operation()),
         }
     }
@@ -42,10 +64,11 @@ impl FolderRefreshCause {
             Self::BookAppendExternal => Self::BookAppendExternal,
             Self::BookAppend(_) => Self::BookAppendExternal,
             Self::External => Self::External,
+            Self::Operation => Self::Operation,
         }
     }
     pub(super) fn is_append_delivery(&self) -> bool {
-        !matches!(self, Self::External)
+        matches!(self, Self::BookAppend(_) | Self::BookAppendExternal)
     }
 }
 
@@ -195,11 +218,10 @@ impl App {
         let Some(receipt) = self.book_append_undo_receipt.as_ref() else {
             return;
         };
-        if self
-            .external_rescan_pending
-            .as_ref()
-            .is_some_and(|scan| crate::folder_tree::path_eq(&scan.folder, &receipt.files.folder))
-        {
+        if self.external_rescan_pending.as_ref().is_some_and(|scan| {
+            scan.cause.is_append_delivery()
+                && crate::folder_tree::path_eq(&scan.folder, &receipt.files.folder)
+        }) {
             let scan = self.external_rescan_pending.take().unwrap();
             scan.cancel_and_retire();
         }
@@ -340,12 +362,12 @@ impl App {
                 }
             }
         } else if current_target {
-            self.folder_refresh_pending = Some(FolderRefreshRequest {
+            self.retain_folder_refresh(FolderRefreshRequest {
                 folder: summary.folder.clone(),
                 cause: receipt
                     .clone()
                     .map(FolderRefreshCause::BookAppend)
-                    .unwrap_or_default(),
+                    .unwrap_or(FolderRefreshCause::BookAppendExternal),
             });
         }
         // Publish only after metadata and the immediate visible adoption terminal.
@@ -484,7 +506,7 @@ impl App {
                     .intent
                     .clone();
                 self.book_op_pending = None;
-                self.folder_refresh_pending = Some(FolderRefreshRequest {
+                self.retain_folder_refresh(FolderRefreshRequest {
                     folder: fallback.folder,
                     cause: FolderRefreshCause::BookAppendExternal,
                 });
@@ -533,7 +555,7 @@ impl App {
             && self.book_append_refresh_folder_is_current(target_folder)
         {
             if self.delete_pending.is_some() {
-                self.folder_refresh_pending = Some(FolderRefreshRequest {
+                self.retain_folder_refresh(FolderRefreshRequest {
                     folder: target_folder.clone(),
                     cause,
                 });
@@ -554,6 +576,56 @@ mod tests {
     use super::*;
     use crate::book_append_undo::{AppendObservations, AppendReceiptBuilder};
     use crate::books::{BookAppendSummary, BookOpIntent, BookOpPending, BookOpResult};
+
+    #[test]
+    fn c1_refresh_cause_distinguishes_passive_and_general_operation() {
+        assert!(FolderRefreshCause::External.is_passive_observation());
+        assert!(!FolderRefreshCause::Operation.is_passive_observation());
+        assert!(!FolderRefreshCause::Operation.is_append_delivery());
+        assert!(!FolderRefreshCause::BookAppendExternal.is_passive_observation());
+        assert!(FolderRefreshCause::BookAppendExternal.is_append_delivery());
+        assert!(matches!(
+            FolderRefreshCause::Operation.verified_for_folder(Path::new("unused")),
+            FolderRefreshCause::Operation
+        ));
+    }
+
+    #[test]
+    fn c1_refresh_cause_merge_preserves_operations_without_reviving_receipt() {
+        use FolderRefreshCause::{BookAppend, BookAppendExternal, External, Operation};
+
+        let (_app, receipt, _) = fixture();
+        assert!(matches!(External.merge_for_refresh(External), External));
+        assert!(matches!(Operation.merge_for_refresh(Operation), Operation));
+        for (left, right) in [(External, Operation), (Operation, External)] {
+            assert!(matches!(left.merge_for_refresh(right), Operation));
+        }
+        for (left, right) in [
+            (External, BookAppend(receipt.clone())),
+            (BookAppend(receipt.clone()), External),
+            (BookAppend(receipt.clone()), BookAppend(receipt.clone())),
+        ] {
+            assert_eq!(
+                left.merge_for_refresh(right).operation(),
+                Some(receipt.operation())
+            );
+        }
+        let mut different = receipt.clone();
+        different.operation_id += 1;
+        for (left, right) in [
+            (BookAppend(receipt.clone()), BookAppend(different)),
+            (BookAppend(receipt.clone()), Operation),
+            (Operation, BookAppend(receipt.clone())),
+            (BookAppendExternal, BookAppend(receipt.clone())),
+            (BookAppend(receipt), BookAppendExternal),
+            (BookAppendExternal, Operation),
+            (Operation, BookAppendExternal),
+            (BookAppendExternal, External),
+            (External, BookAppendExternal),
+        ] {
+            assert!(matches!(left.merge_for_refresh(right), BookAppendExternal));
+        }
+    }
 
     fn fixture() -> (AppTestEnvForTest, BookAppendUndoReceipt, BookAppendSummary) {
         let mut app = setup_app_for_test();
@@ -881,6 +953,60 @@ mod tests {
         assert_eq!(app.fullscreen_idx, Some(0));
         app.cancel_book_append_readonly_refresh();
         assert!(app.folder_refresh_pending.is_none());
+    }
+
+    #[test]
+    fn c1_invalidated_append_terminal_keeps_active_refresh_without_receipt() {
+        let (mut app, receipt, summary) = fixture();
+        let tx = hold(&mut app, &receipt);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(app.admit_book_append_followup_mutation());
+        tx.send(Ok(BookOpResult::Append(summary))).unwrap();
+        app.poll_book_op_pending(&egui::Context::default());
+        assert!(app.book_op_pending.is_none());
+        assert!(app.book_append_undo_receipt.is_none());
+        let request = app.folder_refresh_pending.as_ref().unwrap();
+        assert_eq!(request.folder, receipt.files.folder);
+        assert!(matches!(
+            request.cause,
+            FolderRefreshCause::BookAppendExternal
+        ));
+    }
+
+    #[test]
+    fn c1_cancel_append_refresh_preserves_general_operation_scan_and_hold() {
+        for append_owned in [false, true] {
+            let (mut app, receipt, _) = fixture();
+            let cause = if append_owned {
+                FolderRefreshCause::BookAppend(receipt.clone())
+            } else {
+                FolderRefreshCause::Operation
+            };
+            let (_tx, rx) = mpsc::channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            app.external_rescan_pending = Some(ExternalRescanPending {
+                proof: None,
+                owner_context_id: app.projected_viewer_context_id(),
+                folder: receipt.files.folder.clone(),
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                items_generation: app.items_generation,
+                scan_options: app.current_external_scan_options(),
+                cancel: Arc::clone(&cancel),
+                rx,
+                restart_requested: false,
+                cause: cause.clone(),
+            });
+            app.folder_refresh_pending = Some(FolderRefreshRequest {
+                folder: receipt.files.folder.clone(),
+                cause,
+            });
+            app.book_append_undo_receipt = Some(receipt);
+            app.cancel_book_append_readonly_refresh();
+            assert_eq!(cancel.load(Ordering::Relaxed), append_owned);
+            assert_eq!(app.external_rescan_pending.is_none(), append_owned);
+            assert_eq!(app.folder_refresh_pending.is_none(), append_owned);
+        }
     }
 
     #[test]

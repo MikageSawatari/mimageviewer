@@ -10657,7 +10657,9 @@ mod tests {
     fn composition_legacy_spread_admission_retains_matching_intent_for_effective_zip_scope() {
         use crate::book_composition::*;
         use std::io::Write;
-        let temp = tempfile::tempdir().unwrap();
+        // new_with_session resolves source visibility through the live settings DB.
+        // Isolate its process-global data-dir/DB alongside the other settings tests.
+        let temp = crate::settings_db::DataDirOverrideGuard::new();
         let root = temp.path().join("book.zip");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
         zip.start_file("chapter/a.png", zip::write::SimpleFileOptions::default())
@@ -10720,10 +10722,8 @@ mod tests {
                             Some(expected)
                         );
                     } else {
-                        assert_eq!(
-                            admission.unwrap_err().code,
-                            RemoteWriteErrorCode::Unsupported
-                        );
+                        let error = admission.unwrap_err();
+                        assert_eq!(error.code, RemoteWriteErrorCode::Unsupported, "{error:?}");
                     }
                 }
             }

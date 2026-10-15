@@ -41521,18 +41521,15 @@ mod favorite_adjustment_defaults_tests {
         app.invalidate_rename_migrations_for_removed_paths(&[PathBuf::from("queued-removed")]);
 
         app.quarantine_rename_migration_recovery(&ctx);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while app.rename_migration_recovery_quarantine_running()
-            && std::time::Instant::now() < deadline
-        {
-            app.poll_rename_migration_quarantine();
-            std::thread::yield_now();
-        }
-        assert!(!app.rename_migration_recovery_quarantine_running());
-        assert!(matches!(
-            app.rename_migration_journal_admission,
-            RenameMigrationJournalAdmission::Waiting { .. }
-        ));
+        // Observe the completed rename before App adopts it and starts the new
+        // journal writer. A fast replacement save may recreate JOURNAL_FILE as
+        // soon as poll_rename_migration_quarantine publishes the local snapshot.
+        let RenameMigrationJournalAdmission::RecoveryQuarantining { task, .. } =
+            &mut app.rename_migration_journal_admission
+        else {
+            panic!("explicit quarantine must own its worker");
+        };
+        task.join_terminal();
         assert!(!journal.exists());
         let quarantined = std::fs::read_dir(&data_dir)
             .unwrap()
@@ -41547,6 +41544,12 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(quarantined.len(), 1);
         assert_eq!(std::fs::read(quarantined[0].path()).unwrap(), invalid);
 
+        app.poll_rename_migration_quarantine();
+        assert!(!app.rename_migration_recovery_quarantine_running());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Waiting { .. }
+        ));
         app.flush_rename_migration_journal().unwrap();
         let saved = crate::rename_key_migration::journal_load(&data_dir).unwrap();
         assert_eq!(saved.len(), 3);
@@ -48391,7 +48394,6 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.auto_aspect_cache_target_path().is_none());
     }
 
-    #[test]
     /// 右情報パネルのロックと明示 open は **viewer context ごと**に持つ (backlog §1.158)。
     ///
     /// App-global に置くと、`with_viewer_context` が bundle のフィールドだけを差し替えて

@@ -14,7 +14,8 @@ pub(crate) enum UnitLayout {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum PageMaterial {
-    /// An unoccupied spread slot: no paper, texture, ROI or occurrence.
+    /// An unoccupied canonical slot: no texture, ROI or occurrence. A turning
+    /// face may temporarily cover it with the existing unprinted black paper.
     Vacant,
     Texture {
         texture_id: TextureId,
@@ -296,7 +297,11 @@ impl Leaf<'_> {
         self.domain_silhouette(unit_uv())
     }
     fn image_silhouette(&self) -> Vec<Pos2> {
-        self.domain_silhouette(self.image_parameters())
+        if vacant(self.page) {
+            Vec::new()
+        } else {
+            self.domain_silhouette(self.image_parameters())
+        }
     }
     fn domain_silhouette(&self, domain: Rect) -> Vec<Pos2> {
         let mut p: Vec<_> = rectangle(domain)
@@ -449,7 +454,7 @@ pub(crate) fn project_prepared(
         (
             if old.layout == UnitLayout::Spread {
                 let s = usize::from(direction.turns_right_slot());
-                spread_angle(&old.pages[s], &new.pages[1 - s], progress, recipe.lift).to_degrees()
+                spread_angle(&old.pages[s], progress, recipe.lift).to_degrees()
             } else if direction.forward {
                 90.0
             } else {
@@ -556,17 +561,9 @@ fn spine(unit: &CanonicalUnit, sign: f32) -> f32 {
         }
     })
 }
-fn spread_angle(front: &CanonicalPage, back: &CanonicalPage, p: f32, lift: f32) -> f32 {
-    let start = if vacant(front) {
-        std::f32::consts::FRAC_PI_2
-    } else {
-        lift
-    };
-    let end = if vacant(back) {
-        std::f32::consts::FRAC_PI_2
-    } else {
-        std::f32::consts::PI
-    };
+fn spread_angle(front: &CanonicalPage, p: f32, lift: f32) -> f32 {
+    let start = if vacant(front) { 0.0 } else { lift };
+    let end = std::f32::consts::PI;
     if p == 0.0 {
         start
     } else if p == 1.0 {
@@ -628,17 +625,13 @@ fn scene<'a>(
     let front = &old.pages[s];
     let back = &new.pages[if pair { 1 - s } else { 0 }];
     let theta = if pair {
-        spread_angle(front, back, p, lift)
+        spread_angle(front, p, lift)
     } else if !d.forward {
         lift * (1.0 - smooth(p))
     } else {
         lift + (std::f32::consts::FRAC_PI_2 - lift) * smooth(p)
     };
-    let morph = if pair && vacant(front) {
-        1.0
-    } else if pair && vacant(back) {
-        0.0
-    } else if pair {
+    let morph = if pair {
         smooth((theta.to_degrees() - 60.0) / 60.0)
     } else if d.forward {
         0.0
@@ -647,6 +640,18 @@ fn scene<'a>(
     };
     let h0 = spine(old, sign);
     let h1 = spine(new, sign);
+    // A vacant face is unprinted black paper covering the stationary page on
+    // that side. Use that page's footprint, even when the other slot is smaller.
+    let front_rect = if pair && vacant(front) {
+        new.pages[s].rect.translate(egui::vec2(h0 - h1, 0.0))
+    } else {
+        front.rect
+    };
+    let back_rect = if pair && vacant(back) {
+        old.pages[1 - s].rect.translate(egui::vec2(h1 - h0, 0.0))
+    } else {
+        back.rect
+    };
     let paper = (!pair).then(|| single_paper(old, new));
     let hinge = if pair {
         moving_hinge(h0, h1, p)
@@ -681,18 +686,19 @@ fn scene<'a>(
         }
         let rest = &old.pages[1 - s];
         let rest_rect = rest.rect.translate(old_shift);
-        let back_rect = back.rect.translate(new_shift);
+        let back_rect = back_rect.translate(new_shift);
         // Only canonical-footprint remnants retire in the final tenth.
         let alpha = 1.0 - smooth((p - 0.9) / 0.1);
         if !vacant(rest) {
             if vacant(back) {
-                // No arriving paper covers this side: retire all old support.
+                // The arriving black paper covers this page naturally. Keep
+                // its entire stationary support until ordinary flat adoption.
                 surfaces.push(placed_surface(
                     rest,
                     rest_rect,
                     rest_rect,
                     FaceOwner::Other,
-                    alpha,
+                    1.0,
                 ));
             } else {
                 let hit = rest_rect.intersect(back_rect);
@@ -713,32 +719,39 @@ fn scene<'a>(
         surfaces.push(surface(front, front.rect, FaceOwner::Other, 1.0));
     }
     let front_inner = if sign > 0.0 {
-        front.rect.left() - h0
+        front_rect.left() - h0
     } else {
-        h0 - front.rect.right()
+        h0 - front_rect.right()
     };
-    let front_outer = front_inner + front.rect.width();
+    let front_outer = front_inner + front_rect.width();
     let back_inner = if -sign > 0.0 {
-        back.rect.left() - h1
+        back_rect.left() - h1
     } else {
-        h1 - back.rect.right()
+        h1 - back_rect.right()
     };
-    let back_outer = back_inner + back.rect.width();
-    let is_back = pair && (vacant(front) || theta > std::f32::consts::FRAC_PI_2);
+    let back_outer = back_inner + back_rect.width();
+    let is_back = pair && theta > std::f32::consts::FRAC_PI_2;
     let (page, owner) = if is_back {
         (back, incoming_owner(back))
     } else if !pair && !d.forward {
         (back, incoming_owner(back))
     } else {
-        (front, FaceOwner::OutgoingFront)
+        (
+            front,
+            if vacant(front) {
+                FaceOwner::Other
+            } else {
+                FaceOwner::OutgoingFront
+            },
+        )
     };
     let interpolate = |a: f32, b: f32| a + (b - a) * morph;
     let (inner, outer, top, bottom) = if pair {
         (
             interpolate(front_inner, back_inner),
             interpolate(front_outer, back_outer),
-            interpolate(front.rect.top(), back.rect.top()),
-            interpolate(front.rect.bottom(), back.rect.bottom()),
+            interpolate(front_rect.top(), back_rect.top()),
+            interpolate(front_rect.bottom(), back_rect.bottom()),
         )
     } else {
         let paper = paper.unwrap();
@@ -771,12 +784,12 @@ fn scene<'a>(
                 ),
             )
         }),
-        black_paper: paper.is_some(),
+        black_paper: paper.is_some() || vacant(page),
     };
     Scene {
         surfaces,
-        leaf: (!vacant(page)).then_some(leaf),
-        shadow: if vacant(page) { 0.0 } else { theta.sin().abs() },
+        leaf: Some(leaf),
+        shadow: theta.sin().abs(),
         black_floor: paper.map(|paper| (paper, front.clip_rect)),
     }
 }
@@ -1077,9 +1090,6 @@ fn flat_surface(meshes: &mut Vec<ProjectedMesh>, surface: &Surface<'_>) {
     }
 }
 fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, grid_v: usize) {
-    if vacant(leaf.page) {
-        return;
-    }
     // Preserve the existing neutral thickness/edge and printed-face shading.
     // Single-page padding is an opaque black paper below the original image.
     let silhouette = leaf.silhouette();
@@ -1111,7 +1121,7 @@ fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, 
     }
     if leaf.theta.cos().abs() < 0.00001 {
         materials.push((&paper, unit_uv()));
-    } else {
+    } else if !vacant(leaf.page) {
         for material in leaf
             .page
             .underlay
@@ -2781,6 +2791,125 @@ mod tests {
         }
     }
     #[test]
+    fn page_turn_vacant_black_leaf_covers_unequal_static_pages_without_fading() {
+        for rtl in [false, true] {
+            let (mut pair, _) = fixture(true);
+            let s = usize::from(!rtl);
+            pair.spine_x = Some((pair.pages[0].rect.right() + pair.pages[1].rect.left()) * 0.5);
+            let mut rest = pair.pages[1 - s].rect;
+            if s == 1 {
+                rest.min.x -= 80.0;
+            } else {
+                rest.max.x += 80.0;
+            }
+            rest.min.y -= 24.0;
+            rest.max.y += 36.0;
+            pair.pages[1 - s] = page(9, rest);
+            pair.pages[s] = page(10, pair.pages[s].rect);
+            let mut single = pair.clone();
+            let mut real = pair.pages[s].rect;
+            if s == 1 {
+                real.max.x -= 70.0;
+            } else {
+                real.min.x += 70.0;
+            }
+            real.min.y += 50.0;
+            real.max.y -= 40.0;
+            single.pages[s] = page(11, real);
+            let h = pair.spine_x.unwrap();
+            single.pages[1 - s] = CanonicalPage {
+                occurrence: None,
+                rect: Rect::from_min_max(
+                    pos2(2.0 * h - real.right(), real.top()),
+                    pos2(2.0 * h - real.left(), real.bottom()),
+                ),
+                clip_rect: pair.pages[0].clip_rect,
+                material: PageMaterial::Vacant,
+                underlay: None,
+            };
+            for forward in [false, true] {
+                let (old, new) = if forward {
+                    (&pair, &single)
+                } else {
+                    (&single, &pair)
+                };
+                let d = TurnDirection {
+                    reading_rtl: rtl,
+                    forward,
+                };
+                let recipe = prepare_turn(old, new, d).unwrap();
+                for p in [0.0, 0.1, 0.25, 0.45, 0.6, 0.75, 0.95, 0.99999] {
+                    let pose = scene(old, new, d, p, recipe.lift);
+                    let floor = pose
+                        .surfaces
+                        .iter()
+                        .find(|surface| surface.page.occurrence == Some(9))
+                        .unwrap();
+                    assert_eq!(floor.rect, rest);
+                    assert_eq!(
+                        floor.alpha, 1.0,
+                        "static page must not fade: rtl={rtl} forward={forward} p={p}"
+                    );
+                    let leaf = pose.leaf.as_ref().unwrap();
+                    let projected = project_prepared(old, new, d, recipe, p, false).unwrap();
+                    assert!(projected.meshes.iter().any(|mesh| {
+                        mesh.mesh.texture_id == TextureId::User(9)
+                            && mesh
+                                .mesh
+                                .vertices
+                                .iter()
+                                .all(|vertex| vertex.color.a() == 255)
+                    }));
+                    assert_eq!(
+                        projected.visibility.incoming.len(),
+                        if forward { 1 } else { 2 }
+                    );
+                    if vacant(leaf.page) {
+                        assert!(leaf.black_paper);
+                        assert!(leaf.image_silhouette().is_empty());
+                        assert!(matches!(leaf.owner, FaceOwner::Other));
+                        assert!(projected.meshes.iter().any(|mesh| {
+                            !mesh.mesh.indices.is_empty()
+                                && mesh.mesh.texture_id == TextureId::default()
+                                && mesh
+                                    .mesh
+                                    .vertices
+                                    .iter()
+                                    .all(|vertex| vertex.color == Color32::BLACK)
+                        }));
+                    }
+                    if !forward && p == 0.0 {
+                        assert_eq!(leaf.theta, 0.0);
+                        let visible = projected
+                            .visibility
+                            .incoming
+                            .iter()
+                            .find(|v| v.occurrence == 9)
+                            .unwrap();
+                        assert!(
+                            visible.fraction() < 0.00001,
+                            "black front covers all of the larger incoming page"
+                        );
+                    }
+                    if forward && p == 0.99999 {
+                        let uncovered = subtract_polygon(&floor.polygon, &leaf.silhouette());
+                        assert!(
+                            uncovered.iter().map(|poly| polygon_area(poly)).sum::<f32>() < 1.0,
+                            "black back covers all of the larger old page before flat adoption"
+                        );
+                    }
+                }
+                let end = scene(old, new, d, 1.0, recipe.lift);
+                assert!(end.leaf.is_none() && end.black_floor.is_none());
+                assert_eq!(end.shadow, 0.0);
+                assert!(end.surfaces.iter().all(|surface| !vacant(surface.page)
+                    && surface.rect == surface.page.rect
+                    && surface.alpha == 1.0));
+                assert_eq!(end.surfaces.len(), if forward { 1 } else { 2 });
+            }
+        }
+    }
+    #[test]
     fn normalized_spread_transitions_keep_hinge_printed_basis_and_exact_endpoints_in_four_routes() {
         let (pair, _) = fixture(true);
         let singleton = |id: u64, rect: Rect, kind| {
@@ -2852,7 +2981,11 @@ mod tests {
                             );
                         }
                         if let Some(leaf) = &pose.leaf {
-                            assert!(!vacant(leaf.page));
+                            assert_eq!(leaf.black_paper, vacant(leaf.page));
+                            if vacant(leaf.page) {
+                                assert!(leaf.image_silhouette().is_empty());
+                                assert!(matches!(leaf.owner, FaceOwner::Other));
+                            }
                             let expected = if leaf.back {
                                 &new.pages[1 - s]
                             } else {
@@ -2878,30 +3011,24 @@ mod tests {
                             for visible in &projected.visibility.incoming {
                                 assert!((visible.fraction() - 1.0).abs() < 0.0001);
                             }
-                            assert_eq!(
-                                projected.angle_degrees,
-                                if vacant(&new.pages[1 - s]) {
-                                    90.0
-                                } else {
-                                    180.0
-                                }
-                            );
+                            assert_eq!(projected.angle_degrees, 180.0);
                         }
                     }
                     if vacant(&old.pages[s]) {
                         let leaf = first.leaf.as_ref().unwrap();
-                        assert_eq!(leaf.theta, std::f32::consts::FRAC_PI_2);
-                        assert!(leaf.back && std::ptr::eq(leaf.page, &new.pages[1 - s]));
+                        assert_eq!(leaf.theta, 0.0);
+                        assert!(!leaf.back && std::ptr::eq(leaf.page, &old.pages[s]));
+                        assert!(leaf.black_paper);
                     }
                     if vacant(&new.pages[1 - s]) {
                         let near_end = scene(old, new, d, 0.99999, recipe.lift);
                         let leaf = near_end.leaf.as_ref().unwrap();
-                        assert!(!leaf.back && std::ptr::eq(leaf.page, &old.pages[s]));
-                        assert!((leaf.theta - std::f32::consts::FRAC_PI_2).abs() < 0.00001);
-                        assert!((leaf.position(1.0, 0.5).x - leaf.hinge).abs() < 0.001);
+                        assert!(leaf.back && std::ptr::eq(leaf.page, &new.pages[1 - s]));
+                        assert!(leaf.black_paper);
+                        assert!((leaf.theta - std::f32::consts::PI).abs() < 0.00001);
                         for surface in &near_end.surfaces {
                             if matches!(surface.owner, FaceOwner::Other) {
-                                assert!(surface.alpha < 0.00001);
+                                assert_eq!(surface.alpha, 1.0);
                             }
                         }
                     }

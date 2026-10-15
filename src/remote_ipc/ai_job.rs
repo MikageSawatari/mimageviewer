@@ -863,6 +863,10 @@ fn missing_job_error(state: &RegistryState, owner: &str, job_id: &str) -> Remote
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Worker calls arrive on another thread; a full workspace test run can delay them
+    /// well past one second, so the wait only bounds a call that never comes.
+    const TEST_WORKER_WAIT: Duration = Duration::from_secs(10);
     use std::sync::Barrier;
     use std::sync::mpsc;
 
@@ -1080,7 +1084,7 @@ mod tests {
     fn ready_result_is_retained_then_becomes_typed_gone_tombstone() {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "ready");
-        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         assert_eq!(call.owner, "client");
         assert_eq!(call.request_id, "ready");
         call.complete.send(FakeCompletion::Ready).unwrap();
@@ -1104,7 +1108,7 @@ mod tests {
     fn settings_recovery_failure_keeps_a_distinct_retry_terminal_code() {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "settings-recovery");
-        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         call.complete
             .send(FakeCompletion::SettingsRecoveryInProgress)
             .unwrap();
@@ -1136,7 +1140,7 @@ mod tests {
 
         let job = start(&session, &registry, "settings-recovery-before-publication");
         calls
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(TEST_WORKER_WAIT)
             .unwrap()
             .complete
             .send(FakeCompletion::Ready)
@@ -1176,7 +1180,7 @@ mod tests {
 
         let job = start(&session, &registry, "publication-before-settings-recovery");
         calls
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(TEST_WORKER_WAIT)
             .unwrap()
             .complete
             .send(FakeCompletion::Ready)
@@ -1226,7 +1230,7 @@ mod tests {
     fn disconnect_drain_waits_for_executor_acknowledgement() {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "disconnect");
-        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         let generation = session.snapshot().generation;
 
         session.local_disconnect();
@@ -1269,7 +1273,7 @@ mod tests {
     fn explicit_cancel_and_supersede_are_distinct_terminal_results() {
         let (_data_dir, session, registry, calls) = fixture();
         let cancelled = start(&session, &registry, "cancel");
-        let cancelled_call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let cancelled_call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         assert!(matches!(
             registry.cancel("client", &cancelled.job_id),
             RemoteAiCancelResponse::Success(RemoteAiJobSnapshot {
@@ -1287,9 +1291,9 @@ mod tests {
         );
 
         let old = start(&session, &registry, "old");
-        let old_call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let old_call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         let new = start(&session, &registry, "new");
-        let new_call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let new_call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         assert!(old_call.cancel.load(Ordering::Acquire));
         old_call.complete.send(FakeCompletion::Ready).unwrap();
         new_call.complete.send(FakeCompletion::Ready).unwrap();
@@ -1306,7 +1310,7 @@ mod tests {
     fn recoverable_query_keeps_the_same_nonterminal_job_identity() {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "recover");
-        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         let recovered = match registry.recoverable("client") {
             RemoteAiRecoverableResponse::Success(jobs) => jobs,
             RemoteAiRecoverableResponse::Error(error) => panic!("recover failed: {error:?}"),
@@ -1334,7 +1338,7 @@ mod tests {
         {
             let job = start(&session, &registry, &format!("not-applicable-{index}"));
             calls
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(TEST_WORKER_WAIT)
                 .unwrap()
                 .complete
                 .send(FakeCompletion::NotApplicable(code))
@@ -1378,7 +1382,7 @@ mod tests {
             });
         let job = start_with_request(&session, &registry, mixed_request);
         calls
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(TEST_WORKER_WAIT)
             .unwrap()
             .complete
             .send(FakeCompletion::Mixed(RemoteAiTerminalCode::VectorPdf))
@@ -1428,7 +1432,7 @@ mod tests {
         ));
 
         assert!(session.finish_acquire(session.snapshot().generation));
-        let call = call_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = call_rx.recv_timeout(TEST_WORKER_WAIT).unwrap();
         call.complete.send(FakeCompletion::Ready).unwrap();
         wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
     }
@@ -1458,7 +1462,7 @@ mod tests {
     fn background_expiry_keeps_typed_terminal_until_executor_ack() {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "background-expiry");
-        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         registry.on_session_drain(RemoteLongJobDrainCause::BackgroundExpired);
         assert!(call.cancel.load(Ordering::Acquire));
         wait_for_state(
@@ -1485,7 +1489,7 @@ mod tests {
     fn terminal_retention_expires_at_ten_minute_boundary() {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "retention-boundary");
-        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         call.complete.send(FakeCompletion::Ready).unwrap();
         wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
 
@@ -1513,7 +1517,7 @@ mod tests {
     fn repeated_result_reads_return_stored_bytes_without_reexecuting() {
         let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "stored-result");
-        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        let call = calls.recv_timeout(TEST_WORKER_WAIT).unwrap();
         call.complete.send(FakeCompletion::Ready).unwrap();
         wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
 

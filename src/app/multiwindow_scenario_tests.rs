@@ -639,6 +639,37 @@ fn stable_content(app: &mut App, window_id: u64) -> Option<StableContent> {
     .expect("window retains its viewer context")
 }
 
+// I2 compares completed content before and after parking. A preview may paint
+// while its final load is still pending, so every baseline uses both facts.
+fn stable_paint_frame(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    window_id: u64,
+    require_white: bool,
+) -> ScenarioFrame {
+    let viewport = App::detached_image_window_viewport_id(window_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let frame = driver.root(app);
+        if !records_for(&frame, viewport).is_empty()
+            && (!require_white
+                || frame
+                    .white
+                    .get(&viewport)
+                    .is_some_and(|records| !records.is_empty()))
+            && stable_content(app, window_id).is_some()
+        {
+            return frame;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "window {window_id}: paint did not reach stable content; frame={} records={:#?}",
+            frame.number,
+            frame.records,
+        );
+    }
+}
+
 fn save_portrait(path: &std::path::Path, color: [u8; 3]) {
     let image = image::RgbImage::from_pixel(600, 900, image::Rgb(color));
     image.save(path).expect("real scenario image");
@@ -775,18 +806,7 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         app.detached_window_hwnd_set(200, 0x2000);
         let viewport = App::detached_image_window_viewport_id(100);
         driver.focus(viewport);
-        let mut active = driver.root(&mut app);
-        for _ in 0..12 {
-            if !records_for(&active, viewport).is_empty()
-                && active
-                    .white
-                    .get(&viewport)
-                    .is_some_and(|records| !records.is_empty())
-            {
-                break;
-            }
-            active = driver.root(&mut app);
-        }
+        let active = stable_paint_frame(&mut app, &mut driver, 100, true);
         let owner = stable_content(&mut app, 100).expect("active book state");
         assert_eq!(owner.spread_mode, crate::settings::SpreadMode::LtrCover);
         app.with_window_viewer_context(100, |owner| {
@@ -837,18 +857,7 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         app.queue_deferred_detached_window_activation(200, "page_alone_paint_test");
         let second_viewport = App::detached_image_window_viewport_id(200);
         driver.focus(second_viewport);
-        let mut activated = driver.root(&mut app);
-        for _ in 0..12 {
-            if !records_for(&activated, second_viewport).is_empty()
-                && activated
-                    .white
-                    .get(&second_viewport)
-                    .is_some_and(|records| !records.is_empty())
-            {
-                break;
-            }
-            activated = driver.root(&mut app);
-        }
+        let activated = stable_paint_frame(&mut app, &mut driver, 200, true);
         assert_i1_open_or_paint(
             "page-alone-white",
             true,
@@ -1026,13 +1035,7 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         let first_viewport = App::detached_image_window_viewport_id(100);
         driver.focus(first_viewport);
 
-        let mut before = driver.root(&mut app);
-        for _ in 0..12 {
-            if !records_for(&before, first_viewport).is_empty() {
-                break;
-            }
-            before = driver.root(&mut app);
-        }
+        let before = stable_paint_frame(&mut app, &mut driver, 100, false);
         assert!(
             !records_for(&before, first_viewport).is_empty(),
             "S-B active singleton must reach a real image mesh: frame={} records={:#?}",
@@ -1140,13 +1143,7 @@ fn scenario_b_endpoint_paint_center(
     app.detached_window_hwnd_set(200, 0x2000);
     let first_viewport = App::detached_image_window_viewport_id(100);
     driver.focus(first_viewport);
-    let mut before = driver.root(&mut app);
-    for _ in 0..12 {
-        if !records_for(&before, first_viewport).is_empty() {
-            break;
-        }
-        before = driver.root(&mut app);
-    }
+    let before = stable_paint_frame(&mut app, &mut driver, 100, false);
     let before_paint = records_for(&before, first_viewport);
     assert_eq!(
         before_paint.len(),
@@ -2126,7 +2123,12 @@ fn collection_order_open(
             Some(path),
             "full grid open before first frame"
         );
-        None
+        // A real fullscreen open moves focus off ROOT. Leaving the fake main
+        // viewport focused correctly triggers the production focus-close guard
+        // after its grace period, making this scenario depend on machine load.
+        let viewport = app.fullscreen_viewport_id();
+        driver.focus(viewport);
+        Some(viewport)
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
@@ -2244,7 +2246,17 @@ fn collection_order_observe(
             return;
         }
         if !pending && !display_pending && actual.as_deref() != Some(expected) {
-            assert_eq!(actual.as_deref(), Some(expected));
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "frame={} detached={detached} slideshow={} idx={:?} items={} records={:#?} errors={:?}",
+                frame.number,
+                app.slideshow_playing,
+                app.fullscreen_idx,
+                app.items.len(),
+                frame.records,
+                frame.errors,
+            );
         }
         assert!(
             std::time::Instant::now() < deadline,

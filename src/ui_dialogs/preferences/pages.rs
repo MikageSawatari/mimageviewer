@@ -10510,7 +10510,7 @@ pub(super) fn draw_page_turn_animation_setting(
     ui.add_enabled_ui(*enabled, |ui| {
         let row_width = ui.available_width();
         ui.horizontal_wrapped(|ui| {
-            let label = ui.label("時間（仮）");
+            let label = ui.label("時間");
             // A wrapped row reports its full width even after the label. Reserve
             // the label, spacing, editable value and ms suffix explicitly.
             ui.spacing_mut().slider_width =
@@ -10519,7 +10519,6 @@ pub(super) fn draw_page_turn_animation_setting(
             ui.add(egui::Slider::new(duration_ms, 100..=600).suffix(" ms"));
         });
     });
-    ui.small("時間は動きを確認してから決定します。");
 }
 
 #[cfg(test)]

@@ -803,7 +803,13 @@ impl crate::app::App {
                         let previous = self.folder_observation.take();
                         self.retire_smart_folder_payloads([Box::new(previous)
                             as crate::app::smart_folder::RetiredSmartFolderPayload]);
-                        self.folder_refresh_pending = Some(view.folder.clone().into());
+                        self.retain_folder_refresh(
+                            crate::app::book_append_refresh::FolderRefreshRequest {
+                                folder: view.folder.clone(),
+                                cause:
+                                    crate::app::book_append_refresh::FolderRefreshCause::Operation,
+                            },
+                        );
                     }
                 }
                 Some(StackReturnState::Ready {

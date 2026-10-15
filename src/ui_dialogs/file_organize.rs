@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, mpsc};
 
+use crate::app::book_append_refresh::FolderRefreshCause;
 use crate::app::{App, ExternalChangeCheck};
 use crate::grid_item::GridItem;
 use crate::settings::FileOrganizeDestination;
@@ -511,7 +512,11 @@ impl App {
                 .as_deref()
                 .is_some_and(|current| refresh_matches(current, &request))
         {
-            self.check_external_folder_changes(ctx, ExternalChangeCheck::Notified);
+            self.check_folder_changes_with_cause(
+                ctx,
+                ExternalChangeCheck::Notified,
+                FolderRefreshCause::Operation,
+            );
         }
     }
 

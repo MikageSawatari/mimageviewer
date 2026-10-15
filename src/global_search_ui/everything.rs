@@ -7,7 +7,7 @@ pub(super) use metadata::{SearchMetadataInstall, SearchMetadataResources};
 mod ui;
 pub use ui::{draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture};
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchSource {

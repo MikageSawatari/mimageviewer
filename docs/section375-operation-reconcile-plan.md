@@ -16,6 +16,11 @@ R8 ACCEPTや旧検証をR10の受入証拠にしない。
 旧cache移行は撤回済みで、復活させない。§1.373 R4案1のAppend／Undo operation IDと受付契約は維持する。
 過去の設計は `ae2772c8e`／`84f31c346`／`13f2fc3e9`／`aa26c9b29`／`37dcc8b9c` の履歴を参照する。
 
+2026-10-15追補: 現在の利用者採択は[独立readerの受動更新停止・C1](detached-snapshot-reader-plan.md)。
+案Aは不採用で、[§9](#9-検索終了後の独立readerと物理更新の所有境界案a設計)は`ddcc0166d`で作成した初案の履歴として保持する。
+参照するのはsource／main-owner境界の考え方だけで、§9のreader観測・保留は今回適用しない。
+C2／C3は対象外、linked中の挙動は維持。C1の整理完了を含む由来保持の補完・実装／検証は同設計書§9へ記録し、上記R10の完了記録とは区別する。
+
 ## 1. 原因とR10の不変条件
 
 Deleteは `handle_delete_key` → 確認 → `start_delete_files` → delete worker → `poll_delete_pending` →
@@ -632,3 +637,210 @@ MERGE_HEAD `e5f3905ff`は変更していない。add／commitは0件。
 結果は[native／vendor／build-dev最終state](../target/merge-master-7a7041412-native-final/state.json)と
 [最終source／index照合](../target/merge-master-7a7041412-native-final/final-source-state.json)に保存した。
 `git diff --check`は既存CRLFを改行として扱う設定で成功。独立の接続確認にも追加P1／P2はなかった。
+
+## 9. 検索終了後の独立readerと物理更新の所有境界（案A・設計）
+
+**本節は不採用になった初案の履歴。現在の採択はC1であり、readerの受動観測・保留契約は適用しない。**
+2026-10-15、基点`ddcc0166d`。当初は案A「accepted sourceと更新先の所有者を一つの更新判断へ集約」を提案・選択したが、
+追加の利用者決定でC1へ変更した。source／main-owner境界の考え方だけを[現設計](detached-snapshot-reader-plan.md)へ引き継ぐ。
+以下は当初の設計・試験計画であり、現C1の実装指示や検証成功を意味しない。
+調査全文`CRASH1-out.txt`（利用者指定の
+`C:\Users\mikag\AppData\Local\Temp\claude\C--home-mimageviewer\78a7ba79-28a0-431c-8c1e-98107230ca31\scratchpad\nv\CRASH1-out.txt`）
+を読み、下記の所有遷移と入口を現コードで照合した。アプリ起動による再現は行っていない。
+
+### 9.1 症状・原因・直す境界
+
+Everything（Ctrl+R）の結果から動画を別窓で再生し、検索結果の×を押すと、
+`viewer_context_registry.rs:plan_promote`の`assert_eq!(stashed, self.main)`で終了する。
+Ctrl+Gの共通検索終了経路、音声、通常フォルダ由来のpromote後の実変更も同型。
+
+1. `close_global_search`は検索flags／surfaceを終了させるが、元フォルダの採用までは旧itemsを保持する。
+   旧itemsの`ProjectionRecipe::ExtractedResult(Search(Global))`も保持される。
+2. 元フォルダへの復帰は新しいmain一覧の採用であり、別窓再生中のcontext 0を一度promoteする。
+   registryはmain=1／projection=1、window 1のreaderはcontext 0となる。この移譲は正しい。
+3. 動画更新で0を一時mountするとmain=1／projection=0になる。これも正常な所有遷移である。
+4. `ContextAsyncOwner::FolderObservation`が0で動き、検索flagsが消えたことから物理フォルダと誤認する。
+   新しいwatchの初回走査は`UNIX_EPOCH`から開始され、比較記録不明でDifferentになる。
+   ファイル書込み・OS変更通知は、この再現の必要条件ではない。
+5. 旧contextのnavigation scopeはMainのままであり、既存のDetachedPhysicalだけの保留を通らない。
+   main一覧置換へ流れ、Mountedだけを見た判定で0を二度目のpromoteへ送り、assertが成立しなくなる。
+
+破れている不変条件は「accepted itemsのsourceが、物理観測対象と一致する」と
+「mainを置換する要求だけがmainのreaderをpromoteする」の二つ。
+assertの削除／弱化や、promote判定に`mounted == main`だけを加える修正は行わない。
+後者ではfalse側の`close_fullscreen`が独立readerの再生を止め、クラッシュを機能退行に置き換える。
+
+### 9.2 正本と不変条件
+
+- **accepted source:** itemsと同寿命の既存`ProjectionRecipe`を正本にする。
+  検索UIのflags・surface・`current_folder`だけで採用済みitemsを再分類しない。
+  `ExtractedResult`は検索（Everything／Metadata共通）、タグ、★、Smart、Collection、snapshot、
+  subfolder expansionの結果を表し、物理親フォルダの監視走査で置き換えない。
+  実物理子へdrillして別itemsを採用した場合は、その採用時のrecipeに従う。
+- **物理対象:** `OrdinaryList`はpathを持たないため、recipeだけで監視先を捏造せず、既存のaccepted folder、
+  archive override、document／ZIP処理中、book root等の除外と合わせて決める。
+  `Book(ImageFolder/CompiledFolder)`も既存の実フォルダ資格の範囲内に限り、
+  `Book(Archive/Document)`のitemsを外側のディレクトリ走査で置き換えない。
+  これはディレクトリ観測の資格であり、Archive／Document自体の明示更新を禁止する意味ではない。
+  それらは§1.353のprefix／facet保持を含む既存materializerへ配送する。
+  §1.373のtyped Append配送は別の既存資格を保つ。book rootのwatch除外をAppend配送へ広げない。
+- **mainとprojection:** `viewer_context_main()`がmainのidentityを所有する。
+  mountedはUI投影先を示すだけでmainとは限らない。mount・park・再mountで両者が異なるのは正常。
+  `ViewerNavigationScope::Main`や見た目のdetached flagをmain identityの代用にしない。
+- **live reader:** registryのwindow→context bindingと、そのcontextのsession／reader lifecycleを使う。
+  sessionの一時的な不在だけでreader解放とみなさない。Closingでsessionを消した後も、bindingを保持する
+  終端区間がある。binding／context退役まで既存close lifecycleの所有を守る。
+- **promote:** 置換されるcontextがregistryのmainで、同じcontextを読む別窓メディアが存在するときだけ要求できる。
+  動画／音声とも従来の移譲・lock時の受付規則を保つ。独立readerをmainへ再promoteしない。
+- **観測:** FolderObservationはmain専用にしない。資格のある物理readerも自分のwatch／scanを所有できるが、
+  実差分をlive readerのitemsへ即採用せず、自分の`folder_refresh_pending`へ保留する。
+  retained検索snapshotにはwatchを新設せず、物理scanの結果を採用しない。
+- **隔離:** watch epoch、dirty／cutoff、走査記録、generation、receiver、保留はそのcontextに属する。
+  main変更やmountを理由に兄弟の取消・ack・cache初期化をしない。
+
+### 9.3 一つの更新判断と配送
+
+accepted recipe／既存の対象folder・要求proof／registry main・projected identity／live binding・sessionを入力に、
+**その場で導出する更新判断**を共通化する。新しい保存state、pending owner、reader用boolは作らない。
+判断はsource資格と配送先をまとめて返し、request入口だけでなく採用入口でも再評価する。
+以下の分類名は設計上の呼称であり、永続stateの追加を意味しない。
+
+| 受け付けた操作・現在の所有 | 更新判断／既存経路への配送 |
+| --- | --- |
+| 自動観測、accepted itemsがExtractedResultまたは対象外 | 物理走査を開始しない。既に来た物理結果も拒否し、当該ownerの不適格なwatch／scanを退役する。検索snapshotを保持する |
+| 自動観測、物理source、結果がEqual | 現ownerの記録・観測cutoffだけを進める。install・再生／thumbnail要求の取消・世代更新は行わない |
+| 自動観測、物理source、Different、main一覧 | 既存の一覧採用へ進む。main viewer中は従来の保留、mainを読む別窓メディアなら従来どおりpromoteして新mainへ一覧を採用する |
+| 自動観測、物理source、Different、mainではないlive reader | generic main置換へ入る前に、そのcontextの`folder_refresh_pending`へ配送する。再生・items・reader bindingを維持する |
+| 保留消費、同sourceの一覧へ実際に復帰済み | 既存のowner／source資格を再確認し、新しいscanを要求する。retained検索結果やlive reader中には消費しない |
+| 検索×等による、明示的な新main sourceへの復帰・採用 | incomingの既存navigation／採用proofで新しいmain一覧を作る。旧recipeが検索でも正当な元フォルダ復帰を阻止しない。旧readerのrecipeは旧itemsと一緒にpromoteする |
+
+同sourceの自動更新と、新しいsourceを開く操作を区別する。旧recipeが検索だからといって
+元フォルダへの正当な復帰まで禁止してはならない。逆に、観測結果を「新source採用」に読み替えてはならない。
+明示GridReloadは従来どおり省略しない。検索のrefreshは検索ownerへ、物理子のrefreshは物理ownerへ送る。
+検索UIを閉じたretained readerには再検索可能なquery所有者が残るとは限らないため、
+`ExtractedResult`という情報だけで再検索・元フォルダ走査を開始しない。
+
+requestがmainだった後でpromoteされる場合もある。完了時は同じowner／source／世代／購読epoch等の
+既存proofを検査した上で**現在の更新先**を再評価し、今は独立readerなら保留にする。
+「開始時mainだった」ことを採用権限として持ち越さず、mainが変わっただけで有効なreaderのdirtyを消さない。
+非mainでlive readerを持たない場合も、既存の一覧復帰資格が成立したcontextだけが自分の一覧を更新する。
+Closing／退役途上のcontextを空のmain扱いにして汎用loaderへ送らない。
+
+Differentを保留した時点では、走査記録・mtime・signatureを採用済みに進めず、通知をackしない。
+一覧復帰後に再走査してから既存のcutoff規則でackする。Equalは当該contextの一致結果だけをackする。
+同じfolderの保留を持つlive readerでは、未ack dirtyを理由に毎frame再走査しない。
+watchの通知収集は続け、後続変更も同じ既存保留へ集約し、一覧復帰時のfresh scanでまとめて確認する。
+新しい待機stateやtimerは追加しない。先着scanのrestartもこの既存保留と現在ownerの判断に従う。
+受理中にpromoteしても、新mainにある別watchをackしない。cutoff以後のdirtyは次走査へ残す。
+restart／Resumed／初回scanにも同じ資格判定を適用し、拒否した検索sourceのscanをrestartで復活させない。
+自動originのsidecar取込なし、§1.314のmtime-only例外、Delete→EqualのStack対応表を含むR10契約は保持する。
+
+### 9.4 変更・監査する入口（file:function）
+
+共通判断は既存のApp／context helper付近に置く。小さい導出処理で足りる範囲で実装し、
+新しいreader managerや観測台帳へ分離しない。表の「接続」は変更予定、「監査」は同じ不変条件の確認対象。
+
+| file:function | producer／consumer・対応 |
+| --- | --- |
+| `src/app/book_materialization.rs:ProjectionRecipe`／`ProjectionRecipe::for_physical` | sourceの正本。型・payloadを増やさず既存recipeを読む。OrdinaryListのpath不在と物理除外の接続を監査 |
+| `src/global_search_ui.rs:close_global_search`／`dismiss_global_search_with_origin`、`src/global_search_ui/everything.rs`の× | flags終了producer。閉じた直後も旧recipeがitemsと残ることを監査。検索終了でrecipeをFolderへ書き換えない |
+| `src/app.rs:restore_view_return_origin`／`install_loading_items_inner` | 新main source採用consumer。最初のpromote後に新recipeを設定し、退避readerのrecipeを保持する順序を維持。自動同source更新がこの入口へ誤配送されないことを確認 |
+| `src/app/top_level_grid_view.rs:current_grid_reload_is_physical`／`reload_top_level_grid` | flagsだけの物理判定をaccepted recipeと共通判断へ接続。ディレクトリ観測資格とArchive／Documentのrefresh先を同じboolへ押し込まない。物理判定falseでもFolder分岐で物理reloadするfallbackまで確認し、retained検索readerの誤配送を残さない |
+| `src/app.rs:current_favorite_target`／`ensure_current_folder_watch`／`start_current_folder_watch` | 物理targetと購読producer。watch新設前に資格を確認し、既存source除外を保つ。資格喪失時の退役はそのcontextだけ |
+| `src/app.rs:poll_current_folder_watch`／`check_external_folder_changes` | 通知・Resumed producer。main／非mainにかかわらず資格のある物理sourceを観測。Append中の既存配送とdirty保持を維持 |
+| `src/app.rs:start_external_rescan`／`start_external_rescan_with_cause`／`poll_external_rescan` | 初回・通知・restart・完了。要求と採用の両側でsourceと現在ownerを検査し、Equal／Different／staleを配送。既存worker・proof・cutoffを再利用 |
+| `src/app.rs:apply_external_rescan_with_cause` | Different採用consumer。navigation scopeだけの保留判定をやめ、非main live readerを既存保留へ送る。汎用loaderへ入れる前に判断する |
+| `src/app.rs:note_exported_file_for_folder_refresh`／`poll_delete_pending` | 保留／自己Delete照合producer。検索flagsが消えたretained結果で物理更新を新設しない。成功除去・既存Equal比較は変えない |
+| `src/app.rs:consume_folder_refresh_pending`／`close_fullscreen_now_with_metadata_boundary` | 保留consumer／一覧復帰。takeの前にowner・source・reader終端を確認。閉じる途中や別contextのframeで保留をmain更新へ化けさせない |
+| `src/app.rs:active_detached_media_requires_main_context_transfer`／`change_main_context_for_visible_grid_with_metadata_boundary`／`promote_active_detached_video_for_main_context_change` | main置換consumer。main identityと同ownerのbindingを使い、独立reader更新をpromoteにもfalse側のcloseにも送らない。mainの動画／音声移譲とlockの既存規則は維持 |
+| `src/app.rs:collection_main_context_change_allowed`／`prepare_collection_main_context_change` | 同じmain移譲判定のconsumer。Collectionの正当な新main採用を退行させないことを監査 |
+| `src/app/viewer_context_registry.rs:ContextAsyncOwner::{needs_mounted_service,service,terminate_on_park}` | mount中の観測consumer。FolderObservationの常時service・park中の資源保持自体を一律停止せず、service内から共通判断へ接続 |
+| `src/app/viewer_context_registry.rs:with_viewer_context`／`plan_promote`／`stash_mounted_and_start_fresh`／`retire_context`／`close_and_retire_context` | mount・promote・退役。main／projection／bindingの正本。assertと所有移動を変更せず、呼出し側で更新を正しく配送する |
+| `src/app.rs:update_active_viewer_context`／`park_current_viewer_context_as_live_media`／`poll_parked_live_detached_windows`／`finish_active_detached_session_close` | readerのmount／park／close consumer。session消去後もbindingが残る終端を含め、観測・保留がそのreaderに留まることを監査 |
+| `src/app/book_append_refresh.rs`とregistryの`enqueue_at_rest_book_append_observation`／`cancel_at_rest_book_append_observations` | §1.373 typed cause producer。watchの資格と混同せず、既存Append owner／終端配送・取消を維持 |
+
+### 9.5 open／switch／close／cancel／errorと同型経路
+
+| lifecycle／経路 | 取扱い |
+| --- | --- |
+| 通常open・物理子採用 | itemsとrecipeの同時採用を維持。そのsourceのwatchと初回scanを既存ownerに作る。DB／ファイルI/Oは既存workerへ置く |
+| Ctrl+R／Ctrl+G open→動画／音声別窓→検索× | 共通検索close後の新main採用は一度promote。retained検索readerは以後、検索前folderのwatchを新設しない。flags解除から元フォルダ採用までの区間も同じ資格を使う |
+| 通常フォルダ再生→main移動でpromote→旧folderの実変更 | 独立readerの観測は継続可。Differentは旧contextの保留へ送り、player／itemsを維持。mainを再promoteせず、復帰後の再走査で反映 |
+| F12手動切り離し | mainを読むlinked readerなら、必要なmain置換は既存promote。既に独立したreaderなら同source実変更は保留。F12経由か自動別窓設定かで別の資格を作らない |
+| mount／park／再mount・tray保持・別readerへswitch | binding先のcontextだけをserviceし、source／更新先をその時点で導出。mountをsource変更やmain移譲とみなさない。park時に観測資源を一律破棄しない |
+| scan開始後にmain移譲／source切替 | 同ownerのreader化なら採用時に保留へ配送。別source／世代／epochなら既存stale拒否・取消。旧receiverの結果で新sourceを置換しない |
+| reader close／一覧復帰 | 実際に同contextの一覧へ戻るときだけ保留を消費。close後にcontextを退役する場合は保留も同時にdropし、現mainへ移してflushしない。Closing中の一時的session不在を復帰と誤認しない |
+| context close／cancel／遅着 | 既存context退役でwatch・scan・cancel token・保留を終了。遅着は既存proofで拒否。兄弟のwatch／dirty／playerを触らない |
+| watcher／走査／登録のI/O失敗 | 既存のログ＋通知と明示更新の入口で扱う。再試行owner・保存待ち・rollbackを追加しない。利用者作成DBや設定を削除／作り直さない |
+
+### 9.6 状態を増やさない理由・BA-7
+
+`ProjectionRecipe`とregistryのidentity／bindingが既に持つ事実を、更新入口から共通に参照する。
+「検索は閉じたがitemsは検索結果」「main以外をmount中」という正常な組合せを禁止するのではなく、
+そこから矛盾した物理採用・promoteを導けないようにする。
+reader差分は既存`folder_refresh_pending`へ集約し、新しいpending、bool、世代、操作ID、cache形式を増やさない。
+watchをmain専用にする案、全メディアを閉じてから更新する案、検索closeを待たせる案は、
+通常の別窓再生・物理reader更新を削るため採らない。
+案B「再生開始から独立reader ownerへ移す」は組合せをさらに減らす可能性があるが、
+reader生成・移譲の広い変更となるため利用者決定どおりdetachedリワーク側へ残す。
+
+[CLAUDE.mdのDetached viewerリワーク中のルール](../CLAUDE.md)と
+[detached plan §2](detached-rework-plan.md)に従う。
+該当は**BA-7（推測した状態の組合せではなく所有者から判断する）**。
+rect／viewport形状による推測、時間窓、assert回避、close/retryや追加repaintで症状を隠す変更ではない。
+accepted sourceと採用先の所有境界へrequest／completionの両方を接続する構造修正と判断する。
+native viewport生成・focus・player所有者の作り直しやBA-5のrender entry変更には広げない。
+§11への記録案は[detached plan §11](detached-rework-plan.md#11-リワーク外からの変更記録)に置く。
+当初の案A選択と実装者の構造判断の履歴を記録する。**現在はC1を採択し、案Aでは実装しない。**
+C1の具体化の再確認後にのみコードへ進む。通常操作で再現する今回の順序は「まれな失敗」で割り切らず構造で直す。
+I/O失敗等だけはCLAUDE.mdの既定の割り切り方針（ログ＋通知、既存の単純な復帰入口）による。
+
+### 9.7 受入試験計画
+
+この追補での実行は0件。独立レビュー後、次を既存fixture／worker／fake media backendで追加する。
+assertの期待値、既存のnonmain promote拒否試験、Stack／§1.314の期待値は緩めない。
+
+1. **純粋な更新判断の組合せ:** recipe（OrdinaryList／物理Book／Archive・Document／各ExtractedResult）×
+   mainとmountedの一致／不一致×同ownerのreader有無／Closingのbinding残存×Equal／Differentを表で検査する。
+   flags／surfaceがFolderへ戻ってもExtractedResultは対象外。通常物理子、book root除外とtyped Appendの対照も含む。
+2. **状態遷移:** main 0→promoteでmain 1→reader 0再mount→復元の順を通す。
+   mainだけがpromoteを要求し、非mainの実変更は保留へ入ること、main identityとbindingが維持されることを検査する。
+   開始時mainだったscanがpromote後に到着する順序も固定し、現在ownerへ配送する。
+3. **実handlerのクラッシュ回帰:** Ctrl+R相当Everything／Ctrl+G Metadata結果を実検索採用handlerから作り、
+   実binding・sessionとfake playerを結ぶ。検索×の共通close→元フォルダ採用で最初のpromote→
+   `with_viewer_context`による旧reader再mount→`ContextAsyncOwner::FolderObservation` serviceまで通す。
+   retained検索readerの監視要求は開始されないことを確認し、別fixtureではclose前から先着した物理scanを完了させ、
+   そのpoll／restartでも旧itemsが置換されないことを確認する。動画／音声を対にし、書込みなしでも完走させる。
+   panicしないだけでなくplayer存続、同じitems／recipe／binding、promote一回、main=1を検査する。
+4. **物理readerの実走査完了:** 通常folderから動画／音声を別窓再生→mainの別一覧採用→旧reader再mount後、
+   元folderへ実ファイル変更を入れworker→pollまで通す。Differentはそのreaderの保留だけを作り、
+   player・要求・世代を維持、mainは不変。Equalなら通常の記録更新のみ。復帰で再走査／反映、
+   close退役なら保留dropを対照検査する。初回記録不明、cutoff後通知、restart、Resumedも含める。
+5. **F12／lock／一覧採用の対照:** linkedからの最初のpromote、既に独立したF12 readerの保留、
+   tray・park→resume、lock中の既存受付規則、静止画の既存close／parkを検査する。
+   明示main GridReload・検索refresh・Collection採用・元folderへの復帰は引き続き働き、
+   自動結果だけを取り違えて退行させていないことを確認する。
+6. **兄弟contextと終端:** main＋独立reader二つ（同folder／異folder）を用意し、一つの変更・保留・取消・closeで
+   他二つのitems／generation／watch epoch／dirty／cutoff／thumbnail要求／playerが変わらないことを検査する。
+   Closingでsession消去済みbinding残存、context退役後の遅着、途中source切替も含む。
+7. **既存契約:** §1.375のDelete→Equal（Stack対応表、選択・check・scroll・遅着thumb保持）、
+   §1.314、fork購読、auto sidecar取込0／明示更新取込、§1.353 virtual refresh、
+   §1.373 Append中の観測延期／終端／Undoを関連回帰で確認する。
+
+将来の実装検証は狭い判断・registry・handler試験から始め、関連検索／Everything／media／context試験へ広げる。
+導出判断は既存recipeとregistryのidentity／binding参照だけで行い、UIで新しいstat／read_dirや全行cloneを行わない。
+pending中のreaderへ通知を反復してもscanが増殖しないこと、大量一覧でも判断の費用が行数に比例しないことを確認する。
+fmt、通常／portable core check、共有境界変更としてtest-fullを最後に一回、build-devを予定する。
+この設計提出ではcargo／build／testを実行せず、アプリも起動しない。
+native実窓の確認が必要なら、別途具体的なシナリオを提示して明示承認を得る。自動fixture成功を実機確認と混同しない。
+
+### 9.8 リリース当日の規模と打切り境界
+
+見込みはproduct code **3ファイル**（`app.rs`、`app/top_level_grid_view.rs`、`app/viewer_context_registry.rs`）、
+試験 **1〜2ファイル**（`app/section375_tests.rs`と必要なら既存registry／search test）、
+文書 **2ファイル**（本書とdetached plan）、合計 **6〜7ファイル**。
+純粋判断helperを別moduleへ置く方が既存構造に合う場合だけproduct codeが1ファイル増える。
+検索producerのrecipe採用順序は既に成立しており、検索・player・OS watcher backendの設計変更は想定しない。
+既存の更新判断・保留への接続なので、独立レビューと共有経路の検証を省略しなければリリース当日に扱える範囲と見積もる。
+実装中にnative reader所有者の再構成、新たなsource保持field、通常の閲覧／再生を制限する変更が必要と判明したら、
+案Aの範囲を超えるため止めて設計担当へ返す。時間を理由にpromote guardだけの修正へ縮めない。

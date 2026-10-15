@@ -9444,13 +9444,21 @@ mod tests {
         );
         manager.scheduler.book_query.soft_refresh();
 
-        notify_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("soft publication must finish and repaint without another UI poll");
-        assert!(matches!(
-            manager.query_book(&client, "c:/library/book").as_ref(),
-            BookQuery::Ready(_)
-        ));
+        // A late notification from the first (NotIndexed) query can still arrive after the
+        // drain above, so check after each notification until the soft publication is seen.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            notify_rx
+                .recv_timeout(remaining)
+                .expect("soft publication must finish and repaint without another UI poll");
+            if matches!(
+                manager.query_book(&client, "c:/library/book").as_ref(),
+                BookQuery::Ready(_)
+            ) {
+                break;
+            }
+        }
     }
 
     #[test]

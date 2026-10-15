@@ -9,6 +9,12 @@ that package, not a junction/symlink; the registry copy is never modified.
 Upstream's MIT license is retained in [LICENSE](LICENSE), with AUTHORS and
 the original package/source files.
 
+2026-10-15: upstream 0.26.1 -> 0.26.2 (tag commit `72d1ef9a6468aa68bbc69dcc80cdf60aaf64364d`) was applied on top of
+this copy with the GitHub compare diff (aggregation count/flush fixes, buffered union
+`seek_danger` override removal + `src/query/seek_danger_tests.rs`). It touches none of the
+files changed by the local patch below. Only the version lines of Cargo.toml /
+Cargo.toml.orig were edited by hand. The 0.26.1 baseline text below is kept as history.
+
 Local changes, designed in `docs/fts-integrity-plan.md` r3 §§5/6.1:
 
 - `src/directory/mmap_directory/mod.rs`: retry only a completed TempPath's

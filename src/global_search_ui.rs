@@ -3428,6 +3428,35 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn adopt_c1_search_results_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        paths: &[PathBuf],
+        everything_source: bool,
+    ) {
+        if everything_source {
+            let items = paths
+                .iter()
+                .map(|path| {
+                    if path.extension().is_some_and(|ext| {
+                        crate::folder_tree::is_audio_ext(
+                            &ext.to_string_lossy().to_ascii_lowercase(),
+                        )
+                    }) {
+                        GridItem::Audio(path.clone())
+                    } else {
+                        GridItem::Video(path.clone())
+                    }
+                })
+                .collect();
+            let dataset = everything::tests::dataset(items);
+            everything::tests::adopt(self, ctx, "c1-search", dataset);
+        } else {
+            tests::g1_publish_search_hits(self, ctx, paths);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_search_page_edit_prepare_for_test(&mut self, ctx: &egui::Context) {
         self.global_search.active = true;
         self.global_search.last_executed = "test".into();
@@ -4599,12 +4628,12 @@ impl App {
 // -----------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
 
-    fn g1_publish_search_hits(app: &mut App, ctx: &egui::Context, paths: &[PathBuf]) {
+    pub(crate) fn g1_publish_search_hits(app: &mut App, ctx: &egui::Context, paths: &[PathBuf]) {
         app.open_global_search();
         app.global_search.aggregate_auto = false;
         app.begin_search_page_edit_prepare_for_test(ctx);

@@ -285,7 +285,7 @@ fn restore_source(
                             .source_keys
                             .extend(report.imported.iter().map(|(key, _)| key.clone()));
                     }
-                    for error in [
+                    if let Some(error) = [
                         match &result.edits {
                             ImportFamilyOutcome::Failed(e)
                             | ImportFamilyOutcome::SourceChanged(e) => Some(e),
@@ -299,6 +299,7 @@ fn restore_source(
                     ]
                     .into_iter()
                     .flatten()
+                    .next()
                     {
                         return Err(error.clone());
                     }

@@ -1085,6 +1085,11 @@ UI modal判定だけをRemoteの確定境界とみなさない。現treeの確�
 既存EditorUiStateの確認enumに解除／読み直しをまとめ、別owner／pending／確認boolは作らない。
 前面では説明＋確定／キャンセルだけを表示し、背面のWindow全体（方向・表紙・一覧・undo/redo・保存・
 キャンセル・タイトル×・スクロール／ドラッグ）を操作できなくする。確認のキャンセル／Escではdraftを保つ。
+2026-10-15の表示修正: 編集Windowは確認中も不透明に描き、その上へ既定のModal backdrop
+（黒・alpha 100）を重ねる。Window全体のdisabled描画で背後のページ画像を透かさない。
+入力無効化は維持し、編集Windowを描く間だけdisabled_alphaを1にして直後に元のStyleへ戻す。
+確認ダイアログや他のUIのStyle・テーマは変えない。実際に出力したWindowの塗りがalpha 255で
+編集領域を覆い、その後に暗幕が描かれることと、Styleの復元をLight/Dark・100%/200%・解除/読み直しで検査する。
 Enter／Escは既存AppのIME helperから受け取り、IME変換の確定／取消を奪わない。
 eguiのフォーカスされたボタンによるraw Enterのクリック化も、helperが拒否したEnterを描画前に消費して防ぐ。
 確認を開いた入力passのEnterでそのまま確定せず、前面が存在する時の入力だけで確定する。
@@ -1689,6 +1694,15 @@ test-fullは利用者の「前のmerge分と合わせて1回」に従い、上�
 `target/editor-modal-build-dev.log`）。実行前にcore／Remoteが未起動であることを確認し、
 稼働中coreを停止しない設定を使った。
 アプリ起動・git add／commitは行わない。
+
+#### 確認中の編集画面の不透明化（2026-10-15、b9cd84946からの差分）
+
+eguiの無効化は入力だけでなくWindowの枠にもopacityを掛けるため、確認中に閲覧ページが透けていた。
+§8のとおり入力無効化を残して描画のalphaだけを分離し、既定のModal暗幕で覆う。
+fmt／通常core check、libの関連8件、editor snapshot 11件（更新後の通常比較も成功）、
+ui_snapshotの関連4件が成功。更新PNG12枚を目視確認した。ログは`target/editor-opaque-*.log`。
+マニュアルに編集画面の半透明化の説明はなく変更不要。test-full／build-devは今回の指示により実行しない。
+アプリ起動・停止、git add／commitは行っていない。
 
 #### Alone配置・白い相方の追加決定（2026-10-14、86b06c232からの未コミット差分）
 

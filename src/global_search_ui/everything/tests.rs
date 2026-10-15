@@ -7,7 +7,7 @@ use super::*;
 use crate::everything_results::{EverythingDataset, EverythingPreparedRow, EverythingStats};
 use crate::settings::{ListingSortMetadata, SortOrder};
 
-fn dataset(items: Vec<GridItem>) -> Arc<EverythingDataset> {
+pub(crate) fn dataset(items: Vec<GridItem>) -> Arc<EverythingDataset> {
     let count = items.len();
     Arc::new(EverythingDataset {
         rows: items
@@ -94,7 +94,12 @@ fn poll_until(app: &mut App, ctx: &egui::Context, reason: &str, ready: impl Fn(&
     }
 }
 
-fn adopt(app: &mut App, ctx: &egui::Context, query: &str, dataset: Arc<EverythingDataset>) {
+pub(crate) fn adopt(
+    app: &mut App,
+    ctx: &egui::Context,
+    query: &str,
+    dataset: Arc<EverythingDataset>,
+) {
     start_fake_run(app, ctx, query);
     queue(app, Arc::clone(&dataset));
     poll_until(app, ctx, "completed dataset did not adopt", |app| {

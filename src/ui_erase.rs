@@ -3669,7 +3669,9 @@ impl App {
                 elapsed.as_millis(),
                 pending.purpose.origin()
             ));
-            self.show_feedback_toast("[補完プレビュー完了]".to_string());
+            if self.erase_inpaint_notification_pages().contains(&idx) {
+                self.show_feedback_toast("[補完プレビュー完了]".to_string());
+            }
         } else {
             // **Commit 経路**: fs_cache には戻さず、消しゴム確定結果専用 cache に
             // 格納する。これで AI OFF / 補正変更時に raw fs_cache へ戻れる。
@@ -3698,14 +3700,49 @@ impl App {
                 elapsed.as_millis(),
                 pending.purpose.origin()
             ));
-            self.show_feedback_toast("[補完完了]".to_string());
+            if self.erase_inpaint_notification_pages().contains(&idx) {
+                self.show_feedback_toast("[補完完了]".to_string());
+            }
         }
         if let Some(entry) = pending.purpose.entry() {
             self.resume_original_material_entry(ctx, idx, entry);
         }
     }
 
-    /// 消しゴム補完 worker が生存している間だけ表示する持続型ステータス。
+    /// 通知時点で、この mounted viewer context が表示しているページだけを対象にする。
+    /// 開始時の可視性や計算上の組、他ウィンドウの表示状態は参照しない。
+    fn erase_inpaint_notification_pages(&self) -> Vec<usize> {
+        if self.fullscreen_idx.is_none() {
+            return Vec::new();
+        }
+        // 提示許可 Checking 中は、現在位置から計算した組と実描画が異なる。
+        // 保持表示も通常描画も記録するこの列だけを使い、未描画ページを補わない。
+        let mut pages: Vec<_> = self.fullscreen_page_layout.page_indices().collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
+
+    fn visible_erase_inpaint_progress(
+        &self,
+    ) -> Option<(
+        EraseInpaintKind,
+        EraseInpaintProgress,
+        std::time::Instant,
+        usize,
+    )> {
+        let pages = self.erase_inpaint_notification_pages();
+        let visible = self
+            .erase_inpaint_pending
+            .iter()
+            .filter(|(key, _)| pages.contains(&key.idx));
+        let job_count = visible.clone().count();
+        visible
+            .max_by_key(|(_, pending)| pending.started_at)
+            .map(|(key, pending)| (key.kind, pending.progress, pending.started_at, job_count))
+    }
+
+    /// 表示中ページの消しゴム補完 worker が生存している間だけ表示する持続型ステータス。
     ///
     /// 一時トーストとは寿命を分け、保存済みマスクの自動再生成 (`ensure-result`) も含めて
     /// 「処理中なのに表示が消えた」状態を作らない。推論時間のばらつきが大きいため ETA は
@@ -3726,20 +3763,8 @@ impl App {
             return;
         }
 
-        let job_count = self.erase_inpaint_pending.len();
-        let current_idx = self.fullscreen_idx;
-        let selected = self
-            .erase_inpaint_pending
-            .iter()
-            .filter(|(key, _)| current_idx.is_none_or(|idx| key.idx == idx))
-            .max_by_key(|(_, pending)| pending.started_at)
-            .or_else(|| {
-                self.erase_inpaint_pending
-                    .iter()
-                    .max_by_key(|(_, pending)| pending.started_at)
-            })
-            .map(|(key, pending)| (key.kind, pending.progress, pending.started_at));
-        let Some((kind, progress, started_at)) = selected else {
+        let Some((kind, progress, started_at, job_count)) = self.visible_erase_inpaint_progress()
+        else {
             return;
         };
 
@@ -4846,6 +4871,370 @@ mod book_erase_tests {
         };
         report_inpaint_progress(Some(&tx), progress);
         assert_eq!(rx.try_recv().unwrap(), progress);
+    }
+
+    fn notification_test_pages(app: &mut App) {
+        app.items = (0..4)
+            .map(|page_num| crate::grid_item::GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("C:/erase-notification-test/book.pdf"),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        notification_test_layout(
+            app,
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Single,
+            &[0],
+        );
+    }
+
+    fn notification_test_job(
+        app: &mut App,
+        idx: usize,
+        purpose: EraseInpaintPurpose,
+    ) -> mpsc::Sender<EraseInpaintResult> {
+        let (tx, rx) = mpsc::channel();
+        let (_, progress_rx) = mpsc::channel();
+        app.erase_inpaint_pending.insert(
+            EraseInpaintPendingKey {
+                idx,
+                kind: if purpose.is_preview() {
+                    EraseInpaintKind::Preview
+                } else {
+                    EraseInpaintKind::Commit
+                },
+            },
+            EraseInpaintPending {
+                idx,
+                items_generation: app.items_generation,
+                path_key: app.page_path_key(idx),
+                rx,
+                progress_rx,
+                progress: EraseInpaintProgress::Preparing,
+                cancel: Arc::new(AtomicBool::new(false)),
+                started_at: std::time::Instant::now(),
+                input_generation: 0,
+                mask_generation: 0,
+                purpose,
+            },
+        );
+        tx
+    }
+
+    fn complete_notification_test_job(app: &mut App, tx: mpsc::Sender<EraseInpaintResult>) {
+        tx.send(EraseInpaintResult::Pixels(egui::ColorImage::filled(
+            [1, 1],
+            egui::Color32::WHITE,
+        )))
+        .unwrap();
+        app.poll_erase_inpaint(&egui::Context::default());
+    }
+
+    #[test]
+    fn erase_auto_apply_notifications_require_currently_displayed_page() {
+        for visible in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            notification_test_pages(&mut app);
+            let idx = if visible { 1 } else { 0 };
+            app.fullscreen_idx = Some(idx);
+            notification_test_layout(
+                &mut app,
+                crate::displayed_image_transform::FullscreenPageLayoutKind::Single,
+                &[idx],
+            );
+            let tx = notification_test_job(
+                &mut app,
+                1,
+                EraseInpaintPurpose::Commit {
+                    origin: "auto-apply",
+                },
+            );
+            assert_eq!(app.visible_erase_inpaint_progress().is_some(), visible);
+            complete_notification_test_job(&mut app, tx);
+            assert_eq!(app.fs_feedback_toast.is_some(), visible);
+            assert_eq!(
+                app.erase_result_cache.len(),
+                1,
+                "hidden jobs still complete"
+            );
+        }
+    }
+
+    #[test]
+    fn erase_auto_apply_notifications_follow_navigation_during_job() {
+        let mut app = crate::app::setup_app_for_test();
+        notification_test_pages(&mut app);
+        let tx = notification_test_job(
+            &mut app,
+            1,
+            EraseInpaintPurpose::Commit {
+                origin: "auto-apply",
+            },
+        );
+        assert!(app.visible_erase_inpaint_progress().is_none());
+        app.fullscreen_idx = Some(1);
+        assert!(
+            app.visible_erase_inpaint_progress().is_none(),
+            "not painted yet"
+        );
+        notification_test_layout(
+            &mut app,
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Single,
+            &[1],
+        );
+        assert!(app.visible_erase_inpaint_progress().is_some());
+        app.fullscreen_idx = Some(2);
+        notification_test_layout(
+            &mut app,
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Single,
+            &[2],
+        );
+        assert!(app.visible_erase_inpaint_progress().is_none());
+        complete_notification_test_job(&mut app, tx);
+        assert!(app.fs_feedback_toast.is_none());
+    }
+
+    #[test]
+    fn erase_auto_apply_completion_is_notified_after_entering_target_page() {
+        let mut app = crate::app::setup_app_for_test();
+        notification_test_pages(&mut app);
+        let tx = notification_test_job(
+            &mut app,
+            1,
+            EraseInpaintPurpose::Commit {
+                origin: "auto-apply",
+            },
+        );
+        assert!(app.visible_erase_inpaint_progress().is_none());
+        app.fullscreen_idx = Some(1);
+        notification_test_layout(
+            &mut app,
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Single,
+            &[1],
+        );
+        complete_notification_test_job(&mut app, tx);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "[補完完了]");
+    }
+
+    #[test]
+    fn erase_user_execution_and_preview_keep_notifications() {
+        for purpose in [
+            EraseInpaintPurpose::Commit { origin: "exec" },
+            EraseInpaintPurpose::Preview { origin: "preview" },
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            notification_test_pages(&mut app);
+            app.erase_mode = true;
+            let tx = notification_test_job(&mut app, 0, purpose);
+            assert!(app.visible_erase_inpaint_progress().is_some());
+            complete_notification_test_job(&mut app, tx);
+            assert_eq!(
+                app.fs_feedback_toast.as_ref().unwrap().0,
+                if purpose.is_preview() {
+                    "[補完プレビュー完了]"
+                } else {
+                    "[補完完了]"
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn erase_notifications_stop_when_viewer_closes() {
+        let mut app = crate::app::setup_app_for_test();
+        notification_test_pages(&mut app);
+        let tx = notification_test_job(&mut app, 0, EraseInpaintPurpose::Commit { origin: "exec" });
+        assert!(app.visible_erase_inpaint_progress().is_some());
+        app.fullscreen_idx = None;
+        assert!(app.visible_erase_inpaint_progress().is_none());
+        complete_notification_test_job(&mut app, tx);
+        assert!(app.fs_feedback_toast.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_notifications_use_job_owner_context_instead_of_sibling_display() {
+        let mut app = crate::app::setup_app_for_test();
+        notification_test_pages(&mut app);
+        app.fullscreen_idx = Some(1);
+        notification_test_layout(
+            &mut app,
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Single,
+            &[1],
+        );
+        let mut owner_tx = None;
+        let owner = app.build_window_context_for_test(715, |app| {
+            notification_test_pages(app);
+            owner_tx = Some(notification_test_job(
+                app,
+                1,
+                EraseInpaintPurpose::Commit {
+                    origin: "auto-apply",
+                },
+            ));
+        });
+        assert_eq!(app.fullscreen_idx, Some(1));
+        app.with_window_context_for_test(owner, |app| {
+            assert!(app.visible_erase_inpaint_progress().is_none());
+            complete_notification_test_job(app, owner_tx.take().unwrap());
+            assert!(app.fs_feedback_toast.is_none());
+            assert_eq!(app.erase_result_cache.len(), 1);
+        });
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.erase_result_cache.is_empty());
+    }
+
+    fn notification_test_layout(
+        app: &mut App,
+        kind: crate::displayed_image_transform::FullscreenPageLayoutKind,
+        pages: &[usize],
+    ) {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransformInput, FullscreenFitScaleLimits, RectPixelFit,
+            ResolvedDisplayPlacement,
+        };
+        app.fullscreen_page_layout.begin(kind);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 200.0));
+        for &page_idx in pages {
+            app.fullscreen_page_layout.push(
+                DisplayedImageTransform::from_resolved_rect(
+                    DisplayedImageTransformInput {
+                        pixel_fit: RectPixelFit::Texels,
+                        page_idx,
+                        viewport_rect: rect,
+                        source_size: rect.size(),
+                        texture_size: rect.size(),
+                        rotation: crate::rotation_db::Rotation::None,
+                        free_rotation_rad: 0.0,
+                        content_bbox: None,
+                        fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                            crate::settings::FullscreenFitMode::Page,
+                        ),
+                        fit_scale_limits: FullscreenFitScaleLimits::default(),
+                        pixels_per_point: 1.0,
+                        placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    },
+                    rect,
+                )
+                .unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn erase_notifications_include_spread_partner_and_only_count_visible_jobs() {
+        let mut app = crate::app::setup_app_for_test();
+        notification_test_pages(&mut app);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        notification_test_layout(
+            &mut app,
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Spread,
+            &[0, 1],
+        );
+        let purpose = EraseInpaintPurpose::Commit {
+            origin: "auto-apply",
+        };
+        let tx = notification_test_job(&mut app, 1, purpose);
+        let _hidden = notification_test_job(&mut app, 3, purpose);
+        assert_eq!(app.visible_erase_inpaint_progress().unwrap().3, 1);
+        complete_notification_test_job(&mut app, tx);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "[補完完了]");
+        assert!(app.visible_erase_inpaint_progress().is_none());
+    }
+
+    #[test]
+    fn erase_notifications_follow_visible_continuous_layout() {
+        let mut app = crate::app::setup_app_for_test();
+        notification_test_pages(&mut app);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        notification_test_layout(
+            &mut app,
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous,
+            &[0, 1],
+        );
+        let tx = notification_test_job(
+            &mut app,
+            1,
+            EraseInpaintPurpose::Commit {
+                origin: "auto-apply",
+            },
+        );
+        assert!(app.visible_erase_inpaint_progress().is_some());
+        complete_notification_test_job(&mut app, tx);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "[補完完了]");
+    }
+
+    #[test]
+    fn erase_notifications_exclude_unpainted_spread_partner_while_single_surface_is_held() {
+        use crate::displayed_image_transform::FullscreenPageLayoutKind;
+        for paint_partner_before_completion in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            notification_test_pages(&mut app);
+            app.visible_indices = (0..4).collect();
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 4];
+            app.image_metas = vec![None; 4];
+            app.settings.singleton_spread_first_enabled = false;
+            app.settings.singleton_spread_last_enabled = false;
+            app.settings.final_cover_spread_enabled = false;
+            app.spread_mode = crate::settings::SpreadMode::Ltr;
+            // Checking 時の保持表示と同じ境界: 位置/設定からは見開き 0|1 を
+            // 解けるが、実際に描かれている surface は以前の単ページ 0 のまま。
+            assert_eq!(
+                app.resolve_visible_spread_pair(0),
+                crate::ui_fullscreen::SpreadPair::Double { left: 0, right: 1 },
+            );
+            assert_eq!(
+                app.fullscreen_page_layout
+                    .page_indices()
+                    .collect::<Vec<_>>(),
+                vec![0]
+            );
+            let tx = notification_test_job(
+                &mut app,
+                1,
+                EraseInpaintPurpose::Commit {
+                    origin: "auto-apply",
+                },
+            );
+            assert!(app.visible_erase_inpaint_progress().is_none());
+            if paint_partner_before_completion {
+                notification_test_layout(&mut app, FullscreenPageLayoutKind::Spread, &[0, 1]);
+                assert!(app.visible_erase_inpaint_progress().is_some());
+            }
+            complete_notification_test_job(&mut app, tx);
+            assert_eq!(
+                app.fs_feedback_toast.is_some(),
+                paint_partner_before_completion
+            );
+            assert_eq!(app.erase_result_cache.len(), 1);
+        }
+    }
+
+    #[test]
+    fn erase_notifications_do_not_infer_pages_when_actual_layout_is_empty() {
+        for mode in [
+            crate::settings::SpreadMode::Single,
+            crate::settings::SpreadMode::Ltr,
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            notification_test_pages(&mut app);
+            app.spread_mode = mode;
+            app.fullscreen_page_layout.clear();
+            let tx = notification_test_job(
+                &mut app,
+                0,
+                EraseInpaintPurpose::Commit {
+                    origin: "auto-apply",
+                },
+            );
+            assert!(app.visible_erase_inpaint_progress().is_none());
+            complete_notification_test_job(&mut app, tx);
+            assert!(app.fs_feedback_toast.is_none());
+            assert_eq!(app.erase_result_cache.len(), 1);
+        }
     }
 
     #[test]

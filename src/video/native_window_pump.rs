@@ -1909,6 +1909,103 @@ mod tests {
     const HUD_FOCUS_CHILD_ENV: &str = "MIV_HUD_FOCUS_TEST_CHILD";
 
     #[test]
+    fn hud_raise_burst_is_finite_and_preserves_offsets_and_permit() {
+        let fault = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_events) = native_window_event_route(16, Arc::clone(&fault));
+        let (render_route, _render_events) = native_window_event_route(16, Arc::clone(&fault));
+        let (_command_tx, command_rx) = crossbeam_channel::bounded(4);
+        let (lifecycle_tx, _lifecycle_rx) = crossbeam_channel::bounded(4);
+        let (ui_tx, _ui_rx) = super::super::native_output_event_bus(
+            4,
+            Arc::clone(&fault),
+            Arc::new(super::super::VideoUiWake::default()),
+        );
+        let spawn = NativeWindowPumpSpawn {
+            config: focus_test_config(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            hwnd_out: Arc::new(AtomicU64::new(0)),
+            hud_hwnd_out: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            presenter_visibility: NativePresenterVisibility::new(
+                NativeVideoInitialVisibility::Hidden,
+            ),
+            source_epoch: Arc::new(AtomicU64::new(0)),
+            ui_event_tx: ui_tx,
+            init_error: Arc::new(Mutex::new(None)),
+            channel_fault: Arc::clone(&fault),
+            health: super::super::native_window_health::NativeWindowHealth::new_registered(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: super::super::native_ui_smoke::allocate_output_id(),
+        };
+        let mut runtime = PumpRuntime::new(
+            spawn,
+            command_rx,
+            lifecycle_tx,
+            Arc::new(LatestPumpValues::default()),
+            pump_route,
+            render_route,
+            pump_events,
+        );
+        runtime
+            .handle_command(PumpCommand::RaiseHud { epoch: 7 })
+            .unwrap();
+        runtime
+            .handle_command(PumpCommand::RaiseHud { epoch: 7 })
+            .unwrap();
+        assert_eq!(runtime.hud_raise_deadlines.len(), 3, "requests coalesce");
+        let start = runtime.hud_raise_deadlines[0].1;
+        let offsets: Vec<_> = runtime
+            .hud_raise_deadlines
+            .iter()
+            .map(|(epoch, deadline)| {
+                assert_eq!(*epoch, WindowEpoch(7));
+                deadline.duration_since(start).as_millis()
+            })
+            .collect();
+        assert_eq!(offsets, [0, 16, 50]);
+
+        // Expire deadlines without sleeping. This exercises the real pump consumer
+        // with a retired/missing host; actual HUD raises are covered by hud_window.
+        for (_, deadline) in &mut runtime.hud_raise_deadlines {
+            *deadline = Instant::now();
+        }
+        runtime.run_periodic_work();
+        assert!(runtime.hud_raise_deadlines.is_empty());
+        runtime.run_periodic_work();
+        assert!(
+            runtime.hud_raise_deadlines.is_empty(),
+            "burst stays terminated"
+        );
+
+        runtime
+            .handle_command(PumpCommand::RaiseHud { epoch: 7 })
+            .unwrap();
+        runtime
+            .handle_command(PumpCommand::SetZOrderRecoveryPermit { permitted: false })
+            .unwrap();
+        assert!(runtime.hud_raise_deadlines.is_empty());
+        runtime
+            .handle_command(PumpCommand::RaiseHud { epoch: 7 })
+            .unwrap();
+        assert!(
+            runtime.hud_raise_deadlines.is_empty(),
+            "blocked requests cannot queue"
+        );
+        runtime
+            .handle_command(PumpCommand::SetZOrderRecoveryPermit { permitted: true })
+            .unwrap();
+        runtime
+            .handle_command(PumpCommand::RaiseHud { epoch: 7 })
+            .unwrap();
+        assert_eq!(
+            runtime.hud_raise_deadlines.len(),
+            3,
+            "normal recovery resumes"
+        );
+        assert!(!fault.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn hud_focus_claim_uses_registered_editor_and_preserves_presenter_return() {
         if let Ok(owner) = std::env::var(HUD_FOCUS_CHILD_ENV) {
             run_hud_focus_child(owner.parse().expect("presenter HWND"));

@@ -1922,10 +1922,14 @@ Pairは通常gapを持つが、この形状差は設定変更ではない。各i
 通常gapからHを取り、Center配置は実頁を読書先頭slot（LTR左、RTL右）として扱い、その
 内辺をHとする。表示中の実頁を中央から別の場所へ移さない。空いたslotは明示Vacantで
 surfaceもoccurrenceもreadinessも持たない。白紙へ置き換えず、canvas背景が見える。
-Pairとの遷移も同じ二slot時計で扱う。めくる表がVacantなら90度から新裏面のarrival、
-着地する裏がVacantなら旧表のdepartureを90度で終える。Vacantのstatic/leafは描かず、
-存在しない紙や頁番号を足さない。特殊な片側配置で表/裏が共にVacantとなる方向は、実leafが無いため`vacant_leaf_on_both_sides`の理由でinstantとする。全actual incomingの通常flat採用だけがnavigation完了条件。
-実際の白紙companion・補助表紙・split・媒体継続は今回の別scopeで、理由付きinstantを維持する。
+Pairとの遷移も同じ二slot時計で扱う。2026-10-15の利用者決定により、片面だけVacantなら
+§26.24の黒paperを用いた通常の一枚めくりとする。旧仕様の90度からのarrival／90度で終わる
+departureと旧静止頁のfadeは撤去する。表がVacantなら0度の黒紙から開始し、裏がVacantなら
+180度の黒紙までめくる。Vacantのstaticは描かず、occurrence／readiness／頁番号は足さない。
+特殊な片側配置で表/裏が共にVacantとなる方向は、従来どおり`vacant_leaf_on_both_sides`でinstant。
+全actual incomingの通常flat採用だけがnavigation完了条件。
+実際の白紙companionは§26.21、補助表紙等は各採択節の既存挙動を維持する。
+このVacant改訂ではsplit・媒体継続の適格性を変更しない。
 
 ### 24.3 受付・receipt・会計と切り分け
 
@@ -3023,3 +3027,110 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList
 OFFでは末尾の全体／本別設定でPage 15だけ中央／左を切り替え、Alone本体は先頭設定で別に決まることを確認する。
 `1`の後に`2`で見開きへ復帰し、`3`〜`5`は`2`と構成編集の案内を出す。HUDは`[2]`、
 Pad Selectは単ページ／一致見開き、Remoteの`2`も同じ復帰。方向／表紙を編集した場合は一致キーも3／4／5へ変わる。
+
+### 26.24 Vacant片面を共通の黒paperでめくる（2026-10-15）
+
+利用者は本の構成のあるbook_pdf.pdf、LTR・表紙なし・ON/600msで、9|10→Vacant|11の
+10が90度で消え、後ろの9が突然消失／出現すると報告した（利用者の観測）。原因は§24.2の
+半回転の仕様と、projectionのVacant leaf省略・旧static終盤fadeがその仕様を実装していたこと。
+利用者決定により、片面Vacantを§26.1と同じ無textureの黒paperで普通にめくる。
+
+裏がVacantなら旧10を180度までめくり、後半は黒い裏面とする。旧static9はalpha1で保持し、
+黒いleafが覆うまで見せる。表がVacantなら0度の黒い表から開始し、下の新static9をleafの
+離陸によって露出させ、裏の新10を着地させる。LTR／RTL・前進／後退は同じslot対応を使う。
+表紙境界、補助表紙、余り単ページ、明示Aloneもbuilderの由来で分岐せず同じVacant規則を消費する。
+両面Vacantは既存instantを維持する。白いBlankOpposite／自動白紙の材質・構成・receiptは変更しない。
+Blankと実頁／Blankの既存めくりを保ち、Blank×Vacant境界もVacant側だけ黒くする共通規則に従う。
+
+黒い面の仮紙rectは、その面が覆う対向staticのrectを対応するspine座標へ平行移動したものを使う。
+サイズ差でも下のstaticが最初から露出したり、着地直前に外周をfadeしたりしない。
+実画像のrect／UVを変更せず、既存の角度による形状補間・moving spine・shadow・厚みを共用する。
+Vacantのcanonical材質は空のまま保持する。効果中の黒paperは遮蔽だけを持ち、印刷領域の
+可視面積／実頁receiptは空。新texture・decode・upload・素材要求・実occurrenceは作らない。
+p=1は既存の通常incoming flatだけを返し、黒paper・旧static・影を残さない。
+新しい状態／待機／ownerは足さず、既存leafとblack_paperを共用して組合せを減らす。
+
+回帰は実際の本の構成projection→共通spread builder→通常flat採取→leaf投影を通す。
+11頁・表紙なしの自然余り（LTRでは11|Vacant）と末頁Alone（LTRではVacant|11）を別に組み、
+LTR／RTL×往復で検査する。報告の保存構成そのものを取得したとの扱いにはしない。
+紙サイズが異なる純粋投影fixtureでも、静止9のrect／alpha1、離陸時の完全遮蔽、
+着地直前の完全被覆、黒紙の実頁面積0、終端の通常canonical描画を検査する。
+4方向のspread windows snapshotを再生成・目視し、終端と独立した通常描画との一致も検査する。
+
+検証（2026-10-15）: 通常coreの`cargo check --locked -p mimageviewer --bin mimageviewer-core`、
+page_turn関連216件、book_composition関連219件が成功。追加2回帰と既存正規化行列の単独実行、
+snapshot更新後の再照合、fmt／diff検査も成功。独立静的レビューはACCEPT。
+利用者指定によりtest-full／build-dev／アプリの起動・停止／git add・commitは行わない。
+
+### 26.25 2018fb445実機報告のhandler経路調査（2026-10-15）
+
+ClaudeCodeは隔離dataで構成ありPDFの9|10→Vacant|11と逆方向がinstantに見えると報告した。
+先のbuilder回帰は直接prepare_leafを呼ぶため、通常navigationのoffer／出力採用の証明ではなかった。
+実機での原因はこの観測だけから受付拒否と断定せず、受理後の取消・描画も分けて調査する。
+
+隔離DBを読み取り専用で確認した実構成は40頁・LTR・表紙なし、raw2/4非表示、raw10/11/17がAlone、
+raw15がLeading白紙、raw16/18がTrailing白紙。対象は末尾でなくitems[6,7]（9|10）とitems[8]（11）の中間境界。
+保存値はON/600ms/gap4で、対象頁に保存回転・trimはない。提供先の通常ログ現行／直前世代には
+page-turnのskip行がなく、perf記録も見つからない。従来の通常ログはskipだけなのでstart／cancelは証明できない。
+
+回帰は実permission serviceへ保存／prepareしたこの構成を採用し、素材residentの通常flatから
+handle_fs_navigation_with_operationへページ送り要求を渡す。LTR／RTL・往復、通常窓／縦長領域・native DPI1.5、
+元画像なしでResidentFinalCompositeだけの条件も含め、Offered、curl提出のStarted、中盤25/75%の継続、
+通常flat提出のFinished、skip／cancelなしを検査する。旧11頁末尾Aloneの小fixtureも対照として残す。
+試験のDPIはRawInputのnative_pixels_per_pointで渡す。set_pixels_per_pointは次passのzoom変更なので、
+初回rectが6666×6666、次passが指定rectとなるfixture由来のdestination_clip_changedを起こした。
+この失敗に合わせて本番のclip／DPI gateを緩和しない。
+
+実機で次の観測を判別できるよう、既存emitの通常ログをskipに加えてstart／cancel／finishにも各1行出す。
+frame／first_visible等は従来どおりperfのみ。既存のoperation/context相関と理由を使い、新しい状態／素材／receiptは足さない。
+投影・受理・offer matchingを変更する原因は、現段階では未確定。実機の開始・取消・完了の記録と照合して判断する。
+
+追加handler回帰は全条件でStarted→中盤→Finishedに成功し、skip／cancelなし。
+通常core checkとpage_turn関連217件も成功した。これは実機instantの原因を再現したとの証拠ではなく、
+機能修正済みとは扱わない。2018fb445のperf記録、または追加lifecycleログを含む実機記録が残件。
+book_composition関連219件、fmt／diff検査も成功。独立静的レビューはACCEPT（実機の原因確定を意味しない）。
+指定どおりtest-full／build-dev／アプリ起動・停止／git add・commitは未実施。
+
+
+### 26.26 実機観測の訂正と最終描画の照合（2026-10-15）
+
+ClaudeCodeは73e4415cbの隔離実機確認について、往復とも約600msでstart→finishしており、
+「instantだった」とした§26.25の観測を訂正した。新たな観測は、前進では旧9もめくる10も
+見えず、Vacant|11の完成形に見える一方、後退では10の着地が見えるというもの。
+受付拒否や90度での打切りと同一の原因だとは扱わない。
+
+提供perfの前進3回はfrontの30→約53度、backの約106→157→180度を記録し、
+incoming11の可視率も初期約9%→約36%→100%となる。canonicalと実効clipは全画面で、
+旧9/10のnative User(3)/(4)は後退でも共用され、途中の再生成はない。
+ただし従来のmesh統計・可視面積はprojectionの計算結果であり、最終描画やGPU提示の証明ではない。
+特にfrontの期間は開始後約260msまでなので、撮影コマは開始時刻・frameと対応させる必要がある。
+撮影の遅れが原因だったとは、この記録だけから断定しない。
+
+追加回帰は保存構成を反映した40頁fixtureと実permission/navigation handlerから、MainWindowの
+render_fullscreen_viewport、FullOutput、実tessellationまで通す。LTR/RTLの往復の10/25/60/75%で、
+旧9/新11の静止rect・alpha、10のtextureと曲がったmesh、床→静止頁→leafの描画順、
+最終三角形での被覆（後段のflatや黒面による上書きも含む）を検査する。
+元画像cacheを退去させ、両表示単位を通常rendererで事前表示してから要求する。
+画像は単色fixtureとし、寸法は実機のdecoded PDFと同じ932×1320を使う。
+MainWindow fixtureはvideo_in_window_modeもONにする。presentation/native flagだけを直接設定すると、
+通常openが設定に従ってFullscreenへ移し、destinationだけが不一致になるため、実機の条件と違っていた。
+初期のbuilder回帰は投影DTO、前回のhandler回帰はcurl receiptと開始/完了までだったため、
+この最終描画内容の検査を持っていなかった。
+
+既存perf有効時に限り、projectionのmesh.paint_orderと、discard判定後のoutput_paintを同じframe/passに添える。
+texture ID・rect・clip・UV範囲・alphaと順序を比較し、後段のrectやmeshによる上書きを確認できる。
+二度目のtessellationや素材取得は行わず、新しい状態・texture・decode・要求・実頁receiptは足さない。
+Vacant/白紙の投影規則、面積、素材保持、描画の挙動はこの調査では変更していない。
+実機の根因は未確定であり、機能修正済みとは扱わない。
+
+投影・描画を変更せず、追加回帰はLTR/RTLの往復で成功した。自動試験では前半の旧9/10、
+後半の黒paperによる被覆、終端の通常flatが提出され、報告された前進の欠落は再現していない。
+検査点には外縁1/2%も含める。75%時点の旧9の残りが約4.6%だったため、5%刻みだけでは
+この細い帯を見落とした。これは試験の検査点の不足であり、実機不具合の原因とは扱わない。
+このheadless回帰はnative GPUの画素内容・実App::update全体・画面キャプチャの時刻を証明しない。
+残件は撮影コマと開始後のframe（例: 約150ms）の対応、および実機の最終output_paintの照合。
+その証拠を得るまで、角度・素材・描画順を推測で変更しない。
+
+検証（2026-10-15）: 追加回帰1件（内部でLTR/RTL×往復）、fmt、通常core check、
+page_turn関連218件（既存snapshot比較を含む）、book_composition関連219件、diff検査が成功。
+PNG変更はない。test-full/build-dev、アプリの起動・停止、git add/commitは指定どおり行っていない。
