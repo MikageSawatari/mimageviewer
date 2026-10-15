@@ -1816,7 +1816,6 @@ mod tests {
         assert!(PanoUvTransform::from_gpano(&info).is_none());
     }
 
-    #[test]
     /// V キー / 上部バーのボタン / セッション意図からの復帰が同じ答えを使う
     /// (backlog §1.145)。以前は V キーが連結読みを見ておらず、ボタンだけが見ていた。
     #[test]

@@ -233,6 +233,11 @@ always-active guidance.
   when practical. See the UI snapshot test section in `CLAUDE.md`.
 - Run the narrowest relevant tests first, then broaden when the change touches
   shared behavior.
+- During iteration use `scripts/test-focused.ps1` or an explicit test filter.
+  Run the unfiltered main-library suite through `scripts/test-lib-full.ps1`
+  (nextest), not direct unfiltered `cargo test -p mimageviewer --lib`.
+  Reviewers reuse a successful ledger entry for the same source and conditions;
+  do not rerun it. The final `scripts/test-full.ps1` cargo-test gate is unchanged.
 - During ordinary edit/test iteration, do not default to
   `cargo test --workspace`. Prefer `cargo check -p mimageviewer --bin
   mimageviewer-core`, `cargo test -p mimageviewer --lib <filter>`, or a

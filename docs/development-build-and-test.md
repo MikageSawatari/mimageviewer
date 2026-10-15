@@ -9,6 +9,8 @@
 | --- | --- | --- |
 | 型・借用・依存関係だけ早く確認 | `cargo check -p mimageviewer --bin mimageviewer-core` | 本体 core |
 | 変更したモジュールのテスト | `cargo test -p mimageviewer --lib <filter>` | 本体の指定テストだけ実行 |
+| 変更ファイルから反復テストを選ぶ | `.\scripts\test-focused.ps1` | nextest、選択を毎回表示、0件一致は非ゼロ |
+| 本体lib全件と成功結果の再利用 | `.\scripts\test-lib-full.ps1` | nextest、同じ内容・条件の成功台帳があれば実行を省略 |
 | 診断用の窓固定・入力観測のテスト | `cargo test -p mimageviewer --lib <filter> --features test-script` | `test_script` / `native_ui_smoke`等の対象。通常core checkも別に行う |
 | 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
@@ -80,6 +82,56 @@ Windows の `Instant` は起動直後に大きな時間を引くと underflow �
   未検証範囲を分けて報告し、実アプリ操作は明示了承を得た検証枠でのみ実施する。
 
 ## 軽量化している範囲
+
+### nextest と成功台帳
+
+初回だけ `cargo install cargo-nextest --locked` を利用者が実行する（0.9.143以上、導入確認は
+`cargo nextest --version`）。通常の反復は `.\scripts\test-focused.ps1 -Base HEAD`、
+本体lib全件は `.\scripts\test-lib-full.ps1` を使い、上の「結果の再利用」に従う。
+nextestは1テスト1プロセスでAppのprocess-global lockを分離する。
+`.config/nextest.toml` はCPU数並列・retryなし・60秒警告のみ、実測の重い5件を先行実行する。
+テストの削除・新しいignoreはない。doctestを含む最終 `test-full.ps1` は従来のcargo testのまま。
+導入時の件数突合・時間比較とテスト模擬の修正は [検証記録](test-speed-report.md) を参照する。
+
+- 全件: `-Features test-script`、`-CargoProfile test`、`-NextestProfile default` を指定可能。
+  `-Force` だけが有効な同一結果を再実行する指定。既定の成功閾値は実行9,000件以上。
+  ignore以外の全件を選び、default filter・retry・fail-fastによる取りこぼしを防ぐ。
+- 台帳と各実行のcommand・JUnit・stdout/stderrは `target/test-lib-full/`。
+  同じworktreeの読み取り専用レビューから参照可能。別worktreeとの共有はしない。
+  JUnitの件数整合・exit 0・閾値を検査し、失敗・0件・実行中の入力変更を再利用しない。
+  台帳が書けなくても通常のテストは実行し、記録失敗は警告だけにする。
+- 識別子はGitが列挙した全追跡ファイルと未追跡ファイルの**現在の内容**をSHA-256化する。
+  stagingの有無・HEADの移動だけでは変えず、未コミット編集・削除・新規ファイルを検知する。
+  ignoredでも `vendor` / `testdata` / `testimage` 等のnative入力・実fixtureを含める。
+  rootの`target` / `target-*`、入れ子の`target/`、native build/object、snapshot比較用の
+  `.new/.old/.diff.png`、計測出力 `docs/test-speed-report.md` は除外する。
+  ただし実行体の隣のnative DLLは別の識別子へ含める。`cargo metadata` のtarget directoryから、
+  指定profile（test/dev→debug、bench→release）とtarget triple配下の同profileの直下・`deps/`にある
+  DLLのパス集合と全内容を照合する。FFmpeg 6本を含み、追加・差し替え・削除で台帳はMISSになる。
+  Cargo生成の`-<16桁hex>.dll`は除外する。Git外のDLL探索先・システムDLLは対象外。
+  index・作業ツリー・Git管理領域へは書かない。compiler/nextest版と主要build/runtime環境変数も照合する。
+  `.cargo/config.toml` の`[env]`宣言名を自動で読み取り、そのprocess環境での未設定／値を識別する。
+  `LIBSQLITE3_FLAGS`、`FFMPEG_DIR`、`RUSTFLAGS` / `RUSTDOCFLAGS` / `CARGO_*`、
+  `LIBCLANG_PATH`、`MIV_*` / `MIMV_*`等を含む。環境変数の値は台帳へ出さずhashのみ保存する。
+  対応できないCargo env宣言構文は再利用せず、警告して通常実行する。
+- Git外のglobal Cargo設定、registry側の手編集、ドライバー・ハードウェア・外部サービスの変更、
+  上記以外のignored入力は検知しない。その条件が変わったときは `-Force`。
+  判読できない入力や入れ子Git repositoryがあれば再利用を止め、通常実行する。
+- focusedはHEAD（または`-Base <commit>`）と作業ツリーの差分＋未追跡ファイルから選ぶ。
+  `src/foo/bar.rs`→`test(~foo::bar::)`、`mod.rs`は親module、`tests/name.rs`はそのintegration target、
+  他workspace crateはそのpackage全target。`-Path src/foo.rs`で明示選択、`-PlanOnly`で実行前の確認も可能。
+  `lib.rs` / `app.rs` / `src/app/tests.rs`、Cargo/build/runner設定、vendor、共通test support・snapshotは
+  広域として扱う。それ以外も`testdata/**`、`scripts/**`、workspace外patch crate、文書など、
+  対応付けできない変更が1つでもあれば全該当パスを表示し、部分実行せずexit 2で
+  `test-lib-full.ps1`と必要な専用検査を案内する。自動で全件へ拡大しない。
+  変更パスなし・対応したfilterの0件一致はexit 4。
+  module aliasや他crateへの影響を完全には推定しないため、表示された選択と追加featureを担当者が確認する。
+
+道具の回帰確認は `powershell -NoProfile -File scripts/test-test-tools.ps1`。
+使い捨て小規模crateで本物のGit/nextestを使い、台帳hit/miss・差分・失敗・0件・選択を検査する。
+ツールの導入・commit・アプリ起動・通常設定へのアクセスは行わない。
+仕様根拠: [nextest JUnit](https://nexte.st/docs/machine-readable/junit/)、
+[filterset](https://nexte.st/docs/filtersets/reference/)。
 
 ### ビルドキャッシュの容量管理
 

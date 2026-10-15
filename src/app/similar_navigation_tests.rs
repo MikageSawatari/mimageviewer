@@ -428,10 +428,36 @@ fn run_root_app_update(
 }
 
 #[cfg(windows)]
-fn settle_root_app_update_fixture(app: &mut App, ctx: &egui::Context, frame: &mut eframe::Frame) {
+fn settle_root_app_update_fixture(
+    app: &mut AppTestEnvForTest,
+    ctx: &egui::Context,
+    frame: &mut eframe::Frame,
+) {
     app.indexer_init.mark_unavailable_if_not_ready();
+    // The first update admits startup navigation and asynchronous identity preparation.
+    // Finish those owners before replacing the scene, or a delayed startup restore can
+    // correctly hold the test's same-frame key. Keep startup inside the disposable data.
+    let startup = app.tmp.path().join("root-update-startup");
+    std::fs::create_dir_all(&startup).unwrap();
+    app.settings.startup_folder_mode = crate::settings::StartupFolderMode::Specific;
+    app.settings.startup_folder_path = Some(startup);
     crate::ui_fonts::configure_fonts(ctx);
-    let _ = run_root_app_update(app, ctx, frame, root_update_input(Vec::new(), 0.0));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let _ = run_root_app_update(app, ctx, frame, root_update_input(Vec::new(), 0.0));
+        if app.startup_open_path_resolve_pending.is_none()
+            && app.folder_nav_pending.is_none()
+            && app.folder_pane_open_pending.is_none()
+            && !app.sidecar_restore_active()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup fixture did not settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[cfg(windows)]
