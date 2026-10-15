@@ -13397,6 +13397,85 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn real_decoder_eof_partial_tail_drains_during_quiet_before_loop_seek() {
+        use std::time::{Duration, Instant};
+
+        const RATE: u32 = 48_000;
+        const FRAMES: usize = 96_000;
+        const TAIL: usize = 480; // The final 10ms must still be queued at the first tick.
+        let mut player = real_audio_tail_player("tail10ms.wav", RATE);
+        let serial = player.current_seek_serial();
+        let mut samples = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        // Advance only the device/engine consumers during preparation. In particular,
+        // no EOF tick may begin the quiet interval before the controlled partial tail.
+        while samples.len() / 2 < FRAMES - TAIL && Instant::now() < deadline {
+            player.drain_engine_events();
+            let frames = (FRAMES - TAIL - samples.len() / 2).min(4_800);
+            let mut output = vec![0.0; frames * 2];
+            let (consumed, _) = player
+                .audio
+                .as_ref()
+                .unwrap()
+                .fill_samples_without_device_for_test(
+                    &mut output,
+                    &player.clock,
+                    &player.engine_state_atomic,
+                );
+            samples.extend_from_slice(&output[..consumed * 2]);
+            if consumed == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(samples.len() / 2, FRAMES - TAIL);
+        while !player.clock.audio_tail_complete() && Instant::now() < deadline {
+            player.drain_engine_events();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            player.clock.audio_tail_complete(),
+            "real pump completed EOS"
+        );
+        player.drain_engine_events();
+        assert!(player.clock.is_demux_exhausted());
+        let processed = player.clock.audio_processed_secs();
+        assert!(processed > 0.0 && processed < 0.020, "{processed}");
+        assert!((processed - 0.010).abs() < 1.0 / f64::from(RATE));
+        assert!(player.eof_loop_quiet_since.is_none());
+
+        let ctx = egui::Context::default();
+        player.tick(&ctx);
+        assert!(
+            player.eof_loop_quiet_since.is_some(),
+            "quiet interval started"
+        );
+        assert_eq!(player.current_seek_serial(), serial, "no early loop seek");
+        let mut output = vec![0.0; TAIL * 2];
+        let (consumed, _) = player
+            .audio
+            .as_ref()
+            .unwrap()
+            .fill_samples_without_device_for_test(
+                &mut output,
+                &player.clock,
+                &player.engine_state_atomic,
+            );
+        assert_eq!(
+            consumed, TAIL,
+            "device plays the remaining tail during quiet"
+        );
+        samples.extend_from_slice(&output);
+        assert_eq!(player.clock.audio_processed_secs(), 0.0);
+        player.backdate_eof_quiet_for_test(Duration::from_millis(49));
+        player.tick(&ctx);
+        assert_eq!(player.current_seek_serial(), serial + 1, "one loop seek");
+        assert_eq!(samples.len() / 2, FRAMES, "no PCM frame lost at EOF");
+        assert_one_fixture_burst(&samples, RATE, "tail10ms.wav", serial);
+        assert!(player.error.is_none(), "{:?}", player.error);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch() {
         // These fixtures reproduce the hardware dry-loop report: no-loop is one click,
         // Full-loop produced two for tail4ms/tail10ms, while mid4ms remained one.
