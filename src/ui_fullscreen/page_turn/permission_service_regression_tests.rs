@@ -27,7 +27,7 @@ fn book_fixture(
     )
 }
 
-fn book_fixture_with_pages(
+pub(super) fn book_fixture_with_pages(
     ctx: &egui::Context,
     zip: bool,
     composed: bool,
