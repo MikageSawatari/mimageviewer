@@ -445,7 +445,7 @@ watchのdropもUIで待たず既存retirement workerへ渡す。
 
 回帰は新規15関数（新規module 7＝handler 6＋source資格1、Append cause 4、registry 4）。
 検索closeはCtrl+R／Ctrl+G×動画／音声の4ケースで実staged採用→実binding／session→main復帰→promote→再mountを通す。
-同じplayerのheap identity・再生中・再生位置の前進を確認し、mainの一覧／watchと次の実変更採用を対照にする。
+同じplayerのheap identity・再生中・再生位置が先頭へ戻らないこと（17秒以上の範囲内）を確認し、mainの一覧／watchと次の実変更採用を対照にする。
 整理は実`poll_file_organize`からCopy／MoveのOperation走査→promote→hold→再mountを検査する。
 物理readerの実変更／先着scan・restart、失効Append保留とpark、External応答へ後から合流したOperationの再走査も含む。
 既存reader購読試験はC1の無購読へ変更する一方、main／linkedの購読、fork main dirty、
