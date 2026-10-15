@@ -450,3 +450,156 @@ commit・masterへのmerge・pushは実行しない。以下の論理単位で�
 | `src/app/similar_navigation_tests.rs`（test moduleのみ） | `test: Settle isolated startup before similar navigation input` |
 | `scripts/test-tools-common.ps1`, `scripts/test-lib-full.ps1`, `scripts/test-focused.ps1`, `scripts/test-test-tools.ps1` | `test: Harden success identities and reject incomplete focused selections` |
 | `docs/development-build-and-test.md`, `docs/test-speed-report.md` | `docs: Record review fixes and test identity boundaries` |
+
+## 全体ゲートのnextest移行（2026-10-16）
+
+**状態: 完了。依存不足を解消して通常Cargo homeで再開し、旧／新gateとも完走。全graphの名前・実行・成功・ignoredが一致。**
+
+対象は `full-nextest` worktree（基準 `21673c767`、HEAD `9b4299c13` はbrief追加のみ）。製品コード・CLAUDE.md・依存バージョンは
+変更しない。`test-full.ps1` のworkspace（`pack-build-tools`）とvendor 4 graphをnextestへ移し、
+workspace doctestは同じfeatureの `cargo test --doc --no-fail-fast` として独立段に残す。
+standalone vendorもルートの `.config/nextest.toml` を明示指定する。
+各nextest段はdefault filterを無視し、既存ignored以外の全件、retry 0、段内no-fail-fast、
+0件は失敗とする。各段の非ゼロ終了で後続を止め、未導入時はinstall方法を案内して終了する。
+
+### 完走時間と測定条件
+
+| gate | exit | 全体の壁時計時間 | 成功 / 失敗 / ignored |
+| --- | ---: | ---: | ---: |
+| 旧cargo test gate（再開後の完走1回） | 0 | **2,678.144秒（44分38.144秒）** | 14,596 / 0 / 66 |
+| 新nextest + doc gate（最終1回） | 0 | **491.718秒（8分11.718秒）** | 14,596 / 0 / 66 |
+
+今回の実測は **81.64%短縮、約5.45倍**。同じソース・通常test profile・`pack-build-tools`、
+logical CPU 24、テスト並列数の環境変数上書きなし。buildだけ `CARGO_BUILD_JOBS=1`。
+`CARGO_HOME`／`CARGO_TARGET_DIR` は未設定で、通常のCargo homeと各graphの既定targetを使った。
+全体時間はbuild／metadata／出力を含む。旧gateは並行した一覧準備のegui-winit初回build
+（Cargo表示1分23秒）によるartifact lock待ちも含む（待ち時間のみは未計測）。新gateは
+準備済みcacheを使うため、厳密な同一cache条件の
+benchmarkではない。負荷・cacheで絶対値は変わるが、全検査範囲を維持した実際のgate時間である。
+旧本体libは13,217成功／59 ignored、2,316.08秒。新workspace全体は14,513成功／63 ignored、
+464.048秒だった（対象範囲が異なるため、この2値だけの速度比は出さない）。
+
+コマンドは旧script保存版／新 `scripts/test-full.ps1` をそれぞれ
+`powershell -NoProfile -NonInteractive -File <script> -SuppressCrashDialogs` で実行。
+新gateだけ結果保存のため `NEXTEST_FINAL_STATUS_LEVEL=all` を指定した。
+通常のslow警告・重い5件の先行実行・retry 0は維持する。
+両gateともPASS・error mode復元を記録し、強制再試行や個別失敗の成功扱いはない。
+実行体隣のnative DLL識別子も実行前後で同じ
+`7731f6994704e03105591acdee5e6e0c2f19a804a02e1b1e576cd69c3be72262`。
+ログ／時間: `target/full-nextest-evidence/before-complete.log`・同summary、
+`after.log`・同summary。graph別JUnitは同directoryの `after-*.junit.xml` に保存した。
+
+### error modeとスクリプトの回帰
+
+PowerShell 5.1.26100.9711 / cargo-nextest 0.9.148の専用・非対話probeで、
+親の `GetErrorMode()` と、実nextestテスト子、その子が起動するhelperの値を照合した。
+
+| 条件 | PowerShell親 | nextestテスト子 | helper |
+| --- | --- | --- | --- |
+| 通常 | `0x8001` | `0x8001` | `0x8001` |
+| 必須bit `0x3`を除く対照 | `0x8000` | `0x8000` | `0x8000` |
+| suppression | `0x8003` | `0x8003` | `0x8003` |
+
+各条件2件、合計6件成功、exit 0。finally後の親も元の `0x8001` に一致した。
+必須bitの継承を直接検査したもので、実クラッシュやダイアログを発生させる検査ではない。
+現行のSetErrorMode／復元処理を維持でき、追加wrapperやWER設定変更は不要。
+ローカルのnextest-runner 0.126.0ソースでも、通常のCommand→Tokio spawnを使用し、
+Windowsのerror modeをリセットするcreation flagやAPI呼び出しはない。
+証跡と再現用crate／scriptは `target/full-nextest-evidence/error-mode-probe/`。
+
+`powershell -NoProfile -File scripts/test-release-build-safety.ps1` はPASS、exit 0。
+native cargo stubで通常成功・suppression成功と、version確認／workspace／doc／vendor 4段の
+全7か所の失敗を検査した。失敗コード37の維持、retry／後段実行なし、子への必須bit継承、
+親mode復元、未導入時の `cargo install cargo-nextest --locked` 案内を確認した。
+共通の `test-tools-common.ps1` は変更しない。
+
+### 測定の準備
+
+初回の旧gate起動はTurboJPEGのMSBuild `--parallel 24` でコンパイル失敗し、テストは未実行
+（exit 101、97.013秒）。以前の測定と同じく、生成済みnative buildを
+`cmake --build target/debug/build/turbojpeg-sys-b95e4463f170e2a1/out/build --target install --config Debug -- /m:1 /nr:false`
+で準備した。ツール導入や製品・依存ソースの修正は行わない。
+ログ: `target/full-nextest-evidence/before-build-failed.log` と同summary。
+以後の比較はbuild並列数だけ `CARGO_BUILD_JOBS=1` とし、テスト並列数の既定24は維持する。
+
+### 一覧・実行結果の突合
+
+`compare_inventory.py` は旧scriptの各selectorを確認し、`cargo test --no-run --message-format json`
+のtest artifactから各実行体の `--list` と `--ignored --list` を採取する。nextest側は同じselectorの
+`cargo nextest list --message-format json --ignore-default-filter` を使い、package ID・target種別・
+binary名・テスト名・ignored指定を比較する。空のtest binaryも対象に含める。
+nextest一覧の `mismatch: ignored` は既存ignoredの正常な除外として照合し、それ以外の除外は失敗とする。
+
+| graph | 旧: 実行 / 成功 / ignored | 新: 実行 / 成功 / ignored | 名前・指定・結果の照合 |
+| --- | ---: | ---: | --- |
+| workspace（54実行体） | 14,513 / 14,513 / 63 | 14,513 / 14,513 / 63 | 全14,576件・空実行体を含め完全一致 |
+| vendor/egui | 25 / 25 / 0 | 25 / 25 / 0 | 完全一致 |
+| root graph egui-winit | 29 / 29 / 0 | 29 / 29 / 0 | 完全一致 |
+| vendor/egui-wgpu | 11 / 11 / 0 | 11 / 11 / 0 | 完全一致 |
+| vendor/eframe | 18 / 18 / 0 | 18 / 18 / 0 | 完全一致 |
+| workspace doc（12 package） | 0 / 0 / 3 | 0 / 0 / 3 | 空packageを含め完全一致 |
+| 合計 | **14,596 / 14,596 / 66** | **14,596 / 14,596 / 66** | 差分0件、全graph失敗0件 |
+
+証跡: `target/full-nextest-evidence/inventory/workspace/comparison.json`、同directoryの
+旧／新inventoryとraw一覧、`inventory-resumed/summary.json` と各graphの旧／新inventory・raw一覧。
+一覧比較はテスト本体を実行せず、成功件数の証明には使わない。
+
+実行結果は `compare_execution.py` で旧gateの各Cargo実行体の最終libtest集計と、新gateの
+graph別JUnit／doc出力を照合した。子helperがstdoutへ出す集計や同名testは二重計上しない。
+libtestの表示用 ` - should panic` だけを実名へ戻し、テスト名・成功／ignoredを全件照合する。
+空binaryのnextest JUnit省略は一覧の一致で補い、testを含むbinaryの欠落は認めない。
+`python target/full-nextest-evidence/compare_execution.py` はexit 0、`match: true`、errors 0。
+再現用script、raw入力のhash、各binaryの最終集計・名前／状態は同directoryの
+`execution-comparison.json` に保存。二重登録解消・新しいignore・説明できない差は0件。
+
+### 依存不足による中断と再開の経緯
+
+nextest 0.9.148は実行対象の列挙前に `cargo metadata --all-features` を呼ぶ。
+vendor/eguiでは既存の通常featureのlibtest build／一覧は成功したが、metadata用の
+`backtrace 0.3.76` のglobal Cargo sourceへの展開がsandboxの書込み制限で失敗した（nextest exit 102）。
+registryのsrc／index／cacheだけを、reparse point 0件・日時保持で作業ツリー内の
+`target/full-nextest-evidence/cargo-home/` へ実コピーして調べたところ、同lockfileの24版本の
+sourceが未展開、うち21版本はarchiveもなかった。既存Cargoで取得を試みても
+`addr2line 0.25.1` の `static.crates.io` 取得が `127.0.0.1:9` への接続失敗となった
+（`CARGO_NET_OFFLINE=false`、`CARGO_NET_RETRY=0`、exit 101）。
+ツールのinstall・lockfile／依存バージョンの変更・global cacheへの書込みは行っていない。
+
+不足一覧: `target/full-nextest-evidence/cargo-home-egui-missing-sources.json`。
+取得失敗: 同directoryの `cargo-home-egui-network-enabled-metadata.stderr.log` とsummary。
+local Cargo homeで通常featureのegui `--lib --no-run` は14.06秒で成功したが、28 artifactsが
+すべて再buildされたため、rootの測定条件へこの環境変更を広げていない。
+別案の `--cargo-metadata` 明示経路は対象graphの等価性を別途検証する設計変更となるため未採用・未検証。
+
+この停止条件の確定後、進行中の旧gateは所有するCargo→本体test executableの親子関係と
+worktree内の実行パスを確認して終了させた。経過 **1,401.028秒（23分21.0秒、中断）**、
+PowerShell exit `4294967295`。終了時の親error modeは元の `0x1` へ復元された。
+`before.log`／`before-summary.json` は中断記録であり、製品テストの失敗や全件成功として扱わない。
+停止時点では旧gateの完走はなく、移行後 `test-full.ps1` の最終一回は未実施だった。
+前回の **3,053.825秒（50分53.8秒）** は履歴値として残し、今回の速度比には再開後に
+完走した旧gateの2,678.144秒を使う。中断分や初回compile失敗をその時間へ加算しない。
+
+その後、Opusがsandbox外でrootとstandalone vendor 3 graphに `cargo fetch --locked` を実行し、
+各graphの `cargo metadata --locked --all-features` がexit 0になったと報告した。
+lockfile・依存バージョンは変更なし。エージェントは**通常のCargo home**で再開し、
+local Cargo homeは使用しない。再開後は全graphの一覧・実行結果が一致し、
+旧／新gateとも各1回の完走でPASSとなった。
+
+プロセス分離に伴うテスト修正は0件。製品／テスト本体の変更も0件。
+独立Sol/xhighの最終レビューも **ACCEPT、修正必須指摘なし**。
+ログ・JUnit・27入力のhash・比較処理を確認し、成功したgateの再実行は行っていない。
+PowerShell構文parse・ASCII検査・fmt check・diff checkは成功。
+共通部品は未変更のため `test-test-tools.ps1` の再実行は行っていない。
+スクリプト・文書のみの変更であり、アプリ検証build・UI起動は行わない。
+このbriefの実装・検証に未解決事項はない。
+
+### 引き継ぐ論理コミット単位
+
+commit／merge／pushは行わず、6ファイルを作業ツリーに残す。
+
+| ファイル | commitメッセージ案 |
+| --- | --- |
+| `scripts/test-full.ps1`, `scripts/test-release-build-safety.ps1`, `.config/nextest.toml` | `test: Move complete release gate to cargo-nextest with separate doctests` |
+| `docs/development-build-and-test.md`, `docs/release-checklist.md`, `docs/test-speed-report.md` | `docs: Record complete nextest gate coverage and timings` |
+
+CLAUDE.mdの必須変更は見つからず未編集。AGENTS.md:248の「最終gateはcargo testのまま」という
+旧記述は設計担当側で更新が必要（今回のbriefを優先し、同ファイルは未編集）。
