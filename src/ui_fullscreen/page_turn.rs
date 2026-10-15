@@ -1122,14 +1122,17 @@ fn emit(
 ) {
     #[cfg(test)]
     TEST_EVENTS.with(|events| events.borrow_mut().push((*fact, kind, reason)));
-    if kind == "skip" {
+    // One line per lifecycle transition, never per projected frame. A normal
+    // log must distinguish an unoffered turn from a submitted curl cancelled
+    // before the observer saw it; perf logging is optional in real reports.
+    if matches!(kind, "skip" | "start" | "cancel" | "finish") {
         let sub_check = extra
             .iter()
             .find(|(key, _)| *key == "sub_check")
             .and_then(|(_, value)| value.as_str())
             .unwrap_or(reason);
         crate::logger::log(format!(
-            "[page-turn] skip reason={reason} sub_check={sub_check} operation={:?} context={:?}",
+            "[page-turn] {kind} reason={reason} sub_check={sub_check} operation={:?} context={:?}",
             fact.operation_id, fact.destination.context
         ));
     }

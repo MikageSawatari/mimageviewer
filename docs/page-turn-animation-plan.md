@@ -3061,3 +3061,32 @@ LTR／RTL×往復で検査する。報告の保存構成そのものを取得し
 page_turn関連216件、book_composition関連219件が成功。追加2回帰と既存正規化行列の単独実行、
 snapshot更新後の再照合、fmt／diff検査も成功。独立静的レビューはACCEPT。
 利用者指定によりtest-full／build-dev／アプリの起動・停止／git add・commitは行わない。
+
+### 26.25 2018fb445実機報告のhandler経路調査（2026-10-15）
+
+ClaudeCodeは隔離dataで構成ありPDFの9|10→Vacant|11と逆方向がinstantに見えると報告した。
+先のbuilder回帰は直接prepare_leafを呼ぶため、通常navigationのoffer／出力採用の証明ではなかった。
+実機での原因はこの観測だけから受付拒否と断定せず、受理後の取消・描画も分けて調査する。
+
+隔離DBを読み取り専用で確認した実構成は40頁・LTR・表紙なし、raw2/4非表示、raw10/11/17がAlone、
+raw15がLeading白紙、raw16/18がTrailing白紙。対象は末尾でなくitems[6,7]（9|10）とitems[8]（11）の中間境界。
+保存値はON/600ms/gap4で、対象頁に保存回転・trimはない。提供先の通常ログ現行／直前世代には
+page-turnのskip行がなく、perf記録も見つからない。従来の通常ログはskipだけなのでstart／cancelは証明できない。
+
+回帰は実permission serviceへ保存／prepareしたこの構成を採用し、素材residentの通常flatから
+handle_fs_navigation_with_operationへページ送り要求を渡す。LTR／RTL・往復、通常窓／縦長領域・native DPI1.5、
+元画像なしでResidentFinalCompositeだけの条件も含め、Offered、curl提出のStarted、中盤25/75%の継続、
+通常flat提出のFinished、skip／cancelなしを検査する。旧11頁末尾Aloneの小fixtureも対照として残す。
+試験のDPIはRawInputのnative_pixels_per_pointで渡す。set_pixels_per_pointは次passのzoom変更なので、
+初回rectが6666×6666、次passが指定rectとなるfixture由来のdestination_clip_changedを起こした。
+この失敗に合わせて本番のclip／DPI gateを緩和しない。
+
+実機で次の観測を判別できるよう、既存emitの通常ログをskipに加えてstart／cancel／finishにも各1行出す。
+frame／first_visible等は従来どおりperfのみ。既存のoperation/context相関と理由を使い、新しい状態／素材／receiptは足さない。
+投影・受理・offer matchingを変更する原因は、現段階では未確定。実機の開始・取消・完了の記録と照合して判断する。
+
+追加handler回帰は全条件でStarted→中盤→Finishedに成功し、skip／cancelなし。
+通常core checkとpage_turn関連217件も成功した。これは実機instantの原因を再現したとの証拠ではなく、
+機能修正済みとは扱わない。2018fb445のperf記録、または追加lifecycleログを含む実機記録が残件。
+book_composition関連219件、fmt／diff検査も成功。独立静的レビューはACCEPT（実機の原因確定を意味しない）。
+指定どおりtest-full／build-dev／アプリ起動・停止／git add・commitは未実施。

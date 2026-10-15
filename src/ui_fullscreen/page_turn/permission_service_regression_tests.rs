@@ -16,6 +16,30 @@ fn book_fixture(
     tempfile::TempDir,
     BookCompositionProcessOwner,
 ) {
+    book_fixture_with_pages(
+        ctx,
+        zip,
+        composed,
+        mode,
+        4,
+        &[],
+        &[(0, PageOverride::Alone), (3, PageOverride::Alone)],
+    )
+}
+
+fn book_fixture_with_pages(
+    ctx: &egui::Context,
+    zip: bool,
+    composed: bool,
+    mode: SpreadMode,
+    count: u32,
+    hidden: &[u32],
+    directives: &[(u32, PageOverride)],
+) -> (
+    crate::app::AppTestEnvForTest,
+    tempfile::TempDir,
+    BookCompositionProcessOwner,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join(if zip { "book.zip" } else { "book.pdf" });
     let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
@@ -49,14 +73,16 @@ fn book_fixture(
             } else {
                 crate::book_composition::ReadingDirection::Ltr
             },
-            (0..4).map(page).collect(),
+            (0..count).map(page).collect(),
         );
         book.cover_enabled = mode.has_cover();
-        book.page_overrides = [0, 3]
-            .into_iter()
-            .map(|n| PageOverrideEntry {
+        book.hidden_pages = hidden.iter().copied().map(page).collect();
+        book.page_overrides = directives
+            .iter()
+            .copied()
+            .map(|(n, directive)| PageOverrideEntry {
                 page: page(n),
-                directive: PageOverride::Alone,
+                directive,
             })
             .collect();
         service
@@ -76,7 +102,7 @@ fn book_fixture(
     let (rows, source) = if zip {
         let tree = Arc::new(crate::zip_tree::ZipTree::build(
             root.clone(),
-            (0..4)
+            (0..count)
                 .map(|n| crate::zip_loader::ZipImageEntry {
                     entry_name: format!("{n}.png"),
                     uncompressed_size: 0,
@@ -108,11 +134,11 @@ fn book_fixture(
             },
         )
     } else {
-        let items = (0..4).map(|n| document_page_item(&root, n)).collect();
+        let items = (0..count).map(|n| document_page_item(&root, n)).collect();
         let rows = project_document_composition(
             &root,
-            4,
-            (items, vec![None; 4]),
+            count,
+            (items, vec![None; count as usize]),
             policy,
             prepared.token,
             record.as_ref().map(|record| &record.composition),
@@ -121,7 +147,7 @@ fn book_fixture(
         (
             rows,
             BookCompositionSource::Document {
-                count: 4,
+                count,
                 metadata: None,
                 physical_source: root.clone(),
                 read_target: None,
@@ -129,6 +155,8 @@ fn book_fixture(
         )
     };
     app.items = rows.items;
+    app.visible_indices = (0..app.items.len()).collect();
+    app.details_order = app.visible_indices.clone();
     app.image_metas = rows.metas;
     app.page_identity_index = rows.page_identities;
     app.current_folder = Some(root.clone());
@@ -154,7 +182,7 @@ fn book_fixture(
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
     app.settings.slideshow_interval_secs = 3.0;
-    app.thumbnails = vec![ThumbnailState::Pending; 4];
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
     install(ctx);
     install_fs_navigator_input_tracking(ctx);
     (app, temp, owner)
@@ -180,7 +208,7 @@ fn seed_outgoing(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let demand = app
-            .spread_display_composition_for_anchor(0)
+            .spread_display_composition_for_anchor(app.fullscreen_idx.unwrap())
             .presentation_demand(app.spread_mode, app.fullscreen_page_slice);
         app.retain_book_presentation_demand(&demand);
         if matches!(
@@ -215,6 +243,273 @@ fn finish_turn(app: &mut App, ctx: &egui::Context) {
         app.begin_page_turn_viewer_frame(ctx, false, None);
         assert!(!draw(app, ui, ctx));
     });
+}
+
+#[test]
+fn page_turn_permission_service_vacant_composed_handler_starts_and_completes_both_ways() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    fn viewport_frame(
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        ppp: f32,
+        mut run: impl FnMut(&mut egui::Ui, &egui::Context),
+    ) {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(ppp);
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| run(ui, ctx));
+        });
+    }
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        for (size, ppp, actual_composition) in [
+            (egui::vec2(600.0, 400.0), 1.0, false),
+            (egui::vec2(1280.0, 800.0), 1.5, true),
+            (egui::vec2(800.0, 1320.0), 1.5, true),
+        ] {
+            let ctx = egui::Context::default();
+            // Mirror the isolated book's saved composition, including later
+            // units: raw2/4 hidden, raw10/11/17 Alone and explicit white leaves.
+            let actual_directives = [
+                (10, PageOverride::Alone),
+                (11, PageOverride::Alone),
+                (
+                    15,
+                    PageOverride::BlankOpposite {
+                        page_side: PageSide::Leading,
+                    },
+                ),
+                (
+                    16,
+                    PageOverride::BlankOpposite {
+                        page_side: PageSide::Trailing,
+                    },
+                ),
+                (17, PageOverride::Alone),
+                (
+                    18,
+                    PageOverride::BlankOpposite {
+                        page_side: PageSide::Trailing,
+                    },
+                ),
+            ];
+            let (mut app, _temp, owner) = if actual_composition {
+                book_fixture_with_pages(&ctx, false, true, mode, 40, &[4, 2], &actual_directives)
+            } else {
+                book_fixture_with_pages(
+                    &ctx,
+                    false,
+                    true,
+                    mode,
+                    11,
+                    &[],
+                    &[(10, PageOverride::Alone)],
+                )
+            };
+            let (pair_idx, single_idx) = if actual_composition { (6, 8) } else { (8, 10) };
+            app.settings.spread_page_gap_px = 4;
+            app.settings.final_cover_spread_enabled = false;
+            for idx in 0..app.items.len() {
+                let pixels = Arc::new(egui::ColorImage::filled([120, 170], egui::Color32::GREEN));
+                let tex = ctx.load_texture(
+                    format!("vacant-handler-{idx}"),
+                    pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Static {
+                        tex,
+                        pixels,
+                        source_dims: Some([1200, 1700]),
+                        load_seq: 1,
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                );
+                app.record_page_dims_for_spread(idx, (1200, 1700));
+                app.record_page_layout_dims_for_spread(idx, (1200, 1700));
+                app.rotation_cache
+                    .insert(idx, crate::rotation_db::Rotation::None);
+            }
+            if actual_composition {
+                // The runtime log reports ResidentFinalComposite at both ends.
+                // Keep completed material only, with no original-image cache.
+                for idx in 0..app.items.len() {
+                    let _ = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+                }
+                app.fs_cache.clear();
+                app.edit_result_cache.clear();
+                assert!(app.current_raw_source_pixels(pair_idx).is_none());
+                assert!(matches!(
+                    app.fs_page_load_state(single_idx),
+                    crate::app::FsPageLoadState::DisplayReady(
+                        crate::app::FsPageDisplaySource::ResidentFinalComposite
+                    )
+                ));
+            }
+            app.fullscreen_idx = Some(pair_idx);
+            let demand = app
+                .spread_display_composition_for_anchor(pair_idx)
+                .presentation_demand(mode, crate::page_split::PageSlice::Full);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                app.retain_book_presentation_demand(&demand);
+                if matches!(
+                    app.book_presentation_current(&demand),
+                    PresentationDecision::Allowed(_)
+                ) {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            viewport_frame(&ctx, size, ppp, |ui, ctx| {
+                app.begin_page_turn_viewer_frame(ctx, false, None);
+                assert!(!draw(&mut app, ui, ctx));
+            });
+            for target in [single_idx, pair_idx] {
+                take_test_events();
+                let from = app.fullscreen_idx.unwrap();
+                let PresentationState::Flat(outgoing) = &app.page_turn_presentation.state else {
+                    panic!("ordinary outgoing flat");
+                };
+                let outgoing = outgoing.clone();
+                assert_eq!(
+                    app.adjacent_page_turn_direction(from, target),
+                    Some(target > from)
+                );
+                let operation = ViewerOperationId::Pointer {
+                    batch: next_operation_batch(),
+                    source: egui::ViewportId::ROOT,
+                    ordinal: 0,
+                };
+                viewport_frame(&ctx, size, ppp, |ui, ctx| {
+                    app.begin_page_turn_viewer_frame(ctx, false, None);
+                    app.page_turn_external_operation(
+                        ctx,
+                        operation,
+                        OperationPhase::Press,
+                        "wheel",
+                    );
+                    app.handle_fs_navigation_with_operation(
+                        ctx,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                        FsPageNav::Target(target),
+                        None,
+                        from,
+                        Some(operation),
+                    );
+                    assert_eq!(app.fullscreen_idx, Some(target));
+                    assert!(!app.book_composition_permission.pending());
+                    assert!(
+                        matches!(
+                            app.page_turn_presentation.state,
+                            PresentationState::Offered { .. }
+                        ),
+                        "{mode:?}/{size:?}/{target}: {:?}",
+                        take_test_events()
+                    );
+                    let curled = draw(&mut app, ui, ctx);
+                    let failure = if let PresentationState::Flat(incoming) =
+                        &app.page_turn_presentation.state
+                    {
+                        Some((
+                            prepare_leaf(&outgoing, incoming, target > from).err(),
+                            canonical_unit(&outgoing),
+                            canonical_unit(incoming),
+                        ))
+                    } else {
+                        None
+                    };
+                    assert!(
+                        curled,
+                        "{mode:?}/{size:?}/{target}: {:?} {failure:?}",
+                        take_test_events()
+                    );
+                });
+                let PresentationState::Turning {
+                    offer, incoming, ..
+                } = &app.page_turn_presentation.state
+                else {
+                    panic!("handler must start the effect");
+                };
+                let tracker = offer.submission.clone();
+                assert_eq!(tracker.status(), SubmissionStatus::Started);
+                assert_eq!(
+                    incoming.pages.len(),
+                    if target == single_idx { 1 } else { 2 }
+                );
+                viewport_frame(&ctx, size, ppp, |ui, ctx| {
+                    app.begin_page_turn_viewer_frame(ctx, false, None);
+                    assert!(draw(&mut app, ui, ctx));
+                });
+                assert_eq!(tracker.status(), SubmissionStatus::Started);
+                for progress in [0.25, 0.75] {
+                    let PresentationState::Turning { offer, .. } =
+                        &mut app.page_turn_presentation.state
+                    else {
+                        panic!("effect remains active");
+                    };
+                    offer.accepted_at = Instant::now() - offer.duration.mul_f32(progress);
+                    viewport_frame(&ctx, size, ppp, |ui, ctx| {
+                        app.begin_page_turn_viewer_frame(ctx, false, None);
+                        assert!(draw(&mut app, ui, ctx));
+                    });
+                    assert_eq!(tracker.status(), SubmissionStatus::Started);
+                }
+                let PresentationState::Turning { offer, .. } =
+                    &mut app.page_turn_presentation.state
+                else {
+                    panic!("effect survives the next ordinary frame");
+                };
+                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                for _ in 0..2 {
+                    viewport_frame(&ctx, size, ppp, |ui, ctx| {
+                        app.begin_page_turn_viewer_frame(ctx, false, None);
+                        assert!(!draw(&mut app, ui, ctx));
+                    });
+                }
+                assert_eq!(tracker.status(), SubmissionStatus::Finished);
+                let events = take_test_events();
+                assert!(
+                    events
+                        .iter()
+                        .any(|(fact, kind, reason)| fact.operation_id == operation
+                            && *kind == "start"
+                            && *reason == "curl_submitted")
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|(fact, kind, reason)| fact.operation_id == operation
+                            && *kind == "finish"
+                            && *reason == "canonical_submitted")
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|(_, kind, _)| matches!(*kind, "skip" | "cancel")),
+                    "{events:?}"
+                );
+            }
+            owner.shutdown_and_join();
+        }
+    }
 }
 
 #[test]
