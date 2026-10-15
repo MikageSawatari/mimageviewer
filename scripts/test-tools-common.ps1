@@ -95,6 +95,8 @@ function Get-MivCargoEnvironmentNames {
     foreach ($line in [IO.File]::ReadAllLines($config)) {
         if ($line -match '^\s*(#.*)?$') { continue }
         if ($line -match '^\s*\[([^\]]+)\]\s*(#.*)?$') {
+            # Escapes in quoted keys can spell env (e.g. "\u0065nv"); do not decode them.
+            if ($Matches[1].Contains('\')) { throw 'Escaped Cargo config table name; cannot safely reuse results' }
             # TOML allows quoted and spaced key parts ("env", 'env' . NAME); compare
             # the header with those removed so every spelling of the env table is seen.
             $section = ($Matches[1] -replace '\s', '') -replace '["'']', ''
@@ -103,7 +105,7 @@ function Get-MivCargoEnvironmentNames {
             } elseif ($section -match '^env\.') { throw 'Unsupported Cargo env table syntax; cannot safely reuse results' }
             continue
         }
-        if ($section -eq '' -and $line -match '^\s*["'']?env["'']?\s*[.=]') {
+        if ($section -eq '' -and ($line -match '^\s*["'']?env["'']?\s*[.=]' -or $line -match '^\s*"[^"]*\\')) {
             throw 'Unsupported Cargo env syntax outside an [env] table; cannot safely reuse results'
         }
         if ($section -eq 'env') {

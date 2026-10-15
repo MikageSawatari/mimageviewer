@@ -35,7 +35,9 @@ foreach ($spelling in @(
     $probeNames = @(Get-MivCargoEnvironmentNames $envProbe)
     Assert-That ($probeNames -contains 'PROBE_NAME') "Cargo env spelling was not collected: $spelling"
 }
-foreach ($unsupported in @("env = { PROBE_NAME = `"1`" }", "env.PROBE_NAME = `"1`"", "`"env`".PROBE_NAME = `"1`"")) {
+$escapedEnv = '"' + [char]92 + 'u0065nv"'
+foreach ($unsupported in @("env = { PROBE_NAME = `"1`" }", "env.PROBE_NAME = `"1`"", "`"env`".PROBE_NAME = `"1`"",
+    "[$escapedEnv]`nPROBE_NAME = `"1`"", "[$escapedEnv.PROBE_NAME]`nvalue = `"1`"", "$escapedEnv.PROBE_NAME = `"1`"")) {
     [IO.File]::WriteAllText($envProbeConfig, $unsupported + "`n", $utf8)
     $refused = $false
     try { [void] @(Get-MivCargoEnvironmentNames $envProbe) } catch { $refused = $true }
