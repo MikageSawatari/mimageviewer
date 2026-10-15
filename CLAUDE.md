@@ -334,7 +334,8 @@ cargo test -p mimageviewer --test <integration-test-name>
 `cargo install cargo-nextest --locked` で入れる。経緯と計測は
 [docs/test-speed-report.md](docs/test-speed-report.md)。
 
-全workspace・統合・doc・pack builderテストは `.\scripts\test-full.ps1` に集約する。
+全workspace・統合・doc・pack builderテストは `.\scripts\test-full.ps1` に集約する
+(2026-10-16 から nextest で実行し、doctest だけ `cargo test --doc`。約 8 分、以前の cargo test では約 45〜51 分)。
 これは共有基盤を横断する変更の最終確認、リリース前、または明示的に全体確認を求められた
 場合に実行する。機能追加中の試行錯誤ごとには実行しない。詳細と判断表は
 [docs/development-build-and-test.md](docs/development-build-and-test.md) を参照。

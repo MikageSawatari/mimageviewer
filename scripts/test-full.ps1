@@ -48,15 +48,37 @@ public static class MivTestErrorMode
 
     Push-Location $repoRoot
     try {
-        Write-Host '[test-full] cargo test --workspace --features pack-build-tools --no-fail-fast'
-        & cargo test --workspace --features pack-build-tools --no-fail-fast
+        # No cargo-test fallback: process isolation is part of this gate.
+        & cargo nextest --version
         $gateExit = $LASTEXITCODE
+        if ($gateExit -ne 0) {
+            Write-Host '[test-full] cargo-nextest is required. Install with: cargo install cargo-nextest --locked'
+        }
+        # Explicit root config also applies to the standalone vendor graphs.
+        # Ignore any default filter; ignored tests stay ignored, retries stay zero.
+        $nextestArgs = @('--config-file', (Join-Path $repoRoot '.config/nextest.toml'),
+            '--profile', 'default', '--ignore-default-filter', '--run-ignored', 'default',
+            '--retries', '0', '--no-fail-fast', '--no-tests', 'fail')
+
+        if ($gateExit -eq 0) {
+            Write-Host '[test-full] cargo nextest run --workspace --features pack-build-tools'
+            & cargo nextest run --workspace --features pack-build-tools @nextestArgs
+            $gateExit = $LASTEXITCODE
+        }
+
+        if ($gateExit -eq 0) {
+            # nextest does not execute doctests. Preserve the original workspace
+            # doc scope and features, including crates with zero runnable examples.
+            Write-Host '[test-full] cargo test --workspace --features pack-build-tools --doc --no-fail-fast'
+            & cargo test --workspace --features pack-build-tools --doc --no-fail-fast
+            $gateExit = $LASTEXITCODE
+        }
 
         if ($gateExit -eq 0) {
             # vendor/egui is workspace-excluded, so exercise the locally patched input API
             # explicitly and keep this unfiltered as new regressions are added.
-            Write-Host '[test-full] cargo test --manifest-path vendor/egui/Cargo.toml --lib'
-            & cargo test --manifest-path vendor/egui/Cargo.toml --lib
+            Write-Host '[test-full] cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib'
+            & cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib @nextestArgs
             $gateExit = $LASTEXITCODE
         }
 
@@ -65,8 +87,8 @@ public static class MivTestErrorMode
             # trace regressions without a filter, including future tests.
             # Select the patched dependency from the root graph, keeping its
             # versions aligned with the application and the offline cache.
-            Write-Host '[test-full] cargo test -p egui-winit --lib'
-            & cargo test -p egui-winit --lib
+            Write-Host '[test-full] cargo nextest run -p egui-winit --lib'
+            & cargo nextest run -p egui-winit --lib @nextestArgs
             $gateExit = $LASTEXITCODE
         }
 
@@ -74,16 +96,16 @@ public static class MivTestErrorMode
             # vendor/egui-wgpu is workspace-excluded, so the line above never reaches it. Run its
             # unit tests here, unfiltered: naming one test would silently drop every test added
             # later - which is the failure mode this step exists to prevent.
-            Write-Host '[test-full] cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib'
-            & cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib
+            Write-Host '[test-full] cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib'
+            & cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib @nextestArgs
             $gateExit = $LASTEXITCODE
         }
 
         if ($gateExit -eq 0) {
             # vendor/eframe is workspace-excluded for the same reason. Keep this unfiltered so every
             # scheduler and Windows process regression added to the vendored event-loop fork runs.
-            Write-Host '[test-full] cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib'
-            & cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib
+            Write-Host '[test-full] cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib'
+            & cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib @nextestArgs
             $gateExit = $LASTEXITCODE
         }
 

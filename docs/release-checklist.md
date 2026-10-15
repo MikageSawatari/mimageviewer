@@ -402,8 +402,13 @@
    ```powershell
    .\scripts\test-full.ps1
    ```
-   - `cargo test --workspace --features pack-build-tools --no-fail-fast` で、workspace全体と
-     単体テストを持つ補助bin 2本を同じlib buildとして実行する。
+   - `cargo nextest run --workspace --features pack-build-tools` で、workspace全体のlib・bin・integrationと
+     単体テストを持つ補助bin 2本を同じlib buildとして実行する。workspace外のvendor 4 crateも
+     従来と同じgraph・featureで無filterのlib testを実行する。
+   - nextest対象外のdoctestは `cargo test --workspace --features pack-build-tools --doc --no-fail-fast`
+     を別段で必ず実行する。各段失敗で後段を止め、retryは0、既存ignored以外の全件を実行する。
+     nextest未導入時は `cargo install cargo-nextest --locked` を案内して非ゼロ終了する。
+     共通引数・vendor graphの詳細は [開発ビルドとテスト](development-build-and-test.md#リリースゲート) を参照。
    - `build-dist.ps1` が clean 前に自動実行するため、通常は配布ビルドとは別に実行不要。
    - `build-dist.ps1 -SkipRustTests` は、同一ソースが既にこのゲートを通過し、署名や
      packaging だけを再試行する場合に限る。ソース変更後の初回配布では使わない。

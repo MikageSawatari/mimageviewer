@@ -16,7 +16,7 @@
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
-| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin + 除外された vendor 4 crate の lib test |
+| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | nextestでworkspace 全体 + テストを持つ補助 bin + 除外された vendor 4 crate の lib test、cargo testでworkspace doctest |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
 ReleaseChecksは非対話テストではなく、desktopを使う了承済み検証枠で実行する。
@@ -90,7 +90,8 @@ Windows の `Instant` は起動直後に大きな時間を引くと underflow �
 本体lib全件は `.\scripts\test-lib-full.ps1` を使い、上の「結果の再利用」に従う。
 nextestは1テスト1プロセスでAppのprocess-global lockを分離する。
 `.config/nextest.toml` はCPU数並列・retryなし・60秒警告のみ、実測の重い5件を先行実行する。
-テストの削除・新しいignoreはない。doctestを含む最終 `test-full.ps1` は従来のcargo testのまま。
+テストの削除・新しいignoreはない。最終 `test-full.ps1` も同じnextest設定を使い、
+nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --doc` として実行する。
 導入時の件数突合・時間比較とテスト模擬の修正は [検証記録](test-speed-report.md) を参照する。
 
 - 全件: `-Features test-script`、`-CargoProfile test`、`-NextestProfile default` を指定可能。
@@ -256,19 +257,26 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 
 ## リリースゲート
 
-`test-full.ps1` は次のコマンドを実行し、失敗すれば非ゼロで終了する。
+`test-full.ps1` はnextestの存在を確認してから次のコマンドを順に実行する。
+未導入なら `cargo install cargo-nextest --locked` を案内して非ゼロ終了し、cargo testへ代替しない。
+各段のexit codeを検査し、失敗した段より後は実行しない。nextest各段には共通で
+`--config-file <repo>/.config/nextest.toml --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`
+を渡す。既定filterでテストを落とさず、既存ignored以外の全件を実行し、retryしない。
+60秒は警告だけで打ち切らず、実測の重い5件の先行実行設定も維持する。
 
 ```powershell
-cargo test --workspace --features pack-build-tools --no-fail-fast
-cargo test --manifest-path vendor/egui/Cargo.toml --lib
-cargo test -p egui-winit --lib
-cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib
-cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib
+cargo nextest run --workspace --features pack-build-tools # + common nextest arguments above
+cargo test --workspace --features pack-build-tools --doc --no-fail-fast
+cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib # + common arguments
+cargo nextest run -p egui-winit --lib # + common arguments
+cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib # + common arguments
+cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib # + common arguments
 ```
 
 vendor 4 crate は workspace から除外されているため、追加コマンドで無 filter の lib test を実行する。
 egui-winit は同梱 upstream lock の旧 image / tiff 依存が offline cache に無いため、
 root graph の patched dependency を `-p egui-winit --lib` で無 filter 実行する。
+standalone vendor graphもルートのnextest設定を明示して使う。
 egui の判定済み release 列 API、IME 処理済み Process press の遮断と診断、GPU mipmap、
 native repaint scheduler の回帰をこの経路で保持する。
 `vendor/egui` は既存と同じ 0.33.3 に読み取り API だけを加えたもので、root と standalone の
@@ -277,6 +285,10 @@ native repaint scheduler の回帰をこの経路で保持する。
 
 workspace 全体、統合テスト、doc testに加え、単体テストを持つpack builder 2本を同じ
 `mimageviewer` libのコンパイル結果で実行する。
+doctestは旧gateのworkspace範囲を別段で保持し、vendorは従来どおりlib testのみ。
+`-SuppressCrashDialogs` のWindows error modeはnextestのテスト子とそのhelperにも継承されることを
+PowerShell 5.1 / nextest 0.9.148の非対話probeで検査済み。ゲートの成功・各段失敗時の復元と
+未導入時の打ち切りは `scripts/test-release-build-safety.ps1` で検査する。
 
 `build-dist.ps1` は clean と配布ビルドの前にこのスクリプトを自動実行する。
 `-SkipRustTests` は、同一ソースのテストが既に成功し、署名・パッケージングだけを再試行する
