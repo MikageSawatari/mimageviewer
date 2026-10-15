@@ -407,7 +407,9 @@ install起因thumb再要求を省く。UIは元context・source・世代・投�
 全表示snapshot・DB metadata共有storage・UI全件clone・追加同期I/Oを使わない。
 Delete成功行の除去は同じownerの前回記録へ反映し、非表示候補の繰上げは今回走査の差分として扱う。
 購読・dirty／cutoff・rescan・記録を元contextに閉じ、forkは記録を継承して新ownerへ束縛し、
-独立購読を登録後scanで始める。兄弟のdirty／要求を消さない。
+R10当時は独立購読を登録後scanで始めた。2026-10-15の[C1追補](detached-snapshot-reader-plan.md)では
+非main readerの受動購読を開始せず、promote時もwatch／受動scanを既存workerへ退役する。
+main／linkedの観測と兄弟のdirty／要求は維持し、能動Operation／BookAppend系の終端・保留は残す。
 sidecar stampと別context／RemoteのDB反映資格は判定外。自動更新ではsidecarを取込まず、
 未反映のDB値・外部sidecarは明示GridReload／開き直しで反映する。defer→一覧復帰・restart・
 Resumedでも自動originを保持し、その直後の明示更新／通常openは設定どおり取込む対照試験を行う。
