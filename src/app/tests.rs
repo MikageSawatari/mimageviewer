@@ -21764,6 +21764,164 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.slideshow_playing);
     }
 
+    fn stage_fullscreen_hydration_for_test(
+        app: &mut super::phase_c_support::AppTestEnv,
+        ctx: &egui::Context,
+        pdf: bool,
+        required: bool,
+    ) {
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = true;
+        app.settings.tag_sidecar_backup_enabled = false;
+        let old = app.tmp.path().join("old-book");
+        std::fs::create_dir(&old).unwrap();
+        let texture = ctx.load_texture(
+            "old-hydration-page",
+            egui::ColorImage::filled([2, 2], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        app.current_folder = Some(old.clone());
+        app.install_new_items(vec![GridItem::Image(old.join("page.png"))], vec![None]);
+        app.visible_indices = vec![0];
+        app.thumbnails[0] = crate::grid_item::ThumbnailState::Loaded {
+            tex: texture,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            rendered_at_px: 2,
+            source_dims: None,
+            layout_dims: None,
+        };
+        app.fullscreen_idx = Some(0);
+        app.fs_viewport_shown = true;
+        let path = app
+            .tmp
+            .path()
+            .join(if pdf { "next.pdf" } else { "next.zip" });
+        if pdf {
+            std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+        } else {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"fixture").unwrap();
+            zip.finish().unwrap();
+        }
+        if required {
+            assert!(app.start_physical_history_transition(
+                super::PhysicalHistoryIntent::RequiredFullscreen {
+                    target: crate::snapshot::SnapshotTarget::PdfPage {
+                        pdf_path: path.clone(),
+                        page_num: 0,
+                    },
+                    history_trigger: super::HistoryTrigger::UserChosen,
+                    navigation_purpose: super::FsNavigationPurpose::Ordinary,
+                },
+                path.clone(),
+                super::StartupListIntent::PageContinuation,
+            ));
+        } else {
+            assert!(app.supersede_and_begin_fs_folder_navigation_sequence(
+                ctx,
+                super::FsNavigationPurpose::Ordinary,
+            ));
+            // The production Ctrl+Down result/adoption route, with only the DFS worker elided.
+            app.apply_folder_nav_result(
+                ctx,
+                super::FolderNavResult {
+                    target: Some(super::FolderNavTarget {
+                        route: super::FolderNavRoute::FullFeature(path.clone()),
+                        smart_kind: None,
+                        scanned: super::FolderNavScanResult::NotNeeded,
+                    }),
+                    hit_image_folder: true,
+                    forward: true,
+                    mode: super::FolderNavMode::Fullscreen,
+                    queued_steps: 0,
+                },
+            );
+        }
+        app.settle_open_path_classification_for_test();
+        if pdf {
+            replace_physical_history_preflight_for_test(
+                app,
+                crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                    crate::pdf_loader::PdfEnumerateResult {
+                        pages: vec![crate::pdf_loader::PdfPageEntry {
+                            page_num: 0,
+                            mtime: 1,
+                            file_size: 1,
+                        }],
+                        direction: None,
+                        stamp: None,
+                    },
+                ),
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.current_folder.as_ref() != Some(&path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staged adoption timed out"
+            );
+            app.poll_collection_history_transition(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.sidecar_restore_active());
+        assert!(app.fullscreen_idx.is_none());
+    }
+
+    #[test]
+    fn staged_fullscreen_hydration_keeps_pdf_zip_and_required_viewports_alive() {
+        for (pdf, required) in [(true, false), (false, false), (true, true)] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            stage_fullscreen_hydration_for_test(&mut app, &ctx, pdf, required);
+            assert!(app.fs_nav_deferred_reopen_wait_active());
+            app.poll_fs_nav_lock(&ctx);
+            assert!(app.fs_nav_locked_gen.is_some());
+            assert!(
+                app.fs_nav_holdover_for_draw().is_some(),
+                "old page survives hydration"
+            );
+            let old_texture = app.fs_holdover_tex.as_ref().unwrap().primary_texture_id();
+            let output = ctx.run(Default::default(), |ctx| {
+                app.keep_fullscreen_viewport_alive(ctx)
+            });
+            assert!(app.fs_viewport_shown);
+            assert!(!output.viewport_output.values().any(|output| {
+                output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::Visible(false)))
+            }));
+            assert!(ctx.tessellate(output.shapes, output.pixels_per_point).iter().any(|clipped| {
+                matches!(&clipped.primitive, egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == old_texture)
+            }), "the keep-alive frame draws the old page texture");
+            finish_staged_physical_history_for_test(&mut app);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+        }
+    }
+
+    #[test]
+    fn staged_fullscreen_hydration_true_close_consumes_pdf_zip_and_required_reopen() {
+        for (pdf, required) in [(true, false), (false, false), (true, true)] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            stage_fullscreen_hydration_for_test(&mut app, &ctx, pdf, required);
+            app.finish_fullscreen_navigation_for_true_close();
+            assert!(!app.sidecar_restore_navigation_fullscreen_wait_active());
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            assert!(
+                app.sidecar_restore_active(),
+                "list hydration must finish after viewer close"
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            assert!(app.fullscreen_idx.is_none());
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+        }
+    }
+
     #[test]
     fn failed_quick_folder_switch_preserves_source_slot_and_visible_folder() {
         let mut app = setup_app();

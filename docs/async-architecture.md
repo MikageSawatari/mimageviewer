@@ -347,6 +347,13 @@ active値は従来の`settings.facet_filter`で、設定・履歴DBのschema/key
 採用後に既存sidecar continuationを開始し、復元後にselection、startup intent、folder/ZIPの
 first-displayとdeferred fullscreenを仕上げる。sidecarのwarning/resumeでも履歴/facetを再採用しない。
 新items世代を検証するhydration ownerと、採用前のsource proofは目的が異なる。
+after-hydration のフルスクリーン再オープン予約（DFS の fullscreen 継続／RequiredFullscreen）も
+sidecar continuation が所有し、待機述語は current context・世代・source・live/cancel・items数を
+照合してその所有者から答える。任意の deferred page open に必要な旧 holdover の所有ゲートとは
+分け、true close は予約だけを消費して一覧の hydration を継続する。
+`56c11e621`（v4.5.0）で再オープンを採用直後から hydration 後へ移した際、この予約が待機判定から
+漏れたため、v4.7.0 で PDF 間 Ctrl+↑↓ の viewport hide／ちらつきが報告された。
+再オープンの時点は戻さず、ZIP・変換 cache を含む共通 continuation の待機と取消を補う。
 row依存要求は既存items世代・revision証明を維持し、Smartのsurface leaseは同じownerの
 PDF verification/Collection revision更新を許す。別context/path/同ID再openは許さない。
 ブックマークのresolver/書庫要求はnative request IDとreturn targetを証明に使い、同じ要求中の

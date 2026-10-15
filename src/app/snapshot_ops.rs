@@ -2227,6 +2227,7 @@ impl App {
     }
 
     pub(crate) fn finish_fullscreen_navigation_for_true_close(&mut self) {
+        self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
         self.cancel_inflight_order_dependent_folder_nav();
         if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {

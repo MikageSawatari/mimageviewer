@@ -163,6 +163,12 @@ ZIPの全再読込で準備済みprefixが変わる場合はSameLocationでもro
 同階層の再読込は手動復元済みの値を維持し、外側の履歴cursorはどちらも進めない。
 場所条件は移動時にactive/frame双方から除く。folder/PDF/ZIPのinstall後は履歴とfacetを確定してから
 sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuationが担当する。
+DFS の fullscreen 継続と RequiredFullscreen の after-hydration 再オープン予約は、その sidecar
+continuation が所有する。待機述語も同じ live な context／世代／source／items数と取消状態から答え、
+viewport と旧ページの holdover を hydration 中も維持する。true close はこの予約を消費し、
+hydration 完了で勝手に再オープンしない。ZIP と EPUB／RAR 等の変換 cache にも同じ規則を適用する。
+`56c11e621`（v4.5.0）の採用後 hydration への移行で待機判定が追従せず、v4.7.0 で PDF 間
+Ctrl+↑↓ のちらつきが報告された。再オープンを採用直後へ戻さず、予約所有者からの判定で修正する。
 failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。
 この段階では設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外を対象外とした。
 後続の§1.345は `FileTypeVisibility` を共通の一覧投影 owner とし、実 entry のネスト書庫来歴と
