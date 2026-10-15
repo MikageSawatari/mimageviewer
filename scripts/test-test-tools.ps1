@@ -114,6 +114,19 @@ Assert-That ((Get-MivSourceId $fixture) -ne $nestedId) 'file inside a nested rep
 $nestedId = Get-MivSourceId $fixture
 Write-Fixture 'vendor/nested-ref/.git/description' 'git metadata only'
 Assert-That ((Get-MivSourceId $fixture) -eq $nestedId) 'nested .git metadata changed the source identity'
+[void] [IO.Directory]::CreateDirectory((Join-Path $nestedRoot 'sub/__pycache__'))
+Write-Fixture 'vendor/nested-ref/sub/__pycache__/mod.pyc' 'generated'
+Assert-That ((Get-MivSourceId $fixture) -eq $nestedId) 'generated output inside a nested repository changed the source identity'
+$linkCreated = $false
+try {
+    [void] (New-Item -ItemType SymbolicLink -Path (Join-Path $nestedRoot 'sub/link.txt') -Target (Join-Path $nestedRoot 'sub/data.txt') -ErrorAction Stop)
+    $linkCreated = $true
+} catch { Write-Host "[test-test-tools] file symlink not creatable here; skipped the nested file-link check" }
+if ($linkCreated) {
+    $linkRefused = $false
+    try { [void] (Get-MivSourceId $fixture) } catch { $linkRefused = $true }
+    Assert-That $linkRefused 'a file symlink inside a nested repository was followed'
+}
 Remove-Item -LiteralPath $nestedRoot -Recurse -Force
 $beforeDelete = Get-MivSourceId $fixture
 Remove-Item -LiteralPath (Join-Path $fixture 'src/foo.rs')

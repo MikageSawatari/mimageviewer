@@ -53,6 +53,13 @@ function Get-MivTextHash {
     finally { $sha.Dispose() }
 }
 
+function Test-MivExcludedSourcePath {
+    param([string] $Path)
+    if ($Path -match '(^|/)target/|^target-[^/]*/|(^|/)(node_modules|__pycache__|\.git)/|^vendor/libraw/(build|object)/|^crates/vst3-host/build/|\.(obj|pdb|ilk|tlog|part)$|^tests/snapshots/.*\.(new|old|diff)\.png$') { return $true }
+    # This generated measurement report is not a build/test input.
+    return ($Path -eq 'docs/test-speed-report.md')
+}
+
 function Get-MivNestedFiles {
     param([string] $Absolute, [string] $Relative)
     $result = New-Object 'System.Collections.Generic.List[object]'
@@ -66,9 +73,13 @@ function Get-MivNestedFiles {
         foreach ($entry in $dirInfo.GetFileSystemInfos()) {
             $rel = $item[1] + '/' + $entry.Name
             if ($entry -is [IO.DirectoryInfo]) {
-                if ($entry.Name -eq '.git') { continue }
+                # Same build-output rules as top-level paths (the trailing slash lets
+                # directory patterns such as __pycache__/ and .git/ match).
+                if (Test-MivExcludedSourcePath ($rel + '/')) { continue }
                 $pending.Push(@($entry.FullName, $rel))
             } else {
+                if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Cannot fingerprint reparse point: $rel" }
+                if (Test-MivExcludedSourcePath $rel) { continue }
                 $result.Add([pscustomobject] @{ Absolute = $entry.FullName; Relative = $rel })
             }
         }
@@ -86,9 +97,7 @@ function Get-MivSourceId {
     $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
     foreach ($path in ($trackedAndNew + $ignoredInputs).Split([char]0)) {
         if (-not $path) { continue }
-        if ($path -match '(^|/)target/|^target-[^/]*/|(^|/)(node_modules|__pycache__|\.git)/|^vendor/libraw/(build|object)/|^crates/vst3-host/build/|\.(obj|pdb|ilk|tlog|part)$|^tests/snapshots/.*\.(new|old|diff)\.png$') { continue }
-        # This generated measurement report is not a build/test input.
-        if ($path -eq 'docs/test-speed-report.md') { continue }
+        if (Test-MivExcludedSourcePath $path) { continue }
         [void] $paths.Add($path)
     }
     $sorted = [string[]] @($paths)
