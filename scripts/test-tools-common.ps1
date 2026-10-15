@@ -95,11 +95,16 @@ function Get-MivCargoEnvironmentNames {
     foreach ($line in [IO.File]::ReadAllLines($config)) {
         if ($line -match '^\s*(#.*)?$') { continue }
         if ($line -match '^\s*\[([^\]]+)\]\s*(#.*)?$') {
-            $section = $Matches[1].Trim()
-            if ($section -match '^env\.([A-Za-z_][A-Za-z0-9_-]*|"[A-Za-z_][A-Za-z0-9_-]*"|''[A-Za-z_][A-Za-z0-9_-]*'')$') {
-                $Matches[1].Trim('"', "'")
-            } elseif ($section -match '^env[.\s]') { throw 'Unsupported Cargo env table syntax; cannot safely reuse results' }
+            # TOML allows quoted and spaced key parts ("env", 'env' . NAME); compare
+            # the header with those removed so every spelling of the env table is seen.
+            $section = ($Matches[1] -replace '\s', '') -replace '["'']', ''
+            if ($section -match '^env\.([A-Za-z_][A-Za-z0-9_-]*)$') {
+                $Matches[1]
+            } elseif ($section -match '^env\.') { throw 'Unsupported Cargo env table syntax; cannot safely reuse results' }
             continue
+        }
+        if ($section -eq '' -and $line -match '^\s*["'']?env["'']?\s*[.=]') {
+            throw 'Unsupported Cargo env syntax outside an [env] table; cannot safely reuse results'
         }
         if ($section -eq 'env') {
             if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_-]*|"[A-Za-z_][A-Za-z0-9_-]*"|''[A-Za-z_][A-Za-z0-9_-]*'')\s*=') {

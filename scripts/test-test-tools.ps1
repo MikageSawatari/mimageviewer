@@ -24,6 +24,24 @@ function Count-Runs { return @(Get-ChildItem (Join-Path $fixture 'target/test-li
 Assert-That ((Get-MivTextHash 'abc') -eq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'SHA-256 known vector mismatch'
 $caseFeatures = @(Get-MivFeatureArguments @('extra', 'EXTRA', 'extra'))
 Assert-That (($caseFeatures -join ' ') -eq '--features EXTRA,extra') 'case-sensitive Cargo features were merged'
+# Every TOML spelling of the Cargo env table must yield its names, or refuse reuse.
+$envProbe = Join-Path $fixture 'env-probe'
+[void] [IO.Directory]::CreateDirectory((Join-Path $envProbe '.cargo'))
+$envProbeConfig = Join-Path $envProbe '.cargo/config.toml'
+foreach ($spelling in @(
+    "[env]`nPROBE_NAME = `"1`"", "[`"env`"]`nPROBE_NAME = `"1`"", "[ 'env' ]`n'PROBE_NAME' = `"1`"",
+    "[env.PROBE_NAME]`nvalue = `"1`"", "[`"env`".PROBE_NAME]`nvalue = `"1`"", "[ env . `"PROBE_NAME`" ]`nvalue = `"1`"")) {
+    [IO.File]::WriteAllText($envProbeConfig, $spelling + "`n", $utf8)
+    $probeNames = @(Get-MivCargoEnvironmentNames $envProbe)
+    Assert-That ($probeNames -contains 'PROBE_NAME') "Cargo env spelling was not collected: $spelling"
+}
+foreach ($unsupported in @("env = { PROBE_NAME = `"1`" }", "env.PROBE_NAME = `"1`"", "`"env`".PROBE_NAME = `"1`"")) {
+    [IO.File]::WriteAllText($envProbeConfig, $unsupported + "`n", $utf8)
+    $refused = $false
+    try { [void] @(Get-MivCargoEnvironmentNames $envProbe) } catch { $refused = $true }
+    Assert-That $refused "unsupported Cargo env syntax was silently ignored: $unsupported"
+}
+[IO.Directory]::Delete($envProbe, $true)
 Write-Fixture 'Cargo.toml' @'
 [package]
 name = "mimageviewer"
