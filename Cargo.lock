@@ -6822,7 +6822,7 @@ dependencies = [
 
 [[package]]
 name = "tantivy"
-version = "0.26.1"
+version = "0.26.2"
 dependencies = [
  "aho-corasick",
  "arc-swap",
