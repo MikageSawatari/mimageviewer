@@ -1141,10 +1141,20 @@ fn scenario_b_endpoint_paint_center(
     let first_viewport = App::detached_image_window_viewport_id(100);
     driver.focus(first_viewport);
     let mut before = driver.root(&mut app);
-    for _ in 0..12 {
-        if !records_for(&before, first_viewport).is_empty() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // A painted preview can precede completion of its pending final load.
+        // Capture I2's baseline only once the same stable-content predicate used
+        // after parking is ready; CPU load must not determine that boundary.
+        if !records_for(&before, first_viewport).is_empty()
+            && stable_content(&mut app, 100).is_some()
+        {
             break;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label}: active paint did not reach stable content"
+        );
         before = driver.root(&mut app);
     }
     let before_paint = records_for(&before, first_viewport);
@@ -2126,7 +2136,12 @@ fn collection_order_open(
             Some(path),
             "full grid open before first frame"
         );
-        None
+        // A real fullscreen open moves focus off ROOT. Leaving the fake main
+        // viewport focused correctly triggers the production focus-close guard
+        // after its grace period, making this scenario depend on machine load.
+        let viewport = app.fullscreen_viewport_id();
+        driver.focus(viewport);
+        Some(viewport)
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
@@ -2244,7 +2259,17 @@ fn collection_order_observe(
             return;
         }
         if !pending && !display_pending && actual.as_deref() != Some(expected) {
-            assert_eq!(actual.as_deref(), Some(expected));
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "frame={} detached={detached} slideshow={} idx={:?} items={} records={:#?} errors={:?}",
+                frame.number,
+                app.slideshow_playing,
+                app.fullscreen_idx,
+                app.items.len(),
+                frame.records,
+                frame.errors,
+            );
         }
         assert!(
             std::time::Instant::now() < deadline,

@@ -4033,11 +4033,16 @@ mod tests {
         state.phase = app.sidecar_restore_start_checking(&mut state);
         app.sidecar_restore = Some(state);
         let ctx = egui::Context::default();
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
             app.poll_sidecar_restore(&ctx);
             if app.sidecar_probe_reuse.candidate(&folder).is_some() {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "matching sidecar owner did not publish its proof"
+            );
             std::thread::yield_now();
         }
         assert!(app.sidecars.contains_key(&folder));
