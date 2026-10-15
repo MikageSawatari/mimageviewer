@@ -1,6 +1,11 @@
-> 状態: 設計案 第3版 (2026-10-16、再レビューへの対応、確認前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
+> 状態: 設計 第3.1版 (2026-10-16)。独立レビュー (gpt-6.1-sol / xhigh) が第3版を ACCEPT WITH CHANGES、残る P2 2 件 (ゲームパッド) を設計担当 (ClaudeCode) が第3.1版で反映。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
 
 # 改訂履歴
+
+## 第3.1版 — 2026-10-16 (設計担当が直接修正)
+
+- **第3版レビュー P2-1 — 反映 (方針は既存挙動の保持):** §4.2 ゲームパッド項目8を「復帰後は保持中の軸値で操作を続ける現行挙動を保持」に変更。中立通過の要求は操作を変えるため採らず、§5 に明記。
+- **第3版レビュー P2-2 — 反映:** §4.2 ゲームパッドに項目11 (logic で drain した edge・意味終端の引継ぎ契約) を追加し、段3の回帰に「press→release を複数 logic に分けても失わない」「復帰後の軸継続」と既存回帰の維持を追加。gamepad の 150〜350 行の見積りは、段1b で引継ぎ owner を整理した後に再評価する。
 
 ## 第3版 — 2026-10-16
 
@@ -341,9 +346,10 @@ gilrs threadはforegroundに関係なくqueueへ追加しrepaintを要求する�
 5. 受付事実はPadイベントの局所的なmetadata、または既存Pad保持状態の型へ集約する。全入力共通層、新しいApp pending bool、時間窓は作らない。producerからApp／eguiのlockを取得しない。
 6. 正式な操作先・modal判断は、従来どおり対象contextをmountした配送側で決める。producer側へ第二のviewer resolverを作らない。
 7. 非前面時の`reset_gamepad_continuous_steps`と`suppress_pending_actions`を再利用し、受付不可期間に始まったpress／repeatを復帰後に発火させない。
-8. 軸は物理値を更新しながら、受付不可期間に始まった操作を復帰だけで開始しない。既存中立待ちを利用し、足りない部分だけPadの同じ物理保持owner内で扱う。新しい独立ラッチ群を追加しない。
+8. 軸は物理値を更新し続け、**復帰後は保持中の軸値で操作を続ける現行挙動を保持する** (中立通過を要求しない)。現行の非前面時処理は軸値を保持したままタイマー等だけを抑止し、配送再開後は保持中の軸値を使う (`src/gamepad.rs:375`、`:653` の既存テスト、`src/app/gamepad_input.rs:2398`、`:2518`、`:2764`、`:2809`)。「別アプリでスティックを倒す→倒したままmIVへ戻る」で操作が始まるのはリリース済みの挙動であり、中立通過を要求する案は操作を変えるため採らない (採るなら §5 の手続きで利用者に相談する)。離散pressの遅延採用防止 (項目7) とは分けて扱う。
 9. **一時popup等の既存挙動を一括変更しない。** 現`suppress_pending_actions`は、短いpopup後の軸継続を意図している。操作先不在期間の入力と、既存modal中の抑止を混同しない。
 10. 既に開始したringの意味終端は正しいcontextで行う。disconnect／設定OFF時のring確定とUndo構築を単に捨てたり、root投影で確定したりしない。物理終端と意味終端は既存batch／context所有へ接続し、別終端queueを増やさない。
+11. **logicでdrainした入力の引継ぎ契約。** 物理取込みownerは、受付可能な状態で受けた未配送のedge (press／release) と意味終端 (`session_ended` 等) を、配送側が取り出すまで順序どおり保持する。配送側はUI passの入口で一度だけ取り出し、その時点の内容をmulti-pass replay用batchとして固定する。最終保持状態や最新batchへの置換で代用しない (「logicがpressをdrain→次のlogicがreleaseをdrain→UI実行」で短い押下を失うため。期限超過LogicOnlyで通常に起こる)。現行の`SampledPadTransaction` (`src/app/gamepad_input.rs:73`、`:2115`、`:2260`) は frame番号付きの単一batchであり、この保持をそのまま担わせない。操作追跡ON／OFFの既存挙動 (`:9809` の、追跡OFFではdiscard後のpassでも新しいreleaseをpollする回帰) を区別して維持する。保持は同じ物理取込みowner内に置き、新しい独立queue群やAppフラグは作らない。
 
 根拠: `src/gamepad.rs:380`、`:497`、`src/app/gamepad_input.rs:2342`、`:2398`、`:2510`、`:2732`、`:3657`。前面判定の既存入口は同`:509`。
 
@@ -944,6 +950,7 @@ manifestはrootの`Cargo.toml`、各`crates/*/Cargo.toml`、`tools/*_lab/Cargo.t
 | system font fallback | 既存明示chainを基準 |
 | Ctrl+Shift+C/X/V | 通常窓・native入力欄とも従来操作を保持 |
 | 受信済み入力・release確定 | 既存契約を保持。取消仕様へ変更する案は採らない |
+| 別アプリで倒したgamepad軸の復帰後の継続 | 現行どおり継続 (中立通過を要求しない)。要求する案は操作を変えるので採るなら相談 |
 
 特に、非表示化前に正当に受信したキーを後から取消す、releaseによる既存の確定を抑止する、短いpopup後のgamepad軸継続を一括変更する案は、具体的な操作差を示して相談する。第3版はこれらの変更を必須にしない。
 
@@ -1110,6 +1117,7 @@ compileに加えて、実接続点の次の回帰を実行する。
 - logic-only後の未消費RawInputと復帰後の新規入力。
 - focus移動前に受信した離散キーの採用。
 - gamepadの同じegui frame番号中の複数logic、最小化中のpress／軸／release／disconnect、logic未実行の短い退避・復帰。
+- gamepadの受付可能なpress→releaseを複数logicに分けてdrainしても失わないこと、復帰後に保持中の軸値で操作が続くこと。既存回帰 `src/app/gamepad_input.rs:9697`、`:9763`、`:9809` の期待値を維持。
 - gamepadのmulti-pass二重配送防止とringのcontext所有・Undo。
 - root／childの入力所有とWH_GETMESSAGE既存drain。
 
