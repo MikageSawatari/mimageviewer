@@ -7,6 +7,11 @@
 コマンド・ログ抜粋など、そのまま示すべき固有部分は原文のままでよい)。コミットメッセージや
 コード内コメントは従来どおり (本書の各節の方針に従う)。
 
+5ch 等の利用者報告への調査・返信は、[AGENTS.md の User Reports And Forum Replies](AGENTS.md#user-reports-and-forum-replies)
+に従う。初報から最新までの経緯・回答済み事項を照合し、報告者へ追加の作業を頼む前に
+コード・既存ログ・開発側で可能な検証を進める。「とりあえず試してもらう」を繰り返さず、
+追加確認は調査方針を実際に変えるものに絞り、相手の負担に最大限配慮する。
+
 ## 開発・公開担当とレビューの既定
 
 モデル分担と調整の正本は [AGENTS.md の Model Roles And Coordination](AGENTS.md#model-roles-and-coordination)。

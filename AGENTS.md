@@ -5,6 +5,26 @@ contains the broader project context and operational notes; read only the
 sections relevant to the current task instead of treating the whole file as
 always-active guidance.
 
+## User Reports And Forum Replies
+
+- Before drafting a reply (especially for 5ch), read the relevant conversation
+  from the initial report through the latest response. Keep track of answered
+  questions, reported test results, local findings, and remaining unknowns;
+  never ask again for information already supplied.
+- Minimize the reporter's effort. Investigate source, existing logs, and local
+  test options first. Do not ask them to "try it just in case" or exhaust a
+  speculative test matrix. Request another check only when its result would
+  materially change the next investigation or decision; explain that purpose
+  and keep the request small. After repeated checks, prefer acknowledging the
+  evidence and taking the investigation back to the developer.
+- Reassess hypotheses against all reported results before proposing a test.
+  Distinguish a confirmed cause, a code defect candidate, and an unverified
+  explanation; do not turn a plausible mechanism into a diagnosis.
+- Keep 5ch replies brief, appreciative, and free of unnecessary internal detail.
+  Do not promise a fix or imply ongoing/background investigation unless that
+  work is actually underway. State completed work, current limits, and the next
+  concrete step accurately, preserving who observed each runtime result.
+
 ## Model Roles And Coordination
 
 - Default development roles (2026-09-23 decision, Codex models updated 2026-09-30):
