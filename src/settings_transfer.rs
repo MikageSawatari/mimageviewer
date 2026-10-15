@@ -340,7 +340,7 @@ preferences_policy! {
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
         remember_spread_shift_per_book: bool => ("見開きの調整を本ごとに記憶する", |_, _| true, plain, plain);
         page_turn_animation_enabled: bool => ("ページめくりアニメーション", |_, _| true, plain, plain);
-        page_turn_animation_duration_ms: u32 => ("ページめくりアニメーションの時間（仮）", |v, _| (100..=600).contains(v), plain, plain);
+        page_turn_animation_duration_ms: u32 => ("ページめくりアニメーションの時間", |v, _| (100..=600).contains(v), plain, plain);
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
