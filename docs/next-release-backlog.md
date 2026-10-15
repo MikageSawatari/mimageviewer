@@ -32,6 +32,13 @@
 
 ## 1. 優先候補
 
+### 1.386 Everything 検索 (Ctrl+R) が使えないとき、理由が分からない — 利用者の実機観測 (2026-10-16)
+- 観測 (利用者、v4.7.0): 動画を別ウィンドウ (メインと連動) で開いている間、「ファイル」→「Everything ファイル名検索…」が灰色になり、Ctrl+R を押しても何も起きない。メニューにマウスを乗せても理由が出ず、Ctrl+R でも通知が出ない。
+- 原因 (コード参照): `everything_search_entry_allowed` (src/global_search_ui/everything.rs) が `everything_main_grid_available` (fullscreen_idx・連動 detached の main history 抑止・native video fullscreen) と modal・Remote lock を見て無効にする。設計 docs/everything-search-plan.md の「発火面は main grid のみ」による仕様。Ctrl+G (アイテム検索) にはこの制限が無く、動きがそろっていない。
+- 対応 (次の版): (1) 無効のときはメニューのホバーで理由を出し、Ctrl+R では理由付きの通知を出す (ほかの機能と同じ UI)。(2) C1 (切り離した後の一覧は受動更新をしない) を踏まえ、連動中の別ウィンドウ再生中でも Everything 検索を始められるよう広げるか検討する (promote 経路は C1 で構造的に安全になった)。Ctrl+G との条件差も揃える。
+- 2026-10-16: マニュアル (manual/search.html) に「フルスクリーンや連動した別ウィンドウで閲覧している間は使えない」を追記済み。
+- 規模 / 優先度: Small〜Medium / P2。
+
 ### 1.385 動画フルスクリーンで、VST の窓に重なった下 HUD が前に戻らない — 利用者の実機観測 (2026-10-15)
 - 観測 (利用者、v4.7.0 候補 = HUD 前面化の自己循環を止める修正の前): 動画フルスクリーンで VST の窓を下 HUD に重ねると、下 HUD は VST の窓の後ろのまま。カーソルを下端にしばらく乗せても手前に来ない。上 HUD を出すと、VST の窓が上 HUD に重ならない位置へ移動する。
 - 設計 (docs/vst3-integration.md の Z-order ポリシー) では、VST の z-order 変更時の raise burst と、上下端の hover polling (cursor が activation zone にあり 200ms 以上経過) で HUD を戻すことになっている。独立レビュー (2026-10-15) の読み: VST の窓が帯を覆うとマウス入力が VST に届き、polling の `cursor_input_owned` を満たせない。presenter→登録 editor の移動では app-active が変わらず hook も発火しない。
