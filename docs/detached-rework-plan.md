@@ -5304,7 +5304,7 @@ plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状�
 §2 の所有境界に沿う修正であり、遅延・時間窓・geometry guard を足す症状パッチではないことを実装側でも確認した。
 自動検証結果は [I2 段 2b の記録](ime-process-keys-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。
 
-### §11 追補: staged 本移動の hydration 中 fullscreen 継続（2026-10-16、未コミット）
+### §11 追補: staged 本移動の hydration 中 fullscreen 継続（2026-10-16、`5086d23d6`）
 
 設計 lead の実装依頼に従い、§2 を再読して `sidecar_restore` と共有
 `fs_nav_deferred_reopen_wait_active`、true close の予約消費境界を修正した。
@@ -5320,4 +5320,4 @@ fullscreen の意図が action 自身にあるため、旧 texture／holdover �
 detached の `alive_wanted`（runtime の生存・Closing）は変更しない。`transition_outstanding` は
 該当 continuation の待機中に true となり、従来の deferred_fullscreen 待機と同じ window 継続を表す。
 viewport 生成・registry・HWND・placement・focus owner は変更しない。
-独立レビュー・設計 lead の検収・実機確認は別途とし、実装テストの結果は引き継ぎ報告に記録する。
+設計 lead (ClaudeCode Opus) の検収と独立 GPT-6.1 Sol/xhigh レビューの双方が「症状パッチではなく構造的修正」に同意し、レビューは指摘なしで ACCEPT。実機確認は利用者に依頼中。
