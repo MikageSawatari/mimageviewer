@@ -1277,6 +1277,9 @@ impl super::App {
     /// A synthetic surface can still own a physical descendant. Its position and the
     /// adopted row producer decide refresh routing, not the parent's surface alone.
     pub(super) fn current_grid_reload_is_physical(&self) -> bool {
+        if self.projection_recipe.extracted_surface().is_some() {
+            return false;
+        }
         match self.top_level_grid_view.surface() {
             TopLevelGridSurface::Folder => true,
             TopLevelGridSurface::Collection(_) => self
@@ -1306,6 +1309,13 @@ impl super::App {
     /// 現在の最上位一覧を、その surface が所有する再入場経路で更新する。
     pub(crate) fn reload_top_level_grid(&mut self, ctx: &egui::Context) {
         let surface = self.top_level_grid_view.surface().clone();
+        if matches!(surface, TopLevelGridSurface::Folder)
+            && self.projection_recipe.extracted_surface().is_some()
+        {
+            // Dismissing a search changes its UI before its replacement source is accepted.
+            // The retained reader rows still belong to that extracted source.
+            return;
+        }
         let folder_pane_active = self.effective_folder();
 
         if self.current_grid_reload_is_physical() {

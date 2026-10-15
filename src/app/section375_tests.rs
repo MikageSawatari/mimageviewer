@@ -4,7 +4,7 @@ use super::*;
 use crate::delete_worker::{DeleteMsg, DeletePending};
 use std::time::{Duration, Instant, SystemTime};
 
-fn settle(app: &mut App, ctx: &egui::Context) {
+pub(super) fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         app.poll_open_path_classification(ctx);
@@ -28,7 +28,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-fn fixture(names: &[&str]) -> (AppTestEnvForTest, PathBuf, egui::Context) {
+pub(super) fn fixture(names: &[&str]) -> (AppTestEnvForTest, PathBuf, egui::Context) {
     let mut app = setup_app_for_test();
     app.settings.sidecar_backup_enabled = false;
     app.settings.tag_sidecar_backup_enabled = false;
@@ -444,7 +444,7 @@ fn section1375_automatic_origin_survives_match_diff_restart_resume_and_defer() {
 }
 
 #[test]
-fn section1375_detached_physical_reader_defers_changed_rows_until_list_return() {
+fn section1375_detached_physical_reader_defers_operation_until_list_return() {
     let (mut app, folder, ctx) = fixture(&["a.jpg"]);
     app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
     app.fullscreen_idx = Some(0);
@@ -455,7 +455,11 @@ fn section1375_detached_physical_reader_defers_changed_rows_until_list_return() 
     let selected_path = app.items[0].drag_source_path().unwrap().to_path_buf();
     let added = folder.join("b.jpg");
     std::fs::write(&added, b"external-change").unwrap();
-    app.check_external_folder_changes(&ctx, ExternalChangeCheck::Notified);
+    app.check_folder_changes_with_cause(
+        &ctx,
+        ExternalChangeCheck::Notified,
+        book_append_refresh::FolderRefreshCause::Operation,
+    );
     settle(&mut app, &ctx);
     assert_eq!(app.items_generation, generation);
     assert_eq!(app.fullscreen_idx, Some(0));
@@ -471,7 +475,7 @@ fn section1375_detached_physical_reader_defers_changed_rows_until_list_return() 
     assert_eq!(pending.folder, folder);
     assert!(matches!(
         pending.cause,
-        book_append_refresh::FolderRefreshCause::External
+        book_append_refresh::FolderRefreshCause::Operation
     ));
     app.fullscreen_idx = None;
     app.consume_folder_refresh_pending(&ctx);
@@ -955,7 +959,7 @@ fn section1375_tag_and_edit_sidecar_policy_off_on_explicit_and_open() {
 
 #[cfg(windows)]
 #[test]
-fn section1375_same_folder_fork_park_mount_independent_subscription_and_close() {
+fn section1375_same_folder_fork_is_snapshot_while_main_subscription_survives() {
     let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg"]);
     app.ensure_current_folder_watch(&ctx);
     settle(&mut app, &ctx);
@@ -976,10 +980,11 @@ fn section1375_same_folder_fork_park_mount_independent_subscription_and_close() 
         let generation = app.items_generation;
         app.ensure_current_folder_watch(&ctx);
         settle(app, &ctx);
-        assert_ne!(app.current_folder_watch.as_ref().unwrap().epoch, a_epoch);
+        assert!(app.current_folder_watch.is_none());
+        assert!(app.external_rescan_pending.is_none());
         assert_eq!(
             app.items_generation, generation,
-            "first confirmation scan can Equal"
+            "independent reader must not start a first observation scan"
         );
         std::fs::remove_file(folder.join("b.jpg")).unwrap();
         delete_terminal(app, vec![folder.join("b.jpg")]);
@@ -1010,7 +1015,12 @@ fn section1375_same_folder_fork_park_mount_independent_subscription_and_close() 
     .unwrap();
     let b_cancel = app
         .with_viewer_context(b, |app| {
-            app.start_external_rescan(&ctx, folder.clone(), SystemTime::UNIX_EPOCH);
+            app.start_external_rescan_with_cause(
+                &ctx,
+                folder.clone(),
+                SystemTime::UNIX_EPOCH,
+                book_append_refresh::FolderRefreshCause::Operation,
+            );
             app.external_rescan_pending.as_ref().unwrap().cancel.clone()
         })
         .unwrap();
@@ -1023,7 +1033,7 @@ fn section1375_same_folder_fork_park_mount_independent_subscription_and_close() 
 #[cfg(windows)]
 #[test]
 fn section1375_split_primitive_retains_original_dirty_and_uses_inherited_baseline() {
-    let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg"]);
+    let (mut app, _folder, ctx) = fixture(&["a.jpg", "b.jpg"]);
     app.ensure_current_folder_watch(&ctx);
     settle(&mut app, &ctx);
     let epoch = app.current_folder_watch.as_ref().unwrap().epoch;
@@ -1428,7 +1438,14 @@ fn section1375_two_context_diffs_wait_for_global_hydration_without_new_notificat
     let b = app.fork_materialized_still_context(&folder, 0);
     std::fs::write(folder.join("b.jpg"), b"new").unwrap();
     app.with_viewer_context(b, |app| {
-        app.ensure_current_folder_watch(&ctx);
+        // C1 has no passive subscription in B. An active operation's scan still
+        // owns its result and must wait for A's global hydration before adopting.
+        app.check_folder_changes_with_cause(
+            &ctx,
+            ExternalChangeCheck::Notified,
+            book_append_refresh::FolderRefreshCause::Operation,
+        );
+        assert!(app.current_folder_watch.is_none());
     })
     .unwrap();
     app.check_external_folder_changes(&ctx, ExternalChangeCheck::Notified);

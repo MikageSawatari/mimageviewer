@@ -1455,6 +1455,42 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-15 C1採択: 独立readerの受動更新停止
+
+**現在の利用者採択はC1だけ。案Aは不採用の履歴として保持し、source／main-owner境界の考え方だけを参照する。**
+[C1設計と案Cの影響調査](detached-snapshot-reader-plan.md)が現設計の正本。BA-7に対し、独立readerの受動FS観測をなくしてitems／ProjectionRecipeを
+既存contextで保持することで、観測→保留→再採用の組合せを減らす構造案。
+通常linkedはmainと同じbundleのままとし、linked中の観測・選択連動・最初のpromoteを変更しない。
+独立reader／promote後だけを対象とし、C2（全別窓のopen時分離）／C3（欠損skip拡張）は今回行わない。
+metadata publication／初回sidecar／PDF epoch／明示mutationのhandle解放／Append終端・Undoは残す。
+P2に対しては既存FolderRefreshCauseで受動Externalと能動Operation／BookAppend系を区別し、
+receiptなしAppendもBookAppendExternalを維持。要求・合流・保留・完了・restartで由来を落とさず、
+独立化時も能動終端・必要な保留を残してwatchだけを復活させない設計を追加した。
+新bool／pending owner・rect推測・時間窓・assert回避は採らない。native／renderリワーク残項目を急ぐ条件にはしない。
+独立レビューはC1の構造修正に同意済み。最後のP2（整理完了の能動由来）を補完し、利用者指示でC1だけを実装した。
+`ProjectionRecipe`とregistryのmain identityから観測資格を判断し、fork／promoteで受動資源を退役、
+旧購読proof付き能動走査は既存holdへ戻す。`check_external_folder_changes`全呼出し元を監査し、
+整理Copy／Move終端はcause付きOperationへ配送。要求・保留・合流・応答・restartのcauseを保持する。
+assertを維持し、main／linkedの監視・最初のpromote・能動終端は残した。
+追加の独立コード確認で製品コードのP1／P2はなし。実binding／sessionのhandler回帰と検証結果は
+[C1実施記録§9](detached-snapshot-reader-plan.md#9-実装と検証記録2026-10-15)を参照。実機確認済みとは扱わない。
+
+### 2026-10-15 §1.375 検索終了後の独立readerへの物理更新（案Aの履歴・今回不採用）
+
+当初の案A選択は、その後の利用者決定でC1へ変更した。
+[§1.375 plan §9](section375-operation-reconcile-plan.md#9-検索終了後の独立readerと物理更新の所有境界案a設計)は初案の履歴。
+**以下のreader観測・保留は現C1には適用しない。source／main-owner境界の考え方だけを参照する。**
+itemsと同寿命の既存ProjectionRecipeを観測資格へ接続し、検索flags終了後のretained結果を
+検索前folderの走査で置き換えない。registryのmain identityとreader binding／sessionから更新先を導出し、
+main一覧置換だけが従来どおり動画／音声をpromoteする。非mainの物理readerの実変更は既存の
+context別folder_refresh_pendingへ配送し、再生中には採用しない。要求・完了・restart・保留消費で
+同じ判断を使い、新pending／bool／ownerは追加しない。main以外のmountは正常なままとし、
+plan_promoteのassertとnative viewport／player lifecycleは保持する。
+BA-7に対し、推測flagsではなくaccepted sourceと更新先所有者を正本にする構造修正とCodexは判断する。
+promote判定だけのguard、false側での再生終了、rect推測・時間窓・retryによる回避は採らない。
+案B（再生開始から独立readerへ所有移動）は今回の範囲外。
+**これは不採用案の履歴であり、この案でコードへ進まない。コード変更・検証実行なし。**
+
 ### 2026-10-13 §1.341 黒paperと先頭配置の設定採用
 
 利用者採用の[page-turn plan §26](page-turn-animation-plan.md)に従い、local pagedの演出ON時だけ

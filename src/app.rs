@@ -25545,7 +25545,105 @@ impl App {
         )
     }
 
+    /// Directory scans must describe the accepted rows, including the interval after a
+    /// search UI closes but before its replacement list has been adopted.
+    fn current_listing_accepts_folder_scan(&self) -> bool {
+        !matches!(
+            self.projection_recipe,
+            book_materialization::ProjectionRecipe::ExtractedResult(_)
+                | book_materialization::ProjectionRecipe::Book(
+                    book_materialization::BookScope::Archive { .. }
+                        | book_materialization::BookScope::Document(_)
+                )
+        ) && self
+            .current_folder
+            .as_ref()
+            .is_some_and(|source| !is_synthetic_view_path(source))
+            && self.archive_source_override.is_none()
+            && !self.items_are_global_search_view
+            && !self.global_search.active
+            && !self.items_are_tag_view
+            && !self.tag_view.active
+    }
+
+    /// Mounting a reader never gives it ownership of the main list's passive observation.
+    /// Return surfaces (such as a pinned snapshot root) do not classify its physical child.
+    fn folder_observation_allowed(&self) -> bool {
+        self.projected_viewer_context_id() == self.viewer_context_main()
+            && self.current_listing_accepts_folder_scan()
+    }
+
+    fn folder_refresh_targets_independent_reader(&self) -> bool {
+        if self.projected_viewer_context_id() == self.viewer_context_main() {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.detached_viewer_window_id().is_some() {
+            // The binding survives the session's Closing terminal until context retirement.
+            return true;
+        }
+        self.fullscreen_idx.is_some()
+    }
+
+    pub(crate) fn retain_folder_refresh(
+        &mut self,
+        mut request: book_append_refresh::FolderRefreshRequest,
+    ) {
+        if let Some(previous) = self.folder_refresh_pending.take()
+            && crate::folder_tree::path_eq(&previous.folder, &request.folder)
+        {
+            request.cause = previous.cause.merge_for_refresh(request.cause);
+        }
+        self.folder_refresh_pending = Some(request);
+    }
+
+    /// Explicit ownership transition: retire only passive observation, not an operation's
+    /// terminal. An active scan tied to the old subscription becomes an ordinary active hold.
+    fn retire_passive_folder_observation(&mut self) {
+        if let Some(watch) = self.current_folder_watch.take() {
+            self.retire_smart_folder_payloads([
+                Box::new(watch) as smart_folder::RetiredSmartFolderPayload
+            ]);
+        }
+        self.current_folder_watch_failed = None;
+        let retire_scan = self
+            .external_rescan_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.cause.is_passive_observation()
+                    || pending
+                        .proof
+                        .as_ref()
+                        .is_some_and(|proof| proof.subscription.is_some())
+            });
+        if retire_scan {
+            let mut pending = self.external_rescan_pending.take().unwrap();
+            if !pending.cause.is_passive_observation()
+                && pending.owner_context_id == self.edit_request_owner_context()
+                && pending.items_generation == self.items_generation
+                && self.current_folder.as_ref() == Some(&pending.folder)
+            {
+                self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
+                    folder: pending.folder.clone(),
+                    cause: std::mem::take(&mut pending.cause),
+                });
+            }
+            pending.cancel_and_retire();
+        }
+        if self
+            .folder_refresh_pending
+            .as_ref()
+            .is_some_and(|request| request.cause.is_passive_observation())
+        {
+            self.folder_refresh_pending = None;
+        }
+    }
+
     pub(crate) fn poll_current_folder_watch(&mut self, ctx: &egui::Context) {
+        if !self.folder_observation_allowed() {
+            self.retire_passive_folder_observation();
+            return;
+        }
         self.ensure_current_folder_watch(ctx);
         let now = std::time::Instant::now();
         let mut should_check = false;
@@ -25594,6 +25692,10 @@ impl App {
     }
 
     fn ensure_current_folder_watch(&mut self, ctx: &egui::Context) {
+        if !self.folder_observation_allowed() {
+            self.retire_passive_folder_observation();
+            return;
+        }
         let Some(folder) = self.current_favorite_target().filter(|_| {
             self.current_grid_reload_is_physical()
                 && !self.items_are_global_search_view
@@ -25675,7 +25777,24 @@ impl App {
         ctx: &egui::Context,
         reason: ExternalChangeCheck,
     ) {
-        if self.global_search.active || self.tag_view.active {
+        self.check_folder_changes_with_cause(
+            ctx,
+            reason,
+            book_append_refresh::FolderRefreshCause::External,
+        );
+    }
+
+    pub(crate) fn check_folder_changes_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        reason: ExternalChangeCheck,
+        cause: book_append_refresh::FolderRefreshCause,
+    ) {
+        if cause.is_passive_observation() && !self.folder_observation_allowed() {
+            self.retire_passive_folder_observation();
+            return;
+        }
+        if !self.current_listing_accepts_folder_scan() {
             return;
         }
         // 削除進行中はフォーカス復帰による自動再読み込みを抑止する。削除自身が
@@ -25717,7 +25836,7 @@ impl App {
             }
         }
         // 走査は worker に出す。**UI スレッドで read_dir + 全件分類をしない** (F14)。
-        self.start_external_rescan(ctx, folder, new_mtime);
+        self.start_external_rescan_with_cause(ctx, folder, new_mtime, cause);
     }
 
     /// フォルダー再走査を worker へ出す。同じフォルダーの走査が既に走っていれば足さない。
@@ -25742,6 +25861,17 @@ impl App {
         new_mtime: std::time::SystemTime,
         cause: book_append_refresh::FolderRefreshCause,
     ) {
+        if cause.is_passive_observation() && !self.folder_observation_allowed() {
+            self.retire_passive_folder_observation();
+            return;
+        }
+        if !self.current_listing_accepts_folder_scan() {
+            return;
+        }
+        if self.folder_refresh_targets_independent_reader() {
+            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest { folder, cause });
+            return;
+        }
         if self.defer_book_append_observation(&folder, self.edit_request_owner_context()) {
             return;
         }
@@ -25762,6 +25892,7 @@ impl App {
             && pending.owner_context_id == request_owner
             && !cause.is_append_delivery()
         {
+            pending.cause = std::mem::take(&mut pending.cause).merge_for_refresh(cause);
             pending.restart_requested = true;
             return;
         }
@@ -25931,6 +26062,9 @@ impl App {
 
     /// 走査結果を、**要求を出した viewer context** へ適用する。
     pub(crate) fn poll_external_rescan(&mut self, ctx: &egui::Context) {
+        if !self.folder_observation_allowed() {
+            self.retire_passive_folder_observation();
+        }
         // A rescan accepted before sidecar restore keeps its exact context/generation owner until
         // the modal terminal. Applying it now can replace the item generation being recovered.
         if self.sidecar_restore_active() {
@@ -25955,7 +26089,7 @@ impl App {
         };
         let ExternalRescanPending {
             proof,
-            cause: requested_cause,
+            cause: mut requested_cause,
             owner_context_id,
             folder,
             mtime,
@@ -25975,9 +26109,9 @@ impl App {
         }
 
         // 走査中に届いていた変更は、結果を適用したかどうかに関係なくやり直す (R02)。
-        let restart = |app: &mut Self, ctx: &egui::Context| {
+        let restart = |app: &mut Self, ctx: &egui::Context, cause| {
             if restart_requested {
-                app.start_external_rescan(ctx, folder.clone(), mtime);
+                app.start_external_rescan_with_cause(ctx, folder.clone(), mtime, cause);
             }
         };
 
@@ -26009,12 +26143,7 @@ impl App {
             Some("observation_changed")
         } else if self.edit_request_owner_context() != owner_context_id {
             Some("owner_not_projected")
-        } else if !self.current_grid_reload_is_physical()
-            || self.items_are_global_search_view
-            || self.global_search.active
-            || self.items_are_tag_view
-            || self.tag_view.active
-        {
+        } else if !self.current_listing_accepts_folder_scan() {
             Some("source_is_not_physical")
         } else if self.current_folder.as_ref() != Some(&folder) {
             Some("source_changed")
@@ -26039,7 +26168,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|current| crate::folder_tree::path_eq(current, &folder))
             {
-                self.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
                     folder: folder.clone(),
                     cause: book_append_refresh::FolderRefreshCause::BookAppendExternal,
                 });
@@ -26058,15 +26187,15 @@ impl App {
                 && !restart_requested
                 && self.current_folder.as_ref() == Some(&folder)
             {
-                self.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
                     folder: folder.clone(),
-                    cause: requested_cause.clone(),
+                    cause: std::mem::take(&mut requested_cause),
                 });
             }
             self.retire_smart_folder_payloads([
                 Box::new((scan, proof)) as smart_folder::RetiredSmartFolderPayload
             ]);
-            restart(self, ctx);
+            restart(self, ctx, requested_cause);
             return;
         }
         let _ = scan_options;
@@ -26079,6 +26208,20 @@ impl App {
             requested_cause,
             book_append_refresh::FolderRefreshCause::BookAppendExternal
         ) {
+            cause = book_append_refresh::FolderRefreshCause::BookAppendExternal;
+        } else if matches!(
+            requested_cause,
+            book_append_refresh::FolderRefreshCause::Operation
+        ) && cause.is_passive_observation()
+        {
+            // A user operation may join after the worker captured a passive cause.
+            cause = book_append_refresh::FolderRefreshCause::Operation;
+        } else if matches!(
+            requested_cause,
+            book_append_refresh::FolderRefreshCause::BookAppend(_)
+        ) && cause.is_passive_observation()
+        {
+            // Do not invent a worker-verified receipt for a coalesced request.
             cause = book_append_refresh::FolderRefreshCause::BookAppendExternal;
         }
         if let book_append_refresh::FolderRefreshCause::BookAppend(receipt) = &requested_cause
@@ -26150,7 +26293,7 @@ impl App {
         self.retire_smart_folder_payloads([
             Box::new(proof) as smart_folder::RetiredSmartFolderPayload
         ]);
-        restart(self, ctx);
+        restart(self, ctx, requested_cause);
     }
 
     /// 走査結果の適用。所有 context を mount した状態で呼ぶこと。
@@ -26231,6 +26374,12 @@ impl App {
         new_sig: folder_scan::FolderScanSignature,
         cause: book_append_refresh::FolderRefreshCause,
     ) -> bool {
+        if cause.is_passive_observation() && !self.folder_observation_allowed() {
+            self.retire_smart_folder_payloads([
+                Box::new(scan) as smart_folder::RetiredSmartFolderPayload
+            ]);
+            return false;
+        }
         if self.defer_book_append_observation(&folder, self.edit_request_owner_context()) {
             self.retire_smart_folder_payloads([
                 Box::new(scan) as smart_folder::RetiredSmartFolderPayload
@@ -26253,6 +26402,7 @@ impl App {
         // それ以外の差分や未適用の一覧は従来の reload / defer へ流す。
         if self.viewer_session_blocks_main_window()
             || (self.navigation_scope.is_detached_physical() && self.fullscreen_idx.is_some())
+            || self.folder_refresh_targets_independent_reader()
         {
             // 一覧へ適用すると load_folder_with_scan -> close_fullscreen まで進むため、
             // main viewerと独立physical readerは既存の再読み込みへ先送りする。
@@ -26265,16 +26415,14 @@ impl App {
                 "auto-refresh: folder content changed while main viewer is open; deferring reload ({})",
                 folder.display()
             ));
-            self.folder_refresh_pending =
-                Some(book_append_refresh::FolderRefreshRequest { folder, cause });
+            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest { folder, cause });
             self.retire_smart_folder_payloads([
                 Box::new(scan) as smart_folder::RetiredSmartFolderPayload
             ]);
             return false;
         }
         if self.document_open_modal_admission_blocked() {
-            self.folder_refresh_pending =
-                Some(book_append_refresh::FolderRefreshRequest { folder, cause });
+            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest { folder, cause });
             self.retire_smart_folder_payloads([
                 Box::new(scan) as smart_folder::RetiredSmartFolderPayload
             ]);
@@ -43863,7 +44011,10 @@ impl App {
             return;
         };
         if crate::folder_tree::path_eq(parent, &cur) {
-            self.folder_refresh_pending = Some(cur.into());
+            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
+                folder: cur,
+                cause: book_append_refresh::FolderRefreshCause::Operation,
+            });
         }
     }
 
@@ -43872,10 +44023,14 @@ impl App {
     /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
     /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
     pub(crate) fn consume_folder_refresh_pending(&mut self, ctx: &egui::Context) {
+        if !self.folder_observation_allowed() {
+            self.retire_passive_folder_observation();
+        }
         if self.sidecar_restore_active()
             || self.delete_pending.is_some()
             || self.document_open_modal_admission_blocked()
             || self.book_append_undo_in_progress()
+            || self.folder_refresh_targets_independent_reader()
         {
             return;
         }
@@ -43927,6 +44082,7 @@ impl App {
                 || matches!(
                     target.cause,
                     book_append_refresh::FolderRefreshCause::External
+                        | book_append_refresh::FolderRefreshCause::Operation
                 )
             {
                 self.start_external_rescan_with_cause(
@@ -48364,7 +48520,12 @@ impl App {
             })
         {
             let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
-            self.start_external_rescan(&ctx, folder, std::time::SystemTime::UNIX_EPOCH);
+            self.start_external_rescan_with_cause(
+                &ctx,
+                folder,
+                std::time::SystemTime::UNIX_EPOCH,
+                book_append_refresh::FolderRefreshCause::Operation,
+            );
         }
     }
 
@@ -51742,7 +51903,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|folder| crate::folder_tree::path_eq(folder, &receipt.files.folder))
         {
-            self.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
                 folder: receipt.files.folder.clone(),
                 cause: book_append_refresh::FolderRefreshCause::BookAppendExternal,
             });
@@ -65597,6 +65758,9 @@ impl App {
 
     #[cfg(windows)]
     fn active_detached_media_requires_main_context_transfer(&self) -> bool {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return false;
+        }
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
@@ -65605,7 +65769,9 @@ impl App {
             .or(self.detached_viewer_window_id())
             .is_some_and(|window_id| {
             self.locate_window_context(window_id)
-                .is_some_and(|(_, residence)| residence == ContextResidence::Mounted)
+                .is_some_and(|(owner, residence)| {
+                    owner == self.viewer_context_main() && residence == ContextResidence::Mounted
+                })
         })
             // Tray residency keeps both committed detached sessions and an in-flight switch to
             // detached alive. A main-context refresh must use that same lifecycle predicate before
@@ -99792,6 +99958,8 @@ mod original_material_tests;
 pub(crate) mod paged_prefetch_tests;
 #[cfg(test)]
 pub(crate) mod paint_record_test_support;
+#[cfg(test)]
+mod section375_c1_tests;
 #[cfg(test)]
 mod section375_tests;
 #[cfg(test)]

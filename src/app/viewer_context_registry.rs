@@ -3065,6 +3065,11 @@ impl App {
 
     #[cfg(windows)]
     pub(in crate::app) fn activate_mounted_as_independent_detached(&mut self, window_id: u64) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            // A linked viewer still projects the main list. Only a context that
+            // already owns its independent list loses passive observation here.
+            self.retire_passive_folder_observation();
+        }
         self.viewer_presentation = ViewerPresentation::DetachedWindow;
         self.ensure_mounted_detached_session_binding(window_id);
         self.detached_viewer_independent_active = true;
@@ -4811,6 +4816,13 @@ impl App {
         if let Some(bundle) = self.viewer_contexts.table.at_rest_mut(context)
             && bundle.current_folder.as_deref() == Some(folder)
         {
+            let cause = bundle
+                .folder_refresh_pending
+                .take()
+                .filter(|request| request.folder == folder)
+                .map_or(cause.clone(), |request| {
+                    request.cause.merge_for_refresh(cause)
+                });
             bundle.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
                 folder: folder.to_path_buf(),
                 cause,
@@ -4826,13 +4838,27 @@ impl App {
             if bundle
                 .external_rescan_pending
                 .as_ref()
-                .is_some_and(|pending| pending.folder == folder)
+                .is_some_and(|pending| {
+                    pending.folder == folder && pending.cause.is_append_delivery()
+                })
             {
                 let pending = bundle.external_rescan_pending.take().unwrap();
                 pending.cancel_and_retire();
+                let cause = bundle
+                    .folder_refresh_pending
+                    .take()
+                    .filter(|request| request.folder == folder)
+                    .map_or(
+                        book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                        |request| {
+                            request.cause.merge_for_refresh(
+                                book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                            )
+                        },
+                    );
                 bundle.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
                     folder: folder.to_path_buf(),
-                    cause: book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                    cause,
                 });
             }
         }
@@ -5576,6 +5602,10 @@ impl App {
         _reason: &'static str,
     ) -> ViewerContextId {
         self.publish_mounted_context_rating_writes_at_boundary("promote_outgoing");
+        // The outgoing bundle becomes an independent snapshot reader. Retire
+        // its watch before the table deposits it, retaining active operation
+        // delivery in that same bundle rather than handing it to the new main.
+        self.retire_passive_folder_observation();
         let ops = self.viewer_contexts.table.plan_promote();
         self.execute_viewer_context_ops(ops, None);
         let stashed = self.viewer_contexts.table.finish_promote();
@@ -5764,6 +5794,166 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn seed_c1_subscription_scan(
+        app: &mut App,
+        cause: book_append_refresh::FolderRefreshCause,
+    ) -> Arc<AtomicBool> {
+        let folder = crate::data_dir::get().join("c1-reader");
+        app.current_folder = Some(folder.clone());
+        let watch = CurrentFolderWatch::new(folder.clone(), 0);
+        let epoch = watch.epoch;
+        app.current_folder_watch = Some(watch);
+        let (_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.external_rescan_pending = Some(ExternalRescanPending {
+            proof: Some(FolderRescanProof {
+                baseline: None,
+                projection_key: 0,
+                subscription: Some((epoch, 0)),
+            }),
+            cause,
+            owner_context_id: app.projected_viewer_context_id(),
+            folder,
+            mtime: std::time::UNIX_EPOCH,
+            items_generation: app.items_generation,
+            scan_options: app.current_external_scan_options(),
+            cancel: Arc::clone(&cancel),
+            rx,
+            restart_requested: true,
+        });
+        cancel
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1375_c1_linked_activation_keeps_main_observation_and_operation() {
+        let mut app = crate::app::setup_app_for_test();
+        let cancel =
+            seed_c1_subscription_scan(&mut app, book_append_refresh::FolderRefreshCause::Operation);
+        let epoch = app.current_folder_watch.as_ref().unwrap().epoch;
+        let main = app.viewer_context_main();
+        app.activate_mounted_as_independent_detached(9137);
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(app.current_folder_watch.as_ref().unwrap().epoch, epoch);
+        assert!(app.external_rescan_pending.is_some());
+        assert!(!cancel.load(Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1375_c1_promote_retires_only_passive_observation_in_outgoing_owner() {
+        for cause in [
+            book_append_refresh::FolderRefreshCause::External,
+            book_append_refresh::FolderRefreshCause::Operation,
+            book_append_refresh::FolderRefreshCause::BookAppendExternal,
+        ] {
+            let passive = cause.is_passive_observation();
+            let append = cause.is_append_delivery();
+            let mut app = crate::app::setup_app_for_test();
+            let cancel = seed_c1_subscription_scan(&mut app, cause.clone());
+            let folder = app.current_folder.clone().unwrap();
+            app.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                folder: folder.clone(),
+                cause,
+            });
+            let old_main = app.viewer_context_main();
+            assert_eq!(
+                app.stash_mounted_and_start_fresh("c1_promote_observation"),
+                old_main
+            );
+            let new_main = app.viewer_context_main();
+            assert_ne!(old_main, new_main);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.folder_refresh_pending.is_none());
+            let new_folder = app.tmp.path().join("new-main");
+            app.current_folder_watch = Some(CurrentFolderWatch::new(new_folder, 17));
+            let new_epoch = app.current_folder_watch.as_ref().unwrap().epoch;
+            for _ in 0..2 {
+                app.with_viewer_context(old_main, |owner| {
+                    assert!(owner.current_folder_watch.is_none());
+                    assert!(owner.external_rescan_pending.is_none());
+                    if passive {
+                        assert!(owner.folder_refresh_pending.is_none());
+                    } else {
+                        let request = owner.folder_refresh_pending.as_ref().unwrap();
+                        assert_eq!(request.folder, folder);
+                        assert!(!request.cause.is_passive_observation());
+                        assert_eq!(request.cause.is_append_delivery(), append);
+                    }
+                })
+                .unwrap();
+                assert_eq!(app.viewer_context_main(), new_main);
+                assert_eq!(app.current_folder_watch.as_ref().unwrap().epoch, new_epoch);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1375_c1_live_fork_keeps_main_watch_and_operation_without_reader_watch() {
+        let mut app = crate::app::setup_app_for_test();
+        let cancel =
+            seed_c1_subscription_scan(&mut app, book_append_refresh::FolderRefreshCause::Operation);
+        let main = app.viewer_context_main();
+        let epoch = app.current_folder_watch.as_ref().unwrap().epoch;
+        app.bind_window(main, 9138).unwrap();
+        let reader = app.fork_mounted_live_media_context(9138);
+        assert_ne!(reader, main);
+        assert_eq!(app.current_folder_watch.as_ref().unwrap().epoch, epoch);
+        assert!(app.external_rescan_pending.is_some());
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.with_viewer_context(reader, |owner| {
+            assert!(owner.current_folder_watch.is_none());
+            assert!(owner.external_rescan_pending.is_none());
+            assert!(owner.folder_refresh_pending.is_none());
+        })
+        .unwrap();
+        assert_eq!(app.current_folder_watch.as_ref().unwrap().epoch, epoch);
+        assert!(!cancel.load(Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1375_c1_at_rest_append_cancel_preserves_general_operation() {
+        let mut app = crate::app::setup_app_for_test();
+        let reader = app.build_window_context_for_test(9139, |_| {});
+        let (folder, cancel) = app
+            .with_viewer_context(reader, |owner| {
+                let cancel = seed_c1_subscription_scan(
+                    owner,
+                    book_append_refresh::FolderRefreshCause::Operation,
+                );
+                (owner.current_folder.clone().unwrap(), cancel)
+            })
+            .unwrap();
+        app.cancel_at_rest_book_append_observations(&folder);
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.with_viewer_context(reader, |owner| {
+            assert!(matches!(
+                owner.external_rescan_pending.as_ref().unwrap().cause,
+                book_append_refresh::FolderRefreshCause::Operation
+            ));
+            owner.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                folder: folder.clone(),
+                cause: book_append_refresh::FolderRefreshCause::Operation,
+            });
+        })
+        .unwrap();
+        app.enqueue_at_rest_book_append_observation(
+            reader,
+            &folder,
+            book_append_refresh::FolderRefreshCause::BookAppendExternal,
+        );
+        app.with_viewer_context(reader, |owner| {
+            assert!(matches!(
+                owner.folder_refresh_pending.as_ref().unwrap().cause,
+                book_append_refresh::FolderRefreshCause::BookAppendExternal
+            ));
+        })
+        .unwrap();
+    }
 
     #[cfg(windows)]
     fn pdf_promotion_for_test(
