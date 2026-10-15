@@ -9,6 +9,16 @@
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
 | [detached-snapshot-reader-plan.md](detached-snapshot-reader-plan.md) | 2026-10-15利用者採択はC1だけ。独立reader／promote後の受動更新を停止、能動Operation／BookAppend系の由来は要求・保留・完了・restartまで既存cause型で保持。整理完了もOperationへ接続。関連970件成功、fmt・通常／portable check成功。full一回は音声pumpの1件失敗・単独では成功、vendor gate未実施。実装・検証記録は§9。linked中は変更なし。案Aは履歴・source／main-owner境界だけ参照、C2／C3は今回対象外 |
+| [coding-conventions.md](coding-conventions.md) | CLAUDE.md から分けたコーディング規約の全文。UI・ダイアログ・パネル・IME・スクロール・配色・並行処理・UI スレッドの I/O・グリフ・外部ツール向けテキストを触るとき |
+| [native-dependencies.md](native-dependencies.md) | CLAUDE.md から分けたネイティブ依存物の管理。vendor/ の復旧、PDFium・ONNX Runtime・Susie・FFmpeg・LibRaw・VST3 bridge の更新やビルド |
+| [release-checklist.md](release-checklist.md) | **リリース手順チェックリストの正本**と配布形態。リリース作業を始めるときに最初に全部読む |
+| [codex-cli-usage.md](codex-cli-usage.md) | Codex CLI でレビュー・実装を依頼するときの手順 (resume・stdin・出力の受け取り) |
+| [development-build-and-test-native.md](development-build-and-test-native.md) | Windows ネイティブ挙動の実機確認用バイナリと、検証起動時の設定データ保護 |
+| [git-workflow.md](git-workflow.md) | 整形・コミット・共有作業ツリー・worktree 撤去の運用 |
+| [public-wording-policies.md](public-wording-policies.md) | 公開文書の表記ポリシー (外部ダウンローダ・モザイク関連) と、コード修正時のドキュメント同時更新 |
+| [tag-storage-and-xmp.md](tag-storage-and-xmp.md) | タグ / レーティングの保存先、ファイルへ XMP を書く経路と ExifTool 検証 |
+| [remote-debugging.md](remote-debugging.md) | mIV Remote の不具合調査。サーバ側ログの場所と読み方 |
+| [project-reference.md](project-reference.md) | 技術スタック・ファイル構成・対応形式・性能メモ・スクリーンショット素材の切り出し |
 | [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 ZIP の更新位置。facet帰路・起動復元を修正、回帰9件追加、独立最終ACCEPT。targeted618実行／596件・vendor54件・fmt・通常／portable check・最新dev成功。full一回exit101の失敗48件を全補完、再実行なし |
 | [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 R10、LISTrev13独立設計ACCEPT・実装／独立コードレビュー／自動検証完了。前回／今回の走査の行signature一致時だけinstall・世代・thumb再要求を省く。自動sidecar取込なし、未反映DB値／外部sidecarは明示更新・開き直しで反映。fork記録・§1.314・mainのdirty／cutoffを維持（独立readerの受動購読はC1追補で停止）。targeted406実行／391件、fmt・通常／portable check・最新dev成功。full最終13,531成功／失敗0／ignored63。初回3失敗と修正・性能測定は§8.2、実機確認待ち |
 | [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 R7実装・独立ACCEPT、通常rescanの選択復元退行も修正済み（§7.10）。同じAppend workerで画像作成前に八storeを初期化し、copy report値のcache採用を撤去。ごみ箱Undo・UndoAppend限定排他は維持。Refresh cursorは受理済みhydrationで一度だけ優先解決し、★固定の物理子の復元資格と起動復元資格を分離。最終targeted279実行／237件、fmt・通常／portable check・確認用build成功。full最終完走一回は13,493成功／0失敗／既存ignored63件。追加findingによる中断一回は成功証拠に含めない |
@@ -175,7 +185,7 @@
 | [pdf-pool-harvest-on-cancel-plan.md](pdf-pool-harvest-on-cancel-plan.md) | cancel 時に in-flight の PDF レンダ結果を回収してキャッシュ保存する `CancelWaitPolicy` |
 | [screenshot-howto.md](screenshot-howto.md) | 製品ページ用スクリーンショット手順 |
 | [e2e-smoke-test.md](e2e-smoke-test.md) | E2E スモークテストのチェックリスト |
-| [release-operations.md](release-operations.md) | **リリース運用メモ**。CLAUDE.md「リリース手順チェックリスト」の補助。過去リリースで踏んだ落とし穴・判断基準・復旧手順 (stale core cache / 署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 / 通常設定を使わない隔離 UI 検証 / 配布チャネル別の注意) を集約。別セッション / Codex への引き継ぎ用 |
+| [release-operations.md](release-operations.md) | **リリース運用メモ**。[release-checklist.md](release-checklist.md)「リリース手順チェックリスト」の補助。過去リリースで踏んだ落とし穴・判断基準・復旧手順 (stale core cache / 署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 / 通常設定を使わない隔離 UI 検証 / 配布チャネル別の注意) を集約。別セッション / Codex への引き継ぎ用 |
 | [development-build-and-test.md](development-build-and-test.md) | 開発中の `cargo check` / 絞り込みテスト / 軽量 core ビルドと、リリース前の全体テストゲートの使い分け |
 | [test-video-generation.md](test-video-generation.md) | `testimage/movie/test_*fps_*p_sync.mp4` (FFmpeg testsrc2 + sine ビープ) の再生成手順 |
 | [ui-snapshot-policy.md](ui-snapshot-policy.md) | egui_kittest によるスナップショットテストの運用方針 |
