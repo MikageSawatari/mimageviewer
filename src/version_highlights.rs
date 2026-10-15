@@ -341,6 +341,21 @@ const V4_6_HIGHLIGHTS: &[HighlightItem] = &[
     },
 ];
 
+const V4_7_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "本ごとにページの並びや見開きの組み方を保存できる「本の構成」を追加しました",
+        body: "閲覧中の上部バーの「…」→「本の構成を編集」から開きます。元のファイルは書き換えません。",
+    },
+    HighlightItem {
+        title: "ページめくりのアニメーションを追加しました",
+        body: "環境設定の「表示 → 閲覧表示」か、閲覧中の上部バーの「…」で切り替えます（既定はオフ）。",
+    },
+    HighlightItem {
+        title: "Everything を使ったファイル名検索を追加しました",
+        body: "一覧で Ctrl+R を押します。Everything の検索クライアントを起動しておく必要があります。",
+    },
+];
+
 const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
         version: "2.0.0",
@@ -1071,6 +1086,26 @@ const TABLE: &[VersionHighlights] = &[
             body: "一覧で★を変えて絞り込みから外れたとき、選択はこれまでの前の項目ではなく次の項目へ移ります。フルスクリーンでも読む順の次のページへ移ります。直後の Ctrl+Z で元に戻せます。",
         }],
         highlights: V4_6_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.7.0",
+        // 同名フォルダと本の既定の反転、抽出一覧の単ページ開始、音響調整ボタンの挙動変更を必読へ置く。
+        must_read: &[
+            HighlightItem {
+                title: "同じ名前のフォルダと本が並ぶときは、本を表示するようになりました",
+                body: "環境設定の「ファイル処理 → 同名ファイル」で「本を表示」「フォルダを表示」「両方表示」を選べます。これまでの既定ではフォルダを表示していたので、元の見え方に戻すには「フォルダを表示」を選んでください。",
+            },
+            HighlightItem {
+                title: "検索や絞り込みで集めた一覧は、単ページから開きます",
+                body: "Ctrl+G・タグ・★・スマートフォルダ・コレクションなどの一覧をフルスクリーンで開くと、毎回単ページから始まります。2〜5 を押すと、その間だけ見開きで読めます。",
+            },
+            #[cfg(not(feature = "portable"))]
+            HighlightItem {
+                title: "音響調整の窓がタスクバーに出るようになり、ボタンでは閉じなくなりました",
+                body: "音響調整ボタンは窓を前面に出すだけになりました。窓はタイトルバーの × で閉じます。タスクバーに出さない場合は、環境設定の「動画・音声 → 動画」でオフにします。",
+            },
+        ],
+        highlights: V4_7_HIGHLIGHTS,
     },
 ];
 
