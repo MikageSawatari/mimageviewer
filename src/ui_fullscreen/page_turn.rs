@@ -8,6 +8,8 @@ mod barrier;
 #[cfg(test)]
 mod cover_tests;
 #[cfg(test)]
+mod draw_submit_tests;
+#[cfg(test)]
 mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
@@ -536,6 +538,13 @@ impl egui::Plugin for SubmissionPlugin {
             if let Some(proof) = event.proof {
                 fields.push(("unit", proof));
             }
+            // Projection statistics alone do not prove which shapes survived
+            // the rest of the UI pass. Keep the ordered final payload beside
+            // the same frame/pass receipt, only under the existing perf switch.
+            fields.push((
+                "output_paint",
+                output_paint_diagnostics(&output.shapes).into(),
+            ));
             fields.push(("submitted_pages",serde_json::Value::Array(pending.receipt.pages().iter().map(|(occurrence,source,native,area)|serde_json::json!({"idx":occurrence.idx,"role":format!("{:?}",occurrence.role),"navigation_anchor_idx":occurrence.navigation_anchor_idx,"source_texture_id":format!("{source:?}"),"native_texture_id":format!("{native:?}"),"visible_area":area})).collect())));
         }
         match (event.kind, ledger.status) {
@@ -1122,14 +1131,17 @@ fn emit(
 ) {
     #[cfg(test)]
     TEST_EVENTS.with(|events| events.borrow_mut().push((*fact, kind, reason)));
-    if kind == "skip" {
+    // One line per lifecycle transition, never per projected frame. A normal
+    // log must distinguish an unoffered turn from a submitted curl cancelled
+    // before the observer saw it; perf logging is optional in real reports.
+    if matches!(kind, "skip" | "start" | "cancel" | "finish") {
         let sub_check = extra
             .iter()
             .find(|(key, _)| *key == "sub_check")
             .and_then(|(_, value)| value.as_str())
             .unwrap_or(reason);
         crate::logger::log(format!(
-            "[page-turn] skip reason={reason} sub_check={sub_check} operation={:?} context={:?}",
+            "[page-turn] {kind} reason={reason} sub_check={sub_check} operation={:?} context={:?}",
             fact.operation_id, fact.destination.context
         ));
     }
@@ -2181,7 +2193,8 @@ impl App {
                                 "triangles": indices / 3,
                                 "draws": projection.meshes.len(),
                                 "vertex_bytes": vertices * std::mem::size_of::<egui::epaint::Vertex>(),
-                                "index_bytes": indices * std::mem::size_of::<u32>()
+                                "index_bytes": indices * std::mem::size_of::<u32>(),
+                                "paint_order": projection.meshes.iter().map(|draw| mesh_paint_diagnostics(&draw.mesh, draw.clip_rect)).collect::<Vec<_>>()
                             })
                         });
                         for draw in projection.meshes {
@@ -2605,6 +2618,53 @@ fn stage_one_shape_reason(
 }
 fn rect_diagnostics(rect: egui::Rect) -> [f32; 4] {
     [rect.min.x, rect.min.y, rect.max.x, rect.max.y]
+}
+
+// These summaries inspect the submitted data without tessellating a second time
+// or retaining any additional texture, material, receipt, or presentation state.
+fn mesh_paint_diagnostics(mesh: &egui::Mesh, clip: egui::Rect) -> serde_json::Value {
+    let bounds = |uv: bool| {
+        mesh.vertices
+            .iter()
+            .fold(egui::Rect::NOTHING, |bounds, vertex| {
+                let point = if uv { vertex.uv } else { vertex.pos };
+                bounds.union(egui::Rect::from_min_max(point, point))
+            })
+    };
+    serde_json::json!({
+        "kind":"mesh", "texture_id":format!("{:?}",mesh.texture_id),
+        "rect":rect_diagnostics(bounds(false)), "uv_rect":rect_diagnostics(bounds(true)),
+        "clip_rect":rect_diagnostics(clip), "vertices":mesh.vertices.len(),
+        "triangles":mesh.indices.len()/3,
+        "alpha_range":[mesh.vertices.iter().map(|v|v.color.a()).min(),mesh.vertices.iter().map(|v|v.color.a()).max()],
+        "black":!mesh.vertices.is_empty() && mesh.vertices.iter().all(|v|v.color == egui::Color32::BLACK)
+    })
+}
+fn output_paint_diagnostics(shapes: &[egui::epaint::ClippedShape]) -> Vec<serde_json::Value> {
+    fn visit(shape: &egui::Shape, clip: egui::Rect, result: &mut Vec<serde_json::Value>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, clip, result);
+                }
+            }
+            egui::Shape::Mesh(mesh) => result.push(mesh_paint_diagnostics(mesh, clip)),
+            egui::Shape::Rect(rect) => result.push(serde_json::json!({
+                "kind":"rect", "rect":rect_diagnostics(rect.rect),
+                "clip_rect":rect_diagnostics(clip), "fill":rect.fill.to_array()
+            })),
+            egui::Shape::Noop | egui::Shape::Callback(_) => {}
+            _ => result.push(serde_json::json!({
+                "kind":"other", "rect":rect_diagnostics(shape.visual_bounding_rect()),
+                "clip_rect":rect_diagnostics(clip)
+            })),
+        }
+    }
+    let mut result = Vec::new();
+    for shape in shapes {
+        visit(&shape.shape, shape.clip_rect, &mut result);
+    }
+    result
 }
 
 fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Value {

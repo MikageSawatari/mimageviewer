@@ -80,6 +80,216 @@ fn capture_composed_flat(ctx: &egui::Context, app: &mut App, anchor: usize) -> A
 }
 
 #[test]
+fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() {
+    use crate::page_turn_animation::{PageMaterial, project_prepared};
+
+    let _serial = crate::key_input::lock_test_input();
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for explicit_alone in [false, true] {
+            let mut book =
+                BookComposition::new(direction, (0..11).map(fixtures::document_page).collect());
+            book.cover_enabled = false;
+            if explicit_alone {
+                book.page_overrides.push(PageOverrideEntry {
+                    page: fixtures::document_page(10),
+                    directive: PageOverride::Alone,
+                });
+            }
+            let ctx = egui::Context::default();
+            install(&ctx);
+            let mut app = composed_app(&ctx, &book, 11);
+            app.settings.final_cover_spread_enabled = false;
+            app.settings.last_page_alone_enabled = false;
+            app.settings.page_after_cover_alone_enabled = false;
+            for idx in 0..11 {
+                let image = Arc::new(egui::ColorImage::filled([80, 120], egui::Color32::GREEN));
+                let tex = ctx.load_texture(
+                    format!("coverless-tail-{idx}"),
+                    image.clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Static {
+                        tex,
+                        pixels: image,
+                        source_dims: Some([80, 120]),
+                        load_seq: 1,
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                );
+                app.record_page_dims_for_spread(idx, (80, 120));
+                app.record_page_layout_dims_for_spread(idx, (80, 120));
+                app.rotation_cache
+                    .insert(idx, crate::rotation_db::Rotation::None);
+            }
+            let nav = app.get_nav_indices();
+            let units = app.build_spread_display_units_for_nav(&nav);
+            assert_eq!(units.len(), 6);
+            assert_eq!(units[4].pages, vec![8, 9]);
+            assert_eq!(units[4].formation, SpreadDisplayUnitFormation::Paired);
+            assert_eq!(units[5].pages, vec![10]);
+            assert_eq!(
+                units[5].formation,
+                SpreadDisplayUnitFormation::Singleton(if explicit_alone {
+                    SpreadDisplaySingletonCause::ExplicitAlone
+                } else {
+                    SpreadDisplaySingletonCause::UnpairedSlot
+                })
+            );
+            // A natural last singleton uses the last endpoint; Alone uses the
+            // cover endpoint. Only the latter leaves the arriving leaf vacant.
+            let right = (direction == CompositionDirection::Rtl) != explicit_alone;
+            assert_eq!(
+                app.spread_display_composition_for_anchor(10)
+                    .singleton_placement(),
+                if right {
+                    SingletonSpreadPlacement::Right
+                } else {
+                    SingletonSpreadPlacement::Left
+                }
+            );
+            let pair = capture_composed_flat(&ctx, &mut app, 8);
+            let tail = capture_composed_flat(&ctx, &mut app, 10);
+            assert_eq!(pair.pages.len(), 2);
+            assert_eq!(tail.pages.len(), 1);
+            assert!(tail.white.is_none());
+            assert_eq!(
+                tail.pages[0].occurrence,
+                SpreadPageOccurrence::navigation(10, 10)
+            );
+            let canonical = canonical_unit(&tail).unwrap();
+            let vacant = &canonical.pages[usize::from(!right)];
+            assert!(matches!(vacant.material, PageMaterial::Vacant));
+            assert!(vacant.occurrence.is_none());
+            assert!(vacant.underlay.is_none());
+            assert_eq!(canonical.pages[usize::from(right)].occurrence, Some(0));
+
+            for (outgoing, incoming, forward) in [(&pair, &tail, true), (&tail, &pair, false)] {
+                let leaf = prepare_leaf(outgoing, incoming, forward).unwrap();
+                let incoming_ids = leaf
+                    .incoming
+                    .pages
+                    .iter()
+                    .filter_map(|page| page.occurrence)
+                    .collect::<Vec<_>>();
+                assert_eq!(incoming_ids.len(), incoming.pages.len());
+                let mut previous_angle = 0.0;
+                for progress in [0.0, 0.25, 0.6, 0.95, 1.0] {
+                    let projection = project_prepared(
+                        &leaf.outgoing,
+                        &leaf.incoming,
+                        leaf.direction,
+                        leaf.recipe,
+                        progress,
+                        false,
+                    )
+                    .unwrap();
+                    assert_eq!(projection.finished, progress == 1.0);
+                    assert!(projection.meshes.iter().all(|mesh| {
+                        mesh.mesh.texture_id == egui::TextureId::default()
+                            || outgoing.pages.iter().chain(&incoming.pages).any(|page| {
+                                page.resource.paint_texture_id() == mesh.mesh.texture_id
+                            })
+                    }));
+                    assert_eq!(projection.visibility.incoming.len(), incoming_ids.len());
+                    assert!(
+                        projection
+                            .visibility
+                            .incoming
+                            .iter()
+                            .all(|page| incoming_ids.contains(&page.occurrence))
+                    );
+                    assert!(projection.angle_degrees >= previous_angle);
+                    previous_angle = projection.angle_degrees;
+                    if progress >= 0.6 {
+                        assert!(projection.angle_degrees > 90.0);
+                    }
+                    if explicit_alone && progress < 1.0 {
+                        if !forward && progress == 0.0 {
+                            assert_eq!(projection.angle_degrees, 0.0);
+                        }
+                        let black_face =
+                            (forward && progress >= 0.6) || (!forward && progress <= 0.25);
+                        if black_face {
+                            assert_eq!(projection.showing_back, forward);
+                            assert!(
+                                projection.meshes.iter().any(|mesh| {
+                                    mesh.mesh.texture_id == egui::TextureId::default()
+                                        && !mesh.mesh.indices.is_empty()
+                                        && mesh.mesh.vertices.iter().all(|vertex| {
+                                            vertex.color == egui::Color32::BLACK
+                                                && vertex.uv == egui::epaint::WHITE_UV
+                                        })
+                                }),
+                                "{direction:?}/forward={forward}/progress={progress}: black vacant leaf"
+                            );
+                        }
+                        if forward && progress >= 0.6 {
+                            let static_page =
+                                pair.pages.iter().find(|p| p.occurrence.idx == 8).unwrap();
+                            assert!(
+                                projection.meshes.iter().any(|mesh| {
+                                    mesh.mesh.texture_id == static_page.resource.paint_texture_id()
+                                        && !mesh.mesh.indices.is_empty()
+                                        && mesh.mesh.vertices.iter().all(|v| v.color.a() == 255)
+                                }),
+                                "page 9 remains painted beneath the arriving black leaf"
+                            );
+                        }
+                    }
+                    if progress == 1.0 {
+                        assert_eq!(projection.angle_degrees, 180.0);
+                        // Completion is the actual incoming canonical paint:
+                        // retain its ordinary underlay, but no extra vacant
+                        // black support, old texture or fake receipt.
+                        let canonical_material_count = leaf
+                            .incoming
+                            .pages
+                            .iter()
+                            .filter(|page| !matches!(page.material, PageMaterial::Vacant))
+                            .map(|page| 1 + usize::from(page.underlay.is_some()))
+                            .sum::<usize>();
+                        assert_eq!(projection.meshes.len(), canonical_material_count);
+                        for mesh in &projection.meshes {
+                            let bounds = egui::Rect::from_points(
+                                &mesh.mesh.vertices.iter().map(|v| v.pos).collect::<Vec<_>>(),
+                            );
+                            assert!(leaf.incoming.pages.iter().any(|page| {
+                                !matches!(page.material, PageMaterial::Vacant)
+                                    && bounds == page.rect.intersect(page.clip_rect)
+                            }));
+                            if mesh.mesh.texture_id != egui::TextureId::default() {
+                                let page = incoming
+                                    .pages
+                                    .iter()
+                                    .find(|page| {
+                                        page.resource.paint_texture_id() == mesh.mesh.texture_id
+                                    })
+                                    .expect("terminal texture belongs to the destination unit");
+                                assert_eq!(
+                                    bounds,
+                                    page.transform
+                                        .paint_rect
+                                        .intersect(page.transform.viewport_rect)
+                                );
+                            }
+                        }
+                        assert!(
+                            projection
+                                .visibility
+                                .incoming
+                                .iter()
+                                .all(|page| { (page.fraction() - 1.0).abs() < 0.0001 })
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_proof() {
     use crate::page_turn_animation::project_prepared;
 
