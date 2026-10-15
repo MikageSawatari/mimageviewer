@@ -105,8 +105,15 @@ nextestは1テスト1プロセスでAppのprocess-global lockを分離する。
   ignoredでも `vendor` / `testdata` / `testimage` 等のnative入力・実fixtureを含める。
   rootの`target` / `target-*`、入れ子の`target/`、native build/object、snapshot比較用の
   `.new/.old/.diff.png`、計測出力 `docs/test-speed-report.md` は除外する。
+  ただし実行体の隣のnative DLLは別の識別子へ含める。`cargo metadata` のtarget directoryから、
+  指定profile（test/dev→debug、bench→release）とtarget triple配下の同profileの直下・`deps/`にある
+  DLLのパス集合と全内容を照合する。FFmpeg 6本を含み、追加・差し替え・削除で台帳はMISSになる。
+  Cargo生成の`-<16桁hex>.dll`は除外する。Git外のDLL探索先・システムDLLは対象外。
   index・作業ツリー・Git管理領域へは書かない。compiler/nextest版と主要build/runtime環境変数も照合する。
-  環境変数の値は台帳へ出さずhashのみ保存する。
+  `.cargo/config.toml` の`[env]`宣言名を自動で読み取り、そのprocess環境での未設定／値を識別する。
+  `LIBSQLITE3_FLAGS`、`FFMPEG_DIR`、`RUSTFLAGS` / `RUSTDOCFLAGS` / `CARGO_*`、
+  `LIBCLANG_PATH`、`MIV_*` / `MIMV_*`等を含む。環境変数の値は台帳へ出さずhashのみ保存する。
+  対応できないCargo env宣言構文は再利用せず、警告して通常実行する。
 - Git外のglobal Cargo設定、registry側の手編集、ドライバー・ハードウェア・外部サービスの変更、
   上記以外のignored入力は検知しない。その条件が変わったときは `-Force`。
   判読できない入力や入れ子Git repositoryがあれば再利用を止め、通常実行する。
@@ -114,7 +121,10 @@ nextestは1テスト1プロセスでAppのprocess-global lockを分離する。
   `src/foo/bar.rs`→`test(~foo::bar::)`、`mod.rs`は親module、`tests/name.rs`はそのintegration target、
   他workspace crateはそのpackage全target。`-Path src/foo.rs`で明示選択、`-PlanOnly`で実行前の確認も可能。
   `lib.rs` / `app.rs` / `src/app/tests.rs`、Cargo/build/runner設定、vendor、共通test support・snapshotは
-  広域としてexit 2で案内し、自動で全件へ拡大しない。文書のみ等の選択なし・0件一致はexit 4。
+  広域として扱う。それ以外も`testdata/**`、`scripts/**`、workspace外patch crate、文書など、
+  対応付けできない変更が1つでもあれば全該当パスを表示し、部分実行せずexit 2で
+  `test-lib-full.ps1`と必要な専用検査を案内する。自動で全件へ拡大しない。
+  変更パスなし・対応したfilterの0件一致はexit 4。
   module aliasや他crateへの影響を完全には推定しないため、表示された選択と追加featureを担当者が確認する。
 
 道具の回帰確認は `powershell -NoProfile -File scripts/test-test-tools.ps1`。

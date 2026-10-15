@@ -3,7 +3,7 @@
 対象: `test-speed` worktree、基準 `f5d382385`（製品・テストコードは master `d3f2e913c` と同じ）。
 製品コード・CLAUDE.md・依存バージョンは変更しない。
 
-## 最終結果
+## 独立レビュー前の最終結果（ec0eeebffまで）
 
 | 検証 | 結果 |
 | --- | --- |
@@ -24,7 +24,7 @@
 `target/test-lib-full/c0d544d7310803d5bf5b97484557ad6087f0011670bb3a25ee42b8dd094a9b98.json`、
 source識別子は `18559d98db9e314ee671a1411a9517512542247cb0bc0d834a8ad796b13d90ed`。
 test-full終了後も同じsource識別子であることを読み取りで確認した。失敗試行を成功へ読み替えず、
-修正後の全件成功と上のreceiptを最終証拠とする。未解決の実装事項はない。独立レビューはOpus側の後続工程。
+修正後の全件成功と上のreceiptをこの段階の証拠とする。独立レビュー後のP2対応・追加検証は末尾に記録する。
 
 ## 測定条件
 
@@ -235,6 +235,22 @@ focused log: `target/test-speed-failure-focused.log`、
 各3周・PCMおよび全callback出力のバースト検査は維持する。
 `threads-required`による単独実行・retry・skipは採用しない。
 
+独立レビューP2-1では、旧模擬がtick→callbackの順だったため、末尾10msがprocessedに
+残ったtickで静寂判定を開始し、判定期間中にデバイスが鳴らし切る経路も通っていたと指摘された。
+現在の実時間比例・callback先行の全周回テストは負荷に依存しない一方、この部分残量経路を通る保証はない。
+そこで既存の全周回テストを維持し、別の1テスト
+`real_decoder_eof_partial_tail_drains_during_quiet_before_loop_seek`で決まった手順を検査する。
+実decoder/pumpの`tail10ms.wav`（48kHz、2秒）をcallbackで95,520 framesまで消費し、
+EOS tail処理の完了後も480 frames（10ms、0 < processed < 20ms）が残ることをassertする。
+production tickでquiet_sinceの設定・seek未発行を確認し、callbackで残り480 framesを消費する。
+その後だけ既存`backdate_eof_quiet_for_test(49ms)`を呼び、production tickのseek serial増加、
+PCMのexact length 96,000 framesと元の末尾burstを検査する。静寂期間は実sleepで作らない。
+新hook・製品コード・fixtureの変更はない。
+
+callbackを挟まず10ms残したまま49msを経過させるケースは、デバイス自体の停止であり、
+Opusの設計判断で末尾破棄を想定内とする。旧テストが検査した「判定期間中に実際に鳴らし切る」
+経路とは異なるため、その停止ケースを欠落なしの回帰テストには追加しない。
+
 実時間比例への変更だけで単独nextestは75.123秒で成功した。
 続く負荷試験ではEOF 20processと音楽解析24processを同時実行し、CPU使用率100%を観測。
 EOFは8成功 / 12失敗、負荷側24件は成功（`target/test-speed-eof-load/`）。
@@ -347,14 +363,90 @@ child process・DLL探索・GPU並列負荷の等価性は証明できない。�
 CLAUDE.mdは未編集。Opus側で必要なら、既存の無filter本体lib実行例を
 `scripts/test-lib-full.ps1` へ揃え、最終cargo-test gateの例は維持する。
 
-## Opusへのcommit単位
+## 独立レビューP2対応（ec0eeebff後）
+
+Opusが既存変更を8 commitへ整理した後の追加対応。製品コード・CLAUDE.mdは変更せず、commitしない。
+
+- P2-1: 上記の決定的な部分末尾テストを1件追加。既存の全周回・実時間比例テストは変更しない。
+- P2-2: `.cargo/config.toml` の`[env]`キー（文字列／inline table、`[env.NAME]`形式も含む）を
+  自動で収集し、process環境の未設定／値を台帳へ反映する。現在のFFMPEG_DIR・LIBSQLITE3_FLAGS、
+  既存のRUST/CARGO/NEXTEST/MIV/MIMV系・LIBCLANG_PATH等を含む。値はhashのみ保存する。
+  解釈できないenv宣言は成功再利用を止め、警告して通常実行する。
+- P2-3: sourceの生成物除外は維持し、native runtime識別子を台帳キーへ追加する。
+  Cargo target directoryの指定profile直下・depsとtarget triple配下の同profileを調べ、
+  FFmpeg 6本を含むnative DLLのパス集合・全byteを照合する。Cargoの16桁hash付きRust DLLは除外する。
+  削除・差し替え・追加で識別子が変わり、実行中に変わった場合も成功を記録しない。
+- P2-4: 広域／対応付けできない変更を1つでも含めば、その全パスを表示してexit 2。
+  `test-lib-full.ps1`と必要な専用検査を案内し、残りのmodule等だけを走らせて成功にしない。
+  文書のみもこの扱いとし、変更なし／対応filterの0件一致は従来どおりexit 4。
+
+追加EOFテストの単独nextest stressは **20/20成功、12.735秒**。
+実repoのForce全件と並行したnextest stressも **20/20成功、17.017秒**。
+起動時に全件側の7プロセス以上を待ち、反復中のsnapshotで本体lib test実行体21プロセスを確認した。
+load時も各反復で部分残量・quiet開始・残量消費・seek・exact lengthをすべて検査している。
+ログ: `target/test-speed-p2-eof-alone.log` / `target/test-speed-p2-eof-load.log`、
+並列snapshot: `target/test-speed-p2-eof-load-start.json` / `target/test-speed-p2-eof-load-cpu.json`
+（後者のCPU率はWMI権限不足で未取得、process数は取得済み）。
+
+`scripts/test-test-tools.ps1`は **PASS、exit 0**。実Git/nextestの使い捨てcrateで、
+configから自動収集する任意名2種類を含む環境変数10種類について、変更→MISS・再実行、同値→HITを確認した。
+FFmpeg 6本それぞれの内容交換・削除もMISS・再実行を確認した（fake DLLはロードしない小規模crateのみ）。
+選択できる`src/foo.rs`と未対応入力の混在12ケースは、すべて該当pathと全件案内を表示してexit 2、
+nextestのrun directory増加0。既存のmodule/integration/workspace選択、0件一致exit 4、
+失敗・件数不足・force失敗後の旧成功無効化・index非変更も通過した。
+実repoの`test-focused.ps1 -PlanOnly`も、今回の文書・scriptsの全6パスを表示してexit 2、
+`src/video/mod.rs`だけの部分実行を行わないことを確認した
+（`target/test-speed-p2-focused-actual.log`）。
+ログ: `target/test-speed-p2-tools.log`、fixture:
+`target/test-tools-regression-33efdf55b9754d93bf343b66283b8e09/`。
+PowerShell構文parse・ASCII検査、`cargo fmt --check`、`git diff --check`も成功。
+
+最初のForce全件は **399.616秒、13,146成功 / 1失敗 / 59 ignored、exit 100**。
+source `62256f226ce5b8ae242b175bf59308cc09bcc401af2a3d8b40bd077c77717ed6`、
+run `20261015T024050444Z-7f1b54a1`、ログ`target/test-speed-p2-full.log`。
+追加EOFテストと既存全周回EOF（77.773秒）は成功した。失敗は
+`embedded_similar_move_update_pump_gives_same_frame_page_navigation_priority`のcancel assertで、
+成功台帳は作られなかった。
+
+同テストは単独30/30成功だったが、24プロセス・96回で27成功 / 69失敗となった。
+一時的なテスト内logger診断でも53成功 / 43失敗となり、失敗logで
+`all keyboard input is now held by a dialog: sidecar_restore`を確認した。
+初期updateを1フレームしか進めない準備helperが起動時の非同期sidecar復元を残し、
+検査用sceneへ置換した後のArrowDownを製品が正しく保留していた。
+`settle_root_app_update_fixture`を、使い捨ての空startup folderを開き、
+初期navigationとsidecar復元がproduction updateで完了するまで10秒期限内で進める形に修正した。
+共通helperを使う兄弟5テストに同じ準備を適用し、元のkey・controlled scan・cancel・
+遷移先・項目一致assertは維持する。製品ガード・新hookの追加はなく、診断用loggerは差分から除去した。
+初期再現log: `target/test-speed-p2-navigation-load/`、診断log:
+`target/test-speed-p2-navigation-diag/001.log`等、単独log: `target/test-speed-p2-navigation-alone.log`。
+修正後の同helper利用5件×20回は **100実行すべて成功、15.159秒**
+（`target/test-speed-p2-navigation-fixed.log`）。失敗した1件の24プロセス・96回も
+**96成功 / 0失敗、6.790秒**（`target/test-speed-p2-navigation-fixed-load/summary.json`）。
+
+修正後の検証sourceは `89ea39185c5ba2ef1e47ed1043cb0c3e6c6c337d6d063d7ea7c6c407e30ef74b`。
+`scripts/test-lib-full.ps1 -Force`は **PASS、exit 0、373.979秒（6分13.979秒）**、
+**13,147成功 / 0失敗 / 59 ignored**（合計13,206件）。既存13,146件＋追加EOF 1件で、ignoredは不変。
+wrapper全体は380.998秒。元の作業A 1,710.943秒に対して78.14%短縮、約4.58倍だが、
+並列負荷の変動も含む比較であり今回のP2修正だけの効果とは扱わない。
+ログ: `target/test-speed-p2-full-verified.log`、run `20261015T025951716Z-c3b811d1`。
+成功receipt:
+`target/test-lib-full/1ca6cfc03ec9b9d9d82ab185bbb600308d28d96ad1711cc9a682d767c32843e6.json`。
+既存EOF全周回も76.710秒で成功。実行前後のsource/environment/native runtime一致を確認して記録された。
+
+同一状態の次回呼び出しは **HIT、exit 0、3.080秒、新規run directory 0（6→6）**。
+ログ: `target/test-speed-p2-hit.log` / `target/test-speed-p2-hit-summary.json`。
+初回の失敗を成功へ読み替えず、テスト準備を直したsourceで全件成功を検証した。
+P2の未解決事項はない。依頼により`test-full.ps1`は再実行しない。
+前節の最終gateは追加テストより前の証拠として維持し、今回の変更を検証した結果とは区別する。
+
+### Opusへの未コミット単位
 
 commit・masterへのmerge・pushは実行しない。以下の論理単位で作業ツリーに残す。
-テスト修正 `dfd01d4a6` とrunner `d266be9c2` はOpusがcommit済み。未コミット分は以下。
+共通helperが台帳・focusedの両方を持つため、runnerとその回帰確認を1単位にまとめる。
 
 | ファイル | commitメッセージ案 |
 | --- | --- |
-| `src/video/mod.rs`（test module内のみ） | `test: Match EOF device timing and presenter backpressure` |
-| `src/app/multiwindow_scenario_tests.rs` | `test: Wait for stable content across I2 paint scenarios` |
-| `.config/nextest.toml` | `test: Configure isolated nextest runs and prioritize measured slow tests` |
-| `AGENTS.md`, `docs/development-build-and-test.md`, `docs/test-speed-report.md` | `docs: Document nextest iteration and reusable test evidence` |
+| `src/video/mod.rs`（test module内のみ） | `test: Cover partial EOF tail draining before loop seek` |
+| `src/app/similar_navigation_tests.rs`（test moduleのみ） | `test: Settle isolated startup before similar navigation input` |
+| `scripts/test-tools-common.ps1`, `scripts/test-lib-full.ps1`, `scripts/test-focused.ps1`, `scripts/test-test-tools.ps1` | `test: Harden success identities and reject incomplete focused selections` |
+| `docs/development-build-and-test.md`, `docs/test-speed-report.md` | `docs: Record review fixes and test identity boundaries` |
