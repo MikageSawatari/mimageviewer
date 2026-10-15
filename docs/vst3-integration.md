@@ -74,30 +74,37 @@ HUD バー / シークバー / hover thumbnail は VST GUI の裏に潜ってい
 解決策として、HUD overlay を独立 top-level HWND `HudOverlayWindow` として presenter
 HWND と同じ owner (= presenter HWND) の sibling 配置にし、VST GUI と並ぶ z-order
 group に入れる。両方 `WS_EX_TOPMOST`、HUD を後勝ちで `HWND_TOPMOST` に再アサート
-することで VST より前に出す。詳細な構造は
-[video-architecture.md](video-architecture.md) の "HUD overlay HWND" 節参照。
+することで VST より前に出す。構造・要求経路・許可判定の正本は
+[video-architecture.md](video-architecture.md) の「HUD overlay HWND」節
+（「Z-order 再アサート」「Region 計算とアクティベーション検出」）を参照。
 
 **Z-order ポリシー (= HUD raise burst)**:
 
 VST z-order が変動する各経路 (`set_all_guis_topmost` / `set_all_guis_visible_blocking`
 / `set_all_guis_app_active` / `send_chain_z_order` / `show_slot_gui` (sync/async) /
 `hide_slot_gui` / `user_hide_slot_gui` / `remove_plugin` / `disable_with_reason`) の
-末尾で `DspBridge::fire_hud_raise_hook` を呼ぶ → App が unbounded mpsc 経由で受け、
-fullscreen 中の `VideoPlayer::request_hud_raise()` を 1 回 coalesce 発火 → presenter
-thread が **即時/16ms/64ms の short retry burst** で `SetWindowPos(hud, HWND_TOPMOST)`
-を呼ぶ。非同期 VST IPC の z-order 反映を確実に拾うための retry 設計。
+末尾で `DspBridge::fire_hud_raise_hook` が `AtomicBool` latest-value latch を set → App
+`update` が `swap(false)` で coalesce し、fullscreen 中の `VideoPlayer::request_hud_raise()`
+を 1 回呼ぶ → bounded render command と pump control を経て、pump が
+**即時/16ms/50ms の short retry burst** で `SetWindowPos(hud, HWND_TOPMOST)` を呼ぶ。
+非同期 VST IPC の z-order 反映を拾うための retry 設計。
 
-加えて presenter thread の **50ms 周期 cursor polling** が activation zone (= 画面上下端
-の hover 検出帯) で cursor を検知したら、最後の raise から 200ms 以上経過していれば
-helper `schedule_hud_raise_burst` 経由で同じ retry burst を起動する (= VST 手動クリックで
-HUD が裏に回ったあとの復帰経路、Codex P1 反映)。
+加えて render の **50ms 周期 cursor polling** が pump の latest observation を評価する。
+`cursor_input_owned` が true で、cursor が presenter client rect 内かつ activation zone
+(= 画面上下端の hover 検出帯) 内にある場合、同じ raise burst を要求する。
+VST 側に入力所有がある領域では、この polling による HUD 復帰は保証されない。
 
-HUD wndproc の `WM_WINDOWPOSCHANGING` で `hwndInsertAfter` が `HWND_TOP` / `HWND_TOPMOST`
-を指していたら `RequestRaiseHud` event を流す best-effort safety net もある。
+HUD wndproc の `WM_WINDOWPOSCHANGING` は、`SWP_NOZORDER` がなく、`hwndInsertAfter` が
+`HWND_TOP` / `HWND_TOPMOST` の場合に `RequestRaiseHud` を流す best-effort safety net。
+`SWP_NOZORDER` 付きの geometry 通知では要求を生成せず、`DefWindowProcW` は従来どおり呼ぶ。
+移動・サイズ変更のない HUD 自前 raise のみに `SWP_NOSENDCHANGING` を付け、自己通知から
+次の burst が再予約されることを防ぐ。geometry／DPI／ShowWindow／presenter／VST の操作には広げない。
+外部由来の通知・VST hook・hover polling、foreground／transition permit／window epoch の
+判定と上記 burst は維持する。これは不要な HUD 前面化の繰り返しの修正であり、点滅との因果は未確定。
 
 **Raise skip 条件 (allowlist 判定、`foreground_allows_hud_raise`)**:
 
-各 raise burst deadline 実行直前に `try_raise_hud_to_top(presenter_hwnd)` を通って
+各 raise burst deadline 実行直前に `NativeWindowHost::try_raise_hud_to_top()` を通って
 allowlist チェックする (= command / event / polling のすべての raise 経路で同じ判定)。
 **foreground HWND** を以下で判定:
 
