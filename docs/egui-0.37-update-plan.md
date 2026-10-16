@@ -1,6 +1,15 @@
-> 状態: 設計案 第4版 (2026-10-16、利用者の希望による追加の独立レビュー gpt-6-astra / xhigh の REVISE への対応、再確認前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
+> 状態: 設計案 第4.1版 (2026-10-16、追加の独立レビュー gpt-6-astra / xhigh の再確認で出た IME 中断要求 2 件を反映、再確認前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
 
 # 改訂履歴
+
+## 第4.1版 — 2026-10-16
+
+対象は第4版、HEAD `535968858`。Astra再確認全文と本家・mIVの該当ソースを読み取り専用で照合した。前回4件の対応を維持し、追加2件を反映する。本版の独立レビュー、実装、ビルド、テスト、製品起動は未実施。
+
+- **Astra再確認 P1 — 反映:** Memory全体のIME中断要求を既存のviewport別Focusへ移管する。親だけ／子だけが要求する同一Contextの入れ子run_ui回帰を追加し、detached構造合意・§11記録の範囲へ含める。
+- **Astra再確認 P2 — 反映:** 同一viewportの未配送PlatformOutputを集約するとき、最新のIME矩形等を採用しながら中断要求を保持する。実Context::run_ui内でdiscardする回帰を段2aへ追加する。
+
+App側の補助フラグ、追加repaint、新しいqueue、retryは追加しない。段2aと段3の見積りを更新する。
 
 ## 第4版 — 2026-10-16
 
@@ -600,9 +609,13 @@ consume後にraw snapshotから復活させない。診断snapshotと配送投�
 | focus recovery／次pass claim | 本家との重複を特定してから縮小 |
 | Win32 0xE5 press／repeat除外 | 保持 |
 | Hidden／Forwarded | 保持 |
+| IME中断要求の生成 | Memory共通フラグを既存のviewport別Focusへ移管 |
+| 同一viewportのIME出力集約 | 最新の矩形等を採用し、未配送の中断要求は保持 |
 | nativeのcomposition中断出力 | 対象HWND ownerへ配送 |
 
 影響: `crates/egui-ime/src/lib.rs:15`、`:78`、`:99`、`:116`、`:242`、`:305`、`:329`、`src/ime_focus.rs:1142`、`src/tab_focus.rs:23`、`src/app.rs:22538`、`:22543`、`src/key_input.rs:3960`以降。
+
+中断要求の生成・集約に関する追加の影響箇所は、`crates/egui-ime/src/lib.rs:360`、`:378`のfocus要求、`src/ui_fullscreen.rs:22364`、`:24745`等のimmediate viewport、`src/video/native_presenter/render_core.rs:13702`、`:14007`の出力consumer。各呼出側へ補助フラグを散布せず、egui内の生成・集約境界を修正する。
 
 #### Disabled取消終端の入力契約
 
@@ -658,11 +671,96 @@ Disabled配送を追加しても、このkey hold履歴を消す契機にしな�
 
 traceは既定無効、文字秘匿、worker I/Oを保持する。vendor削除は、配送保証・取消終端が本家と同等になり、traceも不要と判断できた時点とする。
 
+#### IME中断要求のviewport別所有
+
+本家のrequested_interrupt_imeはMemory全体に一つのboolであり、各viewportのbegin_passでfalseへ戻る。end_passはその共有値を当該viewportのIMEOutputへ反映する。
+
+根拠: `egui-0.37.0/src/memory/mod.rs:124`、`:799`、`:1079`、`egui-0.37.0/src/context.rs:3173`。
+
+immediate子窓は同じContextで入れ子のrun_uiを実行する。子から戻る際にviewport IDは復元されるが、中断要求の共有boolは復元されない。
+
+根拠: `eframe-0.37.0/src/native/wgpu_integration.rs:1264`、`egui-0.37.0/src/context.rs:3281`、`:3335`、`egui-0.37.0/src/memory/mod.rs:826`。
+
+このため、親の要求が子のbegin_passで消える場合と、子の要求が親のIME出力へ混入する場合がある。mIVにもimmediate経路がある。製品上の具体的な発生操作は未検証であり、今回の判断はソースからの見立てである。
+
+**最小修正は、既存フラグを既存のviewport別Focusへ移す方式とする。**
+
+1. Memory全体のrequested_interrupt_imeを除く。
+2. 既存のviewport別Focus entryに同じpass内の要求を所有させる。新しい独立mapやApp側の補助フラグは作らない。
+3. interrupt_ime、request_focus、次frameへのfocus要求は、現在viewportのentryだけを更新する。
+4. begin_passは開始対象viewportの要求だけをfalseへ戻す。親や兄弟のentryをresetしない。
+5. end_passは終了対象viewportの要求だけをIMEOutputへ反映する。
+6. 子から親への既存viewport復帰により、親のFocus entryが再び選ばれる。親子間の手動退避・復元処理を重ねない。
+7. 非永続のpass状態として扱い、保存設定やmemoryの新しい永続形式を作らない。
+
+既存のviewport別Focusは`egui-0.37.0/src/memory/mod.rs:503`、そのbegin_passは`:569`、Memory側のviewport選択は`:787`。focusからの中断要求は`:921`、`:931`、中断APIは`:1078`。
+
+**最小回帰は同一Contextの実際の入れ子run_uiで行う。**
+
+親子に別ViewportIdと実TextEditを用意し、事前passでfocusを整える。試験対象passの初期focus設定が、意図しない中断要求として混ざらないようにする。親run_ui内で子run_uiを実行し、親子のFullOutputを別々に検査する。
+
+| 試験対象passの要求 | 親のIMEOutput | 子のIMEOutput |
+|---|---|---|
+| 親のみ。子を呼ぶ前に要求 | true | false |
+| 子のみ | false | true |
+| 両方 | true | true |
+| どちらもなし | false | false |
+
+親子ともSome(IMEOutput)を出していることを確認し、Noneによる見かけの成功を避ける。次の要求なしrunではfalseへ戻ることも検査する。Memoryのviewport IDをテストから手で切り替えるだけでは受入証拠にしない。
+
+各FullOutputは検査後にheadlessの明示破棄を行う。親子のPlatformOutputをappendして試験結果を混ぜない。
+
+この修正はdetachedに関わる構造変更として、着手前の合意と`docs/detached-rework-plan.md` §11記録に含める。App側で要求を出し直す、追加repaintで後から中断する、といった対策は採らない。
+
+#### discard再passのIME出力集約
+
+Context::run_dynは各passのFullOutputをappendする。しかしPlatformOutput::appendは`self.ime = ime.or(self.ime)`であり、後のSome(IMEOutput)が前の値全体を置き換える。TextEditは通常、各passのIMEOutputを中断要求falseで生成する。
+
+根拠: `egui-0.37.0/src/context.rs:1111`、`egui-0.37.0/src/data/output.rs:242`、`egui-0.37.0/src/widgets/text_edit/builder.rs:1056`。
+
+したがって、第1passで中断要求true → discard → 第2passで要求なし・IME出力ありの場合、最終出力の要求がfalseになり得る。nativeのcontrol配送を直しても、生成・集約段階で失われた要求は復元できない。
+
+**同一viewportの未配送出力について、次の集約契約へ修正する。**
+
+- purpose、rect、cursor_rect等は、新しいSome(IMEOutput)の値を採用する。
+- should_interrupt_compositionは、集約前と新出力の要求のORを保持する。
+- 新出力がNoneなら既存のSomeを保持し、従来のOption集約の意味を維持する。
+- 両方NoneならNoneのままとする。
+- 集約済み出力をbackendへ一度移譲した後は、次の新規出力へ要求を持ち越さない。
+- OSのACK待ち、新しいqueue、retry、Context外のsticky flagは作らない。
+
+| 旧出力 | 新出力 | 集約結果 |
+|---|---|---|
+| Some・要求true | Some・要求false | 新metadata・要求true |
+| Some・要求false | Some・要求true | 新metadata・要求true |
+| Some | None | 旧Someを保持 |
+| None | Some | 新Some |
+| None | None | None |
+
+PlatformOutputはviewport IDを持たないため、呼出側も別viewportのplatform出力を混ぜない。共有texture deltaの集約とは区別する。
+
+**必須回帰は実Context::run_ui内でdiscardさせる。**
+
+1. 同じviewportで実TextEditを描く。
+2. 第1passだけ中断を要求し、request_discardする。
+3. 第2passでは中断を要求せず、TextEditからIMEOutputを出す。配置を変え、矩形等を第1passと区別できるようにする。
+4. 実際に再passしたことを確認する。
+5. 最終出力が第2passのIME metadataと中断要求trueを持つことを検査する。
+6. 次の新規run_uiでは要求falseとなることを検査する。
+
+PlatformOutput::append単体の補助試験だけでは受け入れない。nativeの複数logical batch試験とも別の回帰とする。出力は検査後にheadless明示破棄し、製品側の無条件clearは追加しない。
+
+回帰名には共通の`ime_interrupt`を含め、段2aと正式graph切替後の両方で選択・実行できるようにする。修正前失敗・修正後成功の証拠は実装時に取得するものであり、今回実行済みとは扱わない。
+
+この2件はmIV固有ではなく、最小再現と修正前失敗・修正後成功の証拠を添えて本家へ報告する価値がある。報告するかは利用者判断とし、今回は送信しない。
+
 #### native経路のIME出力契約
 
 0.37ではMemory::request_focusがIME中断を要求し、IMEOutput::should_interrupt_compositionへ出る。通常egui-winitはset_ime_allowedの切替で処理する。
 
 根拠: `egui-0.37.0/src/memory/mod.rs:921`、`src/context.rs:3176`、`src/data/output.rs:113`、`egui-winit-0.37.0/src/lib.rs:1277`。
+
+以下の配送契約は、上記のviewport別生成とdiscard再pass集約を修正した出力を前提とする。配送側で親子混入や生成済み要求の消失を補修しない。
 
 mIV nativeはegui-winitを通らず、現在はcursor矩形だけをintentへ変換する。
 
@@ -691,6 +789,8 @@ mIV nativeはegui-winitを通らず、現在はcursor矩形だけをintentへ変
 上書き経路の根拠: `src/video/native_window_pump.rs:339`、`:1604`。既存control送信は同`:207`付近。logical batchのintent集約は`src/video/native_presenter/render_core.rs:3772`。
 
 非対話回帰では、実TextEditのfocus／cursor移動から中断flagが出ること、intent変換、controlへの一度だけの配送、WindowEpoch所有、複数logical pass、visual更新を挟んでも消えないことをfake hostで検査する。OS上の取消結果は段7の実機で確認する。
+
+段3では、段2aの生成・集約回帰が正式graphで使われることと、集約済み要求が通常backend／nativeの正しい配送先へ一度だけ渡ることを接続確認する。
 
 **挙動・見た目:** 日本語確定直後の通常操作、取消、兄弟IME独立性を保持する。下線・cursor・候補窓位置は外観差があり得る。nativeでは新APIの中断要求を正しく実行する。
 
@@ -763,9 +863,16 @@ settings.dbは初期化しない。リリース済みId永続経路が実装時�
 | 旧分類に依存するfixture | (c) 旧count固定を外し、近接・距離境界・時間条件を別検査 |
 | discard_pending_scroll | (b) 同`:595`。新WheelStateへ適応 |
 | repaint delay witness | (b) `src/context.rs:1794`とfeature |
+| IME中断要求のviewport所有 | (b・新規) Memory共通フラグを既存のviewport別Focusへ移管。親子のbegin／endで消失・混入させない |
+| IME中断要求のpass出力集約 | (b・新規) 最新のIME矩形等を採用し、同一viewportの未配送要求をORで保持 |
+| 入れ子run_ui・実discard回帰 | (b・新規) §4.5の親だけ／子だけ要求と、実run_ui再passの最終出力を検査 |
 | テスト・license・standalone | (b) 新構造へ移植 |
 
 新wheel ownerは`egui-0.37.0/src/input_state/mod.rs:228`、`wheel_state.rs:54`。汎用非表示終端APIは追加しない。
+
+IME修正の本家境界は`egui-0.37.0/src/memory/mod.rs:124`、`:503`、`:799`、`:1078`、`src/context.rs:1111`、`:3173`、`src/data/output.rs:242`。既存フラグの所有移管と既存appendの集約契約修正に限定し、App側の補助フラグ、追加repaint、新しいqueue、retryを追加しない。
+
+親子要求の分離はdetached構造合意・§11記録の範囲へ含める。出力集約では別viewportのPlatformOutputを混ぜず、配送後の次frameへ要求を残さない。
 
 #### egui-winit
 
@@ -987,9 +1094,11 @@ mIV代表は§4.3のpanel、§4.4の入力、`src/app.rs:97661`以降の完了�
 
 #### detached凍結
 
-App分離、callback Ui化、gamepad、保留RawInputのviewport所有、native IME intent、scheduler／delta／surfaceは構造合意対象とする。
+App分離、callback Ui化、gamepad、保留RawInputのviewport所有、IME中断要求のviewport別所有と入れ子pass、同一viewportのdiscard再pass出力集約、native IME intent、scheduler／delta／surfaceは構造合意対象とする。
 
 着手前に設計担当と独立レビュー担当が症状パッチではないことに合意し、`docs/detached-rework-plan.md` §11へ範囲・理由を記録する。本改訂案自体を合意済みと扱わない。
+
+IME追加分では、親子の要求が消失・混入しないこと、最新の候補窓矩形等を採りながら未配送要求を保持すること、配送後に要求を残さないことを不変条件として記録する。
 
 rect捕捉条件、geometry由来recreate、新detached pending bool、時間窓、兄弟資源の一括resetを追加しない。
 
@@ -1086,7 +1195,7 @@ AGENTS.mdに従い、起動・foreground切替・入力の前に具体suite、�
 
 ### 段0b: 基準固定
 
-source、toolchain、feature、fixture、警告、PNG、既知失敗を記録する。detached構造合意にRawInput所有とnative IME配送を含める。
+source、toolchain、feature、fixture、警告、PNG、既知失敗を記録する。detached構造合意にRawInput所有、IME中断要求のviewport別所有・入れ子pass・discard再pass集約、native IME配送を含める。
 
 ```powershell
 cargo check -p mimageviewer --bin mimageviewer-core
@@ -1141,11 +1250,13 @@ core check、旧snapshot、focus喪失後のrouted edge、gamepad終端を含め
 
 | 小段 | 範囲 | 推定規模 |
 |---|---|---|
-| 2a | egui既存API、クリックfixture、egui-winit IME配送・Disabled互換・trace・clipboard、共有IME fixture | 9～16ファイル、600～1250行 |
+| 2a | egui既存API、IME中断要求のviewport所有・pass出力集約、クリックfixture、egui-winit IME配送・Disabled互換・trace・clipboard、共有IME fixture | 10～18ファイル、800～1650行 |
 | 2b | egui-wgpu mipmap、delta完結、surface、診断 | 10～16ファイル、1100～2100行 |
 | 2c | eframe scheduler、viewport入力所有、skip保持、visible commit、delta、計測・診断 | 12～20ファイル、1450～2850行 |
 
 原本置換は別計上する。
+
+第4.1版では段2aに約200～400行を追加した。主な増分はegui内の限定修正と、実入れ子run_ui・実discardのheadless回帰である。App側の新しい入力状態や配送queueは含めない。
 
 #### 段2aの順序・受入条件
 
@@ -1154,8 +1265,15 @@ core check、旧snapshot、focus喪失後のrouted edge、gamepad終端を含め
 3. Hidden／Forwardedの網羅回帰を移植。
 4. Ctrl+Shift clipboard、Modifiers、trace秘匿を検査。
 5. release射影の順序・非click・discardを保持し、分類fixtureを本家0.37へ合わせる。
+6. **IME中断要求を既存のviewport別Focusへ移管し、同一Contextの親だけ／子だけ要求する実入れ子run_uiで、それぞれのIMEOutputを検査する。**
+7. **PlatformOutputの同一viewport集約を修正し、実Context::run_uiの第1passだけで要求・discardした場合に、第2passのIME矩形等と中断要求trueが最終出力へ残ることを検査する。**
+8. 親子ともIMEOutputが存在すること、次の新規runでは要求が残らないことを確認する。Memoryのviewport ID手動切替やappend単体試験だけで代用しない。
+9. 生成・集約回帰の名前に共通の`ime_interrupt`を含め、準備graphと正式graphで選択できるようにする。修正前失敗・修正後成功の証拠を実装時に取得する。
+10. IME中断要求の所有修正について、着手前の構造合意とdetached計画§11記録があることを確認する。
 
 本家クリック分類の製品採用は§5の判断を要する。vendor fixtureで本家の事実を検証することと、製品操作差の受入れを混同しない。
+
+段2aはDisabled入力互換、IME中断要求の生成・集約、既存パッチ移植をレビュー可能なコミットへ分ける。各回帰は実windowを作らず、FullOutput検査後のheadless明示破棄を行う。App補助フラグ、追加repaint、新しいqueue、retryは追加しない。
 
 #### 段2bの受入条件
 
@@ -1183,6 +1301,7 @@ whole／partial／free、no-surface、submission、mipmap、headless readback、
 - App／Ui／Panel／Context／on_exit。
 - logic service、Modifiers、wheel。
 - viewport所有RawInputとIME producer互換の正式接続。
+- IME中断要求のviewport別生成とdiscard再pass出力集約の正式接続。
 - gamepad物理更新・受付事実・未配送edge保持・UI batch。
 - native GPU／surface／present、IME中断intent・control配送。
 - 全delta消費・引継ぎ・headless明示破棄。
@@ -1193,6 +1312,7 @@ whole／partial／free、no-surface、submission、mipmap、headless readback、
 ```powershell
 cargo check -p mimageviewer --bin mimageviewer-core
 cargo check --workspace
+cargo test -p egui --lib ime_interrupt
 cargo test -p egui-ime
 cargo test -p egui-winit --lib
 cargo test -p mimageviewer --lib --no-run
@@ -1201,12 +1321,17 @@ cargo test -p mimageviewer --test book_composition_editor_snapshots --no-run
 cargo fmt --check
 ```
 
+`ime_interrupt`は段2aで追加する生成・集約回帰の共通filterとし、正式graphでの実選択件数を記録する。0件選択を成功と扱わない。
+
 実接続点の必須回帰:
 
 - deltaの描画・無描画・早期終了・headless。
 - root／child交互実行とchild skip後の終端保持。
 - Disabled取消がproducerから実TextEditまで到達。
+- 同一Contextの親子で中断要求が消失・混入せず、正式graphで修正済みeguiが使われる。
+- 実run_uiのdiscard再passで最新のIME矩形等と中断要求が保持され、次の新規runへ要求が残らない。
 - nativeのfocus／cursor移動から中断出力、intent、control、対象WindowEpochへ一度だけ配送。
+- 集約済み中断要求が通常backend／nativeの正しい配送先へ一度だけ渡る。別viewportのPlatformOutputを混ぜない。
 - native中断がvisual上書き・複数logical passで消失／重複せず、終了したhostから新hostへ漏れない。
 - focus移動前の受信済み離散キー。
 - gamepadの同じframe番号中の複数logic、短い退避復帰、press→release引継ぎ、disconnect／ring／Undo。
@@ -1226,12 +1351,14 @@ graphの旧egui混入・型分裂・古いpathを確認する。compileだけで
 | delta消費／引継ぎ／headless | 450～1000 |
 | gamepad引継ぎ・受付・UI接続・必須回帰 | 200～450 |
 | viewport入力所有・IME producerの本体接続回帰 | 100～250 |
-| native IME出力・control配送・必須回帰 | 200～450 |
-| **合計** | **2800～5750** |
+| native IME出力・control配送・必須回帰。生成・集約済み出力の接続確認を含む | 250～550 |
+| **合計** | **2850～5850** |
 
 **100～175ファイル程度。**
 
 第3.1版のgamepad引継ぎを再評価し、Astra指摘の接続・回帰を追加した。段2a／2cのvendor実装は上表へ重ねて計上しない。
+
+第4.1版では、IME生成・集約からbackend配送までの接続確認として約50～100行を追加した。egui内のフラグ所有・append修正と最小回帰は段2aへ計上し、ここでは重複計上しない。
 
 段1b後に実差分で再評価する。gamepadやnative配送の抽出が不足する場合は、旧版上の挙動不変抽出を追加し、原子切替へ未整理の大改修を押し込まない。
 
@@ -1377,6 +1504,8 @@ Google日本語入力とMS-IMEで共通の少数シナリオを行う。
 
 OSがどのIME列を出したかと、画面結果を区別して記録する。未発生のDisabled-only経路はheadless回帰で担保し、実機発生を確認済みと書かない。
 
+IME中断要求の親子分離とdiscard再pass保持は、段2a・段3の非対話回帰を主証拠とする。実機では上記のmain／F12／native代表経路で、正当な中断が働き、兄弟への不要な取消がないことを確認する。利用者にdiscardの発生や厳密なpass順序を手操作で再現させる追加マトリクスは要求しない。
+
 ### 7.3 shortcut・wheel・clipboard・クリック
 
 1. main／F12でCtrl／Shift／Altを押して離し、通常へ戻る。
@@ -1433,15 +1562,21 @@ root LogicOnly→child Full→root Full、短い退避、同一batch順序、期
 - egui-winit保持理由・削除条件・Disabled取消互換を記録している。
 - 未消費RawInputを同じviewportだけが消費し、root／child交互実行とchild skip後復帰の回帰が通る。
 - RawInput所有修正について構造合意とdetached計画§11記録がある。
+- IME中断要求のviewport別所有と入れ子passについても構造合意とdetached計画§11記録がある。
+- 同一Contextの親だけ／子だけが中断要求を出す実入れ子run_uiで、要求の消失・混入がない。
+- 実run_uiのdiscard再passで、最新のIME矩形等を採用しながら未配送中断要求を保持する。
+- 集約済み出力を配送した後、次の新規runへ中断要求が残らない。
 - serviceがUI省略時にも必要なwakeで進み、古いContext入力を操作として読まない。
 - SW_HIDE／最小化／visible child／期限超過を区別する。
 - 受信済み離散キー、Win32終端、mouse-nav pendingの既存契約を保持する。
 - gamepad未配送edge・意味終端が複数logicで失われず、保持軸の復帰後継続を維持する。
 - IME取消がproducerから実TextEditまで到達する。
 - native IME中断要求が一度だけ正しいHWNDへ届き、出力上書き・旧hostからの漏れがない。
+- 通常backend／nativeとも、生成・集約済みの正しいviewportのIME出力だけを配送する。
 - release射影の順序保証と本家分類が分離され、連続クリックの操作差が採択されている。
 - texture deltaのdrain／引継ぎ／明示終了・submission・freeが全経路で成立する。
 - 汎用入力フィルタ、一律prune、復帰時一回捨て、旧クリックタイマーを追加していない。
+- IME中断要求を補修するApp側の補助フラグ、追加repaint、新しいqueue、retryを追加していない。
 - Ctrl+Shift clipboardを通常／nativeで保持する。
 - accessibility通過後、全snapshotを更新・通常比較・目視確認する。
 - 非対話gate、確認用build、必要な承認付きdesktop試験、利用者実機確認が完了する。
