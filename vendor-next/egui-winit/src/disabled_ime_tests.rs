@@ -21,6 +21,7 @@ struct Field {
 
 impl Field {
     fn new(ctx: egui::Context, viewport: ViewportId) -> Self {
+        ctx.set_embed_viewports(false);
         egui_ime::install_ime_input_policy(&ctx);
         let mut state = State::new(ctx.clone(), viewport, &NoDisplay, None, None, None);
         state.egui_input.focused = true;
@@ -47,6 +48,15 @@ impl Field {
         }
         let mut empty_preedits = 0;
         let output = self.ctx.run_ui(input, |ui| {
+            if ui.ctx().viewport_id() == ViewportId::ROOT {
+                // RawInput metadata alone does not keep a child registered.
+                // Preserve the sibling's real lifetime across root passes.
+                ui.ctx().show_viewport_deferred(
+                    ViewportId::from_hash_of("sibling"),
+                    egui::ViewportBuilder::default(),
+                    |_, _| {},
+                );
+            }
             empty_preedits = ui.input(|i| {
                 i.events.iter().filter(|event| matches!(event,
                     egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if text.is_empty()

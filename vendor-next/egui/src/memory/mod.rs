@@ -825,6 +825,20 @@ impl Memory {
         self.viewport_id = viewport_id;
     }
 
+    pub(crate) fn remove_viewports(&mut self, retired: &ViewportIdSet) {
+        for id in retired {
+            self.areas.remove(id);
+            self.interactions.remove(id);
+            self.focus.remove(id);
+            self.popups.remove(id);
+        }
+        if retired.contains(&self.viewport_id) {
+            self.viewport_id = ViewportId::ROOT;
+        }
+        // Widget data and caches do not carry viewport ownership. Preserve
+        // their existing lifetime rather than resetting shared application data.
+    }
+
     /// Access memory of the [`Area`](crate::containers::area::Area)s, such as `Window`s.
     pub fn areas(&self) -> &Areas {
         self.areas

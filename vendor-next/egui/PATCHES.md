@@ -1,8 +1,8 @@
-# egui 0.37.0 のローカル変更（段2a-1／2a-2）
+# egui 0.37.0 のローカル変更（段2a-1／2a-2／2a-3）
 
 原本とchecksum・VCSの記録は [upstream-provenance.json](../upstream-provenance.json) を参照。
 段2a-1では0.37.0原本を基準に、旧`vendor/egui`の既存パッチを付け直した。
-段2a-2のIME中断要求の生成・集約修正は末尾の追補に記録する。
+段2a-2のIME中断要求の生成・集約修正と段2a-3の非描画退役は末尾の追補に記録する。
 rootの依存切替・製品操作差の受入れはこの段階に含めない。
 README、Cargo.toml.orig、同梱Cargo.lockは原本を保持する。
 
@@ -20,7 +20,7 @@ README、Cargo.toml.orig、同梱Cargo.lockは原本を保持する。
 | license本文 | (b) 保持 | 旧vendorのMIT / Apache本文をbyte変更なしで同梱する |
 
 段2a-1ではIME中断要求のviewport所有・pass出力集約を変更していない（段2a-2追補を参照）。
-非描画viewport退役入口は引き続き後続段2a-3の範囲である。
+非描画viewport退役入口は段2a-3追補を参照。
 
 ## Wheel終端の境界
 
@@ -84,3 +84,30 @@ rendererはthread-localの元callbackへ必ず戻す。Memoryのviewport IDを�
 egui-ime 26件が成功（各exit 0）。commandと証拠は[段2台帳](../../docs/egui-0.37-stage2-verification.md)に記録する。
 
 本家にも報告する価値がある。実入れ子run_ui／実discardの最小回帰と、各修正の独立した修正前後の証拠を添えられる（今回は未送信）。
+
+## 段2a-3: 承認済み子viewportの非描画退役（2026-10-17）
+
+開始HEAD `9c54f4f1d`。設計第4.4版§4.2・§4.8・段2a順序11と、detached計画§11の
+Close lifecycle構造合意に基づく。以下は**実装担当の内部確認**である。
+
+| 項目 | 分類 | 変更と保証 |
+| --- | --- | --- |
+| `Context::retire_viewport` | (b・新規) | 承認済み子とその子孫の登録を終了し、実際に除去したIDを返す。ROOT／pass中は拒否、未知／重複はno-op。同じIDの明示的な新規openは可能 |
+| 通常GCと共通の退役処理 | (b・新規) | `src/context.rs`。viewport登録・親関係・viewport別Memory・font galley cacheを同じ処理で除去。子孫を同じ終了境界へ合流する |
+| viewport別Memory終了 | (b・新規) | `src/memory/mod.rs`。対象のareas／interactions／Focus（IME中断要求を含む）／popupsだけを除去。現在ownerが対象ならROOTへ戻す。兄弟は変更しない |
+| callback所有物の破棄 | (b・新規) | 明示入口と通常GCとも、除去したViewportStateをContext lockの外へ移してからdropする |
+| 実Context回帰 | (b・新規) | `src/context/viewport_retirement_tests.rs`の8件。兄弟の入力・実TextEdit IME・状態、後続出力、hide/minimize、通常GC、owner復帰、lock外drop、未配送texture delta、入口制約を検査 |
+
+呼出しはcompleteなrun_ui／run_pass／run_logicの終了後、plugin callbackおよびbackend／Contextの
+lock外とする。先行出力・texture deltaの配送と、閉じたIDの新規publish停止はbackend ownerの責務。
+共有texture manager・widget data／cache・plugin所有状態は消去しない。新しい抑止ラッチ・
+退役済みIDリスト・App補助フラグ・追加repaint・保持queue・retryは追加しない。
+egui-ime pluginの状態は従来のRawInput live-set処理に従うため、本入口でplugin全体をresetしない。
+
+Memory終了を外す変異は4成功／4失敗、通常GCの共通処理を外す変異は6成功／2失敗（各exit 101）。
+修正済みbytesへの復元後は8件全成功。全libはegui 106件、egui-winit 43件、egui-ime 26件が成功。
+egui-winitの既存兄弟IME回帰は、metadataだけでなく親からdeferred子登録を維持するfixtureへ適応した。
+producerとassertは変更していない。command・初回失敗の原因・証拠は[段2台帳](../../docs/egui-0.37-stage2-verification.md)に記録する。
+
+eframeのClose受付・消費・backend window／surface／State終了は段2cへ残す。
+本家へは通常GCのviewport別Memory残留とlock下callback破棄を、最小回帰と共に報告する価値がある（未送信）。

@@ -302,3 +302,124 @@ root/準備のCargo.lockも変更しない。既存scene.rsのf32::EPSILON非推
 rootの製品build、live、test-full.ps1、ネットワーク、アプリ起動、git add／commitは実行しない。
 
 本家へ報告する価値がある。実入れ子run_ui／実discardの最小回帰と独立した修正前後の証拠を添えられる（今回は未送信）。
+
+## 段2a-3（2026-10-17）
+
+開始HEAD `9c54f4f1d`、branch `egui-036`、Rust 1.99.0。段2a-2は設計担当がコミット済み。
+本節は**実装担当の内部確認**であり、並行中の正式な独立レビュー・設計受入れを代替しない。
+git add／commit／branch操作は行わず、未コミットで返す。
+
+### 合意・修正境界
+
+設計第4.4版§4.2「非表示子のCloseとlifecycle要求」、§4.8のegui行、段2a順序11、
+IME修正と非描画退役の別コミット指定、detached計画§2・§11の構造合意を読み直した。
+非表示子Closeの受付・消費・既存終了ownerへの合流・非描画退役は合意済みの境界である。
+
+従来の登録終了はend_pass内のGCにしかなく、非描画の承認済み子を終了する公開入口がなかった。
+さらにGCはViewportStateをlock下でdropし、viewport別Memoryを残していた。
+登録・親関係・viewport別状態の所有境界に共通処理を置き、明示退役と通常GCの両方を通した。
+
+| 変更file | 変更内容 |
+| --- | --- |
+| `vendor-next/egui/src/context.rs` | 公開`Context::retire_viewport(ViewportId) -> Vec<ViewportId>`と通常GCの共通finalization。子孫を同時に終了し、実除去IDを返す。Stateのdropは両経路ともlock外 |
+| `vendor-next/egui/src/memory/mod.rs` | 対象のareas／interactions／Focus／popupsを除去。現在Memory ownerが対象ならROOTへ戻す。兄弟と共有widget data／cacheを保持 |
+| `vendor-next/egui/src/context/viewport_retirement_tests.rs` | 実Contextの8回帰。全名の共通filterはviewport_retirement |
+| `vendor-next/egui-winit/src/disabled_ime_tests.rs` | 既存兄弟IME fixtureの生存登録を正規deferred APIで維持。producer・assertは不変（下記原因を参照） |
+| `vendor-next/egui/PATCHES.md`、本台帳 | 契約・結果・残課題 |
+
+入口はcompleteなrun_ui／run_pass／run_logicが返った後、plugin callback外、backend／Context
+lock外で呼ぶ。ROOTとactive passはpanic、未知／重複IDはno-op。返すIDの順序は規定しない。
+先行FullOutput／texture deltaの配送と対象IDの新規publish停止は呼出元backendの責務である。
+新しい抑止ラッチ・退役済みIDリストはなく、後の明示openでは同じIDを新規登録できる。
+子孫は親goneという既存GCの終了条件を同じpassで完了する。
+
+対象登録・親関係・viewport別Memory・font galley cacheだけを終了する。共有texture manager・
+未配送texture delta・generic Memory.data／cache・plugin所有状態はresetもdrainもしない。
+egui-imeのcomposition map等は既存input_hookのRawInput.viewports live-set pruningに従う。
+本入口だけでplugin側の対象IMEまで即時全消去するとは扱わない。段2c／段3のbackend接続では、
+退役対象を新規RawInputのlive-setから外し、既存終了ownerと出力処理を接続する必要がある。
+
+### 回帰と変異による検出確認
+
+実window／EventLoopは作らず、Context.run_ui・show_viewport_deferred・run_logicを通す。
+FullOutput検査後はdrop_without_applying_deltasでheadless明示破棄する。
+
+- 承認済み対象とその子孫の登録・親関係・viewport別Memoryが終了する。
+- 兄弟の保持キー・modifier・pointer・input、実TextEditの非空Preedit・cursor・undoer、Focus・
+  Interaction・commands・pass数が不変。対象font cacheだけが消え、UI呼出しとrepaintは増えない。
+- staleなRawInput metadataが残っても、後続root／兄弟の実出力に対象は再登場しない。
+  同じIDを後で明示openすると、新しい登録が成立する。
+- hide／minimizeだけでは終了せず、通常GCも同じ子孫・Memory終了を行う。
+- 最後のMemory ownerが退役対象のときだけROOTへ戻り、兄弟なら維持する。
+- 明示入口と通常GCのcallback ownerはlock外でdropし、通常Context readが成功する。
+- callback所有TextureHandleの解放は、共有managerの未配送upload／freeへ通常どおり合流し、
+  兄弟textureを解放しない。ROOT／pass中の無効な呼出しは状態変更前に拒否する。
+
+| 条件 | 成功 / 失敗 | exit |
+| --- | --- | --- |
+| Memory終了呼出しだけを外す | 4 / 4 | 101 |
+| 通常GCから共通finalizationへの呼出しだけを外す | 6 / 2 | 101 |
+| 修正済みbytesへ復元 | 8 / 0 | 0 |
+
+変異の実行器は`target/verify-stage2a3-mutations.py`。finallyで元bytesへ復元しhashを記録した。
+件数・command・exit・復元hashは`target/egui037-stage2a3-mutations.json`、ログは同prefixの
+`memory-cleanup-reverted.log`／`normal-gc-sharing-reverted.log`／`focused-restored.log`。
+
+### 既存兄弟IME fixtureの適応
+
+最初の全lib検証はeguiが106成功、egui-winitが42成功／1失敗（exit 101）となった。
+失敗はdisabled_producer_isolates_sibling_state_and_viewportで、兄弟Preeditが実TextEditへ入らなかった。
+fixtureはRawInput.viewportsへIDを載せるだけで、親から子を存続登録していなかった。
+旧GCでも次のroot passで子ViewportStateが消えており、残留Memory.Focusへ依存していた。
+
+Focus除去だけを一時的に外すと旧fixtureの当該1件は成功（exit 0）した。
+finallyで修正済みMemory bytesへ復元した。証拠は`target/egui037-stage2a3-fixture-stale-focus.log`。
+fixtureを非embedにし、root passで既存の兄弟IDをshow_viewport_deferredへ登録し続ける形へ直した。
+State変換→共有plugin→実TextEditの経路と全assertを保ち、producerや製品codeは変更しない。
+修正後は当該1件とegui-winit全43件が成功した。これはegui以外への必要なtest-only適応である。
+
+### 最終検証
+
+MSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=1、CARGO_NET_OFFLINE=true。
+依存解決を伴うcommandには--locked --offlineを付けた。
+
+```powershell
+cargo test --manifest-path vendor-next/Cargo.toml -p egui --lib --features miv-repaint-witness viewport_retirement --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui --lib --features miv-repaint-witness --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-winit --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-ime --lib --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --features test-script --locked --offline
+cargo fmt
+cargo fmt --check
+cargo fmt --manifest-path vendor-next/Cargo.toml --all
+cargo fmt --manifest-path vendor-next/Cargo.toml --all --check
+git diff --check
+```
+
+| 検証 | 結果 |
+| --- | --- |
+| 準備egui lib（witness有効） | 106 passed / 0 failed / 0 ignored、exit 0。追加8件を含む |
+| 準備egui-winit lib | 43 passed / 0 failed / 0 ignored、exit 0 |
+| 準備egui-ime lib | 26 passed / 0 failed / 0 ignored、exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧0.33.3 graph |
+| root fmt／fmt --check | 両方exit 0。準備graphはrootの対象外で別途実行 |
+| 準備fmt／fmt --check | 両方exit 0 |
+| git diff --check | exit 0。新回帰fileは未追跡のまま、別途末尾空白も検査 |
+
+最終command・exit・件数・時間は`target/egui037-stage2a3-final-results.json`。
+root fmt等の先行成功と初回winit失敗は`target/egui037-stage2a3-results.json`に保持した。
+ログは同prefixの`{egui-lib-final,winit-lib-final,ime-lib-final,root-check,root-test-script-check,
+root-fmt,root-fmt-check,prep-fmt-final,prep-fmt-check-final,diff-check}.log`。
+source hashとroot／準備manifest・lock不変の照合は`target/egui037-stage2a3-source.json`。
+root workspace／patch／製品code・旧vendor・両Cargo.lockは変更しない。
+既存scene.rs非推奨警告とroot既存警告は残る。アプリbuild／起動、live、test-full.ps1、networkは実行しない。
+
+別contextの実装担当の内部確認でも、共通GC・子孫所有・lock外drop・共有資源保持・fixture因果を
+sourceと有効な検証証拠で確認し、未解決指摘はなかった。正式な独立ACCEPTを意味しない。
+
+### 残課題・設計書との差
+
+重大な食い違いはない。追加の範囲は上記egui-winitのfixture-only適応で、既存検証の生存前提を修正した。
+段2cのClose受付・消費、backend window／surface／State退役、段2b、段3の正式接続は未実装。
+本家へは通常GCのviewport別Memory残留とlock下callback破棄を最小回帰と共に報告する価値がある（未送信）。

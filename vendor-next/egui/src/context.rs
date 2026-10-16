@@ -2959,7 +2959,10 @@ impl Context {
         #[cfg(debug_assertions)]
         self.debug_painting();
 
-        let mut output = self.write(|ctx| ctx.end_pass());
+        let (mut output, retired) = self.write(|ctx| ctx.end_pass());
+        // Deferred callbacks and other user-owned values may access Context
+        // when dropped. Neither GC nor explicit retirement drops them locked.
+        drop(retired);
 
         let plugins = self.read(|ctx| ctx.plugins.ordered_plugins());
         plugins.on_output(self, &mut output);
@@ -3162,7 +3165,46 @@ impl Context {
 }
 
 impl ContextImpl {
-    fn end_pass(&mut self) -> FullOutput {
+    /// Common finalization for normal GC and backend-approved retirement.
+    /// Return removed states so their user-owned values can be dropped unlocked.
+    fn retire_viewports(
+        &mut self,
+        mut retired_ids: ViewportIdSet,
+    ) -> Vec<(ViewportId, ViewportState)> {
+        retired_ids.remove(&ViewportId::ROOT);
+        // A child's lifetime ends with its parent. Complete that same ownership
+        // transition now, rather than emitting orphaned descendants for a pass.
+        let mut parents: Vec<_> = retired_ids.iter().copied().collect();
+        while let Some(parent) = parents.pop() {
+            for (&child, &owner) in &self.viewport_parents {
+                if child != ViewportId::ROOT && owner == parent && retired_ids.insert(child) {
+                    parents.push(child);
+                }
+            }
+        }
+        let retired = retired_ids
+            .iter()
+            .filter_map(|id| self.viewports.remove(id).map(|state| (*id, state)))
+            .collect();
+        self.viewport_parents
+            .retain(|id, parent| !retired_ids.contains(id) && !retired_ids.contains(parent));
+        self.memory.remove_viewports(&retired_ids);
+        if retired_ids.contains(&self.last_viewport) {
+            self.last_viewport = ViewportId::ROOT;
+        }
+
+        let live_viewport_keys: Vec<_> = self
+            .all_viewport_ids()
+            .into_iter()
+            .map(|id| ViewportKey::new(id.0.value()))
+            .collect();
+        if let Some(fonts) = self.fonts.as_mut() {
+            fonts.retain_galley_caches(|key| live_viewport_keys.contains(&key));
+        }
+        retired
+    }
+
+    fn end_pass(&mut self) -> (FullOutput, Vec<(ViewportId, ViewportState)>) {
         let ended_viewport_id = self.viewport_id();
         let viewport = self.viewports.entry(ended_viewport_id).or_default();
         let pixels_per_point = viewport.input.pixels_per_point;
@@ -3258,9 +3300,10 @@ impl ContextImpl {
 
         self.last_viewport = ended_viewport_id;
 
-        self.viewports.retain(|&id, viewport| {
+        let mut retired_ids = ViewportIdSet::default();
+        for (&id, viewport) in &mut self.viewports {
             if id == ViewportId::ROOT {
-                return true; // never remove the root
+                continue; // never remove the root
             }
 
             let parent = *self.viewport_parents.entry(id).or_default();
@@ -3272,7 +3315,8 @@ impl ContextImpl {
                     viewport.builder.title
                 );
 
-                return false;
+                retired_ids.insert(id);
+                continue;
             }
 
             let is_our_child = parent == ended_viewport_id && id != ViewportId::ROOT;
@@ -3284,14 +3328,14 @@ impl ContextImpl {
                         viewport.builder.title
                     );
 
-                    return false; // Only keep children that have been updated this pass
+                    retired_ids.insert(id);
+                    continue; // Only keep children that have been updated this pass
                 }
 
                 viewport.used = false; // reset so we can check again next pass
             }
-
-            true
-        });
+        }
+        let retired = self.retire_viewports(retired_ids);
 
         // If we are an immediate viewport, this will resume the previous viewport.
         self.viewport_stack.pop();
@@ -3328,44 +3372,69 @@ impl ContextImpl {
             })
             .collect();
 
-        if is_last {
-            // Remove dead viewports:
-            self.viewports.retain(|id, _| all_viewport_ids.contains(id));
-            debug_assert!(
-                self.viewports.contains_key(&ViewportId::ROOT),
-                "Bug in egui: we removed the root viewport"
-            );
-            self.viewport_parents
-                .retain(|id, _| all_viewport_ids.contains(id));
-
-            let live_viewport_keys: Vec<_> = self
-                .viewports
-                .keys()
-                .map(|viewport_id| ViewportKey::new(viewport_id.0.value()))
-                .collect();
-            if let Some(fonts) = self.fonts.as_mut() {
-                fonts.retain_galley_caches(|viewport_key| {
-                    live_viewport_keys.contains(&viewport_key)
-                });
-            }
-        } else {
+        debug_assert!(
+            self.viewports.contains_key(&ViewportId::ROOT),
+            "Bug in egui: we removed the root viewport"
+        );
+        if !is_last {
             let viewport_id = self.viewport_id();
             self.memory.set_viewport_id(viewport_id);
         }
 
         platform_output.num_completed_passes += 1;
 
-        FullOutput {
-            platform_output,
-            textures_delta,
-            shapes,
-            pixels_per_point,
-            viewport_output,
-        }
+        (
+            FullOutput {
+                platform_output,
+                textures_delta,
+                shapes,
+                pixels_per_point,
+                viewport_output,
+            },
+            retired,
+        )
     }
 }
 
 impl Context {
+    /// Retire a child viewport after its lifecycle owner has approved closing it.
+    ///
+    /// This backend entry point removes the viewport and its descendants using
+    /// the same finalization as normal viewport GC. It returns the IDs whose
+    /// registrations were actually removed; an unknown/already retired ID is a
+    /// no-op. Visibility and minimization alone never call this method.
+    ///
+    /// Call only after the complete `run_ui`/`run_pass`/`run_logic` operation has
+    /// returned, outside plugin callbacks and outside all backend/Context locks.
+    /// The backend must first stop publishing the closed viewport and arrange
+    /// delivery of any previously produced output/texture deltas. This does not
+    /// drain, discard or reset the shared texture manager, application widget
+    /// data, or plugin-owned state. Explicitly opening the same ID again is allowed.
+    /// Removed callback owners are dropped after the Context lock is released.
+    ///
+    /// # Panics
+    /// Panics for [`ViewportId::ROOT`] or while a UI pass is active.
+    #[must_use]
+    pub fn retire_viewport(&self, viewport_id: ViewportId) -> Vec<ViewportId> {
+        assert!(
+            viewport_id != ViewportId::ROOT,
+            "cannot retire the root viewport"
+        );
+        let retired = self.write(|ctx| {
+            assert!(
+                ctx.viewport_stack.is_empty(),
+                "viewport retirement requires no active UI pass"
+            );
+            if !ctx.viewports.contains_key(&viewport_id) {
+                return Vec::new();
+            }
+            ctx.retire_viewports(core::iter::once(viewport_id).collect())
+        });
+        let ids = retired.iter().map(|(id, _)| *id).collect();
+        drop(retired);
+        ids
+    }
+
     /// Tessellate the given shapes into triangle meshes.
     ///
     /// `pixels_per_point` is used for feathering (anti-aliasing).
@@ -5033,6 +5102,9 @@ fn flatten_labelled_by(nodes: &mut [(accesskit::NodeId, accesskit::Node)]) {
 
 #[cfg(test)]
 mod ime_interrupt_tests;
+
+#[cfg(test)]
+mod viewport_retirement_tests;
 
 #[cfg(test)]
 mod test {
