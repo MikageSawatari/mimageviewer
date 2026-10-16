@@ -17,6 +17,7 @@
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
 | リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | nextestでworkspace 全体 + テストを持つ補助 bin + 除外された vendor 4 crate の lib test、cargo testでworkspace doctest |
+| 承認済みの standalone eframe窓試験 | `.\scripts\test-live-windows.ps1 -InteractiveApproved` | 利用者が隔離 desktop/session で実行する ignored live 試験1件。自動 gate には接続しない |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
 ReleaseChecksは非対話テストではなく、desktopを使う了承済み検証枠で実行する。
@@ -90,7 +91,8 @@ Windows の `Instant` は起動直後に大きな時間を引くと underflow �
 本体lib全件は `.\scripts\test-lib-full.ps1` を使い、上の「結果の再利用」に従う。
 nextestは1テスト1プロセスでAppのprocess-global lockを分離する。
 `.config/nextest.toml` はCPU数並列・retryなし・60秒警告のみ、実測の重い5件を先行実行する。
-テストの削除・新しいignoreはない。最終 `test-full.ps1` も同じnextest設定を使い、
+nextest導入時にはテストの削除・新しいignoreはなかった。アプリ起動等を行う試験は下記のlive区分へ分離する。
+最終 `test-full.ps1` も同じnextest設定を使い、
 nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --doc` として実行する。
 導入時の件数突合・時間比較とテスト模擬の修正は [検証記録](test-speed-report.md) を参照する。
 
@@ -256,6 +258,37 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 これにより本体unit testはlib test executableに一本化され、lib用の互換`app` stubも不要になった。
 
 ## リリースゲート
+
+### 非対話 gate と live Windows 試験
+
+アプリ起動（standalone eframe Appの`run_native`を含む）、前面切替、稼働中UIへの
+実入力送出へ到達する試験は `#[ignore = "live Windows test: ..."]` とし、既定の
+`cargo test` / nextest / `test-full.ps1` から外す。pure scheduler、合成イベント、
+`egui_kittest` のheadless Harness、wgpu offscreen描画は非対話区分として自動実行を維持する。
+アプリ起動等に該当する場合、テスト名、短時間、子プロセスであることは承認の例外にしない。
+本体のmessage-only HWND、非表示HWNDのz-order、画面外の非アクティブpopupと
+フォーカス要求probeによる8件は、前面切替・実入力・利用者に見える表示を行わない
+headless unit / fake-input試験として、既定の自動gateを維持する。
+
+専用入口は `scripts/test-live-windows.ps1`。対象はeframeの
+`synchronous_damage_returns_before_outer_paint_gate`（damage/paint順序）1件のみ。
+exact名のallowlistと `--run-ignored only`、直列実行、retry 0、
+0件選択の失敗を使い、他のignored hardware試験や実Everything probeを巻き込まない。
+所要は実行約1分＋初回コンパイル数分。使い捨ての窓・メモリ内fixture・loopback IPCだけを使い、
+mIV本体、通常profile、実Everythingには接続しない。利用者が隔離desktop/session上で実行し、
+その間はキーボード・マウスを使用しない。
+
+**エージェントはこのstandalone runnerを起動しない。** 利用者実行であっても、具体suite、
+所要時間、desktop/input使用、使い捨てdata範囲を示して明示承認を得る。
+`-InteractiveApproved` は承認取得済みの表明であり、同意を得るプロンプトではない。
+既存の正規portable-smoke以外をエージェントが起動しない規則は維持する。
+未実施のlive試験は検証台帳に必ず「未実施」と残し、自動gateのPASSと区別する。
+
+runner自体は `powershell -NoProfile -File scripts/test-live-windows-runner.ps1` で
+静的／fake Cargo検査できる（窓もRust test executableも起動しない）。
+段0aの監査と検証結果は [検証台帳](egui-0.37-stage0a-verification.md) を参照。
+
+### 自動 gate の実行内容
 
 `test-full.ps1` はnextestの存在を確認してから次のコマンドを順に実行する。
 未導入なら `cargo install cargo-nextest --locked` を案内して非ゼロ終了し、cargo testへ代替しない。

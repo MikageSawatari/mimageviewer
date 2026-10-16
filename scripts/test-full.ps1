@@ -3,6 +3,10 @@
 # The pack-build-tools feature exposes only the two development helper binaries
 # that contain unit tests. Other development binaries remain outside the test
 # graph, while every selected target shares one mimageviewer library build.
+# This is a noninteractive gate: the live eframe run_native test is #[ignore].
+# Headless unit tests with message-only/hidden HWNDs or fake input stay enabled.
+# Run only the approved live suite via scripts/test-live-windows.ps1 separately;
+# record unperformed live checks as NOT RUN, never as an automated-gate PASS.
 
 [CmdletBinding()]
 param(
@@ -103,7 +107,8 @@ public static class MivTestErrorMode
 
         if ($gateExit -eq 0) {
             # vendor/eframe is workspace-excluded for the same reason. Keep this unfiltered so every
-            # scheduler and Windows process regression added to the vendored event-loop fork runs.
+            # nonignored pure scheduler regression in the vendored event-loop fork runs.
+            # The real-window process test remains ignored (separate approved live entry).
             Write-Host '[test-full] cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib'
             & cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib @nextestArgs
             $gateExit = $LASTEXITCODE

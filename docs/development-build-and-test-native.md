@@ -13,6 +13,15 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
 
 ### 検証起動時の設定データ保護（必須）
 
+standalone Rustテストでもアプリ起動・前面切替・稼働中UIへの実入力送出を行うものはlive試験。
+段0aでは`run_native`でeframeアプリの窓を起動する1件をignoreし、
+利用者実行の `scripts/test-live-windows.ps1` へ分離する。
+message-only HWND、非表示HWND、画面外の非アクティブpopupとフォーカス要求probeを
+使う本体8件は、前面切替・実入力・利用者に見える表示を行わないheadless検査として自動実行する。
+エージェントはこのrunnerを起動しない。具体suite・時間・desktop/input使用・使い捨てdataの
+範囲を示して明示承認を得る規則と、未実施を台帳に「未実施」と残す規則は同じ。
+対象と手順は [live試験の区分](development-build-and-test.md#非対話-gate-と-live-windows-試験) を参照。
+
 - エージェントは `target\dev-runtime\mimageviewer-core.exe`、
   `target\release\mimageviewer.exe`、
   `target\release\mimageviewer-core.exe`、インストール済み mImageViewer、

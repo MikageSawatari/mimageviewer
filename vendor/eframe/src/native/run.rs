@@ -807,6 +807,7 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "live Windows test: opens a real window; use scripts/test-live-windows.ps1 after explicit approval"]
         fn synchronous_damage_returns_before_outer_paint_gate() {
             if std::env::var(CHILD_ROLE_ENV).as_deref() == Ok("1") {
                 run_child();
@@ -828,6 +829,7 @@ mod tests {
             let mut child = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg("native::run::tests::windows_process_test::synchronous_damage_returns_before_outer_paint_gate")
+                .arg("--ignored")
                 .arg("--nocapture")
                 .env(CHILD_ROLE_ENV, "1")
                 .env(GATE_PORT_ENV, gate_port.to_string())
