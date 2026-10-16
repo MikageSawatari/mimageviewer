@@ -141,6 +141,18 @@ pub(crate) struct SidecarLoadContinuation {
     pub(super) restore_started_at: std::time::Instant,
 }
 
+impl SidecarLoadContinuation {
+    fn fullscreen_reopen_pending(&self) -> bool {
+        match &self.navigation_after_hydration {
+            Some(super::MainListAfterHydration::Dfs { continuation, .. }) => {
+                continuation.fullscreen
+            }
+            Some(super::MainListAfterHydration::RequiredFullscreen { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequiredAction {
     Import { clear_preview: bool },
@@ -774,6 +786,39 @@ impl App {
                     .as_ref()
                     .is_some_and(|deferred| deferred.matches_item(&self.items))
         })
+    }
+
+    /// Unlike an arbitrary deferred page open, this accepted navigation continuation owns
+    /// fullscreen intent itself. It needs no old-texture/navigation-holdover sentinel.
+    pub(crate) fn sidecar_restore_navigation_fullscreen_wait_active(&self) -> bool {
+        self.sidecar_restore.as_ref().is_some_and(|state| {
+            self.sidecar_restore_context_current(&state.common)
+                && matches!(&state.common.continuation,
+                    ContinuationOwner::Live(continuation)
+                        if continuation.items_len == self.items.len()
+                            && !continuation.cancel.load(Ordering::Relaxed)
+                            && continuation.fullscreen_reopen_pending())
+        })
+    }
+
+    /// A true viewer close consumes only its reopen intent; accepted list hydration and its
+    /// metadata/first-display maintenance still finish on the owning context.
+    pub(super) fn cancel_sidecar_restore_fullscreen_reopen(&mut self) {
+        let current = self
+            .sidecar_restore
+            .as_ref()
+            .is_some_and(|state| self.sidecar_restore_context_current(&state.common));
+        if !current {
+            return;
+        }
+        let common = &mut self.sidecar_restore.as_mut().unwrap().common;
+        common.deferred_fullscreen = None;
+        if let ContinuationOwner::Live(continuation) = &mut common.continuation
+            && continuation.fullscreen_reopen_pending()
+        {
+            // Drop the DFS tail as well: queued navigation must not restart a closed viewer.
+            continuation.navigation_after_hydration = None;
+        }
     }
 
     /// A fresh detached media builder may publish the existing exact open while hydration
@@ -4661,6 +4706,98 @@ mod tests {
             .common
             .discard_target();
         assert!(!app.sidecar_restore_detached_auto_fullscreen_wait_active());
+    }
+
+    #[test]
+    fn navigation_fullscreen_hydration_wait_requires_live_exact_continuation() {
+        for required in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("navigation-book");
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(folder.join("page.jpg"))];
+            let _rx = app.activate_live_sidecar_restore_for_test(folder.clone());
+            assert!(!app.sidecar_restore_navigation_fullscreen_wait_active());
+            let action = if required {
+                MainListAfterHydration::RequiredFullscreen {
+                    target: crate::snapshot::SnapshotTarget::Fs(folder.join("page.jpg")),
+                    history_trigger: HistoryTrigger::UserChosen,
+                }
+            } else {
+                MainListAfterHydration::Dfs {
+                    continuation: super::super::PhysicalHistoryDfsContinuation {
+                        queued_steps: 0,
+                        mode: super::super::FolderNavMode::Fullscreen,
+                        history_trigger: HistoryTrigger::UserChosen,
+                        restore_video_tile: false,
+                        resume_slideshow: false,
+                        fullscreen: true,
+                    },
+                    ctx: egui::Context::default(),
+                }
+            };
+            app.set_live_sidecar_first_display_for_test(FirstDisplayAction::None, Some(action));
+            // No holdover sentinel is needed: the accepted action owns fullscreen intent.
+            assert!(app.fs_holdover_tex.is_none());
+            assert!(app.fs_nav_deferred_reopen_wait_active());
+            app.items_generation += 1;
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.items_generation -= 1;
+            app.current_folder = Some(app.tmp.path().join("other-book"));
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.cancel_sidecar_restore_fullscreen_reopen();
+            app.current_folder = Some(folder);
+            assert!(
+                app.fs_nav_deferred_reopen_wait_active(),
+                "unrelated source close cannot cancel the owner"
+            );
+            app.items.push(GridItem::Image(PathBuf::from("extra.jpg")));
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.items.pop();
+            let common = &mut app.sidecar_restore.as_mut().unwrap().common;
+            let context = common.target_context;
+            common.target_context = ViewerContextId::for_test(999);
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            app.cancel_sidecar_restore_fullscreen_reopen();
+            app.sidecar_restore.as_mut().unwrap().common.target_context = context;
+            assert!(
+                app.fs_nav_deferred_reopen_wait_active(),
+                "a mounted sibling cannot consume the owner"
+            );
+            let cancel = Arc::clone(
+                app.sidecar_restore
+                    .as_ref()
+                    .unwrap()
+                    .common
+                    .continuation
+                    .cancel(),
+            );
+            cancel.store(true, Ordering::Relaxed);
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+            cancel.store(false, Ordering::Relaxed);
+            if !required {
+                let ContinuationOwner::Live(continuation) =
+                    &mut app.sidecar_restore.as_mut().unwrap().common.continuation
+                else {
+                    unreachable!()
+                };
+                let Some(MainListAfterHydration::Dfs { continuation, .. }) =
+                    &mut continuation.navigation_after_hydration
+                else {
+                    unreachable!()
+                };
+                continuation.fullscreen = false;
+                assert!(
+                    !app.fs_nav_deferred_reopen_wait_active(),
+                    "grid DFS is not a fullscreen wait"
+                );
+            }
+            app.sidecar_restore
+                .as_mut()
+                .unwrap()
+                .common
+                .discard_target();
+            assert!(!app.fs_nav_deferred_reopen_wait_active());
+        }
     }
 
     #[test]

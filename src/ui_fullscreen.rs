@@ -13025,6 +13025,9 @@ impl App {
         self.fs_nav_after_pdf_enumerate.is_some()
             || self.book_deferred_open_wait_active()
             || self.archive_convert_deferred_fullscreen_active()
+            // Accepted after-hydration navigation owns its fullscreen intent in sidecar_restore.
+            // The holdover gate below is only for otherwise arbitrary deferred page opens.
+            || self.sidecar_restore_navigation_fullscreen_wait_active()
             || (sidecar_navigation_owner && self.sidecar_restore_deferred_fullscreen_wait_active())
     }
 

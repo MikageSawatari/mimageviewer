@@ -5303,3 +5303,21 @@ plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状�
 欄が消えた後へ復帰要求を持ち越さない。detached predicate / registry / 生成 / placement は変更しない。
 §2 の所有境界に沿う修正であり、遅延・時間窓・geometry guard を足す症状パッチではないことを実装側でも確認した。
 自動検証結果は [I2 段 2b の記録](ime-process-keys-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。
+
+### §11 追補: staged 本移動の hydration 中 fullscreen 継続（2026-10-16、`5086d23d6`）
+
+設計 lead の実装依頼に従い、§2 を再読して `sidecar_restore` と共有
+`fs_nav_deferred_reopen_wait_active`、true close の予約消費境界を修正した。
+`56c11e621`（v4.5.0）で after-hydration へ移した DFS fullscreen／RequiredFullscreen の
+再オープン予約を待機述語が数えず、v4.7.0 で PDF 間 Ctrl+↑↓ の viewport hide が報告された。
+予約の単一所有者である live sidecar continuation が context・世代・source・items数・cancel を
+照合して待機を答え、true close では予約だけを消費する。任意の deferred page open と異なり
+fullscreen の意図が action 自身にあるため、旧 texture／holdover の存在を再オープン権限にしない。
+新しい App field、時間窓、遅延、retry、repaint、cleanup 例外を足す症状パッチではなく、
+既存予約の所有境界とその投影の欠落を直す構造修正であることを実装側でも確認した。
+状態削減として予約を採用直後に実行する案は、metadata 復元後に表示する契約を壊すため採らず、
+新しい modal／待機 owner は追加しない。既存 hydration の modal 入力 gate は維持する。
+detached の `alive_wanted`（runtime の生存・Closing）は変更しない。`transition_outstanding` は
+該当 continuation の待機中に true となり、従来の deferred_fullscreen 待機と同じ window 継続を表す。
+viewport 生成・registry・HWND・placement・focus owner は変更しない。
+設計 lead (ClaudeCode Opus) の検収と独立 GPT-6.1 Sol/xhigh レビューの双方が「症状パッチではなく構造的修正」に同意し、レビューは指摘なしで ACCEPT。実機確認は利用者に依頼中。

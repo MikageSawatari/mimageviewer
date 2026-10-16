@@ -193,7 +193,9 @@
    (回避方法が変わっていないか)。**掲載が 0 件になったら「現時点で把握している不具合はありません。」
    と明記する** (見出しごと消さない。ページが空だと「更新が止まった」と読まれるため)。
    - 載せる基準: ①通常の操作で遭遇し得る ②不具合だと思う見た目をしている ③回避策があるか
-     「環境のせいではない」と言える ④次の版で直らない。backlog の大半は設計上の負債なので載せない。
+     「環境のせいではない」と言える。次の版で直す予定の不具合も、公開中の版で起きる間は載せ、
+     「次のバージョンで修正します。」と書く (版番号は書かない。直した版の公開時にこのステップで削除する)。
+     backlog の大半は設計上の負債なので載せない。
    - **このステップを飛ばすとページが腐る**。以前ページを置いたときに放置されて消えた経緯がある。
 6.6. **サイトマップを再生成** — htdocs の編集がすべて終わったら
    `python scripts/gen-sitemap-xml.py` を実行して `htdocs/sitemap.xml` を作り直し、
@@ -402,8 +404,13 @@
    ```powershell
    .\scripts\test-full.ps1
    ```
-   - `cargo test --workspace --features pack-build-tools --no-fail-fast` で、workspace全体と
-     単体テストを持つ補助bin 2本を同じlib buildとして実行する。
+   - `cargo nextest run --workspace --features pack-build-tools` で、workspace全体のlib・bin・integrationと
+     単体テストを持つ補助bin 2本を同じlib buildとして実行する。workspace外のvendor 4 crateも
+     従来と同じgraph・featureで無filterのlib testを実行する。
+   - nextest対象外のdoctestは `cargo test --workspace --features pack-build-tools --doc --no-fail-fast`
+     を別段で必ず実行する。各段失敗で後段を止め、retryは0、既存ignored以外の全件を実行する。
+     nextest未導入時は `cargo install cargo-nextest --locked` を案内して非ゼロ終了する。
+     共通引数・vendor graphの詳細は [開発ビルドとテスト](development-build-and-test.md#リリースゲート) を参照。
    - `build-dist.ps1` が clean 前に自動実行するため、通常は配布ビルドとは別に実行不要。
    - `build-dist.ps1 -SkipRustTests` は、同一ソースが既にこのゲートを通過し、署名や
      packaging だけを再試行する場合に限る。ソース変更後の初回配布では使わない。

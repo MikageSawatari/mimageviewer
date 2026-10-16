@@ -5605,7 +5605,8 @@ pub fn enumerate_pages_with_options(
     enumerate_pages_with_read_target(pdf_path, &read, password, cancel, options)
 }
 
-/// Worker-only enumeration using the target already used for a cache lookup.
+/// Background-only (Normal) enumeration using the target already used for a cache lookup.
+/// Foreground navigation preflight uses `enumerate_pages_for_navigation` instead.
 pub fn enumerate_pages_with_read_target(
     pdf_path: &Path,
     read: &ReadTarget,
@@ -5613,29 +5614,12 @@ pub fn enumerate_pages_with_read_target(
     cancel: Option<Arc<AtomicBool>>,
     options: EnumerateOptions,
 ) -> std::io::Result<PdfEnumerateResult> {
-    #[cfg(test)]
-    if let Some(directions) = remote_pdf_test_capture(read.read_path.as_path()) {
-        directions.lock().unwrap().push(options.want_direction);
-        let bytes = remote_pdf_test_run(|cache| {
-            ipc_enumerate(
-                cache,
-                read.read_path.as_path(),
-                password,
-                enumerate_worker_options(read, options),
-            )
-        })?;
-        let mut result = PdfWorkerPool::parse_enumerate_response(&bytes)?;
-        display_enumerated_pages(&mut result, read);
-        return Ok(result);
-    }
-    let pool = get_pool();
     let worker_options = enumerate_worker_options(&read, options);
     let req = encode_enumerate_request(&read.read_path, password, worker_options);
-    // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-    // enumerate_pages_with_cancel は background catch-up 経路なので Unscoped
+    // この API は background catch-up 等の経路なので Normal + Unscoped
     // + AbortOnCancel (enumerate は cheap、cache 保存ロジック無し)。
-    let resp = pool.execute(
+    let resp = execute_enumerate_request(
         PdfPoolRequest::new(&req, &read.read_path),
         cancel.as_ref(),
         JobPriority::Normal,
@@ -5646,6 +5630,142 @@ pub fn enumerate_pages_with_read_target(
     let mut result = PdfWorkerPool::parse_enumerate_response(&resp.bytes)?;
     display_enumerated_pages(&mut result, &read);
     Ok(result)
+}
+
+fn execute_enumerate_request(
+    request: PdfPoolRequest<'_>,
+    cancel: Option<&Arc<AtomicBool>>,
+    priority: JobPriority,
+    perf_key: Option<String>,
+    validity: PdfRenderValidity,
+    cancel_policy: CancelWaitPolicy,
+) -> std::io::Result<ProcessResponse> {
+    #[cfg(test)]
+    {
+        if let Some(directions) = remote_pdf_test_capture(request.read_path.as_path()) {
+            let DecodedRequest::Enumerate {
+                password, options, ..
+            } = decode_request(request.bytes)?
+            else {
+                unreachable!("enumerate request only");
+            };
+            directions.lock().unwrap().push(options.want_direction);
+            let bytes = remote_pdf_test_run(|cache| {
+                ipc_enumerate(
+                    cache,
+                    request.read_path.as_path(),
+                    password.as_deref(),
+                    options,
+                )
+            })?;
+            return Ok(ProcessResponse {
+                bytes,
+                parent_read: ParentReadMetrics::default(),
+                worker_render: None,
+            });
+        }
+        let pool = TEST_ENUMERATE_POOLS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(request.read_path.as_path())
+            .cloned();
+        if let Some(pool) = pool {
+            return pool.execute(request, cancel, priority, perf_key, validity, cancel_policy);
+        }
+    }
+    get_pool().execute(request, cancel, priority, perf_key, validity, cancel_policy)
+}
+
+#[cfg(test)]
+static TEST_ENUMERATE_POOLS: OnceLock<Mutex<HashMap<PathBuf, Arc<PdfWorkerPool>>>> =
+    OnceLock::new();
+
+/// Uses the real enqueue/admission path with a test-owned queue and no child processes.
+#[cfg(test)]
+pub(crate) struct TestPdfEnumeratePool {
+    path: PathBuf,
+    pool: Arc<PdfWorkerPool>,
+}
+
+#[cfg(test)]
+impl TestPdfEnumeratePool {
+    pub(crate) fn new(path: &Path) -> Self {
+        let pool = Arc::new(PdfWorkerPool {
+            queue: Arc::new((Mutex::new(JobQueue::new(DEFAULT_POOL_SIZE)), Condvar::new())),
+            worker_count: DEFAULT_POOL_SIZE,
+            worker_ids: (0..DEFAULT_POOL_SIZE).collect(),
+            dispatcher_threads: Mutex::new(Vec::new()),
+            worker_children: Vec::new(),
+            maintenance_wake: None,
+            maintenance_thread: None,
+        });
+        TEST_ENUMERATE_POOLS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), Arc::clone(&pool));
+        Self {
+            path: path.to_path_buf(),
+            pool,
+        }
+    }
+
+    pub(crate) fn take(&self) -> TestPdfEnumerateJob {
+        let mut q = self.pool.queue.0.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(job) = q
+                .critical
+                .pop_front()
+                .or_else(|| q.high_normal.pop_front())
+                .or_else(|| q.normal.pop_front())
+            {
+                return TestPdfEnumerateJob(job);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "enumeration did not enqueue");
+            q = self.pool.queue.1.wait_timeout(q, remaining).unwrap().0;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestPdfEnumeratePool {
+    fn drop(&mut self) {
+        TEST_ENUMERATE_POOLS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestPdfEnumerateJob(Job);
+
+#[cfg(test)]
+impl TestPdfEnumerateJob {
+    pub(crate) fn priority(&self) -> JobPriority {
+        self.0.priority
+    }
+    pub(crate) fn cancelled(&self) -> bool {
+        queued_job_is_interrupted(&self.0)
+    }
+    pub(crate) fn complete(self, pages: u32) {
+        let mut bytes = vec![STATUS_OK];
+        bytes.extend_from_slice(&pages.to_le_bytes());
+        bytes.resize(5 + pages as usize * 16, 0);
+        let _ = self.0.reply.send(Ok(ProcessResponse {
+            bytes,
+            parent_read: ParentReadMetrics::default(),
+            worker_render: None,
+        }));
+    }
+    pub(crate) fn fail(self, error: PdfReadError) {
+        let _ = self.0.reply.send(Err(error.into_io()));
+    }
 }
 
 /// Blocks on the PDF worker pool. Call from a converter/background thread only.
@@ -6115,7 +6235,22 @@ struct PdfEnumerateWaiterId(u64);
 struct PdfEnumerateRunning {
     request_id: PdfEnumerateRequestId,
     source_cancel: Arc<AtomicBool>,
-    waiters: HashMap<PdfEnumerateWaiterId, mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>>,
+    waiters: HashMap<PdfEnumerateWaiterId, PdfEnumerateReply>,
+}
+
+/// Both UI polling and worker blocking waits share the same coordinator/lease.
+enum PdfEnumerateReply {
+    Ui(mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>),
+    Worker(crossbeam_channel::Sender<Result<PdfEnumerateResult, PdfReadError>>),
+}
+
+impl PdfEnumerateReply {
+    fn send(&self, result: Result<PdfEnumerateResult, PdfReadError>) -> Result<(), ()> {
+        match self {
+            Self::Ui(tx) => tx.send(result).map_err(|_| ()),
+            Self::Worker(tx) => tx.send(result).map_err(|_| ()),
+        }
+    }
 }
 
 struct PdfEnumerateCoordinatorState {
@@ -6148,16 +6283,20 @@ struct PdfEnumerateStart {
 
 enum PdfEnumerateAdmission {
     JoinedRunning,
+    /// Owns the shared worker start, even if this subscriber cancels after registration.
+    /// Only the shared source_cancel may suppress it when all waiters have left.
     Start(PdfEnumerateStart),
 }
 
 /// UI ナビゲーション用 enumerate の実行中 request と待ち手を一元管理する。
 ///
-/// 同じ `(path, password)` の request が cancel されず実行中なら、待ち手だけを追加する。
+/// 同じ `(read_path, password, want_direction)` の request が cancel されず実行中なら、待ち手だけを追加する。
 /// 時間窓や完了結果 cache は持たず、完了時には entry 自体を取り除く。
 #[derive(Default)]
 struct PdfEnumerateCoordinator {
     state: Mutex<PdfEnumerateCoordinatorState>,
+    #[cfg(test)]
+    registered: Condvar,
 }
 
 impl PdfEnumerateCoordinator {
@@ -6181,6 +6320,14 @@ impl PdfEnumerateCoordinator {
         self: &Arc<Self>,
         key: PdfEnumerateKey,
         tx: mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>,
+    ) -> (PdfEnumerateWaiterLease, PdfEnumerateAdmission) {
+        self.subscribe_with_reply(key, PdfEnumerateReply::Ui(tx))
+    }
+
+    fn subscribe_with_reply(
+        self: &Arc<Self>,
+        key: PdfEnumerateKey,
+        tx: PdfEnumerateReply,
     ) -> (PdfEnumerateWaiterLease, PdfEnumerateAdmission) {
         let mut retired_waiters = Vec::new();
 
@@ -6246,6 +6393,8 @@ impl PdfEnumerateCoordinator {
             waiter_id,
             active: AtomicBool::new(true),
         };
+        #[cfg(test)]
+        self.registered.notify_all();
         (lease, admission)
     }
 
@@ -6335,6 +6484,82 @@ impl PdfEnumerateWaiterLease {
     }
 }
 
+impl Drop for PdfEnumerateWaiterLease {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Cancellation owner for a navigation preflight worker. Existing scans read `flag()`;
+/// owners must use `cancel()` so a blocking PDF waiter also wakes without polling.
+pub(crate) struct NavigationPreflightCancel {
+    flag: Arc<AtomicBool>,
+    wake: Mutex<Option<crossbeam_channel::Sender<()>>>,
+    cancelled: crossbeam_channel::Receiver<()>,
+}
+
+impl NavigationPreflightCancel {
+    pub(crate) fn new() -> Self {
+        let (wake, cancelled) = crossbeam_channel::bounded(0);
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            wake: Mutex::new(Some(wake)),
+            cancelled,
+        }
+    }
+
+    pub(crate) fn flag(&self) -> &Arc<AtomicBool> {
+        &self.flag
+    }
+
+    pub(crate) fn load(&self, ordering: Ordering) -> bool {
+        self.flag.load(ordering)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        // Disconnect broadcasts to all waiters, including ones registered after cancel.
+        self.wake.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+}
+
+/// Worker-only synchronous navigation enumeration: same Critical worker and coalescing
+/// as UI navigation, with a waiter lease scoped to this call (also between candidates).
+/// Resolving EPUBs stays on the caller's worker and retains the same generation lease.
+pub(crate) fn enumerate_pages_for_navigation(
+    pdf_path: &Path,
+    password: Option<&str>,
+    cancel: &NavigationPreflightCancel,
+    options: EnumerateOptions,
+) -> std::io::Result<PdfEnumerateResult> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(pre_registration_interrupted().into_io());
+    }
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(pre_registration_interrupted().into_io());
+    }
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let lease = subscribe_known_enumeration_with_reply(
+        pdf_enumerate_coordinator(),
+        pdf_path,
+        read,
+        password,
+        options,
+        PdfEnumerateReply::Worker(tx),
+        start_enumerate_worker,
+    );
+    let result = crossbeam_channel::select_biased! {
+        recv(cancel.cancelled) -> _ => Err(pre_registration_interrupted()),
+        recv(rx) -> result => result.unwrap_or_else(|_| Err(PdfReadError::Other(Arc::new(std::io::Error::other("PDF enumeration worker disconnected"))))),
+    };
+    drop(lease);
+    if cancel.load(Ordering::Acquire) {
+        return Err(pre_registration_interrupted().into_io());
+    }
+    result.map_err(PdfReadError::into_io)
+}
+
 /// UI ナビゲーション経路の PDF ページ列挙ハンドル。
 ///
 /// 各 caller が個別のハンドルと receiver を所有する。同じ実行中 request に合流していても、
@@ -6395,7 +6620,7 @@ pub(crate) fn completed_enumerate_handle_for_test(
     completed_enumerate_handle(pdf_path, result)
 }
 
-/// UI ナビゲーション経路の PDF ページ列挙。
+/// UI および worker preflight のナビゲーション経路の PDF ページ列挙。
 ///
 /// Ctrl+↑↓ で PDF を高速連打したときの grid 更新頻度を上げるため、以下を組み合わせる:
 ///
@@ -6535,9 +6760,35 @@ fn subscribe_known_enumeration(
     options: EnumerateOptions,
     start_worker: impl FnOnce(PdfEnumerateStartWork),
 ) -> PdfEnumerateHandle {
+    let (tx, rx) = mpsc::channel();
+    let lease = subscribe_known_enumeration_with_reply(
+        coordinator,
+        logical,
+        read,
+        password,
+        options,
+        PdfEnumerateReply::Ui(tx),
+        start_worker,
+    );
+    PdfEnumerateHandle {
+        cancel: Arc::new(AtomicBool::new(false)),
+        rx,
+        lease: Arc::new(Mutex::new(Some(lease))),
+    }
+}
+
+fn subscribe_known_enumeration_with_reply(
+    coordinator: &Arc<PdfEnumerateCoordinator>,
+    logical: &Path,
+    read: ReadTarget,
+    password: Option<&str>,
+    options: EnumerateOptions,
+    reply: PdfEnumerateReply,
+    start_worker: impl FnOnce(PdfEnumerateStartWork),
+) -> PdfEnumerateWaiterLease {
     let worker_options = enumerate_worker_options(&read, options);
     let key = PdfEnumerateKey::with_options(read.read_path.as_path(), password, worker_options);
-    let (handle, admission) = coordinator.subscribe(key.clone());
+    let (lease, admission) = coordinator.subscribe_with_reply(key.clone(), reply);
     match admission {
         PdfEnumerateAdmission::Start(start) => start_worker(PdfEnumerateStartWork {
             logical: logical.to_owned(),
@@ -6554,10 +6805,17 @@ fn subscribe_known_enumeration(
         }
         PdfEnumerateAdmission::JoinedRunning => {}
     }
-    handle
+    lease
 }
 
 fn run_pdf_enumerate_admission(task: PdfEnumerateAdmissionTask) {
+    run_pdf_enumerate_admission_before_start(task, || {});
+}
+
+fn run_pdf_enumerate_admission_before_start(
+    task: PdfEnumerateAdmissionTask,
+    before_start: impl FnOnce(),
+) {
     if complete_pre_registration_cancel(&task.cancel, &task.reply) {
         return;
     }
@@ -6592,10 +6850,13 @@ fn run_pdf_enumerate_admission(task: PdfEnumerateAdmissionTask) {
             registered.cancel();
         }
     }
+    before_start();
     if task.cancel.load(Ordering::Relaxed) {
         let _ = task.reply.send(Err(pre_registration_interrupted()));
-        return;
     }
+    // Registration transferred the shared start responsibility to this admission.
+    // Cancelling this UI waiter must not strand an already joined UI/preflight waiter.
+    // start_enumerate_worker checks source_cancel, which represents all waiters leaving.
     let PdfEnumerateAdmission::Start(start) = admission else {
         if crate::perf::is_enabled() {
             let perf_key = crate::grid_item::pdf_file_perf_key(&task.logical);
@@ -6649,21 +6910,20 @@ fn start_enumerate_worker(work: PdfEnumerateStartWork) {
     if let Err(error) = std::thread::Builder::new()
         .name("pdf-enumerate-nav".into())
         .spawn(move || {
-            let result = get_pool()
-                .execute(
-                    PdfPoolRequest::new(&request, &read.read_path),
-                    Some(&source_cancel),
-                    JobPriority::Critical,
-                    Some(perf_key),
-                    PdfRenderValidity::Unscoped,
-                    CancelWaitPolicy::AbortOnCancel,
-                )
-                .and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes))
-                .map_err(PdfReadError::from_io)
-                .map(|mut result| {
-                    display_enumerated_pages(&mut result, &read);
-                    result
-                });
+            let result = execute_enumerate_request(
+                PdfPoolRequest::new(&request, &read.read_path),
+                Some(&source_cancel),
+                JobPriority::Critical,
+                Some(perf_key),
+                PdfRenderValidity::Unscoped,
+                CancelWaitPolicy::AbortOnCancel,
+            )
+            .and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes))
+            .map_err(PdfReadError::from_io)
+            .map(|mut result| {
+                display_enumerated_pages(&mut result, &read);
+                result
+            });
             coordinator_worker.complete(&key_worker, request_id, result);
         })
     {
@@ -7207,6 +7467,218 @@ mod tests {
     }
 
     #[test]
+    fn navigation_preflight_cancel_releases_last_waiter_and_pool_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cancel.pdf");
+        let pool = TestPdfEnumeratePool::new(&path);
+        let cancel = Arc::new(NavigationPreflightCancel::new());
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            enumerate_pages_for_navigation(
+                &worker_path,
+                None,
+                &worker_cancel,
+                EnumerateOptions::default(),
+            )
+        });
+        let job = pool.take();
+        assert_eq!(job.priority(), JobPriority::Critical);
+        cancel.cancel();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(
+            job.cancelled(),
+            "last waiter must cancel the queued pool request"
+        );
+        let key = PdfEnumerateKey::new(&path, None);
+        assert!(
+            !pdf_enumerate_coordinator()
+                .state
+                .lock()
+                .unwrap()
+                .running
+                .contains_key(&key)
+        );
+        // A replacement must not join the cancelled request, and a late old completion
+        // must not consume the replacement's coordinator entry.
+        let replacement = enumerate_pages_async(&path, None);
+        let next = pool.take();
+        job.complete(9);
+        assert!(matches!(
+            replacement.rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        next.complete(1);
+        assert_eq!(
+            replacement
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .pages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn navigation_preflight_cancel_preserves_another_navigation_waiter() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shared.pdf");
+        let pool = TestPdfEnumeratePool::new(&path);
+        let cancel = Arc::new(NavigationPreflightCancel::new());
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            enumerate_pages_for_navigation(
+                &worker_path,
+                Some("secret"),
+                &worker_cancel,
+                EnumerateOptions {
+                    want_direction: true,
+                },
+            )
+        });
+        let job = pool.take();
+        let sibling = enumerate_pages_async_with_options(
+            &path,
+            Some("secret"),
+            EnumerateOptions {
+                want_direction: true,
+            },
+        );
+        let key = PdfEnumerateKey::with_options(
+            &path,
+            Some("secret"),
+            EnumerateOptions {
+                want_direction: true,
+            },
+        );
+        assert_eq!(
+            pdf_enumerate_coordinator().state.lock().unwrap().running[&key]
+                .waiters
+                .len(),
+            2
+        );
+        cancel.cancel();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(!job.cancelled());
+        assert_eq!(
+            pdf_enumerate_coordinator().state.lock().unwrap().running[&key]
+                .waiters
+                .len(),
+            1
+        );
+        job.complete(2);
+        assert_eq!(
+            sibling
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .pages
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn navigation_preflight_cancel_before_registration_does_not_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cancelled.pdf");
+        let pool = TestPdfEnumeratePool::new(&path);
+        let cancel = NavigationPreflightCancel::new();
+        cancel.cancel();
+        let result =
+            enumerate_pages_for_navigation(&path, None, &cancel, EnumerateOptions::default());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(pool.pool.queue.0.lock().unwrap().critical.is_empty());
+    }
+
+    #[test]
+    fn navigation_preflight_preserves_epub_generation_and_typed_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.epub");
+        for failure in [
+            PdfReadError::NotConverted,
+            PdfReadError::EpubUnavailable {
+                reason: Arc::from("unavailable"),
+            },
+        ] {
+            let _failure = fail_epub_for_test(&source, failure.clone());
+            let result = enumerate_pages_for_navigation(
+                &source,
+                None,
+                &NavigationPreflightCancel::new(),
+                EnumerateOptions::default(),
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), failure.kind());
+            assert!(matches!(
+                (typed_read_error(&error).unwrap(), failure),
+                (PdfReadError::NotConverted, PdfReadError::NotConverted)
+                    | (
+                        PdfReadError::EpubUnavailable { .. },
+                        PdfReadError::EpubUnavailable { .. }
+                    )
+            ));
+        }
+        let _pin = pin_epub_with_direction_for_test(&source, 77, 123, PdfReadingDirection::R2L);
+        let read = resolve_read_target(&source).unwrap();
+        let pool = TestPdfEnumeratePool::new(read.read_path.as_path());
+        let worker_source = source.clone();
+        let worker = std::thread::spawn(move || {
+            enumerate_pages_for_navigation(
+                &worker_source,
+                None,
+                &NavigationPreflightCancel::new(),
+                EnumerateOptions {
+                    want_direction: true,
+                },
+            )
+        });
+        let job = pool.take();
+        assert_eq!(job.priority(), JobPriority::Critical);
+        // The lib test has no process startup gate. Reuse its pinned worker target
+        // at the same shared admission boundary that the UI reaches after startup.
+        let sibling = subscribe_known_enumeration(
+            pdf_enumerate_coordinator(),
+            &source,
+            resolve_read_target(&source).unwrap(),
+            None,
+            EnumerateOptions {
+                want_direction: true,
+            },
+            start_enumerate_worker,
+        );
+        job.complete(1);
+        let result = worker.join().unwrap().unwrap();
+        assert_eq!(result.direction, Some(PdfReadingDirection::R2L));
+        assert!(matches!(
+            result.stamp,
+            Some(DocumentStamp::Generation {
+                id: 77,
+                pdf_size: 123
+            })
+        ));
+        assert_eq!(
+            sibling
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .direction,
+            result.direction
+        );
+    }
+
+    #[test]
     fn enumerate_pdf_app_handoff_joins_before_previous_handle_is_dropped() {
         let logical = Path::new("same.pdf");
         let mut issued = Vec::new();
@@ -7263,6 +7735,154 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn enumerate_admission_cancelled_ui_starts_for_joined_preflight() {
+        for drop_ui in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("joined.pdf");
+            let pool = TestPdfEnumeratePool::new(&path);
+            let (ui, task) = pending_enumerate_admission(&path);
+            let mut ui = Some(ui);
+            let cancel = Arc::new(NavigationPreflightCancel::new());
+            let mut preflight = None;
+            run_pdf_enumerate_admission_before_start(task, || {
+                let worker_path = path.clone();
+                let worker_cancel = Arc::clone(&cancel);
+                preflight = Some(std::thread::spawn(move || {
+                    enumerate_pages_for_navigation(
+                        &worker_path,
+                        None,
+                        &worker_cancel,
+                        EnumerateOptions::default(),
+                    )
+                }));
+                let coordinator = pdf_enumerate_coordinator();
+                let key = PdfEnumerateKey::new(&path, None);
+                let (state, _) = coordinator
+                    .registered
+                    .wait_timeout_while(
+                        coordinator.state.lock().unwrap(),
+                        std::time::Duration::from_secs(5),
+                        |state| {
+                            state
+                                .running
+                                .get(&key)
+                                .is_none_or(|running| running.waiters.len() != 2)
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    state.running[&key].waiters.len(),
+                    2,
+                    "preflight must join before UI cancellation"
+                );
+                drop(state);
+                if drop_ui {
+                    drop(ui.take());
+                } else {
+                    ui.as_ref().unwrap().cancel();
+                }
+            });
+            let job = pool.take();
+            assert_eq!(job.priority(), JobPriority::Critical);
+            assert!(!job.cancelled());
+            job.complete(2);
+            assert_eq!(preflight.unwrap().join().unwrap().unwrap().pages.len(), 2);
+            if let Some(ui) = ui {
+                assert_eq!(
+                    ui.rx.recv().unwrap().unwrap_err().kind(),
+                    std::io::ErrorKind::Interrupted
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enumerate_admission_cancelled_ui_starts_for_joined_ui() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("joined-ui.pdf");
+        let pool = TestPdfEnumeratePool::new(&path);
+        let (ui, task) = pending_enumerate_admission(&path);
+        let mut sibling = None;
+        run_pdf_enumerate_admission_before_start(task, || {
+            sibling = Some(enumerate_pages_async(&path, None));
+            ui.cancel();
+        });
+        let job = pool.take();
+        assert!(!job.cancelled());
+        job.complete(1);
+        assert_eq!(
+            sibling
+                .unwrap()
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .pages
+                .len(),
+            1
+        );
+        assert_eq!(
+            ui.rx.recv().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn enumerate_admission_last_ui_cancel_does_not_enqueue() {
+        for drop_ui in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("last.pdf");
+            let pool = TestPdfEnumeratePool::new(&path);
+            let (ui, task) = pending_enumerate_admission(&path);
+            let mut ui = Some(ui);
+            run_pdf_enumerate_admission_before_start(task, || {
+                if drop_ui {
+                    drop(ui.take());
+                } else {
+                    ui.as_ref().unwrap().cancel();
+                }
+            });
+            let q = pool.pool.queue.0.lock().unwrap();
+            assert!(q.critical.is_empty() && q.high_normal.is_empty() && q.normal.is_empty());
+            assert!(
+                !pdf_enumerate_coordinator()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .running
+                    .contains_key(&PdfEnumerateKey::new(&path, None))
+            );
+            if let Some(ui) = ui {
+                assert_eq!(
+                    ui.rx.recv().unwrap().unwrap_err().kind(),
+                    std::io::ErrorKind::Interrupted
+                );
+            }
+        }
+    }
+
+    fn pending_enumerate_admission(path: &Path) -> (PdfEnumerateHandle, PdfEnumerateAdmissionTask) {
+        let (reply, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let lease = Arc::new(Mutex::new(None));
+        (
+            PdfEnumerateHandle {
+                cancel: Arc::clone(&cancel),
+                rx,
+                lease: Arc::clone(&lease),
+            },
+            PdfEnumerateAdmissionTask {
+                logical: path.to_owned(),
+                password: None,
+                options: EnumerateOptions::default(),
+                cancel,
+                lease,
+                reply,
+            },
+        )
     }
 
     #[test]

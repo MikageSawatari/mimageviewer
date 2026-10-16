@@ -171,11 +171,13 @@ Assert-OrderedText $testFull @(
     'public static extern uint SetErrorMode(uint mode);',
     'public static extern uint GetErrorMode();',
     '$effectiveMode = [MivTestErrorMode]::GetErrorMode()',
-    '& cargo test --workspace --features pack-build-tools --no-fail-fast',
-    '& cargo test --manifest-path vendor/egui/Cargo.toml --lib',
-    '& cargo test -p egui-winit --lib',
-    '& cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib',
-    '& cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib',
+    '& cargo nextest --version',
+    '& cargo nextest run --workspace --features pack-build-tools @nextestArgs',
+    '& cargo test --workspace --features pack-build-tools --doc --no-fail-fast',
+    '& cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib @nextestArgs',
+    '& cargo nextest run -p egui-winit --lib @nextestArgs',
+    '& cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib @nextestArgs',
+    '& cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib @nextestArgs',
     '[void][MivTestErrorMode]::SetErrorMode($modeBefore)',
     '$restoredMode = [MivTestErrorMode]::GetErrorMode()',
     'exit $gateExit'
@@ -266,7 +268,7 @@ exit $LASTEXITCODE
     $baselineExit = $LASTEXITCODE
     Assert-True ($baselineExit -eq 0) "test-full default success stub returned $baselineExit; output: $($baselineOutput -join ' | ')"
     $baselineCalls = @(Get-Content -LiteralPath $baselineLog -Encoding UTF8)
-    Assert-True ($baselineCalls.Count -eq 5) "test-full default path invoked cargo $($baselineCalls.Count) times"
+    Assert-True ($baselineCalls.Count -eq 7) "test-full default path invoked cargo $($baselineCalls.Count) times"
     Assert-True (-not (($baselineOutput -join "`n").Contains('crash-dialog suppression active'))) 'test-full default path enabled crash-dialog suppression'
 
     $successLog = Join-Path $testRootFull 'success.log'
@@ -274,18 +276,40 @@ exit $LASTEXITCODE
     $successExit = $LASTEXITCODE
     Assert-True ($successExit -eq 0) "test-full success stub returned $successExit; output: $($successOutput -join ' | ')"
     $successCalls = @(Get-Content -LiteralPath $successLog -Encoding UTF8)
-    Assert-True ($successCalls.Count -eq 5) "test-full success path invoked cargo $($successCalls.Count) times"
+    Assert-True ($successCalls.Count -eq 7) "test-full success path invoked cargo $($successCalls.Count) times"
     Assert-True ((@($successCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a success-path cargo child did not inherit both error-mode bits'
     Assert-True (($successOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full success path did not report error-mode restoration'
 
-    $failureLog = Join-Path $testRootFull 'failure.log'
-    $failureOutput = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $stubRunner -TestFull $testFullPath -FakeCargo $fakeCargo -CargoLog $failureLog -FailCall 2 -FailCode 37 -SuppressCrashDialogs 2>&1)
-    $failureExit = $LASTEXITCODE
-    Assert-True ($failureExit -eq 37) "test-full did not preserve failing cargo exit 37 (actual $failureExit); output: $($failureOutput -join ' | ')"
-    $failureCalls = @(Get-Content -LiteralPath $failureLog -Encoding UTF8)
-    Assert-True ($failureCalls.Count -eq 2) "test-full retried or continued after failure (cargo calls: $($failureCalls.Count))"
-    Assert-True ((@($failureCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a failure-path cargo child did not inherit both error-mode bits'
-    Assert-True (($failureOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full failure path did not report error-mode restoration'
+    $expectedStages = @(
+        'nextest --version',
+        'nextest run --workspace --features pack-build-tools',
+        'test --workspace --features pack-build-tools --doc --no-fail-fast',
+        'nextest run --manifest-path vendor/egui/Cargo.toml --lib',
+        'nextest run -p egui-winit --lib',
+        'nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib',
+        'nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib'
+    )
+    for ($i = 0; $i -lt $expectedStages.Count; $i++) {
+        Assert-True ($successCalls[$i].Contains('args=' + $expectedStages[$i])) "wrong gate stage $i"
+        if ($i -ne 0 -and $i -ne 2) {
+            Assert-True ($successCalls[$i].Contains('--config-file ' + (Join-Path $repoRoot '.config/nextest.toml'))) "stage $i does not use root nextest config"
+            Assert-True ($successCalls[$i].EndsWith('--profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail')) "stage $i can omit tests or retry"
+        }
+    }
+    # Every stage, including missing nextest and doctests, must stop the gate.
+    foreach ($failCall in 1..7) {
+        $failureLog = Join-Path $testRootFull "failure-$failCall.log"
+        $failureOutput = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $stubRunner -TestFull $testFullPath -FakeCargo $fakeCargo -CargoLog $failureLog -FailCall $failCall -FailCode 37 -SuppressCrashDialogs 2>&1)
+        $failureExit = $LASTEXITCODE
+        Assert-True ($failureExit -eq 37) "stage $failCall did not preserve failing cargo exit 37 (actual $failureExit); output: $($failureOutput -join ' | ')"
+        $failureCalls = @(Get-Content -LiteralPath $failureLog -Encoding UTF8)
+        Assert-True ($failureCalls.Count -eq $failCall) "test-full retried or continued after stage $failCall failure (cargo calls: $($failureCalls.Count))"
+        Assert-True ((@($failureCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a failure-path cargo child did not inherit both error-mode bits'
+        Assert-True (($failureOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full failure path did not report error-mode restoration'
+        if ($failCall -eq 1) {
+            Assert-True (($failureOutput -join "`n").Contains('cargo install cargo-nextest --locked')) 'missing nextest did not print installation instructions'
+        }
+    }
 } finally {
     $resolvedTestRoot = [System.IO.Path]::GetFullPath($testRootFull).TrimEnd('\')
     Assert-True ($resolvedTestRoot.Equals($testRootFull, [System.StringComparison]::OrdinalIgnoreCase)) 'temporary cleanup target changed'

@@ -347,6 +347,13 @@ active値は従来の`settings.facet_filter`で、設定・履歴DBのschema/key
 採用後に既存sidecar continuationを開始し、復元後にselection、startup intent、folder/ZIPの
 first-displayとdeferred fullscreenを仕上げる。sidecarのwarning/resumeでも履歴/facetを再採用しない。
 新items世代を検証するhydration ownerと、採用前のsource proofは目的が異なる。
+after-hydration のフルスクリーン再オープン予約（DFS の fullscreen 継続／RequiredFullscreen）も
+sidecar continuation が所有し、待機述語は current context・世代・source・live/cancel・items数を
+照合してその所有者から答える。任意の deferred page open に必要な旧 holdover の所有ゲートとは
+分け、true close は予約だけを消費して一覧の hydration を継続する。
+`56c11e621`（v4.5.0）で再オープンを採用直後から hydration 後へ移した際、この予約が待機判定から
+漏れたため、v4.7.0 で PDF 間 Ctrl+↑↓ の viewport hide／ちらつきが報告された。
+再オープンの時点は戻さず、ZIP・変換 cache を含む共通 continuation の待機と取消を補う。
 row依存要求は既存items世代・revision証明を維持し、Smartのsurface leaseは同じownerの
 PDF verification/Collection revision更新を許す。別context/path/同ID再openは許さない。
 ブックマークのresolver/書庫要求はnative request IDとreturn targetを証明に使い、同じ要求中の
@@ -669,6 +676,19 @@ convert failure の素材だけ成功セルを維持したまま software full-f
 file-local fallback する。close / 動画切替 / fullscreen 終了の cancel owner は変わらない。
 
 通常 PDF と固定済み EPUB の列挙は呼出元で合流登録し、新しい実行要求だけ `pdf-enumerate-nav` スレッドを起こす。未固定 EPUB の admission は専用の背景スレッドで source stat・DB 照合・登録・エンコードを行う。固定表 mutex はメモリ検索・挿入だけを保護し、stat・DB 照合中は保持しない。同じ実読込パスへの追加 waiter はスレッドを増やさない。
+
+ナビゲーション preflight（物理 staged／履歴、コレクション候補、PDF パスワード再開）の
+PDF 列挙も、利用者が採用を待つため同じナビ用列挙（Critical）と実行中要求の合流を使う。
+v4.2.0 の staged 化で背景用の同期列挙（Normal）を通るようになり、旧本の可視サムネイル
+（HighNormal）を待つ退行が入っていた。背景の metadata／cache／Remote 等は Normal を維持する。
+preflight worker は結果と取消通知を channel select で待ち、取消時はその待ち手の lease だけを
+離脱させる。最後の待ち手だけが既存の source cancel を立てる。候補間で待ち手を持ち越さない。
+登録で `Start` を得た admission は、起点の UI 待ち手が取り消されても共有 worker の起動責任を保つ。
+起動を省略するのは、全待ち手の離脱で `source_cancel` が立った場合だけとし、合流済み待ち手を残して起動を捨てない。
+read target は従来と同じ worker 解決・EPUB lease を使い、合流キーは
+`(read_path, password, want_direction)` のまま。取消監視の polling や新しい優先度枠は追加しない。
+既存の連続ナビを保つためモーダル化は行わず、列挙と取消の所有を既存 coordinator に揃える。
+Critical 同士は既存レーンを共有するため、前面描画に対する専用の追加予約はない。
 
 EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、対象範囲lease内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。範囲外の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 

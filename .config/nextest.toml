@@ -1,4 +1,5 @@
-# Unit/integration iteration only. scripts/test-full.ps1 retains cargo test.
+# Unit/integration iteration and scripts/test-full.ps1 (workspace + vendor libs).
+# The full gate runs workspace doctests separately with cargo test --doc.
 nextest-version = "0.9.143"
 
 [profile.default]
