@@ -100,6 +100,11 @@ impl OverlayGpuService {
             callback_latch.latch_if_generation(generation);
         });
 
+        let diagnostic_identity = if crate::perf::is_enabled() {
+            Some(OverlayAdapterIdentity::query(&adapter, &device))
+        } else {
+            None
+        };
         let epoch = Arc::new(DeviceEpoch {
             generation,
             adapter,
@@ -107,6 +112,7 @@ impl OverlayGpuService {
             queue,
             gate: OverlayGpuGate::default(),
             loss_latch,
+            diagnostic_identity,
         });
         epochs.push(Arc::clone(&epoch));
         Ok(DeviceEpochSelection {
@@ -132,11 +138,22 @@ pub(super) struct DeviceEpoch {
     queue: wgpu::Queue,
     gate: OverlayGpuGate,
     loss_latch: Arc<DeviceLossLatch>,
+    // Read-only diagnostic facts; never used for device selection or loss handling.
+    diagnostic_identity: Option<OverlayAdapterIdentity>,
 }
 
 impl DeviceEpoch {
     pub(super) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Cached only when perf is enabled. The actual DX12 device LUID is the
+    /// identity; matching adapter names/vendor IDs alone cannot prove sameness.
+    pub(super) fn diagnostic_identity(&self) -> Option<&OverlayAdapterIdentity> {
+        if !crate::perf::is_enabled() {
+            return None;
+        }
+        self.diagnostic_identity.as_ref()
     }
 
     pub(super) fn adapter(&self) -> &wgpu::Adapter {
@@ -173,6 +190,61 @@ impl DeviceEpoch {
             Ok(())
         }
     }
+}
+
+pub(super) struct OverlayAdapterIdentity {
+    pub(super) name: String,
+    pub(super) vendor: u32,
+    pub(super) device: u32,
+    pub(super) backend: String,
+    pub(super) device_type: String,
+    pub(super) driver: String,
+    pub(super) driver_info: String,
+    /// [LowPart, HighPart bits], matching the D3D11 DXGI LUID representation.
+    pub(super) luid: Option<[u32; 2]>,
+    pub(super) unknown_reason: Option<&'static str>,
+}
+
+impl OverlayAdapterIdentity {
+    fn query(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Self {
+        let info = adapter.get_info();
+        let (luid, unknown_reason) = dx12_device_luid(device);
+        Self {
+            name: info.name,
+            vendor: info.vendor,
+            device: info.device,
+            backend: format!("{:?}", info.backend),
+            device_type: format!("{:?}", info.device_type),
+            driver: info.driver,
+            driver_info: info.driver_info,
+            luid,
+            unknown_reason,
+        }
+    }
+
+    /// Creation-boundary payload, never called for per-frame accumulation.
+    pub(super) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name, "vendor": self.vendor, "device": self.device,
+            "backend": self.backend, "device_type": self.device_type,
+            "driver": self.driver, "driver_info": self.driver_info,
+            "luid": self.luid, "identity": if self.luid.is_some() { "known" } else { "unknown" },
+            "unknown_reason": self.unknown_reason,
+        })
+    }
+}
+
+fn dx12_device_luid(device: &wgpu::Device) -> (Option<[u32; 2]>, Option<&'static str>) {
+    // SAFETY: This guard only borrows the existing wgpu DX12 device. The COM
+    // query is read-only, does not submit/wait/destroy, and only scalar LUID
+    // bits escape; neither the raw COM pointer nor the HAL guard is retained.
+    let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }) else {
+        return (None, Some("dx12_hal_device_unavailable"));
+    };
+    // SAFETY: raw_device is alive for the HAL borrow and GetAdapterLuid only
+    // returns the immutable adapter identity (it has no HRESULT failure path).
+    let luid = unsafe { hal_device.raw_device().GetAdapterLuid() };
+    (Some([luid.LowPart, luid.HighPart as u32]), None)
 }
 
 #[derive(Default)]

@@ -32,6 +32,31 @@
 
 ## 1. 優先候補
 
+### 1.387 サブモニターの動画全画面で HUD の点滅が残る — 5ch >>557〜570 (2026-10-16)
+
+- 状態: **未着手・先行改善と診断は着手可能**。開発側では未再現だが、利用者決定 (2026-10-16) により、再現待ちだけで止めず、根拠のある改善と切り分けを順に進める。以下は全件を同時に製品へ入れる指示ではなく、機能・画質・性能を維持できる対策を段階的に実施する候補一覧。詳細・根拠・実施条件の正本は [点滅調査 §7](video-secondary-monitor-flicker-investigation.md#7-v470後の残存報告と対策台帳2026-10-16)。
+- 既知条件 (報告者): F11 / F12→F11 の両方、拡張表示の FHD 側だけ、同一 GPU の DVI-D / HDMI、100% / 60Hz。カーソル位置に関係なく UI 全体が点滅し、一時停止・上 HUD 固定で収まるが下固定は無効。720p は OS 拡大で収まるが 1080p は収まらない。これらを再質問しない。
+- v4.7.0 の `27fa289ee` は自前 raise の `SWP_NOSENDCHANGING` と NOZORDER 通知の除外を実装済み。>>570 は「完全な解消は難しかったよう」との返信で、未解消の趣旨だが改善量・再試験条件は不明。修正漏れやドライバー原因と断定せず、自己循環の修正を未着手へ戻さない。
+
+**先に進める改善・計測**
+
+- [ ] **定常再生中の軽い診断**: raise の要求元・適用/不適用数、geometry 要求/実変更数、region の hash と実描画状態、DComp attach/detach/Commit、動画/HUD の Present と surface 更新を window epoch・時刻で関連付ける。source/SAR/回転、映像/各 HWND の矩形、実効ロック、モニター/DPI、D3D11/DX12 の adapter identity も変化時に記録する。1秒程度の集約とし、同期 I/O や新しい常時 tick は追加しない。既存 observer は遷移外を記録しないため、それだけで完了にしない。
+- [ ] **HUD geometry の冪等化**: 同一位置・サイズへの `SetWindowPos` を owner 境界で省く。Resize / GeometryChanged / DPI / F11 / monitor 移動 / 再生成を同じ境界で確認し、外部変更後の再適用を落とさない。上流の z-order-only 通知除外や renderer の同サイズ判定だけでは HWND 操作は抑制されていない。ただし定常再生での反復と点滅への因果は未確認。
+- [ ] **HUD の attach/detach を最終描画境界へ集約**: 1 input batch 内の複数 logical pass の途中で非表示になっても、その時点で実 DComp detach を発行しない設計を確認する。最終表示結果に一度だけ適用し、最終表示なのに中間で detach/再attach/Commit する経路を除く。最終非表示・無描画・close/cancel・device/surface 終端と delta 完結は維持する。入力のない常時点滅の原因とまでは扱わない。
+- [ ] **必要な場合だけ前面化する所有規則**: 実 z-order と正規要求の由来を確認し、既に正しい順序なら不要な操作を減らす案を検討・検証する。VST editor/popup の非同期変更後の復旧、0/16/50ms burst、foreground/epoch/transition permit を維持し、予約時点の一度の判定だけで後続復旧を消さない。§1.385 と整合させ、EffeTune を無条件に VST allowlist へ加えない。
+- [ ] **§1.382 の egui/wgpu 更新前後比較**: 0.37 更新計画 (作業ツリー `G:\home\mimageviewer-egui036\docs\egui-0.37-update-plan.md` §4.9) と連携する。HUD の renderer/present と余分な repaint の本家修正は関係し得るが、動画 D3D11・分離 HWND・基本 Present 方式は維持する計画であり、更新だけで点滅が解消するとは告知しない。透明 alpha、色空間、VSync/latency、実矩形・実効ロックを照合し、前後比較用ログを残す。
+
+**開発側の診断比較と、その結果による追加対策**
+
+- [ ] **映像の寸法と位置・重なりを分離**: 同一1080p動画で、映像寸法を固定して Y 位置/上 HUD との重なりだけを変える診断を行う。上/下固定の差を「縮小したから」だけで説明しない。720p/1080p・4:3/16:9・OS/アプリ拡大も既知結果と照合する。
+- [ ] **分離 HUD の有無**: `MIV_HUD_OVERLAY=0` の既存 fallback と通常経路を比較する。fallback は VST editor 裏へ HUD が潜り得るため、比較結果だけで製品の既定へ変更せず、必要なら z-order/入力を保つ合成構成の再設計へ進む。
+- [ ] **透明カバーの有無・合成経路**: 既存 `MIV_DISABLE_MPO_COVER` の有無を個別比較し、透明カバーの実効性を測る。同じカバーの重複追加や、完全透明だから MPO を抑止できるという決め付けをしない。位置・カバー・swap chain 属性が関係すると分かったら、既存画素・拡大品質・操作を保つ局所変更を設計する。
+- [ ] **PresentMon/ETW の確認**: アプリの配置・region・attach・raise が安定しているなら、動画/HUD swap chain 別の PresentMode・表示時刻をアプリ時刻と突き合わせる。Present 成功や画面キャプチャに映らないことを、物理表示が正常な証拠にしない。
+- [ ] **必要な場合の表示同期・合成構成の設計**: 上の証拠に応じて submit/present の順序・同期、surface 寿命/色空間/alpha/latency、HUD と動画の同一 DComp tree 等を検討する。単一 HWND 化や Present 方式の交換は独立した大きい設計単位。遅延・GPU負荷増、VST前面操作や既存機能の縮小を伴う案は、具体的な費用と代案を示して利用者判断を取る。
+- 今は採らない回避策も調査 §7 に保持する: 上固定/1px余白/微小な不透明面の強制、OS拡大の強制、等倍でも全件shader化、WINDOWPOS由来raiseの全廃、Windows全体のMPO無効化やdriver変更の報告者への依頼。`CreateSwapChainForComposition` に合わない bitblt / `DXGI_SCALING_NONE` への属性だけの変更は行わない。
+- 受入: 改善ごとに独立した差分・回帰と実施結果を残し、設定/画質/表示領域、VST/EffeTune、上下HUD/パネル/ストリップ、IME/focus、最前面、F11/F12・park/promote・複数窓を維持する。detached へ触れる変更は構造的修正の合意を取る。実画面試験は隔離portableと当該runの承認が必要。報告者へ思い付きの試験や既回答の質問を重ねず、追加依頼が必要なら通常操作1回と診断ZIP程度へ集約する。
+- 規模 / 優先度: 先行改善・診断 Small〜Medium / P2。合成構成の再設計は証拠次第で Medium〜Large。次版への一括収録や点滅解消を確約しない。
+
 ### 1.386 Everything 検索 (Ctrl+R) が使えないとき、理由が分からない — 利用者の実機観測 (2026-10-16)
 - 観測 (利用者、v4.7.0): 動画を別ウィンドウ (メインと連動) で開いている間、「ファイル」→「Everything ファイル名検索…」が灰色になり、Ctrl+R を押しても何も起きない。メニューにマウスを乗せても理由が出ず、Ctrl+R でも通知が出ない。
 - 原因 (コード参照): `everything_search_entry_allowed` (src/global_search_ui/everything.rs) が `everything_main_grid_available` (fullscreen_idx・連動 detached の main history 抑止・native video fullscreen) と modal・Remote lock を見て無効にする。設計 docs/everything-search-plan.md の「発火面は main grid のみ」による仕様。Ctrl+G (アイテム検索) にはこの制限が無く、動きがそろっていない。
@@ -145,6 +170,32 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 本の全ページを見渡し、選んだページへ戻れる表示を検討する。現行サムネイルストリップは前後の確認用で、全ページ一覧の代わりにはならない。
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
+
+### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
+
+- 観測 (このセッションの全件実行の記録。単独で再実行するとどれも成功):
+  - ページめくり D2 のブランチで本体 lib 全件を 3 回回したとき、3 / 2 / 1 件が落ちた。別の作業ツリー (§1.387) でも
+    同時に全件テストが走っていた時間帯。落ちたのは `detached_native_video_navigation_syncs_main_selection` (worker 未完了)、
+    `streaming_drain_and_reacquire_between_frames_do_not_restore_local_view` (AcquiringRemote のまま)、
+    `abort_on_cancel_returns_interrupted_immediately` (218ms で時間上限)、
+    `finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch` (producer 完了待ち timeout)、
+    `startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` (scan marker 不一致)、
+    `incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls` (similar array の base publish の `MoveFileExW` がアクセス拒否 → 120 秒で timeout)。
+    記録の正本は [page-turn 計画 §27](page-turn-animation-plan.md) の D2 検証記録。
+  - §1.387 を master へ取り込んだ直後 (`578c0bced`) の全件で 5 件が落ちた。別の作業ツリーで Codex がビルド中だった。
+    すべてページめくりの実時計を使うテスト: `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`、
+    `permission_service_handlers_pdf_zip_automatic_and_composed_turn_on_receipt`、
+    `page_turn_permission_service_vacant_composed_handler_starts_and_completes_both_ways`、
+    `page_turn_gap_setting_change_before_repaint_skips_stale_outgoing_at_acceptance`、
+    `page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_backward`。
+  - 何も並行しない状態の全体テスト (master `f69942205`・`76aebc18f` の test-full) では全件成功している。
+- 見込み (コードの読み): worker 待ち・時間上限・producer 待ち・ページめくりの 5 件は、実時間の上限や実時計の進み具合に
+  依存していて負荷で外れる、で説明が付く (ページめくりは `draw_current` が実時計を読むので、遅いフレームで途中の状態を飛ばす)。
+  **scan marker 不一致と `MoveFileExW` のアクセス拒否の 2 件は、負荷だけでは説明できない** (独立レビューの指摘)。
+- 方針: 実時計に依存するテストは fake clock / 明示的な時刻注入へ移す (ページめくり D4 で時計を型に分けるのに合わせる)。
+  時間上限は負荷で変わらない検査 (完了の通知・状態) に置き換える。上の 2 件は、テスト同士が同じファイル・同じ marker を
+  共有していないかを先に調べる。assert を弱めない、retry を足さない。§1.321 / §1.334 と同じ系統。
+- 規模 / 優先度: Small〜Medium / P2 (全件テストの偽失敗でリリース判断が止まる)。
 
 ### 1.334 `zip_loader::tests::shared_directory_cache_reparses_when_the_archive_identity_changes` が全体実行でまれに落ちる — テスト側の共有キャッシュ (2026-10-05)
 

@@ -461,6 +461,7 @@ pub(super) fn draw_native_video_left_panel(
     creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
+    painted_rect_out: Option<&mut Option<egui::Rect>>,
 ) -> bool {
     let panel_rect = native_jump_panel_rect(overlay_height_points, bottom_bar_height);
     let mut close_clicked = false;
@@ -470,6 +471,9 @@ pub(super) fn draw_native_video_left_panel(
         .fixed_pos(panel_rect.min)
         .show(ctx, |ui| {
             ui.set_min_size(panel_rect.size());
+            if let Some(out) = painted_rect_out {
+                *out = Some(panel_rect);
+            }
             let painter = ui.painter().clone();
             painter.rect_filled(
                 panel_rect,
@@ -4380,6 +4384,7 @@ const NATIVE_TOP_BAR_RIGHT_PAD: f32 = 12.0;
 // The render routes return this witness so layout tests exercise their actual control responses.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct NativeTopBarLayout {
+    pub(super) painted_rect: Option<egui::Rect>,
     pub(super) controls_rect: Option<egui::Rect>,
     pub(super) vst_button_rect: Option<egui::Rect>,
     pub(super) text_rect: egui::Rect,
@@ -4460,6 +4465,7 @@ pub(super) fn draw_top_bar_text_lines(
         });
 
     NativeTopBarLayout {
+        painted_rect: None,
         controls_rect,
         vst_button_rect: None,
         text_rect,
@@ -5015,7 +5021,7 @@ pub(super) fn draw_native_top_bar(
                 vst_button_rect = Some(vst3_rect);
                 include_native_top_bar_control(&mut controls_rect, vst3_rect);
             }
-            let layout = draw_top_bar_text_lines(
+            let mut layout = draw_top_bar_text_lines(
                 &painter,
                 overlay_width_points,
                 controls_rect,
@@ -5027,6 +5033,7 @@ pub(super) fn draw_native_top_bar(
             if dimmed {
                 painter.rect_filled(rect, 0.0, native_hud_dim_color());
             }
+            layout.painted_rect = Some(rect);
             layout
         });
 
@@ -5193,7 +5200,7 @@ pub(super) fn draw_native_top_bar_tile(
                 commands,
             );
             include_native_top_bar_control(&mut controls_rect, less_rect);
-            let layout = draw_top_bar_text_lines(
+            let mut layout = draw_top_bar_text_lines(
                 &painter,
                 overlay_width_points,
                 controls_rect,
@@ -5205,6 +5212,7 @@ pub(super) fn draw_native_top_bar_tile(
             if dimmed {
                 painter.rect_filled(rect, 0.0, native_hud_dim_color());
             }
+            layout.painted_rect = Some(rect);
             layout
         })
         .inner
@@ -5312,7 +5320,7 @@ pub(super) fn draw_native_navigation_preview(
                 NativeOverlayCommand::CloseFullscreen,
                 commands,
             );
-            draw_top_bar_text_lines(
+            let mut layout = draw_top_bar_text_lines(
                 &painter,
                 overlay_width_points,
                 Some(close_rect),
@@ -5320,7 +5328,9 @@ pub(super) fn draw_native_navigation_preview(
                 &preview.subtitle,
                 88,
                 120,
-            )
+            );
+            layout.painted_rect = Some(rect);
+            layout
         })
         .inner
 }
@@ -6100,6 +6110,7 @@ pub(super) fn draw_native_metadata_panel(
     click_to_show: bool,
     info_panel_locked: bool,
     effective_info_panel_locked: bool,
+    painted_rect_out: Option<&mut Option<egui::Rect>>,
 ) {
     let rect = native_metadata_panel_rect(
         overlay_width_points,
@@ -6112,6 +6123,9 @@ pub(super) fn draw_native_metadata_panel(
         .show(ctx, |ui| {
             ui.set_min_size(rect.size());
             let rect = ui.min_rect();
+            if let Some(out) = painted_rect_out {
+                *out = Some(rect);
+            }
             let painter = ui.painter();
             painter.rect_filled(
                 rect,
@@ -7943,6 +7957,7 @@ pub(crate) mod tests {
                     true,
                     true,
                     false,
+                    None,
                 );
                 captured_for_ui.lock().unwrap().extend(commands);
             });
@@ -8856,6 +8871,7 @@ pub(crate) mod tests {
                     &creative_luts,
                     &mut commands,
                     false,
+                    None,
                 );
             });
 

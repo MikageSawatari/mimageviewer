@@ -5335,6 +5335,46 @@ readyのproofとnavigatorも提出materialを共有し、Nativeのsource cache�
 D1r `cc4e775c1`の独立設計レビューでこの方向は構造修正として合意済みであり、利用者からACCEPTと
 D2実装承認を受けた。実装差分・自動検証・未確認事項の正本は[page-turn計画 §27.11](page-turn-animation-plan.md)。
 
+### §11 追補: §1.387 native HUDのowner境界を揃える I1（2026-10-16、実装・自動検証済み）
+
+§2を再読。正本は[動画サブモニター点滅調査 §8](video-secondary-monitor-flicker-investigation.md#8-a1a3-の先行改善設計-d1実装-i12026-10-16)。
+利用者からの引継ぎによると、D1 `66708856f` の独立 `gpt-6.1-sol` / `xhigh` レビューは
+指摘なしのACCEPTで、同レビュアーとClaudeCodeの双方が「症状パッチではなく構造的修正」に
+明示的に合意した。I1はv4.7.1の次のリリース向けにA1/A2/A3だけを実装する。
+この設計受入を、実装の独立レビュー・ClaudeCode検収・実機受入の完了とは扱わない。
+
+触れる範囲は既存video outputとwindow healthの診断相関、native window/pump/host/HUDの
+要求・実操作、native presenterのCPU/GPU描画境界と既存callerの失敗伝播、およびvideo内の
+診断helperと回帰に限る。Appのdetached述語、viewport生成、HWND捕捉、placement保存先、
+park/promote/mount/depositの所有権を変更しない。
+
+- A1はperf ONで同一output IDをpump/renderへ渡し、exact window epoch/role/owner内の
+  counterとsnapshotを既存出口で有界集約する。約1秒という条件はログ区間だけに使い、
+  表示・geometry・inputの時間窓や新しいtick/thread・同期I/O・待機にしない。
+- A2は既に所有するHUD HWNDについて、各要求時点の実screen rectをGetWindowRectで確認し、
+  正規化した要求の4辺と完全一致するときだけSetWindowPosを省く。要求cacheやrect一致による
+  host同定ではなく、同じownerが不要な副作用を作る境界の修正である。query失敗・外部変更後は
+  既存flagsの適用へ進み、DPI/ppp/surface処理や兄弟窓へskipを波及させない。
+- A3は既存batchが最終shapes/visibilityを一回の描画で公開する契約に合わせ、途中logical hiddenの
+  DComp detachを外し、Present後のfinalizerで最終visibilityを一回適用する。hidden cleanupや
+  egui delta/input/IME/commandは保持する。失敗時は成功tailへ進まず既存render fault/dropへ渡し、
+  candidate prime失敗は旧coreを保持する既存abortへ戻す。新しい可視性bool/pending・rollback・
+  retry・再生成・追加Presentを足すものではない。
+
+modal化やwindow閉鎖/再生成は再生・HUD/VST操作を制限するため採らず、既存geometry ownerと
+batch末尾の確定点へ処理を揃えて組合せを減らす。A4のraise抑制、A5の依存更新、DComp構成変更、
+上HUD強制固定や映像領域/画質変更は含めない。
+
+実装と本体lib全件の自動検証は完了した。独立`gpt-6.1-sol` / `xhigh`ソースレビューは
+指摘対応後ACCEPT。A2の実pump/SetWindowPos回帰とA3のproduction finalizer回帰は変異でredを
+確認し、復元後の関連回帰・test-script回帰・全libも成功した。全libは13,245成功・59除外、exit 0。
+初回のfixture不足等の失敗、補完と再実行条件、Git管理領域の書込み拒否によるcommit未作成も、
+証拠とともに調査文書§8.9へ記録した。
+その後ClaudeCodeが検収してcommitし (`53c57394d` / `5c9a83ada`)、完成時の独立レビューのP2 2件
+(診断snapshotの変換行列とHUD実矩形) を `675bea45d` で修正、同レビュアーの再レビューもACCEPTで、
+detached経路の構造的修正という判断も維持された。2026-10-16にmasterへ統合した。負荷測定と実機確認は未実施である。
+実機suiteは別途明示承認を必要とし、内部Present完了や回帰成功を報告者の物理点滅解消とは扱わない。
+
 ### 2026-10-16 egui 0.37 更新に伴う構造修正 (設計上の合意済み・未実装)
 
 [更新設計書第4.2版](egui-0.37-update-plan.md) §4.2・§4.5・§4.8・§4.9・§4.11の

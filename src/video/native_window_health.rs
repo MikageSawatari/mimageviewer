@@ -141,6 +141,7 @@ impl Drop for NativeRenderOperationGuard<'_> {
 
 /// Per-native-output state. Every field written after construction is atomic.
 pub(crate) struct NativeWindowHealth {
+    diagnostic_output_id: super::native_diagnostics::DiagnosticOutputId,
     started_at: Instant,
     pump_thread_id: AtomicU32,
     presenter_hwnd: AtomicU64,
@@ -194,6 +195,7 @@ pub(crate) struct NativeWindowHealth {
 impl NativeWindowHealth {
     pub(crate) fn new_registered() -> Arc<Self> {
         let health = Arc::new(Self {
+            diagnostic_output_id: super::native_diagnostics::DiagnosticOutputId::allocate(),
             started_at: Instant::now(),
             pump_thread_id: AtomicU32::new(0),
             presenter_hwnd: AtomicU64::new(0),
@@ -248,6 +250,10 @@ impl NativeWindowHealth {
             registry.push(Arc::downgrade(&health));
         }
         health
+    }
+
+    pub(crate) fn diagnostic_output_id(&self) -> super::native_diagnostics::DiagnosticOutputId {
+        self.diagnostic_output_id
     }
 
     fn now_stamp(&self) -> u64 {
