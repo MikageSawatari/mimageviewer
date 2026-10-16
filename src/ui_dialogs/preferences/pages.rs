@@ -1485,10 +1485,9 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     for kind in GridItemDisplayKind::ALL {
                         let selected = s.grid_display_order.row_for(kind) == row;
                         let response = ui.radio(selected, "");
-                        crate::ui_helpers::set_accessibility_label(
-                            &response,
-                            &format!("{} / {}", kind.label(), row + 1),
-                        );
+                        crate::ui_helpers::set_accessibility_label_with(&response, || {
+                            format!("{} / {}", kind.label(), row + 1)
+                        });
                         if response.clicked() {
                             s.grid_display_order.assign(kind, row);
                         }
@@ -1903,10 +1902,9 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     let included = stage <= current;
                     let mut selected = included;
                     let response = ui.checkbox(&mut selected, "");
-                    crate::ui_helpers::set_accessibility_label(
-                        &response,
-                        &format!("{name} / {}", stage.label()),
-                    );
+                    crate::ui_helpers::set_accessibility_label_with(&response, || {
+                        format!("{name} / {}", stage.label())
+                    });
                     if response.clicked() {
                         *field(&mut state.settings) = stage;
                     }
@@ -5636,10 +5634,9 @@ fn right_drag_mode_combo(
             );
         })
         .response;
-    crate::ui_helpers::set_accessibility_label(
-        &response,
-        &format!("{} / 右ドラッグ", context.label()),
-    );
+    crate::ui_helpers::set_accessibility_label_with(&response, || {
+        format!("{} / 右ドラッグ", context.label())
+    });
     settings.set_right_drag_mode(context, mode);
 }
 
@@ -5665,10 +5662,9 @@ fn viewer_short_right_click_combo(
             }
         })
         .response;
-    crate::ui_helpers::set_accessibility_label(
-        &response,
-        &format!("{} / 右クリック短押し", context.label()),
-    );
+    crate::ui_helpers::set_accessibility_label_with(&response, || {
+        format!("{} / 右クリック短押し", context.label())
+    });
     settings.set_viewer_short_right_click_action(context, action);
 }
 fn mouse_button_context_editor(
@@ -10073,10 +10069,9 @@ pub(super) fn draw_fullscreen_specified_scale_axis_controls(
             },
         )
         .inner;
-    crate::ui_helpers::set_accessibility_label(
-        &_unit_response.response,
-        &format!("{label} / 単位"),
-    );
+    crate::ui_helpers::set_accessibility_label_with(&_unit_response.response, || {
+        format!("{label} / 単位")
+    });
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
         data.insert_temp(

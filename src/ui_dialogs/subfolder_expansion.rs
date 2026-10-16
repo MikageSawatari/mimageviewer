@@ -21,19 +21,19 @@ fn draw_calendar_date_row(ui: &mut egui::Ui, label: &str, date: &mut Option<Face
                     .range(1970..=9999)
                     .suffix("年"),
             );
-            crate::ui_helpers::set_accessibility_label(&response, &format!("{label} / 年"));
+            crate::ui_helpers::set_accessibility_label_with(&response, || format!("{label} / 年"));
             let response = ui.add(
                 egui::DragValue::new(&mut value.month)
                     .range(1..=12)
                     .suffix("月"),
             );
-            crate::ui_helpers::set_accessibility_label(&response, &format!("{label} / 月"));
+            crate::ui_helpers::set_accessibility_label_with(&response, || format!("{label} / 月"));
             let response = ui.add(
                 egui::DragValue::new(&mut value.day)
                     .range(1..=31)
                     .suffix("日"),
             );
-            crate::ui_helpers::set_accessibility_label(&response, &format!("{label} / 日"));
+            crate::ui_helpers::set_accessibility_label_with(&response, || format!("{label} / 日"));
         });
     });
     value.sanitize();

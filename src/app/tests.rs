@@ -4323,7 +4323,8 @@ fn phase_a2_install_virtual_page(app: &mut App, image: &Path) {
 
 fn phase_a2_wait_for_mask(app: &mut App) {
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_page_edit_reconciliation(&ctx);
         if app.mask_pages.contains(&0) && app.page_edit_snapshot.is_some() {
             return;
@@ -4515,7 +4516,8 @@ fn phase_a2_late_local_adjust_commit_and_delete_reconcile() {
                 .remove_layers(&key)
                 .unwrap();
         }
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_page_edit_reconciliation(&ctx);
             if app.local_adjust_pages.contains(&0) == wanted
                 && app
@@ -4815,7 +4817,8 @@ fn phase_a2_sibling_write_refreshes_parked_bundle_on_remount() {
         .unwrap();
     phase_a2_wait_for_mask(&mut app);
     let mut sibling_ready = false;
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         sibling_ready = app
             .with_viewer_context(sibling, |context| context.mask_pages.contains(&0))
             .unwrap();
@@ -6033,7 +6036,8 @@ fn phase_b_search_streaming_result_projects_saved_mask() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.mask_pages.contains(&0) {
             break;
@@ -6066,7 +6070,8 @@ fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
     stream.send(phase_b_search_batch(&first, 1)).unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items_are_global_search_view && app.items.len() == 1 {
             break;
@@ -6084,7 +6089,8 @@ fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items.len() == 2 && app.mask_pages.len() == 2 {
             break;
@@ -6112,7 +6118,8 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items.len() == 1 {
             break;
@@ -6146,7 +6153,8 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
     std::fs::write(&image, b"image").unwrap();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items_are_global_search_view {
             break;
@@ -6164,7 +6172,8 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
             reason: crate::global_search::DoneReason::Complete,
         })
         .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.search_ready_is_held_for_test() {
             break;
@@ -6180,7 +6189,8 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
         .set(&key, &[true], &[], 1, 1)
         .unwrap();
     app.release_search_ready_for_test();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_global_search_events(&ctx);
         if app.items.len() == 1 && app.mask_pages.contains(&0) {
             break;
@@ -6390,7 +6400,8 @@ fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
     RATING_INSTALL_UI_TAG_PREWARMS.with(|calls| calls.set(0));
     app.enter_rating_view(3);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.mask_pages.contains(&0) {
@@ -6401,7 +6412,8 @@ fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
     app.set_rating_view_sort(crate::rating_view::RatingViewSort::Normal(
         crate::settings::SortOrder::FileName,
     ));
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.rating_view_pending.is_none() && !app.sidecar_restore_active() {
@@ -6471,7 +6483,8 @@ fn phase_b_rating_pending_result_publishes_after_shared_star_write() {
     app.write_user_rating_shared(&key, 0, Some(&meta)).unwrap();
     let before_install = app.items_generation;
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.rating_view_pending.is_none() {
@@ -6485,7 +6498,8 @@ fn phase_b_rating_pending_result_publishes_after_shared_star_write() {
         app.visible_indices.is_empty(),
         "the prepared row installs once, then the committed star is hidden before paint"
     );
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&egui::Context::default());
         if app.rating_view_pending.is_none() && app.items.is_empty() {
@@ -6545,7 +6559,8 @@ fn phase_b_rating_pending_result_rebases_after_tag_write() {
     tx.send(result).unwrap();
     app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.rating_view_pending.is_none() {
@@ -6592,7 +6607,8 @@ fn phase_b_rating_pending_result_rebases_after_book_page_copy() {
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(app.rating_session_write_generation, local_generation);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.items.len() == 2 && app.rating_view_pending.is_none() {
@@ -6642,7 +6658,8 @@ fn phase_b_rating_rejects_edit_written_without_view_snapshot() {
     assert!(tx.send(result).is_ok());
     app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
         if app.items_are_rating_view && app.mask_pages.contains(&0) {
@@ -6698,7 +6715,8 @@ fn phase_b_reading_history_opened_folder_resolves_masked_member_before_paint() {
         None,
     )]);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_sidecar_restore(&ctx);
         if !app.sidecar_restore_active() {
             break;
@@ -6707,7 +6725,8 @@ fn phase_b_reading_history_opened_folder_resolves_masked_member_before_paint() {
     }
     app.note_reading_history_open(0);
     app.load_folder(folder);
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_sidecar_restore(&ctx);
         if !app.sidecar_restore_active() {
             break;
@@ -6750,7 +6769,8 @@ fn phase_b_reading_history_opened_zip_resolves_masked_member_before_paint() {
         None,
     )]);
     let ctx = egui::Context::default();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_sidecar_restore(&ctx);
         if !app.sidecar_restore_active() {
             break;
@@ -6759,7 +6779,8 @@ fn phase_b_reading_history_opened_zip_resolves_masked_member_before_paint() {
     }
     app.note_reading_history_open(0);
     app.load_zip_as_folder(archive.clone(), crate::app::StartupListIntent::ExplicitList);
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         app.poll_zip_enumerate();
         app.poll_sidecar_restore(&ctx);
         if app
@@ -20634,7 +20655,8 @@ mod phase_c_folder_nav_history_tests {
 
     pub(super) fn finish_staged_physical_history_for_test(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.settle_open_path_classification_for_test();
             app.poll_sidecar_restore(&ctx);
             if app
@@ -23166,7 +23188,8 @@ mod phase_c_folder_nav_history_tests {
 
     fn finish_rating_navigation_for_test(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_rating_view();
             app.poll_sidecar_restore(&ctx);
             if app.rating_view_pending.is_none() && !app.sidecar_restore_active() {
@@ -24808,7 +24831,8 @@ mod phase_c_folder_nav_history_tests {
             }
             finish_staged_physical_history_for_test(&mut app);
             let ctx = egui::Context::default();
-            for _ in 0..1000 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
                 if !app.sidecar_restore_active() {
                     break;
                 }
@@ -24856,7 +24880,8 @@ mod phase_c_folder_nav_history_tests {
                 );
                 }
                 finish_staged_physical_history_for_test(&mut app);
-                for _ in 0..1000 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
                     if !app.sidecar_restore_active() {
                         break;
                     }
@@ -26532,7 +26557,8 @@ mod phase_c_folder_nav_history_tests {
         assert!(rating_app.suppress_folder_nav_record_once);
 
         let ctx = egui::Context::default();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             rating_app.poll_rating_view();
             rating_app.poll_sidecar_restore(&ctx);
             if rating_app.items_are_rating_view && rating_app.rating_view_pending.is_none() {
@@ -26953,7 +26979,8 @@ mod phase_c_folder_nav_history_tests {
     #[cfg(windows)]
     fn finish_context_jump_hydration(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if !app.sidecar_restore_active() {
                 return;
             }
@@ -29557,7 +29584,8 @@ mod phase_c_drill_nav_tests {
         );
 
         let ctx = egui::Context::default();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -41145,7 +41173,8 @@ mod favorite_adjustment_defaults_tests {
     }
 
     fn wait_for_book_op(app: &mut App, ctx: &egui::Context) {
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_book_op_pending(ctx);
             if app.book_op_pending.is_none() {
                 return;
@@ -43234,7 +43263,8 @@ mod favorite_adjustment_defaults_tests {
 
     fn poll_archive_decisions_for_test(app: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 return;
@@ -43472,7 +43502,8 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.converted_archive_cache_paths_pending.is_some());
 
         let ctx = egui::Context::default();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -44642,7 +44673,8 @@ mod favorite_adjustment_defaults_tests {
         start_archive_decisions_for_test(&mut app, 0..1);
 
         let ctx = egui::Context::default();
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -44875,7 +44907,8 @@ mod favorite_adjustment_defaults_tests {
         ));
         app.reload_queue = Some(Arc::clone(&reload_queue));
         app.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_converted_archive_cache_paths(&ctx);
             if app.converted_archive_cache_paths_pending.is_none() {
                 break;
@@ -48399,7 +48432,8 @@ mod favorite_adjustment_defaults_tests {
 
         app.enter_conceal_mode(&egui::Context::default(), idx);
 
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_local_adjust_render(&ctx);
             if app.conceal_mode {
                 break;
@@ -54055,7 +54089,8 @@ mod pipeline_cache_refactor_tests {
         assert!(!app.colorize_display_requires_final_effect(idx));
         let entries = app.settings.creative_luts.clone();
         let lut_id = entries.first().unwrap().id;
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.creative_lut_library.poll(&entries, &ctx);
             if app.creative_lut_library.get(Some(lut_id)).is_some() {
                 break;
@@ -54096,7 +54131,8 @@ mod pipeline_cache_refactor_tests {
 
         let entries = app.settings.creative_luts.clone();
         let lut_id = entries.first().unwrap().id;
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.creative_lut_library.poll(&entries, &ctx);
             if app.creative_lut_library.get(Some(lut_id)).is_some() {
                 break;
@@ -54574,7 +54610,8 @@ mod pipeline_cache_refactor_tests {
         );
 
         assert!(app.ensure_conceal_texture(&ctx, idx).is_none());
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_local_adjust_render(&ctx);
             if app.conceal_cache.contains_key(&idx) {
                 break;
@@ -54588,7 +54625,8 @@ mod pipeline_cache_refactor_tests {
         app.bump_conceal_generation();
         app.frame_counter = app.frame_counter.wrapping_add(1);
         assert!(app.ensure_conceal_texture(&ctx, idx).is_none());
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_local_adjust_render(&ctx);
             if app.conceal_cache.contains_key(&idx) {
                 break;
@@ -62185,7 +62223,8 @@ mod still_window_mode_key_tests {
     }
 
     fn poll_media_navigation_until_done_for_test(app: &mut App, ctx: &egui::Context) {
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_media_navigation_pending(ctx);
             if app.media_navigation_pending.is_none() {
                 return;
@@ -89061,7 +89100,8 @@ mod rating_view_navigation_tests {
             "preflight does not commit the child"
         );
         let ctx = egui::Context::default();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if app
                 .top_level_grid_view
                 .history_navigation_transition()
@@ -89082,7 +89122,8 @@ mod rating_view_navigation_tests {
         app.finish_page_identity_preparation_for_test();
         let owner = app.rating_view_physical_load_owner(&path).unwrap();
         assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if app
                 .top_level_grid_view
                 .history_navigation_transition()
@@ -89140,7 +89181,8 @@ mod rating_view_navigation_tests {
         app.rating_view_back();
 
         let ctx = egui::Context::default();
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             app.poll_rating_view();
             app.poll_sidecar_restore(&ctx);
             if app.items_are_rating_view && !app.sidecar_restore_active() {

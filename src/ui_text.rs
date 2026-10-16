@@ -8015,7 +8015,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         for (i, outline) in t.extra_outlines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
-                ui.label(format!("外フチ{}", i + 1));
+                let outline_label = ui.label(format!("外フチ{}", i + 1));
                 let mut col = to_c32(outline.color);
                 if annotation_color_edit_button(ui, &mut col).changed() {
                     outline.color = from_c32(col);
@@ -8023,6 +8023,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 }
                 *changed |= ui
                     .add(egui::Slider::new(&mut outline.width_px, 0.0..=48.0).text("太さ"))
+                    .labelled_by(outline_label.id)
                     .changed();
                 if ui.small_button("削除").clicked() {
                     remove = Some(i);
@@ -8065,23 +8066,21 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 sh.color = from_c32(col);
                 *changed = true;
             }
-            let coordinate_label = ui.label("X");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
-                .labelled_by(coordinate_label.id)
-                .changed();
-            let coordinate_label = ui.label("Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
-                .labelled_by(coordinate_label.id)
-                .changed();
+            ui.label("X");
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.0).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 X");
+            *changed |= response.changed();
+            ui.label("Y");
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.1).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 Y");
+            *changed |= response.changed();
         });
         *changed |= ui
             .add(egui::Slider::new(&mut sh.blur_px, 0.0..=48.0).text("ぼかし"))
             .changed();
-        *changed |= ui
-            .add(egui::Slider::new(&mut sh.spread_px, 0.0..=24.0).text("広がり"))
-            .changed();
+        let response = ui.add(egui::Slider::new(&mut sh.spread_px, 0.0..=24.0).text("広がり"));
+        crate::ui_helpers::set_accessibility_label(&response, "影 広がり");
+        *changed |= response.changed();
     }
 
     let mut has_glow = t.glow.is_some();
@@ -8105,9 +8104,9 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         *changed |= ui
             .add(egui::Slider::new(&mut glow.radius_px, 0.0..=64.0).text("半径"))
             .changed();
-        *changed |= ui
-            .add(egui::Slider::new(&mut glow.spread_px, 0.0..=32.0).text("広がり"))
-            .changed();
+        let response = ui.add(egui::Slider::new(&mut glow.spread_px, 0.0..=32.0).text("広がり"));
+        crate::ui_helpers::set_accessibility_label(&response, "発光 広がり");
+        *changed |= response.changed();
     }
 
     let mut has_bg = t.background.is_some();
@@ -8165,16 +8164,14 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
             }
         });
         ui.horizontal(|ui| {
-            let coordinate_label = ui.label("X");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut echo.offset.0).speed(0.5))
-                .labelled_by(coordinate_label.id)
-                .changed();
-            let coordinate_label = ui.label("Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut echo.offset.1).speed(0.5))
-                .labelled_by(coordinate_label.id)
-                .changed();
+            ui.label("X");
+            let response = ui.add(egui::DragValue::new(&mut echo.offset.0).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "Echo X");
+            *changed |= response.changed();
+            ui.label("Y");
+            let response = ui.add(egui::DragValue::new(&mut echo.offset.1).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "Echo Y");
+            *changed |= response.changed();
         });
     }
 }
@@ -8834,15 +8831,13 @@ fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     });
     // 先端 (tip) を画像座標で直接編集 (キャンバスのハンドルドラッグと等価)。
     ui.horizontal(|ui| {
-        let coordinate_label = ui.label("先端");
-        *changed |= ui
-            .add(egui::DragValue::new(&mut t.tip.0).speed(1.0))
-            .labelled_by(coordinate_label.id)
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut t.tip.1).speed(1.0))
-            .labelled_by(coordinate_label.id)
-            .changed();
+        ui.label("先端");
+        let response = ui.add(egui::DragValue::new(&mut t.tip.0).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "先端 X");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut t.tip.1).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "先端 Y");
+        *changed |= response.changed();
     });
     // 付け根の自動配置: 中心→先端のレイが輪郭を抜ける位置に根を付ける (対象を指す)。
     // オフにすると `base_t` で手動指定 (付け根ハンドルのドラッグでも切れる)。先端は固定。
@@ -9113,16 +9108,14 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
                 sh.color = from_c32(col);
                 *changed = true;
             }
-            let coordinate_label = ui.label("X");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
-                .labelled_by(coordinate_label.id)
-                .changed();
-            let coordinate_label = ui.label("Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
-                .labelled_by(coordinate_label.id)
-                .changed();
+            ui.label("X");
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.0).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 X");
+            *changed |= response.changed();
+            ui.label("Y");
+            let response = ui.add(egui::DragValue::new(&mut sh.offset.1).speed(0.5));
+            crate::ui_helpers::set_accessibility_label(&response, "影 Y");
+            *changed |= response.changed();
         });
     }
 
@@ -9148,24 +9141,20 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
 
     // 余白 (per-side insets)。
     ui.add_space(2.0);
-    let coordinate_label = ui.label("余白 (左/上/右/下)");
+    ui.label("余白 (左/上/右/下)");
     ui.horizontal(|ui| {
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.left).speed(1.0))
-            .labelled_by(coordinate_label.id)
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.top).speed(1.0))
-            .labelled_by(coordinate_label.id)
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.right).speed(1.0))
-            .labelled_by(coordinate_label.id)
-            .changed();
-        *changed |= ui
-            .add(egui::DragValue::new(&mut w.padding.bottom).speed(1.0))
-            .labelled_by(coordinate_label.id)
-            .changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.left).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 左");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.top).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 上");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.right).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 右");
+        *changed |= response.changed();
+        let response = ui.add(egui::DragValue::new(&mut w.padding.bottom).speed(1.0));
+        crate::ui_helpers::set_accessibility_label(&response, "余白 下");
+        *changed |= response.changed();
     });
 }
 
@@ -9225,20 +9214,19 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
             *changed |= ui
                 .add(egui::Slider::new(&mut w.name_plate.corner_px, 0.0..=40.0).text("角丸"))
                 .changed();
-            *changed |= ui
-                .add(egui::Slider::new(&mut w.name_plate.padding_px, 0.0..=40.0).text("余白"))
-                .changed();
+            let response =
+                ui.add(egui::Slider::new(&mut w.name_plate.padding_px, 0.0..=40.0).text("余白"));
+            crate::ui_helpers::set_accessibility_label(&response, "名前プレート 余白");
+            *changed |= response.changed();
         }
         ui.horizontal(|ui| {
-            let coordinate_label = ui.label("位置 X/Y");
-            *changed |= ui
-                .add(egui::DragValue::new(&mut w.name_plate.offset.0).speed(1.0))
-                .labelled_by(coordinate_label.id)
-                .changed();
-            *changed |= ui
-                .add(egui::DragValue::new(&mut w.name_plate.offset.1).speed(1.0))
-                .labelled_by(coordinate_label.id)
-                .changed();
+            ui.label("位置 X/Y");
+            let response = ui.add(egui::DragValue::new(&mut w.name_plate.offset.0).speed(1.0));
+            crate::ui_helpers::set_accessibility_label(&response, "位置 X");
+            *changed |= response.changed();
+            let response = ui.add(egui::DragValue::new(&mut w.name_plate.offset.1).speed(1.0));
+            crate::ui_helpers::set_accessibility_label(&response, "位置 Y");
+            *changed |= response.changed();
         });
     }
 
@@ -9275,9 +9263,10 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
                 }
             });
         }
-        *changed |= ui
-            .add(egui::Slider::new(&mut w.portrait.margin_px, 0.0..=60.0).text("余白"))
-            .changed();
+        let response =
+            ui.add(egui::Slider::new(&mut w.portrait.margin_px, 0.0..=60.0).text("余白"));
+        crate::ui_helpers::set_accessibility_label(&response, "立ち絵枠 余白");
+        *changed |= response.changed();
     }
 
     // ── 続き指標 ──
@@ -9750,6 +9739,122 @@ fn shape_half(shape: &BubbleShape) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
+
+    fn assert_annotation_accessibility_controls(
+        mut draw: impl FnMut(&mut egui::Ui),
+        expected: &[(&str, egui::accesskit::Role, f64)],
+    ) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 2000.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw(ui));
+            },
+        );
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        for &(name, role, value) in expected {
+            let matches: Vec<_> = nodes
+                .iter()
+                .filter(|(_, node)| node.label() == Some(name) && node.role() == role)
+                .collect();
+            assert_eq!(matches.len(), 1, "ambiguous or missing control: {name}");
+            assert_eq!(matches[0].1.numeric_value(), Some(value), "{name}");
+        }
+    }
+
+    #[test]
+    fn annotation_coordinate_accessibility_names_distinguish_axes_and_sides() {
+        use egui::accesskit::Role::SpinButton;
+
+        let mut bubble = BubbleObject {
+            tail: Some(default_bubble_tail((21.0, 34.0))),
+            ..Default::default()
+        };
+        let tip = bubble.tail.as_ref().unwrap().tip;
+        assert_annotation_accessibility_controls(
+            |ui| bubble_tail_ui(ui, &mut bubble, &mut false),
+            &[
+                ("先端 X", SpinButton, tip.0 as f64),
+                ("先端 Y", SpinButton, tip.1 as f64),
+            ],
+        );
+
+        let mut window = MessageWindowObject::default();
+        window.padding.left = 11.0;
+        window.padding.top = 22.0;
+        window.padding.right = 33.0;
+        window.padding.bottom = 44.0;
+        window.shadow = Some(ShadowStyle {
+            offset: (7.0, 8.0),
+            ..Default::default()
+        });
+        assert_annotation_accessibility_controls(
+            |ui| window_body_ui(ui, &mut window, &mut false),
+            &[
+                ("影 X", SpinButton, 7.0),
+                ("影 Y", SpinButton, 8.0),
+                ("余白 左", SpinButton, 11.0),
+                ("余白 上", SpinButton, 22.0),
+                ("余白 右", SpinButton, 33.0),
+                ("余白 下", SpinButton, 44.0),
+            ],
+        );
+
+        window.name_plate.mode = NamePlateMode::Boxed;
+        window.name_plate.offset = (15.0, -25.0);
+        window.name_plate.padding_px = 12.0;
+        window.portrait.side = PortraitSide::Left;
+        window.portrait.margin_px = 18.0;
+        assert_annotation_accessibility_controls(
+            |ui| window_parts_ui(ui, &mut window, &mut false),
+            &[
+                ("位置 X", SpinButton, 15.0),
+                ("位置 Y", SpinButton, -25.0),
+                ("名前プレート 余白", egui::accesskit::Role::Slider, 12.0),
+                ("立ち絵枠 余白", egui::accesskit::Role::Slider, 18.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn annotation_effect_accessibility_names_distinguish_shadow_glow_and_echo() {
+        use egui::accesskit::Role::{Slider, SpinButton};
+
+        let mut text = TextBlock {
+            shadow: Some(TextShadowStyle {
+                offset: (1.0, 2.0),
+                spread_px: 3.0,
+                ..Default::default()
+            }),
+            glow: Some(TextGlowStyle {
+                spread_px: 4.0,
+                ..Default::default()
+            }),
+            echo: Some(TextEchoStyle {
+                offset: (5.0, 6.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_annotation_accessibility_controls(
+            |ui| text_effects_ui(ui, &mut text, &mut false),
+            &[
+                ("影 X", SpinButton, 1.0),
+                ("影 Y", SpinButton, 2.0),
+                ("Echo X", SpinButton, 5.0),
+                ("Echo Y", SpinButton, 6.0),
+                ("影 広がり", Slider, 3.0),
+                ("発光 広がり", Slider, 4.0),
+            ],
+        );
+    }
 
     #[test]
     fn comic_noop_history_selection_and_presets_preserve_append_revision() {

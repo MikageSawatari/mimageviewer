@@ -969,7 +969,7 @@ fn show_offset_tooltip(
     tip: egui::Tooltip<'_>,
     dark: bool,
     anchor: Option<egui::Rect>,
-    text: impl Into<egui::WidgetText>,
+    text: impl FnOnce() -> egui::WidgetText,
 ) {
     show_offset_tooltip_with_observer(ctx, tip, dark, anchor, text, |_, _| {});
 }
@@ -980,7 +980,7 @@ fn show_offset_tooltip_with_observer(
     tip: egui::Tooltip<'_>,
     dark: bool,
     anchor: Option<egui::Rect>,
-    text: impl Into<egui::WidgetText>,
+    text: impl FnOnce() -> egui::WidgetText,
     on_render: impl FnOnce(&egui::Ui, &egui::Response),
 ) {
     let mut tip = tip.gap(TOOLTIP_GAP);
@@ -1000,7 +1000,7 @@ fn show_offset_tooltip_with_observer(
         if dark {
             crate::os_theme::apply_dark_ui(ui);
         }
-        let label = ui.add(egui::Label::new(text));
+        let label = ui.add(egui::Label::new(text()));
         on_render(ui, &label);
     });
 }
@@ -1013,14 +1013,14 @@ pub(crate) fn hover_tip_disabled_observed(
     text: &'static str,
     on_render: impl FnOnce(&egui::Ui, &egui::Response, &'static str),
 ) -> egui::Response {
-    set_tooltip_accessibility_label(&response, text);
+    let tooltip_text = tooltip_text_with_accessibility(&response, text);
     let anchor = anchor_for(&response);
     show_offset_tooltip_with_observer(
         &response.ctx,
         egui::Tooltip::for_disabled(&response),
         false,
         anchor,
-        text,
+        tooltip_text,
         |ui, label| on_render(ui, label, text),
     );
     response
@@ -1046,32 +1046,52 @@ pub(crate) trait HoverTipExt {
 /// A DragValue's meaning is named separately from its numeric value.
 /// Both versions expose this API; no visible text is added.
 pub(crate) fn set_accessibility_label(response: &egui::Response, label: &str) {
-    if !label.trim().is_empty() {
-        response.ctx.accesskit_node_builder(response.id, |node| {
+    set_accessibility_label_with(response, || label);
+}
+
+/// Build a dynamic spoken name only when AccessKit visits the widget's node.
+pub(crate) fn set_accessibility_label_with<S: AsRef<str>>(
+    response: &egui::Response,
+    label: impl FnOnce() -> S,
+) {
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        let label = label();
+        let label = label.as_ref();
+        if !label.trim().is_empty() {
             node.set_label(label);
-        });
-    }
+        }
+    });
 }
 
 /// Match 0.37's hover-text fallback while preserving explicit names/relations.
-fn set_tooltip_accessibility_label(response: &egui::Response, label: &str) {
+/// Convert at most once: when an unnamed AccessKit node needs it, or when the
+/// tooltip content is rendered. With neither consumer, conversion is skipped.
+fn tooltip_text_with_accessibility<T: Into<egui::WidgetText>>(
+    response: &egui::Response,
+    text: T,
+) -> impl FnOnce() -> egui::WidgetText + use<T> {
+    let mut pending = Some(text);
+    let mut converted = None;
     response.ctx.accesskit_node_builder(response.id, |node| {
         if !matches!(
             node.role(),
             egui::accesskit::Role::Unknown | egui::accesskit::Role::Label
         ) && node.labelled_by().is_empty()
             && node.label().is_none_or(str::is_empty)
-            && !label.trim().is_empty()
         {
-            node.set_label(label);
+            let text: egui::WidgetText = pending.take().unwrap().into();
+            if !text.text().trim().is_empty() {
+                node.set_label(text.text());
+            }
+            converted = Some(text);
         }
     });
+    move || converted.unwrap_or_else(|| pending.unwrap().into())
 }
 
 impl HoverTipExt for egui::Response {
     fn hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
-        let text = text.into();
-        set_tooltip_accessibility_label(&self, text.text());
+        let text = tooltip_text_with_accessibility(&self, text);
         let anchor = anchor_for(&self);
         show_offset_tooltip(
             &self.ctx,
@@ -1084,8 +1104,7 @@ impl HoverTipExt for egui::Response {
     }
 
     fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
-        let text = text.into();
-        set_tooltip_accessibility_label(&self, text.text());
+        let text = tooltip_text_with_accessibility(&self, text);
         let anchor = anchor_for(&self);
         // The fullscreen bar contains many buttons. Avoid cloning a complete dark Style for
         // every button on every frame when no tooltip can be shown.
@@ -1102,8 +1121,7 @@ impl HoverTipExt for egui::Response {
     }
 
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self {
-        let text = text.into();
-        set_tooltip_accessibility_label(&self, text.text());
+        let text = tooltip_text_with_accessibility(&self, text);
         let anchor = anchor_for(&self);
         show_offset_tooltip(
             &self.ctx,
@@ -1119,6 +1137,123 @@ impl HoverTipExt for egui::Response {
 #[cfg(test)]
 mod accessibility_names_tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct CountedTooltip<'a>(&'a Cell<usize>);
+
+    impl From<CountedTooltip<'_>> for egui::WidgetText {
+        fn from(text: CountedTooltip<'_>) -> Self {
+            text.0.set(text.0.get() + 1);
+            "操作の説明".into()
+        }
+    }
+
+    #[test]
+    fn non_hovered_tooltips_skip_conversion_without_accesskit() {
+        let ctx = egui::Context::default();
+        let conversions = Cell::new(0);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.button("").hover_tip(CountedTooltip(&conversions));
+                ui.button("").hover_tip_dark(CountedTooltip(&conversions));
+                ui.add_enabled(false, egui::Button::new(""))
+                    .hover_tip_disabled(CountedTooltip(&conversions));
+            });
+        });
+        assert_eq!(conversions.get(), 0);
+    }
+
+    #[test]
+    fn accesskit_only_converts_tooltips_for_unnamed_input_nodes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let conversions = Cell::new(0);
+                ui.button("").hover_tip(CountedTooltip(&conversions));
+                ui.button("").hover_tip_dark(CountedTooltip(&conversions));
+                ui.add_enabled(false, egui::Button::new(""))
+                    .hover_tip_disabled(CountedTooltip(&conversions));
+                assert_eq!(conversions.get(), 3);
+
+                let named_conversions = Cell::new(0);
+                ui.button("既存名")
+                    .hover_tip(CountedTooltip(&named_conversions));
+                let label = ui.label("既存ラベル");
+                ui.button("")
+                    .labelled_by(label.id)
+                    .hover_tip(CountedTooltip(&named_conversions));
+                ui.label("説明")
+                    .hover_tip(CountedTooltip(&named_conversions));
+                assert_eq!(named_conversions.get(), 0);
+            });
+        });
+    }
+
+    #[test]
+    fn tooltip_rendering_converts_once_and_reuses_accesskit_text() {
+        for accesskit in [false, true] {
+            let ctx = egui::Context::default();
+            if accesskit {
+                ctx.enable_accesskit();
+            }
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui.button("");
+                    let conversions = Cell::new(0);
+                    let text =
+                        tooltip_text_with_accessibility(&response, CountedTooltip(&conversions));
+                    assert_eq!(conversions.get(), usize::from(accesskit));
+                    let renders = Cell::new(0);
+                    show_offset_tooltip_with_observer(
+                        ctx,
+                        egui::Tooltip::for_widget(&response),
+                        false,
+                        Some(response.rect),
+                        text,
+                        |_, _| {
+                            renders.set(renders.get() + 1);
+                            assert_eq!(conversions.get(), 1);
+                        },
+                    );
+                    assert_eq!(renders.get(), 1);
+                    assert_eq!(conversions.get(), 1);
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn dynamic_accessibility_names_are_built_only_in_node_callback() {
+        for accesskit in [false, true] {
+            let ctx = egui::Context::default();
+            if accesskit {
+                ctx.enable_accesskit();
+            }
+            let mut id = egui::Id::NULL;
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui.button("");
+                    id = response.id;
+                    let builds = Cell::new(0);
+                    set_accessibility_label_with(&response, || {
+                        builds.set(builds.get() + 1);
+                        format!("対象 / {}", 1)
+                    });
+                    assert_eq!(builds.get(), usize::from(accesskit));
+                });
+            });
+            if accesskit {
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                let node = &nodes
+                    .iter()
+                    .find(|(node_id, _)| node_id.0 == id.value())
+                    .unwrap()
+                    .1;
+                assert_eq!(node.label(), Some("対象 / 1"));
+            }
+        }
+    }
 
     #[test]
     fn tooltip_names_are_available_without_hover_and_preserve_widget_metadata() {

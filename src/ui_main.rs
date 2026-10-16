@@ -1205,19 +1205,19 @@ fn draw_facet_calendar_date_row(
                     .range(1970..=9999)
                     .suffix("年"),
             );
-            crate::ui_helpers::set_accessibility_label(&year, &format!("{label} 年"));
+            crate::ui_helpers::set_accessibility_label_with(&year, || format!("{label} 年"));
             let month = ui.add(
                 egui::DragValue::new(&mut value.month)
                     .range(1..=12)
                     .suffix("月"),
             );
-            crate::ui_helpers::set_accessibility_label(&month, &format!("{label} 月"));
+            crate::ui_helpers::set_accessibility_label_with(&month, || format!("{label} 月"));
             let day = ui.add(
                 egui::DragValue::new(&mut value.day)
                     .range(1..=31)
                     .suffix("日"),
             );
-            crate::ui_helpers::set_accessibility_label(&day, &format!("{label} 日"));
+            crate::ui_helpers::set_accessibility_label_with(&day, || format!("{label} 日"));
         });
     });
     value.sanitize();
@@ -1257,10 +1257,9 @@ pub(crate) fn draw_facet_size_value_row(
                         ui.selectable_value(&mut current.unit, unit, unit.label());
                     }
                 });
-            crate::ui_helpers::set_accessibility_label(
-                &unit.response,
-                &format!("{label} サイズ単位"),
-            );
+            crate::ui_helpers::set_accessibility_label_with(&unit.response, || {
+                format!("{label} サイズ単位")
+            });
             ui.label(relation);
         });
     });
