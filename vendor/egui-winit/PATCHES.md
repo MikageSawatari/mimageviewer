@@ -42,6 +42,26 @@ release 終端の keys_down 消去、次の新規 press の repeat 解除を検�
 winit 経路のホスト / 共有 crate fixture は Process press とその release の両方を含めない。移植全体の記録は
 [IME 計画](../../docs/ime-process-keys-plan.md)。
 
+## 段1b-3c：共有clipboard判定への委譲（2026-10-16、依存feature訂正は同17日）
+
+`Cargo.toml`に`egui-ime = { path = "../../crates/egui-ime" }`を追加した。
+`src/lib.rs`の`append_keyboard_input`は、従来のclipboardショートカット判定を
+`egui_ime::winit_clipboard_command`へ委譲し、`ClipboardCommand`を受け取る。
+同じ共有crateにnative Windows overlay用の判定も置くが、両bridgeの受付差は維持する。
+共有crateの通常のegui依存は`default-features = false`とし、headless描画テストに必要な
+`default_fonts`だけをdev-dependencyで明示する。これにより、この依存追加から
+egui-winitの通常依存へ既定フォントを持ち込まない。
+
+Process/IMEとpress/releaseの判定は引き続きhostが先に行う。論理キー優先／物理キーfallback、
+Ctrl+Shift+C/X/V、専用clipboardキーとWindowsのInsert/Delete、Copy優先の判定順、
+clipboard I/O、CRLF正規化、空Pasteの抑止、認識時のearly returnも従来どおり。
+共有crateの修飾キー真理値表と、本crateの実配送・物理キーfallback回帰で契約を確認する。
+
+egui 0.37更新の段2で原本へ付け直す際は、上記依存edge、共有判定への委譲と配送回帰を
+IME処理済みキーの既存差分とともに移す。root `Cargo.lock`のegui-winitにもegui-imeのedgeを保持する。
+`Cargo.toml.orig`と同梱`Cargo.lock`は取り込み原本として保持し、このローカルedgeは加えない。
+以下の「原本のまま」「dependencies不変」は初回取り込み時点の記録である。
+
 ## 出典・取り込み
 
 - crates.io package: `egui-winit-0.33.3.crate`

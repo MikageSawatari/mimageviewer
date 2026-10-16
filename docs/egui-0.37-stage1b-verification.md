@@ -802,3 +802,129 @@ native presenter / native window / host、IME headless fixture、module宣言、
 core通常／test-script、fmt、glyph、焦点1,363件、snapshot295件の成功は同じ製品／テストsourceのまま有効。
 設計書・root Cargo.toml・toolchain・対象外DSPの4ファイルとPNG 445枚も検証前後でバイト列不変。
 最後は台帳だけを追記して`git diff --check`を実施し、HEAD `9481bc344`のまま未コミットで引き渡す。
+
+## 段1b-3c 独立レビュー後：resume競合調査と依存feature訂正（2026-10-17）
+
+対象はHEAD `8cb951deb`。独立レビューの正式結果はACCEPT WITH CHANGES（P3 1件）。
+以下の調査・判定・検証は**実装担当の内部確認**であり、独立レビューではない。
+製品の処理と既存テストの待機・assert・上限は変更しない。
+
+### A：トレイ／F12設定変更のresume assertion
+
+設計担当の全件run `target/test-lib-full/runs/20261016T144808451Z-2f8b0881/`は
+13,324 passed / 2 failed / 59 skipped、exit 100。
+失敗は`startup_restore_tests::section1335_tray_image_folder_book_setting_changed_in_f12_`の
+`returns_parent_and_keeps_resume`（`startup_restore.rs:3624`）と
+`keeps_backspace_explicit_list`（同3666）。DB値はSome(0)、期待値Some(1)だった。
+
+結論は**書込み完了を証明せずDBを読む既存のテスト競合**。変更前`1aee8863c`の実行体でも
+両テストの同じassertを再現した。段1b-3bでresume writerが初めて非同期になったわけではない。
+通常の負荷比較とwriterを遅らせた追加比較は区別する。旧版でSome(0)そのものは再現せず、
+まだ最初のRecordも反映されていないNoneを読んだ。現HEADではSome(0)とNoneの両方を観測した。
+以下のFIFOと完了確認の欠落に照らし、どちらも最新Recordの完了前に読める競合と判断した。
+再現率の差だけから性能差や製品の保存退行を推定しない。
+
+| 経路 | `1aee8863c`と現HEADの共通契約／差分 |
+| --- | --- |
+| fixtureのbook初回open→`open_fullscreen(1, UserChosen)` | `record_book_resume`→`persist_book_resume_with_identity`→`BookResumeWriter::record_identity`でRecord(0)、Record(1)を同じFIFOへ受付。送信成功はcommit完了ではない |
+| F12 linked reading中の設定変更 | 表示sessionと設定を切り替え、読みかけのpage 1を保持。新たなpage 0 writeはない。Backspaceからの再openも選択index 1を使う |
+| ×でトレイへ退避 | 親一覧への帰還／fullscreen close→`persist_window_state_and_flush(ProcessKeepsRunning)`。プロセス・writerは継続し、UIを止めないためwriterを待たない既存契約（`tray_integration.rs`） |
+| `settle_book`／復帰後のassert | helperはhistory／ZIP／page identityを完了させるが、resume writerのACKを取得しない。`BookResumeDb::get`とfence解決後の`resume_page_for_container`は別のSQLite接続からSELECTする |
+| 段1b-3bのreceipt整理 | editor保存票を収穫した場合に限る処理。fixtureにはeditor操作owner・保存票がなく、Remote progressも通らないため対象経路を実行しない |
+| meter helperの前後差分 | 戻り値boolの追加のみ。tuple重複判定、既存workerへの送信、meter更新、`last_book_resume`更新の順序は同じ。`book_resume_db.rs`、`startup_restore.rs`、`startup_list_restore.rs`、preferences実装は前後で差分なし |
+
+RecordのDB commit→完了snapshot／watermark公開は`book_resume_db.rs`の同じworkerが所有する。
+Record(0)だけ完了すればSome(0)、両Recordが未完了ならNoneになり得る。
+`prepare_cached`はSQL statementのcacheであり、古い位置値を保持するcacheではない。
+
+比較にはworktree・branch・index・HEAD操作を使わず、差分のある既存ソース／manifest／lock
+28ファイルを退避して`git show 1aee8863c:<path>`のbytesを一時配置した。
+旧版にない追加moduleは旧module graphから参照されない。docsと対象外DSPは置換していない。
+旧版のbuild・負荷実行後にfinallyで全28ファイルを復元し、SHA-256不一致0を確認した。
+テストソースへの診断用sleep／pause／assert変更は行っていない。
+
+再現器は`target/egui037-stage1b-3c-followup/stress.py`。
+各runはlib test実行体の指定filterを`--test-threads=1`で実行し、複数runを並列化する。
+CPU負荷はこの再現器が起動した24プロセスだけで、終了時に全て停止する。
+追加比較は、この再現器のtest子PIDに属する`book-resume-writer`だけを
+Win32 `SetThreadPriority`で遅らせた条件。ほかのアプリ／threadや前面・実入力には触れない。
+これは共通の非同期境界を調べる診断条件で、通常条件の失敗率には合算しない。
+
+| 条件 | 旧`1aee8863c` | 現`8cb951deb` |
+| --- | --- | --- |
+| filter 6件、48並列＋CPU負荷24、300反復 | 1,800 passed / 0 failed（0/300 run） | 1,795 passed / 5 failed（5/300 run）。全てBackspace側、Some(0) 4件／None 1件 |
+| 追加のwriter優先度LOWEST (-2)、対象2件、16並列＋CPU負荷24、100反復 | 189 passed / 11 failed（全てBackspace側、None） | 196 passed / 4 failed（全てBackspace側、Some(0) 1件／None 3件） |
+| 追加のwriter優先度IDLE (-15)、親へ帰る1件、16並列＋CPU負荷24、100反復 | 80 passed / 20 failed（同3624のNone） | 72 passed / 28 failed（同3624が27件：Some(0) 2件／None 25件。残り1件は下記） |
+
+現HEADの先行確認（6件、16並列＋CPU負荷24、100反復）は600 passed / 0 failed。
+優先度負荷の初版はthread ID再利用時の捕捉漏れがあり、旧193 passed / 7 failed、
+現188 passed / 12 failed。上表のLOWEST比較は捕捉処理を直した同じ再現器で再実行した結果。
+元ログも残し、比較からの除外理由をここに記録する。
+外部から生成済みthreadを捕捉するため、全workerへの優先度変更は保証しない。
+LOWESTの捕捉数は旧57／現40、IDLEは旧75／現96で、Win32 APIの失敗は0。
+IDLEの現HEAD `0055.log`は`tests.rs:20695`の既存history preflight未完了で失敗し、
+resume assertionに未到達。これをresume再現件数へ加えない。
+失敗したlib test子はexit 101、成功した子はexit 0。収集器自身のexit 0は検証成功を意味しない。
+
+将来のテスト訂正案は、最後の位置要求後に既存writerの`watermarks().admitted`をcutoffとして捕捉し、
+`read_position_after(normalize(book), cutoff)`のreceiptの成功と`completed_through >= cutoff`を確認してから、
+元のDB assertionを維持すること。既存のFIFO `read_all` ACKも先行writeのcommitを証明できる。
+これはsleep／任意回数の再試行ではなく、既存ownerの完了証明をテストの前提にするもの。
+**設計担当の指示に従い、この調査の時点では訂正を実装しない。** 製品のhideを同期flushへ変更しない。
+
+比較のsource manifest、復元照合、新旧実行体のSHA-256、各runのstdoutと集計は
+`target/egui037-stage1b-3c-followup/`の`comparison-source-manifest.json`、
+`comparison-restoration.json`、`*-result.json`、`stress-summary.json`、各負荷名のdirectoryに保持する。
+新旧の実行体はそれぞれ`current-test.exe`／`old-test.exe`（headless lib test専用）。
+
+### B：egui-imeの通常依存とvendor差分の記録
+
+`crates/egui-ime/Cargo.toml`の通常egui依存を`default-features = false`に変更し、
+描画を含むheadless testの`default_fonts`だけをdev-dependencyで明示する。
+`vendor/egui-winit/PATCHES.md`にegui-imeのpath依存edge、共有clipboard判定への委譲と配送回帰、
+段2で原本へ付け直す際の対象、取り込み原本のmanifest／lockとの区別を追記した。
+clipboard受付条件、IME処理済みキーとreleaseの所有、I/O／空Paste／CRLFの扱いは変更していない。
+
+### 検証
+
+検証のbuild環境は`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`。
+CPU／優先度負荷は終了し、下記gateには加えていない。
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、15.220秒 |
+| `cargo fmt`／`cargo fmt --check` | 両方exit 0 |
+| `git diff --check` | exit 0 |
+| `cargo nextest run -p egui-ime --lib --no-tests fail --retries 0 --no-fail-fast` | 23 passed / 0 failed、exit 0 |
+| `cargo nextest run -p egui-winit --lib --no-tests fail --retries 0 --no-fail-fast` | 29 passed / 0 failed、exit 0 |
+| 本体lib焦点nextest（default profile、retry 0） | 400 passed / 0 failed、exit 0。実行24.974秒、build込み119.680秒 |
+| `scripts/test-lib-full.ps1` | 13,325 passed / 1 failed / 59 skipped、exit 100。実行451.324秒、command全体456.130秒 |
+
+焦点filterは`test(/startup_restore/) | test(/book_resume/) | test(/root_lifecycle/) | test(/book_composition_editor/) | test(/clipboard/) | test(/ime_focus/)`。
+`egui-ime --no-default-features -e normal,build,features`の`cargo tree`はexit 0で、
+`default_fonts`／`epaint_default_fonts`を含まない。root graphのegui-winit tree（exit 0）は
+本体が明示的に要求するフォントを引き続き含むので、これをminimal graphの証明とは扱わない。
+補助調査で`cargo tree -p egui-winit --no-default-features ...`を指定した初回は、
+workspace外packageにfeature指定できないためexit 101。通常root graphのtreeへ訂正した。
+これは製品／テストの失敗ではなく調査commandの指定誤りで、元ログも保持する。
+
+command／exit／時間は`*-result.json`、焦点・crate別のJUnitは`*-junit.xml`、
+集計は`verification-summary.json`。旧版とのsource比較は`resume-source-comparison.json`と
+`book-resume-meter.diff`。設計書・DSP・root manifest／lock・toolchainと復元対象ソースの
+SHA-256不一致0を`protected-after.json`に記録した。
+live／製品の起動、確認用製品build、commitは行わない。
+
+最後の全件はrun `target/test-lib-full/runs/20261016T152517382Z-7d4528d8/`、
+source ID `ac9495ce047446fe0cd3c5d655324cb339bb34415afba6e345cbc3022b5093a6`。
+失敗はAの`keeps_backspace_explicit_list`だけで、同じ3666行のSome(0) / Some(1)、本文1.396秒。
+親へ帰る側は成功。無関係な失敗はなく、今回の焦点400件では両テストとも成功している。
+追加の待機・assert変更・上限緩和・全件再実行で隠さず、**全件libゲートは未達**とする。
+利用者の指示どおり既存競合の訂正は未実装であり、製品挙動の修正は行っていない。
+run内stdout／stderr／JUnitと、`lib-full.log`／`lib-full-result.json`／
+`lib-full-junit.xml`に非ゼロ結果を保持し、焦点成功を全件成功へ読み替えない。
+全件中には別nextestプロセスも観測したが、その実行条件・失敗との因果は未確認。
+今回の負荷用子プロセスは全件前に終了している。
+
+最終差分は依存manifest・vendorパッチ台帳・本台帳の3ファイル。
+設計書、製品Rustソース、既存テスト、root manifest／lock、toolchainと対象外DSPは内容不変。
+全件後は本台帳の結果追記と`git diff --check`だけを行い、HEAD `8cb951deb`のまま未コミットで返す。
