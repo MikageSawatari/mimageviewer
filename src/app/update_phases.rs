@@ -286,9 +286,11 @@ impl App {
         self.last_main_focused = main_focused_now;
     }
 
-    pub(super) fn service_folder_observation(&mut self, ctx: &egui::Context) {
+    pub(super) fn service_folder_watch(&mut self, ctx: &egui::Context) {
         self.poll_current_folder_watch(ctx);
-        self.poll_external_rescan(ctx);
+    }
+
+    pub(super) fn service_periodic_folder_work(&mut self, ctx: &egui::Context) {
         self.poll_association_handler_prewarm(ctx);
 
         // dirty のまま一定時間が経ったサイドカーを書き出す (電源断や強制終了への保険)。

@@ -325,27 +325,45 @@ impl App {
     /// Keep a destructive settings-family worker owned by the live App when a root-window close
     /// would otherwise end the process. A plain close handled by the existing tray-hide path
     /// remains a hide; process-exit close is replayed after the worker reaches terminal.
+    #[cfg(test)]
     pub(crate) fn defer_settings_family_root_close(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|input| input.viewport().close_requested()) {
-            return;
+        if ctx.input_for(egui::ViewportId::ROOT, |input| {
+            input.viewport().close_requested()
+        }) {
+            let intent = if self.sidecar_restore_root_lifecycle_close_requested() {
+                crate::app::root_lifecycle::RootCloseIntent::ApplicationQuit
+            } else {
+                crate::app::root_lifecycle::RootCloseIntent::WindowClose
+            };
+            self.accept_settings_family_root_close(ctx, intent);
         }
-        let application_quit = self.sidecar_restore_root_lifecycle_close_requested();
-        let plain_close_hides_to_tray = !application_quit
-            && self.settings.minimize_to_tray_on_close
-            && self.tray_controller.is_some();
+    }
+
+    pub(crate) fn accept_settings_family_root_close(
+        &mut self,
+        ctx: &egui::Context,
+        intent: crate::app::root_lifecycle::RootCloseIntent,
+    ) -> bool {
+        use crate::app::root_lifecycle::RootCloseIntent;
+        let application_quit = matches!(intent, RootCloseIntent::ApplicationQuit);
+        let plain_close_hides_to_tray = matches!(intent, RootCloseIntent::TrayHide)
+            || (!application_quit
+                && self.settings.minimize_to_tray_on_close
+                && self.tray_controller.is_some());
         let Some(requested) =
             settings_family_deferred_root_close(application_quit, plain_close_hides_to_tray)
         else {
-            return;
+            return false;
         };
-        if self
+        let deferred = self
             .settings_restore_state
             .family_operation
-            .defer_root_close(requested)
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            .defer_root_close(requested);
+        if deferred {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
             ctx.request_repaint();
         }
+        deferred
     }
 
     /// Final process-exit fence for the destructive settings-family worker and its retry task.
@@ -409,7 +427,7 @@ impl App {
         }
 
         self.poll_operation_share_task(ctx);
-        self.poll_settings_family_operation(ctx);
+        self.service_settings_family_operation(ctx);
         let preferences_transfer_was_open =
             self.settings_restore_state.preferences_transfer.is_some();
         self.show_preferences_transfer_dialog(ctx);
@@ -527,7 +545,7 @@ impl App {
         }
     }
 
-    fn poll_settings_family_operation(&mut self, ctx: &egui::Context) {
+    pub(crate) fn service_settings_family_operation(&mut self, ctx: &egui::Context) {
         let mut deferred_close = None;
         let state = std::mem::replace(
             &mut self.settings_restore_state.family_operation,
@@ -638,8 +656,14 @@ impl App {
         };
         if let Some(close) = deferred_close {
             match close {
-                DeferredRootClose::WindowClose => self.request_main_window_close(ctx),
-                DeferredRootClose::ApplicationQuit => self.request_application_quit(ctx),
+                DeferredRootClose::WindowClose => self.resume_root_lifecycle_close(
+                    ctx,
+                    crate::app::root_lifecycle::RootCloseIntent::WindowClose,
+                ),
+                DeferredRootClose::ApplicationQuit => self.resume_root_lifecycle_close(
+                    ctx,
+                    crate::app::root_lifecycle::RootCloseIntent::ApplicationQuit,
+                ),
             }
         }
     }
@@ -1918,7 +1942,8 @@ mod tests {
     }
 
     #[test]
-    fn hidden_explicit_quit_keeps_the_wake_until_the_exact_task_reissues_close() {
+    fn egui037_continuation_root_lifecycle_hidden_explicit_quit_keeps_the_wake_until_the_exact_task_reissues_close()
+     {
         let mut app = crate::app::setup_app_for_test();
         app.settings.minimize_to_tray_on_close = false;
         app.window_visible = false;
@@ -1935,6 +1960,7 @@ mod tests {
             task,
             deferred_close: None,
         };
+        let finish_save = app.sent_composition_save_for_lifecycle_test();
         let ctx = egui::Context::default();
         let mut raw = egui::RawInput::default();
         raw.viewports
@@ -1943,7 +1969,7 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let blocked = ctx.run(raw, |ctx| app.defer_settings_family_root_close(ctx));
+        let blocked = ctx.run(raw, |ctx| app.service_root_lifecycle(ctx));
         assert!(
             blocked
                 .viewport_output
@@ -1967,19 +1993,36 @@ mod tests {
         let update_source = &app_source[update..];
         assert!(
             update_source
-                .find("defer_settings_family_root_close(ctx)")
+                .find("accept_root_lifecycle_before_frame(ctx)")
                 .expect("close latch")
                 < update_source
-                    .find("self.update_frame(ctx, frame)")
+                    .find("self.update_frame(ctx, frame")
                     .expect("tray wake publication pass"),
             "the hidden-root close latch must precede update_frame's tray wake publication"
+        );
+
+        finish_save(Ok(()));
+        let still_blocked = ctx.run(egui::RawInput::default(), |ctx| {
+            app.service_root_lifecycle(ctx)
+        });
+        assert!(!app.composition_editor_writes_pending());
+        assert!(
+            still_blocked.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(
+            !still_blocked.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close),
+            "a save receipt cannot bypass the settings worker's barrier"
         );
 
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let output = ctx.run(egui::RawInput::default(), |ctx| {
-                app.poll_settings_family_operation(ctx)
+                app.service_root_lifecycle(ctx)
             });
             if output
                 .viewport_output
@@ -1997,6 +2040,15 @@ mod tests {
         ));
         assert!(worker_finished.load(std::sync::atomic::Ordering::Acquire));
         assert!(!app.tray_resident_media_updates_needed());
+        let again = ctx.run(egui::RawInput::default(), |ctx| {
+            app.service_root_lifecycle(ctx)
+        });
+        assert!(
+            !again
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::Close))
+        );
     }
 
     #[test]

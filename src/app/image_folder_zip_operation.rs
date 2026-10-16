@@ -258,31 +258,64 @@ impl App {
             op.cancel();
         }
     }
+    #[cfg(test)]
     pub(crate) fn defer_image_folder_zip_root_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|input| input.viewport().close_requested()) {
-            if let Some(op) = self.image_folder_zip_operation.as_mut() {
-                op.exit = Exit::Root;
-                #[cfg(windows)]
-                if self.settings.minimize_to_tray_on_close
-                    && self
-                        .tray_controller
-                        .as_ref()
-                        .is_some_and(|tc| !tc.is_quit_requested())
-                    && !self
-                        .shutdown_requested
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    op.exit = Exit::TrayHide;
-                }
-                op.cancel();
-                crate::logger::log(format!(
-                    "folder_zip_close owner={:?} wait={:?} exit={:?}",
-                    op.owner, op.last_wait, op.exit,
-                ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            }
+        if ctx.input_for(egui::ViewportId::ROOT, |input| {
+            input.viewport().close_requested()
+        }) {
+            let intent = if self.sidecar_restore_root_lifecycle_close_requested() {
+                super::root_lifecycle::RootCloseIntent::ApplicationQuit
+            } else {
+                super::root_lifecycle::RootCloseIntent::WindowClose
+            };
+            self.accept_image_folder_zip_root_close(ctx, intent);
         }
     }
+
+    pub(super) fn accept_image_folder_zip_root_close(
+        &mut self,
+        ctx: &egui::Context,
+        intent: super::root_lifecycle::RootCloseIntent,
+    ) -> bool {
+        use super::root_lifecycle::RootCloseIntent;
+        let Some(op) = self.image_folder_zip_operation.as_mut() else {
+            return false;
+        };
+        op.exit = Exit::Root;
+        #[cfg(windows)]
+        if matches!(intent, RootCloseIntent::TrayHide)
+            || (matches!(intent, RootCloseIntent::WindowClose)
+                && self.settings.minimize_to_tray_on_close
+                && self.tray_controller.is_some())
+        {
+            op.exit = Exit::TrayHide;
+        }
+        #[cfg(not(windows))]
+        let _ = intent;
+        op.cancel();
+        crate::logger::log(format!(
+            "folder_zip_close owner={:?} wait={:?} exit={:?}",
+            op.owner, op.last_wait, op.exit,
+        ));
+        let hydration_owner = matches!(op.phase, Phase::ParentHydration(_)).then_some(op.owner);
+        if let Some(owner) = hydration_owner {
+            self.cancel_image_zip_hydration_for_exit(owner);
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
+        true
+    }
+
+    /// Only an existing cancellation/exit owner may run through the non-drawing service.
+    pub(super) fn service_image_folder_zip_exit(&mut self, ctx: &egui::Context) {
+        if self
+            .image_folder_zip_operation
+            .as_ref()
+            .is_some_and(|op| !matches!(op.exit, Exit::None))
+        {
+            self.poll_image_folder_zip(ctx);
+        }
+    }
+
     pub(crate) fn poll_image_folder_zip(&mut self, ctx: &egui::Context) {
         let Some(mut op) = self.image_folder_zip_operation.take() else {
             return;
@@ -443,9 +476,13 @@ impl App {
                         self.sidecars = std::mem::take(&mut resources.sidecars);
                         self.tags_db = resources.tags.take();
                         for (id, pending) in trims.into_iter().skip(resources.saved_trims) {
-                            let _ = self.with_viewer_context(id, |app| {
-                                app.restore_pending_view_trim_transfer(pending)
-                            });
+                            let restore =
+                                |app: &mut App| app.restore_pending_view_trim_transfer(pending);
+                            let _ = if matches!(op.exit, Exit::None) {
+                                self.with_viewer_context(id, restore)
+                            } else {
+                                self.with_viewer_context_state(id, restore)
+                            };
                         }
                         let keys = std::mem::take(&mut resources.source_keys);
                         let edits = std::mem::take(&mut resources.source_edits);
@@ -464,7 +501,11 @@ impl App {
                             self.notify_bookmarks_changed();
                             self.invalidate_tag_apply_suggestions();
                         }
-                        self.begin_image_zip_terminal_refresh();
+                        if matches!(op.exit, Exit::None) {
+                            self.begin_image_zip_terminal_refresh();
+                        } else {
+                            self.begin_image_zip_terminal_refresh_state();
+                        }
                         Phase::RefreshIndex {
                             result: result.map(|_| ()),
                             keys,
@@ -482,9 +523,13 @@ impl App {
                         self.sidecars = std::mem::take(&mut resources.sidecars);
                         self.tags_db = resources.tags.take();
                         for (id, pending) in trims.into_iter().skip(resources.saved_trims) {
-                            let _ = self.with_viewer_context(id, |app| {
-                                app.restore_pending_view_trim_transfer(pending)
-                            });
+                            let restore =
+                                |app: &mut App| app.restore_pending_view_trim_transfer(pending);
+                            let _ = if matches!(op.exit, Exit::None) {
+                                self.with_viewer_context(id, restore)
+                            } else {
+                                self.with_viewer_context_state(id, restore)
+                            };
                         }
                         self.resume_metadata_transfer_context_readers();
                         op.failed(
@@ -498,7 +543,12 @@ impl App {
                 keys,
                 edits,
             } => {
-                if !self.advance_image_zip_terminal_refresh(&keys) {
+                let complete = if matches!(op.exit, Exit::None) {
+                    self.advance_image_zip_terminal_refresh(&keys)
+                } else {
+                    self.advance_image_zip_terminal_refresh_state(&keys)
+                };
+                if !complete {
                     Phase::RefreshIndex {
                         result,
                         keys,
@@ -510,8 +560,14 @@ impl App {
                         page_state: true,
                         ..Default::default()
                     };
-                    let mut requests =
-                        self.take_metadata_import_refresh_requests(changed, &Default::default());
+                    let mut requests = if matches!(op.exit, Exit::None) {
+                        self.take_metadata_import_refresh_requests(changed, &Default::default())
+                    } else {
+                        self.take_metadata_import_refresh_requests_state(
+                            changed,
+                            &Default::default(),
+                        )
+                    };
                     for request in &mut requests {
                         request.items.retain(|item| {
                             keys.contains(&item.key)
@@ -578,7 +634,16 @@ impl App {
                 }
                 // One bounded chunk per frame, including context mounting.
                 if let Some(chunk) = refresh.chunks.pop_front() {
-                    self.apply_image_zip_source_chunk(chunk);
+                    if matches!(op.exit, Exit::None) {
+                        self.apply_image_zip_source_chunk(chunk);
+                    } else {
+                        let last = chunk.last;
+                        let _ = self.with_viewer_context_state(chunk.context, |app| {
+                            if app.apply_image_zip_source_chunk_current(chunk) && last {
+                                app.mark_metadata_import_display_reconciliation();
+                            }
+                        });
+                    }
                 }
                 if refresh.chunks.is_empty() {
                     Phase::AwaitCaches { result }
@@ -619,7 +684,11 @@ impl App {
                 Ok(()) => op.success(),
                 Err(mpsc::TryRecvError::Empty) => Phase::ParentHydration(completed),
                 Err(mpsc::TryRecvError::Disconnected) if !matches!(op.exit, Exit::None) => {
-                    op.success()
+                    if self.image_zip_discarded_hydration_exit_pending(op.owner) {
+                        Phase::ParentHydration(completed)
+                    } else {
+                        op.success()
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => op.failed(
                     "親の一覧の更新を完了できませんでした。作成先を開き直してください。".into(),
@@ -634,11 +703,17 @@ impl App {
                 self.show_feedback_toast(message.clone());
             }
             if matches!(op.exit, Exit::Root) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.resume_root_lifecycle_close(
+                    ctx,
+                    super::root_lifecycle::RootCloseIntent::WindowClose,
+                );
             }
             #[cfg(windows)]
             if matches!(op.exit, Exit::TrayHide) {
-                self.hide_to_tray(ctx);
+                self.resume_root_lifecycle_close(
+                    ctx,
+                    super::root_lifecycle::RootCloseIntent::TrayHide,
+                );
             }
         } else {
             if !matches!(op.phase, Phase::Result { .. }) {
@@ -782,9 +857,12 @@ impl App {
                 self.sidecars = std::mem::take(&mut resources.sidecars);
                 self.tags_db = resources.tags.take();
                 for (id, pending) in trims {
-                    let _ = self.with_viewer_context(id, |app| {
-                        app.restore_pending_view_trim_transfer(pending)
-                    });
+                    let restore = |app: &mut App| app.restore_pending_view_trim_transfer(pending);
+                    let _ = if matches!(op.exit, Exit::None) {
+                        self.with_viewer_context(id, restore)
+                    } else {
+                        self.with_viewer_context_state(id, restore)
+                    };
                 }
                 Err(error)
             }
@@ -886,58 +964,64 @@ impl App {
         Phase::ParentHydration(receipt)
     }
     fn apply_image_zip_source_chunk(&mut self, chunk: SourceChunk) {
+        let last = chunk.last;
         let _ = self.with_viewer_context(chunk.context, |app| {
-            if app.items_generation != chunk.generation {
-                return;
-            }
-            for (key, tags) in chunk.tags {
-                app.set_tags_cache_entry(key, tags);
-            }
-            for page in chunk.pages {
-                let idx = page.index;
-                app.evict_thumbnail_for_reload(idx);
-                app.bump_adjustment_generation(idx);
-                app.bump_erase_mask_generation(idx);
-                app.bump_local_adjust_generation(idx);
-                app.adjustment_page_params.remove(&idx);
-                if let Some(params) = page.adjustment {
-                    app.adjustment_page_params.insert(idx, params);
-                }
-                app.local_adjust_pages.remove(&idx);
-                if page.local {
-                    app.local_adjust_pages.insert(idx);
-                }
-                app.local_adjust_page_layers.remove(&idx);
-                app.local_adjust_selected_layers.remove(&idx);
-                app.export_crop_pages.remove(&idx);
-                app.export_crop_page_settings.remove(&idx);
-                if let Some(crop) = page.crop {
-                    app.export_crop_pages.insert(idx);
-                    app.export_crop_page_settings.insert(idx, crop);
-                }
-                app.view_trim_page_overrides.remove(&idx);
-                if let Some(trim) = page.trim {
-                    app.view_trim_page_overrides.insert(idx, trim);
-                }
-                for (set, enabled) in [
-                    (&mut app.mask_pages, page.mask),
-                    (&mut app.conceal_pages, page.conceal),
-                    (&mut app.comic_pages, page.comic),
-                ] {
-                    set.remove(&idx);
-                    if enabled {
-                        set.insert(idx);
-                    }
-                }
-                app.rotation_cache.remove(&idx);
-                if let Some(rotation) = page.rotation {
-                    app.rotation_cache.insert(idx, rotation);
-                }
-            }
-            if chunk.last {
+            if app.apply_image_zip_source_chunk_current(chunk) && last {
                 app.rebuild_visible_indices_preserving_facet_scope();
             }
         });
+    }
+
+    /// Metadata ownership updates are independent of visible membership adoption.
+    fn apply_image_zip_source_chunk_current(&mut self, chunk: SourceChunk) -> bool {
+        if self.items_generation != chunk.generation {
+            return false;
+        }
+        for (key, tags) in chunk.tags {
+            self.set_tags_cache_entry(key, tags);
+        }
+        for page in chunk.pages {
+            let idx = page.index;
+            self.evict_thumbnail_for_reload(idx);
+            self.bump_adjustment_generation(idx);
+            self.bump_erase_mask_generation(idx);
+            self.bump_local_adjust_generation(idx);
+            self.adjustment_page_params.remove(&idx);
+            if let Some(params) = page.adjustment {
+                self.adjustment_page_params.insert(idx, params);
+            }
+            self.local_adjust_pages.remove(&idx);
+            if page.local {
+                self.local_adjust_pages.insert(idx);
+            }
+            self.local_adjust_page_layers.remove(&idx);
+            self.local_adjust_selected_layers.remove(&idx);
+            self.export_crop_pages.remove(&idx);
+            self.export_crop_page_settings.remove(&idx);
+            if let Some(crop) = page.crop {
+                self.export_crop_pages.insert(idx);
+                self.export_crop_page_settings.insert(idx, crop);
+            }
+            self.view_trim_page_overrides.remove(&idx);
+            if let Some(trim) = page.trim {
+                self.view_trim_page_overrides.insert(idx, trim);
+            }
+            for (set, enabled) in [
+                (&mut self.mask_pages, page.mask),
+                (&mut self.conceal_pages, page.conceal),
+                (&mut self.comic_pages, page.comic),
+            ] {
+                set.remove(&idx);
+                if enabled {
+                    set.insert(idx);
+                }
+            }
+            self.rotation_cache.remove(&idx);
+            if let Some(rotation) = page.rotation {
+                self.rotation_cache.insert(idx, rotation);
+            }
+        }
+        true
     }
     pub(crate) fn show_image_folder_zip(&mut self, ctx: &egui::Context) {
         let Some(op) = self.image_folder_zip_operation.as_ref() else {
@@ -1490,7 +1574,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn image_folder_zip_close_finishes_accepted_save_then_exits_or_hides_without_parent_wait() {
+    fn egui037_continuation_root_lifecycle_image_folder_zip_close_finishes_accepted_save_then_exits_or_hides_without_parent_wait()
+     {
         for tray in [false, true] {
             for stage in 0..4 {
                 let committed = stage != 0;
@@ -1559,8 +1644,8 @@ mod tests {
                     .events
                     .push(egui::ViewportEvent::Close);
                 ctx.begin_pass(input);
-                assert!(!app.maybe_intercept_close(&ctx));
-                app.defer_image_folder_zip_root_close(&ctx);
+                let lifecycle = app.accept_root_lifecycle_before_frame(&ctx);
+                app.service_root_lifecycle_tray_checkpoint(&ctx, lifecycle);
                 assert_eq!(
                     matches!(
                         app.image_folder_zip_operation.as_ref().unwrap().exit,
@@ -1576,9 +1661,12 @@ mod tests {
                         .contains(&egui::ViewportCommand::CancelClose)
                 );
                 ctx.begin_pass(egui::RawInput::default());
-                pump_until(&mut app, &ctx, |app| {
-                    app.image_folder_zip_operation.is_none()
-                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while app.image_folder_zip_operation.is_some() {
+                    app.service_root_lifecycle(&ctx);
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
                 let terminal = ctx.end_pass();
                 assert_eq!(
                     terminal.viewport_output[&egui::ViewportId::ROOT]
@@ -1591,6 +1679,89 @@ mod tests {
                 assert_eq!(source.with_extension("zip").exists(), committed);
             }
         }
+    }
+
+    #[test]
+    fn egui037_continuation_root_lifecycle_zip_hydration_waits_for_discarded_terminal() {
+        let mut app = setup_app_for_test();
+        app.settings.minimize_to_tray_on_close = false;
+        let source = app.tmp.path().join("hydrating-book");
+        std::fs::create_dir(&source).unwrap();
+        app.current_folder = Some(source.clone());
+        let ctx = egui::Context::default();
+        assert!(app.start_image_folder_zip(&ctx, source.clone(), false));
+        let destination = app
+            .image_folder_zip_operation
+            .as_ref()
+            .unwrap()
+            .destination
+            .clone();
+        let owner = app.image_folder_zip_operation.as_ref().unwrap().owner;
+        let (completed, receipt) = mpsc::channel();
+        app.image_folder_zip_operation.as_mut().unwrap().phase = Phase::ParentHydration(receipt);
+        let hydration_messages = app.activate_live_sidecar_restore_for_test(source);
+        app.set_live_sidecar_first_display_for_test(
+            crate::app::sidecar_restore::FirstDisplayAction::None,
+            Some(super::super::MainListAfterHydration::ImageFolderZip {
+                destination,
+                completed,
+            }),
+        );
+        let selected = app.selected;
+        let mut raw = egui::RawInput::default();
+        raw.viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let blocked = ctx.run(raw, |ctx| {
+            let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
+            app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
+            assert!(app.image_zip_discarded_hydration_exit_pending(owner));
+            app.service_image_folder_zip_exit(ctx);
+            assert!(
+                app.image_folder_zip_operation.is_some(),
+                "ZIP exit waits for its discarded hydration owner"
+            );
+        });
+        assert!(
+            blocked.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(
+            !blocked.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(matches!(
+            hydration_messages.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        let terminal = ctx.run(egui::RawInput::default(), |ctx| {
+            app.service_discarded_sidecar_restore(ctx);
+            assert!(!app.image_zip_discarded_hydration_exit_pending(owner));
+            app.service_root_lifecycle(ctx);
+        });
+        assert!(app.image_folder_zip_operation.is_none());
+        assert!(
+            terminal.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert_eq!(
+            app.selected, selected,
+            "cancelled hydration cannot select the ZIP destination"
+        );
+        let again = ctx.run(egui::RawInput::default(), |ctx| {
+            app.service_root_lifecycle(ctx)
+        });
+        assert!(
+            !again
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::Close))
+        );
     }
 
     #[test]
@@ -1953,6 +2124,67 @@ mod tests {
         assert!(!app.comic_pages.contains(&0));
         assert!(app.mask_pages.contains(&1));
         assert!(app.comic_pages.contains(&1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn egui037_continuation_context_state_zip_exit_defers_membership_to_own_ui() {
+        use crate::app::context_state_tests::Fixture;
+        let Fixture {
+            mut env,
+            main,
+            other,
+            old_stamp,
+            ..
+        } = Fixture::new();
+        let (generation, key) = env
+            .with_viewer_context_state(other, |app| {
+                (app.items_generation, app.rating_path_key(0).unwrap())
+            })
+            .unwrap();
+        let source = env.tmp.path().join("source");
+        env.image_folder_zip_operation = Some(Box::new(Operation {
+            owner: other,
+            purpose: Purpose::FolderContext,
+            completion: Completion::Viewer,
+            destination: source.with_extension("zip"),
+            source,
+            control: Default::default(),
+            _lease: None,
+            exit: Exit::OwnerRetired,
+            last_wait: None,
+            phase: Phase::Apply {
+                result: Ok(()),
+                refresh: SourceRefresh {
+                    snapshot: None,
+                    errors: vec![],
+                    chunks: [SourceChunk {
+                        context: other,
+                        generation,
+                        tags: vec![(key, vec!["saved-tag".into()])],
+                        pages: vec![],
+                        last: true,
+                    }]
+                    .into(),
+                },
+            },
+        }));
+        App::start_rating_boundary_trace_for_test();
+        env.service_image_folder_zip_exit(&egui::Context::default());
+        assert!(App::take_rating_boundary_trace_for_test().is_empty());
+        App::stop_rating_boundary_trace_for_test();
+        Fixture::assert_pending(&env, main, 4, old_stamp);
+        env.with_viewer_context_state(other, |app| {
+            Fixture::assert_pending(app, other, 7, old_stamp);
+            assert!(matches!(app.metadata_import_refresh_index,
+                Some(super::super::MetadataImportRefreshState::DisplayReconciliation { items_generation }) if items_generation == generation));
+        }).unwrap();
+        env.image_folder_zip_operation = None;
+        env.with_viewer_context(other, |app| {
+            assert!(app.metadata_import_refresh_index.is_none());
+            assert!(app.visible_indices.is_empty());
+        })
+        .unwrap();
     }
 
     #[cfg(windows)]

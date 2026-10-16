@@ -1576,7 +1576,7 @@ pub(in crate::app) struct ViewerContextBundle {
     rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
     rating_session_write_seen_generation: u64,
-    metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
+    metadata_import_refresh_index: Option<MetadataImportRefreshState>,
     current_folder_rating_cache: Option<u8>,
     current_folder_last_mtime: Option<std::time::SystemTime>,
     current_folder_signature: Option<folder_scan::FolderScanSignature>,
@@ -5217,6 +5217,26 @@ impl App {
         }
     }
 
+    /// Access only the editor state belonging to the still-current operation.
+    pub(super) fn with_composition_editor_owner_state<R>(
+        &mut self,
+        owner: &super::book_composition_editor::CompositionEditorOwner,
+        f: impl FnOnce(&mut super::book_composition_editor::CompositionEditorState) -> R,
+    ) -> Option<R> {
+        if self.composition_editor_operations.owner.as_ref() != Some(owner) {
+            return None;
+        }
+        match self.viewer_contexts.table.residence(owner.context_id) {
+            ContextResidence::Mounted => Some(f(&mut self.composition_editor)),
+            ContextResidence::AtRest => self
+                .viewer_contexts
+                .table
+                .at_rest_mut(owner.context_id)
+                .map(|bundle| f(&mut bundle.composition_editor)),
+            _ => None,
+        }
+    }
+
     #[track_caller]
     pub(in crate::app) fn bind_window(
         &mut self,
@@ -5287,22 +5307,51 @@ impl App {
         id: ViewerContextId,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, MountError> {
+        if self.viewer_contexts.table.mounted_id().is_none() {
+            return Err(MountError {
+                id,
+                residence: self.viewer_contexts.table.residence(id),
+            });
+        }
+        self.publish_mounted_context_rating_writes_at_boundary("mount_outgoing");
+        let result = self.with_viewer_context_state(id, |app| {
+            app.publish_mounted_context_rating_writes_at_boundary("mount_incoming");
+            if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+                app.poll_page_edit_reconciliation(&ctx);
+            }
+            app.consume_metadata_import_display_reconciliation();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(app)));
+            app.publish_mounted_context_rating_writes_at_boundary("return_outgoing");
+            result
+        })?;
+        self.publish_mounted_context_rating_writes_at_boundary("return_incoming");
+        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+            self.poll_page_edit_reconciliation(&ctx);
+        }
+        self.consume_metadata_import_display_reconciliation();
+        match result {
+            Ok(value) => Ok(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Exchange the existing payloads without adopting any display publication.
+    /// Service callbacks must themselves perform only owner-scoped state work.
+    pub(in crate::app) fn with_viewer_context_state<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
         let Some(original) = self.viewer_contexts.table.mounted_id() else {
             return Err(MountError {
                 id,
                 residence: self.viewer_contexts.table.residence(id),
             });
         };
-        self.publish_mounted_context_rating_writes_at_boundary("mount_outgoing");
         let ops = self.viewer_contexts.table.plan_mount(id)?;
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
-        self.publish_mounted_context_rating_writes_at_boundary("mount_incoming");
-        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
-            self.poll_page_edit_reconciliation(&ctx);
-        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-        self.publish_mounted_context_rating_writes_at_boundary("return_outgoing");
         let ops = self
             .viewer_contexts
             .table
@@ -5310,10 +5359,6 @@ impl App {
             .expect("mounted viewer-context owner disappeared");
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
-        self.publish_mounted_context_rating_writes_at_boundary("return_incoming");
-        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
-            self.poll_page_edit_reconciliation(&ctx);
-        }
         match result {
             Ok(value) => Ok(value),
             Err(payload) => std::panic::resume_unwind(payload),
@@ -5329,6 +5374,17 @@ impl App {
             .locate_window_context(window_id)
             .unwrap_or_else(|| panic!("window {window_id} has no viewer-context binding"));
         self.with_viewer_context(id, f)
+    }
+
+    pub(crate) fn with_window_viewer_context_state<R>(
+        &mut self,
+        window_id: u64,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
+        let (id, _) = self
+            .locate_window_context(window_id)
+            .unwrap_or_else(|| panic!("window {window_id} has no viewer-context binding"));
+        self.with_viewer_context_state(id, f)
     }
 
     pub(in crate::app) fn build_viewer_context(
@@ -5648,6 +5704,24 @@ impl App {
 
 #[cfg(not(windows))]
 impl App {
+    pub(super) fn with_composition_editor_owner_state<R>(
+        &mut self,
+        owner: &super::book_composition_editor::CompositionEditorOwner,
+        f: impl FnOnce(&mut super::book_composition_editor::CompositionEditorState) -> R,
+    ) -> Option<R> {
+        (self.composition_editor_operations.owner.as_ref() == Some(owner)
+            && owner.context_id == ViewerContextId::single_context())
+        .then(|| f(&mut self.composition_editor))
+    }
+
+    pub(in crate::app) fn with_viewer_context_state<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
+        self.with_viewer_context(id, f)
+    }
+
     pub(in crate::app) fn viewer_context_main(&self) -> ViewerContextId {
         ViewerContextId::single_context()
     }
@@ -5686,6 +5760,27 @@ impl App {
 
 #[cfg(all(test, windows))]
 impl App {
+    pub(super) fn start_rating_boundary_trace_for_test() {
+        VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(super) fn take_rating_boundary_trace_for_test() -> Vec<(&'static str, ViewerContextId)> {
+        VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| {
+            trace
+                .borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|event| (event.boundary, event.owner))
+                .collect()
+        })
+    }
+
+    pub(super) fn stop_rating_boundary_trace_for_test() {
+        VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| *trace.borrow_mut() = None);
+    }
+
     pub(in crate::app) fn begin_mounted_detached_session_for_test(
         &mut self,
         window_id: u64,

@@ -559,3 +559,126 @@ HEAD `c02e62349` で、他のcargo/nextestプロセスが無いことを確か�
 実装担当の全件で落ちた3件はすべて成功した。原因の断定はしない。
 独立レビュー（GPT-6.1 Sol / xhigh）は`c02e62349`をACCEPT（指摘なし）。以上で段1b-3aを受け入れる。
 台帳の留保（mount前後の表示副作用、bookmarkのlocal採用、AI取消終端の表示poll依存、Closeの`show_viewport_immediate`依存）は1b-3bと段2・3で扱う。
+
+## 段1b-3b: 保存・取消終端、D3、root lifecycle、状態アクセス（2026-10-16）
+
+開始HEAD `1aee8863c`。1b-3aは設計担当による正式独立レビューACCEPT・全件13,294 passed/0 failedで受入済み。
+本節はその後の未コミット差分の記録であり、前節の失敗履歴は書き換えない。
+Rust 1.99.0 / egui 0.33.3を維持。第4.4版の段1b-3b、root Close、C3 mount、D3、共通受入と
+detached §2/§11の追加合意を再読した。更新計画書を変更せず、logic接続・製品/live起動・commitを行わない。
+
+### 境界・owner・通常driverの接続
+
+| 境界 | 非描画側の責務 | UI側と通常0.33.3の順序 |
+| --- | --- | --- |
+| composition receipt | App-global ticketを一度収穫。receiptのpath/page identity/meterを既存共有writer/meter/dedup mirrorへ直接記録。editorはowner identityを照合しMounted/AtRestの当該stateだけ更新 | Preparing/Reloading・publication/permissionは旧post-frame位置。receipt→publication順を維持 |
+| context access | `with_viewer_context_state`は既存table plan/payload交換/finishとfavorite投影・元ownerへの復元だけ。callback unwindも同じ復元契約 | `with_viewer_context`にmount_outgoing→mount_incoming→callback→return_outgoing→return_incomingのrating境界とincoming後のpage-edit reconciliationを明示して残す |
+| owner付きeditor終了 | 狭い`with_composition_editor_owner_state`で既存stateを更新し、mount不要。古いticketは新sessionを変更しない | 表示準備のpollは既存UI mount wrapperを使う |
+| Remote/共有bookmark | pause/AI barrier・bookmark invalidation/disconnectをstate accessへ。唯一の共有receiver/routerを維持 | local `ContainerListed`は既存requestの`RowsReceived` phaseへ渡す。projection worker開始と採用は旧UI projection checkpoint。共通完成queueは追加しない |
+| discarded sidecar | `service_discarded_sidecar_restore`はDiscardedの予約返却・global effects・reader再開だけ。preview clear ACKは収穫し、共有Clearedイベントを表示pollへ残す | live hydration・retained shift readoption・F13のcache採用/rating再採用は旧UI位置。reader再開の一時mountはstate access |
+| AI取消終端 | `service_cancelled_ai_terminals`は取消済receiver/exact context/key/jobを終端。retained orphanは既存CPU cache処理、live結果は既存backlogに保持 | 共通collector/orphan処理をUIと共有。通常UIの取消Ready採用等の従来policy・旧poll位置は変更せず、新serviceのlogic接続は段3 |
+| watcher/周期保存 | watcher collectと既存周期保存の入口 | `poll_external_rescan`の走査結果受信・Equal/Different採用・hydration/cutoff ACKをその間の旧UI位置へ残す |
+| D3 | App-global hydration要求ownerの`sidecar_restore_request_seq`をchecked採番。一要求一回、通常/IndexOnly共通 | Commonとbook restoreに同じID。取消/完了で消えるper-request stateやcontext bundleへsequenceを入れない。frame/input計装は進めない |
+
+root lifecycleは通常入力と独立し、最新ROOT ViewportInfoを明示して読む。
+`RootLifecycleSnapshot`は一呼出し内だけの値で、Appのpending stateではない。
+通常driverでは旧outer-update位置のsettings→composition→ZIP受付と、旧tray要求poll後のhide判断を2 checkpointに保つ。
+modal ownerは終端poll前にsnapshot化し、通常×・明示Quit・保持TrayHideを区別する。
+`service_root_lifecycle`は同じ受付/判断とreceipt・settings-family・ZIP exit・discarded sidecar終端をUIなしで呼べる。
+既存EditorExitRequest/DeferredRootClose/ZIP Exitだけが終了意図を保持し、各終端から共通のbarrier判断へ戻す。
+rootのCancelCloseはlifecycleで返し、sidecarのキー/pointer/IME sanitizeはroot Closeを判断しない。子の入力sanitizeは従来どおり。
+
+ZIPの終了経路ではresource/trim返却・source cache更新をstate accessで行い、表示membership再構築を分けた。
+既存per-context `metadata_import_refresh_index` ownerを`Collecting`/`DisplayReconciliation`のtyped phaseへ整理し、
+同generationの最終chunkで表示採用を保持する。次の当該UI boundaryで一度だけ再構築し、state accessでは消費しない。
+タグ更新もあるため、page-edit stampだけではこの表示再構築を代用できなかった。新bool・第二queue/registry/bundleは追加しない。
+ParentHydration中のCloseは、そのownerのImageFolderZip continuationだけを既存Discardedへ渡し、
+sender破棄後もglobal終端が済むまで既存ZIP phaseを保持する。通常取消/非exitの表示更新と親一覧採用は旧UI経路を維持する。
+
+### 回帰・接続前提
+
+追加境界回帰は`egui037_continuation`、rootは`root_lifecycle`、状態アクセスは`context_state`、D3は`hydration`でも選択する。
+実owner/receiver/ACKと、未反映rating・受信済み未採用page-edit snapshot、fake save receipt、実共有resume writerを使う。
+source grepだけを主証拠にせず、receipt・one-shot終了・UI側の後続採用を検査する。
+実装担当の内部確認を行い、正式な独立レビューとは区別する。
+
+0.37 backendのlogic直後のClose確定/RawInputの配送消費は段2c・段3へ残す。
+0.33.3では後続file-organize admissionもROOT Closeを参照するため、ここでrawのCloseを消去しない。
+backendが届けた一回を旧driverの一回のcheckpointで受付け、frame counterや新しい重複受付flagは作らない。
+tray hideの既存root自身の親一覧復元はauto_fullscreen=falseの既存navigationを維持する。egui UI/viewport callbackの強制実行ではない。
+前節の`close_all_detached_viewers_for_mode_change`の既存immediate viewport退役は段2・3のvendor/App接続の留保であり、
+今回新たに強制UI・repaint・delay・retryを加えて代用しない。
+
+### 検証
+
+証跡は`target/egui037-stage1b-3b/`。通常feature、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。
+検証対象は最終Rust source 715ファイルのSHA-256で記録する（`sources-final.json`）。
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| core check 通常 / test-script | 成功、20.922秒 / 48.458秒。以後のsource変更は既存test-only 4ファイルの比較・監査修正だけ | 0 / 0 |
+| cargo fmt / fmt --check | 成功。最後のtest-only比較修正後にも実行、15.855秒 / 16.347秒 | 0 / 0 |
+| 共通境界初回compile | 既存テストの旧struct `.next_item`参照でcompile失敗。typed phaseを明示して同じ上限を検査する形へ修正 | 101 |
+| 共通境界32件 | 全て成功、2.529秒（compile込み345.253秒） | 0 |
+| 関連焦点nextest（2回） | 各2,008 passed / 1 failed。失敗は同じretired receiptテストで、下記の期待値所有前提とpath比較。81.241秒 / 81.453秒 | 100 / 100 |
+| 修正対象＋共通境界の最終nextest | 33 passed / 0 failed、2.598秒（compile込み144.618秒）。他の2,008件は同じ製品sourceでの成功結果を再利用、unique 2,009件をカバー | 0 |
+| 個別filter成立件数 | 最終33件内で共通32、root_lifecycle 8、context_state 6、hydration 4（D3 3件とZIP hydration 1件） | 上記0の内数 |
+| 旧snapshot通常比較 | 統合181 + 11、lib 103の計295 passed。成功52コマンド、PNG 445枚SHA-256不変。初回の異常終了は下記へ別記 | 最終全て0 |
+| 全件lib初回 | 13,312 passed / 1 failed / 59 skipped、374.759秒（wrapper378.447秒）。下記のsource監査文字列不一致 | 100 |
+| 外部ツール監査＋共通境界 | 34 passed / 0 failed、監査anchor修正後（compile込み135.715秒） | 0 |
+| App分割先の禁止コード監査を含む最終焦点 | 40 passed / 0 failed（compile込み171.948秒）。他の既存成功と重複を除く件数はevidenceへ記録 | 0 |
+| 最後のfmt / fmt --check | 監査対象追加後も成功、15.315秒 / 16.826秒 | 0 / 0 |
+
+焦点filterは`test(egui037_continuation) | test(tray) | test(startup) | test(sidecar_restore) | test(composition) | test(rating) | test(hydration) | test(remote) | test(book_bookmark) | test(spread_shift) | test(metadata_import) | test(ai_cancel) | test(final_ai) | test(edit_preview) | test(image_folder_zip)`。
+最終は`test(egui037_continuation) | test(retired_owner_save_receipt_records_once_without_reviving_owner_or_touching_main)`。
+`evidence-summary.json`は成功名のunionを取り、重複を足し合わせない。
+
+- 既存`retired_owner_save_receipt_records_once_without_reviving_owner_or_touching_main`は、
+  退役後のreceiptが`last_book_resume`を更新しないことを要求していた。しかしmirrorはbundleに含まれないApp-global stateであり、
+  第4.4版C3はwriter/meter/dedup mirrorの共通利用を指定する。この前提を訂正し、正しいpath/page identity/meterと、
+  共通入口から再記録してもwriter受付件数が増えないことを検査する。mainのitems/generation不変・失敗時に記録しない検査は維持した。
+  追加比較のpath表記（raw Windows pathと正規化済みscope）も既存`path_key::normalize`で照合した。製品のpath解釈は変えない。
+- snapshotの`book_composition_editor_snapshots`初回は7件成功後に`STATUS_ACCESS_VIOLATION`で異常終了
+  （exit 3221225477 / 0xc0000005、7.584秒）。Appを生成しないpure editor fixtureで、今回差分との因果関係は未確認。
+  コード・backend・並列数・期待PNGを変えず同じコマンドで単独再実行し、11 passed / 0 failed、8.378秒、exit 0。
+  UI統合181件は初回成功（187.600秒）を再利用し、残りの通常lib比較50コマンドも全て成功した。異常終了の原因解消は主張しない。
+
+`boundary*-result.json` / `*-junit.xml`、`focused*-result.json` / `*-junit.xml`に焦点結果、
+`snapshots-first-results.json`と`book_composition_editor_snapshots-first.log`に異常終了、
+`snapshots-remaining-results.json` / `snapshot-remaining-summary.json`に再実行と残りの通常比較を保存した。
+更新計画・Cargo manifest/lock・toolchain・対象外DSPの5ファイルとPNG 445枚は比較前後で不変。
+
+全件初回の失敗は`external_tool::tests::the_launch_boundary_is_acked_even_when_the_frame_body_returns_early`。
+今回の`update_frame(ctx, frame, root_lifecycle)`への引数受渡しに対し、test-only監査が旧2引数文字列を探していた。
+製品のdraw/launch ACK入口と順序は変えず、監査anchorと「frame前へ移した場合」の変異fixtureを新呼出しへ合わせた。
+変異fixtureが実際に文字列を書き換えたことも検査する。外部ツールの製品コードを1b-3cより先に変更したものではない。
+
+分割先の追加に合わせ、1b-1で整えたApp禁止コード監査の5種（borderless状態書込み、子Close生成、昇格述語、
+font-resync、TRT lifecycle迂回）へ`root_lifecycle.rs` / `ai_terminal_service.rs`を加えた。
+子Close生成数の監査は、新moduleのinline testのROOT Close assertionを除いた製品本文を対象とし、生成数の上限は維持する。
+これらと外部ツールの変更はtest-onlyで、core/snapshotの製品source・fixture・条件は不変。
+初回失敗は今回の呼出し抽出に関連する監査互換の問題として修正し、焦点成功後に同条件で全件を再検証する。
+再検証の`scripts/test-lib-full.ps1`は **13,313 passed / 0 failed / 59 skipped、375.601秒
+（wrapper381.036秒）、exit 0**。runは`target/test-lib-full/runs/20261016T133838852Z-73d3bdb9/`、
+source IDは`0859396af08fcc24553038e5b065ece10a97756eee37d0551b37923c29e5f2c6`。
+成功receiptは`target/test-lib-full/3b0b7300c88416fa68ca2f051d35f7c7c0a928d53fe40a0bfda6841d4687f6a9.json`。
+初回run `20261016T132120965Z-3f2a2a01`（source `a55f6845af11a23b85177fcac862758f6c5410cd36135d1fb02291bbb914b683`）の
+13,312成功/監査1失敗も、`lib-full.log` / `lib-full-result.json` / `lib-full-first-junit.xml`に保持する。
+最終runは`lib-full-final.log` / `lib-full-final-result.json` / `lib-full-final-junit.xml`。
+
+最終焦点40件は2.641秒、前の成功結果とのunique unionは2,016件。
+common 32 / root_lifecycle 8 / context_state 6の内数を二重加算しない。
+core以後の差分4ファイルは`app/tests.rs`、`app/book_composition_editor/tests.rs`、`external_tool.rs`のtests、
+`ai/trt_worker_lifecycle.rs`のtestsだけ。実行製品source・依存・snapshot fixtureは不変として成功を再利用した。
+全件終了後も最終Rust 715ファイル、保護対象5ファイル、PNG 445枚のハッシュが一致した（`evidence-summary.json`）。
+最後は台帳だけを追記し、`git diff --check`もexit 0で確認した。
+
+変更は新規`app/root_lifecycle.rs` / `app/ai_terminal_service.rs` / `app/context_state_tests.rs`と、
+App driver/registry、composition editor/receipt/meter、sidecar/D3、ZIP/tray/settings-family、対応監査・台帳の18ファイル。
+対象外DSPの開始時差分は保持した。HEAD `1aee8863c`のまま未コミットで返し、branch/push操作は行わない。
+
+残る接続は1b-3cと段2・3。特にbackendの最新root Close消費/logic直後のCancelClose確定、
+既存immediate viewport退役、App::logic/uiの正式接続を今回の成功と混同しない。
+設計との照合では、per-requestのhydration Optionへsequenceを置けないことと、ZIPのtag membership再構築がpage-edit stampだけでは
+延期できないことを確認し、前述の既存App-global owner/既存refresh ownerのtyped phaseへ整理した。
+旧テストのdedup mirrorのmain所有前提は訂正済み。それ以外の重大な設計不一致は確認していない。

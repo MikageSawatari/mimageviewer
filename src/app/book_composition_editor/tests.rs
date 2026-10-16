@@ -1923,10 +1923,31 @@ fn retired_owner_save_receipt_records_once_without_reviving_owner_or_touching_ma
             f.app.composition_editor,
             CompositionEditorState::Closed
         ));
-        assert!(
-            f.app.last_book_resume.is_none(),
-            "retired receipt uses global writer, not main's dedup owner"
-        );
+        if failure {
+            assert!(f.app.last_book_resume.is_none());
+        } else {
+            // The dedup mirror belongs to the shared writer, not the mounted viewer.
+            let (path, page, meter, identity) = f.app.last_book_resume.clone().unwrap();
+            let position = reply.position.as_ref().unwrap();
+            assert_eq!(
+                crate::path_key::normalize(&path),
+                crate::path_key::normalize(&f.scope.logical_root)
+            );
+            assert_eq!(page, position.page);
+            assert_eq!(identity, position.identity);
+            assert!(meter.is_some());
+            f.app
+                .persist_book_resume_with_identity(path, page, meter, identity);
+            assert_eq!(
+                f.app
+                    .book_resume_writer
+                    .as_ref()
+                    .unwrap()
+                    .watermarks()
+                    .admitted,
+                cutoff
+            );
+        }
         assert_eq!(f.app.items, main_items);
         assert_eq!(f.app.items_generation, main_generation);
         if failure {

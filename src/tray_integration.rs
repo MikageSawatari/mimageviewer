@@ -220,33 +220,39 @@ impl App {
 
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
+    #[cfg(test)]
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
-        // The conversion owns its close barrier through resource/adoption completion.
-        // Keep the window visible now; its terminal uses this same tray-vs-exit policy.
+        if !ctx.input_for(egui::ViewportId::ROOT, |i| i.viewport().close_requested()) {
+            return false;
+        }
         if self.image_folder_zip_operation.is_some() {
             self.defer_image_folder_zip_root_close(ctx);
             return false;
         }
-        // トレイメニュー「終了」 / インストーラからの shutdown 要求は常に通す。
-        let tray_wants_quit = self
-            .tray_controller
-            .as_ref()
-            .is_some_and(|tc| tc.is_quit_requested());
-        let installer_wants_quit = self
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if tray_wants_quit || installer_wants_quit {
+        let explicit_quit = self.sidecar_restore_root_lifecycle_close_requested();
+        let modal_owner = self.root_tray_hide_modal_owner();
+        self.intercept_root_close_request(ctx, explicit_quit, false, modal_owner)
+    }
+
+    /// Apply the tray policy to an already accepted root lifecycle request.
+    /// Modal ownership was sampled before this pass can harvest its terminal.
+    pub(crate) fn intercept_root_close_request(
+        &mut self,
+        ctx: &egui::Context,
+        explicit_quit: bool,
+        retained_tray_hide: bool,
+        modal_owner: Option<&'static str>,
+    ) -> bool {
+        if explicit_quit {
             return false;
         }
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if !close_requested {
+        if !retained_tray_hide
+            && (!self.settings.minimize_to_tray_on_close || self.tray_controller.is_none())
+        {
             return false;
         }
-        if !self.settings.minimize_to_tray_on_close || self.tray_controller.is_none() {
-            return false;
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        if let Some(owner) = self.root_tray_hide_modal_owner() {
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
+        if let Some(owner) = modal_owner {
             crate::logger::log(format!(
                 "[tray] kept main window visible for modal owner={owner}"
             ));
@@ -263,7 +269,7 @@ impl App {
     /// Modal state is sampled before polling terminal workers in this frame. A dialog that was
     /// visible when CloseRequested arrived therefore keeps the main window visible for the whole
     /// frame, even if its worker reaches a terminal result later in the pass.
-    fn root_tray_hide_modal_owner(&self) -> Option<&'static str> {
+    pub(crate) fn root_tray_hide_modal_owner(&self) -> Option<&'static str> {
         root_tray_hide_modal_owner(
             self.sidecar_restore_active(),
             self.staged_smart_root_modal_visible(),
@@ -724,7 +730,8 @@ mod tests {
     }
 
     #[test]
-    fn close_to_tray_keeps_a_saved_group_modal_visible_for_the_whole_frame() {
+    fn egui037_continuation_root_lifecycle_close_to_tray_keeps_a_saved_group_modal_visible_for_the_whole_frame()
+     {
         let mut app = crate::app::setup_app_for_test();
         let root = app.tmp.path().join("books");
         std::fs::create_dir_all(root.join("Current")).unwrap();
@@ -744,10 +751,10 @@ mod tests {
             .push(egui::ViewportEvent::Close);
 
         let output = ctx.run(raw, |ctx| {
-            assert!(!app.maybe_intercept_close(ctx));
-            // Simulate a terminal transition later in the same App::update pass. The close
-            // decision already sampled the visible modal and must not hide retroactively.
+            let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
+            // Terminal completion cannot change the modal ownership sampled at acceptance.
             assert!(app.cancel_saved_group_open_request(request_id));
+            app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
         });
 
         assert!(app.window_visible);

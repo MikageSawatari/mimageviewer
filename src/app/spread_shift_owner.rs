@@ -280,6 +280,11 @@ pub(super) struct ViewerBookRestore {
 }
 
 impl ViewerBookRestore {
+    #[cfg(test)]
+    pub(super) fn open_id_for_test(&self) -> u64 {
+        self.receipt.open_id
+    }
+
     pub(super) fn refresh_memory_policy(
         &mut self,
         generation: u64,

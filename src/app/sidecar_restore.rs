@@ -989,7 +989,8 @@ impl App {
         }
         Self::sanitize_sidecar_restore_viewport_input(
             ctx,
-            !self.sidecar_restore_root_lifecycle_close_requested(),
+            ctx.viewport_id() != egui::ViewportId::ROOT
+                && !self.sidecar_restore_root_lifecycle_close_requested(),
         );
         // These owners were derived before the modal began, so filtering RawInput alone cannot
         // release them.  End the gestures explicitly on every mounted-context pass; none of the
@@ -1015,7 +1016,10 @@ impl App {
     /// filtering therefore is insufficient: scroll and pointer button state have already been
     /// derived by egui.  Reset those derived values at the viewport boundary as well.
     pub(crate) fn consume_sidecar_restore_viewport_input(ctx: &egui::Context) {
-        Self::sanitize_sidecar_restore_viewport_input(ctx, true);
+        Self::sanitize_sidecar_restore_viewport_input(
+            ctx,
+            ctx.viewport_id() != egui::ViewportId::ROOT,
+        );
     }
 
     fn sanitize_sidecar_restore_viewport_input(ctx: &egui::Context, cancel_close: bool) {
@@ -1265,6 +1269,16 @@ impl App {
         }
     }
 
+    /// One App-global identity source for live hydration and index-only requests.
+    /// Cancelling a request or mounting another viewer never rewinds this sequence.
+    fn next_sidecar_restore_request_id(&mut self) -> u64 {
+        self.sidecar_restore_request_seq = self
+            .sidecar_restore_request_seq
+            .checked_add(1)
+            .expect("sidecar restore request sequence exhausted");
+        self.sidecar_restore_request_seq
+    }
+
     pub(super) fn begin_sidecar_restore(
         &mut self,
         continuation: SidecarLoadContinuation,
@@ -1347,10 +1361,7 @@ impl App {
         let source_path = continuation.source_path.clone();
         let clear_sidecar_cache_after_flush = !continuation.detached_physical;
 
-        let request_id = self
-            .frame_counter
-            .wrapping_add(self.input_seq)
-            .wrapping_add(1);
+        let request_id = self.next_sidecar_restore_request_id();
         let started_at = continuation.restore_started_at;
         let book_restore = self.begin_book_shift_restore(request_id);
         self.sidecar_restore = Some(SidecarRestoreState {
@@ -1499,12 +1510,9 @@ impl App {
             // ordinary poll cancels any deferred open through the same failure tail.
         }
         let cancel = Arc::new(AtomicBool::new(false));
+        let request_id = self.next_sidecar_restore_request_id();
         let book_restore = if self.spread_shift.scope != self.current_spread_shift_scope() {
-            self.begin_book_shift_restore(
-                self.frame_counter
-                    .wrapping_add(self.input_seq)
-                    .wrapping_add(1),
-            )
+            self.begin_book_shift_restore(request_id)
         } else {
             None
         };
@@ -1512,10 +1520,7 @@ impl App {
             #[cfg(test)]
             checking_relay: None,
             common: Common {
-                request_id: self
-                    .frame_counter
-                    .wrapping_add(self.input_seq)
-                    .wrapping_add(1),
+                request_id,
                 started_at: std::time::Instant::now(),
                 target_context: self.sidecar_restore_projected_context(),
                 items_generation: self.items_generation,
@@ -1894,6 +1899,9 @@ impl App {
 
     pub(crate) fn poll_sidecar_restore(&mut self, ctx: &egui::Context) {
         self.poll_retained_shift_readoption(ctx);
+        if self.service_discarded_sidecar_restore(ctx) {
+            return;
+        }
         let Some(mut state) = self.sidecar_restore.take() else {
             return;
         };
@@ -1931,6 +1939,46 @@ impl App {
         }
         self.sidecar_restore = Some(state);
         self.poll_sidecar_restore_projected(ctx);
+    }
+
+    /// Only the already discarded continuation's global terminal is service work.
+    /// Live hydration, retained shift readoption and preview adoption remain UI-owned.
+    pub(crate) fn service_discarded_sidecar_restore(&mut self, ctx: &egui::Context) -> bool {
+        if !self.sidecar_restore.as_ref().is_some_and(|state| {
+            matches!(
+                state.common.continuation,
+                ContinuationOwner::Discarded { .. }
+            )
+        }) {
+            return false;
+        }
+        let state = self.sidecar_restore.take().unwrap();
+        self.poll_discarded_sidecar_restore(ctx, state);
+        true
+    }
+
+    pub(super) fn cancel_image_zip_hydration_for_exit(&mut self, owner: ViewerContextId) {
+        if let Some(state) = self.sidecar_restore.as_mut()
+            && state.common.target_context == owner
+            && matches!(&state.common.continuation, ContinuationOwner::Live(continuation)
+                if matches!(continuation.navigation_after_hydration,
+                    Some(super::MainListAfterHydration::ImageFolderZip { .. })))
+        {
+            state.common.discard_target();
+        }
+    }
+
+    pub(super) fn image_zip_discarded_hydration_exit_pending(
+        &self,
+        owner: ViewerContextId,
+    ) -> bool {
+        self.sidecar_restore.as_ref().is_some_and(|state| {
+            state.common.target_context == owner
+                && matches!(
+                    state.common.continuation,
+                    ContinuationOwner::Discarded { .. }
+                )
+        })
     }
 
     fn poll_sidecar_restore_projected(&mut self, ctx: &egui::Context) {
@@ -2723,7 +2771,8 @@ impl App {
                         false
                     }
                     PreviewClearPoll::Cleared => {
-                        self.poll_edit_preview_cache(ctx);
+                        // The clear ACK retires this discarded request. The shared Cleared
+                        // notification remains for the existing UI cache adoption checkpoint.
                         state.phase = self.sidecar_restore_start_cache_refresh(&mut state);
                         false
                     }
@@ -3210,6 +3259,195 @@ fn marker_clear_warning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn install_hydration_identity_book(app: &mut App, source: PathBuf) {
+        app.current_folder = Some(source.clone());
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: source,
+            page_num: 0,
+            content_type: None,
+        }];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+    }
+
+    fn hydration_identity_continuation(app: &App) -> SidecarLoadContinuation {
+        let (tx, _rx) = mpsc::channel();
+        let now = std::time::Instant::now();
+        SidecarLoadContinuation {
+            navigation_after_hydration: None,
+            audio_art_prune: None,
+            first_display_action: FirstDisplayAction::None,
+            restore_intent: super::super::StartupListIntent::PreservePresentation,
+            auto_aspect_seed: None,
+            source_path: app.current_folder.clone().unwrap(),
+            source_is_directory: false,
+            prepared_subfolder: None,
+            prepared_page_edits: None,
+            prepared_aggregate: None,
+            catalog_existing_keys: HashSet::new(),
+            video_items: Vec::new(),
+            sli_seq: 0,
+            sli_t0: now,
+            items_len: app.items.len(),
+            detached_physical: false,
+            tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            restore_started_at: now,
+        }
+    }
+
+    fn hydration_request_with_book_id(app: &App) -> u64 {
+        let common = &app.sidecar_restore.as_ref().unwrap().common;
+        assert_eq!(
+            common.request_id,
+            common.book_restore.as_ref().unwrap().open_id_for_test(),
+            "hydration and its book restore must share one allocated identity"
+        );
+        common.request_id
+    }
+
+    fn cancel_hydration_identity_request(app: &mut App) {
+        let cancel = Arc::clone(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel(),
+        );
+        assert!(
+            app.sidecar_restore
+                .as_mut()
+                .unwrap()
+                .common
+                .discard_target()
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Some(state) = app.sidecar_restore.take() {
+            app.poll_discarded_sidecar_restore(&egui::Context::default(), state);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel did not settle"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn egui037_continuation_hydration_ids_survive_cancel_restart_and_index_only_replacement() {
+        let mut app = crate::app::setup_app_for_test();
+        app.frame_counter = 13;
+        app.input_seq = 29;
+        let first_source = app.tmp.path().join("identity-first.pdf");
+        install_hydration_identity_book(&mut app, first_source);
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        let first = hydration_request_with_book_id(&app);
+        let rejected = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(rejected, false).is_err());
+        assert_eq!(app.sidecar_restore_request_seq, first);
+        cancel_hydration_identity_request(&mut app);
+
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        let restarted = hydration_request_with_book_id(&app);
+        assert_eq!(restarted, first + 1);
+        cancel_hydration_identity_request(&mut app);
+
+        let second_source = app.tmp.path().join("identity-second.pdf");
+        install_hydration_identity_book(&mut app, second_source);
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        let index_only = hydration_request_with_book_id(&app);
+        assert_eq!(index_only, restarted + 1);
+        let superseded_cancel = Arc::clone(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .continuation
+                .cancel(),
+        );
+        app.items_generation += 1;
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        assert!(superseded_cancel.load(Ordering::Relaxed));
+        let replacement = app.sidecar_restore.as_ref().unwrap().common.request_id;
+        assert_eq!(replacement, index_only + 1);
+        assert!(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .common
+                .book_restore
+                .is_none()
+        );
+        cancel_hydration_identity_request(&mut app);
+
+        app.prepare_current_listing_page_identity_index(Default::default(), None);
+        let index_restarted = app.sidecar_restore.as_ref().unwrap().common.request_id;
+        assert_eq!(index_restarted, replacement + 1);
+        cancel_hydration_identity_request(&mut app);
+
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        assert_eq!(hydration_request_with_book_id(&app), index_restarted + 1);
+        cancel_hydration_identity_request(&mut app);
+        assert_eq!((app.frame_counter, app.input_seq), (13, 29));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn egui037_continuation_hydration_ids_do_not_reset_across_context_mounts() {
+        let mut app = crate::app::setup_app_for_test();
+        app.frame_counter = 13;
+        app.input_seq = 29;
+        let main_source = app.tmp.path().join("identity-main.pdf");
+        let detached_source = app.tmp.path().join("identity-detached.pdf");
+        install_hydration_identity_book(&mut app, main_source);
+        let detached = app.build_active_context_for_test(
+            Some(837),
+            super::super::DetachedSource::Book,
+            |owner| install_hydration_identity_book(owner, detached_source),
+        );
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        let first = hydration_request_with_book_id(&app);
+        cancel_hydration_identity_request(&mut app);
+        let mounted = app
+            .with_viewer_context(detached, |owner| {
+                owner.prepare_current_listing_page_identity_index(Default::default(), None);
+                let id = hydration_request_with_book_id(owner);
+                assert_eq!(id, first + 1);
+                cancel_hydration_identity_request(owner);
+                id
+            })
+            .unwrap();
+        assert_eq!(app.sidecar_restore_request_seq, mounted);
+        let continuation = hydration_identity_continuation(&app);
+        assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+        assert_eq!(hydration_request_with_book_id(&app), mounted + 1);
+        cancel_hydration_identity_request(&mut app);
+        assert_eq!((app.frame_counter, app.input_seq), (13, 29));
+    }
+
+    #[test]
+    fn egui037_continuation_hydration_sequence_exhaustion_never_reuses_an_id() {
+        let mut app = crate::app::setup_app_for_test();
+        app.sidecar_restore_request_seq = u64::MAX - 1;
+        assert_eq!(app.next_sidecar_restore_request_id(), u64::MAX);
+        for _ in 0..2 {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    app.next_sidecar_restore_request_id()
+                }))
+                .is_err()
+            );
+            assert_eq!(app.sidecar_restore_request_seq, u64::MAX);
+            assert!(app.sidecar_restore.is_none());
+        }
+    }
 
     #[test]
     fn phase_presentation_names_the_actual_restore_step() {
@@ -5200,14 +5438,10 @@ mod tests {
             .push(egui::ViewportEvent::Close);
 
         let output = ctx.run(raw, |ctx| {
+            let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
             app.consume_input_during_sidecar_restore(ctx);
             assert!(ctx.input(|input| input.viewport().close_requested()));
-            let tray_hide_started = if app.sidecar_restore_blocks_root_tray_hide() {
-                false
-            } else {
-                app.maybe_intercept_close(ctx)
-            };
-            assert!(!tray_hide_started);
+            app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
             app.show_sidecar_restore_dialog(ctx);
         });
         assert!(app.window_visible);

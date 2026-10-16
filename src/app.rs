@@ -609,6 +609,10 @@ pub(crate) mod raw_page_store;
 pub(crate) mod smart_folder;
 mod snapshot_ops;
 use raw_page_store::*;
+mod ai_terminal_service;
+#[cfg(all(test, windows))]
+mod context_state_tests;
+pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
 mod update_phases;
@@ -4184,6 +4188,12 @@ struct MetadataImportRefreshIndex {
     folder_pin_aliases: Vec<(String, String)>,
 }
 
+/// The existing per-context refresh owner also retains its final UI adoption.
+enum MetadataImportRefreshState {
+    Collecting(MetadataImportRefreshIndex),
+    DisplayReconciliation { items_generation: u64 },
+}
+
 fn metadata_import_context_path_is_affected(
     path: &Path,
     import_root: &Path,
@@ -5299,6 +5309,10 @@ impl BookBookmarkProjectionKey {
 
 pub(crate) enum CurrentBookBookmarksStage {
     ReadingRows(u64),
+    RowsReceived {
+        request_id: u64,
+        result: Result<Vec<crate::book_bookmarks::BookBookmark>, String>,
+    },
     Projecting(mpsc::Receiver<crate::bookmark_browser::BookBookmarkProjection>),
 }
 
@@ -16938,7 +16952,7 @@ pub struct App {
     pub(crate) rating_publication_count: usize,
     /// modal import中だけ保持する、path keyから現在context cache indexへの逆引き。
     /// import開始前に1回構築し、streaming refresh batchごとの全items走査を避ける。
-    metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
+    metadata_import_refresh_index: Option<MetadataImportRefreshState>,
     /// `current_folder` (コンテナ) 自身のレーティングキャッシュ。アドレスバー描画で
     /// 毎フレーム参照されるので SQLite を叩かない。`None` は未計算を意味する。
     /// `load_folder` / `set_current_folder_rating` / `set_rating` (コンテナ変更時) で
@@ -17471,6 +17485,8 @@ pub struct App {
     /// 初回 sidecar 復旧の全ライフサイクルと load continuation を所有する。
     /// `Some` 自体が全入力を止める共通 modal の根拠になる。
     pub(crate) sidecar_restore: Option<sidecar_restore::SidecarRestoreState>,
+    /// App-global hydration identity; survives cancellation and context swaps.
+    pub(crate) sidecar_restore_request_seq: u64,
     pub(crate) sidecar_probe_reuse: sidecar_restore::SidecarProbeReuseCache,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
@@ -20708,6 +20724,7 @@ impl App {
             show_subfolder_expansion_dialog: false,
             modal_block_reason_logged: None,
             sidecar_restore: None,
+            sidecar_restore_request_seq: 0,
             sidecar_probe_reuse: Default::default(),
             subfolder_expansion_pending: None,
             subfolder_expansion_install_pending: None,
@@ -22851,6 +22868,12 @@ impl App {
             ));
         })
         .ok()
+    }
+
+    #[cfg(windows)]
+    fn with_active_viewer_context_state<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let id = self.active_viewer_context_id()?;
+        self.with_viewer_context_state(id, f).ok()
     }
 
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
@@ -45983,6 +46006,100 @@ impl App {
         }
     }
 
+    fn begin_image_zip_terminal_refresh_state(&mut self) {
+        for id in self.viewer_context_ids() {
+            let _ =
+                self.with_viewer_context_state(id, |app| app.metadata_import_refresh_index = None);
+        }
+    }
+
+    fn advance_image_zip_terminal_refresh_state(&mut self, keys: &HashSet<String>) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3);
+        let mut remaining = 2_048;
+        for id in self.viewer_context_ids() {
+            if remaining == 0 || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            if self.with_viewer_context_state(id, |app| {
+                app.advance_current_metadata_import_terminal_index(
+                    Path::new(""),
+                    false,
+                    Some(keys),
+                    &mut remaining,
+                    deadline,
+                )
+            }) != Ok(true)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mark_metadata_import_display_reconciliation(&mut self) {
+        self.metadata_import_refresh_index =
+            Some(MetadataImportRefreshState::DisplayReconciliation {
+                items_generation: self.items_generation,
+            });
+    }
+
+    fn consume_metadata_import_display_reconciliation(&mut self) {
+        if let Some(MetadataImportRefreshState::DisplayReconciliation { items_generation }) =
+            self.metadata_import_refresh_index.as_ref()
+        {
+            let current = *items_generation == self.items_generation;
+            self.metadata_import_refresh_index = None;
+            if current {
+                self.rebuild_visible_indices_preserving_facet_scope();
+            }
+        }
+    }
+
+    fn take_metadata_import_refresh_requests_state(
+        &mut self,
+        _changed: crate::metadata_transfer::ImportChangedSections,
+        committed: &crate::metadata_transfer::ImportCommittedChanges,
+    ) -> Vec<metadata_import_refresh::ContextRequest> {
+        let mut requests = Vec::new();
+        let main = self.viewer_context_main();
+        let mut ids = self.viewer_context_ids();
+        ids.sort_by_key(|id| (*id != main, id.serial()));
+        for id in ids {
+            let _ = self.with_viewer_context_state(id, |app| {
+                let spread_key = app.spread_container_key_with_fallback();
+                let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
+                let shift_changed = app.spread_shift.scope.as_ref().is_some_and(|scope| {
+                    committed.spread_shift_scopes.contains(&scope.storage_key())
+                });
+                let shift_read = app.admit_imported_shift_read(shift_changed);
+                let Some(MetadataImportRefreshState::Collecting(index)) =
+                    app.metadata_import_refresh_index.take()
+                else {
+                    return;
+                };
+                if index.complete && index.affected {
+                    let (spread_container_path, spread_container_fallback) = spread_key
+                        .map(|key| (Some(key.exact), key.fallback))
+                        .unwrap_or_default();
+                    requests.push(metadata_import_refresh::ContextRequest {
+                        context_id: id,
+                        items_generation: index.items_generation,
+                        pin_materialization: index.pin_materialization,
+                        items: index.items,
+                        current_rating_key: index.current_rating_key,
+                        spread_container_path,
+                        spread_container_fallback,
+                        shift_read,
+                        old_folder_pin_keys,
+                        folder_pin_paths: index.folder_pin_paths,
+                        folder_pin_aliases: index.folder_pin_aliases,
+                    });
+                }
+            });
+        }
+        requests
+    }
+
     fn advance_metadata_import_terminal_refresh_target(
         &mut self,
         import_root: &Path,
@@ -46090,7 +46207,11 @@ impl App {
         let restart = self
             .metadata_import_refresh_index
             .as_ref()
-            .is_none_or(|index| index.items_generation != self.items_generation);
+            .is_none_or(|state| {
+                !matches!(state,
+                MetadataImportRefreshState::Collecting(index)
+                    if index.items_generation == self.items_generation)
+            });
         if restart {
             let affected = changed_keys.is_some()
                 || self.current_folder.as_deref().is_some_and(|path| {
@@ -46105,21 +46226,24 @@ impl App {
             let folder_pin_paths = affected
                 .then(|| self.folder_pin_context_lookup_paths())
                 .unwrap_or_default();
-            self.metadata_import_refresh_index = Some(MetadataImportRefreshIndex {
-                pin_materialization: self.pin_materialization_request(CurrentViewRefresh::Full),
-                items_generation: self.items_generation,
-                current_rating_key,
-                affected,
-                complete: !affected || self.items.is_empty(),
-                folder_pin_paths,
-                ..MetadataImportRefreshIndex::default()
-            });
+            self.metadata_import_refresh_index = Some(MetadataImportRefreshState::Collecting(
+                MetadataImportRefreshIndex {
+                    pin_materialization: self.pin_materialization_request(CurrentViewRefresh::Full),
+                    items_generation: self.items_generation,
+                    current_rating_key,
+                    affected,
+                    complete: !affected || self.items.is_empty(),
+                    folder_pin_paths,
+                    ..MetadataImportRefreshIndex::default()
+                },
+            ));
         }
 
-        let mut index = self
-            .metadata_import_refresh_index
-            .take()
-            .expect("terminal metadata refresh index initialized");
+        let Some(MetadataImportRefreshState::Collecting(mut index)) =
+            self.metadata_import_refresh_index.take()
+        else {
+            unreachable!("terminal metadata refresh index initialized");
+        };
         while index.affected
             && index.next_item < self.items.len()
             && *remaining > 0
@@ -46227,7 +46351,7 @@ impl App {
             || (index.items_generation == self.items_generation
                 && index.next_item >= self.items.len());
         let complete = index.complete;
-        self.metadata_import_refresh_index = Some(index);
+        self.metadata_import_refresh_index = Some(MetadataImportRefreshState::Collecting(index));
         complete
     }
 
@@ -46237,7 +46361,7 @@ impl App {
         committed: &crate::metadata_transfer::ImportCommittedChanges,
     ) -> Vec<metadata_import_refresh::ContextRequest> {
         fn take_current(
-            index: &mut Option<MetadataImportRefreshIndex>,
+            index: &mut Option<MetadataImportRefreshState>,
             context_id: ViewerContextId,
             spread_container_key: Option<crate::spread_db::SpreadContainerKey>,
             shift_read: Option<(
@@ -46246,7 +46370,9 @@ impl App {
             )>,
             old_folder_pin_keys: std::collections::HashSet<String>,
         ) -> Option<metadata_import_refresh::ContextRequest> {
-            let index = index.take()?;
+            let MetadataImportRefreshState::Collecting(index) = index.take()? else {
+                return None;
+            };
             let (spread_container_path, spread_container_fallback) = spread_container_key
                 .map(|key| (Some(key.exact), key.fallback))
                 .unwrap_or_default();
@@ -46465,7 +46591,7 @@ impl App {
         #[cfg(windows)]
         {
             for id in self.other_viewer_context_ids() {
-                if let Err(error) = self.with_viewer_context(id, |app| {
+                if let Err(error) = self.with_viewer_context_state(id, |app| {
                     app.ensure_mounted_tag_prewarm_started();
                 }) {
                     crate::logger::log(format!(
@@ -49324,8 +49450,8 @@ impl App {
         self.poll_book_bookmark_context_projections();
     }
 
-    /// Single shared receiver/router for local and Remote replies. The legacy
-    /// owner updates still use UI mount boundaries until stage 1b-3b.
+    /// Single shared receiver/router. Local rows stay in their existing request
+    /// owner until the UI projection checkpoint; Remote ACKs can finish without it.
     pub(crate) fn poll_book_bookmark_service_responses(&mut self) {
         loop {
             let event = match self
@@ -49344,7 +49470,7 @@ impl App {
                             .book_bookmark_context_matches(owner, |_, _, request| request.is_some())
                             || self.book_bookmark_context_title_editing(owner)
                         {
-                            self.with_book_bookmark_context(owner, |app| {
+                            self.with_book_bookmark_context_state(owner, |app| {
                                 app.current_book_bookmarks_request = None;
                                 app.clear_book_bookmark_title_edit();
                             });
@@ -49420,12 +49546,11 @@ impl App {
                         })
                     });
                     if let Some(owner) = owner {
-                        self.with_book_bookmark_context(owner, |app| {
-                            app.apply_current_book_bookmark_rows(
-                                request_id,
-                                &container_key,
-                                result,
-                            );
+                        self.with_book_bookmark_context_state(owner, |app| {
+                            if let Some(pending) = app.current_book_bookmarks_request.as_mut() {
+                                pending.stage =
+                                    CurrentBookBookmarksStage::RowsReceived { request_id, result };
+                            }
                         });
                     }
                 }
@@ -49583,6 +49708,14 @@ impl App {
         }
     }
 
+    fn with_book_bookmark_context_state<R>(
+        &mut self,
+        id: ViewerContextId,
+        apply: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        self.with_viewer_context_state(id, apply).ok()
+    }
+
     fn book_bookmark_projections_pending(&self) -> bool {
         self.viewer_context_ids()
             .into_iter()
@@ -49626,6 +49759,19 @@ impl App {
     }
 
     fn poll_current_book_bookmark_projection(&mut self) {
+        if let Some(pending) = self.current_book_bookmarks_request.as_mut()
+            && let CurrentBookBookmarksStage::RowsReceived { request_id, .. } = &pending.stage
+        {
+            let request_id = *request_id;
+            let CurrentBookBookmarksStage::RowsReceived { result, .. } = std::mem::replace(
+                &mut pending.stage,
+                CurrentBookBookmarksStage::ReadingRows(request_id),
+            ) else {
+                unreachable!()
+            };
+            let container_key = pending.key.container_key.clone();
+            self.apply_current_book_bookmark_rows(request_id, &container_key, result);
+        }
         let Some(pending) = self.current_book_bookmarks_request.as_ref() else {
             return;
         };
@@ -49666,7 +49812,7 @@ impl App {
                 !rows.is_empty() || key.is_some() || request.is_some()
             }) || self.book_bookmark_context_title_editing(owner)
             {
-                self.with_book_bookmark_context(owner, |app| {
+                self.with_book_bookmark_context_state(owner, |app| {
                     app.current_book_bookmarks.clear();
                     app.current_book_bookmarks_key = None;
                     app.current_book_bookmarks_request = None;
@@ -49683,7 +49829,7 @@ impl App {
                 loaded.is_some_and(|loaded| loaded.container_key == key)
                     || request.is_some_and(|pending| pending.key.container_key == key)
             }) {
-                self.with_book_bookmark_context(owner, |app| {
+                self.with_book_bookmark_context_state(owner, |app| {
                     app.invalidate_current_book_bookmark_projection(&key)
                 });
             }
@@ -62301,7 +62447,7 @@ impl App {
         #[cfg(windows)]
         {
             for id in self.other_viewer_context_ids() {
-                match self.with_viewer_context(id, |app| {
+                match self.with_viewer_context_state(id, |app| {
                     app.pause_mounted_animations_for_remote_session()
                 }) {
                     Ok(count) => animations_paused += count,
@@ -78552,7 +78698,7 @@ impl App {
         self.cancel_mounted_context_ai_for_remote_barrier();
         #[cfg(windows)]
         {
-            let _ = self.with_active_viewer_context(|app| {
+            let _ = self.with_active_viewer_context_state(|app| {
                 app.cancel_mounted_context_ai_for_remote_barrier();
             });
         }
@@ -78692,8 +78838,9 @@ impl App {
     pub(crate) fn local_ai_remote_barrier_snapshot(&mut self) -> LocalAiRemoteBarrierSnapshot {
         let mounted = self.mounted_context_ai_remote_barrier_snapshot();
         #[cfg(windows)]
-        let detached =
-            self.with_active_viewer_context(|app| app.mounted_context_ai_remote_barrier_snapshot());
+        let detached = self.with_active_viewer_context_state(|app| {
+            app.mounted_context_ai_remote_barrier_snapshot()
+        });
         #[cfg(not(windows))]
         let detached = None;
         let video_upscale =
@@ -86722,20 +86869,7 @@ impl App {
 
     pub(crate) fn poll_final_ai(&mut self, ctx: &egui::Context) {
         // 全 AI ジョブ共有の単一チャネルを drain する。
-        let mut completed = std::mem::take(&mut self.final_ai_result_backlog);
-        let mut disconnected = false;
-        if let Some(rx) = self.final_ai_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(result) => completed.push(result),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
+        let (completed, disconnected) = self.collect_final_ai_results();
         if disconnected {
             // ワーカースレッドが死んだ (通常は起きない)。キューをリセットして
             // 次回 enqueue 時に作り直し、stuck pending を一掃する。
@@ -86763,6 +86897,10 @@ impl App {
                 .retained_final_ai_orphans
                 .get(&key)
                 .is_some_and(|orphan_job_id| *orphan_job_id == job_id);
+            if !live_pending && retained_orphan {
+                let _ = self.finish_retained_final_ai_orphan_result(result);
+                continue;
+            }
             if !live_pending && !retained_orphan {
                 if self.should_defer_final_ai_result_for_detached_context(key, job_id) {
                     deferred.push(result);
@@ -94693,7 +94831,12 @@ impl App {
     ///
     /// **早期 return を複数持つ。** frame の最後に必ず走らせたい処理は、ここではなく
     /// 呼び出し側 (`update`) へ置く。
-    fn update_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update_frame(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &mut eframe::Frame,
+        root_lifecycle: root_lifecycle::RootLifecycleSnapshot,
+    ) {
         let update_perf_on = crate::perf::is_enabled();
         let mut update_perf = update_perf_start_with(
             update_perf_on,
@@ -94779,15 +94922,17 @@ impl App {
             // viewports are registered below; returning here omits them from egui's frame and
             // destroys their host HWNDs (and any WS_CHILD native presenter). hide_to_tray has
             // already made each retained viewport explicit Hidden, so normal registration is safe.
-            let _tray_hide_started = self.maybe_intercept_close(ctx);
         }
+        self.service_root_lifecycle_tray_checkpoint(ctx, root_lifecycle);
         // request_repaint cannot wake a hidden Win32 root window. Publish the current media
         // ownership projection near the top of every pass so the tray thread can continue (or
         // stop) its 50ms WM_PAINT bridge even when later update paths return early.
         self.sync_tray_resident_media_wake();
 
         self.input_main_focus_resume(ctx);
-        self.service_folder_observation(ctx);
+        self.service_folder_watch(ctx);
+        self.poll_external_rescan(ctx);
+        self.service_periodic_folder_work(ctx);
         self.input_frame_diagnostics(ctx);
         mark_update_perf(&mut update_perf, UpdatePerfStage::FrameStart);
 
@@ -94812,6 +94957,7 @@ impl App {
         self.render_startup_workers(ctx);
         self.input_pointer_and_ime(ctx);
         self.service_page_edit_completion(ctx);
+        self.consume_metadata_import_display_reconciliation();
         crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
 
         self.input_drop_and_activity(ctx);
@@ -95961,9 +96107,7 @@ impl eframe::App for App {
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.
-        self.defer_settings_family_root_close(ctx);
-        self.defer_composition_editor_root_close(ctx);
-        self.defer_image_folder_zip_root_close(ctx);
+        let root_lifecycle = self.accept_root_lifecycle_before_frame(ctx);
         #[cfg(not(windows))]
         {
             // Non-Windows builds have one mounted viewer context and therefore no
@@ -95975,7 +96119,7 @@ impl eframe::App for App {
             }
         }
         self.poll_image_folder_zip(ctx);
-        self.update_frame(ctx, frame);
+        self.update_frame(ctx, frame, root_lifecycle);
         self.render_update_after_frame(ctx);
         self.render_update_owner_dialogs(ctx);
         // `update_frame` has several native/fullscreen early returns. Recovery polling belongs

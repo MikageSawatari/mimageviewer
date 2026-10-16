@@ -2081,6 +2081,14 @@ mod tests {
             ("runtime", include_str!("runtime.rs")),
             ("app", include_str!("../app.rs")),
             ("app phases", include_str!("../app/update_phases.rs")),
+            (
+                "app root lifecycle",
+                include_str!("../app/root_lifecycle.rs"),
+            ),
+            (
+                "app AI terminals",
+                include_str!("../app/ai_terminal_service.rs"),
+            ),
             ("preferences", include_str!("../ui_dialogs/preferences.rs")),
             ("notice", include_str!("../ui_dialogs/trt_worker_notice.rs")),
             ("install", include_str!("../ui_dialogs/trt_install.rs")),

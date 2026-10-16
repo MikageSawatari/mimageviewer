@@ -5551,7 +5551,12 @@ fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
 #[test]
 #[cfg(windows)]
 fn borderless_runtime_state_writes_stay_on_the_observed_path() {
-    let source = concat!(include_str!("../app.rs"), include_str!("update_phases.rs"));
+    let source = concat!(
+        include_str!("../app.rs"),
+        include_str!("update_phases.rs"),
+        include_str!("root_lifecycle.rs"),
+        include_str!("ai_terminal_service.rs")
+    );
     assert_eq!(
         source
             .matches("self.detached_viewer_borderless_fullscreen =")
@@ -5571,7 +5576,21 @@ fn borderless_runtime_state_writes_stay_on_the_observed_path() {
 #[test]
 #[cfg(windows)]
 fn detached_child_teardown_has_no_programmatic_viewport_close_producers() {
-    let app_source = concat!(include_str!("../app.rs"), include_str!("update_phases.rs"));
+    // These modules contain inline fixtures with root Close assertions. Audit
+    // their product code, just as app.rs excludes its separate test module.
+    let app_source = [
+        include_str!("../app.rs"),
+        include_str!("update_phases.rs"),
+        include_str!("root_lifecycle.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap(),
+        include_str!("ai_terminal_service.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap(),
+    ]
+    .concat();
     let native_video_source = include_str!("native_video.rs");
     let fullscreen_source = include_str!("../ui_fullscreen.rs");
 
@@ -9409,11 +9428,14 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
 
     app.begin_metadata_import_terminal_refresh();
     assert!(!app.advance_metadata_import_terminal_refresh(&root, false));
-    let first_frame_items = app
+    let MetadataImportRefreshState::Collecting(index) = app
         .metadata_import_refresh_index
         .as_ref()
         .expect("index preparation started")
-        .next_item;
+    else {
+        panic!("expected collecting index")
+    };
+    let first_frame_items = index.next_item;
     assert!((1..=2_048).contains(&first_frame_items));
 
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
@@ -57899,6 +57921,8 @@ mod pipeline_cache_refactor_tests {
         for relative in [
             "src/app.rs",
             "src/app/update_phases.rs",
+            "src/app/root_lifecycle.rs",
+            "src/app/ai_terminal_service.rs",
             "src/ui_fullscreen.rs",
         ] {
             let source = std::fs::read_to_string(manifest_dir.join(relative))
@@ -81090,8 +81114,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn app_has_no_viewport_lifecycle_font_resync_state_machine() {
-        const APP_SOURCE: &str =
-            concat!(include_str!("../app.rs"), include_str!("update_phases.rs"));
+        const APP_SOURCE: &str = concat!(
+            include_str!("../app.rs"),
+            include_str!("update_phases.rs"),
+            include_str!("root_lifecycle.rs"),
+            include_str!("ai_terminal_service.rs")
+        );
         const VIEWPORT_SOURCE: &str = include_str!("../ui_fullscreen.rs");
         const NATIVE_VIDEO_SOURCE: &str = include_str!("native_video.rs");
 

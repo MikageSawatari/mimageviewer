@@ -5185,7 +5185,8 @@ mod tests {
     }
 
     fn launch_boundary_ack_survives_early_return(app: &str, phases: &str) -> bool {
-        let Some((_, wrapper)) = app.split_once("self.update_frame(ctx, frame);") else {
+        let Some((_, wrapper)) = app.split_once("self.update_frame(ctx, frame, root_lifecycle);")
+        else {
             return false;
         };
         let Some((tail, _)) = wrapper.split_once("fn on_exit(") else {
@@ -5224,8 +5225,12 @@ mod tests {
         ));
         // Moving the call into update_frame would lose it on native/fullscreen returns.
         let before_frame = missing_call.replace(
-            "self.update_frame(ctx, frame);",
-            &format!("{call}\nself.update_frame(ctx, frame);"),
+            "self.update_frame(ctx, frame, root_lifecycle);",
+            &format!("{call}\nself.update_frame(ctx, frame, root_lifecycle);"),
+        );
+        assert_ne!(
+            before_frame, missing_call,
+            "the mutation must reach the frame call"
         );
         assert!(!launch_boundary_ack_survives_early_return(
             &before_frame,

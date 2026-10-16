@@ -187,18 +187,21 @@ impl App {
         idx: usize,
         value: Option<ReadingMeterValue>,
         identity: Option<crate::book_resume_db::PageIdentity>,
-    ) {
+    ) -> bool {
         let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
         let record = (path, idx, value, identity);
         if self.last_book_resume.as_ref() == Some(&record) {
-            return;
+            return true;
         }
-        if let Some(writer) = &self.book_resume_writer
-            && writer.record_identity(&record.0, idx, value, record.3.clone())
-        {
+        let recorded = self
+            .book_resume_writer
+            .as_ref()
+            .is_some_and(|writer| writer.record_identity(&record.0, idx, value, record.3.clone()));
+        if recorded {
             self.book_resume_meters.record(&record.0, value);
         }
         self.last_book_resume = Some(record);
+        recorded
     }
 
     pub(crate) fn reload_book_resume_meters(&mut self) {
