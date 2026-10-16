@@ -40,7 +40,7 @@ pub struct FullOutput {
 }
 
 impl FullOutput {
-    /// Add on new output.
+    /// Add on new output from the same viewport.
     pub fn append(&mut self, newer: Self) {
         use alloc::collections::btree_map::Entry;
 
@@ -220,7 +220,7 @@ impl PlatformOutput {
         Default::default()
     }
 
-    /// Add on new output.
+    /// Add on new output from the same viewport.
     pub fn append(&mut self, newer: Self) {
         let Self {
             mut commands,
@@ -239,7 +239,14 @@ impl PlatformOutput {
         self.cursor_image = cursor_image;
         self.events.append(&mut events);
         self.mutable_text_under_cursor = mutable_text_under_cursor;
-        self.ime = ime.or(self.ime);
+        if let Some(mut ime) = ime {
+            // Newer metadata wins, but an interruption requested by any of the
+            // undelivered passes must survive (e.g. after request_discard).
+            ime.should_interrupt_composition |= self
+                .ime
+                .is_some_and(|previous| previous.should_interrupt_composition);
+            self.ime = Some(ime);
+        }
         self.num_completed_passes += num_completed_passes;
         self.request_discard_reasons
             .append(&mut request_discard_reasons);

@@ -1,7 +1,8 @@
-# egui 0.37.0 のローカル変更（段2a-1）
+# egui 0.37.0 のローカル変更（段2a-1／2a-2）
 
 原本とchecksum・VCSの記録は [upstream-provenance.json](../upstream-provenance.json) を参照。
-0.37.0原本を基準に、旧`vendor/egui`の既存パッチだけを付け直す。
+段2a-1では0.37.0原本を基準に、旧`vendor/egui`の既存パッチを付け直した。
+段2a-2のIME中断要求の生成・集約修正は末尾の追補に記録する。
 rootの依存切替・製品操作差の受入れはこの段階に含めない。
 README、Cargo.toml.orig、同梱Cargo.lockは原本を保持する。
 
@@ -18,7 +19,8 @@ README、Cargo.toml.orig、同梱Cargo.lockは原本を保持する。
 | 本家click分類 | (a) 差分不要 | 0.37の距離・時間条件をそのまま使用する。旧分類を再実装せず、本家の事実を別回帰で固定する |
 | license本文 | (b) 保持 | 旧vendorのMIT / Apache本文をbyte変更なしで同梱する |
 
-IME中断要求のviewport所有・pass出力集約と、非描画viewport退役入口は後続段2a-2／2a-3の範囲であり、本段では変更しない。
+段2a-1ではIME中断要求のviewport所有・pass出力集約を変更していない（段2a-2追補を参照）。
+非描画viewport退役入口は引き続き後続段2a-3の範囲である。
 
 ## Wheel終端の境界
 
@@ -50,3 +52,35 @@ packageの`MIT OR Apache-2.0`宣言は維持する。原本crateには本文が�
 | --- | --- |
 | `../../vendor/egui/LICENSE-MIT` | `3fceb7b317f3c70451942b0e123723a2e250c7eaf970ce4b490a57a94c5588ff` |
 | `../../vendor/egui/LICENSE-APACHE` | `1ac50a5abd5cff5331d59928d83369b66b0099a88f0111dc2175526b3c666dec` |
+
+## 段2a-2: IME中断要求の生成・集約（2026-10-17）
+
+設計第4.4版§4.5と、detached計画§11で合意済みの所有境界を準備graphで実装した。
+対象HEADは`8023e4bdd`。以下は**実装担当の内部確認**であり、正式な独立レビュー・受入れではない。
+
+| 項目 | 分類 | 変更と保証 |
+| --- | --- | --- |
+| IME中断要求のviewport所有 | (b・新規) | `src/memory/mod.rs`。Memory共通のrequested_interrupt_imeを既存のviewport別Focusへ移す。interrupt_ime、request_focus、request_focus_next_frameは現在のFocusだけを更新する |
+| pass開始・出力の対象 | (b・新規) | Focus::begin_passで対象entryだけresetする。end_passの既存getterは同じviewportのFocusを読み、子end後の既存viewport復帰で親Focusへ戻る。手動退避・復元や第二mapは作らない |
+| 未配送PlatformOutput集約 | (b・新規) | `src/data/output.rs`。同じviewportの新IME metadataを採り、中断要求は旧・新のORを保持。新Noneなら旧Someを保持し、take後や次の新規runへ要求を持ち越さない |
+| 実入れ子・実discard回帰 | (b・新規) | `src/context/ime_interrupt_tests.rs`、登録はcontext.rs。共通名ime_interruptで選択する6件。親子のPlatformOutputは混ぜない |
+
+Focus map全体が既存のserde(skip)対象であるため、新しい永続形式・設定は作らない。
+移管した既存要求以外のbool、App補助フラグ、追加repaint、新queue、retryは追加していない。
+後続の非描画退役・eframe・egui-wgpu・root製品graphには触れない。
+
+回帰は実show_viewport_immediateのheadless rendererから、同じContextの子run_uiを実行する。
+実TextEditと事前focus passを使い、親のみ／子のみ／両方／なしについて3要求入口を検査する。
+親子ともSome(IMEOutput)、各1pass、親へのviewport復帰、次の要求なしrunで両方falseを確認する。
+rendererはthread-localの元callbackへ必ず戻す。Memoryのviewport IDをテストから切り替えない。
+
+実discard回帰は第1passだけ要求し、第2passでTextEditの位置とpurposeを変える。
+再passの実行、最新rect／cursor_rect／purposeと中断要求true、次の新規runでfalseを検査する。
+補助回帰はSome/None・要求有無の16組とtake後の消失を検査する。
+全FullOutputは各viewport別に検査用metadataを採取してから、headlessで明示破棄する。
+
+修正前は6件中4失敗。所有修正だけ／集約修正だけを戻す変異はそれぞれ4成功・2失敗で、
+修正済みbytesへ復元後は6件全成功。準備graphの全lib結果はegui 98件、egui-winit 43件、
+egui-ime 26件が成功（各exit 0）。commandと証拠は[段2台帳](../../docs/egui-0.37-stage2-verification.md)に記録する。
+
+本家にも報告する価値がある。実入れ子run_ui／実discardの最小回帰と、各修正の独立した修正前後の証拠を添えられる（今回は未送信）。

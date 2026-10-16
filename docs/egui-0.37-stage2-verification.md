@@ -173,3 +173,132 @@ source/graph照合は`*-audit.json`、`*-graph-audit.json`、`*-source.json`、
 段2a-2のIME中断要求のviewport所有とdiscard再pass集約、段2a-3の非描画退役入口、
 段2b/2c、段3の正式graph切替は未着手であり、段2a全体の完了とは扱わない。
 新pending bool・時間窓・追加repaint・製品機能制限は加えていない。
+
+## 段2a-2（2026-10-17）
+
+開始HEAD `8023e4bdd`、branch `egui-036`、Rust 1.99.0。段2a-1は設計担当が
+`b5365dc73`（原本）と`8023e4bdd`（差分の付け直し）に分けてコミット済み。
+本節はその後の**実装担当の内部確認**であり、段2a-1の並行中の独立レビューや、
+今回の正式な独立レビュー・設計受入れ・実機確認を代替しない。
+今回もgit add／commit／branch操作は行わず、未コミットで返す。
+
+### 合意・原因・修正境界
+
+設計第4.4版§4.5「IME中断要求のviewport別所有」「discard再passのIME出力集約」、
+段2a順序6〜10、detached計画§2と§11の構造合意を読み直した。
+両修正は§11で設計上合意済みであり、新しい症状パッチの例外を設けていない。
+
+観測した破れは二つである。
+
+- 同一Contextの実入れ子run_uiで、親の要求が子begin_passのMemory共通bool resetにより消え、
+  子の要求が親end_passのIME出力へ混入する。親のみ／子のみの回帰でそれぞれ検出した。
+- 実request_discardの第1passだけが要求した場合、PlatformOutput::appendが後のSome全体で
+  置換するため、最終出力の要求がfalseになる。新しい矩形・purpose自体は届いていた。
+
+所有の不変条件は「要求を出したviewportの同じpassだけが生成し、そのviewportの未配送出力だけが保持する」。
+既存のFocus ownerと既存append境界へ修正を収めた。
+
+| 変更file | 変更内容 |
+| --- | --- |
+| `vendor-next/egui/src/memory/mod.rs` | Memory共通requested_interrupt_imeを既存viewport別Focusへ移管。Focus::begin_passは自分だけreset。interrupt_imeとgetterは現在Focusだけを扱う |
+| `vendor-next/egui/src/data/output.rs` | 同一viewportの新IME metadataを採り、中断要求を旧・新のORで保持。新Noneなら既存Someを保持する。appendの同一viewport契約を明記 |
+| `vendor-next/egui/src/context.rs` | 新回帰moduleの登録のみ。end_passの生成・既存viewport復帰のproduction処理は変更しない |
+| `vendor-next/egui/src/context/ime_interrupt_tests.rs` | 実入れ子4件、実discard1件、Option/転送の補助1件。全名にime_interruptを含む |
+| `vendor-next/egui/PATCHES.md`、本台帳 | 段2a-2の変更、証拠、残課題 |
+
+request_focus、request_focus_next_frameは既存どおりinterrupt_imeへ合流する。
+menuの次frame focus等の同型producerも同じ入口を通ることをsource確認した。
+子endは対象Focusから生成し、既存viewport stack復帰後は親のentryを再選択する。
+新map、親子の要求の手動退避・復元、App補助フラグ、追加repaint、新queue、retryは作らない。
+Focus map自体が既存のserde(skip)対象のため、移管したpass状態は永続化されない。
+
+### 回帰の内容
+
+入れ子4件は`ime_interrupt_nested_{parent_only,child_only,both,neither}`。
+headless rendererを実show_viewport_immediateへ登録し、そのcallbackで同じContextの子run_uiを実行する。
+実window/EventLoopや製品は作らない。既存の親子登録・used判定・viewport stack復帰を通し、
+Memoryのviewport IDをテストから手動で変更しない。
+
+事前passで親子の実TextEditへfocusを設定し、もう1passで両方のSome(IMEOutput)と要求falseを確認する。
+測定passでは親のみ／子のみ／両方／なしについて、interrupt_ime／request_focus／
+request_focus_next_frameの3入口をそれぞれ検査する。
+親の要求は子を呼ぶ前に出す。親のNormalと子のPasswordのmetadataを別々に検査し、
+両方Some、各1pass、親へviewportが復帰していることを必須とする。
+測定後の新規runで、要求なしなら両方falseへ戻ることも検査する。
+rendererの差し替えはthread-localで、失敗時も元callbackを復元する。
+
+`ime_interrupt_discard_keeps_request_and_latest_text_edit_metadata`は実run_ui内の第1passだけで
+要求とrequest_discardを行う。第2passは要求せず、TextEditの位置とpurposeを変える。
+実2passを確認し、第1/第2passのrectとcursor_rectが違うこと、最終出力が第2passの
+rect／cursor_rect／Passwordと要求trueを持つことを検査する。
+その出力を一度移譲・明示破棄し、次の新規runで同じmetadataと要求falseになることを確認する。
+
+補助の`ime_interrupt_platform_append_preserves_option_and_request_contract`は、
+旧/新のSome/Noneと要求有無の16組、take後の要求消失を検査する。
+この補助試験だけを実入れ子・実discardの代わりにはしていない。
+各FullOutputはviewportごとにmetadataを採取して検査し、headlessで
+drop_without_applying_deltasする。親子のPlatformOutputをappendしない。
+
+### 修正前失敗・変異・復元
+
+同じ6回帰のソースを保ったまま、修正前と修正後を比較した。
+さらに修正済みsourceのbytesを保持し、所有／集約を一つずつ開始HEADの実装へ戻して検査した。
+finallyで両sourceを修正済みbytesへ復元し、SHA-256一致と再成功を確認した。
+
+| 条件 | 成功/失敗 | exit | 検出した失敗 |
+| --- | --- | --- | --- |
+| 修正前（両方旧実装） | 2 / 4 | 101 | 親のみ、子のみ、実discard、append補助 |
+| 所有修正だけを戻す | 4 / 2 | 101 | 親のみ、子のみ。集約回帰は成功 |
+| 集約修正だけを戻す | 4 / 2 | 101 | 実discard、append補助。入れ子4件は成功 |
+| 両修正を復元 | 6 / 0 | 0 | 全件成功 |
+
+変異の実行器は`target/verify-stage2a2-mutations.py`、command／exit／件数・復元hashは
+`target/egui037-stage2a2-mutations.json`。ログは同prefixの
+`before.log`、`ownership-reverted.log`、`aggregation-reverted.log`、`focused-restored.log`。
+単独の変異から両不具合が独立して検出できることを確認した。
+
+### 最終検証
+
+MSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=1、CARGO_NET_OFFLINE=true。
+依存解決を伴う最終commandは--locked --offlineで実行する。
+
+```powershell
+cargo test --manifest-path vendor-next/Cargo.toml -p egui --lib --features miv-repaint-witness ime_interrupt --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui --lib --features miv-repaint-witness --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-winit --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-ime --lib --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --features test-script --locked --offline
+cargo fmt
+cargo fmt --check
+cargo fmt --manifest-path vendor-next/Cargo.toml --all
+cargo fmt --manifest-path vendor-next/Cargo.toml --all --check
+git diff --check
+```
+
+| 検証 | 結果 |
+| --- | --- |
+| 準備egui lib（witness有効） | 98 passed / 0 failed / 0 ignored、exit 0。追加6件を含む |
+| 準備egui-winit lib | 43 passed / 0 failed / 0 ignored、exit 0 |
+| 準備egui-ime lib | 26 passed / 0 failed / 0 ignored、exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧0.33.3 graph |
+| root fmt／fmt --check | 両方exit 0 |
+| 準備graph fmt／fmt --check | 両方exit 0 |
+| git diff --check | exit 0。新回帰fileはgit addせず未追跡 |
+
+最終command・exit・件数・時間は`target/egui037-stage2a2-results.json`、ログは同prefixの
+`{egui-lib,winit-lib,ime-lib,root-check,root-test-script-check,root-fmt,root-fmt-check,prep-fmt,prep-fmt-check,diff-check}.log`。
+関連source hashとroot／準備manifest・lock不変の照合は`target/egui037-stage2a2-source.json`。
+準備graph以外のRust／テスト・root workspace／patch／製品codeは変更しない。
+root/準備のCargo.lockも変更しない。既存scene.rsのf32::EPSILON非推奨警告とrootの既存警告は対象外。
+
+別contextによる実装担当の内部確認でも、生成対象とviewport復帰、非永続性、集約と回帰・
+変異証拠を照合し、未解決指摘はなかった。こちらはcargoを再実行せず、親担当の有効な証拠を再利用した。
+
+### 残課題・本家報告
+
+設計書との重大な食い違いはない。正式な独立レビュー・設計担当の受入れは未実施。
+段2a-3の非描画退役、段2b/2c、段3の正式graph切替には手を付けていない。
+rootの製品build、live、test-full.ps1、ネットワーク、アプリ起動、git add／commitは実行しない。
+
+本家へ報告する価値がある。実入れ子run_ui／実discardの最小回帰と独立した修正前後の証拠を添えられる（今回は未送信）。

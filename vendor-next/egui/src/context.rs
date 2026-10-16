@@ -5032,6 +5032,9 @@ fn flatten_labelled_by(nodes: &mut [(accesskit::NodeId, accesskit::Node)]) {
 }
 
 #[cfg(test)]
+mod ime_interrupt_tests;
+
+#[cfg(test)]
 mod test {
     use crate::{FontDefinitions, Panel};
 

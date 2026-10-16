@@ -117,11 +117,6 @@ pub struct Memory {
     /// (e.g. relative to some other widget).
     #[cfg_attr(feature = "persistence", serde(skip))]
     popups: ViewportIdMap<OpenPopup>,
-
-    /// Whether to inform the backend to interrupt any ongoing IME composition
-    /// this pass.
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    requested_interrupt_ime: bool,
 }
 
 impl Default for Memory {
@@ -139,7 +134,6 @@ impl Default for Memory {
             popups: Default::default(),
             everything_is_visible: Default::default(),
             add_fonts: Default::default(),
-            requested_interrupt_ime: Default::default(),
         };
         slf.interactions.entry(slf.viewport_id).or_default();
         slf.areas.entry(slf.viewport_id).or_default();
@@ -501,6 +495,11 @@ pub(crate) struct InteractionState {
 /// Keeps tracks of what widget has keyboard focus
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Focus {
+    /// Whether this viewport requested interruption of IME composition in the
+    /// current pass. Kept with focus so nested viewport passes cannot reset or
+    /// inherit another viewport's request. The entire Focus map is transient.
+    requested_interrupt_ime: bool,
+
     /// The widget with keyboard focus (i.e. a text input field).
     focused_widget: Option<FocusWidget>,
 
@@ -567,6 +566,7 @@ impl Focus {
     }
 
     fn begin_pass(&mut self, new_input: &crate::data::input::RawInput) {
+        self.requested_interrupt_ime = false;
         self.id_two_frames_ago = self.id_previous_frame;
         self.id_previous_frame = self.focused();
         if let Some(id) = self.id_next_frame.take() {
@@ -795,8 +795,6 @@ impl Memory {
         self.popups.retain(|id, _| viewports.contains(id));
 
         self.areas.entry(self.viewport_id).or_default();
-
-        self.requested_interrupt_ime = false;
 
         // self.interactions  is handled elsewhere
 
@@ -1074,13 +1072,14 @@ impl Memory {
         self.has_focus(id)
     }
 
-    /// Interrupt the current IME composition, if any.
+    /// Interrupt the current viewport's IME composition, if any.
     pub fn interrupt_ime(&mut self) {
-        self.requested_interrupt_ime = true;
+        self.focus_mut().requested_interrupt_ime = true;
     }
 
     pub(crate) fn should_interrupt_ime(&self) -> bool {
-        self.requested_interrupt_ime
+        self.focus()
+            .is_some_and(|focus| focus.requested_interrupt_ime)
     }
 }
 
