@@ -1690,7 +1690,10 @@ fn log_window_state(label: &str, hwnd: HWND) {
         let mut rect = RECT::default();
         let rect_ok = GetWindowRect(hwnd, &mut rect).is_ok();
         let visible = IsWindowVisible(hwnd).as_bool();
+        #[cfg(not(test))]
         let foreground = GetForegroundWindow();
+        #[cfg(test)]
+        let foreground = HWND(crate::test_native_focus::foreground_hwnd() as *mut _);
         crate::logger::log(format!(
             "[native-video] window {label}: hwnd=0x{:x} visible={} rect_ok={} rect=({},{} {}x{}) foreground=0x{:x}",
             hwnd.0 as usize,

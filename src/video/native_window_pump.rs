@@ -2357,9 +2357,13 @@ mod tests {
     }
 
     fn run_hud_focus_child(owner_raw: u64) {
+        use windows::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, NULLREGION, SetWindowRgn,
+        };
+
         let module = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let create = |owner| {
-            unsafe {
+            let hwnd = unsafe {
                 CreateWindowExW(
                     WS_EX_NOACTIVATE,
                     w!("STATIC"),
@@ -2375,15 +2379,35 @@ mod tests {
                     None,
                 )
             }
-            .expect("create popup")
+            .expect("create popup");
+            // Negative coordinates can still be on a monitor. An empty region
+            // prevents pixels on every layout while retaining HWND visibility.
+            let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+            assert!(!region.is_invalid(), "create empty popup region");
+            let assigned = unsafe { SetWindowRgn(hwnd, Some(region), false) };
+            if assigned == 0 {
+                let _ = unsafe { DeleteObject(region.into()) };
+            }
+            assert_ne!(assigned, 0, "assign empty region before showing popup");
+            // SetWindowRgn transfers region ownership to the window on success.
+            hwnd
         };
         let editor = create(Some(HWND(owner_raw as *mut _)));
         let unregistered_owned = create(Some(HWND(owner_raw as *mut _)));
         let external = create(None);
         unsafe {
-            let _ = ShowWindow(editor, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(unregistered_owned, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(external, SW_SHOWNOACTIVATE);
+            for hwnd in [editor, unregistered_owned, external] {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                assert!(IsWindowVisible(hwnd).as_bool());
+                let copy = CreateRectRgn(0, 0, 0, 0);
+                assert!(!copy.is_invalid());
+                let kind = GetWindowRgn(hwnd, copy);
+                let _ = DeleteObject(copy.into());
+                assert_eq!(
+                    kind, NULLREGION,
+                    "shown fixture must have no drawable pixels"
+                );
+            }
         }
         println!(
             "MIV_FOCUS_WINDOWS {} {} {}",

@@ -505,7 +505,7 @@ fn mouse_button_action_blocked_by_edit_mode(edit_mode_active: bool, action: &Rin
 /// mIV のいずれかのウィンドウが OS の前面なら、その HWND を返す。
 /// gilrs はフォーカス非依存でグローバル入力を拾うため、別アプリ前面時の入力を
 /// ブロックすると同時に、detached viewer とメイングリッドのどちらが入力面かを決める。
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn foreground_app_hwnd() -> Option<u64> {
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
@@ -520,9 +520,15 @@ fn foreground_app_hwnd() -> Option<u64> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn foreground_app_hwnd() -> Option<u64> {
     Some(1)
+}
+
+#[cfg(test)]
+fn foreground_app_hwnd() -> Option<u64> {
+    crate::test_native_focus::foreground_belongs_to_current_process_strict()
+        .then(crate::test_native_focus::foreground_hwnd)
 }
 
 fn ring_shortcut_context_for_surface_state(

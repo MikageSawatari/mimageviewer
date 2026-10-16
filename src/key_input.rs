@@ -2172,16 +2172,21 @@ fn synthetic_perf_facts_enabled() -> bool {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn current_foreground_hwnd_raw() -> u64 {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     unsafe { GetForegroundWindow().0 as usize as u64 }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn current_foreground_hwnd_raw() -> u64 {
     0
+}
+
+#[cfg(test)]
+fn current_foreground_hwnd_raw() -> u64 {
+    crate::test_native_focus::foreground_hwnd()
 }
 
 fn resolve_registered_target(

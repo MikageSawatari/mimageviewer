@@ -1,5 +1,10 @@
 mod music_bass;
 
+#[cfg(test)]
+use crate::test_native_focus as foreground_observer;
+#[cfg(all(windows, not(test)))]
+use crate::video::native_window as foreground_observer;
+
 // Evaluate old fixture payloads before borrowing AppTestEnv through DerefMut.
 #[cfg(test)]
 macro_rules! send_thumbnail_for_test {
@@ -59986,7 +59991,7 @@ impl App {
         let Some(hwnd) = self.detached_viewer_host_hwnd_alive() else {
             return false;
         };
-        crate::video::native_window::foreground_hwnd() == hwnd
+        foreground_observer::foreground_hwnd() == hwnd
     }
 
     #[cfg(not(windows))]
@@ -77521,7 +77526,7 @@ impl App {
         // 意図的に前面にしていたケースで奪い返さないため)。
         // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
         let foreground_is_ours =
-            crate::video::native_window::foreground_belongs_to_current_process_strict();
+            foreground_observer::foreground_belongs_to_current_process_strict();
         // in-window モードでは presenter は main の子で、close 時も main が
         // foreground のまま。fullscreen 用の foreground 奪還は不要なのでスキップ
         // (Codex P2)。

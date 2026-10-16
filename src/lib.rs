@@ -22,6 +22,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
+mod test_native_focus;
+#[cfg(test)]
 #[path = "../tests/support/ui_harness.rs"]
 pub(crate) mod test_ui;
 mod wgpu_backend_policy;

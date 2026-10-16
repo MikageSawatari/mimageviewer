@@ -1,6 +1,8 @@
 # egui 0.37 更新・段0a 検証台帳
 
-2026-10-16、`egui-036` / `9acf4122612a5aa69e34f11ac25f456e7c65e33f` 上の未コミット差分。
+2026-10-16、`egui-036`。初回基点は `9acf4122612a5aa69e34f11ac25f456e7c65e33f`、
+独立レビュー修正の基点は段0a・段0b取り込み後の `020b7eafbcbc105a2453f0146dce3383152454a4`。
+以下の履歴と、末尾の独立レビュー修正結果を区別する。今回の修正は未コミット。
 Rust 1.99.0、Windows x86_64 MSVC、cargo-nextest 0.9.148、PowerShell 5.1.26100.9711、通常feature / test profile。
 実装担当が非対話検証を所有し、設計担当がレビュー・コミットを行う。
 live試験・製品バイナリの起動、ブランチ操作、コミットは行わない。
@@ -24,19 +26,21 @@ runnerは承認済みswitchを要求するが
 
 `vendor/eframe`、`vendor/egui-wgpu`、`vendor/egui-winit`、`vendor/egui`、`crates/`、
 `src/`、`tests/` のRust test属性と、window作成・`run_native`・foreground・実入力API、
-子process、production owner/helperの呼出元を照合した。追加の未隔離live試験は見つからなかった。
-実装者の監査に加え、別contextのread-only監査でも残りの疑わしい経路を確認した。
+子process、production owner/helperの呼出元を照合した。
+初回は「追加の未隔離live試験なし」と判断したが、独立レビューでfullscreen合成入力から
+実OSの前面観測・前面化に到達する経路の見落としが判明した。この旧結論は撤回する。
+後述の再監査・テスト専用境界の追加後の結論を使用する。
 
 設計レビュー後の修正：初回は実HWNDの作成までliveに含め、本体8件を広くignoreしすぎた。
 AGENTS.mdの承認対象はアプリ起動・前面切替・稼働中UIへの実入力送出であり、
 headless unit / snapshot / fake-input検査は自動継続する。本体8件のignoreと子側へ加えた
-`--ignored`を撤回し、該当する`src/`の3ファイルはHEADと同じ内容へ戻した。
+`--ignored`を撤回した（当時のHEADと3ファイルが一致）。その後、今回のP2でpumpのfixtureを改善した。
 
 | 自動gateを維持する本体headless試験 | 対象外とした理由・コード根拠 |
 | --- | --- |
 | Everything IPCの`fake_hwnd_*` 5件（`src/everything_ipc/native.rs`） | `HWND_MESSAGE`のfake endpoint。アプリ起動・前面切替・実入力送出なし |
 | hidden HUD 2件（`src/video/native_window_host/hud_window.rs`） | `hidden_hud`は非表示HWNDを作り、非表示のままgeometry/z-orderを検査 |
-| HUD focus 1件（`src/video/native_window_pump.rs`） | 子popupは(-2000,-2000)、`WS_EX_NOACTIVATE`＋`SW_SHOWNOACTIVATE`。入力はsinkへの合成イベント。`install_focus_claim_probe_for_test`により`native_window_host.rs`のClaimTextInputFocus分岐はカウンタ更新後continueし、実`claim_foreground`へ進まない。HUDも画面外・空regionで利用者に見える表示なし |
+| HUD focus 1件（`src/video/native_window_pump.rs`） | 子popupは表示前に空window regionを設定し、表示後も`NULLREGION`と`IsWindowVisible`を検査する。座標・モニター配置に依存せず描画しない。`WS_EX_NOACTIVATE`＋`SW_SHOWNOACTIVATE`を維持。入力はsinkへの合成イベント。既存`install_focus_claim_probe_for_test`が要求を数えて実`claim_foreground`前にcontinueする。HUD自体も空region |
 
 既存ignoreのlive試験は変更せず、今回のrunnerの対象にも追加しない：
 `real_everything_diagnostic_probe`（実Everythingとinput desktop）、
@@ -54,10 +58,10 @@ headless unit / snapshot / fake-input検査は自動継続する。本体8件の
 | egui、egui-ime、UI snapshot / headless Harness | egui Context/合成input/texture readback。native event loopなし |
 | `native_window::presenter_wndproc_handles_setcursor_without_defaulting_to_class_arrow` | NULL HWNDで対象branchを直接検査。ログと`LRESULT(1)`だけでcursor変更なし |
 | `window_host_contract` / `native_ui_smoke` receipt tests | 連番opaque handle、固定fake HWNDとbroker検証。SendInputを呼ばない |
-| tray / gamepad | `cfg(test)` controllerはatomic/channelだけ、gilrs readerを起動しない |
+| tray / gamepad | `cfg(test)` controllerはatomic/channelだけ、gilrs readerを起動しない。gamepadのforeground判定は今回さらにfake化 |
 | clipboard capture / cut clipboard | 注入reader・0 HWND mailbox・Inert/Disabled observer。production窓ownerを起動しない |
 | native context menu / native name dialog | IDataObject/HGLOBAL、pure判定、template検査のみ。popup/dialog表示ownerを呼ばない |
-| Effetune / VST editor配送 | `FakeHost` / `Bridge::fake_host_for_test`でprocess/editor境界を置換 |
+| Effetune / VST editor配送 | `FakeHost` / `Bridge::fake_host_for_test`でprocess/editor境界を置換。ただし周辺の前面・owner観測は未隔離だったため、今回DSPの呼出境界もfake化 |
 | EPUB worker | URL/options/process fixtureのみ。WebView用`Host::new`を呼ばない |
 | vst3-host-tester | testはprotocol JSON。`run_native`/GUI hostはmain経路のみ |
 | launcher/watchdog subprocess tests | test executable内の終了処理やheadless Contextを呼び、アプリmainを呼ばない |
@@ -127,17 +131,106 @@ RAW fixtureは設計担当が`vendor/raw-samples/`へコピーし、`885.dng`の
 照合結果は`target/egui037-stage0a/review-fix-summary.txt`。
 成功台帳は`target/test-lib-full/c0d801cb5e990b7261aa0fd993f542f44708627e5901f2faf9ec92f49b2457ef.json`、
 source IDは`64f86f8ec4a6a3af23d4bab7a788aa7828dffe5fabaf6f9681839c2160f7ed8a`。
-成功後は本台帳への結果追記のみで、Rust・runnerを変更していない。
+この成功は独立レビュー修正前の履歴である。今回の差分に対する結果は次節に記録する。
 
 RAW fixture欠落の37失敗は解消した。ページめくり1件も今回は再発せず成功したため、
 追加の単独再実行は行わない。初回全件失敗→初回単独成功の履歴は上節に保持し、
 描画の原因調査・修正はこの段の範囲外として実施していない。
 
+## 独立レビュー修正・src再監査
+
+P1の不変条件：headlessアプリの合成入力は実OSへ前面化・focus・入力送出を行わない。
+隔離必須なのはデスクトップへ作用する操作であり、DSPなどの受動的な読取は対象外とする。
+製品の分岐・Win32処理は維持する。
+`cfg(test)`専用の`test_native_focus`にthread-localな観測値と要求履歴を持たせ、
+既定値はHWND 0、scope終了時は復元する。別テストthreadやworkerへ状態を共有しない。
+既存の低レベルWin32 helperを一括置換せず、headlessアプリ側の呼出境界を置換した。
+
+| srcの経路・API群 | 再監査結果と処置・対象外の根拠 |
+| --- | --- |
+| `ui_fullscreen` の `native_window_under_cursor_focus_target` / `claim_native_window_focus` / `current_foreground_hwnd` | 合成ドラッグ等から実`WindowFromPoint`、`GetForegroundWindow`、`claim_foreground`へ到達していた。3境界をtest専用fakeへ置換。実render handlerを通し、他の前面窓には要求1回、既に対象が前面なら要求0回、viewport Focusと入力抑制も検査する新規回帰テストを追加 |
+| `app.rs` / `app/native_video.rs` の前面・自process所有判定 | close/reopen、focus reconciliation、key診断の既定テストから低レベルgetterに到達するためtest時のimport先をfakeに変更。製品時は元のmoduleを参照 |
+| `app/gamepad_input.rs` / `key_input.rs` | 入力面判定とsynthetic foreground override未指定時のfallbackをfake化。既存の明示overrideは維持 |
+| `presentation_observer.rs` のsnapshot | fake host effectの診断から実前面窓・PID/TID/class観測へ到達するためforeground欄だけfake化。製品の採取内容は維持 |
+| `video/dsp/mod.rs` のGUI owner / foreground判定 | VST toggleのworkerやEffetune fake-hostから`WindowFromPoint` / `GetForegroundWindow`へ到達するが、これらは受動的な読取で、前面化・AttachThreadInput・実入力送出を行わない。設計再確認に従いDSP差分をすべて撤回。製品と共通の判断ロジックで検査し、test専用の写しとその追加テストは削除 |
+| `video/native_window.rs` の`log_window_state` | hidden presenter作成時の診断にも実前面読みがあったため、その診断値だけfake化 |
+| `native_window_host` のClaimTextInputFocus | 既定HUD試験は既存probeが実claim前に要求を記録してcontinueする。要求件数の期待値を維持 |
+| `claim_foreground` / `SetForegroundWindow` / `AttachThreadInput` / `SetFocus` / `SetActiveWindow` とpresentation wrapper | 残る呼出元は製品event loop/callback、ignored native/hardware試験、または実main HWNDのないfake handler。main reclaimやRaisePresenterを実対象で実行する既定テストはない。fullscreenの既定到達経路は上記で隔離 |
+| `native_ui_smoke` の`SendInput` / tray / single-instance / name dialog | OS入力driverやactivation callbackは製品入口。既定テストはreceipt検証、channel/fake controller、template検査で、実入力・dialog表示を呼ばない |
+| VST buttonの`WindowFromPoint`・前面診断、`foreground_ui_group` | VST buttonは実editor snapshotが必要で、既定App/overlayテストは空snapshot。DSPの`foreground_ui_group`は受動的な読取のため維持。実editor付き試験はignored/hardware側 |
+| hidden HUDの前面保持assert / message-only HWND | 前面が変わらないことを確認する受動的なbefore/after読取は保持。指定した非表示HWNDのgeometry/owner/visibility検査も保持。アプリ起動・前面化・実入力送出を行うものではない |
+
+`src/`全体の該当API検索結果は`target/egui037-stage0a/p1-review/os-focus-inventory.txt`。
+別contextのread-only棚卸しも実施した。新たなignoreは追加せず、本体headless 8件は自動gateを維持する。
+再監査の結論：既定試験から前面切替・実入力送出へ進む未隔離経路は確認されず、
+fullscreenの操作境界はfake/probeに隔離した。DSPの受動的な観測や前面保持assertは維持する。
+他の変更ファイルも確認し、owner policyなどの判断ロジックをtest側へ書き写した箇所は残っていない。
+`foreground_observer`の別名、前面HWNDの読取helper、gamepadの所有HWND読取、診断欄の整形は
+OS観測値を置換する境界であり、入力面や前面化要否を決める製品ロジックは共通のまま維持した。
+P2の空regionは表示前に設定し、成功時のregion所有権はWindowsへ渡す。
+P3のsnapshot manifestハッシュはCRLF→LF正規化後の値であることをbaselineへ明記した。
+live runner末尾の余分な空行を除去した。detached計画§11は変更していない。
+build/test文書のpopupの記述も、画面外座標ではなく表示前の空regionを根拠とするよう更新した。
+別contextのSol xhighによる静的レビューはDSP撤回前にACCEPT（テスト実行は実装担当が所有）。
+その後の設計確認でDSPの写しが不要と指摘され、上記のとおり撤回した。
+
+### DSP撤回前の検証（履歴）
+
+ログ保存先：`target/egui037-stage0a/p1-review/`。
+焦点テスト以降は`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`を指定する。
+
+| コマンド・検査 | 結果 | exit code |
+| --- | --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功（既存警告688件）、最終`core-check-final.log`、43.51秒 | 0 |
+| 焦点nextest初回（fullscreen / native pump / DSP policy / fake scope） | 50件中49 passed、1 failed、13,243 skipped、3.957秒。新規回帰テストの定常状態fixture不足。`focused.log` | 100 |
+| 同filterの再検証 | 50 passed、0 failed、13,243 skipped、11.327秒。`focused-final.log`（既存lib test警告558件） | 0 |
+| `cargo nextest list -p mimageviewer --lib --config-file .config/nextest.toml --profile default --ignore-default-filter --run-ignored default --message-format json` | 全13,293件、既定対象13,234件、既存ignore 59件。上記ignored native/hardware 4件はすべて`ignored` mismatch。`main-list.json` | 0 |
+| `powershell -NoProfile -File scripts/test-lib-full.ps1` | MISSで実実行。13,234 passed、0 failed、59 skipped、570.931秒（6 slow）、成功台帳発行。`main-run.log` | 0 |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check`（通常差分と`9acf41226`からの累積差分） | workspace全体成功。`fmt-check.log`、`diff-check*.log` | 0 / 0 / 0 |
+| manifest hash / encoding検査 | LF正規化後SHA-256が`2660181e631b432106b7104cdb141077f5217aa58cfcf2d50427ceec63e9756e`と一致。runner ASCII・余分な末尾空行なし、変更MarkdownにBOMなし | 0 |
+| 全件JUnit照合 | 新規回帰3/3件、本体headless HWND 8/8件、ページめくり間欠候補1件がすべて実行・成功。`full-summary.txt` | 0 |
+
+焦点filter：`test(ui_fullscreen::native_focus_tests::) | test(test_native_focus::) | test(ui_fullscreen::specified_scale_consumer_tests::) | test(video::native_window_pump::) | test(video::dsp::effetune_policy_tests::)`。
+共通引数は`cargo nextest run -p mimageviewer --lib --config-file .config/nextest.toml --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail -E <filter>`。
+初回の新規回帰テストはclaim履歴とFocus commandには成功したが、fullscreen開始時の300ms猶予により
+抑制の期待が失敗した。warmup後にfixtureの`fs_focus_regained_at`を解除して定常クリックを作り、
+クリック前に抑制Idleもassertした。製品・既存テスト・新規テストの期待値は変更していない。
+
+全件ログ・JUnit：`target/test-lib-full/runs/20261016T032610952Z-b7e7de19/`。
+成功台帳：`target/test-lib-full/b50a50aef6b03c1079f829a93ae58a7ccaf560558bed1a30b07d4ad27108dacc.json`。
+source ID：`be0603d1d5cec303157aef8da43565198e864a16bdfa029acae8e75ee2e1ebe0`。
+実行中の入力変更なし。成功後は本台帳への結果追記のみで、Rust・scriptは変更していない。
+ページめくりの間欠候補は再発せず、単独再実行や描画修正は行わなかった。
+
+### DSP撤回後の検証
+
+`src/video/dsp/mod.rs`は`HEAD 020b7eafb`と一致（`git diff --exit-code -- src/video/dsp/mod.rs`、exit 0）。
+追加のignoreや既存assertの変更はない。ログ保存先は`target/egui037-stage0a/dsp-revert/`。
+検証には`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`を指定する。
+
+| コマンド・検査 | 結果 | exit code |
+| --- | --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功（既存警告688件）、33.21秒。`core-check.log` | 0 |
+| DSP / fullscreen焦点nextest | 76 passed、0 failed、13,216 skipped、5.420秒。`focused.log`（既存lib test警告557件） | 0 |
+| nextest一覧と隔離確認 | 全13,292件、既定13,233件、ignore 59件。撤回したDSPテストは不在、既存live/hardware 4件は`ignored` mismatch。`main-list.json` | 0 |
+| `powershell -NoProfile -File scripts/test-lib-full.ps1` | MISSで実実行。13,233 passed、0 failed、59 skipped、448.742秒（6 slow）、成功台帳発行。`main-run.log` | 0 |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | workspace全体成功。`fmt-check.log`、`diff-check.log` | 0 / 0 / 0 |
+| 全件JUnit・DSPのHEAD一致照合 | 本体headless HWND 8/8件、残るfocus回帰2/2件、ページめくり間欠候補が成功。撤回したDSPテストは不在、DSPはHEADとバイト単位で一致。`full-summary.txt` | 0 |
+
+焦点filter：`test(video::dsp::) | test(ui_fullscreen::native_focus_tests::) | test(ui_fullscreen::specified_scale_consumer_tests::) | test(test_native_focus::)`。
+共通引数は前節と同じ。live試験と製品バイナリは起動しない。
+
+全件ログ・JUnit：`target/test-lib-full/runs/20261016T034413819Z-487d6c3f/`。
+成功台帳：`target/test-lib-full/1974dd11d4cabae3851275b29fbdd9067f243089ed8d42f29426bd9b000a50cc.json`。
+source ID：`0c57eeca5b8e2b92134877513670ef739dbc6f975fc0d8a6ea40d689aff6319f`。
+実行中の入力変更なし。終了後は本台帳への結果追記のみで、Rust・scriptは変更していない。
+ページめくりは再発しなかったため単独再実行・描画修正は行っていない。
+
 ## 未実施
 
 - 全live試験：**未実施**。段0aでは実行禁止。専用入口もfake Cargo以外では起動していない。
 - `scripts/test-full.ps1`：**未実施**。依頼どおり設計担当の判断へ残す。
-- `test-script`追加featureや既存ignored hardware/probe：**未実施**。今回の変更は属性と実行入口のみ。
+- `test-script`追加featureや既存ignored hardware/probe：**未実施**。今回の実行対象は通常featureのheadless試験。
 - ページめくり描画の修正・原因調査：この段の範囲外。今回の全件再検証では再発なし。
 - 確認用製品build：**対象外**（テスト・script・文書のみの変更）。
 

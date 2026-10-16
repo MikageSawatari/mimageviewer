@@ -40,4 +40,3 @@ try {
     Pop-Location
 }
 exit $gateExit
-

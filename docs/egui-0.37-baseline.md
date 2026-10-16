@@ -92,7 +92,8 @@ PowerShellのリダイレクト出力はUTF-16、加工したJSON・manifestはU
 `git ls-files 'tests/snapshots/*.png'`は**445枚、30,572,520 bytes**。
 repository全体の追跡PNGは597枚で、製品素材・Web素材・fixture等を含むためsnapshot基準には使わない。
 445枚のpath＋SHA-256一覧は`target/egui037-stage0b/snapshot-png-sha256.txt`。
-このUTF-8/LF manifestのSHA-256は`2660181e631b432106b7104cdb141077f5217aa58cfcf2d50427ceec63e9756e`。
+このUTF-8 manifestをLF正規化（CRLFをLFへ変換）した後のSHA-256は
+`2660181e631b432106b7104cdb141077f5217aa58cfcf2d50427ceec63e9756e`。
 画像の生成・更新・今回の比較実行・目視採択は行っていない。
 
 | integration target | 実PNG生成入口（現HEAD行） | 段5の対象 |

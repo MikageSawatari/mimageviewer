@@ -4274,7 +4274,7 @@ impl App {
             // UI thread から presenter HWND を直接 SetWindowPos せず、復旧が必要な
             // foreground 状態を観測したら presenter 所有スレッドへ依頼する。
             let now = std::time::Instant::now();
-            let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+            let foreground_hwnd = foreground_observer::foreground_hwnd();
             let editor_snapshot = self.dsp_bridge.editor_ui_snapshot();
             let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_snapshot);
             let foreground_group = crate::video::native_window::ui_group_for_hwnd(
@@ -4706,10 +4706,10 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn cancel_video_audio_viewport_handoff_for_external_foreground(&mut self) {
-        let foreground = crate::video::native_window::foreground_hwnd();
+        let foreground = foreground_observer::foreground_hwnd();
         if super::should_cancel_video_audio_handoff_for_external_foreground(
             foreground,
-            crate::video::native_window::foreground_belongs_to_current_process_strict(),
+            foreground_observer::foreground_belongs_to_current_process_strict(),
         ) {
             self.cancel_video_audio_viewport_handoff("external_foreground");
         }
@@ -12329,7 +12329,7 @@ impl App {
         let presentation = self.viewer_presentation;
         let video_audio_mode = self.video_audio_mode;
         let music_vst_shell = self.music_vst_shell.is_some();
-        let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+        let foreground_hwnd = foreground_observer::foreground_hwnd();
         let presenter_hwnd = self
             .pending_native_video_output_hwnds_for_fs(fs_idx)
             .map(|(hwnd, _)| hwnd)

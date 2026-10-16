@@ -18,6 +18,8 @@
 //! v0.9.0 で native presenter に移行済。新規追加 / 移植時に「ui_fullscreen.rs を見て
 //! しまう」誤認を避けるため明示。
 
+#[cfg(test)]
+mod native_focus_tests;
 mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
@@ -8389,7 +8391,7 @@ struct NativeFocusTarget {
     target_hwnd: usize,
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -8421,7 +8423,7 @@ fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn claim_native_window_focus(target_hwnd: usize) -> NativeFocusClaim {
     let report = crate::video::native_window::claim_foreground(target_hwnd as u64);
     NativeFocusClaim {
@@ -8452,7 +8454,7 @@ struct NativeFocusTarget {
     target_hwnd: usize,
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
     NativeFocusTarget {
         foreground_hwnd: 0,
@@ -8460,7 +8462,7 @@ fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn claim_native_window_focus(target_hwnd: usize) -> NativeFocusClaim {
     NativeFocusClaim {
         foreground_hwnd: 0,
@@ -8473,16 +8475,44 @@ fn claim_native_window_focus(target_hwnd: usize) -> NativeFocusClaim {
     }
 }
 
-#[cfg(windows)]
+#[cfg(test)]
+fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
+    let (foreground, target) = crate::test_native_focus::cursor_focus_target();
+    NativeFocusTarget {
+        foreground_hwnd: foreground as usize,
+        target_hwnd: target as usize,
+    }
+}
+
+#[cfg(test)]
+fn claim_native_window_focus(target_hwnd: usize) -> NativeFocusClaim {
+    let (before, after) = crate::test_native_focus::claim_foreground(target_hwnd as u64);
+    NativeFocusClaim {
+        foreground_hwnd: before as usize,
+        post_foreground_hwnd: after as usize,
+        target_hwnd,
+        set_foreground_ok: target_hwnd != 0,
+        attach_thread_input_ok: false,
+        set_active_ok: target_hwnd != 0,
+        set_focus_ok: target_hwnd != 0,
+    }
+}
+
+#[cfg(all(windows, not(test)))]
 fn current_foreground_hwnd() -> usize {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     unsafe { GetForegroundWindow().0 as usize }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn current_foreground_hwnd() -> usize {
     0
+}
+
+#[cfg(test)]
+fn current_foreground_hwnd() -> usize {
+    crate::test_native_focus::foreground_hwnd() as usize
 }
 
 /// 物理的な Ctrl キー押下を OS から直接読む。フルスクリーンビューポートでは

@@ -266,9 +266,10 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 `cargo test` / nextest / `test-full.ps1` から外す。pure scheduler、合成イベント、
 `egui_kittest` のheadless Harness、wgpu offscreen描画は非対話区分として自動実行を維持する。
 アプリ起動等に該当する場合、テスト名、短時間、子プロセスであることは承認の例外にしない。
-本体のmessage-only HWND、非表示HWNDのz-order、画面外の非アクティブpopupと
+本体のmessage-only HWND、非表示HWNDのz-order、表示前に空regionを設定した非アクティブpopupと
 フォーカス要求probeによる8件は、前面切替・実入力・利用者に見える表示を行わない
 headless unit / fake-input試験として、既定の自動gateを維持する。
+headlessアプリの前面化操作はテスト専用fake/probeへ置換する。DSPなどの受動的な前面読取は隔離対象外。
 
 専用入口は `scripts/test-live-windows.ps1`。対象はeframeの
 `synchronous_damage_returns_before_outer_paint_gate`（damage/paint順序）1件のみ。
