@@ -561,6 +561,24 @@ def analyze_page_turn_animation(
                     else:
                         group["metrics"][f"application_ingress_to_{kind}_ms"].append((visible - input_t) * 1000)
         frame_rows = phases.get("frame", [])
+        # D4 explicitly separates preparation latency from the accepted-output
+        # motion clock. Keep older schemas valid and never turn these optional
+        # observations into proof of backend submission / OS presentation.
+        motion_rows = [event for kind in ("frame", "finish", "fully_visible")
+                       for event in phases.get(kind, [])
+                       if event.get("clock_origin") == "first_accepted_curl"]
+        for metric in ("accept_to_first_curl_ms", "motion_frames", "motion_max_gap_ms",
+                       "motion_elapsed_ms", "output_motion_elapsed_ms"):
+            values = [_animation_number(event.get(metric)) for event in motion_rows]
+            values = [value for value in values if value is not None]
+            if values:
+                group["metrics"][metric].append(max(values))
+        if motion_rows:
+            first_curl = next((event for event in phases.get("start", [])
+                               if event.get("clock_origin") == "first_accepted_curl"), None)
+            progress = _animation_number(first_curl.get("progress")) if first_curl else None
+            if progress is not None:
+                group["metrics"]["first_curl_progress"].append(progress)
         seen_frames = set()
         samples = []
         for event in frame_rows:
