@@ -107,6 +107,14 @@ optional = true
 version = "0.37.0"
 default-features = false
 
+[dependencies.egui-ime]
+path = "../egui-ime"
+
+[dev-dependencies.egui]
+version = "0.37.0"
+default-features = false
+features = ["default_fonts"]
+
 [dependencies.log]
 version = "0.4.34"
 features = ["std"]

@@ -514,6 +514,16 @@ impl InputState {
         self.viewport_rect - self.safe_area_insets
     }
 
+    /// Discard the remaining smoothed wheel input when its UI owner closes.
+    ///
+    /// Call this at the owner's termination boundary, after handling this pass's
+    /// input. This discards queued scroll and wheel-zoom deltas, leaving current
+    /// deltas, events, touch gestures and the wheel's gesture/modifier state intact.
+    /// A new wheel event in the next pass is processed normally.
+    pub fn discard_pending_scroll(&mut self) {
+        self.wheel.unprocessed_wheel_delta = Vec2::ZERO;
+    }
+
     /// Returns the full area available to egui, including parts that might be partially covered,
     /// for example, by the OS status bar or notches (see [`Self::safe_area_insets`]).
     ///
@@ -1483,6 +1493,24 @@ impl PointerState {
             .any(|event| matches!(event, &PointerEvent::Released { button: b, click: Some(_) } if button == b))
     }
 
+    /// Returns all pointer-button releases from this pass in raw-event order, together with
+    /// egui's adjudicated click position and count.
+    ///
+    /// A release that egui did not classify as a click is returned with `None`. This is useful
+    /// when an input owner needs to combine egui's click classification with other ordered raw
+    /// events, such as focus changes, without implementing a second click timer.
+    pub fn released_buttons_with_click_counts(
+        &self,
+    ) -> impl Iterator<Item = (PointerButton, Option<(Pos2, u32)>)> + '_ {
+        self.pointer_events.iter().filter_map(|event| match event {
+            PointerEvent::Released { click, button } => Some((
+                *button,
+                click.as_ref().map(|click| (click.pos, click.count)),
+            )),
+            PointerEvent::Moved(_) | PointerEvent::Pressed { .. } => None,
+        })
+    }
+
     /// Was the button given double clicked this frame?
     pub fn button_double_clicked(&self, button: PointerButton) -> bool {
         self.pointer_events.iter().any(|event| {
@@ -1751,5 +1779,239 @@ impl PointerState {
         ui.label(format!("last_last_click_time: {last_last_click_time:#?}"));
         ui.label(format!("last_move_time: {last_move_time:#?}"));
         ui.label(format!("pointer_events: {pointer_events:?}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Context, Event, Modifiers, PointerButton, RawInput, pos2};
+
+    use super::{InputOptions, InputState};
+
+    fn button(pos: crate::Pos2, button: PointerButton, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn next_pass(state: InputState, time: f64, events: Vec<Event>, scale: f32) -> InputState {
+        state.begin_pass(
+            RawInput {
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            false,
+            scale,
+            InputOptions::default(),
+        )
+    }
+
+    fn click_pass(state: InputState, time: f64, x: f32, scale: f32) -> InputState {
+        let pos = pos2(x, 20.0);
+        next_pass(
+            state,
+            time,
+            vec![
+                button(pos, PointerButton::Primary, true),
+                button(pos, PointerButton::Primary, false),
+            ],
+            scale,
+        )
+    }
+
+    fn projected_count(state: &InputState) -> u32 {
+        let releases = state
+            .pointer
+            .released_buttons_with_click_counts()
+            .collect::<Vec<_>>();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].0, PointerButton::Primary);
+        releases[0].1.unwrap().1
+    }
+
+    #[test]
+    fn adjudicated_releases_use_upstream_six_point_click_distance() {
+        assert_eq!(InputOptions::default().max_click_dist, 6.0);
+        for scale in [1.0, 2.0] {
+            for (distance, expected) in [(5.999, 2), (6.0, 1), (6.001, 1)] {
+                let first = click_pass(InputState::default(), 0.0, 20.0, scale);
+                assert_eq!(projected_count(&first), 1);
+                let second = click_pass(first, 0.1, 20.0 + distance, scale);
+                assert_eq!(projected_count(&second), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn adjudicated_releases_use_upstream_strict_time_and_triple_intervals() {
+        let delay = InputOptions::default().max_double_click_delay;
+        for (times, expected) in [
+            ([0.0, delay - 0.001, 2.0 * (delay - 0.001)], [1, 2, 3]),
+            ([0.0, delay, delay + 0.1], [1, 1, 2]),
+            // The old total-window rule would classify the last release as triple.
+            ([0.0, delay + 0.1, delay + 0.2], [1, 1, 2]),
+            ([0.0, 0.1, 0.1 + delay + 0.001], [1, 2, 1]),
+        ] {
+            let mut state = InputState::default();
+            for (time, count) in times.into_iter().zip(expected) {
+                state = click_pass(state, time, 20.0, 1.0);
+                assert_eq!(projected_count(&state), count, "times={times:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn discard_pending_scroll_ends_scroll_and_zoom_remainders_only() {
+        use crate::{MouseWheelSource, MouseWheelUnit, TouchPhase, Vec2, vec2};
+
+        for modifiers in [Modifiers::NONE, Modifiers::COMMAND] {
+            let wheel = || Event::MouseWheel {
+                unit: MouseWheelUnit::Line,
+                delta: vec2(0.0, 3.0),
+                phase: TouchPhase::Move,
+                source: MouseWheelSource::Unknown,
+                modifiers,
+            };
+            let mut state = next_pass(
+                InputState::default(),
+                0.0,
+                vec![
+                    button(pos2(10.0, 10.0), PointerButton::Primary, true),
+                    wheel(),
+                ],
+                1.0,
+            );
+            assert_ne!(state.wheel.unprocessed_wheel_delta, Vec2::ZERO);
+            let before = state.clone();
+            // Without termination, the same queued wheel would reach the next pass.
+            let baseline = next_pass(before.clone(), 0.01, vec![], 1.0);
+            assert!(baseline.smooth_scroll_delta() != Vec2::ZERO || baseline.zoom_delta() != 1.0);
+
+            state.discard_pending_scroll();
+            assert_eq!(state.wheel.unprocessed_wheel_delta, Vec2::ZERO);
+            assert_eq!(state.wheel.status, before.wheel.status);
+            assert_eq!(state.wheel.source, before.wheel.source);
+            assert_eq!(state.wheel.modifiers, before.wheel.modifiers);
+            assert_eq!(state.wheel.last_wheel_event, before.wheel.last_wheel_event);
+            assert_eq!(
+                state.wheel.smooth_wheel_delta,
+                before.wheel.smooth_wheel_delta
+            );
+            assert_eq!(state.smooth_scroll_delta(), before.smooth_scroll_delta());
+            assert_eq!(state.zoom_delta(), before.zoom_delta());
+            assert_eq!(state.events, before.events);
+            assert_eq!(state.raw.events, before.raw.events);
+            assert!(state.pointer.primary_down());
+            assert!(state.focused);
+
+            let idle = next_pass(state, 0.01, vec![], 1.0);
+            assert_eq!(idle.smooth_scroll_delta(), Vec2::ZERO);
+            assert_eq!(idle.zoom_delta(), 1.0);
+            let fresh = next_pass(idle, 0.02, vec![wheel()], 1.0);
+            if modifiers == Modifiers::NONE {
+                assert_ne!(fresh.smooth_scroll_delta(), Vec2::ZERO);
+                assert_eq!(fresh.zoom_delta(), 1.0);
+            } else {
+                assert_eq!(fresh.smooth_scroll_delta(), Vec2::ZERO);
+                assert_ne!(fresh.zoom_delta(), 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn adjudicated_releases_preserve_raw_order_clicks_and_non_clicks() {
+        for (positions, counts) in [
+            ([20.0, 30.0, 40.0, 50.0], [1, 1, 1, 1]),
+            ([20.0, 21.0, 22.0, 23.0], [1, 2, 3, 3]),
+        ] {
+            let [a, b, c, d] = positions.map(|p| pos2(p, p));
+            let ctx = Context::default();
+            let mut input = RawInput {
+                time: Some(1.0),
+                focused: true,
+                ..Default::default()
+            };
+            input.events = vec![
+                button(pos2(10.0, 10.0), PointerButton::Primary, true),
+                Event::PointerMoved(pos2(100.0, 100.0)),
+                button(pos2(100.0, 100.0), PointerButton::Primary, false),
+                Event::WindowFocused(false),
+                button(a, PointerButton::Secondary, true),
+                button(a, PointerButton::Secondary, false),
+                Event::WindowFocused(true),
+                button(b, PointerButton::Middle, true),
+                button(b, PointerButton::Middle, false),
+                Event::PointerGone,
+                button(c, PointerButton::Extra1, true),
+                button(c, PointerButton::Extra1, false),
+                button(d, PointerButton::Extra2, true),
+                button(d, PointerButton::Extra2, false),
+            ];
+
+            let mut releases = Vec::new();
+            let output = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx();
+                releases = ctx.input(|input| {
+                    input
+                        .pointer
+                        .released_buttons_with_click_counts()
+                        .collect::<Vec<_>>()
+                });
+            });
+            output.drop_without_applying_deltas();
+
+            assert_eq!(
+                releases,
+                vec![
+                    (PointerButton::Primary, None),
+                    (PointerButton::Secondary, Some((a, counts[0]))),
+                    (PointerButton::Middle, Some((b, counts[1]))),
+                    (PointerButton::Extra1, Some((c, counts[2]))),
+                    (PointerButton::Extra2, Some((d, counts[3]))),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn adjudicated_releases_are_not_replayed_in_a_discarded_second_pass() {
+        let ctx = Context::default();
+        let pos = pos2(12.0, 34.0);
+        let mut input = RawInput {
+            time: Some(1.0),
+            focused: true,
+            ..Default::default()
+        };
+        input.events = vec![
+            button(pos, PointerButton::Primary, true),
+            button(pos, PointerButton::Primary, false),
+        ];
+        let mut releases_by_pass = Vec::new();
+
+        let output = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx();
+            releases_by_pass.push(ctx.input(|input| {
+                input
+                    .pointer
+                    .released_buttons_with_click_counts()
+                    .collect::<Vec<_>>()
+            }));
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("exercise release ordering across passes");
+            }
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(releases_by_pass.len(), 2);
+        assert_eq!(
+            releases_by_pass[0],
+            vec![(PointerButton::Primary, Some((pos, 1)))]
+        );
+        assert!(releases_by_pass[1].is_empty());
     }
 }

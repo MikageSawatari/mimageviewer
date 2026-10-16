@@ -2242,6 +2242,22 @@ impl Context {
         self.has_requested_repaint_for(&self.viewport_id())
     }
 
+    /// Read-only diagnostic for the current pass, including delayed requests.
+    /// Unlike the previous-pass witness, this can describe an early-return tail.
+    #[cfg(feature = "miv-repaint-witness")]
+    pub fn miv_requested_repaint_delay(&self) -> Option<Duration> {
+        self.read(|ctx| {
+            let repaint = &ctx.viewports.get(&ctx.viewport_id())?.repaint;
+            if repaint.outstanding > 0 {
+                Some(Duration::ZERO)
+            } else if repaint.repaint_delay < Duration::MAX {
+                Some(repaint.repaint_delay)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Has a repaint been requested for the given viewport?
     #[must_use]
     pub fn has_requested_repaint_for(&self, viewport_id: &ViewportId) -> bool {
@@ -5020,6 +5036,36 @@ mod test {
     use crate::{FontDefinitions, Panel};
 
     use super::Context;
+
+    #[cfg(feature = "miv-repaint-witness")]
+    #[test]
+    fn miv_repaint_witness_reads_current_scheduler_without_mutation() {
+        use std::time::Duration;
+        let ctx = Context::default();
+        for (outstanding, delay, expected) in [
+            (0, Duration::MAX, None),
+            (
+                0,
+                Duration::from_millis(50),
+                Some(Duration::from_millis(50)),
+            ),
+            (0, Duration::ZERO, Some(Duration::ZERO)),
+            (1, Duration::MAX, Some(Duration::ZERO)),
+        ] {
+            ctx.write(|state| {
+                let id = state.viewport_id();
+                let repaint = &mut state.viewports.get_mut(&id).unwrap().repaint;
+                repaint.outstanding = outstanding;
+                repaint.repaint_delay = delay;
+            });
+            assert_eq!(ctx.miv_requested_repaint_delay(), expected);
+            ctx.read(|state| {
+                let repaint = &state.viewports.get(&state.viewport_id()).unwrap().repaint;
+                assert_eq!(repaint.outstanding, outstanding);
+                assert_eq!(repaint.repaint_delay, delay);
+            });
+        }
+    }
 
     #[cfg(debug_assertions)]
     #[test]

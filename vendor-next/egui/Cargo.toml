@@ -54,6 +54,7 @@ targets = [
 ]
 
 [features]
+miv-repaint-witness = []
 _override_unity = ["epaint/_override_unity"]
 bytemuck = ["epaint/bytemuck"]
 callstack = ["dep:backtrace"]

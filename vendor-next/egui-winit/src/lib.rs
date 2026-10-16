@@ -10,7 +10,7 @@
 #![expect(clippy::manual_range_contains)]
 
 #[cfg(target_os = "windows")]
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 #[cfg(feature = "accesskit")]
 pub use accesskit_winit;
@@ -29,6 +29,12 @@ pub mod clipboard;
 mod dropped_file;
 mod safe_area;
 mod window_settings;
+
+#[cfg(test)]
+mod disabled_ime_tests;
+mod ime_key_trace;
+#[cfg(test)]
+mod keyboard_input_tests;
 
 pub use window_settings::{WindowGeometry, WindowSettings};
 
@@ -82,6 +88,15 @@ pub struct EventResponse {
 }
 
 // ----------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyHold {
+    /// No press in this physical hold has reached egui.
+    Hidden,
+    /// At least one press reached egui; its release must also reach egui.
+    Forwarded,
+}
 
 /// Handles the integration between egui and a winit Window.
 ///
@@ -140,11 +155,11 @@ pub struct State {
     #[cfg(target_os = "macos")]
     scroll_momentum_monitor: Option<macos_scroll_momentum::ScrollMomentumMonitor>,
 
-    /// Used by [`State::try_on_ime_processed_keyboard_input`] to track key
-    /// release events that should be filtered out. See comments in that method
-    /// for details.
+    /// Whether egui has seen a press during each current physical hold.
+    /// Forwarded survives later Process repeats until release or focus loss.
     #[cfg(target_os = "windows")]
-    pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
+    key_holds: HashMap<winit::keyboard::PhysicalKey, KeyHold>,
+    ime_key_trace: Option<&'static ime_key_trace::Trace>,
 }
 
 impl State {
@@ -200,7 +215,8 @@ impl State {
             #[cfg(target_os = "macos")]
             scroll_momentum_monitor: macos_scroll_momentum::ScrollMomentumMonitor::install(),
             #[cfg(target_os = "windows")]
-            pressed_processed_physical_keys: HashSet::new(),
+            key_holds: HashMap::new(),
+            ime_key_trace: ime_key_trace::init(),
         };
 
         slf.egui_input
@@ -376,7 +392,11 @@ impl State {
             _ => {}
         }
 
-        match event {
+        let trace = self
+            .ime_key_trace
+            .and_then(|trace| trace.begin(event, self.egui_input.events.len()));
+
+        let response = match event {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let native_pixels_per_point = *scale_factor as f32;
 
@@ -460,22 +480,18 @@ impl State {
                         consumed: false,
                     }
                 } else {
-                    let egui_wants_keyboard_input = self.egui_ctx.egui_wants_keyboard_input();
-
-                    if let Some(response) =
-                        self.try_on_ime_processed_keyboard_input(event, egui_wants_keyboard_input)
-                    {
-                        response
-                    } else {
-                        self.on_keyboard_input(event);
-
-                        // When pressing the Tab key, egui focuses the first focusable element, hence Tab always consumes.
-                        let consumed = egui_wants_keyboard_input
+                    if self.on_keyboard_input(event) {
+                        let consumed = self.egui_ctx.egui_wants_keyboard_input()
                             || event.logical_key
                                 == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab);
                         EventResponse {
                             repaint: true,
                             consumed,
+                        }
+                    } else {
+                        EventResponse {
+                            repaint: false,
+                            consumed: self.egui_ctx.egui_wants_keyboard_input(),
                         }
                     }
                 }
@@ -490,14 +506,7 @@ impl State {
                     *focused
                 };
 
-                self.egui_input.focused = focused;
-                if !focused {
-                    // Avoid sticky modifiers when focus is lost (egui clears its own copy too).
-                    self.modifiers = egui::Modifiers::default();
-                }
-                self.egui_input
-                    .events
-                    .push(egui::Event::WindowFocused(focused));
+                self.on_focused(focused);
                 EventResponse {
                     repaint: true,
                     consumed: false,
@@ -546,27 +555,7 @@ impl State {
                 consumed: false,
             },
             WindowEvent::ModifiersChanged(state) => {
-                let state = state.state();
-
-                let alt = state.alt_key();
-                let ctrl = state.control_key();
-                let shift = state.shift_key();
-                let super_ = state.super_key();
-
-                self.modifiers.alt = alt;
-                self.modifiers.ctrl = ctrl;
-                self.modifiers.shift = shift;
-                // Use `Context::os()` rather than `target_os`, so that this also works on the web,
-                // where the OS is only known at runtime (web integrations should set it using
-                // `Context::set_os()` and `egui::os::OperatingSystem::from_user_agent()`).
-                let is_mac = self.egui_ctx.os().is_mac();
-                self.modifiers.mac_cmd = is_mac && super_;
-                self.modifiers.command = if is_mac { super_ } else { ctrl };
-
-                self.egui_input
-                    .events
-                    .push(egui::Event::ModifiersChanged(self.modifiers));
-
+                self.on_modifiers_changed(state.state());
                 EventResponse {
                     repaint: true,
                     consumed: false,
@@ -633,92 +622,11 @@ impl State {
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
+        };
+        if let Some(trace) = trace {
+            trace.finish(self.viewport_id, event, &self.egui_input.events);
         }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[expect(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
-    #[inline(always)]
-    fn try_on_ime_processed_keyboard_input(
-        &mut self,
-        _event: &winit::event::KeyEvent,
-        _egui_wants_keyboard_input: bool,
-    ) -> Option<EventResponse> {
-        // `KeyboardInput` events processed by the IME are not emitted by
-        // `winit` on non-Windows platforms, so we don't need to do anything
-        // here.
-
-        None
-    }
-
-    #[cfg(target_os = "windows")]
-    #[inline(always)]
-    fn try_on_ime_processed_keyboard_input(
-        &mut self,
-        event: &winit::event::KeyEvent,
-        egui_wants_keyboard_input: bool,
-    ) -> Option<EventResponse> {
-        if !self.allow_ime {
-            None
-        } else if event.logical_key == winit::keyboard::NamedKey::Process {
-            // On Windows, the current version of `winit` (0.30.12) has a bug
-            // where `KeyboardInput` events processed by the IME are still
-            // emitted. [^1]
-            //
-            // As a workaround, we detect these events by checking whether their
-            // `logical_key` is `winit::keyboard::NamedKey::Process`, and filter
-            // them out to keep behavior consistent with other platforms.
-            //
-            // `winit::keyboard::NamedKey::Process` is not documented in
-            // `winit`. Reading through its source code, we find that it is
-            // mapped from `VK_PROCESSKEY` on Windows [^2]. (On an unrelated
-            // note, Web is the only other platform that also uses it [^3].)
-            // According to Microsoft, “the IME sets the virtual key value
-            // to `VK_PROCESSKEY` after processing a key input message” [^4].
-            // See also [^5].
-            // (I can't find a documentation page dedicated to this value.)
-            //
-            // TODO(umajho): Remove this workaround once the `winit` bug is fixed
-            // and we've updated to a version that includes the fix. NOTE: Don't
-            // forget to also remove the `pressed_processed_physical_keys` field
-            // and its related code.
-            //
-            // [^1]: https://github.com/rust-windowing/winit/issues/4508
-            // [^2]: https://github.com/rust-windowing/winit/blob/e9809ef54b18499bb4f2cac945719ecc2a61061b/src/platform_impl/windows/keyboard_layout.rs#L946
-            // [^3]: https://developer.mozilla.org/en-US/docs/Web/API/UI_Events/Keyboard_event_key_values
-            // [^4]: https://learn.microsoft.com/en-us/windows/win32/api/imm/nf-imm-immgetvirtualkey#remarks
-            // [^5]: https://learn.microsoft.com/en-us/windows/win32/learnwin32/keyboard-input#character-messages
-
-            self.pressed_processed_physical_keys
-                .insert(event.physical_key);
-
-            Some(EventResponse {
-                repaint: false,
-                consumed: egui_wants_keyboard_input,
-            })
-        } else if event.state == ElementState::Released
-            && self
-                .pressed_processed_physical_keys
-                .remove(&event.physical_key)
-        {
-            // Unlike key-presses, we can not tell whether a key-release event
-            // is processed by the IME or not by looking at its `logical_key`,
-            // because their `logical_key` is the original value (e.g.
-            // `winit::keyboard::Key::Character(…)`) rather than
-            // `winit::keyboard::Key::Named(winit::keyboard::NamedKey::Process)`.
-            // (See the screencast for Windows in [^1].)
-            // So we track the physical keys of processed key-presses and
-            // filter out the corresponding key-releases.
-            //
-            // [^1]: https://github.com/rust-windowing/winit/issues/4508
-
-            Some(EventResponse {
-                repaint: false,
-                consumed: egui_wants_keyboard_input,
-            })
-        } else {
-            None
-        }
+        response
     }
 
     /// ## NOTE
@@ -783,7 +691,27 @@ impl State {
             // [`winit::event::Ime::Enabled`] means different things in X11 and
             // Wayland, but it doesn't matter to us.
             // See <https://github.com/rust-windowing/winit/issues/2498>
-            winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
+            // mIV's shared normalizer still needs terminal notifications when
+            // Windows emits Disabled without an empty Preedit/Commit. Keep the
+            // legacy Enabled notification too; TextEdit itself ignores both.
+            #[expect(deprecated, reason = "mIV IME normalization compatibility boundary")]
+            winit::event::Ime::Enabled => {
+                // Preserve the old X11/Wayland exception; non-empty Preedit
+                // itself starts composition in the shared policy.
+                if !cfg!(target_os = "linux") {
+                    self.egui_input
+                        .events
+                        .push(egui::Event::Ime(egui::ImeEvent::Enabled));
+                }
+            }
+            #[expect(
+                deprecated,
+                reason = "mIV Disabled-only cancellation must reach normalization"
+            )]
+            winit::event::Ime::Disabled => self
+                .egui_input
+                .events
+                .push(egui::Event::Ime(egui::ImeEvent::Disabled)),
             winit::event::Ime::Preedit(text, active_range_bytes) => {
                 let active_range_chars = match *active_range_bytes {
                     Some((start_bytes, end_bytes)) => {
@@ -806,7 +734,8 @@ impl State {
                                 Some(start_chars..start_chars + middle_chars)
                             }
                         } else {
-                            log::warn!("ignoring {ime:?}'s range because it is invalid");
+                            // Do not expose the preedit text through ordinary logs.
+                            log::warn!("ignoring invalid IME preedit byte range");
                             None
                         }
                     }
@@ -1076,112 +1005,79 @@ impl State {
         }
     }
 
-    fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) {
-        let winit::event::KeyEvent {
-            // Represents the position of a key independent of the currently active layout.
-            //
-            // It also uniquely identifies the physical key (i.e. it's mostly synonymous with a scancode).
-            // The most prevalent use case for this is games. For example the default keys for the player
-            // to move around might be the W, A, S, and D keys on a US layout. The position of these keys
-            // is more important than their label, so they should map to Z, Q, S, and D on an "AZERTY"
-            // layout. (This value is `KeyCode::KeyW` for the Z key on an AZERTY layout.)
-            physical_key,
-
-            // Represents the results of a keymap, i.e. what character a certain key press represents.
-            // When telling users "Press Ctrl-F to find", this is where we should
-            // look for the "F" key, because they may have a dvorak layout on
-            // a qwerty keyboard, and so the logical "F" character may not be located on the physical `KeyCode::KeyF` position.
-            logical_key: winit_logical_key,
-
-            text,
-
-            state,
-
-            location: _, // e.g. is it on the numpad?
-            repeat: _,   // egui will figure this out for us
-            ..
-        } = event;
-
-        let pressed = *state == winit::event::ElementState::Pressed;
-
-        let physical_key = if let winit::keyboard::PhysicalKey::Code(keycode) = *physical_key {
-            key_from_key_code(keycode)
+    fn on_modifiers_changed(&mut self, state: winit::keyboard::ModifiersState) {
+        self.modifiers.alt = state.alt_key();
+        self.modifiers.ctrl = state.control_key();
+        self.modifiers.shift = state.shift_key();
+        // Preserve upstream's runtime OS selection, including web integrations.
+        let is_mac = self.egui_ctx.os().is_mac();
+        self.modifiers.mac_cmd = is_mac && state.super_key();
+        self.modifiers.command = if is_mac {
+            state.super_key()
         } else {
-            None
+            state.control_key()
         };
+        self.egui_input
+            .events
+            .push(egui::Event::ModifiersChanged(self.modifiers));
+    }
 
-        let logical_key = key_from_winit_key(winit_logical_key);
-
-        // Helpful logging to enable when adding new key support
-        log::trace!(
-            "logical {:?} -> {:?},  physical {:?} -> {:?}",
-            event.logical_key,
-            logical_key,
+    fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) -> bool {
+        self.on_keyboard_input_parts(
+            &event.logical_key,
             event.physical_key,
-            physical_key
-        );
+            event.text.as_ref().map(|text| text.as_str()),
+            event.state,
+            event.repeat,
+        )
+    }
 
-        // "Logical OR physical key" is a fallback mechanism for keyboard layouts without Latin characters: it lets them
-        // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
-        // are mapped to the physical keys that normally contain C, X, V, etc.
-        // See also: https://github.com/emilk/egui/issues/3653
-        if let Some(active_key) = logical_key.or(physical_key) {
-            if pressed && self.clipboard_shortcuts {
-                if is_cut_command(self.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Cut);
-                    return;
-                } else if is_copy_command(self.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Copy);
-                    return;
-                } else if is_paste_command(self.modifiers, active_key) {
-                    if let Some(contents) = self.clipboard.get() {
-                        let contents = contents.replace("\r\n", "\n");
-                        if !contents.is_empty() {
-                            self.egui_input.events.push(egui::Event::Paste(contents));
-                        }
-                    } else if let Some(image) = self.clipboard.get_image() {
-                        // No usable text on the clipboard (e.g. an image was copied with
-                        // mspaint/Snipping Tool, which never puts a text representation
-                        // alongside it) — fall back to an image paste rather than doing
-                        // nothing, mirroring `Event::Copy`/`OutputCommand::CopyImage`.
-                        self.egui_input
-                            .events
-                            .push(egui::Event::PasteImage(std::sync::Arc::new(image)));
-                    }
-                    return;
+    // KeyEvent has private platform fields; keep State's delivery path testable without a window.
+    fn on_keyboard_input_parts(
+        &mut self,
+        logical_key: &winit::keyboard::Key,
+        physical_key: winit::keyboard::PhysicalKey,
+        text: Option<&str>,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        append_keyboard_input(
+            &mut self.egui_input,
+            self.modifiers,
+            logical_key,
+            physical_key,
+            text,
+            state,
+            repeat,
+            #[cfg(target_os = "windows")]
+            self.allow_ime,
+            #[cfg(target_os = "windows")]
+            &mut self.key_holds,
+            self.clipboard_shortcuts,
+            || {
+                if let Some(text) = self.clipboard.get() {
+                    Some(PasteContent::Text(text))
+                } else {
+                    self.clipboard.get_image().map(PasteContent::Image)
                 }
-            }
+            },
+        )
+    }
 
-            self.egui_input.events.push(egui::Event::Key {
-                key: active_key,
-                physical_key,
-                pressed,
-                repeat: false, // egui will fill this in for us!
-                modifiers: self.modifiers,
-            });
+    fn on_focused(&mut self, focused: bool) {
+        #[cfg(target_os = "windows")]
+        if !focused {
+            // Releases may go to another window while unfocused.
+            self.key_holds.clear();
         }
-
-        if let Some(text) = text
-            .as_ref()
-            .map(|t| t.as_str())
-            .or_else(|| winit_logical_key.to_text())
-        {
-            // Make sure there is text, and that it is not control characters
-            // (e.g. delete is sent as "\u{f728}" on macOS).
-            if !text.is_empty() && text.chars().all(is_printable_char) {
-                // On some platforms we get here when the user presses Cmd-C (copy), ctrl-W, etc.
-                // We need to ignore these characters that are side-effects of commands.
-                // Also make sure the key is pressed (not released). On Linux, text might
-                // contain some data even when the key is released.
-                let is_cmd =
-                    self.modifiers.ctrl || self.modifiers.command || self.modifiers.mac_cmd;
-                if pressed && !is_cmd {
-                    self.egui_input
-                        .events
-                        .push(egui::Event::Text(text.to_owned()));
-                }
-            }
+        if !focused {
+            // As upstream 0.37: avoid sticky modifiers (InputState clears too).
+            self.modifiers = egui::Modifiers::default();
         }
+        self.egui_input.focused = focused;
+        self.egui_input
+            .events
+            .push(egui::Event::WindowFocused(focused));
     }
 
     /// Call with the output given by `egui`.
@@ -1259,16 +1155,6 @@ impl State {
         let is_toggling_ime = self.allow_ime != allow_ime;
         if is_toggling_ime {
             self.allow_ime = allow_ime;
-            #[cfg(target_os = "windows")]
-            if !self.allow_ime {
-                // Defensively clear the set to avoid unexpected behavior.
-                //
-                // We don't do the same in `ime_event_disable` because the key
-                // release events for IME confirmation keys arrive after
-                // `winit::event::Ime::Disabled`.
-                self.pressed_processed_physical_keys.clear();
-            }
-
             profiling::scope!("set_ime_allowed");
             window.set_ime_allowed(allow_ime);
         }
@@ -1535,22 +1421,127 @@ fn is_printable_char(chr: char) -> bool {
     !is_in_private_use_area && !chr.is_ascii_control()
 }
 
-fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
-    keycode == egui::Key::Cut
-        || (modifiers.command_only() && keycode == egui::Key::X)
-        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Delete)
+enum PasteContent {
+    Text(String),
+    Image(egui::ColorImage),
 }
 
-fn is_copy_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
-    keycode == egui::Key::Copy
-        || (modifiers.command_only() && keycode == egui::Key::C)
-        || (cfg!(target_os = "windows") && modifiers.ctrl && keycode == egui::Key::Insert)
+// The complete keyboard delivery path, separated from KeyEvent's private
+// platform fields so tests exercise the same gate and event producers as State.
+// Clipboard access stays lazy: only an ordinary paste press reads it.
+fn append_keyboard_input(
+    input: &mut egui::RawInput,
+    modifiers: egui::Modifiers,
+    winit_logical_key: &winit::keyboard::Key,
+    winit_physical_key: winit::keyboard::PhysicalKey,
+    text: Option<&str>,
+    state: winit::event::ElementState,
+    _repeat: bool, // egui derives repeat itself, as before
+    #[cfg(target_os = "windows")] allow_ime: bool,
+    #[cfg(target_os = "windows")] key_holds: &mut HashMap<winit::keyboard::PhysicalKey, KeyHold>,
+    clipboard_shortcuts: bool,
+    clipboard_content: impl FnOnce() -> Option<PasteContent>,
+) -> bool {
+    #[cfg(target_os = "windows")]
+    if try_on_ime_processed_keyboard_input(
+        allow_ime,
+        key_holds,
+        winit_logical_key,
+        winit_physical_key,
+        state,
+    ) {
+        return false;
+    }
+
+    let pressed = state == winit::event::ElementState::Pressed;
+
+    let physical_key = if let winit::keyboard::PhysicalKey::Code(keycode) = winit_physical_key {
+        key_from_key_code(keycode)
+    } else {
+        None
+    };
+
+    let logical_key = key_from_winit_key(winit_logical_key);
+
+    // Keyboard diagnostics use the opt-in, redacted ime_key_trace path.
+
+    // "Logical OR physical key" is a fallback mechanism for keyboard layouts without Latin characters: it lets them
+    // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
+    // are mapped to the physical keys that normally contain C, X, V, etc.
+    // See also: https://github.com/emilk/egui/issues/3653
+    if let Some(active_key) = logical_key.or(physical_key) {
+        if pressed && clipboard_shortcuts {
+            if let Some(command) = egui_ime::winit_clipboard_command(modifiers, active_key) {
+                match command {
+                    egui_ime::ClipboardCommand::Cut => input.events.push(egui::Event::Cut),
+                    egui_ime::ClipboardCommand::Copy => input.events.push(egui::Event::Copy),
+                    egui_ime::ClipboardCommand::Paste => match clipboard_content() {
+                        Some(PasteContent::Text(contents)) => {
+                            let contents = contents.replace("\r\n", "\n");
+                            if !contents.is_empty() {
+                                input.events.push(egui::Event::Paste(contents));
+                            }
+                        }
+                        Some(PasteContent::Image(image)) => input
+                            .events
+                            .push(egui::Event::PasteImage(std::sync::Arc::new(image))),
+                        None => {}
+                    },
+                }
+                return true;
+            }
+        }
+
+        input.events.push(egui::Event::Key {
+            key: active_key,
+            physical_key,
+            pressed,
+            repeat: false, // egui will fill this in for us!
+            modifiers: modifiers,
+        });
+    }
+
+    if let Some(text) = text.or_else(|| winit_logical_key.to_text()) {
+        // Make sure there is text, and that it is not control characters
+        // (e.g. delete is sent as "\u{f728}" on macOS).
+        if !text.is_empty() && text.chars().all(is_printable_char) {
+            // On some platforms we get here when the user presses Cmd-C (copy), ctrl-W, etc.
+            // We need to ignore these characters that are side-effects of commands.
+            // Also make sure the key is pressed (not released). On Linux, text might
+            // contain some data even when the key is released.
+            let is_cmd = modifiers.ctrl || modifiers.command || modifiers.mac_cmd;
+            if pressed && !is_cmd {
+                input.events.push(egui::Event::Text(text.to_owned()));
+            }
+        }
+    }
+    true
 }
 
-fn is_paste_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
-    keycode == egui::Key::Paste
-        || (modifiers.command_only() && keycode == egui::Key::V)
-        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Insert)
+/// Based on upstream 0.34.0, with typed ownership for the entire physical hold.
+/// KeyEvent's public parts let delivery tests use the production path.
+/// https://github.com/emilk/egui/pull/7967
+#[cfg(target_os = "windows")]
+fn try_on_ime_processed_keyboard_input(
+    allow_ime: bool,
+    key_holds: &mut HashMap<winit::keyboard::PhysicalKey, KeyHold>,
+    logical_key: &winit::keyboard::Key,
+    physical_key: winit::keyboard::PhysicalKey,
+    state: winit::event::ElementState,
+) -> bool {
+    match state {
+        ElementState::Released => key_holds.remove(&physical_key) == Some(KeyHold::Hidden),
+        ElementState::Pressed => {
+            if allow_ime && *logical_key == winit::keyboard::NamedKey::Process {
+                // Never demote a hold whose earlier press already reached egui.
+                key_holds.entry(physical_key).or_insert(KeyHold::Hidden);
+                true
+            } else {
+                key_holds.insert(physical_key, KeyHold::Forwarded);
+                false
+            }
+        }
+    }
 }
 
 fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::PointerButton> {
