@@ -17,12 +17,23 @@ fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage
                 .transform
                 .visible_region_request(page.painter.clip_rect())
                 .expect("visible page");
-            assert!(page.transform.total_scale * page.transform.pixels_per_point > 1.0);
-            let resource = crate::gpu_lanczos::test_native_resource_with_region(
-                source,
-                visible.target_size,
-                visible.source_uv_rect,
-            );
+            let physical_scale = page.transform.total_scale * page.transform.pixels_per_point;
+            let resource = if physical_scale < 1.0 {
+                let size = source.size();
+                let target = size.map(|length| {
+                    crate::displayed_image_transform::physical_pixel_extent(
+                        length as f32,
+                        physical_scale,
+                    )
+                });
+                crate::gpu_lanczos::test_native_resource(source, target)
+            } else {
+                crate::gpu_lanczos::test_native_resource_with_region(
+                    source,
+                    visible.target_size,
+                    visible.source_uv_rect,
+                )
+            };
             let material = resource.capture_presentation(page.painter.ctx());
             assert!(
                 material.matches_prepare(
@@ -35,14 +46,12 @@ fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage
                 ),
                 "fixture must match the actual ordinary prepare request"
             );
-            assert!(
-                canonical_roi_uv(
-                    canonical_source_uv(&page.transform),
-                    material.visible_source_uv_rect().unwrap(),
-                    material.size()
-                )
-                .is_ok()
-            );
+            if let Some(roi) = material.visible_source_uv_rect() {
+                assert!(
+                    canonical_roi_uv(canonical_source_uv(&page.transform), roi, material.size())
+                        .is_ok()
+                );
+            }
             PreparedPagedPage {
                 resource: resource.into(),
                 ..page.clone()
@@ -58,9 +67,41 @@ fn start_native_turn(
     crate::app::AppTestEnvForTest,
     Vec<PreparedPagedPage>,
 ) {
+    start_native_turn_with_source_size(mode, None)
+}
+
+fn start_native_turn_with_source_size(
+    mode: SpreadMode,
+    source_size: Option<[usize; 2]>,
+) -> (
+    egui::Context,
+    crate::app::AppTestEnvForTest,
+    Vec<PreparedPagedPage>,
+) {
     let ctx = egui::Context::default();
     install(&ctx);
     let mut app = ready_app(&ctx, mode);
+    if let Some(size) = source_size {
+        for idx in 0..4 {
+            let pixels = Arc::new(egui::ColorImage::filled(size, egui::Color32::LIGHT_BLUE));
+            let tex = ctx.load_texture(
+                format!("prepare-source-{idx}"),
+                (*pixels).clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: Some(size),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            app.record_page_dims_for_spread(idx, (size[0] as u32, size[1] as u32));
+        }
+    }
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
     app.thumbnails = (0..4).map(|_| ThumbnailState::Pending).collect();
@@ -315,14 +356,16 @@ fn changed_presentation_view_and_filter_reenter_ordinary_prepare() {
             } else {
                 old.underlay.clone()
             };
-            let prepared = app.prepare_fs_paged_paint_payload(
-                &payload,
-                &transform,
-                &painter,
-                &underlay,
-                FsPageLayoutSource::CurrentItem,
-                true,
-            );
+            let prepared = app
+                .prepare_fs_paged_paint_payload(
+                    &payload,
+                    &transform,
+                    &painter,
+                    &underlay,
+                    FsPageLayoutSource::CurrentItem,
+                    true,
+                )
+                .expect("resident source still enters ordinary prepare");
             assert!(
                 matches!(prepared, FullscreenPaintPayload::NormalResource(_)),
                 "{change:?}"
@@ -481,5 +524,457 @@ fn original_preview_nonfinal_and_faithful_spread_never_reuse_frozen_native() {
             expected,
             "{case}: the caller's ordinary paint eligibility must reach prepare before reuse"
         );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AbsentStage {
+    Turning,
+    CompletingOn,
+    CompletingOff,
+}
+
+fn prepare_absent_stage(app: &mut App, stage: AbsentStage) {
+    retain_turn_clock(app);
+    if !matches!(stage, AbsentStage::Turning) {
+        app.page_turn_presentation.cancel("source-absent-fixture");
+        app.settings.page_turn_animation_enabled = matches!(stage, AbsentStage::CompletingOn);
+        assert!(app.page_turn_completion_active());
+    }
+}
+
+fn evict_normal_sources(app: &mut App, ctx: &egui::Context, held: &[PreparedPagedPage]) {
+    app.fs_cache.clear();
+    app.final_composite_cache.clear();
+    app.edit_result_cache.clear();
+    app.comic_cache.clear();
+    app.conceal_cache.clear();
+    app.erase_result_cache.clear();
+    app.erase_preview_cache.clear();
+    app.erase_base_tex_cache.clear();
+    app.local_adjust_cache.clear();
+    app.local_adjust_layer_bypass_cache.clear();
+    app.local_adjust_prefix_preview_cache.clear();
+    for page in held {
+        let idx = page.occurrence.idx;
+        assert!(
+            app.resolve_original_preview_tex(idx).is_none(),
+            "raw source must actually be absent"
+        );
+        assert!(
+            app.resolve_fs_display_tex(idx, false).is_none(),
+            "processed normal source must actually be absent"
+        );
+        assert!(
+            ctx.tex_manager()
+                .read()
+                .meta(page.resource.source_texture_id())
+                .is_none(),
+            "presentation cannot keep its old source"
+        );
+    }
+    app.fs_lanczos_cache.take_test_resolve_input_ids();
+}
+
+fn install_allowed_thumbnails(
+    app: &mut App,
+    ctx: &egui::Context,
+    held: &[PreparedPagedPage],
+) -> Vec<egui::TextureId> {
+    held.iter()
+        .map(|page| {
+            let idx = page.occurrence.idx;
+            let size = [8, 12];
+            let texture = ctx.load_texture(
+                format!("source-absent-thumb-{idx}"),
+                egui::ColorImage::filled(size, egui::Color32::LIGHT_BLUE),
+                egui::TextureOptions::LINEAR,
+            );
+            let id = texture.id();
+            app.thumbnails[idx] = ThumbnailState::Loaded {
+                tex: texture,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                from_edit_preview: false,
+                rendered_at_px: 12,
+                source_dims: Some((80, 120)),
+                layout_dims: None,
+            };
+            assert_eq!(app.fs_thumbnail_texture_for_display(idx).unwrap().id(), id);
+            id
+        })
+        .collect()
+}
+
+/// The existing draw_current helper requires a Single transform. Use the same real
+/// resolver/selector/draw entry without unwrapping so loading is observable too.
+fn draw_with_absent_source(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    held: &[PreparedPagedPage],
+    original_preview_active: bool,
+) -> FsNavigatorTextureSources {
+    let anchor = app.fullscreen_idx.unwrap();
+    let composition = app.spread_display_composition_for_anchor(anchor);
+    let rect = ui.max_rect();
+    if held.len() == 2 {
+        return app.draw_fs_spread_with_submission(
+            ui,
+            ctx,
+            rect,
+            held[0].occurrence.idx,
+            held[1].occurrence.idx,
+            original_preview_active,
+            FsPageTurnDecision::normal(),
+            None,
+            StillSeekGeometry::bar_only(),
+            true,
+            Some(&composition),
+        );
+    }
+    let idx = held[0].occurrence.idx;
+    let ordinary = app.resolve_fs_processed_texture(ctx, idx, original_preview_active);
+    let payload = app.fullscreen_paint_payload_for_page(idx, ordinary, original_preview_active);
+    let thumbnail = app.fs_thumbnail_texture_for_display(idx);
+    let source_size = app
+        .known_page_dims_for_idx(idx)
+        .map(|(w, h)| egui::vec2(w as f32, h as f32));
+    let live = !original_preview_active
+        && app.settings.page_turn_animation_enabled
+        && app.page_turn_view_eligible(idx);
+    let fit_mode = app.effective_fullscreen_fit_mode();
+    let limits = FullscreenFitScaleLimits {
+        pixels_per_point: ctx.pixels_per_point(),
+        ..Default::default()
+    };
+    let mut sources = FsNavigatorTextureSources::default();
+    app.fullscreen_page_layout
+        .begin(FullscreenPageLayoutKind::Single);
+    if let Some(transform) = app.draw_fs_image_with_receipt(
+        ui,
+        rect,
+        idx,
+        source_size,
+        FsPageLayoutSource::CurrentItem,
+        None,
+        None,
+        composition.singleton_placement(),
+        payload.as_ref(),
+        thumbnail.as_ref(),
+        false,
+        false,
+        false,
+        crate::rotation_db::Rotation::None,
+        None,
+        0.0,
+        &held[0].underlay,
+        "",
+        false,
+        fit_mode,
+        limits,
+        None,
+        Some(&mut sources),
+        live,
+    ) {
+        app.fullscreen_page_layout
+            .push_occurrence(transform, held[0].occurrence);
+    }
+    sources
+}
+
+fn texture_ids_in_output(output: &egui::FullOutput) -> Vec<egui::TextureId> {
+    fn collect(shape: &egui::Shape, ids: &mut Vec<egui::TextureId>) {
+        match shape {
+            egui::Shape::Mesh(mesh) => ids.push(mesh.texture_id),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ids = Vec::new();
+    for shape in &output.shapes {
+        collect(&shape.shape, &mut ids);
+    }
+    ids
+}
+
+fn output_has_loading(output: &egui::FullOutput) -> bool {
+    output.shapes.iter().any(|shape| {
+        matches!(&shape.shape,
+        egui::Shape::Text(text) if text.galley.text().contains("\u{8aad}\u{8fbc}\u{4e2d}"))
+    })
+}
+
+fn paint_fallback_navigator_and_emit_ready(
+    app: &mut App,
+    ui: &egui::Ui,
+    ctx: &egui::Context,
+    sources: &FsNavigatorTextureSources,
+    thumbnails: &[egui::TextureId],
+) {
+    for page in &sources.pages {
+        let transform = app
+            .fullscreen_page_layout
+            .page_by_occurrence(page.occurrence)
+            .expect("fallback layout occurrence")
+            .transform;
+        assert!(sources.paint_page(ui.painter(), page.idx(), &transform, None));
+    }
+    let composition = app.spread_display_composition_for_anchor(app.fullscreen_idx.unwrap());
+    app.emit_fs_page_turn_ready_for_display_unit(
+        ctx,
+        &composition,
+        FsPageTurnDecision::normal(),
+        sources,
+    );
+    let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+        panic!("fallback has an actual paged receipt");
+    };
+    if receipt.was_accepted() {
+        // OFF's ordinary flat receipt is already accepted and not deferred.
+        assert!(app.pending_fs_page_turn_ready.is_none());
+        return;
+    }
+    let pending = app
+        .pending_fs_page_turn_ready
+        .as_ref()
+        .expect("fallback submission awaits the accepted paint pass");
+    assert_eq!(pending.sources.pages.len(), thumbnails.len());
+    assert!(
+        pending
+            .sources
+            .pages
+            .iter()
+            .zip(thumbnails)
+            .all(|(page, id)| page.resource.paint_texture_id() == *id),
+        "ready notification must retain the actual thumbnail selection"
+    );
+}
+
+#[test]
+fn source_absent_original_preview_never_paints_frozen_native_single_and_pair() {
+    for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+        for stage in [
+            AbsentStage::Turning,
+            AbsentStage::CompletingOn,
+            AbsentStage::CompletingOff,
+        ] {
+            for with_thumbnail in [false, true] {
+                let (ctx, mut app, held) = start_native_turn(mode);
+                prepare_absent_stage(&mut app, stage);
+                evict_normal_sources(&mut app, &ctx, &held);
+                let thumbnails = if with_thumbnail {
+                    install_allowed_thumbnails(&mut app, &ctx, &held)
+                } else {
+                    Vec::new()
+                };
+                for page in &held {
+                    assert!(
+                        app.fullscreen_paint_payload_for_page(page.occurrence.idx, None, true)
+                            .is_none(),
+                        "original preview cannot select a processed frozen material after raw eviction"
+                    );
+                }
+                let output = frame(&ctx, |ui, ctx| {
+                    let sources = draw_with_absent_source(&mut app, ui, ctx, &held, true);
+                    if with_thumbnail {
+                        assert_eq!(sources.pages.len(), held.len());
+                        assert!(
+                            sources
+                                .pages
+                                .iter()
+                                .zip(&thumbnails)
+                                .all(|(page, id)| page.resource.paint_texture_id() == *id)
+                        );
+                        paint_fallback_navigator_and_emit_ready(
+                            &mut app,
+                            ui,
+                            ctx,
+                            &sources,
+                            &thumbnails,
+                        );
+                    } else {
+                        assert!(sources.pages.is_empty());
+                    }
+                });
+                let painted = texture_ids_in_output(&output);
+                assert!(
+                    held.iter()
+                        .all(|page| !painted.contains(&page.resource.paint_texture_id())),
+                    "{mode:?} {stage:?}"
+                );
+                if with_thumbnail {
+                    assert!(thumbnails.iter().all(|id| painted.contains(id)));
+                } else {
+                    assert!(
+                        output_has_loading(&output),
+                        "existing loading paint must remain visible"
+                    );
+                    assert!(
+                        matches!(
+                            app.page_turn_presentation.state,
+                            PresentationState::Inactive
+                        ),
+                        "{mode:?} {stage:?}: missing candidates must retire the frozen presentation"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn source_absent_stable_view_keeps_native_single_and_pair() {
+    for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+        for stage in [
+            AbsentStage::Turning,
+            AbsentStage::CompletingOn,
+            AbsentStage::CompletingOff,
+        ] {
+            let (ctx, mut app, held) = start_native_turn(mode);
+            prepare_absent_stage(&mut app, stage);
+            evict_normal_sources(&mut app, &ctx, &held);
+            let output = frame(&ctx, |ui, ctx| {
+                let sources = draw_with_absent_source(&mut app, ui, ctx, &held, false);
+                assert_eq!(sources.pages.len(), held.len());
+                assert!(
+                    sources.pages.iter().zip(&held).all(|(page, old)| page
+                        .resource
+                        .paint_texture_id()
+                        == old.resource.paint_texture_id()
+                        && page.resource.source_texture().is_none()),
+                    "{mode:?} {stage:?}"
+                );
+            });
+            assert_frozen_layout(&app, &held);
+            assert!(
+                app.fs_lanczos_cache
+                    .take_test_resolve_input_ids()
+                    .is_empty()
+            );
+            let painted = texture_ids_in_output(&output);
+            assert!(
+                held.iter()
+                    .any(|page| painted.contains(&page.resource.paint_texture_id()))
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AbsentChange {
+    Resize,
+    Dpi,
+    Fit,
+    DownscaleSmoothing,
+}
+
+#[test]
+fn source_absent_changed_view_or_prepare_key_uses_existing_fallback() {
+    for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+        for stage in [AbsentStage::Turning, AbsentStage::CompletingOff] {
+            for change in [
+                AbsentChange::Resize,
+                AbsentChange::Dpi,
+                AbsentChange::Fit,
+                AbsentChange::DownscaleSmoothing,
+            ] {
+                let (ctx, mut app, held) = if matches!(change, AbsentChange::DownscaleSmoothing) {
+                    start_native_turn_with_source_size(mode, Some([320, 480]))
+                } else {
+                    start_native_turn(mode)
+                };
+                prepare_absent_stage(&mut app, stage);
+                evict_normal_sources(&mut app, &ctx, &held);
+                let thumbnails = if matches!(change, AbsentChange::Resize) {
+                    Vec::new()
+                } else {
+                    install_allowed_thumbnails(&mut app, &ctx, &held)
+                };
+                if matches!(change, AbsentChange::Fit) {
+                    app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
+                }
+                if matches!(change, AbsentChange::DownscaleSmoothing) {
+                    assert!(
+                        held.iter()
+                            .all(|p| p.resource.visible_source_uv_rect().is_none())
+                    );
+                    app.settings.downscale_smoothing_percent = 20;
+                }
+                let screen_size = if matches!(change, AbsentChange::Resize) {
+                    egui::vec2(800.0, 500.0)
+                } else {
+                    egui::vec2(600.0, 400.0)
+                };
+                let input_ppp = if matches!(change, AbsentChange::Dpi) {
+                    1.25
+                } else {
+                    1.0
+                };
+                ctx.set_pixels_per_point(input_ppp);
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size)),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                assert_eq!(ctx.pixels_per_point(), input_ppp);
+                                let sources =
+                                    draw_with_absent_source(&mut app, ui, ctx, &held, false);
+                                if thumbnails.is_empty() {
+                                    assert!(sources.pages.is_empty());
+                                } else {
+                                    assert_eq!(sources.pages.len(), held.len());
+                                    assert!(
+                                        sources
+                                            .pages
+                                            .iter()
+                                            .zip(&thumbnails)
+                                            .all(|(page, id)| page.resource.paint_texture_id()
+                                                == *id),
+                                        "{mode:?} {stage:?} {change:?}"
+                                    );
+                                    paint_fallback_navigator_and_emit_ready(
+                                        &mut app,
+                                        ui,
+                                        ctx,
+                                        &sources,
+                                        &thumbnails,
+                                    );
+                                }
+                            });
+                    },
+                );
+                let painted = texture_ids_in_output(&output);
+                assert!(
+                    held.iter()
+                        .all(|page| !painted.contains(&page.resource.paint_texture_id())),
+                    "{mode:?} {stage:?} {change:?}: rejected frozen Native must not be painted"
+                );
+                if thumbnails.is_empty() {
+                    assert!(output_has_loading(&output));
+                    assert!(
+                        matches!(
+                            app.page_turn_presentation.state,
+                            PresentationState::Inactive
+                        ),
+                        "{mode:?} {stage:?} {change:?}: missing candidates must retire the frozen presentation"
+                    );
+                } else {
+                    assert!(thumbnails.iter().all(|id| painted.contains(id)));
+                }
+                let resolved = app.fs_lanczos_cache.take_test_resolve_input_ids();
+                assert!(
+                    resolved.iter().all(|id| thumbnails.contains(id)),
+                    "no absent source or Native paint ID may become an input"
+                );
+            }
+        }
     }
 }

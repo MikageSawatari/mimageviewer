@@ -193,35 +193,150 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
             "source {id:?} still pinned"
         );
     }
-    if !expired {
-        // Exercise the real next-frame selector/prepare/bind route too. Source
-        // eviction cannot turn an adopted Native presentation into a cache miss.
-        if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state {
-            offer.accepted_at = Instant::now();
-            offer.duration = Duration::from_millis(600);
-        }
-        frame(&ctx, |ui, ctx| {
-            let (_, sources) = draw_current(&mut app, ui, ctx);
-            let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
-                panic!("native receipt")
-            };
-            assert!(
-                receipt.curl,
-                "source-free Native must still paint the frozen turn"
-            );
-            assert!(
-                sources
-                    .pages
-                    .iter()
-                    .all(|page| page.resource.source_texture().is_none())
-            );
-        });
-    }
+    // These measured output dimensions deliberately model the recorded 03/04
+    // allocations, not this 600x400 fixture's view demand. They prove ownership
+    // and pin admission only. The demand-matched fixture below checks actual
+    // source-free selection/preparation/drawing after eviction.
     let mut accountant = VramAccountant::default();
     app.page_turn_leases.account(&mut accountant);
     assert_eq!(
         accountant.finish().total_bytes(),
         if expired { 2 } else { 4 } * output_bytes
+    );
+}
+
+#[test]
+fn demand_matched_native_materials_survive_eviction_through_real_next_frame_draw() {
+    let ctx = egui::Context::default();
+    install(&ctx);
+    let mut app = ready_app(&ctx, SpreadMode::Ltr);
+    app.settings.page_turn_animation_enabled = true;
+    app.settings.page_turn_animation_duration_ms = 600;
+    app.thumbnails = (0..4).map(|_| ThumbnailState::Pending).collect();
+    let mut templates = Vec::new();
+    let mut source_ids = Vec::new();
+    for anchor in [0, 2] {
+        app.fullscreen_idx = Some(anchor);
+        frame(&ctx, |ui, ctx| {
+            draw_current(&mut app, ui, ctx);
+        });
+        let PresentationState::Flat(unit) = &app.page_turn_presentation.state else {
+            panic!("ordinary prepared template");
+        };
+        let mut pages = unit.pages.clone();
+        assert_eq!(pages.len(), 2);
+        for page in &mut pages {
+            let crate::gpu_lanczos::FullscreenPaintPayload::PresentationMaterial(material) =
+                &page.resource
+            else {
+                panic!("ordinary adopted material");
+            };
+            let source = material.source_texture().unwrap().clone();
+            source_ids.push(source.id());
+            let request = page
+                .transform
+                .visible_region_request(page.painter.clip_rect())
+                .unwrap();
+            assert!(page.transform.total_scale * page.transform.pixels_per_point > 1.0);
+            assert_eq!(
+                app.effective_params(page.occurrence.idx).post_filter,
+                crate::adjustment::PostFilter::None
+            );
+            let normal = app.fullscreen_paint_resource_for_texture(page.occurrence.idx, source);
+            let native = crate::gpu_lanczos::test_native_resource_with_region(
+                normal,
+                request.target_size,
+                request.source_uv_rect,
+            );
+            let captured = native.capture_presentation(&ctx);
+            assert!(captured.matches_prepare(
+                page.transform.total_scale,
+                page.transform.pixels_per_point,
+                Some(request),
+                crate::adjustment::PostFilter::None,
+                app.settings.downscale_smoothing_percent,
+                app.settings.anime_upscale_source_limit,
+            ));
+            page.resource = native.into();
+        }
+        templates.push(pages);
+    }
+    app.fullscreen_idx = Some(0);
+    frame(&ctx, |_, ctx| {
+        app.submit_paged_display_unit(ctx, &templates[0], None);
+    });
+    frame(&ctx, |_, ctx| {
+        let operation = ViewerOperationId::Pad {
+            batch: next_operation_batch(),
+            ordinal: 0,
+        };
+        app.page_turn_external_operation(
+            ctx,
+            operation,
+            OperationPhase::Press,
+            "demand-matched-material",
+        );
+        app.offer_page_turn_with_operation(ctx, 2, true, Some(operation));
+        let PresentationState::Offered { offer, .. } = &app.page_turn_presentation.state else {
+            panic!("resident input offer");
+        };
+        let now = offer.accepted_at + Duration::from_millis(1);
+        app.fullscreen_idx = Some(2);
+        let receipt = app
+            .submit_paged_display_unit_with_clock(ctx, &templates[1], None, || now)
+            .unwrap();
+        assert!(receipt.curl);
+    });
+    let PresentationState::Turning { incoming, .. } = &app.page_turn_presentation.state else {
+        panic!("prepared Native turn");
+    };
+    let native_ids = incoming
+        .pages
+        .iter()
+        .map(|page| page.resource.paint_texture_id())
+        .collect::<Vec<_>>();
+    drop(templates);
+    app.fs_cache.clear();
+    app.final_composite_cache.clear();
+    app.edit_result_cache.clear();
+    for id in source_ids {
+        assert!(
+            ctx.tex_manager().read().meta(id).is_none(),
+            "source {id:?} still pinned"
+        );
+    }
+    if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state {
+        offer.accepted_at = Instant::now();
+        offer.duration = Duration::from_millis(600);
+    }
+    app.fs_lanczos_cache.take_test_resolve_input_ids();
+    let output = frame(&ctx, |ui, ctx| {
+        let (_, sources) = draw_current(&mut app, ui, ctx);
+        let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+            panic!("source-free Native receipt");
+        };
+        assert!(
+            receipt.curl,
+            "matching source-free Native must paint the frozen turn"
+        );
+        assert_eq!(sources.pages.len(), 2);
+        for (page, id) in sources.pages.iter().zip(&native_ids) {
+            assert!(page.resource.source_texture().is_none());
+            assert_eq!(page.resource.paint_texture_id(), *id);
+        }
+        assert!(
+            app.fs_lanczos_cache
+                .take_test_resolve_input_ids()
+                .is_empty()
+        );
+    });
+    let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+    assert!(
+        primitives.iter().any(|primitive| matches!(
+            &primitive.primitive,
+            egui::epaint::Primitive::Mesh(mesh) if native_ids.contains(&mesh.texture_id)
+        )),
+        "accepted Native material must reach the actual tessellated draw batch"
     );
 }
 

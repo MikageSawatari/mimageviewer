@@ -1799,31 +1799,32 @@ impl App {
         if old.occurrence != page.occurrence {
             return page;
         }
+        // Native reuse was already validated by the shared prepare boundary.
+        // Do not revive a rejected Native after its ordinary fallback prepared.
+        if old.resource.lanczos_output().is_some()
+            && old.resource.paint_texture_id() != page.resource.paint_texture_id()
+        {
+            return page;
+        }
         PreparedPagedPage {
             painter: page.painter,
             ..old.clone()
         }
     }
 
-    /// A source-free output can serve a changed view only inside its actual
-    /// source coverage. On a real miss the ordinary selector uses its existing
-    /// thumbnail/loading candidate; it never prepares from a native paint ID.
-    pub(super) fn page_turn_source_free_paint_supported(
-        &mut self,
+    /// Coverage is one input to the shared prepare/reuse decision, not permission
+    /// to draw a Native allocation after a view or cache-key mismatch.
+    pub(super) fn page_turn_material_covers_transform(
+        &self,
         resource: &crate::gpu_lanczos::FullscreenPaintPayload,
         transform: &DisplayedImageTransform,
     ) -> bool {
         if resource.source_texture().is_some() {
             return true;
         }
-        let supported = resource.visible_source_uv_rect().is_none_or(|roi| {
+        resource.visible_source_uv_rect().is_none_or(|roi| {
             canonical_roi_uv(canonical_source_uv(transform), roi, resource.size()).is_ok()
-        });
-        if !supported {
-            self.page_turn_presentation
-                .cancel("source_geometry_or_binding_changed");
-        }
-        supported
+        })
     }
 
     /// Called only at accepted Sequential navigation, before opening/mutating the target.
