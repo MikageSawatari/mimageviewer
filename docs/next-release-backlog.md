@@ -171,6 +171,32 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 
+### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
+
+- 観測 (このセッションの全件実行の記録。単独で再実行するとどれも成功):
+  - ページめくり D2 のブランチで本体 lib 全件を 3 回回したとき、3 / 2 / 1 件が落ちた。別の作業ツリー (§1.387) でも
+    同時に全件テストが走っていた時間帯。落ちたのは `detached_native_video_navigation_syncs_main_selection` (worker 未完了)、
+    `streaming_drain_and_reacquire_between_frames_do_not_restore_local_view` (AcquiringRemote のまま)、
+    `abort_on_cancel_returns_interrupted_immediately` (218ms で時間上限)、
+    `finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch` (producer 完了待ち timeout)、
+    `startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` (scan marker 不一致)、
+    `incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls` (similar array の base publish の `MoveFileExW` がアクセス拒否 → 120 秒で timeout)。
+    記録の正本は [page-turn 計画 §27](page-turn-animation-plan.md) の D2 検証記録。
+  - §1.387 を master へ取り込んだ直後 (`578c0bced`) の全件で 5 件が落ちた。別の作業ツリーで Codex がビルド中だった。
+    すべてページめくりの実時計を使うテスト: `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`、
+    `permission_service_handlers_pdf_zip_automatic_and_composed_turn_on_receipt`、
+    `page_turn_permission_service_vacant_composed_handler_starts_and_completes_both_ways`、
+    `page_turn_gap_setting_change_before_repaint_skips_stale_outgoing_at_acceptance`、
+    `page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_backward`。
+  - 何も並行しない状態の全体テスト (master `f69942205`・`76aebc18f` の test-full) では全件成功している。
+- 見込み (コードの読み): worker 待ち・時間上限・producer 待ち・ページめくりの 5 件は、実時間の上限や実時計の進み具合に
+  依存していて負荷で外れる、で説明が付く (ページめくりは `draw_current` が実時計を読むので、遅いフレームで途中の状態を飛ばす)。
+  **scan marker 不一致と `MoveFileExW` のアクセス拒否の 2 件は、負荷だけでは説明できない** (独立レビューの指摘)。
+- 方針: 実時計に依存するテストは fake clock / 明示的な時刻注入へ移す (ページめくり D4 で時計を型に分けるのに合わせる)。
+  時間上限は負荷で変わらない検査 (完了の通知・状態) に置き換える。上の 2 件は、テスト同士が同じファイル・同じ marker を
+  共有していないかを先に調べる。assert を弱めない、retry を足さない。§1.321 / §1.334 と同じ系統。
+- 規模 / 優先度: Small〜Medium / P2 (全件テストの偽失敗でリリース判断が止まる)。
+
 ### 1.334 `zip_loader::tests::shared_directory_cache_reparses_when_the_archive_identity_changes` が全体実行でまれに落ちる — テスト側の共有キャッシュ (2026-10-05)
 
 - 観測: next-file-ops (570587339) を master へ取り込んだ後の `cargo test -p mimageviewer --lib` 全体 (10,631 件) で 1 回だけ失敗。`the changed archive identity must be cached` (src/zip_loader.rs の `slot_for_path_for_test` が None)。単独で再実行すると成功。テストは 2026-09-07 からあり、今回の取り込みで変わっていない。
