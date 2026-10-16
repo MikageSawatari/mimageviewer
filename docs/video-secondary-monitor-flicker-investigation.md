@@ -1,8 +1,11 @@
-# 動画のサブモニター点滅調査（5ch >>557〜567）
+# 動画のサブモニター点滅調査（5ch >>557〜570）
 
 調査日: 2026-10-15。対象報告は v4.6.0、source inspection は master
 `ddcc0166d`。製品アプリを起動せず、コード確認と非表示の独立 Win32 probe を実施した。
 報告者の物理画面の点滅は開発側で再現できていない。**原因確定・修正完了の記録ではない。**
+
+2026-10-16追補: §3・§6の自己通知対策はv4.7.0で実装済み。修正前の経緯はそのまま残し、
+残存報告と以後の全対策候補は§7を正本とする。バックログは§1.387。
 
 ## 1. 回答済み事項と今回の判断
 
@@ -286,3 +289,83 @@ EffeTuneを一般VSTの復旧対象へ広げない。DComp構成・映像サイ�
 実装時は関連する動画／VST文書のイベント説明も同期する。
 §6.4の自動回帰・実機条件と独立レビューを満たせば、点滅未再現でもコード欠陥の修正として
 次版候補にできる。点滅原因の診断追加は§6.2を別単位で扱う。
+
+## 7. v4.7.0後の残存報告と対策台帳（2026-10-16）
+
+### 7.1 観測と利用者決定
+
+- >>569で作者は、自前raiseの自己循環を修正したが点滅との関係は未確認と説明した。
+  `27fa289ee`はv4.7.0に含まれ、現行masterでも自前raiseの`SWP_NOSENDCHANGING`と
+  NOZORDER通知からの要求除外を維持している。これを未着手へ戻さない。
+- [>>570](https://egg.5ch.io/test/read.cgi/software/1782419551/570)は
+  「完全な解消は難しかったよう」とのお礼。未解消の趣旨と読めるが、改善量・再試験の
+  設定・旧条件が全て継続するかまでは記載がない。「全く変わらない」と読み替えない。
+- 開発側は現在も未再現。DWM/MPO/driver原因、残存する前面化ループのいずれも確定していない。
+- 利用者決定: 再現待ちで止めず、取れる対策を候補から落とさず記録し、根拠のある改善・
+  計測・比較を順に進める。機能を失う回避策や未評価の構成変更を全件同時投入する意味ではない。
+
+### 7.2 先行する実装候補
+
+| ID | 対策と根拠 | 維持する契約・確認事項 |
+| --- | --- | --- |
+| A1 | §6.2の定常診断。raise要求元/適用/skip、geometry要求/実変更、region hash、実描画状態、attach/detach/Commit、動画/HUD Presentとsurface変更を同一epoch・時刻へ関連付ける | 1秒程度の集約＋変更時詳細、既存非同期logger、OFF時の低コスト。新しい常時tickやUI/pump同期I/Oを追加しない。source/SAR/回転、全矩形、実効固定、monitor/DPI、動画D3D11/HUD DX12のadapter identityも比較可能にする |
+| A2 | `HudOverlayWindow::set_geometry`の同一矩形操作をowner境界で省く。`native_window_pump`のResize/GeometryChanged/DpiChangedから直接届き、上流のz-order-only除外やrendererの同サイズ抑制だけでは止まらない | HWND再生成・外部位置変更・F11・monitor/DPI変更後も正しい実矩形へ適用する。現在のコードで重複操作が可能という根拠と、定常再生で反復しているか未確認という限界を分離 |
+| A3 | `run_native_event_batch`がlogical passを一回のPresentへまとめる契約に、実DComp可視性の適用も揃える。`render_logical_once`の中間非表示でdetachし、最終表示ならPresent後にattachし直し得る | logical passごとの入力所有・IME・コマンド・deltaを変えず、実attach/detachだけ最終結果で一度適用。最終非表示/無描画/失敗/close/cancelを同じownerで完結する。無操作の定常ちらつきの原因とは未認定 |
+| A4 | 実z-orderと正規要求の由来に基づき、既に正しい順序なら不要なraiseを省く設計 | §1.385のVSTによる遮蔽を悪化させない。非同期editor/popupの後着変更、0/16/50ms burst、foreground/epoch/transition permitを維持。予約時点の判定だけで後続burstを捨てない。EffeTuneとの区別は継続 |
+| A5 | §1.382のegui 0.37 / wgpu 30更新と、同条件の前後比較 | HUDの描画・Presentとeguiの余分なrepaint修正は変わり得る。動画D3D11/分離HWND/基本Present方式は維持する計画で、更新を点滅修正と断定しない。既存の透明alpha・色空間・AutoVsync/latency 1・実矩形を照合 |
+
+A3の主な根拠は`render_core.rs::run_native_event_batch`、
+`NativeEguiOverlay::render_logical_once`、`NativeEguiOverlayState::render_logical_once`の
+`if !overlay_visible { detach_visual()?; }`、`present_logical_batch`後の再attach。
+単一logical passの通常描画や、同値なら戻る`set_visual_attached`だけを調べて終了しない。
+「表示→途中非表示→最終表示」のbatchで不要なCommitがない回帰と、最終非表示になる回帰を置く。
+A2も直接helperだけでなくpumpのResize/GeometryChanged/DPI経路を通す。
+
+egui更新計画は作業ツリー
+`G:\home\mimageviewer-egui036\docs\egui-0.37-update-plan.md`第3.1版、特に§4.9/段4c。
+master未取込の計画と製品実装を混同しない。本家の
+[0.37更新履歴](https://github.com/emilk/egui/releases/tag/0.37.0)には余分なrepaintの修正があるが、
+今回の解像度・上固定依存との因果を示すものではない。
+調査したwgpu-hal 27.0.4/30.0.1のDX12では、CompositionVisualに対する
+`CreateSwapChainForComposition`・FLIP_DISCARD・最終的なDXGI Presentの基本方式は共通。
+更新による変化は、前後の設定と実geometryを揃えて評価する。
+
+### 7.3 診断比較と、結果に応じて進める対策
+
+| ID | 開発側の比較 | 結果を受けた次の対策 |
+| --- | --- | --- |
+| B1 | 同一1080pで映像寸法とHUD状態を固定し、映像Y位置/上HUDとの重なりだけを変える。既知の上/下固定・720p/1080p・4:3/16:9・OS/アプリ拡大と照合 | 位置・重なりが原因なら、画素や表示領域を削らずに配置/合成ownerを修正する。1px余白や強制固定を通常仕様へ混ぜない |
+| B2 | 通常の分離HUDと`MIV_HUD_OVERLAY=0`の既存fallbackを比較 | 分離構成が関係するなら、入力/IME/z-orderを維持するDComp構成の設計へ進む。fallbackはVSTの裏へHUDが潜るため、診断で改善しても既定化は別判断 |
+| B3 | `MIV_DISABLE_MPO_COVER`の有無を一つずつ比較し、既存透明カバーの実効性を確認 | カバーやMPOが関係すると分かったら、重複追加ではなく実効性を測れる合成構成を設計する。完全透明なvisualの存在だけでMPO無効化を保証しない |
+| B4 | A1でアプリ状態の反復を排除してから、PresentMon/ETWで動画/HUD swap chain別のPresentMode・表示時刻とアプリ時刻を照合 | compose/scanout/synchronizationの問題を分離し、submit/present順・同期、surface寿命、alpha/色空間/latencyの対象を絞る。物理ちらつきは必要なら画面撮影と対応付け、Present成功を無点滅の証拠にしない |
+| B5 | 局所対策で解決できず、B1〜B4で構成の関与を裏付けられた場合のみ、同一DComp tree・単一HWND化・対応する別Present方式を設計比較 | 独立した大きい変更として設計/レビュー/負荷測定を行う。VST前面操作、TOPMOST、focus、各パネルと既存画質を維持。維持できない案や通常利用が遅くなる案は費用と代案を示して利用者判断を取る |
+
+環境変数は開発側の比較用。実画面検証はそのrunの明示承認と隔離portableを必要とし、
+通常profileや利用者データをagentが起動して試さない。報告者へこの比較表を渡して総当たりを求めない。
+追加ログが不可欠になったときも、質問済み事項を繰り返さず、目的を説明した小さい一回の採取へ集約する。
+
+### 7.4 現時点で通常版へ入れない回避策
+
+§6.3の候補も捨てず、採らない理由を維持する。利用者の「取れる対策を進める」を、
+次の機能変更まで承認されたという意味にはしない。
+
+- 常に上HUD固定、映像へ1px余白、微小な不透明面: 表示領域や画素を変えるため、診断と通常仕様を分離。
+- OS拡大の強制、物理等倍でも全件shaderへ回す: 選択したフィルタ・画質・GPU負荷が変わる。比較用には検討可能だが無断で既定化しない。
+- WINDOWPOS由来のraiseを丸ごと削る、予約時点だけのz-order判定でburstを消す: 正規のVST復旧を失う恐れ。A4の所有規則と回帰が先。
+- Windows全体のMPO無効化・driver更新等を報告者へ次々依頼: 他アプリへ影響し、負担が大きい。アプリ側の根拠と開発側診断を先にする。
+- bitblt / `DXGI_SCALING_NONE`を現在の`CreateSwapChainForComposition`へ属性だけ差し替える: APIの前提に合わない。必要ならB5の独立した構成設計として扱う。
+- HUD HWNDの常時廃止・既存透明カバーの無検証撤去: VST復旧や過去に改善した症状を退行させ得るため、B2/B3/B5の結果と設計なしには行わない。
+
+### 7.5 実施順・完了の判定
+
+A1と、根拠のあるA2/A3の小改善、A5の更新前後比較を先行対象とする。A4は§1.385との
+所有規則を設計してから着手し、B1〜B4は診断の結果を見ながら小さく実施する。B5は最後の選択肢。
+改善ごとに差分・根拠・自動回帰・実機未確認事項を分けて記録し、大きい更新と一括にして原因を見失わない。
+detached経路は既存の双方レビュー合意・§11記録を守り、§6.4のVST/EffeTune、
+上下HUD/ストリップ/左右パネル、最前面/focus/IME、F11/F12、monitor移動、park/promote、兄弟窓を確認する。
+設定・画質・表示領域・既存操作を削る案は、利用者に費用を示して判断を求める。
+
+小改善の回帰が通ったことと、>>570の物理点滅が直ったことは別の受入条件。
+開発側か報告者による改善確認まで「点滅を修正済み」とは記載せず、収録済みの対策を具体的に説明する。
+本追補で製品コード変更・実画面比較は実施しておらず、本項目の対策を開始済みとは扱わない。
+§1.382自体の独立した進捗は更新担当が管理し、A5の点滅比較の実施・成功と混同しない。
