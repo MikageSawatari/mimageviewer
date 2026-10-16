@@ -3754,6 +3754,9 @@ resize/DPI/fit等で一致しないときは従来の通常prepareへ進む。�
 不一致時の通常prepare、後段bind/取消、最初のOffered入力prepare、thaw後の品質upgradeを維持する。
 無条件のheld選択、新bool/pending、新worker/queue、source再pinは追加しない。
 §27.4の契約をこの境界に合わせて明確化した。先行の素材所有・receipt指摘も修正済みである。
+source退去後も同じ契約を使う。通常の表示modeがheldを許可しない場合は候補にせず、
+Nativeのview/key/coverage不一致はprepare済み素材なしとして通常thumbnail/loadingへ戻す。
+後段bindは、shared prepareが選んだNativeのpaint IDを確認し、拒否した旧Nativeを復活させない。
 
 #### 27.11.2 checkpoint `a021f23f8`以前の検証記録
 
@@ -3812,3 +3815,77 @@ CC0サンプル27件（360,971,087 bytes）を`tests/raw-samples.json`のSHA-256
 ignored入力の追加なので、全件は`test-lib-full.ps1 -Force`で改めて実行する。
 本体lib全件は`test-lib-full.ps1`の台帳/JUnitと最終報告を実行結果の正本とする。
 実機・製品バイナリ起動・build-devは今回の指示どおり実施しない。D3a/D3b/D4は未実装である。
+
+#### 27.11.4 source退去後の完成レビュー指摘への対応（2026-10-16）
+
+`1e3639d86` / `dde4dd345`の完成独立レビューはREVISE、P2が2件だった。
+元画像selectorがNoneを返してもheldの加工済みNativeへ戻る経路と、source不在でview/keyが不一致でも
+presentationの無条件cloneが旧Nativeを描く経路が残っていた。設計担当も退行と判断し修正を指示した。
+
+修正は既存の通常選択・prepare境界にまとめる。`fullscreen_paint_payload_for_page`へ呼出し元の
+既存original-preview sampleを渡し、通常resolverと同じ`fs_display_bypasses_final_pipeline`を使う。
+bypass時は通常sourceだけを選び、NoneならNoneとする。OSキーの再sampleや新しいmode状態は足さない。
+単頁・ズーム・見開きで同じ入口を使い、OfferedのNormal入力overrideにも同じ資格を適用する。
+
+`prepare_fs_paged_paint_payload`はview/key/coverageが一致するNativeだけを返す。
+sourceを持たないNativeが不一致なら、その候補ではpreparedなしを返し、single/Pairの既存candidate loopが
+通常thumbnailを一度選び直すかloadingへ進む。通常sourceがある候補は従来のprepareへ進み、
+Managedは実allocation保持を維持する。source-freeの無条件cloneを行う下位wrapperは削除した。
+coverageだけを再利用の許可とせず、同じprepare判定の一入力として扱う。
+
+keyだけの不一致（例: downscale smoothing変更）からthumbnailを選んだ場合も、late bindが旧Nativeを
+戻さないよう、旧素材がNativeなら準備後のpaint ID一致を要求する。IDは選択結果の確認であり、
+寿命は既存のArc leaseが保証する。後段に別のkey計算やsource再pinは足さない。
+単頁の候補切れも見開きと同じempty submit / `no_page`退役へ接続し、loadingだけでCompletingを残さない。
+単頁のRAW提示通知もprepareで採用した候補だけに行い、拒否候補を表示済みとして記録しない。
+新しいbool/pending/state/worker/queue/repaint/待機は追加せず、producer・時計・予算式は変更しない。
+
+回帰はsource cacheを退去させ、通常raw selectorがNoneであることを確認してから描画する。
+元画像表示、安定view、resize/DPI/fit、key-only変更、通常thumbnail/loading、Turning/Completingを検査し、
+最終mesh・navigator/readyと状態の終了まで追う。03/04のbytes/offer/prepare後予算/expiry/lease会計は維持し、
+実viewと異なる数値用Native fixtureを安定view描画の証拠とする検査は、実需要一致の小fixtureへ分離する。
+一時変異はGit管理外の`target/d2-source-absent-mutations.py`で次の4種類を個別に有効化した。
+変異なしの対照2件は成功・終了コード0、各変異は対応回帰が失敗し、すべて終了コード100だった。
+
+| 一時的に壊した処理 | 失敗したsource不在の回帰 |
+| --- | --- |
+| 通常表示modeによるheld選択の拒否を除去 | 元画像表示で加工済みNativeを描かない検査 |
+| 不一致Nativeの無条件cloneを復活 | resize/DPI/fit/key変更から通常候補へ戻す検査 |
+| late bindのNative paint ID照合を除去 | key-only変更後のOFF/thumbnail選択を維持する検査 |
+| 単頁の候補切れempty submitを除去 | loadingへ進んだCompletingを退役させる検査 |
+
+変異後は2つの製品ファイルを開始前のbytes/SHA-256と照合して復元し、注入コードが残っていないことを確認した。
+結果は`target/d2-source-absent-mutations-result.json`と対応ログに保存する。
+初回focusedではCompleting/OFFのthumbnailが即acceptされた際もpendingを要求するテスト側の誤りが2件あった。
+実際のreceiptがaccept済みならpending不在を検査するよう修正し、上記対照と変異を実行した。
+製品側の挙動をテストに合わせて変更したものではない。
+fullscreen全体の初回検査は933件中932成功・1失敗（終了コード100）だった。既存ROIテストはheld ownerも
+一致keyもないNativeを直接渡し、coverage内なら描けると期待していたため、今回の不変条件と矛盾していた。
+独立レビューでもテスト前提の修正を妥当と確認し、covered/expandedの両需要で既存thumbnailへ戻り
+旧Nativeを描かない検査に変更した。正当な再利用は実offer/startと実需要key一致の回帰で検査する。
+復元後の引数なし`cargo fmt`とcore checkは終了コード0。修正後の`test-focused.ps1 -Path src/ui_fullscreen.rs`は
+933件全成功・終了コード0（70.209秒）で、追加回帰と03/04の実offer/prepare後予算検査も含む。
+UI snapshotも181件全成功・終了コード0（25.29秒）。独立レビューは製品差分とテスト前提修正をACCEPTした。
+本体lib全件の初回は13,263成功・59 skip・3失敗（終了コード100）だった。変更外の
+`detached_native_video_navigation_syncs_main_selection`（worker未完了）、
+`streaming_drain_and_reacquire_between_frames_do_not_restore_local_view`（AcquiringRemoteのまま）、
+`startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker`（scan marker不一致）が失敗した。
+同じソースの失敗3件を明示filterで限定再実行すると全成功・終了コード0（0.348秒）。
+原因は未確定であり、製品/テスト/並列条件を変えず全件を再実行する。初回ログは
+`target/d2-source-absent-final-lib-full.log`、限定再検査は`target/d2-source-absent-full-failures-focused.log`に残す。
+同条件の全件再実行は13,264成功・59 skip・2失敗（終了コード100）。初回の3件は成功し、今回は変更外の
+`abort_on_cancel_returns_interrupted_immediately`（218msで時間上限超過）と
+`finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch`（producer完了待ちtimeout）が失敗した。
+この2件の限定再検査も全成功・終了コード0（2.080秒）。ログは`target/d2-source-absent-final-lib-full-rerun.log`と
+`target/d2-source-absent-full-rerun-failures-focused.log`に保存する。最終全件はホストの同時実行数を
+プロセス内の`NEXTEST_TEST_THREADS=4`へ下げて実行する。製品/テスト/skip/retry条件は変更しない。
+この実行条件も台帳へ含まれる。並列度変更による因果の確定や、初回失敗を製品修正で解決したとは扱わない。
+並列度4の初回全件は13,265成功・59 skip・1失敗（終了コード100、1,222.377秒）。先の5件は成功し、
+変更外の`incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls`だけが失敗した。
+similar arrayのbase publish（既存`MoveFileExW`）がアクセス拒否を返してDegradedとなり、完了待ちが120秒で切れた。
+同じソースの限定再検査は1件成功・終了コード0（2.831秒）。ログは`target/d2-source-absent-final-lib-full-threads4.log`と
+`target/d2-source-absent-threads4-failure-focused.log`に保存する。原因は未確定であり、対象外のI/O処理へ
+retryや回復処理を追加せず、同じ並列度4で全件を再確認する。
+最後の本体lib全件は`test-lib-full.ps1`で実行し、対象差分のsource hash・件数・終了コードは
+`target/test-lib-full/`の成功台帳/JUnitと完了報告を正本とする（文書への結果追記で台帳のsourceを失効させない）。
+製品バイナリ起動・build-dev・コミットは行わず、実機・03/04実本・F12は未確認である。

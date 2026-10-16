@@ -84,7 +84,9 @@ presentationへ置換してから再予算判定する。Flat/curl/canonical/bat
 source ID・世代・元寸法は値のproofであり、raw cacheから再取得して描く権限にはしない。
 実提出unitの内容bindingもreceiptへ値で保存し、遅延readyでmask/params/comicの変更を照合する。
 OFFへ切り替えたON由来canonical再描画もreceiptのoriginで素材化し、原寸sourceを再保持しない。
-source退去後も保持出力で描く。navigatorは全景を覆う出力を使い、本物のpartialでは同頁の通常cacheの
+source退去後もview/key/coverage一致時だけ保持出力で描き、不一致は通常thumbnail/loadingへ戻す。
+元画像表示/分析のbypassでは通常selectorの結果だけを使い、held fallbackで加工済み素材を戻さない。
+navigatorは全景を覆う出力を使い、本物のpartialでは同頁の通常cacheの
 同じsource IDを一時参照し、なければ既存の許可thumbnailを使う。対象外のON表示/SNS previewは通常sourceを維持する。
 通常source/派生cacheはmounted/at-rest/parked共通のread-only会計walkerが独立に数える。
 等倍/Nearest拡大/出力上限fallback/大判Directは従来のManaged allocationを保持する。

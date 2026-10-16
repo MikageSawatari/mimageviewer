@@ -35,6 +35,8 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 安定viewでは既存bindと共有するview比較と通常cache keyでNativeの需要一致を確認して出力を再利用する。
 品質publication後の新sourceのresampleは従来どおりthaw後に始め、view/key変更時は通常prepareへ進む。
 需要は保持transform・寸法で導出し、source再pinや追加の待機状態を作らない（plan §27.11.1）。
+source不在でも同じview/key/coverage判定を通し、不成立は既存thumbnail/loadingへ戻す。
+元画像等の表示modeも通常selectorと共有し、候補切れは既存no_page退役で終える（plan §27.11.4）。
 resident-only acceptの一時Normal入力leaseは、通常prepareの生成・submit後に描画素材へ置き換える。
 Native素材は`Arc<LanczosOutput>`の登録leaseだけを保持し、source handle/CPU pixelsを演出durationへ持ち越さない。
 source自体を描くManagedは実ハンドルとmip policyを保持する。native IDだけの寿命代用はしない。
