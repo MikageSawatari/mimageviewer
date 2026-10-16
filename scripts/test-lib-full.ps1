@@ -19,7 +19,7 @@ $store = Join-Path $RepoRoot 'target/test-lib-full'
 $sourceId = $null
 $key = $null
 try {
-    $sourceId = Get-MivSourceId $RepoRoot
+    $sourceId = Get-MivSourceId $RepoRoot -ForceHash:$Force
     $environmentId = Get-MivEnvironmentId $RepoRoot
     $runtimeId = Get-MivNativeRuntimeId $RepoRoot $CargoProfile
     $commandId = @('nextest-run-v1') + $selection + $featureArgs + @($CargoProfile, $NextestProfile, 'ignore-default-filter', 'run-ignored=default', 'retries=0', 'fail-fast=false')
@@ -67,7 +67,7 @@ try {
 Write-Host "[test-lib-full] PASS: $($summary.Executed) passed, $($summary.Skipped) skipped; $($summary.Seconds)s"
 if ($key) {
     try {
-        if ((Get-MivSourceId $RepoRoot) -ne $sourceId -or (Get-MivEnvironmentId $RepoRoot) -ne $environmentId -or (Get-MivNativeRuntimeId $RepoRoot $CargoProfile) -ne $runtimeId) {
+        if ((Get-MivSourceId $RepoRoot -ForceHash:$Force) -ne $sourceId -or (Get-MivEnvironmentId $RepoRoot) -ne $environmentId -or (Get-MivNativeRuntimeId $RepoRoot $CargoProfile) -ne $runtimeId) {
             Write-Warning 'Inputs changed during execution; success is not recorded for reuse.'
         } else {
             $receipt = [ordered]@{

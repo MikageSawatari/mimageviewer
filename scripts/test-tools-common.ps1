@@ -89,8 +89,104 @@ function Get-MivNestedFiles {
     return $items
 }
 
+function Read-MivSourceHashCache {
+    param([string] $Path, [string] $RepoRoot)
+    $entries = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    if ([IO.File]::Exists($Path)) {
+        $lines = [IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8)
+        if ($lines.Length -lt 2 -or $lines[0] -cne ('miv-stat-cache-v2 ' + (Get-MivTextHash $RepoRoot))) { throw 'Invalid stat-cache header' }
+        # A well-formed but altered row (for example one changed hex digit) must not
+        # be trusted: the footer carries a digest of every line before it.
+        $body = New-Object Text.StringBuilder
+        for ($i = 0; $i -lt ($lines.Length - 1); $i++) { [void] $body.Append($lines[$i]).Append("`n") }
+        $bodyDigest = Get-MivTextHash $body.ToString()
+        for ($i = 1; $i -lt ($lines.Length - 1); $i++) {
+            $fields = $lines[$i].Split([char]9)
+            if ($fields.Length -ne 6 -or $fields[4] -cnotmatch '^[0-9A-F]{64}$') { throw 'Invalid stat-cache row' }
+            $relative = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($fields[0]))
+            $size = [long]::Parse($fields[1], [Globalization.CultureInfo]::InvariantCulture)
+            $modified = [long]::Parse($fields[2], [Globalization.CultureInfo]::InvariantCulture)
+            $created = [long]::Parse($fields[3], [Globalization.CultureInfo]::InvariantCulture)
+            $recorded = [long]::Parse($fields[5], [Globalization.CultureInfo]::InvariantCulture)
+            if ($size -lt 0 -or $modified -le 0 -or $created -le 0 -or $recorded -le 0) { throw 'Invalid stat-cache metadata' }
+            $entries.Add($relative, @($size, $modified, $created, $fields[4], $recorded))
+        }
+        if ($lines[$lines.Length - 1] -cne ('end ' + $entries.Count + ' ' + $bodyDigest)) { throw 'Incomplete or altered stat cache' }
+    }
+    # Return the dictionary itself, including when it is empty.
+    return ,$entries
+}
+
+function Write-MivSourceHashCache {
+    param([string] $Path, [string] $RepoRoot, $Entries)
+    $text = New-Object Text.StringBuilder
+    [void] $text.Append('miv-stat-cache-v2 ').Append((Get-MivTextHash $RepoRoot)).Append("`n")
+    foreach ($entry in $Entries.GetEnumerator()) {
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($entry.Key))
+        [void] $text.Append($encoded).Append([char]9).Append(($entry.Value -join "`t")).Append("`n")
+    }
+    $bodyDigest = Get-MivTextHash $text.ToString()
+    [void] $text.Append('end ').Append($Entries.Count).Append(' ').Append($bodyDigest).Append("`n")
+    [void] [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
+    [IO.File]::WriteAllText($Path, $text.ToString(), (New-Object Text.UTF8Encoding($false)))
+}
+
+function Get-MivSourceFileHash {
+    param([string] $Absolute, [string] $Relative, $Sha, $Cache)
+    $info = New-Object IO.FileInfo $Absolute
+    if (-not $info.Exists) { return 'missing' }
+    $size = $info.Length
+    $modified = $info.LastWriteTimeUtc.Ticks
+    $created = $info.CreationTimeUtc.Ticks
+    # A file link's stat may describe the link rather than its changing target.
+    # Preserve the original content-hash behavior without caching such files.
+    $canCache = $null -ne $Cache -and -not ($info.Attributes -band [IO.FileAttributes]::ReparsePoint)
+    $entry = $null
+    if ($canCache -and $Cache.Old.TryGetValue($Relative, [ref] $entry) -and
+        $entry[0] -eq $size -and $entry[1] -eq $modified -and $entry[2] -eq $created -and
+        ($entry[4] - $modified) -gt [TimeSpan]::FromSeconds(2).Ticks) {
+        # Keep the original observation time: a hit must never age a racy entry.
+        $Cache.New.Add($Relative, $entry)
+        return $entry[3]
+    }
+    $recorded = [DateTime]::UtcNow.Ticks
+    $stream = [IO.File]::OpenRead($Absolute)
+    try { $digest = ([BitConverter]::ToString($Sha.ComputeHash($stream))).Replace('-', '') }
+    finally { $stream.Dispose() }
+    if ($canCache) {
+        $info.Refresh()
+        if ($info.Exists -and $info.Length -eq $size -and $info.LastWriteTimeUtc.Ticks -eq $modified -and $info.CreationTimeUtc.Ticks -eq $created) {
+            $Cache.New.Add($Relative, @($size, $modified, $created, $digest, $recorded))
+        }
+    }
+    return $digest
+}
+
 function Get-MivSourceId {
-    param([string] $RepoRoot)
+    [CmdletBinding()]
+    param([string] $RepoRoot, [switch] $NoCache, [switch] $ForceHash)
+    $cache = $null
+    $cachePath = Join-Path $RepoRoot 'target/test-lib-full/source-hashes-v1.tsv'
+    if (-not $NoCache) {
+        try {
+            $old = if ($ForceHash) { New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal) }
+                else { Read-MivSourceHashCache $cachePath $RepoRoot }
+            $cache = @{ Old = $old; New = (New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)) }
+        } catch { Write-Warning "Cannot read source hash cache; hashing all files without cache: $_" }
+    }
+    $source = Get-MivSourceManifestId $RepoRoot $cache
+    if ($null -ne $cache) {
+        try { Write-MivSourceHashCache $cachePath $RepoRoot $cache.New }
+        catch {
+            Write-Warning "Cannot write source hash cache; hashing all files without cache: $_"
+            return Get-MivSourceManifestId $RepoRoot $null
+        }
+    }
+    return $source
+}
+
+function Get-MivSourceManifestId {
+    param([string] $RepoRoot, $Cache)
     $trackedAndNew = Invoke-MivGit $RepoRoot @('ls-files', '-z', '--cached', '--others', '--exclude-standard')
     # Include ignored native inputs and optional real fixtures, but no build outputs.
     $ignoredInputs = Invoke-MivGit $RepoRoot @('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', '.cargo', '.config', 'src', 'tests', 'scripts', 'crates', 'vendor', 'testdata', 'testimage', 'test_images', 'assets', 'resources')
@@ -112,19 +208,12 @@ function Get-MivSourceId {
                 # git lists a nested repository (e.g. a cloned reference under testdata)
                 # as one directory entry. Hash its files, excluding its .git.
                 foreach ($nested in (Get-MivNestedFiles $absolute $path)) {
-                    $stream = [IO.File]::OpenRead($nested.Absolute)
-                    try { $digest = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
-                    finally { $stream.Dispose() }
+                    $digest = Get-MivSourceFileHash $nested.Absolute $nested.Relative $sha $Cache
                     [void] $manifest.Append($nested.Relative).Append([char]0).Append($digest).Append("`n")
                 }
                 continue
             }
-            $digest = 'missing'
-            if ([IO.File]::Exists($absolute)) {
-                $stream = [IO.File]::OpenRead($absolute)
-                try { $digest = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
-                finally { $stream.Dispose() }
-            }
+            $digest = Get-MivSourceFileHash $absolute $path $sha $Cache
             [void] $manifest.Append($path).Append([char]0).Append($digest).Append("`n")
         }
     } finally { $sha.Dispose() }
