@@ -3137,7 +3137,7 @@ PNG変更はない。test-full/build-dev、アプリの起動・停止、git add
 
 ## 27. D1 — 高解像度の素材保持とフレーム停止の分離（2026-10-16）
 
-**D2実装中・prepare境界の設計判断待ち・実機未確認（2026-10-16）。** D1文書は `81b6d8d38`、D1rは `cc4e775c1`。
+**D2実装済み・実機未確認（2026-10-16）。** D1文書は `81b6d8d38`、D1rは `cc4e775c1`。
 利用者からD1rの独立設計再レビュー「指摘なし・ACCEPT」とD2実装の承認を受けた。
 独立レビュー（GPT-6.1 Sol / xhigh、利用者から全文伝達）はREVISE、P1相当なし・P2が3件。
 D2のsource/paint所有分離と、それがdetachedの症状パッチではなく構造修正である方向には同意を得た。
@@ -3308,8 +3308,10 @@ renderer lock等の個別寄与は **未確定**。低cyclesや巨大なt空白�
 いずれもリリース済み挙動の退行なので **不採用**。採るなら利用者判断が必要であり、本案の前提にしない。
 
 代わりに組合せを削る方法として、**通常pipelineだけが画像を準備し、presentationは完成した
-paint materialと値のgeometryだけを消費する**。D2はこの所有分離だけを行い、通常prepareの呼出位置・
-同期/非同期・表示選択時刻を変えない。毎frameの通常prepare後の上書きをなくす案はD3の未確定範囲とする。
+paint materialと値のgeometryだけを消費する**。D2はこの所有分離を行い、通常producerの実行位置・
+同期/非同期・表示選択時刻を変えない。prepare境界では、旧版の既存出力直接再利用を維持するため、
+同じviewと既存cache identityのNativeだけを再利用する（§27.4、§27.11.1）。
+新sourceのprepareを先に実行してから旧素材で上書きする形にはしない。重いprepareの移管はD3の未確定範囲である。
 演出専用のdecode/prefetch/cache、resample queue、復旧state、cancel後のresumeを作らない。
 既存 `Inactive/Flat/Offered/Turning/Completing` と一件continuationの所有は保つ。
 
@@ -3360,6 +3362,17 @@ incomingのacceptでは現在のresident-only選択・faithful gateを維持し�
 本/編集/許可等のbindingが無効になった場合は同pass通常表示・理由付きskipで終え、遅着から再開しない。
 未完成materialを待つ新Offered queueやアニメーション専用のsource keepを作らない。
 通常の隣unit需要（§26.8）とresample cacheは引き続き通常ownerのものとする。
+
+保持済みNativeがあるframeの通常prepare境界は、既存bindと共有するview比較を先に行う。
+一致時だけ保持page自身のtransform・論理寸法から需要を導出し、通常resolveと共有する
+`LanczosCacheKey`の計算でtarget寸法・有効smoothing・scale branch・ROIを照合する。
+source ID/世代は保持素材の値を使い、品質publicationの新sourceへの置換を再利用の条件にしない。
+これらが一致する間は既存Nativeを再利用し、新sourceのresample/submitはthaw後に始める。
+resize/DPI/fit/clip/画質設定等が一致しなければ従来の通常prepareへ進み、その後に既存bind/取消判定を行う。
+したがって「毎frameの通常prepare後にbind」は、常に新sourceを生成するという意味ではなく、
+この通常のprepare/既存出力再利用の境界を通った後にbindするという契約へ明確化する。
+設定同期とfallback記録の解除は従来の直接再利用と同じで、cache-use時計は進めない。
+別のbool/pending・worker/queue・source再pinを足さない。
 
 Flat記録もNativeの余分なsourceをpinしない。Managedでは描画に必要なsourceそのものを保持する。
 通常flat paintの準備済みmaterialを借り、次の操作へ使うのは採用された一unitだけ。
@@ -3654,7 +3667,7 @@ guardを足して通さず範囲を設計担当へ返す。大判Directの新素
   構造合意・実装/テスト/実機受入れ、D3bの具体策の合意は未了。
   D1r時点では設計文書だけで停止した。D2の今回記録は次項に分ける。
 
-### 27.11 D2実装記録（2026-10-16、設計判断待ち・実機未確認）
+### 27.11 D2実装記録（2026-10-16、実機未確認）
 
 `FullscreenPaintResource`は通常source/prepare用の型として残し、描画境界の
 `FullscreenPaintPayload`を`NormalResource | PresentationMaterial`へ分離した。
@@ -3670,14 +3683,14 @@ accept直後は既存のresident選択を`AcceptedSources`の短命なNormal入�
 診断情報を含む受理素材をprepared presentationへ置き換え、入力leaseを解放してから再予算判定する。
 Flat/unit/batch、navigator、pending readyも同じpresentationを保持し、Nativeのraw handleを復活させない。
 追加worker/job queue/待機状態を作らず、通常producerとaccepted_at原点は維持した。
-通常prepareの仕事開始時刻については、下記の未解決差分があるため維持をまだ保証しない。
+通常prepareの仕事開始境界は§27.11.1の採択に従い、既存出力の条件付き再利用を維持する。
 テストの時計注入は既存の時刻読取り位置だけに置き、OFFでは時計を読まない。
 
 実装上、従来のheld resourceは通常TextureHandle選択とgeometryの入力にも使われていた。
 通常selectorの実行を残したまま、最終paint選択をcache residencyから分離し、
 sourceが退去してもheld outputと保存した寸法/fitの値から描く。
-通常sourceが在住するpassは通常prepareを通してから保持素材へbindし、
-viewport/clip/placement等は現passから再計算して既存のbinding取消判定へ渡す。
+通常sourceが在住するpassも通常のprepare境界を通すが、同じview/keyのNativeは生成前に再利用する。
+viewport/clip/placement等は現passから再計算し、既存bindと共有するview比較で変更を検出する。
 source不在で新しい要求UVが保持ROIを超える場合だけ、同passの既存許可thumbnail/loading選択へ戻し、
 既存のbinding取消理由を使う。source texelの既存許容内の丸め差は不足としない。
 readyは採用済みreceipt・destination/layout/items/input generationと素材のprovenanceを照合し、
@@ -3719,24 +3732,30 @@ pinを通過しただけでfinishしたとは判定しない。寸法fixtureはG
 build-dev、製品起動、コミットは行わず、実機確認とgit操作は設計担当/利用者へ渡す。
 seq67/78の開始前省略、02の停止、準備時間がdurationを消費する挙動は今回の未解決範囲として残す。
 
-#### 27.11.1 設計担当へ戻すprepare境界（未解決）
+#### 27.11.1 prepare境界の補足判断（解決済み、2026-10-16）
 
 独立実装レビューで、source-free化後の通常prepareの仕事開始時刻にD1rとの不一致を確認した。
 旧版は通常producer/pollを続けながら、安定viewの描画にはheld source付きLanczos resourceを返していた。
 `GpuLanczosCache::resolve`はその既存出力を再利用するため、新finalのpublicationがあっても、
-新sourceのresampleはthaw後に始まる。現在の差分では通常selectorの新sourceをprepareし、その後に旧素材へbindする。
+新sourceのresampleはthaw後に始まる。checkpoint `a021f23f8`では通常selectorの新sourceをprepareし、その後に旧素材へbindしていた。
 新sourceの出力がcache missならturn中に生成・submitが前倒しされる。旧素材を描き続けるだけでは
 §27.9.1のprepare開始・完了維持を満たさない。性能悪化の実測証拠はなく、仕事の開始境界の差をコードで確認した段階である。
 
-設計担当への推奨案は、安定したviewで保持素材とgeometry/ROI/filterが一致するときは既存Native出力を再利用し、
-resize/DPI/fit等で一致しないときは従来の通常prepareへ進む責務を明示すること。
-無条件のheld選択ではview変更を見落とすため採用できない。新worker/queueやsource再pinは必要ないが、
-§27.4の「毎frameの通常prepare後にbind」とこの条件付き再利用との関係を設計担当と合意してから実装する。
-新sourceの生成・submitの前倒しを許容するなら、D2の範囲変更と潜在的な費用について利用者判断が必要である。
-この判断前に追加のadmission制御を実装せず、安全なcheckpointで停止した。現差分は未完成であり、出荷・コミット可能とはしない。
-独立レビューの素材所有・receiptに関する先行指摘は修正済みだが、この開始境界の相談は未解決である。
+設計担当は推奨案を採択した。安定したviewで保持素材とgeometry/ROI/filterが一致するときは既存Native出力を再利用し、
+resize/DPI/fit等で一致しないときは従来の通常prepareへ進む。新sourceの生成・submitを演出中に前倒しする案は採らない。
+旧版の仕事開始時刻を維持するための選択なので、追加の利用者判断は不要との決定である。
 
-#### 27.11.2 checkpointの検証記録
+実装は既存bindのview比較を`page_turn_matching_held_page`へ共通化し、single/Pair双方からprepare前にも使う。
+品質publicationでsource寸法が変わっても、同じviewなら保持transformの倍率と保持source寸法で需要を作る。
+新sourceの倍率を旧寸法へ掛ける判定はしない。Native出力自身が生成時の`LanczosCacheKey`を値で所有し、
+通常resolveと共有する需要計算・既存のtarget/smoothing/scale branch/ROIの一致を使う。
+描画coverage用の許容誤差をcache keyへ混ぜず、ManagedはこのNative再利用の対象にしない。
+一致時には設定同期とfallback記録解除を保ち、cache-use時計や新source key lookup/生成は進めない。
+不一致時の通常prepare、後段bind/取消、最初のOffered入力prepare、thaw後の品質upgradeを維持する。
+無条件のheld選択、新bool/pending、新worker/queue、source再pinは追加しない。
+§27.4の契約をこの境界に合わせて明確化した。先行の素材所有・receipt指摘も修正済みである。
+
+#### 27.11.2 checkpoint `a021f23f8`以前の検証記録
 
 - `cargo fmt`（引数なし）、core `cargo check`は終了コード0。ただしcore check後の小さなreceipt/選択修正は
   focusedでコンパイル・検査しており、判断後の最終core checkは再実行する。
@@ -3747,5 +3766,49 @@ resize/DPI/fit等で一致しないときは従来の通常prepareへ進む責�
 - `python -m unittest test_analyze_perf`は103件成功、`cargo run -p viewer_context_audit`も終了コード0。
   `git diff --check`は終了コード0。
 - 03/04は実offer入口とprepare後再判定の回帰で検査済み。旧時計のexpiryは固定時計で分離している。
-  対象処理を壊す変異検査と`test-lib-full.ps1`は未実施。設計判断後の修正・再レビューと併せて実施する。
+  このcheckpointでは変異検査と`test-lib-full.ps1`は未実施だった。続きの検証は次項に分ける。
 - 実GPU、実本03/04、F12実機は未確認。製品バイナリ起動、build-dev、コミットは行っていない。
+
+#### 27.11.3 prepare境界の追加回帰と最終検証
+
+`prepare_boundary_tests`は実offer/startを通し、実需要と同じkeyのNative metadata fixtureで
+single/Pairの通常描画と通常resolve入口spyを接続する。固定時計で開始を成立させ、その後の
+prepare検査中はexpiryから十分離す。時計の原点・製品のduration処理は変えない。
+
+- 安定viewで新sourceのID/寸法/input epochがpublishされても通常resolveを呼ばず、保持出力/geometryで描く。
+  通常selector自身は新sourceを返すため、producerを停止して成功させる検査ではない。
+- resize/DPI/fit/clip/underlay/filterの変更では新sourceの通常prepareへ進む。
+- ON/OFF双方のCompletingはcanonical flat採用まで保持し、thaw後の通常描画は新sourceをprepareする。
+- 見開きの原画preview・faithful表示・非最終提出ではNativeを早期再利用しない。
+  実際の提出資格をprepare前へ渡し、後段でliveを下げるだけで加工済み素材が残る回帰を防ぐ。
+
+GPU側の3件は共通keyの各入力・Managed拒否・通常の設定同期/fallback解除・cache-use時計維持を検査する。
+これらはmetadata・処理経路の自動検証であり、実GPU生成/presentや利用者の滑らかさ評価を証明しない。
+独立レビューは見開きの資格伝達の指摘修正後、製品差分と新規4件をACCEPT（テスト実行は親担当）。
+一時変異はscratch `target/d2-mutations.py`で実行し、次の9種類を一つずつ有効にした。
+対照9件は全成功・終了コード0。各変異は対応回帰1件が失敗し、すべて終了コード100だった。
+
+| 一時的に壊した処理 | 失敗した回帰 |
+| --- | --- |
+| 大判Nativeをsource保持のManagedへ戻す | 03/04の実offer入口・prepare後pin再判定 |
+| prepare後のpin超過を通す | 入力解放後の出力超過拒否 |
+| at-rest通常source会計を外す | A退去後もparked Bのresidentが残る検査 |
+| receiptの内容照合を省く | mask変更/missing binding/品質publicationの区別 |
+| 成功Native再利用を無効にする | 安定single/Pairで新sourceのprepare入口を呼ばない検査 |
+| 共通view比較の拒否を無効にする | 変更viewで通常prepareへ進む検査 |
+| Native cache keyの一致を無視する | ROI/target/filter/Anime limitの入力別検査 |
+| 再利用時の設定同期/fallback解除を省く | housekeepingとcache時計維持の検査 |
+| 見開きの提出/原画等の資格を無視する | 原画preview/nonfinal/faithfulの実描画検査 |
+
+全変異を除去し、4ファイルを開始前のbytes/SHA-256と照合して復元一致を確認した。
+scratchとログはGit管理外の`target/`だけに置く。復元後の最終gateは引数なしfmt、core check、
+focused（page-turn/GPU/通常会計/UI fullscreen）、UI snapshot、本体lib全件の順で行う。
+復元後のfmt/core checkは終了コード0。focusedは109/49/4/929件が成功（延べ1,091件、
+page-turnの重複を除くと982件）、UI snapshotは181件が成功し、各終了コード0だった。
+Python解析器103件とviewer context auditも終了コード0である。
+全件の初回実行はRAW用fixture不足で37件失敗（終了コード100）。製品コードを変更せず、既存checkoutの
+CC0サンプル27件（360,971,087 bytes）を`tests/raw-samples.json`のSHA-256/サイズと照合して実体コピーし、
+失敗37件の限定再検査は全成功・終了コード0になった。fixtureはGit管理外の`vendor/raw-samples/`に置く。
+ignored入力の追加なので、全件は`test-lib-full.ps1 -Force`で改めて実行する。
+本体lib全件は`test-lib-full.ps1`の台帳/JUnitと最終報告を実行結果の正本とする。
+実機・製品バイナリ起動・build-devは今回の指示どおり実施しない。D3a/D3b/D4は未実装である。

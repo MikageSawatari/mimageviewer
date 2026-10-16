@@ -89,8 +89,9 @@ source退去後も保持出力で描く。navigatorは全景を覆う出力を�
 通常source/派生cacheはmounted/at-rest/parked共通のread-only会計walkerが独立に数える。
 等倍/Nearest拡大/出力上限fallback/大判Directは従来のManaged allocationを保持する。
 OFFのsource描画、通常producer、accepted_at原点の時計は維持する。
-現差分の通常prepareには、新sourceの仕事開始がturn中へ前倒しされる未解決点があり、
-安定viewの再利用境界を設計担当へ確認中である。詳細・検証はplan §27.11。
+prepare前には既存bindと同じview比較を行い、一致時だけ保持transform・寸法から通常cache keyを導出する。
+同じtarget/smoothing/scale branch/ROIのNativeは既存出力を再利用し、新sourceのresampleをthawまで前倒ししない。
+view/key変更時は通常prepareへ進む。詳細・検証はplan §27.11。
 
 PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
 （未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、

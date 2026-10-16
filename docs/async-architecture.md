@@ -32,8 +32,9 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 ## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）
 
 画像producerと通常GPU prepareの実行配置は従来どおりで、演出用workerや待機queueを作らない。
-ただし現差分には品質publication後の新sourceのprepareがturn中へ前倒しされる未解決差分があり、
-安定viewの既存出力再利用との境界は設計判断待ちである（plan §27.11.1）。開始/完了時刻の維持は未達である。
+安定viewでは既存bindと共有するview比較と通常cache keyでNativeの需要一致を確認して出力を再利用する。
+品質publication後の新sourceのresampleは従来どおりthaw後に始め、view/key変更時は通常prepareへ進む。
+需要は保持transform・寸法で導出し、source再pinや追加の待機状態を作らない（plan §27.11.1）。
 resident-only acceptの一時Normal入力leaseは、通常prepareの生成・submit後に描画素材へ置き換える。
 Native素材は`Arc<LanczosOutput>`の登録leaseだけを保持し、source handle/CPU pixelsを演出durationへ持ち越さない。
 source自体を描くManagedは実ハンドルとmip policyを保持する。native IDだけの寿命代用はしない。

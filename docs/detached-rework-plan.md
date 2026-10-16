@@ -5328,7 +5328,8 @@ viewport 生成・registry・HWND・placement・focus owner は変更しない�
 通常source/派生cacheはregistryのmounted/at-rest/parkedから同じread-only walkerで会計し、
 presentationのsource参照削除がB側のresident会計を消さないようにした。contextのmount/deposit/retire、
 viewport述語/生成、HWND/placement/focus、通常producerの経路は変更していない。
-通常prepareの新source仕事開始境界には未解決差分があり、page-turn計画 §27.11.1で設計担当へ戻している。
+通常prepareの新source仕事開始境界はpage-turn計画 §27.11.1で補足合意した。
+既存bindと共有するview比較と通常cache keyが一致するNativeだけを再利用し、view変更は通常prepareへ通す。
 readyのproofとnavigatorも提出materialを共有し、Nativeのsource cache在住を可視証明にしない。
 新しいdetached分岐、待機/guard/retry/repaintで症状を隠さず、素材・会計の通常owner境界で修正する。
 D1r `cc4e775c1`の独立設計レビューでこの方向は構造修正として合意済みであり、利用者からACCEPTと
