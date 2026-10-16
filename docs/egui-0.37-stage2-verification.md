@@ -787,3 +787,132 @@ audit.jsonに原本28／変更8／追加5の全一覧、root不変、graph実体
 rootの既存警告は残る。設計との重大な食い違いはない。実windowのresize／show／surfaceは未実行で、
 後続2c-2〜4・製品切替・実機確認を残す。新App flag・queue・retry・時間窓・追加repaintは追加しない。
 live・製品build／起動・test-full.ps1・ネットワーク・git add／commit／branch操作は行っていない。
+
+## 段2c-2 保留RawInputのviewport所有・child skip保持（2026-10-17）
+
+開始HEAD `d9a28e0f3`（段2c-1は設計担当がコミット済み、独立レビュー中）。
+第4.4版§4.2のbackend保留・root LogicOnlyとvisible child・条件表・hook契約、§4.8 eframe行、
+段2c受入条件の最初8項目、およびdetached §2／§11の構造合意を再確認した。
+以下は**実装担当の内部確認**であり、正式な独立レビュー・ACCEPTではない。未ステージ・未コミット。
+
+### 原因と所有境界の変更
+
+本家由来のEpiIntegration共通pending_raw_inputは、root LogicOnly(A)の未消費入力を
+deferred child Full(B)のprepare_raw_inputが取り出せた。RawInput.appendはeventsを連結しつつ
+viewport_idを新しい側へ変えるため、Aがchildへ混入してroot Full(C)で欠落する。
+両backendのchild skipもState take後であり、UIを実行しない子の入力をそのまま捨てていた。
+
+共通保留を削除し、wgpu／glowそれぞれの既存Viewportへ移した（b・新規）。
+共通take helperは対象ownerの保留→新規State入力だけをappendし、最新metadataを採る。
+hookは連結後・従来位置で呼ぶ。root LogicOnlyはpost-hookの未消費RawInputを返し、
+backendはユーザーコード中のborrow／lockを解放してから同じrootへ戻す。
+deferred／immediateも同じ取得入口を使い、immediateだけの追加App hookは作らない。
+child skipは共通selectorでState take前に判断し、State・既存保留の双方を触らない。
+
+追加の寿命照合で、skip後の入力を持つStateがnative builder再生成時に破棄される経路も確認した。
+native window再生成はlogical Viewportの終了ではないため、置換前に旧Stateの未消費入力を
+同じ既存保留ownerへ移譲する。保留→旧State→再生成後の新規入力の順序を維持する。
+初回take前のState raw viewport_idはROOTの既定値なので、Viewport.ids.thisで正規化する。
+次の通常取得で最新の全viewport metadataを付けてhookへ渡し、誤配送後に捨てるguardは作らない。
+通常GCでlogical Viewportを除去した場合だけそのownerの保留とStateが終了し、兄弟は不変。
+同IDの新規logical ownerへ旧保留を移さない。hide／minimizeだけでは除去しない。
+
+### IME policyの通常GC寿命
+
+準備egui-imeの入力hookだけによるlive-set pruningには、Context GCが入力hookの後で走り、
+次のUI passで不在metadataを観測する前に同IDが再openされる穴があった。
+run_logicは入力hookを呼ばないので、それだけでは旧compositionを終端できない。
+
+既存のper-pass output_hookへ、実Context GC後の全viewport_output集合による対象限定pruneを接続した。
+FullOutput集約で古いIDをunionする前の集合を使用する。minimized／hiddenなlive siblingは残す。
+終了対象のcompositionと既存focus contract、その欄の既存retryだけを削除する。
+同ID再openでpass番号がresetすると古いretry番号が再び有効になり得るため、この寿命も揃えた。
+別欄へfocus contractを置換／破棄するときには旧欄のretryも終端し、既存contractで所有対象を
+特定できる不変条件を保つ。新registry／queue／Plugin APIや共有widget dataの一括resetは追加しない。
+
+egui-ime変更は準備copyだけ。eframeのnative dev-dependencyに同じ準備egui-imeを追加し、
+準備Cargo.lockのeframe依存列へ1行追加しただけで版・checksum更新はない。
+root製品のcrates/egui-ime、Cargo.toml／Cargo.lock、workspace／patch／旧vendor・Appは不変。
+段3で単一policyへ統合する際、この寿命差分と回帰も移す（同crate PATCHESへ記録）。
+
+### 回帰と部分復元の証拠
+
+窓なしで実EpiIntegration.update／update_logic_onlyとfake App・入力取得fixtureを接続する。
+native run_ui_and_paint全体やHWNDをfakeで置換した試験ではなく、実integration＋共通取得helperの
+実行と、両backendの実接続のsource照合を区別する。実State fixtureはUnavailable display handleを使う。
+実window／EventLoopを作らず、FullOutput検査後はdrop_without_applying_deltasで明示破棄する。
+
+| 回帰 | 検査する契約 |
+| --- | --- |
+| viewport_input_logic_only_child_full_root_full_preserves_owner_and_hook_order | 1回／3回のroot LogicOnlyとchild Fullの交互更新。childはBのみ、rootはA＋C、hook mutationもrootへ保持。次のFullは新規Dだけ |
+| viewport_input_skips_do_not_drain_and_resume_appends_new_input_after_terminal_events | 反復skipでtake 0回、兄弟Full不変、release／focus／ModifiersChangedと新規入力の順序、最新rect、一度だけ消費 |
+| viewport_input_child_skip_preserves_keys_focus_ime_terminal_and_real_text_edit | 実TextEditのPreedit→skip×2→他viewport Full→Commit／Disabled＋新規入力。keys_down空・modifier解除・composition終端・TextEdit focusと文字列・再配送なし |
+| viewport_input_state_replacement_retains_queued_terminal_events_and_owner | 実Stateの初回take前／取得済み双方で、保留＋release／focus／ModifiersChanged／Disabledを移譲。child ID・metadata・一度のdrain・新Stateの入力順序 |
+| wgpu／glowのviewport lifetime回帰各1件 | 実initialize_or_update_viewportのnative再生成／deferred→immediate変更で保留と実State入力を保持。logical remove／同ID再openは空、兄弟不変。wgpuは実通常GC helperも通す |
+| normal_viewport_gc_ends_input_policy_before_logic_and_same_id_reopen | 実Context GC、古いRawInput live metadata、run_logic、同ID再open・pass resetを通し、旧composition／focus contract／retryを終端。非表示・最小化siblingは不変 |
+| changing_text_focus_ends_the_previous_fields_hidden_retry | 旧欄を描かず別欄へfocusを移すと、旧retryがそのcontract寿命を越えて残らない |
+
+変更部分を一時的に戻す変異試験を行い、各回で元のbyte列へfinally復元した。
+
+| 部分復元 | 修正を外した結果 | 復元後 |
+| --- | --- | --- |
+| skip判定前にStateをdrain | 5件中2件失敗、exit 101（take回数・終端列欠落） | 最終suite成功 |
+| EpiIntegration共通pendingを復活 | 対象1件失敗、exit 101。childでa＋B0を観測 | 最終suite成功 |
+| egui-imeのGC output_hook無効 | 対象1件失敗、exit 101。GC後も対象compositionが残る | 最終suite成功 |
+| native State置換前移譲helper無効 | 6件中3件失敗、exit 101（core／wgpu／glowの終端列欠落） | 最終suite成功 |
+
+ログは`target/egui037-stage2c2-mutation-*.log`、変異結果も
+`target/egui037-stage2c2-results.json`へ保存した。
+最初のfocused compileではtest fixtureのcallback引数数とViewportClass Debug制約の誤りがあり、
+それぞれ新版の2引数closure／直接比較へ修正した。新しいproduction契約の変更で回避していない。
+
+### 検証・未実施と後続境界
+
+最終command・件数・exit codeは`target/egui037-stage2c2-results.json`、実行scriptは
+`target/verify-stage2c2.py`。Rust 1.99.0、locked／offline、MSBuild node reuse無効・jobs 1。
+root fmtと準備fmtは対象が異なるため、それぞれfmt／fmt --checkを明示実行する。
+
+```powershell
+cargo test --manifest-path vendor-next/Cargo.toml -p eframe --features glow,persistence --lib --locked --offline -- --nocapture
+cargo test --manifest-path vendor-next/Cargo.toml -p eframe --features glow,persistence,miv-test-script-window-witness --lib --locked --offline -- --nocapture
+cargo test --manifest-path vendor-next/Cargo.toml -p eframe --no-default-features --features glow,default_fonts --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-wgpu --features winit --lib --locked --offline -- --nocapture
+cargo test --manifest-path vendor-next/Cargo.toml -p egui --features miv-repaint-witness --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-winit --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-ime --lib --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --features test-script --locked --offline
+cargo fmt
+cargo fmt --check
+cargo fmt --manifest-path vendor-next/Cargo.toml --all
+cargo fmt --manifest-path vendor-next/Cargo.toml --all --check
+git diff --check
+```
+
+| 最終検証 | 結果 |
+| --- | --- |
+| eframe lib（default＋glow／persistence） | 34 passed / 0 failed / 1 ignored、exit 0 |
+| eframe lib（上記＋witness） | 38 passed / 0 failed / 1 ignored、exit 0 |
+| eframe lib（glow／default_fontsのみ） | 29 passed / 0 failed / 0 ignored、exit 0。wgpu用live fixtureはこの構成ではcompile対象外 |
+| egui-wgpu lib | 16 passed / 0 failed / 0 ignored、exit 0、GPU skip無し |
+| egui／egui-winit／egui-ime lib | 106／43／28 passed、失敗・ignore無し、各exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧graph使用 |
+| root fmt／fmt --check、準備fmt／fmt --check | すべてexit 0 |
+| git diff --check、root不変・index空・準備graph実体・検証後source hash照合 | 成功 |
+
+liveのsynchronous_damage_returns_before_outer_paint_gateはignoreと子再実行用--ignoredを維持し、
+今回の実行commandへ--ignoredを付けていない。既存scheduler／deadline回帰も全libで維持された。
+検証済みRust／manifest／lock hashを同prefixのtested-source.jsonに、root不変・対象file一覧・
+graph実体・index照合をaudit.jsonへ保存する。別contextの実装担当の内部確認で見つけた
+State置換時の入力移譲漏れは修正し、実State fixtureとsource接続を再確認して未解決重大指摘なし。
+既存scene.rsのEPSILON、witnessのfetch_update、feature別未使用variant、rootの警告は残る。
+
+案B・Windows最小化中のUI継続、immediateの描画資格・非描画action完結は2c-3へ残す。
+Closeの受付・拒否／承認・保留snapshotからの要求消費・backend／Contextのpass外退役は2c-4へ残す。
+現在backendからContext::retire_viewportを呼ぶ経路はない。通常GCとは別に、明示Close退役時にも
+同じ対象のpolicyを終端する接続が2c-4で必要であり、今回のoutput_hookだけで完了とはしない。
+rootのlogic-only Close確定追加回帰も後続である。
+
+設計との重大な食い違いはない。実State再生成時の入力移譲は同じlogical ownerの寿命保持として
+今回に含め、Close契約は先取りしなかった。実装担当の内部確認でも所有・寿命と後続範囲を照合した。
+live・製品build／起動・test-full.ps1・ネットワーク・git add／commit／branch操作は行っていない。

@@ -50,3 +50,21 @@ through this normalizer and a real headless TextEdit before other patch ports.
 4. Remove the preparation copy and its workspace/patch references after all
    preparation consumers have moved; do not leave two policy implementations.
    Do not remove Enabled/Disabled solely to silence deprecation warnings.
+
+## Stage 2c-2 lifecycle delta (2026-10-17)
+
+Internal implementation verification (実装担当の内部確認), not independent acceptance.
+The existing output hook now prunes the policy immediately after normal Context
+viewport GC, using the complete per-pass live set before FullOutput aggregation.
+Input-hook pruning alone cannot observe removal followed by same-ID reuse when
+only run_logic occurs between them. Hidden/minimized live viewports are retained.
+Scoped cleanup removes the ended owner's composition, focus contract, and its
+known field retry. Field replacement/forget also ends the old recovery claim so
+no undrawn retry escapes its existing contract owner. No new registry or queue
+is introduced; shared widget data and sibling policy are preserved.
+
+Two headless regressions cover actual Context GC → run_logic → same-ID reopen
+with stale input metadata and a reset pass counter, and field replacement while
+an old retry is undrawn. Explicit pass-free Close retirement is not connected by
+eframe yet; its policy cleanup remains stage 2c-4 work. Carry this lifecycle delta
+and both regressions into the single product policy at stage 3 consolidation.

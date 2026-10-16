@@ -205,6 +205,9 @@ pub struct Viewport {
 
     /// `window` and `egui_winit` are initialized together.
     egui_winit: Option<egui_winit::State>,
+
+    /// Input not yet consumed by this logical viewport's UI pass.
+    pending_raw_input: egui::RawInput,
 }
 
 impl Drop for SharedState {
@@ -450,6 +453,7 @@ impl<'app> WgpuWinitApp<'app> {
                 window: Some(window),
                 surface_generation: 1,
                 egui_winit: Some(egui_winit),
+                pending_raw_input: Default::default(),
             },
         );
 
@@ -770,20 +774,15 @@ impl WgpuWinitRunning<'_> {
                 return Ok(EventResult::Wait);
             };
 
-            let Viewport {
-                viewport_ui_cb,
-                window,
-                egui_winit,
-                info,
-                ..
-            } = viewport;
-
-            let viewport_ui_cb = viewport_ui_cb.clone();
-
-            let Some(window) = window else {
+            let Some(window) = viewport.window.as_ref() else {
                 return Ok(EventResult::Wait);
             };
-            egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
+            egui_winit::update_viewport_info(
+                &mut viewport.info,
+                &integration.egui_ctx,
+                window,
+                false,
+            );
 
             // A hidden window is not painted, since nothing would be shown — unless someone
             // wants the pixels anyway, e.g. to screenshot an app that is in the background:
@@ -792,6 +791,21 @@ impl WgpuWinitRunning<'_> {
                     .actions_requested
                     .iter()
                     .any(egui_winit::ActionRequested::wants_paint);
+
+            let show_ui = mode == PassMode::Full
+                && (is_visible || is_viewport_or_descendant_visible(viewports, viewport_id));
+
+            let Viewport {
+                viewport_ui_cb,
+                window,
+                egui_winit,
+                pending_raw_input,
+                ..
+            } = viewports
+                .get_mut(&viewport_id)
+                .expect("viewport was just found");
+            let viewport_ui_cb = viewport_ui_cb.clone();
+            let window = window.as_ref().expect("window was just found");
 
             {
                 profiling::scope!("set_window");
@@ -805,18 +819,22 @@ impl WgpuWinitRunning<'_> {
             if let Some(max_texture_side) = painter.max_texture_side() {
                 egui_winit.set_max_texture_side(max_texture_side);
             }
-            let mut raw_input = egui_winit.take_egui_input(window);
-
-            let show_ui = mode == PassMode::Full
-                && (is_visible || is_viewport_or_descendant_visible(viewports, viewport_id));
+            // A skipped child has no logic consumer: leave its State untouched.
+            let mut raw_input = super::epi_integration::take_viewport_input_if(
+                show_ui || viewport_id == ViewportId::ROOT,
+                pending_raw_input,
+                || egui_winit.take_egui_input(window),
+            );
 
             integration.pre_update();
 
-            raw_input.time = Some(integration.beginning.elapsed().as_secs_f64());
-            raw_input.viewports = viewports
-                .iter()
-                .map(|(id, viewport)| (*id, viewport.info.clone()))
-                .collect();
+            if let Some(raw_input) = raw_input.as_mut() {
+                raw_input.time = Some(integration.beginning.elapsed().as_secs_f64());
+                raw_input.viewports = viewports
+                    .iter()
+                    .map(|(id, viewport)| (*id, viewport.info.clone()))
+                    .collect();
+            }
 
             #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
             if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
@@ -834,15 +852,22 @@ impl WgpuWinitRunning<'_> {
             let is_root_viewport = viewport_ui_cb.is_none();
             if is_root_viewport {
                 // The app logic keeps ticking, so it can e.g. ask to be shown again:
-                let egui::LogicOutput {
-                    platform_output,
-                    viewport_commands,
-                } = integration.update_logic_only(app.as_mut(), raw_input);
+                let (
+                    egui::LogicOutput {
+                        platform_output,
+                        viewport_commands,
+                    },
+                    unused_input,
+                ) = integration.update_logic_only(
+                    app.as_mut(),
+                    raw_input.expect("root input is taken even without a UI pass"),
+                );
 
                 let mut shared_mut = shared.borrow_mut();
                 let SharedState { viewports, .. } = &mut *shared_mut;
 
                 if let Some(viewport) = viewports.get_mut(&viewport_id) {
+                    viewport.pending_raw_input = unused_input;
                     viewport.info.events.clear(); // they should have been processed
                     if let Viewport {
                         window: Some(window),
@@ -899,7 +924,11 @@ impl WgpuWinitRunning<'_> {
             );
             #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
             drop(callback_window);
-            integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input)
+            integration.update(
+                app.as_mut(),
+                viewport_ui_cb.as_deref(),
+                raw_input.expect("a Full UI pass takes its viewport's input"),
+            )
         };
         let startup_tag = (viewport_id == ViewportId::ROOT)
             .then(|| egui_wgpu::take_root_startup_frame_tag(&integration.egui_ctx));
@@ -1481,7 +1510,10 @@ fn render_immediate_viewport(
         if let Some(max_texture_side) = painter.max_texture_side() {
             egui_winit.set_max_texture_side(max_texture_side);
         }
-        let mut input = egui_winit.take_egui_input(window);
+        let mut input =
+            super::epi_integration::take_viewport_input(&mut viewport.pending_raw_input, || {
+                egui_winit.take_egui_input(window)
+            });
         input.viewports = viewports
             .iter()
             .map(|(id, viewport)| (*id, viewport.info.clone()))
@@ -1812,6 +1844,7 @@ fn initialize_or_update_viewport<'a>(
                 window: None,
                 surface_generation: 0,
                 egui_winit: None,
+                pending_raw_input: Default::default(),
             })
         }
 
@@ -1831,6 +1864,13 @@ fn initialize_or_update_viewport<'a>(
                     ids.this,
                     viewport.builder.title
                 );
+                if let Some(state) = viewport.egui_winit.as_mut() {
+                    super::epi_integration::retain_viewport_input_before_state_replacement(
+                        viewport.ids.this,
+                        &mut viewport.pending_raw_input,
+                        state,
+                    );
+                }
                 viewport.window = None;
                 viewport.egui_winit = None;
                 if let Err(err) = pollster::block_on(painter.set_window(viewport.ids.this, None)) {
@@ -1852,6 +1892,117 @@ fn initialize_or_update_viewport<'a>(
 mod stage2c1_tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn viewport_input_follows_logical_lifetime_and_gc_preserves_sibling() {
+        struct HeadlessDisplay;
+        impl raw_window_handle::HasDisplayHandle for HeadlessDisplay {
+            fn display_handle(
+                &self,
+            ) -> std::result::Result<
+                raw_window_handle::DisplayHandle<'_>,
+                raw_window_handle::HandleError,
+            > {
+                Err(raw_window_handle::HandleError::Unavailable)
+            }
+        }
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let mut painter = pollster::block_on(egui_wgpu::winit::Painter::new(
+            ctx.clone(),
+            Default::default(),
+            false,
+            Default::default(),
+        ));
+        let mut viewports = Viewports::default();
+        let mut window_ids = HashMap::default();
+        let child = ViewportId::from_hash_of("input-child");
+        let sibling = ViewportId::from_hash_of("input-sibling");
+        for (id, text) in [(child, "old-child"), (sibling, "old-sibling")] {
+            let viewport = initialize_or_update_viewport(
+                &mut viewports,
+                ViewportIdPair::from_self_and_parent(id, ViewportId::ROOT),
+                ViewportClass::Deferred,
+                ViewportBuilder::default(),
+                Some(Arc::new(|_| {})),
+                &mut painter,
+            );
+            viewport.pending_raw_input = egui::RawInput {
+                viewport_id: id,
+                events: vec![egui::Event::Text(text.into())],
+                ..Default::default()
+            };
+        }
+        let queued = vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::WindowFocused(false),
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            egui::Event::Ime(egui::ImeEvent::Commit("terminal".into())),
+        ];
+        let mut state =
+            egui_winit::State::new(ctx.clone(), child, &HeadlessDisplay, None, None, None);
+        state.egui_input_mut().events = queued.clone();
+        viewports.get_mut(&child).unwrap().egui_winit = Some(state);
+        // Native resource recreation and deferred/immediate class changes do
+        // not end the logical owner. Its pending input stays with it.
+        let viewport = initialize_or_update_viewport(
+            &mut viewports,
+            ViewportIdPair::from_self_and_parent(child, ViewportId::ROOT),
+            ViewportClass::Immediate,
+            ViewportBuilder::default().with_active(false),
+            None,
+            &mut painter,
+        );
+        let input = super::super::epi_integration::take_viewport_input(
+            &mut viewport.pending_raw_input,
+            || egui::RawInput {
+                viewport_id: child,
+                events: vec![egui::Event::Text("new-child".into())],
+                ..Default::default()
+            },
+        );
+        assert_eq!(input.viewport_id, child);
+        let mut expected = vec![egui::Event::Text("old-child".into())];
+        expected.extend(queued);
+        expected.push(egui::Event::Text("new-child".into()));
+        assert_eq!(input.events, expected);
+        viewport.pending_raw_input = input;
+
+        // Normal output GC ends the owner without a real window or a UI pass
+        // between removal and creation of a fresh owner with the same ID.
+        let output = ctx.run_ui(Default::default(), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(sibling, ViewportBuilder::default(), |_, _| {});
+        });
+        remove_viewports_not_in(
+            &mut viewports,
+            &mut painter,
+            &mut window_ids,
+            &output.viewport_output,
+        );
+        output.drop_without_applying_deltas();
+        assert!(!viewports.contains_key(&child));
+        let recreated = initialize_or_update_viewport(
+            &mut viewports,
+            ViewportIdPair::from_self_and_parent(child, ViewportId::ROOT),
+            ViewportClass::Deferred,
+            ViewportBuilder::default(),
+            Some(Arc::new(|_| {})),
+            &mut painter,
+        );
+        assert!(recreated.pending_raw_input.events.is_empty());
+        assert!(recreated.egui_winit.is_none());
+        assert_eq!(
+            viewports[&sibling].pending_raw_input.events,
+            vec![egui::Event::Text("old-sibling".into())]
+        );
+    }
 
     #[test]
     fn immediate_screenshot_callbacks_keep_identity_order_and_one_shot_completion() {

@@ -5485,3 +5485,19 @@ wgpuの既存pending deltaを共有rendererと対応するSharedState ownerへ�
 UI省略をguardで補う症状パッチではない。詳細・検証範囲は[段2台帳](egui-0.37-stage2-verification.md)に記録した。
 案B、保留RawInput所有、子Close受付・消費・非描画退役、root Close追加回帰は段2c-2〜4へ残す。
 root製品graph・Appの判断は変更せず、実window・live試験は実行していない。
+
+#### 2026-10-17 段2c-2の準備graph実装記録
+
+上記の保留RawInput所有合意を`vendor-next/eframe`へ実装した。共通EpiIntegrationの保留を
+各backend Viewportへ移し、同ownerの保留→新規入力をhook前に連結する。root LogicOnlyは
+未消費入力を同じrootへ返し、skip子はStateをtakeしない。wgpu／glow、deferred／immediateで
+共通取得helperを使い、ユーザーコード中はbackend borrow／lockを保持しない。
+native window再生成ではlogical ownerは続くため旧Stateの未消費入力を既存保留へ移譲し、
+logical ownerの通常GC終了では対象の入力だけを終端する。兄弟の保留を変更しない。
+準備egui-imeは通常Context GCの既存output_hookで対象composition／focus contract／retryを整理する。
+run_logicだけではinput_hook pruningが走らないため、同ID再open前に旧ownerを終端する修正である。
+新queue／pending bool／汎用復帰フィルタ／hide・minimize prune／一括resetによる症状パッチではない。
+**実装担当の内部確認**として実integration・実State・実TextEditと対象限定寿命の非対話回帰を行い、
+部分復元で失敗する証拠も段2台帳へ記録する。正式な独立ACCEPTではない。
+案B・immediate描画資格は2c-3、Closeの受付・消費・承認後のpass外退役とそのpolicy整理接続は2c-4。
+root製品graph・Appの判断は不変、実window・live試験は実行していない。

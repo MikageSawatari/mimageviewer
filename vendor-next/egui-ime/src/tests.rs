@@ -263,6 +263,136 @@ fn viewport_destroy_and_focus_loss_discard_unterminated_composition() {
 }
 
 #[test]
+fn normal_viewport_gc_ends_input_policy_before_logic_and_same_id_reopen() {
+    let ctx = test_context();
+    ctx.set_embed_viewports(false);
+    let target = egui::ViewportId::from_hash_of("gc-ime-target");
+    let sibling = egui::ViewportId::from_hash_of("gc-ime-sibling");
+    let target_field = egui::Id::unique("gc-ime-target-field");
+    let sibling_field = egui::Id::unique("gc-ime-sibling-field");
+    let input = |viewport_id, events| {
+        let mut input = viewport_raw_input(viewport_id, events);
+        // Keep stale target metadata even after GC. No input hook can infer
+        // that its previous owner ended from an intervening absence snapshot.
+        for id in [target, sibling] {
+            input.viewports.insert(
+                id,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    minimized: Some(true),
+                    occluded: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+        input
+    };
+    let declare = |ctx: &egui::Context, keep_target| {
+        for id in [target, sibling] {
+            if id != target || keep_target {
+                ctx.show_viewport_deferred(id, Default::default(), |_, _| {});
+                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(false));
+            }
+        }
+    };
+    ctx.run_ui(input(egui::ViewportId::ROOT, vec![]), |ui| {
+        declare(ui.ctx(), true);
+    })
+    .drop_without_applying_deltas();
+
+    for (id, field) in [(target, target_field), (sibling, sibling_field)] {
+        let mut text = "text".to_owned();
+        let mut request = true;
+        ctx.run_ui(input(id, vec![]), |ui| {
+            draw_recovery_field(ui, field, &mut text, Some(&mut request), false);
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
+            input(
+                id,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "変換".into(),
+                        active_range_chars: None,
+                    }),
+                    key_event(egui::Key::J),
+                ],
+            ),
+            |ui| {
+                let response = draw_recovery_field(ui, field, &mut text, None, true);
+                assert!(response.has_focus());
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(ime_input_active_in_viewport(&ctx, id));
+    }
+    let sibling_contract = ctx.data(|data| {
+        data.get_temp::<ImeTextFocusContract>(text_focus_contract_id(sibling))
+            .unwrap()
+    });
+    let sibling_retry = ctx.data(|data| {
+        data.get_temp::<u64>(focus_retry_id(sibling, sibling_field))
+            .unwrap()
+    });
+    let old_target_retry = ctx.data(|data| {
+        data.get_temp::<u64>(focus_retry_id(target, target_field))
+            .unwrap()
+    });
+
+    let output = ctx.run_ui(input(egui::ViewportId::ROOT, vec![]), |ui| {
+        // The input hook still sees target's old native metadata. Only the
+        // actual end-pass registration GC knows that its owner is ending.
+        assert!(ime_input_active_in_viewport(ui.ctx(), target));
+        declare(ui.ctx(), false);
+    });
+    assert!(!output.viewport_output.contains_key(&target));
+    assert!(output.viewport_output.contains_key(&sibling));
+    output.drop_without_applying_deltas();
+    assert!(!ime_input_active_in_viewport(&ctx, target));
+    assert!(ime_input_active_in_viewport(&ctx, sibling));
+    ctx.data(|data| {
+        assert!(
+            data.get_temp::<ImeTextFocusContract>(text_focus_contract_id(target))
+                .is_none()
+        );
+        assert!(
+            data.get_temp::<u64>(focus_retry_id(target, target_field))
+                .is_none()
+        );
+        let contract = data
+            .get_temp::<ImeTextFocusContract>(text_focus_contract_id(sibling))
+            .unwrap();
+        assert_eq!(contract.widget_id, sibling_contract.widget_id);
+        assert_eq!(contract.focused_pass, sibling_contract.focused_pass);
+        assert_eq!(
+            data.get_temp::<u64>(focus_retry_id(sibling, sibling_field)),
+            Some(sibling_retry)
+        );
+    });
+
+    let _ = ctx.run_logic(&input(egui::ViewportId::ROOT, vec![]), |_| {});
+    ctx.run_ui(input(egui::ViewportId::ROOT, vec![]), |ui| {
+        declare(ui.ctx(), true);
+    })
+    .drop_without_applying_deltas();
+    // A reopened viewport's pass counter starts at zero. Leave its old field
+    // undrawn until the old retry's pass would match again, then press a key.
+    for _ in 0..=old_target_retry {
+        ctx.run_ui(input(target, vec![]), |_| {})
+            .drop_without_applying_deltas();
+    }
+    let mut reopened_text = "reopened".to_owned();
+    ctx.run_ui(input(target, vec![key_event(egui::Key::J)]), |ui| {
+        assert!(!ime_input_active(ui.ctx()));
+        assert!(recovering_text_input(ui.ctx()).is_none());
+        let response = draw_recovery_field(ui, target_field, &mut reopened_text, None, false);
+        assert!(!response.has_focus(), "a dead owner's retry cannot refocus");
+    })
+    .drop_without_applying_deltas();
+    assert!(ime_input_active_in_viewport(&ctx, sibling));
+}
+
+#[test]
 #[allow(
     deprecated,
     reason = "Exercise legacy Enabled/Disabled compatibility notifications retained for Windows cancellation"
@@ -1142,6 +1272,35 @@ fn focus_retry_expires_when_field_is_hidden_before_next_pass() {
         .drop_without_applying_deltas();
         assert!(!caller_request);
     }
+}
+
+#[test]
+fn changing_text_focus_ends_the_previous_fields_hidden_retry() {
+    let ctx = test_context();
+    let first = egui::Id::unique("superseded-retry-first");
+    let second = egui::Id::unique("superseded-retry-second");
+    let mut text = "text".to_owned();
+    let mut request = true;
+    ctx.run_ui(Default::default(), |ui| {
+        draw_recovery_field(ui, first, &mut text, Some(&mut request), false);
+    })
+    .drop_without_applying_deltas();
+    recover_with_alt_disabled(&ctx, first, &mut text, None);
+    let first_retry = focus_retry_id(egui::ViewportId::ROOT, first);
+    assert!(ctx.data(|data| data.get_temp::<u64>(first_retry)).is_some());
+
+    // The previous field is absent while another field takes focus. Its retry
+    // must not outlive the contract that owns it or escape viewport GC later.
+    request = true;
+    ctx.run_ui(Default::default(), |ui| {
+        draw_recovery_field(ui, second, &mut text, Some(&mut request), false);
+    })
+    .drop_without_applying_deltas();
+    assert!(ctx.data(|data| data.get_temp::<u64>(first_retry)).is_none());
+    assert_eq!(
+        text_focus_contract_snapshot(&ctx).unwrap().widget_id,
+        second
+    );
 }
 
 #[test]

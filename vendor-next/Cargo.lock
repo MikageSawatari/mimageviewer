@@ -869,6 +869,7 @@ dependencies = [
  "directories",
  "document-features",
  "egui",
+ "egui-ime",
  "egui-wgpu",
  "egui-winit",
  "egui_glow",

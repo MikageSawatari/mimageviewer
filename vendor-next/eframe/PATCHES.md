@@ -56,3 +56,31 @@ Screenshot前倒し取り込みも2c-3へ残し、既存保留Screenshotの移�
 新しいApp flag・queue・retry・時間窓・追加repaint・強制UIは追加しない。
 
 実行command・件数・exit code・未実施・handoff境界は[段2検証台帳](../../docs/egui-0.37-stage2-verification.md)。
+
+## 段2c-2: 保留RawInputのviewport所有（2026-10-17）
+
+`d9a28e0f3`上で上記2c-1の未実装項目のうち入力所有・skip保持を実装した。
+以下は**実装担当の内部確認**。正式な独立レビュー・ACCEPTではない。
+
+- (b・新規) EpiIntegration共通pending_raw_inputを除き、wgpu／glowの各Viewportへ移管。
+  共通take helperはそのownerの保留→新規State入力だけをappendし、最新metadataを採る。
+  hookは連結後の従来位置で呼ぶ。root LogicOnlyはpost-hookの未消費RawInputを返し、
+  backendはユーザーコード中のborrowを解放した上で同じrootへ戻す。
+- (b・新規) child skipはState take前の共通selectorで決定し、StateとViewportの保留を触らない。
+  root／deferred／immediateが同じ取得helperを使う。immediateのApp hook呼出位置は増やさない。
+- (b・新規) native window再生成はlogical Viewportの終了ではない。旧Stateを置換する前に
+  その未消費入力を同じ既存保留へ移譲する。初回take前のStateのraw viewport_idはROOTなので、
+  所有Viewport.ids.thisで正規化し、次の通常取得で最新live-setを付けてhookへ渡す。
+  mapからlogical ownerを除去した場合だけ保留も終了し、同IDの新ownerは空から始まる。
+- (b・新規・準備egui-ime) 通常Context GC直後の既存output_hookでpost-GCの全live-setを用い、
+  終了対象だけのcomposition／focus contract／既存retryを整理する。入力hookだけを待たない。
+  別欄がfocus contractを置換するときは旧欄のretryを終了し、対象を既存contractで特定可能にする。
+  新しいqueue／registry／Plugin APIや全widget data resetは追加しない。
+
+実EpiIntegration＋fake App／State取得fixture、実egui-winit State、実TextEdit、両backendの
+実initialize_or_update_viewportと、wgpuの通常GC helperを通す回帰を追加した。FullOutputは検査後に明示破棄する。
+準備eframeのegui-ime依存追加はnative dev-dependencyだけで、root製品の共有policyは不変。
+
+明示Closeの受付・承認・backendとContextのpass外退役、およびその時のpolicy整理接続は2c-4へ残す。
+現在backendからContext::retire_viewportを呼ぶ経路はない。案B・immediate描画資格は2c-3のまま。
+実window／live試験は実行しない。検証件数・変異試験は段2台帳を参照。

@@ -139,6 +139,9 @@ struct Viewport {
     info: ViewportInfo,
     actions_requested: Vec<egui_winit::ActionRequested>,
 
+    /// Input not consumed by a UI pass yet, owned only by this viewport.
+    pending_raw_input: egui::RawInput,
+
     /// Any not yet applied deltas for this viewport.
     pending_delta: TexturesDelta,
 
@@ -683,24 +686,37 @@ impl GlowWinitRunning<'_> {
                     .iter()
                     .any(egui_winit::ActionRequested::wants_paint);
 
-            let Some(egui_winit) = viewport.egui_winit.as_mut() else {
-                return Ok(EventResult::Wait);
-            };
-            let mut raw_input = egui_winit.take_egui_input(window);
             let viewport_ui_cb = viewport.viewport_ui_cb.clone();
 
             let show_ui = mode == PassMode::Full
                 && (is_visible
                     || is_viewport_or_descendant_visible(&glutin.viewports, viewport_id));
 
-            self.integration.pre_update();
+            let viewport = glutin.viewports.get_mut(&viewport_id).unwrap();
+            let Some(window) = viewport.window.as_ref() else {
+                return Ok(EventResult::Wait);
+            };
+            let Some(egui_winit) = viewport.egui_winit.as_mut() else {
+                return Ok(EventResult::Wait);
+            };
+            // A skipped child must retain its input in State. Only root logic consumes
+            // an input batch without a UI pass, and returns it to this viewport below.
+            let raw_input = epi_integration::take_viewport_input_if(
+                show_ui || viewport_id == ViewportId::ROOT,
+                &mut viewport.pending_raw_input,
+                || egui_winit.take_egui_input(window),
+            );
 
-            raw_input.time = Some(self.integration.beginning.elapsed().as_secs_f64());
-            raw_input.viewports = glutin
-                .viewports
-                .iter()
-                .map(|(id, viewport)| (*id, viewport.info.clone()))
-                .collect();
+            let raw_input = raw_input.map(|mut raw_input| {
+                self.integration.pre_update();
+                raw_input.time = Some(self.integration.beginning.elapsed().as_secs_f64());
+                raw_input.viewports = glutin
+                    .viewports
+                    .iter()
+                    .map(|(id, viewport)| (*id, viewport.info.clone()))
+                    .collect();
+                raw_input
+            });
 
             (raw_input, viewport_ui_cb, is_visible, show_ui)
         };
@@ -712,15 +728,20 @@ impl GlowWinitRunning<'_> {
             let is_root_viewport = viewport_ui_cb.is_none();
             if is_root_viewport {
                 // The app logic keeps ticking, so it can e.g. ask to be shown again:
-                let egui::LogicOutput {
-                    platform_output,
-                    viewport_commands,
-                } = self
-                    .integration
-                    .update_logic_only(self.app.as_mut(), raw_input);
+                let (
+                    egui::LogicOutput {
+                        platform_output,
+                        viewport_commands,
+                    },
+                    unused_input,
+                ) = self.integration.update_logic_only(
+                    self.app.as_mut(),
+                    raw_input.expect("root logic always acquires its own input"),
+                );
 
                 let mut glutin = self.glutin.borrow_mut();
                 if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
+                    viewport.pending_raw_input = unused_input;
                     viewport.info.events.clear(); // they should have been processed
                     if let Some(window) = viewport.window.clone()
                         && let Some(egui_winit) = viewport.egui_winit.as_mut()
@@ -753,6 +774,8 @@ impl GlowWinitRunning<'_> {
                 EventResult::Wait
             });
         }
+
+        let raw_input = raw_input.expect("a UI pass always acquires its viewport input");
 
         // HACK: In order to get the right clear_color, the system theme needs to be set, which
         // usually only happens in the `update` call. So we call Options::begin_pass early
@@ -1317,6 +1340,7 @@ impl GlutinWindowContext {
                 deferred_commands: vec![],
                 info: viewport_info,
                 actions_requested: Default::default(),
+                pending_raw_input: Default::default(),
                 pending_delta: Default::default(),
                 viewport_ui_cb: None,
                 gl_surface: None,
@@ -1642,6 +1666,7 @@ fn initialize_or_update_viewport<'a>(
                 deferred_commands: vec![],
                 info: Default::default(),
                 actions_requested: Default::default(),
+                pending_raw_input: Default::default(),
                 pending_delta: Default::default(),
                 viewport_ui_cb,
                 window: None,
@@ -1667,6 +1692,13 @@ fn initialize_or_update_viewport<'a>(
                     viewport.builder.title
                 );
                 viewport.window = None;
+                if let Some(state) = viewport.egui_winit.as_mut() {
+                    epi_integration::retain_viewport_input_before_state_replacement(
+                        viewport.ids.this,
+                        &mut viewport.pending_raw_input,
+                        state,
+                    );
+                }
                 viewport.egui_winit = None;
                 viewport.gl_surface = None;
                 if *current_viewport == Some(ids.this) {
@@ -1758,7 +1790,10 @@ fn render_immediate_viewport(
         };
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
 
-        let mut raw_input = egui_winit.take_egui_input(window);
+        let mut raw_input =
+            epi_integration::take_viewport_input(&mut viewport.pending_raw_input, || {
+                egui_winit.take_egui_input(window)
+            });
         raw_input.viewports = glutin
             .viewports
             .iter()
@@ -2014,6 +2049,130 @@ mod tests {
         });
         assert_eq!(result, Ok("compat"));
         assert_eq!(tried, ["core", "es", "compat"]);
+    }
+}
+
+#[cfg(test)]
+mod viewport_input_tests {
+    use super::*;
+
+    struct NoDisplay;
+
+    impl raw_window_handle::HasDisplayHandle for NoDisplay {
+        fn display_handle(
+            &self,
+        ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+        {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn pending_input_follows_viewport_lifetime_across_recreation_and_class_change() {
+        let child = ViewportId::from_hash_of("input-child");
+        let sibling = ViewportId::from_hash_of("input-sibling");
+        let mut viewports = OrderedViewportIdMap::default();
+        let mut current = None;
+        for (id, event) in [(child, "old-child"), (sibling, "old-sibling")] {
+            let viewport = initialize_or_update_viewport(
+                &mut viewports,
+                &mut current,
+                ViewportIdPair::from_self_and_parent(id, ViewportId::ROOT),
+                ViewportClass::Deferred,
+                ViewportBuilder::default(),
+                Some(Arc::new(|_| {})),
+            );
+            viewport.pending_raw_input = egui::RawInput {
+                viewport_id: id,
+                events: vec![egui::Event::Text(event.into())],
+                ..Default::default()
+            };
+        }
+
+        let queued_terminal_events = vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::WindowFocused(false),
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+        ];
+        let viewport = viewports.get_mut(&child).unwrap();
+        let mut state = egui_winit::State::new(
+            egui::Context::default(),
+            child,
+            &NoDisplay,
+            None,
+            None,
+            None,
+        );
+        state.egui_input_mut().events = queued_terminal_events.clone();
+        viewport.egui_winit = Some(state);
+        // Explicit LogicOnly child skip retains the batch in the real State.
+        assert!(
+            epi_integration::take_viewport_input_if(false, &mut viewport.pending_raw_input, || {
+                viewport
+                    .egui_winit
+                    .as_mut()
+                    .unwrap()
+                    .egui_input_mut()
+                    .take()
+            },)
+            .is_none()
+        );
+
+        current = Some(child);
+        let viewport = initialize_or_update_viewport(
+            &mut viewports,
+            &mut current,
+            ViewportIdPair::from_self_and_parent(child, ViewportId::ROOT),
+            ViewportClass::Immediate,
+            // Changing active requires native window recreation, but does not
+            // end the viewport's lifetime or its unconsumed input ownership.
+            ViewportBuilder::default().with_active(false),
+            None,
+        );
+        assert!(current.is_none());
+        assert!(viewport.class == ViewportClass::Immediate);
+        assert!(viewport.egui_winit.is_none());
+        let mut expected_events = vec![egui::Event::Text("old-child".into())];
+        expected_events.extend(queued_terminal_events);
+        assert_eq!(viewport.pending_raw_input.viewport_id, child);
+        assert_eq!(viewport.pending_raw_input.events, expected_events);
+        let input = epi_integration::take_viewport_input(&mut viewport.pending_raw_input, || {
+            egui::RawInput {
+                viewport_id: child,
+                events: vec![egui::Event::Text("new-child".into())],
+                ..Default::default()
+            }
+        });
+        assert_eq!(input.viewport_id, child);
+        expected_events.push(egui::Event::Text("new-child".into()));
+        assert_eq!(input.events, expected_events);
+        assert!(viewport.pending_raw_input.events.is_empty());
+
+        // A removed viewport is a different lifetime even if the ID is reused.
+        viewport.pending_raw_input.events = vec![egui::Event::Text("retired-child".into())];
+        viewports.remove(&child);
+        let recreated = initialize_or_update_viewport(
+            &mut viewports,
+            &mut current,
+            ViewportIdPair::from_self_and_parent(child, ViewportId::ROOT),
+            ViewportClass::Deferred,
+            ViewportBuilder::default(),
+            Some(Arc::new(|_| {})),
+        );
+        assert!(recreated.pending_raw_input.events.is_empty());
+        let sibling_input = &viewports[&sibling].pending_raw_input;
+        assert_eq!(sibling_input.viewport_id, sibling);
+        assert_eq!(
+            sibling_input.events,
+            vec![egui::Event::Text("old-sibling".into())]
+        );
     }
 }
 

@@ -71,6 +71,26 @@ struct ImeInputPlugin {
 }
 
 impl ImeInputPlugin {
+    fn retain_viewports(
+        &mut self,
+        ctx: &egui::Context,
+        mut is_live: impl FnMut(egui::ViewportId) -> bool,
+    ) {
+        self.viewports.retain(|&id, _| {
+            if is_live(id) {
+                return true;
+            }
+            ctx.data_mut(|data| {
+                if let Some(contract) =
+                    data.remove_temp::<ImeTextFocusContract>(text_focus_contract_id(id))
+                {
+                    data.remove_temp::<u64>(focus_retry_id(id, contract.widget_id));
+                }
+            });
+            false
+        });
+    }
+
     fn composing_in_viewport(&self, viewport_id: egui::ViewportId) -> bool {
         self.viewports
             .get(&viewport_id)
@@ -83,16 +103,24 @@ impl egui::Plugin for ImeInputPlugin {
         "miv_ime_input_policy"
     }
 
-    fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         // RawInput lists all live viewports. A destroyed viewport must not leave
         // composition behind when its id is reused without a terminal event.
-        self.viewports
-            .retain(|id, _| input.viewports.contains_key(id));
+        self.retain_viewports(ctx, |id| input.viewports.contains_key(&id));
         let state = self.viewports.entry(input.viewport_id).or_default();
         normalize_ime_input(&mut input.events, state);
         if !input.focused {
             state.lose_focus();
         }
+    }
+
+    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
+        // Normal viewport GC happens after the input hook. End that owner's
+        // input/focus policy now: the same ID can reopen before another UI pass
+        // observes its absence, and run_logic does not invoke input hooks.
+        // This is the complete post-GC registration set, including hidden and
+        // minimized viewports; visibility alone never ends their policy.
+        self.retain_viewports(ctx, |id| output.viewport_output.contains_key(&id));
     }
 }
 
@@ -293,18 +321,31 @@ fn remember_text_focus(
         focused_pass: ctx.cumulative_pass_nr(),
         diagnostic_key_policy,
     };
-    let id = text_focus_contract_id(ctx.viewport_id());
-    ctx.data_mut(|data| data.insert_temp(id, contract));
+    let viewport_id = ctx.viewport_id();
+    let id = text_focus_contract_id(viewport_id);
+    ctx.data_mut(|data| {
+        if let Some(previous) = data.get_temp::<ImeTextFocusContract>(id)
+            && previous.widget_id != widget_id
+        {
+            // A new field supersedes the previous field's recovery claim.
+            // Keep every pending retry owned by the known viewport contract,
+            // so viewport GC can remove it without clearing shared widget data.
+            data.remove_temp::<u64>(focus_retry_id(viewport_id, previous.widget_id));
+        }
+        data.insert_temp(id, contract);
+    });
 }
 
 fn forget_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
-    let id = text_focus_contract_id(ctx.viewport_id());
+    let viewport_id = ctx.viewport_id();
+    let id = text_focus_contract_id(viewport_id);
     ctx.data_mut(|data| {
         if data
             .get_temp::<ImeTextFocusContract>(id)
             .is_some_and(|contract| contract.widget_id == widget_id)
         {
             data.remove_temp::<ImeTextFocusContract>(id);
+            data.remove_temp::<u64>(focus_retry_id(viewport_id, widget_id));
         }
     });
 }

@@ -173,6 +173,46 @@ impl egui::FontProvider for MissingSystemFontsWarning {
 
 // ----------------------------------------------------------------------------
 
+/// Take only this viewport's unconsumed input, then append its newest State input.
+/// The caller must release any viewport borrow/lock before running user code.
+pub(super) fn take_viewport_input(
+    pending: &mut egui::RawInput,
+    take_new: impl FnOnce() -> egui::RawInput,
+) -> egui::RawInput {
+    let mut input = core::mem::take(pending);
+    input.append(take_new());
+    input
+}
+
+/// A skipped child keeps its input in State: even taking it would consume it.
+/// Root logic-only still takes input so it can return the unconsumed batch.
+pub(super) fn take_viewport_input_if(
+    should_take: bool,
+    pending: &mut egui::RawInput,
+    take_new: impl FnOnce() -> egui::RawInput,
+) -> Option<egui::RawInput> {
+    should_take.then(|| take_viewport_input(pending, take_new))
+}
+
+/// Replacing a native State does not end its logical viewport's input lifetime.
+/// A skipped child may still have terminal events queued in that State.
+pub(super) fn retain_viewport_input_before_state_replacement(
+    viewport_id: ViewportId,
+    pending: &mut egui::RawInput,
+    state: &mut egui_winit::State,
+) {
+    *pending = take_viewport_input(pending, || {
+        let mut input = state.egui_input_mut().take();
+        // State::new leaves RawInput's default ROOT id until the first window
+        // take. Use the same owner id as State::take_egui_input, including when
+        // rebuilding before the child's first Full pass. Normal acquisition
+        // will refresh the complete live-viewport metadata before the hook.
+        input.viewport_id = viewport_id;
+        input.viewports.entry(viewport_id).or_default();
+        input
+    });
+}
+
 /// Everything needed to make a winit-based integration for [`epi`].
 ///
 /// Only one instance per app (not one per viewport).
@@ -181,10 +221,6 @@ pub struct EpiIntegration {
     last_auto_save: Instant,
     pub beginning: Instant,
     pub egui_ctx: egui::Context,
-
-    /// Input that we have received, but not yet given to egui,
-    /// because we haven't run any pass since (see [`Self::update_logic_only`]).
-    pending_raw_input: egui::RawInput,
 
     pending_full_output: egui::FullOutput,
 
@@ -278,7 +314,6 @@ impl EpiIntegration {
         Self {
             frame,
             last_auto_save: Instant::now(),
-            pending_raw_input: Default::default(),
             pending_full_output: Default::default(),
             close: false,
             can_drag_window: false,
@@ -380,11 +415,13 @@ impl EpiIntegration {
     /// the app will find everything where it left it once the window is visible again.
     ///
     /// Only call this for the root viewport: only it has [`crate::App::logic`].
+    /// Returns the post-hook input, which no UI pass consumed. The caller must
+    /// return it to the same root viewport's pending input before its next tick.
     pub fn update_logic_only(
         &mut self,
         app: &mut dyn epi::App,
         raw_input: egui::RawInput,
-    ) -> egui::LogicOutput {
+    ) -> (egui::LogicOutput, egui::RawInput) {
         let raw_input = self.prepare_raw_input(app, raw_input);
 
         let close_requested = raw_input.viewport().close_requested();
@@ -394,9 +431,6 @@ impl EpiIntegration {
             app.logic(ctx, &mut self.frame);
         });
 
-        // No pass consumed the input, so save it for the next one:
-        self.pending_raw_input = raw_input;
-
         if close_requested {
             let canceled = logic_output
                 .viewport_commands
@@ -405,18 +439,15 @@ impl EpiIntegration {
             self.handle_close_request(canceled);
         }
 
-        logic_output
+        (logic_output, raw_input)
     }
 
-    /// Prepend any input we couldn't give to egui earlier, set the time, and run the app hook.
+    /// Set the time and run the app hook on the viewport's already-combined input.
     fn prepare_raw_input(
         &mut self,
         app: &mut dyn epi::App,
-        new_input: egui::RawInput,
+        mut raw_input: egui::RawInput,
     ) -> egui::RawInput {
-        let mut raw_input = core::mem::take(&mut self.pending_raw_input);
-        raw_input.append(new_input); // The new input wins where they overlap
-
         raw_input.time = Some(self.beginning.elapsed().as_secs_f64());
 
         app.raw_input_hook(&self.egui_ctx, &mut raw_input);
@@ -563,4 +594,476 @@ pub fn load_egui_memory(_storage: Option<&dyn epi::Storage>) -> Option<egui::Mem
     }
     #[cfg(not(feature = "persistence"))]
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, Key, Modifiers, RawInput};
+    use std::sync::Mutex;
+
+    fn child_id() -> ViewportId {
+        ViewportId::from_hash_of("input-owner-child")
+    }
+
+    fn input(id: ViewportId, events: Vec<Event>) -> RawInput {
+        let mut input = RawInput {
+            viewport_id: id,
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        input.viewports.insert(child_id(), Default::default());
+        input
+    }
+
+    fn text(value: &str) -> Event {
+        Event::Text(value.to_owned())
+    }
+
+    fn key(key: Key, pressed: bool) -> Event {
+        Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// Same ownership boundary as the native Viewport, with a fake State drain.
+    /// Skips exercise the production selector, rather than a copied condition.
+    struct InputOwner {
+        pending: RawInput,
+        state: RawInput,
+        takes: usize,
+    }
+
+    impl InputOwner {
+        fn new(id: ViewportId) -> Self {
+            Self {
+                pending: Default::default(),
+                state: input(id, vec![]),
+                takes: 0,
+            }
+        }
+
+        fn take_if(&mut self, should_take: bool) -> Option<RawInput> {
+            take_viewport_input_if(should_take, &mut self.pending, || {
+                self.takes += 1;
+                self.state.take()
+            })
+        }
+
+        fn take(&mut self) -> RawInput {
+            // Immediate rendering uses this same unconditional acquisition entry.
+            take_viewport_input(&mut self.pending, || {
+                self.takes += 1;
+                self.state.take()
+            })
+        }
+    }
+
+    fn headless_integration() -> EpiIntegration {
+        let egui_ctx = egui::Context::default();
+        egui_ctx.set_embed_viewports(false);
+        egui_ime::install_ime_input_policy(&egui_ctx);
+        EpiIntegration {
+            frame: epi::Frame {
+                info: epi::IntegrationInfo { cpu_usage: None },
+                storage: None,
+                #[cfg(feature = "glow")]
+                gl: None,
+                #[cfg(feature = "glow")]
+                glow_register_native_texture: None,
+                #[cfg(feature = "wgpu_no_default_features")]
+                wgpu_render_state: None,
+                #[cfg(feature = "wgpu_no_default_features")]
+                wgpu_surface_config: None,
+                window: None,
+                raw_display_handle: Err(raw_window_handle::HandleError::Unavailable),
+                raw_window_handle: Err(raw_window_handle::HandleError::Unavailable),
+                native_window_visible_commit_completed: false,
+                activation_token: None,
+            },
+            last_auto_save: Instant::now(),
+            beginning: Instant::now(),
+            egui_ctx,
+            pending_full_output: Default::default(),
+            close: false,
+            can_drag_window: false,
+            #[cfg(feature = "persistence")]
+            persist_window: false,
+            restored_window_settings: None,
+            #[cfg(feature = "persistence")]
+            normal_geometry: None,
+            app_icon_setter: super::super::app_icon::AppTitleIconSetter::new(String::new(), None),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingApp {
+        hooks: Vec<(ViewportId, Vec<Event>)>,
+        root_passes: Vec<Vec<Event>>,
+        logic_calls: usize,
+    }
+
+    impl epi::App for RecordingApp {
+        fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut RawInput) {
+            self.hooks
+                .push((raw_input.viewport_id, raw_input.events.clone()));
+            // A hook mutation from LogicOnly must survive in the owner's pending batch.
+            for event in &mut raw_input.events {
+                if *event == text("A") {
+                    *event = text("a");
+                }
+            }
+        }
+
+        fn logic(&mut self, _ctx: &egui::Context, _frame: &mut epi::Frame) {
+            self.logic_calls += 1;
+        }
+
+        fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut epi::Frame) {
+            self.root_passes
+                .push(ui.input(|input| input.events.clone()));
+            ui.ctx()
+                .show_viewport_deferred(child_id(), ViewportBuilder::default(), |_, _| {});
+        }
+    }
+
+    #[test]
+    fn viewport_input_logic_only_child_full_root_full_preserves_owner_and_hook_order() {
+        for logic_ticks in [1, 3] {
+            let mut integration = headless_integration();
+            let mut app = RecordingApp::default();
+            let mut root = InputOwner::new(ViewportId::ROOT);
+            let mut child = InputOwner::new(child_id());
+            let child_passes = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&child_passes);
+            let callback = move |ui: &mut egui::Ui| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(ui.input(|i| i.events.clone()));
+            };
+            let mut expected_root = Vec::new();
+            let mut expected_hooks = Vec::new();
+
+            for tick in 0..logic_ticks {
+                root.state.events.push(text("A"));
+                let mut before_hook = expected_root.clone();
+                before_hook.push(text("A"));
+                expected_hooks.push((ViewportId::ROOT, before_hook));
+                let (_, unused) =
+                    integration.update_logic_only(&mut app, root.take_if(true).unwrap());
+                root.pending = unused;
+                expected_root.push(text("a"));
+                assert!(app.root_passes.is_empty(), "logic must not invoke UI");
+
+                let event = text(&format!("B{tick}"));
+                child.state.events.push(event.clone());
+                expected_hooks.push((child_id(), vec![event.clone()]));
+                integration
+                    .update(&mut app, Some(&callback), child.take_if(true).unwrap())
+                    .drop_without_applying_deltas();
+                assert_eq!(child_passes.lock().unwrap()[tick], vec![event]);
+                assert_eq!(root.pending.events, expected_root);
+            }
+
+            root.state.events.push(text("C"));
+            expected_root.push(text("C"));
+            expected_hooks.push((ViewportId::ROOT, expected_root.clone()));
+            integration
+                .update(&mut app, None, root.take_if(true).unwrap())
+                .drop_without_applying_deltas();
+            assert_eq!(app.root_passes, vec![expected_root]);
+            assert_eq!(app.hooks, expected_hooks);
+            assert_eq!(app.logic_calls, logic_ticks + 1);
+
+            root.state.events.push(text("D"));
+            integration
+                .update(&mut app, None, root.take())
+                .drop_without_applying_deltas();
+            assert_eq!(app.root_passes.last().unwrap(), &vec![text("D")]);
+            assert!(root.pending.events.is_empty());
+            assert!(child.pending.events.is_empty());
+        }
+    }
+
+    #[test]
+    fn viewport_input_skips_do_not_drain_and_resume_appends_new_input_after_terminal_events() {
+        let mut child = InputOwner::new(child_id());
+        child.pending = input(child_id(), vec![text("pending")]);
+        let old_rect = child.state.screen_rect;
+        child.state.events = vec![key(Key::A, false), Event::WindowFocused(false)];
+        assert!(child.take_if(false).is_none());
+        child
+            .state
+            .events
+            .push(Event::ModifiersChanged(Modifiers::NONE));
+        assert!(child.take_if(false).is_none());
+        assert_eq!(child.takes, 0);
+        assert_eq!(child.pending.events, vec![text("pending")]);
+
+        let mut sibling = InputOwner::new(ViewportId::ROOT);
+        sibling.pending = input(ViewportId::ROOT, vec![text("sibling-pending")]);
+        sibling.state.events.push(text("sibling-new"));
+        let sibling_input = sibling.take();
+        assert_eq!(
+            sibling_input.events,
+            vec![text("sibling-pending"), text("sibling-new")]
+        );
+        assert_eq!(child.takes, 0);
+
+        child
+            .state
+            .events
+            .extend([Event::WindowFocused(true), text("new")]);
+        child.state.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        assert_ne!(child.state.screen_rect, old_rect);
+        let expected_rect = child.state.screen_rect;
+        let resumed = child.take_if(true).unwrap();
+        assert_eq!(resumed.viewport_id, child_id());
+        assert_eq!(resumed.screen_rect, expected_rect);
+        assert_eq!(
+            resumed.events,
+            vec![
+                text("pending"),
+                key(Key::A, false),
+                Event::WindowFocused(false),
+                Event::ModifiersChanged(Modifiers::NONE),
+                Event::WindowFocused(true),
+                text("new"),
+            ]
+        );
+        assert_eq!(child.takes, 1);
+        assert!(
+            child.take().events.is_empty(),
+            "resumed input is consumed exactly once"
+        );
+
+        sibling.pending = input(ViewportId::ROOT, vec![text("survives-child-close")]);
+        drop(child);
+        assert_eq!(sibling.take().events, vec![text("survives-child-close")]);
+    }
+
+    #[derive(Default)]
+    struct TextField {
+        text: String,
+        request_initial_focus: bool,
+        focused: bool,
+        composing: bool,
+        keys_down: std::collections::HashSet<Key>,
+        modifiers: Modifiers,
+        events: Vec<Event>,
+    }
+
+    #[test]
+    #[allow(deprecated, reason = "Disabled is the Windows cancellation terminal")]
+    fn viewport_input_state_replacement_retains_queued_terminal_events_and_owner() {
+        for state_has_taken_input in [false, true] {
+            let integration = headless_integration();
+            let mut state = egui_winit::State::new(
+                integration.egui_ctx.clone(),
+                child_id(),
+                &integration.frame,
+                Some(1.5),
+                None,
+                None,
+            );
+            // A newly created child State really starts with ROOT in its raw
+            // buffer. This must not relabel the surviving viewport's pending
+            // events if it is rebuilt before its first Full input take.
+            assert_eq!(state.egui_input().viewport_id, ViewportId::ROOT);
+            if state_has_taken_input {
+                state.egui_input_mut().viewport_id = child_id();
+            }
+
+            let mut pending = input(child_id(), vec![text("older-pending")]);
+            pending.focused = true;
+            pending.max_texture_side = Some(1024);
+            let terminal_events = vec![
+                key(Key::A, false),
+                Event::WindowFocused(false),
+                Event::ModifiersChanged(Modifiers::NONE),
+                Event::Ime(egui::ImeEvent::Disabled),
+            ];
+            let latest_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(10.0, 20.0),
+                egui::vec2(640.0, 480.0),
+            ));
+            let queued = state.egui_input_mut();
+            queued.events = terminal_events.clone();
+            queued.focused = false;
+            queued.max_texture_side = Some(4096);
+            queued.system_theme = Some(egui::Theme::Dark);
+            queued.screen_rect = latest_rect;
+            queued.time = Some(42.0);
+            queued.predicted_dt = 0.02;
+
+            retain_viewport_input_before_state_replacement(child_id(), &mut pending, &mut state);
+
+            let mut expected_events = vec![text("older-pending")];
+            expected_events.extend(terminal_events);
+            assert_eq!(pending.viewport_id, child_id());
+            assert!(pending.viewports.contains_key(&child_id()));
+            assert_eq!(pending.events, expected_events);
+            assert!(!pending.focused);
+            assert_eq!(pending.max_texture_side, Some(4096));
+            assert_eq!(pending.system_theme, Some(egui::Theme::Dark));
+            assert_eq!(pending.screen_rect, latest_rect);
+            assert_eq!(pending.time, Some(42.0));
+            assert_eq!(pending.predicted_dt, 0.02);
+            assert!(state.egui_input().events.is_empty());
+            assert_eq!(state.egui_input().screen_rect, None);
+
+            // Retiring the native State leaves the logical owner's single
+            // pending batch intact, then the next State contributes after it.
+            drop(state);
+            expected_events.push(text("new-state-input"));
+            let next_input = take_viewport_input(&mut pending, || {
+                input(child_id(), vec![text("new-state-input")])
+            });
+            assert_eq!(next_input.viewport_id, child_id());
+            assert_eq!(next_input.events, expected_events);
+            assert!(pending.events.is_empty());
+        }
+    }
+
+    impl TextField {
+        fn show(&mut self, ui: &mut egui::Ui) {
+            self.events = ui.input(|i| i.events.clone());
+            self.keys_down = ui.input(|i| i.keys_down.clone());
+            self.modifiers = ui.input(|i| i.modifiers);
+            self.composing = egui_ime::ime_input_active(ui.ctx());
+            let response = ui.add(egui::TextEdit::singleline(&mut self.text));
+            if self.request_initial_focus {
+                response.request_focus();
+                self.request_initial_focus = false;
+            }
+            self.focused = response.has_focus();
+        }
+    }
+
+    #[test]
+    #[allow(deprecated, reason = "Disabled is the Windows cancellation terminal")]
+    fn viewport_input_child_skip_preserves_keys_focus_ime_terminal_and_real_text_edit() {
+        // Both commit and cancellation must terminate the composition while new
+        // text after restoration remains editable in the same pass.
+        for terminal in [
+            egui::ImeEvent::Commit("done".to_owned()),
+            egui::ImeEvent::Disabled,
+        ] {
+            let mut integration = headless_integration();
+            let mut app = RecordingApp::default();
+            let mut child = InputOwner::new(child_id());
+            let mut root = InputOwner::new(ViewportId::ROOT);
+            let field = Arc::new(Mutex::new(TextField {
+                request_initial_focus: true,
+                ..Default::default()
+            }));
+            let child_field = Arc::clone(&field);
+            let callback = move |ui: &mut egui::Ui| child_field.lock().unwrap().show(ui);
+
+            integration
+                .update(&mut app, Some(&callback), child.take())
+                .drop_without_applying_deltas();
+            child.state.events = vec![
+                key(Key::A, true),
+                Event::ModifiersChanged(Modifiers::SHIFT),
+                Event::Ime(egui::ImeEvent::Preedit {
+                    text: "preedit".to_owned(),
+                    active_range_chars: None,
+                }),
+            ];
+            integration
+                .update(&mut app, Some(&callback), child.take())
+                .drop_without_applying_deltas();
+            {
+                let field = field.lock().unwrap();
+                assert_eq!(field.text, "preedit");
+                assert!(field.focused);
+                assert!(field.composing);
+                assert!(field.keys_down.contains(&Key::A));
+                assert!(field.modifiers.shift);
+            }
+
+            let terminal_events = vec![
+                key(Key::A, false),
+                Event::WindowFocused(false),
+                Event::ModifiersChanged(Modifiers::NONE),
+                Event::Ime(terminal.clone()),
+            ];
+            child.state.events = terminal_events.clone();
+            let hooks_before_skip = app.hooks.len();
+            for _ in 0..2 {
+                assert!(child.take_if(false).is_none());
+            }
+            assert_eq!(
+                app.hooks.len(),
+                hooks_before_skip,
+                "skips cannot invoke hook"
+            );
+            root.state.events = vec![text("root-only")];
+            integration
+                .update(&mut app, None, root.take())
+                .drop_without_applying_deltas();
+            assert_eq!(app.root_passes, vec![vec![text("root-only")]]);
+            assert!(egui_ime::ime_input_active_in_viewport(
+                &integration.egui_ctx,
+                child_id()
+            ));
+
+            child
+                .state
+                .events
+                .extend([Event::WindowFocused(true), text("new")]);
+            let mut expected_hook_events = terminal_events;
+            expected_hook_events.extend([Event::WindowFocused(true), text("new")]);
+            integration
+                .update(&mut app, Some(&callback), child.take_if(true).unwrap())
+                .drop_without_applying_deltas();
+            assert_eq!(
+                app.hooks.last().unwrap(),
+                &(child_id(), expected_hook_events)
+            );
+            {
+                let field = field.lock().unwrap();
+                assert!(
+                    field.keys_down.is_empty(),
+                    "late release must end held keys"
+                );
+                assert_eq!(field.modifiers, Modifiers::NONE);
+                assert!(!field.composing, "terminal event must end composition");
+                assert!(
+                    field.focused,
+                    "window focus changes preserve TextEdit focus"
+                );
+                assert_eq!(
+                    field.text,
+                    if matches!(terminal, egui::ImeEvent::Commit(_)) {
+                        "donenew"
+                    } else {
+                        "new"
+                    }
+                );
+            }
+
+            integration
+                .update(&mut app, Some(&callback), child.take())
+                .drop_without_applying_deltas();
+            assert!(field.lock().unwrap().events.is_empty());
+            assert!(!egui_ime::ime_input_active_in_viewport(
+                &integration.egui_ctx,
+                child_id()
+            ));
+        }
+    }
 }
