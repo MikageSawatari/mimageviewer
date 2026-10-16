@@ -369,3 +369,304 @@ detached経路は既存の双方レビュー合意・§11記録を守り、§6.4
 開発側か報告者による改善確認まで「点滅を修正済み」とは記載せず、収録済みの対策を具体的に説明する。
 本追補で製品コード変更・実画面比較は実施しておらず、本項目の対策を開始済みとは扱わない。
 §1.382自体の独立した進捗は更新担当が管理し、A5の点滅比較の実施・成功と混同しない。
+
+## 8. A1〜A3 の先行改善設計 D1（2026-10-16、設計レビュー待ち）
+
+### 8.1 対象・証拠・判断
+
+利用者の2026-10-16指示により、§7を正本としてA1〜A3だけを設計する。
+v4.7.1への収録候補であり、実装・収録の決定や点滅解消の保証ではない。
+source inspection対象は `hud-flicker-1387` の `0272439ac6f03ead6470bdb40787e8969cf6c4f1`。
+D1では本節だけを変更し、製品コード・設定・バイナリ・実画面試験には触れていない。
+独立設計レビューとClaudeCodeの検収は未実施。担当モデルの設定を本書によって変更したとは扱わない。
+
+報告者>>570は未解消の趣旨で、改善量と再試験条件は不明。開発側も未再現である（§7.1）。
+以下の根拠はコードの構造であり、報告者の画面で反復が起きたという実測ではない。
+
+| 対策 | コードで確認した前提・根拠 | D1の判断 |
+| --- | --- | --- |
+| A1 | `presentation_observer::observe` はactive transitionがないと記録しない。`hud_region_publish`、`egui_overlay_visual`、`video_geometry`等のperfはあるが、全経路に共通のoutput/window identity・要求由来・実適用結果は揃わない。`perf.rs::{is_enabled,program_start,event}`と`log_writer`の非同期配送を利用できる | 定常診断を追加する。観測専用で、raiseの可否・頻度や描画cadenceを変更しない |
+| A2 | [`HudOverlayWindow::set_geometry`](../src/video/native_window_host/hud_window.rs) は同一矩形を省くコメントと異なり、null HWND以外は毎回SetWindowPosを発行。[`PumpRuntime::handle_command` / `drain_window_events`](../src/video/native_window_pump.rs) のResize / GeometryChanged / DpiChangedはいずれも`NativeWindowHost::set_hud_geometry`へ届く | HUD HWNDの実矩形をownerで照合して冪等化する。定常反復・点滅への因果は未確認 |
+| A3 | [`run_native_event_batch`](../src/video/native_presenter/render_core.rs) はwheel/入力所有境界で複数logical passを実行し、`NativeOverlayLogicalBatch::append`が最終shapes/visibilityと累積delta/commandを一回の`batch_present`へ渡す。一方、Stateの`render_logical_once`は中間非表示でもdetach closureを呼び、GPUの`set_visual_attached(false)`がRemoveVisual＋Commitする。最終表示なら`present_logical_batch`がPresent後に再attachする | 実可視性も最終描画境界へ移す。単一passの同値skipだけでは防げない余分なDComp操作を除く。無操作の定常点滅の原因とは認定しない |
+
+指示された関数名・3つのpump入口・中間detach／最終attachの前提に食い違いはない。
+ただし終端の設計には次の現状も含める。`video/mod.rs`のoverlay input/tick、初期描画、
+GeometryChanged/DpiChangedのresize等には、描画エラーをログだけにして継続する呼出し元がある。
+「どの描画失敗も既にrender faultで終了する」とは前提にしない（§8.5）。
+また、描画なしの正常returnは既に存在し、毎batch必ずPresentするわけではない。
+
+### 8.2 共通の不変条件・変更所有者
+
+1. HWNDのcreate/query/move/region/z-order/focus/IMEは既存のpump / `NativeWindowHost`、
+   D3D/DXGI/DComp/wgpuはrender / `NativeRenderCore`の所有を維持する。
+   renderにUSER32 queryを持ち込まず、pumpからGPU ackやjoinを同期waitしない。
+2. 新しい常時tick、repaint、delay、retry、z-order判定、focus操作、設定・永続化を足さない。
+   0/16/50msのraise burst、hover polling、foreground/epoch/permit、VST hookは既存のまま。
+   v4.7.0のNOSENDCHANGING/NOZORDER修正も維持する。
+3. 動画のsource/表示領域/画素/フィルタ、SAR/回転/zoom、swap chain選択、MPO cover、
+   alpha/色空間/Present mode/latency、各パネルと入力操作は変更しない。
+4. 資源と計数はexact output/window epochで所有する。同じ動画path/index、同じHWND値の再利用、
+   共有DX12 deviceを理由に別windowの記録・可視性・regionを変更しない。
+5. logical passごとのegui run、入力segmentのrouting、IME、hidden cleanup、command順、
+   `FullOutput::append`によるtexture set/freeとplatform output、repaint deadlineの扱いを維持する。
+   最終shapes/visibility/strip inventoryだけが最後のpassを表す現契約も維持する。
+
+実装予定の所有範囲は、A1が `video/mod.rs`（output生成・source/raise由来の配送）、
+`native_window.rs`（通知由来の採取）、`native_window_pump.rs` / `native_window_host{,/hud_window}.rs`
+（要求・実操作）、`native_presenter/{render_core,overlay_gpu}.rs`（GPU事実）、
+必要最小限のvideo内診断helperと解析テスト。A2はHUD ownerと上記pump経路の回帰、
+A3はrender_coreのCPU/GPU境界とmod.rsの該当エラー伝播・回帰である。
+`presentation_observer`の遷移専用契約、Appのdetached述語、viewport/placement reducerは変更しない。
+実装時の関連動画文書更新と、必要になった場合のdetached計画§11への記録は別作業に含める。
+
+### 8.3 A1: 定常診断の相関・項目・コスト
+
+#### 相関と集約のowner
+
+- perf有効時だけ、native output作成時にprocess内で一意な診断用`output_id`を割り当て、
+  pump spawnとrender configへ同じ値を渡す。既存window epochはoutputを跨ぐ一意性を保証しないので、
+  `output_id + window_epoch + target_role`を主キーにする。既存source epoch、placement、
+  既存transition/request ID（あれば）、overlay device generationとsurface revisionも記録する。
+  診断IDをイベント受理や可視性の新しいgateとして使用しない。
+- 時刻は`perf::program_start()`と同じInstant原点から採取した`observed_us`とする。
+  perf行の`t`は発行時刻なので別に残す。要求発行／pump消費／実操作の時刻とsequenceを区別し、
+  異なるthreadの行順を因果順とみなさない。各snapshotに観測時刻・revisionを付け、
+  pumpの矩形とrenderのsource情報が厳密に同時だったかのように一行へ合成しない。
+- pumpとrenderは自分のowner内の固定個数counter・最新snapshotを更新し、各既存loop/event/
+  Presentの出口で約1秒経過したときだけ集約をperfへ送る。診断専用thread/timer/wakeは作らない。
+  無操作で既存処理が止まる間は記録も止め、次の既存起床または退役で残区間を出す。
+  区間のstart/end/elapsedを記録し、「1秒間隔の行が無い」をゼロ操作の証拠にしない。
+- source/geometry/visibility/region/target/device/surface変更時は詳細を残す。
+  振動時にも無制限に行を増やさないよう、owner・1秒区間ごとに詳細は最大8件、
+  以降は種別別の変更総数・省略数・最初/最後のsampleを集約する。退役時も同じ上限に従う。
+  最初のsnapshotと最終snapshot、正常終端/abort/faultを識別できるようにする。
+  logger journalの欠落とは別の「詳細省略」であり、途中順序が不明なら解析結果も不明とする。
+- latest-value coalesceを維持する。raiseは少なくともVST hook由来のApp要求、renderのhover要求、
+  HUDのWINDOWPOS通知を、同じ無情報なRaiseHudへ合流させる前に分類する。
+  診断用の由来/sequence/sampleを既存command/event envelopeからpumpまで運び、burstは元要求へ紐付ける。
+  混在してcoalesceした要求を一つの由来へ断定せず、由来別受付数と置換数・代表sampleを区別する。
+  VST内部hook回数、App latchをdrainした要求数、pump要求数、burst実行数は別の量である。
+  この設計での必須「要求数」はApp/render/wndprocがnative経路へ発行した数とし、
+  windowの確定していないVST内部hookを現epochへ遡って帰属させない。
+
+#### 計装する事実
+
+| 所有境界 | 集約・変化時詳細 | 読み方・費用の制約 |
+| --- | --- | --- |
+| raiseのproducer / pump / HUD owner | origin、要求/消費/coalesce数、burst slot、適用試行/Win32成功/失敗、permit無効・hostなし/退役・HUDなし・snapshotなし・foreground不許可によるskip。WINDOWPOS flags/insertAfter、foreground HWND/分類、要求と操作のsequence | `try_raise_hud_to_top`のboolはWin32成功を保証しない（内部raiseは現在結果を捨てる）。既存判定を一回だけ評価して診断結果を返し、ログのために再判定しない。snapshotやpopupの許可規則は変更しない |
+| HUD geometry owner / pump | Resize / GeometryChanged / DpiChanged別の要求数・要求rect、照合した実rect、same skip、query失敗、SetWindowPos試行/成功/失敗、操作後の実変更/不変/未確認。presenterの要求・window/client rect、HUD window/client rect、各観測revision | 呼出数やSetWindowPos成功数を実矩形変更数と同一視しない。A2の前照合を再利用し、perf ON時の実操作後だけ追加queryする。外部変更は実sampleの差として記録し、自己操作と区別する |
+| pumpのregion / HWND表示 | 要求hash/count/empty、foreground抑止前後のhash、実SetWindowRgnの試行/成功/同値skip/失敗、適用成功hash、HWND show/hide/破棄とtopology | `NativeWindowHost::apply_hud_regions`のpublish hashと`HudOverlayWindow::last_regions_hash`の成功hashを分ける。shared hit regionとOS適用結果も混同しない。既存hash計算を再利用し、詳細rect列は変更時だけ |
+| renderのCPU描画・最終batch | logical pass数と中間/最終overlay_visible、top_bar_drawn_visible / bottom_hud_visible、strip/左右panel/preview/tile/modal等の実描画区分、raw固定とexact hostへ投影した実効固定、ppp/OS DPI/UI scale、最終HUD各rectとpaint job数 | regionやhoverから実描画を再推定しない。logical visible・実paint有無・DComp attach・HWND visibleを別フィールドにする。文字列・画素内容・IME本文は記録しない |
+| renderのDComp | target/visual role、AddVisual/RemoveVisual/SetContent/transform/SetRoot、Commitの理由・試行/成功/失敗、attachの旧/要求/成功後状態。生成・surface交換・geometry・HUD最終可視性・退役を区別 | 全Commit callsite（core初期化、video surface切替、transform、HUD attach/detach）を棚卸しして計数。COM成功はDWMでの可視完了ではない。記録用Commit/WaitForCommitCompletionは発行しない |
+| renderのPresent / surface | video/HUD別のattempt/success/error、直近時刻・所要時間、video sync interval、hidden consume-and-hold、surface作成/交換/configure/ResizeBuffers/dropとrevision、寸法/content種別、format/alpha/colorspace情報/present mode/latency | wgpuのpresentは返り値がないため「present呼出完了」と書き、DXGI HRESULT成功や物理表示完了と同じsuccessにしない。background/透明coverのPresentも別roleで識別し、video/HUD回数へ混ぜない |
+| renderのvideo geometry | source width/height、SAR、orientation、filter、zoom/compact、video surface size/content、予約領域、target rect、最終visual transform/映像rect、letterbox/canvas寸法 | `set_video_geometry`、surface policy、`update_video_visual_transform`の既に確定した値を採取し、診断用に配置・shader選択を再計算しない |
+| pumpのmonitor / renderのadapter | exact presenter/HUD HWND、monitor handle/device名・monitor/work rect、DPIと観測時刻。video D3D11とoverlay DX12それぞれのLUID、vendor/device/subsystem等の取得可能なID、名称/backend、DX12 device generation、surface対応関係 | monitor/HWND queryはpumpだけ。生成・geometry/DPI event・既存起床の約1秒sampleで採取し、4ms/8ms毎には追加しない。adapter照会はrenderの生成時だけキャッシュし、monitor移動でGPUが移ったと推定しない |
+
+D3D11のadapterは現行`anime4k_adapter_and_key`と同じDXGI device→GetAdapter→GetDesc1から
+LUIDを読むが、Anime4Kの有効化やbenchmarkを起動しない。HUDは
+`overlay_gpu.rs::DeviceEpoch`の実wgpu DX12 deviceからLUIDを取得する。
+ローカル依存ソースのwgpu 27.0.1 `Device::as_hal`、wgpu-hal 27.0.4 DX12
+`Device::raw_device`、Windows bindingの`ID3D12Device::GetAdapterLuid`が利用可能なことを読んだ。
+unsafeなborrow guard内でread-only照会して値だけを保持し、raw COM pointerを別ownerへ公開しない。
+`Adapter::get_info().name`やvendor/deviceの一致だけを同一adapterの証明にしない。
+照会不能は`unknown`と理由を残し、失敗のために描画deviceを変更しない。
+通常DX12経路で両LUIDを比較できることをA1受入に含める。
+
+#### コストとOFF条件
+
+perf OFFでは入口のatomic check以外に新たな時計読取・集計・JSON/format・hash走査・monitor/
+adapter queryを行わない。A2の正しさのためのGetWindowRectとA3の最終適用はperfから独立する。
+perf ONでも毎frameは固定counterと必要なscalar sample更新だけとし、既存Instantを再利用する。
+詳細/集約のJSON化は境界でのみ行い、`perf::event`の外側で必ずenabledを判定する。
+出力は既存`log_writer`の有界非blocking journalへ送る。UI/pump/renderでopen/write/flush、
+flush完了待ち、ログ専用の共有mutex待ち、GPU同期を追加しない。
+既存perfイベントは互換性を保って相関fieldを補う。新規診断の定常追加量はownerごと約1行/秒、
+変化詳細は上記上限内とし、既存イベント分と分けて測る。
+
+### 8.4 A2: 実矩形照合によるHUD geometry冪等化
+
+ownerは`HudOverlayWindow::set_geometry`のままにする。要求値キャッシュを新設する案は採らない。
+各要求で次の順に一度だけ処理する。
+
+1. 既存と同じw/hの正規化（最低1px）で要求screen pixel rectを作る。
+   HWNDが無い場合は従来どおり操作せず、A1へ`no_hwnd`を記録する。
+2. pump owner threadで当該HUDの`GetWindowRect`を読む。HUDは枠なしWS_POPUPなので、
+   位置・幅・高さを同じscreen座標で比較できる。regionで切られた表示範囲や
+   DWM extended frame boundsは比較に使わない。負座標を維持し、DPI awarenessも現行pumpと揃える。
+3. query成功かつ4辺が要求と完全一致ならSetWindowPosを省く。
+   query失敗・不一致では、従来のflags（NOACTIVATE/NOZORDER/NOOWNERZORDER）のまま一回適用する。
+   「前回要求が同じ」「前回SetWindowPos成功」だけでは省かない。
+4. 操作成功を実矩形一致のキャッシュへ変換しない。次要求でも実矩形を読むため、
+   OSのclampや外部移動・サイズ変更後は同じ要求でも再適用される。query/適用失敗はログ対象、
+   retry・別のpending・recreate・新しい復旧経路を作らない。
+
+これでHWND再生成/F11/placement switch/monitor-DPI変更時も、旧要求の記憶がskipを作らない。
+DpiChangedはsuggested rectを従来どおり要求し、後続GeometryChangedが別rectならそれも適用する。
+要求順・coalesce・採用epochは変えず、DPI/ppp更新やsurface resizeをgeometry skipに連動して省かない。
+外部操作が照合後に到着すれば既存の次の要求で再照合する。新しい外部監視・補正tickは足さず、
+外部移動後に要求が来ない場合まで自動復元する仕様は追加しない。
+
+コストはgeometry要求あたりGetWindowRect一回（perf OFFでも必要）。同一要求が少ない場合の
+純増と、重複時に減るSetWindowPos/通知の両方を測る。WM_WINDOWPOSCHANGEDでcacheを管理する案は、
+全外部変更・失敗・再生成の失効ownerを増やすため、D1では現在OS状態を照合する単純な案を選ぶ。
+
+### 8.5 A3: 最終batchの可視性とGPU終端
+
+`NativeEguiOverlayState::render_logical_once`から実detach closureと呼出しだけを除く。
+`if !overlay_visible`内のseek/preview/frame-step cleanupとegui runは残す。
+既存`NativeOverlayLogicalBatch::overlay_visible`を最終要求として使い、pending visible boolや
+passごとのGPU状態を増やさない。`NativeEguiOverlay`が最終描画と失敗のownerになる。
+
+| batch/終了結果 | 最終境界の処理 |
+| --- | --- |
+| logical passが0、dirtyなし正常return | 既存と同じ無描画。実attach状態を保ち、Commit/Presentを追加しない。regionの既存publishは維持する |
+| 最終表示、成功 | 累積texture set、最終shapesのencode/submit/Presentを従来どおり一回実行。その後に`set_visual_attached(true)`を一回だけ呼ぶ。同値ならDComp操作なし。成功後に最終strip inventory等をcommitし、texture freeを完結する |
+| 最終非表示、成功 | 空shapesでもegui deltaを捨てず、既存の透明clear/submit/Presentを一回維持。その後に`set_visual_attached(false)`を一回だけ呼ぶ。同値ならCommitなし。hidden inventory、texture free、command/window intentは既存の成功tailで完結する |
+| 表示だがpaint jobが0 | `overlay_visible`とpaint job数を混同しない。既存どおり透明clear/Present後、最終visibilityへ適用する。前frameのpixelを残さない |
+| prepare/logical/texture/acquire/submit/Present/attach-Commit等の失敗 | 成功inventory・成功commandを公開せず、当該batchを終端する。最終可視性適用が成功したように状態を書かない。通常の最終適用を重ねず、ownerを既存render fault終端へ渡してそのcore/target/rendererを破棄する |
+| close/cancel/host lost、candidate abort/retire、device/surface終端 | 既存のwindow-host close/abort/retire/quarantineとrender core detach/dropで当該ownerだけを終了する。中断batchのdelta/commandを後継surfaceへ移さず、後続の再attachや追加Presentを作らない |
+
+最終非表示のdetachはPresent成功後に揃えるため、GPU処理中の旧frameの見え方は従来の
+「logical pass中に直ちにdetach」と異なる。batchを既に一回のPresentへ畳む契約に合わせる変更で、
+新しい待機を入れるものではない。失敗時は成功tailへ進まず、古いframeを表示したまま
+log-onlyで次のframeへ進むことも避ける。
+
+実装では`NativeEguiOverlay`のbatch実行・単発`render_once`・`render_if_dirty`・resizeの
+同じfinalizerを通す。最終可視性は必ず一回、再attachはPresent後だけとし、
+`set_visual_attached`の既存boolは成功したAdd/Remove＋Commit後だけ更新する。
+Commit失敗でDComp側の状態が不明になった場合はdropで終え、別のboolやrollback Commitを足さない。
+途中失敗時のtexture freeだけを後継へ再送せず、renderer全体のdropが未完deltaの資源終端を担う。
+正常hiddenのdelta freeまで省く最適化は行わない。
+
+現在log-onlyの呼出し元（§8.1）は、A3対象のfinalizerが失敗した場合に既存の
+`run_native_video_output`のErr→`render_fault`へ伝播させる。初期描画、入力batch、tick、
+overlayを描くresize/設定更新/placement primeの全callerを確認し、prime失敗は既存の
+candidate abortで旧coreを保持する。非描画の通常操作エラーを一括でfatalに変えない。
+これにより資源が不確定なrendererを使い続ける経路を残さず、通知は既存output error経路を使う。
+まれな失敗は既定の割り切り（ログ＋通知）とし、device再生成、surface再configure retry、
+command再生、rollback、完了待ちを追加しない。
+
+### 8.6 同型の入口・終了とdetached構造規則
+
+| 経路 | 適用・保持する境界と検証対象 |
+| --- | --- |
+| main fullscreen / F11往復 | FullscreenBorderlessの独立HUDへA2、各overlayへA3。main内Childとの切替は新epoch/topologyでA1を分け、再表示・初回attachとHUD復帰を落とさない |
+| F12 detached / F12→F11 | DetachedViewerChildは独立HUDなしのpresenter内overlayでA3。同じset_visual_attachedの`after_visual=Some(video)`を維持。F11で独立HUDへ移る場合も既存placement switchのhidden prime→publish/retireだけを使う |
+| park / resume / promote / 兄弟窓 | context mount/depositだけでA1 counterやGPU状態をresetしない。outputが同じならidentity継続、target再生成ならepoch更新。同じpath/indexや共有DX12 deviceでもsiblingをdetach/region更新しない。旧output teardownと新configureの既存device gateも維持 |
+| source switch / video→audio / VST shell / tray hide-show | source epoch変更とwindow epoch変更を区別。HWND非表示とDComp非表示を同一視しない。hidden consume-and-hold、音声transport、復帰時held frame、strip session資源を既存ownerのまま保持 |
+| VST editor / popup / EffeTune | 明示hook・hover・WINDOWPOSの要求源のみ観測。allowlist、TOPMOST、owner、focus、HUD click-throughとeditor前面操作は変更しない。EffeTuneのownerless/非TOPMOST方針を維持し、一般VST allowlistへ加えない |
+| 上下HUD / strip / 左右panel / modal / IME | 描画済み状態とregionを同じ最終結果に対応付けるが、各logical passの入力所有とhidden cleanupは維持。途中hiddenをstrip worker終了やIME cancelへ読み替えない |
+| monitor移動 / DPI / Resize / 外部HUD移動 | A2の実rect照合へ全要求を通す。monitor/DPI snapshotはpump、adapterはrenderに残す。負座標・同サイズ位置移動・DPIだけの変更でも必要な既存ppp/surface処理は進む |
+| close / cancel / destroy / prepare失敗 / device-surface終端 | exact epochのhost/coreで完結。staging失敗は旧表示先を変更せず、成功済inventoryや旧記録を新epochへ流用しない |
+
+本設計はdetached述語・viewport生成・HWND捕捉・placement保存先を変更しない。
+A2は既に所有しているHUD HWNDへの副作用を現在の実矩形で冪等化し、A3は既存render ownerの
+「logical結果は一回の描画で公開する」契約の不一致を直す。geometry heuristic、新しい
+detached bool/pending、host_lost再生成、時間窓、追加repaintで症状を覆わないため、
+CodexのD1判断は「症状パッチではなく構造的修正」である。
+
+ただしこれは合意済みという記録ではない。ClaudeCodeと独立レビュー担当にもこの構造判断への
+明示的合意を求め、実装前に確認する。実装差分がdetached述語/viewport経路へ広がる場合は
+先に範囲を戻してレビューし、触れる範囲・理由・合意を`detached-rework-plan.md` §11へ記録する。
+D1の「この文書だけを変更する」範囲では同計画へ追記しない。
+
+設計簡素化として、再生やwindow切替をmodal化／windowを閉じて再生成する案も検討した。
+連続するHUD入力・VST操作・再生を制限し、不要な再生成を増やすため採らない。
+代わりに「geometryは現在OS状態を一箇所で照合」「可視性の確定点は既存batch末尾一箇所」
+として扱う組合せを減らす。A1の1秒は記録集約だけで、動作のdebounceには使わない。
+
+### 8.7 テスト計画・受入条件
+
+D1では製品テスト・buildを実行しない。実装時は担当者が次の証拠を一つの台帳に残し、
+独立レビュアーは同じsource/条件の成功結果を再利用する。各改善を別のcoherent差分として検証する。
+
+**A1（非対話・注入時計／記録sink）**
+
+- OFFで追加のclock/query/format/集計が走らないことをspyで検査する。ONでは1秒境界、
+  複数秒の無起床後、終了時の端数集約、8件を超える変化、coalesceと欠落を検査する。
+  要求=適用とみなさず、origin/skip/Win32失敗と実変更の各counterを突合する。
+- output A/Bの同epoch・再利用HWND・source切替・共有device・staging abortを同一sinkへ流し、
+  keyと観測時刻/revisionが混ざらないことを検査する。実際のproducer→pump受信経路で
+  VST/hover/WINDOWPOS由来が保持される回帰を置く。
+- Commit/Present/surfaceの成功・失敗・無描画・hidden holdの記録をproduction境界で検査し、
+  現行の全Commit/Present callsiteをrole別一覧と照合する。取得不能adapterはunknownを保つ。
+  logger停止中もproducerが待たない既存回帰を再利用し、新規診断が同期I/Oを呼ばないことを確認する。
+
+**A2（pump経路＋非表示の実HUD HWND）**
+
+- `hud_window.rs`の既存`hidden_hud`はproduction class/wndprocを使いShowWindowしない。
+  これをcfg(test)のhost注入fixtureへ拡張して`PumpRuntime::handle_command(Resize)`と
+  stamped event→`drain_window_events(GeometryChanged / DpiChanged)`を通す。
+  独立helperに同じ分岐を複製するテストでは済ませない。
+- 3経路それぞれで同rectを反復し、最初の必要な移動は一回、以後のSetWindowPosは0回とする。
+  A1のattemptと実wndproc通知を併用して、単に最終rectが合っているだけのテストにしない。
+  NOZORDERでRequestRaiseHudが増えないv4.7.0回帰も維持する。
+- 同サイズ位置移動、負座標、0寸法正規化、外部SetWindowPos後に同じ要求、別epochの再生成、
+  DPI suggested→presenter geometryの連続、HUDなしtopology、退役event、兄弟host不変を検査する。
+  query/SetWindowPos失敗は狭いOS-call seamで注入し、same skipに誤分類しないことを確認する。
+  fixtureがproduction createのSW_SHOWNAを通らないことも検査する。
+
+**A3（実CPU描画／実batch reducer＋最終GPU境界の記録adapter）**
+
+- `NativeEguiOverlayState`の既存fixtureと`run_native_event_batch`を組み合わせ、
+  実入力segmentで「表示→途中非表示→最終表示」を作る。既にattachedなら
+  Present=1、RemoveVisual/AddVisual/可視性Commit=0とする。未attachedからは
+  Present後のAddVisual/Commit=各1で、中間detach=0とする。
+- 「表示→最終非表示」はPresent=1、末尾のRemoveVisual/Commit=各1、再attach=0。
+  既にdetachedなら可視性Commit=0。最終非表示でもtexture set/free、command、
+  IME/window intents、hidden cleanup、strip最終inventoryが完結することを検査する。
+- 無入力・dirtyなしはPresent/attach/detach/Commit=0。visibleで空paint、単発render、
+  resize、fallback tree、全panel/strip/固定chromeも同じfinalizerへ届くことを検査する。
+  既存のwheel/文字入力/IME/escape/command attribution/repaint deadlineのbatch回帰を維持する。
+- prepare/logical/acquire/最終Commit等の失敗とclose/cancel/abort/retireを注入し、成功inventoryの
+  公開や後継への再attachがないこと、delta所有がそのrendererで終了することを確認する。
+  既存headless batch targetだけでは実GPU呼出回数を検証できないため、production finalizerが
+  使う狭いGPU操作境界を記録adapterで差し替える。GPU resourceのOption化やテスト専用可視性ロジックは作らない。
+
+反復は上の新規回帰＋該当moduleの明示filterから開始し、通常core check、関連する既存
+native window/input/overlay/placement/seek-strip回帰へ広げる。共有pump/render変更の最終gateは
+`scripts/test-full.ps1`、必要なtest-script回帰、`cargo fmt --check`。
+UI文字列を変更した場合だけglyph検査も行う。実装者が検証用`build-dev.ps1`を作る。
+これらのcommand・対象commit・環境・件数・exitと未実施理由を記録し、0件一致を成功としない。
+
+実画面の受入は§6.4の了承済み隔離portable検証枠、または利用者起動の通常確認buildで行う。
+目安20〜30分＋build待ち、desktop/マウス/キーボードを使用し、使い捨て動画と設定だけを使う。
+agentが起動・入力するrunは別途、具体的suiteについて明示承認を得る。
+ShowWindowを行う既存`hud_focus_claim_uses_registered_editor_and_preserves_presenter_return`等もこの枠へ分ける。
+F11/F12/park-promote/兄弟窓、monitor/DPI移動、再生/pause、上下hover/固定、strip/左右panel、
+VST/EffeTune表示・操作・非表示、IME/focus/Alt+Tab/最前面、close/reopenを§8.6の表に沿って確認する。
+上固定だけで安定する等の報告条件は既知比較用に保持し、設定を強制しない。
+
+受入は、(1)要求源から実操作まで相関できる低負荷診断、(2)3つのpump入口で実rectが同じ時だけ
+geometryを省く回帰、(3)中間hiddenでDCompを動かさず最終hiddenも正しく閉じる回帰、
+(4)自動gateと既存機能の実機受入、(5)独立設計/実装レビューとClaudeCode検収である。
+perf OFFの追加診断処理がないこと、ONの行数上限とpump遅延/CPU・render所要時間に有意な
+悪化がないことを前後同条件で測り、未測定のまま低負荷達成とは記載しない。
+内部Present完了や回帰greenを、報告者>>570の物理点滅解消の証拠にはしない。
+
+### 8.8 実施順・見積り・採らない案
+
+| 単位 | 内容 | 実装・自動検証の概算 |
+| --- | --- | --- |
+| A1 | 相関ID/由来の既存route接続、owner別集約、geometry/region/DComp/Present/surface/adapter記録、解析回帰 | 1.5〜2.5人日 |
+| A2 | 実rect照合、pump3経路の非表示fixture回帰、A1の要求/実変更突合 | 0.5〜1人日 |
+| A3 | CPU副作用除去、最終可視性finalizer、全callerの失敗終端、batch/終了回帰 | 1〜2人日 |
+| 共通 | 最終gate・関連文書・build・独立レビュー指摘対応・承認後の実機受入 | 1〜1.5人日＋実機枠 |
+
+合計4〜7人日程度。実測工数ではなくfixture/失敗伝播の範囲を含む概算。
+A1の最小相関を先に接続し、A2/A3の各差分を別々に回帰で固定する。全計装完了や点滅再現を
+A2/A3の根拠ある改善の前提にはしない。設計レビューで所有境界の拡張が必要なら再見積りする。
+
+- A4の実z-orderに基づくraise抑制、A5のegui/wgpu更新比較、B1〜B5、§7.4の回避策は今回の範囲外。
+  origin/skipを記録するためにallowlistやburstを変えることも含めない。
+- 同一「要求」rectのcache、rendererの同寸法skipだけに依存する案は、pump直通と外部変更を取りこぼす。
+  geometry通知の全廃やDPI/resize抑止も採らない。
+- 全logical passの一本化やhidden pass自体の省略は、入力/IME/command/deltaとcleanupの契約を変える。
+  detachだけの時間抑止、後からrepaintで戻す案も所有境界の修正にならない。
+- hidden時のPresent省略、device再生成/失敗retry、HUD HWND廃止や単一DComp tree化は採らない。
+  後二者の構成比較はB5等の別設計で、A3を理由に混ぜない。
+- 常時全frameログ、ログ専用tick/同期I/O/同期flush、物理ちらつきを内部ログだけで判定する案は採らない。
+
+D1時点で追加の利用者仕様判断は不要。必要なのは次段の設計レビューと構造判断への合意である。
+実装で通常操作の遅延/機能縮小/表示領域や画質変更が必要と判明した場合だけ、変更前に
+費用・代案を示して利用者判断へ戻す。収録判断、実機未確認事項、点滅への効果は別々に報告する。
