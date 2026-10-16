@@ -171,6 +171,17 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 
+### 1.390 `scripts/page-turn-smoke.ps1` が `--test-evidence-dir` を渡さず、操作スクリプトが起動直後に終了する — 夜間計測で判明 (2026-10-17)
+
+- 観測 (ClaudeCode の隔離 portable 計測、2026-10-17 未明): `-Script` 付きで実行すると core が exit 2。app log は
+  `runner start failed` で、`--test-script` には `--test-evidence-dir` が必須 (`src/test_script.rs` の `cli_capture_dir_from`)。
+  さらに証跡先は `target/ui-smoke/runs/` の **ちょうど 2 階層下** で、**事前に存在する** 必要がある。page-turn-smoke.ps1 は
+  どれも満たさないので、`-SelfTest` / `-Script` / 既定の計測のすべてが現在は動かない (いつから壊れていたかは未確認)。
+- 回避 (今回): 写しに証跡先 `target/ui-smoke/runs/pageturn-d4/<run>` を足し、フォルダを先に作って実行した。§27.13 の計測はこの方法。
+- 直し方: ui-smoke と同じ証跡先の作り方 (run id ディレクトリの作成) を page-turn-smoke.ps1 にも入れる。`-SelfTest` を
+  定期的に回す回帰か、ui-smoke 側の共通関数への寄せを検討する。`.ps1` は ASCII のみ。
+- 規模 / 優先度: Small / P2 (ページめくりの実アプリ計測の入口が壊れている)。
+
 ### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
 
 - 観測 (このセッションの全件実行の記録。単独で再実行するとどれも成功):
