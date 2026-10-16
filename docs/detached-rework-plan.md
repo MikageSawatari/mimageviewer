@@ -5321,3 +5321,88 @@ detached の `alive_wanted`（runtime の生存・Closing）は変更しない�
 該当 continuation の待機中に true となり、従来の deferred_fullscreen 待機と同じ window 継続を表す。
 viewport 生成・registry・HWND・placement・focus owner は変更しない。
 設計 lead (ClaudeCode Opus) の検収と独立 GPT-6.1 Sol/xhigh レビューの双方が「症状パッチではなく構造的修正」に同意し、レビューは指摘なしで ACCEPT。実機確認は利用者に依頼中。
+
+### 2026-10-16 egui 0.37 更新に伴う構造修正 (合意待ち)
+
+[更新設計書第4.2版](egui-0.37-update-plan.md) §4.2・§4.5・§4.8・§4.9・§4.11の
+構造合意対象を、段0bで実装担当が下書きする。§2を再読した。**設計担当と独立レビュー担当の
+双方合意は未取得**であり、本項を実装着手の合意済み記録として扱わない。
+旧版の静的調査・非対話検査は[段0b基準台帳](egui-0.37-baseline.md)へ分ける。
+以下のBA番号は§2が参照する[提案書§2](detached-viewer-lifecycle-redesign-proposal.md#2-初期診断の壊れた前提と現在の解消状況)への対応であり、各BA全体の解消を主張しない。
+
+- **Appのlogic/ui分離（BA-5 / BA-7）**: `src/app.rs`のservice/input/render/post-renderと
+  eframe App接続、各ラボ・`vst3-host-tester`のApp実装を対象とする。worker結果・取消/保存終端・
+  Remote完了・tray要求をUI入力に依存しないserviceへ分け、結果採用は既存registry/mount ownerへ戻す。
+  古いContext events・key level・pass counterをserviceの操作や進行条件にせず、表示ACKは描画側に残す。
+  必要なwakeに応じて進め、常時tickは追加しない。
+  frame内のmodal gateを早く外さない責務分離であり、update全体の改名、追加repaint、
+  logicからの強制UI呼出し、非表示guardや新pending boolで埋めない。
+- **viewport callbackのUi化（BA-5 / BA-7）**: `src/ui_fullscreen.rs`のdeferred/immediate、
+  本体・ラボの関連描画とvendor eframeのcallback接続を対象とする。受け取った`&mut Ui`を描画入口とし、
+  `ui.ctx()`と対象viewportの入力/出力所有を揃えるAPI移行である。既存window identity・lifetime・
+  placementを保ち、rect捕捉guard、geometry由来recreate、追加keep-alive/repaintで代用しない。
+- **gamepad物理取込みと配送の分離（BA-7）**: `src/gamepad.rs`、`src/app/gamepad_input.rs`、
+  Appのsample/service接続を対象とする。物理drain・保持更新はApp-global単一owner、操作batchと
+  modal判断は既存mounted contextへ残す。UIが進まない間の未配送edgeと意味終端も同じ物理ownerで
+  順序保持し、UI入口で一度取り出してmulti-pass batchを固定する。取込み時の既存OS前面判定を共用し、
+  離散press/repeat抑止と、復帰後の保持軸継続・release/disconnect/ring/Undo終端を分ける。
+  段1bは旧順序の抽出だけ、logic接続は段3。二重drain、新App pending bool、時間窓、
+  最終保持値だけへの置換、復帰後の中立通過要求は採らない。
+- **保留RawInputのviewport所有（BA-7）**: vendor eframeの`native/epi_integration.rs`、
+  `wgpu_integration.rs`・`glow_integration.rs`を対象とする。共通EpiIntegrationの保留を各Viewportへ
+  移管し、同じownerの保留＋新規入力だけを順に連結してhookへ渡す。root LogicOnlyの未消費入力は
+  rootへ返し、child skipはStateのtake前に判断する。deferred/immediateも同じ取得境界を使い、
+  明示終了時だけ対象の入力を終端する。誤配送を後から捨てるguard、hide/minimize時のprune・
+  一括reset、silent fallback、App側の第二queueや新pending boolは採らない。
+- **IME中断要求のviewport所有・入れ子pass（BA-7）**: vendor eguiの`memory/mod.rs`・
+  `context.rs`を対象とする。Memory共通の要求を既存viewport別Focusへ移し、begin/endは対象entry
+  だけを扱う。既存viewport復帰で親のownerを再選択するため、子beginによる親要求の消失と
+  子要求の親出力への混入を生成境界で防ぐ。実TextEdit＋同一Contextの実入れ子run_uiで親だけ/子だけ/
+  両方/なしを検査する。新map・App補助flag・手動退避復元・delay/retry・追加repaintは採らない。
+- **discard再passのIME出力集約（BA-7）**: vendor eguiの`data/output.rs`のappendと
+  `context.rs`の実run_ui回帰を対象とする。同一viewportの未配送出力では新しいIME metadataを採り、
+  中断要求はORで保持する。Noneの従来集約を保ち、一度移譲した後の新規runへ要求を残さない。
+  親子PlatformOutputを混ぜず、実TextEdit・第1pass要求/discard・第2pass新矩形で検査する。
+  消失をconsumer側で補うguard、Context外sticky flag、新queue、ACK待ち、retryは採らない。
+- **native IME intent配送（BA-7、対象同定はBA-1の禁止事項も維持）**:
+  `src/video/native_presenter/render_core.rs`、`native_window_host.rs`、`native_window_pump.rs`と
+  既存配送接続を対象とする。集約済み中断を一度だけNativeWindowIntentへ移譲し、既存control queue・
+  WindowEpochでIME入力/cursorと同じHWND owner threadへ届ける。取消後のOS通知は既存入力正規化へ戻す。
+  visual snapshotの上書きでpulseを落とす境界を直すもので、foreground/rectから別HWNDを推定せず、
+  rendererから直接IMM32を呼ばない。新queue/pending bool、retry、偽Commit、IME恒久無効化は採らない。
+- **非表示子Closeの受付・消費・終了owner合流・非描画退役（BA-5 / BA-7）**:
+  vendor eframeのApp hook（`epi.rs`）とwgpu/glow integration、vendor eguiのContext登録GC、
+  本体`src/app.rs`・`src/app/detached_window_manager.rs`・`src/ui_fullscreen.rs`の既存終了service接続を対象とする。
+  OS/programmatic Closeをbackend borrow/lock外・描画pass外で対象ViewportId付き受付へ渡す。
+  passiveは既存modal判断・batch/close-by-idsへ、active/parkedは各既存終了/取消ownerへ委譲し、
+  bar/watcher由来入口も同じ判断へ揃える。子FrameのOS Close読取りを重ねず、承認/拒否とも
+  その一回をinfo.events・保留snapshotから消費する。拒否後の新しいCloseは受け付ける。
+  承認後は子callback/親Fullを待たず、既存Closing・worker/media/gesture終端、backend window/
+  WindowId対応/State/surface/入力、Contextのviewport/親子登録を対象限定で退役する。
+  通常GCと処理を共有するpass外入口を新設し、未配送deltaは共有rendererへ引き継ぐ。
+  後続root/兄弟出力から再作成させず、兄弟の入力・IME・資源・寿命、root終了/tray契約を維持する。
+  非管理Appの明示的な従来UI委譲は保持するが、管理対象のsilent fallbackには使わない。
+  復帰待ちqueue、新pending bool、拒否ラッチ、retry、追加repaint/RequestPaintWhileHidden/強制UI、
+  全memory reset、退役済みIDの別抑止ラッチは採らない。hide/minimizeだけでは退役しない。
+- **scheduler付け直し（BA-5 / BA-7）**: vendor eframeの`native/run.rs`とintegrationを対象とする。
+  本家hidden repaint基本修正と、現vendorのdirty/painting・surface generation・outer phase・
+  非ゼロresize provenance・初回visible commitを区別して移植する。描画可否とservice進行の境界を
+  揃える構造修正で、frame頻度の差をdelay/retry・常時追加repaint・新pending boolで隠さない。
+- **texture delta付け直し（BA-7）**: vendor eframe/egui-wgpuのpending・renderer/winit、
+  本体native overlay・各headless consumerを対象とする。set drain→upload/描画submit→free drainを
+  完結ownerへ揃え、surfaceなし・acquire不成立・早期終了・viewport消滅も完結または既存ownerへ引き継ぐ。
+  同一IDのwhole/partial順序と共有rendererを保持し、headlessは検査後だけ明示破棄する。
+  window終了を理由に共有deltaを捨てず、製品の無条件clear・兄弟一括reset・二重適用・
+  重複空submit・GPU待機・retry・silent fallbackは採らない。
+- **surface付け直し（BA-7、BA-4のidentityを維持）**: vendor egui-wgpuの`winit.rs`、
+  本体`src/lib.rs`と`src/video/native_presenter/{overlay_gpu,render_core}.rs`等のsurface接続を対象とする。
+  対象surfaceだけの破棄、Surface/DeviceEpoch寿命、configure write lock・submit/present read lockを
+  新APIでも維持する。AutoVsync/latency方針を保ち、presentをgate外へ出さない。
+  geometry由来recreate、全surface clear、新device-lost latchやretryで寿命の誤りを隠さない。
+
+簡素化は既存ownerへの移管と既存終了/GCの共通化を採る。全窓をmodal化したり閉じて開き直す案は、
+既存の非表示処理・複数窓・保持軸継続や閲覧状態を失い、入力/出力の所有の誤りも解決しないため採らない。
+長い処理の既存modal gateは維持し、汎用非表示入力層・新しい回復機構は作らない。
+共通してguard・delay・retry・追加repaint・一括reset・silent fallback・新pending boolを根因修正の
+代用にしない。まれな失敗は既定のログ・通知・fault終端へ揃える。
+今段は文書下書きのみ。修正前失敗/修正後成功、実機観測、実装レビューの完了は主張しない。
