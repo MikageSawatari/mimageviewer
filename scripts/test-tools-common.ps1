@@ -94,7 +94,12 @@ function Read-MivSourceHashCache {
     $entries = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
     if ([IO.File]::Exists($Path)) {
         $lines = [IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8)
-        if ($lines.Length -lt 2 -or $lines[0] -cne ('miv-stat-cache-v1 ' + (Get-MivTextHash $RepoRoot))) { throw 'Invalid stat-cache header' }
+        if ($lines.Length -lt 2 -or $lines[0] -cne ('miv-stat-cache-v2 ' + (Get-MivTextHash $RepoRoot))) { throw 'Invalid stat-cache header' }
+        # A well-formed but altered row (for example one changed hex digit) must not
+        # be trusted: the footer carries a digest of every line before it.
+        $body = New-Object Text.StringBuilder
+        for ($i = 0; $i -lt ($lines.Length - 1); $i++) { [void] $body.Append($lines[$i]).Append("`n") }
+        $bodyDigest = Get-MivTextHash $body.ToString()
         for ($i = 1; $i -lt ($lines.Length - 1); $i++) {
             $fields = $lines[$i].Split([char]9)
             if ($fields.Length -ne 6 -or $fields[4] -cnotmatch '^[0-9A-F]{64}$') { throw 'Invalid stat-cache row' }
@@ -106,7 +111,7 @@ function Read-MivSourceHashCache {
             if ($size -lt 0 -or $modified -le 0 -or $created -le 0 -or $recorded -le 0) { throw 'Invalid stat-cache metadata' }
             $entries.Add($relative, @($size, $modified, $created, $fields[4], $recorded))
         }
-        if ($lines[$lines.Length - 1] -cne ('end ' + $entries.Count)) { throw 'Incomplete stat cache' }
+        if ($lines[$lines.Length - 1] -cne ('end ' + $entries.Count + ' ' + $bodyDigest)) { throw 'Incomplete or altered stat cache' }
     }
     # Return the dictionary itself, including when it is empty.
     return ,$entries
@@ -115,12 +120,13 @@ function Read-MivSourceHashCache {
 function Write-MivSourceHashCache {
     param([string] $Path, [string] $RepoRoot, $Entries)
     $text = New-Object Text.StringBuilder
-    [void] $text.Append('miv-stat-cache-v1 ').Append((Get-MivTextHash $RepoRoot)).Append("`n")
+    [void] $text.Append('miv-stat-cache-v2 ').Append((Get-MivTextHash $RepoRoot)).Append("`n")
     foreach ($entry in $Entries.GetEnumerator()) {
         $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($entry.Key))
         [void] $text.Append($encoded).Append([char]9).Append(($entry.Value -join "`t")).Append("`n")
     }
-    [void] $text.Append('end ').Append($Entries.Count).Append("`n")
+    $bodyDigest = Get-MivTextHash $text.ToString()
+    [void] $text.Append('end ').Append($Entries.Count).Append(' ').Append($bodyDigest).Append("`n")
     [void] [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
     [IO.File]::WriteAllText($Path, $text.ToString(), (New-Object Text.UTF8Encoding($false)))
 }

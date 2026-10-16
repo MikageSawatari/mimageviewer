@@ -210,12 +210,22 @@ $creationBefore = [IO.File]::GetCreationTimeUtc($statFile)
 Assert-That ((Get-MivSourceId $statRoot) -eq $racyId) 'same-stat fixture did not exercise a cache hit'
 $forceId = Get-MivSourceId $statRoot -ForceHash
 Assert-That ($forceId -ne $racyId -and $forceId -eq (Get-MivSourceId $statRoot -NoCache)) 'ForceHash did not repair a same-stat edit'
-foreach ($broken in @('corrupt', "miv-stat-cache-v1 $(Get-MivTextHash $statRoot)`ntruncated`n")) {
+foreach ($broken in @('corrupt', "miv-stat-cache-v2 $(Get-MivTextHash $statRoot)`ntruncated`n")) {
     [IO.File]::WriteAllText($statCachePath, $broken, $utf8)
     $cacheWarnings = @()
     $brokenId = Get-MivSourceId $statRoot -WarningVariable cacheWarnings -WarningAction SilentlyContinue
     Assert-That ($brokenId -eq $forceId -and $cacheWarnings.Count -gt 0) 'broken cache did not warn and hash correctly'
 }
+# A well-formed row whose digest differs by one hex digit must not be trusted.
+[void] (Get-MivSourceId $statRoot -ForceHash)
+$cacheLines = [IO.File]::ReadAllLines($statCachePath, [Text.Encoding]::UTF8)
+$rowFields = $cacheLines[1].Split([char]9)
+$rowFields[4] = $(if ($rowFields[4][0] -eq 'A') { 'B' } else { 'A' }) + $rowFields[4].Substring(1)
+$cacheLines[1] = $rowFields -join "`t"
+[IO.File]::WriteAllText($statCachePath, (($cacheLines -join "`n") + "`n"), $utf8)
+$cacheWarnings = @()
+$alteredId = Get-MivSourceId $statRoot -WarningVariable cacheWarnings -WarningAction SilentlyContinue
+Assert-That ($alteredId -eq $forceId -and $cacheWarnings.Count -gt 0) 'an altered but well-formed cache row was trusted'
 # A locked cache also fails closed on both reading and writing.
 [void] (Get-MivSourceId $statRoot -ForceHash)
 $locked = [IO.File]::Open($statCachePath, 'Open', 'ReadWrite', 'None')
