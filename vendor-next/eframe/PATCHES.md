@@ -145,3 +145,28 @@ Close／退役・再作成防止の証拠とはしない。実native HWND／GL�
 3種の部分復元で両回帰の失敗を確認し、byte復元後の全検証は段2台帳へ記録する。
 native/run.rs・scheduler・root製品graph・双方のlockは不変。追加repaint・強制UI・App flag・
 新pending bool・retryは追加せず、Closeの受付・消費・退役とroot Close回帰は2c-4へ残す。
+
+## 段2c-4a: 子Closeの非描画受付・消費・退役（2026-10-17）
+
+`41ec02184`上へ、合意済みの子Close lifecycleを実装した（b・新規）。
+以下は**実装担当の内部確認**であり、正式な独立レビュー・ACCEPTではない。
+
+- `App::on_viewport_close_requested(ctx, viewport_id)`と`ViewportCloseResponse`を追加する。
+  Close／Cancelはその一回を消費し、DelegateToUi（既定）は従来UIへ委譲する。rootには呼ばない。
+  非描画の`native/viewport_lifecycle.rs`を両backendのOS event完了・outer Full／logic前後へ接続し、
+  backend borrow／lockやUI passの外でAppの既存終了ownerへ渡す。immediate callbackからは呼ばない。
+- OSとprogrammatic Closeは既存のViewportInfoのCloseへ合流する。window未生成のCloseも受付可能。
+  承認・拒否とも対象info.eventsと全ownerの保留RawInput／State snapshotからCloseだけを取り除く。
+  Contextの既存cached inputも限定消費し、通常のkey／pointer／focus／modifier／IME列を保つ。
+  拒否ラッチは作らず、新しいCloseは再び受け付ける。
+- 承認後は対象と子孫のnative window・WindowId対応・State・surface・保留入力を、通常GCと共用の
+  resource cleanupで終了する。次の子callback／親Fullを待たない。兄弟と共有deltaは保持する。
+  既存rendererへのdelta移譲を先に完了し、終了を理由にdeltaをclearしない。
+- native公開停止後、borrow外で`Context::retire_viewport`と
+  `egui_ime::retire_viewport_ime_policy`を呼ぶ。保留中のcomposition／focus contract／retryも
+  そのownerだけ終了し、同IDの明示再openへ引き継がない。準備eframeのegui-imeをnative実依存へ移した。
+
+hide／minimizeだけでは退役しない。新queue・pending bool・退役済みIDリスト・追加repaint・
+強制UI・RequestPaintWhileHidden・retry・全memory resetは追加しない。
+rootの終了／tray契約と製品graphは変更せず、root logic-only Close確定回帰は2c-4bへ残す。
+実windowを作らない回帰・変異確認・feature別結果は[段2台帳](../../docs/egui-0.37-stage2-verification.md)。

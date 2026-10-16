@@ -148,8 +148,35 @@ impl CreationContext<'_> {
 
 // ----------------------------------------------------------------------------
 
+/// The application's decision for one child viewport close request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewportCloseResponse {
+    /// Preserve the existing close event for the viewport's UI callback.
+    DelegateToUi,
+    /// Consume this request; a later, newly received request may be handled again.
+    Cancel,
+    /// The application owner has ended this child; retire its native and egui registrations.
+    Close,
+}
+
 /// Implement this trait to write apps that can be compiled for both web/wasm and desktop/native using [`eframe`](https://github.com/emilk/egui/tree/main/crates/eframe).
 pub trait App {
+    /// Handle one native child-viewport close request without running UI.
+    ///
+    /// Called outside UI passes and backend locks, for both OS and programmatic
+    /// close requests. `Close` and `Cancel` consume this request, including its
+    /// pending input snapshots. `Close` additionally retires the child and its
+    /// descendants immediately. End application-owned work before returning it.
+    /// Root close handling remains with `logic`/`ui` and `CancelClose`.
+    /// The default preserves the existing UI callback contract.
+    fn on_viewport_close_requested(
+        &mut self,
+        _ctx: &egui::Context,
+        _viewport_id: egui::ViewportId,
+    ) -> ViewportCloseResponse {
+        ViewportCloseResponse::DelegateToUi
+    }
+
     /// Called once before each call to [`Self::ui`],
     /// and additionally also called when the UI is hidden, but [`egui::Context::request_repaint`] was called.
     ///

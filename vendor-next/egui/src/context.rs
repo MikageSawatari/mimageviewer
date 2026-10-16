@@ -3435,6 +3435,30 @@ impl Context {
         ids
     }
 
+    /// Consume a child close request from existing cached viewport metadata.
+    ///
+    /// Native integrations call this outside UI passes after an application has
+    /// accepted or rejected that request. It changes no ordinary input events,
+    /// creates no viewport registration and does not suppress future requests.
+    pub fn consume_viewport_close(&self, viewport_id: ViewportId) {
+        assert!(
+            viewport_id != ViewportId::ROOT,
+            "root close uses CancelClose"
+        );
+        self.write(|ctx| {
+            assert!(
+                ctx.viewport_stack.is_empty(),
+                "close consumption requires no active UI pass"
+            );
+            for viewport in ctx.viewports.values_mut() {
+                if let Some(info) = viewport.input.raw.viewports.get_mut(&viewport_id) {
+                    info.events
+                        .retain(|event| *event != crate::ViewportEvent::Close);
+                }
+            }
+        });
+    }
+
     /// Tessellate the given shapes into triangle meshes.
     ///
     /// `pixels_per_point` is used for feathering (anti-aliasing).
@@ -5525,5 +5549,64 @@ mod test {
             );
             output.drop_without_applying_deltas();
         }
+    }
+}
+
+#[cfg(test)]
+mod child_close_consumption_tests {
+    use super::*;
+
+    #[test]
+    fn child_close_consumption_changes_only_existing_cached_lifecycle_metadata() {
+        let ctx = Context::default();
+        let child = ViewportId::from_hash_of("close-cache-child");
+        let sibling = ViewportId::from_hash_of("close-cache-sibling");
+        let events = vec![
+            crate::Event::Text("keep".to_owned()),
+            crate::Event::WindowFocused(false),
+        ];
+        for id in [ViewportId::ROOT, child, sibling] {
+            let mut raw = RawInput {
+                viewport_id: id,
+                events: events.clone(),
+                ..Default::default()
+            };
+            for target in [ViewportId::ROOT, child, sibling] {
+                raw.viewports.insert(
+                    target,
+                    crate::ViewportInfo {
+                        events: vec![crate::ViewportEvent::Close],
+                        ..Default::default()
+                    },
+                );
+            }
+            let _ = ctx.run_logic(&raw, |_| {});
+            ctx.input_mut_for(id, |input| input.raw.events = events.clone());
+        }
+        ctx.consume_viewport_close(child);
+        for id in [ViewportId::ROOT, child, sibling] {
+            ctx.input_for(id, |input| {
+                assert_eq!(input.raw.events, events);
+                assert!(!input.raw.viewports[&child].close_requested());
+                assert!(input.raw.viewports[&sibling].close_requested());
+                assert!(input.raw.viewports[&ViewportId::ROOT].close_requested());
+            });
+        }
+        let unknown = ViewportId::from_hash_of("never-created-close-owner");
+        ctx.consume_viewport_close(unknown);
+        assert!(ctx.retire_viewport(unknown).is_empty());
+        let mut raw = RawInput::default();
+        raw.viewports.insert(
+            child,
+            crate::ViewportInfo {
+                events: vec![crate::ViewportEvent::Close],
+                ..Default::default()
+            },
+        );
+        let _ = ctx.run_logic(&raw, |_| {});
+        assert!(
+            ctx.input(|input| input.raw.viewports[&child].close_requested()),
+            "a newly received request must remain eligible"
+        );
     }
 }

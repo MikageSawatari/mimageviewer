@@ -745,6 +745,13 @@ impl WgpuWinitRunning<'_> {
             shared,
         } = self;
 
+        // Close is a lifecycle request, independent of taking input or running UI.
+        super::viewport_lifecycle::dispatch_child_close_requests(
+            &integration.egui_ctx,
+            app.as_mut(),
+            shared,
+        );
+
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
@@ -897,6 +904,12 @@ impl WgpuWinitRunning<'_> {
                     }
                 }
             }
+
+            super::viewport_lifecycle::dispatch_child_close_requests(
+                &integration.egui_ctx,
+                app.as_mut(),
+                shared,
+            );
 
             sleep_if_invisible_or_minimized(
                 shared
@@ -1075,8 +1088,6 @@ impl WgpuWinitRunning<'_> {
             0.0
         };
 
-        let active_viewports_ids: ViewportIdSet = viewport_output.keys().copied().collect();
-
         handle_viewport_output(
             &integration.egui_ctx,
             &viewport_output,
@@ -1084,11 +1095,6 @@ impl WgpuWinitRunning<'_> {
             painter,
             viewport_from_window,
         );
-
-        // Prune dead viewports:
-        viewports.retain(|id, _| active_viewports_ids.contains(id));
-        viewport_from_window.retain(|_, id| active_viewports_ids.contains(id));
-        painter.gc_viewports(&active_viewports_ids);
 
         let window = viewport_from_window
             .get(&window_id)
@@ -1106,6 +1112,15 @@ impl WgpuWinitRunning<'_> {
 
         sleep_if_invisible_or_minimized(window.map(|window| window.as_ref()));
 
+        // Immediate children can queue Close while the outer pass is active.
+        // Output and shared deltas have been delivered before retirement.
+        drop(shared_mut);
+        super::viewport_lifecycle::dispatch_child_close_requests(
+            &integration.egui_ctx,
+            app.as_mut(),
+            shared,
+        );
+
         if integration.should_close() {
             Ok(EventResult::CloseRequested)
         } else {
@@ -1119,11 +1134,11 @@ impl WgpuWinitRunning<'_> {
         event: &winit::event::WindowEvent,
     ) -> EventResult {
         let Self {
+            app,
             integration,
-            shared,
-            ..
+            shared: shared_owner,
         } = self;
-        let mut shared = shared.borrow_mut();
+        let mut shared = shared_owner.borrow_mut();
 
         let viewport_id = shared.viewport_from_window.get(&window_id).copied();
 
@@ -1254,12 +1269,6 @@ impl WgpuWinitRunning<'_> {
                 {
                     // Tell viewport it should close:
                     viewport.info.events.push(egui::ViewportEvent::Close);
-
-                    // We may need to repaint both us and our parent to close the window,
-                    // and perhaps twice (once to notice the close-event, once again to enforce it).
-                    // `request_repaint_of` does a double-repaint though:
-                    integration.egui_ctx.request_repaint_of(viewport_id);
-                    integration.egui_ctx.request_repaint_of(viewport.ids.parent);
                 }
             }
 
@@ -1277,8 +1286,26 @@ impl WgpuWinitRunning<'_> {
             })
             .unwrap_or_default();
 
+        drop(shared);
+        super::viewport_lifecycle::dispatch_child_close_requests(
+            &integration.egui_ctx,
+            app.as_mut(),
+            shared_owner,
+        );
+        let shared = shared_owner.borrow();
+        if matches!(event, winit::event::WindowEvent::CloseRequested)
+            && let Some(viewport) = viewport_id.and_then(|id| shared.viewports.get(&id))
+            && viewport.info.close_requested()
+        {
+            // Preserve the traditional UI-delegated close path, after lifecycle handling.
+            integration.egui_ctx.request_repaint_of(viewport.ids.this);
+            integration.egui_ctx.request_repaint_of(viewport.ids.parent);
+        }
+
         if integration.should_close() {
             EventResult::CloseRequested
+        } else if !shared.viewport_from_window.contains_key(&window_id) {
+            EventResult::Wait
         } else if event_response.repaint {
             if repaint_asap {
                 EventResult::repaint_now(window_id, RepaintNowReason::InteractiveResize)
@@ -1307,6 +1334,15 @@ impl Viewport {
         egui_ctx: &egui::Context,
         mut commands: Vec<egui::ViewportCommand>,
     ) {
+        // Close must be observable even before a native window is initialized.
+        commands.retain(|command| {
+            if matches!(command, egui::ViewportCommand::Close) {
+                self.info.events.push(egui::ViewportEvent::Close);
+                false
+            } else {
+                true
+            }
+        });
         self.deferred_commands.append(&mut commands);
 
         if let Some(window) = self.window.as_ref() {
@@ -1850,10 +1886,100 @@ pub(crate) fn remove_viewports_not_in(
 ) {
     let active_viewports_ids: ViewportIdSet = viewport_output.keys().copied().collect();
 
-    // Prune dead viewports:
-    viewports.retain(|id, _| active_viewports_ids.contains(id));
-    viewport_from_window.retain(|_, id| active_viewports_ids.contains(id));
-    painter.gc_viewports(&active_viewports_ids);
+    retain_viewport_resources(
+        viewports,
+        viewport_from_window,
+        &active_viewports_ids,
+        |active| painter.gc_viewports(active),
+    );
+}
+
+/// Both normal output GC and accepted lifecycle Close end the same native owners.
+/// The surface owner is injectable so headless tests exercise production cleanup.
+fn retain_viewport_resources<K: Eq + std::hash::Hash>(
+    viewports: &mut Viewports,
+    viewport_from_window: &mut HashMap<K, ViewportId>,
+    active: &ViewportIdSet,
+    mut retain_surfaces: impl FnMut(&ViewportIdSet),
+) {
+    viewports.retain(|id, _| active.contains(id));
+    viewport_from_window.retain(|_, id| active.contains(id));
+    retain_surfaces(active);
+}
+
+impl super::viewport_lifecycle::ChildCloseBackend for Rc<RefCell<SharedState>> {
+    fn close_requests(&self) -> Vec<ViewportId> {
+        self.borrow()
+            .viewports
+            .iter()
+            .filter_map(|(id, viewport)| viewport.info.close_requested().then_some(*id))
+            .collect()
+    }
+
+    fn consume_close(&mut self, id: ViewportId) {
+        let mut shared = self.borrow_mut();
+        if let Some(viewport) = shared.viewports.get_mut(&id) {
+            viewport
+                .info
+                .events
+                .retain(|event| !matches!(event, egui::ViewportEvent::Close));
+        }
+        for viewport in shared.viewports.values_mut() {
+            super::viewport_lifecycle::consume_close_in_input(&mut viewport.pending_raw_input, id);
+            if let Some(state) = &mut viewport.egui_winit {
+                super::viewport_lifecycle::consume_close_in_input(state.egui_input_mut(), id);
+            }
+        }
+    }
+
+    fn retire(&mut self, ctx: &egui::Context, id: ViewportId) {
+        {
+            let mut shared = self.borrow_mut();
+            let retired = native_viewport_subtree(&shared.viewports, id);
+            let active = shared
+                .viewports
+                .keys()
+                .copied()
+                .filter(|id| !retired.contains(id))
+                .collect();
+            let SharedState {
+                viewports,
+                painter,
+                viewport_from_window,
+                focused_viewport,
+                resized_viewport,
+                ..
+            } = &mut *shared;
+            retain_viewport_resources(viewports, viewport_from_window, &active, |active| {
+                painter.gc_viewports(active);
+            });
+            if focused_viewport.is_some_and(|id| retired.contains(&id)) {
+                *focused_viewport = None;
+            }
+            if resized_viewport.is_some_and(|id| retired.contains(&id)) {
+                *resized_viewport = None;
+            }
+        }
+        // Native publication stops first. Context callbacks and IME policy are
+        // retired outside the backend borrow and outside the completed UI pass.
+        let retired = ctx.retire_viewport(id);
+        egui_ime::retire_viewport_ime_policy(ctx, &retired);
+    }
+}
+
+fn native_viewport_subtree(viewports: &Viewports, root: ViewportId) -> ViewportIdSet {
+    let mut retired = ViewportIdSet::from_iter([root]);
+    loop {
+        let before = retired.len();
+        for (id, viewport) in viewports {
+            if retired.contains(&viewport.ids.parent) {
+                retired.insert(*id);
+            }
+        }
+        if retired.len() == before {
+            return retired;
+        }
+    }
 }
 
 /// Add new viewports, and update existing ones:
@@ -2487,5 +2613,401 @@ mod stage2c1_tests {
         assert_eq!(delta.set[&id][0].pos, None);
         assert_eq!(delta.set[&id][1].pos, Some([1, 2]));
         delta.clear(); // headless diagnostic fixture intentionally has no renderer destination
+    }
+}
+
+#[cfg(test)]
+mod stage2c4a_tests {
+    use super::super::viewport_lifecycle::{ChildCloseBackend as _, dispatch_child_close_requests};
+    use super::*;
+
+    struct HeadlessDisplay;
+
+    impl raw_window_handle::HasDisplayHandle for HeadlessDisplay {
+        fn display_handle(
+            &self,
+        ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+        {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    fn fixture(ctx: &egui::Context, child: ViewportId, sibling: ViewportId) -> SharedState {
+        let painter = pollster::block_on(egui_wgpu::winit::Painter::new(
+            ctx.clone(),
+            Default::default(),
+            false,
+            Default::default(),
+        ));
+        let mut shared = SharedState {
+            egui_ctx: ctx.clone(),
+            viewports: Default::default(),
+            painter,
+            pending_deltas: Default::default(),
+            viewport_from_window: Default::default(),
+            focused_viewport: Some(child),
+            resized_viewport: Some(child),
+            clipboard_shortcuts: true,
+        };
+        for id in [ViewportId::ROOT, child, sibling] {
+            initialize_or_update_viewport(
+                &mut shared.viewports,
+                ViewportIdPair::from_self_and_parent(id, ViewportId::ROOT),
+                ViewportClass::Deferred,
+                ViewportBuilder::default(),
+                None,
+                &mut shared.painter,
+            );
+        }
+        shared
+    }
+
+    #[test]
+    fn child_close_wgpu_cancel_consumes_snapshots_and_fresh_close_retires_without_ui() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let child = ViewportId::from_hash_of("close-wgpu-child");
+        let sibling = ViewportId::from_hash_of("close-wgpu-sibling");
+        let child_callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_counter = child_callbacks.clone();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            let callback_counter = callback_counter.clone();
+            ui.ctx()
+                .show_viewport_deferred(child, ViewportBuilder::default(), move |ui, _| {
+                    callback_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert!(!ui.input(|input| input.viewport().close_requested()));
+                });
+            ui.ctx()
+                .show_viewport_deferred(sibling, ViewportBuilder::default(), |_, _| {});
+        });
+        let child_ui = output.viewport_output[&child]
+            .viewport_ui_cb
+            .clone()
+            .unwrap();
+        let mut shared = fixture(&ctx, child, sibling);
+        shared
+            .pending_deltas
+            .append(core::mem::take(&mut output.textures_delta));
+        output.drop_without_applying_deltas();
+        let ordinary = vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("keep".into()),
+            egui::Event::WindowFocused(false),
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            egui::Event::Ime(egui::ImeEvent::Commit("terminal".into())),
+        ];
+        // OS ingress, including a skipped/minimized child and snapshots retained
+        // by other logical owners. The ordinary input sequence is untouched.
+        shared.viewports.get_mut(&child).unwrap().info.minimized = Some(true);
+        shared
+            .viewports
+            .get_mut(&child)
+            .unwrap()
+            .info
+            .events
+            .push(egui::ViewportEvent::Close);
+        for (id, viewport) in &mut shared.viewports {
+            viewport.pending_raw_input.events = ordinary.clone();
+            viewport
+                .pending_raw_input
+                .viewports
+                .entry(child)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let mut state =
+                egui_winit::State::new(ctx.clone(), *id, &HeadlessDisplay, None, None, None);
+            state.egui_input_mut().events = ordinary.clone();
+            state
+                .egui_input_mut()
+                .viewports
+                .entry(child)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            viewport.egui_winit = Some(state);
+        }
+        let delta_before = texture_delta_stats(&shared.pending_deltas);
+        let mut shared = Rc::new(RefCell::new(shared));
+        struct Owner {
+            shared: Rc<RefCell<SharedState>>,
+            calls: Vec<ViewportId>,
+            response: crate::ViewportCloseResponse,
+        }
+        impl App for Owner {
+            fn ui(&mut self, _: &mut egui::Ui, _: &mut crate::Frame) {
+                panic!("lifecycle must not run application UI");
+            }
+            fn on_viewport_close_requested(
+                &mut self,
+                _: &egui::Context,
+                id: ViewportId,
+            ) -> crate::ViewportCloseResponse {
+                // The production dispatcher must release the backend borrow.
+                let _exclusive_backend_access = self.shared.borrow_mut();
+                self.calls.push(id);
+                self.response
+            }
+        }
+        let mut owner = Owner {
+            shared: shared.clone(),
+            calls: vec![],
+            response: crate::ViewportCloseResponse::Cancel,
+        };
+        assert_eq!(child_callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        dispatch_child_close_requests(&ctx, &mut owner, &mut shared);
+        dispatch_child_close_requests(&ctx, &mut owner, &mut shared);
+        assert_eq!(owner.calls, [child]);
+        assert_eq!(child_callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        {
+            let shared = shared.borrow();
+            assert!(!shared.viewports[&child].info.close_requested());
+            for viewport in shared.viewports.values() {
+                assert_eq!(viewport.pending_raw_input.events, ordinary);
+                assert!(!viewport.pending_raw_input.viewports[&child].close_requested());
+                let input = viewport.egui_winit.as_ref().unwrap().egui_input();
+                assert_eq!(input.events, ordinary);
+                assert!(!input.viewports[&child].close_requested());
+            }
+        }
+        // The modal ends and the child restores. First advance root logic only:
+        // this is a real non-UI Context operation and must not redeliver Close.
+        shared
+            .borrow_mut()
+            .viewports
+            .get_mut(&child)
+            .unwrap()
+            .info
+            .minimized = Some(false);
+        let metadata: egui::ViewportIdMap<ViewportInfo> = shared
+            .borrow()
+            .viewports
+            .iter()
+            .map(|(id, viewport)| (*id, viewport.info.clone()))
+            .collect();
+        let logic_output = ctx.run_logic(
+            &egui::RawInput {
+                viewports: metadata.clone(),
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(!ctx.input(|input| input.raw.viewports[&child].close_requested()));
+            },
+        );
+        assert!(logic_output.viewport_commands.is_empty());
+        dispatch_child_close_requests(&ctx, &mut owner, &mut shared);
+        assert_eq!(owner.calls, [child]);
+        assert_eq!(child_callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Then run the actual retained callback through a child Full. Use the
+        // same pending-plus-State input owner as the native preparation path.
+        let mut input = {
+            let mut shared = shared.borrow_mut();
+            let viewport = shared.viewports.get_mut(&child).unwrap();
+            let state = viewport.egui_winit.as_mut().unwrap();
+            super::super::epi_integration::take_viewport_input(
+                &mut viewport.pending_raw_input,
+                || std::mem::take(state.egui_input_mut()),
+            )
+        };
+        input.viewport_id = child;
+        input.viewports = metadata.clone();
+        let expected_input = ordinary
+            .iter()
+            .chain(&ordinary)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(input.events, expected_input);
+        let output = ctx.run_ui(input, |ui| {
+            assert_eq!(ui.input(|input| input.raw.events.clone()), expected_input);
+            child_ui(ui);
+        });
+        output.drop_without_applying_deltas();
+        dispatch_child_close_requests(&ctx, &mut owner, &mut shared);
+        assert_eq!(child_callbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(owner.calls, [child]);
+
+        // A parent Full keeps the child declared and still sees no rejected
+        // Close. Neither actual Full may turn modal completion into a retry.
+        let callback = child_ui.clone();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                viewports: metadata,
+                ..Default::default()
+            },
+            |ui| {
+                assert!(!ui.input(|input| input.raw.viewports[&child].close_requested()));
+                let callback = callback.clone();
+                ui.ctx()
+                    .show_viewport_deferred(child, ViewportBuilder::default(), move |ui, _| {
+                        callback(ui)
+                    });
+                ui.ctx()
+                    .show_viewport_deferred(sibling, ViewportBuilder::default(), |_, _| {});
+            },
+        );
+        assert!(output.viewport_output.contains_key(&child));
+        output.drop_without_applying_deltas();
+        dispatch_child_close_requests(&ctx, &mut owner, &mut shared);
+        assert_eq!(owner.calls, [child]);
+        assert_eq!(child_callbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A fresh programmatic Close uses the same hook and may now be accepted.
+        // No native window exists, so this still verifies pre-window delivery.
+        shared
+            .borrow_mut()
+            .viewports
+            .get_mut(&child)
+            .unwrap()
+            .process_commands(
+                &ctx,
+                vec![
+                    egui::ViewportCommand::Close,
+                    egui::ViewportCommand::Title("kept".into()),
+                ],
+            );
+        owner.response = crate::ViewportCloseResponse::Close;
+        dispatch_child_close_requests(&ctx, &mut owner, &mut shared);
+        dispatch_child_close_requests(&ctx, &mut owner, &mut shared);
+        assert_eq!(owner.calls, [child, child]);
+        {
+            let shared = shared.borrow();
+            assert!(!shared.viewports.contains_key(&child));
+            assert!(shared.viewports.contains_key(&sibling));
+            assert_eq!(
+                shared.viewports[&sibling].pending_raw_input.events,
+                ordinary
+            );
+            assert_eq!(texture_delta_stats(&shared.pending_deltas), delta_before);
+            assert_eq!(shared.focused_viewport, None);
+            assert_eq!(shared.resized_viewport, None);
+        }
+        let output = ctx.run_ui(
+            egui::RawInput {
+                viewport_id: sibling,
+                viewports: [
+                    (ViewportId::ROOT, ViewportInfo::default()),
+                    (sibling, ViewportInfo::default()),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert!(!output.viewport_output.contains_key(&child));
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(Default::default(), |_| {});
+        assert!(!output.viewport_output.contains_key(&child));
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn child_close_wgpu_default_delegates_and_root_stays_on_existing_path() {
+        struct DefaultOwner;
+        impl App for DefaultOwner {
+            fn ui(&mut self, _: &mut egui::Ui, _: &mut crate::Frame) {
+                panic!("delegation must not force a UI pass");
+            }
+        }
+        let ctx = egui::Context::default();
+        let child = ViewportId::from_hash_of("close-wgpu-default-child");
+        let sibling = ViewportId::from_hash_of("close-wgpu-default-sibling");
+        let mut shared = fixture(&ctx, child, sibling);
+        for id in [ViewportId::ROOT, child] {
+            shared
+                .viewports
+                .get_mut(&id)
+                .unwrap()
+                .info
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        let mut shared = Rc::new(RefCell::new(shared));
+        let before = shared.close_requests();
+        dispatch_child_close_requests(&ctx, &mut DefaultOwner, &mut shared);
+        assert_eq!(shared.close_requests(), before);
+        assert!(shared.borrow().viewports[&child].info.close_requested());
+        assert!(
+            shared.borrow().viewports[&ViewportId::ROOT]
+                .info
+                .close_requested()
+        );
+        assert!(shared.borrow().viewports.contains_key(&sibling));
+    }
+
+    #[test]
+    fn child_close_wgpu_subtree_and_usual_gc_share_fake_native_resource_cleanup() {
+        struct Resource(std::rc::Rc<std::cell::Cell<usize>>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let ctx = egui::Context::default();
+        let child = ViewportId::from_hash_of("close-wgpu-subtree-child");
+        let grandchild = ViewportId::from_hash_of("close-wgpu-subtree-grandchild");
+        let sibling = ViewportId::from_hash_of("close-wgpu-subtree-sibling");
+        let mut shared = fixture(&ctx, child, sibling);
+        initialize_or_update_viewport(
+            &mut shared.viewports,
+            ViewportIdPair::from_self_and_parent(grandchild, child),
+            ViewportClass::Immediate,
+            ViewportBuilder::default(),
+            None,
+            &mut shared.painter,
+        );
+        let retired = native_viewport_subtree(&shared.viewports, child);
+        assert_eq!(retired.len(), 2);
+        assert!(retired.contains(&grandchild));
+        let active: ViewportIdSet = shared
+            .viewports
+            .keys()
+            .copied()
+            .filter(|id| !retired.contains(id))
+            .collect();
+        let drops = Rc::new(std::cell::Cell::new(0));
+        // Fake native window, State and surface owners: no OS or GPU creation.
+        let mut resources: HashMap<_, _> = [ViewportId::ROOT, child, grandchild, sibling]
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    [
+                        Resource(drops.clone()),
+                        Resource(drops.clone()),
+                        Resource(drops.clone()),
+                    ],
+                )
+            })
+            .collect();
+        let mut mapping: HashMap<_, _> = [
+            (0, ViewportId::ROOT),
+            (1, child),
+            (2, grandchild),
+            (3, sibling),
+        ]
+        .into_iter()
+        .collect();
+        retain_viewport_resources(&mut shared.viewports, &mut mapping, &active, |active| {
+            resources.retain(|id, _| active.contains(id));
+        });
+        assert_eq!(drops.get(), 6);
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(resources.len(), 2);
+        assert!(!shared.viewports.contains_key(&child));
+        assert!(!shared.viewports.contains_key(&grandchild));
+        assert!(shared.viewports.contains_key(&sibling));
+        // Repeating ordinary GC does not retire retained siblings a second time.
+        retain_viewport_resources(&mut shared.viewports, &mut mapping, &active, |active| {
+            resources.retain(|id, _| active.contains(id));
+        });
+        assert_eq!(drops.get(), 6);
     }
 }

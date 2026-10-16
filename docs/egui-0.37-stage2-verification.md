@@ -1119,3 +1119,99 @@ native/run.rs・scheduler・EpiIntegration・製品コード・旧vendor・両gr
 追加repaint・強制UI・App補助flag・新queue／pending bool・独自延期／retryは追加しない。
 Close受付・消費・非描画退役とroot LogicOnly Close回帰は2c-4へ残した。実機確認・正式独立レビューは別工程。
 依存取得・ネットワーク・live・製品build／起動・test-full.ps1・git add／commit／branch操作は行っていない。
+
+## 段2c-4a 子Closeの非描画受付・消費・退役（2026-10-17）
+
+開始HEAD `41ec02184`。2c-3bは設計担当がコミット済み、独立レビュー中との引継ぎで着手。
+設計書第4.4版§4.2の非表示子Close・受付／判断／消費・対象限定退役、§4.8 eframe、
+段2cのClose受入条件と案B11、§11の合意を読み直した。今回の分割指示に従い、
+案B15のroot logic-only Close確定回帰は2c-4bへ残す。
+以下は**実装担当の内部確認**であり正式な独立レビュー・ACCEPTではない。未ステージ・未コミット。
+
+### 実装・接続と分類（b・新規）
+
+`App::on_viewport_close_requested(ctx, viewport_id)`と`ViewportCloseResponse`を追加した。
+CloseはAppの既存終了ownerが終了を確定した結果、Cancelは今回の拒否、DelegateToUiは既定の従来UI委譲。
+製品のmodal・window/context判定をvendorへ持ち込まない。rootにはこのhookを呼ばず、既存終了／tray経路を保つ。
+両backendはOS event処理の完了時とouter Full／logicの前後で共通`viewport_lifecycle`入口へ渡す。
+App hookはnative map／State／painter／Contextのborrow・lockを持たず、描画passの外で呼ぶ。
+入れ子immediate callbackでは呼ばず、既存の最外FullOutputへ集約されたcommandsの通常配送後に扱う。
+
+OS Closeとprogrammatic Closeは既存のViewportInfoイベント／既存deferred commandsを同じ受付で扱う。
+window未生成・最初の子callback前でも受付できる。承認・拒否とも対象info.eventsと、全viewport ownerの
+pending_raw_input／State内metadata snapshotから対象Closeだけを消費する。通常key・pointer・release・focus・
+ModifiersChanged・IME終端列は取り除かない。兄弟Closeも変更しない。拒否ラッチは作らず新しいCloseを受け付ける。
+
+Contextのcached RawInputにも古いCloseを残さないため、`Context::consume_viewport_close`を限定追加した。
+既存ViewportStateだけを走査し、対象metadataのCloseだけを消す。public input_mut_forを未知のviewportに
+適用して登録を作る方法は採らない。root／UI pass中は拒否し、memory全体や通常input eventsはresetしない。
+この補助入口は要求を新規保存・抑止するものではなく、合意済みのsnapshot消費の接続である。
+
+承認後はnative側の対象と子孫を、通常GCと同じresource cleanupへ渡す。window・WindowId対応・State・
+surface・保留入力・callback ownerを除き、対象を指すfocus／resize／current-surface identityだけを終了する。
+native公開停止後にborrow外で段2a-3のContext::retire_viewportを呼び、戻ったID列だけを準備egui-imeの
+`retire_viewport_ime_policy`へ渡す。composition・focus contract・既存retryを対象限定で整理する。
+入力／出力hookの次の実行を待たず、同IDの明示再open・run_logicへ旧policyを持ち越さない。
+eframeの準備egui-ime依存はnative dev-dependencyからnative実依存へ移した。同じ準備crate実体を使い、
+新依存の取得は不要。製品側egui-imeとroot graphは不変、双方のCargo.lockも変わらなかった。
+
+2c-1／3a／3bで生成deltaはviewport再検索より前に既存共有renderer ownerへ渡してある。
+退役helperはそのownerを除かず、未配送deltaをclearしない。兄弟のtexture・surface・入力・IME・寿命は保つ。
+hide／minimizeは退役要求に変換しない。追加repaint・RequestPaintWhileHidden・強制UI・復帰待ちqueue・
+新pending bool・拒否ラッチ・退役済みIDリスト・retry・全memory resetは追加しない。
+
+### 窓なし回帰と証拠の範囲
+
+| 回帰 | 内容 |
+| --- | --- |
+| eframe wgpu 3件 | 実Rc backend adapter／共通dispatch＋fake App（uiでpanic）、実State。初回callback前の最小化子Close拒否→root LogicOnly→復元した子Full→親Full→再発火なし→新programmatic Close承認。通常入力順序、共有delta、兄弟保持、後続Fullの非再作成。既定AppのUI委譲・root対象外。通常GCと共用するcleanupへfake native／surface ownerを接続し実際のdropを検査 |
+| eframe glow 4件 | 実使用selector／snapshot消費、実State入力列、root・兄弟要求。共通dispatch＋fake Appとresource ownerを接続し、拒否→復元子／親Full→再発火なし→新programmatic Close承認、実Context退役と後続兄弟／root Full、native所有物drop・WindowId両方向対応・共有delta不変。通常GCと同じ対象／子孫cleanup |
+| egui 1件 | 実run_logicで作った複数viewportのcached snapshotから対象Closeだけ消費。通常events・root／兄弟Closeを保ち、未知IDで登録を作らず、新しいCloseは残す |
+| egui-ime 2件 | 実Contextの対象／子孫退役から明示policy整理へ接続。同IDをUI無しで再登録／logic実行、実TextEdit入力、兄弟composition／入力／focus contract／retry保持、hidden／minimizedの非退役。plugin無しのcleanupと非自動install |
+
+Closeの受付・承認時にApp::ui／子callbackを呼んで成功させていない。拒否後の復元Fullは再発火しないことを
+検査する別の通常UI操作であり、承認・退役を実行する条件ではない。App hook内の再borrowとContext参照も検査した。
+FullOutput／headless deltaは検査後に明示破棄する。fake native ownerは実cleanup helperでmap除去・dropまで検査する。
+glowの実GlutinWindowContext構築、OSイベントループ全体と実HWND／GL surface破棄はsource接続の照合まで。
+実GPU consumerは同graphのegui-wgpu16件で別に検査した。製品Appの既存終了ownerへの正式接続は段3。
+
+### 部分復元と内部確認の修正
+
+各変異は一時的に外し、finallyで元byteへ戻した。いずれも期待どおり失敗（exit 101）した。
+
+| 部分復元 | 結果 |
+| --- | --- |
+| 共通dispatchからbackend snapshot消費を除く | Close7件中5 passed／2 failed、同じ拒否要求を再受付 |
+| 共通dispatchから承認後の退役を除く | Close7件中5 passed／2 failed、native ownerが残存 |
+| Context cached Close消費を除く | 対象1件が失敗、0 passed／1 failed |
+| 明示IME policy整理からcomposition owner除去を除く | 対象2件中1 passed／1 failed |
+
+初回compileでfixtureのcustom-hasher mapへarray.intoを使ったE0277を、into_iter().collectへ修正した。
+glowの最初の接続回帰は退役後の兄弟RawInputにcurrent viewportのmap登録が無く失敗したため、
+存続backend ownerからmetadataを組み立てるよう修正し、実Contextとassertionを維持した。
+これらは内部fixtureの修正であり実windowの障害観測ではない。失敗ログも残している。
+
+### 最終検証・残作業
+
+Rust 1.99.0、cargo locked／offline。MSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=1。
+最終14項目は`target/verify-stage2c4a.py`、変異は`target/mutate-stage2c4a.py`。
+command・所要時間・件数・exit codeは`target/egui037-stage2c4a-results.json`、ログは同prefixの各項目名.log。
+
+| 検証 | 最終結果 |
+| --- | --- |
+| eframe lib default＋glow／persistence | 53 passed／0 failed／1 ignored、exit 0 |
+| eframe lib 上記＋miv-test-script-window-witness | 57 passed／0 failed／1 ignored、exit 0 |
+| eframe lib glow／default_fontsのみ | 43 passed／0 failed／0 ignored、exit 0 |
+| egui-wgpu lib（winit） | 16 passed／0 failed／0 ignored、exit 0、GPU skipなし |
+| egui／egui-winit／egui-ime lib | 107／43／30 passed、失敗・ignoreなし、各exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧graph |
+| root fmt／fmt --check、準備fmt --all／fmt --all --check | すべてexit 0 |
+| git diff --check、新file空白、検証後source hash／保護対象／index照合 | 成功 |
+
+検証済みsource hashはtested-source.json、対象diff・保護対象はaudit.json（同prefix）。
+live試験はignoreと内部の子再実行用--ignoredを維持し、今回の実行には--ignoredを付けていない。
+root workspace／patch／製品・旧vendor・両lock・schedulerは不変。既存警告は残る。
+設計との重大な食い違いはない。snapshot消費補助入口とnative IME依存の接続は上記に明示した。
+案B15のroot logic-only Close確定回帰は分割指示どおり2c-4b、製品接続は段3、実機確認は段7へ残す。
+正式独立レビューは別工程。ネットワーク・依存取得・live・製品build／起動・test-full.ps1・
+git add／commit／branch操作は行っていない。

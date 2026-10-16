@@ -68,3 +68,17 @@ with stale input metadata and a reset pass counter, and field replacement while
 an old retry is undrawn. Explicit pass-free Close retirement is not connected by
 eframe yet; its policy cleanup remains stage 2c-4 work. Carry this lifecycle delta
 and both regressions into the single product policy at stage 3 consolidation.
+
+## Stage 2c-4a explicit Close retirement (2026-10-17)
+
+実装担当の内部確認; not independent acceptance.
+`retire_viewport_ime_policy(ctx, retired_ids)` ends only the composition entries,
+focus contracts and known field retries returned by Context::retire_viewport.
+It shares focus cleanup with normal GC, does not install a missing plugin, and
+does not infer retirement from hidden/minimized metadata. Eframe calls it after
+native and Context retirement, outside locks and before same-ID reuse or logic.
+Two headless regressions cover actual Context retirement, descendants, sibling
+composition/input/focus/retry preservation, same-ID logic reopening without a UI
+gap, real TextEdit, and cleanup without a plugin. No queue or shared-data reset.
+Carry this explicit lifecycle API and regressions into the single product policy
+at stage 3; root's current egui-ime implementation remains unchanged in this stage.

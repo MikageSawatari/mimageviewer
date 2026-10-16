@@ -3,6 +3,7 @@ mod epi_integration;
 mod event_loop_context;
 mod frame_output;
 pub mod run;
+mod viewport_lifecycle;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;

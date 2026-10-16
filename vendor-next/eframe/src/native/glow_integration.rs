@@ -39,6 +39,9 @@ use super::{
         ImmediateViewportBackend, PassDecision, WinitImmediateOutputTarget, WinitOutputTarget,
         finish_main_viewport_output, run_immediate_viewport,
     },
+    viewport_lifecycle::{
+        ChildCloseBackend, consume_close_in_input, dispatch_child_close_requests,
+    },
     winit_integration::{EventResult, PassMode, UserEvent, WinitApp, create_egui_context},
 };
 use crate::epaint::textures::TexturesDelta;
@@ -630,6 +633,16 @@ impl WinitApp for GlowWinitApp<'_> {
 }
 
 impl GlowWinitRunning<'_> {
+    fn dispatch_child_close_requests(&mut self) {
+        dispatch_child_close_requests(
+            &self.integration.egui_ctx,
+            self.app.as_mut(),
+            &mut GlowChildCloseBackend {
+                glutin: &self.glutin,
+            },
+        );
+    }
+
     fn run_ui_and_paint(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -637,6 +650,10 @@ impl GlowWinitRunning<'_> {
         mode: PassMode,
     ) -> Result<EventResult> {
         profiling::function_scope!();
+
+        // Close is a lifecycle request, and must precede input acquisition even
+        // for an immediate viewport or a LogicOnly/otherwise skipped child.
+        self.dispatch_child_close_requests();
 
         let Some(viewport_id) = self
             .glutin
@@ -771,6 +788,9 @@ impl GlowWinitRunning<'_> {
                     .and_then(|viewport| viewport.window.as_deref()),
             );
 
+            // Logic commands can close a child without producing a UI pass.
+            self.dispatch_child_close_requests();
+
             return Ok(if self.integration.should_close() {
                 EventResult::CloseRequested
             } else {
@@ -845,13 +865,13 @@ impl GlowWinitRunning<'_> {
         let Self {
             integration,
             app,
-            glutin,
+            glutin: glutin_cell,
             painter,
             pending_deltas,
             ..
         } = self;
 
-        let mut glutin = glutin.borrow_mut();
+        let mut glutin = glutin_cell.borrow_mut();
         let mut painter = painter.borrow_mut();
         let mut pending_deltas = pending_deltas.borrow_mut();
 
@@ -1022,6 +1042,21 @@ impl GlowWinitRunning<'_> {
 
         sleep_if_invisible_or_minimized(window.as_deref());
 
+        // Nested immediate output is now merged into this outer output and all
+        // commands/GC and shared texture ownership have completed. App hooks
+        // and Context retirement must run outside every renderer/native borrow.
+        drop(window);
+        drop(pending_deltas);
+        drop(painter);
+        drop(glutin);
+        dispatch_child_close_requests(
+            &integration.egui_ctx,
+            app.as_mut(),
+            &mut GlowChildCloseBackend {
+                glutin: glutin_cell,
+            },
+        );
+
         if integration.should_close() {
             Ok(EventResult::CloseRequested)
         } else {
@@ -1030,6 +1065,17 @@ impl GlowWinitRunning<'_> {
     }
 
     fn on_window_event(
+        &mut self,
+        window_id: WindowId,
+        event: &winit::event::WindowEvent,
+    ) -> EventResult {
+        let result = self.on_window_event_inner(window_id, event);
+        // on_window_event_inner has released GlutinWindowContext and State.
+        self.dispatch_child_close_requests();
+        result
+    }
+
+    fn on_window_event_inner(
         &mut self,
         window_id: WindowId,
         event: &winit::event::WindowEvent,
@@ -1170,6 +1216,122 @@ impl GlowWinitRunning<'_> {
             EventResult::Wait
         }
     }
+}
+
+/// Short native borrows only: neither the App hook nor Context retirement may
+/// hold the RefCell borrowed by the immediate viewport renderer.
+struct GlowChildCloseBackend<'a> {
+    glutin: &'a RefCell<GlutinWindowContext>,
+}
+
+impl ChildCloseBackend for GlowChildCloseBackend<'_> {
+    fn close_requests(&self) -> Vec<ViewportId> {
+        glow_child_close_requests(&self.glutin.borrow().viewports)
+    }
+
+    fn consume_close(&mut self, id: ViewportId) {
+        consume_glow_child_close(&mut self.glutin.borrow_mut().viewports, id);
+    }
+
+    fn retire(&mut self, ctx: &egui::Context, id: ViewportId) {
+        assert_ne!(id, ViewportId::ROOT);
+        {
+            let mut glutin = self.glutin.borrow_mut();
+            let retired = glow_viewport_subtree(
+                id,
+                glutin.viewports.iter().map(|(id, vp)| (*id, vp.ids.parent)),
+            );
+            glutin.retire_viewport_resources(&retired);
+        }
+        // Produced deltas already belong to GlowWinitRunning's shared painter
+        // owner, which this target-limited cleanup deliberately does not touch.
+        retire_glow_child_context(ctx, id);
+    }
+}
+
+fn retire_glow_child_context(ctx: &egui::Context, id: ViewportId) {
+    let retired = ctx.retire_viewport(id);
+    egui_ime::retire_viewport_ime_policy(ctx, &retired);
+}
+
+fn glow_child_close_requests<Owner: std::borrow::Borrow<Viewport>>(
+    viewports: &OrderedViewportIdMap<Owner>,
+) -> Vec<ViewportId> {
+    viewports
+        .iter()
+        .filter_map(|(id, vp)| {
+            let vp = vp.borrow();
+            (*id != ViewportId::ROOT
+                && (vp.info.close_requested()
+                    || vp.deferred_commands.contains(&egui::ViewportCommand::Close)))
+            .then_some(*id)
+        })
+        .collect()
+}
+
+fn consume_glow_child_close<Owner: std::borrow::BorrowMut<Viewport>>(
+    viewports: &mut OrderedViewportIdMap<Owner>,
+    id: ViewportId,
+) {
+    for (owner, vp) in viewports {
+        let vp = vp.borrow_mut();
+        if *owner == id {
+            vp.info
+                .events
+                .retain(|event| !matches!(event, egui::ViewportEvent::Close));
+            vp.deferred_commands
+                .retain(|command| !matches!(command, egui::ViewportCommand::Close));
+        }
+        // Every snapshot can mention the target; only its Close flag is
+        // consumed. Ordinary events, metadata and sibling flags stay intact.
+        consume_close_in_input(&mut vp.pending_raw_input, id);
+        if let Some(state) = &mut vp.egui_winit {
+            consume_close_in_input(state.egui_input_mut(), id);
+        }
+    }
+}
+
+fn glow_viewport_subtree(
+    root: ViewportId,
+    parents: impl Iterator<Item = (ViewportId, ViewportId)>,
+) -> egui::ViewportIdSet {
+    let parents: Vec<_> = parents.collect();
+    let mut retired = egui::ViewportIdSet::from_iter([root]);
+    loop {
+        let count = retired.len();
+        for (id, parent) in &parents {
+            if *id != ViewportId::ROOT && retired.contains(parent) {
+                retired.insert(*id);
+            }
+        }
+        if retired.len() == count {
+            return retired;
+        }
+    }
+}
+
+/// Common resource-owner cleanup for normal output GC and approved child
+/// retirement. Generic owners let headless tests observe real map removals and
+/// destruction without constructing a GL context or a native window.
+fn retire_glow_viewport_resources<Owner, WindowKey: Eq + std::hash::Hash>(
+    viewports: &mut OrderedViewportIdMap<Owner>,
+    viewport_from_window: &mut HashMap<WindowKey, ViewportId>,
+    window_from_viewport: &mut OrderedViewportIdMap<WindowKey>,
+    current_viewport: &mut Option<ViewportId>,
+    focused_viewport: &mut Option<ViewportId>,
+    retired: &egui::ViewportIdSet,
+) {
+    if current_viewport.is_some_and(|id| retired.contains(&id)) {
+        // The shared GL context survives; its cached surface identity does not.
+        *current_viewport = None;
+    }
+    if focused_viewport.is_some_and(|id| retired.contains(&id)) {
+        *focused_viewport = None;
+    }
+    viewport_from_window.retain(|_, id| !retired.contains(id));
+    window_from_viewport.retain(|id, _| !retired.contains(id));
+    // Drop each target's State, pending input, surface and window together.
+    viewports.retain(|id, _| !retired.contains(id));
 }
 
 /// Resource updates use a surviving shared-context surface, independent of
@@ -1657,20 +1819,28 @@ impl GlutinWindowContext {
         &mut self,
         viewport_output: &OrderedViewportIdMap<ViewportOutput>,
     ) {
-        if let Some(current_viewport) = self.current_viewport
-            && !viewport_output.contains_key(&current_viewport)
-        {
-            // The context is still current, but on a surface we are about to drop.
-            self.current_viewport = None;
-        }
+        let retired = self
+            .viewports
+            .keys()
+            .chain(self.window_from_viewport.keys())
+            .chain(self.viewport_from_window.values())
+            .chain(self.current_viewport.iter())
+            .chain(self.focused_viewport.iter())
+            .copied()
+            .filter(|id| !viewport_output.contains_key(id))
+            .collect();
+        self.retire_viewport_resources(&retired);
+    }
 
-        // GC old viewports
-        self.viewports
-            .retain(|id, _| viewport_output.contains_key(id));
-        self.viewport_from_window
-            .retain(|_, id| viewport_output.contains_key(id));
-        self.window_from_viewport
-            .retain(|id, _| viewport_output.contains_key(id));
+    fn retire_viewport_resources(&mut self, retired: &egui::ViewportIdSet) {
+        retire_glow_viewport_resources(
+            &mut self.viewports,
+            &mut self.viewport_from_window,
+            &mut self.window_from_viewport,
+            &mut self.current_viewport,
+            &mut self.focused_viewport,
+            retired,
+        );
     }
 
     fn handle_viewport_output(
@@ -2439,6 +2609,534 @@ mod viewport_input_tests {
             sibling_input.events,
             vec![egui::Event::Text("old-sibling".into())]
         );
+    }
+}
+
+#[cfg(test)]
+mod child_close_tests {
+    use super::*;
+
+    struct NoDisplay;
+
+    impl raw_window_handle::HasDisplayHandle for NoDisplay {
+        fn display_handle(
+            &self,
+        ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+        {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    fn viewports(ids: &[ViewportId]) -> OrderedViewportIdMap<Viewport> {
+        let mut viewports = OrderedViewportIdMap::default();
+        for &id in ids {
+            let vp = initialize_or_update_viewport(
+                &mut viewports,
+                &mut None,
+                ViewportIdPair::from_self_and_parent(id, ViewportId::ROOT),
+                ViewportClass::Deferred,
+                ViewportBuilder::default(),
+                Some(Arc::new(|_| {
+                    panic!("Close must not invoke a child callback")
+                })),
+            );
+            vp.info.minimized = Some(true);
+            vp.egui_winit = Some(egui_winit::State::new(
+                egui::Context::default(),
+                id,
+                &NoDisplay,
+                None,
+                None,
+                None,
+            ));
+        }
+        viewports
+    }
+
+    #[test]
+    fn glow_child_close_sources_share_dispatch_selection_and_exclude_root() {
+        let child = ViewportId::from_hash_of("close-child");
+        let mut viewports = viewports(&[ViewportId::ROOT, child]);
+        // The OS producer publishes this same authoritative info event.
+        viewports.get_mut(&child).unwrap().info.events = vec![egui::ViewportEvent::Close];
+        viewports.get_mut(&ViewportId::ROOT).unwrap().info.events =
+            vec![egui::ViewportEvent::Close];
+        assert_eq!(glow_child_close_requests(&viewports), vec![child]);
+        consume_glow_child_close(&mut viewports, child);
+        assert!(glow_child_close_requests(&viewports).is_empty());
+        assert!(viewports[&ViewportId::ROOT].info.close_requested());
+
+        // Before native window initialization, programmatic Close remains a
+        // deferred command. It must not depend on window creation or first UI.
+        let ctx = egui::Context::default();
+        viewports
+            .get_mut(&child)
+            .unwrap()
+            .process_commands(&ctx, vec![egui::ViewportCommand::Close]);
+        assert_eq!(glow_child_close_requests(&viewports), vec![child]);
+        consume_glow_child_close(&mut viewports, child);
+        assert!(glow_child_close_requests(&viewports).is_empty());
+        viewports.get_mut(&child).unwrap().info.events = vec![egui::ViewportEvent::Close];
+        assert_eq!(glow_child_close_requests(&viewports), vec![child]);
+    }
+
+    #[test]
+    fn glow_child_close_consumption_preserves_normal_events_and_sibling_requests() {
+        let child = ViewportId::from_hash_of("cancel-child");
+        let sibling = ViewportId::from_hash_of("cancel-sibling");
+        let ids = [ViewportId::ROOT, child, sibling];
+        let mut viewports = viewports(&ids);
+        let ordinary = vec![
+            egui::Event::Text("keep".into()),
+            egui::Event::PointerGone,
+            egui::Event::WindowFocused(false),
+            egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        for &owner in &ids {
+            let vp = viewports.get_mut(&owner).unwrap();
+            vp.info.events = vec![egui::ViewportEvent::Close];
+            let input = egui::RawInput {
+                viewport_id: owner,
+                events: ordinary.clone(),
+                viewports: ids
+                    .iter()
+                    .map(|id| {
+                        (
+                            *id,
+                            ViewportInfo {
+                                events: vec![egui::ViewportEvent::Close],
+                                minimized: Some(true),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            vp.pending_raw_input = input.clone();
+            *vp.egui_winit.as_mut().unwrap().egui_input_mut() = input;
+        }
+
+        consume_glow_child_close(&mut viewports, child);
+        assert!(!viewports[&child].info.close_requested());
+        assert!(viewports[&sibling].info.close_requested());
+        for &owner in &ids {
+            let vp = &viewports[&owner];
+            for input in [
+                &vp.pending_raw_input,
+                vp.egui_winit.as_ref().unwrap().egui_input(),
+            ] {
+                assert_eq!(input.events, ordinary);
+                assert_eq!(input.viewport_id, owner);
+                assert!(!input.viewports[&child].close_requested());
+                assert!(input.viewports[&sibling].close_requested());
+                assert!(input.viewports[&ViewportId::ROOT].close_requested());
+                assert_eq!(input.viewports[&child].minimized, Some(true));
+            }
+        }
+        // Refusing one request neither retains it nor suppresses a fresh one.
+        viewports.get_mut(&child).unwrap().info.events = vec![egui::ViewportEvent::Close];
+        assert!(glow_child_close_requests(&viewports).contains(&child));
+    }
+
+    struct NativeResource {
+        id: ViewportId,
+        kind: &'static str,
+        dropped: Rc<RefCell<Vec<(ViewportId, &'static str)>>>,
+    }
+
+    impl Drop for NativeResource {
+        fn drop(&mut self) {
+            self.dropped.borrow_mut().push((self.id, self.kind));
+        }
+    }
+
+    struct ResourceOwner {
+        // Real State/pending/callback ownership plus headless native handles.
+        viewport: Viewport,
+        _window: NativeResource,
+        _surface: NativeResource,
+    }
+
+    impl std::borrow::Borrow<Viewport> for ResourceOwner {
+        fn borrow(&self) -> &Viewport {
+            &self.viewport
+        }
+    }
+
+    impl std::borrow::BorrowMut<Viewport> for ResourceOwner {
+        fn borrow_mut(&mut self) -> &mut Viewport {
+            &mut self.viewport
+        }
+    }
+
+    struct SharedDelta(TexturesDelta);
+
+    impl Drop for SharedDelta {
+        fn drop(&mut self) {
+            self.0.clear();
+        }
+    }
+
+    struct HeadlessNativeResources {
+        owners: OrderedViewportIdMap<ResourceOwner>,
+        from_window: HashMap<usize, ViewportId>,
+        from_viewport: OrderedViewportIdMap<usize>,
+        current: Option<ViewportId>,
+        focused: Option<ViewportId>,
+        pending_delta: SharedDelta,
+    }
+
+    impl ChildCloseBackend for Rc<RefCell<HeadlessNativeResources>> {
+        fn close_requests(&self) -> Vec<ViewportId> {
+            glow_child_close_requests(&self.borrow().owners)
+        }
+
+        fn consume_close(&mut self, id: ViewportId) {
+            consume_glow_child_close(&mut self.borrow_mut().owners, id);
+        }
+
+        fn retire(&mut self, ctx: &egui::Context, id: ViewportId) {
+            {
+                let mut resources = self.borrow_mut();
+                let retired = glow_viewport_subtree(
+                    id,
+                    resources
+                        .owners
+                        .iter()
+                        .map(|(id, owner)| (*id, owner.viewport.ids.parent)),
+                );
+                let HeadlessNativeResources {
+                    owners,
+                    from_window,
+                    from_viewport,
+                    current,
+                    focused,
+                    ..
+                } = &mut *resources;
+                retire_glow_viewport_resources(
+                    owners,
+                    from_window,
+                    from_viewport,
+                    current,
+                    focused,
+                    &retired,
+                );
+            }
+            retire_glow_child_context(ctx, id);
+        }
+    }
+
+    #[test]
+    fn glow_child_close_dispatch_cancels_then_retires_native_and_context_without_ui() {
+        let child = ViewportId::from_hash_of("dispatch-child");
+        let sibling = ViewportId::from_hash_of("dispatch-sibling");
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        ctx.run_ui(Default::default(), |ui| {
+            for id in [child, sibling] {
+                ui.ctx()
+                    .show_viewport_deferred(id, ViewportBuilder::default(), |_, _| {
+                        panic!("lifecycle must not run deferred UI")
+                    });
+            }
+        })
+        .drop_without_applying_deltas();
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let owners: OrderedViewportIdMap<_> = viewports(&[ViewportId::ROOT, child, sibling])
+            .into_iter()
+            .map(|(id, mut viewport)| {
+                if id != sibling {
+                    viewport.info.events.push(egui::ViewportEvent::Close);
+                }
+                viewport.pending_raw_input.events = vec![egui::Event::Text("kept".into())];
+                let resource = |kind| NativeResource {
+                    id,
+                    kind,
+                    dropped: Rc::clone(&dropped),
+                };
+                (
+                    id,
+                    ResourceOwner {
+                        viewport,
+                        _window: resource("window"),
+                        _surface: resource("surface"),
+                    },
+                )
+            })
+            .collect();
+        let from_window: HashMap<_, _> = owners
+            .keys()
+            .enumerate()
+            .map(|(window, id)| (window, *id))
+            .collect();
+        let from_viewport = from_window
+            .iter()
+            .map(|(window, id)| (*id, *window))
+            .collect();
+        let mut pending_delta = SharedDelta(TexturesDelta::default());
+        pending_delta.0.free(egui::TextureId::Managed(851));
+        let expected_delta = SharedDelta(pending_delta.0.clone());
+        let mut backend = Rc::new(RefCell::new(HeadlessNativeResources {
+            owners,
+            from_window,
+            from_viewport,
+            current: Some(child),
+            focused: Some(child),
+            pending_delta,
+        }));
+        struct CloseOwner {
+            backend: Rc<RefCell<HeadlessNativeResources>>,
+            response: crate::ViewportCloseResponse,
+            calls: Vec<ViewportId>,
+        }
+        impl App for CloseOwner {
+            fn ui(&mut self, _: &mut egui::Ui, _: &mut crate::Frame) {
+                panic!("Close dispatch must not call App::ui");
+            }
+
+            fn on_viewport_close_requested(
+                &mut self,
+                ctx: &egui::Context,
+                id: ViewportId,
+            ) -> crate::ViewportCloseResponse {
+                // A real hook can enter its own owner and inspect Context.
+                let _exclusive_access = self.backend.borrow_mut();
+                ctx.input(|_| {});
+                self.calls.push(id);
+                self.response
+            }
+        }
+        let mut app = CloseOwner {
+            backend: Rc::clone(&backend),
+            response: crate::ViewportCloseResponse::Cancel,
+            calls: Vec::new(),
+        };
+        dispatch_child_close_requests(&ctx, &mut app, &mut backend);
+        dispatch_child_close_requests(&ctx, &mut app, &mut backend);
+        assert_eq!(app.calls, [child]);
+        assert!(dropped.borrow().is_empty());
+        assert!(
+            !backend.borrow().owners[&child]
+                .viewport
+                .info
+                .close_requested()
+        );
+
+        // The modal has ended and the child is restored through an ordinary
+        // child Full, then a parent Full. Neither may rediscover the rejection.
+        let input = {
+            let mut resources = backend.borrow_mut();
+            let vp = &mut resources.owners.get_mut(&child).unwrap().viewport;
+            vp.info.minimized = Some(false);
+            let mut input = epi_integration::take_viewport_input(&mut vp.pending_raw_input, || {
+                vp.egui_winit.as_mut().unwrap().egui_input_mut().take()
+            });
+            input.viewport_id = child;
+            input.viewports = resources
+                .owners
+                .iter()
+                .map(|(id, owner)| (*id, owner.viewport.info.clone()))
+                .collect();
+            input
+        };
+        let mut normal_child_calls = 0;
+        ctx.run_ui(input, |ui| {
+            normal_child_calls += 1;
+            assert!(!ui.input(|input| input.viewport().close_requested()));
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(Default::default(), |ui| {
+            for id in [child, sibling] {
+                ui.ctx()
+                    .show_viewport_deferred(id, ViewportBuilder::default(), |_, _| {});
+            }
+        })
+        .drop_without_applying_deltas();
+        dispatch_child_close_requests(&ctx, &mut app, &mut backend);
+        assert_eq!(normal_child_calls, 1);
+        assert_eq!(app.calls, [child]);
+
+        // A fresh programmatic request uses the same production selector and
+        // consumer, without requiring native initialization or another UI pass.
+        backend
+            .borrow_mut()
+            .owners
+            .get_mut(&child)
+            .unwrap()
+            .viewport
+            .process_commands(&ctx, vec![egui::ViewportCommand::Close]);
+        app.response = crate::ViewportCloseResponse::Close;
+        dispatch_child_close_requests(&ctx, &mut app, &mut backend);
+        dispatch_child_close_requests(&ctx, &mut app, &mut backend);
+        assert_eq!(app.calls, [child, child]);
+        {
+            let backend = backend.borrow();
+            assert!(!backend.owners.contains_key(&child));
+            assert_eq!(backend.owners.len(), 2);
+            assert_eq!(backend.from_window.len(), 2);
+            assert_eq!(backend.from_viewport.len(), 2);
+            assert!(backend.current.is_none());
+            assert!(backend.focused.is_none());
+            assert!(
+                backend.owners[&ViewportId::ROOT]
+                    .viewport
+                    .info
+                    .close_requested()
+            );
+            assert_eq!(
+                backend.owners[&sibling].viewport.pending_raw_input.events,
+                vec![egui::Event::Text("kept".into())]
+            );
+            assert!(backend.pending_delta.0 == expected_delta.0);
+        }
+        assert_eq!(
+            dropped.borrow().as_slice(),
+            [(child, "window"), (child, "surface")]
+        );
+        // The adapter used the actual non-drawing Context retirement, not just
+        // native bookkeeping. Later sibling/root Full outputs cannot recreate it.
+        assert!(ctx.retire_viewport(child).is_empty());
+        for id in [sibling, ViewportId::ROOT] {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    viewport_id: id,
+                    viewports: backend
+                        .borrow()
+                        .owners
+                        .iter()
+                        .map(|(id, owner)| (*id, owner.viewport.info.clone()))
+                        .collect(),
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            assert!(!output.viewport_output.contains_key(&child));
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn glow_child_close_retirement_drops_native_owners_and_subtree_using_normal_gc_cleanup() {
+        let child = ViewportId::from_hash_of("retire-child");
+        let descendant = ViewportId::from_hash_of("retire-descendant");
+        let sibling = ViewportId::from_hash_of("retire-sibling");
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let mut viewports = viewports(&[ViewportId::ROOT, child, descendant, sibling]);
+        viewports.get_mut(&descendant).unwrap().ids.parent = child;
+        viewports
+            .get_mut(&sibling)
+            .unwrap()
+            .pending_raw_input
+            .events = vec![egui::Event::Text("sibling pending".into())];
+        viewports
+            .get_mut(&sibling)
+            .unwrap()
+            .egui_winit
+            .as_mut()
+            .unwrap()
+            .egui_input_mut()
+            .events = vec![egui::Event::Text("sibling State".into())];
+        let retired =
+            glow_viewport_subtree(child, viewports.iter().map(|(id, vp)| (*id, vp.ids.parent)));
+        assert_eq!(retired, egui::ViewportIdSet::from_iter([child, descendant]));
+
+        let mut owners: OrderedViewportIdMap<_> = viewports
+            .into_iter()
+            .map(|(id, viewport)| {
+                let resource = |kind| NativeResource {
+                    id,
+                    kind,
+                    dropped: Rc::clone(&dropped),
+                };
+                (
+                    id,
+                    ResourceOwner {
+                        viewport,
+                        _window: resource("window"),
+                        _surface: resource("surface"),
+                    },
+                )
+            })
+            .collect();
+        let mut from_window: HashMap<_, _> = owners
+            .keys()
+            .enumerate()
+            .map(|(index, id)| (index, *id))
+            .collect();
+        let mut from_viewport: OrderedViewportIdMap<_> = from_window
+            .iter()
+            .map(|(window, id)| (*id, *window))
+            .collect();
+        let sibling_window = from_viewport[&sibling];
+        let mut current = Some(descendant);
+        let mut focused = Some(child);
+        let mut pending_delta = SharedDelta(TexturesDelta::default());
+        pending_delta.0.free(egui::TextureId::Managed(850));
+        let expected_delta = SharedDelta(pending_delta.0.clone());
+
+        retire_glow_viewport_resources(
+            &mut owners,
+            &mut from_window,
+            &mut from_viewport,
+            &mut current,
+            &mut focused,
+            &retired,
+        );
+        assert_eq!(owners.len(), 2);
+        assert!(owners.contains_key(&ViewportId::ROOT));
+        assert!(owners.contains_key(&sibling));
+        assert!(!owners.contains_key(&child));
+        assert!(!owners.contains_key(&descendant));
+        assert_eq!(from_window.len(), 2);
+        assert_eq!(from_viewport.len(), 2);
+        assert_eq!(from_window[&sibling_window], sibling);
+        assert!(current.is_none());
+        assert!(focused.is_none());
+        assert_eq!(dropped.borrow().len(), 4);
+        for &id in &[child, descendant] {
+            for kind in ["window", "surface"] {
+                assert!(dropped.borrow().contains(&(id, kind)));
+            }
+        }
+        assert_eq!(
+            owners[&sibling]
+                .viewport
+                .egui_winit
+                .as_ref()
+                .unwrap()
+                .egui_input()
+                .events,
+            vec![egui::Event::Text("sibling State".into())]
+        );
+        assert_eq!(
+            owners[&sibling].viewport.pending_raw_input.events,
+            vec![egui::Event::Text("sibling pending".into())]
+        );
+        assert!(pending_delta.0 == expected_delta.0);
+
+        // Reusing the same GC helper is idempotent; a surviving resource
+        // context can apply the original shared delta later.
+        current = Some(sibling);
+        focused = Some(sibling);
+        retire_glow_viewport_resources(
+            &mut owners,
+            &mut from_window,
+            &mut from_viewport,
+            &mut current,
+            &mut focused,
+            &retired,
+        );
+        assert_eq!(current, Some(sibling));
+        assert_eq!(focused, Some(sibling));
+        assert_eq!(dropped.borrow().len(), 4);
     }
 }
 

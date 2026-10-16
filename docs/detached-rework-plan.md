@@ -5536,3 +5536,23 @@ glowは既存rendererのdelta ownerをRcで共有し、viewport別ownerを除い
 正式な独立ACCEPTではなく、実HWND／GL surfaceは未実施。owner不在fixtureは資源配送の検査であり、
 Close／退役・再作成防止の検査ではない。Close受付・消費・非描画退役とroot Close回帰は2c-4へ残す。
 root製品graph・App・lockは不変。実window・live・製品は起動していない。
+
+#### 2026-10-17 段2c-4aの準備graph実装記録
+
+合意済みの非表示子Close受付・消費・非描画退役を、`vendor-next/eframe`の両backendへ接続した。
+対象ViewportId付きApp hookを、OS event完了とouter Full／logic前後のborrow・lock／pass外で呼ぶ。
+承認／拒否した要求はinfo.events・保留RawInput／State snapshotとContextの既存cached metadataから
+Closeだけを消費する。拒否後の新Closeを抑止せず、通常入力や兄弟の要求をresetしない。
+既定Appは従来UIへ委譲し、rootの終了／tray経路を子hookへ置き換えない。
+承認はAppの既存終了ownerによる確定結果とし、native公開停止・window／WindowId対応／State／surface／
+入力の対象／子孫cleanupを通常GCと共有する。既存共有rendererへのdelta移譲を先に済ませ、保持deltaを捨てない。
+borrow外でContext::retire_viewportへ接続し、返却IDだけのegui-ime composition／focus contract／retryを
+明示整理する。準備eframeのegui-imeをnative実依存へ移した。hide／minimizeだけのpruneは行わない。
+Contextのsnapshot消費補助入口は既存入力metadataだけを処理し、登録を作らず通常event列を保つ。
+追加repaint・強制UI・RequestPaintWhileHidden・新queue／pending bool・拒否／退役IDラッチ・retry・
+全memory resetで補っていない。子callbackや親FullでGCを起こす代用も採らない。
+**実装担当の内部確認**として実使用dispatch・消費・cleanupとfake App／resource owner、実State／Contextを
+接続し、拒否後Fullの非再発火・新要求・実際の資源drop・後続出力の非再作成・兄弟とIME policy保持を検査した。
+部分復元で失敗する証拠と全featureの結果は段2台帳。正式独立ACCEPT・実HWND／GL確認ではない。
+分割指示に従いroot logic-only Close確定回帰は2c-4bへ残す。製品Appの既存終了owner接続は段3。
+root製品graph・両lock・schedulerは不変。実window・live・製品は起動していない。

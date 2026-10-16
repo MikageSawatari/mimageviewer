@@ -111,3 +111,14 @@ producerとassertは変更していない。command・初回失敗の原因・�
 
 eframeのClose受付・消費・backend window／surface／State終了は段2cへ残す。
 本家へは通常GCのviewport別Memory残留とlock下callback破棄を、最小回帰と共に報告する価値がある（未送信）。
+
+## 段2c-4a: 処理済み子Closeのcached metadata消費（2026-10-17）
+
+`Context::consume_viewport_close`を限定追加した（b・新規）。**実装担当の内部確認**。
+eframeの子Close hookが承認／拒否した一回だけ、既存の全ViewportState.input.raw.viewportsから
+対象Closeを消費する。root／UI pass中は拒否し、通常input events・兄弟Close・他metadataは保つ。
+public input_mut_forで未知IDを列挙すると登録を作るため、既存内部mapだけを走査する。
+未知IDで登録を作らず、新しいCloseは抑止しない。新状態・queue・一括resetは追加しない。
+実Contextのrun_logic後snapshotと次の新Closeを検査する回帰を追加した。
+承認時の登録終了は既存retire_viewportのままで、IME policy整理は準備egui-imeの明示入口へ接続する。
+検証結果は段2台帳。正式な独立ACCEPT・実機確認ではない。
