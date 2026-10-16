@@ -29,6 +29,22 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 
 ---
 
+## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）
+
+画像producerと通常GPU prepareの実行配置は従来どおりで、演出用workerや待機queueを作らない。
+ただし現差分には品質publication後の新sourceのprepareがturn中へ前倒しされる未解決差分があり、
+安定viewの既存出力再利用との境界は設計判断待ちである（plan §27.11.1）。開始/完了時刻の維持は未達である。
+resident-only acceptの一時Normal入力leaseは、通常prepareの生成・submit後に描画素材へ置き換える。
+Native素材は`Arc<LanczosOutput>`の登録leaseだけを保持し、source handle/CPU pixelsを演出durationへ持ち越さない。
+source自体を描くManagedは実ハンドルとmip policyを保持する。native IDだけの寿命代用はしない。
+同じ素材をFlat/Turning/Completingと採用済みready/navigatorへ渡し、in-flight paint callbackが最終batchまで保持する。
+receiptは実提出unitの内容bindingを値で持ち、遅延readyの内容変更をsource cacheに依存せず拒否する。
+ON由来のOFF-Completingも同じ素材handoffを維持し、通常OFFではbinding snapshotを作らない。
+取消/close/入力supersessionは既存contextの状態を退役させ、残るbatchのleaseだけが最後に解放される。
+通常resident会計はcontext registryのmounted/at-rest/parked cacheを共通walkerで読むため、
+presentationからsource参照を外しても兄弟の通常source会計は消えない。共有TextureIdは全体で重複排除する。
+通常OFF fast pathとaccepted_at clockは変更しない。実装・検証の正本は[page-turn計画 §27.11](page-turn-animation-plan.md)。
+
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 
 `run_music_analysis` はデコード成功と取消なしを確認し、必要な `TimelineComplete` の送信後に

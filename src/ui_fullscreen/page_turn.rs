@@ -13,6 +13,8 @@ mod draw_submit_tests;
 mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
+#[cfg(test)]
+mod material_budget_tests;
 #[cfg(all(test, windows))]
 mod merge_master_tests;
 #[cfg(all(test, windows))]
@@ -262,7 +264,7 @@ pub(crate) fn install(ctx: &egui::Context) {
 pub(super) struct PreparedPagedPage {
     pub(super) occurrence: SpreadPageOccurrence,
     pub(super) transform: DisplayedImageTransform,
-    pub(super) resource: FullscreenPaintResource,
+    pub(super) resource: crate::gpu_lanczos::FullscreenPaintPayload,
     pub(super) painter: egui::Painter,
     pub(super) underlay: FsBgStyle,
     pub(super) live: bool,
@@ -277,7 +279,16 @@ pub(super) struct SubmittedUnitReceipt {
     pass: u64,
     pages: ReceiptPages,
     accepted: AcceptanceEvidence,
+    binding: SubmittedContentBinding,
     pub(super) curl: bool,
+}
+
+/// Immutable evidence travels with the accepted paint, independently of cache
+/// residency or a later change of presentation state. Ordinary OFF allocates no snapshot.
+#[derive(Clone)]
+enum SubmittedContentBinding {
+    Ordinary,
+    Presentation(Vec<PageTurnContent>),
 }
 
 type ReceiptPage = (SpreadPageOccurrence, egui::TextureId, egui::TextureId, f32);
@@ -324,6 +335,36 @@ impl AcceptanceEvidence {
 }
 
 impl SubmittedUnitReceipt {
+    pub(super) fn has_presentation_binding(&self) -> bool {
+        matches!(self.binding, SubmittedContentBinding::Presentation(_))
+    }
+
+    pub(super) fn content_matches(&self, app: &App) -> bool {
+        let SubmittedContentBinding::Presentation(content) = &self.binding else {
+            return false;
+        };
+        content.len() == self.pages.as_slice().len()
+            && content
+                .iter()
+                .zip(self.pages.as_slice())
+                .all(|(saved, (page, _, _, _))| *saved == app.page_turn_content(page.idx))
+    }
+
+    fn capture_binding(&mut self, unit: &PaintedUnit) {
+        if unit.content.len() == self.pages.as_slice().len()
+            && unit.pages.len() == self.pages.as_slice().len()
+            && unit.pages.iter().zip(self.pages.as_slice()).all(
+                |(page, (occurrence, source, paint, _))| {
+                    page.occurrence == *occurrence
+                        && page.resource.source_texture_id() == *source
+                        && page.resource.paint_texture_id() == *paint
+                },
+            )
+        {
+            self.binding = SubmittedContentBinding::Presentation(unit.content.clone());
+        }
+    }
+
     pub(super) fn matches(
         &self,
         destination: PresentationDestination,
@@ -656,7 +697,8 @@ struct PageTurnContent {
 #[derive(Clone)]
 struct AcceptedSource {
     occurrence: SpreadPageOccurrence,
-    resource: crate::gpu_lanczos::FullscreenPaintResource,
+    resource: crate::gpu_lanczos::FullscreenPaintPayload,
+    source_mipmapped: bool,
     quality: &'static str,
     content: PageTurnContent,
 }
@@ -664,20 +706,73 @@ struct AcceptedSource {
 struct AcceptedSources(Vec<AcceptedSource>);
 
 impl AcceptedSources {
+    fn diagnostics(&self) -> serde_json::Value {
+        if !crate::perf::is_enabled() {
+            return serde_json::Value::Null;
+        }
+        serde_json::json!(self.0.iter().map(|source| {
+            let mut allocation = material_diagnostics(&source.resource);
+            if let crate::gpu_lanczos::FullscreenPaintPayload::NormalResource(resource) = &source.resource {
+                let input_bytes = crate::vram_budget::texture_size_texels(resource.size(), source.source_mipmapped) as u64 * 4;
+                let output_bytes = resource.lanczos_output().map_or(0, |output| output.size()[0] as u64 * output.size()[1] as u64 * 4);
+                allocation["retained_bytes"] = (input_bytes + output_bytes).into();
+            }
+            serde_json::json!({
+            "idx": source.occurrence.idx,
+            "quality": source.quality,
+            "temporary_input": matches!(source.resource, crate::gpu_lanczos::FullscreenPaintPayload::NormalResource(_)),
+            "input_mipmapped": source.source_mipmapped,
+            "allocation": allocation,
+        })}).collect::<Vec<_>>())
+    }
+
     fn account(&self, accountant: &mut crate::vram_budget::VramAccountant) {
         for source in &self.0 {
-            accountant.add_texture(
-                crate::vram_budget::VramSubsystem::PageTurnPresentation,
-                source.resource.source_texture(),
-                true,
-            );
+            // Before ordinary prepare this is an input lease. It remains real
+            // resident memory, then is replaced by the prepared material once.
+            if let crate::gpu_lanczos::FullscreenPaintPayload::NormalResource(resource) =
+                &source.resource
+            {
+                accountant.add_texture(
+                    crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                    resource.source_texture(),
+                    source.source_mipmapped,
+                );
+                if let Some(output) = resource.lanczos_output() {
+                    accountant.add_texture_id(
+                        crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                        output.texture_id(),
+                        output.size(),
+                        false,
+                    );
+                }
+            } else {
+                source.resource.account_material(accountant);
+            }
         }
     }
 }
 
 impl PaintedUnit {
+    fn material_diagnostics(&self) -> serde_json::Value {
+        if !crate::perf::is_enabled() {
+            return serde_json::Value::Null;
+        }
+        serde_json::json!(
+            self.pages
+                .iter()
+                .map(|page| serde_json::json!({
+                    "idx": page.occurrence.idx,
+                    "allocation": material_diagnostics(&page.resource),
+                }))
+                .collect::<Vec<_>>()
+        )
+    }
     fn select_flat(previous: Arc<Self>, current: &Arc<Self>) -> Arc<Self> {
-        if previous.evidence.was_accepted() && previous.same_material_and_geometry(current) {
+        if previous.evidence.was_accepted()
+            && previous.content == current.content
+            && previous.same_material_and_geometry(current)
+        {
             previous
         } else {
             current.clone()
@@ -715,19 +810,7 @@ impl PaintedUnit {
     }
     fn account(&self, accountant: &mut crate::vram_budget::VramAccountant) {
         for page in &self.pages {
-            accountant.add_texture(
-                crate::vram_budget::VramSubsystem::PageTurnPresentation,
-                page.resource.source_texture(),
-                true,
-            );
-            if let Some(output) = page.resource.lanczos_output() {
-                accountant.add_texture_id(
-                    crate::vram_budget::VramSubsystem::PageTurnPresentation,
-                    output.texture_id(),
-                    output.size(),
-                    false,
-                );
-            }
+            page.resource.account_material(accountant);
             if let FsBgStyle::Checker(texture) = &page.underlay {
                 accountant.add_texture(
                     crate::vram_budget::VramSubsystem::PageTurnPresentation,
@@ -737,6 +820,23 @@ impl PaintedUnit {
             }
         }
     }
+}
+
+fn material_diagnostics(
+    resource: &crate::gpu_lanczos::FullscreenPaintPayload,
+) -> serde_json::Value {
+    let mut accountant = crate::vram_budget::VramAccountant::default();
+    resource.account_material(&mut accountant);
+    serde_json::json!({
+        "kind": if resource.lanczos_output().is_some() { "native" } else { "managed" },
+        "source_texture_id": format!("{:?}", resource.source_texture_id()),
+        "paint_texture_id": format!("{:?}", resource.paint_texture_id()),
+        "logical_size": resource.size(),
+        "paint_size": resource.lanczos_output().map_or(resource.size(), |output| output.size()),
+        "source_handle_retained": resource.source_texture().is_some(),
+        "retained_bytes": accountant.finish().total_bytes(),
+        "source_uv_domain": resource.visible_source_uv_rect().map(rect_diagnostics),
+    })
 }
 
 fn same_fit_policy(a: FullscreenFitInput, b: FullscreenFitInput) -> bool {
@@ -765,6 +865,17 @@ fn page_turn_pin_limit(budget: crate::vram_budget::VramPoolBudget) -> u64 {
     budget
         .fullscreen_bytes
         .map_or(1024 * 1024 * 1024, |bytes| bytes / 10)
+}
+
+fn page_turn_budget(app: &App, ctx: &egui::Context) -> crate::vram_budget::VramPoolBudget {
+    #[cfg(test)]
+    if let Some(budget) = ctx.data(|data| {
+        data.get_temp::<crate::vram_budget::VramPoolBudget>(egui::Id::new("page_turn_test_budget"))
+    }) {
+        return budget;
+    }
+    let _ = ctx;
+    app.vram_pool_budget()
 }
 
 fn same_underlay(a: &FsBgStyle, b: &FsBgStyle) -> bool {
@@ -1567,7 +1678,7 @@ impl App {
     pub(super) fn page_turn_held_resource(
         &self,
         idx: usize,
-    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintPayload> {
         if self.settings.page_turn_animation_enabled && !self.page_turn_view_eligible(idx) {
             return None;
         }
@@ -1614,6 +1725,21 @@ impl App {
         }
     }
 
+    /// Frozen geometry is value-only; it does not reacquire a source texture
+    /// merely to recover fit/aspect metadata after ordinary cache eviction.
+    pub(super) fn page_turn_held_transform(&self, idx: usize) -> Option<DisplayedImageTransform> {
+        self.page_turn_held_resource(idx)?;
+        match &self.page_turn_presentation.state {
+            PresentationState::Turning { incoming, .. }
+            | PresentationState::Completing { incoming, .. } => incoming
+                .pages
+                .iter()
+                .find(|page| page.occurrence.idx == idx)
+                .map(|page| page.transform),
+            _ => None,
+        }
+    }
+
     pub(super) fn page_turn_bind_prepared(&self, page: PreparedPagedPage) -> PreparedPagedPage {
         if self.settings.page_turn_animation_enabled && !page.live {
             return page;
@@ -1655,6 +1781,27 @@ impl App {
             painter: page.painter,
             ..old.clone()
         }
+    }
+
+    /// A source-free output can serve a changed view only inside its actual
+    /// source coverage. On a real miss the ordinary selector uses its existing
+    /// thumbnail/loading candidate; it never prepares from a native paint ID.
+    pub(super) fn page_turn_source_free_paint_supported(
+        &mut self,
+        resource: &crate::gpu_lanczos::FullscreenPaintPayload,
+        transform: &DisplayedImageTransform,
+    ) -> bool {
+        if resource.source_texture().is_some() {
+            return true;
+        }
+        let supported = resource.visible_source_uv_rect().is_none_or(|roi| {
+            canonical_roi_uv(canonical_source_uv(transform), roi, resource.size()).is_ok()
+        });
+        if !supported {
+            self.page_turn_presentation
+                .cancel("source_geometry_or_binding_changed");
+        }
+        supported
     }
 
     /// Called only at accepted Sequential navigation, before opening/mutating the target.
@@ -1784,10 +1931,16 @@ impl App {
                 );
                 return;
             };
-            let resource = self.fullscreen_paint_resource_for_texture(occurrence.idx, texture);
+            let source_mipmapped = ctx
+                .tex_manager()
+                .read()
+                .meta(texture.id())
+                .is_some_and(|meta| meta.options.mipmap_mode.is_some());
+            let resource = self.fullscreen_paint_payload_for_texture(occurrence.idx, texture);
             ready_sources.push(AcceptedSource {
                 occurrence,
                 resource,
+                source_mipmapped,
                 quality,
                 content: self.page_turn_content(occurrence.idx),
             });
@@ -1849,7 +2002,7 @@ impl App {
             return;
         }
         let bytes = outgoing.retained_bytes();
-        let budget = self.vram_pool_budget();
+        let budget = page_turn_budget(self, ctx);
         let resident_bytes = self.vram_accounting_snapshot().total_bytes();
         let pin_bytes = {
             let mut accountant = crate::vram_budget::VramAccountant::default();
@@ -1882,6 +2035,8 @@ impl App {
                     ("resident_bytes", resident_bytes.into()),
                     ("pin_bytes", pin_bytes.into()),
                     ("pin_limit_bytes", limit.into()),
+                    ("outgoing_materials", outgoing.material_diagnostics()),
+                    ("incoming_inputs", ready_sources.diagnostics()),
                     (
                         "fullscreen_budget_bytes",
                         serde_json::json!(budget.fullscreen_bytes),
@@ -1916,6 +2071,8 @@ impl App {
                 ("pool_budget_bytes", serde_json::json!(budget.pool_bytes)),
                 ("pin_limit_policy", "fullscreen_tenth_or_unlimited_1gib".into()),
                 ("accepted_quality", serde_json::json!(ready_sources.0.iter().map(|s| serde_json::json!({"idx":s.occurrence.idx,"quality":s.quality,"size":s.resource.size()})).collect::<Vec<_>>())),
+                ("outgoing_materials", outgoing.material_diagnostics()),
+                ("incoming_inputs", ready_sources.diagnostics()),
             ],
         );
         self.page_turn_presentation.state = PresentationState::Offered {
@@ -1940,6 +2097,27 @@ impl App {
         pages: &[PreparedPagedPage],
         white: Option<(egui::Rect, egui::Rect)>,
     ) -> Option<SubmittedUnitReceipt> {
+        self.submit_paged_display_unit_with_clock(ctx, pages, white, Instant::now)
+    }
+
+    pub(super) fn page_turn_submission_eligible(
+        &self,
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+    ) -> bool {
+        pages
+            .iter()
+            .all(|page| page.live && self.page_turn_view_eligible(page.occurrence.idx))
+            && !self.page_turn_loupe_hold(ctx)
+    }
+
+    fn submit_paged_display_unit_with_clock(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+        white: Option<(egui::Rect, egui::Rect)>,
+        clock: impl FnOnce() -> Instant,
+    ) -> Option<SubmittedUnitReceipt> {
         if pages.is_empty() {
             self.page_turn_presentation.deactivate("no_page");
             return None;
@@ -1948,7 +2126,7 @@ impl App {
             pages.len() <= 2,
             "normal paged units have at most two real occurrences"
         );
-        self.refresh_page_turn_completion_pages(pages, white);
+        self.refresh_page_turn_completion_pages(ctx, pages, white);
         // OFF does no effect clock, snapshot/inventory work, geometry projection or input diagnostics.
         if !self.settings.page_turn_animation_enabled {
             for page in pages {
@@ -1958,7 +2136,12 @@ impl App {
                 paint_white_companion(&pages[0].painter, rect, clip);
             }
             let completing = self.page_turn_completion_active();
-            let receipt = flat_receipt(self.page_turn_destination(), ctx, pages, !completing);
+            let mut receipt = flat_receipt(self.page_turn_destination(), ctx, pages, !completing);
+            if let PresentationState::Completing { incoming, .. } =
+                &self.page_turn_presentation.state
+            {
+                receipt.capture_binding(incoming);
+            }
             let event = self.page_turn_completion_event(&receipt);
             self.record_page_turn_completion_flat(&receipt);
             if completing {
@@ -1968,10 +2151,7 @@ impl App {
         }
         // `live` comes from the normal unit/source selector. Do not re-resolve,
         // prepare or mutate holdover readiness while deciding presentation.
-        let eligible = pages
-            .iter()
-            .all(|p| p.live && self.page_turn_view_eligible(p.occurrence.idx))
-            && !self.page_turn_loupe_hold(ctx);
+        let eligible = self.page_turn_submission_eligible(ctx, pages);
         if !eligible {
             self.page_turn_presentation.cancel("ineligible_view");
             for page in pages {
@@ -1980,7 +2160,12 @@ impl App {
             if let Some((rect, clip)) = white {
                 paint_white_companion(&pages[0].painter, rect, clip);
             }
-            let receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
+            let mut receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
+            if let PresentationState::Completing { incoming, .. } =
+                &self.page_turn_presentation.state
+            {
+                receipt.capture_binding(incoming);
+            }
             let event = self.page_turn_completion_event(&receipt);
             self.record_page_turn_completion_flat(&receipt);
             queue_submission(ctx, receipt.clone(), event);
@@ -1998,7 +2183,15 @@ impl App {
                 .unwrap_or(self.reading_direction)
                 == ReadingDirection::Rtl,
             slice: self.fullscreen_page_slice,
-            pages: pages.to_vec(),
+            pages: pages
+                .iter()
+                .map(|page| PreparedPagedPage {
+                    resource: crate::gpu_lanczos::FullscreenPaintPayload::PresentationMaterial(
+                        page.resource.capture_presentation(ctx),
+                    ),
+                    ..page.clone()
+                })
+                .collect(),
             white,
             reserved_bytes: Arc::new(AtomicU64::new(0)),
             evidence: receipt.accepted.clone(),
@@ -2011,9 +2204,12 @@ impl App {
             &mut self.page_turn_presentation.state,
             PresentationState::Inactive,
         );
-        let now = Instant::now();
+        let now = clock();
         let selected = match old {
-            PresentationState::Offered { outgoing, offer } => {
+            PresentationState::Offered {
+                outgoing,
+                mut offer,
+            } => {
                 let matching = outgoing.evidence.was_accepted()
                     && offer.fact.destination == unit.destination
                     && outgoing.items == unit.items
@@ -2050,11 +2246,40 @@ impl App {
                 if matching && now.saturating_duration_since(offer.accepted_at) < offer.duration {
                     match prepare_leaf(&outgoing, &unit, offer.forward) {
                         Ok(projection) => {
-                            // Include the ordinary prepared native ROI as well as
-                            // the accepted source, globally deduplicated.
+                            // Ordinary prepare has submitted its input. Transfer
+                            // only the actual paint allocations into the turn;
+                            // neither diagnostics nor ready handoff keep Native
+                            // source handles alive for the animation duration.
+                            offer.ready_sources = Arc::new(AcceptedSources(
+                                offer
+                                    .ready_sources
+                                    .0
+                                    .iter()
+                                    .zip(&unit.pages)
+                                    .map(|(source, page)| AcceptedSource {
+                                        resource: page.resource.clone(),
+                                        ..source.clone()
+                                    })
+                                    .collect(),
+                            ));
+                            self.page_turn_leases
+                                .sources
+                                .push(Arc::downgrade(&offer.ready_sources));
+                            // Recheck the prepared allocations, globally deduplicated.
                             let pin_bytes = self.page_turn_leases.reservation_bytes_with(&unit);
-                            let budget = self.vram_pool_budget();
+                            let budget = page_turn_budget(self, ctx);
                             let limit = page_turn_pin_limit(budget);
+                            emit(
+                                &offer.fact,
+                                "material",
+                                "prepared",
+                                &[
+                                    ("pin_bytes", pin_bytes.into()),
+                                    ("pin_limit_bytes", limit.into()),
+                                    ("outgoing_materials", outgoing.material_diagnostics()),
+                                    ("incoming_materials", unit.material_diagnostics()),
+                                ],
+                            );
                             if pin_bytes > limit {
                                 offer.submission.end();
                                 emit(
@@ -2339,6 +2564,12 @@ impl App {
                 retained,
             );
         }
+        match &final_state {
+            PresentationState::Flat(unit)
+            | PresentationState::Turning { incoming: unit, .. }
+            | PresentationState::Completing { incoming: unit, .. } => receipt.capture_binding(unit),
+            _ => {}
+        }
         self.page_turn_presentation.state = final_state;
         if !curl {
             if submission_event.is_none() {
@@ -2400,6 +2631,7 @@ impl App {
     /// logical target and immutable source are unchanged.
     fn refresh_page_turn_completion_pages(
         &mut self,
+        ctx: &egui::Context,
         pages: &[PreparedPagedPage],
         white: Option<(egui::Rect, egui::Rect)>,
     ) {
@@ -2431,7 +2663,15 @@ impl App {
             return;
         }
         let fresh = Arc::new(PaintedUnit {
-            pages: pages.to_vec(),
+            pages: pages
+                .iter()
+                .map(|page| PreparedPagedPage {
+                    resource: crate::gpu_lanczos::FullscreenPaintPayload::PresentationMaterial(
+                        page.resource.capture_presentation(ctx),
+                    ),
+                    ..page.clone()
+                })
+                .collect(),
             white,
             ..(**incoming).clone()
         });
@@ -2525,6 +2765,7 @@ fn flat_receipt(
     accepted: bool,
 ) -> SubmittedUnitReceipt {
     SubmittedUnitReceipt {
+        binding: SubmittedContentBinding::Ordinary,
         destination,
         frame: ctx.cumulative_frame_nr(),
         pass: ctx.cumulative_pass_nr(),
@@ -2920,7 +3161,7 @@ fn canonical_unit(
     }
 }
 
-fn canonical_roi_uv(
+pub(super) fn canonical_roi_uv(
     uv: [egui::Pos2; 4],
     roi: egui::Rect,
     source_size: [usize; 2],
@@ -3016,6 +3257,7 @@ mod tests {
     }
     fn receipt(ctx: &egui::Context, idx: usize) -> SubmittedUnitReceipt {
         SubmittedUnitReceipt {
+            binding: SubmittedContentBinding::Ordinary,
             destination: destination(1),
             frame: ctx.cumulative_frame_nr(),
             pass: ctx.cumulative_pass_nr(),
@@ -3079,7 +3321,8 @@ mod tests {
                     0,
                     texture,
                     crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 1, input: 0 },
-                ),
+                )
+                .into(),
                 painter: ctx.debug_painter().with_clip_rect(rect),
                 underlay: FsBgStyle::Solid(egui::Color32::BLACK),
                 live: true,
@@ -3542,7 +3785,7 @@ mod tests {
         let mut accountant = crate::vram_budget::VramAccountant::default();
         accountant.add_texture(
             crate::vram_budget::VramSubsystem::FsCache,
-            old.pages[0].resource.source_texture(),
+            old.pages[0].resource.source_texture().unwrap(),
             true,
         );
         inventory.account(&mut accountant);
@@ -3625,6 +3868,29 @@ mod tests {
         assert!(Arc::ptr_eq(
             &PaintedUnit::select_flat(selected.clone(), &next),
             &selected
+        ));
+    }
+
+    #[test]
+    fn same_material_flat_replay_replaces_changed_content_binding() {
+        let ctx = egui::Context::default();
+        let app =
+            crate::ui_fullscreen::page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
+        let texture = ctx.load_texture(
+            "content-binding",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut previous = unit(&ctx, texture, 1);
+        Arc::make_mut(&mut previous).content = vec![app.page_turn_content(0)];
+        let mut current = Arc::new((*previous).clone());
+        Arc::make_mut(&mut current).content[0].gap += 1;
+        assert!(previous.evidence.was_accepted());
+        assert!(previous.same_material_and_geometry(&current));
+        assert_ne!(previous.content[0].gap, current.content[0].gap);
+        assert!(Arc::ptr_eq(
+            &PaintedUnit::select_flat(previous, &current),
+            &current
         ));
     }
 

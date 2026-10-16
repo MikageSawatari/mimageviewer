@@ -66,7 +66,7 @@ use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::fullscreen_specified_scale::{
     FullscreenFitBasis, FullscreenFitInput, resolve_specified_scale,
 };
-use crate::gpu_lanczos::FullscreenPaintResource;
+use crate::gpu_lanczos::{FullscreenPaintPayload, FullscreenPaintResource};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::items_generation_cache::ItemsGenerationMap;
 use crate::keymap::{
@@ -2149,7 +2149,7 @@ enum FsDisplayUnitPageProvenance {
 #[derive(Clone)]
 struct FsNavigatorTextureSource {
     occurrence: SpreadPageOccurrence,
-    resource: FullscreenPaintResource,
+    resource: FullscreenPaintPayload,
     provenance: FsDisplayUnitPageProvenance,
 }
 
@@ -2209,19 +2209,7 @@ pub(crate) struct PendingFsPageTurnReady {
 impl PendingFsPageTurnReady {
     pub(crate) fn account(&self, accountant: &mut crate::vram_budget::VramAccountant) {
         for page in &self.sources.pages {
-            accountant.add_texture(
-                crate::vram_budget::VramSubsystem::PageTurnPresentation,
-                page.resource.source_texture(),
-                true,
-            );
-            if let Some(output) = page.resource.lanczos_output() {
-                accountant.add_texture_id(
-                    crate::vram_budget::VramSubsystem::PageTurnPresentation,
-                    output.texture_id(),
-                    output.size(),
-                    false,
-                );
-            }
+            page.resource.account_material(accountant);
         }
     }
 }
@@ -2247,7 +2235,7 @@ impl FsNavigatorTextureSources {
                         role: SpreadPageRole::Navigation,
                         navigation_anchor_idx: page_idx,
                     },
-                    resource,
+                    resource: resource.into(),
                     provenance: FsDisplayUnitPageProvenance::Live,
                 })
                 .collect(),
@@ -2269,7 +2257,7 @@ impl FsNavigatorTextureSources {
                     role: SpreadPageRole::Navigation,
                     navigation_anchor_idx: left_idx,
                 },
-                resource,
+                resource: resource.into(),
                 provenance: FsDisplayUnitPageProvenance::Live,
             });
         }
@@ -2280,7 +2268,7 @@ impl FsNavigatorTextureSources {
                     role: SpreadPageRole::Navigation,
                     navigation_anchor_idx: left_idx,
                 },
-                resource,
+                resource: resource.into(),
                 provenance: FsDisplayUnitPageProvenance::Live,
             });
         }
@@ -2290,13 +2278,24 @@ impl FsNavigatorTextureSources {
         }
     }
 
-    fn from_prepared(pages: &[PreparedPagedPage], receipt: Option<SubmittedUnitReceipt>) -> Self {
+    fn from_prepared(
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+        receipt: Option<SubmittedUnitReceipt>,
+        presentation: bool,
+    ) -> Self {
         Self {
             pages: pages
                 .iter()
                 .map(|page| FsNavigatorTextureSource {
                     occurrence: page.occurrence,
-                    resource: page.resource.clone(),
+                    resource: if presentation {
+                        FullscreenPaintPayload::PresentationMaterial(
+                            page.resource.capture_presentation(ctx),
+                        )
+                    } else {
+                        page.resource.clone()
+                    },
                     provenance: if page.live {
                         FsDisplayUnitPageProvenance::Live
                     } else {
@@ -2320,7 +2319,7 @@ impl FsNavigatorTextureSources {
             .iter()
             .map(|page| FsNavigatorTextureSource {
                 occurrence: page.occurrence,
-                resource: page.texture.clone(),
+                resource: page.texture.clone().into(),
                 provenance: FsDisplayUnitPageProvenance::Holdover,
             })
             .collect();
@@ -2334,8 +2333,62 @@ impl FsNavigatorTextureSources {
         self.pages
             .iter()
             .find(|source| source.idx() == page_idx)
-            .map(|source| source.resource.source_texture())
+            .and_then(|source| source.resource.source_texture())
             .or(thumbnail)
+    }
+
+    fn partial_presentation_source_id(&self, page_idx: usize) -> Option<egui::TextureId> {
+        let source = self.pages.iter().find(|source| source.idx() == page_idx)?;
+        let FullscreenPaintPayload::PresentationMaterial(material) = &source.resource else {
+            return None;
+        };
+        let uv = material.visible_source_uv_rect()?;
+        page_turn::canonical_roi_uv(
+            [
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0),
+            ],
+            uv,
+            material.size(),
+        )
+        .is_err()
+        .then_some(material.source_texture_id())
+    }
+
+    /// A navigator always represents the entire image. Full presentation outputs can
+    /// be sampled directly; partial outputs borrow the normal owner's full-image source
+    /// or the existing thumbnail fallback instead of losing offscreen image content.
+    fn paint_page(
+        &self,
+        painter: &egui::Painter,
+        page_idx: usize,
+        geometry: &DisplayedImageGeometry,
+        full_image_fallback: Option<&egui::TextureHandle>,
+    ) -> bool {
+        let submitted = self.pages.iter().find(|source| source.idx() == page_idx);
+        if let Some(FsNavigatorTextureSource {
+            resource: FullscreenPaintPayload::PresentationMaterial(material),
+            ..
+        }) = submitted
+        {
+            if self.partial_presentation_source_id(page_idx).is_some() {
+                let Some(texture) = full_image_fallback else {
+                    return false;
+                };
+                geometry.paint_texture(painter, texture.id(), egui::Color32::WHITE);
+                return true;
+            }
+            geometry.paint_texture(painter, material.paint_texture_id(), egui::Color32::WHITE);
+            material.retain_native_output_for_paint(painter);
+            true
+        } else if let Some(texture) = self.texture_for_page(page_idx, full_image_fallback) {
+            geometry.paint_texture(painter, texture.id(), egui::Color32::WHITE);
+            true
+        } else {
+            false
+        }
     }
 
     fn rebind_occurrences(&mut self, occurrences: &[SpreadPageOccurrence]) -> bool {
@@ -10968,17 +11021,47 @@ impl App {
         None
     }
 
+    /// Borrow a captured source only from this page's existing normal owners. Selecting
+    /// a new final must not hide a still-resident raw/edit allocation with the saved ID.
+    fn fs_resident_texture_for_source_id(
+        &self,
+        idx: usize,
+        source_id: egui::TextureId,
+    ) -> Option<egui::TextureHandle> {
+        let matching = |texture: &egui::TextureHandle| texture.id() == source_id;
+        self.current_comic_composite_texture(idx)
+            .filter(matching)
+            .or_else(|| self.current_final_composite_texture(idx).filter(matching))
+            .or_else(|| self.current_edit_result_texture(idx).filter(matching))
+            .or_else(|| {
+                self.conceal_cache
+                    .get(&idx)
+                    .filter(|entry| entry.generation == self.conceal_generation)
+                    .map(|entry| entry.texture.clone())
+                    .filter(matching)
+            })
+            .or_else(|| self.current_local_adjust_texture(idx).filter(matching))
+            .or_else(|| self.current_erase_result_texture(idx).filter(matching))
+            .or_else(|| {
+                match self.fs_cache.get(&idx) {
+                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                    Some(FsCacheEntry::RawPreview { preview, .. }) => {
+                        preview.as_ref().map(|p| p.tex.clone())
+                    }
+                    _ => None,
+                }
+                .filter(matching)
+            })
+            .or_else(|| self.cached_passthrough_rendition(idx).filter(matching))
+            .or_else(|| self.fs_thumbnail_texture_for_display(idx).filter(matching))
+            .filter(|texture| self.display_texture_matches_page(texture, idx))
+    }
+
     pub(crate) fn fullscreen_paint_resource_for_texture(
         &self,
         idx: usize,
         texture: egui::TextureHandle,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
-        if let Some(resource) = self
-            .page_turn_held_resource(idx)
-            .filter(|resource| resource.source_texture_id() == texture.id())
-        {
-            return resource;
-        }
         let is_thumbnail = self.thumbnails.get(idx).is_some_and(|thumbnail| {
             matches!(thumbnail, ThumbnailState::Loaded { tex, .. } if tex.id() == texture.id())
         });
@@ -11011,6 +11094,100 @@ impl App {
             resource
         };
         resource
+    }
+
+    pub(crate) fn fullscreen_paint_payload_for_texture(
+        &self,
+        idx: usize,
+        texture: egui::TextureHandle,
+    ) -> FullscreenPaintPayload {
+        match self.page_turn_held_resource(idx) {
+            // An accepted offer owns the selected input until its first ordinary prepare.
+            Some(resource @ FullscreenPaintPayload::NormalResource(_)) => resource,
+            Some(FullscreenPaintPayload::PresentationMaterial(material))
+                if material.source_id().is_none()
+                    && material.source_texture_id() == texture.id() =>
+            {
+                // A captured Direct thumbnail stays Direct after its normal cache entry
+                // is evicted. It still passes through ordinary prepare as before.
+                let resource = FullscreenPaintResource::direct(texture);
+                #[cfg(test)]
+                let resource = if let Some(proof) = material.test_paint_provenance().cloned() {
+                    resource.with_test_paint_provenance(proof)
+                } else {
+                    resource
+                };
+                #[cfg(all(windows, feature = "test-script"))]
+                let resource = if let Some(proof) = material.test_script_content_proof().cloned() {
+                    resource.with_test_script_content_proof(proof)
+                } else {
+                    resource
+                };
+                resource.into()
+            }
+            // Keep ordinary preparation current even while the presentation is frozen.
+            // The prepared page binds its held output only after validating the current view.
+            Some(FullscreenPaintPayload::PresentationMaterial(_)) | None => self
+                .fullscreen_paint_resource_for_texture(idx, texture)
+                .into(),
+        }
+    }
+
+    /// Resident inputs still pass through ordinary prepare before held-output binding.
+    /// Without an input, a Native held page remains drawable through its output lease.
+    fn fullscreen_paint_payload_for_page(
+        &self,
+        idx: usize,
+        texture: Option<egui::TextureHandle>,
+    ) -> Option<FullscreenPaintPayload> {
+        texture
+            .map(|texture| self.fullscreen_paint_payload_for_texture(idx, texture))
+            .or_else(|| self.page_turn_held_resource(idx))
+    }
+
+    pub(crate) fn prepare_fullscreen_paint_payload(
+        &mut self,
+        resource: &FullscreenPaintPayload,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_region: Option<crate::displayed_image_transform::VisibleRegionRequest>,
+    ) -> FullscreenPaintPayload {
+        match resource {
+            FullscreenPaintPayload::NormalResource(resource) => self
+                .prepare_fullscreen_paint_resource(
+                    resource,
+                    logical_scale,
+                    pixels_per_point,
+                    visible_region,
+                )
+                .into(),
+            FullscreenPaintPayload::PresentationMaterial(_) => resource.clone(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_fullscreen_paint_payload_with_filter(
+        &mut self,
+        resource: &FullscreenPaintPayload,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_region: Option<crate::displayed_image_transform::VisibleRegionRequest>,
+        post_filter: crate::adjustment::PostFilter,
+        trace_current_item_key: bool,
+    ) -> FullscreenPaintPayload {
+        match resource {
+            FullscreenPaintPayload::NormalResource(resource) => self
+                .prepare_fullscreen_paint_resource_with_filter(
+                    resource,
+                    logical_scale,
+                    pixels_per_point,
+                    visible_region,
+                    post_filter,
+                    trace_current_item_key,
+                )
+                .into(),
+            FullscreenPaintPayload::PresentationMaterial(_) => resource.clone(),
+        }
     }
 
     pub(crate) fn prepare_fullscreen_paint_resource(
@@ -11192,17 +11369,26 @@ impl App {
 
     /// Perf trace 用に、実際に選ばれた fullscreen テクスチャの所有元を特定する。
     /// 通常時は呼ばれず、perf ログ有効時の診断だけで cache lookup を行う。
+    #[cfg(test)]
     fn fs_texture_source_for_trace(
         &self,
         idx: usize,
         texture: &egui::TextureHandle,
         provenance: FsDisplayUnitPageProvenance,
     ) -> &'static str {
-        let texture_id = texture.id();
+        self.fs_texture_source_id_for_trace(idx, texture.id(), provenance)
+    }
+
+    fn fs_texture_source_id_for_trace(
+        &self,
+        idx: usize,
+        texture_id: egui::TextureId,
+        provenance: FsDisplayUnitPageProvenance,
+    ) -> &'static str {
         if provenance == FsDisplayUnitPageProvenance::Holdover {
             return "holdover";
         }
-        if self.is_passthrough_rendition_texture(texture) {
+        if self.is_passthrough_rendition_texture_id(texture_id) {
             return "thumbnail";
         }
         if self
@@ -12179,7 +12365,7 @@ impl App {
             return ordinary;
         }
         self.page_turn_held_resource(idx)
-            .map(|resource| resource.source_texture().clone())
+            .and_then(|resource| resource.source_texture().cloned())
             .or(ordinary)
     }
 
@@ -13714,17 +13900,13 @@ impl App {
         submitted: Option<&mut FsNavigatorTextureSources>,
     ) -> Option<DisplayedImageTransform> {
         let rotation = self.get_rotation(fs_idx);
-        let paint_resource = state
-            .tex
-            .clone()
-            .map(|texture| self.fullscreen_paint_resource_for_texture(fs_idx, texture));
+        let paint_resource = self.fullscreen_paint_payload_for_page(fs_idx, state.tex.clone());
         let active = self.fs_zoom_active;
         let pixel_grid = self.fs_pixel_grid_enabled;
-        let tex_size = state
-            .tex
+        let tex_size = paint_resource
             .as_ref()
-            .or(state.thumb_tex.as_ref())
-            .map(egui::TextureHandle::size_vec2);
+            .map(FullscreenPaintPayload::size_vec2)
+            .or_else(|| state.thumb_tex.as_ref().map(egui::TextureHandle::size_vec2));
         let cursor = ctx
             .input(|i| i.pointer.hover_pos())
             .unwrap_or_else(|| image_rect.center());
@@ -26318,25 +26500,24 @@ impl App {
                                                     self.view_trim_single_content_bbox(paint_idx)
                                                 };
                                                 let paint_resource =
-                                                    state.tex.clone().map(|texture| {
-                                                        self.fullscreen_paint_resource_for_texture(
-                                                            paint_idx, texture,
-                                                        )
-                                                    });
+                                                    self.fullscreen_paint_payload_for_page(
+                                                        paint_idx, state.tex.clone(),
+                                                    );
                                                 let bg_style = self.fs_bg_style(ctx);
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 let test_script_content_proof = paint_resource
                                                     .as_ref()
-                                                    .map(|resource| resource.source_texture())
-                                                    .or(state.thumb_tex.as_ref())
-                                                    .and_then(|texture| {
-                                                        self.test_script_content_proof(
-                                                            paint_idx,
-                                                            texture,
-                                                            self.test_script_paint_source_kind(
-                                                                paint_idx, texture,
-                                                            ),
-                                                        )
+                                                    .and_then(|resource| resource.test_script_content_proof().cloned())
+                                                    .or_else(|| {
+                                                        paint_resource.as_ref()
+                                                            .and_then(|resource| resource.source_texture())
+                                                            .or(state.thumb_tex.as_ref())
+                                                            .and_then(|texture| {
+                                                                self.test_script_content_proof(
+                                                                    paint_idx, texture,
+                                                                    self.test_script_paint_source_kind(paint_idx, texture),
+                                                                )
+                                                            })
                                                     });
                                                 let painted = self.draw_fs_image_with_receipt(
                                                     ui,
@@ -28715,15 +28896,15 @@ impl App {
                     .iter()
                     .find(|selected| selected.occurrence == *occurrence)
                     .map(|selected| {
-                        let texture = selected.resource.source_texture();
-                        let source = self.fs_texture_source_for_trace(
+                        let texture_id = selected.resource.source_texture_id();
+                        let source = self.fs_texture_source_id_for_trace(
                             occurrence.idx,
-                            texture,
+                            texture_id,
                             selected.provenance,
                         );
                         FsDisplayUnitTracePage {
                             occurrence: *occurrence,
-                            texture_id: texture.id(),
+                            texture_id,
                             provenance: selected.provenance,
                             source,
                         }
@@ -29112,6 +29293,15 @@ impl App {
                     )
                 }))
             || pending.sources.pages.iter().any(|page| {
+                let native_presentation = matches!(
+                    &page.resource,
+                    FullscreenPaintPayload::PresentationMaterial(_)
+                ) && page.resource.lanczos_output().is_some();
+                if native_presentation
+                    && (!receipt.has_presentation_binding() || !receipt.content_matches(self))
+                {
+                    return true;
+                }
                 let held = matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
                     .then(|| self.page_turn_held_resource(page.idx()))
                     .flatten()
@@ -29128,11 +29318,23 @@ impl App {
                         }
                         // Legacy Direct thumbnails/animations have no producer generation.
                         // Their owning source resolver below still checks the current identity.
-                        None => matches!(&page.resource, FullscreenPaintResource::Direct { .. }),
+                        None => matches!(
+                            &page.resource,
+                            FullscreenPaintPayload::NormalResource(
+                                FullscreenPaintResource::Direct { .. }
+                            ) | FullscreenPaintPayload::PresentationMaterial(_)
+                        ),
                     };
+                let presentation_matches = native_presentation
+                    && receipt.has_presentation_binding()
+                    && receipt.content_matches(self)
+                    && page.resource.source_generation().is_some()
+                    && held.as_ref().is_none_or(|resource| {
+                        resource.paint_texture_id() == page.resource.paint_texture_id()
+                    });
                 let current_source = match pending.source_policy {
                     FsSubmittedSourcePolicy::Normal => held
-                        .map(|resource| resource.source_texture().clone())
+                        .and_then(|resource| resource.source_texture().cloned())
                         .or_else(|| self.resolve_fs_display_tex(page.idx(), true)),
                     FsSubmittedSourcePolicy::Original => self
                         .resolve_original_preview_tex(page.idx())
@@ -29143,6 +29345,7 @@ impl App {
                 };
                 !generation_matches
                     || (page.provenance == FsDisplayUnitPageProvenance::Live
+                        && !presentation_matches
                         && !current_source.is_some_and(|texture| {
                             texture.id() == page.resource.source_texture_id()
                         }))
@@ -29641,6 +29844,36 @@ impl App {
                 FullscreenFitInput::legacy(self.effective_fullscreen_fit_mode())
             }
             _ => captured,
+        }
+    }
+
+    fn fs_fit_input_for_payload(
+        &self,
+        idx: usize,
+        mode: FullscreenFitMode,
+        resource: &FullscreenPaintPayload,
+    ) -> Option<FullscreenFitInput> {
+        match resource {
+            FullscreenPaintPayload::NormalResource(resource) => {
+                self.fs_fit_input_for_resource(idx, mode, resource.source_texture())
+            }
+            FullscreenPaintPayload::PresentationMaterial(_) => {
+                self.fs_fit_input_for_idx(idx, mode).or_else(|| {
+                    // Only the source basis is frozen. Current fit policy must still reach
+                    // binding so a user view change cannot reuse an incompatible ROI.
+                    let basis = match self.page_turn_held_transform(idx)?.fit_input {
+                        FullscreenFitInput::SpecifiedScale { basis, .. }
+                        | FullscreenFitInput::CanonicalPage { basis } => basis,
+                        FullscreenFitInput::Legacy(_) => return None,
+                    };
+                    Some(FullscreenFitInput::from_mode(
+                        mode,
+                        self.settings.fullscreen_specified_scale,
+                        basis,
+                        self.settings.fullscreen_specified_scale_max_tenths,
+                    ))
+                })
+            }
         }
     }
 
@@ -36447,20 +36680,25 @@ impl App {
             || !self.draw_compare_navigator_content(ctx, fs_idx, &layout, &canvas_painter)
         {
             for page in &layout.pages {
-                let texture = texture_sources
-                    .texture_for_page(page.main.page_idx, None)
-                    .or_else(|| match self.thumbnails.get(page.main.page_idx) {
-                        Some(ThumbnailState::Loaded { tex, .. })
-                            if self.raw_fullscreen_fallback_allowed(page.main.page_idx) =>
-                        {
-                            Some(tex)
-                        }
-                        _ => None,
+                let full_image_source = texture_sources
+                    .partial_presentation_source_id(page.main.page_idx)
+                    .and_then(|source_id| {
+                        self.fs_resident_texture_for_source_id(page.main.page_idx, source_id)
                     });
-                if let Some(tex) = texture {
-                    page.navigator
-                        .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
-                } else {
+                let thumbnail = match self.thumbnails.get(page.main.page_idx) {
+                    Some(ThumbnailState::Loaded { tex, .. })
+                        if self.raw_fullscreen_fallback_allowed(page.main.page_idx) =>
+                    {
+                        Some(tex)
+                    }
+                    _ => None,
+                };
+                if !texture_sources.paint_page(
+                    &canvas_painter,
+                    page.main.page_idx,
+                    &page.navigator,
+                    full_image_source.as_ref().or(thumbnail),
+                ) {
                     canvas_painter.rect_filled(
                         page.navigator.paint_rect,
                         0.0,
@@ -40847,6 +41085,7 @@ impl App {
         // 分割中にどちらの半分を描くかは、この関数が自分で解決する (下記)。
         content_bbox: Option<egui::Rect>,
     ) -> Option<DisplayedImageTransform> {
+        let payload = tex.cloned().map(FullscreenPaintPayload::from);
         self.draw_fs_image_with_receipt(
             ui,
             full_rect,
@@ -40856,7 +41095,7 @@ impl App {
             resolved_transform,
             white_companion_override,
             singleton_placement,
-            tex,
+            payload.as_ref(),
             thumb_tex,
             is_video,
             vst3_waiting_for_video,
@@ -40885,7 +41124,7 @@ impl App {
         resolved_transform: Option<DisplayedImageTransform>,
         white_companion_override: Option<(egui::Rect, egui::Rect)>,
         singleton_placement: SingletonSpreadPlacement,
-        tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
+        tex: Option<&FullscreenPaintPayload>,
         thumb_tex: Option<&egui::TextureHandle>,
         is_video: bool,
         vst3_waiting_for_video: bool,
@@ -40918,7 +41157,7 @@ impl App {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let using_full_texture = tex.is_some();
+        let mut using_full_texture = tex.is_some();
         let thumb_resource = thumb_tex
             .cloned()
             .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
@@ -40934,19 +41173,23 @@ impl App {
                     }
                 }
                 resource
-            });
-        let display_tex = if is_video {
+            })
+            .map(FullscreenPaintPayload::from);
+        let mut display_tex = if is_video {
             tex
         } else {
             tex.or(thumb_resource.as_ref())
         };
-        if let Some(resource) = display_tex {
-            let handle = resource.source_texture();
-            let tex_size = handle.size_vec2();
+        let mut fallback = (!is_video && tex.is_some())
+            .then_some(thumb_resource.as_ref())
+            .flatten();
+        while let Some(resource) = display_tex.take() {
+            let tex_size = resource.size_vec2();
             let layout_source_size = match layout_source {
                 FsPageLayoutSource::Captured { layout_size, .. } => Some(layout_size),
                 FsPageLayoutSource::CurrentItem => {
-                    let use_source_layout = self.fs_page_layout_uses_source_size(page_idx, handle);
+                    let use_source_layout =
+                        self.fs_page_layout_uses_source_id(page_idx, resource.source_texture_id());
                     use_source_layout
                         .then(|| self.fs_page_layout_source_size(page_idx))
                         .flatten()
@@ -40961,7 +41204,7 @@ impl App {
                     .unwrap_or_else(|| self.captured_fit_input_for_replay(fit_input)),
                 FsPageLayoutSource::CurrentItem => resolved_transform
                     .map(|t| t.fit_input)
-                    .or_else(|| self.fs_fit_input_for_resource(page_idx, fit_mode, handle))?,
+                    .or_else(|| self.fs_fit_input_for_payload(page_idx, fit_mode, resource))?,
             };
             let transform_input = DisplayedImageTransformInput {
                 pixel_fit: RectPixelFit::Texels,
@@ -41002,6 +41245,11 @@ impl App {
             let Some(transform) = transform else {
                 return None;
             };
+            if !self.page_turn_source_free_paint_supported(resource, &transform) {
+                display_tex = fallback.take();
+                using_full_texture = false;
+                continue;
+            }
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(page_idx);
             }
@@ -41019,7 +41267,7 @@ impl App {
                 .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
             let paint_resource = match layout_source {
                 FsPageLayoutSource::Captured { post_filter, .. } => self
-                    .prepare_fullscreen_paint_resource_with_filter(
+                    .prepare_fullscreen_paint_payload_with_filter(
                         resource,
                         transform.total_scale,
                         ui.ctx().pixels_per_point(),
@@ -41027,7 +41275,7 @@ impl App {
                         post_filter,
                         false,
                     ),
-                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_resource(
+                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_payload(
                     resource,
                     transform.total_scale,
                     ui.ctx().pixels_per_point(),
@@ -41058,18 +41306,27 @@ impl App {
             let img_rect = transform.full_image_rect;
             let total_scale = transform.total_scale;
             if let Some(submitted) = submitted {
+                let receipt =
+                    self.submit_paged_display_unit(ui.ctx(), std::slice::from_ref(&page), white);
+                let presentation = receipt
+                    .as_ref()
+                    .is_some_and(SubmittedUnitReceipt::has_presentation_binding);
                 submitted.pages.clear();
                 submitted.pages.push(FsNavigatorTextureSource {
                     occurrence: page.occurrence,
-                    resource: page.resource.clone(),
+                    resource: if presentation {
+                        FullscreenPaintPayload::PresentationMaterial(
+                            page.resource.capture_presentation(ui.ctx()),
+                        )
+                    } else {
+                        page.resource.clone()
+                    },
                     provenance: if matches!(layout_source, FsPageLayoutSource::Captured { .. }) {
                         FsDisplayUnitPageProvenance::Holdover
                     } else {
                         FsDisplayUnitPageProvenance::Live
                     },
                 });
-                let receipt =
-                    self.submit_paged_display_unit(ui.ctx(), std::slice::from_ref(&page), white);
                 submitted.submission = receipt.map_or(
                     FsDisplayUnitSubmission::Unsubmitted,
                     FsDisplayUnitSubmission::Paged,
@@ -41102,7 +41359,8 @@ impl App {
                 );
             }
             return Some(transform);
-        } else if fs_load_failed {
+        }
+        if fs_load_failed {
             ui.painter().text(
                 full_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -44407,7 +44665,7 @@ impl App {
                 if let Some(resource) = draw_tex {
                     painted_sources.pages.push(FsNavigatorTextureSource {
                         occurrence: page.occurrence,
-                        resource,
+                        resource: resource.into(),
                         provenance: FsDisplayUnitPageProvenance::Live,
                     });
                 }
@@ -46443,7 +46701,7 @@ impl App {
                         resolved_transform,
                         white_companion_override,
                         unit.singleton_placement,
-                        Some(&page.texture),
+                        Some(&page.texture.clone().into()),
                         None,
                         false,
                         false,
@@ -46525,14 +46783,6 @@ impl App {
         submit_final: bool,
     ) -> FsNavigatorTextureSources {
         let mut submit = |pages: &[PreparedPagedPage]| {
-            let mut sources = FsNavigatorTextureSources::from_prepared(pages, None);
-            for source in &mut sources.pages {
-                source.provenance = if captured {
-                    FsDisplayUnitPageProvenance::Holdover
-                } else {
-                    FsDisplayUnitPageProvenance::Live
-                };
-            }
             let receipt = if submit_final {
                 self.submit_paged_display_unit(ctx, pages, None)
             } else {
@@ -46541,10 +46791,18 @@ impl App {
                 }
                 None
             };
-            sources.submission = receipt.map_or(
-                FsDisplayUnitSubmission::Unsubmitted,
-                FsDisplayUnitSubmission::Paged,
-            );
+            let presentation = receipt
+                .as_ref()
+                .is_some_and(SubmittedUnitReceipt::has_presentation_binding);
+            let mut sources =
+                FsNavigatorTextureSources::from_prepared(ctx, pages, receipt, presentation);
+            for source in &mut sources.pages {
+                source.provenance = if captured {
+                    FsDisplayUnitPageProvenance::Holdover
+                } else {
+                    FsDisplayUnitPageProvenance::Live
+                };
+            }
             sources
         };
         match pages {
@@ -46699,19 +46957,29 @@ impl App {
                 FsPageTurnPaintSource::PassThrough
             );
         let (mut left_display_tex, mut right_display_tex) = match display_override {
-            Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
+            Some((left, right)) => (
+                Some(left.texture.clone().into()),
+                Some(right.texture.clone().into()),
+            ),
             None if pass_through => (
                 self.ensure_passthrough_rendition(ctx, left_idx)
-                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+                    .map(FullscreenPaintResource::direct)
+                    .map(FullscreenPaintPayload::from),
                 self.ensure_passthrough_rendition(ctx, right_idx)
-                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+                    .map(FullscreenPaintResource::direct)
+                    .map(FullscreenPaintPayload::from),
             ),
-            None => (
-                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active)
-                    .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
-                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active)
-                    .map(|texture| self.fullscreen_paint_resource_for_texture(right_idx, texture)),
-            ),
+            None => {
+                // Keep ordinary producers running before selecting frozen presentation output.
+                let left =
+                    self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active);
+                let right =
+                    self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active);
+                (
+                    self.fullscreen_paint_payload_for_page(left_idx, left),
+                    self.fullscreen_paint_payload_for_page(right_idx, right),
+                )
+            }
         };
         let settling_with_renditions = display_override.is_none()
             && !pass_through
@@ -46725,10 +46993,12 @@ impl App {
         if settling_with_renditions {
             left_display_tex = self
                 .ensure_passthrough_rendition(ctx, left_idx)
-                .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+                .map(FullscreenPaintResource::direct)
+                .map(FullscreenPaintPayload::from);
             right_display_tex = self
                 .ensure_passthrough_rendition(ctx, right_idx)
-                .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+                .map(FullscreenPaintResource::direct)
+                .map(FullscreenPaintPayload::from);
         }
         let color_faithful_rendition_unit = pass_through || settling_with_renditions;
         if color_faithful_rendition_unit
@@ -46818,11 +47088,7 @@ impl App {
                 .map(|(left, _)| left.fit_input)
                 .or_else(|| {
                     left_display_tex.as_ref().and_then(|resource| {
-                        self.fs_fit_input_for_resource(
-                            left_idx,
-                            fit_mode,
-                            resource.source_texture(),
-                        )
+                        self.fs_fit_input_for_payload(left_idx, fit_mode, resource)
                     })
                 })
                 .or_else(|| {
@@ -46833,11 +47099,7 @@ impl App {
                 .map(|(_, right)| right.fit_input)
                 .or_else(|| {
                     right_display_tex.as_ref().and_then(|resource| {
-                        self.fs_fit_input_for_resource(
-                            right_idx,
-                            fit_mode,
-                            resource.source_texture(),
-                        )
+                        self.fs_fit_input_for_payload(right_idx, fit_mode, resource)
                     })
                 })
                 .or_else(|| {
@@ -47025,7 +47287,7 @@ impl App {
                                    content_bbox| {
                     let handle =
                         self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail)?;
-                    self.resolve_fs_spread_page_transform(
+                    self.resolve_fs_spread_page_payload_transform(
                         &handle,
                         image_rect,
                         rect,
@@ -47313,9 +47575,9 @@ impl App {
     fn fs_spread_page_paint_resource(
         &mut self,
         idx: usize,
-        display_tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
+        display_tex: Option<&FullscreenPaintPayload>,
         allow_thumbnail: bool,
-    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+    ) -> Option<FullscreenPaintPayload> {
         display_tex.cloned().or_else(|| {
             if !allow_thumbnail {
                 return None;
@@ -47332,7 +47594,7 @@ impl App {
             } else {
                 resource
             };
-            Some(resource)
+            Some(resource.into())
         })
     }
 
@@ -47351,22 +47613,48 @@ impl App {
         pixels_per_point: f32,
         placement: ResolvedDisplayPlacement,
     ) -> Option<DisplayedImageTransform> {
+        self.resolve_fs_spread_page_payload_transform(
+            &handle.clone().into(),
+            viewport_rect,
+            rect,
+            idx,
+            source_size,
+            layout_source,
+            rotation,
+            content_bbox,
+            pixels_per_point,
+            placement,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_fs_spread_page_payload_transform(
+        &mut self,
+        handle: &FullscreenPaintPayload,
+        viewport_rect: egui::Rect,
+        rect: egui::Rect,
+        idx: usize,
+        source_size: Option<egui::Vec2>,
+        layout_source: FsPageLayoutSource,
+        rotation: crate::rotation_db::Rotation,
+        content_bbox: Option<egui::Rect>,
+        pixels_per_point: f32,
+        placement: ResolvedDisplayPlacement,
+    ) -> Option<DisplayedImageTransform> {
         let tex_size = handle.size_vec2();
         let fit_input = match layout_source {
             FsPageLayoutSource::Captured { fit_input, .. } => {
                 self.captured_fit_input_for_replay(fit_input)
             }
-            FsPageLayoutSource::CurrentItem => self.fs_fit_input_for_resource(
-                idx,
-                self.effective_fullscreen_fit_mode(),
-                handle.source_texture(),
-            )?,
+            FsPageLayoutSource::CurrentItem => {
+                self.fs_fit_input_for_payload(idx, self.effective_fullscreen_fit_mode(), handle)?
+            }
         };
         let layout_size = match layout_source {
             FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
             FsPageLayoutSource::CurrentItem => {
                 let preserve_texture_aspect =
-                    self.fs_page_layout_uses_source_size(idx, handle.source_texture());
+                    self.fs_page_layout_uses_source_id(idx, handle.source_texture_id());
                 let use_layout = preserve_texture_aspect
                     || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
                 use_layout
@@ -47482,6 +47770,7 @@ impl App {
         // `translate`: 左右を一体で置き直すための平行移動 (§1.154)。物理ピクセルの整数倍。
         translate: egui::Vec2,
     ) -> Option<DisplayedImageTransform> {
+        let payload = display_tex.cloned().map(FullscreenPaintPayload::from);
         match self.prepare_fs_spread_page(
             painter,
             viewport_rect,
@@ -47492,7 +47781,7 @@ impl App {
             rotation,
             bg_style,
             location_display,
-            display_tex,
+            payload.as_ref(),
             allow_thumbnail,
             content_bbox,
             pixels_per_point,
@@ -47543,7 +47832,7 @@ impl App {
         rotation: crate::rotation_db::Rotation,
         bg_style: &FsBgStyle,
         _location_display: &str,
-        display_tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
+        display_tex: Option<&FullscreenPaintPayload>,
         allow_thumbnail: bool,
         content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
@@ -47551,11 +47840,14 @@ impl App {
         // `translate`: 左右を一体で置き直すための平行移動 (§1.154)。物理ピクセルの整数倍。
         translate: egui::Vec2,
     ) -> Option<PreparedPagedPage> {
-        let handle = self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail);
-        if let Some(handle) = handle {
+        let mut candidate = self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail);
+        let mut fallback_allowed = display_tex.is_some() && allow_thumbnail;
+        let mut using_full_texture = display_tex.is_some();
+        while let Some(handle_value) = candidate.take() {
+            let handle = handle_value;
             let handle = &handle;
             let transform = self
-                .resolve_fs_spread_page_transform(
+                .resolve_fs_spread_page_payload_transform(
                     handle,
                     viewport_rect,
                     rect,
@@ -47568,9 +47860,19 @@ impl App {
                     placement,
                 )?
                 .translated_by(translate);
+            if !self.page_turn_source_free_paint_supported(handle, &transform) {
+                candidate = if fallback_allowed {
+                    self.fs_spread_page_paint_resource(idx, None, true)
+                } else {
+                    None
+                };
+                fallback_allowed = false;
+                using_full_texture = false;
+                continue;
+            }
             let paint_resource = match layout_source {
                 FsPageLayoutSource::Captured { post_filter, .. } => self
-                    .prepare_fullscreen_paint_resource_with_filter(
+                    .prepare_fullscreen_paint_payload_with_filter(
                         handle,
                         transform.total_scale,
                         pixels_per_point,
@@ -47578,7 +47880,7 @@ impl App {
                         post_filter,
                         false,
                     ),
-                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_resource(
+                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_payload(
                     handle,
                     transform.total_scale,
                     pixels_per_point,
@@ -47599,7 +47901,7 @@ impl App {
                 painter: painter.clone(),
                 underlay: bg_style.clone(),
                 spine: None,
-                live: display_tex.is_some()
+                live: using_full_texture
                     && matches!(layout_source, FsPageLayoutSource::CurrentItem),
             });
         }
@@ -63013,12 +63315,12 @@ mod tests {
             pages: vec![
                 FsNavigatorTextureSource {
                     occurrence: SpreadPageOccurrence::navigation(3, 3),
-                    resource: FullscreenPaintResource::direct(shared_page_3),
+                    resource: FullscreenPaintResource::direct(shared_page_3).into(),
                     provenance: FsDisplayUnitPageProvenance::Holdover,
                 },
                 FsNavigatorTextureSource {
                     occurrence: SpreadPageOccurrence::navigation(4, 3),
-                    resource: FullscreenPaintResource::direct(page_4),
+                    resource: FullscreenPaintResource::direct(page_4).into(),
                     provenance: FsDisplayUnitPageProvenance::Live,
                 },
             ],
@@ -65479,6 +65781,497 @@ mod tests {
         assert!(!fs_navigator_visibility_requested(
             false, false, true, false
         ));
+    }
+
+    #[test]
+    fn page_turn_native_submission_and_navigator_survive_source_eviction() {
+        let ctx = egui::Context::default();
+        let source = ctx.load_texture(
+            "native-submission-source",
+            egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_id = source.id();
+        let generation = crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 3, input: 7 };
+        let native = crate::gpu_lanczos::test_native_resource(
+            FullscreenPaintResource::resampleable(0, source.clone(), generation),
+            [4, 6],
+        );
+        let native_id = native.paint_texture_id();
+        let transform = navigator_test_transform(
+            0,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        );
+        let page = PreparedPagedPage {
+            occurrence: SpreadPageOccurrence::navigation(0, 0),
+            transform,
+            resource: native.into(),
+            painter: ctx.layer_painter(egui::LayerId::background()),
+            underlay: FsBgStyle::Solid(egui::Color32::BLACK),
+            spine: None,
+            live: true,
+        };
+        let sources =
+            FsNavigatorTextureSources::from_prepared(&ctx, std::slice::from_ref(&page), None, true);
+        drop(page);
+        drop(source);
+        assert!(ctx.tex_manager().read().meta(source_id).is_none());
+        let payload = &sources.pages[0].resource;
+        assert!(payload.source_texture().is_none());
+        assert_eq!(payload.source_texture_id(), source_id);
+        assert_eq!(payload.source_generation(), Some(generation));
+        assert_eq!(payload.size(), [8, 12]);
+        assert_eq!(payload.paint_texture_id(), native_id);
+
+        let pending = PendingFsPageTurnReady {
+            items_generation: 3,
+            units: Arc::new(Vec::new()),
+            mode: SpreadMode::Single,
+            slice: crate::page_split::PageSlice::Full,
+            composition: SpreadDisplayComposition::from_navigation_pages(0, &[0]).unwrap(),
+            layout: FullscreenPageLayout::default(),
+            decision: FsPageTurnDecision::normal(),
+            source_policy: FsSubmittedSourcePolicy::Normal,
+            sources: sources.clone(),
+        };
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        pending.account(&mut accountant);
+        assert_eq!(accountant.finish().total_texels, 4 * 6);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(sources.paint_page(
+                &ctx.layer_painter(egui::LayerId::background()),
+                0,
+                &transform,
+                None,
+            ));
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == source_id)));
+    }
+
+    #[test]
+    fn page_turn_off_submission_preserves_ordinary_navigator_source_endpoint() {
+        let ctx = egui::Context::default();
+        let source = ctx.load_texture(
+            "ordinary-navigator-source",
+            egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_id = source.id();
+        let native = crate::gpu_lanczos::test_native_resource(
+            FullscreenPaintResource::resampleable(
+                0,
+                source,
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 3, input: 7 },
+            ),
+            [4, 6],
+        );
+        let native_id = native.paint_texture_id();
+        let transform = navigator_test_transform(
+            0,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        );
+        let page = PreparedPagedPage {
+            occurrence: SpreadPageOccurrence::navigation(0, 0),
+            transform,
+            resource: native.into(),
+            painter: ctx.layer_painter(egui::LayerId::background()),
+            underlay: FsBgStyle::Solid(egui::Color32::BLACK),
+            spine: None,
+            live: true,
+        };
+        let sources = FsNavigatorTextureSources::from_prepared(
+            &ctx,
+            std::slice::from_ref(&page),
+            None,
+            false,
+        );
+        drop(page);
+        assert_eq!(sources.texture_for_page(0, None).unwrap().id(), source_id);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(sources.paint_page(
+                &ctx.layer_painter(egui::LayerId::background()),
+                0,
+                &transform,
+                None,
+            ));
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == source_id)));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+    }
+
+    #[test]
+    fn page_turn_on_ineligible_native_submission_keeps_full_navigator_and_sns_source() {
+        for sns_active in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = crate::app::setup_app_for_test();
+            app.items = vec![
+                GridItem::Image(PathBuf::from("C:/test/native-ordinary-a.png")),
+                GridItem::Image(PathBuf::from("C:/test/native-ordinary-b.png")),
+            ];
+            app.fullscreen_idx = Some(0);
+            app.settings.page_turn_animation_enabled = true;
+            if sns_active {
+                app.sns_split = Some(crate::sns_split::SnsSplitLayout::centered_max(
+                    crate::sns_split::SnsTarget::X,
+                    2,
+                    [8, 12],
+                ));
+            } else {
+                app.fs_zoom = 2.0;
+            }
+            let mut source_ids = Vec::new();
+            let pages = [0, 1].map(|idx| {
+                let source = ctx.load_texture(
+                    format!("ordinary-native-{idx}"),
+                    egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                );
+                source_ids.push(source.id());
+                let native = crate::gpu_lanczos::test_native_resource_with_region(
+                    FullscreenPaintResource::resampleable(
+                        idx,
+                        source,
+                        crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 0, input: 0 },
+                    ),
+                    [16, 12],
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75)),
+                );
+                Some(PreparedPagedPage {
+                    occurrence: SpreadPageOccurrence::navigation(idx, 0),
+                    transform: navigator_test_transform(
+                        idx,
+                        crate::rotation_db::Rotation::None,
+                        ResolvedDisplayPlacement::Normal {
+                            zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+                        },
+                    ),
+                    resource: native.into(),
+                    painter: ctx.layer_painter(egui::LayerId::background()),
+                    underlay: FsBgStyle::Solid(egui::Color32::BLACK),
+                    spine: None,
+                    live: true,
+                })
+            });
+            let mut sources = None;
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                let submitted = app.submit_fs_spread_prepared(ctx, pages.clone(), false, false);
+                assert!(submitted.pages.iter().all(|page| matches!(
+                    page.resource,
+                    FullscreenPaintPayload::NormalResource(_)
+                )));
+                // The SNS panel borrows this exact endpoint from the painted unit.
+                assert_eq!(
+                    submitted.texture_for_page(0, None).unwrap().id(),
+                    source_ids[0]
+                );
+                let geometry = navigator_test_transform(
+                    0,
+                    crate::rotation_db::Rotation::None,
+                    ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                );
+                assert!(submitted.paint_page(
+                    &ctx.layer_painter(egui::LayerId::background()),
+                    0,
+                    &geometry,
+                    None,
+                ));
+                sources = Some(submitted);
+            });
+            assert_eq!(
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Mesh(mesh) => Some(mesh.texture_id),
+                        _ => None,
+                    })
+                    .last(),
+                Some(source_ids[0])
+            );
+            assert!(
+                sources.unwrap().pages[0]
+                    .resource
+                    .source_texture()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn page_turn_partial_presentation_navigator_uses_full_source_or_thumbnail() {
+        let ctx = egui::Context::default();
+        let source = ctx.load_texture(
+            "partial-native-source",
+            egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let thumbnail = ctx.load_texture(
+            "partial-native-thumbnail",
+            egui::ColorImage::filled([2, 3], egui::Color32::GRAY),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_id = source.id();
+        let native = crate::gpu_lanczos::test_native_resource_with_region(
+            FullscreenPaintResource::resampleable(
+                0,
+                source.clone(),
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 0, input: 0 },
+            ),
+            [16, 12],
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75)),
+        );
+        let native_id = native.paint_texture_id();
+        let geometry = navigator_test_transform(
+            0,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        );
+        let sources = FsNavigatorTextureSources {
+            pages: vec![FsNavigatorTextureSource {
+                occurrence: SpreadPageOccurrence::navigation(0, 0),
+                resource: FullscreenPaintPayload::PresentationMaterial(
+                    native.capture_presentation(&ctx),
+                ),
+                provenance: FsDisplayUnitPageProvenance::Live,
+            }],
+            submission: FsDisplayUnitSubmission::Unsubmitted,
+        };
+        drop(native);
+        assert!(sources.pages[0].resource.source_texture().is_none());
+        assert_eq!(sources.partial_presentation_source_id(0), Some(source_id));
+        for fallback in [&source, &thumbnail] {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                assert!(sources.paint_page(
+                    &ctx.layer_painter(egui::LayerId::background()),
+                    0,
+                    &geometry,
+                    Some(fallback)
+                ));
+            });
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Mesh(mesh) if mesh.texture_id == fallback.id())));
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+            let mesh = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == fallback.id() => Some(mesh),
+                    _ => None,
+                })
+                .unwrap();
+            let positions = mesh
+                .vertices
+                .iter()
+                .map(|vertex| vertex.pos)
+                .collect::<Vec<_>>();
+            assert_rect_close(egui::Rect::from_points(&positions), geometry.paint_rect);
+            assert!(mesh.vertices.iter().any(|vertex| vertex.uv.y == 0.0));
+            assert!(mesh.vertices.iter().any(|vertex| vertex.uv.y == 1.0));
+        }
+    }
+
+    #[test]
+    fn page_turn_source_free_expanded_uv_selects_existing_thumbnail_same_pass() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(PathBuf::from(
+            "C:/test/source-free-roi.png",
+        ))];
+        app.fullscreen_idx = Some(0);
+        app.settings.page_turn_animation_enabled = true;
+        let source = ctx.load_texture(
+            "source-free-roi",
+            egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_id = source.id();
+        let native = crate::gpu_lanczos::test_native_resource_with_region(
+            FullscreenPaintResource::resampleable(
+                0,
+                source,
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 0, input: 0 },
+            ),
+            [16, 12],
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75)),
+        );
+        let native_id = native.paint_texture_id();
+        let payload =
+            FullscreenPaintPayload::PresentationMaterial(native.capture_presentation(&ctx));
+        drop(native);
+        assert!(ctx.tex_manager().read().meta(source_id).is_none());
+        let thumbnail = ctx.load_texture(
+            "source-free-roi-thumbnail",
+            egui::ColorImage::filled([2, 3], egui::Color32::GRAY),
+            egui::TextureOptions::LINEAR,
+        );
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        for (content_bbox, expected_id) in [
+            (
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.25),
+                    egui::pos2(1.0, 0.75),
+                )),
+                native_id,
+            ),
+            (None, thumbnail.id()),
+        ] {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(
+                            app.draw_fs_image_with_receipt(
+                                ui,
+                                rect,
+                                0,
+                                None,
+                                FsPageLayoutSource::CurrentItem,
+                                None,
+                                None,
+                                SingletonSpreadPlacement::Center,
+                                Some(&payload),
+                                Some(&thumbnail),
+                                false,
+                                false,
+                                false,
+                                crate::rotation_db::Rotation::None,
+                                None,
+                                0.0,
+                                &FsBgStyle::Solid(egui::Color32::BLACK),
+                                "",
+                                false,
+                                FullscreenFitMode::Page,
+                                FullscreenFitScaleLimits::default(),
+                                content_bbox,
+                                None,
+                                true,
+                            )
+                            .is_some()
+                        );
+                    });
+                },
+            );
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Mesh(mesh) if mesh.texture_id == expected_id)));
+            if expected_id == thumbnail.id() {
+                assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+            }
+        }
+    }
+
+    #[test]
+    fn page_turn_full_equivalent_numeric_roi_navigator_keeps_native_output() {
+        let ctx = egui::Context::default();
+        let source = ctx.load_texture(
+            "numeric-full-roi",
+            egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let native = crate::gpu_lanczos::test_native_resource_with_region(
+            FullscreenPaintResource::resampleable(
+                0,
+                source,
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 0, input: 0 },
+            ),
+            [16, 24],
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(0.99999994, 1.0)),
+        );
+        let native_id = native.paint_texture_id();
+        let sources = FsNavigatorTextureSources {
+            pages: vec![FsNavigatorTextureSource {
+                occurrence: SpreadPageOccurrence::navigation(0, 0),
+                resource: FullscreenPaintPayload::PresentationMaterial(
+                    native.capture_presentation(&ctx),
+                ),
+                provenance: FsDisplayUnitPageProvenance::Live,
+            }],
+            submission: FsDisplayUnitSubmission::Unsubmitted,
+        };
+        drop(native);
+        assert!(sources.partial_presentation_source_id(0).is_none());
+        let geometry = navigator_test_transform(
+            0,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        );
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(sources.paint_page(
+                &ctx.layer_painter(egui::LayerId::background()),
+                0,
+                &geometry,
+                None
+            ));
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+    }
+
+    #[test]
+    fn page_turn_navigator_finds_captured_raw_after_new_final_publication() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(PathBuf::from(
+            "C:/test/navigator-raw-final.png",
+        ))];
+        app.fullscreen_idx = Some(0);
+        let pixels = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+        let raw = ctx.load_texture(
+            "navigator-old-raw",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: raw.clone(),
+                pixels: pixels.clone(),
+                source_dims: Some([8, 12]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        let new_final = ctx.load_texture(
+            "navigator-new-final",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let key = app.final_composite_key_for_pixels(
+            app.current_edit_result_key(0),
+            [8, 12],
+            app.effective_params(0),
+        );
+        app.final_composite_cache.insert(
+            key,
+            crate::app::FinalCompositeEntry {
+                canonical_dims: None,
+                source_size: [8, 12],
+                pixels,
+                texture: new_final.clone(),
+                complete: true,
+            },
+        );
+        assert_eq!(
+            app.resolve_fs_display_tex(0, false).unwrap().id(),
+            new_final.id()
+        );
+        assert_eq!(
+            app.fs_resident_texture_for_source_id(0, raw.id())
+                .unwrap()
+                .id(),
+            raw.id()
+        );
     }
 
     #[test]
@@ -88183,10 +88976,8 @@ pub(crate) mod page_turn_submission_tests {
         let rect = ui.max_rect();
         let sources = match screen.as_slice() {
             [page] => {
-                let texture = app
-                    .resolve_fs_processed_texture(ctx, page.idx, false)
-                    .unwrap();
-                let resource = app.fullscreen_paint_resource_for_texture(page.idx, texture);
+                let texture = app.resolve_fs_processed_texture(ctx, page.idx, false);
+                let resource = app.fullscreen_paint_payload_for_page(page.idx, texture);
                 let mut sources = FsNavigatorTextureSources::default();
                 app.fullscreen_page_layout
                     .begin(FullscreenPageLayoutKind::Single);
@@ -88201,7 +88992,7 @@ pub(crate) mod page_turn_submission_tests {
                         None,
                         None,
                         composition.singleton_placement(),
-                        Some(&resource),
+                        resource.as_ref(),
                         None,
                         false,
                         false,
@@ -88788,7 +89579,8 @@ pub(crate) mod page_turn_submission_tests {
         frame(&ctx, |ui, ctx| {
             let (composition, mut sources) = draw_current(&mut app, ui, ctx);
             sources.pages[0].resource =
-                FullscreenPaintResource::direct(app.resolve_fs_display_tex(1, false).unwrap());
+                FullscreenPaintResource::direct(app.resolve_fs_display_tex(1, false).unwrap())
+                    .into();
             app.emit_fs_page_turn_ready_for_display_unit(
                 ctx,
                 &composition,
@@ -88918,6 +89710,256 @@ pub(crate) mod page_turn_submission_tests {
             assert!(app.current_final_composite_is_complete(2));
             assert!(app.current_final_composite_is_complete(3));
         });
+    }
+
+    #[test]
+    fn paged_native_pending_proof_rejects_mask_edit_and_missing_binding_but_accepts_quality() {
+        for case in ["mask_edit", "quality_publication", "missing_binding"] {
+            let ctx = egui::Context::default();
+            page_turn::install(&ctx);
+            let mut app = ready_app(&ctx, SpreadMode::Ltr);
+            app.settings.page_turn_animation_enabled = case != "missing_binding";
+            frame(&ctx, |ui, ctx| {
+                let (composition, normal_sources) = draw_current(&mut app, ui, ctx);
+                let mut pages = app
+                    .fullscreen_page_layout
+                    .displayed_pages()
+                    .map(|displayed| {
+                        let selected = normal_sources
+                            .pages
+                            .iter()
+                            .find(|p| p.occurrence == displayed.occurrence())
+                            .unwrap();
+                        let source = selected.resource.source_texture().unwrap().clone();
+                        let generation = selected.resource.source_generation().unwrap();
+                        let native = crate::gpu_lanczos::test_native_resource(
+                            FullscreenPaintResource::resampleable(
+                                displayed.page_idx(),
+                                source,
+                                generation,
+                            ),
+                            [40, 60],
+                        );
+                        PreparedPagedPage {
+                            occurrence: displayed.occurrence(),
+                            transform: displayed.transform,
+                            resource: native.into(),
+                            painter: ui.painter().clone(),
+                            underlay: FsBgStyle::Solid(egui::Color32::BLACK),
+                            spine: None,
+                            live: true,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut sources = app.submit_fs_spread_prepared(
+                    ctx,
+                    [Some(pages.remove(0)), Some(pages.remove(0))],
+                    false,
+                    true,
+                );
+                let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                    panic!("native receipt");
+                };
+                assert_eq!(
+                    receipt.has_presentation_binding(),
+                    case != "missing_binding"
+                );
+                if case == "missing_binding" {
+                    // A Native payload alone cannot promote an Ordinary receipt to proof.
+                    for page in &mut sources.pages {
+                        page.resource = FullscreenPaintPayload::PresentationMaterial(
+                            page.resource.capture_presentation(ctx),
+                        );
+                    }
+                    app.pending_fs_page_turn_ready = Some(PendingFsPageTurnReady {
+                        items_generation: app.items_generation,
+                        units: Arc::clone(&app.spread_display_units_cache.units),
+                        mode: app.spread_mode,
+                        slice: app.fullscreen_page_slice,
+                        composition,
+                        layout: app.fullscreen_page_layout.clone(),
+                        decision: FsPageTurnDecision::normal(),
+                        source_policy: FsSubmittedSourcePolicy::Normal,
+                        sources,
+                    });
+                } else {
+                    assert!(
+                        sources
+                            .pages
+                            .iter()
+                            .all(|page| page.resource.source_texture().is_none())
+                    );
+                    app.emit_fs_page_turn_ready_for_display_unit(
+                        ctx,
+                        &composition,
+                        FsPageTurnDecision::normal(),
+                        &sources,
+                    );
+                }
+            });
+            let pending = app
+                .pending_fs_page_turn_ready
+                .as_ref()
+                .expect("native handoff is deferred");
+            let FsDisplayUnitSubmission::Paged(proof) = &pending.sources.submission else {
+                unreachable!();
+            };
+            let proof = proof.clone();
+            assert!(proof.was_accepted());
+            let input_epoch = app.input_generation.get(&0).copied();
+            if case == "mask_edit" {
+                app.erase_mask_generation.insert(0, 1);
+                assert!(!proof.content_matches(&app));
+            } else if case == "quality_publication" {
+                let upgraded = ctx.load_texture(
+                    "native-proof-upgraded-final",
+                    egui::ColorImage::filled([80, 120], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                );
+                let mut published = false;
+                for (key, entry) in app.final_composite_cache.iter_mut() {
+                    if key.edit_key.idx == 0 {
+                        entry.texture = upgraded.clone();
+                        published = true;
+                    }
+                }
+                assert!(published, "ordinary initial draw created the final entry");
+                app.fs_cache.clear();
+                assert!(proof.content_matches(&app));
+            }
+            assert_eq!(app.input_generation.get(&0).copied(), input_epoch);
+            app.fs_nav_locked_gen = Some(app.items_generation);
+            app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+                previous: None,
+                chrome: FsNavigationChromeContinuation::None,
+                purpose: FsNavigationPurpose::Ordinary,
+                opened_at: std::time::Instant::now(),
+                target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                    items_generation: app.items_generation,
+                    anchor_idx: 0,
+                    accept_rendition: false,
+                    phase: FsNavigationTargetPhase::Presenting {
+                        demand: crate::app::FsNavigationDisplayDemand::navigation_only(
+                            0,
+                            vec![0, 1],
+                        ),
+                        presentation: FsNavigationPresentation::Materialized,
+                    },
+                }),
+            }));
+            frame(&ctx, |_, ctx| app.flush_submitted_page_turn_ready(ctx));
+            assert_eq!(
+                app.fs_navigation_sequence_blocks_new_target(),
+                case != "quality_publication",
+                "{case}"
+            );
+            assert!(app.pending_fs_page_turn_ready.is_none());
+        }
+    }
+
+    #[test]
+    fn paged_completing_resize_native_receipt_keeps_on_off_handoffs_source_free() {
+        for enabled in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, SpreadMode::Single);
+            seed_interrupted_leaf(&ctx, &mut app, 2);
+            app.adopt_page_turn_animation_settings(enabled, 600);
+            assert!(app.page_turn_completion_active());
+            let held = app
+                .page_turn_held_resource(1)
+                .expect("ON-origin canonical target");
+            let native = crate::gpu_lanczos::test_native_resource(
+                FullscreenPaintResource::resampleable(
+                    1,
+                    held.source_texture().unwrap().clone(),
+                    held.source_generation().unwrap(),
+                ),
+                [40, 60],
+            );
+            drop(held);
+            let native_id = native.paint_texture_id();
+            let mut submitted_sources = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let rect = ui.max_rect();
+                            let transform =
+                                DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                                    pixel_fit: RectPixelFit::Texels,
+                                    page_idx: 1,
+                                    viewport_rect: rect,
+                                    source_size: native.size_vec2(),
+                                    texture_size: native.size_vec2(),
+                                    rotation: crate::rotation_db::Rotation::None,
+                                    free_rotation_rad: 0.0,
+                                    content_bbox: None,
+                                    fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                                    fit_scale_limits: app
+                                        .fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+                                    pixels_per_point: ctx.pixels_per_point(),
+                                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                                })
+                                .unwrap();
+                            let page = PreparedPagedPage {
+                                occurrence: SpreadPageOccurrence::navigation(1, 1),
+                                transform,
+                                resource: native.clone().into(),
+                                painter: ui.painter().clone(),
+                                underlay: FsBgStyle::Solid(egui::Color32::BLACK),
+                                spine: None,
+                                live: false,
+                            };
+                            app.fullscreen_page_layout
+                                .begin(FullscreenPageLayoutKind::Single);
+                            app.fullscreen_page_layout
+                                .push_occurrence(transform, page.occurrence);
+                            // This is an already normally prepared Native output at the submission
+                            // boundary; OFF and ineligible-ON canonical rebinds retain only its allocation.
+                            let sources =
+                                app.submit_fs_spread_prepared(ctx, [Some(page), None], false, true);
+                            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission
+                            else {
+                                panic!("canonical receipt");
+                            };
+                            assert!(receipt.has_presentation_binding());
+                            assert!(!receipt.was_accepted());
+                            assert!(sources.pages[0].resource.source_texture().is_none());
+                            assert_eq!(sources.pages[0].resource.paint_texture_id(), native_id);
+                            let composition = app.spread_display_composition_for_anchor(1);
+                            app.emit_fs_page_turn_ready_for_display_unit(
+                                ctx,
+                                &composition,
+                                FsPageTurnDecision::normal(),
+                                &sources,
+                            );
+                            assert!(sources.paint_page(ui.painter(), 1, &transform, None));
+                            submitted_sources = Some(sources);
+                        });
+                },
+            );
+            drop(native);
+            let sources = submitted_sources.unwrap();
+            assert!(sources.pages[0].resource.source_texture().is_none());
+            let pending = app
+                .pending_fs_page_turn_ready
+                .as_ref()
+                .expect("OFF-origin canonical output still awaits accepted handoff");
+            assert!(pending.sources.pages[0].resource.source_texture().is_none());
+            let mut accountant = crate::vram_budget::VramAccountant::default();
+            pending.account(&mut accountant);
+            assert_eq!(accountant.finish().total_texels, 40 * 60);
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+        }
     }
 
     #[test]

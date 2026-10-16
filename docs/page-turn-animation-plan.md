@@ -3137,11 +3137,12 @@ PNG変更はない。test-full/build-dev、アプリの起動・停止、git add
 
 ## 27. D1 — 高解像度の素材保持とフレーム停止の分離（2026-10-16）
 
-**D1r改訂・独立設計再レビュー待ち。製品コード未変更。** D1文書は `81b6d8d38`。
+**D2実装中・prepare境界の設計判断待ち・実機未確認（2026-10-16）。** D1文書は `81b6d8d38`、D1rは `cc4e775c1`。
+利用者からD1rの独立設計再レビュー「指摘なし・ACCEPT」とD2実装の承認を受けた。
 独立レビュー（GPT-6.1 Sol / xhigh、利用者から全文伝達）はREVISE、P1相当なし・P2が3件。
 D2のsource/paint所有分離と、それがdetachedの症状パッチではなく構造修正である方向には同意を得た。
 P2-1は本改訂でD2のManaged方針・単独受入条件へ反映し、P2-2/3はD3の未解決要件として残す。
-本改訂自体の再レビュー合格や製品変更の承認済み実装を主張しない。調査の基点は `pageturn-material` /
+当初調査の基点は `pageturn-material` /
 `911d33427`（開始時clean）。v4.7.0で出荷済みの機能に対する改修案であり、未出荷機能として
 既存の操作・表示品質を削らない。本節は素材所有・処理配置・時計の改訂案だけを扱う。
 §1〜26のmotion、既定OFF、PC/F12限定、flat-first、最新の§26.12のslideshow契約は維持する。
@@ -3651,4 +3652,100 @@ guardを足して通さず範囲を設計担当へ返す。大判Directの新素
   ログからそれらの性能を一般化しない。
 - clock原点と準備+Dの費用は利用者採択済み、実装は次版D4。D1rの独立再レビュー、D2の具体的実装範囲の
   構造合意・実装/テスト/実機受入れ、D3bの具体策の合意は未了。
-  **本D1rは設計文書だけをコミットし、設計再レビューのためここで止める。masterへ統合しない。**
+  D1r時点では設計文書だけで停止した。D2の今回記録は次項に分ける。
+
+### 27.11 D2実装記録（2026-10-16、設計判断待ち・実機未確認）
+
+`FullscreenPaintResource`は通常source/prepare用の型として残し、描画境界の
+`FullscreenPaintPayload`を`NormalResource | PresentationMaterial`へ分離した。
+`FullscreenPresentationResource`の素材は`Native(Arc<LanczosOutput>) | Managed`の排他的な所有で、
+Nativeはsource ID・世代・論理寸法・proofを値で保持するだけである。
+Managedは実ハンドルとcapture時のTextureOptionsを持ち、実mip policyで会計する。
+通常display sourceはallocationのsamplerを後から変更しない。egui 0.33のmetadataは初期optionsなので、
+この既存契約をcaptureの前提とする。`.set`/partial更新の実使用はmask overlayだけで、display sourceではない。
+大判Direct、等倍、Nearest拡大、出力上限fallbackをNativeへ変える処理は足していない。
+
+accept直後は既存のresident選択を`AcceptedSources`の短命なNormal入力leaseとして保持する。
+通常描画が一度prepareした後、offeredの照合・旧expiry・projectionが成立する境界で、
+診断情報を含む受理素材をprepared presentationへ置き換え、入力leaseを解放してから再予算判定する。
+Flat/unit/batch、navigator、pending readyも同じpresentationを保持し、Nativeのraw handleを復活させない。
+追加worker/job queue/待機状態を作らず、通常producerとaccepted_at原点は維持した。
+通常prepareの仕事開始時刻については、下記の未解決差分があるため維持をまだ保証しない。
+テストの時計注入は既存の時刻読取り位置だけに置き、OFFでは時計を読まない。
+
+実装上、従来のheld resourceは通常TextureHandle選択とgeometryの入力にも使われていた。
+通常selectorの実行を残したまま、最終paint選択をcache residencyから分離し、
+sourceが退去してもheld outputと保存した寸法/fitの値から描く。
+通常sourceが在住するpassは通常prepareを通してから保持素材へbindし、
+viewport/clip/placement等は現passから再計算して既存のbinding取消判定へ渡す。
+source不在で新しい要求UVが保持ROIを超える場合だけ、同passの既存許可thumbnail/loading選択へ戻し、
+既存のbinding取消理由を使う。source texelの既存許容内の丸め差は不足としない。
+readyは採用済みreceipt・destination/layout/items/input generationと素材のprovenanceを照合し、
+Nativeの可視証明としてraw cache在住を再要求しない。
+実提出unitの`PageTurnContent`をreceiptの排他的な`Ordinary | Presentation`値bindingとして捕捉し、
+flush時にmask/params/comic等も照合する。emit時の現値を採り直さず、maskだけが変わってinput epochが
+同じ場合も旧Native readyを採用しない。通常OFFはOrdinaryでsnapshot allocationを行わない。
+ON由来のOFF-Completing再描画は実receiptのoriginから素材化し、canonicalのgeometry更新後も
+unit/navigator/ready経由でNative sourceを再pinしない。
+演出対象外のON表示・SNS previewとOFFのnavigatorは従来の通常sourceを使う。
+演出由来でもnavigator全景を覆わない本物のpartial出力は、該当頁の通常cacheに残る同じsource IDを
+read-onlyで一時参照し、なければ既存の許可thumbnailへ戻す。新finalのpublicationで旧rawが候補の
+一位から外れても、在住する旧rawを見つける。新しい素材生成/keep/workerは足さない。
+
+通常会計ownerにread-onlyの`ViewerTextureCaches`列挙を置き、mounted/at-rest/parkedを同じwalkerへ接続した。
+通常source・final/edit/comic/erase/local-adjust/conceal等の派生cacheとthumbnailを、
+presentation inventoryの有無やON/OFFとは独立に数え、全contextで同じTextureId集合を使う。
+従来の兄弟列挙がLanczos/similar中心だった欠落と、通常passthrough/holdover/snapshotの保持も監査・接続した。
+通常cache側の既存mip規約（静止画等true、thumbnail/passthrough false）は維持する。
+erase preview、analysis overlay/SV、退避snapshot thumbnail、類似候補Ready thumbnail、
+composition editorの採用済みtexture mapも列挙する。
+editor worker送信前/receiver内の未採用textureはread-only列挙不能で、既存producer/transferの別境界である。
+今回の保証は通常cacheと採用済みmapの全context会計であり、全GPU所有の完全列挙を主張しない。
+この既存の未採用境界はpresentation参照削除によって生じた会計消失ではなく、D2でproducerを変更しない。
+通常snapshot/holdoverだけに残ったthumbnailは通常resourceにmip metadataがなく、既存true規約の保守的な会計となる。
+presentationのManagedはこの制約とは別に実optionsを記録する。
+
+pinの上限式は据え置き。03/04 fixtureのoffer入口では、一時入力2枚とoutgoing Native2枚の
+564,864,504 / 729,216,848 bytesを判定し、prepare後は4出力の55,987,200 / 60,333,360 bytesだけを予約する。
+前者の一時入力は実residentとしても数える。固定時計で旧expiryとpin拒否を分離し、
+pinを通過しただけでfinishしたとは判定しない。寸法fixtureはGPU/pixel確保をしないheadless会計検査であり、
+実GPUでの画質・開始率・滑らかさ改善の証拠ではない。
+`offered`/`skip(pin_budget)`にinput/materialのID・寸法・保持内訳を、
+`material / prepared`に入力解放後の再判定bytesと両unitの素材内訳を追加する。
+解析器は同kindを任意診断として読み、operation/頁idxごとのNative/Managed内訳とpin値を出す。
+旧ログに新fieldを必須化せず、D3/D4の性能gateは追加しない。perf無効時は新しい素材JSONを構築しない。
+
+今回の利用者指定の実行gateはfmt、core check、focused、本体lib全件と必要なsnapshotである。
+build-dev、製品起動、コミットは行わず、実機確認とgit操作は設計担当/利用者へ渡す。
+seq67/78の開始前省略、02の停止、準備時間がdurationを消費する挙動は今回の未解決範囲として残す。
+
+#### 27.11.1 設計担当へ戻すprepare境界（未解決）
+
+独立実装レビューで、source-free化後の通常prepareの仕事開始時刻にD1rとの不一致を確認した。
+旧版は通常producer/pollを続けながら、安定viewの描画にはheld source付きLanczos resourceを返していた。
+`GpuLanczosCache::resolve`はその既存出力を再利用するため、新finalのpublicationがあっても、
+新sourceのresampleはthaw後に始まる。現在の差分では通常selectorの新sourceをprepareし、その後に旧素材へbindする。
+新sourceの出力がcache missならturn中に生成・submitが前倒しされる。旧素材を描き続けるだけでは
+§27.9.1のprepare開始・完了維持を満たさない。性能悪化の実測証拠はなく、仕事の開始境界の差をコードで確認した段階である。
+
+設計担当への推奨案は、安定したviewで保持素材とgeometry/ROI/filterが一致するときは既存Native出力を再利用し、
+resize/DPI/fit等で一致しないときは従来の通常prepareへ進む責務を明示すること。
+無条件のheld選択ではview変更を見落とすため採用できない。新worker/queueやsource再pinは必要ないが、
+§27.4の「毎frameの通常prepare後にbind」とこの条件付き再利用との関係を設計担当と合意してから実装する。
+新sourceの生成・submitの前倒しを許容するなら、D2の範囲変更と潜在的な費用について利用者判断が必要である。
+この判断前に追加のadmission制御を実装せず、安全なcheckpointで停止した。現差分は未完成であり、出荷・コミット可能とはしない。
+独立レビューの素材所有・receiptに関する先行指摘は修正済みだが、この開始境界の相談は未解決である。
+
+#### 27.11.2 checkpointの検証記録
+
+- `cargo fmt`（引数なし）、core `cargo check`は終了コード0。ただしcore check後の小さなreceipt/選択修正は
+  focusedでコンパイル・検査しており、判断後の最終core checkは再実行する。
+- `test-focused.ps1`はpage-turn 105件、gpu_lanczos 46件、通常会計4件、ui_fullscreen 925件が成功、終了コード0。
+  ui_fullscreen内にpage-turn 105件を含み、延べ1,080件・重複を除くと975件。
+- `cargo test -p mimageviewer --test ui_snapshot`は181件成功、終了コード0。
+  `--features test-script`の`drawn_paint_records_native_presentation_after_source_release`は1件成功、終了コード0。
+- `python -m unittest test_analyze_perf`は103件成功、`cargo run -p viewer_context_audit`も終了コード0。
+  `git diff --check`は終了コード0。
+- 03/04は実offer入口とprepare後再判定の回帰で検査済み。旧時計のexpiryは固定時計で分離している。
+  対象処理を壊す変異検査と`test-lib-full.ps1`は未実施。設計判断後の修正・再レビューと併せて実施する。
+- 実GPU、実本03/04、F12実機は未確認。製品バイナリ起動、build-dev、コミットは行っていない。

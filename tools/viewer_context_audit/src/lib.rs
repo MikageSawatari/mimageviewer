@@ -212,6 +212,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn at_rest (bundle : & 'a ViewerContextBundle) -> Self",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fullscreen_idx (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn items (self) -> & 'a [GridItem]",
+    // D2 resident accounting borrows the same normal GPU stores in mounted/at-rest contexts.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn texture_caches (self) -> super :: vram_accounting :: ViewerTextureCaches < 'a >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_cache (self) -> & 'a ItemsGenerationMap < FsCacheEntry >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn viewer_session_last_sync_stamp (self) -> Option < & 'a ViewerSyncStamp >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pdf_password_request (self) -> Option < & 'a PdfPasswordRequest >",

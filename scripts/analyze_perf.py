@@ -367,7 +367,7 @@ PAGE_TURN_ANIMATION_PROFILES = (
 )
 PAGE_TURN_ANIMATION_KINDS = {
     "opportunity", "offered", "start", "skip", "cancel", "finish",
-    "first_visible", "fully_visible", "frame",
+    "first_visible", "fully_visible", "frame", "material",
 }
 
 
@@ -448,7 +448,7 @@ def analyze_page_turn_animation(
         group = groups.setdefault(group_key, {
             "profile": operation_profile, "context": identity[0], "window": identity[1],
             "counts": Counter(), "runs": Counter(), "skip_reasons": Counter(),
-            "metrics": defaultdict(list),
+            "metrics": defaultdict(list), "material_snapshots": [],
         })
         counts = group["counts"]
         group["runs"][operation_run] += 1
@@ -486,6 +486,39 @@ def analyze_page_turn_animation(
                 incomplete.append(f"{identity}: skip without reason")
                 reason = "unknown"
             group["skip_reasons"][reason] += 1
+
+        # D2 allocation observations are optional diagnostics, not another
+        # performance or clock gate. Replay must not count a prepared snapshot twice.
+        seen_materials = set()
+        for event in phases.get("material", []):
+            material_key = json.dumps(event, sort_keys=True)
+            if material_key in seen_materials:
+                continue
+            seen_materials.add(material_key)
+            allocations = []
+            for side in ("outgoing", "incoming"):
+                pages = event.get(f"{side}_materials", [])
+                if not isinstance(pages, list):
+                    continue
+                for page in pages:
+                    if not isinstance(page, dict) or not isinstance(page.get("allocation"), dict):
+                        continue
+                    allocation = page["allocation"]
+                    allocations.append({
+                        "side": side, "idx": page.get("idx"), "occurrence": page.get("occurrence"),
+                        **{field: allocation.get(field) for field in (
+                            "kind", "source_texture_id", "paint_texture_id", "logical_size",
+                            "paint_size", "source_handle_retained", "retained_bytes", "source_uv_domain",
+                        )},
+                    })
+            snapshot = {"operation_id": identity[2], "reason": event.get("reason"),
+                        "allocations": allocations}
+            for metric in ("pin_bytes", "pin_limit_bytes"):
+                value = _animation_number(event.get(metric))
+                snapshot[metric] = value
+                if value is not None:
+                    group["metrics"][metric].append(value)
+            group["material_snapshots"].append(snapshot)
 
         # Lifecycle timings are counted once per operation. Frame timings use the
         # emitted frame identity, or exact timestamp for older diagnostic builds.
@@ -577,6 +610,14 @@ def analyze_page_turn_animation(
             "runs": dict(group["runs"]),
             "skip_reasons": {reason: {"count": count, "ratio": count / opportunities}
                              for reason, count in sorted(group["skip_reasons"].items())},
+            "material_diagnostics": {
+                "snapshots": group["material_snapshots"],
+                "allocation_kinds": dict(Counter(
+                    allocation["kind"] for snapshot in group["material_snapshots"]
+                    for allocation in snapshot["allocations"]
+                    if isinstance(allocation.get("kind"), str)
+                )),
+            },
             "metrics": {metric: {"samples": len(values), "p50": percentile(values, .50),
                                   "p95": percentile(values, .95), "p99": percentile(values, .99),
                                   "max": max(values)}
@@ -608,6 +649,10 @@ def cmd_page_turn_animation(events: list[dict], args, delivery: dict | None = No
               + (f"finished/started={group['finished_ratio']:.1%}" if group['finished_ratio'] is not None else "finished/started=N/A")
               + f" runs={group['runs']}")
         print(f"    skips={group['skip_reasons']} metrics={group['metrics']}")
+        material = group["material_diagnostics"]
+        if material["snapshots"]:
+            print(f"    D2 material snapshots={len(material['snapshots'])} "
+                  f"allocations={material['allocation_kinds']} (details in JSON report)")
     print(f"  excluded (outside opportunity denominator): {report['excluded_reasons']}")
     for reason in report["failures"] + report["incomplete"]:
         print(f"  {reason}")

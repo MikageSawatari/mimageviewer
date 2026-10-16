@@ -45,7 +45,7 @@ UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[
 `page_turn_animation.rs`のcanonical unit projectionへ分離する。既存navigation target、
 ready判定、captureのfit/UV/occurrenceを正本にし、unit全体の通常prepare後にflat/curlを選ぶ。
 保持する旧画素は提出済みimmutable paint resourceで、別のdecode/upload/resample経路を作らない。
-共有weak lease inventoryはsource/outputのVRAM会計を担い、兄弟readerの状態を所有しない。
+共有weak lease inventoryはpresentation素材とprepare前の一時入力leaseを会計し、兄弟readerの状態を所有しない。
 ONはeguiの最終output hookで破棄passを除外して実occurrence/source/nativeの提示receiptを採用し、
 当該contextの次のpre-drawで既存ready observerへ届ける。配送時には元画像/通常final/passthroughの
 既存選択、unit/layout、items/input generationを照合する。OFFは従来の同pass通知を保つ。
@@ -76,6 +76,21 @@ ambient frame stampは既存fieldの(ViewportId, frame_nr)で、viewportの違�
 根因・実機取消3件・回帰の詳細は[page-turn-animation-plan.md §21](page-turn-animation-plan.md)を正本とする。
 
 2026-10-11 resident readiness追補: acceptは現在keyのresident complete/incomplete final、対応comic、既存faithful rendition、通常元画像/RAW preview、許可thumbnailを品質順に選ぶ。acceptでproducer/I/O/uploadは呼ばない。incomingもtyped resourceとしてpin会計へ入り、thumbnailのDirect属性をcache失効後も保持する。通常producer/poll/prepareは継続し、turnとcanonical flatは最初の素材・geometryに固定する。source品質publicationのinput epoch更新はcancelしないが、item/edit/params/comic/view/context bindingの失効は維持する。実素材のIDでnavigator/receiptを作り、flat採用後は通常selectorへ戻る。§22を過去のfinal-only記録より優先する。
+
+2026-10-16 D2追補（実機未確認）: 通常`FullscreenPaintResource`とONの提出payloadを型で分離した。
+prepare済み`FullscreenPresentationResource`はNative出力leaseだけ、または実際に描くManagedハンドルと
+TextureOptionsを保持し、Nativeの原寸sourceをpinしない。受理時のNormal入力leaseは通常prepare後に
+presentationへ置換してから再予算判定する。Flat/curl/canonical/batch/ready/navigatorがこの素材を共有する。
+source ID・世代・元寸法は値のproofであり、raw cacheから再取得して描く権限にはしない。
+実提出unitの内容bindingもreceiptへ値で保存し、遅延readyでmask/params/comicの変更を照合する。
+OFFへ切り替えたON由来canonical再描画もreceiptのoriginで素材化し、原寸sourceを再保持しない。
+source退去後も保持出力で描く。navigatorは全景を覆う出力を使い、本物のpartialでは同頁の通常cacheの
+同じsource IDを一時参照し、なければ既存の許可thumbnailを使う。対象外のON表示/SNS previewは通常sourceを維持する。
+通常source/派生cacheはmounted/at-rest/parked共通のread-only会計walkerが独立に数える。
+等倍/Nearest拡大/出力上限fallback/大判Directは従来のManaged allocationを保持する。
+OFFのsource描画、通常producer、accepted_at原点の時計は維持する。
+現差分の通常prepareには、新sourceの仕事開始がturn中へ前倒しされる未解決点があり、
+安定viewの再利用境界を設計担当へ確認中である。詳細・検証はplan §27.11。
 
 PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
 （未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
@@ -1502,13 +1517,17 @@ page rect は包含枠として保持し、実 texture はその内側へ contai
 ナビゲータ上の位置は `screen_to_source_normalized` で UV へ変換し、
 `pan_to_center_source_normalized` で倍率を変えずに画面中央へ置く `fs_pan` を求める。
 このためフィット、表示トリム、90度回転、見開きの配置をナビゲータ側で再計算しない。
-縮小画像は、そのフレームの単ページ / 見開き描画が解決済みの
+通常の縮小画像は、そのフレームの単ページ / 見開き描画が解決済みの
 `FullscreenPaintResource::source_texture()` を使う。これは加工済みの full-image texture であり、
 ズーム中に可視 source 領域だけを持つ Lanczos 拡大出力 (`paint_texture_id()`) は使わない。
 加工済み composite が未準備のページだけは既存のサムネイルカタログへフォールバックし、黒や
 点滅を挟まない。nav / final-effect source-reload holdover を重ねたフレームは、ナビゲータへ渡す idx → resource も
 その display unit 全体へ置き換え、本文とナビゲータが新旧ページで食い違わないようにする。
 ナビゲータ自身は texture producer を呼ばず、UI スレッドで画像読み込みやデコードも行わない。
+D2の演出由来payloadだけはsourceを所有しない。全景coverageを既存texel許容込みで証明できるNativeは
+出力を直接使い、本物のpartialでは同頁の通常cacheのsaved source IDを一時借用して全画像を描く。
+旧rawより新finalが優先されても、同じIDが在住すれば借用できる。source不在時は既存の許可thumbnailへ戻る。
+演出対象外のON/SNS splitやOFFは通常sourceを使う。本文のpartial ROIだけを全景として引き伸ばさない。
 比較表示では本文と同じ単一比較キャンバスをレイアウト正本とし、Wipe / Diff はナビゲータの
 画像矩形へ `zoom_pan=None` で同じ `CompareShaderCallback` を再描画する。PinnedNormal は
 準備済み pinned texture を直接描画する。同一フレームの2 callback は同じ `pair.key` と寸法を

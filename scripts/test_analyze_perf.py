@@ -2328,6 +2328,49 @@ class PageTurnAnimationTests(unittest.TestCase):
         self.assertEqual(report["profiles"][0]["started"], 90)
         self.assertEqual(report["profiles"][0]["metrics"]["mesh_cpu_ms"]["samples"], 90)
 
+    def test_d2_material_snapshots_preserve_allocations_without_changing_gate(self):
+        rows = self.complete_rows()
+        opportunity = next(row for row in rows if row["kind"] == "opportunity")
+        native = {
+            "kind": "native", "source_texture_id": "Managed(1)", "paint_texture_id": "User(2)",
+            "logical_size": [6144, 8192], "paint_size": [1620, 2160],
+            "source_handle_retained": False, "retained_bytes": 13_996_800,
+            "source_uv_domain": [0, 0, 1, 1],
+        }
+        managed = {
+            "kind": "managed", "source_texture_id": "Managed(3)", "paint_texture_id": "Managed(3)",
+            "logical_size": [7, 5], "paint_size": [7, 5],
+            "source_handle_retained": True, "retained_bytes": 140, "source_uv_domain": None,
+        }
+        material = {**opportunity, "kind": "material", "reason": "prepared",
+                    "pin_bytes": 13_996_940, "pin_limit_bytes": 1_012_421_099,
+                    "outgoing_materials": [{"idx": 2, "allocation": native}],
+                    "incoming_materials": [{"idx": 3, "allocation": managed}]}
+        report = self.analyze(rows + [material, dict(material)])
+        self.assertEqual(report["status"], "pass")
+        group = report["profiles"][0]
+        self.assertEqual(group["started"], 90)
+        self.assertEqual(group["metrics"]["pin_bytes"]["samples"], 1)
+        self.assertEqual(group["metrics"]["pin_bytes"]["max"], 13_996_940)
+        self.assertEqual(group["metrics"]["pin_limit_bytes"]["max"], 1_012_421_099)
+        diagnostics = group["material_diagnostics"]
+        self.assertEqual(diagnostics["allocation_kinds"], {"native": 1, "managed": 1})
+        self.assertEqual(len(diagnostics["snapshots"]), 1)
+        snapshot = diagnostics["snapshots"][0]
+        self.assertEqual(snapshot["reason"], "prepared")
+        self.assertEqual(snapshot["allocations"][0], {"side": "outgoing", "idx": 2, "occurrence": None, **native})
+        self.assertEqual(snapshot["allocations"][1], {"side": "incoming", "idx": 3, "occurrence": None, **managed})
+        # Missing optional allocation fields do not invalidate an otherwise complete legacy trace.
+        diagnostic_only = {**opportunity, "kind": "material", "reason": "prepared"}
+        self.assertEqual(self.analyze(rows + [diagnostic_only])["status"], "pass")
+
+    def test_unknown_animation_kind_still_cannot_judge(self):
+        rows = self.complete_rows()
+        rows.append({**rows[0], "kind": "unknown-material-protocol"})
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "CannotJudge")
+        self.assertTrue(any("Unknown animation event kind" in reason for reason in report["incomplete"]))
+
     def test_acceptance_time_is_not_reported_as_physical_input_time(self):
         rows = self.complete_rows(ingress=False)
         report = self.analyze(rows)
