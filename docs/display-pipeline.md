@@ -95,6 +95,14 @@ prepare前には既存bindと同じview比較を行い、一致時だけ保持tr
 同じtarget/smoothing/scale branch/ROIのNativeは既存出力を再利用し、新sourceのresampleをthawまで前倒ししない。
 view/key変更時は通常prepareへ進む。詳細・検証はplan §27.11。
 
+2026-10-16 D4追補（次版向け実装済み・実機未確認）: ONのmotion時計は最初の採用curl outputを原点とする。
+受理時刻はレイテンシ専用で、Offered照合にduration expiryを使わない。Turningの排他時計は
+AwaitingAcceptedOutputではp=0を提出し、operation固有ledgerが非discard outputで一回公開した時刻を
+次のowning描画がRunningへ取り込む。追加frame/replay/mountでresetせず、以後はwall/durationで進める。
+取消/closeの終端とoperation/destination照合が遅いhookの復活を防ぐ。素材待ちを増やさず、accept無素材はinstant。
+flat-firstと§26.12のslideshow（短間隔instant、それ以外はcanonical flat採用後から保存間隔全体）、
+OFF・連結読みの時計は維持する。perfの受理レイテンシとmotion統計の区別は[plan §27.12](page-turn-animation-plan.md)を参照。
+
 PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
 （未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
 派生workerで更新しない。fullscreen本体はUnscoped＋既存fs_pending cancel/generation、

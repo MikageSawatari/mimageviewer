@@ -384,12 +384,14 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
             assert_ne!(page10, page11);
             let mut black_counts = Vec::new();
             for progress in [0.1, 0.25, 0.6, 0.75] {
-                let PresentationState::Turning { offer, .. } =
+                let PresentationState::Turning { clock, offer, .. } =
                     &mut app.page_turn_presentation.state
                 else {
                     panic!("effect must remain active at {progress}");
                 };
-                offer.accepted_at = Instant::now() - offer.duration.mul_f32(progress);
+                *clock = MotionClock::Running {
+                    start_at: Instant::now() - offer.duration.mul_f32(progress),
+                };
                 time += 0.01;
                 let frame = capture(&mut app, &ctx, time, |_, _| {});
                 assert_eq!(tracker.status(), SubmissionStatus::Started);
@@ -483,11 +485,14 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
                     "black front must uncover new9 progressively: {black_counts:?}"
                 );
             }
-            let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state
+            let PresentationState::Turning { clock, offer, .. } =
+                &mut app.page_turn_presentation.state
             else {
                 panic!("turn must survive middle frames");
             };
-            offer.accepted_at -= offer.duration + Duration::from_millis(1);
+            *clock = MotionClock::Running {
+                start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+            };
             time += 0.01;
             capture(&mut app, &ctx, time, |_, _| {});
             time += 0.01;

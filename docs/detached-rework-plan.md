@@ -5375,6 +5375,17 @@ batch末尾の確定点へ処理を揃えて組合せを減らす。A4のraise�
 detached経路の構造的修正という判断も維持された。2026-10-16にmasterへ統合した。負荷測定と実機確認は未実施である。
 実機suiteは別途明示承認を必要とし、内部Present完了や回帰成功を報告者の物理点滅解消とは扱わない。
 
+### §11 追補: 紙めくりD4の初回採用output時計（2026-10-16、実機未確認）
+
+§2を確認した。変更は`ui_fullscreen/page_turn.rs`の既存context presentationとsubmission ledger内に限定する。
+Turning内の排他時計へ、当該operation/destinationの最初の非discard curl output時刻だけを渡す。
+既存bundleのmove/mount/depositは同じ時計・trackerを移すだけでresetしない。forkは従来どおりInactiveで、
+close/retire/取消の終端後の遅いhookは開始を公開しない。viewport/窓の選択述語、HWND、placement、再生成を変更しない。
+他機能の時計の原点をその出力所有境界に置く構造修正であり、detached症状を隠すguard/delay/retryではない。
+採択済み§27.6と利用者のD4実装指示を根拠に実装し、独立完成レビュアーも上記の具体的所有境界を
+症状パッチでなく構造修正として確認した。素材・通常producerとflat-firstを維持し、新detached bool・同期I/O・tick/queueを追加しない。
+実装・自動検証・残る実機gateは[page-turn計画 §27.12](page-turn-animation-plan.md)を正本とする。
+
 ### 2026-10-16 egui 0.37 更新に伴う構造修正 (設計上の合意済み・未実装)
 
 [更新設計書第4.2版](egui-0.37-update-plan.md) §4.2・§4.5・§4.8・§4.9・§4.11の

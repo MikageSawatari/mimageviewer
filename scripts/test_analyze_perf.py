@@ -2328,6 +2328,25 @@ class PageTurnAnimationTests(unittest.TestCase):
         self.assertEqual(report["profiles"][0]["started"], 90)
         self.assertEqual(report["profiles"][0]["metrics"]["mesh_cpu_ms"]["samples"], 90)
 
+    def test_d4_motion_metrics_separate_slow_preparation_and_deduplicate_replay(self):
+        rows = self.complete_rows()
+        for row in rows:
+            if row["kind"] in ("start", "frame", "finish", "fully_visible"):
+                row.update(clock_origin="first_accepted_curl", accept_to_first_curl_ms=350,
+                           motion_frames=1 if row["kind"] == "start" else 8,
+                           motion_max_gap_ms=0 if row["kind"] == "start" else 60,
+                           motion_elapsed_ms=0 if row["kind"] == "start" else 200,
+                           output_motion_elapsed_ms=0 if row["kind"] == "start" else 250,
+                           progress=0 if row["kind"] == "start" else 1)
+        report = self.analyze(rows + [dict(row) for row in rows])
+        self.assertEqual(report["status"], "pass")
+        metrics = report["profiles"][0]["metrics"]
+        for name, value in (("accept_to_first_curl_ms", 350), ("motion_frames", 8),
+                            ("motion_max_gap_ms", 60), ("first_curl_progress", 0),
+                            ("motion_elapsed_ms", 200), ("output_motion_elapsed_ms", 250)):
+            self.assertEqual(metrics[name]["max"], value)
+            self.assertEqual(metrics[name]["samples"], 90)
+
     def test_d2_material_snapshots_preserve_allocations_without_changing_gate(self):
         rows = self.complete_rows()
         opportunity = next(row for row in rows if row["kind"] == "opportunity")

@@ -217,7 +217,10 @@ fn page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_bac
             });
             let tracker = match &mut app.page_turn_presentation.state {
                 PresentationState::Turning {
-                    offer, projection, ..
+                    clock,
+                    offer,
+                    projection,
+                    ..
                 } => {
                     assert_eq!(offer.forward, forward);
                     assert_eq!(offer.submission.status(), SubmissionStatus::Started);
@@ -233,7 +236,9 @@ fn page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_bac
                             assert!(uv.iter().all(|p| roi_unit().contains(*p)));
                         }
                     }
-                    offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                    *clock = MotionClock::Running {
+                        start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                    };
                     offer.submission.clone()
                 }
                 _ => panic!("started native turn"),

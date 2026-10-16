@@ -3137,7 +3137,7 @@ PNG変更はない。test-full/build-dev、アプリの起動・停止、git add
 
 ## 27. D1 — 高解像度の素材保持とフレーム停止の分離（2026-10-16）
 
-**D2実装済み・実機未確認（2026-10-16）。** D1文書は `81b6d8d38`、D1rは `cc4e775c1`。
+**D2・D4実装済み・実機未確認（2026-10-16）。** D1文書は `81b6d8d38`、D1rは `cc4e775c1`。
 利用者からD1rの独立設計再レビュー「指摘なし・ACCEPT」とD2実装の承認を受けた。
 独立レビュー（GPT-6.1 Sol / xhigh、利用者から全文伝達）はREVISE、P1相当なし・P2が3件。
 D2のsource/paint所有分離と、それがdetachedの症状パッチではなく構造修正である方向には同意を得た。
@@ -3457,13 +3457,13 @@ tile数・転送上限・新GPU scheduler、native source所有の具体策は�
 全処理の演出後送り、先読み削減、低画質固定、最終画質化の意図的延期は不採用のまま。
 必要と判明すれば利用者判断へ返し、D2だけで02のカクつき解消や全体性能gate達成と報告しない。
 
-### 27.6 時計の採択（2026-10-16利用者決定、実装は次版D4）
+### 27.6 時計の採択（2026-10-16利用者決定、次版D4実装済み・実機未確認）
 
 **最初に採用されたcurl提出を演出時計の原点にする案を利用者が採択した。**
 `accepted_at`は操作から準備/初出までのレイテンシの観測値として残し、motion clockと混ぜない。
 この仕様では、例えば準備120ms + 設定200msなら全面表示まで約320ms＋採用境界となる。
 受理から約200msで打切る現行より全面表示が遅くなり得る費用も了承済み。
-再質問は不要だが、**実装は次版のD4であり、v4.7.1/D2ではaccepted_at原点・expiry判定を変更しない**。
+再質問は不要。**v4.7.1/D2ではaccepted_at原点・expiry判定を維持した。次版D4で本契約を実装した（§27.12、実機未確認）**。
 
 採択済み案の実装条件:
 
@@ -3631,7 +3631,7 @@ vendor配送/計装を変更した場合は同gate内のvendor graphも含める
 | Nativeの余分なsource参照を除き既存output/ROIを共有、source描画はManagedで保持 | **D2採用案、v4.7.1**。新素材生成/skipなし。実residentとat-rest通常sourceの会計を保つ |
 | 表示consumerと通常準備producerの分離、重いCPUの既存worker移管 | **次版D3aの候補**。要求開始・描画前採用・cache miss表示の未解決契約を先に確定する |
 | GPU配送/提出の計装→原因別の非同期・有界準備 | **次版D3bの候補、egui 0.37更新後**。旧baselineは先行可、更新後に再計測・配送契約を再照合して再設計する |
-| 初回採用curlをclock原点にする | **利用者採択済み、次版D4**。準備+Dの全面表示費用を了承。D2では時計を変更しない |
+| 初回採用curlをclock原点にする | **利用者採択済み、次版D4実装済み・実機未確認**。準備+Dの全面表示費用を了承。D2単独では時計を変更しなかった |
 | pin上限増量、会計だけsourceを除外、source寸法偽装 | 不採用。実所有と乖離、通常VRAM圧迫・原寸誤認を残す |
 | 演出専用decode/縮小cache、frameごとのcapture/readback、mesh削減だけ | 不採用。通常準備の重複・画質/寿命問題を増やし、観測された主区間を直さない |
 | 演出中全producer停止、final uploadをfinish後へ一括延期、先読み削減 | 不採用。通常機能の退行。採るなら別途利用者判断が必要 |
@@ -3889,3 +3889,110 @@ retryや回復処理を追加せず、同じ並列度4で全件を再確認す�
 最後の本体lib全件は`test-lib-full.ps1`で実行し、対象差分のsource hash・件数・終了コードは
 `target/test-lib-full/`の成功台帳/JUnitと完了報告を正本とする（文書への結果追記で台帳のsourceを失効させない）。
 製品バイナリ起動・build-dev・コミットは行わず、実機・03/04実本・F12は未確認である。
+
+### 27.12 D4実装記録（2026-10-16、実機未確認）
+
+D4は採択済み§27.6の時計だけを変更する。`accepted_at`は受理レイテンシの診断値とし、
+Offeredの照合はbinding/source/geometry/許可・pinだけで判定する。durationによる準備中のexpiryは撤去し、
+不一致は`offer_binding_or_source_mismatch`へ分離した。受理時にdisplayable sourceがない場合は従来のinstantで、
+新しい素材待ち・timeout・後着からの再開を作らない。通常prepare、producer、Managed/Native所有はD2のままである。
+
+Turningは`MotionClock::AwaitingAcceptedOutput | Running { start_at }`を持つ。
+Awaitingでは既存recipeのp=0（初期lift）を提出する。既存output hookが非discard curlを初採用したときだけ、
+operation固有のsubmission ledgerへ時刻を公開する。hookはtrackerのimmutable operation/destinationとreceiptの
+宛先を照合し、Offered/Started以外の終端から開始を復活させない。UI ownerは次の描画で一度取り込み、
+Runningではmonotonic wall time / durationだけを使う。replay、追加output、mount/depositで原点を更新せず、
+hitch・少ないframe数を理由に延長しない。取消・close優先、canonical flat採用→次frame continuationの順序は変更しない。
+slideshowは§26.12のまま、interval < Dならinstant、それ以外はflat採用後から保存間隔全体を数える。
+OFF・短間隔・連結読みのtimerには変更を加えない。
+
+簡素化は既存operation ledgerへの一回publishと既存Turning内の排他時計で実現した。
+モーダル化・入力停止・別pending bool・新しいtick/worker/queueは不要で、追加しない。
+まれな失敗は既存のログ＋演出省略を維持し、復旧処理を追加しない。
+
+perfは既存`page_turn_animation`のstart/frame/finish/visibilityに以下を追加する。
+`clock_origin=first_accepted_curl`はmotionの原点で、旧`elapsed_ms`の意味は受理→projectionのまま保つ。
+`accept_to_first_curl_ms`は受理→最初の非discard curl output採用、`motion_elapsed_ms`はその原点→projection、
+`output_motion_elapsed_ms`は原点→当該output hook、`progress`は実提出poseである。
+`motion_frames`は採用curl数、`motion_max_gap_ms`は採用output同士の最大間隔（最初のcanonical終端までを含む）。
+初回の準備時間は含めず、1 curl→duration超hitch→canonicalでも最大間隔を記録する。
+解析器はoperationごとのレイテンシ・frame数・最大間隔・初回progress・motion/output elapsedを任意診断として集約する。
+旧ログへの必須fieldや新性能gateは追加せず、backend submit/OS presentの証拠とは扱わない。
+開始後のbackend停止やD3の同期処理は今回の未解決範囲である。
+
+回帰はfake clockで2秒の準備後に実handler/通常描画からp=0を提出し、Single/LTR/RTLのmeshをrecipeと照合する。
+projection後からhookまでさらに80ms進め、開始がprepare時刻ではなく初回output採用時刻であることも区別する。
+Singleは1 curl後の1秒hitchで着地し、見開きは50/150/199msの中間提出から着地まで確認する。
+原点一回、discard/replay、取消/宛先/operation不一致の遅いhook、wallのhitch完了、無素材instantと後着非再開を検査する。
+既存の実mount回帰は兄弟ごとの異なる開始時刻と、兄弟取消・deposit後に元contextが原点を維持することも確認する。
+既存のpose/finishテストはaccepted_atの書換えからmotion時計の操作へ変更し、D2の03/04会計fixtureも
+準備duration超過で失効しない契約へ更新した。slideshow・OFF・短間隔・連結とsnapshotも検査対象に含む。
+実行結果・変異確認は本節追補と`target/`内ログ、全libは`target/test-lib-full/`の台帳/JUnitを正本とする。
+利用者指示によりbuild-dev・製品起動・コミットは行わない。実機03/04と滑らかさ・F12/presentは未確認。
+
+公開文書は設計担当が変更する。修正案:
+
+- `manual/settings.html#page-turn-animation`の「時間」は「めくる動きが始まってからの時間。
+  画像の準備時間は含まれず、操作してから次のページが全面表示されるまでは準備時間もかかる」と補足する。
+- `manual/fullscreen.html#page-turn-animation`の時間にも同じ意味を添える。
+- 両ページの「残り時間が短ければ省略」は§26.12と不一致なので削除し、
+  「スライドショー間隔がめくる時間未満なら省略。それ以外は全面表示後から設定間隔を数える」へ変更する。
+- `manual/changelog.html`の既存リリース記事は履歴として維持し、次版記事で時計の変更を説明する。
+
+#### 27.12.1 自動検証の条件と記録
+
+新規worktreeではLibRawソースが不足していたため、既存checkoutのLibRaw 0.22.2/zlib 1.3.1のtarballを
+setup scriptの固定SHA-256と照合して展開した。RAWのCC0 fixture 27件（360,971,087 bytes）も
+manifestのサイズ・SHA-256と照合して実体コピーし、FFmpegの6 DLLを`target/debug/deps/`へ配置した。
+TurboJPEGのMSBuild経由の構築は終了1・診断0で失敗したため、同じturbojpeg-sys 1.2.0 / Debug /
+SIMD有効 / 静的CRT条件の既存install出力を実体コピーしてexplicit static指定で検証する。
+MSVCのincludeには通常形式パスもCXXFLAGSへ渡す。製品/依存ソースはこの環境問題のために変更しない。
+環境指定・native入力hashは`target/d4-native-env.ps1`と`target/d4-verification-environment.json`へ保存する。
+
+初回focusedは追加fixtureのnavigation引数型でコンパイル失敗（101、テスト0件）。
+修正後は116件中115成功・追加回帰1失敗（100）。draw helperの通常ready通知がなくobserverが退役しない
+fixture不備だったため、実経路と同じ通知を追加した。限定再検査は3件中2成功・1失敗（100）で、
+見開きfixtureが単頁用Deltaを渡していた。見開き入力の解決済みTargetを渡す契約へ直し、
+限定3件は全成功（0）となった。製品のnavigation/observer/採用条件を弱める修正はしていない。
+独立Sol / xhighの静的完成レビューは指摘修正と回帰補強後にACCEPT、未解消P1/P2なし。
+レビュアーはテストを実行せず、親担当の実行証拠を再利用する。
+最終の全件件数・終了コード・source/条件は`target/test-lib-full/`の台帳/JUnitと完了報告を正本とする。
+
+一時変異はGit管理外の`target/d4-mutations.py`で6種類を個別に実行した。
+対照の新規3回帰は成功（0）で、各変異は対象回帰1件がassertionで失敗し、全て終了100だった。
+
+| 壊した処理 | 検出した回帰 |
+| --- | --- |
+| Offeredへ旧duration expiryを復活 | 2秒準備後もp=0から開始 |
+| 進行率をaccepted_at原点へ戻す | 初回の実提出meshとp=0 recipeの照合 |
+| hookではなくprojection時刻を公開 | projection→hookの80msの区別 |
+| 後続curlでも原点を再公開 | 初回後のhook/replayで開始原点が一回だけ |
+| 取消後のhookにも原点の公開を許可 | 終端ledgerがAwaitingのままであること |
+| 終端canonicalを最大間隔から除外 | 1 curl→1秒hitch→canonicalの間隔 |
+
+全変異を除去し、`page_turn.rs`を開始前のbytes/SHA-256と照合して復元一致を確認した。
+結果は`target/d4-mutations-results.json`と対応ログに保存する。復元後の最終gateは
+引数なしfmt、core check、fullscreen/geometry focused、UI snapshot、本体lib全件の順とする。
+全件はホスト負荷による既知の不安定さを考慮し、初回から`NEXTEST_TEST_THREADS=4`で実行する。
+製品/テストのretry・skip・回復処理は追加しない。全件の結果追記だけのためにソースを変更せず、
+成功台帳/JUnitと最終報告で件数・終了コード・同条件再実行の有無を示す。
+
+### 27.13 D2+D4 の実アプリ計測（2026-10-17 未明、ClaudeCode が隔離 portable で実行）
+
+利用者が夜間の実アプリ検証を許可した時間枠で、`build-dev.ps1 -TestScript` の診断ビルドを使い捨て data-dir で起動し、
+`target/repro/page-turn-budget-571-20261016/` の 03 / 04 を 1 回ずつ 8 回めくった (間隔 2.5 秒、設定 200ms、演出 ON)。
+これは開発機での perf ログの計測で、利用者の実機での見え方の確認ではない。証跡は `target/page-turn-smoke/<run>/logs/perf_events.jsonl`。
+
+| 条件 | 1 回の演出の curl frame 数 | 受理から初回 curl | frame 間隔の最大 |
+| --- | --- | --- | --- |
+| 04 単ページ、D4 前 (master `417e8331a`) | 6〜9 (早く始まった 2 回は 19) | 約 90〜100ms | 51〜64ms |
+| 04 単ページ、D4 後 (`3c6ae74cb`) | 22〜26 | 約 70〜78ms (早い回 17〜19ms) | 38〜58ms |
+| 03 単ページ、D4 後 | 18〜28 | 約 54〜60ms | 31〜59ms |
+| 04 見開き (RtlCover)、D4 後 | 2〜26 (8 回中 2 回が 2〜3) | 約 62〜158ms | 42〜111ms |
+| 03 見開き (RtlCover)、D4 後 | 3〜28 (8 回中 2 回が 3) | 約 35〜133ms | 33〜93ms |
+
+- D4 で、準備が遅れた回も演出が最後まで進む (最終 frame が初回 curl の約 200ms 後)。単ページはほぼ毎 frame 描ける。
+- 見開きでは演出中にも約 90〜110ms の停止が残り、最初の 2 回は 2〜3 frame しか出ない。2 頁分の通常準備が演出中に走るためと見ており、
+  D3a / D3b (§27.5) の対象。D4 で解消したとは扱わない。
+- 計測中に `scripts/page-turn-smoke.ps1` が現行の `--test-evidence-dir` 必須条件を渡しておらず起動直後に exit 2 になることが分かった
+  (バックログ §1.390)。今回は一時的な写しで証跡先 (`target/ui-smoke/runs/` の 2 階層下、事前作成) を足して実行した。

@@ -872,6 +872,7 @@ fn page_turn_merge_master_explicit_blank_turns_both_ways_with_only_real_receipts
                             );
                         });
                         let PresentationState::Turning {
+                            clock,
                             incoming,
                             offer,
                             projection,
@@ -897,7 +898,9 @@ fn page_turn_merge_master_explicit_blank_turns_both_ways_with_only_real_receipts
                         );
                         let tracker = offer.submission.clone();
                         assert_eq!(tracker.status(), SubmissionStatus::Started);
-                        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                        *clock = MotionClock::Running {
+                            start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                        };
                         frame(&ctx, |ui, ctx| {
                             app.begin_page_turn_viewer_frame(ctx, false, None);
                             let (composition, sources) = draw_current(&mut app, ui, ctx);
