@@ -370,3 +370,12 @@ command / exitは`diagnose-full-failures-results.json`、ログとJUnitは
 製品設計との差異はなく、依存差分も増やさない。
 前回のworkspace check未通過（launcherのrelease入力3本不足）は別途残る。
 live、製品起動、`test-full.ps1`、snapshot更新、コミット・branch操作・pushは行わない。
+
+#### 再起動後の全件再実行と段1aの受入れ（2026-10-16、設計担当）
+
+PC再起動後、同じworktreeとHEAD `68994b047`で、他のcargo/nextestプロセスが無いことを確かめてから
+`scripts/test-lib-full.ps1`を設計担当が実行した。結果は **13,240 passed / 0 failed / 59 skipped、418.378秒、exit 0**
+（run dir `target/test-lib-full/runs/20261016T080041419Z-1a279085`）。上記の3件は今回すべて成功した。
+並行する別セッションのテスト負荷と重なった実行でだけ失敗したことになるが、原因を負荷と断定はしない。
+3件のテスト本体は未変更のまま残し、同じ失敗が再び出たら別課題として扱う。
+独立レビュー（GPT-6.1 Sol / xhigh）は`68994b047`をACCEPTした。以上で段1aを受け入れる。
