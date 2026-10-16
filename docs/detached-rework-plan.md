@@ -5556,3 +5556,16 @@ Contextのsnapshot消費補助入口は既存入力metadataだけを処理し、
 部分復元で失敗する証拠と全featureの結果は段2台帳。正式独立ACCEPT・実HWND／GL確認ではない。
 分割指示に従いroot logic-only Close確定回帰は2c-4bへ残す。製品Appの既存終了owner接続は段3。
 root製品graph・両lock・schedulerは不変。実window・live・製品は起動していない。
+
+#### 2026-10-17 段2c-4bの準備graph実装記録
+
+合意済みのroot Close非描画lifecycleについて、準備eframeの共通実update_logic_onlyに回帰を接続した。
+fake AppのlogicだけがCancelClose／Closeを返し、uiは呼ぶと失敗する。logic直後に終了が止まる／
+確定することと、完了後のCloseが通常出力から次回入力へ一度だけ渡ることを検査する。
+wgpu／glowのfeature別に同じ実integrationを使い、両backendの既存root保留入力返却・event消費2行を
+共通helperへ抽出した。native入口との接続はsource照合で、実OS／HWNDを動かした検証ではない。
+本家のlogic直後のClose確定、通常入力保持、root終了／tray契約は変更しない。製品policyは持ち込まず、
+新pending bool・repaint・強制UI・retryを足さない。製品の既存終了ownerへの接続は段3で行う。
+**実装担当の内部確認**として3種類の部分復元で失敗を確認し、復元後の非対話gateを実行した。
+正式な独立ACCEPTではない。段2準備graphの実装完了と後続引継ぎ一覧は段2台帳へ記録する。
+root製品graph・両lock・schedulerは不変。live・製品は起動していない。

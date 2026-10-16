@@ -882,8 +882,11 @@ impl WgpuWinitRunning<'_> {
                 let SharedState { viewports, .. } = &mut *shared_mut;
 
                 if let Some(viewport) = viewports.get_mut(&viewport_id) {
-                    viewport.pending_raw_input = unused_input;
-                    viewport.info.events.clear(); // they should have been processed
+                    super::epi_integration::finish_root_logic_input(
+                        &mut viewport.pending_raw_input,
+                        &mut viewport.info,
+                        unused_input,
+                    );
                     if let Viewport {
                         window: Some(window),
                         egui_winit: Some(egui_winit),

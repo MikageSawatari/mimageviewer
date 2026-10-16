@@ -596,6 +596,17 @@ pub fn load_egui_memory(_storage: Option<&dyn epi::Storage>) -> Option<egui::Mem
     None
 }
 
+/// Return unconsumed root input to its owner, then consume this tick's native
+/// lifecycle events. The next acquisition supplies the current metadata again.
+pub(super) fn finish_root_logic_input(
+    pending: &mut egui::RawInput,
+    info: &mut egui::ViewportInfo,
+    unused: egui::RawInput,
+) {
+    *pending = unused;
+    info.events.clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,5 +1295,186 @@ mod tests {
         assert_eq!(child_state.events, vec![key(Key::A, false)]);
         assert_eq!(*child_ui_calls.lock().unwrap(), 1);
         assert_eq!(app.logic_calls, 2);
+    }
+
+    #[derive(Clone, Copy)]
+    enum RootCloseDecision {
+        Cancel,
+        Allow,
+        Complete,
+    }
+
+    struct LogicCloseApp {
+        decision: RootCloseDecision,
+        received: Vec<bool>,
+        hooks: Vec<Vec<Event>>,
+    }
+
+    impl epi::App for LogicCloseApp {
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut epi::Frame) {
+            panic!("root Close must be decided by logic without UI");
+        }
+
+        fn raw_input_hook(&mut self, _: &egui::Context, input: &mut RawInput) {
+            assert_eq!(input.viewport_id, ViewportId::ROOT);
+            self.hooks.push(input.events.clone());
+        }
+
+        fn logic(&mut self, ctx: &egui::Context, frame: &mut epi::Frame) {
+            assert!(!frame.native_window_visible_commit_completed());
+            let close = ctx.input(|input| {
+                assert_eq!(input.raw.viewport_id, ViewportId::ROOT);
+                assert_eq!(input.viewport().minimized, Some(true));
+                input.viewport().close_requested()
+            });
+            self.received.push(close);
+            match self.decision {
+                RootCloseDecision::Cancel if close => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                RootCloseDecision::Complete => {
+                    // Test-only completion owner: consume its terminal state
+                    // once, and return the request through ordinary output.
+                    self.decision = RootCloseDecision::Allow;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                RootCloseDecision::Cancel | RootCloseDecision::Allow => {}
+            }
+        }
+    }
+
+    /// Fake native effects only. The actual integration decides Close, the
+    /// production input helper preserves pending input, and the same completion
+    /// helper used by both native backends consumes the current native event.
+    struct RootCloseWindow {
+        info: egui::ViewportInfo,
+        pending: RawInput,
+        state: RawInput,
+        delivered_close: usize,
+        delivered_cancel: usize,
+    }
+
+    impl RootCloseWindow {
+        fn new() -> Self {
+            Self {
+                info: egui::ViewportInfo {
+                    minimized: Some(true),
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+                pending: Default::default(),
+                state: RawInput {
+                    events: vec![key(Key::A, false), Event::WindowFocused(false)],
+                    ..Default::default()
+                },
+                delivered_close: 0,
+                delivered_cancel: 0,
+            }
+        }
+
+        fn take(&mut self) -> RawInput {
+            let mut input = take_viewport_input(&mut self.pending, || self.state.take());
+            // Native acquisition installs current metadata after combining
+            // pending and new input; its old Close snapshot must not win.
+            input.viewports.insert(ViewportId::ROOT, self.info.clone());
+            input
+        }
+
+        fn finish(&mut self, output: egui::LogicOutput, unused: RawInput) {
+            finish_root_logic_input(&mut self.pending, &mut self.info, unused);
+            assert!(self.info.events.is_empty());
+            assert!(output.platform_output.commands.is_empty());
+            for (id, commands) in output.viewport_commands {
+                assert_eq!(id, ViewportId::ROOT);
+                for command in commands {
+                    match command {
+                        egui::ViewportCommand::Close => {
+                            // Native command delivery generates the next Close
+                            // event, rather than directly forcing process exit.
+                            self.delivered_close += 1;
+                            self.info.events.push(egui::ViewportEvent::Close);
+                        }
+                        egui::ViewportCommand::CancelClose => self.delivered_cancel += 1,
+                        other => panic!("unexpected root lifecycle command: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_root_logic_close(backend: &str) {
+        for cancel_first in [false, true] {
+            let mut integration = headless_integration();
+            let mut window = RootCloseWindow::new();
+            let mut app = LogicCloseApp {
+                decision: if cancel_first {
+                    RootCloseDecision::Cancel
+                } else {
+                    RootCloseDecision::Allow
+                },
+                received: vec![],
+                hooks: vec![],
+            };
+            let ordinary = window.state.events.clone();
+            let (output, unused) = integration.update_logic_only(&mut app, window.take());
+            // Check immediately after logic, before native effects or any UI
+            // could supply a late CancelClose.
+            assert_eq!(integration.should_close(), !cancel_first, "{backend}");
+            assert_eq!(app.received, [true]);
+            window.finish(output, unused);
+            assert_eq!(window.delivered_cancel, usize::from(cancel_first));
+            assert_eq!(window.delivered_close, 0);
+
+            let (output, unused) = integration.update_logic_only(&mut app, window.take());
+            assert_eq!(integration.should_close(), !cancel_first, "{backend}");
+            assert_eq!(app.received, [true, false]);
+            window.finish(output, unused);
+
+            if cancel_first {
+                app.decision = RootCloseDecision::Complete;
+                let (output, unused) = integration.update_logic_only(&mut app, window.take());
+                assert!(
+                    !integration.should_close(),
+                    "a command is not an incoming Close"
+                );
+                assert_eq!(app.received, [true, false, false]);
+                window.finish(output, unused);
+                assert_eq!(window.delivered_close, 1);
+
+                let (output, unused) = integration.update_logic_only(&mut app, window.take());
+                assert!(
+                    integration.should_close(),
+                    "{backend}: resumed Close must exit"
+                );
+                assert_eq!(app.received, [true, false, false, true]);
+                window.finish(output, unused);
+
+                // An extra headless probe observes no replay. The real native
+                // loop would already have returned its CloseRequested result.
+                let (output, unused) = integration.update_logic_only(&mut app, window.take());
+                assert!(integration.should_close());
+                assert_eq!(app.received, [true, false, false, true, false]);
+                window.finish(output, unused);
+                assert_eq!(window.delivered_close, 1);
+                assert_eq!(window.delivered_cancel, 1);
+            }
+            assert!(app.hooks.iter().all(|events| events == &ordinary));
+            assert_eq!(window.pending.events, ordinary);
+            assert!(window.info.events.is_empty());
+            assert!(!integration.frame.native_window_visible_commit_completed());
+            assert!(integration.pending_full_output.textures_delta.is_empty());
+        }
+    }
+
+    #[cfg(feature = "wgpu_no_default_features")]
+    #[test]
+    fn minimized_full_root_logic_only_close_wgpu() {
+        check_root_logic_close("wgpu");
+    }
+
+    #[cfg(feature = "glow")]
+    #[test]
+    fn minimized_full_root_logic_only_close_glow() {
+        check_root_logic_close("glow");
     }
 }

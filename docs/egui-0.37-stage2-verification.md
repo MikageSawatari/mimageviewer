@@ -1215,3 +1215,123 @@ root workspace／patch／製品・旧vendor・両lock・schedulerは不変。既
 案B15のroot logic-only Close確定回帰は分割指示どおり2c-4b、製品接続は段3、実機確認は段7へ残す。
 正式独立レビューは別工程。ネットワーク・依存取得・live・製品build／起動・test-full.ps1・
 git add／commit／branch操作は行っていない。
+
+## 段2c-4b root logic-only Close確定回帰・案B15（2026-10-17）
+
+開始HEAD `19fc1e55a`。2c-4aは設計担当がコミット済み、独立レビュー中との引継ぎで着手。
+設計第4.4版の案B15、fake Appのlogicのみからcommandを返す条件、§4.2 root lifecycleと§11合意を照合した。
+以下は**実装担当の内部確認**であり正式な独立レビュー・ACCEPTではない。未ステージ・未コミット。
+
+### 実装と回帰の接続境界
+
+本家由来の実EpiIntegration::update_logic_onlyは変更せず、root Closeを含むRawInputで直接実行する。
+fake Appのuiは呼ぶとpanicし、CancelClose／Closeはlogicだけから返す。raw_input_hookとlogicの受付も検査する。
+logic直後・native出力効果より前に実should_closeを読み、CancelCloseありならfalse、無しならtrueを確認する。
+新しいroot hookや製品設定は追加しない。tray・保存・settings-family・ZIPの判断は段1b／段3の責務のまま。
+
+両backendの既存LogicOnly処理にあるpending_raw_input返却とinfo.events.clearの2行だけを
+共通finish_root_logic_inputへ抽出した（b・新規回帰の接続点、動作は同じ）。
+回帰もこの実使用helperと既存take_viewport_inputを使い、同rootの保留入力を保つ。
+fake windowはnative効果だけを置換する。LogicOutputのCloseを受けて次回のViewportEvent::Closeを生成し、
+終了判定そのものは模倣しない。metadataは保留と新規入力の連結後に現在値を入れるnativeの順序と揃え、
+古いClose snapshotが後のlogicへ復活しないことを確認する。
+
+回帰名はminimized_full_root_logic_only_close_wgpu／glowの2件。両featureで同じ共通実integrationを検査する。
+各回帰で次を実行する。
+
+- CancelClose無しのCloseをlogic直後に確定し、後続の窓なしprobeで同じ要求を再受付しない。
+- CancelCloseありのCloseを止め、次の入力でCloseが消費済みであることを確認する。
+- fake完了ownerのterminal状態を一度だけ消費し、logicからCloseを通常LogicOutputへ返す。
+  この出力時点ではincoming Closeではないため終了しない。fake native配送後の次のRawInputで通常受付し、
+  CancelClose無しで確定する。さらにprobeしてClose再配送・完了の再発行がないことを確認する。
+- 通常のkey release／focus入力は各logicのhookへ保持され、保留も同rootへ戻る。
+  UI・viewport callback・paint・visible commitは実行せず、pending texture deltaは空のまま。
+
+各回帰のlogicは計7回、合計14回。Close受信は拒否しない例1回と拒否／再Close例2回で各3回。
+後者のlogic観測列は[true, false, false, true, false]、出力CloseとCancelCloseは各1回。
+最終probeは再発火検査のための窓なし追加呼出しで、実native loopはshould_close確定時に終了する。
+新しい製品pending bool・queue・retry・repaint・強制UIは追加しない。
+
+両backendの既存run_ui_and_paint→実update_logic_only→共通入力返却の接続はsourceで照合した。
+feature別2件は共通integration／helperの実行であり、native backend全入口・OS event scheduling・
+実HWND／GL／製品終了ownerまで動かした試験ではない。fake Closeイベント生成はegui-winitの通常command効果と照合した。
+実装担当の内部確認でも未解決の重大指摘はない。正式独立レビュー・実機確認とは区別する。
+
+### 部分復元・最終検証
+
+次の3種類を一時変更し、各回finallyで元byteへ戻した。いずれも両回帰が失敗
+（0 passed／2 failed、各exit 101）し、復元後の全suiteが成功した。
+
+| 部分復元 | 検出した破れ |
+| --- | --- |
+| logic直後のCancelClose判定結果を無視する | CancelCloseが終了を止めない |
+| logic直後のClose確定を省略する | CancelClose無しでも終了しない |
+| 共通返却helperでnative Closeイベント消費を省略する | 処理済みイベントが残る |
+
+Rust 1.99.0、cargo locked／offline、MSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=1。
+最終14項目は`target/verify-stage2c4b.py`、変異は`target/mutate-stage2c4b.py`。
+command・所要時間・件数・exit codeは`target/egui037-stage2c4b-results.json`、ログは同prefixの各項目名.log。
+
+| 検証 | 最終結果 |
+| --- | --- |
+| eframe lib default＋glow／persistence | 55 passed／0 failed／1 ignored、exit 0 |
+| eframe lib 上記＋miv-test-script-window-witness | 59 passed／0 failed／1 ignored、exit 0 |
+| eframe lib glow／default_fontsのみ | 44 passed／0 failed／0 ignored、exit 0 |
+| egui-wgpu lib（winit） | 16 passed／0 failed／0 ignored、exit 0、GPU skipなし |
+| egui／egui-winit／egui-ime lib | 107／43／30 passed、失敗・ignoreなし、各exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧graph |
+| root fmt／fmt --check、準備fmt --all／fmt --all --check | すべてexit 0 |
+| git diff --check、検証後source hash／保護対象／index照合 | 成功 |
+
+検証済みsource hashはtested-source.json、変更範囲・保護対象はaudit.json（同prefix）。
+既存liveのignoreと内部子再実行用--ignoredを維持し、今回のcommandに--ignoredは付けない。
+root workspace／patch／製品・旧vendor・両graphのmanifest／lock・schedulerは不変。
+設計との重大な食い違いはない。ネットワーク・依存取得・live・製品build／起動・test-full.ps1・
+git add／commit／branch操作は行っていない。
+
+## 段2全体の実装状態と後続への引継ぎ（2c-4b完了時点）
+
+**準備graphに対する段2の実装と実装担当の内部確認は完了**。rootの製品切替・全体受入完了を意味しない。
+段2a全体の独立ACCEPTは設計担当から引継ぎ済み。段2b／2cの正式レビュー・受入結果は設計担当が集約する。
+本台帳の内部確認や自動テスト成功で、その独立ACCEPTを補完しない。
+
+| 段階 | 準備graphでの実装 |
+| --- | --- |
+| 2a-1 | egui／egui-winit原本・既存差分・Disabled取消・新版共有IMEとクリックfixture |
+| 2a-2／3 | viewport別IME中断要求・実入れ子／discard集約・通常GCと共有する非描画Context退役 |
+| 2b | egui-wgpu原本と差分、map/set型deltaの完結owner・submission・mipmap・readback・対象surface寿命 |
+| 2c-1／2 | eframe原本・scheduler等の差分、保留RawInputのviewport所有・skip保持・通常GC時IME整理 |
+| 2c-3a／b | 案BのUI／surface分離・非描画出力／action、immediate子自身の描画資格・capture |
+| 2c-4a／b | 子Closeの非描画受付／消費／退役と明示IME整理、root logic-only Close確定回帰 |
+
+段2に残る未実装項目はない。以前の節やPATCHESにある「後続2cへ残す」は、その時点の境界を残した履歴で、
+上表の追補まで含めて判断する。後続で必要な引継ぎは次のとおり。
+
+1. **正式レビュー集約**: 段2b／2c各コミットの独立レビュー結果・修正を設計担当が確認し、段3へ渡す。
+   2c-4bは未コミット。原本／適用後handoffとprovenanceは各段の記録を維持する。
+2. **段3の原子的graph切替**: root workspace／patch・製品・ラボ／vst3-host-tester・kittestを同時に
+   新egui／wgpuへ接続する。App／Ui／Panel／Context／on_exit、Modifiers／wheel、clipboard／screenshot、
+   feature／Win32／SurfaceConfigと全test compileを移行し、旧egui混入・型分裂・古いpathを確認する。
+3. **共有egui-imeの一本化**: 製品側の途中変更と準備コピーを照合し、通常GC／retry寿命差分と明示退役APIも
+   単一crates/egui-imeへ統合する。全consumer接続後に準備コピーと参照を撤去する。
+   producer→正規化→実TextEditのDisabled回帰と1b-3c clipboard共有条件を正式graphで再検証する。
+4. **IME出力の正式配送**: viewport別中断要求・discard集約を通常backendとnativeへ接続する。
+   nativeはcursorと中断要求を既存intent／control queue／WindowEpochへ渡し、上書き可能なvisual snapshotだけに
+   置かない。生成済み出力の配送後消失・旧host漏れを正式graphで検査し、OS取消結果は実機で確認する。
+5. **製品logicと終了owner接続**: C1・保存ACK・取消／寿命終端・watcher・root lifecycleを既存ownerへ接続する。
+   tray／保存待ち／settings-family／ZIP等の製品policyは段1bのroot_lifecycleと段3の接続回帰で検査する。
+   子CloseはOS／programmatic／bar／watcherを既存modal・active／parked終了ownerへ揃え、二重受付を残さない。
+   C2／C4／C5・C3表示pollのUI所有と順序、gamepad edge／保持軸、非描画mount／receipt／未反映ratingも維持する。
+6. **全delta／surface consumerの正式移行**: eframeだけでなくnative overlay、no-surface・renderer未準備・
+   early return・acquire不成立・viewport／Context終了・headlessの消費／移譲／明示破棄を成立させる。
+   AutoVsync／latency 1と環境変数を新設定へ接続する。D3D11 presenter／別Naga経路は同時更新しない。
+7. **操作差の利用者採択**: 0.37の距離6 points等に合わせたvendor fixture成功は製品操作差の承認ではない。
+   double／triple分類が音量・速度reset、reader、resize reset、文字選択へ与える差を比較し、§5の判断を得る。
+8. **後続の外観・全体gate**: accessibilityを候補画像収集より先に修正する。列挙済み全lib／integration snapshotを
+   baseline未更新で比較し、修正・外観採択後に全対象更新→更新なし再比較する。445枚は対象漏れの基準。
+   正式graphの全体gate・確認用buildは段6で行う。
+9. **承認付きlive／実機**: 段7でscheduler live、実HWND／GL surface／present、native IME・複数窓・DPI、
+   親最小化／visible immediate子などの代表操作を確認する。eframe実入口→実GPU一体実行も今回の証拠範囲外。
+   ignored liveと製品を今回起動していないことを維持し、未実施をPASSにしない。
+10. **任意の本家報告**: IME中断要求の親子所有／discard集約、通常GCのviewport別Memory残留／lock下callback破棄は
+    最小回帰と修正前後の証拠を添えて報告する価値があるが、未送信。報告するかは別判断で、段2の追加gateではない。

@@ -170,3 +170,17 @@ hide／minimizeだけでは退役しない。新queue・pending bool・退役済
 強制UI・RequestPaintWhileHidden・retry・全memory resetは追加しない。
 rootの終了／tray契約と製品graphは変更せず、root logic-only Close確定回帰は2c-4bへ残す。
 実windowを作らない回帰・変異確認・feature別結果は[段2台帳](../../docs/egui-0.37-stage2-verification.md)。
+
+## 段2c-4b: root logic-only Close確定回帰（2026-10-17）
+
+`19fc1e55a`上へ案B15の回帰を追加した（b・新規）。**実装担当の内部確認**であり、独立ACCEPTではない。
+wgpu／glowのfeature別2件が、共通の実EpiIntegration::update_logic_onlyをfake Appと実行する。
+App::uiはpanic、commandsはlogicだけから返す。root Close入りRawInputで、logic直後・native効果前に
+CancelCloseでshould_close=false、CancelClose無しでtrueを検査する。本家の確定経路は変更しない。
+完了を消費したlogicのCloseは通常出力→fake nativeイベント→次回入力へ一度だけ渡し、再受付・再発行を検査する。
+両backendの既存「未消費入力を同rootへ戻す／今tickのinfo.eventsを消費する」2行だけを
+finish_root_logic_inputへ共通抽出し、回帰でも同じhelperと既存take_viewport_inputを使う。
+通常入力保持・metadataの更新順序・visible commit無しも確認する。
+backend全入口／OS配送はsource接続の確認までであり、実window・GPU・製品終了ownerを動かした試験ではない。
+tray・保存・settings-family・ZIPの製品policy、新pending bool・queue・retry・repaint・強制UIは追加しない。
+3種類の部分復元で両回帰の失敗を確認し、復元後の全graph検証と段2全体の引継ぎ一覧は段2台帳へ記録する。

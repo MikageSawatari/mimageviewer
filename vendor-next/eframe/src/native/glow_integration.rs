@@ -761,8 +761,11 @@ impl GlowWinitRunning<'_> {
 
                 let mut glutin = self.glutin.borrow_mut();
                 if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
-                    viewport.pending_raw_input = unused_input;
-                    viewport.info.events.clear(); // they should have been processed
+                    epi_integration::finish_root_logic_input(
+                        &mut viewport.pending_raw_input,
+                        &mut viewport.info,
+                        unused_input,
+                    );
                     if let Some(window) = viewport.window.clone()
                         && let Some(egui_winit) = viewport.egui_winit.as_mut()
                     {
