@@ -221,5 +221,58 @@
         "checkpoint": "patched only; absent from upstream archive"
       }
     }
+  },
+  "eframe": {
+    "version": "0.37.0",
+    "archive": "C:\\Users\\mikag\\.cargo\\registry\\cache\\index.crates.io-1949cf8c6b5b557f\\eframe-0.37.0.crate",
+    "registry_source": "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\eframe-0.37.0",
+    "package_sha256": "9c5642501a65ca657d05f00c643a5c14ff2346cb3818032bfe23d58e1f8e5f84",
+    "checksum_reference": "C:\\Users\\mikag\\.cargo\\registry\\index\\index.crates.io-1949cf8c6b5b557f\\.cache\\ef\\ra\\eframe",
+    "vcs": {
+      "git": {
+        "sha1": "3c6eb8261c3293ad9c7ea1ed58487e038860ebef"
+      },
+      "path_in_vcs": "crates/eframe"
+    },
+    "license": "MIT OR Apache-2.0",
+    "upstream_repository": "https://github.com/emilk/egui",
+    "files": {
+      ".cargo_vcs_info.json": "6b52daea212c1b9ede504ecd06ca5bb992e586c82eecaf4c94e4c9135094a084",
+      "Cargo.lock": "2229fc8d2087e1cb3d971e7a6a6ae5e50a407d0412e0499ce72d5e73a50cc9b1",
+      "Cargo.toml": "7f58dcb7f4e4aa2a3d768c446c8b606e24e467c4a8fdc5ace556d8ff94f4b6fa",
+      "Cargo.toml.orig": "81537677af58c662ec9a1d3010ac370d1cc33906d036700a5330c3e6c9510d57",
+      "README.md": "ffd6e92a4ceb337bcb72ad70a13d614fb43984556b58f6c997635db98660a9a4",
+      "data/icon.png": "9e076c34e32a0b0ef35c62ebf6be8b5594a4601e7bcd478b681e9eff1f327973",
+      "src/epi.rs": "8b7a16af6cf7654bfb0c829b5bb52fb75f417f5af231292614c1c7a821173734",
+      "src/icon_data.rs": "73f4e8c114c45e5da3906446a3018caad6bdf2fbc2a02b823f6df135eaf1f8e9",
+      "src/lib.rs": "104f16618665b690070e692a1954e2c7439b2363c59c972ee07bb1ddf691be30",
+      "src/native/app_icon.rs": "564497fe78a187e7c01e0b3a00648df5667f5798a38f054714dd2cd6fc7daa76",
+      "src/native/epi_integration.rs": "d4d6d19ee8fb9f92cdb0e8ae6702924f360e4ddc40598d25e5bc6afcb42c2bb1",
+      "src/native/event_loop_context.rs": "6530a614da665b4b2c147c36b2ba86df80dc2450fc8581b2959c49a979fba005",
+      "src/native/file_storage.rs": "a4e86acf8c0298d980972ffb27fa032b9337554cd64e0bca6de70fafce49ec30",
+      "src/native/glow_integration.rs": "126bf05970d14177f885c2e767446576d8721be44bc81e1dead26596bc7880c4",
+      "src/native/macos.rs": "95a32ddd36cf282d96b358860cce1ff45eb48351c7be72970576d4dd8c92918b",
+      "src/native/mod.rs": "299b8240c7e04c8caa9d5f70338da773bbc2d50aa9274d56a153617c7916d491",
+      "src/native/run.rs": "c3ac2c5096efccfc7bfad8f3984161002aca61cb28a0cdcb3a6683b8db0185f5",
+      "src/native/wgpu_integration.rs": "658a1283f49ecabc308a8dd69fbe7baa694fd745723c623ecb77836e8e1a39a7",
+      "src/native/winit_integration.rs": "fde55ab55d673a1580ed3f385c54bd6147cc7f4e35d429deac92bb8d4ab3d57f",
+      "src/stopwatch.rs": "aacdfb9a90e7198cf669a317fde5e0136629a3ad6aa3b5b75afec71d512607f7",
+      "src/web/app_runner.rs": "36171dd4d6070745da54aec1f2c7b4589fb1bb86a190a67f7d7bba7bea06732f",
+      "src/web/backend.rs": "9d395480f8b7e9b00748aeee699d5dc123329f561eaa561776b787cb1452e512",
+      "src/web/canvas_glyphs.rs": "0b0888277eee60712746b807bb8cc64856752f1d54198e5373ad53e5ec8f6c91",
+      "src/web/dropped_file.rs": "31f257a2e9083c7bf0113247339314f61b807fec67549674bfc608e268eb4937",
+      "src/web/events.rs": "8fd108cf7ba7d645994e6f21fc9d82d2577b87d624afb03b91549d9f230d19c5",
+      "src/web/input.rs": "1bf5bb38b387cf902f7e4c960ffb8f731aaf6a27f90c262fab28b1954e6a5930",
+      "src/web/mod.rs": "38c61c07ab46d80b634f33bc415cfa537d3869834e6424a89aa4ad4ce0ea739e",
+      "src/web/panic_handler.rs": "757c56a43c2cfd9fcc0231bc7452b2296e65266e6e0031efad08c92212c6429a",
+      "src/web/screen_reader.rs": "898d6110b4ddb1a72cbd13404257ee1788f577ffa2a3872ebb37ca660ad93946",
+      "src/web/storage.rs": "d010a855cc24830fca07fa44666d9912d65cf5f80fde4ec1bb819dd3f772fa33",
+      "src/web/text_agent.rs": "6780eee0f523c6ae35ff001d9ed95088661221e7e14a55c0a91f9ceed99c870d",
+      "src/web/web_logger.rs": "6371a94f55feb7d4d112c5ad3302d82a14b3e835b1e4af8d7f33c81839afd5e0",
+      "src/web/web_painter.rs": "6f36d134981ddf3e257c5b54a8c57b47140f5182ac17ab6e187b3f479dc02c88",
+      "src/web/web_painter_glow.rs": "ca153fa10889cbe3edf8449fc1408a9fab5993010665e91d8f8d8ac973c0f6d4",
+      "src/web/web_painter_wgpu.rs": "742a86a3935a116cfbe37d5a0ff45a954e8b9c6c2d662980971ccc5a01abb316",
+      "src/web/web_runner.rs": "38ea5334250dcdd5f7480dd4bf30fbe060ac34d41fa21399c4528dff3d561f5c"
+    }
   }
 }

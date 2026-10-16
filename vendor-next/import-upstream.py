@@ -27,12 +27,12 @@ def main():
     records = json.loads(provenance.read_text(encoding="utf-8")) if provenance.exists() else {}
     imported = {}
     for name in args.packages:
-        if name not in ("egui", "egui-winit", "egui-wgpu"):
+        if name not in ("egui", "egui-winit", "egui-wgpu", "eframe"):
             raise RuntimeError(f"Unsupported package: {name}")
         package = f"{name}-0.37.0"
         source = REGISTRY / "src" / INDEX / package
         archive = REGISTRY / "cache" / INDEX / f"{package}.crate"
-        index = REGISTRY / "index" / INDEX / ".cache" / "eg" / "ui" / name
+        index = REGISTRY / "index" / INDEX / ".cache" / name[:2] / name[2:4] / name
         entry = next(
             json.loads(part)
             for part in index.read_bytes().split(b"\0")
