@@ -46,7 +46,11 @@ ON由来のOFF-Completingも同じ素材handoffを維持し、通常OFFではbin
 取消/close/入力supersessionは既存contextの状態を退役させ、残るbatchのleaseだけが最後に解放される。
 通常resident会計はcontext registryのmounted/at-rest/parked cacheを共通walkerで読むため、
 presentationからsource参照を外しても兄弟の通常source会計は消えない。共有TextureIdは全体で重複排除する。
-通常OFF fast pathとaccepted_at clockは変更しない。実装・検証の正本は[page-turn計画 §27.11](page-turn-animation-plan.md)。
+D2単独では通常OFF fast pathとaccepted_at clockを維持した。次版D4はONのTurning内だけを
+AwaitingAcceptedOutput / Runningへ分離し、operation固有submission ledgerから初回採用curlの時刻を一回渡す。
+output hookはoperation/destinationと既存終端を照合し、取消/close後に開始を復活させない。
+準備待ち、専用tick/worker/queue、UI同期I/Oは追加しない。OFF・slideshow等の既存timerを維持する。
+素材所有は[page-turn計画 §27.11](page-turn-animation-plan.md)、時計と検証は同§27.12を正本とする。
 
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 mod barrier;
 #[cfg(test)]
+mod clock_tests;
+#[cfg(test)]
 mod cover_tests;
 #[cfg(test)]
 mod draw_submit_tests;
@@ -438,20 +440,30 @@ enum SubmissionStatus {
 }
 
 struct SubmissionTracker {
+    fact: ViewerOperationFact,
     ledger: Mutex<SubmissionLedger>,
 }
 
 struct SubmissionLedger {
     status: SubmissionStatus,
+    motion: MotionClock,
+    motion_frames: u64,
+    last_motion_output_at: Option<Instant>,
+    max_curl_gap: Duration,
     visible_pages: u8,
     canonical_visible: bool,
 }
 
 impl SubmissionTracker {
-    fn new() -> Self {
+    fn new(fact: ViewerOperationFact) -> Self {
         Self {
+            fact,
             ledger: Mutex::new(SubmissionLedger {
                 status: SubmissionStatus::Offered,
+                motion: MotionClock::AwaitingAcceptedOutput,
+                motion_frames: 0,
+                last_motion_output_at: None,
+                max_curl_gap: Duration::ZERO,
                 visible_pages: 0,
                 canonical_visible: false,
             }),
@@ -466,6 +478,13 @@ impl SubmissionTracker {
         state.status = SubmissionStatus::Cancelled;
         previous
     }
+    fn started_at(&self) -> Option<Instant> {
+        let ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        match (ledger.status, ledger.motion) {
+            (SubmissionStatus::Started, MotionClock::Running { start_at }) => Some(start_at),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -479,7 +498,9 @@ struct SubmissionEvent {
     tracker: Arc<SubmissionTracker>,
     fact: ViewerOperationFact,
     kind: SubmissionKind,
-    elapsed_ms: f64,
+    accepted_at: Instant,
+    projected_at: Instant,
+    progress: f32,
     retained_bytes: u64,
     mesh_ms: f64,
     silhouette_visibility_ms: f64,
@@ -557,15 +578,60 @@ impl egui::Plugin for SubmissionPlugin {
         let Some(event) = pending.event else {
             return;
         };
+        if !same_operation(&event.fact, &event.tracker.fact)
+            || pending.receipt.destination != event.fact.destination
+        {
+            return;
+        }
         let mut ledger = event
             .tracker
             .ledger
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // Only the first accepted curl can publish the origin. A canceled or
+        // retired operation's delayed hook cannot revive it. Each tracker is
+        // created for one immutable operation/destination, never reused.
+        let now = presentation_now();
+        if matches!(event.kind, SubmissionKind::Curl)
+            && matches!(
+                ledger.status,
+                SubmissionStatus::Offered | SubmissionStatus::Started
+            )
+        {
+            if ledger.status == SubmissionStatus::Offered {
+                ledger.motion = MotionClock::Running { start_at: now };
+            }
+            ledger.motion_frames += 1;
+        }
+        if ledger.status == SubmissionStatus::Started
+            || matches!(event.kind, SubmissionKind::Curl)
+                && ledger.status == SubmissionStatus::Offered
+        {
+            // Include the first canonical landing: one curl followed by a
+            // duration-sized hitch must not report a zero maximum gap.
+            if let Some(last) = ledger.last_motion_output_at {
+                ledger.max_curl_gap = ledger.max_curl_gap.max(now.saturating_duration_since(last));
+            }
+            ledger.last_motion_output_at = Some(now);
+        }
         let mut fields = Vec::new();
         if crate::perf::is_enabled() {
             fields.extend([
-                ("elapsed_ms", event.elapsed_ms.into()),
+                (
+                    "elapsed_ms",
+                    (event
+                        .projected_at
+                        .saturating_duration_since(event.accepted_at)
+                        .as_secs_f64()
+                        * 1000.0)
+                        .into(),
+                ),
+                ("progress", event.progress.into()),
+                ("motion_frames", ledger.motion_frames.into()),
+                (
+                    "motion_max_gap_ms",
+                    (ledger.max_curl_gap.as_secs_f64() * 1000.0).into(),
+                ),
                 ("retain_bytes", event.retained_bytes.into()),
                 ("mesh_cpu_ms", event.mesh_ms.into()),
                 (
@@ -576,8 +642,33 @@ impl egui::Plugin for SubmissionPlugin {
                 ("outer_mask_cpu_ms", event.outer_mask_ms.into()),
                 ("frame", pending.receipt.frame.into()),
                 ("pass", pending.receipt.pass.into()),
-                ("clock_origin", "accepted_navigation".into()),
+                ("clock_origin", "first_accepted_curl".into()),
             ]);
+            if let MotionClock::Running { start_at } = ledger.motion {
+                fields.extend([
+                    (
+                        "accept_to_first_curl_ms",
+                        (start_at
+                            .saturating_duration_since(event.accepted_at)
+                            .as_secs_f64()
+                            * 1000.0)
+                            .into(),
+                    ),
+                    (
+                        "motion_elapsed_ms",
+                        (event
+                            .projected_at
+                            .saturating_duration_since(start_at)
+                            .as_secs_f64()
+                            * 1000.0)
+                            .into(),
+                    ),
+                    (
+                        "output_motion_elapsed_ms",
+                        (now.saturating_duration_since(start_at).as_secs_f64() * 1000.0).into(),
+                    ),
+                ]);
+            }
             if let Some(proof) = event.proof {
                 fields.push(("unit", proof));
             }
@@ -618,7 +709,7 @@ impl egui::Plugin for SubmissionPlugin {
             }
             (SubmissionKind::Canonical, SubmissionStatus::Offered) => {
                 ledger.status = SubmissionStatus::Cancelled;
-                emit(&event.fact, "skip", "expired_before_accepted_curl", &[]);
+                emit(&event.fact, "skip", "canonical_without_accepted_curl", &[]);
             }
             _ => {}
         }
@@ -953,6 +1044,33 @@ struct PreparedLeaf {
     prepare_cpu_ms: f64,
 }
 
+/// The UI owns the motion clock; the output hook only publishes its first
+/// accepted timestamp through the operation's existing submission ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MotionClock {
+    AwaitingAcceptedOutput,
+    Running { start_at: Instant },
+}
+
+impl MotionClock {
+    fn progress(&self, now: Instant, duration: Duration) -> f32 {
+        match *self {
+            Self::AwaitingAcceptedOutput => 0.0,
+            Self::Running { start_at } => {
+                now.saturating_duration_since(start_at).as_secs_f32() / duration.as_secs_f32()
+            }
+        }
+    }
+}
+
+fn presentation_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = clock_tests::now() {
+        return now;
+    }
+    Instant::now()
+}
+
 fn prepare_leaf(
     outgoing: &PaintedUnit,
     incoming: &PaintedUnit,
@@ -988,6 +1106,7 @@ enum PresentationState {
         incoming: Arc<PaintedUnit>,
         offer: AcceptedOffer,
         projection: PreparedLeaf,
+        clock: MotionClock,
     },
     Completing {
         incoming: Arc<PaintedUnit>,
@@ -2105,10 +2224,10 @@ impl App {
                 ready_sources,
                 resident_bytes,
                 pin_bytes,
-                accepted_at: Instant::now(),
+                accepted_at: presentation_now(),
                 duration,
                 forward,
-                submission: Arc::new(SubmissionTracker::new()),
+                submission: Arc::new(SubmissionTracker::new(fact)),
             },
         };
         let _ = ctx;
@@ -2120,7 +2239,7 @@ impl App {
         pages: &[PreparedPagedPage],
         white: Option<(egui::Rect, egui::Rect)>,
     ) -> Option<SubmittedUnitReceipt> {
-        self.submit_paged_display_unit_with_clock(ctx, pages, white, Instant::now)
+        self.submit_paged_display_unit_with_clock(ctx, pages, white, presentation_now)
     }
 
     pub(super) fn page_turn_submission_eligible(
@@ -2266,7 +2385,7 @@ impl App {
                                     == p.resource.source_generation()
                                 && source.content == self.page_turn_content(p.occurrence.idx)
                         });
-                if matching && now.saturating_duration_since(offer.accepted_at) < offer.duration {
+                if matching {
                     match prepare_leaf(&outgoing, &unit, offer.forward) {
                         Ok(projection) => {
                             // Ordinary prepare has submitted its input. Transfer
@@ -2334,6 +2453,7 @@ impl App {
                                     incoming: unit.clone(),
                                     offer,
                                     projection,
+                                    clock: MotionClock::AwaitingAcceptedOutput,
                                 }
                             }
                         }
@@ -2345,7 +2465,7 @@ impl App {
                     }
                 } else {
                     offer.submission.end();
-                    emit(&offer.fact, "skip", "offer_mismatch_or_expired", &[]);
+                    emit(&offer.fact, "skip", "offer_binding_or_source_mismatch", &[]);
                     PresentationState::Flat(unit.clone())
                 }
             }
@@ -2354,6 +2474,7 @@ impl App {
                 incoming,
                 offer,
                 projection,
+                clock,
             } => {
                 if incoming.content == unit.content && incoming.same_material_and_geometry(&unit) {
                     PresentationState::Turning {
@@ -2361,6 +2482,7 @@ impl App {
                         incoming,
                         offer,
                         projection,
+                        clock,
                     }
                 } else {
                     let previous = offer.submission.end();
@@ -2406,12 +2528,15 @@ impl App {
             incoming,
             offer,
             projection: prepared,
-        } = &final_state
+            clock,
+        } = &mut final_state
         {
-            let progress = now
-                .saturating_duration_since(offer.accepted_at)
-                .as_secs_f32()
-                / offer.duration.as_secs_f32();
+            if matches!(clock, MotionClock::AwaitingAcceptedOutput)
+                && let Some(start_at) = offer.submission.started_at()
+            {
+                *clock = MotionClock::Running { start_at };
+            }
+            let progress = clock.progress(now, offer.duration);
             if progress < 1.0 {
                 let t0 = crate::perf::is_enabled().then(Instant::now);
                 let projection = crate::page_turn_animation::project_prepared(
@@ -2499,10 +2624,9 @@ impl App {
                             tracker: offer.submission.clone(),
                             fact: offer.fact,
                             kind: SubmissionKind::Curl,
-                            elapsed_ms: now
-                                .saturating_duration_since(offer.accepted_at)
-                                .as_secs_f64()
-                                * 1000.0,
+                            accepted_at: offer.accepted_at,
+                            projected_at: now,
+                            progress,
                             retained_bytes: outgoing.reserved_bytes.load(Ordering::Relaxed),
                             mesh_ms: t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
                             silhouette_visibility_ms: projection.cost.silhouette_visibility_ms,
@@ -2545,10 +2669,9 @@ impl App {
                     tracker: offer.submission.clone(),
                     fact: offer.fact,
                     kind: SubmissionKind::Canonical,
-                    elapsed_ms: now
-                        .saturating_duration_since(offer.accepted_at)
-                        .as_secs_f64()
-                        * 1000.0,
+                    accepted_at: offer.accepted_at,
+                    projected_at: now,
+                    progress,
                     retained_bytes: 0,
                     mesh_ms: 0.0,
                     silhouette_visibility_ms: 0.0,
@@ -2634,11 +2757,9 @@ impl App {
             tracker: diagnostics.tracker.clone(),
             fact: diagnostics.fact,
             kind: SubmissionKind::Canonical,
-            elapsed_ms: if crate::perf::is_enabled() {
-                diagnostics.accepted_at.elapsed().as_secs_f64() * 1000.0
-            } else {
-                0.0
-            },
+            accepted_at: diagnostics.accepted_at,
+            projected_at: presentation_now(),
+            progress: 1.0,
             retained_bytes: 0,
             mesh_ms: 0.0,
             silhouette_visibility_ms: 0.0,
@@ -3261,14 +3382,14 @@ fn actual_page_visibility(
 mod tests {
     use super::*;
 
-    fn destination(serial: u64) -> PresentationDestination {
+    pub(super) fn destination(serial: u64) -> PresentationDestination {
         PresentationDestination {
             context: crate::app::ViewerContextId::for_test(serial),
             window: None,
             viewport: egui::ViewportId::ROOT,
         }
     }
-    fn fact(batch: u64) -> ViewerOperationFact {
+    pub(super) fn fact(batch: u64) -> ViewerOperationFact {
         ViewerOperationFact {
             destination: destination(1),
             operation_id: ViewerOperationId::Pad { batch, ordinal: 0 },
@@ -3278,7 +3399,7 @@ mod tests {
             diagnostic_input_seq: 1,
         }
     }
-    fn receipt(ctx: &egui::Context, idx: usize) -> SubmittedUnitReceipt {
+    pub(super) fn receipt(ctx: &egui::Context, idx: usize) -> SubmittedUnitReceipt {
         SubmittedUnitReceipt {
             binding: SubmittedContentBinding::Ordinary,
             destination: destination(1),
@@ -3294,12 +3415,14 @@ mod tests {
             curl: false,
         }
     }
-    fn event(tracker: &Arc<SubmissionTracker>, kind: SubmissionKind) -> SubmissionEvent {
+    pub(super) fn event(tracker: &Arc<SubmissionTracker>, kind: SubmissionKind) -> SubmissionEvent {
         SubmissionEvent {
             tracker: tracker.clone(),
             fact: fact(1),
             kind,
-            elapsed_ms: 0.0,
+            accepted_at: presentation_now(),
+            projected_at: presentation_now(),
+            progress: 0.0,
             retained_bytes: 0,
             mesh_ms: 0.0,
             silhouette_visibility_ms: 0.0,
@@ -3507,8 +3630,8 @@ mod tests {
                 continuation: None,
                 diagnostics: CompletionDiagnostics {
                     fact,
-                    tracker: Arc::new(SubmissionTracker::new()),
-                    accepted_at: Instant::now(),
+                    tracker: Arc::new(SubmissionTracker::new(fact)),
+                    accepted_at: presentation_now(),
                 },
             };
             owner.page_turn_external_operation(
@@ -3692,7 +3815,7 @@ mod tests {
     fn output_plugin_accepts_only_last_actual_submission() {
         let ctx = egui::Context::default();
         install(&ctx);
-        let tracker = Arc::new(SubmissionTracker::new());
+        let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         let mut receipts = Vec::new();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let proof = receipt(ctx, 1);
@@ -3732,7 +3855,7 @@ mod tests {
         for matching in [true, false] {
             let ctx = egui::Context::default();
             install(&ctx);
-            let tracker = Arc::new(SubmissionTracker::new());
+            let tracker = Arc::new(SubmissionTracker::new(fact(1)));
             tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 if ctx.current_pass_index() == 0 {
@@ -3760,7 +3883,7 @@ mod tests {
     fn canceled_leaf_credits_unseen_pages_only_after_canonical_output_is_adopted() {
         let ctx = egui::Context::default();
         install(&ctx);
-        let tracker = Arc::new(SubmissionTracker::new());
+        let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
         tracker.end();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -3941,10 +4064,10 @@ mod tests {
                 ready_sources: Arc::new(AcceptedSources(Vec::new())),
                 resident_bytes: bytes,
                 pin_bytes: bytes,
-                accepted_at: Instant::now(),
+                accepted_at: presentation_now(),
                 duration: Duration::from_millis(200),
                 forward: true,
-                submission: Arc::new(SubmissionTracker::new()),
+                submission: Arc::new(SubmissionTracker::new(fact(1))),
             },
         };
         presentation.cancel("new_operation");
@@ -4148,7 +4271,7 @@ mod tests {
         );
         let outgoing = unit(&ctx, texture.clone(), 1);
         let incoming = unit(&ctx, texture, 1);
-        let tracker = Arc::new(SubmissionTracker::new());
+        let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.page_turn_external_operation(
@@ -4163,6 +4286,7 @@ mod tests {
             let old_fact = app.page_turn_presentation.take_candidate().unwrap();
             app.page_turn_presentation.state = PresentationState::Turning {
                 projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
+                clock: MotionClock::AwaitingAcceptedOutput,
                 outgoing: outgoing.clone(),
                 incoming: incoming.clone(),
                 offer: AcceptedOffer {
@@ -4170,7 +4294,7 @@ mod tests {
                     ready_sources: Arc::new(AcceptedSources(Vec::new())),
                     resident_bytes: 0,
                     pin_bytes: 0,
-                    accepted_at: Instant::now(),
+                    accepted_at: presentation_now(),
                     duration: Duration::from_millis(200),
                     forward: true,
                     submission: tracker.clone(),

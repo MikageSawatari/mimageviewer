@@ -371,6 +371,7 @@ fn navigate(
     // Started is adopted by the final-output hook, after ctx.run returns.
     let tracker = if expected == BoundaryDiagnosis::Ready {
         let PresentationState::Turning {
+            clock,
             incoming: actual,
             offer,
             ..
@@ -392,7 +393,9 @@ fn navigate(
         );
         assert_eq!(offer.forward, forward);
         assert_eq!(offer.submission.status(), SubmissionStatus::Started);
-        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+        *clock = MotionClock::Running {
+            start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+        };
         Some(offer.submission.clone())
     } else {
         None
