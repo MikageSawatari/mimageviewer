@@ -151,8 +151,20 @@ pub(crate) struct NativeVideoWindowEventEnvelope {
     pub(crate) generation: u64,
     pub(crate) source: NativeVideoWindowSource,
     pub(crate) event: NativeVideoWindowEvent,
+    pub(crate) raise_diagnostic: Option<NativeRaiseSample>,
     #[cfg(feature = "test-script")]
     pub(crate) smoke_metadata: Option<super::native_ui_smoke::NativeUiSmokeMessageMetadata>,
+}
+
+/// Bounded provenance travels with the existing latest-value mailbox. A replaced
+/// request retains its own epoch; it is never attributed to the replacement HWND.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeRaiseSample {
+    pub(crate) epoch: u64,
+    pub(crate) sequence: u64,
+    pub(crate) observed_us: u64,
+    pub(crate) flags: u32,
+    pub(crate) insert_after: i64,
 }
 
 const WINDOW_EVENT_LATEST_MOUSE_MOVE: usize = 0;
@@ -186,6 +198,13 @@ struct NativeWindowEventRouteShared {
     next_sequence: AtomicU64,
     latest: Vec<LatestWindowEventSlot>,
     overflow_fault: Arc<AtomicBool>,
+    raise_diagnostics: Option<NativeRaiseRouteDiagnostics>,
+}
+
+struct NativeRaiseRouteDiagnostics {
+    tx: crossbeam_channel::Sender<(NativeRaiseSample, bool)>,
+    rx: crossbeam_channel::Receiver<(NativeRaiseSample, bool)>,
+    overflow: AtomicU64,
 }
 
 /// Lock-free single-value mailbox. Producer and consumer each take ownership
@@ -201,12 +220,13 @@ impl LatestWindowEventSlot {
         }
     }
 
-    fn publish(&self, event: NativeVideoWindowEventEnvelope) {
+    fn publish(
+        &self,
+        event: NativeVideoWindowEventEnvelope,
+    ) -> Option<NativeVideoWindowEventEnvelope> {
         let next = Box::into_raw(Box::new(event));
         let prior = self.value.swap(next, Ordering::AcqRel);
-        if !prior.is_null() {
-            unsafe { drop(Box::from_raw(prior)) };
-        }
+        (!prior.is_null()).then(|| unsafe { *Box::from_raw(prior) })
     }
 
     fn take(&self) -> Option<NativeVideoWindowEventEnvelope> {
@@ -245,13 +265,34 @@ pub(crate) fn native_window_event_route(
     lossless_capacity: usize,
     overflow_fault: Arc<AtomicBool>,
 ) -> (NativeWindowEventRoute, NativeWindowEventReceiver) {
+    native_window_event_route_with_diagnostics(
+        lossless_capacity,
+        overflow_fault,
+        crate::perf::is_enabled(),
+    )
+}
+
+fn native_window_event_route_with_diagnostics(
+    lossless_capacity: usize,
+    overflow_fault: Arc<AtomicBool>,
+    collect_raise: bool,
+) -> (NativeWindowEventRoute, NativeWindowEventReceiver) {
     let (lossless_tx, lossless_rx) = crossbeam_channel::bounded(lossless_capacity);
+    let raise_diagnostics = collect_raise.then(|| {
+        let (tx, rx) = crossbeam_channel::bounded(256);
+        NativeRaiseRouteDiagnostics {
+            tx,
+            rx,
+            overflow: AtomicU64::new(0),
+        }
+    });
     let shared = Arc::new(NativeWindowEventRouteShared {
         next_sequence: AtomicU64::new(1),
         latest: (0..WINDOW_EVENT_LATEST_SLOTS)
             .map(|_| LatestWindowEventSlot::empty())
             .collect(),
         overflow_fault,
+        raise_diagnostics,
     });
     (
         NativeWindowEventRoute {
@@ -266,10 +307,28 @@ pub(crate) fn native_window_event_route(
 }
 
 impl NativeWindowEventRoute {
+    fn record_raise_diagnostic(&self, sample: NativeRaiseSample, replaced: bool) {
+        if let Some(diagnostic) = &self.shared.raise_diagnostics
+            && diagnostic.tx.try_send((sample, replaced)).is_err()
+        {
+            diagnostic.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn send(&self, mut envelope: NativeVideoWindowEventEnvelope) {
         envelope.sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if let Some(diagnostic) = &mut envelope.raise_diagnostic {
+            diagnostic.sequence = envelope.sequence;
+        }
         if let Some(slot) = native_window_event_latest_slot(&envelope.event) {
-            self.shared.latest[slot].publish(envelope);
+            if let Some(sample) = envelope.raise_diagnostic {
+                self.record_raise_diagnostic(sample, false);
+            }
+            if let Some(prior) = self.shared.latest[slot].publish(envelope)
+                && let Some(sample) = prior.raise_diagnostic
+            {
+                self.record_raise_diagnostic(sample, true);
+            }
             return;
         }
         match self.lossless_tx.try_send(envelope) {
@@ -283,6 +342,15 @@ impl NativeWindowEventRoute {
 }
 
 impl NativeWindowEventReceiver {
+    pub(crate) fn drain_raise_diagnostics(&self) -> (Vec<(NativeRaiseSample, bool)>, u64) {
+        let Some(diagnostic) = &self.shared.raise_diagnostics else {
+            return (Vec::new(), 0);
+        };
+        (
+            diagnostic.rx.try_iter().collect(),
+            diagnostic.overflow.swap(0, Ordering::Relaxed),
+        )
+    }
     pub(crate) fn drain(&self) -> Vec<NativeVideoWindowEventEnvelope> {
         let mut events: Vec<_> = self.lossless_rx.try_iter().collect();
         events.extend(self.shared.latest.iter().filter_map(|slot| slot.take()));
@@ -334,10 +402,48 @@ impl NativeVideoWindowEventSink {
             generation: self.generation,
             source: self.source,
             event,
+            raise_diagnostic: None,
             #[cfg(feature = "test-script")]
             smoke_metadata: None,
         };
         self.dispatch(envelope);
+    }
+
+    pub(crate) fn send_hud_raise(&self, flags: u32, insert_after: i64) {
+        self.send_hud_raise_with_clock(flags, insert_after, || {
+            crate::perf::program_start().map_or(0, |start| {
+                start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+            })
+        });
+    }
+
+    fn send_hud_raise_with_clock(
+        &self,
+        flags: u32,
+        insert_after: i64,
+        observed_us: impl FnOnce() -> u64,
+    ) {
+        let diagnostic = if self.pump_route.shared.raise_diagnostics.is_some() {
+            Some(NativeRaiseSample {
+                epoch: self.epoch,
+                flags,
+                insert_after,
+                observed_us: observed_us(),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        self.dispatch(NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch: self.epoch,
+            generation: self.generation,
+            source: self.source,
+            event: NativeVideoWindowEvent::RequestRaiseHud,
+            raise_diagnostic: diagnostic,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
+        });
     }
 
     #[cfg(feature = "test-script")]
@@ -362,6 +468,7 @@ impl NativeVideoWindowEventSink {
             }
         }
         let envelope = NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: self.epoch,
             generation: self.generation,
@@ -3554,10 +3661,103 @@ mod tests {
     }
 
     #[test]
+    fn hud_raise_producer_coalesce_preserves_displaced_epoch_flags_and_sequence() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump, receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), true);
+        let (render, _render_receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), false);
+        let first = NativeVideoWindowEventSink::new(
+            7,
+            7,
+            NativeVideoWindowSource::Hud,
+            pump.clone(),
+            render.clone(),
+        );
+        let second =
+            NativeVideoWindowEventSink::new(8, 8, NativeVideoWindowSource::Hud, pump, render);
+        first.send_hud_raise_with_clock(0x10, -1, || 101);
+        second.send_hud_raise_with_clock(0x20, 0, || 102);
+        let events = receiver.drain();
+        assert_eq!(events.len(), 1, "latest value semantics preserved");
+        let surviving = events[0].raise_diagnostic.unwrap();
+        assert_eq!(
+            (
+                events[0].epoch,
+                surviving.epoch,
+                surviving.flags,
+                surviving.insert_after,
+                surviving.observed_us
+            ),
+            (8, 8, 0x20, 0, 102)
+        );
+        let (samples, lost) = receiver.drain_raise_diagnostics();
+        assert_eq!(lost, 0);
+        assert_eq!(samples.len(), 3);
+        assert_eq!((samples[0].0.epoch, samples[0].1), (7, false));
+        assert_eq!((samples[1].0.epoch, samples[1].1), (8, false));
+        assert_eq!((samples[2].0.epoch, samples[2].1), (7, true));
+        assert_eq!(samples[2].0.sequence, samples[0].0.sequence);
+        assert_eq!(
+            (
+                samples[2].0.flags,
+                samples[2].0.insert_after,
+                samples[2].0.observed_us
+            ),
+            (0x10, -1, 101)
+        );
+        assert!(surviving.sequence > samples[0].0.sequence);
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hud_raise_diagnostics_off_skip_clock_and_overflow_never_faults_product_route() {
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump, receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), false);
+        let (render, _render_receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), false);
+        let sink = NativeVideoWindowEventSink::new(
+            7,
+            7,
+            NativeVideoWindowSource::Hud,
+            pump,
+            render.clone(),
+        );
+        sink.send_hud_raise_with_clock(0, -1, || panic!("disabled producer must not read clock"));
+        assert!(
+            receiver.shared.raise_diagnostics.is_none(),
+            "OFF allocates no diagnostic channel"
+        );
+        assert!(receiver.drain()[0].raise_diagnostic.is_none());
+        assert!(receiver.drain_raise_diagnostics().0.is_empty());
+        let (pump, receiver) =
+            native_window_event_route_with_diagnostics(1, Arc::clone(&overflow), true);
+        let sink =
+            NativeVideoWindowEventSink::new(9, 9, NativeVideoWindowSource::Hud, pump, render);
+        for _ in 0..150 {
+            sink.send_hud_raise_with_clock(0, -1, || 200);
+        }
+        let (samples, lost) = receiver.drain_raise_diagnostics();
+        assert_eq!(samples.len(), 256);
+        assert_eq!(
+            lost, 43,
+            "150 issued +149 replaced exceed bounded diagnostic side channel"
+        );
+        assert_eq!(
+            receiver.drain().len(),
+            1,
+            "product latest event survives diagnostic overflow"
+        );
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn lossless_window_event_overflow_is_an_explicit_session_fault() {
         let overflow = Arc::new(AtomicBool::new(false));
         let (route, _rx) = native_window_event_route(1, Arc::clone(&overflow));
         route.send(NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: 1,
             generation: 1,
@@ -3567,6 +3767,7 @@ mod tests {
             smoke_metadata: None,
         });
         route.send(NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: 1,
             generation: 1,
@@ -3584,6 +3785,7 @@ mod tests {
         let overflow = Arc::new(AtomicBool::new(false));
         let (route, rx) = native_window_event_route(1, Arc::clone(&overflow));
         let mouse = |x, token| NativeVideoWindowEventEnvelope {
+            raise_diagnostic: None,
             sequence: 0,
             epoch: 3,
             generation: 3,

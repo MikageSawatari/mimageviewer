@@ -3170,12 +3170,30 @@ impl Drop for DspBridge {
 /// Codex 10 回目 P2 #4)。
 #[cfg(windows)]
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HudRaiseForegroundDecision {
+    pub(crate) allowed: bool,
+    pub(crate) foreground_hwnd: u64,
+    pub(crate) classification: &'static str,
+}
+
+#[cfg(windows)]
 pub(crate) fn foreground_allows_hud_raise(
     presenter_hwnd: u64,
     hud_hwnd: u64,
     main_hwnd: u64,
     editor_hwnds: &std::collections::HashSet<u64>,
 ) -> bool {
+    hud_raise_foreground_decision(presenter_hwnd, hud_hwnd, main_hwnd, editor_hwnds).allowed
+}
+
+#[cfg(windows)]
+pub(crate) fn hud_raise_foreground_decision(
+    presenter_hwnd: u64,
+    hud_hwnd: u64,
+    main_hwnd: u64,
+    editor_hwnds: &std::collections::HashSet<u64>,
+) -> HudRaiseForegroundDecision {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -3185,20 +3203,25 @@ pub(crate) fn foreground_allows_hud_raise(
 
     unsafe {
         let foreground = GetForegroundWindow();
+        let decision = |allowed, classification| HudRaiseForegroundDecision {
+            allowed,
+            foreground_hwnd: foreground.0 as usize as u64,
+            classification,
+        };
         if foreground.0.is_null() {
-            return false;
+            return decision(false, "none");
         }
         let raw = foreground.0 as u64;
 
         // 1. mIV の既知 HWND だけ許可 (= presenter / HUD / main)。
         if raw == presenter_hwnd || raw == hud_hwnd || raw == main_hwnd {
-            return true;
+            return decision(true, "known_miv_window");
         }
         let mut pid = 0_u32;
         let _ = GetWindowThreadProcessId(foreground, Some(&mut pid));
         if pid == GetCurrentProcessId() {
             // mIV process 内の別 HWND (= 設定ダイアログ等) → skip。
-            return false;
+            return decision(false, "other_miv_window");
         }
 
         // 2. editor allowlist 判定 (foreground 自身 + GA_ROOT、GA_ROOTOWNER は使わない)。
@@ -3223,7 +3246,7 @@ pub(crate) fn foreground_allows_hud_raise(
             break;
         }
         if !editor_matched {
-            return false;
+            return decision(false, "external_unregistered");
         }
 
         // 3. editor が foreground でも、editor が popup を出していたら skip。
@@ -3238,10 +3261,10 @@ pub(crate) fn foreground_allows_hud_raise(
             }
             let popup_raw = popup.0 as u64;
             if !editor_hwnds.contains(&popup_raw) && IsWindowVisible(popup).as_bool() {
-                return false;
+                return decision(false, "editor_popup");
             }
         }
 
-        true
+        decision(true, "registered_editor")
     }
 }
