@@ -916,3 +916,116 @@ rootのlogic-only Close確定追加回帰も後続である。
 設計との重大な食い違いはない。実State再生成時の入力移譲は同じlogical ownerの寿命保持として
 今回に含め、Close契約は先取りしなかった。実装担当の内部確認でも所有・寿命と後続範囲を照合した。
 live・製品build／起動・test-full.ps1・ネットワーク・git add／commit／branch操作は行っていない。
+
+## 段2c-3a 案Bのroot／deferred UI継続と非描画出力（2026-10-17）
+
+開始HEAD `1034d4ea4`。段2c-2は設計担当がコミット済み、独立レビュー中との引継ぎで着手。
+第4.4版§4.2条件表・UI／surface分離、§4.8 eframeの案B行、段2c受入条件の案B1〜14と
+独立コミット分割を読み直した。今回の追加指示によりimmediate関連13／14は2c-3bへ、
+Close関連11／15は2c-4へ残す。以下は**実装担当の内部確認**であり正式な独立ACCEPTではない。
+未ステージ・未コミット。前段の記録は変更せず、今回分を追記する。
+
+### 実装と接続境界
+
+共通`native/frame_output.rs`を追加し、両backendの実root／deferred経路から使用する（b・新規）。
+PassDecisionはFullかどうか、実ViewportInfo、visible descendant、既存の明示描画要求、
+Windows最小化からUI資格とpaint資格を別々に計算する。
+UIはFullかつvisible／visible descendant／明示描画／Windows最小化のいずれかで進める。
+surfaceはFullかつvisible／明示描画の場合だけ。metadataをtrueへ偽装しない。
+他OSのocclusionと明示LogicOnlyは従来どおりで、LogicOnlyをFullへ変更しない。
+
+共通finish_main_viewport_outputは当該UIのRequestCut／RequestCopy／RequestPaste、
+Screenshot／RequestPaintWhileHiddenを既存actions_requestedへ先に移し、元のcommandから除く。
+platform／IME出力を対象Stateへ渡した後、Cut／Copy／Pasteを同Stateの次回入力へ一度だけ渡す。
+その後でpaintを再判定するので、当該root／deferred UIからの明示描画要求にも対応する。
+残りのnative commandsは従来handlerへ順序保持で渡し、同じactionを後段で再登録しない。
+非描画action drainはScreenshot／PaintWhileHiddenを保持し、paint consumerだけが完了する。
+
+clipboardは従来のState APIを使う。CRLF→LF、空textならイベントなし、textがNoneのときだけ
+image fallback、を維持し、通常／nativeのproducer条件・Process／IME gateは変更しない。
+追加clipboard channelやrepaintで次回配送を成立させず、既存の次回State入力規則を保つ。
+
+wgpuは共有deltaを一度だけappendし、paintでは既存paint consumer、非描画では既存
+Painter::apply_textures_deltaへ渡す。surface／resource分岐をfinish_wgpu_main_renderへ抽出した。
+set drain→upload／submit→freeは段2b consumerが完結する。renderer未準備時だけ既存ownerへ残る。
+tessellation／capture／post_renderingはsurface経路内にあり、非描画でpresent／visible commitを呼ばない。
+
+glowは現在の出力元、現在の生存viewport、その他生存surfaceの順で有効なGL contextを選び、
+非描画でもset_texture→free_textureを実行する。clear／paint／swapやGPU待機は追加しない。
+contextが無い場合は既存pending_deltasを保ち、後の有効contextで適用する。別queueは作らない。
+preclearを実際に行った条件をstack-localで保持し、当該UIのScreenshotで後段paintが成立した場合も
+必要なclearを省かない。persistentなpending boolは追加していない。
+
+両backendでFull中に出力元viewportがGCされた場合のearly returnを取り除き、共有deltaと
+他viewport宛commandsを完結／既存ownerへ引き継ぐ。終了済み入力ownerを兄弟へ流さない。
+native/run.rsは不変。100ms下限、遅い要求の非加速、要求なしsleep、outer phase、bootstrap／
+非ゼロresize例外と本家250ms deadlineを保持する。新しい延期・時間窓・retryは足さない。
+両render_immediate_viewport本体は不変。root workspace／patch／製品／旧vendor・双方のlockも不変。
+
+### 窓なし回帰と証拠の範囲
+
+追加10件はすべて名前にminimized_fullを含める。
+
+| 回帰群 | 検査内容 |
+| --- | --- |
+| shared PassDecision 1件 | root／child相当、Win／他OS、minimized／occluded／visible、descendant、明示描画、Full／LogicOnlyの組合せ。metadata不変 |
+| shared action／paste／output境界 3件 | 実使用helper＋fake targetでplatform／IME配送、CopyText後のPaste、同State入力順序、兄弟不変、空textとimage fallback、native commandsの保持、capture identity保持、後続passで非重複 |
+| 実EpiIntegration／実State 2件 | fake Appと実update／update_logic_only、実TextEdit。最小化root logic＋UI、deferred callback（App logic重複なし）、root A→child B→root A＋C、IME／platform／viewport commandsとtexture set／free生成、visible receiptなし。child skipは明示LogicOnlyで検査 |
+| wgpu実使用dispatch／output境界 1件 | fake window／painterで非描画surface closure禁止、whole→partial→submission→free、IME／clipboard once、当該UIのcaptureでpaint成立・callback一回、空resource submit重複なし |
+| glow実使用resource／context選択 3件 | fake painterでwhole→partial→free、一度だけdrain。終了した出力元から生存contextへ移し、context無しでは既存ownerを保持し、復帰時に適用。resource helperにはclear／paint／swapの能力を渡さない |
+
+実native run_ui_and_paint全体をfakeで差し替えて実行した試験ではなく、実EpiIntegration、実State、
+backendが実使用する判断・配送・resource helperの実行と、そのsource接続の照合である。
+実HWND／GL context／surface presentは未実施。eframeから実GPU完結まで一体実行したとはしない。
+実GPUのsubmission／readbackは同graphのegui-wgpu16件を別に実行した。
+FullOutputは検査後にdrop_without_applying_deltas、headless deltaは明示破棄する。
+
+### 部分復元での失敗と復元後成功
+
+5種類を一時的に戻し、各回finallyで元のbyteへ復元した。ログは同prefixのmutation-*.log、
+結果は`target/egui037-stage2c3a-results.json`に保存する。
+
+| 部分復元 | 期待どおりの失敗 |
+| --- | --- |
+| Windows最小化FullのUI資格を撤回 | 10件中3件失敗、exit 101 |
+| main出力helperの非描画action処理を除去 | 10件中2件失敗、exit 101 |
+| 当該UIのScreenshot／PaintWhileHidden取り込みを除去 | 10件中3件失敗、exit 101 |
+| wgpuで非描画もsurface closureへ送る | 10件中1件失敗、exit 101（fixedfixtureログ） |
+| glowの非描画resource適用を除去 | 10件中3件失敗、exit 101（fixedfixtureログ） |
+
+初回compileはtest／helperのViewportCommand名とIMEOutputの参照先が誤っており、
+新版のRequestCut／Copy／Pasteとegui::output::IMEOutputへ訂正した（初回exit 101を保存）。
+最初のwgpu／glow変異では、意図したassertion後に未適用deltaのDrop assertionが重なり
+test processが0xc0000409（3221226505）で終了した。変異自体はfinallyで復元済み。
+失敗を覆い隠さないよう、headless fixtureの異常経路でも明示clearする形へ補強し、
+再変異で上表の通常のtest失敗を確認した。製品のcrash・実機観測とは扱わない。
+productionへ無条件clearを追加したものではない。最終suiteは復元済みsourceで成功した。
+
+### 最終検証と残作業
+
+Rust 1.99.0、全command locked／offline。MSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=1。
+実行commandは前段の段2c-2と同じ14項目で、scriptは`target/verify-stage2c3a.py`、
+個別command・所要時間・件数・exit codeは同prefixのresults.json、ログは各項目名.log。
+
+| 検証 | 最終結果 |
+| --- | --- |
+| eframe lib default＋glow／persistence | 44 passed / 0 failed / 1 ignored、exit 0 |
+| eframe lib 上記＋witness | 48 passed / 0 failed / 1 ignored、exit 0 |
+| eframe lib glow／default_fontsのみ | 38 passed / 0 failed / 0 ignored、exit 0。wgpu用liveはcompile対象外 |
+| egui-wgpu lib | 16 passed / 0 failed / 0 ignored、exit 0、GPU skipなし |
+| egui／egui-winit／egui-ime lib | 106／43／28 passed、失敗・ignoreなし、各exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧graph |
+| root fmt／fmt --check、準備fmt／fmt --check | すべてexit 0（root fmt対象外の準備graphも明示実行） |
+| git diff --check、新file空白、検証後source hash、root／lock／scheduler／immediate不変、index空 | 成功 |
+
+検証済みRust／manifest／lockはtested-source.json、対象diff・保護対象・両immediate関数hashはaudit.json。
+live試験synchronous_damage_returns_before_outer_paint_gateはignoreと内部の子再実行用--ignoredを維持。
+今回のcommandには--ignoredを付けず、実window・live・製品は起動していない。
+実装担当の内部確認でも実使用helper・scope・所有境界を照合し、未解決重大指摘なし。
+既存scene.rs EPSILON・witness fetch_update・feature別未使用variant・root警告は残る。
+
+設計との重大な食い違いはない。今回は主経路に限定し、immediate子の描画資格・非描画出力と
+当該子UIからのaction完結は2c-3bへ残す。Close受付・消費・非描画退役とroot LogicOnly Close回帰は
+2c-4へ残す。native GL／HWNDの実機確認と正式な独立レビューは別工程。
+追加repaint・強制UI・App補助flag・新queue／pending bool・retryは追加しない。
+依存取得・ネットワーク・製品build／起動・test-full.ps1・git add／commit／branch操作は行っていない。

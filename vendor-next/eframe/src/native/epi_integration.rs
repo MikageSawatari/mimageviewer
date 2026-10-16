@@ -1066,4 +1066,223 @@ mod tests {
             ));
         }
     }
+
+    #[derive(Default)]
+    struct MinimizedOutputField {
+        text: String,
+        events: Vec<Event>,
+        info: Option<egui::ViewportInfo>,
+        texture: Option<egui::TextureId>,
+    }
+
+    impl MinimizedOutputField {
+        fn show(&mut self, ui: &mut egui::Ui) {
+            let id = ui.ctx().viewport_id();
+            self.events = ui.input(|i| i.events.clone());
+            self.info = Some(ui.input(|i| i.viewport().clone()));
+            let field_id = egui::Id::unique(("minimized-output-field", id));
+            ui.memory_mut(|memory| memory.request_focus(field_id));
+            ui.add(egui::TextEdit::singleline(&mut self.text).id(field_id));
+            ui.ctx().copy_text(format!("output-{id:?}"));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(format!("title-{id:?}")));
+            let texture = ui.ctx().load_texture(
+                "minimized-output-texture",
+                egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            );
+            self.texture = Some(texture.id());
+            // This FullOutput must deliver both allocation and retirement even
+            // though there will be no surface paint.
+            drop(texture);
+        }
+    }
+
+    #[derive(Default)]
+    struct MinimizedOutputApp {
+        logic_calls: usize,
+        ui_calls: usize,
+        root: MinimizedOutputField,
+        hooks: Vec<(ViewportId, Vec<Event>)>,
+    }
+
+    impl epi::App for MinimizedOutputApp {
+        fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut RawInput) {
+            self.hooks.push((raw.viewport_id, raw.events.clone()));
+        }
+
+        fn logic(&mut self, _ctx: &egui::Context, _frame: &mut epi::Frame) {
+            self.logic_calls += 1;
+        }
+
+        fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut epi::Frame) {
+            self.ui_calls += 1;
+            self.root.show(ui);
+            ui.ctx()
+                .show_viewport_deferred(child_id(), ViewportBuilder::default(), |_, _| {});
+        }
+    }
+
+    fn minimized_input(id: ViewportId, events: Vec<Event>) -> RawInput {
+        let mut raw = input(id, events);
+        for info in raw.viewports.values_mut() {
+            info.minimized = Some(true);
+            info.occluded = Some(false);
+        }
+        raw
+    }
+
+    fn check_minimized_output(
+        output: &egui::FullOutput,
+        id: ViewportId,
+        field: &MinimizedOutputField,
+    ) {
+        let info = field.info.as_ref().unwrap();
+        assert_eq!(info.minimized, Some(true));
+        assert_eq!(info.visible(), Some(false), "UI cannot falsify visibility");
+        assert!(
+            output.platform_output.ime.is_some(),
+            "real TextEdit emits IME output"
+        );
+        assert!(output.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &format!("output-{id:?}"))
+        ));
+        assert!(output.viewport_output[&id].commands.iter().any(
+            |command| matches!(command, egui::ViewportCommand::Title(title) if title == &format!("title-{id:?}"))
+        ));
+        let texture = field.texture.unwrap();
+        assert!(
+            output
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == texture)
+        );
+        assert!(output.textures_delta.free.contains(&texture));
+    }
+
+    #[test]
+    fn minimized_full_nonpaint_actions_feed_real_owner_state_once() {
+        use super::super::frame_output::process_non_paint_actions;
+
+        let integration = headless_integration();
+        let mut state = egui_winit::State::new(
+            integration.egui_ctx.clone(),
+            child_id(),
+            &integration.frame,
+            None,
+            None,
+            None,
+        );
+        state.egui_input_mut().events.push(key(Key::A, false));
+        let mut actions = vec![
+            egui_winit::ActionRequested::Cut,
+            egui_winit::ActionRequested::PaintWhileHidden,
+            egui_winit::ActionRequested::Copy,
+        ];
+        process_non_paint_actions(&mut actions, &mut state);
+        process_non_paint_actions(&mut actions, &mut state);
+        assert_eq!(
+            state.egui_input().events,
+            vec![key(Key::A, false), Event::Cut, Event::Copy]
+        );
+        assert!(matches!(
+            actions.as_slice(),
+            [egui_winit::ActionRequested::PaintWhileHidden]
+        ));
+    }
+
+    #[test]
+    fn minimized_full_real_integration_keeps_root_child_input_outputs_and_logic_only_boundary() {
+        use super::super::{frame_output::PassDecision, winit_integration::PassMode};
+
+        let mut integration = headless_integration();
+        let mut app = MinimizedOutputApp::default();
+        let mut root_pending = RawInput::default();
+        let mut child_pending = RawInput::default();
+        let child = Arc::new(Mutex::new(MinimizedOutputField::default()));
+        let callback_child = Arc::clone(&child);
+        let child_ui_calls = Arc::new(Mutex::new(0));
+        let callback_calls = Arc::clone(&child_ui_calls);
+        let callback = move |ui: &mut egui::Ui| {
+            *callback_calls.lock().unwrap() += 1;
+            callback_child.lock().unwrap().show(ui);
+        };
+
+        let root_logic_input = minimized_input(ViewportId::ROOT, vec![text("A")]);
+        let decision = PassDecision::for_viewport(
+            PassMode::LogicOnly,
+            root_logic_input.viewport(),
+            true,
+            true,
+            true,
+        );
+        assert!(!decision.run_ui && !decision.paint);
+        let (_, unused) = integration.update_logic_only(&mut app, root_logic_input);
+        root_pending.append(unused);
+        assert_eq!(app.logic_calls, 1);
+        assert_eq!(app.ui_calls, 0);
+        assert_eq!(*child_ui_calls.lock().unwrap(), 0);
+
+        // A deferred child Full does not run App::logic or consume root input.
+        let child_input = take_viewport_input(&mut child_pending, || {
+            minimized_input(child_id(), vec![text("B")])
+        });
+        let decision =
+            PassDecision::for_viewport(PassMode::Full, child_input.viewport(), false, false, true);
+        assert!(decision.run_ui && !decision.paint);
+        let output = integration.update(&mut app, Some(&callback), child_input);
+        check_minimized_output(&output, child_id(), &child.lock().unwrap());
+        output.drop_without_applying_deltas();
+        assert_eq!(app.logic_calls, 1);
+        assert_eq!(app.ui_calls, 0);
+        assert_eq!(*child_ui_calls.lock().unwrap(), 1);
+        assert_eq!(child.lock().unwrap().events, vec![text("B")]);
+        assert_eq!(root_pending.events, vec![text("A")]);
+
+        let root_input = take_viewport_input(&mut root_pending, || {
+            minimized_input(ViewportId::ROOT, vec![text("C")])
+        });
+        let decision =
+            PassDecision::for_viewport(PassMode::Full, root_input.viewport(), false, false, true);
+        assert!(decision.run_ui && !decision.paint);
+        let output = integration.update(&mut app, None, root_input);
+        check_minimized_output(&output, ViewportId::ROOT, &app.root);
+        output.drop_without_applying_deltas();
+        assert_eq!(app.logic_calls, 2);
+        assert_eq!(app.ui_calls, 1);
+        assert_eq!(app.root.events, vec![text("A"), text("C")]);
+        assert_eq!(app.root.text, "AC");
+        assert_eq!(child.lock().unwrap().text, "B");
+        assert_eq!(
+            app.hooks,
+            vec![
+                (ViewportId::ROOT, vec![text("A")]),
+                (child_id(), vec![text("B")]),
+                (ViewportId::ROOT, vec![text("A"), text("C")]),
+            ]
+        );
+        assert!(root_pending.events.is_empty() && child_pending.events.is_empty());
+        assert!(!integration.frame.native_window_visible_commit_completed());
+
+        // The same minimized child's explicit LogicOnly decision is a skip;
+        // use the production acquisition selector to keep its queued input.
+        let mut child_state = minimized_input(child_id(), vec![key(Key::A, false)]);
+        let decision = PassDecision::for_viewport(
+            PassMode::LogicOnly,
+            child_state.viewport(),
+            true,
+            true,
+            true,
+        );
+        assert!(
+            take_viewport_input_if(decision.run_ui, &mut child_pending, || {
+                child_state.take()
+            })
+            .is_none()
+        );
+        assert_eq!(child_state.events, vec![key(Key::A, false)]);
+        assert_eq!(*child_ui_calls.lock().unwrap(), 1);
+        assert_eq!(app.logic_calls, 2);
+    }
 }

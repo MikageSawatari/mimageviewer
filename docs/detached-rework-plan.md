@@ -5501,3 +5501,20 @@ run_logicだけではinput_hook pruningが走らないため、同ID再open前�
 部分復元で失敗する証拠も段2台帳へ記録する。正式な独立ACCEPTではない。
 案B・immediate描画資格は2c-3、Closeの受付・消費・承認後のpass外退役とそのpolicy整理接続は2c-4。
 root製品graph・Appの判断は不変、実window・live試験は実行していない。
+
+#### 2026-10-17 段2c-3aの準備graph実装記録
+
+合意済み案Bのうちroot／deferredの主経路を`vendor-next/eframe`へ実装した。
+要求済みFullはWindows最小化でもUIを進め、実metadataを保ってsurface描画資格を別に決める。
+明示的LogicOnlyと本家250ms期限超過、他OSのocclusion、要求なしsleep・100ms下限・
+outer phase／bootstrap／resizeの既存例外は変更しない。常時tickや追加repaintではない。
+同じ主経路の出力helperでplatform／IMEとclipboard actionをpaint外で対象ownerへ配送し、
+当該UIの明示描画要求を既存action ownerへ一度だけ移してからpaint判定する。
+非描画時もwgpuは既存delta consumer、glowは有効な生存contextでresourceだけを適用する。
+Full中の出力元GCで他viewport宛commandや共有deltaを取り落とさず、非描画ではpresent・
+visible commit・実表示ACKを発行しない。App flag／新queue／pending bool／retryで補っていない。
+**実装担当の内部確認**として実integrationと両backendの実使用helperを窓なしで検査し、
+部分復元で失敗する証拠を段2台帳へ記録する。正式な独立ACCEPTではない。
+今回はコミット分割のため主経路だけ。immediate子自身の描画資格と出力完結は2c-3b、
+子Closeの受付・消費・pass外退役とroot LogicOnly Close回帰は2c-4へ残す。
+root製品graph・Appの判断は不変、実window・live試験は実行していない。

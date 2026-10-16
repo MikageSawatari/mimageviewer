@@ -36,6 +36,7 @@ use log::warn;
 
 use super::{
     epi_integration, event_loop_context,
+    frame_output::{PassDecision, WinitOutputTarget, finish_main_viewport_output},
     winit_integration::{EventResult, PassMode, UserEvent, WinitApp, create_egui_context},
 };
 use crate::epaint::textures::TexturesDelta;
@@ -667,7 +668,7 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let (raw_input, viewport_ui_cb, is_visible, show_ui) = {
+        let (raw_input, viewport_ui_cb, paint, show_ui) = {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
@@ -678,19 +679,20 @@ impl GlowWinitRunning<'_> {
             };
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
-            // A hidden window is not painted, since nothing would be shown — unless someone
-            // wants the pixels anyway, e.g. to screenshot an app that is in the background:
-            let is_visible = viewport.info.visible().unwrap_or(true)
-                || viewport
-                    .actions_requested
-                    .iter()
-                    .any(egui_winit::ActionRequested::wants_paint);
-
             let viewport_ui_cb = viewport.viewport_ui_cb.clone();
-
-            let show_ui = mode == PassMode::Full
-                && (is_visible
-                    || is_viewport_or_descendant_visible(&glutin.viewports, viewport_id));
+            let info = viewport.info.clone();
+            let actions_want_paint = viewport
+                .actions_requested
+                .iter()
+                .any(egui_winit::ActionRequested::wants_paint);
+            let decision = PassDecision::for_viewport(
+                mode,
+                &info,
+                is_viewport_or_descendant_visible(&glutin.viewports, viewport_id),
+                actions_want_paint,
+                cfg!(target_os = "windows"),
+            );
+            let show_ui = decision.run_ui;
 
             let viewport = glutin.viewports.get_mut(&viewport_id).unwrap();
             let Some(window) = viewport.window.as_ref() else {
@@ -718,7 +720,7 @@ impl GlowWinitRunning<'_> {
                 raw_input
             });
 
-            (raw_input, viewport_ui_cb, is_visible, show_ui)
+            (raw_input, viewport_ui_cb, decision.paint, show_ui)
         };
 
         if !show_ui {
@@ -790,7 +792,8 @@ impl GlowWinitRunning<'_> {
         let has_many_viewports = self.glutin.borrow().viewports.len() > 1;
         let clear_before_update = !has_many_viewports; // HACK: for some reason, an early clear doesn't "take" on Mac with multiple viewports.
 
-        if is_visible && clear_before_update {
+        let cleared_before_update = paint && clear_before_update;
+        if cleared_before_update {
             // clear before we call update, so users can paint between clear-color and egui windows:
 
             let mut glutin = self.glutin.borrow_mut();
@@ -855,32 +858,64 @@ impl GlowWinitRunning<'_> {
             textures_delta,
             shapes,
             pixels_per_point,
-            viewport_output,
+            mut viewport_output,
         } = full_output;
         pending_deltas.append(textures_delta);
 
         glutin.remove_viewports_not_in(&viewport_output);
 
-        let GlutinWindowContext {
-            viewports,
-            current_gl_context,
-            not_current_gl_context,
-            current_viewport,
-            ..
-        } = &mut *glutin;
-
-        let Some(viewport) = viewports.get_mut(&viewport_id) else {
-            return Ok(EventResult::Wait);
+        let window = glutin
+            .viewports
+            .get(&viewport_id)
+            .and_then(|viewport| viewport.window.clone());
+        let paint = if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
+            viewport.info.events.clear(); // they should have been processed
+            if let Some(egui_winit) = viewport.egui_winit.as_mut()
+                && let Some(window) = &window
+                && let Some(output) = viewport_output.get_mut(&viewport_id)
+            {
+                // Current-UI actions and platform/IME output complete before
+                // painting is decided, including when the surface is hidden.
+                finish_main_viewport_output(
+                    platform_output,
+                    &mut output.commands,
+                    &mut viewport.actions_requested,
+                    &mut WinitOutputTarget {
+                        state: egui_winit,
+                        window,
+                        event_loop,
+                    },
+                );
+            }
+            PassDecision::for_viewport(
+                mode,
+                &viewport.info,
+                false,
+                viewport
+                    .actions_requested
+                    .iter()
+                    .any(ActionRequested::wants_paint),
+                cfg!(target_os = "windows"),
+            )
+            .paint
+                && window.is_some()
+                && viewport.egui_winit.is_some()
+                && viewport.gl_surface.is_some()
+        } else {
+            false
         };
 
-        viewport.info.events.clear(); // they should have been processed
-        let window = viewport.window.clone().unwrap();
-        let gl_surface = viewport.gl_surface.as_ref().unwrap();
-        let egui_winit = viewport.egui_winit.as_mut().unwrap();
-
-        egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
-
-        if is_visible {
+        if paint {
+            let GlutinWindowContext {
+                viewports,
+                current_gl_context,
+                not_current_gl_context,
+                current_viewport,
+                ..
+            } = &mut *glutin;
+            let viewport = viewports.get_mut(&viewport_id).unwrap();
+            let window = window.as_ref().unwrap();
+            let gl_surface = viewport.gl_surface.as_ref().unwrap();
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
             {
@@ -898,7 +933,7 @@ impl GlowWinitRunning<'_> {
 
             let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
 
-            if !clear_before_update {
+            if !cleared_before_update {
                 painter.clear(screen_size_in_pixels, clear_color);
             }
 
@@ -919,27 +954,8 @@ impl GlowWinitRunning<'_> {
                         ActionRequested::PaintWhileHidden => {
                             // Painting this frame is all it asked for.
                         }
-                        ActionRequested::Cut => {
-                            egui_winit.egui_input_mut().events.push(egui::Event::Cut);
-                        }
-                        ActionRequested::Copy => {
-                            egui_winit.egui_input_mut().events.push(egui::Event::Copy);
-                        }
-                        ActionRequested::Paste => {
-                            if let Some(contents) = egui_winit.clipboard_text() {
-                                let contents = contents.replace("\r\n", "\n");
-                                if !contents.is_empty() {
-                                    egui_winit
-                                        .egui_input_mut()
-                                        .events
-                                        .push(egui::Event::Paste(contents));
-                                }
-                            } else if let Some(image) = egui_winit.clipboard_image() {
-                                egui_winit
-                                    .egui_input_mut()
-                                    .events
-                                    .push(egui::Event::PasteImage(std::sync::Arc::new(image)));
-                            }
+                        ActionRequested::Cut | ActionRequested::Copy | ActionRequested::Paste => {
+                            unreachable!("clipboard actions are consumed before painting");
                         }
                     }
                 }
@@ -951,7 +967,7 @@ impl GlowWinitRunning<'_> {
                     }
                 }
 
-                integration.post_rendering(&window);
+                integration.post_rendering(window);
             }
 
             {
@@ -980,6 +996,15 @@ impl GlowWinitRunning<'_> {
             {
                 save_screenshot_and_exit(&path, &painter, screen_size_in_pixels);
             }
+        } else if !pending_deltas.is_empty() {
+            // A UI pass can generate textures without painting any surface.
+            // Apply them now on a valid shared context; if no surface exists,
+            // the existing renderer owner retains them until one is available.
+            finish_glow_texture_delta(
+                glutin.make_resource_context_current(viewport_id),
+                &mut *painter,
+                pending_deltas,
+            );
         }
 
         glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
@@ -988,10 +1013,12 @@ impl GlowWinitRunning<'_> {
 
         integration.maybe_autosave(
             app.as_mut(),
-            (viewport_id == ViewportId::ROOT).then_some(&window),
+            (viewport_id == ViewportId::ROOT)
+                .then_some(window.as_deref())
+                .flatten(),
         );
 
-        sleep_if_invisible_or_minimized(Some(&window));
+        sleep_if_invisible_or_minimized(window.as_deref());
 
         if integration.should_close() {
             Ok(EventResult::CloseRequested)
@@ -1143,6 +1170,53 @@ impl GlowWinitRunning<'_> {
     }
 }
 
+/// Resource updates use a surviving shared-context surface, independent of
+/// whether the viewport that produced them still exists or will be painted.
+fn select_glow_resource_viewport(
+    preferred: ViewportId,
+    current: Option<ViewportId>,
+    available: impl Iterator<Item = ViewportId>,
+) -> Option<ViewportId> {
+    available.max_by_key(|id| (*id == preferred, Some(*id) == current))
+}
+
+trait GlowTexturePainter {
+    fn set_texture(&mut self, id: egui::TextureId, delta: &egui::epaint::ImageDelta);
+    fn free_texture(&mut self, id: egui::TextureId);
+}
+
+impl GlowTexturePainter for egui_glow::Painter {
+    fn set_texture(&mut self, id: egui::TextureId, delta: &egui::epaint::ImageDelta) {
+        Self::set_texture(self, id, delta);
+    }
+
+    fn free_texture(&mut self, id: egui::TextureId) {
+        Self::free_texture(self, id);
+    }
+}
+
+/// Complete a non-paint FullOutput's resource work on a current GL context.
+/// Without one, keep the existing renderer-owned delta intact.
+fn finish_glow_texture_delta(
+    has_current_context: bool,
+    painter: &mut impl GlowTexturePainter,
+    pending: &mut TexturesDelta,
+) {
+    if !has_current_context {
+        return;
+    }
+    #[expect(clippy::iter_over_hash_type)] // Different texture IDs are independent.
+    for (id, image_deltas) in pending.set.drain() {
+        for delta in image_deltas {
+            painter.set_texture(id, &delta);
+        }
+    }
+    #[expect(clippy::iter_over_hash_type)] // Free order does not matter.
+    for id in pending.free.drain() {
+        painter.free_texture(id);
+    }
+}
+
 fn change_gl_context(
     current_gl_context: &mut Option<glutin::context::PossiblyCurrentContext>,
     not_current_gl_context: &mut Option<glutin::context::NotCurrentContext>,
@@ -1187,6 +1261,30 @@ fn change_gl_context(
 }
 
 impl GlutinWindowContext {
+    fn make_resource_context_current(&mut self, preferred: ViewportId) -> bool {
+        let viewport_id = select_glow_resource_viewport(
+            preferred,
+            self.current_viewport,
+            self.viewports
+                .iter()
+                .filter_map(|(id, viewport)| viewport.gl_surface.as_ref().map(|_| *id)),
+        );
+        let Some(viewport_id) = viewport_id else {
+            return false;
+        };
+        if self.current_gl_context.is_none() && self.not_current_gl_context.is_none() {
+            return false;
+        }
+        change_gl_context(
+            &mut self.current_gl_context,
+            &mut self.not_current_gl_context,
+            &mut self.current_viewport,
+            viewport_id,
+            self.viewports[&viewport_id].gl_surface.as_ref().unwrap(),
+        );
+        true
+    }
+
     #[expect(unsafe_code)]
     unsafe fn new(
         egui_ctx: &egui::Context,
@@ -2049,6 +2147,132 @@ mod tests {
         });
         assert_eq!(result, Ok("compat"));
         assert_eq!(tried, ["core", "es", "compat"]);
+    }
+}
+
+#[cfg(test)]
+mod minimized_full_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct HeadlessDelta(TexturesDelta);
+
+    impl std::ops::Deref for HeadlessDelta {
+        type Target = TexturesDelta;
+        fn deref(&self) -> &TexturesDelta {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for HeadlessDelta {
+        fn deref_mut(&mut self) -> &mut TexturesDelta {
+            &mut self.0
+        }
+    }
+
+    impl Drop for HeadlessDelta {
+        fn drop(&mut self) {
+            // Explicitly end headless ownership even if a regression assertion
+            // fails, so an unapplied-delta assertion does not mask that failure.
+            self.0.clear();
+        }
+    }
+
+    #[derive(Default)]
+    struct ResourcePainter {
+        calls: Vec<(&'static str, egui::TextureId, Option<[usize; 2]>)>,
+    }
+
+    impl GlowTexturePainter for ResourcePainter {
+        fn set_texture(&mut self, id: egui::TextureId, delta: &egui::epaint::ImageDelta) {
+            self.calls.push(("set", id, delta.pos));
+        }
+
+        fn free_texture(&mut self, id: egui::TextureId) {
+            self.calls.push(("free", id, None));
+        }
+    }
+
+    fn texture_delta(id: egui::TextureId) -> HeadlessDelta {
+        let mut delta = TexturesDelta::default();
+        delta.push(
+            id,
+            egui::epaint::ImageDelta::full(
+                egui::ColorImage::filled([2, 2], egui::Color32::RED),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        delta.push(
+            id,
+            egui::epaint::ImageDelta::partial(
+                [0, 0],
+                egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        delta.free(id);
+        HeadlessDelta(delta)
+    }
+
+    #[test]
+    fn minimized_full_glow_resource_work_completes_once_without_surface_paint() {
+        let id = egui::TextureId::Managed(42);
+        let mut pending = texture_delta(id);
+        let mut painter = ResourcePainter::default();
+        // This production helper exposes resource operations only: neither
+        // clear/paint/swap nor post_rendering/visible ACK can run through it.
+        finish_glow_texture_delta(true, &mut painter, &mut pending);
+        assert_eq!(
+            painter.calls,
+            vec![
+                ("set", id, None),
+                ("set", id, Some([0, 0])),
+                ("free", id, None),
+            ]
+        );
+        assert!(pending.is_empty());
+        finish_glow_texture_delta(true, &mut painter, &mut pending);
+        assert_eq!(painter.calls.len(), 3);
+    }
+
+    #[test]
+    fn minimized_full_glow_missing_viewport_uses_surviving_resource_context() {
+        let removed = ViewportId::from_hash_of("removed");
+        let sibling = ViewportId::from_hash_of("sibling");
+        let available = [ViewportId::ROOT, sibling];
+        let selected = select_glow_resource_viewport(removed, Some(sibling), available.into_iter());
+        assert_eq!(selected, Some(sibling));
+        assert_eq!(
+            select_glow_resource_viewport(removed, Some(removed), [sibling].into_iter()),
+            Some(sibling)
+        );
+        assert_eq!(
+            select_glow_resource_viewport(ViewportId::ROOT, Some(sibling), available.into_iter()),
+            Some(ViewportId::ROOT)
+        );
+        let mut pending = texture_delta(egui::TextureId::Managed(43));
+        let mut painter = ResourcePainter::default();
+        finish_glow_texture_delta(selected.is_some(), &mut painter, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(painter.calls.len(), 3);
+    }
+
+    #[test]
+    fn minimized_full_glow_no_context_keeps_existing_renderer_delta_until_available() {
+        let mut pending = texture_delta(egui::TextureId::Managed(44));
+        let expected = pending.clone();
+        let mut painter = ResourcePainter::default();
+        let selected = select_glow_resource_viewport(ViewportId::ROOT, None, [].into_iter());
+        finish_glow_texture_delta(selected.is_some(), &mut painter, &mut pending);
+        assert!(pending.0 == expected.0);
+        assert!(painter.calls.is_empty());
+        // The old owner still has all work; once a context exists, apply it
+        // without requiring the original producing viewport to return.
+        finish_glow_texture_delta(true, &mut painter, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(painter.calls.len(), 3);
+        let mut expected = expected;
+        expected.clear();
     }
 }
 

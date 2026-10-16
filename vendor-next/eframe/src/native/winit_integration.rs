@@ -33,7 +33,9 @@ pub fn sleep_if_invisible_or_minimized(window: Option<&Window>) {
 /// What [`WinitApp::run_ui_and_paint`] runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassMode {
-    /// Run [`crate::App::logic`], plus the ui and painting if the viewport is visible.
+    /// Run [`crate::App::logic`] for root, and eligible root/deferred UI.
+    /// Windows minimization does not skip requested UI; surface painting is
+    /// qualified separately by visibility or an explicit paint request.
     Full,
 
     /// Run only [`crate::App::logic`]: no egui pass and no painting.

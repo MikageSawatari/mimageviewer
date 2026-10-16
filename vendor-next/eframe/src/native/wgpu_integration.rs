@@ -745,7 +745,7 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (viewport_ui_cb, raw_input, is_visible, show_ui) = {
+        let (viewport_ui_cb, raw_input, show_ui) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
@@ -784,16 +784,21 @@ impl WgpuWinitRunning<'_> {
                 false,
             );
 
-            // A hidden window is not painted, since nothing would be shown — unless someone
-            // wants the pixels anyway, e.g. to screenshot an app that is in the background:
-            let is_visible = viewport.info.visible().unwrap_or(true)
-                || viewport
+            let viewport = &viewports[&viewport_id];
+
+            // UI progress and surface rendering have different qualifications.
+            // In particular, Windows minimization does not skip a requested Full.
+            let show_ui = super::frame_output::PassDecision::for_viewport(
+                mode,
+                &viewport.info,
+                is_viewport_or_descendant_visible(viewports, viewport_id),
+                viewport
                     .actions_requested
                     .iter()
-                    .any(egui_winit::ActionRequested::wants_paint);
-
-            let show_ui = mode == PassMode::Full
-                && (is_visible || is_viewport_or_descendant_visible(viewports, viewport_id));
+                    .any(ActionRequested::wants_paint),
+                cfg!(target_os = "windows"),
+            )
+            .run_ui;
 
             let Viewport {
                 viewport_ui_cb,
@@ -842,7 +847,7 @@ impl WgpuWinitRunning<'_> {
                     "[capture-probe] eframe_pass viewport={viewport_id:?} class=root_or_deferred"
                 ));
             }
-            (viewport_ui_cb, raw_input, is_visible, show_ui)
+            (viewport_ui_cb, raw_input, show_ui)
         };
 
         if !show_ui {
@@ -951,7 +956,7 @@ impl WgpuWinitRunning<'_> {
             textures_delta,
             shapes,
             pixels_per_point,
-            viewport_output,
+            mut viewport_output,
         } = full_output;
 
         egui_wgpu::atlas_diag::record_produced(
@@ -969,94 +974,99 @@ impl WgpuWinitRunning<'_> {
             painter.set_surface_config(surface_config);
         }
 
-        let Some(viewport) = viewports.get_mut(&viewport_id) else {
-            painter.apply_textures_delta(pending_deltas);
-            return Ok(EventResult::Wait);
-        };
+        // Completing this output never depends on a live surface. In particular,
+        // a source viewport disappearing must not skip other viewports' commands.
+        let vsync_secs = if let Some(viewport) = viewports.get_mut(&viewport_id) {
+            viewport.info.events.clear(); // they should have been processed
+            if let Viewport {
+                window: Some(window),
+                egui_winit: Some(egui_winit),
+                info,
+                actions_requested,
+                ..
+            } = viewport
+            {
+                let commands = &mut viewport_output
+                    .get_mut(&viewport_id)
+                    .expect("a retained viewport has an output entry")
+                    .commands;
+                super::frame_output::finish_main_viewport_output(
+                    platform_output,
+                    commands,
+                    actions_requested,
+                    &mut super::frame_output::WinitOutputTarget {
+                        state: egui_winit,
+                        window,
+                        event_loop,
+                    },
+                );
+                let paint = super::frame_output::PassDecision::for_viewport(
+                    PassMode::Full,
+                    info,
+                    false,
+                    actions_requested.iter().any(ActionRequested::wants_paint),
+                    cfg!(target_os = "windows"),
+                )
+                .paint;
+                finish_wgpu_main_render(
+                    paint,
+                    painter,
+                    pending_deltas,
+                    |painter, pending_deltas| {
+                        let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
-        viewport.info.events.clear(); // they should have been processed
-
-        let Viewport {
-            window: Some(window),
-            egui_winit: Some(egui_winit),
-            ..
-        } = viewport
-        else {
-            painter.apply_textures_delta(pending_deltas);
-            return Ok(EventResult::Wait);
-        };
-
-        egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
-
-        let vsync_secs = if is_visible {
-            let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-
-            let screenshot_commands = take_screenshot_requests(&mut viewport.actions_requested);
-            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-            let screenshot_commands_count = screenshot_commands.len();
-            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-            if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
-                egui_wgpu::atlas_diag::log_line(format!(
-                    "[capture-probe] painter_request viewport={viewport_id:?} class=root_or_deferred count={}",
-                    screenshot_commands.len()
-                ));
-            }
-            #[cfg(all(test, target_os = "windows"))]
-            render_phase_test_gate::before_surface_acquire();
-            let vsync_secs = painter.paint_and_update_textures_with_startup_tag(
-                viewport_id,
-                pixels_per_point,
-                app.clear_color(&egui_ctx.global_style().visuals),
-                &clipped_primitives,
-                pending_deltas,
-                screenshot_commands,
-                window,
-                startup_tag,
-            );
-            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-            if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
-                egui_wgpu::atlas_diag::log_line(format!(
-                    "[capture-probe] painter_return viewport={viewport_id:?} class=root_or_deferred request_count={} image_delivery=async",
-                    screenshot_commands_count
-                ));
-            }
-            #[cfg(all(test, target_os = "windows"))]
-            render_phase_test_gate::after_paint();
-
-            for action in viewport.actions_requested.drain(..) {
-                match action {
-                    ActionRequested::Screenshot { .. } | ActionRequested::PaintWhileHidden => {
-                        // Screenshots were handled above, and painting this frame is all that
-                        // `PaintWhileHidden` asked for.
-                    }
-                    ActionRequested::Cut => {
-                        egui_winit.egui_input_mut().events.push(egui::Event::Cut);
-                    }
-                    ActionRequested::Copy => {
-                        egui_winit.egui_input_mut().events.push(egui::Event::Copy);
-                    }
-                    ActionRequested::Paste => {
-                        if let Some(contents) = egui_winit.clipboard_text() {
-                            let contents = contents.replace("\r\n", "\n");
-                            if !contents.is_empty() {
-                                egui_winit
-                                    .egui_input_mut()
-                                    .events
-                                    .push(egui::Event::Paste(contents));
-                            }
-                        } else if let Some(image) = egui_winit.clipboard_image() {
-                            egui_winit
-                                .egui_input_mut()
-                                .events
-                                .push(egui::Event::PasteImage(std::sync::Arc::new(image)));
+                        let screenshot_commands = take_screenshot_requests(&mut *actions_requested);
+                        #[cfg(all(
+                            target_os = "windows",
+                            feature = "miv-test-script-window-witness"
+                        ))]
+                        let screenshot_commands_count = screenshot_commands.len();
+                        #[cfg(all(
+                            target_os = "windows",
+                            feature = "miv-test-script-window-witness"
+                        ))]
+                        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                            egui_wgpu::atlas_diag::log_line(format!(
+                                "[capture-probe] painter_request viewport={viewport_id:?} class=root_or_deferred count={}",
+                                screenshot_commands.len()
+                            ));
                         }
-                    }
-                }
+                        #[cfg(all(test, target_os = "windows"))]
+                        render_phase_test_gate::before_surface_acquire();
+                        let vsync_secs = painter.paint_and_update_textures_with_startup_tag(
+                            viewport_id,
+                            pixels_per_point,
+                            app.clear_color(&egui_ctx.global_style().visuals),
+                            &clipped_primitives,
+                            pending_deltas,
+                            screenshot_commands,
+                            window,
+                            startup_tag,
+                        );
+                        #[cfg(all(
+                            target_os = "windows",
+                            feature = "miv-test-script-window-witness"
+                        ))]
+                        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                            egui_wgpu::atlas_diag::log_line(format!(
+                                "[capture-probe] painter_return viewport={viewport_id:?} class=root_or_deferred request_count={} image_delivery=async",
+                                screenshot_commands_count
+                            ));
+                        }
+                        #[cfg(all(test, target_os = "windows"))]
+                        render_phase_test_gate::after_paint();
+
+                        actions_requested
+                            .retain(|action| !matches!(action, ActionRequested::PaintWhileHidden));
+                        integration.post_rendering(window);
+                        vsync_secs
+                    },
+                    |painter, pending_deltas| painter.apply_textures_delta(pending_deltas),
+                )
+            } else {
+                painter.apply_textures_delta(pending_deltas);
+                0.0
             }
-
-            integration.post_rendering(window);
-
-            vsync_secs
         } else {
             painter.apply_textures_delta(pending_deltas);
             0.0
@@ -1708,6 +1718,23 @@ fn take_screenshot_requests(actions: &mut Vec<ActionRequested>) -> Vec<egui::Scr
     screenshots
 }
 
+/// The main pass always delivers resources; only the qualified surface path
+/// may tessellate, render, capture or publish a visible commit.
+fn finish_wgpu_main_render<P>(
+    paint: bool,
+    painter: &mut P,
+    pending: &mut TexturesDelta,
+    render: impl FnOnce(&mut P, &mut TexturesDelta) -> f32,
+    apply_resources: impl FnOnce(&mut P, &mut TexturesDelta),
+) -> f32 {
+    if paint {
+        render(painter, pending)
+    } else {
+        apply_resources(painter, pending);
+        0.0
+    }
+}
+
 /// mIV: what egui's own texture manager believes is installed for the font atlas.
 ///
 /// This is the value the backend is obliged to have on the GPU once it has applied the batch that
@@ -1885,6 +1912,226 @@ fn initialize_or_update_viewport<'a>(
 
             entry.into_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod minimized_full_tests {
+    use super::super::frame_output::{
+        ClipboardInput, MainOutputTarget, PassDecision, finish_main_viewport_output,
+    };
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeWindow {
+        input: egui::RawInput,
+        clipboard: Option<String>,
+        outputs: Vec<egui::PlatformOutput>,
+    }
+
+    impl ClipboardInput for FakeWindow {
+        fn input(&mut self) -> &mut egui::RawInput {
+            &mut self.input
+        }
+        fn clipboard_text(&mut self) -> Option<String> {
+            self.clipboard.clone()
+        }
+        fn clipboard_image(&mut self) -> Option<egui::ColorImage> {
+            None
+        }
+    }
+
+    impl MainOutputTarget for FakeWindow {
+        fn handle_platform_output(&mut self, output: egui::PlatformOutput) {
+            for command in &output.commands {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    self.clipboard = Some(text.clone());
+                }
+            }
+            self.outputs.push(output);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakePainter {
+        operations: Vec<(&'static str, egui::TextureId, Option<[usize; 2]>)>,
+        submissions: usize,
+        surface_calls: Vec<&'static str>,
+    }
+
+    impl FakePainter {
+        fn apply(&mut self, delta: &mut TexturesDelta) {
+            if delta.is_empty() {
+                return;
+            }
+            for (id, updates) in delta.set.drain() {
+                for update in updates {
+                    self.operations.push(("set", id, update.pos));
+                }
+            }
+            self.submissions += 1;
+            for id in delta.free.drain() {
+                self.operations.push(("free", id, None));
+            }
+        }
+    }
+
+    #[test]
+    fn minimized_full_wgpu_delivers_outputs_resources_and_current_capture_once() {
+        let owner = ViewportId::from_hash_of("minimized-main-owner");
+        let info = ViewportInfo {
+            minimized: Some(true),
+            occluded: Some(false),
+            ..Default::default()
+        };
+        let decision = PassDecision::for_viewport(PassMode::Full, &info, false, false, true);
+        assert!(decision.run_ui && !decision.paint);
+        assert_eq!(info.visible(), Some(false));
+        let mut window = FakeWindow {
+            input: egui::RawInput {
+                viewport_id: owner,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sibling = FakeWindow::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 20.0));
+        let platform = egui::PlatformOutput {
+            commands: vec![egui::OutputCommand::CopyText("copy\r\ntext".into())],
+            ime: Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Normal,
+                rect,
+                cursor_rect: rect,
+                should_interrupt_composition: true,
+            }),
+            ..Default::default()
+        };
+        let mut commands = vec![
+            egui::ViewportCommand::Title("owner".into()),
+            egui::ViewportCommand::RequestCopy,
+            egui::ViewportCommand::RequestPaste,
+        ];
+        let mut actions = vec![ActionRequested::Cut];
+        finish_main_viewport_output(platform.clone(), &mut commands, &mut actions, &mut window);
+        assert!(window.outputs == vec![platform]);
+        assert_eq!(window.input.viewport_id, owner);
+        assert_eq!(
+            window.input.events,
+            vec![
+                egui::Event::Cut,
+                egui::Event::Copy,
+                egui::Event::Paste("copy\ntext".into())
+            ]
+        );
+        assert!(sibling.outputs.is_empty() && sibling.input.events.is_empty());
+        assert!(matches!(
+            commands.as_slice(),
+            [egui::ViewportCommand::Title(_)]
+        ));
+        assert!(actions.is_empty());
+
+        let id = egui::TextureId::Managed(71);
+        let mut delta = TexturesDelta::default();
+        delta.push(
+            id,
+            egui::epaint::ImageDelta::full(
+                egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        delta.push(
+            id,
+            egui::epaint::ImageDelta::partial(
+                [0, 0],
+                egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        delta.free(id);
+        let mut painter = FakePainter::default();
+        // This is the dispatch used by the real root/deferred backend. A
+        // non-paint Full may not enter tessellation/present/post_rendering.
+        assert_eq!(
+            finish_wgpu_main_render(
+                decision.paint,
+                &mut painter,
+                &mut delta,
+                |_, delta| {
+                    // The headless fixture must end delta ownership before
+                    // reporting a forbidden render call, even on failure.
+                    delta.clear();
+                    panic!("nonpaint entered the surface path");
+                },
+                FakePainter::apply
+            ),
+            0.0
+        );
+        assert!(delta.is_empty());
+        assert_eq!(
+            painter.operations,
+            vec![
+                ("set", id, None),
+                ("set", id, Some([0, 0])),
+                ("free", id, None)
+            ]
+        );
+        assert_eq!(painter.submissions, 1);
+        assert!(painter.surface_calls.is_empty());
+
+        // A current-UI capture request must participate in this pass's paint
+        // decision and must not remain a command that re-registers it later.
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&captures);
+        let callback = egui::ScreenshotCallback::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        commands = vec![
+            egui::ViewportCommand::Screenshot(callback.clone()),
+            egui::ViewportCommand::RequestPaintWhileHidden,
+        ];
+        window.input.events.clear();
+        finish_main_viewport_output(Default::default(), &mut commands, &mut actions, &mut window);
+        assert!(commands.is_empty() && window.input.events.is_empty());
+        let decision = PassDecision::for_viewport(
+            PassMode::Full,
+            &info,
+            false,
+            actions.iter().any(ActionRequested::wants_paint),
+            true,
+        );
+        assert!(decision.paint);
+        finish_wgpu_main_render(
+            decision.paint,
+            &mut painter,
+            &mut delta,
+            |painter, delta| {
+                painter
+                    .surface_calls
+                    .extend(["tessellate", "paint", "present", "post_rendering"]);
+                painter.apply(delta);
+                for capture in take_screenshot_requests(&mut actions) {
+                    capture.complete(Arc::new(egui::ColorImage::filled(
+                        [1, 1],
+                        egui::Color32::WHITE,
+                    )));
+                }
+                actions.retain(|action| !matches!(action, ActionRequested::PaintWhileHidden));
+                0.0
+            },
+            FakePainter::apply,
+        );
+        callback.complete(Arc::new(egui::ColorImage::filled(
+            [1, 1],
+            egui::Color32::WHITE,
+        )));
+        assert_eq!(captures.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(actions.is_empty());
+        assert_eq!(
+            painter.submissions, 1,
+            "no duplicate empty resource submission"
+        );
+        finish_main_viewport_output(Default::default(), &mut commands, &mut actions, &mut window);
+        assert!(commands.is_empty() && actions.is_empty() && window.input.events.is_empty());
     }
 }
 

@@ -84,3 +84,37 @@ Screenshot前倒し取り込みも2c-3へ残し、既存保留Screenshotの移�
 明示Closeの受付・承認・backendとContextのpass外退役、およびその時のpolicy整理接続は2c-4へ残す。
 現在backendからContext::retire_viewportを呼ぶ経路はない。案B・immediate描画資格は2c-3のまま。
 実window／live試験は実行しない。検証件数・変異試験は段2台帳を参照。
+
+## 段2c-3a: 案Bのroot／deferred Fullとsurface分離（2026-10-17）
+
+`1034d4ea4`上へ、合意済み案Bの主経路だけを実装した（b・新規）。
+以下は**実装担当の内部確認**であり、正式な独立レビュー・ACCEPTではない。
+
+- 新規`native/frame_output.rs`のPassDecisionを両backendの実主経路で共用する。
+  Windows最小化中も要求済みFullのUIを実行し、paintはmetadataのvisibleまたは明示描画要求で決める。
+  metadataは変更せず、LogicOnly、他OS occlusion、visible descendantの既存方針は保つ。
+- 同じ主経路のfinish_main_viewport_outputでplatform／IME出力を対象Stateへ渡し、
+  Cut／Copy／Pasteをsurface描画の外で対象の次回入力へ一度だけ配送する。
+  従来のclipboard API、CRLF正規化、空textとtext無しのimage fallbackの区別は保持する。
+  native／通常のclipboard producer条件やegui-ime policyは変更しない。
+- 当該root／deferred UIのRequestCut／Copy／Paste、Screenshot／RequestPaintWhileHiddenを
+  既存actions_requestedへ先に移し、そのcommandだけを元の列から除く。
+  取り込み後にpaintを再計算し、後段の通常command handlerで重複登録しない。
+  非描画action処理はcapture／PaintWhileHiddenを保持し、paint ownerだけが完了する。
+- wgpuは非描画時にも共有deltaを既存Painter::apply_textures_deltaへ渡す。
+  主経路のsurface／resource分岐をfinish_wgpu_main_renderへ抽出し、surface処理には
+  tessellation／capture／post_renderingを集める。非描画はpresent／visible commitを呼ばない。
+- glowは有効な生存GL contextを選び、非描画でもset_texture→free_textureを実行する。
+  clear／tessellate／paint／swapとは区別し、contextが無い場合だけ既存renderer ownerへ残す。
+  post-UIの明示描画に備え、preclearを実行した事実から後段clearの要否を決める。
+- 出力元がFull中GCで消えても、共有deltaの処理と他viewport宛commandsの通常配送を継続する。
+  rootのvisible receipt／実表示ACKはsurface経路のみ。追加repaintや待機／retryは足さない。
+
+回帰名minimized_fullの10件は、実EpiIntegration＋fake App、実State／TextEdit、
+実backendが使う判断・出力・resource helperとfake window／painterを検査する。
+native run_ui_and_paint全体、実HWND／GL surface、eframeから実GPUまでの一体実行は行っていない。
+GPU consumerは同graphのegui-wgpu回帰で別に確認する。詳細・変異試験は段2台帳。
+
+native/run.rsと両render_immediate_viewport本体は不変。100ms下限、遅い要求の非加速、sleep、
+outer phase・bootstrap／resize例外、250ms deadlineを維持する。
+immediate子の描画資格と非描画出力・当該子UI action完結は2c-3b、Close契約は2c-4へ残す。
