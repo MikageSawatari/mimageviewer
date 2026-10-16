@@ -1,6 +1,14 @@
-> 状態: 設計案 第4.1版 (2026-10-16、追加の独立レビュー gpt-6-astra / xhigh の再確認で出た IME 中断要求 2 件を反映、再確認前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
+> 状態: 設計案 第4.2版 (2026-10-16、追加の独立レビュー gpt-6-astra / xhigh の第3回で出た、最小化した別窓の Close 要求の件を反映、再確認前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
 
 # 改訂履歴
+
+## 第4.2版 — 2026-10-16
+
+対象は第4.1版、HEAD `ea54a4ca0`。現在の設計書、Astra再確認全文、本家・mIVの該当ソースを読み取り専用で照合した。前回のIME中断要求2件の対応を維持する。本版の独立レビュー、実装、ビルド、テスト、製品起動は未実施。
+
+- **Astra再確認 P1 — 反映:** 最小化した子のCloseを、UI復帰待ちの通常入力から分ける。非描画の受付から既存のmodal判断・終了ownerへ一度だけ渡し、拒否もその要求の消費として扱う。承認後は子callbackや親の描画passを待たず対象viewportを退役させる。wgpu／glow、App接続、構造合意・§11記録、回帰・実機手順・見積りへ反映。
+
+タスクバーから最小化した別窓を閉じる操作は通常利用で到達するため、まれな失敗として割り切らない。追加repaint、最小化中の子へのUI pass強制、新しいpending boolや時間窓は使わない。
 
 ## 第4.1版 — 2026-10-16
 
@@ -258,16 +266,19 @@ schedulerのHWND可視判定と、UI省略の`ViewportInfo::visible()`を区別�
 | root最小化、visible扱いの子あり | Fullなら親UIも実行 | root logic＋UI | 各viewportが自身の入力を消費 |
 | screenshot／RequestPaintWhileHiddenあり | Fullでwants_paintが成立 | UI実行可能 | 既存capture ownerを維持 |
 | rootのRedrawRequested期限超過 | 可視性・子の可視性と別にLogicOnly | root logicのみ | root ownerに保持 |
-| childのUIが最小化・期限超過等でskip | child callbackなし。App::logicも呼ばれない | 子UIなし | 子のStateからtakeせず保持 |
+| childのUIが最小化・期限超過等でskip | child callbackなし。App::logicも呼ばれない | 子UIなし | 通常入力は子のStateからtakeせず保持。Closeは下記lifecycle経路で処理 |
+| 最小化childへCloseRequested | 本家ではCloseを積み、子と親へrepaintを要求するだけ | 子UIの省略は解除されない | 第4.2版ではUI復帰待ちにせず、既存終了ownerへ配送・消費 |
 | repaint・wake等の要求なし | Wait等でsleep | 呼出なし | 常時UI／logicとは扱わない |
 
-根拠: `eframe-0.37.0/src/native/run.rs:216`、`:243`、`:266`、`src/native/wgpu_integration.rs:682`、`:702`、`:717`、`:1189`、`egui-winit-0.37.0/src/lib.rs:1507`。
+根拠: `eframe-0.37.0/src/native/run.rs:216`、`:243`、`:266`、`src/native/wgpu_integration.rs:682`、`:702`、`:717`、`:1031`、`:1189`、`egui-winit-0.37.0/src/lib.rs:1507`。
 
 winit Windowsのis_visibleはIsWindowVisible、is_minimizedはIsIconicを読む。WindowsではOccludedは未対応で、WM_SIZEも生成しない。
 
 根拠: `winit-0.30.13/src/platform_impl/windows/window.rs:147`、`:668`、`util.rs:143`、`event_loop.rs:1397`、`winit-0.30.13/src/event.rs:418`。
 
 mIVのトレイ退避は`src/tray_integration.rs:276`、`:323`の直接SW_HIDEである。
+
+Closeの配送・拒否・承認・退役は、以下の「非表示子のCloseとlifecycle要求」に従う。通常入力を保持する契約だけでは、終了要求の進行を保証できない。
 
 #### root LogicOnlyとvisible childが共存する経路
 
@@ -315,10 +326,12 @@ mIVは実際にdeferred childを使う。根拠: `src/ui_fullscreen.rs:22139`。
 | 処理 | 移行先 |
 |---|---|
 | worker結果、取消・保存終端、Remote完了、トレイ要求 | UI入力を読まないlogic service |
+| 子のOS／programmatic Close要求 | 非描画のlifecycle受付から、対象windowの既存modal判断・終了ownerへ。一度処理した要求を子UIへ再配送しない |
 | gamepad物理drain・保持更新 | logicから進めるApp-global単一owner |
 | gamepad操作batch・multi-pass配送 | 既存batch ownerとmounted context |
 | key／wheel／pointer／focus／IMEのpass処理 | ui／対象viewport |
 | panel／dialog／viewport登録・paint | ui |
+| 承認済みviewportの退役 | 既存寿命ownerの終了確定からbackend／Contextの対象限定cleanupへ。描画passを前提にしない |
 | 表示済み前提のACK等 | 実際の描画側 |
 | contextごとの結果採用 | 既存registry／mount owner |
 | native動画frame | 既存presenter thread |
@@ -326,6 +339,101 @@ mIVは実際にdeferred childを使う。根拠: `src/ui_fullscreen.rs:22139`。
 旧updateを丸ごとlogic／uiへ改名しない。logicは古いevents・キーlevel・時刻を操作として読まず、UI pass counterをservice進行条件にしない。
 
 post-render終端を前へ移す際は、そのframeのmodal gateを早く外さない。
+
+Close専用の非描画受付は、通常入力の消費や子UIの代行ではない。既存の終了判断・取消・cleanupを呼ぶ入口を揃えるものであり、App側に別のclose待ち状態を追加しない。
+
+#### 非表示子のCloseとlifecycle要求
+
+本家0.37のwgpu経路では、最小化等でshow_ui=falseの子についてcallbackを呼ばずに戻る。一方、CloseRequestedはviewport.info.eventsへCloseを積み、子と親にrepaintを要求するだけである。Closeはwants_paintではなく、UI省略を解除しない。
+
+根拠: `eframe-0.37.0/src/native/wgpu_integration.rs:682`、`:702`、`:716`、`:720`、`:1031`。
+
+WindowsのWM_CLOSEもCloseRequestedへ変換して戻り、その場ではwindowを破棄しない。根拠: `winit-0.30.13/src/platform_impl/windows/event_loop.rs:1251`。
+
+mIVのpassive deferred子は、子callback内でCloseを読み、Frameイベントとして親へ送り、親がclose_idsへ採用する。
+
+- `src/ui_fullscreen.rs:22184`: 子callbackでCloseを読む。
+- 同`:22246`: 親向けFrameイベントを生成。
+- 同`:21531`: close_idsへ採用。
+- 同`:21756`: modal判断とbatch適用。
+- 同`:21876`: 既存のwindow終了処理。
+- 同`:22035`付近: deferredイベントのdrainが描画関数内にある。
+
+したがって、最小化した別窓をタスクバーから閉じる通常操作で、復元までCloseが処理されない経路が残ると見立てる。実機再現は今回行っていない。まれな失敗の割切り対象にはしない。
+
+glowにも同じUI省略とClose蓄積がある。根拠: `eframe-0.37.0/src/native/glow_integration.rs:689`、`:692`、`:708`、`:1061`、`:1075`。修正はwgpuだけに限定しない。
+
+**採る案は、Close専用の非描画受付から既存終了ownerへ渡す方式とする。**
+
+親logicで更新済みRawInput.viewportsを読む案も検討した。run_logicが最新のwindow情報を渡すこと自体は確認できるが、snapshotを読むだけでは、元のviewport.info.eventsの消費、子Fullとの競合、拒否後の再配送を一つの所有境界で解決できない。また、親がlogic-onlyのままでは通常の描画後GCにも到達しない。このため、snapshot監視を新たなclose検出器として重ねる案は採らない。
+
+根拠: `egui-0.37.0/src/context.rs:1174`以降、`eframe-0.37.0/src/native/wgpu_integration.rs:808`、`:1330`、`src/native/glow_integration.rs:853`、`:1533`。
+
+##### 受付・判断・消費
+
+1. vendor/eframeに、子Close専用の非描画App hookを追加する。仮称は`App::on_viewport_close_requested`とし、対象ViewportIdを明示して渡す。子の描画callbackではない。
+2. hookはbackendのViewports／glutinのborrow・lockを解放した状態で呼ぶ。描画passの中から再入して呼ばず、window eventまたはviewport commandの処理を終えた非描画境界で配送する。
+3. OSのCloseRequestedと、既存ViewportCommand::Closeから生じる要求を同じ受付へ揃える。rootの終了・tray契約は従来どおりとし、この子専用変更で置き換えない。
+4. mIVは既存のViewportId→window／context所有から対象を決める。rect、現在foreground、現在表示中のwindowから推定しない。
+5. passive deferred子は既存のmodal判断と`apply_detached_image_window_event_batch`／`close_detached_image_windows_by_ids`へ合流させる。必要な部分を描画に依存しない終了serviceとして抽出し、同じ判断を複製しない。
+6. active／parkedのegui子についても、既存のwindow／context所有と終了・取消経路へ委譲する。active fullscreen、列挙待ち、parked mediaの終了処理をpassive画像のcleanupで代用しない。
+7. hookの返値は、その一回の要求の処理結果とする。mIVが管理する子では「既存ownerが終了を確定した」「既存modal等により今回は拒否した」を区別する。新しいpending boolや復帰待ち状態は作らない。
+8. mIVが所有しない子には明示的な従来UI経路への委譲を用意し、既定Appの互換性を保つ。これはmIVの管理対象を黙って見逃すfallbackには使わない。
+9. mIVが処理したCloseは、承認・拒否のどちらでもその一回で消費する。元のinfo.events、保留RawInputのviewport情報、子callbackへ同じ要求を残して再発火させない。通常のkey／pointer／focus／IME列は変更しない。
+10. 拒否後に新しく届いたCloseは別の要求として通常どおり判断する。拒否済みを再試行したり、以後のCloseを抑止するラッチを置いたりしない。
+
+既存のViewportCommand::CloseはCloseイベントを追加する処理であり、承認済みの即時破棄命令ではない。CancelCloseもegui-winit内では別途処理が必要とされている。これらを送るだけで配送・消費・退役が済んだとは扱わない。
+
+根拠: `egui-winit-0.37.0/src/lib.rs:1955`、`:1958`。
+
+passive FrameのOS Close読取りは新受付へ集約し、同じ要求をFrame経由でも処理する二重ownerを残さない。独自barの×、watcher由来Closeも、既存の要求源を保持したまま同じApp側のmodal判断・終了serviceへ揃える。watcherは画面上のclick検出であり、タスクバーから届く全WM_CLOSEの代替ではない。
+
+根拠: `src/app.rs:3247`、`:3524`、`src/app/detached_window_manager.rs:169`、`:265`。
+
+##### 承認後の対象限定退役
+
+Appが登録を外しても、親の次のFull passだけを待ってbackendを掃除する設計にはしない。rootもlogic-onlyの場合を含め、承認した子を復元せずに終了できることを契約とする。
+
+- App側は既存終了ownerで対象のClosing／登録解除・worker／media終端を行う。
+- backend側は承認結果から、対象window、WindowId対応、egui-winit State、surface、保留入力を通常終了と同じ所有境界で退役させる。
+- eguiのviewport登録・親子登録も同じ終了に合わせて取り除き、後の兄弟FullOutputから閉じた子が再作成されないようにする。
+- 現在は通常Full後に行われるviewport GCを、対象を明示した共通退役処理へ抽出する。Context側にはそのためのeframe向け非描画退役入口を新設し、既存GCと処理範囲を共有する。UI passを実行してGCを起こす方法は採らない。
+- 退役入口はpass外で、Appの終了ownerが確定した対象にだけ使う。rootや存続する兄弟の入力・memory・cache・surfaceを一括resetしない。
+- 対象viewportに未配送texture deltaがあれば、§4.9の共有renderer ownerへ引き継いでから退役する。window終了を理由に共有deltaを捨てない。
+- 既存終了処理が持つ保存・取消の意味を維持する。まれな失敗用のretryや新しい回復状態は追加しない。
+
+本家のbackend GCは`eframe-0.37.0/src/native/wgpu_integration.rs:1330`、`src/native/glow_integration.rs:1533`。Context登録の通常GCは`egui-0.37.0/src/context.rs:3317`以降。現本家にこの非描画退役入口があるとは扱わず、今回の限定追加としてvendor台帳と段2へ計上する。
+
+##### Close以外の要求・通知の棚卸し
+
+| 対象 | 確認した経路・扱い |
+|---|---|
+| ViewportEvent | 0.37.0の離散variantはCloseだけ。別の同種lifecycle要求は見当たらない。根拠: `egui-0.37.0/src/data/input/viewport_info.rs:6` |
+| programmatic Close | ViewportCommand::CloseもClose生成源。上記と同じ受付へ揃える |
+| focus・minimize・maximize・配置・DPI・occlusion | window状態／入力情報。終了要求ではない。通常入力・metadataの所有契約を維持し、Close queueへ変換しない |
+| focus喪失等による右drag取消 | passive callback内の`capture_right_drag_event`から既存Cancelを生成する経路がある。`src/app.rs:2040`、`src/ui_fullscreen.rs:21622`付近。callback依存の状態終端として回帰監査対象に含めるが、全focus／releaseを汎用終端配送へ移す理由にはしない。Close時は対象の既存gesture ownerも終了することを検査する |
+| FirstCallback・初期配置適用・表示ACK | 実際のcallback／表示を知らせる通知。`src/app.rs:1901`、`:2010`付近、`src/ui_fullscreen.rs:21495`。Closeのために偽造しない。初回callback前のCloseも終了できることを検査する |
+| 独自barの×・watcher Close | 既存App要求源。最小化中のOS Closeの代替ではない。同じ終了判断へ合流 |
+| ActivationTokenDone | backendがFrameへ応答を保持する経路。子callbackだけの読取りではない。wgpu `:987`付近、glow `:1024` |
+| native presenterのClose／Destroyed | 既存native pump・WindowEpoch経路。`src/video/native_window_pump.rs:1465`以降。egui子Closeを重ねて配送しない |
+
+今回確認した範囲では、Close以外に追加の離散ViewportEvent要求はない。focus由来のgesture取消等は性質を分けて記録し、既存順序・所有を保つ回帰を行う。具体的な失敗が示されていない状態まで、新しい汎用lifecycle機構へ広げない。
+
+##### 必須回帰
+
+- child最小化→Close→子を復元せず終了。子callbackの呼出回数が増えていないこと。
+- rootもlogic-onlyのままで、承認した子のwindow・backend／Context登録が退役すること。
+- modal拒否→modal終了→子復元で、同じCloseが再発火しないこと。
+- 拒否後の新しいCloseは受理できること。
+- 子Full／親logicとの順序が変わっても、同じ要求を二重処理しないこと。
+- 初回子callback前のCloseを処理でき、表示ACKを偽造しないこと。
+- 兄弟の入力、IME、保留RawInput、texture、surface、寿命を維持すること。
+- 承認後の兄弟Full／root Fullで閉じた子を再作成しないこと。
+- OS Close、programmatic Close、bar／watcherの既存App入口で同じmodal判断・終了ownerを使うこと。
+
+追加repaintやRequestPaintWhileHiddenで閉じる動作を成立させる試験にはしない。既存終了処理が通常の状態反映として行うrepaintは保持できるが、その到着やFull passを終了完了の必要条件にしない。
+
+この受付・消費・非描画退役はdetachedの構造修正として、着手前の双方合意と§11記録を必要とする。
 
 #### 保留RawInputの最小修正
 
@@ -866,6 +974,7 @@ settings.dbは初期化しない。リリース済みId永続経路が実装時�
 | IME中断要求のviewport所有 | (b・新規) Memory共通フラグを既存のviewport別Focusへ移管。親子のbegin／endで消失・混入させない |
 | IME中断要求のpass出力集約 | (b・新規) 最新のIME矩形等を採用し、同一viewportの未配送要求をORで保持 |
 | 入れ子run_ui・実discard回帰 | (b・新規) §4.5の親だけ／子だけ要求と、実run_ui再passの最終出力を検査 |
+| 承認済み子viewportの非描画退役入口 | (b・新規) 既存Context viewport GCを共通化し、pass外で対象登録を退役できるeframe向け入口を追加。兄弟やrootを変更しない |
 | テスト・license・standalone | (b) 新構造へ移植 |
 
 新wheel ownerは`egui-0.37.0/src/input_state/mod.rs:228`、`wheel_state.rs:54`。汎用非表示終端APIは追加しない。
@@ -873,6 +982,8 @@ settings.dbは初期化しない。リリース済みId永続経路が実装時�
 IME修正の本家境界は`egui-0.37.0/src/memory/mod.rs:124`、`:503`、`:799`、`:1078`、`src/context.rs:1111`、`:3173`、`src/data/output.rs:242`。既存フラグの所有移管と既存appendの集約契約修正に限定し、App側の補助フラグ、追加repaint、新しいqueue、retryを追加しない。
 
 親子要求の分離はdetached構造合意・§11記録の範囲へ含める。出力集約では別viewportのPlatformOutputを混ぜず、配送後の次frameへ要求を残さない。
+
+非描画退役は、Appの既存終了ownerが承認したviewportの寿命終了に限る。通常のGC境界は`egui-0.37.0/src/context.rs:3317`以降。最小化・hideだけでは呼ばず、UI pass強制、全memory reset、退役済みIDを抑止する別ラッチで代用しない。通常GCとの処理範囲共有、兄弟不変、後続出力での非再作成を回帰化する。
 
 #### egui-winit
 
@@ -901,6 +1012,8 @@ IME修正の本家境界は`egui-0.37.0/src/memory/mod.rs:124`、`:503`、`:799`
 | max_texture_side統一 | (b) `native/wgpu_integration.rs:735`、`:1235`。同等性回帰後に撤去判断 |
 | 未消費RawInputのviewport所有 | **(b・新規)** EpiIntegration共通保留をViewportへ移管。§4.2 |
 | child skip時の入力保持 | **(b・新規)** take前判定。wgpu／glow同等経路 |
+| 子Closeの非描画受付・消費 | **(b・新規)** 子callbackを待たずAppの既存modal判断・終了ownerへ渡す。拒否も一回の要求消費として扱う |
+| 承認済み子の非描画退役 | **(b・新規)** 通常の対象限定cleanupを共通化し、window・surface・入力・Context登録を親Full待ちにせず終了 |
 | 非描画・消滅viewport delta | (b) 同`:828`、`:1313`。共通完結ownerへ |
 | immediate child screenshot | (b) callbackへ移行。旧Event方式は(c) |
 | 通常版immediate計測 | (b) 同`:1206`、`:1396`。段階別時間・delta bytes・遅延ログ |
@@ -909,6 +1022,12 @@ IME修正の本家境界は`egui-0.37.0/src/memory/mod.rs:124`、`:503`、`:799`
 | manifest／Win32 feature／standalone | (b) 新原本基準 |
 
 RawInput修正は保持のviewport所有に限定する。汎用フィルタ・復帰pruneは追加しない。交互実行、child skip→復帰、終端、新規入力、retireの回帰を付ける。
+
+CloseはUI復帰待ちの通常入力と区別する。wgpuのUI省略・Close生成は`eframe-0.37.0/src/native/wgpu_integration.rs:702`、`:716`、`:1031`、glowの同等経路は`src/native/glow_integration.rs:692`、`:708`、`:1061`。両backendで同じ受付・消費・退役契約を実装する。
+
+App hookはbackend borrow／lockの外で呼ぶ。承認・拒否した要求をinfo.eventsや保留snapshotから再配送せず、新しいCloseは受け付ける。rootの終了・tray契約と、mIV非管理Appの従来UI経路を維持する。
+
+対象限定cleanupの本家境界はwgpu `:1330`、glow `:1533`。承認済みCloseを実際のwindow／surface退役とegui登録終了まで接続し、兄弟の入力・寿命・共有deltaを維持する。追加repaintや子UI pass強制で代用しない。
 
 通常版immediate計測はstartup／test-script診断と別責務として保持し、常時I/Oへ拡大しない。
 
@@ -1094,11 +1213,13 @@ mIV代表は§4.3のpanel、§4.4の入力、`src/app.rs:97661`以降の完了�
 
 #### detached凍結
 
-App分離、callback Ui化、gamepad、保留RawInputのviewport所有、IME中断要求のviewport別所有と入れ子pass、同一viewportのdiscard再pass出力集約、native IME intent、scheduler／delta／surfaceは構造合意対象とする。
+App分離、callback Ui化、gamepad、保留RawInputのviewport所有、IME中断要求のviewport別所有と入れ子pass、同一viewportのdiscard再pass出力集約、native IME intent、非表示子Closeの受付・消費・既存終了ownerへの合流・非描画退役、scheduler／delta／surfaceは構造合意対象とする。
 
 着手前に設計担当と独立レビュー担当が症状パッチではないことに合意し、`docs/detached-rework-plan.md` §11へ範囲・理由を記録する。本改訂案自体を合意済みと扱わない。
 
 IME追加分では、親子の要求が消失・混入しないこと、最新の候補窓矩形等を採りながら未配送要求を保持すること、配送後に要求を残さないことを不変条件として記録する。
+
+Close追加分では、対象window／contextの既存modal判断と終了処理を一つのownerに揃えること、承認・拒否した一回の要求を再配送しないこと、子や親のUI復帰を待たず承認済み対象を退役させること、兄弟の入力・資源・寿命を変更しないことを記録する。Context側の非描画退役入口とwgpu／glowのcleanup共通化も合意範囲へ含める。
 
 rect捕捉条件、geometry由来recreate、新detached pending bool、時間窓、兄弟資源の一括resetを追加しない。
 
@@ -1195,7 +1316,7 @@ AGENTS.mdに従い、起動・foreground切替・入力の前に具体suite、�
 
 ### 段0b: 基準固定
 
-source、toolchain、feature、fixture、警告、PNG、既知失敗を記録する。detached構造合意にRawInput所有、IME中断要求のviewport別所有・入れ子pass・discard再pass集約、native IME配送を含める。
+source、toolchain、feature、fixture、警告、PNG、既知失敗を記録する。detached構造合意にRawInput所有、IME中断要求のviewport別所有・入れ子pass・discard再pass集約、native IME配送、非表示子Closeの受付・消費・既存終了ownerへの合流・非描画退役を含める。
 
 ```powershell
 cargo check -p mimageviewer --bin mimageviewer-core
@@ -1250,13 +1371,15 @@ core check、旧snapshot、focus喪失後のrouted edge、gamepad終端を含め
 
 | 小段 | 範囲 | 推定規模 |
 |---|---|---|
-| 2a | egui既存API、IME中断要求のviewport所有・pass出力集約、クリックfixture、egui-winit IME配送・Disabled互換・trace・clipboard、共有IME fixture | 10～18ファイル、800～1650行 |
+| 2a | egui既存API、IME中断要求のviewport所有・pass出力集約、承認済みviewportの非描画退役入口、クリックfixture、egui-winit IME配送・Disabled互換・trace・clipboard、共有IME fixture | 11～20ファイル、900～1850行 |
 | 2b | egui-wgpu mipmap、delta完結、surface、診断 | 10～16ファイル、1100～2100行 |
-| 2c | eframe scheduler、viewport入力所有、skip保持、visible commit、delta、計測・診断 | 12～20ファイル、1450～2850行 |
+| 2c | eframe scheduler、viewport入力所有、skip保持、子Close受付・消費・非描画退役、visible commit、delta、計測・診断 | 14～24ファイル、1700～3350行 |
 
 原本置換は別計上する。
 
 第4.1版では段2aに約200～400行を追加した。主な増分はegui内の限定修正と、実入れ子run_ui・実discardのheadless回帰である。App側の新しい入力状態や配送queueは含めない。
+
+第4.2版では、通常GCと共有する非描画退役入口・回帰として段2aへ約100～200行、wgpu／glowのClose受付・消費・対象限定退役と回帰として段2cへ約250～500行を追加した。App側の終了owner接続は段3へ別計上する。
 
 #### 段2aの順序・受入条件
 
@@ -1270,10 +1393,13 @@ core check、旧snapshot、focus喪失後のrouted edge、gamepad終端を含め
 8. 親子ともIMEOutputが存在すること、次の新規runでは要求が残らないことを確認する。Memoryのviewport ID手動切替やappend単体試験だけで代用しない。
 9. 生成・集約回帰の名前に共通の`ime_interrupt`を含め、準備graphと正式graphで選択できるようにする。修正前失敗・修正後成功の証拠を実装時に取得する。
 10. IME中断要求の所有修正について、着手前の構造合意とdetached計画§11記録があることを確認する。
+11. 承認済みviewportの非描画退役入口を通常GCと共通化し、対象登録の終了、兄弟不変、後続root／兄弟出力からの非再作成を検査する。hide／minimizeだけでは退役しない。
 
 本家クリック分類の製品採用は§5の判断を要する。vendor fixtureで本家の事実を検証することと、製品操作差の受入れを混同しない。
 
 段2aはDisabled入力互換、IME中断要求の生成・集約、既存パッチ移植をレビュー可能なコミットへ分ける。各回帰は実windowを作らず、FullOutput検査後のheadless明示破棄を行う。App補助フラグ、追加repaint、新しいqueue、retryは追加しない。
+
+非描画退役の抽出はIME修正と別コミットに分け、Close lifecycleの構造合意・§11記録に含める。
 
 #### 段2bの受入条件
 
@@ -1289,9 +1415,21 @@ whole／partial／free、no-surface、submission、mipmap、headless readback、
 - immediate／deferred、wgpu／共有glow経路の入力取得・寿命処理が一致する。
 - viewport終了が兄弟の保留を消さない。
 - scheduler、outer phase、SW_HIDE、最小化、visible child、期限超過をpure testで確認。
+- 子を最小化→Close要求→復元せず終了する。子callbackやUI passを実行して成功させない。
+- rootもlogic-onlyの場合に、承認済み子のbackend／Context登録を退役できる。
+- modalで拒否したCloseが、modal終了・子復元・後続Fullで再発火しない。
+- 拒否後の新しいCloseは通常どおり受け付ける。
+- 子Fullと親処理の順序が変わっても二重処理せず、初回callback前のCloseも扱える。
+- OS Closeとprogrammatic Closeが同じ受付を通る。rootの終了・tray契約と既定Appの従来委譲を維持する。
+- 承認後の兄弟Full／root Fullで対象を再作成せず、兄弟の入力・IME・texture・surface・寿命を維持する。
+- 拒否した要求だけを消費し、通常のkey／pointer／focus／IME列を消さない。
+- 未配送deltaを共有rendererへ引き継いでから対象を退役する。
+- wg​​pu／glowのClose配送・消費・退役が同じ契約を満たす。
 - §11の構造合意・記録がある。
 
 各段でstandalone非対話試験と旧root core checkを維持する。live compileは可能だが実行は段7。全差分を台帳化する。
+
+Close回帰はbackendの実際の受付・消費・退役helperとfake App／resource ownerを接続して行い、単に「close予定になった」だけで成功としない。追加repaintや強制UI passを必要とせず登録・資源が退役することを非対話で検査し、実HWNDの結果は段7で確認する。
 
 ### 段3: 依存と必須契約の原子的切替
 
@@ -1302,6 +1440,7 @@ whole／partial／free、no-surface、submission、mipmap、headless readback、
 - logic service、Modifiers、wheel。
 - viewport所有RawInputとIME producer互換の正式接続。
 - IME中断要求のviewport別生成とdiscard再pass出力集約の正式接続。
+- 子Closeの非描画受付、既存modal判断・終了ownerへの合流、承認後の対象限定退役。
 - gamepad物理更新・受付事実・未配送edge保持・UI batch。
 - native GPU／surface／present、IME中断intent・control配送。
 - 全delta消費・引継ぎ・headless明示破棄。
@@ -1327,6 +1466,12 @@ cargo fmt --check
 
 - deltaの描画・無描画・早期終了・headless。
 - root／child交互実行とchild skip後の終端保持。
+- 最小化したpassive deferred子のCloseが、既存modal判断・終了ownerへ届き、復元せず終了する。
+- active／parkedの対象contextへの終了委譲を維持し、passive画像のcleanupで代用しない。
+- modalで拒否したCloseが後から再発火せず、新しいCloseは受け付ける。
+- OS Close、programmatic Close、bar／watcherのApp入口を同じ終了判断へ揃え、子FrameのOS Close読取りによる二重採用を残さない。
+- rootもlogic-onlyの場合に承認済み対象を退役でき、兄弟の入力・資源・寿命を維持する。
+- 対象Close時に既存gesture／media／worker ownerを終了し、共有deltaを失わず、後続root／兄弟Fullで子を再作成しない。
 - Disabled取消がproducerから実TextEditまで到達。
 - 同一Contextの親子で中断要求が消失・混入せず、正式graphで修正済みeguiが使われる。
 - 実run_uiのdiscard再passで最新のIME矩形等と中断要求が保持され、次の新規runへ要求が残らない。
@@ -1337,6 +1482,8 @@ cargo fmt --check
 - gamepadの同じframe番号中の複数logic、短い退避復帰、press→release引継ぎ、disconnect／ring／Undo。
 - gamepad保持軸の復帰後継続。既存`src/app/gamepad_input.rs:9697`、`:9763`、`:9809`の期待値を維持。
 - WH_GETMESSAGE既存drain。
+
+CloseのApp側接続では、`src/ui_fullscreen.rs:21756`、`:21876`の既存modal判断・終了処理を描画非依存のserviceとして再利用する。`src/app.rs:3524`のwatcher Closeやbarの×も同じ判断へ合流させる。新しいclose pending bool、復帰待ちqueue、時間窓は追加しない。
 
 graphの旧egui混入・型分裂・古いpathを確認する。compileだけでは受け入れない。
 
@@ -1352,13 +1499,16 @@ graphの旧egui混入・型分裂・古いpathを確認する。compileだけで
 | gamepad引継ぎ・受付・UI接続・必須回帰 | 200～450 |
 | viewport入力所有・IME producerの本体接続回帰 | 100～250 |
 | native IME出力・control配送・必須回帰。生成・集約済み出力の接続確認を含む | 250～550 |
-| **合計** | **2850～5850** |
+| 子CloseのApp終了owner接続・入口統一・接続回帰 | 200～400 |
+| **合計** | **3050～6250** |
 
-**100～175ファイル程度。**
+**105～185ファイル程度。**
 
 第3.1版のgamepad引継ぎを再評価し、Astra指摘の接続・回帰を追加した。段2a／2cのvendor実装は上表へ重ねて計上しない。
 
 第4.1版では、IME生成・集約からbackend配送までの接続確認として約50～100行を追加した。egui内のフラグ所有・append修正と最小回帰は段2aへ計上し、ここでは重複計上しない。
+
+第4.2版では、子Closeの既存終了ownerへの接続、OS／bar／watcher入口の統一、modal拒否後の非再発火と兄弟不変の接続回帰として約200～400行を追加した。非描画退役のvendor実装・単体回帰は段2a／2cへ計上する。
 
 段1b後に実差分で再評価する。gamepadやnative配送の抽出が不足する場合は、旧版上の挙動不変抽出を追加し、原子切替へ未整理の大改修を押し込まない。
 
@@ -1535,8 +1685,13 @@ IME中断要求の親子分離とdiscard再pass保持は、段2a・段3の非対
 9. 同じPDF／画像の兄弟reader片方を閉じても他方を保持。
 10. root非表示中のRemote応答・完了。
 11. idle／wakeは承認済みReleaseChecks。
+12. **別窓を2つ用意し、一方をpassive状態でタスクバーから最小化する。そのwindowのタスクバーメニューから「ウィンドウを閉じる」を選び、復元せず終了することを確認する。もう一方の表示・入力は維持する。**
+13. **対象子で既存のCloseを拒否するmodal条件を作り、最小化したまま同じClose操作を行う。modalを終え、子を復元しても勝手に閉じないこと、その後の新しいCloseでは終了できることを確認する。**
+14. rootも最小化した代表ケースで子をタスクバーから閉じ、root・子の復元を必要とせず対象だけが終了することを確認する。rootを戻した後も子が再作成されないことを確認する。
 
 root LogicOnly→child Full→root Full、短い退避、同一batch順序、期限超過は非対話回帰を主証拠とする。実PCへ大量の任意入力を送らない。「前後入力をすべて捨てる」を期待結果にしない。
+
+modal拒否・初回callback前・兄弟Fullとの順序網羅は非対話回帰を主証拠とする。実機のmodal条件は既存機能で再現できる代表一例に絞り、試験のための保存失敗や設定破損を作らない。エージェント実行の場合は追加したCloseシナリオも承認suiteへ明示する。
 
 ### 7.5 動画HUD・GPU
 
@@ -1563,6 +1718,12 @@ root LogicOnly→child Full→root Full、短い退避、同一batch順序、期
 - 未消費RawInputを同じviewportだけが消費し、root／child交互実行とchild skip後復帰の回帰が通る。
 - RawInput所有修正について構造合意とdetached計画§11記録がある。
 - IME中断要求のviewport別所有と入れ子passについても構造合意とdetached計画§11記録がある。
+- 子Closeの非描画受付・消費・既存終了ownerへの合流・backend／Context退役について構造合意とdetached計画§11記録がある。
+- 最小化した子へのCloseが、復元や子callback実行を必要とせず既存終了ownerへ届く。
+- modalで拒否した要求はその一回で消費され、modal終了・復元後に再発火しない。新しいCloseは受け付ける。
+- rootもlogic-onlyの場合に承認済み子を退役でき、後のroot／兄弟Fullで再作成しない。
+- 子終了で兄弟の入力・IME・保留RawInput・texture・surface・寿命を変更しない。
+- wg​​pu／glowで同じClose配送・消費・退役契約を満たし、rootの終了・tray契約を維持する。
 - 同一Contextの親だけ／子だけが中断要求を出す実入れ子run_uiで、要求の消失・混入がない。
 - 実run_uiのdiscard再passで、最新のIME矩形等を採用しながら未配送中断要求を保持する。
 - 集約済み出力を配送した後、次の新規runへ中断要求が残らない。
@@ -1576,6 +1737,7 @@ root LogicOnly→child Full→root Full、短い退避、同一batch順序、期
 - release射影の順序保証と本家分類が分離され、連続クリックの操作差が採択されている。
 - texture deltaのdrain／引継ぎ／明示終了・submission・freeが全経路で成立する。
 - 汎用入力フィルタ、一律prune、復帰時一回捨て、旧クリックタイマーを追加していない。
+- Closeを処理するための追加repaint、最小化子へのUI pass強制、新しいclose pending bool・復帰待ちqueue・時間窓を追加していない。
 - IME中断要求を補修するApp側の補助フラグ、追加repaint、新しいqueue、retryを追加していない。
 - Ctrl+Shift clipboardを通常／nativeで保持する。
 - accessibility通過後、全snapshotを更新・通常比較・目視確認する。
