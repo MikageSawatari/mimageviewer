@@ -3134,3 +3134,430 @@ Vacant/白紙の投影規則、面積、素材保持、描画の挙動はこの�
 検証（2026-10-15）: 追加回帰1件（内部でLTR/RTL×往復）、fmt、通常core check、
 page_turn関連218件（既存snapshot比較を含む）、book_composition関連219件、diff検査が成功。
 PNG変更はない。test-full/build-dev、アプリの起動・停止、git add/commitは指定どおり行っていない。
+
+## 27. D1 — 高解像度の素材保持とフレーム停止の分離（2026-10-16）
+
+**設計案・独立設計レビュー待ち。製品コード未変更。** 基点は `pageturn-material` /
+`911d33427`（開始時clean）。v4.7.0で出荷済みの機能に対する改修案であり、未出荷機能として
+既存の操作・表示品質を削らない。本節は素材所有・処理配置・時計の改訂案だけを扱う。
+§1〜26のmotion、既定OFF、PC/F12限定、flat-first、最新の§26.12のslideshow契約は維持する。
+とくに§15〜18のfinal-onlyや古いslideshow期限条件を現行仕様へ戻さない。
+
+### 27.1 調査範囲と証拠の限界
+
+利用者の2026-10-16の報告は「03/04で省略、4800×7200の02でカクつく」。今回の実行時の根拠は
+利用者の既存perfログの読取りであり、エージェントによるアプリ起動・画面観測は行っていない。
+指定文書のほか、coding-conventions、git-workflow、development-build-and-test、detached-rework-plan §2、
+現行の§22〜26と以下の所有・描画コードを照合した。
+
+ログのディレクトリは `C:\Users\mikag\AppData\Roaming\mimageviewer\logs\`。原本を移動・削除・更新しない。
+表のbytes/行数/hashは読取り時点のsnapshot範囲。現ログには調査中も追記があり、末尾再読取り時には
+49行増えていたが、集計済み先頭15,393,771 bytesのhashは一致した。追加分にanimationイベントはない。
+以下の行番号はJSONLの1始まり、`t`はsession内秒。別ファイルの時刻やoperation IDを混ぜない。
+
+| 原本 | bytes / 行数 | session / SHA-256 |
+| --- | --- | --- |
+| `perf_events.jsonl` | 15,393,771 / 26,492 | `33064-1792109295164`、UI tid=99348 / `84b3709a34f333e7e3c3d202c0557073756de0686bdbb4bb3671af2a627bc7e6` |
+| `perf_events.1.jsonl` | 24,827,426 / 55,250 | `69140-1792109089896` / `40e3e5d446f22b0b39652bc9163d7f672d1f03e33435fe471d3ae54cfacbf29d` |
+
+集計用Pythonと全204 curl frameの相関CSVはリポジトリ外の
+`%TEMP%\miv-pageturn-d1\`（`aggregate.py`、`budget.py`、`compact.py`、`finalstats.py`、`frames.csv`等）へ置いた。
+各frameを `(session, context, window, viewport, operation_id)` でまとめ、同tidの
+`frame.begin.prev_update_start_t/end_t` に重なるouter updateへ対応させた。
+outer frame Nの時間は次の `frame.begin`（n=N+1）が報告する値を用いる。
+`fs_viewport_breakdown` はnを持たないため、同tid・包含区間で対応させる。丸めたtの境界は約1msの誤差を持つ。
+UIの親子区間は加算しない。別tidのthumb decodeやfs worker時間もUI時間へ加算しない。
+
+既存 `analyze_perf.py ... page-turn-animation --check` と `... hitches --ms 150` も実行したが、
+checkpoint/coverage証明、profile/run_id等がなく **CannotJudge**。
+解析器には `flat_barrier` / `continuation_commit` 未対応もある。以下は保存済みイベントの集計であり、
+ログ完全性、出荷性能gate、OS presentの合格を主張しない。
+ログの実入力は `target\repro\page-turn-budget-571-20261016\` 内のZIP
+（`02_portrait_4800x7200.zip`、`03_portrait_6144x8192.zip`、`04_extreme_8000x8192.zip`等）。
+利用者の元の画像フォルダでの観測と、これらのZIPのログ上の結果は区別する。
+
+### 27.2 観測された失敗とコード上の違反
+
+#### A. pin_budgetは画面用出力ではなくsource込みの保持量で超える
+
+`perf_events.jsonl` はopportunity=34、offered=25、start=23、finish=22、cancel=1、
+curl frame=204。機会内skipはpin_budget=9とoffer_mismatch_or_expired=2。
+別の14 skipはcontext移動6・境界7・continuation instant 1である。
+`.1.jsonl` はanimation skip=23（`book_presentation_not_fully_allowed` 22、`rendition_or_burst` 1）、start/frame/pin_budgetは0。
+したがって9件のpin_budgetは全て現ログの同一sessionに属する。
+
+現上限はfullscreen予算10,124,210,995 bytesの1/10 = **1,012,421,099 bytes（965.520 MiB）**。
+`page_turn_pin_limit`（`src/ui_fullscreen/page_turn.rs:764`）の値に一致する。全9件はaccept時の拒否で、
+`prepared_incoming_roi`での拒否ではない。
+
+| 対象 / operationのseq（診断値） | pin bytes / MiB | outgoing retain bytes | 出どころ |
+| --- | --- | --- | --- |
+| 03 / 68〜74、7件 | 1,101,735,408 / 1,050.697 | 564,864,504 | L21485〜22158、t=1403.513〜1407.098 |
+| 04 / 79〜80、2件 | 1,428,267,016 / 1,362.102 | 729,216,848 | L23205/23326、t=1412.780/1413.864 |
+
+`PaintedUnit::account`（同:716）は各pageのsource（完全mip込み）とnative outputの両方を数え、
+`AcceptedSources::account`（同:667）はincoming sourceを数える。accept時点の総量は次の式で
+**ログとバイト単位で一致**する。RGBA8、mipは各辺を整数半分・最小1まで足した実式
+（`src/vram_budget.rs`の`texture_size_texels`）を用い、4/3近似は使っていない。
+
+| 所有対象 | 03の1枚bytes × 枚数 | 04の1枚bytes × 枚数 |
+| --- | --- | --- |
+| outgoing source、mip込み | 268,435,452（6144×8192）×2 | 349,525,084（8000×8192）×2 |
+| outgoing native output、1 mip | 13,996,800（1620×2160）×2 | 15,083,340（1919×1965）×2 |
+| incoming accepted source、mip込み | 268,435,452×2 | 349,525,084×2 |
+| 合計（この時点ではincoming native outputを含まない） | **1,101,735,408** | **1,428,267,016** |
+
+代表の03はoutgoingが003/002頁、incomingが005/004頁（L21484 target=3、0始まり）。
+直前のpaintにはoutgoing source `Managed(953)/(952)` がある（L21424/21425）。
+04も同じ頁対応で、outgoing sourceは `Managed(1029)/(1028)`（L23176/23177）。
+native寸法は `gpu/lanczos_regenerate`（03: L21410/21411、04: L23158/23159）から取った。
+ただしskipイベント自身は全leaseのID一覧を持たないため、incomingの正確なManaged ID、native ID、
+各参照元までをこのログから復元したとは言わない。上表はcodeと隣接イベントによる会計の再構成であり、
+全9件の実lease inventoryの直接dumpではない。
+
+同じ4面をnative出力だけで保持する参考値は03=55,987,200 bytes（53.394 MiB）、
+04=60,333,360 bytes（57.538 MiB）。checker等があればその実allocationを加える。
+これは改修後の実測ではない。通常cacheにあるsource分のVRAMまで消えるという意味でもない。
+**上限を緩める問題ではなく、presentationが描かない原寸sourceまで所有する境界の問題**である。
+
+#### B. 200msの演出に高解像度の通常準備が重なる
+
+23 operation / 204 frame全体のmesh CPUは中央値0.0663ms、p95=0.1880ms、最大0.4362ms。
+4000×6000群（seq44〜51）はframe数 `2,1,11,3,11,14,7,18`、最大間隔131.7448ms
+（seq44のelapsed差、L17345から次curl frame）。
+02（seq55〜62）は計15 frameで、以下の通り。間隔はイベントのtの丸め差でなくelapsed差から求める。
+
+| seq / 初回frameの行 | curl数 | 初回elapsed ms | 最大curl間隔 ms | 初回を含むouter N / update ms | viewport closure / closure外 ms |
+| --- | --- | --- | --- | --- | --- |
+| 55 / L19447 | 1 | 79.513 | 次curlなし | 2831 / 239.376 | 57.282 / 162.989 |
+| 56 / L19592 | 1 | 111.810 | 次curlなし | 2839 / 158.939 | 86.317 / 70.107 |
+| 57 / L19729 | 1 | 124.911 | 次curlなし | 2850 / 190.246 | 119.696 / 68.050 |
+| 58 / L19875 | 1 | 147.229 | 次curlなし | 2863 / 274.453 | 141.270 / 130.159 |
+| 59 / L20008 | 1 | 105.209 | 次curlなし | 2874 / 186.416 | 83.288 / 100.364 |
+| 60 / L20144 | 1 | 61.529 | 次curlなし | 2885 / 145.890 | 38.735 / 95.764 |
+| 61 / L20265 | 1 | 111.416 | 次curlなし | 2894 / 192.765 | 93.928 / 96.018 |
+| 62 / L20382 | 8 | 70.479 | 85.943 | 2903 / 130.387 | 53.415 / 65.877 |
+
+02の通常原寸面は4800×7200、native面は1440×2160。
+例外として最初のseq55の片面はaccept時thumbnail 526×789をDirectで使用している
+（L19446のunit.incoming.pages）。「02は全素材が1440×2160」とはしない。
+02だけのmesh中央値は0.0689ms。高解像度mesh化やsegment削減は今回の主対策にならない。
+
+代表区間の内訳は次の通り。
+
+- N2831（1393.775940〜1394.015316、次begin L19462）: update=239.376ms。
+  viewport body=220.272msはclosure=57.282ms + `eframe_show_ms`=162.989ms。
+  closure内setup=35.453ms、media=21.413ms（L19455）。同区間の通常final合成2件は
+  23.359/15.079ms、内訳edit=7.780/0.015、post=7.472/7.557、load_texture側=8.083/7.496ms
+  （L19443/19444）。poll_prefetchも2回、13.649/11.140ms、そのupload区間13.546/11.074ms
+  （L19429/19441）。合成はclosureの子、pollは呼出位置によってbodyの子なので全部を再加算しない。
+- N2863: update=274.453ms、body=271.430ms = closure141.270 + closure外130.159ms
+  （L19878、次begin L19885）。通常final合成50.245 + 87.658ms（L19870/19871）がclosureの
+  大半を説明する。post計76.931ms、load_texture側計52.589ms、edit計8.352ms。
+- 初回入場付近のN2829は別に560.253ms（次begin L19365）。poll_prefetch=164.004msのうち
+  同期補正92.227、auto_apply_saved_mask47.181、upload24.151ms（L19324）、
+  viewport render=373.882ms（L19358）。これは演出開始前の入場費用として別集計する。
+- N2832にもpoll 41.223/36.521ms、うちauto_apply_saved_mask31.542/30.226msがある
+  （L19467/19471）。この段名だけで「DBのマスク読取が全時間の原因」とは断定しない。
+  `auto_apply_saved_mask`はmask有無を調べる前にerase入力の解決・black flattenも行う
+  （`src/ui_erase.rs:3194`、`:2977`）。分割計装が必要。
+- 02の完了後には `prev_outside_ms` が約200〜264msのframeもある
+  （例N2913、L20479:264.250ms）。これはupdate外で、curl計算へ足してはならない。
+  同時期の別tidのthumbnail decodeがUIを直接実行している証拠はない。
+
+コード上、`resolve_fs_processed_texture`（`src/ui_fullscreen.rs:12167`付近）は
+**通常の副作用つきcache/ensureを先に実行し、その後でheld resourceへ差し替える**。
+通常final build（`src/app.rs:85631`以降）はedit準備・post処理・全画素clone・load_textureを同期実行できる。
+`page_turn_bind_prepared`も通常prepareの後で旧pageを戻すため、最終的に保持面を描くframeでも
+その前の仕事は消えない。これが確認できた「表示の固定とproducer実行が分かれていない」境界である。
+poll_prefetchのslotも呼出単位でcurrent + otherを取り出し（同:92239以降）、
+rootとviewportの複数pollでouter frame全体の1枚上限にはなっていない。
+
+**計測上の重要な区別**: `ctx.load_texture`は `vendor/egui/src/context.rs:2263` ではTextureManagerへの
+allocation/delta登録である。実際の `queue.write_texture`、mipmap、buffers、surface acquire、submit、presentは
+`vendor/egui-wgpu/src/winit.rs:590`以降、`renderer.rs:602`以降で実行される。
+資料中の「load_texture = 同期GPU upload」という要約だけでは、今回のclosure外163msを説明し切れない。
+`fs_viewport_breakdown.eframe_show_ms`はbodyからclosureを引いた値（`ui_fullscreen.rs:27893`）で、
+GPU実行時間そのものではない。ここまでを確認済みとし、texture delta配送/mip/GPU待ち/present/
+renderer lock等の個別寄与は **未確定**。低cyclesや巨大なt空白だけでdevice wait、pagingと診断しない。
+
+#### C. 準備が時計を消費し、開始すら省かれる
+
+`AcceptedOffer.accepted_at`は受理処理で作られ（`page_turn.rs:1928`）、
+`:2050`で `now - accepted_at < duration` を開始条件にし、`:2164`の進行率も同じ原点を使う。
+02の初回elapsedは61.529〜147.229msなので、最初から200msの31〜74%を使っている。
+03のseq67はoffered=1402.330→skip=1402.590（L21349/21392、約260ms）、
+04のseq78は1411.348→1411.723（L23097/23140、約375ms）で
+`offer_mismatch_or_expired`。duration超過は事実だが、現ログはmismatchとexpiryを分離しないため、
+「照合は全項目成功、expiryだけが原因」とまでは証明できない。pin_budget以外にもこの失敗がある。
+
+### 27.3 先に検討した簡素化と不変条件
+
+まずモーダル化、演出中の全画像処理停止、設定切替でreaderを閉じて再openする案を検討した。
+モーダル化は連打・seek・close・F12を不便にし、全停止は既に進む通常高画質化や次unit先読みを
+演出後まで遅らせる。reader再openは表示位置・窓・cacheを作り直す。
+いずれもリリース済み挙動の退行なので **不採用**。採るなら利用者判断が必要であり、本案の前提にしない。
+
+代わりに組合せを削る方法として、**通常pipelineだけが画像を準備し、presentationは完成した
+paint materialと値のgeometryだけを消費する**。同じ一面を毎frame通常prepareしてから上書きしない。
+演出専用のdecode/prefetch/cache、resample queue、復旧state、cancel後のresumeを作らない。
+既存 `Inactive/Flat/Offered/Turning/Completing` と一件continuationの所有は保つ。
+
+守る不変条件:
+
+1. OFFでは従来のselector、入力基数、producer/admission、prepare/paint、時計を含むfast pathを維持する。
+   共通pipelineの非同期化を適用する場合もOFFのfirst-visible/最終画質到達が遅くならないことを別gateにする。
+2. source identityとpaint allocationを別の型にする。sourceのidx/role/items/input/content/論理寸法は値の証拠であり、
+   そのメタデータのために原寸TextureHandleやCPU pixelsをpresentationへ残さない。
+3. Lanczos native出力は実allocationと `Arc<LanczosOutput>` をleaseする。Directの小さい画像は実managed handleをleaseする。
+   TextureIdだけを所有証明にしない。native出力から元textureを再構築・readbackしない。
+4. 通常の色忠実性、許可token、編集・AI・comic順、各頁自身のcanonical rect/UV/ROIを維持。
+   不足ROIを引伸ばさず、演出poseから通常fit・PDF需要を再導出しない。
+5. 通常producerは進み、演出後は最新の通常最終画質へ戻る。演出に固定した品質を最終cacheへ書き戻さない。
+6. 自然終了・取消ともincoming全unitのmatching canonical flatを一採用frame提出し、その後だけnavigationを解放。
+   close/別本/retireは既存の明示終了を優先する。破棄pass・部分curlはflat完了の証拠にしない。
+7. 各contextの生成・更新・drain・cancel・invalidation・dropをそのownerに閉じる。共有するのは会計inventoryと
+   GPU実行資源まで。兄弟を止めるanimation-active global boolやglobal source epochを作らない。
+
+### 27.4 採用する所有境界 — sourceと画面素材を分ける
+
+名称は仮称。単なる `account()` の減算ではなく、参照グラフ自体を変更する。
+
+| 所有者 | 保持するもの / handoff |
+| --- | --- |
+| 通常source/派生cache・通常prepare | 従来の原寸source、CPU pixels、編集/AI結果、`FullscreenPaintResource`、resampler需要。通常のkeep/evictionを継続 |
+| `PresentationMaterial` | 排他的な `Native(Arc<LanczosOutput>)` / `Managed { handle, actual_mip_policy }`。paint ID、実寸、source UV domain、sampler等の描画契約。Native variantにsource handleはない |
+| `PresentationPage` / unit | occurrence/role、source provenanceとgeneration/論理寸法の値、prepared material、transform/clip/spine/underlay、content binding、採用証拠。Painterは長期の正本にせず現passから供給 |
+| Flat / Offered / Turning / Completing | 同じpresentation unitをmove/共有。acceptのincomingはresident選択の証拠と再利用可能なmaterialを捕捉し、通常prepareから最初の一回だけmaterialを受ける。独自の準備待ちは作らない |
+| accepted output / in-flight batch | 実際に使うmaterial/underlayの同じArc lease。最後のbatch破棄までnative登録を保ち、UIでqueue完了を待たない |
+
+通常prepareが出したLanczos結果は `LanczosOutput` 自体にsource handleを含まない
+（`gpu_lanczos.rs:1001`）。この所有を利用し、`FullscreenPaintResource::Lanczos` 全体のcloneをやめる。
+sourceを使う通常prepareにpaint-onlyを混ぜると、source再prepareやルーペで低解像度を原寸と誤認するので、
+`FullscreenPaintResource`へ「sizeだけ偽装したDirect」を足す案は採らない。
+元寸法・source IDは比較証拠として値で残すが、そのIDでsourceを描くことはできない型にする。
+
+incomingのacceptでは現在のresident-only選択・faithful gateを維持し、I/O/新uploadを呼ばない。
+使える通常prepared出力があればそのmaterialを共有する。なければ通常描画の一回のprepareから切り離す。
+その間sourceを必要とする参照は通常pipelineのprepare jobが所有し、`AcceptedSources`の永続handle pinは廃止する。
+通常prepare ownerは選択済み入力を準備完了まで保持して実resident会計し、単なるcache退去や品質publicationで
+受理済み素材を失わない。準備が終わればその入力leaseを解放し、演出durationまで通常jobにsourceを残してはならない。
+本/編集/許可等のbindingが無効になった場合は同pass通常表示・理由付きskipで終え、遅着から再開しない。
+未完成materialを待つ新Offered queueやアニメーション専用のsource keepを作らない。
+通常の隣unit需要（§26.8）とresample cacheは引き続き通常ownerのものとする。
+
+Flat記録もsourceをpinしない。通常flat paintの準備済みmaterialを借り、次の操作へ使うのは採用された一unitだけ。
+同じ解像度で通常flat、curl、mandatory canonical flatを描くので、終端で画質やgeometryが変わらない。
+そのflat採用後、既存の次frame入口でfreezeを解き、通常selectorが新finalを選ぶ。
+これはcopy/export/ルーペ用の原寸所有を移す設計ではない。明示的な操作は既存の通常素材要求へ戻す。
+
+間接的なsource保持も同じ変更範囲に含める。`FsNavigatorTextureSource`と
+`PendingFsPageTurnReady`（`ui_fullscreen.rs:2150/2204`付近）は現在resourceをcloneし、後者もsource/outputを会計する。
+これらのON-origin提出情報を `NormalResource | PresentationMaterial` の明示的な提出payloadへ分け、
+navigator・receipt・ready observerは描いたmaterialと保存したsource provenanceを消費する。
+rawのcache存在をpresentationの可視証明として再要求せず、source IDを現在の新finalへ偽装もしない。
+capture/holdover/frozen snapshotの通常原寸resourceを全域置換する必要はないが、presentation由来の
+ready handoff/batch経由で原寸が再pinされないことを必須監査にする。
+
+Directはallocation全体が必要な表示解像度内のthumbnail/等倍素材ならコピーせず保持できる。
+大判Direct、拡大上限fallback、部分ROIでは、通常ownerが供給する必要domainを覆う画面素材が必要。
+既存出力の無いケースへ演出専用縮小や原寸の隠れpinを足さない。
+**これらを新理由で一律skipする仕様はまだ採用しない**。現行で演出できるDirect/指定サイズcaseを実装前に列挙し、
+通常ownerで品質を変えず素材を供給できない場合は、追加対応か適用範囲変更を利用者判断へ返す。
+通常fitの03/04は既存のLanczos出力だけで分離できることをD2の最初のfixtureで証明する。
+
+### 27.5 フレームを止めない通常準備 — 採用方向と未確定のGPU区間
+
+採用方向は **表示選択と準備producerの分離**。`resolve_fs_processed_texture`の先頭へheld判定を足して
+通常仕事を止めるだけでは根本修正にしない。
+
+1. 通常pipelineの準備/adoptionと、read-onlyなpaint選択を分ける。フレームの表示選択を一度
+   `Ordinary | FrozenPresentation(unit)` として解決し、Frozenなら同じmaterial/geometryから描く。
+   Turning/Completing中に `ensure_final_composite_texture`、source resample、原寸再取得を描画のために呼ばない。
+   許可・content・view binding変更は通常取消へ通し、保持面のために新contentを作らない。
+2. 通常のedit/final workerに、同期のedit準備・補正・sharpen・post・clamp/大きい画像cloneも含めた
+   immutableな通常要求を渡す。既存key/generation/cancel/優先度を使い、表示されたunitと通常生成中の
+   最新結果を混ぜない。演出ON専用workerを並立させず、カラー化/LUTだけworkerへ出す現在の境界を整理する。
+   `apply_sync_adjustment`とauto mask前処理も同じCPU処理のinventoryへ含める。
+   全mask有無を先にguardするだけでなく、実際のmask/alphaページでもUIに画素処理を残さない。
+3. GPUの大きいsource/final uploadは、ctx.load_textureの呼出回数だけで管理しない。
+   root/viewport/parkedのpollを越える **outer accepted frame・device単位のbyte/job予算** を通常upload ownerに持たせる。
+   current/相方/次unitの優先順位と結果のcontext配送は維持し、thumbnailの既存8枚slotを勝手に減らさない。
+   単一の巨大upload自体が予算を超えるなら1枚/frameにするだけでは不十分である。
+4. D2ではまず§27.8のbackend計装でclosure外の内訳を確定する。texture配送・mip・resampleが支配的なら、
+   通常GPU準備の重いallocation/staging/encodeをworkerへ移し、共有queueへの提出を有界jobとして扱う方向。
+   UIには完成したresourceの短い登録/adoptionだけを返し、renderer lockを重い処理の全区間で保持しない。
+   GPU queue自体が詰まる場合はupload/mip/resampleの分割可能な作業単位とpaint優先の提出境界まで設計対象になる。
+   **threadへ移すだけでGPU競合が消えるとはしない**。単一callの分割が必要か、surface/present側が主因かは
+   今のログでは未確定なので、tile数・転送上限値や新しいGPU schedulerの実装をD1で決め打ちしない。
+
+4は「演出中なのでfinishまでdrainしない」という停止案ではない。通常高画質化・source load・AIは継続し、
+完了は通常cacheへ採用する。presentationだけが固定materialを描く。
+managed deltaをworkerから投げるだけでは実GPU仕事がUIへ戻る点、native化しても既存resamplerが
+`renderer.texture(id).texture`を要求する点（`gpu_lanczos.rs:715`）を実装前reviewで検討する。
+native sourceを使うなら通常source所有のtyped GPU resource/実texture viewを通す必要があり、
+`TextureId`から無理に取得・CPU readbackする近道は採らない。
+
+GPU区間の確定後に範囲・費用を再レビューする。既存の準備完了時刻を遅らせないまま処理を外せるかが
+通常pipeline全体の受入条件であり、**全処理の演出後送り、先読み削減、低画質固定、最終画質化の意図的延期は
+利用者判断が必要**。本案でそれらを暗黙に選ばない。D2のmaterial分離だけでカクつき解消と報告しない。
+
+### 27.6 時計の改訂案（利用者判断が必要）
+
+準備でdurationを使い切る現行方式は、演出の設定時間の意味として不適切と判断する。
+**推奨は最初の採用されたcurl提出を演出時計の原点とすること**。
+`accepted_at`は操作から準備/初出までのレイテンシの観測値として残し、motion clockと混ぜない。
+この仕様では、例えば準備120ms + 設定200msなら全面表示まで約320ms＋採用境界となる。
+現行の受理から約200msで打切る挙動より全面表示が遅くなり得るため、D1では改訂案を提示するに留め、
+**利用者がこの費用を採択する前に時計の製品変更を実装しない**。
+
+採択された場合の具体契約:
+
+- 最初の通常prepareで照合・ROI・pin admissionが成立したpassにp=0の初期poseを提出。
+  同じoperationの最初の非discard outputだけが既存submission ledgerに開始時刻を一度publishする。
+  次のowning frameがそれを使う。owner/hookの責務を逆転せず、毎frame/replay/mountで原点を更新しない。
+  `Turning`内のclockを `AwaitingAcceptedOutput | Running { start_at }` の排他的な型にし、別pending boolを足さない。
+- 以後のpはmonotonic wall clock / durationで決める。フレーム数で時間を伸ばす、hitchごとに時計を止める、
+  最低frame数に達するまでfinishを待つ案は採らない。開始後に遅いframeがあれば飛ぶ事実を計測する。
+- prepare待ちを新設しない。accept時にdisplayable sourceがなければ従来どおりinstant。
+  一回の通常prepare handoffが成立しない場合も理由付きskipで終わり、非同期materialの後着でstartし直さない。
+  `offer_mismatch_or_expired`はbinding/source不一致と旧clock expiryを分離し、durationを準備timeoutとして流用しない。
+- output採用はOS presentではない。backend提出前の長い163ms等が残ればこの新clockでも体感時間を消費する。
+  まず処理分離を完了し、§27.8でaccepted output→backend submit/presentを併記する。
+  実present原点が必要と判明した場合は既存output tagからbackend提出証拠を同じledgerへ戻す範囲を別reviewし、
+  wall clockを都合よくresetして合格にしない。
+- close/取消・flat-first・新入力の既存順序は維持。slideshowは最新§26.12の
+  「interval < Dならinstant、そうでなければcanonical flat採用後から保存間隔全体」を維持する。
+  新clockに合わせて旧期限比較を復活させない。OFF/短間隔/連結読みの時計は変えない。
+
+### 27.7 VRAM会計・lifecycle・多context
+
+pin上限式は変更しない。会計は二種類を区別する。
+
+- **実resident**: 通常cacheのsource/mip/出力と、cache外でも生存する通常prepare job入力・presentation/batchを
+  `VramAccountant`のTextureIdで一回だけ数える。原寸sourceが通常cacheにあれば当然そのbytesを数える。
+  subsystemの先着分類は総量と区別し、presentation-only/共有residentを診断で分ける。
+- **演出pin admission**: 全contextで実際に保持するpresentation material allocationの和をdedupして予約する。
+  Nativeは出力のみ・1mip、Managedは実際のmip/sampler属性を使う（thumbnailまで一律mip=trueにしない）。
+  underlay checkerも保持するなら加算。logical source sizeの値をtexture allocationとして加算しない。
+  Flatの実residentも会計し、Offered→Turningのincoming material確定で同じreservationを再評価する。
+  共有outputを両面/二窓/batchで使っても一allocation。予算の確認とreservation確定はUI ownerの一境界で行う。
+
+現在のweak inventoryはtextureを所有しない仕組みを保ち、source一覧ではなくmaterial leaseを登録する。
+予約の有効性はtyped reservation ownerに結び、数値0を将来の状態判別sentinelとして増殖させない。
+finish/cancelでpresentationがoutgoingを手放しても、生存batchのpin/実residentは解放しない。
+canonical採用後のincomingは通常Flatへ移り、batchも含め最後のreservation ownerが退役した時だけpinを外す。
+毎framesource cache全体を追加走査せず、既存の保持素材集合と通常会計を用いる。
+
+| 入口・終了 | 維持/変更するhandoffと確認対象 |
+| --- | --- |
+| 初回open、通常の別本open、folder/history/seek switch | 初回に採用Flatがなければ演出なし。別本/列/許可bindingの変更は旧ownerを退役。新本へ素材・continuation・worker完了を流さない |
+| 単発key/click/wheel/touch/ring/gamepad | 既存semantic navigationと同じoffer入口。real source/role/slotから通常unitを作り、incoming全頁の一回prepareをhandoff。入力eventの再注入なし |
+| 連打/held/no-op/方向反転 | 新operationでCompleting。incoming全unitを保持materialでcanonical flat採用→次frameに一件continuation。追加入力queue、finish待ち、drop規則変更なし |
+| 自然終了、設定OFF、編集/fit/trim/rotation/resize/DPI | 自然終了と表示操作取消は既存flat completion。内容/geometryが無効なら通常再prepareへ戻し旧receiptを拒否。OFF由来で新material/clockを作らない |
+| close/cancel/error/retire | closeはflat強制より先、当該ownerの要求/lease/receiptを退役。in-flight batchは自然drop。device loss/VRAM不足はログ＋演出省略、回復state/retryなし |
+| F12 fork / promote / mount / deposit / park | forkは新presentation Inactive、通常の値移譲は同じcontext identityとmaterial/receipt/clockを保つ。新prepare要求もcontext所有。pause中にcontinuationを自動dispatchしない |
+| 複数context / 同じ本・同じ頁 | Aのaccept/adoption/close/失効はAだけ。Bのmaterial/resample cache/queue/source世代を変更しない。共有allocationは会計dedupし、各窓のoperation/時間/receiptは別 |
+| slideshow / 媒体境界 / 連結 / Split | §26.12の時間と通常のsource送りを維持。native動画への切替は§18のclose→commit→描画binding再判定。未実装Split演出を今回拡張せず、通常Split/連結読み/Remoteを維持 |
+
+detached-rework-plan §2を読んだ。今回想定する変更は既存ViewerContextBundleのpresentation/通常準備資源を
+sourceとpaintに分けるもの。geometryでHWNDを推測、host_lostで再生成、grace/retry、
+新detached bool/placement保存を足さず、window/viewport述語を性能逃がしに変更しない。
+したがって**症状パッチではなく素材・要求の所有境界の構造的修正**として提案する。
+描画入口・frozen/ready payloadへ触る実装はClaudeCodeと独立reviewerの双方がこの根拠に合意した後に限る。
+実変更時に同plan §11へ範囲と根拠を追記する。D1ではそのファイルを変更せず、合意済みとも記録しない。
+
+### 27.8 追加perf計装と判定方法
+
+perf無効/OFF fast pathでextrasや新しい時計を作らない。既存非blocking writerへ、次を相関して送る。
+新profileはsource寸法・viewport物理寸法・ppp・duration・GPU/driver・warm/cold・通常/ZIP/PDF・窓配置を固定する。
+
+| 境界 | 必須の測定/識別 |
+| --- | --- |
+| material capture / admission | source provenance（ID/世代/品質/寸法、非所有）、paint allocation ID/実寸/ROI/mip、owner=context/op、参照元=cache/Flat/offer/turn/completing/batch、per-allocation bytes・共有先・global pin合計・limit。skipでも内訳を一回出す |
+| paint選択 / 通常producer | read-only選択、held選択、通常ensure/edit/final/post/clone/clamp、mask lookup/erase input/black flatten/rasterize、upload登録を排他的spanに分離。worker側のqueue/runとUI adoptionを区別 |
+| root/viewport pollとupload | session/context/viewport、outer frame stampとpass、origin、request/key/items/content世代、current/companion/prefetch、job数/bytes/mips、CPU clone・delta登録時間。複数pollの総量を同outer frameへ合算 |
+| backend（vendor経路） | output/view/context tag、deltaごとのID・bytes・mip数、renderer lock wait/hold、allocation/write、mip encode、resample encode/submit、buffers、surface acquire、queue.submit、present、free。wallとUI cyclesを対にし、親子/同時workerを二重加算しない |
+| 演出の時計 | ingress→accept、accept→material prepared、prepared→first accepted curl、accepted curl→backend submit/present、motion elapsed、canonical flat採用、通常final-ready→初paint。旧accepted originと新motion originをschemaで明示 |
+
+GPU timestamp等で実GPU時間を追加する場合は対応環境だけに限定し、CPU encode-submit時間をGPU時間と呼ばない。
+backend計装は全viewport共通の既存配送点に置き、page-turn専用の別rendererを作らない。
+renderer lock/driver待ちが支配的で通常spanで説明不能なら、次に非対話traceの待機stackを取る判断へ進む。
+最初から大量の仮説別テストを利用者へ要求しない。
+
+`analyze_perf.py`は新event/schemaと既存flat_barrier/continuationを扱い、session/context/window/
+viewport/operationごとのcurl frame間隔・初回progress・完走・全skip理由を出す。
+frame gap全体（idle/sleep含む）を演出中のhitchへ混ぜず、accepted outputと実presentを別列にする。
+checkpoint/profile不備をFailでなくCannotJudgeとして残す現在の証拠規則は弱めない。
+
+### 27.9 テスト計画・受入条件
+
+実装者がfocusedと会計/状態回帰を所有し、同じsource/条件の成功台帳を独立reviewerが再利用する。
+D1ではRustを変更していないためcargo fmt/test/buildを実施しない。文書差分・式・参照の照合だけを行う。
+
+| 検査 | 必須の反例と成功条件 |
+| --- | --- |
+| 素材寿命/会計 | Native materialから原寸handleへのstrong pathがない。source cacheをevictしてもoutputを描ける。通常cacheに残るsourceは総VRAMから消さない。managed/native/underlay/mipをIDでdedup。複数context+batchで共有し最後のdropだけ解放 |
+| pin budget | 上記03/04式を旧構造の負例、4出力53.394/57.538MiBを新構造の正例にする。limit未満/等値/超過、incoming prepare確定時の増分、兄弟予約、自然終了/取消/close後のbatch残留を検査。数字を引くだけでsourceが生き残る実装を失敗にする |
+| 状態遷移 | fake clockでFlat→Offered→Turning→Completing→Flat、accept後prepareがD以上、discard/replay、no source/no outgoing、bind/content/token変更、late結果、OFF切替。選んだ時計なら初回p=0、開始一度、再passで原点更新なし、開始後hitchはwallで進みduration無限延長なし |
+| producer/入力統合 | root/viewport/gamepad/click/wheel/slideshowを実handler経由。Frozen frameに同期ensure/画素処理/upload/resampleがないことをspy、同時に通常workerの完了と最終cache採用・解除直後のupgradeが進むことを検査。単に全producerを停止して緑になる試験にしない |
+| flat/capture/quality | LTR/RTL前後、single/Pair、横長/黒paper、Blank/Vacant/補助表紙、mixed thumbnail/native、trim/回転/ROI/DPI。始点とmandatory canonical flatは同material/geometry、終端/cancelの画素は通常flatと一致。navigator/receipt/ready/copy/exportがpaint IDとsource identityを取り違えない |
+| multi-context/lifecycle | A/Bで同じ本・頁、Aだけclose/別本/失効、fork/mount/deposit/park/promote、Aの遅着をBへ採用しない。source eviction後にF12のready/batchが原寸を再pinしない。媒体切替・close優先・flat-first N→N+1・OFF基数の既存回帰を維持 |
+| GPU/性能 | headless rendererでoutput登録・sample・batch lifetime、delta配送と原寸free後の画素を検査。通常fit02/03/04、4000×6000、原寸/指定サイズ/DirectとOFF対照、二F12同時を別profile。実GPU/present/滑らかさは承認済み隔離実機枠の残gate |
+
+自動gateは狭い状態/handler/会計→snapshot→共通変更の `scripts/test-full.ps1`。
+vendor配送/計装を変更した場合は同gate内のvendor graphも含める。検証用buildは実装段階で
+`build-dev.ps1`、exact release性能はrelease構成、ライブ確認は別の明示承認枠とする。
+製品バイナリのエージェント起動・実データのテスト利用はしない。
+
+受入条件:
+
+- 予算式を据え置き、03/04の通常fit・resident warm条件でsource pinによる9件と同型のskipを解消する。
+  全件skipや分母除外で性能合格にしない。§9.1の3run×30機会、開始率90%/完走率95%を各profile別に評価する。
+- presentationが保持するのは必要解像度の実materialと値の証拠のみ。原寸sourceやCPU pixelsを間接保持しない。
+  通常cacheの原寸品質と最終表示は維持する。
+- 代表warm 60Hz/200ms profileでは初回progressを準備時間で飛ばさず、curl提出間隔p95≤20ms・最大≤33.4msを
+  **提案gate**とする（利用者/設計reviewで固定してから測定）。CPU追加p95≤0.5ms/contextと
+  GPU追加≤2ms/4Kの既存仮gateも維持。cold/open費用は別に報告し、大きいhitchを平均へ埋めない。
+- OFF/held/seek/連結と、ONの通常高画質到達・次unit先読みの時間/件数をbaselineと比較し、
+  意図的な待ち・機能削減なし。同期処理を消してもGPU側の50〜163ms等が残るなら性能未達とする。
+- 最終画質の着地・flat-first・兄弟独立・native lifetimeの自動回帰、独立完了review、利用者のmotion評価を全て満たす。
+  D1の数値再構成やheadless成功をそれらの代用にしない。
+
+### 27.10 採否・実装順・見積り・未確認事項
+
+| 案 | D1での判断 |
+| --- | --- |
+| source ownershipとpaint materialを分け既存output/ROIを共有 | **採用案**。実leaseを減らして予算と寿命を一致させる |
+| 表示consumerと通常準備producerを分け、重いCPUを既存workerへ | **採用案**。heldを返す直前の無駄な同期仕事を所有境界から外す |
+| GPU配送/提出の計装→原因別の非同期・有界準備 | **採用方向**。具体的backend改修は計装後に再レビュー。原因未確定のschedulerを先行実装しない |
+| 初回採用curlをclock原点にする | **推奨・利用者判断が必要**。準備+Dの全面表示費用を明示。設定のD自体を増やす案とは区別 |
+| pin上限増量、会計だけsourceを除外、source寸法偽装 | 不採用。実所有と乖離、通常VRAM圧迫・原寸誤認を残す |
+| 演出専用decode/縮小cache、frameごとのcapture/readback、mesh削減だけ | 不採用。通常準備の重複・画質/寿命問題を増やし、観測された主区間を直さない |
+| 演出中全producer停止、final uploadをfinish後へ一括延期、先読み削減 | 不採用。通常機能の退行。採るなら別途利用者判断が必要 |
+| modal入力lock、delay/retry/追加repaint、全case原寸保持のsilent fallback | 不採用。所有違反と停止を隠す。通常不足は理由付きskip、まれなVRAM不足/device lossはログ＋演出省略、回復機構を足さない |
+
+実装は独立設計レビュー後にcoherent chunkで分ける。共有fileのwriterは各chunkで一人。
+
+| chunk | 完成物・主なfile所有範囲 | 概算（一人の作業日） |
+| --- | --- | --- |
+| D2 | material/source分離、Flat/accept/batch/ready/navigator会計の一貫接続と回帰。`page_turn.rs`、`gpu_lanczos.rs`、`ui_fullscreen.rs`、`app/vram_accounting.rs`、context登録。並行して既存区間を壊さないperf/解析の完成 | 3〜5日 |
+| D3a | 通常selector/producer分離、edit/final/mask前処理のworker接続、同型callerとcontext/cancelの回帰。`app.rs`、既存edit/final worker、`ui_erase.rs`、表示経路 | 3〜5日 |
+| D3b | backend計装で確定したupload/mip/resample/lock/submitの改修。`vendor/egui-wgpu`、必要な通常GPU準備owner、`gpu_lanczos.rs`。ここは事前再レビュー必須 | 3〜6日、共有upload基盤の再構成が必要なら追加見積り |
+| D4 | 採択後のclock、fake clock/handler/snapshot/perf/full gate、関連正本/spec/manual/detached §11更新、検証buildとprofile比較 | 2〜3日＋実機待ち |
+
+合計目安 **11〜19作業日＋独立設計/完了レビュー・修正・実機枠**。
+単純な数行のpin会計変更として扱わない。D2だけを独立検証できるが、目的2の完了とはしない。
+GPU区間未確定のため固定納期ではない。通常pipelineやDirect対応で正しい変更がこの範囲を超える場合は、
+guardを足して通さず、その所有境界と追加範囲を設計担当へ返す。
+
+未確認の前提・次に解決するもの:
+
+- closure外の支配要因。既存ログが確定したのは境界までで、GPU待ち/配送/mip/present/lockの割合ではない。
+  D2計装後にD3bを具体化する。新しい実機ログ採取はこのD1では利用者へ求めない。
+- skipped offerの全texture ID/参照元、Direct/部分ROI/指定サイズ全域のmaterial供給可否、
+  実GPUでsource解放後のnative出力独立性。値のIDだけを残して通常機能を壊さないことをD2の検証で閉じる。
+- 元の画像フォルダとログのZIPで同じ割合になるか、二F12同時のupload競合、GPU/driver/refresh条件別の改善幅。
+  ログからそれらの性能を一般化しない。
+- clock費用の利用者採択、具体的GPU変更の構造合意、独立設計レビュー、実装/テスト/実機受入れは未了。
+  **本D1は設計文書だけをコミットし、設計レビューのためここで止める。masterへ統合しない。**
