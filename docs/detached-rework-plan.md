@@ -5342,6 +5342,13 @@ D2実装承認を受けた。実装差分・自動検証・未確認事項の正
 **合意 (2026-10-16)**: 設計担当 (ClaudeCode Opus) と独立レビュー担当 (GPT-6.1 Sol / xhigh) の双方が、
 以下の 11 項目すべてについて「症状パッチではなく構造的修正である」ことに同意した (段0a・段0b のレビュー、ACCEPT)。
 これは設計上の合意であり、各項目の実装は各段の実装レビューで改めて受け入れる。実機確認・修正前失敗/修正後成功は主張しない。
+**追加合意 (2026-10-16、設計書第4.3〜4.4版)**: 利用者が案B (Windows の最小化中も要求済み repaint を UI pass として消化し、
+surface 描画の要否は別に判断する。RedrawRequested 期限超過の LogicOnly は残す) を選んだ。これに伴う
+(1) scheduler 方針の変更と残る期限超過経路、(2) root Close (トレイ退避・保存待ち・settings-family・ZIP 取消) の非描画 lifecycle 化、
+(3) `with_viewer_context` の owner 付き状態更新と mount 時の表示再採用・reconciliation の境界分離、
+(4) immediate 子窓の描画判定 (両 backend の `render_immediate_viewport` で子自身の metadata と明示描画要求を使う) について、
+設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.4版 ACCEPT) の双方が「症状パッチではなく構造的修正である」ことに同意した。
+下の 11 項目のうち「App の logic/ui 分離」「scheduler 付け直し」「非表示子 Close」の範囲を、この追加合意で補う。
 旧版の静的調査・非対話検査は[段0b基準台帳](egui-0.37-baseline.md)へ分ける。
 以下のBA番号は§2が参照する[提案書§2](detached-viewer-lifecycle-redesign-proposal.md#2-初期診断の壊れた前提と現在の解消状況)への対応であり、各BA全体の解消を主張しない。
 
