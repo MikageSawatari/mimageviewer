@@ -17367,10 +17367,8 @@ pub struct App {
     /// eframe の wgpu::Device / Queue / Adapter / target_format。起動時の creator closure
     /// (`lib.rs`) で `cc.wgpu_render_state` から渡される。
     ///
-    /// 導入時の用途は Windows 固有 (動画 GPU レンダリングで
-    /// `wgpu::Device::create_texture_from_hal::<Dx12>` 経由で D3D11 NT shared テクスチャを
-    /// import する) だったが、現在は **プラットフォーム非依存の用途にも使う** —
-    /// GPU Lanczos、比較モードの GPU テクスチャ解放、パノラマの settle overlay。
+    /// GPU Lanczos、比較モードの GPU テクスチャ解放、パノラマの settle overlay に使う。
+    /// 動画本体の共有テクスチャは D3D11 native presenter 内で開き、wgpu へ import しない。
     /// そのため `cfg(windows)` を付けない。付けると、cfg なしの経路 (`eframe::App::update`
     /// など) から参照するたびに非 Windows ビルドが壊れ、CI の
     /// `cargo check (ubuntu / non-Windows cfg)` でしか気付けない

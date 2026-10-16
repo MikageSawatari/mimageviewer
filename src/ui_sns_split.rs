@@ -969,7 +969,7 @@ impl App {
         };
 
         ui.add_space(6.0);
-        ui.label("継ぎ目");
+        let seam_label = ui.label("継ぎ目");
         ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(seam_choice == SnsSplitSeamChoice::None, "なし")
@@ -1001,13 +1001,15 @@ impl App {
         });
         if seam_choice == SnsSplitSeamChoice::Custom {
             let mut seam_percent = f64::from(seam_permille) / 10.0;
-            let response = ui.add(
-                egui::DragValue::new(&mut seam_percent)
-                    .range(0.0..=10.0)
-                    .speed(0.1)
-                    .fixed_decimals(1)
-                    .suffix("%"),
-            );
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut seam_percent)
+                        .range(0.0..=10.0)
+                        .speed(0.1)
+                        .fixed_decimals(1)
+                        .suffix("%"),
+                )
+                .labelled_by(seam_label.id);
             if response.changed() {
                 seam_permille = (seam_percent * 10.0)
                     .round()

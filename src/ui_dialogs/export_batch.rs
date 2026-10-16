@@ -287,17 +287,20 @@ impl App {
                     let is_long_edge =
                         matches!(state.scale, crate::export_dialog::ExportScale::LongEdge(_));
                     ui.horizontal(|ui| {
-                        if ui.radio(is_long_edge, "長辺指定").clicked() {
+                        let long_edge_label = ui.radio(is_long_edge, "長辺指定");
+                        if long_edge_label.clicked() {
                             state.scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
                         }
-                        let resp = ui.add(
-                            egui::DragValue::new(&mut long_edge_px)
-                                .range(
-                                    crate::export_dialog::ExportScale::LONG_EDGE_MIN
-                                        ..=crate::export_dialog::ExportScale::LONG_EDGE_MAX,
-                                )
-                                .suffix("px"),
-                        );
+                        let resp = ui
+                            .add(
+                                egui::DragValue::new(&mut long_edge_px)
+                                    .range(
+                                        crate::export_dialog::ExportScale::LONG_EDGE_MIN
+                                            ..=crate::export_dialog::ExportScale::LONG_EDGE_MAX,
+                                    )
+                                    .suffix("px"),
+                            )
+                            .labelled_by(long_edge_label.id);
                         if resp.changed() {
                             state.scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
                         }

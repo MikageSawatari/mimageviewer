@@ -4285,13 +4285,14 @@ impl App {
             .show(ctx, |ui| {
                 crate::os_theme::apply_dark_ui(ui);
                 ui.horizontal(|ui| {
-                    ui.label("見本");
+                    let sample_label = ui.label("見本");
                     if crate::ime_focus::add_singleline(
                         ui,
                         &mut self.text_font_dialog_sample,
                         None,
                         |edit| edit.desired_width(180.0),
                     )
+                    .labelled_by(sample_label.id)
                     .changed()
                     {
                         self.font_sample_cache.clear();
@@ -7516,7 +7517,7 @@ fn bubble_struct_toggles_ui(
 /// スタイル (サイズ / 塗り / 枠 / 角丸 / 余白 / オフセット) は 部品 タブ側 (`window_parts_ui`)。
 fn window_name_header_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
     ui.horizontal(|ui| {
-        ui.label("名前");
+        let combo_label = ui.label("名前");
         egui::ComboBox::from_id_salt("win_name_mode")
             .selected_text(name_plate_mode_label(w.name_plate.mode))
             .show_ui(ui, |ui| {
@@ -7533,7 +7534,9 @@ fn window_name_header_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed
                         *changed = true;
                     }
                 }
-            });
+            })
+            .response
+            .labelled_by(combo_label.id);
         if w.name_plate.mode != NamePlateMode::None {
             let mut col = to_c32(w.name_plate.name.color);
             if annotation_color_edit_button(ui, &mut col).changed() {
@@ -7973,7 +7976,7 @@ fn text_block_ui(
             .position(|(_, r)| marker_pairs_eq(&t.markup_rules, r));
         let cur_label = cur_idx.map(|i| sets[i].0).unwrap_or("カスタム");
         ui.horizontal(|ui| {
-            ui.label("記号セット");
+            let combo_label = ui.label("記号セット");
             egui::ComboBox::from_id_salt("marker_set_combo")
                 .selected_text(cur_label)
                 .show_ui(ui, |ui| {
@@ -7983,7 +7986,9 @@ fn text_block_ui(
                             *changed = true;
                         }
                     }
-                });
+                })
+                .response
+                .labelled_by(combo_label.id);
         });
     }
     // 行間 / 字間。
@@ -8060,13 +8065,15 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 sh.color = from_c32(col);
                 *changed = true;
             }
-            ui.label("X");
+            let coordinate_label = ui.label("X");
             *changed |= ui
                 .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
+                .labelled_by(coordinate_label.id)
                 .changed();
-            ui.label("Y");
+            let coordinate_label = ui.label("Y");
             *changed |= ui
                 .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
+                .labelled_by(coordinate_label.id)
                 .changed();
         });
         *changed |= ui
@@ -8146,10 +8153,11 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 echo.color = from_c32(col);
                 *changed = true;
             }
-            ui.label("数");
+            let coordinate_label = ui.label("数");
             let mut count = echo.count as i32;
             if ui
                 .add(egui::DragValue::new(&mut count).range(1..=12))
+                .labelled_by(coordinate_label.id)
                 .changed()
             {
                 echo.count = count.clamp(1, 12) as u32;
@@ -8157,13 +8165,15 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("X");
+            let coordinate_label = ui.label("X");
             *changed |= ui
                 .add(egui::DragValue::new(&mut echo.offset.0).speed(0.5))
+                .labelled_by(coordinate_label.id)
                 .changed();
-            ui.label("Y");
+            let coordinate_label = ui.label("Y");
             *changed |= ui
                 .add(egui::DragValue::new(&mut echo.offset.1).speed(0.5))
+                .labelled_by(coordinate_label.id)
                 .changed();
         });
     }
@@ -8824,12 +8834,14 @@ fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     });
     // 先端 (tip) を画像座標で直接編集 (キャンバスのハンドルドラッグと等価)。
     ui.horizontal(|ui| {
-        ui.label("先端");
+        let coordinate_label = ui.label("先端");
         *changed |= ui
             .add(egui::DragValue::new(&mut t.tip.0).speed(1.0))
+            .labelled_by(coordinate_label.id)
             .changed();
         *changed |= ui
             .add(egui::DragValue::new(&mut t.tip.1).speed(1.0))
+            .labelled_by(coordinate_label.id)
             .changed();
     });
     // 付け根の自動配置: 中心→先端のレイが輪郭を抜ける位置に根を付ける (対象を指す)。
@@ -9101,13 +9113,15 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
                 sh.color = from_c32(col);
                 *changed = true;
             }
-            ui.label("X");
+            let coordinate_label = ui.label("X");
             *changed |= ui
                 .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
+                .labelled_by(coordinate_label.id)
                 .changed();
-            ui.label("Y");
+            let coordinate_label = ui.label("Y");
             *changed |= ui
                 .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
+                .labelled_by(coordinate_label.id)
                 .changed();
         });
     }
@@ -9134,19 +9148,23 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
 
     // 余白 (per-side insets)。
     ui.add_space(2.0);
-    ui.label("余白 (左/上/右/下)");
+    let coordinate_label = ui.label("余白 (左/上/右/下)");
     ui.horizontal(|ui| {
         *changed |= ui
             .add(egui::DragValue::new(&mut w.padding.left).speed(1.0))
+            .labelled_by(coordinate_label.id)
             .changed();
         *changed |= ui
             .add(egui::DragValue::new(&mut w.padding.top).speed(1.0))
+            .labelled_by(coordinate_label.id)
             .changed();
         *changed |= ui
             .add(egui::DragValue::new(&mut w.padding.right).speed(1.0))
+            .labelled_by(coordinate_label.id)
             .changed();
         *changed |= ui
             .add(egui::DragValue::new(&mut w.padding.bottom).speed(1.0))
+            .labelled_by(coordinate_label.id)
             .changed();
     });
 }
@@ -9212,12 +9230,14 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
                 .changed();
         }
         ui.horizontal(|ui| {
-            ui.label("位置 X/Y");
+            let coordinate_label = ui.label("位置 X/Y");
             *changed |= ui
                 .add(egui::DragValue::new(&mut w.name_plate.offset.0).speed(1.0))
+                .labelled_by(coordinate_label.id)
                 .changed();
             *changed |= ui
                 .add(egui::DragValue::new(&mut w.name_plate.offset.1).speed(1.0))
+                .labelled_by(coordinate_label.id)
                 .changed();
         });
     }
@@ -9454,13 +9474,14 @@ fn stamp_ui(
     let mut long = s.half_w.max(s.half_h) * 2.0;
     ui.horizontal(|ui| {
         ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
-        ui.label("大きさ");
+        let size_label = ui.label("大きさ");
         if ui
             .add(
                 egui::Slider::new(&mut long, 16.0..=1600.0)
                     .suffix("px")
                     .clamping(egui::SliderClamping::Edits),
             )
+            .labelled_by(size_label.id)
             .changed()
         {
             let half_long = (long * 0.5).max(8.0);

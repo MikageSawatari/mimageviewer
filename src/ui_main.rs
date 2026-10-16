@@ -1200,21 +1200,24 @@ fn draw_facet_calendar_date_row(
     ui.horizontal(|ui| {
         ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(
+            let year = ui.add(
                 egui::DragValue::new(&mut value.year)
                     .range(1970..=9999)
                     .suffix("年"),
             );
-            ui.add(
+            crate::ui_helpers::set_accessibility_label(&year, &format!("{label} 年"));
+            let month = ui.add(
                 egui::DragValue::new(&mut value.month)
                     .range(1..=12)
                     .suffix("月"),
             );
-            ui.add(
+            crate::ui_helpers::set_accessibility_label(&month, &format!("{label} 月"));
+            let day = ui.add(
                 egui::DragValue::new(&mut value.day)
                     .range(1..=31)
                     .suffix("日"),
             );
+            crate::ui_helpers::set_accessibility_label(&day, &format!("{label} 日"));
         });
     });
     value.sanitize();
@@ -1239,20 +1242,25 @@ pub(crate) fn draw_facet_size_value_row(
     let mut enabled = value.is_some();
     let mut current = value.unwrap_or(default);
     ui.horizontal(|ui| {
-        ui.checkbox(&mut enabled, label);
+        let label_response = ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
             ui.add(
                 egui::DragValue::new(&mut current.value)
                     .range(0..=u32::MAX)
                     .speed(1),
-            );
-            egui::ComboBox::from_id_salt(("facet_size_unit", id))
+            )
+            .labelled_by(label_response.id);
+            let unit = egui::ComboBox::from_id_salt(("facet_size_unit", id))
                 .selected_text(current.unit.label())
                 .show_ui(ui, |ui| {
                     for unit in FacetSizeUnit::ALL {
                         ui.selectable_value(&mut current.unit, unit, unit.label());
                     }
                 });
+            crate::ui_helpers::set_accessibility_label(
+                &unit.response,
+                &format!("{label} サイズ単位"),
+            );
             ui.label(relation);
         });
     });
@@ -1839,12 +1847,14 @@ fn grid_sort_combo<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
     toolbar_combo_slot(ui, enabled, 100.0, text, |ui, text| {
-        egui::ComboBox::from_id_salt(id_salt)
+        let combo = egui::ComboBox::from_id_salt(id_salt)
             .width(100.0)
             .height(height)
             .popup_style(sort_combo_popup_style())
             .selected_text(text)
-            .show_ui(ui, add)
+            .show_ui(ui, add);
+        crate::ui_helpers::set_accessibility_label(&combo.response, "ソート:");
+        combo
     })
 }
 
@@ -2027,6 +2037,7 @@ fn draw_collection_toolbar_controls(
                 }
             })
     });
+    crate::ui_helpers::set_accessibility_label(&combo.response, "コレクション");
     result.popup_open = egui::ComboBox::is_open(ctx, combo.response.id);
 
     let target_name = target_id.and_then(|target| {
@@ -8795,13 +8806,14 @@ impl App {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("新しい本");
+                    let name_label = ui.label("新しい本");
                     crate::ime_focus::add_singleline(
                         ui,
                         &mut self.book_manager_new_name,
                         None,
                         |edit| edit,
-                    );
+                    )
+                    .labelled_by(name_label.id);
                     let name = crate::books::normalize_book_name(&self.book_manager_new_name);
                     let can_create = !name.trim().is_empty() && self.book_op_pending.is_none();
                     if ui
@@ -8879,7 +8891,7 @@ impl App {
                                             .book_manager_rename_inputs
                                             .entry(row.name.clone())
                                             .or_insert_with(|| row.name.clone());
-                                        crate::ime_focus::add_singleline(
+                                        let name_response = crate::ime_focus::add_singleline(
                                             ui,
                                             input,
                                             None,
@@ -8914,13 +8926,13 @@ impl App {
                                                 {
                                                     set_active_request = Some(row.name.clone());
                                                 }
-                                                if ui
+                                                let rename_response = ui
                                                     .add_enabled(
                                                         can_rename,
                                                         egui::Button::new("名前変更"),
-                                                    )
-                                                    .clicked()
-                                                {
+                                                    );
+                                                name_response.clone().labelled_by(rename_response.id);
+                                                if rename_response.clicked() {
                                                     rename_request =
                                                         Some((row.name.clone(), new_name.clone()));
                                                 }
@@ -9431,6 +9443,7 @@ impl App {
                                 );
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&combo.response, "移動先の本");
                     if egui::ComboBox::is_open(ctx, combo.response.id) {
                         transfer_combo_open = true;
                         consume_wheel_input(ctx);
@@ -10520,6 +10533,7 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                             }
                         })
 });
+                    crate::ui_helpers::set_accessibility_label(&combo.response, "本棚:");
                     toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                     let add_resp = ui
                         .add_enabled(has_book_add_target, egui::Button::new("追加"))
@@ -10681,6 +10695,7 @@ egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                     }
                                 })
 });
+                            crate::ui_helpers::set_accessibility_label(&combo.response, "列:");
                             toolbar_combo_popup_open |=
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
@@ -10784,6 +10799,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     }
                                 })
 });
+                            crate::ui_helpers::set_accessibility_label(&combo.response, "比率:");
                             toolbar_combo_popup_open |=
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
@@ -10958,6 +10974,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
                             })
 });
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "ソート:");
                         toolbar_combo_popup_open |=
                             egui::ComboBox::is_open(ctx, combo.response.id);
                     }
@@ -11154,6 +11171,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 },
                             )
                             .inner;
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "お気に入り:");
                         toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                     } else if show_inline {
                         for fav in &self.settings.favorites {
@@ -11230,6 +11248,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 },
                             )
                             .inner;
+                        crate::ui_helpers::set_accessibility_label(&combo.response, "スマートフォルダ:");
                         toolbar_combo_popup_open |=
                             egui::ComboBox::is_open(ctx, combo.response.id);
                     } else if show_inline {
@@ -11325,6 +11344,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     },
                                 )
                                 .inner;
+                            crate::ui_helpers::set_accessibility_label(&combo.response, "タグ:");
                             toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                             if let Some(p) = new_pick {
                                 self.toolbar_tag_dropdown_pick = Some(p);
@@ -12599,7 +12619,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.draw_facet_filter_bar_settings_menu(ui);
                 });
                 if self.items_are_reading_history_view {
-                    egui::ComboBox::from_id_salt("reading_history_grid_media_filter")
+                    let named_combo = egui::ComboBox::from_id_salt("reading_history_grid_media_filter")
                         .selected_text(format!(
                             "閲覧履歴種別: {}",
                             self.reading_history_media_filter.label()
@@ -12615,12 +12635,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .changed();
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "閲覧履歴種別");
                     if matches!(
                         self.reading_history_media_filter,
                         crate::bookmark_browser::MediaFilter::All
                             | crate::bookmark_browser::MediaFilter::Book
                     ) {
-                        egui::ComboBox::from_id_salt("reading_history_grid_book_kind_filter")
+                        let named_combo = egui::ComboBox::from_id_salt("reading_history_grid_book_kind_filter")
                             .selected_text(format!(
                                 "本: {}",
                                 self.reading_history_book_kind_filter.label()
@@ -12636,11 +12657,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         .changed();
                                 }
                             });
+                        crate::ui_helpers::set_accessibility_label(&named_combo.response, "本");
                     }
                     ui.separator();
                 }
                 if self.items_are_bookmark_view {
-                    egui::ComboBox::from_id_salt("bookmark_grid_media_filter")
+                    let named_combo = egui::ComboBox::from_id_salt("bookmark_grid_media_filter")
                         .selected_text(format!(
                             "ブックマーク種別: {}",
                             self.bookmark_media_filter.label()
@@ -12656,12 +12678,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .changed();
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "ブックマーク種別");
                     if matches!(
                         self.bookmark_media_filter,
                         crate::bookmark_browser::MediaFilter::All
                             | crate::bookmark_browser::MediaFilter::Book
                     ) {
-                        egui::ComboBox::from_id_salt("bookmark_grid_book_kind_filter")
+                        let named_combo = egui::ComboBox::from_id_salt("bookmark_grid_book_kind_filter")
                             .selected_text(format!(
                                 "本: {}",
                                 self.bookmark_book_kind_filter.label()
@@ -12677,6 +12700,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         .changed();
                                 }
                             });
+                        crate::ui_helpers::set_accessibility_label(&named_combo.response, "本");
                     }
                     ui.separator();
                 }
@@ -13600,7 +13624,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             self.settings.facet_filter.date_preset,
                             Some(FacetDatePreset::CustomDays(_))
                         );
-                        if ui.selectable_label(selected, "日数を指定").clicked() {
+                        let days_label = ui.selectable_label(selected, "日数を指定");
+                        if days_label.clicked() {
                             self.active_facet_filter_mut().date_preset =
                                 Some(FacetDatePreset::CustomDays(custom_days));
                             changed = true;
@@ -13611,6 +13636,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .range(1..=36_500)
                                     .suffix(" 日以内"),
                             )
+                            .labelled_by(days_label.id)
                             .changed()
                         {
                             self.active_facet_filter_mut().date_preset =
@@ -14034,14 +14060,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.horizontal(|ui| {
                     let r_response =
                         ui.add(egui::DragValue::new(&mut r).range(0..=255).prefix("R "));
+                    crate::ui_helpers::set_accessibility_label(&r_response, "RGB R");
                     self.color_filter.input_has_focus |= r_response.has_focus();
                     input_changed |= r_response.changed();
                     let g_response =
                         ui.add(egui::DragValue::new(&mut g).range(0..=255).prefix("G "));
+                    crate::ui_helpers::set_accessibility_label(&g_response, "RGB G");
                     self.color_filter.input_has_focus |= g_response.has_focus();
                     input_changed |= g_response.changed();
                     let b_response =
                         ui.add(egui::DragValue::new(&mut b).range(0..=255).prefix("B "));
+                    crate::ui_helpers::set_accessibility_label(&b_response, "RGB B");
                     self.color_filter.input_has_focus |= b_response.has_focus();
                     input_changed |= b_response.changed();
                 });
@@ -14058,14 +14087,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.horizontal(|ui| {
                     let h_response =
                         ui.add(egui::DragValue::new(&mut h).range(0..=360).prefix("H "));
+                    crate::ui_helpers::set_accessibility_label(&h_response, "HSL H");
                     self.color_filter.input_has_focus |= h_response.has_focus();
                     input_changed |= h_response.changed();
                     let s_response =
                         ui.add(egui::DragValue::new(&mut s).range(0..=100).prefix("S "));
+                    crate::ui_helpers::set_accessibility_label(&s_response, "HSL S");
                     self.color_filter.input_has_focus |= s_response.has_focus();
                     input_changed |= s_response.changed();
                     let l_response =
                         ui.add(egui::DragValue::new(&mut l).range(0..=100).prefix("L "));
+                    crate::ui_helpers::set_accessibility_label(&l_response, "HSL L");
                     self.color_filter.input_has_focus |= l_response.has_focus();
                     input_changed |= l_response.changed();
                 });
@@ -15414,6 +15446,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             );
                                             output.response
                                         };
+                                        crate::ui_helpers::set_accessibility_label(
+                                            &resp,
+                                            "フォルダ:",
+                                        );
                                         self.address_has_focus = resp.has_focus();
                                         if !is_snap_active && resp.lost_focus() && enter_pressed {
                                             let address_text = self.address.trim();
@@ -15619,16 +15655,20 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // して「ファイル名」を表示する (メタ系を選んでも無反応な
                     // 分かりにくさを防ぐ)。
                     ui.add_enabled_ui(false, |ui| {
-                        egui::ComboBox::from_id_salt("ctrl_f_search_target")
+                        let named_combo = egui::ComboBox::from_id_salt("ctrl_f_search_target")
                             .selected_text("ファイル名")
                             .width(160.0)
                             .show_ui(ui, |_ui| {});
+                        crate::ui_helpers::set_accessibility_label(
+                            &named_combo.response,
+                            "検索対象",
+                        );
                     });
                 } else {
                     let current =
                         crate::global_search_ui::TargetChoice::from_target(&self.search_target);
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("ctrl_f_search_target")
+                    let named_combo = egui::ComboBox::from_id_salt("ctrl_f_search_target")
                         .selected_text(current.label())
                         .width(160.0)
                         .show_ui(ui, |ui| {
@@ -15636,6 +15676,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, choice, choice.label());
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "検索対象");
                     if next != current {
                         self.search_target = next.to_target();
                         // クエリが空でなければ即再検索
@@ -15804,7 +15845,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("favsearch_fav")
+                    let named_combo = egui::ComboBox::from_id_salt("favsearch_fav")
                         .selected_text(label_for(current))
                         .width(140.0)
                         .show_ui(ui, |ui| {
@@ -15816,6 +15857,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, Some(fav.id), &fav.name);
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "お気に入り");
                     if next != current {
                         self.favsearch.favorite_filter = next;
                         // ドロップダウン変更は即再実行。クエリが空なら execute_favsearch が早期 return する。
@@ -15840,7 +15882,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("favsearch_kind")
+                    let named_combo = egui::ComboBox::from_id_salt("favsearch_kind")
                         .selected_text(label_for(current))
                         .width(110.0)
                         .show_ui(ui, |ui| {
@@ -15853,6 +15895,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, choice, label_for(choice));
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "種別");
                     if next != current {
                         self.favsearch.kind_filter = next;
                         query_changed = true;
@@ -15966,7 +16009,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 {
                     let current = self.tag_view.kind_filter;
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("tag_view_kind")
+                    let named_combo = egui::ComboBox::from_id_salt("tag_view_kind")
                         .selected_text(current.label())
                         .width(140.0)
                         .show_ui(ui, |ui| {
@@ -15974,6 +16017,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.selectable_value(&mut next, choice, choice.label());
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "種類");
                     if next != current {
                         self.tag_view.kind_filter = next;
                         self.tag_view.last_executed.clear();

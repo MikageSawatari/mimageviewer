@@ -45,7 +45,7 @@ impl App {
                             .weak(),
                     );
                     ui.add_space(8.0);
-                    ui.label("表示名 (ツールバーやメニューに表示される名前):");
+                    let field_label = ui.label("表示名 (ツールバーやメニューに表示される名前):");
                     ui.add_space(2.0);
 
                     let resp = crate::ime_focus::add_singleline(
@@ -53,7 +53,8 @@ impl App {
                         &mut self.fav_add_name_input,
                         None,
                         |edit| edit.desired_width(f32::INFINITY),
-                    );
+                    )
+                    .labelled_by(field_label.id);
                     // 初回フォーカス
                     if !resp.has_focus()
                         && ctx.input(|i| i.focused)

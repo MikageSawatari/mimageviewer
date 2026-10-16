@@ -60,7 +60,7 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, settings: &mut Settings) {
             for category in DetailsNameCategory::ALL {
                 ui.push_id(category.index(), |ui| {
                     ui.vertical(|ui| {
-                        ui.strong(category.label());
+                        let category_label = ui.strong(category.label());
                         let choice = &mut settings.details_name_colors.colors[category.index()];
                         let mut custom = matches!(choice, DetailsNameColor::Custom { .. });
                         let before = custom;
@@ -71,7 +71,9 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, settings: &mut Settings) {
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut custom, false, "既定");
                                     ui.selectable_value(&mut custom, true, "カスタム");
-                                });
+                                })
+                                .response
+                                .labelled_by(category_label.id);
                         });
                         if custom != before {
                             clear_hex_editor(ui.ctx());
@@ -202,7 +204,9 @@ pub(super) fn hex_input_ready(ctx: &egui::Context) -> bool {
 
 fn draw_rgb_editor(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> egui::Response {
     ui.horizontal_wrapped(|ui| {
-        if ui.color_edit_button_srgb(rgb).changed() {
+        let color_response = ui.color_edit_button_srgb(rgb);
+        crate::ui_helpers::set_accessibility_label(&color_response, "色");
+        if color_response.changed() {
             clear_hex_editor(ui.ctx());
         }
         let widget_id = ui.make_persistent_id("rgb_hex");
@@ -215,7 +219,8 @@ fn draw_rgb_editor(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> egui::Response {
             edit.id(widget_id)
                 .desired_width(76.0)
                 .font(egui::TextStyle::Monospace)
-        });
+        })
+        .labelled_by(color_response.id);
         if response.changed()
             && !crate::ime_focus::ime_composing_with_pending_events(
                 ui.ctx(),

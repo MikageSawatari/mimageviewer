@@ -4338,7 +4338,7 @@ impl App {
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("global_search_fav")
+                    let named_combo = egui::ComboBox::from_id_salt("global_search_fav")
                         .selected_text(label_for(current))
                         .width(160.0)
                         .height(combo_popup_height)
@@ -4351,6 +4351,7 @@ impl App {
                                 ui.selectable_value(&mut next, Some(fav.id), &fav.name);
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "お気に入り");
                     if next != current {
                         self.global_search.filters.favorite = next;
                         filter_changed = true;
@@ -4367,7 +4368,7 @@ impl App {
                         }
                     };
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("global_search_kind")
+                    let named_combo = egui::ComboBox::from_id_salt("global_search_kind")
                         .selected_text(label_for(current))
                         .width(140.0)
                         .height(combo_popup_height)
@@ -4376,6 +4377,7 @@ impl App {
                                 ui.selectable_value(&mut next, choice, label_for(choice));
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "種類");
                     if next != current {
                         self.global_search.filters.kind = next;
                         filter_changed = true;
@@ -4386,7 +4388,7 @@ impl App {
                 {
                     let current = TargetChoice::from_target(&self.global_search.filters.target);
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("global_search_target")
+                    let named_combo = egui::ComboBox::from_id_salt("global_search_target")
                         .selected_text(current.label())
                         .width(160.0)
                         .height(combo_popup_height)
@@ -4395,6 +4397,7 @@ impl App {
                                 ui.selectable_value(&mut next, choice, choice.label());
                             }
                         });
+                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "検索対象");
                     if next != current {
                         self.global_search.filters.target = next.to_target();
                         filter_changed = true;

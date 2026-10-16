@@ -3973,7 +3973,7 @@ fn draw_operation_context_filter(ui: &mut egui::Ui, state: &mut PreferencesState
     ];
 
     ui.horizontal(|ui| {
-        ui.label("場所:");
+        let field_label = ui.label("場所:");
         let selected = operation_keyboard_context_filter_label(state.operation_keyboard_context);
         egui::ComboBox::from_id_salt("operation_context_filter")
             .selected_text(selected)
@@ -3990,7 +3990,9 @@ fn draw_operation_context_filter(ui: &mut egui::Ui, state: &mut PreferencesState
                         state.command_edit_notice = None;
                     }
                 }
-            });
+            })
+            .response
+            .labelled_by(field_label.id);
     });
 }
 

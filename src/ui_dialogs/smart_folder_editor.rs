@@ -497,13 +497,14 @@ impl App {
                 );
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("名前に含む:");
+                    let field_label = ui.label("名前に含む:");
                     crate::ime_focus::add_singleline(
                         ui,
                         &mut draft.filter.name_contains,
                         None,
                         |edit| edit.desired_width(320.0),
-                    );
+                    )
+                    .labelled_by(field_label.id);
                     ui.label(egui::RichText::new("（任意）").weak());
                 });
                 ui.label(egui::RichText::new("保存する条件").strong());
@@ -706,13 +707,13 @@ impl App {
                         ui.set_max_size(right_size);
                         if let Some(definition) = draft.as_mut() {
                             ui.horizontal(|ui| {
-                                ui.label("名前:");
+                                let field_label = ui.label("名前:");
                                 if crate::ime_focus::add_singleline(
                                     ui,
                                     &mut definition.name,
                                     None,
                                     |edit| edit,
-                                )
+                                ).labelled_by(field_label.id)
                                 .lost_focus()
                                 {
                                     normalize_definition_text = true;
@@ -736,7 +737,7 @@ impl App {
                                 ui.colored_label(ui.visuals().error_fg_color, error);
                             }
                             ui.add_space(4.0);
-                            ui.label(egui::RichText::new("並び方").strong());
+                            let field_label = ui.label(egui::RichText::new("並び方").strong());
                             ui.horizontal_wrapped(|ui| {
                                 egui::ComboBox::from_id_salt("smart_folder_grouping")
                                     .selected_text(definition.grouping.label())
@@ -748,7 +749,7 @@ impl App {
                                                 grouping.label(),
                                             );
                                         }
-                                    });
+                                    }).response.labelled_by(field_label.id);
                                 ui.label(
                                     egui::RichText::new(
                                         "表示形式とソート順は現在の一覧設定を使います",
@@ -806,13 +807,13 @@ impl App {
                                                 "サブフォルダを含む",
                                             );
                                             ui.horizontal(|ui| {
-                                                ui.label("名前に含む:");
+                                                let field_label = ui.label("名前に含む:");
                                                 if crate::ime_focus::add_singleline(
                                                     ui,
                                                     &mut rule.filter.name_contains,
                                                     None,
                                                     |edit| edit.desired_width(240.0),
-                                                )
+                                                ).labelled_by(field_label.id)
                                                     .lost_focus()
                                                 {
                                                     normalize_definition_text = true;

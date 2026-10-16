@@ -752,7 +752,7 @@ impl App {
                                         .on_hover_text(
                                             "操作カスタマイズの「お気に入り1を開く」などで使う順番です。",
                                         );
-                                    ui.label(egui::RichText::new("表示名").strong());
+                                    let name_label = ui.label(egui::RichText::new("表示名").strong());
                                     ui.label(egui::RichText::new("パス").strong());
                                     ui.label(
                                         egui::RichText::new("標準設定を分ける").strong(),
@@ -810,7 +810,7 @@ impl App {
                                             &mut self.settings.favorites[i].name,
                                             None,
                                             |edit| edit,
-                                        );
+                                        ).labelled_by(name_label.id);
                                         if name_resp.changed() {
                                             any_setting_dirty = true;
                                         }

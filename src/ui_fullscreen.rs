@@ -48187,7 +48187,7 @@ impl App {
                         );
 
                         child_ui.horizontal(|ui| {
-                            ui.label(
+                            let label = ui.label(
                                 egui::RichText::new("ページ送り")
                                     .color(egui::Color32::from_gray(210)),
                             );
@@ -48195,7 +48195,8 @@ impl App {
                                 egui::Slider::new(slideshow_interval, 0.5..=30.0)
                                     .suffix(" 秒")
                                     .fixed_decimals(1),
-                            );
+                            )
+                            .labelled_by(label.id);
                         });
 
                         child_ui.add_space(2.0);
@@ -48205,17 +48206,18 @@ impl App {
                                 .color(egui::Color32::from_gray(150)),
                         );
                         child_ui.horizontal(|ui| {
-                            ui.label(
+                            let label = ui.label(
                                 egui::RichText::new("待機").color(egui::Color32::from_gray(210)),
                             );
                             ui.add(
                                 egui::Slider::new(slideshow_continuous_wait_secs, 0.1..=30.0)
                                     .suffix(" 秒")
                                     .fixed_decimals(1),
-                            );
+                            )
+                            .labelled_by(label.id);
                         });
                         child_ui.horizontal(|ui| {
-                            ui.label(
+                            let label = ui.label(
                                 egui::RichText::new("移動時間")
                                     .color(egui::Color32::from_gray(210)),
                             );
@@ -48223,16 +48225,18 @@ impl App {
                                 egui::Slider::new(slideshow_continuous_scroll_secs, 0.0..=5.0)
                                     .suffix(" 秒")
                                     .fixed_decimals(1),
-                            );
+                            )
+                            .labelled_by(label.id);
                         });
                         child_ui.horizontal(|ui| {
-                            ui.label(
+                            let label = ui.label(
                                 egui::RichText::new("移動量").color(egui::Color32::from_gray(210)),
                             );
                             ui.add(
                                 egui::Slider::new(slideshow_continuous_scroll_percent, 1..=100)
                                     .suffix(" %"),
-                            );
+                            )
+                            .labelled_by(label.id);
                         });
 
                         child_ui.add_space(2.0);
@@ -53052,6 +53056,7 @@ impl App {
                                 )
                                 .suffix("px"),
                         );
+                        crate::ui_helpers::set_accessibility_label(&resp, "長辺指定");
                         if resp.changed() {
                             state.scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
                         }

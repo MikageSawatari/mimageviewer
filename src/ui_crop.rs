@@ -365,13 +365,14 @@ impl App {
         let mut aspect_mode = current
             .map(|settings| settings.aspect_mode)
             .unwrap_or(self.export_crop_aspect_mode);
-        egui::ComboBox::from_id_salt("export_crop_aspect")
+        let aspect_response = egui::ComboBox::from_id_salt("export_crop_aspect")
             .selected_text(aspect_mode.label())
             .show_ui(ui, |ui| {
                 for mode in CropAspectMode::ALL {
                     ui.selectable_value(&mut aspect_mode, mode, mode.label());
                 }
             });
+        crate::ui_helpers::set_accessibility_label(&aspect_response.response, "切り取りの縦横比");
         if aspect_mode != self.export_crop_aspect_mode
             || current.is_some_and(|settings| settings.aspect_mode != aspect_mode)
         {
@@ -445,16 +446,20 @@ impl App {
         let mut h = settings.rect.height().round() as i32;
         let before = (x, y, w, h);
         ui.horizontal(|ui| {
-            ui.label("X");
-            ui.add(egui::DragValue::new(&mut x).range(0..=image_size[0].saturating_sub(1) as i32));
-            ui.label("Y");
-            ui.add(egui::DragValue::new(&mut y).range(0..=image_size[1].saturating_sub(1) as i32));
+            let label = ui.label("X");
+            ui.add(egui::DragValue::new(&mut x).range(0..=image_size[0].saturating_sub(1) as i32))
+                .labelled_by(label.id);
+            let label = ui.label("Y");
+            ui.add(egui::DragValue::new(&mut y).range(0..=image_size[1].saturating_sub(1) as i32))
+                .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("W");
-            ui.add(egui::DragValue::new(&mut w).range(1..=image_size[0].max(1) as i32));
-            ui.label("H");
-            ui.add(egui::DragValue::new(&mut h).range(1..=image_size[1].max(1) as i32));
+            let label = ui.label("W");
+            ui.add(egui::DragValue::new(&mut w).range(1..=image_size[0].max(1) as i32))
+                .labelled_by(label.id);
+            let label = ui.label("H");
+            ui.add(egui::DragValue::new(&mut h).range(1..=image_size[1].max(1) as i32))
+                .labelled_by(label.id);
         });
         if (x, y, w, h) != before {
             let rect = crate::export_crop::crop_from_xywh_inputs(

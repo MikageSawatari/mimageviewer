@@ -1013,6 +1013,7 @@ pub(crate) fn hover_tip_disabled_observed(
     text: &'static str,
     on_render: impl FnOnce(&egui::Ui, &egui::Response, &'static str),
 ) -> egui::Response {
+    set_tooltip_accessibility_label(&response, text);
     let anchor = anchor_for(&response);
     show_offset_tooltip_with_observer(
         &response.ctx,
@@ -1040,8 +1041,37 @@ pub(crate) trait HoverTipExt {
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self;
 }
 
+/// Supply a spoken name without replacing the widget's role, value or state.
+/// Like egui 0.37's `Response::accessible_name`, this changes only the label.
+/// A DragValue's meaning is named separately from its numeric value.
+/// Both versions expose this API; no visible text is added.
+pub(crate) fn set_accessibility_label(response: &egui::Response, label: &str) {
+    if !label.trim().is_empty() {
+        response.ctx.accesskit_node_builder(response.id, |node| {
+            node.set_label(label);
+        });
+    }
+}
+
+/// Match 0.37's hover-text fallback while preserving explicit names/relations.
+fn set_tooltip_accessibility_label(response: &egui::Response, label: &str) {
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        if !matches!(
+            node.role(),
+            egui::accesskit::Role::Unknown | egui::accesskit::Role::Label
+        ) && node.labelled_by().is_empty()
+            && node.label().is_none_or(str::is_empty)
+            && !label.trim().is_empty()
+        {
+            node.set_label(label);
+        }
+    });
+}
+
 impl HoverTipExt for egui::Response {
     fn hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
+        let text = text.into();
+        set_tooltip_accessibility_label(&self, text.text());
         let anchor = anchor_for(&self);
         show_offset_tooltip(
             &self.ctx,
@@ -1054,6 +1084,8 @@ impl HoverTipExt for egui::Response {
     }
 
     fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
+        let text = text.into();
+        set_tooltip_accessibility_label(&self, text.text());
         let anchor = anchor_for(&self);
         // The fullscreen bar contains many buttons. Avoid cloning a complete dark Style for
         // every button on every frame when no tooltip can be shown.
@@ -1070,6 +1102,8 @@ impl HoverTipExt for egui::Response {
     }
 
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self {
+        let text = text.into();
+        set_tooltip_accessibility_label(&self, text.text());
         let anchor = anchor_for(&self);
         show_offset_tooltip(
             &self.ctx,
@@ -1079,6 +1113,84 @@ impl HoverTipExt for egui::Response {
             text,
         );
         self
+    }
+}
+
+#[cfg(test)]
+mod accessibility_names_tests {
+    use super::*;
+
+    #[test]
+    fn tooltip_names_are_available_without_hover_and_preserve_widget_metadata() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut slider_value = 0.25;
+        let mut ids = Vec::new();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ids.clear();
+                ids.push(ui.button("").hover_tip("通常の操作").id);
+                ids.push(ui.button("").hover_tip_dark("暗色の操作").id);
+                ids.push(
+                    ui.add_enabled(false, egui::Button::new(""))
+                        .hover_tip_disabled("無効な操作")
+                        .id,
+                );
+                ids.push(
+                    ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0))
+                        .hover_tip("適用量")
+                        .id,
+                );
+                ids.push(ui.button("既存の名前").hover_tip("補足説明").id);
+                let label = ui.label("既存ラベル");
+                let response = ui.button("").labelled_by(label.id).hover_tip("別の説明");
+                ids.push(response.id);
+                ids.push(label.id);
+                let mut days = 7;
+                let drag = ui.add(egui::DragValue::new(&mut days).range(1..=30));
+                set_accessibility_label(&drag, "日数");
+                ids.push(drag.id);
+                let mut checked = true;
+                let checkbox = ui.checkbox(&mut checked, "");
+                set_accessibility_label(&checkbox, "対象");
+                ids.push(checkbox.id);
+            });
+        });
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let node = |index: usize| {
+            &nodes
+                .iter()
+                .find(|(id, _)| id.0 == ids[index].value())
+                .unwrap()
+                .1
+        };
+        for (index, name) in [
+            "通常の操作",
+            "暗色の操作",
+            "無効な操作",
+            "適用量",
+            "既存の名前",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(node(index).label(), Some(name));
+        }
+        assert!(node(2).is_disabled());
+        assert_eq!(node(3).role(), egui::accesskit::Role::Slider);
+        assert_eq!(node(3).numeric_value(), Some(0.25));
+        assert_eq!(node(3).min_numeric_value(), Some(0.0));
+        assert_eq!(node(3).max_numeric_value(), Some(1.0));
+        assert_eq!(
+            node(5).labelled_by(),
+            &[egui::accesskit::NodeId(ids[6].value())]
+        );
+        assert!(node(5).label().is_none_or(str::is_empty));
+        assert_eq!(node(7).label(), Some("日数"));
+        assert_eq!(node(7).role(), egui::accesskit::Role::SpinButton);
+        assert_eq!(node(7).numeric_value(), Some(7.0));
+        assert_eq!(node(8).label(), Some("対象"));
+        assert_eq!(node(8).toggled(), Some(egui::accesskit::Toggled::True));
     }
 }
 

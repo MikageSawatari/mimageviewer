@@ -3847,7 +3847,12 @@ fn draw_local_adjust_layer_list(
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.set_min_width(42.0);
                         let mut enabled = layer.enabled;
-                        if ui.checkbox(&mut enabled, "").changed() {
+                        let enabled_response = ui.checkbox(&mut enabled, "");
+                        crate::ui_helpers::set_accessibility_label(
+                            &enabled_response,
+                            layer.effect.display_label(),
+                        );
+                        if enabled_response.changed() {
                             *set_enabled = Some((idx, enabled));
                         }
                         ui.horizontal(|ui| {
@@ -9452,6 +9457,7 @@ macro_rules! slider_with_reset {
         } else {
             $ui.add(slider)
         };
+        crate::ui_helpers::set_accessibility_label(&r, $label);
         if r.changed() {
             $changed = true;
         }
@@ -9486,6 +9492,7 @@ macro_rules! slider_log_with_reset {
         } else {
             $ui.add(slider)
         };
+        crate::ui_helpers::set_accessibility_label(&r, $label);
         if r.changed() {
             $changed = true;
         }
@@ -9694,6 +9701,7 @@ fn draw_colorize_settings(
             });
             let mut tolerance = params.colorize.mono_tolerance as f32;
             let response = ui.add(egui::Slider::new(&mut tolerance, 1.0..=64.0).step_by(1.0));
+            crate::ui_helpers::set_accessibility_label(&response, "色味の許容量");
             if response.changed() {
                 params.colorize.mono_tolerance = tolerance as u8;
                 changed = true;
@@ -9775,12 +9783,13 @@ fn draw_colorize_settings(
                     if ui.color_edit_button_srgb(&mut point.color).changed() {
                         changed = true;
                     }
-                    ui.label("強さ");
+                    let strength_label = ui.label("強さ");
                     let response = ui.add(
                         egui::DragValue::new(&mut point.strength)
                             .range(0.0..=10.0)
                             .speed(0.05),
                     );
+                    let response = response.labelled_by(strength_label.id);
                     if response.changed() {
                         changed = true;
                     }
@@ -9853,6 +9862,7 @@ fn draw_colorize_settings(
                 .step_by(1.0)
                 .suffix("%"),
         );
+        crate::ui_helpers::set_accessibility_label(&response, "元画像の明るさを保持");
         if response.changed() {
             params.colorize.luminance_weight = luminance_weight as u8;
             changed = true;
@@ -9928,6 +9938,7 @@ fn draw_colorize_settings(
                     .step_by(1.0)
                     .suffix("%"),
             );
+            crate::ui_helpers::set_accessibility_label(&response, "変換の強さ");
             if response.changed() {
                 params.colorize.tone_strength = strength as u8;
                 changed = true;
@@ -10117,6 +10128,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "黒点");
             if r.changed() {
                 params.black_point = bp as u8;
                 changed = true;
@@ -10151,6 +10163,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "白点");
             if r.changed() {
                 params.white_point = wp as u8;
                 changed = true;
@@ -10185,6 +10198,7 @@ fn draw_sliders(
             } else {
                 ui.add(slider)
             };
+            crate::ui_helpers::set_accessibility_label(&r, "中間点");
             if r.changed() {
                 changed = true;
             }
@@ -10346,6 +10360,7 @@ fn draw_sliders(
                 );
             }
             let r = ui.add(egui::Slider::new(&mut strength, 0.0..=100.0).step_by(1.0));
+            crate::ui_helpers::set_accessibility_label(&r, "シャープ化");
             if r.changed() {
                 params.smart_sharpen = strength as u8;
                 changed = true;
@@ -10396,6 +10411,7 @@ fn draw_sliders(
                             .map(|value| value / 100.0)
                     }),
             );
+            crate::ui_helpers::set_accessibility_label(&response, "適用量");
             changed |= response.changed();
             dragging |= response.dragged();
 
@@ -10729,7 +10745,7 @@ fn draw_image_creative_lut_combo(
             }
         });
     let before = *selected_id;
-    egui::ComboBox::from_id_salt("image_creative_lut")
+    let response = egui::ComboBox::from_id_salt("image_creative_lut")
         .selected_text(selected_name)
         .width(ui.available_width().max(120.0))
         .height(420.0)
@@ -10751,6 +10767,7 @@ fn draw_image_creative_lut_combo(
                     .on_hover_text(hover);
             }
         });
+    crate::ui_helpers::set_accessibility_label(&response.response, "Creative LUT");
     *selected_id != before
 }
 

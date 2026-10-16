@@ -4123,8 +4123,6 @@ dependencies = [
  "uuid",
  "webp",
  "wgpu",
- "wgpu-hal",
- "windows 0.58.0",
  "windows 0.61.3",
  "windows-core 0.61.2",
  "windows-dpapi",

@@ -74,7 +74,7 @@ impl App {
                                 ui.label(egui::RichText::new("番号").strong()).on_hover_text(
                                     "ピン留めタグ1〜20のコマンドで使う順番です。ピン留めしていないタグは番号なしです。",
                                 );
-                                ui.label(egui::RichText::new("タグ名").strong());
+                                let name_label = ui.label(egui::RichText::new("タグ名").strong());
                                 ui.label(egui::RichText::new("プレビュー").strong());
                                 ui.label(egui::RichText::new("表示").strong());
                                 ui.label(egui::RichText::new("操作").strong());
@@ -99,7 +99,7 @@ impl App {
                                         &mut self.tag_editor_draft[i].name,
                                         None,
                                         |edit| edit,
-                                    );
+                                    ).labelled_by(name_label.id);
                                     // Enter で次行 or 追加行作成 (未実装、v1.1 検討)
                                     let _ = resp;
 

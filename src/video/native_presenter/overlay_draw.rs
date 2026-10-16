@@ -729,7 +729,7 @@ fn draw_native_video_adjustment_body(
                     );
                 }
                 NativeVideoAdjustmentTab::Filter => {
-                    ui.label(egui::RichText::new("動画の拡大方法").strong());
+                    let filter_label = ui.label(egui::RichText::new("動画の拡大方法").strong());
                     let previous_filter = *scale_filter;
                     egui::ComboBox::from_id_salt("native_video_scale_filter")
                         .selected_text(scale_filter.label())
@@ -738,7 +738,9 @@ fn draw_native_video_adjustment_body(
                             for filter in crate::settings::VideoScaleFilter::ALL {
                                 ui.selectable_value(scale_filter, filter, filter.label());
                             }
-                        });
+                        })
+                        .response
+                        .labelled_by(filter_label.id);
                     if *scale_filter != previous_filter {
                         commands.push(NativeOverlayCommand::RequestVideoScaleSettings {
                             filter: *scale_filter,
@@ -748,7 +750,7 @@ fn draw_native_video_adjustment_body(
 
                     if *scale_filter == crate::settings::VideoScaleFilter::Anime {
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("品質の余裕").strong());
+                        let budget_label = ui.label(egui::RichText::new("品質の余裕").strong());
                         let previous_budget = *anime4k_budget;
                         egui::ComboBox::from_id_salt("native_video_anime4k_budget")
                             .selected_text(anime4k_budget.label())
@@ -757,7 +759,9 @@ fn draw_native_video_adjustment_body(
                                 for budget in crate::video::anime4k_policy::VideoAnime4kBudgetPreset::ALL {
                                     ui.selectable_value(anime4k_budget, budget, budget.label());
                                 }
-                            });
+                            })
+                            .response
+                            .labelled_by(budget_label.id);
                         if *anime4k_budget != previous_budget {
                             commands.push(NativeOverlayCommand::SetVideoAnime4kBudget {
                                 budget: *anime4k_budget,
@@ -849,7 +853,7 @@ fn draw_native_video_adjustment_body(
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Creative LUT").strong());
+                    let lut_label = ui.label(egui::RichText::new("Creative LUT").strong());
                     ui.label(
                         egui::RichText::new("環境設定 > 表示 > LUT で登録した .cube を適用")
                             .small()
@@ -887,14 +891,16 @@ fn draw_native_video_adjustment_body(
                                 )
                                 .on_hover_text(&entry.path);
                             }
-                        });
+                        })
+                        .response
+                        .labelled_by(lut_label.id);
                     if adjustments.creative_lut.id != before {
                         changed = true;
                         persist = true;
                     }
                     if let Some(id) = adjustments.creative_lut.id {
-                        ui.horizontal(|ui| {
-                            ui.label("適用量");
+                        let strength_label = ui.horizontal(|ui| {
+                            let label = ui.label("適用量");
                             if (adjustments.creative_lut.strength - 1.0).abs() > 0.001
                                 && ui.small_button("↩").clicked()
                             {
@@ -902,10 +908,12 @@ fn draw_native_video_adjustment_body(
                                 changed = true;
                                 persist = true;
                             }
-                        });
+                            label
+                        }).inner;
                         let mut percent = adjustments.creative_lut.strength * 100.0;
                         let response =
-                            ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"));
+                            ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
+                                .labelled_by(strength_label.id);
                         if response.changed() {
                             adjustments.creative_lut.strength = percent / 100.0;
                             changed = true;
@@ -990,15 +998,20 @@ fn video_grade_slider(
     changed: &mut bool,
     persist: &mut bool,
 ) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        if (*value - default).abs() > 0.001 && ui.small_button("↩").clicked() {
-            *value = default;
-            *changed = true;
-            *persist = true;
-        }
-    });
-    let response = ui.add(egui::Slider::new(value, range));
+    let label_response = ui
+        .horizontal(|ui| {
+            let label_response = ui.label(label);
+            if (*value - default).abs() > 0.001 && ui.small_button("↩").clicked() {
+                *value = default;
+                *changed = true;
+                *persist = true;
+            }
+            label_response
+        })
+        .inner;
+    let response = ui
+        .add(egui::Slider::new(value, range))
+        .labelled_by(label_response.id);
     *changed |= response.changed();
     *persist |= response.drag_stopped() || (response.changed() && !response.dragged());
 }

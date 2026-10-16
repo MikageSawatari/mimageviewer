@@ -1568,9 +1568,9 @@ pub enum VideoFrameData {
     /// `Vec<u8>` は `width * height * 4` バイト。
     Cpu(Vec<u8>),
     /// GPU 上の D3D11 NT 共有テクスチャ (GPU 経路: HW + VideoProcessorBlt → RGBA shared)。
-    /// native presenter (`crate::video::native_presenter`) が `OpenSharedHandle` で
+    /// native presenter (`crate::video::native_presenter`) が `OpenSharedResource1` で
     /// 受け取り、自分の D3D11 swap chain backbuffer に Copy/Blit して present する。
-    /// テクスチャの寿命管理は `D3d11Frame` が `Drop` で `CloseHandle` する責務を持つ。
+    /// `D3d11Frame::Drop` は slot の使用権を返し、フレーム所有の HANDLE だけを close する。
     #[cfg(windows)]
     Gpu(crate::video::gpu_renderer::D3d11Frame),
 }
@@ -4718,7 +4718,7 @@ fn run_video_decode(
             // frame.format() == AV_PIX_FMT_D3D11 かつ mIV 側で GpuVideoDevice が
             // 利用可能な場合、av_hwframe_transfer_data + swscale を **完全に
             // スキップ** して、ID3D11VideoProcessor で直接 NV12→RGBA blit する。
-            // 出力は NT 共有 ID3D11Texture2D で wgpu (egui) 側から sample される。
+            // 出力は NT 共有 ID3D11Texture2D で D3D11 native presenter へ渡される。
             #[cfg(windows)]
             if matches!(frame.format(), Pixel::D3D11) {
                 let frame_hwframes_snapshot = d3d11va_hwframes_snapshot_from_frame(&frame);
@@ -8873,9 +8873,9 @@ fn try_gpu_blit_path(
             pts_secs,
         )?
     };
-    // `output_texture` は D3D11 側の COM オブジェクト。NT shared handle 経由で
-    // D3D12 側に開いてもらう運用なので、ここで drop しても問題ない (NT カーネル
-    // オブジェクトの refcount で D3D12 側のリソースは生存)。
+    // `output_texture` は producer 側の COM 参照。pool の参照または NT shared HANDLE が
+    // 共有出力を保持するため、この参照はここで drop できる。native presenter は
+    // OpenSharedResource1 で別の COM 参照を得る。
     let _ = blit.output_texture;
     let shared_handle = blit.shared_handle;
     let fence_value = blit.fence_value;

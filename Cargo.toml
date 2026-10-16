@@ -294,13 +294,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.61"
-# wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも
-# 公開し、wgpu の hal::Api::Device 経由で得る ID3D12Resource を OpenSharedHandle
-# 経由で生成するときに使う (本体の windows 0.61 とは ID3D12Resource 型互換性なし)。
-windows_058 = { package = "windows", version = "0.58", features = [
-    "Win32_Graphics_Direct3D12",
-    "Win32_Foundation",
-] }
 windows = { version = "0.61", features = [
     "Win32_Globalization",
     "Win32_UI_Accessibility",
@@ -361,12 +354,9 @@ eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
 egui-ime = { path = "crates/egui-ime" }
 egui-wgpu = "0.33"
-# 動画 GPU レンダリングで wgpu API + dx12 hal 経由の D3D11→wgpu テクスチャ共有が
-# 必要なので、明示的に wgpu / wgpu-hal を依存させる (eframe[wgpu] が間接的に
-# 引いている版に揃える)。wgpu-hal 27 は windows 0.58 系の ID3D12Resource を要求
-# するため、そちらも `windows_058` 別名で導入する (本体側は windows 0.61)。
+# 静止画縮小・比較・パノラマと native presenter の HUD overlay に使う。
+# eframe[wgpu] / egui-wgpu が使う版に揃える。動画本体は D3D11 native presenter。
 wgpu = "27"
-wgpu-hal = { version = "27", features = ["dx12"] }
 pollster = "0.4"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 qrcode = { version = "0.14", default-features = false }

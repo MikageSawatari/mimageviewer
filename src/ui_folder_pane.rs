@@ -245,7 +245,7 @@ impl App {
                 .unwrap_or_else(|| "Drive".to_string());
             let mut next_drive = selected_drive.clone();
             let drives = self.folder_pane.drives().to_vec();
-            egui::ComboBox::from_id_salt("folder_pane_drive_combo")
+            let named_combo = egui::ComboBox::from_id_salt("folder_pane_drive_combo")
                 .width(54.0)
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
@@ -259,6 +259,7 @@ impl App {
                         }
                     }
                 });
+            crate::ui_helpers::set_accessibility_label(&named_combo.response, "Drive");
             if let Some(drive) = next_drive
                 && selected_drive
                     .as_ref()

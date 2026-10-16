@@ -1342,6 +1342,8 @@ python scripts/check_ui_glyphs.py
 
 焦点試験・旧PNG通常比較。名前だけなら画像不変を確認する。適切な区切りでtest-lib-fullを行う。
 
+実施記録: [段1aの検証台帳](egui-0.37-stage1a-verification.md)（2026-10-16）。
+
 **規模:** 12～30ファイル、180～500行。
 
 ### 段1b: 0.33.3上の挙動不変抽出

@@ -126,13 +126,17 @@ fn draw_thumb_quality_panel(
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
-            ui.label("サイズ:");
-            let response = ui.add(egui::Slider::new(size, 128..=1536).text("px"));
+            let field_label = ui.label("サイズ:");
+            let response = ui
+                .add(egui::Slider::new(size, 128..=1536).text("px"))
+                .labelled_by(field_label.id);
             action.reencode |= response.drag_stopped() || response.lost_focus();
         });
         ui.horizontal(|ui| {
-            ui.label("品質:");
-            let response = ui.add(egui::Slider::new(quality, 1..=100));
+            let field_label = ui.label("品質:");
+            let response = ui
+                .add(egui::Slider::new(quality, 1..=100))
+                .labelled_by(field_label.id);
             action.reencode |= response.drag_stopped() || response.lost_focus();
         });
         ui.add_space(4.0);

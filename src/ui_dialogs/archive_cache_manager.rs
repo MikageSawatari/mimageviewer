@@ -570,7 +570,8 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
 
                 for (idx, entry) in rows.iter().enumerate() {
                     let mut selected = app.archive_cache_selection.contains(&idx);
-                    if ui.checkbox(&mut selected, "").changed() {
+                    let selected_response = ui.checkbox(&mut selected, "");
+                    if selected_response.changed() {
                         if selected {
                             app.archive_cache_selection.insert(idx);
                         } else {
@@ -590,7 +591,7 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
                         egui::RichText::new(format!("✗ {}", truncate_name(&name, 40)))
                             .color(ui.visuals().error_fg_color)
                     };
-                    ui.label(label).on_hover_text(path_text);
+                    selected_response.labelled_by(ui.label(label).on_hover_text(path_text).id);
                     let format_resp = ui.label(format_display_text(entry));
                     if let Some(hover) = format_hover_text(entry) {
                         format_resp.on_hover_text(hover);

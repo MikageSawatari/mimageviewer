@@ -93,12 +93,14 @@ impl App {
                     // ── 古いキャッシュの削除 ──────────────────────
                     ui.horizontal(|ui| {
                         let mut days_str = self.cache_manager_days.to_string();
-                        ui.label("最終更新から");
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut days_str)
-                                .desired_width(48.0)
-                                .horizontal_align(egui::Align::Center),
-                        );
+                        let field_label = ui.label("最終更新から");
+                        let resp = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut days_str)
+                                    .desired_width(48.0)
+                                    .horizontal_align(egui::Align::Center),
+                            )
+                            .labelled_by(field_label.id);
                         if resp.changed() {
                             if let Ok(v) = days_str.parse::<u32>() {
                                 if v > 0 {

@@ -14,17 +14,20 @@ impl LabHoverTipExt for egui::Response {
 fn lab_combo_box<R>(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
+    accessible_label: &str,
     selected_text: impl Into<egui::WidgetText>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    ComboBox::from_id_salt(id_salt)
+    let response = ComboBox::from_id_salt(id_salt)
         .selected_text(selected_text)
         .height(420.0)
         .popup_style(crate::os_theme::dark_popup_style(ui.ctx()))
         .show_ui(ui, |ui| {
             crate::os_theme::apply_dark_ui(ui);
             add_contents(ui)
-        })
+        });
+    crate::ui_helpers::set_accessibility_label(&response.response, accessible_label);
+    response
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1232,6 +1235,7 @@ fn draw_tone_detail_effect_params(
             lab_combo_box(
                 ui,
                 "photo_filter_preset",
+                "フォトフィルタープリセット",
                 photo_filter_preset_label(params.preset),
                 |ui| {
                     for preset in [
@@ -5383,6 +5387,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "mosaic_boundary",
+                "モザイクの境界",
                 mosaic_boundary_label(params.boundary),
                 |ui| {
                     for boundary in [
@@ -5695,28 +5700,34 @@ pub(crate) fn draw_effect_params(
                 }
             });
             let before = params.preset;
-            lab_combo_box(ui, "look_preset", look_preset_label(params.preset), |ui| {
-                for preset in [
-                    LookPreset::None,
-                    LookPreset::Sunset,
-                    LookPreset::Night,
-                    LookPreset::BrightSun,
-                    LookPreset::Pale,
-                    LookPreset::Cool,
-                    LookPreset::Warm,
-                    LookPreset::RetroFilm,
-                    LookPreset::TealOrange,
-                    LookPreset::CherryBlossom,
-                    LookPreset::FreshGreen,
-                    LookPreset::Moonlight,
-                    LookPreset::HighKey,
-                    LookPreset::LowKey,
-                    LookPreset::Sepia,
-                    LookPreset::Cyberpunk,
-                ] {
-                    ui.selectable_value(&mut params.preset, preset, look_preset_label(preset));
-                }
-            });
+            lab_combo_box(
+                ui,
+                "look_preset",
+                "ルックプリセット",
+                look_preset_label(params.preset),
+                |ui| {
+                    for preset in [
+                        LookPreset::None,
+                        LookPreset::Sunset,
+                        LookPreset::Night,
+                        LookPreset::BrightSun,
+                        LookPreset::Pale,
+                        LookPreset::Cool,
+                        LookPreset::Warm,
+                        LookPreset::RetroFilm,
+                        LookPreset::TealOrange,
+                        LookPreset::CherryBlossom,
+                        LookPreset::FreshGreen,
+                        LookPreset::Moonlight,
+                        LookPreset::HighKey,
+                        LookPreset::LowKey,
+                        LookPreset::Sepia,
+                        LookPreset::Cyberpunk,
+                    ] {
+                        ui.selectable_value(&mut params.preset, preset, look_preset_label(preset));
+                    }
+                },
+            );
             if params.preset != before {
                 if params.preset != LookPreset::None && params.strength <= f32::EPSILON {
                     params.strength = 1.0;
@@ -5873,6 +5884,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "retro_palette_mode",
+                "レトロ減色の方式",
                 retro_palette_mode_label(params.mode),
                 |ui| {
                     for mode in [
@@ -5945,6 +5957,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "crt_display_mode",
+                "ブラウン管表示の方式",
                 crt_display_mode_label(params.mode),
                 |ui| {
                     for mode in [
@@ -6148,6 +6161,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "duotone_preset",
+                "ダブルトーンプリセット",
                 duotone_preset_label(params.preset),
                 |ui| {
                     for preset in [
@@ -6294,6 +6308,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "gradient_map_preset",
+                "グラデーションマッププリセット",
                 gradient_map_preset_label(params.preset),
                 |ui| {
                     for preset in [
@@ -6342,16 +6357,22 @@ pub(crate) fn draw_effect_params(
         }
         LocalEffect::Repair(params) => {
             let before_mode = params.mode;
-            lab_combo_box(ui, "repair_mode", repair_mode_label(params.mode), |ui| {
-                for mode in [
-                    RepairMode::Solid,
-                    RepairMode::PreserveLuminance,
-                    RepairMode::Surrounding,
-                    RepairMode::Clone,
-                ] {
-                    ui.selectable_value(&mut params.mode, mode, repair_mode_label(mode));
-                }
-            });
+            lab_combo_box(
+                ui,
+                "repair_mode",
+                "補修の方式",
+                repair_mode_label(params.mode),
+                |ui| {
+                    for mode in [
+                        RepairMode::Solid,
+                        RepairMode::PreserveLuminance,
+                        RepairMode::Surrounding,
+                        RepairMode::Clone,
+                    ] {
+                        ui.selectable_value(&mut params.mode, mode, repair_mode_label(mode));
+                    }
+                },
+            );
             if params.mode != before_mode {
                 changed = true;
                 if params.mode != RepairMode::Clone {
@@ -6391,6 +6412,7 @@ pub(crate) fn draw_effect_params(
                 lab_combo_box(
                     ui,
                     "repair_color_source",
+                    "補修の色の参照元",
                     repair_color_source_label(params.color_source),
                     |ui| {
                         for source in [RepairColorSource::Surrounding, RepairColorSource::Sampled] {
@@ -6449,6 +6471,7 @@ pub(crate) fn draw_effect_params(
                         lab_combo_box(
                             ui,
                             "repair_patch_size",
+                            "補修のパッチサイズ",
                             repair_patch_size_label(params.patch_size),
                             |ui| {
                                 for patch_size in [
@@ -6476,6 +6499,7 @@ pub(crate) fn draw_effect_params(
                         lab_combo_box(
                             ui,
                             "repair_quality",
+                            "補修の品質",
                             repair_quality_label(params.quality),
                             |ui| {
                                 for quality in [
@@ -6631,6 +6655,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "color_fill_shape",
+                "塗りの形状",
                 color_overlay_shape_label(params.shape),
                 |ui| {
                     for shape in [
@@ -6810,15 +6835,21 @@ pub(crate) fn draw_effect_params(
                 }
             });
             let before_mode = params.mode;
-            lab_combo_box(ui, "frame_mode", frame_mode_label(params.mode), |ui| {
-                for mode in [
-                    FrameMode::Border,
-                    FrameMode::Letterbox,
-                    FrameMode::RoundedMatte,
-                ] {
-                    ui.selectable_value(&mut params.mode, mode, frame_mode_label(mode));
-                }
-            });
+            lab_combo_box(
+                ui,
+                "frame_mode",
+                "フレームの方式",
+                frame_mode_label(params.mode),
+                |ui| {
+                    for mode in [
+                        FrameMode::Border,
+                        FrameMode::Letterbox,
+                        FrameMode::RoundedMatte,
+                    ] {
+                        ui.selectable_value(&mut params.mode, mode, frame_mode_label(mode));
+                    }
+                },
+            );
             if params.mode != before_mode {
                 match params.mode {
                     FrameMode::Border if params.width_px <= f32::EPSILON => {
@@ -7010,6 +7041,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "outline_stroke_placement",
+                "縁取りの位置",
                 outline_stroke_placement_label(params.placement),
                 |ui| {
                     for placement in [
@@ -7304,6 +7336,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "color_overlay_shape",
+                "カラーオーバーレイの形状",
                 color_overlay_shape_label(params.shape),
                 |ui| {
                     for shape in [
@@ -7324,6 +7357,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "color_overlay_blend_mode",
+                "カラーオーバーレイの合成方式",
                 color_overlay_blend_mode_label(params.blend_mode),
                 |ui| {
                     for mode in [
@@ -9067,6 +9101,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "noise_distribution",
+                "分布",
                 noise_distribution_label(params.distribution),
                 |ui| {
                     ui.selectable_value(
@@ -9172,6 +9207,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "anaglyph_mode",
+                "方式",
                 anaglyph_mode_label(params.mode),
                 |ui| {
                     ui.selectable_value(
@@ -9713,6 +9749,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "pixel_sort_direction",
+                "方向",
                 pixel_sort_direction_label(params.direction),
                 |ui| {
                     ui.selectable_value(
@@ -9734,6 +9771,7 @@ pub(crate) fn draw_effect_params(
             lab_combo_box(
                 ui,
                 "pixel_sort_order",
+                "並び順",
                 pixel_sort_order_label(params.order),
                 |ui| {
                     ui.selectable_value(
@@ -10957,6 +10995,7 @@ mod tests {
                     lab_combo_box(
                         ui,
                         "repair_quality_theme_regression",
+                        "",
                         repair_quality_label(quality),
                         |ui| {
                             for candidate in [

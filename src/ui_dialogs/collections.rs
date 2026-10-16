@@ -3850,13 +3850,13 @@ impl App {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("新しいコレクション");
+                    let field_label = ui.label("新しいコレクション");
                     crate::ime_focus::add_singleline(
                         ui,
                         &mut self.collection_ui.manager_new_name,
                         None,
                         |edit| edit.desired_width(220.0),
-                    );
+                    ).labelled_by(field_label.id);
                     let name = self.collection_ui.manager_new_name.trim().to_owned();
                     if ui
                         .add_enabled(
@@ -3936,9 +3936,10 @@ impl App {
                                         .manager_rename_inputs
                                         .entry(definition.id)
                                         .or_insert_with(|| definition.name.clone());
-                                    crate::ime_focus::add_singleline(ui, input, None, |edit| {
+                                    let name_response = crate::ime_focus::add_singleline(ui, input, None, |edit| {
                                         edit.desired_width(220.0)
                                     });
+                                    crate::ui_helpers::set_accessibility_label(&name_response, "コレクション名を変更");
                                     let new_name = input.trim().to_owned();
                                     let can_rename = !new_name.is_empty()
                                         && new_name != definition.name
@@ -4368,12 +4369,13 @@ impl App {
                 let mut keep = true;
                 let mut submit = false;
                 egui::Modal::new(egui::Id::new("collection_name_modal")).show(ctx, |ui| {
-                    ui.heading(match action {
+                    let field_label = ui.heading(match action {
                         NameAction::Create => "コレクションを作成",
                         NameAction::Rename { .. } => "コレクション名を変更",
                     });
                     let response =
-                        crate::ime_focus::add_singleline(ui, &mut draft, None, |edit| edit);
+                        crate::ime_focus::add_singleline(ui, &mut draft, None, |edit| edit)
+                            .labelled_by(field_label.id);
                     response.request_focus();
                     ui.horizontal(|ui| {
                         if ui
