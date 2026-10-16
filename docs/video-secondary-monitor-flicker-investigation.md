@@ -6,6 +6,8 @@
 
 2026-10-16追補: §3・§6の自己通知対策はv4.7.0で実装済み。修正前の経緯はそのまま残し、
 残存報告と以後の全対策候補は§7を正本とする。バックログは§1.387。
+同日I1: D1の設計受入・構造合意に基づくA1〜A3の実装と本体lib全件検証を行った。対象はv4.7.1の次のリリース。
+実装・検証の現在地は§8.9を正本とし、物理点滅の原因・解消は引き続き未確認である。
 
 ## 1. 回答済み事項と今回の判断
 
@@ -367,18 +369,22 @@ detached経路は既存の双方レビュー合意・§11記録を守り、§6.4
 
 小改善の回帰が通ったことと、>>570の物理点滅が直ったことは別の受入条件。
 開発側か報告者による改善確認まで「点滅を修正済み」とは記載せず、収録済みの対策を具体的に説明する。
-本追補で製品コード変更・実画面比較は実施しておらず、本項目の対策を開始済みとは扱わない。
+§7追補時点では製品コード変更・実画面比較は実施していなかった。その後のA1〜A3の着手は§8.9へ記録する。
 §1.382自体の独立した進捗は更新担当が管理し、A5の点滅比較の実施・成功と混同しない。
 
-## 8. A1〜A3 の先行改善設計 D1（2026-10-16、設計レビュー待ち）
+## 8. A1〜A3 の先行改善設計 D1／実装 I1（2026-10-16）
 
 ### 8.1 対象・証拠・判断
 
-利用者の2026-10-16指示により、§7を正本としてA1〜A3だけを設計する。
-v4.7.1への収録候補であり、実装・収録の決定や点滅解消の保証ではない。
+利用者の2026-10-16指示により、§7を正本としてD1でA1〜A3だけを設計した。
+D1時点ではv4.7.1への収録候補だったが、I1の対象は**v4.7.1の次のリリース**へ変更された。
+点滅解消の保証やリリース完了の記録ではない。
 source inspection対象は `hud-flicker-1387` の `0272439ac6f03ead6470bdb40787e8969cf6c4f1`。
 D1では本節だけを変更し、製品コード・設定・バイナリ・実画面試験には触れていない。
-独立設計レビューとClaudeCodeの検収は未実施。担当モデルの設定を本書によって変更したとは扱わない。
+利用者からの引継ぎによると、D1 commit `66708856f` は独立した `gpt-6.1-sol` / `xhigh`
+レビューで指摘なしの **ACCEPT**。同レビュアーとClaudeCodeの双方が、A2/A3は症状パッチではなく
+既存ownerの契約を直す構造的修正であることへ明示的に合意した。このD1受入をI1の実装レビュー・
+自動検証・実機検収へ読み替えない。担当モデルの設定を本書によって変更したとは扱わない。
 
 報告者>>570は未解消の趣旨で、改善量と再試験条件は不明。開発側も未再現である（§7.1）。
 以下の根拠はコードの構造であり、報告者の画面で反復が起きたという実測ではない。
@@ -565,10 +571,11 @@ A2は既に所有しているHUD HWNDへの副作用を現在の実矩形で冪�
 detached bool/pending、host_lost再生成、時間窓、追加repaintで症状を覆わないため、
 CodexのD1判断は「症状パッチではなく構造的修正」である。
 
-ただしこれは合意済みという記録ではない。ClaudeCodeと独立レビュー担当にもこの構造判断への
-明示的合意を求め、実装前に確認する。実装差分がdetached述語/viewport経路へ広がる場合は
+この構造判断はD1 `66708856f` の独立レビュアーとClaudeCodeが明示的に合意した
+（利用者からの引継ぎ、§8.1）。I1の対象範囲と理由は`detached-rework-plan.md` §11へ記録する。
+実装差分がdetached述語/viewport経路へ広がる場合は
 先に範囲を戻してレビューし、触れる範囲・理由・合意を`detached-rework-plan.md` §11へ記録する。
-D1の「この文書だけを変更する」範囲では同計画へ追記しない。
+D1の「この文書だけを変更する」段階では同計画へ追記していなかった。
 
 設計簡素化として、再生やwindow切替をmodal化／windowを閉じて再生成する案も検討した。
 連続するHUD入力・VST操作・再生を制限し、不要な再生成を増やすため採らない。
@@ -624,9 +631,12 @@ D1では製品テスト・buildを実行しない。実装時は担当者が次�
   使う狭いGPU操作境界を記録adapterで差し替える。GPU resourceのOption化やテスト専用可視性ロジックは作らない。
 
 反復は上の新規回帰＋該当moduleの明示filterから開始し、通常core check、関連する既存
-native window/input/overlay/placement/seek-strip回帰へ広げる。共有pump/render変更の最終gateは
-`scripts/test-full.ps1`、必要なtest-script回帰、`cargo fmt --check`。
-UI文字列を変更した場合だけglyph検査も行う。実装者が検証用`build-dev.ps1`を作る。
+native window/input/overlay/placement/seek-strip回帰へ広げる。共有pump/render変更のD1最終gateは
+`scripts/test-full.ps1`。I1では利用者の検証指定に従い、必要なtest-script回帰と
+`cargo fmt --check`に加え、最後に`scripts/test-lib-full.ps1`で本体lib全件を実行する。
+workspace/vendor/doctest全体の`test-full.ps1`は設計lead側の後続gateとして区別して残す。
+UI文字列を変更した場合だけglyph検査も行う。検証用`build-dev.ps1`は通常は実装者が作るが、
+I1では利用者の明示指示により省略し、設計lead側へ引き継ぐ（§8.9）。
 これらのcommand・対象commit・環境・件数・exitと未実施理由を記録し、0件一致を成功としない。
 
 実画面の受入は§6.4の了承済み隔離portable検証枠、または利用者起動の通常確認buildで行う。
@@ -667,6 +677,80 @@ A2/A3の根拠ある改善の前提にはしない。設計レビューで所有
   後二者の構成比較はB5等の別設計で、A3を理由に混ぜない。
 - 常時全frameログ、ログ専用tick/同期I/O/同期flush、物理ちらつきを内部ログだけで判定する案は採らない。
 
-D1時点で追加の利用者仕様判断は不要。必要なのは次段の設計レビューと構造判断への合意である。
+D1時点で追加の利用者仕様判断は不要と判断し、その後の設計レビュー・構造合意は§8.1のとおり受けた。
 実装で通常操作の遅延/機能縮小/表示領域や画質変更が必要と判明した場合だけ、変更前に
 費用・代案を示して利用者判断へ戻す。収録判断、実機未確認事項、点滅への効果は別々に報告する。
+
+### 8.9 I1実装と検証台帳（2026-10-16、作業中）
+
+実装先は `hud-flicker-1387`。対象はA1/A2/A3だけであり、A4のraise抑制、A5の依存更新、
+B1〜B5の構成比較や新しい回避策は含めない。実装・自動検証・独立実装レビュー・ClaudeCode検収・
+実機受入を分けて記録する。実装・本体lib全件の自動検証は完了したが、低負荷の実測達成や
+報告者の物理点滅解消は主張しない。本台帳作成時点ではGit管理領域の書き込み拒否により、
+I1担当によるcommitは未作成である。
+
+| 対象 | I1で実装する境界 | 現在地 |
+| --- | --- | --- |
+| A1 | `NativeWindowHealth`が同じoutputの診断IDをpump/renderへ渡す。`native_diagnostics.rs`はownerごとの固定counter・scalar snapshot・観測時刻/revisionを保持し、既存の出口で約1秒ごと、詳細最大8件と種別別total/omitted/first/lastを既存perf journalへ送る。終了時も同じ上限で端数を出す | 実装・自動検証済み。OFF spy・注入時計/sink・同epochの複数output・省略/終端の回帰を追加。raiseの発行/置換/消費/burstを元sequence・由来で相関する |
+| A1 adapter | `DeviceEpoch`の生成時だけperf ONで実DX12 deviceのLUIDとadapter情報をキャッシュする。D3D11側のLUIDと比較できる値を残し、query不能はunknownとする。診断値をdevice選択・loss判定へ使わない | 実装済み。通常core checkで型/APIを確認。実機のD3D11/DX12照合と生成時payloadの採取は未実施 |
+| A2 | HUD geometry ownerが各要求で正規化済みscreen rectと`GetWindowRect`の4辺を比較し、完全一致のときだけ`SetWindowPos`を省く。query失敗・不一致では従来flagsの一回適用を維持する。Resize/GeometryChanged/DpiChangedを同じownerへ通す | 実装・自動検証済み。要求・前照合・試行・結果・操作後観測を別計数。geometryの入口とowner観測時刻を記録し、上流発行時刻まで追跡済みとは扱わない |
+| A3 | CPU logical passからDComp detach副作用を外し、最終batchのPresent後に最終visibilityを一回適用する。中間hidden cleanup、egui delta、入力/IME/command、無描画returnは維持する | 実装・自動検証済み。production finalizerと成功tailを実CPU batch＋GPU記録adapterの回帰で共有する |
+| A3 caller失敗 | GPU終端失敗を成功tailやlog-only継続へ流さず、既存render fault/target dropへ伝える。candidate prime失敗は既存abortで旧coreを保持し、非描画エラーを一括fatal化しない | 実装済み。初期描画・入力・tick・GeometryChanged/DpiChanged/同placement resizeの描画失敗を既存render faultへ接続。candidate prime失敗は既存abortを維持 |
+
+固定tableが満杯の場合はcounter/snapshot/fieldの省略を明示し、journal欠落とは区別する。
+診断はowner内だけに保持し、新しいtick/thread・同期I/O・flush待ち・共有診断mutex・GPU同期を追加しない。
+1秒は記録区間の条件であり、geometryや表示・入力のdebounceには使わない。
+`pump`/`pump_raise`/video core/HUD/background/cover等の論理ownerは別々に上限を持つため、
+一つのoutput/epochで定常summaryが一行だけになるという意味ではない。
+geometryの前照合値と、操作後だけ採った実矩形をmonitor/window snapshotにも再利用する。
+video transformは同じ確定layout/targetから描画と診断へ渡し、診断用に配置を再計算しない。
+明示detachは通常eventとし、video/HUDのsurface_dropと終端flushは各GPU ownerのDropで一度だけ行う。
+
+実行環境は本worktreeのWindows/MSVC、通常featureと`test-script`、cargo-nextest 0.9.148。
+対象はHEAD `66708856f` に対するI1差分である。10個の製品Rustファイルの実バイトhash一覧は
+`target/hud-flicker-i1/source-manifest.txt`、その一覧をLFに正規化した文字列のSHA-256は
+`81e206641d4e09eee9fee9789d6ac3e8a8ad34d87bcde5b6a76d14387a9a760a`。
+全lib成功時のsource fingerprintは
+`00d4d92f2663d042d92a5dba53f1e06bcaeecf9ba509ca5be9198a29717e05c9`。
+実行後に更新したのは本書・`video-architecture.md`・`detached-rework-plan.md`だけであり、
+製品コードやtestを変更していない。receiptを書き換えず、同じ製品source/条件の証拠を再利用する。
+
+| 検証 | source / command / 環境 / 件数 / exit / ログ | 状態・限界 |
+| --- | --- | --- |
+| A1注入時計/sink・OFF spy・相関/集約 | helper 4件＋raiseのproducer/coalesce/bus/pump 4件成功。新規計14件と既存1件を選ぶ明示nextest filterは15件成功、exit 0。`target/hud-flicker-i1/restored-narrow.xml` | OFFではsample/query/format/追加時計/sinkを呼ばないspy、interval/終端・相関・overflowを検査。実perf負荷の測定ではない |
+| A2 pump3入口・非表示HUD・外部変更/失敗/兄弟owner | 新規pump回帰2件成功、module 7件成功、exit 0。`target/test-focused/runs/20261016T031217421Z-f7e8a11d/` | production class/wndprocの非表示HWND、実pump command/event経路、試行数と位置通知を検査。実monitor/DPI移動は未確認 |
+| A3実CPU batch・GPU記録境界・終端/失敗 | 新規4件成功。実logical CPU passとproduction `finalize_native_overlay_gpu_batch` / `apply_native_overlay_visibility` / `commit_native_overlay_presented`を共有 | 中間hidden・最終hidden・無描画・操作失敗・free/command/intentsを検査。最終inventoryのVisible→Hidden公開と失敗時の旧inventory維持も最終feature/全libで確認 |
+| 関連native input/window/overlay/placement/seek-strip回帰 | `scripts/test-focused.ps1 -Path`でdiag/render_core/overlay_gpu/hud_window: 4+169+3+2件。pump/window/host/health/strip/strip_layout/host_contract: 7+19+5+4+56+17+11件。両run exit 0 | 計297実行（hostとhud_windowの2件は重複）。ログは`target/test-focused/runs/20261016T030955978Z-63bc5c32/`から`20261016T031231314Z-3fe1527c/`の各run |
+| 通常core check・fmt・diff・test-script | `cargo check -p mimageviewer --bin mimageviewer-core`、引数なし全workspace `cargo fmt`、`cargo fmt --check`、`git diff --check`: exit 0。`test-focused.ps1 -Features test-script -Path`はrender_core 173＋pump 7＋window 20＋native_ui_smoke 47件成功、exit 0 | 最新inventory assertを含むrender_coreは`target/test-focused/runs/20261016T032016232Z-bffc992f/`で再確認。UI文言変更なしのためglyph検査は対象外 |
+| `scripts/test-lib-full.ps1`本体lib最終gate | `$env:NEXTEST_TEST_THREADS='4'; .\scripts\test-lib-full.ps1`: **13,245成功、59除外、0失敗、1295.369秒、exit 0**。`target/test-lib-full/runs/20261016T033708384Z-c2ef5c2b/`。receipt: `target/test-lib-full/144fd8232b5368b881b7b8fc904e40f0fa5daaa408a936ea628ecc1f4e11589d.json` | I1の明示的なsuite実行指示に基づき、defaultの非activate fixtureを含めた。実foreground切替/OS入力を行うignoredテストは従来どおり除外。再試行回数0・assert/timeout/ignore変更なし |
+| `scripts/test-full.ps1` workspace/vendor/doctest | I1では未実施 | I1の利用者指定は本体lib全件。後続gateとして設計leadへ引き継ぐ |
+| 独立実装レビュー・ClaudeCode検収 | 独立`gpt-6.1-sol` / `xhigh`のソースレビューは指摘対応後ACCEPT。変異XMLと復元greenも照合済み | D1 ACCEPTと区別する。ClaudeCode検収と実機受入は未実施 |
+| perf OFF/ON前後の行数・pump遅延/CPU・render所要時間 | 未記入 | 未測定。低負荷の達成は未判定 |
+| 確認用binary・実画面suite | binary作成/起動とも未実施 | 利用者の明示指示でI1担当の`build-dev.ps1`を省略し、設計lead側で後に扱う。agent起動・入力はsuiteごとの明示承認が必要 |
+
+変異確認ではA2の実rect一致gateを一時的に無効にし、A3のproduction finalizerの可視性適用を
+一時的にbypassした。同じ実装境界を使う6件の選択で、A2のpump回帰はSetWindowPos試行が
+期待1回に対し5回となって失敗し、A3の4件もAdd/Remove/Commitや失敗伝播の欠落で失敗した。
+無関係の既存1件は成功し、合計5失敗・exit 100。`target/hud-flicker-i1/mutation.xml`へ保存した。
+両変異を戻し、A2はbyte単位の元hash一致、A3は元blockの復元と変異marker消失を確認した。
+操作回数/順のassertを保ったままinventory assertを強化し、その後のfeature回帰と全libも成功した。
+
+初回全libは13,207成功・38失敗・59除外、575.674秒、exit 100
+（`target/test-lib-full/runs/20261016T032119853Z-6cda44ac/`）。37件は
+`vendor/raw-samples`未配置、1件は変更していないmask previewの100ms閾値に対する189.8049msだった。
+既存ローカルの正規CC0 sample 27個（360,971,087 byte）を`tests/raw-samples.json`のSHA-256/sizeへ
+照合して実copyし、失敗38件を`--test-threads 4`で再確認したところ38成功、143.143秒、exit 0
+（`target/hud-flicker-i1/fixture-recheck.xml`）。製品コード・assert・除外を変更せず全件も再実行した。
+また初回build前に不足していたLibRawの固定archive由来build inputを復元し、FFmpeg DLLを
+`vendor/ffmpeg/bin`から`target/debug/deps`へ実copyした。いずれも無視対象の作業tree前提であり、
+依存versionの更新やreparse pointの追加ではない。
+
+本台帳作成時のI1担当のcommit操作は、共有Git管理領域
+`C:/home/mimageviewer/.git/worktrees/mimageviewer-hudflicker/index.lock`の作成が
+Permission denied（exit 128）となり未作成。権限やhookを変更して回避していない。
+許可された通常shell用に、英語の本文と明示path指定の2件のcommit手順を
+`target/hud-flicker-i1/commit-i1.ps1`へ用意した。新規fileだけ先に`git add`し、
+branchと対象file hashも確認する。`git add -A`、master統合、pushは行っていない。
+
+実画面では§8.6/§8.7のF11/F12・park/promote・兄弟窓・monitor/DPI・HUD/panel/strip・
+VST/EffeTune・IME/focus・close/reopenを確認する。現時点では実機結果を記録していない。

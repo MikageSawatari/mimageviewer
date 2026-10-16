@@ -16,6 +16,15 @@ native overlayは必須のGPU資源 `NativeEguiOverlayGpu` とCPU側の入力・
 configure / submissionは製品rendererの既存境界に残る。検証範囲は
 [locked chrome抑制の実装追補](fullscreen-locked-chrome-suppression-plan.md#13-実装レビュー追補2026-10-08)を参照。
 
+§1.387 I1（2026-10-16、v4.7.1の次のリリース向け、実装・自動検証済み）では、CPU logical passの
+中間hiddenによるDComp detachを外し、既存batchの最終visibilityをGPU finalizerへ渡す。
+最終表示・非表示とも既存のclear/submit/Present後にattach/detachを一回だけ適用し、
+dirtyなし・logical passなしの正常returnではPresent/Commitを増やさない。hidden cleanup、
+texture set/free、入力/IME/commandの累積契約を保つ。finalizer失敗は成功inventoryを公開せず
+既存render fault/dropで終了し、placement candidateのprime失敗は旧coreを維持する既存abortへ戻す。
+単発・batch・dirty・resize・設定更新・primeのcallerを同じ終端へ接続する。
+D1設計受入とI1の自動/実機受入は別であり、[調査・I1台帳](video-secondary-monitor-flicker-investigation.md#89-i1実装と検証台帳2026-10-16作業中)を参照。
+
 ## 設計目標
 
 | 優先順位 | 目標 |
@@ -209,6 +218,21 @@ latched epoch を選ばず fresh epoch を作る。既存 overlay は dead epoch
 terminal error を返して従来どおり presenter を停止する。`SurfaceError::Lost / Outdated / Timeout`
 は surface / swapchain 条件として epoch を invalidate せず、`Other` も callback latch が立った場合だけ
 device loss と診断する。旧 generation の遅い callback は successor の latch と一致しない。
+
+I1のadapter診断はperf有効時だけepoch生成時にキャッシュする。wgpu DX12の実deviceを
+`Device::as_hal`のborrow guard内で読み、`raw_device().GetAdapterLuid()`のscalar値だけを保持する。
+adapterのname/vendor/device/backend等も併記するが、名称の一致だけでD3D11との同一性を判定しない。
+診断値はdevice選択・gate・loss callbackの方針に影響せず、照会不能はunknownと理由を記録する。
+
+I1の定常診断は`native_diagnostics.rs`が既存pump/render ownerごとに保持する。
+perf有効時だけoutput IDを割り当て、window epoch/target role/ownerと、各snapshotの
+observed_us/revisionで相関する。時刻原点は`perf::program_start()`。source epoch/device generation/
+surface revision等はそのownerが観測したsampleへ記録し、別threadのsnapshotを同時点とみなさない。
+固定counterとscalar snapshotを既存出口で約1秒ごとに集約し、区間ごとの詳細は最大8件、
+以後は種別別のtotal/omitted/first/lastを残す。既存処理が止まれば記録も止まり、次の起床・退役で
+区間を送る。OFFではsample closure・追加時計・monitor/adapter query・JSON化を行わず、
+新しい診断thread/tick・同期I/O・共有診断mutex・flush完了待ちは追加しない。
+負荷改善や点滅解消の実測結果は未確定であり、測定とjournal欠落/詳細省略を区別する。
 
 `VideoPlayer::tick(ctx)` は再生制御 / 意味的 deadline / ホバーサムネイル要求を扱う。
 フレームの実体描画は native presenter 内のスレッドが行うため、native 経路では
@@ -584,7 +608,7 @@ raise 経路で **allowlist 判定**):
 詳細は [vst3-integration.md](vst3-integration.md) の "Fullscreen focus handoff" 節を参照。
 
 **Geometry / DPI / UI 表示倍率の同期**: presenter HWND の `WM_WINDOWPOSCHANGED` →
-`GeometryChanged` event → HUD HWND の `SetWindowPos` + overlay surface resize。HUD HWND の
+`GeometryChanged` event → HUD geometry要求 + overlay surface resize。HUD HWND の
 `WM_DPICHANGED` → `DpiChanged` event → `set_overlay_pixels_per_point(dpi/96.0)` + HUD
 `set_hud_geometry(suggested_rect)` + `resize_overlay_surface_only`。`NativeEguiOverlay` は main egui
 Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源を
@@ -593,6 +617,13 @@ Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源�
 設定変更と同じ close 経路で active fullscreen / detached / native presenter session を閉じる。
 再 open で新倍率を適用するため、短い再生中断は許容する。presenter HWND 自身
 (= video transform / background) には影響させず、VST editor の別 HWND にもアプリ内倍率を掛けない。
+
+I1ではResize / GeometryChanged / DpiChangedのgeometry要求を既存HUD ownerへ揃え、
+最低1pxへ正規化したscreen pixel rectとその場の`GetWindowRect`の4辺が完全一致するときだけ
+`SetWindowPos`を省く。負座標を維持し、query失敗や不一致は既存のNOACTIVATE/NOZORDER/
+NOOWNERZORDERで一回適用する。前回要求/成功のcacheでは省かず、外部移動・OS clamp・
+HWND再生成後の同じ要求も現在OS状態で判定する。geometry skipでppp/DPI更新やsurface resizeを
+省略せず、外部監視tick・retry・新しいpending状態を追加しない。実操作後の追加queryはperf ON時だけとする。
 
 **UI フォント / コントラストの同期**: `NativeVideoOutputConfig` → `NativeRenderConfig` は
 `text_contrast` に加えて `UiFontSettings` も保持し、`NativeEguiOverlay` の独立
@@ -2189,11 +2220,13 @@ intent だけで host と接続する。
 | ファイル / 範囲 | 責務 | 主な型 |
 |---|---|---|
 | `native_window_pump.rs` | bounded request/ack、window-host reducer、全 placement の create/pump/publish/destroy、observation/intent 適用、typed shutdown/quarantine | `NativeWindowPumpRenderClient`, `PumpLifecycleEvent`, `PumpPlacementRequest` |
+| `native_diagnostics.rs` | I1: perf ON限定のoutput相関ID、owner別固定counter/scalar snapshot、既存境界での有界集約。新しい起床・同期I/Oを所有しない | `DiagnosticOutputId`, `NativeDiagnostics`, `DiagnosticSample` |
 | `native_window_host.rs` | presenter/HUD topology、visibility/geometry/region/z-order/focus/IME/cursor mutation、thread affinity | `NativeWindowHost`, `NativeRenderTargets`, `NativeWindowIntent` |
 | `native_window_host/hud_window.rs` | HUD HWND RAII owner と wndproc/region mutation | `HudOverlayWindow` |
 | `native_touch.rs` | presenter / HUD `PT_TOUCH` stream の bounded ownership 純ロジック、typed source、共通 recognizer adapter、座標/command 写像 | `NativeTouchOwnership`, `NativeTouchAdapter` |
 | `native_presenter/mod.rs` | render facade と `overlay_draw` module 宣言 | — |
 | `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
+| `native_presenter/overlay_gpu.rs` | process-owned Instance/device epoch cache、configure/submission gate、device-loss latch、I1の生成時adapter/LUID診断 | `OverlayGpuService`, `DeviceEpoch` |
 | `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
 | `native_presenter/grade_pipeline.rs` | 色調補正 / Creative LUT shader pipeline | `VideoGradePipeline` |
 | `native_presenter/resample_pipeline.rs` | 表示 orientation、Lanczos3 / NIS / nearest、生成 topology 駆動 Anime4K multi-pass、RGBA16F 中間 RT | `VideoResamplePipeline` |

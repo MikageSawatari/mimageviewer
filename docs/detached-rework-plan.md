@@ -5321,3 +5321,41 @@ detached の `alive_wanted`（runtime の生存・Closing）は変更しない�
 該当 continuation の待機中に true となり、従来の deferred_fullscreen 待機と同じ window 継続を表す。
 viewport 生成・registry・HWND・placement・focus owner は変更しない。
 設計 lead (ClaudeCode Opus) の検収と独立 GPT-6.1 Sol/xhigh レビューの双方が「症状パッチではなく構造的修正」に同意し、レビューは指摘なしで ACCEPT。実機確認は利用者に依頼中。
+
+### §11 追補: §1.387 native HUDのowner境界を揃える I1（2026-10-16、実装・自動検証済み）
+
+§2を再読。正本は[動画サブモニター点滅調査 §8](video-secondary-monitor-flicker-investigation.md#8-a1a3-の先行改善設計-d1実装-i12026-10-16)。
+利用者からの引継ぎによると、D1 `66708856f` の独立 `gpt-6.1-sol` / `xhigh` レビューは
+指摘なしのACCEPTで、同レビュアーとClaudeCodeの双方が「症状パッチではなく構造的修正」に
+明示的に合意した。I1はv4.7.1の次のリリース向けにA1/A2/A3だけを実装する。
+この設計受入を、実装の独立レビュー・ClaudeCode検収・実機受入の完了とは扱わない。
+
+触れる範囲は既存video outputとwindow healthの診断相関、native window/pump/host/HUDの
+要求・実操作、native presenterのCPU/GPU描画境界と既存callerの失敗伝播、およびvideo内の
+診断helperと回帰に限る。Appのdetached述語、viewport生成、HWND捕捉、placement保存先、
+park/promote/mount/depositの所有権を変更しない。
+
+- A1はperf ONで同一output IDをpump/renderへ渡し、exact window epoch/role/owner内の
+  counterとsnapshotを既存出口で有界集約する。約1秒という条件はログ区間だけに使い、
+  表示・geometry・inputの時間窓や新しいtick/thread・同期I/O・待機にしない。
+- A2は既に所有するHUD HWNDについて、各要求時点の実screen rectをGetWindowRectで確認し、
+  正規化した要求の4辺と完全一致するときだけSetWindowPosを省く。要求cacheやrect一致による
+  host同定ではなく、同じownerが不要な副作用を作る境界の修正である。query失敗・外部変更後は
+  既存flagsの適用へ進み、DPI/ppp/surface処理や兄弟窓へskipを波及させない。
+- A3は既存batchが最終shapes/visibilityを一回の描画で公開する契約に合わせ、途中logical hiddenの
+  DComp detachを外し、Present後のfinalizerで最終visibilityを一回適用する。hidden cleanupや
+  egui delta/input/IME/commandは保持する。失敗時は成功tailへ進まず既存render fault/dropへ渡し、
+  candidate prime失敗は旧coreを保持する既存abortへ戻す。新しい可視性bool/pending・rollback・
+  retry・再生成・追加Presentを足すものではない。
+
+modal化やwindow閉鎖/再生成は再生・HUD/VST操作を制限するため採らず、既存geometry ownerと
+batch末尾の確定点へ処理を揃えて組合せを減らす。A4のraise抑制、A5の依存更新、DComp構成変更、
+上HUD強制固定や映像領域/画質変更は含めない。
+
+実装と本体lib全件の自動検証は完了した。独立`gpt-6.1-sol` / `xhigh`ソースレビューは
+指摘対応後ACCEPT。A2の実pump/SetWindowPos回帰とA3のproduction finalizer回帰は変異でredを
+確認し、復元後の関連回帰・test-script回帰・全libも成功した。全libは13,245成功・59除外、exit 0。
+初回のfixture不足等の失敗、補完と再実行条件、Git管理領域の書込み拒否によるcommit未作成も、
+証拠とともに調査文書§8.9へ記録した。ClaudeCode検収、負荷測定と実機確認は未実施である。
+利用者の明示指示によりI1担当は確認用binaryを作成/起動せず、build-devは設計lead側で後に扱う。
+実機suiteは別途明示承認を必要とし、内部Present完了や回帰成功を報告者の物理点滅解消とは扱わない。
