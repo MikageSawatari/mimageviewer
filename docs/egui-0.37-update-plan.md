@@ -1,6 +1,16 @@
-> 状態: 設計案 第4.3版 (2026-10-16、利用者決定の案B = Windows の最小化中も UI pass を続ける、と段1b-1 の C1〜C5・D3 を反映、独立レビュー前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
+> 状態: 設計案 第4.4版 (2026-10-16、第4.3版の設計レビュー REVISE への対応: root Close の非描画 lifecycle、mount 境界の表示副作用、immediate 子窓の描画判定。再レビュー前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
 
 # 改訂履歴
+
+## 第4.4版 — 2026-10-16
+
+対象は第4.3版、HEAD `b14571d8d`。Sol / xhighのレビュー全文と、root Close、context mount、両backendのimmediate viewport実装を読み取り専用で照合した。案Bとscheduler方針変更が構造修正であるとのレビュー合意を維持する。本版の実装・独立レビュー・ビルド・テスト・製品起動は未実施。並行中の段1b-2のgamepad実装は変更・審査していない。
+
+- **P1 root Close — 反映:** トレイ置換、保存待ち、settings-family、ZIP取消等の既存終了判断を、通常入力から独立したroot lifecycle処理へ集約する。最新のviewport Close情報を使い、logic-onlyでもCancelCloseと完了後の終了再開を行う。
+- **P2 非描画mount — 反映:** 保存receiptはまずmount不要のowner付き更新へ寄せる。必要な一時mountではpayload交換と表示再採用・reconciliationを分離し、logicから既存UI mount wrapperを呼ばない。別contextのreceiptと未反映ratingを用いる回帰を追加する。
+- **P2 immediate子描画 — 反映:** wg​​pu／glowの`render_immediate_viewport`を案Bの対象へ明記する。子自身のmetadataと明示描画要求で描画資格を決め、非描画時も出力を完結させる。
+
+段1b-3、段2c、段3の範囲・受入条件・見積りを更新する。新しいpending bool、表示副作用を抑える後付けguard、追加repaint、強制UI、retryは追加しない。
 
 ## 第4.3版 — 2026-10-16
 
@@ -174,6 +184,17 @@ C4の進捗だけをlogicへ移す分割は必須としない。完成採用か�
 
 新しいpending bool、時間窓、常時tick、追加repaint、logicからの強制UI呼出しは設けない。最小化中のUI継続はbackendの実行方針であり、Appがlogicからuiを呼ぶ回避策ではない。
 
+第4.4版では、次の簡素化を先に採る。
+
+| 対象 | 採る案と理由 | 採らない案と理由 |
+|---|---|---|
+| root Close | 通常の終了判断と既存operationの延期・取消・終端を一つのlifecycle入口へ揃える | logic-only専用の終了判断、uiの旧Close処理との二重受付、別のroot close待ちbool |
+| 保存receipt | receiptが持つpath／identityを既存App-global writerへ渡し、editor状態はowner付きで直接更新する | receiptのためだけにviewerをmountし、関係のないratingや表示を再採用する |
+| 非描画mount | 必要なサービスだけが既存registryのpayload交換を使う。表示境界はUI wrapperへ残す | `in_logic`等のflagで従来mountの副作用を後から抑止する |
+| immediate子 | root／deferredと同じ出力・action契約へ揃え、描画資格は各子で判定する | 親の可視性を子の描画資格として流用する、immediateだけ常時描画する |
+
+既存modalの排他とoperation ownerを保ち、終了待ちのために新たな並行操作の組合せを作らない。まれなworker／資源処理失敗は既存のログ・通知・終端へ揃え、終了要求専用の回復機構は設けない。
+
 ## 2. 前提・更新履歴要約との相違
 
 | 前提・要約 | ソース確認 | 反映 |
@@ -334,6 +355,37 @@ Closeの配送・拒否・承認・退役は、以下の「非表示子のClose�
 
 RedrawRequested期限超過は本家の250 ms判定を残す。根拠: `eframe-0.37.0/src/native/run.rs:29`、`:233`、`:266`。新しい時間窓は追加せず、最小化前の未到着deadline等によるLogicOnlyも排除されたとは扱わない。
 
+###### immediate子自身の描画資格
+
+案Bの対象は主経路の`show_ui`と描画分岐だけではない。両backendの`render_immediate_viewport`も、同じ出力・action完結契約へ揃える。
+
+| 対象 | 本家の現状 |
+|---|---|
+| wg​​pu immediate | `eframe-0.37.0/src/native/wgpu_integration.rs:1203`。子metadata更新は`:1249`、UIは`:1272`、tessellation／paintは`:1308`、`:1309` |
+| glow immediate | `eframe-0.37.0/src/native/glow_integration.rs:1708`。子metadata更新は`:1759`、UIは`:1781`、tessellationは`:1787`、clear／paint／swapは`:1835`以降 |
+| mIV | `src/ui_fullscreen.rs:22625`等にimmediate呼出しがある。現vendorもwgpu `:1340`、`:1365`で描画へ進む |
+
+本家immediate経路の描画は主経路と別であり、主経路だけの修正では最小化immediate子の通常描画が残る。
+
+- 子UIが親Fullから呼ばれた場合は、案Bに従いUIを進める。親がLogicOnlyなら、子UIを別途強制呼出ししない。
+- 子の描画資格は、子自身の最新ViewportInfoと子宛てScreenshot／PaintWhileHiddenで決める。親の`is_visible`、親surfaceの描画結果、親の描画要求を流用しない。
+- 子UIの出力に含まれる子宛て明示描画要求も、既存action ownerへ一度だけ取り込む。既存保留actionと合わせ、判定・配送・完了のconsumerを一つにする。描画後のcommand処理で同じrequestを再登録しない。
+- 子が非描画でもdelta、platform output、viewport commands、Cut／Copy／Pasteを完結させる。deltaはviewport消滅・surfaceなしも共有renderer ownerへ渡し、不可視子のpendingへ放置しない。
+- Screenshotは子のsurface・子のcallbackへ配送する。本家wgpu immediateの空capture引数をそのまま残さず、既存のimmediate screenshot移行と共通のaction処理へ接続する。
+- glowではtexture適用に必要なGL contextの選択と、surfaceへのclear／paint／swapを区別する。非描画を理由に必要な資源適用を省かず、資源適用のためだけにsurfaceを描画しない。
+- 借用・lockを保持してUI callbackへ再入しない。親の登録・子の寿命・surface generation・通常版immediate計測を維持し、表示ACKを偽造しない。
+
+必須回帰は実`render_immediate_viewport`の判断・配送入口に接続し、wgpu／glowの双方で行う。
+
+| 条件 | 期待結果 |
+|---|---|
+| 親最小化・子visible | 親と子のUIは進む。親surfaceは非描画、子surfaceは描画 |
+| 親子とも最小化 | UIは進むが通常tessellation／render／presentまたはclear／paint／swapは行わない。出力は完結 |
+| 最小化immediate子へのScreenshot | 子の明示描画とcallbackを一度だけ実行。親は要求がなければ非描画 |
+| 親だけへScreenshot | 子の描画資格へ流用せず、子callbackへ誤配送しない |
+
+既存actionとして保持済みの場合と、子UIからrequestが出る場合を検査する。要求配送に必要な既存Fullの列を使い、追加repaint・専用retryでcallbackを成立させない。surface acquire等のまれな失敗は既存のログ・通知・終端へ揃える。
+
 #### root LogicOnlyとvisible childが共存する経路
 
 **単純な「root最小化＋既にvisible扱いのchild＋Full要求」では、親UIも実行される。** この条件だけを保留入力誤配送の根拠にはしない。
@@ -404,6 +456,58 @@ Close専用の非描画受付は、通常入力の消費や子UIの代行では�
 
 Fullではlogic→ui、LogicOnlyではlogicだけが呼ばれる。根拠: `eframe-0.37.0/src/native/epi_integration.rs:337`、`:384`。後者のContext入力はUI passの入力更新を伴わない。根拠: `egui-0.37.0/src/context.rs:1174`。
 
+##### root Closeの非描画lifecycle境界
+
+前掲の「key／wheel／pointer／focus／IMEのpass処理」はroot Closeを含めない。root CloseはOS／viewportのlifecycle要求であり、通常キー入力やdialog描画を通過しなくても処理する。
+
+本家`update_logic_only`はlogic実行前にrootのCloseを読み、logic直後にCancelCloseの有無から終了を確定する。したがって、uiでCancelCloseを出す設計では遅い。
+
+根拠: `eframe-0.37.0/src/native/epi_integration.rs:391`、`:401`、`:428`。`Context::run_logic`はviewport情報を更新するため、ここで参照するroot Closeは古いキーeventとは異なる。根拠: `egui-0.37.0/src/context.rs:1174`。
+
+**入口と判断owner**
+
+1. App::logicの非描画lifecycle入口で、最新のroot ViewportInfoのCloseと、既存tray Quit／installer shutdownの要求元を受け取る。rootを明示し、現在mountしているviewerやforegroundから終了対象を推定しない。
+2. 既存の`defer_settings_family_root_close`、`defer_composition_editor_root_close`、`defer_image_folder_zip_root_close`、`maybe_intercept_close`の判断をこの入口へ揃える。ui側に同じCloseを再判断するconsumerを残さない。
+3. 「通常の×」「明示的なアプリ終了」「operation終端から戻る終了継続」を区別する。明示Quitをトレイ退避へ変えず、延期された通常Closeも勝手に強制Quitへ格上げしない。
+4. 受付時のmodal・operation状態は、完了pollで変える前にその呼出し内で取得する。従来のterminal frameのmodal保護を維持し、時間窓や保持boolを追加しない。
+5. 既存の判断・取消副作用は従来の順序と優先規則で実行する。終了継続の保持には既存operationの`EditorExitRequest`、`DeferredRootClose`、ZIPの`Exit`等を使い、同じ要求の第二ownerをAppへ追加しない。
+6. 延期ownerの終端では、保持した要求を一度だけ取り出して共通の終了判断へ戻す。他の既存barrierを飛び越えて直接終了・hideしない。UI復帰を再開条件にしない。
+
+| 既存判断 | 非描画で維持する契約 |
+|---|---|
+| トレイ置換 | 設定ON・tray稼働中の通常×はCancelCloseを返し、既存hide ownerへ渡す。明示Quit／installer終了はこの置換を通さない |
+| composition保存待ち | editorのdraftは既存終了理由で閉じ、送信済みticketは維持する。receipt終端までCancelCloseでAppを生かし、完了後に一度だけ終了継続を返す |
+| settings-family | 実行中worker／既存retry taskの終了barrierを維持する。通常tray-hideとprocess exitの既存区別を保ち、終端収穫をdialog描画から独立させる |
+| 画像folder→ZIP | 既存ownerへ取消とRoot／TrayHideの終了意図を渡す。worker・予約・reader等の終端までCancelCloseし、終了時の通常表示採用を新たに実行しない |
+| sidecar等のmodal | 現行の通常Close拒否・tray-hide抑止と、明示lifecycle終了の区別を維持する。入力sanitizeに含まれているroot Close判断も、この入口へ分ける |
+
+代表箇所: `src/tray_integration.rs:223`、`src/app/book_composition_editor.rs:495`、`src/ui_dialogs/settings_restore.rs:328`、`:530`、`src/app/image_folder_zip_operation.rs:261`、`:636`、`src/app/sidecar_restore.rs:984`、`:1021`、`:1037`。
+
+root用の入力sanitizeから分けるのはClose判断であり、release・pointer・IME等の既存入力処理をlogicへ移す変更ではない。子Closeの既存非描画ownerも維持する。
+
+**CancelCloseと終了再開**
+
+- 退避・拒否・延期の判断は、同じlogic呼出しのLogicOutputへroot宛てCancelCloseとして反映する。後のuiに委ねない。
+- worker結果の収穫と終了判断は非blockingで行う。既存workerの終端待ちをUI threadのjoinや新しい待機loopへ変えない。
+- 完了後のClose再要求は、既存終了継続を消費した時に一度だけ発行する。backendがその要求を次回のCloseとして扱う場合も、同じ共通判断を通す。
+- 同じ受信Closeを保留snapshotや後続Fullから再受付しない。既存viewport情報の受付・消費境界と延期ownerを使い、frame counterによる重複抑止や「復帰時に一度捨てる」を追加しない。
+- tray／hide、保存、取消の処理は後述の非描画context境界を使い、内部のmountから表示再採用へ到達しない。
+- 送信済み保存の失敗も既存のreceipt終端として扱う。ログ・通知と既存終了方針を保ち、新しいretry・救済状態を加えない。
+
+通常Fullでも同じlifecycle入口を使う。期限超過時だけの特別な終了判断を作らず、本家のroot Close確定とCancelCloseのhandshakeを維持する。
+
+**必須のUIなし回帰**
+
+App::ui、viewport callback、paintを一度も呼ばず、最新root Closeを含むRawInputで実`update_logic_only`または同じClose確定経路へ接続する。
+
+- 通常×・tray設定ON: CancelCloseがlogic出力へ入り、既存hide効果をfake ownerで一度だけ観測する。backendの`should_close`はfalse。
+- tray設定OFF／明示Quit: 不要なCancelCloseやhideを出さず、既存の終了判断を通る。
+- composition保存中: Closeを受けても終了せず、ticketを失わない。後続logicでreceipt・resume書込みを収穫し、終了継続を一度だけ発行する。
+- settings-family実行中、ZIP取消中: UIなしでbarrier・取消終端を進め、終端前は終了しない。終端後は元のClose／Quit／TrayHideの意味へ戻る。
+- modalによる拒否と、保存待ちによる延期を区別する。拒否した通常×をmodal終了後に自動再発火させない。
+- 同じframe番号の複数logicと、その後のFullでhide・取消・終了継続を重複しない。保存中に後着した明示Quitの既存優先規則も維持する。
+- uiを呼んだ時だけCancelCloseが補われるfixtureは失敗とする。backendがlogic直後に終了判定することまで検査する。
+
 ##### C1: Remote
 
 代表: `src/app/update_phases.rs:27`、`src/remote_ipc/ui.rs:1068`。
@@ -459,6 +563,61 @@ F13の`service_initial_worker_results`も例外ではない。段1b台帳が追�
 `poll_composition_editor_operations`は送信済みticket収穫と、editor準備・Reloading継続を分ける。保存receiptは既存Reloading等へ確定し、表示reloadとmodal解除は旧ui終端で行う。Remote取得では既存editor closeが表示ownerを終了し、送信済みticketは共通ownerへ残す。
 
 `poll_book_composition_service`のchanged scopeをlogicで先にdrainして失わない。receipt→publicationの既存順序を維持し、projection／permissionの表示採用はuiへ残す。共有cacheのACK・取消終端から表示再採用へ到達する部分も、同じ原則で切り分ける。
+
+###### owner付き状態更新と非描画mount
+
+C1・C3の「既存owner／mountを使う」は、logicから現行`with_viewer_context`をそのまま呼ぶ許可ではない。
+
+現行入口はcallbackの前後でrating publicationとpage-edit reconciliationを実行する。rating publicationはmembership採用からfullscreen再openへ到達し得る。
+
+根拠: `src/app/viewer_context_registry.rs:5285`、`:5296`、`:5300`、`:5305`、`:5313`、`src/app.rs:73183`付近、`src/app/rating_membership_ops.rs:462`、`:471`。保存receipt・editor終了の現在の呼出しは`src/app/book_composition_editor.rs:486`、`:535`、`:558`。
+
+**先にmountを不要にする**
+
+- 保存receiptのresumeは、receiptが保持するpath・page identity・meterを既存App-global writerへ渡す。現在の`persist_book_resume_with_identity`が扱うwriter、meter、重複記録のmirrorを共通利用し、receiptのためだけにviewerをmountしない。
+- この処理は現在投影中のitemsや選択から保存先を引き直さない。contextが終了していても、既に送信した保存のauthoritative receiptを失わない。
+- editorのClosed／Reloading／既存error状態への更新は、`CompositionEditorOwner`等のowner identityを確認した狭い状態更新入口へ寄せる。MountedならApp内の当該状態、AtRestなら既存bundle内の状態を更新する。新しいeditor ownerやコピーを作らない。
+- 古いreceiptは新しいeditor sessionを変更しない。表示ownerが既に終了していても、保存・resumeの終端は共通ownerで収穫する。
+
+既存のread-only `ContextRef`やAtRest宛てreply配送と同じく、必要なpayloadだけへ届く入口を優先する。代表: `src/app/viewer_context_registry.rs:5204`、`deliver_spread_shift_reply_at_rest`。receiptのresume記録は`src/app/book_resume_meter.rs:184`。
+
+**App上の一時投影が必要なserviceの境界**
+
+残る取消・寿命処理でApp形式のpayloadアクセスが必要な場合は、現行mountを次の二層へ分ける。
+
+| 境界 | 責務 |
+|---|---|
+| 非描画の状態mount | 既存tableのplan／payload交換／finish、必要なfavorite設定投影、owner付きcallback、元ownerへの復元 |
+| UI mount wrapper | 従来のmount／return前後のrating publicationとpage-edit reconciliationを、従来順序で明示して呼ぶ |
+
+非描画入口は仮称`with_viewer_context_state`とする。既存`with_viewer_context`はUI wrapperとして残し、通常Fullの旧呼出位置・rating boundary順序・reconciliationを維持する。
+
+共通化するのは既存registryとpayload交換であり、第二registry、第二bundle、shadow ownerを作らない。元contextへの復元・既存unwind時の復元契約も共有する。`swap_viewer_context_bundle`内のfavorite overlay投影は所有contextに必要な状態交換として維持し、そこへnavigationや表示refreshを追加しない。
+
+非描画入口では、往路・callback・復路のどこでも次を行わない。
+
+- `publish_mounted_context_rating_writes_at_boundary`
+- `poll_page_edit_reconciliation`による表示用snapshot採用・再要求
+- membership再配置、fullscreen open／再open、UI decision、入力sample、表示ACK
+
+`in_logic`、`suppress_display`等のflagを従来mountへ足して副作用を抑える方式は採らない。状態交換そのものに表示hookを含めず、UI wrapperだけが表示境界を呼ぶ構造にする。非描画callback自身にも表示継続を含めない。
+
+未反映ratingの既存write generation／seen generation、page-editのstamp／pendingはそのownerへ残す。非描画アクセスのためにseenを進めたり、表示更新済みへ偽装したりしない。次の当該UI境界で、現在と同じ表示再採用を行う。新しい「reconcile待ち」boolやqueueは不要である。
+
+C1、save receipt、editor終了、root／子Close、ZIP取消、discarded sidecar等の非描画serviceについて、callback本体だけでなく呼出し前後を監査する。`with_window_viewer_context`等のwrapperも同じ対象とする。build／fork／promote等の表示開始境界を、状態更新の代用品としてlogicから呼ばない。
+
+**別contextを使う必須回帰**
+
+Aを現在投影し、Bに送信済みcomposition save ticketを置く。A・Bには、UIで採用するとmembership・表示位置が変わる未反映rating writeを用意する。
+
+1. UIなしでserviceを実行し、Bのreceipt収穫、正しいpath／identityへのresume記録、Bのeditor状態確定を検査する。
+2. A・Bのfullscreen open／再open、page-turn decision、表示用reconciliationの実行が0回であることを検査する。兄弟の選択、表示位置、items generation、window bindingを変更しない。
+3. 元の投影owner・favorite設定投影が復元され、ratingの未反映generationとpage-editの未採用状態が保持されることを検査する。
+4. 後にUI mountを行うと、従来のboundary順で正しいcontextだけが未反映rating・編集状態を採用する。service側で更新済みと偽装していないことを確認する。
+5. A／Bを逆にした場合、同じcontextへのアクセス、入れ子の状態アクセス、B終了後の遅いreceiptも検査する。新editor sessionへ旧receiptを適用しない。
+6. 必要な状態mountのcallbackがunwindする既存fixtureでは元ownerへ戻り、復路でも表示hookを実行しない。
+
+テスト専用の「表示禁止flag」で成立させず、製品が使う状態アクセス／mount入口とUI wrapperを検査する。正常なowner付き保存のために兄弟表示を動かすことも、次の正当なUI採用を永久に抑止することも許容しない。
 
 ##### C4: 原画完成とeditor再開
 
@@ -1201,6 +1360,17 @@ RedrawRequested期限超過は`eframe-0.37.0/src/native/run.rs:29`、`:233`、`:
 
 案Bはscheduler方針の明示的な変更として、App責務分離とともにdetached計画§11へ追記する。既存の11項目の合意を破棄せず、変更箇所と残る期限超過経路について設計担当・独立レビュー担当が整合を確認する。
 
+第4.4版の追加台帳:
+
+| 項目 | 分類・方針 |
+|---|---|
+| root lifecycleのlogic-only接続 | (b・新規) 本家のlogic直後のClose確定を維持し、Appの非描画終了判断が同じLogicOutputへCancelCloseを返すことを回帰で固定する。root用の第二Close queueや別hookは追加しない |
+| immediate子の描画資格・出力完結 | (b・新規) 両backendの`render_immediate_viewport`で子自身のmetadata・明示描画要求を使う。主経路とaction／delta契約を共通化し、親の可視性を流用しない |
+
+root lifecycleの製品判断はApp側の既存ownerへ置き、vendor側でtray設定・保存状態を解釈しない。非描画context境界もApp側の責務であり、vendorに表示抑止flagを追加しない。
+
+immediate修正は既存のscreenshot callback移行、通常版計測、非描画・消滅viewport deltaと同じ入口へ付け直す。別rendererや別pending delta ownerを増やさない。
+
 #### egui-wgpu
 
 | 項目 | 分類・方針 |
@@ -1401,6 +1571,12 @@ rect捕捉条件、geometry由来recreate、新detached pending bool、時間窓
 
 これは合意済み11項目の適用範囲を具体化し、scheduler方針の変更を記録するものである。利用者の案B採択と、設計担当・独立レビュー担当の構造整合確認を区別し、本追補だけで追加範囲の独立レビュー完了を主張しない。
 
+第4.3版レビューで、案Bとscheduler方針変更が症状パッチではなく構造修正であるとの合意を得た。本版はその合意を維持する。
+
+§11へは、追加でroot lifecycleの非描画受付・既存延期ownerへの合流、owner付き状態更新と非描画mount／UI mountの境界、immediate子自身の描画資格を追記する。§11本文は設計担当が更新する。
+
+状態mountで兄弟の表示を再採用しないことと、次の正当なUI境界では従来どおり再採用することを、両方の不変条件として記録する。既存のrating publicationを後付けguardで抑える変更にはしない。追加3件の実装前レビューと、案B自体について成立した合意を区別する。
+
 ### 4.12 Rust 1.99警告とMSRV
 
 既存ログはf32 fallback 445件／36ファイル、lib全体688警告。今回の実行結果ではない。
@@ -1590,6 +1766,10 @@ C2・C4・C5とC3のlive表示用pollはuiに残す分類を固定し、通常�
 - watcher／周期保存と、走査結果採用・hydration・cutoff ACKを分ける。
 - 通常／IndexOnly hydrationのIDを既存ownerの単一採番へ集約する。
 - G1〜G3の表示準備・upload予算と、G4のUI分割準備・Cancel／ACK、G5のactivation入力資格は既存UI側へ残す。新しいservice counterへ一括置換しない。
+- root Closeの受付・トレイ置換・保存待ち・settings-family・ZIP取消・終了継続を、通常入力から独立したlifecycle入口へ整理する。
+- 保存receiptとeditor終了はmount不要のowner付き更新を優先する。残るserviceの一時mountは、payload交換とUI再採用・reconciliationを分離する。
+
+0.33.3では旧driverの呼出順・Closeの優先規則・modal frameの保護を維持する。0.37のlogic-only接続は段3で行う。
 
 **受入:**
 
@@ -1600,10 +1780,19 @@ C2・C4・C5とC3のlive表示用pollはuiに残す分類を固定し、通常�
 - watcherのcutoff ACKは採用後だけ。通知、cause、restart要求を失わない。
 - frame_counter・input_seqを固定して通常／IndexOnly要求の開始・取消・再開始を行い、別要求は別ID、同じ要求のCommonとbook restoreは同じIDとなる。mountで採番が戻らない。
 - C4・C5の既存pointer／decision／frame予算回帰を弱体化しない。
+- root lifecycle serviceだけを呼び、trayへの置換、保存中の延期、receipt後の一度だけの終了継続、settings-family終端、ZIP取消終端を検査する。UIでCancelCloseを補わない。
+- sidecar等のmodal拒否と、保存待ちによる延期を区別する。通常Closeと明示Quitの意味を保持する。
+- 別contextのsave receiptと未反映ratingを同時に用意し、receipt・resume記録は進むが、往路・callback・復路で表示再採用が起きない。
+- UI mount wrapperは従来のrating boundary・reconciliation順序を維持し、未反映更新を次のUIで正しく採用する。
+- 元owner・favorite設定投影の復元、入れ子、同contextアクセス、既存unwind復元、終了済みcontextへの遅いreceiptを検査する。
 
 追加境界回帰は共通filter `egui037_continuation`で選択可能にする。実ownerの未受信保持・単一消費・終端・採番を検査し、source grepだけを証拠にしない。
 
-**規模:** 5～10ファイル、250～500行。純移動を除く。
+root CloseのApp回帰には`root_lifecycle`、状態アクセス／mount回帰には`context_state`も含め、個別に選択できるようにする。0.37 backendがlogic直後にCloseを確定する接続回帰は段2c・段3へ残す。
+
+レビュー可能な単位で、既存保存・取消／D3、root lifecycle、非描画状態アクセス／mountを分けてコミットする。root lifecycleとmount整理で同じ共有ファイルを触る場合は一人のwriterで順に進める。段1b-2へ追加しない。
+
+**規模:** 8～16ファイル、650～1250行。純移動を除く。第4.3版の250～500行に、root lifecycle約180～350行、owner付き状態更新・非描画mount約220～400行を追加した。App内の共通化・非対話回帰を含み、段2cのvendor回帰・段3の正式接続は重複計上しない。
 
 #### 段1b-3c: 入力投影・clipboard・native出力
 
@@ -1619,9 +1808,9 @@ foreground、wheel消費位置、clipboard条件、native IME出力変換・inte
 |---|---:|---:|
 | 1b-2 gamepad | 4～8 | 250～500 |
 | 1b-3a Remote | 4～8 | 350～650 |
-| 1b-3b 保存・取消終端／D3 | 5～10 | 250～500 |
+| 1b-3b 保存・取消終端／D3／root lifecycle／非描画状態アクセス | 8～16 | 650～1250 |
 | 1b-3c 入力・出力 | 6～12 | 300～650 |
-| **残作業合計** | **重複を除き15～30程度** | **1150～2300** |
+| **残作業合計** | **重複を除き18～38程度** | **1550～3050** |
 
 完了済み1b-1の純移動、段2のvendor、段3の正式接続、PNG更新は含めない。小段ごとにビルド可能な状態でコミットする。
 
@@ -1637,6 +1826,10 @@ cargo test -p mimageviewer --lib egui037_continuation
 
 受信・採用・取消・ACK・mount ownerの対応を台帳へ記録する。「全serviceの入力依存0件」という名称ベースの完了条件にはしない。実ウィンドウ試験は自動gateへ混ぜない。
 
+第4.4版の増分は1b-3bへ集約する。段1b-2は並行中のgamepadの範囲・受入条件を維持し、ここでは完了や検証結果を先取りしない。
+
+`root_lifecycle`と`context_state`の個別filterも成立件数を記録する。非描画serviceが旧UI mount wrapperへ戻る変更と、UI wrapperから表示再採用を落とす変更の双方を拒否できる回帰を置く。
+
 ### 段2: 新版vendor再構築
 
 準備用の実ディレクトリ・standalone graphで新版を検証し、root patchは旧vendorのまま維持する。新版egui-imeの共有正規化も準備graphへ接続する。正式置換は段3。reparse pointは使わない。
@@ -1645,7 +1838,7 @@ cargo test -p mimageviewer --lib egui037_continuation
 |---|---|---|
 | 2a | egui既存API、IME中断要求のviewport所有・pass出力集約、承認済みviewportの非描画退役入口、クリックfixture、egui-winit IME配送・Disabled互換・trace・clipboard、共有IME fixture | 11～20ファイル、900～1850行 |
 | 2b | egui-wgpu mipmap、delta完結、surface、診断 | 10～16ファイル、1100～2100行 |
-| 2c | eframe scheduler、案Bの最小化UI継続と非描画出力・action完結、viewport入力所有、skip保持、子Close受付・消費・非描画退役、visible commit、delta、計測・診断 | 16～28ファイル、1900～3850行 |
+| 2c | eframe scheduler、案Bの最小化UI継続と非描画出力・action完結、immediate子自身の描画資格、root lifecycleのClose確定接続回帰、viewport入力所有、skip保持、子Close受付・消費・非描画退役、visible commit、delta、計測・診断 | 17～30ファイル、2050～4150行 |
 
 原本置換は別計上する。
 
@@ -1654,6 +1847,8 @@ cargo test -p mimageviewer --lib egui037_continuation
 第4.2版では、通常GCと共有する非描画退役入口・回帰として段2aへ約100～200行、wgpu／glowのClose受付・消費・対象限定退役と回帰として段2cへ約250～500行を追加した。App側の終了owner接続は段3へ別計上する。
 
 第4.3版では案Bの判断条件・共通action処理・コメントに約40～120行、非対話回帰に約150～350行を見込み、段2cを丸めて約200～500行増とした。既存scheduler／delta修正は重複計上しない。案Bの方針変更と残る期限超過経路を§11へ追記する前提とする。
+
+第4.4版では、両backendのimmediate描画資格・action接続と、root logic-only Close確定の非対話回帰として段2cへ約150～300行を追加した。App側のroot policy・非描画mount実装は段1b、正式接続は段3へ計上する。
 
 #### 段2aの順序・受入条件
 
@@ -1719,8 +1914,15 @@ Close回帰はbackendの実際の受付・消費・退役helperとfake App／res
 10. child skipのfixtureは期限超過等を明示し、Windows最小化単独をskipの期待値にしない。
 11. 案Bの通常Full回帰とは別に、CloseはUI／callbackを実行しない試験でも受付・消費・退役できる。
 12. §11へscheduler方針変更、UI／surface分離、残る期限超過経路が追記され、構造整合を確認している。
+13. immediateの実入口で、親最小化・子visible、親子とも最小化、最小化子へのScreenshotを検査する。子のUI／paint／callbackと親のpaintを別々に数える。
+14. immediateの非描画でもdelta・platform output・commands・clipboard actionを完結し、当該子UIからのScreenshotと既存保留Screenshotが重複・欠落しない。
+15. root Closeを含むRawInputで`update_logic_only`へ接続し、ui呼出し0のままCancelCloseで終了を止める場合と、CancelCloseなしで終了する場合を検査する。完了後の再Closeは一度だけ通常経路へ配送する。
 
 準備graphの回帰名に`minimized_full`を含め、正式graphでも選択できるようにする。scheduler／App呼出し・出力適用はfake window／painterと実integration入口で検査する。surfaceを使う検査は既存offscreen契約を利用し、desktop操作を自動gateへ混ぜない。
+
+root Close確定回帰はfake Appのlogicだけからcommandを返し、uiを呼ぶと失敗するfixtureとする。tray・保存・settings-family・ZIPの本体policyは段1b／段3で検査し、vendorに製品設定を持ち込まない。
+
+immediate修正とroot Close確定回帰は独立したコミットへ分ける。glowでも必要なGL資源適用とsurface描画を区別する。§11の追加範囲にroot lifecycle・非描画mount・immediate子描画を記録する。
 
 ### 段3: 依存と必須契約の原子的切替
 
@@ -1791,10 +1993,11 @@ graphの旧egui混入・型分裂・古いpathを確認する。compileだけで
 | viewport入力所有・IME producerの本体接続回帰 | 100～250 |
 | native IME出力・control配送・必須回帰。生成・集約済み出力の接続確認を含む | 250～550 |
 | 子CloseのApp終了owner接続・入口統一・接続回帰 | 200～400 |
-| 案BとC1〜C5・D3の正式接続・追加接続回帰 | 100～250 |
-| **合計** | **3150～6500** |
+| 案BとC1〜C5・D3の正式接続・追加接続回帰。immediateの親子条件を含む | 100～250 |
+| root lifecycle・非描画状態アクセスの正式接続回帰 | 150～300 |
+| **合計** | **3300～6800** |
 
-**108～192ファイル程度。**
+**112～200ファイル程度。**
 
 第3.1版のgamepad引継ぎを再評価し、Astra指摘の接続・回帰を追加した。段2a／2cのvendor実装は上表へ重ねて計上しない。
 
@@ -1805,6 +2008,8 @@ graphの旧egui混入・型分裂・古いpathを確認する。compileだけで
 第4.3版では、案Bの正式接続、最小化Fullでの表示継続、期限超過中のRemote・保存・取消終端、次の対象Fullへの引継ぎの追加接続回帰として約100～250行を追加した。Remote owner整理・共有終端抽出・D3採番は段1b、案Bのvendor判断・action配送と最小回帰は段2cへ計上し、上表へ重複計上しない。
 
 C2・C4・C5とC3の表示用pollをuiへ残すため、全完成結果のlogic受信、共通表示待ちqueue、C4進捗のみの必須分割は見積りに含めない。一方、期限超過が残るのでC1と保存・取消終端を一括削除して減額することもしない。
+
+第4.4版では、実logic-onlyのroot Closeと、別contextのreceipt・未反映ratingを使う正式接続回帰として約150～300行を追加した。root policy・owner付き状態更新・非描画mountの共通化は段1b-3b、immediate描画資格とvendor最小回帰は段2cへ計上する。immediateのApp側代表接続は既存案B行の範囲で見込む。
 
 段1b後に実差分で再評価する。gamepadやnative配送の抽出が不足する場合は、旧版上の挙動不変抽出を追加し、原子切替へ未整理の大改修を押し込まない。
 
@@ -1818,6 +2023,9 @@ C2・C4・C5とC3の表示用pollをuiへ残すため、全完成結果のlogic�
 - RedrawRequested期限超過中はlogicだけで必要な終端を進め、表示用結果を既存receiverへ保持する。別viewportのFullでは消費しない。
 - 旧outer tailは既存のui本体の早期returnでも実行する。logicからUI tailを強制実行しない。
 - frame_counterは表示・入力・予算の既存ownerへ残し、D3の採番だけを分離する。F13、G1〜G5の留保を無視したlogic接続をしない。
+- root Closeは通常キー入力から分離したlifecycle入口へ接続し、logic直後のbackend終了判定へCancelCloseを間に合わせる。
+- C1・保存・取消・終了処理はowner付き状態更新または非描画mountを使う。旧UI mount wrapperをserviceの前後へ残さない。
+- immediate子は両backendの実入口まで正式接続し、子自身のmetadata・描画要求でsurface描画を決める。
 
 正式graphの必須接続回帰:
 
@@ -1832,6 +2040,11 @@ C2・C4・C5とC3の表示用pollをuiへ残すため、全完成結果のlogic�
 9. D3は採用前のcutoff ACK／mtime／signature更新を行わず、cause・restartを保持する。通常／IndexOnly要求のIDはframeを進めず再開始しても異なる。
 10. 非描画Fullのdelta・platform output・commands・clipboard action、明示screenshot、実表示ACKを実接続点で検査する。
 11. 期限超過root LogicOnly→child Full→root Full、child skip後の終端保持と、非描画Close退役の既存回帰を維持する。
+12. root CloseはUIを一度も実行せず、通常×のtray置換、保存中の終了延期、receipt後の一度だけの終了継続、settings-family・ZIP取消終端を満たす。CancelCloseの有無からbackendが終了を確定するところまで接続する。
+13. rootのmodal拒否は後から再発火せず、延期要求は既存ownerの終端で再開する。通常Close／明示Quitの優先規則を維持する。
+14. A投影中にBのsave receiptと未反映ratingを処理し、receipt・resume書込みだけが進む。往復mountを含めfullscreen再open、UI decision、兄弟表示再採用は0回で、未反映generationを保持する。
+15. 次の正当なUI mountで従来のrating・page-edit採用が行われる。非描画化のために表示更新を永久に止めていない。
+16. 親最小化・immediate子visibleでは子だけ描画し、親子最小化では通常描画せずUIと出力は進む。最小化immediate子のScreenshotは子の描画・callbackを一度だけ完了する。
 
 ```powershell
 cargo test -p mimageviewer --lib egui037_continuation
@@ -1841,6 +2054,8 @@ cargo test -p mimageviewer --lib egui037_continuation
 段2cの`minimized_full`回帰も正式vendor graphで実行する。manifest／featureは段2c台帳の成立したコマンドを用い、0件選択を成功としない。vendorの判断・出力回帰と、上記App owner接続回帰を区別する。
 
 追加repaint、新pending bool、時間窓、logicからの強制UIで成立させない。実Windowsの最小化・復元・負荷とRemote操作は段7へ残す。
+
+第4.4版では`root_lifecycle`、`context_state`の個別filterも実行して選択件数を記録する。headless回帰では本体lifecycle serviceと実backendのClose確定境界を接続し、実ShowWindow・desktop操作だけをfake effect ownerへ置き換える。UIを呼んでから検査する試験では代用しない。
 
 ### 段4a: 入力・非表示・popupの等価経路確認
 
@@ -2032,6 +2247,14 @@ modal拒否・初回callback前・兄弟Fullとの順序網羅は非対話回帰
 
 厳密な100 ms境界、250 ms期限超過、pass交互順序、非描画Fullの出力完結は非対話回帰を主証拠とする。全C3入口・画像形式の手操作マトリクスを増やさない。既存ReleaseChecksへ最小化が含まれない場合は、この追加範囲を別の承認済み検証として記録し、未実施をPASSにしない。
 
+第4.4版の実機代表確認:
+
+19. 通常×をtrayへ置換する設定でrootを閉じ、従来どおり退避・復帰できることを確認する。送信済み保存を伴う代表例では、保存を失わず既存の終了方針へ戻ることを確認する。
+20. 別contextに保存完了が届く代表操作で、現在表示中の兄弟のページや選択が勝手に再採用されないこと、そのcontextを通常表示した時は最新rating・編集結果が反映されることを確認する。
+21. 既存immediate子を使う代表経路で、親最小化・子visibleの表示を確認する。親子とも最小化した場合の通常描画抑止と、最小化子のScreenshotはheadless／offscreen回帰を主証拠とする。
+
+厳密な期限超過中のClose、receiptとratingの競合順序、UI呼出し0回は非対話回帰で検査する。利用者へdeadline発生の手動再現を求めず、保存失敗や設定破損も作らない。エージェント実行は既存の明示承認・使い捨てportableの規則に従う。
+
 ### 7.5 動画HUD・GPU
 
 1. 再生、HUD文字、時間、速度、音量、track。
@@ -2104,3 +2327,19 @@ modal拒否・初回callback前・兄弟Fullとの順序網羅は非対話回帰
 - scheduler方針変更と残る期限超過経路、C1〜C5の責務境界について、設計担当・独立レビュー担当の整合確認とdetached計画§11記録がある。
 
 段1b検証台帳へ入口・receiver・採用・取消・ACK・mount ownerの対応を追記する。`docs/web-remote-plan.md`では単一writer、取得時の全ローカル閲覧終了、返却後の非復元を保持する。案Bの採択を負荷同値・実機確認・追加構造レビューの完了証拠へ読み替えない。
+
+第4.4版の追加完了条件:
+
+- root Closeの判断が通常キー入力・dialog描画から分離され、logic直後のbackend終了確定へCancelCloseを返せる。
+- UIなしでtray置換、保存待ち、settings-family、ZIP取消、完了後の一度だけの終了継続が成立する。
+- modal拒否とoperation延期、通常×と明示Quitを区別し、旧ui入口との二重受付を残していない。
+- 保存receiptのresume記録とeditor状態更新はmount不要のowner付き更新を優先し、元context終了後もauthoritative receiptを失わない。
+- 必要な非描画mountはpayload交換・owner更新・復元だけを行い、往路・callback・復路から表示再採用へ到達しない。
+- 未反映rating・page-editのgeneration／stampを非描画アクセスで消費せず、次の正当なUI mountで従来どおり採用する。
+- 別contextのreceiptと未反映ratingを使う回帰で、保存は進むがfullscreen再open・UI decision・兄弟表示再採用が起きない。
+- 両backendのimmediate実入口が、子自身のmetadataと明示描画要求を使う。
+- 親最小化・子visible、親子最小化、最小化immediate子Screenshotの回帰が成立し、非描画でも出力を完結する。
+- 後付けの表示抑止guard、logic-mode flag、第二registry、第二Close queue、新pending bool、追加repaint・retryを追加していない。
+- 案Bについて成立した構造合意を維持し、追加のroot lifecycle・非描画mount・immediate子描画の範囲と理由を§11へ記録している。
+
+段1b台帳のO6・F6はroot lifecycleへの接続へ更新する。C1／C3／F13の留保には、callback本体だけでなくmount前後の表示副作用を含める。段1b-2のgamepadのみの並行実装へ追加3件を混ぜず、検証証拠とファイル所有を分ける。
