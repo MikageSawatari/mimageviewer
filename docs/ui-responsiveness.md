@@ -560,6 +560,12 @@ target clone を全件に行っていた。さらに可視優先範囲が移る�
 
 ### 4.4 コレクションの区間計測
 
+ナビゲーション preflight の PDF 列挙は前面の要求として既存の Critical 列挙・合流を使う。
+v4.2.0 の staged 化で背景用 Normal に流れていたため、旧本の HighNormal サムネイルを
+待つ退行があった。同期待ちは preflight worker 上だけで行い、結果／取消通知の channel
+select で待ち手単位に離脱する。background 列挙の優先度や pool の admission caps は変えない。
+詳細は [非同期構成](async-architecture.md) の PDF 列挙を参照。
+
 `--perf-log` の `cat="collection"` は、Grid / 管理画面 / Remote の `actor_rtt`、
 Grid `prepare` の `stage=classify/sidecar_scan/pin_db/identity`、UI `install`、
 navigation の `preflight`、import / export、source migration を記録する。

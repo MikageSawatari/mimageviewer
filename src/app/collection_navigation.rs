@@ -405,7 +405,7 @@ pub(crate) enum PhysicalHistoryPreflightPoll {
 }
 
 pub(crate) struct PhysicalHistoryPreflight {
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<crate::pdf_loader::NavigationPreflightCancel>,
     receiver: std::sync::mpsc::Receiver<Result<PhysicalHistoryPreflightPayload, String>>,
 }
 
@@ -415,7 +415,7 @@ impl PhysicalHistoryPreflight {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(Ok(payload)).expect("seed physical preflight");
         Self {
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
             receiver,
         }
     }
@@ -439,7 +439,7 @@ impl PhysicalHistoryPreflight {
 
 impl Drop for PhysicalHistoryPreflight {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
     }
 }
 
@@ -560,7 +560,7 @@ pub(in crate::app) enum CollectionNavigationPending {
         watch: CollectionRevisionWatch,
         prepared: Arc<CollectionPreparedSnapshot>,
         target_kind: CollectionNavigationTargetKind,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<crate::pdf_loader::NavigationPreflightCancel>,
         receiver: std::sync::mpsc::Receiver<
             Result<Option<CollectionNavigationPreflightReady>, CollectionPrepareError>,
         >,
@@ -579,7 +579,7 @@ pub(in crate::app) enum CollectionNavigationPending {
         target: CollectionPreparedNavigationTarget,
         password: String,
         save: bool,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<crate::pdf_loader::NavigationPreflightCancel>,
         receiver: std::sync::mpsc::Receiver<std::io::Result<crate::pdf_loader::PdfEnumerateResult>>,
     },
     AwaitingOuterContinuation {
@@ -673,10 +673,11 @@ impl CollectionNavigationPending {
 
     pub(crate) fn cancel(&self) {
         match self {
-            Self::Preparing { cancel, .. }
-            | Self::Preflighting { cancel, .. }
-            | Self::PdfPasswordPreflighting { cancel, .. } => {
+            Self::Preparing { cancel, .. } => {
                 cancel.store(true, Ordering::Release);
+            }
+            Self::Preflighting { cancel, .. } | Self::PdfPasswordPreflighting { cancel, .. } => {
+                cancel.cancel()
             }
             Self::RequestNeeded { .. } | Self::Snapshot { .. } => {}
             Self::AwaitingPdfPassword { .. } => {}
@@ -865,7 +866,7 @@ fn preflight_candidates(
     still_only: bool,
     tree_options: crate::folder_tree::FolderTreeOptions,
     show_hidden_files: bool,
-    cancel: &Arc<AtomicBool>,
+    cancel: &Arc<crate::pdf_loader::NavigationPreflightCancel>,
     collection_id: CollectionId,
     request_sequence: u64,
 ) -> Result<Option<CollectionNavigationPreflightReady>, CollectionPrepareError> {
@@ -894,13 +895,13 @@ fn preflight_candidates(
                     let qualifies = if still_only {
                         crate::folder_tree::folder_has_still_image_with_options(
                             path,
-                            Some(cancel),
+                            Some(cancel.flag()),
                             tree_options.clone(),
                         )
                     } else {
                         crate::folder_tree::folder_should_stop_with_options(
                             path,
-                            Some(cancel),
+                            Some(cancel.flag()),
                             tree_options.clone(),
                         )
                     };
@@ -913,7 +914,7 @@ fn preflight_candidates(
                             tree_options.include_epub,
                             show_hidden_files,
                             &tree_options.file_type_visibility,
-                            Some(cancel),
+                            Some(cancel.flag()),
                         )
                         .ok()
                         .filter(|scan| {
@@ -938,7 +939,7 @@ fn preflight_candidates(
                 CollectionResolvedKind::Zip => {
                     crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                         path,
-                        Some(cancel),
+                        Some(cancel.flag()),
                     )
                     .ok()
                     .filter(|enumeration| !enumeration.entries.is_empty())
@@ -967,10 +968,10 @@ fn preflight_candidates(
                     {
                         None
                     } else {
-                        match crate::pdf_loader::enumerate_pages_with_options(
+                        match crate::pdf_loader::enumerate_pages_for_navigation(
                             path,
                             candidate.pdf_password.as_deref(),
-                            Some(Arc::clone(cancel)),
+                            cancel,
                             crate::pdf_loader::EnumerateOptions {
                                 want_direction: candidate.want_direction,
                             },
@@ -1021,7 +1022,10 @@ fn preflight_candidates(
                             return Some(CollectionNavigationPreflightPayload::RarOpen);
                         }
                         match crate::archive_converter::scan_summary_with_password_cancelable(
-                            path, format, None, cancel,
+                            path,
+                            format,
+                            None,
+                            cancel.flag(),
                         ) {
                             Ok(summary)
                                 if summary.image_count != 0
@@ -1149,7 +1153,7 @@ impl App {
                 })
             },
         );
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let spawn = std::thread::Builder::new()
@@ -1192,7 +1196,7 @@ impl App {
                                 tree_options.include_epub,
                                 show_hidden_files,
                                 &tree_options.file_type_visibility,
-                                Some(&worker_cancel),
+                                Some(worker_cancel.flag()),
                             )
                             .map(PhysicalHistoryPreflightPayload::Folder)
                             .map_err(|error| format!("フォルダを読み込めません: {error}"))
@@ -1216,7 +1220,7 @@ impl App {
                                 && let Ok(enumeration) =
                                     crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                                         &backing_path,
-                                        Some(&worker_cancel),
+                                        Some(worker_cancel.flag()),
                                     )
                             {
                                 return Ok(PhysicalHistoryPreflightPayload::ZipCached {
@@ -1226,17 +1230,17 @@ impl App {
                             }
                             crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                                 &path,
-                                Some(&worker_cancel),
+                                Some(worker_cancel.flag()),
                             )
                             .map(|raw| crate::zip_loader::PreparedZipEnumeration::prepare(path.clone(), raw, tree_options.file_type_visibility.clone()))
                             .map(PhysicalHistoryPreflightPayload::Zip)
                             .map_err(|error| format!("書庫を読み込めません: {error}"))
                         }
                         CollectionResolvedKind::Pdf => {
-                            match crate::pdf_loader::enumerate_pages_with_options(
+                            match crate::pdf_loader::enumerate_pages_for_navigation(
                                 &path,
                                 pdf_password.as_deref(),
-                                Some(Arc::clone(&worker_cancel)),
+                                &worker_cancel,
                                 crate::pdf_loader::EnumerateOptions { want_direction },
                             ) {
                                 Ok(pages) if !pages.pages.is_empty() => {
@@ -1292,7 +1296,7 @@ impl App {
                                 && let Ok(enumeration) =
                                     crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
                                         &backing_path,
-                                        Some(&worker_cancel),
+                                        Some(worker_cancel.flag()),
                                     )
                             {
                                 return Ok(PhysicalHistoryPreflightPayload::ZipCached {
@@ -1304,7 +1308,7 @@ impl App {
                                 &path,
                                 format,
                                 password.as_deref(),
-                                &worker_cancel,
+                                worker_cancel.flag(),
                             ) {
                                 Ok(summary) => {
                                     Ok(PhysicalHistoryPreflightPayload::ConvertibleArchive(summary))
@@ -2076,7 +2080,7 @@ impl App {
             self.finish_collection_navigation_without_target_no_context(&request.action);
             return true;
         }
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let worker_cancel = Arc::clone(&cancel);
         let worker_path = target.source_path.clone();
         let worker_password = password.clone();
@@ -2089,10 +2093,10 @@ impl App {
         let spawn = std::thread::Builder::new()
             .name("collection-pdf-password-preflight".into())
             .spawn(move || {
-                let result = crate::pdf_loader::enumerate_pages_with_options(
+                let result = crate::pdf_loader::enumerate_pages_for_navigation(
                     &worker_path,
                     Some(&worker_password),
-                    Some(worker_cancel),
+                    &worker_cancel,
                     crate::pdf_loader::EnumerateOptions { want_direction },
                 );
                 let _ = sender.send(result);
@@ -2365,7 +2369,7 @@ impl App {
         };
         let tree_options = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
         let show_hidden_files = self.settings.show_hidden_files;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
         let warm_live_delivery = request
@@ -2394,7 +2398,7 @@ impl App {
                 if let Some((owner, retained)) = warm_live_delivery
                     && !worker_cancel.load(Ordering::Acquire)
                 {
-                    let live = match super::collection_grid::prepare_collection_grid_live_thumbnail_sources(retained.payload.clone(), &worker_cancel) {
+                    let live = match super::collection_grid::prepare_collection_grid_live_thumbnail_sources(retained.payload.clone(), worker_cancel.flag()) {
                         Ok(live) => live,
                         Err(error) => { let _ = sender.send(Err(error)); return; }
                     };
@@ -2612,13 +2616,13 @@ impl App {
                 receiver,
             } => match observe_revision(&watch, request.origin.collection_id) {
                 RevisionObservation::Deleted => {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.finish_collection_navigation_without_target(ctx, &request.action);
                 }
                 RevisionObservation::Revision(revision)
                     if revision > prepared.collection_revision =>
                 {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.restart_collection_navigation(ctx, request);
                 }
                 _ if request
@@ -2626,7 +2630,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|owner| owner.page_edit_revision != self.page_edit_revision) =>
                 {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.restart_collection_navigation(ctx, request);
                 }
                 _ => match receiver.try_recv() {
@@ -2762,14 +2766,14 @@ impl App {
                 if !self.collection_navigation_exact_target_is_current(&request, &prepared, &target)
                     || matches!(observation, RevisionObservation::Deleted)
                 {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.finish_collection_navigation_without_target(ctx, &request.action);
                 } else if matches!(
                     observation,
                     RevisionObservation::Revision(revision)
                         if revision > prepared.collection_revision
                 ) {
-                    cancel.store(true, Ordering::Release);
+                    cancel.cancel();
                     self.restart_collection_navigation(ctx, request);
                 } else {
                     match receiver.try_recv() {
@@ -5924,7 +5928,7 @@ mod tests {
                 watch: client.subscribe().unwrap(),
                 prepared,
                 target_kind,
-                cancel: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
                 receiver,
             }));
         let key = crate::adjustment_db::normalize_path(&second);
@@ -7480,6 +7484,255 @@ mod tests {
     }
 
     #[test]
+    fn navigation_preflight_pdf_enqueues_critical() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("foreground.pdf");
+        std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+        let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&path);
+        let (app, _) = start_ready_app(&temp.path().join("collection.db"));
+        let preflight = app.start_physical_history_preflight(path, None).unwrap();
+        let job = pool.take();
+        let priority = job.priority();
+        job.complete(1);
+        let result = preflight
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            PhysicalHistoryPreflightPayload::PdfPages(_)
+        ));
+        assert_eq!(priority, crate::pdf_loader::JobPriority::Critical);
+    }
+
+    #[test]
+    fn navigation_preflight_collection_candidates_release_each_pdf_and_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("empty.pdf");
+        let second = temp.path().join("next.pdf");
+        let never = temp.path().join("never.pdf");
+        let first_pool = crate::pdf_loader::TestPdfEnumeratePool::new(&first);
+        let second_pool = crate::pdf_loader::TestPdfEnumeratePool::new(&second);
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            preflight_candidates(
+                vec![
+                    candidate(first, CollectionResolvedKind::Pdf),
+                    candidate(second, CollectionResolvedKind::Pdf),
+                    candidate(never, CollectionResolvedKind::Pdf),
+                ],
+                1,
+                false,
+                crate::folder_tree::FolderTreeOptions::default(),
+                false,
+                &worker_cancel,
+                CollectionId::new(),
+                1,
+            )
+        });
+        let first_job = first_pool.take();
+        assert_eq!(
+            first_job.priority(),
+            crate::pdf_loader::JobPriority::Critical
+        );
+        first_job.complete(0);
+        let second_job = second_pool.take();
+        assert_eq!(
+            second_job.priority(),
+            crate::pdf_loader::JobPriority::Critical
+        );
+        cancel.cancel();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(CollectionPrepareError::Cancelled)
+        ));
+        assert!(second_job.cancelled());
+    }
+
+    #[test]
+    fn navigation_preflight_password_and_open_failures_keep_existing_payloads() {
+        use crate::pdf_loader::PdfReadError;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("errors.pdf");
+        std::fs::write(&path, b"%PDF-1.4\n").unwrap();
+        let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&path);
+        let (app, _) = start_ready_app(&temp.path().join("collection.db"));
+        for failure in [
+            PdfReadError::PasswordRequired,
+            PdfReadError::NotConverted,
+            PdfReadError::EpubUnavailable {
+                reason: Arc::from("test"),
+            },
+        ] {
+            let preflight = app
+                .start_physical_history_preflight(path.clone(), None)
+                .unwrap();
+            let job = pool.take();
+            assert_eq!(job.priority(), crate::pdf_loader::JobPriority::Critical);
+            job.fail(failure.clone());
+            let payload = preflight
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                (&failure, payload),
+                (
+                    PdfReadError::PasswordRequired,
+                    PhysicalHistoryPreflightPayload::PdfPasswordRequired
+                ) | (
+                    PdfReadError::NotConverted,
+                    PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::NotConverted
+                    )
+                ) | (
+                    PdfReadError::EpubUnavailable { .. },
+                    PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::EpubUnavailable(_)
+                    )
+                )
+            ));
+            let worker_path = path.clone();
+            let worker = std::thread::spawn(move || {
+                preflight_candidates(
+                    vec![candidate(worker_path, CollectionResolvedKind::Pdf)],
+                    1,
+                    false,
+                    crate::folder_tree::FolderTreeOptions::default(),
+                    false,
+                    &Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
+                    CollectionId::new(),
+                    1,
+                )
+            });
+            pool.take().fail(failure.clone());
+            let ready = worker.join().unwrap().unwrap().unwrap();
+            assert!(matches!(
+                (failure, ready.payload),
+                (
+                    PdfReadError::PasswordRequired,
+                    CollectionNavigationPreflightPayload::PdfPasswordRequired
+                ) | (
+                    PdfReadError::NotConverted,
+                    CollectionNavigationPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::NotConverted
+                    )
+                ) | (
+                    PdfReadError::EpubUnavailable { .. },
+                    CollectionNavigationPreflightPayload::PdfOpenFailure(
+                        super::super::PdfOpenFailure::EpubUnavailable(_)
+                    )
+                )
+            ));
+        }
+        let preflight = app.start_physical_history_preflight(path, None).unwrap();
+        pool.take().complete(0);
+        assert!(
+            preflight
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .err()
+                .unwrap()
+                .contains("ページがありません")
+        );
+    }
+
+    #[test]
+    fn navigation_preflight_collection_password_resume_enqueues_critical() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&pdf);
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("password".into()).unwrap());
+        let snapshot = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &pdf,
+                            CollectionResolvedKind::Pdf,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        )
+        .snapshot;
+        let prepared = prepare_snapshot(&snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .clone();
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        let mut request = CollectionNavigationRequest {
+            origin: app.collection_outer_navigation_origin(Some(0)).unwrap(),
+            action: CollectionNavigationAction::OuterFullscreen {
+                fs_idx: 0,
+                forward: true,
+                resume_slideshow: false,
+                native_toast: false,
+                queued_steps: 0,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+            lease: navigation_test_lease(),
+            book_owner: None,
+            navigation: None,
+        };
+        request.lease.pause(Instant::now(), "pdf_password_input");
+        let watch = client.subscribe().unwrap();
+        let revision_wake = CollectionRevisionWake::spawn(&egui::Context::default(), &watch);
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Pdf);
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(
+                CollectionNavigationPending::AwaitingPdfPassword {
+                    request,
+                    watch,
+                    revision_wake,
+                    prepared,
+                    target,
+                },
+            ));
+        assert!(app.resume_collection_pdf_password_request(&pdf, "secret".into(), false));
+        let job = pool.take();
+        assert_eq!(job.priority(), crate::pdf_loader::JobPriority::Critical);
+        job.complete(1);
+        let pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap();
+        let CollectionNavigationPending::PdfPasswordPreflighting { receiver, .. } = pending else {
+            panic!("password preflight must be running");
+        };
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .pages
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn epub_pdf_preflight_keeps_typed_open_failure_for_the_request_owner() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("book.epub");
@@ -7490,7 +7743,7 @@ mod tests {
             false,
             crate::folder_tree::FolderTreeOptions::default(),
             false,
-            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
             CollectionId::new(),
             1,
         )
@@ -7543,7 +7796,7 @@ mod tests {
             false,
             crate::folder_tree::FolderTreeOptions::default(),
             false,
-            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(crate::pdf_loader::NavigationPreflightCancel::new()),
             CollectionId::new(),
             1,
         )
@@ -7559,7 +7812,8 @@ mod tests {
     #[test]
     fn collection_preflight_observes_cancellation_before_filesystem_work() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
-        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
+        cancel.cancel();
         let result = preflight_candidates(
             vec![candidate(
                 PathBuf::from(r"Z:\never-probed.jpg"),
@@ -7700,7 +7954,7 @@ mod tests {
         // Submission consumes the visible password request, while the context's typed
         // preflight continues to own the same physical book until adoption/cancellation.
         app.pdf_password_request = None;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         let (_sender, receiver) = std::sync::mpsc::channel();
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(
@@ -7816,7 +8070,7 @@ mod tests {
         let request_id = request.lease.request_id();
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Image);
         let (sender, receiver) = std::sync::mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::pdf_loader::NavigationPreflightCancel::new());
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(CollectionNavigationPending::Preflighting {
                 request,

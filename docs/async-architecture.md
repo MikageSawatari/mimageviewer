@@ -677,6 +677,17 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 
 通常 PDF と固定済み EPUB の列挙は呼出元で合流登録し、新しい実行要求だけ `pdf-enumerate-nav` スレッドを起こす。未固定 EPUB の admission は専用の背景スレッドで source stat・DB 照合・登録・エンコードを行う。固定表 mutex はメモリ検索・挿入だけを保護し、stat・DB 照合中は保持しない。同じ実読込パスへの追加 waiter はスレッドを増やさない。
 
+ナビゲーション preflight（物理 staged／履歴、コレクション候補、PDF パスワード再開）の
+PDF 列挙も、利用者が採用を待つため同じナビ用列挙（Critical）と実行中要求の合流を使う。
+v4.2.0 の staged 化で背景用の同期列挙（Normal）を通るようになり、旧本の可視サムネイル
+（HighNormal）を待つ退行が入っていた。背景の metadata／cache／Remote 等は Normal を維持する。
+preflight worker は結果と取消通知を channel select で待ち、取消時はその待ち手の lease だけを
+離脱させる。最後の待ち手だけが既存の source cancel を立てる。候補間で待ち手を持ち越さない。
+read target は従来と同じ worker 解決・EPUB lease を使い、合流キーは
+`(read_path, password, want_direction)` のまま。取消監視の polling や新しい優先度枠は追加しない。
+既存の連続ナビを保つためモーダル化は行わず、列挙と取消の所有を既存 coordinator に揃える。
+Critical 同士は既存レーンを共有するため、前面描画に対する専用の追加予約はない。
+
 EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、対象範囲lease内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。範囲外の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 
 ### サムネイルの動画・音声長さ取得
