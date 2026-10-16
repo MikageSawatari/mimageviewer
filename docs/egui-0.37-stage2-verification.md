@@ -597,3 +597,193 @@ wgpuのruntime capture probe off/onを回帰内で検査する、と受入条件
 今回のoffscreenでは同一owner／cleanup helperと実GPU資源で検証し、実機確認は後続へ残す。
 段2cのeframe接続、段3の製品切替・native overlay・VSync環境変数接続、段4の実機確認は未着手。
 live・製品build／起動・test-full.ps1・ネットワーク・git add／commitは実行していない。
+
+## 段2c-1 着手・依存不足による中断（2026-10-17）
+
+開始HEAD `fb07cec57`。段2bは設計担当が`603e2aa5c`（原本）と`fb07cec57`（差分）へ
+分けてコミット済み、独立レビュー中。段2aは全体が独立レビューACCEPTという引継ぎで着手した。
+以下は**実装担当の内部確認**であり、段2c-1の実装完了・正式な独立レビューを意味しない。
+
+設計第4.4版§4.2全体、§4.8のeframe行・取り込み手順、§4.9、段2c受入条件と案Bの1〜15を
+読み直した。今回を既存パッチ移植までとし、入力所有・案B・描画資格・Closeは後続2c-2〜4へ残す。
+
+### 完了した原本取り込み
+
+- `vendor-next/import-upstream.py`へeframeを追加し、index pathをpackage名から組み立てる形へ適応した。
+- `python vendor-next/import-upstream.py eframe`でローカルregistryの0.37.0原本36ファイルを配置した。
+  archive／index checksum／展開sourceをbyte照合。既存3packageのprovenance記録は維持する。
+- archive SHA-256は`9c5642501a65ca657d05f00c643a5c14ff2346cb3818032bfe23d58e1f8e5f84`。
+  VCS・MIT OR Apache-2.0宣言・全file hashはupstream-provenance.jsonのeframe行へ追記した。
+- `target/egui037-stage2c1-handoff/original/`へ原本packageとその時点のimporter／provenanceを保存した。
+  mIV追加ファイル・license本文の追加は原本境界に含めていない。現packageも原本36ファイルのまま。
+- 旧vendor対0.33.3原本の機械差分台帳を`target/egui037-stage2c1-old-inventory.json`へ、
+  file別diffを同prefixのold-diff以下へ保存した。項目別の新版再適用は未着手。
+
+### offline準備graphの解決失敗
+
+eframeを準備workspaceのmember／path patchへ追加して、次を実行した。
+
+```powershell
+cargo generate-lockfile --manifest-path vendor-next/Cargo.toml --offline
+```
+
+`no matching package named egui_inspection found`で失敗した（tool exit 1）。
+新版eframeのinspection featureはoptionalだが、無効な構成でもCargoの依存解決対象となる。
+新manifestのoptional依存・featureを削って回避することはしていない。
+指定registryのindex `.cache/eg/ui/egui_inspection`、srcの`egui_inspection-*`、
+cacheの`egui_inspection-*.crate`はいずれも存在しないことを読み取りで確認した。
+この不成立のnative Cargo exit codeは採取していないため、101等を推測して記録しない。
+
+ネットワークを使わない条件に従い、差分移植・新版のテストへ進まず中断した。
+追加予定の準備manifestは`target/egui037-stage2c1-handoff/patched/vendor-next/Cargo.toml`へ保存し、
+作業ツリーの準備manifestは開始HEADと同じ4member／3patchへ戻した。
+準備Cargo.lockも不変。これにより並行レビュー中の段2b graphを依存不足で壊さない。
+patched handoffは**依存解決で中断した部分状態**であり、パッチ適用済みの完成状態ではない。
+
+### 検証・未実施・再開条件
+
+原本36ファイルのhash一致と、root workspace／patch／Cargo.lock、既存準備manifest／lockが
+開始HEADと不変であることを確認した。実行結果は同prefixのblocked-results.jsonへ記録した。
+
+| 検証 | 結果 |
+| --- | --- |
+| root core check 通常／test-script | 両方exit 0 |
+| root fmt／fmt --check | 両方exit 0 |
+| 既存準備graph fmt／fmt --check | 両方exit 0 |
+| 既存4memberのmetadata（locked／offline／no-deps） | exit 0 |
+| git diff --check、原本36file hash、不変file・index照合 | 成功、indexは空 |
+
+新eframeのlibテスト・scheduler等の移植・その分類台帳・live試験の新版compileは未実施。
+新eframeが未接続なので、既存4crateの成功を段2c-1新版graphの検証とは扱わない。
+live・製品build／起動・test-full.ps1・ネットワーク・git add／commit／branch操作は行わない。
+
+再開には少なくともegui_inspection 0.37系のindex情報を含むローカル依存cacheの補充が必要。
+補充後にoffline解決を再開し、他の不足があれば同じ条件で報告する。
+設計との重大な矛盾は観測していないが、差分移植と受入条件の検証はこれからである。
+
+## 段2c-1 再開・既存eframeパッチの付け直し（2026-10-17）
+
+設計担当がegui_inspection 0.37.0とeframe全featureの依存cacheを補充し、原本36ファイルと
+原本記録を`83836dd16`へコミットしたとの引継ぎで再開した。上の中断記録は当時の事実として残す。
+今回の作業中は取得・ネットワーク通信を行わず、すべて`--offline`で解決・検証できた。
+以下は**実装担当の内部確認**。正式な独立レビュー・ACCEPTではない。変更は未ステージ・未コミット。
+
+### 原本・差分・handoffの境目
+
+原本は前節と同じeframe 0.37.0、archive SHA-256
+`9c5642501a65ca657d05f00c643a5c14ff2346cb3818032bfe23d58e1f8e5f84`、
+VCS `3c6eb8261c3293ad9c7ea1ed58487e038860ebef`の`crates/eframe`、MIT OR Apache-2.0。
+registry原本・原本handoff・provenanceの36file hashを再照合した。原本コミットを変更していない。
+
+`target/egui037-stage2c1-handoff/original/`は原本36ファイルと取り込み時点の記録を維持する。
+`patched/`は中断時の部分状態から最終の適用後状態へ更新し、CHECKPOINT.jsonへ境目を記録する。
+原本36ファイル中、**28ファイルは原本とbyte一致、8ファイルを変更、5ファイルを追加**した。
+
+- 変更8件: `Cargo.toml`、`src/epi.rs`、`src/lib.rs`、`src/native/epi_integration.rs`、
+  `src/native/glow_integration.rs`、`src/native/run.rs`、`src/native/wgpu_integration.rs`、
+  `src/native/winit_integration.rs`。
+- 追加5件: `LICENSE-APACHE`、`LICENSE-MIT`、`PATCHES.md`、
+  `src/miv_test_script_window_witness.rs`、`src/startup_window_observer.rs`。原本境目には含めない。
+- 上記以外の原本ファイルはすべて不変。特にREADME.md、Cargo.toml.orig、同梱Cargo.lockは原本のまま。
+  ライセンス本文は旧vendorからbyte保持で同梱し、取得元・hashをprovenanceへ追記した。
+
+準備workspaceはegui／egui-winit／egui-ime／egui-wgpu／eframeの5member。
+新版の依存・featureを基準にeframeのmemberとpath patchを追加し、旧manifestはコピーしていない。
+metadataでeframeから使うegui・egui-winit・egui-wgpuが各1実体で、すべて準備directoryであること、
+wgpuが30.0.1であることを確認する。egui_glow・egui_inspection等は補充済みregistryを使用する。
+rootのworkspace／patch／依存版／Cargo.lock／製品コード・旧vendorは不変。
+
+準備用`vendor-next/Cargo.lock`だけはoffline再生成でeframe等を追加した（計452package）。
+再解決により既存のzbus_names 4.3.4→4.3.5、zvariant／zvariant_derive 5.15.0→5.15.1も更新された。
+追加31エントリ・削除3エントリの内訳は同prefixのlock-audit.jsonに残す。
+これは準備graphのresolver更新であり、root lockや製品の依存更新ではない。
+
+### 実差分の分類と付け直し
+
+旧vendor対eframe 0.33.3原本の実差分を項目別に照合した。
+詳細は[eframe/PATCHES.md](../vendor-next/eframe/PATCHES.md)。READMEだけを移植台帳としていない。
+
+| 分類 | 対象と新版での扱い |
+| --- | --- |
+| (a) 上流採用 | #7905のhidden due基本経路・sleep、PassMode／250ms期限、callback screenshot、Ui／SurfaceConfig等の新版基本APIを保持。旧backportを重ねない |
+| (b) scheduler | dirty／painting、window別claim・surface generation／size、outer epochを移植。hidden再予約のmaxによる100ms下限と遅い要求を早めない保証を保持。本家のdeadline mapを同じschedulerへ統合し、期限超過はouter LogicOnly、同対象のFull damageを優先。idle heartbeatは追加しない |
+| (b) resize | Bootstrap／AccessKit／InteractiveResizeのprovenance。元Resizedが非ゼロの場合だけinline資格を付け、描画時の最新実寸利用は本家のまま |
+| (b) show・観測 | root show返却後の初回visible receiptとFrame getter、startup window observer。子paintがrootのreceiptを消費しない。新版のbefore／after_first_showも保持 |
+| (b) renderer限界 | root／childのegui-winit Stateへ同じ実renderer由来max_texture_sideを設定 |
+| (b) delta配送 | lookup／GC前に共有pending ownerへappendし、非描画・消滅viewportも段2bのmutable Painter consumerへ接続。未初期化renderer時は同ownerへ保持 |
+| (b) screenshot | 既存保留actionにあるimmediate子のcallbackをその子へ配送。wgpuの子paint、glowの子surface readbackで完了し、one-shot・順序・他action保持を検査 |
+| (b) 診断 | test-script witness／capture・focus診断、通常版immediateの段階別時間・delta件数／RGBA bytes・遅延ログを移植。wgpu_no_default_featuresとcallback APIへ適応 |
+| (b) 配布・検証 | miv feature、Win32 Gdi／Performance、Windows test用wgpu30 DX12、workspace patch、license同梱。live試験のignoreと子再実行--ignoredを保持し、App::uiへ適応 |
+| (c) 削除・非移植 | 旧Event::Screenshot／capture channelはcallbackへ置換し、画像配送だけのrepaintを復活させない。旧manifest・lockはコピーせず、#7905だけを理由とするvendor全体の撤去条件も採用しない |
+
+### delta完結ownerと後続段との境界
+
+本家0.37でRunning／Viewportに分かれていたpending deltaを、旧パッチにある共有renderer単位の
+SharedState ownerへ集約した。UI出力は対象viewport lookupやGCより前に一度だけappendする。
+通常描画も無描画も同じmutable deltaをPainterへ渡し、段2bのset drain→upload／submit→free drainが
+完結ownerになる。renderer未準備時は共有ownerへ残す。viewport Dropで共有deltaをclearしない。
+共有renderer／Contextそのものの終了時だけ明示破棄し、診断目的の適用権を持つcloneを作らない。
+
+eframeの窓なし回帰は実GC helperを通す子消滅時のdelta保持・root generation不変、callbackの対象・
+順序・one-shotと他action保持、whole／partialのRGBA統計を検査する。
+glow側は偽画像でcallback完了を検査する。schedulerは既存14件と新版deadline統合4件、
+Frame receiptは既存2件、witnessは既存4件を新版APIで検査する。
+
+窓なしでeframeのPainterへ実RenderStateを注入する既存APIがないため、新setterや初期化時点変更は
+追加していない。実GPUでのdrain／submit／free・readbackは同じgraphのegui-wgpu回帰で検証し、
+eframeの接続はsourceを照合した。eframe実入口からGPU完結まで一体実行したという証拠ではない。
+
+2c-2の保留RawInput所有／child skip、2c-3の案B・最小化UI継続／UIと描画の分離／immediate描画資格・
+当該UI出力のaction完結、2c-4のClose受付・消費・非描画退役には未着手。本家の現挙動を保持する。
+既存保留Screenshotの移植と、当該UI出力Screenshotの前倒し消費を混同しない。
+構造合意に対する今回の実装範囲をdetached-rework-plan.md §11へ追記した。
+
+### 検証結果
+
+Rust 1.99.0（b940084d7 2026-09-28）。すべて非対話・offline。
+最終commandと所要時間は`target/egui037-stage2c1-final-results.json`、ログは同prefixの`*-final.log`。
+root fmtの成功は先行した同prefix results.jsonの記録を再利用した（rootソース不変）。
+
+```powershell
+cargo test --manifest-path vendor-next/Cargo.toml -p eframe --features glow,persistence --lib --locked --offline -- --nocapture
+cargo test --manifest-path vendor-next/Cargo.toml -p eframe --features glow,persistence,miv-test-script-window-witness --lib --locked --offline -- --nocapture
+cargo check --manifest-path vendor-next/Cargo.toml -p eframe --no-default-features --features glow,default_fonts --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-wgpu --features winit --lib --locked --offline -- --nocapture
+cargo test --manifest-path vendor-next/Cargo.toml -p egui --features miv-repaint-witness --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-winit --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-ime --lib --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --features test-script --locked --offline
+cargo fmt
+cargo fmt --check
+cargo fmt --manifest-path vendor-next/Cargo.toml --all
+cargo fmt --manifest-path vendor-next/Cargo.toml --all --check
+git diff --check
+```
+
+| 検証 | 結果 |
+| --- | --- |
+| eframe lib（defaultにglow／persistence追加） | 28 passed / 0 failed / 1 ignored、exit 0 |
+| eframe lib（上記＋witness） | 32 passed / 0 failed / 1 ignored、exit 0 |
+| eframe glowのみcheck | exit 0 |
+| egui-wgpu lib | 16 passed / 0 failed / 0 ignored、exit 0。GPU skip無し |
+| egui／egui-winit／egui-ime lib | 106／43／26 passed、失敗・ignore無し、各exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧graph使用 |
+| root fmt／fmt --check、準備fmt／fmt --check | すべてexit 0。root fmtの対象外なので準備側も明示実行 |
+| diff／原本hash／root不変／graph単一実体／index照合 | 成功。indexは空 |
+
+live試験`synchronous_damage_returns_before_outer_paint_gate`は両構成ともignoreされ、実行していない。
+その内部の子再実行用`--ignored`は保存しているが、検証commandには付けていない。
+初回の診断構成はViewportClassのDebug実装が無くcompile exit 101。
+診断formatterを4variantの明示ラベルへ修正後、上記通常／診断を再実行して成功した。
+初回失敗ログも残す。receipt回帰の意図的panicはcatch済みで、失敗件数には含まれない。
+
+最終tested-source.jsonのRust／manifest／lock hashをhandoff時に照合し、有効なテスト結果と一致させる。
+audit.jsonに原本28／変更8／追加5の全一覧、root不変、graph実体、handoff file hashを保存する。
+別contextによる実装担当の内部確認でも実差分・所有境界・後続段との区切り・テスト証拠を照合した。
+正式な独立レビューは設計担当から依頼される別工程である。
+
+既存egui scene.rsのf32::EPSILON、witnessのfetch_update非推奨、glowのみ構成の未使用AccessKit variant、
+rootの既存警告は残る。設計との重大な食い違いはない。実windowのresize／show／surfaceは未実行で、
+後続2c-2〜4・製品切替・実機確認を残す。新App flag・queue・retry・時間窓・追加repaintは追加しない。
+live・製品build／起動・test-full.ps1・ネットワーク・git add／commit／branch操作は行っていない。

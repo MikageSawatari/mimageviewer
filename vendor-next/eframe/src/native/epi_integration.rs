@@ -180,7 +180,6 @@ pub struct EpiIntegration {
     pub frame: epi::Frame,
     last_auto_save: Instant,
     pub beginning: Instant,
-    is_first_frame: bool,
     pub egui_ctx: egui::Context,
 
     /// Input that we have received, but not yet given to egui,
@@ -239,6 +238,7 @@ impl EpiIntegration {
             window: Some(Arc::clone(window)),
             raw_display_handle: window.display_handle().map(|h| h.as_raw()),
             raw_window_handle: window.window_handle().map(|h| h.as_raw()),
+            native_window_visible_commit_completed: false,
             activation_token: None,
         };
 
@@ -291,7 +291,6 @@ impl EpiIntegration {
             beginning: Instant::now()
                 .checked_sub(web_time::Duration::from_secs_f64(egui_ctx.time()))
                 .unwrap_or_else(Instant::now),
-            is_first_frame: true,
             egui_ctx,
         }
     }
@@ -440,12 +439,43 @@ impl EpiIntegration {
 
     pub fn post_rendering(&mut self, window: &winit::window::Window) {
         profiling::function_scope!();
-        if core::mem::take(&mut self.is_first_frame) {
+        // Frame's native handle belongs to ROOT. A child paint cannot publish its receipt.
+        let is_root = window.window_handle().ok().is_some_and(|handle| {
+            self.frame
+                .raw_window_handle
+                .as_ref()
+                .is_ok_and(|root| *root == handle.as_raw())
+        });
+        if is_root && !self.frame.native_window_visible_commit_completed() {
+            #[cfg(target_os = "windows")]
+            let diagnostic_hwnd = if crate::startup_window_observer::enabled() {
+                window.window_handle().ok().and_then(|handle| {
+                    if let raw_window_handle::RawWindowHandle::Win32(handle) = handle.as_raw() {
+                        Some(handle.hwnd.get() as usize)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = diagnostic_hwnd {
+                crate::startup_window_observer::emit("eframe.first_paint.call_returned", hwnd);
+            }
             if let Some(window_settings) = &self.restored_window_settings {
                 window_settings.before_first_show(window);
             }
-            // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
-            window.set_visible(true);
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = diagnostic_hwnd {
+                crate::startup_window_observer::emit("eframe.set_visible.begin", hwnd);
+            }
+            self.frame
+                .commit_initial_native_visibility(|| window.set_visible(true));
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = diagnostic_hwnd {
+                crate::startup_window_observer::emit("eframe.set_visible.complete", hwnd);
+            }
             if let Some(window_settings) = &self.restored_window_settings {
                 window_settings.after_first_show(window);
             }

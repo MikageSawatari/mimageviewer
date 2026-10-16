@@ -9,6 +9,7 @@
 | `egui-winit` | 0.37.0原本＋入力配送・診断・clipboard互換 |
 | `egui-ime` | 製品共有policyの新版準備用コピー |
 | `egui-wgpu` | 0.37.0原本＋mipmap・delta完結・surface所有・診断（wgpu 30.0.1） |
+| `eframe` | 0.37.0原本＋段2c-1の既存scheduler・delta配送・計測等。入力所有・案B・Closeは後続 |
 
 `upstream-provenance.json`は原本archive SHA-256、VCS、取り込んだ全ファイルのSHA-256を持つ。
 `import-upstream.py`はローカルregistry archiveと展開sourceをbyte照合して原本だけを配置する。
@@ -28,10 +29,14 @@ cargo test --manifest-path vendor-next/Cargo.toml -p egui-winit --lib --locked -
 cargo test --manifest-path vendor-next/Cargo.toml -p egui-ime --lib --locked --offline
 cargo test --manifest-path vendor-next/Cargo.toml -p egui-wgpu --features winit --lib --locked --offline
 cargo test --manifest-path vendor-next/Cargo.toml -p egui-wgpu --features winit,egui/miv-repaint-witness --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p eframe --features glow,persistence --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p eframe --features glow,persistence,miv-test-script-window-witness --lib --locked --offline
 cargo fmt --manifest-path vendor-next/Cargo.toml --all --check
 ```
 
-4 crateのlib testsはwindow/EventLoopを作らない。egui-wgpuのGPU回帰はoffscreen DX12を使用する。
+egui／egui-winit／egui-ime／egui-wgpuのlib testsはwindow/EventLoopを作らない。
+eframeの実window試験1件はignoreされており、上記commandでは実行しない。--ignoredを付けない。
+egui-wgpuのGPU回帰はoffscreen DX12を使用する。
 wgpu固有の旧診断はruntime設定であり、架空の診断featureは追加しない。診断構成では既存の
 egui/miv-repaint-witnessを併用し、capture probeのoff/onはGPU回帰内で検査する。
 egui/egui-winitの同梱Cargo.lockは原本記録であり、
@@ -42,3 +47,5 @@ egui/egui-winitの同梱Cargo.lockは原本記録であり、
 egui-wgpu原本だけの追加取り込みは、同directoryが未配置の場合に
 `python vendor-next/import-upstream.py egui-wgpu`で行う。既存のegui／egui-winit記録は保持する。
 段2bの原本／差分適用後handoffは`target/egui037-stage2b-handoff/{original,patched}/`に保存する。
+eframeも未配置時に`python vendor-next/import-upstream.py eframe`で追加できる。
+段2c-1のhandoffは`target/egui037-stage2c1-handoff/{original,patched}/`。

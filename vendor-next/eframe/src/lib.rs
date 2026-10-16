@@ -168,6 +168,9 @@ pub use epi::*;
 
 pub(crate) mod stopwatch;
 
+#[doc(hidden)]
+pub mod startup_window_observer;
+
 // ----------------------------------------------------------------------------
 // When compiling for web
 
@@ -208,6 +211,15 @@ pub use native::file_storage::storage_dir;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod icon_data;
+
+/// mImageViewer diagnostics for the actual native window owning a viewport callback.
+#[cfg(all(
+    target_os = "windows",
+    feature = "wgpu_no_default_features",
+    feature = "miv-test-script-window-witness"
+))]
+#[doc(hidden)]
+pub mod miv_test_script_window_witness;
 
 // ----------------------------------------------------------------------------
 

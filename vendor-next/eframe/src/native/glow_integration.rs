@@ -1845,6 +1845,12 @@ fn render_immediate_viewport(
         &mut viewport.pending_delta,
     );
 
+    // Preserve the queued immediate child's screenshot request on its own surface.
+    // Requests emitted by this UI's viewport output still enter the existing action path below.
+    complete_immediate_screenshots(&mut viewport.actions_requested, || {
+        Arc::new(painter.borrow().read_screen_rgba(screen_size_in_pixels))
+    });
+
     {
         profiling::scope!("swap_buffers");
         if let Err(err) = gl_surface.swap_buffers(current_gl_context) {
@@ -1857,6 +1863,27 @@ fn render_immediate_viewport(
     event_loop_context::with_current_event_loop(|event_loop| {
         glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
     });
+}
+
+fn complete_immediate_screenshots(
+    actions: &mut Vec<ActionRequested>,
+    read_screen: impl FnOnce() -> Arc<egui::ColorImage>,
+) {
+    let mut callbacks = Vec::new();
+    actions.retain(|action| {
+        if let ActionRequested::Screenshot(callback) = action {
+            callbacks.push(callback.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if !callbacks.is_empty() {
+        let image = read_screen();
+        for callback in callbacks {
+            callback.complete(Arc::clone(&image));
+        }
+    }
 }
 
 /// The OpenGL contexts to ask for, in order of preference.
@@ -1987,5 +2014,46 @@ mod tests {
         });
         assert_eq!(result, Ok("compat"));
         assert_eq!(tried, ["core", "es", "compat"]);
+    }
+}
+
+#[cfg(test)]
+mod immediate_screenshot_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn queued_child_screenshots_complete_once_and_preserve_other_actions() {
+        let images = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&images);
+        let callback =
+            egui::ScreenshotCallback::new(move |image| received.lock().unwrap().push(image));
+        let mut actions = vec![
+            ActionRequested::Copy,
+            ActionRequested::Screenshot(callback.clone()),
+            ActionRequested::PaintWhileHidden,
+            ActionRequested::Screenshot(callback.clone()),
+            ActionRequested::Paste,
+        ];
+        let image = Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::RED));
+        let mut reads = 0;
+        complete_immediate_screenshots(&mut actions, || {
+            reads += 1;
+            Arc::clone(&image)
+        });
+        assert_eq!(reads, 1);
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ActionRequested::Copy,
+                ActionRequested::PaintWhileHidden,
+                ActionRequested::Paste
+            ]
+        ));
+        assert_eq!(images.lock().unwrap().len(), 1);
+        assert!(Arc::ptr_eq(&images.lock().unwrap()[0], &image));
+        complete_immediate_screenshots(&mut actions, || panic!("no capture remains"));
+        callback.complete(Arc::clone(&image));
+        assert_eq!(images.lock().unwrap().len(), 1);
     }
 }

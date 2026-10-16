@@ -5473,3 +5473,15 @@ Appの旧呼出順・早期return・mount先を保持し、passiveイベントdr
 共通してguard・delay・retry・追加repaint・一括reset・silent fallback・新pending boolを根因修正の
 代用にしない。まれな失敗は既定のログ・通知・fault終端へ揃える。
 今段は文書下書きのみ。修正前失敗/修正後成功、実機観測、実装レビューの完了は主張しない。
+
+#### 2026-10-17 段2c-1の準備graph実装記録
+
+上記合意のうち既存scheduler・visible commit・delta配送の付け直しを、`vendor-next/eframe`
+0.37.0原本コミット`83836dd16`上へ実装した。**実装担当の内部確認**であり正式な独立ACCEPTではない。
+dirty/painting・surface generation・非ゼロresize provenanceとouter phaseを移植し、本家250msの
+期限超過はLogicOnlyのまま接続した。既存100ms下限・要求なしsleep・rootのvisible commitを保持する。
+wgpuの既存pending deltaを共有rendererと対応するSharedState ownerへ一本化し、非描画・消滅時も
+同じmutable consumerへ渡す。これは合意済みの所有境界の付け直しであり、viewport別入力や
+UI省略をguardで補う症状パッチではない。詳細・検証範囲は[段2台帳](egui-0.37-stage2-verification.md)に記録した。
+案B、保留RawInput所有、子Close受付・消費・非描画退役、root Close追加回帰は段2c-2〜4へ残す。
+root製品graph・Appの判断は変更せず、実window・live試験は実行していない。

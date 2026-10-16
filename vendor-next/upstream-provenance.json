@@ -273,6 +273,18 @@
       "src/web/web_painter_glow.rs": "ca153fa10889cbe3edf8449fc1408a9fab5993010665e91d8f8d8ac973c0f6d4",
       "src/web/web_painter_wgpu.rs": "742a86a3935a116cfbe37d5a0ff45a954e8b9c6c2d662980971ccc5a01abb316",
       "src/web/web_runner.rs": "38ea5334250dcdd5f7480dd4bf30fbe060ac34d41fa21399c4528dff3d561f5c"
+    },
+    "local_license_files": {
+      "LICENSE-MIT": {
+        "copied_from": "vendor/eframe/LICENSE-MIT",
+        "sha256": "3fceb7b317f3c70451942b0e123723a2e250c7eaf970ce4b490a57a94c5588ff",
+        "checkpoint": "patched only; absent from upstream archive"
+      },
+      "LICENSE-APACHE": {
+        "copied_from": "vendor/eframe/LICENSE-APACHE",
+        "sha256": "1ac50a5abd5cff5331d59928d83369b66b0099a88f0111dc2175526b3c666dec",
+        "checkpoint": "patched only; absent from upstream archive"
+      }
     }
   }
 }
