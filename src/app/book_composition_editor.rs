@@ -144,6 +144,19 @@ pub(crate) enum CompositionEditorState {
     Reloading,
 }
 
+impl CompositionEditorState {
+    /// Borrow adopted session maps; unadopted thumbnail-worker replies are outside this view.
+    pub(crate) fn resident_thumbnail_textures(&self) -> impl Iterator<Item = &egui::TextureHandle> {
+        let session = match self {
+            Self::Editing(session) | Self::Saving(session) => Some(session),
+            Self::Closed | Self::Preparing { .. } | Self::Reloading => None,
+        };
+        session
+            .into_iter()
+            .flat_map(|session| session.textures.values())
+    }
+}
+
 enum ResumeSeed {
     Page(PageIdentity),
     Existing(mpsc::Receiver<crate::book_resume_db::PositionReadReply>),

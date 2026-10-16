@@ -244,6 +244,16 @@ impl Default for SimilarPanelState {
 }
 
 impl SimilarPanelState {
+    /// Borrow every uploaded thumbnail, including while this viewer is parked.
+    pub(crate) fn resident_thumbnail_textures(&self) -> impl Iterator<Item = &egui::TextureHandle> {
+        self.thumbnails
+            .values()
+            .filter_map(|entry| match &entry.state {
+                SimilarThumbEntryState::Ready(texture) => Some(texture),
+                SimilarThumbEntryState::Pending { .. } | SimilarThumbEntryState::Failed => None,
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn set_book_query_override_for_test(
         &mut self,
@@ -8894,5 +8904,48 @@ mod tag_panel_tests {
         let choices = tag_panel_picker_choices(&catalog, &query_key, false);
         let names: Vec<_> = choices.iter().map(|choice| choice.name.as_str()).collect();
         assert_eq!(names, vec!["旅行"]);
+    }
+}
+
+#[cfg(test)]
+mod resident_texture_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn resident_thumbnail_accounting_keeps_offscreen_ready_allocations() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "offscreen-similar-thumbnail",
+            egui::ColorImage::filled([3, 2], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let id = texture.id();
+        let mut panel = SimilarPanelState::default();
+        panel.thumbnails.insert(
+            "retained-offscreen".into(),
+            SimilarThumbEntry {
+                request_id: 17,
+                stamp: SimilarThumbStamp {
+                    target: None,
+                    mtime: 0,
+                    file_size: 0,
+                    thumb_px: 3,
+                    thumb_quality: 75,
+                    pdf_credential_revision: 0,
+                },
+                state: SimilarThumbEntryState::Ready(texture),
+            },
+        );
+        // Accounting must follow resident ownership even without a current visible demand.
+        assert!(panel.origin_key.is_none());
+        assert_eq!(
+            panel
+                .resident_thumbnail_textures()
+                .map(egui::TextureHandle::id)
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert_eq!(panel.resident_thumbnail_textures().count(), 1);
+        assert_eq!(panel.thumbnails.len(), 1);
     }
 }

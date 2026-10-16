@@ -5321,3 +5321,16 @@ detached の `alive_wanted`（runtime の生存・Closing）は変更しない�
 該当 continuation の待機中に true となり、従来の deferred_fullscreen 待機と同じ window 継続を表す。
 viewport 生成・registry・HWND・placement・focus owner は変更しない。
 設計 lead (ClaudeCode Opus) の検収と独立 GPT-6.1 Sol/xhigh レビューの双方が「症状パッチではなく構造的修正」に同意し、レビューは指摘なしで ACCEPT。実機確認は利用者に依頼中。
+
+### §11 追補: 紙めくりD2の素材所有と通常resident会計（2026-10-16、実機未確認）
+
+§2を再確認し、既存contextのpresentation内でNativeのoutput leaseと通常source所有を分離した。
+通常source/派生cacheはregistryのmounted/at-rest/parkedから同じread-only walkerで会計し、
+presentationのsource参照削除がB側のresident会計を消さないようにした。contextのmount/deposit/retire、
+viewport述語/生成、HWND/placement/focus、通常producerの経路は変更していない。
+通常prepareの新source仕事開始境界はpage-turn計画 §27.11.1で補足合意した。
+既存bindと共有するview比較と通常cache keyが一致するNativeだけを再利用し、view変更は通常prepareへ通す。
+readyのproofとnavigatorも提出materialを共有し、Nativeのsource cache在住を可視証明にしない。
+新しいdetached分岐、待機/guard/retry/repaintで症状を隠さず、素材・会計の通常owner境界で修正する。
+D1r `cc4e775c1`の独立設計レビューでこの方向は構造修正として合意済みであり、利用者からACCEPTと
+D2実装承認を受けた。実装差分・自動検証・未確認事項の正本は[page-turn計画 §27.11](page-turn-animation-plan.md)。
