@@ -9860,15 +9860,18 @@ impl NativeEguiOverlayState {
                 //   (= 'V' 文字を typing 扱いで挿入してしまうのを防ぐ)。
                 // plugin state に pending event を最終状態まで投影する
                 // `ime_composing()` で判定し、commit 後の通常ショートカットは通す。
-                let is_clipboard_shortcut = key.ctrl
-                    && !key.alt
-                    && self.text_input_active()
-                    && !self.ime_composing()
-                    && matches!(key.virtual_key, 0x43 | 0x56 | 0x58); // C/V/X
-                if is_clipboard_shortcut {
+                let clipboard_command =
+                    if key.ctrl && !key.alt && self.text_input_active() && !self.ime_composing() {
+                        egui_key_from_virtual_key(key.virtual_key).and_then(|key| {
+                            egui_ime::native_windows_clipboard_command(modifiers, key)
+                        })
+                    } else {
+                        None
+                    };
+                if let Some(clipboard_command) = clipboard_command {
                     if matches!(event, NativeEvent::KeyDown(_)) {
-                        match key.virtual_key {
-                            0x56 => {
+                        match clipboard_command {
+                            egui_ime::ClipboardCommand::Paste => {
                                 // Ctrl+V: Windows の CF_UNICODETEXT は CRLF 改行なので
                                 // \r\n / 単独 \r を \n に正規化する。クリップボード読み出しが
                                 // 失敗 (空 / 非テキスト) しても intercept は成立 (raw 'V' 入力防止)。
@@ -9890,15 +9893,14 @@ impl NativeEguiOverlayState {
                                     }
                                 }
                             }
-                            0x43 => {
+                            egui_ime::ClipboardCommand::Copy => {
                                 self.pending_events.push(egui::Event::Copy);
                                 self.dirty = true;
                             }
-                            0x58 => {
+                            egui_ime::ClipboardCommand::Cut => {
                                 self.pending_events.push(egui::Event::Cut);
                                 self.dirty = true;
                             }
-                            _ => unreachable!(),
                         }
                     }
                     // KeyDown / KeyUp 両方を return で抑止 (Codex C15)
@@ -13699,13 +13701,12 @@ impl NativeEguiOverlayState {
                 write_clipboard_text_windows(text);
             }
         }
-        if let Some(intent) = self.ime_cursor_area_intent(full_output.platform_output.ime) {
-            window_intents.push(intent);
-        }
-        window_intents.push(NativeWindowIntent::SetCursorPolicy {
-            icon: Self::resolve_cursor_icon(full_output.platform_output.cursor_icon),
-            auto_hide_allowed: !cursor_blocking_overlay_visible,
-        });
+        append_native_platform_window_intents(
+            &full_output.platform_output,
+            self.pixels_per_point,
+            !cursor_blocking_overlay_visible,
+            &mut window_intents,
+        );
 
         self.dirty = self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
@@ -13837,17 +13838,17 @@ impl NativeEguiOverlay {
             &full_output.textures_delta,
         );
         let texture_update_t0 = Instant::now();
-        for (id, image_delta) in &full_output.textures_delta.set {
-            let before = self.gpu.renderer.texture_size(id);
+        crate::egui_output::apply_texture_sets(&full_output.textures_delta, |id, image_delta| {
+            let before = self.gpu.renderer.texture_size(&id);
             self.gpu.renderer.update_texture(
                 self.gpu.gpu_epoch.device(),
                 self.gpu.gpu_epoch.queue(),
-                *id,
+                id,
                 image_delta,
             );
-            let after = self.gpu.renderer.texture_size(id);
-            egui_wgpu::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
-        }
+            let after = self.gpu.renderer.texture_size(&id);
+            egui_wgpu::atlas_diag::record_applied(id, diag_id, image_delta, before, after);
+        });
         let texture_update_ms = texture_update_t0.elapsed().as_secs_f64() * 1000.0;
         if atlas_batch.tracked() {
             egui_wgpu::atlas_diag::flush("applying the presenter's texture delta batch");
@@ -13954,9 +13955,10 @@ impl NativeEguiOverlay {
             seek_strip_inventory,
             seek_strip_window,
         );
-        for id in &full_output.textures_delta.free {
+        let texture_set_count = full_output.textures_delta.set.len();
+        crate::egui_output::finish_texture_output(full_output.textures_delta, |id| {
             self.gpu.renderer.free_texture(id);
-        }
+        });
         state.render_count = state.render_count.saturating_add(1);
         log_event(
             "egui_overlay_present",
@@ -13973,10 +13975,7 @@ impl NativeEguiOverlay {
                 ),
                 ("shapes", Value::from(shape_count as i64)),
                 ("paint_jobs", Value::from(paint_jobs.len() as i64)),
-                (
-                    "texture_set_count",
-                    Value::from(full_output.textures_delta.set.len() as i64),
-                ),
+                ("texture_set_count", Value::from(texture_set_count as i64)),
                 ("wants_pointer", Value::from(state.wants_pointer_input)),
                 ("wants_keyboard", Value::from(state.wants_keyboard_input)),
                 ("hud_visible", Value::from(hud_visible)),
@@ -14003,26 +14002,102 @@ impl NativeEguiOverlay {
     }
 }
 
-impl NativeEguiOverlayState {
-    fn ime_cursor_area_intent(
-        &self,
-        ime: Option<egui::output::IMEOutput>,
-    ) -> Option<NativeWindowIntent> {
-        let ime = ime?;
-        let ppp = self.pixels_per_point;
-        let cursor = ime.cursor_rect;
-        let x = (cursor.min.x * ppp).round() as i32;
-        let y = (cursor.min.y * ppp).round() as i32;
-        let width = (cursor.width().max(1.0) * ppp).round() as i32;
-        let height = (cursor.height().max(1.0) * ppp).round() as i32;
-        Some(NativeWindowIntent::UpdateImeCursorArea {
-            x,
-            y,
-            width,
-            height,
-        })
+// Keep platform conversion separate from both GPU presentation and HWND mutation. The
+// logical batch still accumulates these intents in the same order before its one present.
+fn append_native_platform_window_intents(
+    output: &egui::PlatformOutput,
+    pixels_per_point: f32,
+    auto_hide_allowed: bool,
+    intents: &mut Vec<NativeWindowIntent>,
+) {
+    if let Some(intent) = native_ime_cursor_area_intent(output.ime, pixels_per_point) {
+        intents.push(intent);
+    }
+    intents.push(NativeWindowIntent::SetCursorPolicy {
+        icon: NativeEguiOverlayState::resolve_cursor_icon(output.cursor_icon),
+        auto_hide_allowed,
+    });
+}
+
+fn native_ime_cursor_area_intent(
+    ime: Option<egui::output::IMEOutput>,
+    pixels_per_point: f32,
+) -> Option<NativeWindowIntent> {
+    let ime = ime?;
+    let ppp = pixels_per_point;
+    let cursor = ime.cursor_rect;
+    let x = (cursor.min.x * ppp).round() as i32;
+    let y = (cursor.min.y * ppp).round() as i32;
+    let width = (cursor.width().max(1.0) * ppp).round() as i32;
+    let height = (cursor.height().max(1.0) * ppp).round() as i32;
+    Some(NativeWindowIntent::UpdateImeCursorArea {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+#[cfg(test)]
+mod native_output_tests {
+    use super::*;
+
+    #[test]
+    fn native_platform_intents_keep_focus_ime_and_cursor_order_without_presenting() {
+        let output = egui::PlatformOutput {
+            ime: Some(egui::output::IMEOutput {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 30.0)),
+                cursor_rect: egui::Rect::from_min_size(
+                    egui::pos2(-1.5, 3.0),
+                    egui::vec2(0.25, 10.0),
+                ),
+            }),
+            cursor_icon: egui::CursorIcon::Text,
+            ..Default::default()
+        };
+        let mut intents = vec![NativeWindowIntent::ClaimTextInputFocus];
+        append_native_platform_window_intents(&output, 1.5, false, &mut intents);
+        assert!(matches!(
+            intents.as_slice(),
+            [
+                NativeWindowIntent::ClaimTextInputFocus,
+                NativeWindowIntent::UpdateImeCursorArea {
+                    x: -2,
+                    y: 5,
+                    width: 2,
+                    height: 15,
+                },
+                NativeWindowIntent::SetCursorPolicy {
+                    icon: NativeCursorIcon::Text,
+                    auto_hide_allowed: false,
+                },
+            ]
+        ));
     }
 
+    #[test]
+    fn native_platform_output_without_ime_keeps_only_its_cursor_policy() {
+        let mut intents = Vec::new();
+        append_native_platform_window_intents(
+            &egui::PlatformOutput {
+                cursor_icon: egui::CursorIcon::None,
+                ..Default::default()
+            },
+            2.0,
+            true,
+            &mut intents,
+        );
+        assert!(matches!(
+            intents.as_slice(),
+            [NativeWindowIntent::SetCursorPolicy {
+                icon: NativeCursorIcon::Hidden,
+                auto_hide_allowed: true,
+            }]
+        ));
+    }
+}
+
+impl NativeEguiOverlayState {
     fn resolve_cursor_icon(cursor_icon: egui::CursorIcon) -> NativeCursorIcon {
         match cursor_icon {
             egui::CursorIcon::None => NativeCursorIcon::Hidden,
@@ -14977,6 +15052,107 @@ mod chrome_suppression_interaction_tests {
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn native_clipboard_key(
+        virtual_key: u32,
+        alt: bool,
+    ) -> crate::video::native_window::NativeVideoKeyEvent {
+        crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: true,
+            ctrl: true,
+            alt,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn native_clipboard_ctrl_shift_copy_cut_suppress_raw_keys_and_release_duplicates() {
+        for (virtual_key, is_copy) in [(0x43, true), (0x58, false)] {
+            let (mut overlay, _) = fixture(false);
+            overlay.tag_picker_open = true;
+            overlay.pending_events.clear();
+            let key = native_clipboard_key(virtual_key, false);
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            assert!(
+                matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::Copy] if is_copy
+                ) || matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::Cut] if !is_copy
+                )
+            );
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert_eq!(
+                overlay.pending_events.len(),
+                1,
+                "release must remain suppressed"
+            );
+
+            overlay.pending_events.clear();
+            let key = native_clipboard_key(virtual_key, true);
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert!(
+                matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::Key { pressed: true, modifiers: down, .. },
+                     egui::Event::Key { pressed: false, modifiers: up, .. }]
+                        if down.ctrl && down.shift && down.alt && up == down
+                ),
+                "Ctrl+Alt keeps the ordinary raw-key path"
+            );
+        }
+    }
+
+    #[test]
+    fn native_clipboard_copy_cut_follow_pending_ime_composition_and_commit() {
+        use crate::video::native_window::NativeVideoImeEvent;
+
+        for (virtual_key, is_copy) in [(0x43, true), (0x58, false)] {
+            let mut overlay = tag_picker_ime_fixture();
+            overlay.pending_events.clear();
+            let key = native_clipboard_key(virtual_key, false);
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert!(
+                matches!(
+                    overlay.pending_events.as_slice(),
+                    [
+                        egui::Event::Key { pressed: true, .. },
+                        egui::Event::Key { pressed: false, .. }
+                    ]
+                ),
+                "active IME must retain both ordinary key events"
+            );
+            overlay.pending_events.clear();
+            overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(
+                "かな".to_owned(),
+            )));
+            overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Disabled));
+            assert!(!overlay.ime_composing());
+            overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+            overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            assert!(
+                matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::Ime(egui::ImeEvent::Commit(text)),
+                     egui::Event::Ime(egui::ImeEvent::Disabled), egui::Event::Copy]
+                        if text == "かな" && is_copy
+                ) || matches!(
+                    overlay.pending_events.as_slice(),
+                    [egui::Event::Ime(egui::ImeEvent::Commit(text)),
+                     egui::Event::Ime(egui::ImeEvent::Disabled), egui::Event::Cut]
+                        if text == "かな" && !is_copy
+                ),
+                "pending commit enables exactly one clipboard event before the next pass"
+            );
         }
     }
 
@@ -19789,7 +19965,7 @@ mod tests {
 
         fn batch_prepare(&mut self) -> Result<(), String> {
             let mut rects = None;
-            let _ = self.ctx.run(
+            let full_output = self.ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -19803,6 +19979,7 @@ mod tests {
                     rects = Some((strip, panel));
                 },
             );
+            crate::egui_output::discard_headless_output(full_output);
             let (strip, panel) = rects.expect("headless regions");
             assert!(
                 !strip.intersects(panel),
@@ -20037,6 +20214,7 @@ mod tests {
                 .map(egui::TextureId::Managed)
                 .collect();
             self.presented_shape_count = full_output.shapes.len();
+            crate::egui_output::discard_headless_output(full_output);
             Ok((batch.commands, batch.window_intents))
         }
     }

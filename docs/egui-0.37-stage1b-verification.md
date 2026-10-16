@@ -682,3 +682,123 @@ App driver/registry、composition editor/receipt/meter、sidecar/D3、ZIP/tray/s
 設計との照合では、per-requestのhydration Optionへsequenceを置けないことと、ZIPのtag membership再構築がpage-edit stampだけでは
 延期できないことを確認し、前述の既存App-global owner/既存refresh ownerのtyped phaseへ整理した。
 旧テストのdedup mirrorのmain所有前提は訂正済み。それ以外の重大な設計不一致は確認していない。
+
+## 段1b-3c: 入力投影・clipboard・native出力
+
+2026-10-16、開始HEAD `9481bc344`。前段1b-3bは利用者から独立レビューACCEPT（指摘なし）の通知を受け、
+設計担当がコミット済み。本節は第4.4版の1b-3cの実装記録であり、以下のソース照合は**実装担当の内部確認**である。
+正式な独立レビューの結果は先取りしない。Rust 1.99.0 / egui 0.33.3 / wgpu 27を維持し、logic接続・新版API移行は行わない。
+
+### 抽出した境界と旧呼出順
+
+| 境界 | 入口・配置 | 保持する順序・所有 | 段2・3の接続先／留保 |
+| --- | --- | --- | --- |
+| foreground物理取込み | `native_window::foreground_process_hwnd`、既存`foreground_app_hwnd`から委譲 | OS foreground HWNDを一回採取し、null / PID 0 / 別processを拒否。同じHWNDを物理gamepad ownerへ返す。non-Windowsとheadless fakeは旧入口のまま | 既存の取込みownerが同じ判定を使用。新しいforeground入力除外は加えない |
+| main mouse-nav pending | `keyboard_input::main_keyboard_drains_mouse_nav` | 先行するsession blockとactive detached foreground除外の後だけ判定。静止画detached＋main非focusは子へ残し、native動画はglobal hookの重複をdrain。modal / IME等によるearly returnより前という位置も不変 | UIのviewport ownerへ残す。現在focusの有無と、配送済み離散edgeの資格を混同しない |
+| unsmoothed wheel取得 | `wheel_input::remaining_wheel_input` | root一覧はmenu / toolbar / facet後・grid直前。fullscreenは従来の前面owner／navigator内。0.33の残存`raw_scroll_delta`とpass modifiersをその場で読み、threshold 0.5・一回の集約・Ctrl列数操作を維持 | UI側。0.37でのみ消費位置の`InputState.events`から単位換算・event別modifiersを投影する。raw.events保存やsmooth値で代用しない |
+| wheel消費 | `wheel_input::consume_wheel_input` | App一覧・popup、main menu、fullscreen navigator / HUD popup、筆半径の旧消費位置でraw / smooth / MouseWheel eventsをまとめて消費。筆のShift専用notch計算、popup終了時の既存内部残量終端は変更しない | UI側。内部smoothing tailを新たにresetしない |
+| text clipboard条件 | `egui-ime/clipboard`の`ClipboardCommand`、通常／nativeの二つの純粋入口 | 通常はcommand+C/X/V・専用キー・Windows Insert/Deleteを維持。nativeはCtrlかつAltなしのC/X/V。両方でShiftを許可。Process / press-release / text focus / IME gateは各integrationの旧位置、I/O・正規化・空paste抑止も各ownerへ残す | `egui-winit`が既存共有crateへpath依存する。版変更なし。Ctrl+AltやInsert/Deleteの従来のintegration差を共通化の名目で拡大・縮小しない |
+| grid Shell clipboard | `App::grid_clipboard_requests`、semantic / transition bitの純粋判定は`keyboard_input` | main focus・text owner・grid admission → semantic events → Ctrl/VのGetAsyncKeyState → effective keymap / pressを旧順序で採取。解除済み割当のsemantic復活なし。Cut優先、copy/cut実行後にpaste実行。call-localな値だけでApp状態を追加しない | root UI入力。Shell貼付けのtransition bit契約を通常text clipboardへ置換しない |
+| modifier resync / routed edge | 既存`resync_egui_modifiers_from_os`、`keyboard_input_permits`、`key_input::begin_frame_for_context_with_tracking` | title後のresyncとfocused guard、event時点modifiers、最初のpassだけWin32 queueをdrainする条件を変更しない。focus喪失後も同じviewport宛routed edgeを離散操作として採用 | 0.37のModifiersChanged化は段3。過去edgeの修飾値の書換え・二重drainを加えない |
+| native platform出力変換 | `append_native_platform_window_intents` / `native_ime_cursor_area_intent` | logical batchで既存focus intent → IME cursor area → cursor policy。DPI倍率・round・最小矩形とnative CopyTextの旧処理位置を維持。別viewport出力の合成を追加しない | 0.37のIME中断生成／discard再pass集約／control命令は段2a・3。今回のIMEOutputには中断flagがない |
+| native IME配送 | `native_window_host::native_ime_window_forms` / `update_ime_cursor_area` | pumpの既存WindowEpoch / visual資格を経て同じhostへ配送。self.hwndのHIMC → composition → candidate → release、nullなら従来どおり終了。foregroundから配送先を選び直さない | 新IMM32取消操作・新intentは段3。既存pump・control / visual配送条件は変更しない |
+| texture適用・完結 | `egui_output::apply_texture_sets` / `finish_texture_output` | nativeの既存atlas診断／GPU gate内でset順を適用 → acquire / draw / submit / present → 既存commit処理 → free。set/free数の診断も維持。完結入口はdeltaを所有権で受ける | 新版set列のdrain、無surface／acquire失敗時upload submit、eframe共有rendererへの引継ぎは段2・3。旧早期error経路は今回変更しない |
+| headless破棄 | `egui_output::discard_headless_output`（test限定） | nativeの実logical batchを検査するfake target、wheel回帰、IMEの実TextEdit回帰から明示的に破棄。製品Contextでの資源配送省略には使えない | 0.37ではこの境界を`drop_without_applying_deltas`へ接続。今回の0.33では所有したFullOutputをdropするだけ |
+
+Appのphase driverと`input_root_keyboard`の呼出順・early returnは変更していない。
+Win32 native key queue、WH_GETMESSAGEのpending counter、focus喪失時のrouted edgeのproducer / drain本体も変更していない。
+新しいApp pending bool、queue、時間窓、repaint、強制UI、IME中断や入力除外は追加していない。
+detached側は§11で合意済みの入力／出力owner境界の抽出だけで、viewport寿命や再生成には触れていない。
+
+### 回帰と実装担当の内部確認
+
+- wheelの実0.33 `InputState::begin_pass`でPoint / Line / Page、Shift / Altの軸変換、event modifiersとpass modifiersの区別、
+  同pass集約を確認する。消費後もimmutable raw.eventsが残るfixtureで、配送値とeventsが復活しないことを確認する（新規4件）。
+- clipboardのmodifier 32組合せで通常／nativeの受付差を固定する（共有crateの新規1件）。
+  通常bridgeの既存delivery回帰はCtrl / Ctrl+Shift / Ctrl+Alt / Ctrl+Shift+Alt、physical fallback、repeat / release、空pasteを維持する。
+  nativeの実`push_native_event`でCtrl+Shift+C/Xの一回配送・raw Key/Text抑止・KeyUp重複なし・Ctrl+Alt通常経路、
+  IME中とpending Commit直後のgateを検査する（新規2件）。Shellのhigh bit＋transition bitとsemantic抽出も純粋回帰に分ける（新規1件）。
+- native IMEの矩形変換／intent順、IMM32形式のcursor除外と最小矩形を検査する（新規4件）。
+  textureは同ID whole→partialの順序とsubmit後free、free-only出力をfake consumerで検査する（新規2件）。
+  既存native batch driverのmulti-pass集約／一回present、key入力replay／focus喪失／mouse-nav／gamepad回帰も焦点対象とする。
+- HEADとのソース照合ではclipboard採取／dispatch順、foregroundのstrict判定、set / submit / present / free、
+  nativeの早期errorとWindowEpoch配送条件を確認した。**実装担当の内部確認**であり、独立レビューの代替とはしない。
+
+### 検証
+
+証跡は`target/egui037-stage1b-3c/`。`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`で実行する。
+製品・live・`test-full.ps1`・snapshot更新・commit / branch / pushは実行しない。
+対象外DSPの開始時変更表示はそのまま保持し、設計書・root Cargo.toml・toolchainとともにバイト列を照合する。
+Cargo.lockの差分はegui-winitから既存egui-imeへの一つの依存edgeのみで、依存versionは変わらない。
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| core check 通常 / test-script | 成功、62.836秒 / 63.584秒 | 0 / 0 |
+| cargo fmt / fmt --check | 成功、最終15.768秒 / 15.688秒 | 0 / 0 |
+| vendor egui-winitのrustfmt --check | 成功、0.082秒（workspace fmt対象外も明示確認） | 0 |
+| git diff --check | 成功、0.183秒。台帳追記後も最後に確認する | 0 |
+| check_ui_glyphs.py | 危険glyph 0件、2.404秒 | 0 |
+| 本体入力／native／output焦点nextest | 1,345 passed / 0 failed、77.893秒（compile込み488.082秒） | 0 |
+| 共通clipboard純粋判定nextest | egui-ime 1 passed / 0 failed、0.008秒（compile込み15.826秒） | 0 |
+| 通常bridgeのclipboard／Process／release焦点nextest | egui-winit 17 passed / 0 failed、0.069秒（compile込み70.735秒） | 0 |
+| 旧snapshot通常比較 | 統合181 + 11、lib 103、計295 passed / 0 failed。52コマンド全て成功、PNG 445枚SHA-256不変 | 全て0 |
+| 全件lib初回 | 13,325 passed / 1 failed / 59 skipped、425.957秒（wrapper431.230秒）。下記の既存videoテスト | 100 |
+| 上記失敗の単独診断 | 1 passed / 0 failed、0.203秒（compile込み2.882秒）。同じmiv-tool config / feature / source | 0 |
+| 全件lib再確認 | 13,325 passed / 1 failed / 59 skipped、673.185秒（wrapper699.263秒）、8 slow / 1 leaky。初回のvideoは成功、今回は下記PDF時間条件 | 100 |
+| PDF失敗の単独診断 | 1 passed / 0 failed、0.161秒（compile込み2.103秒）。runtime設定は同じ、JUnit出力先だけ分離 | 0 |
+
+焦点は計1,363件（crateが異なるため重複なし）。本体filterは
+`test(keyboard) | test(key_input) | test(keymap) | test(ime) | test(focus) | test(wheel) | test(clipboard) | test(native_presenter) | test(egui_output) | test(mouse_nav) | test(gamepad)`。
+通常bridgeは`test(clipboard) | test(delivery_) | test(process) | test(hidden)`で、Process／repeatの非配送、
+Forwarded release、IME許可の切替、空pasteの既存回帰も維持する。共通crateは`test(clipboard)`。
+全コマンドで既存ignoredを除外し、retry 0 / no-fail-fast / 0件を失敗とする。
+
+最初のbridgeコマンドはworkspace memberのegui-imeとvendor依存egui-winitを一括`-p`指定し、
+`package ID specification egui-winit did not match any packages`、exit 101（1.011秒）で選択に失敗した。
+テスト未実行で、製品／テストの失敗件数には数えない。packageごとに分けた上記2コマンドは成功した。
+失敗の`clipboard-bridges.log` / `clipboard-bridges-result.json`は保持し、この失敗時の古いJUnitは
+`clipboard-bridges-stale-junit.xml`として成功証拠に使わない。ソース・feature条件の修正は行っていない。
+
+残課題は段2・3の正式接続。案Bのscheduler条件変更、0.37のwheel／ModifiersChanged、IME中断要求のviewport所有・
+discard再pass集約・control配送、texture deltaの新しいdrain／早期error／無surface経路は今回未実装である。
+0.33における現在の集約値と通常／native clipboard受付差を記録し、設計書の「新版delta／新中断は後段」へ合わせた。
+重大な設計不一致は確認していない。
+
+全件初回の失敗は`video::tests::real_demux_seek_failure_retires_selection_base`、
+`src/video/mod.rs:14065`の`take_seek_request().unwrap()`がNoneだったもの（テスト本文0.07秒、timeoutではない）。
+このfixtureは実demuxをspawnし、`decoder.rs:3200`とtestが同じclockのtakeを呼ぶため競合の可能性がある。
+これはソースからの見立てであり、原因を確定／解消したとは扱わない。
+該当test / decoder / clockは今回変更しておらず、native overlayを使わないfixtureである。
+同じconfig・profileのexact単独再実行は1 passed / exit 0。
+新コード・既存テスト・上限・待機・並列数を修正して通したものではない。
+
+初回全件のsourceは`83195f868f8b7e3df8132c6affda5e932b899208657fc8bb36ca8a9c1fa89ec4`、
+runは`target/test-lib-full/runs/20261016T142316656Z-5a7ea903/`。
+`lib-full.log` / `lib-full-result.json`とrun内stdout / stderrに失敗・件数を保持した。
+単独診断で同じconfigを使ったため、このrun内のJUnitは診断1件の結果に上書きされた。
+これを初回全件のJUnitとしては扱わず、`lib-full-single-junit.xml`として保存する。
+初回全件の件数の根拠は元のstdout / stderrで、診断結果は`lib-full-single.log` / `lib-full-single-result.json`。
+全件の失敗を単独成功へ読み替えず、履歴を保持したまま、未変更の製品／テストsourceと同条件で全件を再確認する。
+
+再全件の失敗は`pdf_loader::tests::abort_on_cancel_returns_interrupted_immediately`。
+`src/pdf_loader.rs:10313`の既存`elapsed_ms < 200`に対し208msだった。
+実装はtest専用`mock_recv_loop`（30ms後に取消、10ms recv timeout）で、Appや今回の入力／native出力を通らない。
+このファイルは変更していない。再全件中には別nextestの同時CPU使用も観測したが、そのコマンド／worktreeや失敗との因果は未確認。
+既存テスト・上限・待機・並列数を変えずexact単独診断し、1 passed / exit 0。
+診断configはJUnit出力先だけを`lib-full-pdf-single-junit.xml`へ分け、再全件のJUnitが保持されたことをハッシュで確認した。
+初回videoの失敗は再全件で再発していない。いずれも原因解消・全件PASSとは扱わず、三回目の全件再実行で成功を探さない。
+
+再全件runは`target/test-lib-full/runs/20261016T143249825Z-97cf90cd/`、
+source IDは`fc1ab36e915e10153009812506d3ac0b733194a612e0ca87cfe4c86388988f35`。
+`lib-full-final.log` / `lib-full-final-result.json` / `lib-full-final-junit.xml`とrun内stdout / stderr / JUnitを保持する。
+PDF単独は`lib-full-pdf-single.log` / `lib-full-pdf-single-result.json` / `lib-full-pdf-single-junit.xml`。
+二つの全件source IDの差は台帳への初回結果追記によるもので、検証開始以後のsrc・共有crate・関係vendor 734ファイルは不変。
+`evidence-summary.json`は初回全件の元ログ由来の件数と、再全件／診断のJUnit由来の件数を区別する。
+**全件libゲートは未達（両回exit 100）**として返す。単独成功・別runの成功件数を合算して全件成功にはしない。
+
+変更は19ファイル。新規`wheel_input.rs` / `egui_output.rs` / `egui-ime/clipboard.rs`、
+App / keyboard_input / gamepad foreground委譲、main / fullscreen / brush wheel、
+native presenter / native window / host、IME headless fixture、module宣言、vendor依存edgeとCargo.lock、台帳。
+core通常／test-script、fmt、glyph、焦点1,363件、snapshot295件の成功は同じ製品／テストsourceのまま有効。
+設計書・root Cargo.toml・toolchain・対象外DSPの4ファイルとPNG 445枚も検証前後でバイト列不変。
+最後は台帳だけを追記して`git diff --check`を実施し、HEAD `9481bc344`のまま未コミットで引き渡す。

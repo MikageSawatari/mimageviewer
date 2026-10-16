@@ -792,7 +792,7 @@ mod tests {
         let mut first = String::new();
         let mut second = String::new();
         let mut focus_request = true;
-        let _ = ctx.run(Default::default(), |ctx| {
+        crate::egui_output::discard_headless_output(ctx.run(Default::default(), |ctx| {
             draw_text_fields(
                 ctx,
                 first_id,
@@ -801,8 +801,8 @@ mod tests {
                 &mut second,
                 &mut focus_request,
             );
-        });
-        let _ = ctx.run(Default::default(), |ctx| {
+        }));
+        crate::egui_output::discard_headless_output(ctx.run(Default::default(), |ctx| {
             draw_text_fields(
                 ctx,
                 first_id,
@@ -811,8 +811,8 @@ mod tests {
                 &mut second,
                 &mut focus_request,
             );
-        });
-        let _ = ctx.run(
+        }));
+        crate::egui_output::discard_headless_output(ctx.run(
             egui::RawInput {
                 events: vec![key_event(egui::Key::Tab)],
                 ..Default::default()
@@ -827,11 +827,11 @@ mod tests {
                     &mut focus_request,
                 );
             },
-        );
+        ));
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
-        let _ = ctx.run(
+        crate::egui_output::discard_headless_output(ctx.run(
             egui::RawInput {
                 events: vec![
                     egui::Event::Text("x".to_owned()),
@@ -851,7 +851,7 @@ mod tests {
                     &mut focus_request,
                 );
             },
-        );
+        ));
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
         assert_eq!(first, "xあ");

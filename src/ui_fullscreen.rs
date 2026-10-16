@@ -37911,7 +37911,8 @@ impl App {
         let in_video_tile = self.video_tile_mode_active;
         #[cfg(not(windows))]
         let in_video_tile = false;
-        let (wheel_y, modifiers) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers));
+        let wheel = ctx.input(crate::wheel_input::remaining_wheel_input);
+        let (wheel_y, modifiers) = (wheel.delta.y, wheel.modifiers);
         let ctrl_held = modifiers.ctrl;
         #[cfg(windows)]
         let suppress_egui_wheel = should_suppress_egui_wheel_for_native_detached_video(
@@ -38032,19 +38033,9 @@ impl App {
             // F12 detached 動画では native presenter child HWND がホイールを
             // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
             // 同じ wheel が届く環境があるため、ここでは消費だけして二重ナビを防ぐ。
-            ctx.input_mut(|i| {
-                i.raw_scroll_delta = egui::Vec2::ZERO;
-                i.smooth_scroll_delta = egui::Vec2::ZERO;
-                i.events
-                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-            });
+            crate::wheel_input::consume_wheel_input(ctx);
         } else if wheel_y.abs() > 0.5 && handle_wheel_here {
-            ctx.input_mut(|i| {
-                i.raw_scroll_delta = egui::Vec2::ZERO;
-                i.smooth_scroll_delta = egui::Vec2::ZERO;
-                i.events
-                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-            });
+            crate::wheel_input::consume_wheel_input(ctx);
             if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
                 // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
                 // Ctrl+ホイールのときだけ倍率変更。
@@ -49792,13 +49783,7 @@ impl FsHudPopupWheelInput {
 }
 
 fn consume_fs_hud_popup_wheel(ctx: &egui::Context) {
-    ctx.input_mut(|input| {
-        input.raw_scroll_delta = egui::Vec2::ZERO;
-        input.smooth_scroll_delta = egui::Vec2::ZERO;
-        input
-            .events
-            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
-    });
+    crate::wheel_input::consume_wheel_input(ctx);
 }
 
 fn fs_fit_popup_frame() -> egui::Frame {

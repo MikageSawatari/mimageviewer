@@ -1112,17 +1112,17 @@ fn append_keyboard_input(
     // See also: https://github.com/emilk/egui/issues/3653
     if let Some(active_key) = logical_key.or(physical_key) {
         if pressed {
-            if is_cut_command(input.modifiers, active_key) {
-                input.events.push(egui::Event::Cut);
-                return true;
-            } else if is_copy_command(input.modifiers, active_key) {
-                input.events.push(egui::Event::Copy);
-                return true;
-            } else if is_paste_command(input.modifiers, active_key) {
-                if let Some(contents) = clipboard_text() {
-                    let contents = contents.replace("\r\n", "\n");
-                    if !contents.is_empty() {
-                        input.events.push(egui::Event::Paste(contents));
+            if let Some(command) = egui_ime::winit_clipboard_command(input.modifiers, active_key) {
+                match command {
+                    egui_ime::ClipboardCommand::Cut => input.events.push(egui::Event::Cut),
+                    egui_ime::ClipboardCommand::Copy => input.events.push(egui::Event::Copy),
+                    egui_ime::ClipboardCommand::Paste => {
+                        if let Some(contents) = clipboard_text() {
+                            let contents = contents.replace("\r\n", "\n");
+                            if !contents.is_empty() {
+                                input.events.push(egui::Event::Paste(contents));
+                            }
+                        }
                     }
                 }
                 return true;
@@ -1407,57 +1407,66 @@ mod keyboard_input_tests {
 
     #[test]
     fn delivery_ordinary_clipboard_commands_keep_fallback_normalization_and_releases() {
-        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
-        for (physical, character, expected) in [
-            (KeyCode::KeyX, "x", egui::Event::Cut),
-            (KeyCode::KeyC, "c", egui::Event::Copy),
-            (
-                KeyCode::KeyV,
-                "v",
-                egui::Event::Paste("first\nsecond".into()),
-            ),
+        for modifiers in [
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+            egui::Modifiers::CTRL
+                | egui::Modifiers::COMMAND
+                | egui::Modifiers::SHIFT
+                | egui::Modifiers::ALT,
         ] {
-            for logical in [Key::Character(character.into()), Key::Character("ж".into())] {
-                for repeat in [false, true] {
-                    let mut input = egui::RawInput {
-                        modifiers,
-                        ..Default::default()
-                    };
-                    let mut reads = 0;
-                    append_keyboard_input(
-                        &mut input,
-                        &logical,
-                        PhysicalKey::Code(physical),
-                        Some(character),
-                        ElementState::Pressed,
-                        repeat,
-                        #[cfg(target_os = "windows")]
-                        true,
-                        #[cfg(target_os = "windows")]
-                        &mut HashMap::new(),
-                        || {
-                            reads += 1;
-                            Some("first\r\nsecond".into())
-                        },
-                    );
-                    assert_eq!(input.events, vec![expected.clone()]);
-                    assert_eq!(reads, usize::from(physical == KeyCode::KeyV));
-                    input.events.clear();
-                    append_keyboard_input(
-                        &mut input,
-                        &logical,
-                        PhysicalKey::Code(physical),
-                        Some(character),
-                        ElementState::Released,
-                        false,
-                        #[cfg(target_os = "windows")]
-                        true,
-                        #[cfg(target_os = "windows")]
-                        &mut HashMap::new(),
-                        || panic!("Release must not read clipboard"),
-                    );
-                    let key = key_from_key_code(physical).unwrap();
-                    assert_eq!(input.events, vec![key_event(key, key, false, modifiers)]);
+            for (physical, character, expected) in [
+                (KeyCode::KeyX, "x", egui::Event::Cut),
+                (KeyCode::KeyC, "c", egui::Event::Copy),
+                (
+                    KeyCode::KeyV,
+                    "v",
+                    egui::Event::Paste("first\nsecond".into()),
+                ),
+            ] {
+                for logical in [Key::Character(character.into()), Key::Character("ж".into())] {
+                    for repeat in [false, true] {
+                        let mut input = egui::RawInput {
+                            modifiers,
+                            ..Default::default()
+                        };
+                        let mut reads = 0;
+                        append_keyboard_input(
+                            &mut input,
+                            &logical,
+                            PhysicalKey::Code(physical),
+                            Some(character),
+                            ElementState::Pressed,
+                            repeat,
+                            #[cfg(target_os = "windows")]
+                            true,
+                            #[cfg(target_os = "windows")]
+                            &mut HashMap::new(),
+                            || {
+                                reads += 1;
+                                Some("first\r\nsecond".into())
+                            },
+                        );
+                        assert_eq!(input.events, vec![expected.clone()]);
+                        assert_eq!(reads, usize::from(physical == KeyCode::KeyV));
+                        input.events.clear();
+                        append_keyboard_input(
+                            &mut input,
+                            &logical,
+                            PhysicalKey::Code(physical),
+                            Some(character),
+                            ElementState::Released,
+                            false,
+                            #[cfg(target_os = "windows")]
+                            true,
+                            #[cfg(target_os = "windows")]
+                            &mut HashMap::new(),
+                            || panic!("Release must not read clipboard"),
+                        );
+                        let key = key_from_key_code(physical).unwrap();
+                        assert_eq!(input.events, vec![key_event(key, key, false, modifiers)]);
+                    }
                 }
             }
         }
@@ -2305,28 +2314,17 @@ mod keyboard_input_tests {
             );
         }
         let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
-        assert!(is_cut_command(modifiers, egui::Key::X));
-        assert!(is_copy_command(modifiers, egui::Key::C));
-        assert!(is_paste_command(modifiers, egui::Key::V));
+        for (key, expected) in [
+            (egui::Key::X, egui_ime::ClipboardCommand::Cut),
+            (egui::Key::C, egui_ime::ClipboardCommand::Copy),
+            (egui::Key::V, egui_ime::ClipboardCommand::Paste),
+        ] {
+            assert_eq!(
+                egui_ime::winit_clipboard_command(modifiers, key),
+                Some(expected)
+            );
+        }
     }
-}
-
-fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
-    keycode == egui::Key::Cut
-        || (modifiers.command && keycode == egui::Key::X)
-        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Delete)
-}
-
-fn is_copy_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
-    keycode == egui::Key::Copy
-        || (modifiers.command && keycode == egui::Key::C)
-        || (cfg!(target_os = "windows") && modifiers.ctrl && keycode == egui::Key::Insert)
-}
-
-fn is_paste_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
-    keycode == egui::Key::Paste
-        || (modifiers.command && keycode == egui::Key::V)
-        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Insert)
 }
 
 fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::PointerButton> {

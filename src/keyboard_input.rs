@@ -196,6 +196,37 @@ pub(crate) fn keyboard_input_permits(ctx: &egui::Context) -> KeyboardInputPermit
     decide_keyboard_input_permits(viewport, viewport_focused, routed_key_down)
 }
 
+/// Main's WH_GETMESSAGE hook drain decision after its existing session and
+/// foreground exclusions. Routed key edges use a separate discrete permit;
+/// this current-focus decision must never replace that event-time evidence.
+pub(crate) const fn main_keyboard_drains_mouse_nav(
+    detached: bool,
+    main_focused: bool,
+    native_video: bool,
+) -> bool {
+    !detached || main_focused || native_video
+}
+
+/// Semantic events are independent of the keymap's physical press route.
+pub(crate) fn clipboard_semantic_requests(events: &[egui::Event]) -> (bool, bool) {
+    let mut copy = false;
+    let mut cut = false;
+    for event in events {
+        match event {
+            egui::Event::Copy => copy = true,
+            egui::Event::Cut => cut = true,
+            _ => {}
+        }
+    }
+    (copy, cut)
+}
+
+/// Preserve Shell paste's current Win32 high-bit level plus V transition bit.
+/// This is deliberately not the text clipboard shortcut policy.
+pub(crate) const fn shell_paste_transition_requested(ctrl: i16, v: i16) -> bool {
+    ctrl < 0 && v < 0 && (v & 1) != 0
+}
+
 pub(crate) fn focused_key_state_permit(ctx: &egui::Context) -> Option<FocusedKeyStatePermit> {
     focused_key_state_permit_for_viewport(
         ctx.viewport_id(),
@@ -912,6 +943,37 @@ mod tests {
         assert!(
             !decide_keyboard_owner(pending).blocks_legacy_keymap_shortcuts(),
             "S3 must not activate PendingFocus as a new keymap block"
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_projection_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_shell_paste_requires_transition_and_both_held_keys() {
+        let held = 0x8000u16 as i16;
+        for ctrl in [0, 1, held, held | 1] {
+            for v in [0, 1, held, held | 1] {
+                assert_eq!(
+                    shell_paste_transition_requested(ctrl, v),
+                    ctrl < 0 && v == (held | 1)
+                );
+            }
+        }
+        assert_eq!(
+            clipboard_semantic_requests(&[
+                egui::Event::Copy,
+                egui::Event::Paste("text".into()),
+                egui::Event::Cut,
+                egui::Event::Copy,
+            ]),
+            (true, true)
+        );
+        assert_eq!(
+            clipboard_semantic_requests(&[egui::Event::Paste("text".into())]),
+            (false, false)
         );
     }
 }

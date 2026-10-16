@@ -105,6 +105,9 @@ optional = true
 version = "0.33.3"
 default-features = false
 
+[dependencies.egui-ime]
+path = "../../crates/egui-ime"
+
 [dependencies.log]
 version = "0.4.28"
 features = ["std"]

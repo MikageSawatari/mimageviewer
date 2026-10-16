@@ -58915,19 +58915,14 @@ impl App {
         let cell_h = self.last_cell_h.max(1.0);
 
         // マウスホイールイベントだけを取り出し、egui には渡さない
-        let (scroll_delta_y, ctrl) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
+        let wheel = ctx.input(crate::wheel_input::remaining_wheel_input);
+        let (scroll_delta_y, ctrl) = (wheel.delta.y, wheel.modifiers.ctrl);
         if scroll_delta_y.abs() > 0.5 {
             // This owner consumes the wheel before render_grid can observe it.
             // An accepted scroll (including Ctrl+wheel at a column limit) ends
             // the grid click run even when the resulting offset is unchanged.
             self.grid_click_pairing.end_activation();
-            ctx.input_mut(|i| {
-                i.raw_scroll_delta = egui::Vec2::ZERO;
-                i.smooth_scroll_delta = egui::Vec2::ZERO;
-                // MouseWheel イベントも消費
-                i.events
-                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-            });
+            crate::wheel_input::consume_wheel_input(ctx);
 
             if ctrl {
                 // Ctrl+ホイール: 列数を増減（1〜20 の範囲）
@@ -58968,12 +58963,7 @@ impl App {
         if !ctx.is_popup_open() {
             return;
         }
-        ctx.input_mut(|i| {
-            i.raw_scroll_delta = egui::Vec2::ZERO;
-            i.smooth_scroll_delta = egui::Vec2::ZERO;
-            i.events
-                .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-        });
+        crate::wheel_input::consume_wheel_input(ctx);
     }
 
     /// Path-free diagnostics only at Rating restore/scroll writes; geometry is supplied by its owner.
@@ -59482,28 +59472,22 @@ impl App {
         let _ = ctx;
     }
 
-    /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
-    fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
+    /// Sample this root pass's clipboard requests before any Shell I/O.
+    /// The Win32 transition bit, keymap and semantic events keep their old order.
+    fn grid_clipboard_requests(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<(Option<crate::native_context_menu::ShellClipboardVerb>, bool)> {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if !main_focused
             || self.shortcuts_blocked_by_text_input(ctx)
             || !self.grid_item_input_allowed()
         {
-            return;
+            return None;
         }
 
-        let (egui_copy, egui_cut) = ctx.input(|i| {
-            let mut c = false;
-            let mut x = false;
-            for event in &i.events {
-                match event {
-                    egui::Event::Copy => c = true,
-                    egui::Event::Cut => x = true,
-                    _ => {}
-                }
-            }
-            (c, x)
-        });
+        let (egui_copy, egui_cut) =
+            ctx.input(|i| crate::keyboard_input::clipboard_semantic_requests(&i.events));
 
         let ctrl_v = {
             #[cfg(windows)]
@@ -59515,7 +59499,7 @@ impl App {
                     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11) };
                 let v =
                     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x56) };
-                (ctrl & (0x8000u16 as i16)) != 0 && (v & (0x8000u16 as i16)) != 0 && (v & 1) != 0
+                crate::keyboard_input::shell_paste_transition_requested(ctrl, v)
             }
             #[cfg(not(windows))]
             false
@@ -59534,12 +59518,22 @@ impl App {
         let cut_requested = self.keymap.pressed_action(ctx, KeyAction::GridCutFiles)
             || (egui_cut && cut_accepts_semantic_event);
 
-        if copy_requested || cut_requested {
-            let verb = if cut_requested {
-                crate::native_context_menu::ShellClipboardVerb::Cut
-            } else {
-                crate::native_context_menu::ShellClipboardVerb::Copy
-            };
+        let verb = if cut_requested {
+            Some(crate::native_context_menu::ShellClipboardVerb::Cut)
+        } else if copy_requested {
+            Some(crate::native_context_menu::ShellClipboardVerb::Copy)
+        } else {
+            None
+        };
+        Some((verb, ctrl_v))
+    }
+
+    /// Dispatch copy/cut before paste, at the original root UI checkpoint.
+    fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
+        let Some((verb, ctrl_v)) = self.grid_clipboard_requests(ctx) else {
+            return;
+        };
+        if let Some(verb) = verb {
             self.invoke_shell_clipboard_verb(ctx, verb);
         }
 
@@ -60159,17 +60153,17 @@ impl App {
         if self.active_detached_viewer_has_foreground() {
             return false;
         }
-        if self.viewer_session_is_detached() && !main_has_focus {
-            // Static detached viewers rely on the egui viewport handler to consume
-            // APPCOMMAND/BrowserBack input. Native detached video has its own Win32
-            // window proc, so main can drain the global hook counter to prevent a
-            // stale duplicate after the native handler has already moved.
-            return matches!(
+        // Static detached viewers keep the hook pending for their viewport.
+        // Native video already consumes Win32 navigation, so main discards its
+        // duplicate even without current focus. Keep the foreground checks above.
+        crate::keyboard_input::main_keyboard_drains_mouse_nav(
+            self.viewer_session_is_detached(),
+            main_has_focus,
+            matches!(
                 self.fullscreen_idx.and_then(|idx| self.items.get(idx)),
                 Some(GridItem::Video(_))
-            );
-        }
-        true
+            ),
+        )
     }
 
     #[cfg(windows)]

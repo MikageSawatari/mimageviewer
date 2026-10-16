@@ -25,6 +25,7 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
+use crate::wheel_input::consume_wheel_input;
 
 #[cfg(windows)]
 fn effetune_toolbar_button(
@@ -1464,15 +1465,6 @@ fn draw_facet_checkbox_choice(
         .inner;
     response.on_hover_text(hover_text);
     changed
-}
-
-fn consume_wheel_input(ctx: &egui::Context) {
-    ctx.input_mut(|i| {
-        i.raw_scroll_delta = egui::Vec2::ZERO;
-        i.smooth_scroll_delta = egui::Vec2::ZERO;
-        i.events
-            .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-    });
 }
 
 fn suppress_menu_button_wheel_passthrough(ctx: &egui::Context, response: &egui::Response) {

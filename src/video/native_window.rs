@@ -1231,6 +1231,15 @@ pub fn foreground_hwnd() -> u64 {
     unsafe { GetForegroundWindow().0 as u64 }
 }
 
+/// Snapshot the strict process-owned foreground target once for physical input.
+/// Unknown/null ownership suppresses gamepad actions, as at the old ingress.
+pub(crate) fn foreground_process_hwnd() -> Option<u64> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        hwnd_belongs_to_current_process_strict(hwnd).then_some(hwnd.0 as u64)
+    }
+}
+
 /// Foreground ownership shared by presenter recovery, HUD input and the VST host.
 /// A bridge process is not sufficient evidence: only its registered, visible
 /// editor window (or a child of that window) belongs to this UI group.

@@ -1,10 +1,12 @@
-//! Host-independent IME input repair and composition focus policy for egui.
+//! Shared egui IME, text-focus and clipboard input policy.
 //!
 //! Install the input policy before the first pass of each Context. Hosts retain
 //! their own shortcut ownership, diagnostics and application-wide focus policy.
 
+mod clipboard;
 mod tab_focus;
 
+pub use clipboard::{ClipboardCommand, native_windows_clipboard_command, winit_clipboard_command};
 pub use tab_focus::{cancel_tab_focus_traversal, install_tab_shortcut_focus_policy};
 
 use std::collections::HashMap;

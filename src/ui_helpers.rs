@@ -471,13 +471,7 @@ pub(crate) fn apply_brush_radius_wheel(
 
     *radius = crate::manual_mask_tools::brush_radius_after_wheel(*radius, notches, min, max);
     let applied = *radius;
-    ctx.input_mut(|input| {
-        input.raw_scroll_delta = egui::Vec2::ZERO;
-        input.smooth_scroll_delta = egui::Vec2::ZERO;
-        input
-            .events
-            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
-    });
+    crate::wheel_input::consume_wheel_input(ctx);
     Some(applied)
 }
 

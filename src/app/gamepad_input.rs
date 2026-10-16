@@ -514,17 +514,7 @@ fn mouse_button_action_blocked_by_edit_mode(edit_mode_active: bool, action: &Rin
 /// ブロックすると同時に、detached viewer とメイングリッドのどちらが入力面かを決める。
 #[cfg(all(windows, not(test)))]
 fn foreground_app_hwnd() -> Option<u64> {
-    use windows::Win32::System::Threading::GetCurrentProcessId;
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return None;
-        }
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        (pid != 0 && pid == GetCurrentProcessId()).then_some(hwnd.0 as u64)
-    }
+    crate::video::native_window::foreground_process_hwnd()
 }
 
 #[cfg(all(not(windows), not(test)))]

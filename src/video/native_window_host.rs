@@ -160,6 +160,32 @@ pub(crate) enum NativeWindowIntent {
     },
 }
 
+fn native_ime_window_forms(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (COMPOSITIONFORM, CANDIDATEFORM) {
+    let area = RECT {
+        left: x,
+        top: y,
+        right: x + width.max(1),
+        bottom: y + height.max(1),
+    };
+    let candidate_form = CANDIDATEFORM {
+        dwIndex: 0,
+        dwStyle: windows::Win32::UI::Input::Ime::CFS_EXCLUDE,
+        ptCurrentPos: POINT { x, y },
+        rcArea: area,
+    };
+    let composition_form = COMPOSITIONFORM {
+        dwStyle: windows::Win32::UI::Input::Ime::CFS_POINT,
+        ptCurrentPos: POINT { x, y: area.bottom },
+        rcArea: area,
+    };
+    (composition_form, candidate_form)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeFocusState {
     pub(crate) target_id: u64,
@@ -621,34 +647,22 @@ impl NativeWindowHost {
                     width,
                     height,
                 } => {
-                    let area = RECT {
-                        left: x,
-                        top: y,
-                        right: x + width.max(1),
-                        bottom: y + height.max(1),
-                    };
-                    let candidate_form = CANDIDATEFORM {
-                        dwIndex: 0,
-                        dwStyle: windows::Win32::UI::Input::Ime::CFS_EXCLUDE,
-                        ptCurrentPos: POINT { x, y },
-                        rcArea: area,
-                    };
-                    let composition_form = COMPOSITIONFORM {
-                        dwStyle: windows::Win32::UI::Input::Ime::CFS_POINT,
-                        ptCurrentPos: POINT { x, y: area.bottom },
-                        rcArea: area,
-                    };
-                    unsafe {
-                        let hwnd = self.hwnd();
-                        let himc = ImmGetContext(hwnd);
-                        if !himc.0.is_null() {
-                            let _ = ImmSetCompositionWindow(himc, &composition_form);
-                            let _ = ImmSetCandidateWindow(himc, &candidate_form);
-                            let _ = ImmReleaseContext(hwnd, himc);
-                        }
-                    }
+                    self.update_ime_cursor_area(x, y, width, height);
                 }
                 NativeWindowIntent::SetCursorPolicy { .. } => {}
+            }
+        }
+    }
+
+    fn update_ime_cursor_area(&self, x: i32, y: i32, width: i32, height: i32) {
+        let (composition_form, candidate_form) = native_ime_window_forms(x, y, width, height);
+        unsafe {
+            let hwnd = self.hwnd();
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                let _ = ImmSetCompositionWindow(himc, &composition_form);
+                let _ = ImmSetCandidateWindow(himc, &candidate_form);
+                let _ = ImmReleaseContext(hwnd, himc);
             }
         }
     }
@@ -962,6 +976,49 @@ fn log_detached_native_set_window_pos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_ime_forms_keep_cursor_exclusion_and_composition_below_the_cursor() {
+        let (composition, candidate) = native_ime_window_forms(-3, 9, 4, 18);
+        assert_eq!(
+            composition.dwStyle,
+            windows::Win32::UI::Input::Ime::CFS_POINT
+        );
+        assert_eq!(
+            (composition.ptCurrentPos.x, composition.ptCurrentPos.y),
+            (-3, 27)
+        );
+        assert_eq!(candidate.dwIndex, 0);
+        assert_eq!(
+            candidate.dwStyle,
+            windows::Win32::UI::Input::Ime::CFS_EXCLUDE
+        );
+        assert_eq!(
+            (candidate.ptCurrentPos.x, candidate.ptCurrentPos.y),
+            (-3, 9)
+        );
+        for area in [composition.rcArea, candidate.rcArea] {
+            assert_eq!(
+                (area.left, area.top, area.right, area.bottom),
+                (-3, 9, 1, 27)
+            );
+        }
+    }
+
+    #[test]
+    fn native_ime_forms_keep_the_existing_one_physical_pixel_minimum() {
+        let (composition, candidate) = native_ime_window_forms(10, 20, 0, -2);
+        assert_eq!(
+            (composition.ptCurrentPos.x, composition.ptCurrentPos.y),
+            (10, 21)
+        );
+        for area in [composition.rcArea, candidate.rcArea] {
+            assert_eq!(
+                (area.left, area.top, area.right, area.bottom),
+                (10, 20, 11, 21)
+            );
+        }
+    }
 
     macro_rules! assert_not_impl_any {
         ($ty:ty: $trait:path) => {
