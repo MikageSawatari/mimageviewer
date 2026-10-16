@@ -191,6 +191,24 @@ impl CaptureState {
     /// Pass in the buffer returned from [`CaptureState::copy_textures`].
     /// Make sure to call this after the encoder has been submitted.
     pub fn read_screen_rgba(&self, buffer: wgpu::Buffer, callbacks: Vec<ScreenshotCallback>) {
+        self.read_screen_rgba_with_viewport(buffer, callbacks, None);
+    }
+
+    pub(crate) fn read_screen_rgba_in_viewport(
+        &self,
+        buffer: wgpu::Buffer,
+        callbacks: Vec<ScreenshotCallback>,
+        viewport_id: egui::ViewportId,
+    ) {
+        self.read_screen_rgba_with_viewport(buffer, callbacks, Some(viewport_id));
+    }
+
+    fn read_screen_rgba_with_viewport(
+        &self,
+        buffer: wgpu::Buffer,
+        callbacks: Vec<ScreenshotCallback>,
+        viewport_id: Option<egui::ViewportId>,
+    ) {
         #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
         let buffer = Arc::new(buffer);
         let buffer_clone = Arc::clone(&buffer);
@@ -202,6 +220,12 @@ impl CaptureState {
             wgpu::TextureFormat::Rgba8Unorm => [0, 1, 2, 3],
             wgpu::TextureFormat::Bgra8Unorm => [2, 1, 0, 3],
             _ => {
+                if crate::atlas_diag::capture_probe_active() {
+                    crate::atlas_diag::log_line(format!(
+                        "[capture-probe] wgpu_capture_image viewport={viewport_id:?} produced=false unsupported_format={format:?} callbacks={}",
+                        callbacks.len()
+                    ));
+                }
                 log::error!(
                     "Screen can't be captured unless the surface format is Rgba8Unorm or Bgra8Unorm. Current surface format is {format:?}"
                 );
@@ -210,6 +234,11 @@ impl CaptureState {
         };
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             if let Err(err) = result {
+                if crate::atlas_diag::capture_probe_active() {
+                    crate::atlas_diag::log_line(format!(
+                        "[capture-probe] wgpu_capture_image viewport={viewport_id:?} produced=false map_error={err}"
+                    ));
+                }
                 log::error!("Failed to map buffer for reading: {err}");
                 return;
             }
@@ -219,6 +248,11 @@ impl CaptureState {
             let mapped_range = match buffer_slice.get_mapped_range() {
                 Ok(range) => range,
                 Err(err) => {
+                    if crate::atlas_diag::capture_probe_active() {
+                        crate::atlas_diag::log_line(format!(
+                            "[capture-probe] wgpu_capture_image viewport={viewport_id:?} produced=false mapped_range_error={err}"
+                        ));
+                    }
                     log::error!("Failed to get mapped range for reading: {err}");
                     return;
                 }
@@ -241,10 +275,109 @@ impl CaptureState {
                 [tex_extent.width as usize, tex_extent.height as usize],
                 pixels,
             ));
+            let callback_count = callbacks.len();
             for callback in callbacks {
                 callback.complete(Arc::clone(&image));
             }
+            if crate::atlas_diag::capture_probe_active() {
+                crate::atlas_diag::log_line(format!(
+                    "[capture-probe] wgpu_capture_image viewport={viewport_id:?} produced=true size={}x{} callback_requests={callback_count}",
+                    tex_extent.width, tex_extent.height
+                ));
+            }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn capture_headless_callback_readback_preserves_rgba_and_unpads_bgra() {
+        struct RestoreProbe(bool);
+        impl Drop for RestoreProbe {
+            fn drop(&mut self) {
+                crate::atlas_diag::set_capture_probe(self.0);
+            }
+        }
+        let _restore = RestoreProbe(crate::atlas_diag::capture_probe_active());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("headless DX12 adapter required for capture regression");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default()))
+            .expect("headless capture device");
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
+        ] {
+            let probe = format == wgpu::TextureFormat::Bgra8Unorm;
+            crate::atlas_diag::set_capture_probe(probe);
+            assert_eq!(crate::atlas_diag::capture_probe_active(), probe);
+            let mut capture = CaptureState::new(
+                &device,
+                wgpu::Extent3d {
+                    width: 3,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+                format,
+            );
+            // Exercise resize and the non-256-byte row padding path.
+            capture.update(
+                &device,
+                wgpu::Extent3d {
+                    width: 5,
+                    height: 3,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let view = capture.texture.create_view(&Default::default());
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 1.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 1.0,
+                            }),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    ..Default::default()
+                });
+            }
+            let buffer = capture.copy_textures(&device, None, &mut encoder);
+            let submission = queue.submit([encoder.finish()]);
+            let (tx, rx) = mpsc::channel();
+            let first_tx = tx.clone();
+            let callback = ScreenshotCallback::new(move |image| first_tx.send(image).unwrap());
+            let second = ScreenshotCallback::new(move |image| tx.send(image).unwrap());
+            capture.read_screen_rgba(buffer, vec![callback.clone(), callback, second]);
+            // Waiting is confined to headless readback tests, never the painter.
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(Duration::from_secs(10)),
+                })
+                .expect("readback callbacks complete");
+            for _ in 0..2 {
+                let image = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(image.size, [5, 3]);
+                assert_eq!(image.pixels, vec![epaint::Color32::RED; 15]);
+            }
+            assert!(rx.try_recv().is_err(), "a cloned callback remains one-shot");
+        }
     }
 }
 

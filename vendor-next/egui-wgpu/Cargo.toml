@@ -21,8 +21,8 @@ authors = [
 ]
 build = false
 include = [
-    "../../LICENSE-APACHE",
-    "../../LICENSE-MIT",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
     "**/*.rs",
     "**/*.wgsl",
     "Cargo.toml",
@@ -75,6 +75,9 @@ x11 = ["winit?/x11"]
 [lib]
 name = "egui_wgpu"
 path = "src/lib.rs"
+
+[dev-dependencies.pollster]
+version = "0.4"
 
 [dependencies.ahash]
 version = "0.8.12"

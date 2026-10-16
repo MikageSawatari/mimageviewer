@@ -208,6 +208,18 @@
       "src/setup.rs": "c438389fc2b4e8a4d5dfe2eef57c76caed3cb2c199f9f15d7f80b105cf4246bf",
       "src/texture_copy.wgsl": "b5f7873cceca89e13932ce8d32e487feed2124f414e9959fc7dbe4a5d33939c6",
       "src/winit.rs": "3f9f39150119a4ef071ab9e0ed9384edbebad36cc72bc35a90ac1639d165be51"
+    },
+    "local_license_files": {
+      "LICENSE-MIT": {
+        "copied_from": "vendor/egui-wgpu/LICENSE-MIT",
+        "sha256": "3fceb7b317f3c70451942b0e123723a2e250c7eaf970ce4b490a57a94c5588ff",
+        "checkpoint": "patched only; absent from upstream archive"
+      },
+      "LICENSE-APACHE": {
+        "copied_from": "vendor/egui-wgpu/LICENSE-APACHE",
+        "sha256": "1ac50a5abd5cff5331d59928d83369b66b0099a88f0111dc2175526b3c666dec",
+        "checkpoint": "patched only; absent from upstream archive"
+      }
     }
   }
 }

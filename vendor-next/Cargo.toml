@@ -1,11 +1,12 @@
 # Stage 2 preparation graph. Product workspace/patches remain on 0.33.3.
 [workspace]
 resolver = "2"
-members = ["egui", "egui-winit", "egui-ime"]
+members = ["egui", "egui-winit", "egui-ime", "egui-wgpu"]
 
 [patch.crates-io]
 egui = { path = "egui" }
 egui-winit = { path = "egui-winit" }
+egui-wgpu = { path = "egui-wgpu" }
 
 [profile.dev]
 debug = "line-tables-only"

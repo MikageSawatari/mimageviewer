@@ -423,3 +423,177 @@ sourceと有効な検証証拠で確認し、未解決指摘はなかった。�
 重大な食い違いはない。追加の範囲は上記egui-winitのfixture-only適応で、既存検証の生存前提を修正した。
 段2cのClose受付・消費、backend window／surface／State退役、段2b、段3の正式接続は未実装。
 本家へは通常GCのviewport別Memory残留とlock下callback破棄を最小回帰と共に報告する価値がある（未送信）。
+
+## 段2b（2026-10-17）
+
+開始HEAD `357b25c9d`、branch `egui-036`、Rust 1.99.0。段2a-1／2a-2は独立レビューACCEPT、
+段2a-3は設計担当がコミット済みで独立レビュー中、という引継ぎで着手した。
+本節は**実装担当の内部確認**。正式な独立レビュー・設計受入れを代替しない。
+git add／commit／branch操作／pushは行わず、未コミットで返す。
+
+### 原本・取り込み境界・準備graph
+
+設計第4.4版§4.8のegui-wgpu行・取り込み手順、§4.9、段2表2b・受入条件を読み直した。
+旧vendor READMEに加え、registryの0.33.3原本と現vendorの実差分全体を照合した。
+srcは9ファイルの差分（追加moduleを含む）で、shader空行以外の機能差分を論理項目ごとに付け直した。
+旧差分の全file台帳は`target/egui037-stage2b-old-inventory.json`、diffは同prefixのold-diff以下。
+
+| 原本記録 | 値 |
+| --- | --- |
+| 配置 | 実directory `vendor-next/egui-wgpu`、version 0.37.0 |
+| 元 | `C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-wgpu-0.37.0` |
+| archive | 同registryのcacheにあるegui-wgpu-0.37.0.crate |
+| archive SHA-256 | `0309cbe1febed48af5b974e4bcc424b35e9664863a4d402697147b57a488c864` |
+| checksum照合 | registry index cksum、archive、展開sourceが一致 |
+| VCS | `7c0b40402271e8d40cda69f87cf3c2617c2e4382`、crates/egui-wgpu |
+| license | MIT OR Apache-2.0。本文は旧vendorから追加、hashはupstream-provenance.jsonのlocal_license_files |
+
+import-upstream.pyへpackage指定と既存provenance保持を追加し、
+`python vendor-next/import-upstream.py egui-wgpu`で原本12ファイルをbyte照合して配置した。
+原本を置いてから移植し、旧manifestを上書きコピーしていない。`.cargo-ok`、target、
+不要なregistry管理ファイル・他DLLは取り込まず、junction／symlinkも作らない。
+
+| handoff | 内容 |
+| --- | --- |
+| `target/egui037-stage2b-handoff/original/` | 原本package12ファイル＋その時点のimporter／provenance。mIV追加source・回帰・PATCHES・license本文をpackageに含めない |
+| 同`patched/` | 最終packageと変更した準備graph・文書・file hash。CHECKPOINT.jsonで原本不変／変更／追加を区別 |
+
+原本のままなのは`.cargo_vcs_info.json`、同梱Cargo.lock、Cargo.toml.orig、README.md、
+src/egui.wgsl、src/setup.rs、src/texture_copy.wgslの7ファイル。
+原本から変更したのはCargo.toml、src/lib.rs、src/renderer.rs、src/winit.rs、src/capture.rsの5ファイル。
+追加はatlas_diag.rs、mipmap.rs／wgsl、startup_diagnostics.rs、renderer_tests.rs、winit_tests.rs、
+PATCHES.md、LICENSE-MIT／APACHEの9ファイルで、全てpatched側にだけ含める。
+
+準備workspaceへmemberとegui-wgpu path patchを足した。eguiは既存vendor-next/eguiと同じ実体。
+準備lockはwgpu 30.0.1接続とpollster dev依存のため更新した。既存package版の除去・更新はなく、
+新package版を44件追加した（lock-audit.json）。rootのworkspace・patch・製品code・Cargo.lockは不変。
+同梱crate lockは原本資料として残し、実行はvendor-next/Cargo.lockへ統一する。
+
+### 付け直した差分と分類
+
+詳細は`vendor-next/egui-wgpu/PATCHES.md`と実source差分を正本とする。
+
+| 項目 | 分類・処置 |
+| --- | --- |
+| managed mipmap allocation／再生成／sampler | (b)。opt-in allocation、whole／partial後の再生成、Noneへのview制限を保持。0.37のflags bindingとpredictable filteringを維持 |
+| 公開MipmapGenerator／exact texel count | (b)。wgpu30のBGL Option・immediate_size・multiview_maskへ適応。奇数端・非正方形を保持 |
+| atlas diagnostics／identity／texture_size | (b)。RGBAとID別delta列に対応、各deltaのbefore／after・freeと順序を記録 |
+| 既存atlas overflow skip-write | (b・既存範囲のみ)。根治策として広げず、通常whole→partialを実画素で検査 |
+| 無描画delta／対象surface限定退役 | (b)。同じTextureDeliveryでdrain／submit／free、safe／unsafe入口共通で対象だけの資源を除去 |
+| startup GPU stage／root present observer | (b)。async列挙・Instance保持・Queue::presentへ適応。setと最終submit/freeのTextureDelivery spanを保持 |
+| atlas-probe／capture outcome／readback診断 | (b)。文字列summaryだけを保持し、viewport相関と中断・callback結果を記録。診断cloneに適用権を持たせない |
+| upstream submission guard | (a)+(b)。早期終了submit保証を利用し、mutable deltaとmipmap submit・free完結を接続 |
+| callback screenshot／hidden offscreen capture | (a)。本家のone-shot callback・共有画像・acquire失敗時capture継続を利用 |
+| SurfaceConfig／stencil／lib test有効化 | (a)。新版構造・buffer条件・既定test有効を利用。stencilだけを理由にbufferを追加しない |
+| shader空行・旧channel／Event配送・旧surface error分類・旧manifest/lockコピー | (c)。空行は不要、他は新版API／準備workspaceへ置換。追加repaintや旧版動作を再注入しない |
+| license／test依存・回帰接続 | (b)。本文のbyte保持、local license includeとpollsterを新manifestへ追加 |
+
+AutoVsync／latency 1とMIV_WGPU_FRAME_LATENCY等の製品設定はroot旧graphでそのまま保持する。
+新WgpuConfiguration.surfaceへの正式接続は段3。vendorに製品環境変数parserを複製しない。
+D3D11 native presenter／Naga27の別経路も変更しない。
+
+### TexturesDeltaとsubmissionの完結owner
+
+Painter consumerは`&mut TexturesDelta`を受け、rendererがあればsurface lookupより前に
+set mapをdrainする。各ID内のwhole→partial列順を保持し、全IDの適用後にsubmitを完結してから
+free setをdrainする。renderer未準備なら両方未消費のまま呼出元の既存pending ownerへ残す。
+
+TextureDeliveryは本家guardを拡張した呼出し内の単一完結ownerで、通常submit後の空submitを抑止する。
+内部update結果Unchanged／Pending／Submittedにより、最後のmipmap内部submitを追う。
+最後がmipmapなら不要な空submitをせず、後から通常writeがあればsubmitする。
+update_buffers後・acquire不成立・capture zero-size・surface再作成失敗も同じ完結境界に合流する。
+通常paint／capture-onlyは通常submit後にfreeし、RootPresentedは実presentの返却時だけ発行する。
+単なるsurfaceなしではcaptureのgeometryがないので、upload/freeだけを完結する。
+
+共有rendererと未配送deltaをviewport終了で一括clearしない。productionのGPU待機・retry・
+新queue／pending owner・App補助フラグ・追加repaint・二重適用は加えていない。
+本家のsurface回復・repaint動作は維持する。診断用ownerはcall-local enum／Stringだけで、適用権はない。
+headlessで配送先不在と確定したfixtureだけはmetadata採取後clear／FullOutput明示破棄で終端する。
+
+### 回帰・追加確認で見つかった検証不備
+
+全16件。mip count2件、shader/layout2件、atlas列順1件、startup final-pass／present observer2件、
+managed／公開mipmap GPU2件、capture GPU1件、Painter経路6件で構成する。
+
+- no-surfaceでatlas whole1x1→2x2→重なるpartial2件を配送し、最終4画素の順序を検査。
+  同batch creation+free、free-only、消費済みdelta空、実submit回数、free後のtexture不在を確認する。
+- renderer不在はset／freeを保持し、通常／fallback submit回数が0のまま。
+- acquire不成立相当は実update_buffers後に同じ完結ownerをdropし、通常submit経路とも比較する。
+- mip→通常、通常→mip、全mipでfallback回数を1／0／0、通常submitでnormal1／fallback0を検査する。
+- managed mipmapは実bind group／samplerで描画してreadback。partial後の鎖再生成、None view制限、
+  wholeでのサイズ更新、公開generatorの3x3奇数端の寄与を検査する。
+- captureはsurface無しでRGBA／BGRAのresize・row padding・clone callback one-shot・複数要求を検査。
+  runtime probe off/on両方を通し元設定へ戻す。新callbackに追加repaintを付けない。
+- safe／unsafe set_window(None)の実公開入口へactual GPU depth／MSAA viewを登録し、対象だけの除去と
+  root／兄弟attachment・共有renderer identity／texture保持を検査。surface mapは同じ共通helperへ
+  drop sentinelを渡して対象だけのdropを検査する。実Surfaceはwindow無しでは作らない。
+- startup callbackからset側とfinalization側のBegin/End、実submit返却・free後の観測順を検査する。
+
+初回test compileは新API差4件で失敗した（tool exit 1）：InstanceDescriptorにDefaultがない2箇所と、
+device.pop_error_scopeがErrorScopeGuardへ変わった2箇所。新版factoryとguard.popへ訂正した。
+
+追加の変異確認では、fallback submitを外しても最初のGPU buffer readback回帰が成功した。
+この結果をsubmitの証拠として採用せず、driver側の原因も断定しない。
+実normal／fallback queue.submitの返却直後だけ加算するcfg(test) thread-local counterを追加し、
+consumer前後の回数差で欠落と重複を検査する形へ補強した。productionには計測field／flagを残さない。
+GPU readbackは画素・buffer内容の証拠として維持する。
+内部確認で見つけた旧atlas/capture outcomeログ・最終free spanの移植漏れも、全検証前に復元した。
+
+| 最終変異 | 成功 / 失敗 | exit |
+| --- | --- | --- |
+| fallback submit条件を無効化 | 0 / 1 | 101 |
+| 対象限定cleanupを全clearへ戻す | 0 / 1 | 101 |
+| 修正済みbytesへ復元・通常lib全件 | 16 / 0 | 0 |
+
+変異はfinallyでsource bytesを復元しhashを記録した。記録は
+`target/egui037-stage2b-mutations-final.json`、各ログはsubmission-guard-reverted／
+target-cleanup-reverted／wgpu-restored。検出できなかった初回試験も同prefixの
+submission-reverted.log／mutations.jsonとして保持し、成功証拠と混同しない。
+
+### 最終検証・残課題
+
+MSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=1、CARGO_NET_OFFLINE=true。
+全Cargo commandはoffline、解決を伴う最終commandはlockedも指定した。registry不足はなかった。
+
+```powershell
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-wgpu --features winit --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-wgpu --features winit,egui/miv-repaint-witness --lib --locked --offline
+cargo check --manifest-path vendor-next/Cargo.toml -p egui-wgpu --features winit --locked --offline
+cargo check --manifest-path vendor-next/Cargo.toml -p egui-wgpu --no-default-features --features wgpu/dx12 --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui --lib --features miv-repaint-witness --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-winit --lib --locked --offline
+cargo test --manifest-path vendor-next/Cargo.toml -p egui-ime --lib --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --locked --offline
+cargo check -p mimageviewer --bin mimageviewer-core --features test-script --locked --offline
+cargo fmt
+cargo fmt --check
+cargo fmt --manifest-path vendor-next/Cargo.toml --all
+cargo fmt --manifest-path vendor-next/Cargo.toml --all --check
+git diff --check
+```
+
+| 検証 | 結果 |
+| --- | --- |
+| 準備egui-wgpu lib 通常／診断 | 各16 passed / 0 failed / 0 ignored、exit 0。nocaptureログにもGPU skip無し |
+| 同通常check／egui無し最小check | 両方exit 0 |
+| 準備egui／egui-winit／egui-ime lib | 106／43／26 passed、失敗・ignore無し、各exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧graph使用 |
+| root fmt／fmt --check | 両方exit 0 |
+| 準備fmt／fmt --check | 両方exit 0（root fmt対象外のため別途実施） |
+| diff／原本hash／新file空白／root不変／準備graph実体照合 | 成功 |
+
+初回全件の結果は`target/egui037-stage2b-results.json`。最終補強で変えたwgpuだけ再検証し、
+不変の関連crate／rootの有効な成功結果を再利用した。最終結果は同prefixのfinal-results.json、
+ログはwgpu-lib-final／wgpu-lib-diagnostic-final／wgpu-normal-check-final／wgpu-minimal-check-final等。
+sourceと原本・root不変照合は同prefixのaudit.json、準備metadataはmetadata.jsonに保存する。
+wgpu固有の旧診断featureは存在しないため、新featureは作らず既存egui witnessを診断graphに併用し、
+wgpuのruntime capture probe off/onを回帰内で検査する、と受入条件を具体化した。
+
+別contextの実装担当の内部確認でも、旧実差分・所有境界・新API・最終変異／検証証拠を照合し、
+最終的な未解決指摘はなかった。正式な独立ACCEPTを主張しない。
+既存egui scene.rsのf32::EPSILON警告とrootの既存警告は残る。
+
+設計との重大な食い違いはない。実Surfaceの作成・acquire／presentそのものはwindow必須なので、
+今回のoffscreenでは同一owner／cleanup helperと実GPU資源で検証し、実機確認は後続へ残す。
+段2cのeframe接続、段3の製品切替・native overlay・VSync環境変数接続、段4の実機確認は未着手。
+live・製品build／起動・test-full.ps1・ネットワーク・git add／commitは実行していない。

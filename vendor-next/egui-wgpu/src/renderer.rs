@@ -170,6 +170,15 @@ pub struct Texture {
     pub options: Option<epaint::textures::TextureOptions>,
 }
 
+/// What this upload did to the queue's pending writes. The delivery owner can avoid an empty
+/// submission after mip generation already submitted them, without losing a later base-level write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextureUpdateSubmission {
+    Unchanged,
+    Pending,
+    Submitted,
+}
+
 /// Ways to configure [`Renderer`] during creation.
 #[derive(Clone, Copy, Debug)]
 pub struct RendererOptions {
@@ -256,8 +265,12 @@ pub struct Renderer {
     textures: HashMap<epaint::TextureId, Texture>,
     next_user_texture_id: u64,
     samplers: HashMap<epaint::textures::TextureOptions, wgpu::Sampler>,
+    mipmap_generator: Option<crate::mipmap::MipmapGenerator>,
 
     options: RendererOptions,
+
+    /// mIV: distinguishes the main renderer from the native presenter's renderer in atlas dumps.
+    diag_id: u64,
 
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
     ///
@@ -488,7 +501,9 @@ impl Renderer {
             textures: HashMap::default(),
             next_user_texture_id: 0,
             samplers: HashMap::default(),
+            mipmap_generator: None,
             options,
+            diag_id: crate::atlas_diag::next_renderer_id(),
             callback_resources: CallbackResources::default(),
         }
     }
@@ -641,6 +656,16 @@ impl Renderer {
         id: epaint::TextureId,
         image_delta: &epaint::ImageDelta,
     ) {
+        self.update_texture_with_submission(device, queue, id, image_delta);
+    }
+
+    pub(crate) fn update_texture_with_submission(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        id: epaint::TextureId,
+        image_delta: &epaint::ImageDelta,
+    ) -> TextureUpdateSubmission {
         profiling::function_scope!();
 
         let width = image_delta.image.width() as u32;
@@ -699,6 +724,28 @@ impl Renderer {
                 .expect("Tried to update a texture that has not been allocated yet.");
             let texture = texture.expect("Tried to update user texture.");
             let options = options.expect("Tried to update user texture.");
+
+            // mIV: preserve the existing diagnostic skip-write guard. A stale partial delta
+            // would otherwise panic before the batch (including a later full repair) is logged.
+            let existing = texture.size();
+            if pos[0] as u32 + width > existing.width || pos[1] as u32 + height > existing.height {
+                crate::atlas_diag::report_overflow(
+                    id,
+                    self.diag_id,
+                    pos,
+                    [width as usize, height as usize],
+                    [existing.width, existing.height],
+                );
+                self.textures.insert(
+                    id,
+                    Texture {
+                        texture: Some(texture),
+                        bind_group,
+                        options: Some(options),
+                    },
+                );
+                return TextureUpdateSubmission::Unchanged;
+            }
             let origin = wgpu::Origin3d {
                 x: pos[0] as u32,
                 y: pos[1] as u32,
@@ -718,16 +765,28 @@ impl Renderer {
             )
         } else {
             // allocate a new texture
+            // Keep the upstream one-level allocation unless the caller opts into mipmaps.
+            let mip_level_count = if image_delta.options.mipmap_mode.is_some() {
+                crate::mipmap::mip_level_count(width, height)
+            } else {
+                1
+            };
             let texture = {
                 profiling::scope!("create_texture");
                 device.create_texture(&wgpu::TextureDescriptor {
                     label,
                     size,
-                    mip_level_count: 1,
+                    mip_level_count,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | if mip_level_count > 1 {
+                            wgpu::TextureUsages::RENDER_ATTACHMENT
+                        } else {
+                            wgpu::TextureUsages::empty()
+                        },
                     view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
                 })
             };
@@ -749,9 +808,19 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                        ),
+                        resource: wgpu::BindingResource::TextureView(&texture.create_view(
+                            &wgpu::TextureViewDescriptor {
+                                // Disabling mipmaps also hides lower levels after an options change.
+                                mip_level_count: Some(
+                                    if image_delta.options.mipmap_mode.is_some() {
+                                        texture.mip_level_count()
+                                    } else {
+                                        1
+                                    },
+                                ),
+                                ..Default::default()
+                            },
+                        )),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -767,6 +836,15 @@ impl Renderer {
         });
 
         queue_write_data_to_texture(&texture, origin);
+        let submission = if texture.mip_level_count() > 1 {
+            // Partial level-0 writes invalidate the entire lower chain too.
+            self.mipmap_generator
+                .get_or_insert_with(|| crate::mipmap::MipmapGenerator::new(device))
+                .generate(device, queue, &texture);
+            TextureUpdateSubmission::Submitted
+        } else {
+            TextureUpdateSubmission::Pending
+        };
 
         // A full update must (re)create the texture at exactly the delta's size,
         // or glyph UVs (normalized by the CPU atlas size) will sample the wrong rows.
@@ -785,10 +863,25 @@ impl Renderer {
                 options: Some(image_delta.options),
             },
         );
+        submission
+    }
+
+    /// Size currently allocated by this renderer, used to diagnose atlas delta delivery.
+    pub fn texture_size(&self, id: &epaint::TextureId) -> Option<[u32; 2]> {
+        let texture = self.textures.get(id)?.texture.as_ref()?;
+        let size = texture.size();
+        Some([size.width, size.height])
+    }
+
+    /// Stable identity of this renderer in atlas diagnostic dumps.
+    pub fn diag_id(&self) -> u64 {
+        self.diag_id
     }
 
     pub fn free_texture(&mut self, id: &epaint::TextureId) {
         if let Some(texture) = self.textures.remove(id).and_then(|t| t.texture) {
+            let size = texture.size();
+            crate::atlas_diag::record_freed(*id, self.diag_id, [size.width, size.height]);
             texture.destroy();
         }
     }
@@ -1189,12 +1282,17 @@ fn create_sampler(
         epaint::textures::TextureWrapMode::Repeat => wgpu::AddressMode::Repeat,
         epaint::textures::TextureWrapMode::MirroredRepeat => wgpu::AddressMode::MirrorRepeat,
     };
+    let mipmap_filter = match options.mipmap_mode {
+        None | Some(epaint::textures::TextureFilter::Nearest) => wgpu::MipmapFilterMode::Nearest,
+        Some(epaint::textures::TextureFilter::Linear) => wgpu::MipmapFilterMode::Linear,
+    };
     device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some(&format!(
-            "egui sampler (mag: {mag_filter:?}, min {min_filter:?})"
+            "egui sampler (mag: {mag_filter:?}, min: {min_filter:?}, mip: {mipmap_filter:?})"
         )),
         mag_filter,
         min_filter,
+        mipmap_filter,
         address_mode_u: address_mode,
         address_mode_v: address_mode,
         ..Default::default()
@@ -1273,3 +1371,7 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
 };
+
+#[cfg(test)]
+#[path = "renderer_tests.rs"]
+pub(crate) mod tests;
