@@ -24,6 +24,8 @@ mod nonfinal_tests;
 #[cfg(all(test, windows))]
 mod permission_service_regression_tests;
 #[cfg(test)]
+mod prepare_boundary_tests;
+#[cfg(test)]
 mod roi_tests;
 #[cfg(test)]
 mod slideshow_regression_tests;
@@ -1740,27 +1742,31 @@ impl App {
         }
     }
 
-    pub(super) fn page_turn_bind_prepared(&self, page: PreparedPagedPage) -> PreparedPagedPage {
-        if self.settings.page_turn_animation_enabled && !page.live {
-            return page;
+    /// Use the same view boundary before preparation and when binding the final paint.
+    pub(super) fn page_turn_matching_held_page(
+        &self,
+        idx: usize,
+        transform: &DisplayedImageTransform,
+        painter: &egui::Painter,
+        underlay: &FsBgStyle,
+        live: bool,
+    ) -> Option<&PreparedPagedPage> {
+        if self.settings.page_turn_animation_enabled && !live {
+            return None;
         }
         let incoming = match &self.page_turn_presentation.state {
             PresentationState::Turning { incoming, .. }
             | PresentationState::Completing { incoming, .. } => incoming,
-            _ => return page,
+            _ => return None,
         };
-        if self.page_turn_held_resource(page.occurrence.idx).is_none() {
-            return page;
+        if self.page_turn_held_resource(idx).is_none() {
+            return None;
         }
-        let Some(old) = incoming
-            .pages
-            .iter()
-            .find(|old| old.occurrence == page.occurrence)
-        else {
-            return page;
+        let Some(old) = incoming.pages.iter().find(|old| old.occurrence.idx == idx) else {
+            return None;
         };
         let a = &old.transform;
-        let b = &page.transform;
+        let b = transform;
         // Only raster quality/layout metadata may change during the frozen turn.
         // A real viewport/view change remains ordinary cancellation/rebinding.
         if a.viewport_rect != b.viewport_rect
@@ -1771,10 +1777,26 @@ impl App {
             || a.content_bbox != b.content_bbox
             || a.fit_mode != b.fit_mode
             || a.fit_scale_limits != b.fit_scale_limits
-            || old.painter.clip_rect() != page.painter.clip_rect()
-            || !same_underlay(&old.underlay, &page.underlay)
+            || old.painter.clip_rect() != painter.clip_rect()
+            || !same_underlay(&old.underlay, underlay)
             || !same_fit_policy(a.fit_input, b.fit_input)
         {
+            return None;
+        }
+        Some(old)
+    }
+
+    pub(super) fn page_turn_bind_prepared(&self, page: PreparedPagedPage) -> PreparedPagedPage {
+        let Some(old) = self.page_turn_matching_held_page(
+            page.occurrence.idx,
+            &page.transform,
+            &page.painter,
+            &page.underlay,
+            page.live,
+        ) else {
+            return page;
+        };
+        if old.occurrence != page.occurrence {
             return page;
         }
         PreparedPagedPage {

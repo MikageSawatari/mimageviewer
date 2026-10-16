@@ -11125,15 +11125,15 @@ impl App {
                 };
                 resource.into()
             }
-            // Keep ordinary preparation current even while the presentation is frozen.
-            // The prepared page binds its held output only after validating the current view.
+            // Select ordinary inputs; the prepare boundary validates the held view/key
+            // before admitting any new-source GPU work.
             Some(FullscreenPaintPayload::PresentationMaterial(_)) | None => self
                 .fullscreen_paint_resource_for_texture(idx, texture)
                 .into(),
         }
     }
 
-    /// Resident inputs still pass through ordinary prepare before held-output binding.
+    /// Resident inputs reach the shared prepare/reuse boundary before held-output binding.
     /// Without an input, a Native held page remains drawable through its output lease.
     fn fullscreen_paint_payload_for_page(
         &self,
@@ -11187,6 +11187,74 @@ impl App {
                 )
                 .into(),
             FullscreenPaintPayload::PresentationMaterial(_) => resource.clone(),
+        }
+    }
+
+    /// Reuse the old Native output only under the same view and prepare identity.
+    /// Quality publication may change raster dimensions, so derive the held demand
+    /// from its own transform, just as the released source-owning path did.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_fs_paged_paint_payload(
+        &mut self,
+        resource: &FullscreenPaintPayload,
+        transform: &DisplayedImageTransform,
+        painter: &egui::Painter,
+        underlay: &FsBgStyle,
+        layout_source: FsPageLayoutSource,
+        live: bool,
+    ) -> FullscreenPaintPayload {
+        if matches!(layout_source, FsPageLayoutSource::CurrentItem)
+            && let Some(held) = resource.page_idx().and_then(|idx| {
+                self.page_turn_matching_held_page(idx, transform, painter, underlay, live)
+            })
+            && let FullscreenPaintPayload::PresentationMaterial(material) = &held.resource
+        {
+            let material = material.clone();
+            let held_transform = held.transform;
+            let post_filter = match resource {
+                FullscreenPaintPayload::NormalResource(resource) => {
+                    self.fullscreen_paint_post_filter(resource)
+                }
+                FullscreenPaintPayload::PresentationMaterial(_) => {
+                    if self.post_filter_bypassed {
+                        crate::adjustment::PostFilter::None
+                    } else {
+                        resource
+                            .page_idx()
+                            .map_or(crate::adjustment::PostFilter::None, |idx| {
+                                self.effective_params(idx).post_filter
+                            })
+                    }
+                }
+            };
+            if self.fs_lanczos_cache.reuse_presentation(
+                &material,
+                held_transform.total_scale,
+                held_transform.pixels_per_point,
+                held_transform.visible_region_request(painter.clip_rect()),
+                post_filter,
+                self.settings.downscale_smoothing_percent,
+                self.settings.anime_upscale_source_limit,
+            ) {
+                return FullscreenPaintPayload::PresentationMaterial(material);
+            }
+        }
+        match layout_source {
+            FsPageLayoutSource::Captured { post_filter, .. } => self
+                .prepare_fullscreen_paint_payload_with_filter(
+                    resource,
+                    transform.total_scale,
+                    transform.pixels_per_point,
+                    transform.visible_region_request(painter.clip_rect()),
+                    post_filter,
+                    false,
+                ),
+            FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_payload(
+                resource,
+                transform.total_scale,
+                transform.pixels_per_point,
+                transform.visible_region_request(painter.clip_rect()),
+            ),
         }
     }
 
@@ -41265,23 +41333,14 @@ impl App {
             };
             let white = white_companion_override
                 .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
-            let paint_resource = match layout_source {
-                FsPageLayoutSource::Captured { post_filter, .. } => self
-                    .prepare_fullscreen_paint_payload_with_filter(
-                        resource,
-                        transform.total_scale,
-                        ui.ctx().pixels_per_point(),
-                        transform.visible_region_request(painter.clip_rect()),
-                        post_filter,
-                        false,
-                    ),
-                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_payload(
-                    resource,
-                    transform.total_scale,
-                    ui.ctx().pixels_per_point(),
-                    transform.visible_region_request(painter.clip_rect()),
-                ),
-            };
+            let paint_resource = self.prepare_fs_paged_paint_payload(
+                resource,
+                &transform,
+                &painter,
+                bg_style,
+                layout_source,
+                live_eligible && using_full_texture && submitted.is_some(),
+            );
             let page = PreparedPagedPage {
                 occurrence: SpreadPageOccurrence {
                     idx: page_idx,
@@ -47388,16 +47447,17 @@ impl App {
                     pixels_per_point,
                     resolved_placement,
                     page_offset,
+                    submit_final
+                        && !original_preview_active
+                        && !color_faithful_rendition_unit
+                        && self.settings.page_turn_animation_enabled
+                        && self.page_turn_view_eligible(idx),
                 ) {
                     if let Some(occurrence) =
                         occurrences.iter().find(|occurrence| occurrence.idx == idx)
                     {
                         page.occurrence = *occurrence;
                     }
-                    page.live &= !original_preview_active
-                        && !color_faithful_rendition_unit
-                        && self.settings.page_turn_animation_enabled
-                        && self.page_turn_view_eligible(idx);
                     page.spine = Some(spread_rects.spine);
                     if submit_final {
                         page = self.page_turn_bind_prepared(page);
@@ -47500,6 +47560,7 @@ impl App {
                     // 寸法未確定のフォールバック。間隔合わせの前提 (最終幅が分かって
                     // いること) が成り立たないので、ここでは合わせない。
                     egui::Vec2::ZERO,
+                    false,
                 ) {
                     if let Some(occurrence) =
                         occurrences.iter().find(|occurrence| occurrence.idx == idx)
@@ -47787,6 +47848,7 @@ impl App {
             pixels_per_point,
             placement,
             translate,
+            false,
         ) {
             Some(page) => {
                 page_turn::paint_flat_page(&page);
@@ -47839,6 +47901,7 @@ impl App {
         placement: ResolvedDisplayPlacement,
         // `translate`: 左右を一体で置き直すための平行移動 (§1.154)。物理ピクセルの整数倍。
         translate: egui::Vec2,
+        live_eligible: bool,
     ) -> Option<PreparedPagedPage> {
         let mut candidate = self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail);
         let mut fallback_allowed = display_tex.is_some() && allow_thumbnail;
@@ -47870,23 +47933,14 @@ impl App {
                 using_full_texture = false;
                 continue;
             }
-            let paint_resource = match layout_source {
-                FsPageLayoutSource::Captured { post_filter, .. } => self
-                    .prepare_fullscreen_paint_payload_with_filter(
-                        handle,
-                        transform.total_scale,
-                        pixels_per_point,
-                        transform.visible_region_request(painter.clip_rect()),
-                        post_filter,
-                        false,
-                    ),
-                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_payload(
-                    handle,
-                    transform.total_scale,
-                    pixels_per_point,
-                    transform.visible_region_request(painter.clip_rect()),
-                ),
-            };
+            let paint_resource = self.prepare_fs_paged_paint_payload(
+                handle,
+                &transform,
+                &painter,
+                bg_style,
+                layout_source,
+                using_full_texture && live_eligible,
+            );
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(idx);
             }
@@ -47901,7 +47955,8 @@ impl App {
                 painter: painter.clone(),
                 underlay: bg_style.clone(),
                 spine: None,
-                live: using_full_texture
+                live: live_eligible
+                    && using_full_texture
                     && matches!(layout_source, FsPageLayoutSource::CurrentItem),
             });
         }
