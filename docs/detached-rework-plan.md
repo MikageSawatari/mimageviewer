@@ -5322,7 +5322,6 @@ detached の `alive_wanted`（runtime の生存・Closing）は変更しない�
 viewport 生成・registry・HWND・placement・focus owner は変更しない。
 設計 lead (ClaudeCode Opus) の検収と独立 GPT-6.1 Sol/xhigh レビューの双方が「症状パッチではなく構造的修正」に同意し、レビューは指摘なしで ACCEPT。実機確認は利用者に依頼中。
 
-<<<<<<< HEAD
 ### §11 追補: 紙めくりD2の素材所有と通常resident会計（2026-10-16、実機未確認）
 
 §2を再確認し、既存contextのpresentation内でNativeのoutput leaseと通常source所有を分離した。
