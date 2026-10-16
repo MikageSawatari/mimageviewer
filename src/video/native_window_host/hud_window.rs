@@ -68,8 +68,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-    GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow,
-    MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
+    GWLP_USERDATA, GetWindowLongPtrW, GetWindowRect, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
+    IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, WINDOWPOS,
     WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
@@ -150,8 +150,24 @@ pub(super) struct HudOverlayWindow {
     /// で済むよう responsibility をこの API に集約、Codex CP2 P3 反映)。
     /// `None` の初期値は `create` 直後の空 region 状態に対応する hash で上書きされる。
     last_regions_hash: Option<u64>,
+    #[cfg(test)]
+    geometry_probe: std::cell::Cell<GeometryProbe>,
     owner_thread: std::thread::ThreadId,
     _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(super) struct HudGeometryResult {
+    pub requested: RECT,
+    pub before: Option<RECT>,
+    pub outcome: &'static str,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct GeometryProbe {
+    attempts: usize,
+    fail_query: bool,
+    fail_apply: bool,
 }
 
 // HWND と `*mut WindowState` を持つため `Send`/`Sync` は自動 derive されない。
@@ -169,6 +185,15 @@ impl HudOverlayWindow {
     }
 
     pub(super) fn create(cfg: HudOverlayConfig) -> Result<Self, String> {
+        Self::create_with_visibility(cfg, true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_hidden_for_test(cfg: HudOverlayConfig) -> Result<Self, String> {
+        Self::create_with_visibility(cfg, false)
+    }
+
+    fn create_with_visibility(cfg: HudOverlayConfig, show: bool) -> Result<Self, String> {
         register_window_class()?;
         unsafe {
             let hmodule =
@@ -180,6 +205,8 @@ impl HudOverlayWindow {
                 touch_ownership: NativeTouchOwnership::default(),
                 mouse_tracking: false,
                 last_mouse_move_log_at: None,
+                #[cfg(test)]
+                position_notifications: 0,
             });
             let state_ptr = Box::into_raw(state);
 
@@ -267,17 +294,21 @@ impl HudOverlayWindow {
             // 初期 region は空 (= 全画面穴) なので、ShowWindow を呼んでも物理的に
             // 表示される pixel はなく flicker は起きない。CP5 で region に実 UI rect が
             // 入って初めて HUD のピクセルが見えるようになる。
-            let _ = crate::presentation_observer::show_window(
-                hwnd,
-                SW_SHOWNA,
-                crate::presentation_observer::WindowRole::Hud,
-                "HudOverlayWindow::create",
-            );
+            if show {
+                let _ = crate::presentation_observer::show_window(
+                    hwnd,
+                    SW_SHOWNA,
+                    crate::presentation_observer::WindowRole::Hud,
+                    "HudOverlayWindow::create",
+                );
+            }
 
             Ok(Self {
                 hwnd,
                 _state_ptr: state_ptr,
                 last_regions_hash: initial_hash,
+                #[cfg(test)]
+                geometry_probe: std::cell::Cell::new(GeometryProbe::default()),
                 owner_thread: std::thread::current().id(),
                 _not_send_or_sync: std::marker::PhantomData,
             })
@@ -291,24 +322,108 @@ impl HudOverlayWindow {
 
     /// 同じサイズ / 位置への resize は no-op (= `SetWindowPos` を毎フレーム呼ばない)。
     /// `MirrorHudGeometry` 経路から呼ばれる。
-    pub(super) fn set_geometry(&self, x: i32, y: i32, w: u32, h: u32) {
+    pub(super) fn set_geometry(&self, x: i32, y: i32, w: u32, h: u32) -> HudGeometryResult {
         self.assert_owner_thread();
+        // Compare the actual HWND, not the previous request: external changes,
+        // DPI adjustment and HWND replacement must never inherit a stale skip.
+        let width = w.max(1) as i32;
+        let height = h.max(1) as i32;
+        let requested = RECT {
+            left: x,
+            top: y,
+            right: x.saturating_add(width),
+            bottom: y.saturating_add(height),
+        };
         if self.hwnd.0.is_null() {
-            return;
+            return HudGeometryResult {
+                requested,
+                before: None,
+                outcome: "no_hwnd",
+            };
+        }
+        let before = self.geometry_window_rect();
+        if before == Some(requested) {
+            return HudGeometryResult {
+                requested,
+                before,
+                outcome: "same_skip",
+            };
+        }
+        #[cfg(test)]
+        {
+            let mut probe = self.geometry_probe.get();
+            probe.attempts += 1;
+            self.geometry_probe.set(probe);
+            if probe.fail_apply {
+                return HudGeometryResult {
+                    requested,
+                    before,
+                    outcome: "apply_failed",
+                };
+            }
         }
         unsafe {
-            let _ = crate::presentation_observer::set_window_pos(
+            let result = crate::presentation_observer::set_window_pos(
                 self.hwnd,
                 None,
                 x,
                 y,
-                w.max(1) as i32,
-                h.max(1) as i32,
+                width,
+                height,
                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
                 crate::presentation_observer::WindowRole::Hud,
                 "HudOverlayWindow::set_geometry",
             );
+            if let Err(error) = &result {
+                crate::logger::log(format!(
+                    "native-presenter: HUD SetWindowPos failed: {error}"
+                ));
+            }
+            HudGeometryResult {
+                requested,
+                before,
+                outcome: if result.is_ok() {
+                    "applied"
+                } else {
+                    "apply_failed"
+                },
+            }
         }
+    }
+
+    fn geometry_window_rect(&self) -> Option<RECT> {
+        #[cfg(test)]
+        if self.geometry_probe.get().fail_query {
+            return None;
+        }
+        let mut rect = RECT::default();
+        match unsafe { GetWindowRect(self.hwnd, &mut rect) } {
+            Ok(()) => Some(rect),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "native-presenter: HUD GetWindowRect failed: {error}"
+                ));
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn geometry_probe_for_test(&self) -> usize {
+        self.geometry_probe.get().attempts
+    }
+
+    #[cfg(test)]
+    pub(super) fn position_notifications_for_test(&self) -> usize {
+        unsafe { (*self._state_ptr).position_notifications }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_geometry_failure_for_test(&self, query: bool, apply: bool) {
+        let mut probe = self.geometry_probe.get();
+        probe.fail_query = query;
+        probe.fail_apply = apply;
+        self.geometry_probe.set(probe);
     }
 
     /// HUD overlay ウィンドウの表示 / 非表示を切り替える (Inc 7 hidden presenter:
@@ -333,13 +448,13 @@ impl HudOverlayWindow {
     }
 
     /// HUD HWND を VST GUI より前面に上げ直す。retry burst の各回で呼ばれる。
-    pub(super) fn raise_to_top(&self) {
+    pub(super) fn raise_to_top(&self) -> bool {
         self.assert_owner_thread();
         if self.hwnd.0.is_null() {
-            return;
+            return false;
         }
         unsafe {
-            let _ = crate::presentation_observer::set_window_pos(
+            crate::presentation_observer::set_window_pos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
                 0,
@@ -350,7 +465,8 @@ impl HudOverlayWindow {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
                 crate::presentation_observer::WindowRole::Hud,
                 "HudOverlayWindow::raise_to_top",
-            );
+            )
+            .is_ok()
         }
     }
 
@@ -363,23 +479,29 @@ impl HudOverlayWindow {
     ///
     /// 共有 `regions: Arc<Mutex<HudInteractiveRegions>>` (= `WM_NCHITTEST`
     /// フェイルセーフ用) の更新は呼び出し側の責務 (`NativeEguiOverlay::run` 末尾)。
-    pub(super) fn apply_regions(&mut self, regions: &[RECT]) {
+    pub(super) fn apply_regions(&mut self, regions: &[RECT]) -> &'static str {
         self.assert_owner_thread();
         if self.hwnd.0.is_null() {
-            return;
+            return "region_no_hwnd";
         }
         let new_hash = hash_regions(regions);
         if self.last_regions_hash == Some(new_hash) {
-            return; // 前回と同じ rect 集合 → SetWindowRgn skip
+            return "region_same_skip"; // 前回と同じ rect 集合 → SetWindowRgn skip
         }
         // Codex CP2 (再) P2 反映: 成功時のみ hash を更新する。失敗時は
         // `last_regions_hash` を `None` にリセットし、次回 (= 同じ regions が来ても)
         // skip せずに必ず再試行できるようにする。
         if apply_window_region(self.hwnd, regions) {
             self.last_regions_hash = Some(new_hash);
+            "region_applied"
         } else {
             self.last_regions_hash = None;
+            "region_apply_failed"
         }
+    }
+
+    pub(super) fn applied_regions_hash(&self) -> Option<u64> {
+        self.last_regions_hash
     }
 }
 
@@ -427,6 +549,8 @@ struct WindowState {
     /// CP9 実機 debug: HUD wndproc が WM_MOUSEMOVE を log した直近時刻。100ms 周期で
     /// 1 回だけ log する rate limit 用。
     last_mouse_move_log_at: Option<std::time::Instant>,
+    #[cfg(test)]
+    position_notifications: usize,
 }
 
 fn register_window_class() -> Result<(), String> {
@@ -1006,6 +1130,10 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_WINDOWPOSCHANGING => {
+            #[cfg(test)]
+            if let Some(state) = window_state(hwnd) {
+                state.position_notifications += 1;
+            }
             // `hwndInsertAfter` が自分より前を指す変更 (= 別 window が割り込む) を
             // 検知したら raise 要求を流す。完全な判定ではなく best-effort safety net。
             // (主経路は z-order 操作後 hook と presenter polling で吸収するので緩めに。)
@@ -1025,7 +1153,7 @@ unsafe extern "system" fn hud_wnd_proc(
                         if let Some(state) = window_state(hwnd) {
                             state
                                 .event_sink
-                                .send(NativeVideoWindowEvent::RequestRaiseHud);
+                                .send_hud_raise(unsafe { (*wp).flags }.0, raw as i64);
                         }
                     }
                 }
@@ -1115,6 +1243,7 @@ mod tests {
             touch_ownership: NativeTouchOwnership::default(),
             mouse_tracking: false,
             last_mouse_move_log_at: None,
+            position_notifications: 0,
         }));
         let hwnd = unsafe {
             CreateWindowExW(
@@ -1137,6 +1266,7 @@ mod tests {
             hwnd,
             _state_ptr: state,
             last_regions_hash: None,
+            geometry_probe: std::cell::Cell::new(GeometryProbe::default()),
             owner_thread: std::thread::current().id(),
             _not_send_or_sync: std::marker::PhantomData,
         };
