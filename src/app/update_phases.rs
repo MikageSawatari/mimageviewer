@@ -27,6 +27,8 @@ impl App {
     pub(super) fn render_update_begin(&mut self, ctx: &egui::Context) {
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
+        // The Remote coordinator interleaves service and PC-display checkpoints
+        // at the two old reload positions. Logic hookup is deferred to stage 3.
         self.poll_remote_session(ctx);
         // Before any shortcut path, so a state that swallows every key says so once, in the
         // ordinary log, whether or not the reader happened to be running with --perf-log.
@@ -1599,10 +1601,9 @@ impl App {
 
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_update_after_frame(&mut self, ctx: &egui::Context) {
-        // Composition publications and Prepare completions belong to the
-        // display-independent async boundary. Run after the presentation pass
-        // so a newly adopted book also starts its read in an early-return frame.
-        // Dedicated viewers additionally admit reads through their mounted owner.
+        // Keep sent-ticket receipts before UI preparation and publication.
+        // The receipt entry is split, while legacy owner mounts remain until 1b-3b.
+        // Run at the old post-presentation position, including early-return frames.
         self.poll_composition_editor_operations(ctx);
         self.poll_book_composition_service(ctx);
     }

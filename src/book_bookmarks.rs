@@ -224,6 +224,19 @@ pub struct BookBookmarkService {
 }
 
 impl BookBookmarkService {
+    #[cfg(test)]
+    pub(crate) fn with_event_sender_for_test() -> (Self, mpsc::Sender<BookBookmarkEvent>) {
+        let (sender, rx) = mpsc::channel();
+        (
+            Self {
+                tx: None,
+                rx,
+                handle: None,
+            },
+            sender,
+        )
+    }
+
     pub fn spawn() -> Option<Self> {
         let (request_tx, request_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();

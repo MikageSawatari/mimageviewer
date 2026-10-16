@@ -514,6 +514,58 @@ impl App {
         if self.remote_session_blocks_local_control() {
             self.close_local_composition_editor(CompositionEditorCloseReason::RemoteAcquire);
         }
+        self.poll_composition_editor_save_receipts(ctx);
+        if let Some(owner) = self.composition_editor_operations.owner.clone() {
+            let result = self.with_viewer_context(owner.context_id, |app| {
+                let state = std::mem::take(&mut app.composition_editor);
+                app.composition_editor = match state {
+                    CompositionEditorState::Preparing { input, receiver } => {
+                        match receiver.try_recv() {
+                            Ok(Ok(session)) => CompositionEditorState::Editing(session),
+                            Ok(Err(error)) => CompositionEditorState::Editing(Box::new(
+                                EditorSession::new(*input, Err(error), false),
+                            )),
+                            Err(mpsc::TryRecvError::Empty) => {
+                                CompositionEditorState::Preparing { input, receiver }
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                CompositionEditorState::Editing(Box::new(EditorSession::new(
+                                    *input,
+                                    Err("本のページを準備できませんでした".into()),
+                                    false,
+                                )))
+                            }
+                        }
+                    }
+                    CompositionEditorState::Reloading if !app.book_composition.is_pending() => {
+                        // Start/poll the current publication even for main-only/parked editors.
+                        app.poll_book_composition_read(ctx);
+                        if app.book_composition.is_pending() {
+                            CompositionEditorState::Reloading
+                        } else {
+                            CompositionEditorState::Closed
+                        }
+                    }
+                    CompositionEditorState::Editing(mut session) => {
+                        session.poll_results();
+                        CompositionEditorState::Editing(session)
+                    }
+                    state => state,
+                };
+                matches!(app.composition_editor, CompositionEditorState::Closed)
+            });
+            if result != Ok(false) {
+                self.composition_editor_operations.owner = None;
+            }
+        }
+        if self.composition_editor_modal_active() || self.composition_editor_writes_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Harvest sent tickets once, before composition publication. Owner updates
+    /// retain their old mount behavior here; stage 1b-3b separates state access.
+    pub(crate) fn poll_composition_editor_save_receipts(&mut self, ctx: &egui::Context) {
         let tickets = std::mem::take(&mut self.composition_editor_operations.tickets);
         for ticket in tickets {
             let completion = match ticket.receiver.try_recv() {
@@ -585,52 +637,6 @@ impl App {
                 }
             }
             ctx.request_repaint();
-        }
-        if let Some(owner) = self.composition_editor_operations.owner.clone() {
-            let result = self.with_viewer_context(owner.context_id, |app| {
-                let state = std::mem::take(&mut app.composition_editor);
-                app.composition_editor = match state {
-                    CompositionEditorState::Preparing { input, receiver } => {
-                        match receiver.try_recv() {
-                            Ok(Ok(session)) => CompositionEditorState::Editing(session),
-                            Ok(Err(error)) => CompositionEditorState::Editing(Box::new(
-                                EditorSession::new(*input, Err(error), false),
-                            )),
-                            Err(mpsc::TryRecvError::Empty) => {
-                                CompositionEditorState::Preparing { input, receiver }
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                CompositionEditorState::Editing(Box::new(EditorSession::new(
-                                    *input,
-                                    Err("本のページを準備できませんでした".into()),
-                                    false,
-                                )))
-                            }
-                        }
-                    }
-                    CompositionEditorState::Reloading if !app.book_composition.is_pending() => {
-                        // Start/poll the current publication even for main-only/parked editors.
-                        app.poll_book_composition_read(ctx);
-                        if app.book_composition.is_pending() {
-                            CompositionEditorState::Reloading
-                        } else {
-                            CompositionEditorState::Closed
-                        }
-                    }
-                    CompositionEditorState::Editing(mut session) => {
-                        session.poll_results();
-                        CompositionEditorState::Editing(session)
-                    }
-                    state => state,
-                };
-                matches!(app.composition_editor, CompositionEditorState::Closed)
-            });
-            if result != Ok(false) {
-                self.composition_editor_operations.owner = None;
-            }
-        }
-        if self.composition_editor_modal_active() || self.composition_editor_writes_pending() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
@@ -1426,3 +1432,60 @@ mod tests;
 #[cfg(test)]
 #[path = "book_composition_editor/metadata_transfer_tests.rs"]
 mod metadata_transfer_tests;
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    #[test]
+    fn egui037_continuation_sent_save_terminal_unblocks_remote_without_editor_ui() {
+        for status in [Ok(None), Err("fake save failure".to_owned())] {
+            let mut app = crate::app::setup_app_for_test();
+            drop(app.book_resume_writer.take());
+            let ctx = egui::Context::default();
+            let (worker, receiver) = mpsc::channel();
+            let scope = BookScopeKey::document(&app.tmp.path().join("saved.cbz")).unwrap();
+            app.composition_editor_operations
+                .tickets
+                .push(SentSaveTicket {
+                    owner: CompositionEditorOwner {
+                        context_id: ViewerContextId::for_test(999),
+                        scope,
+                        request_id: 1,
+                    },
+                    receiver,
+                });
+            let handle = crate::remote_ipc::session::SessionHandle::new();
+            app.set_remote_session_handle(handle.clone());
+            handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+                client_id: "save-continuation".into(),
+                peer: mimageviewer_ipc::SessionPeerInfo {
+                    connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                    device_name: None,
+                },
+            });
+            app.service_remote_session(&ctx);
+            app.poll_composition_editor_save_receipts(&ctx);
+            assert!(app.composition_editor_writes_pending());
+            assert_eq!(
+                handle.snapshot().phase,
+                crate::remote_ipc::session::RemoteControlPhase::AcquiringRemote
+            );
+            worker.send(SaveCompletion { status }).unwrap();
+            app.poll_composition_editor_save_receipts(&ctx);
+            assert!(!app.composition_editor_writes_pending());
+            assert!(matches!(
+                app.composition_editor,
+                CompositionEditorState::Closed
+            ));
+            app.service_remote_session(&ctx);
+            assert_eq!(
+                handle.snapshot().phase,
+                crate::remote_ipc::session::RemoteControlPhase::RemoteActive
+            );
+            app.poll_composition_editor_save_receipts(&ctx);
+            assert!(app.composition_editor_acquire_ready());
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+        }
+    }
+}

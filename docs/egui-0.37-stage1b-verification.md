@@ -419,3 +419,135 @@ command/exit/時間は`results.json`、JUnitと件数は`*-nextest-junit.xml` / 
 `a50dcc37f..6ee226289`の差分は更新計画とdetached設計の文書だけで、実行/テストsourceは変わっていない。
 両設計文書は現在のHEADと一致し、実装担当の編集はない。製品実行コード・一時変異は最終diffに含まれない。
 今回の修正は未コミットで返す。この追補は修正と検証の記録であり、正式独立レビューの再判定ではない。
+
+## 段1b-3a: C1 Remoteと共有完了の境界（2026-10-16）
+
+開始: `egui-036` / `9dfc6e91e`、Rust 1.99.0 / egui 0.33.3を維持する。
+更新計画第4.4版の改訂履歴・§1追補・§4.2条件表/責務表/C1〜C5/Closeと、段1b-3a〜3c/共通受入、
+Remote設計§2.1/§2.2、detached設計§2/§11の追加合意を読み直した。
+最小化案B、root lifecycle、非描画mount、immediate子のbackend接続は今回実装しない。
+製品/liveは起動せず、更新設計書・manifest/lock/vendor・対象外DSPを編集しない。コミットしない。
+
+### 境界と旧driver順序
+
+| 順 | 入口 | 所有・内容 | 今回と段3接続の扱い |
+| --- | --- | --- | --- |
+| R1 | `service_remote_session_begin` | App-global `remote_session_ui`。session snapshot、sequence採用、旧stream取消、AI lease返却、Local表示slot登録 | 通常driverの旧位置。表示reloadは呼ばない |
+| R2 | `continue_remote_local_display` | 同ownerのslotを一度takeし、Local phaseと取得/返却sequenceを照合して既存一覧reload/既定起動先へ | 旧control_return採用直後の表示位置。rootのUI継続 |
+| R3 | `service_remote_session_requests` | 既存全context Close/editor取消、取得/AI/save/resume/shift barrier、headless stream、要求受信、resume read、DrainingRemote完了 | 旧R2後。既存終了owner/副作用は維持。下記の推移依存留保あり |
+| R4 | `continue_remote_local_display` | R3でApp drainがLocal返却した場合の同じ表示slot消費 | 旧complete_app_drain直後の表示位置 |
+| R5 | `service_remote_session_finish` | reading write receipt/ACK、既存16ms/50ms/1sのwake条件 | 旧R4後。表示slotを新しいwake条件にしない |
+
+`poll_remote_session`はR1→R2→R3→R4→R5の通常0.33.3 driver。
+`render_update_begin`内のtray wake ACK→heartbeat→Remote→modal診断の位置も維持する。
+`service_remote_session`はR1→R3→R5だけを組み合わせ、PC表示継続を消費しない入口である。
+0.33.3の製品driverはこのservice-only入口へ切り替えず、最小化時の表示延期を導入しない。
+
+旧`pending_fullscreen_restore`を同ownerの`pending_local_display: Option<PendingLocalDisplay>`へ置換した。
+slotは`acquisition_sequence` / `control_return_sequence` / `ReloadedView`を持つ。
+返却sequenceの採用と同じ境界で登録し、再取得で失効する。UI消費時にもsessionのidentityを照合し、
+serviceを挟まず再取得→遅いUIとなった場合も旧Local表示へ渡さない。coalesced reacquireのAI lease保持は従来どおり。
+旧fullscreen復元には製品の生成元がなく、直接生成していたApp終了drain fixtureだけを新slotへ合わせた。
+`item_key` / `smart_request_id` / `wait_frames`と旧復元pollを撤去し、閉じた閲覧窓を再openしない。
+第二queue、新pending bool、時間窓、追加repaint、強制UIによる新しい継続機構は設けない。
+App終了時は既存`RemoteAppDrainLease`へslotを移して破棄し、UI消費をACK/drain条件にしない。
+
+### 共有完了とcontext owner
+
+| 対象 | 受信・採用・取消・ACK | 旧位置/表示との境界 |
+| --- | --- | --- |
+| Remote内read/write | resume/readingの既存receiverとclaimed requestが一度だけ応答。headless動画も既存owner | R3/R5を維持 |
+| bookmark | `poll_book_bookmark_service_responses`が唯一の共有receiver/router。Remote応答を先に判定して残りを既存local ownerへ | `poll_book_bookmarks`はrouter→`poll_book_bookmark_context_projections`。旧metadata位置で順序不変。local rows採用はrouter内に残る |
+| shift | `poll_spread_shift_service`の既存単一routerを共通完了入口として利用可能にした。Remote ShiftClearを先に判定、残りは現owner/AtRestへ | 通常driverのfile dialog後の旧位置を変更しない。第二receiverを作らない |
+| composition | `poll_composition_editor_save_receipts`が送信済ticketだけを収穫。既存global ticket ownerを維持 | 旧wrapperはRemote時close→receipt→Preparing/Reloading/編集中result。旧post-frame位置と、その後のpublication順序を維持 |
+
+Remote session/AI lease/slot/claimed request/ticket/routerはApp-globalで、viewer context切替とともに交換しない。
+ローカルのClose・editor状態・bookmark invalidationは既存owner identity/registryをそのまま使う。
+受渡し先をforegroundから推定したり、rootの結果をparked/兄弟へ表示したりしない。
+shared routerやticket収穫をR1の早い位置へ追加せず、通常のmodal/terminal frameの順序を維持する。
+
+### 推移依存の留保・設計との照合
+
+今回の入口名やservice-only回帰は、C1全体が非描画logicへ接続可能になったことを意味しない。
+コードで確認した次の前提は、予定済み1b-3b/段2・3の整理を必要とする。
+
+- composition close/receiptのresume記録・editor状態更新、Remote bookmark invalidation、pause/AI barrierは
+  既存`with_viewer_context` / active wrapperへ到達する。往路/復路のrating publication・page-edit reconciliationが残る。
+  `Some(ResumeCommit)`のowner付き直接記録、editor状態アクセス、未反映ratingを持つ別context回帰は1b-3bへ残す。
+- `close_all_detached_viewers_for_mode_change`にはVisible(false)を成立させる既存`show_viewport_immediate`とfocus処理がある。
+  既存関数を呼ぶだけで「UIを強制実行せず全contextを終了できる」とは扱えない。
+  挙動不変の段ではこれを削除せず、合意済みの非描画退役/終了接続を段2・3へ残す。
+- AI pending/orphanの静止終端には既存表示poll依存、bookmark router内にはlocal結果採用/refreshが残る。
+  取消・破棄済workerとlive表示結果の分離は1b-3b。publicationのchanged scopesを先にdrainして捨てない。
+
+したがって「3a単独で全取得条件を任意の非描画contextで完結できる」という前提は成立しない。
+今回は既存副作用を変えず境界と単一ownerを整理し、段3のlogic接続前に必要な依存を明記する。
+同じservice入口を旧mountのままlogicへ接続する、表示副作用をflag/guardで抑える、といった代用はしない。
+これは既存コードとの照合で明らかになった接続上の留保であり、まれな失敗用の回復状態は追加しない。
+
+### 内部確認と検証範囲
+
+実装担当の内部確認（別contextのコード棚卸しを含む）を行った。正式な独立レビューとは区別する。
+内部確認の指摘で、slot消失だけでなくReadingHistoryの実reloadによるitems generationの変化と、
+通常driverの2つの返却位置での一度だけのreloadを回帰へ加えた。source順序検査はその補助証拠である。
+追加の境界回帰は共通filter `egui037_continuation`で選択する。
+取得/AI lease、fake保存worker ACK/Draining、resume read receiver、共有bookmark router、返却slot/再取得/coalescing、
+送信済saveの成功(None)/失敗終端を、PC表示継続/UI passを呼ばず同じframe番号で検査する。
+別contextのresume/meter保存、live editor状態更新、全contextの非描画退役を網羅したとは記録しない。
+
+通常feature / Rust 1.99.0、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。
+証跡は`target/egui037-stage1b-3a/`。結果は以下に記録する。
+
+### 検証結果
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| core check 通常 / test-script | 成功、20.244秒 / 21.796秒 | 0 / 0 |
+| `cargo fmt` / `cargo fmt --check` | 成功。最後の境界回帰追加後にも実行、14.430秒 / 14.163秒 | 0 / 0 |
+| Remote等の焦点nextest | 936 passed / 0 failed、実行34.801秒（compile込み265.039秒） | 0 |
+| 共通filter `egui037_continuation` | 最終の10件が全てpassed、実行0.594秒（compile込み139.784秒） | 0 |
+| 旧snapshot通常比較 | 統合181 + 11、lib 103の計295 passed。52コマンド全て成功。PNG 445枚SHA-256不変、更新なし | 全て0 |
+| `git diff --check` | 成功。台帳の結果追記後にも再確認 | 0 |
+| `scripts/test-lib-full.ps1` 初回 | 13,292 passed / 2 failed / 59 skipped、実行393.247秒（wrapper396.952秒） | 100 |
+| 初回失敗2件の焦点nextest | 2 passed / 0 failed、実行0.491秒 | 0 |
+| `scripts/test-lib-full.ps1` 同条件の再検証 | 13,293 passed / 1 failed / 59 skipped、実行419.706秒（wrapper423.501秒） | 100 |
+| 再検証の失敗1件の焦点nextest | 1 passed / 0 failed、実行1.554秒 | 0 |
+
+**全件ゲートは未達。** 失敗履歴を成功扱いで省略しない。
+
+- 初回: `favorite_search_worker_installs_sources_before_loading_and_requeries_on_refresh`が
+  `audio_favsearch_sidecars.rs:110`のsidecar削除でWindows共有違反(code 32)。
+  `recovery_modal_escape_keeps_failure_and_requests_quarantine_cancel`が
+  `tests.rs:41670`でquarantine終端の3秒以内待ちを満たさなかった。
+- 同じソースで2件を絞ると成功したため、一度だけ元の全件条件で再検証した。再検証では初回2件は成功。
+  別の`clipboard_capture::fetch::tests::total_deadline_covers_slow_headers_drip_bodies_and_redirect_remaining_time`が
+  `fetch_tests.rs:566`でdrip処理731.1077msとなり、650ms未満の判定を満たさなかった。
+  この1件もコードを変えずに絞ると成功した。
+- Favorite search試験は直接のfavsearch/sidecar poll、rename試験は専用modal helper、
+  clipboard試験はfetch単体で、今回のRemote coordinator/共有完了入口を通らない。
+  今回差分との因果関係は確認できていないが、間欠失敗の根本原因を解消したとは主張しない。
+  対象外の製品コード・テスト・期待値・期限・並列数を変更せず、3回目の全件実行は行わない。
+
+Remote焦点filterは`test(egui037_continuation) | test(remote) | test(session) | test(reading_write) | test(composition_editor) | test(book_bookmark) | test(spread_shift)`。
+共通filterは新規9件と既存App終了drain試験の改名1件で計10件。936件成功後にtest-onlyのstale fixture補強と
+返却identity回帰1件を追加したため、最終common 10件を別実行した。実行コードはその間も不変で、
+最終ソースの全件実行にも全10件が含まれ成功した。source grepによるdriver順序検査は、実reload副作用の回帰に対する補助証拠。
+初回焦点compileは追加テストの`ReadingPosition`比較型とfixture借用の2エラーでexit 101となり、
+テストだけを修正して再compileした。core check後の変更は`cfg(test)`内だけである。
+
+`checks-results.json` / `focused-summary.json` / `focused-remote-junit.xml` / `boundary-junit.xml`に焦点結果、
+`snapshots-results.json` / `snapshot-summary.json`に通常比較、`full-summary.json`に全件と失敗再実行の件数を保存した。
+全件のraw結果は`lib-full-first.log` / `full-first-results.json` / `full-first-junit.xml`と
+`lib-full-second.log` / `full-second-results.json` / `full-second-junit.xml`。
+個別失敗の再実行は`full-failures-focused*` / `full-second-failure-focused*`、失敗詳細は`full-failures.json`に残す。
+両fullのsource IDは`99e6b89068a6509c70edcf3d2639160251ffc5770c9fce4a1a1ddcbc98b7ca38`で同一。
+元runは`target/test-lib-full/runs/20261016T120806050Z-86ddf4b5/`と
+`target/test-lib-full/runs/20261016T121615834Z-9db40088/`。成功receiptは生成されていない。
+
+`body-reconstruction.json`ではbookmark router/後段projectionとcomposition receiptの本文保存、
+Remote断片をslot受渡し・旧dead restoreの明示差分だけで再構成できることを確認した（空白差は正規化）。
+`source-hashes.json`の最終Rust source/テスト/依存と、開始時の更新計画・対象外DSP・PNG 445枚は全件後も一致した。
+以後は台帳結果の追記だけで、実行source・依存・fixtureは変更していない。
+
+今回の7ファイルの差分は未コミットで返す。1b-3b/3c、段2・3の正式接続は未着手。
+上記のmount/Close等の接続前提と、全件ゲートの失敗3件の原因確認を残課題とする。

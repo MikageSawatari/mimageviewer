@@ -19053,7 +19053,7 @@ impl App {
         self.spread_shift_process_owner = Some(owner);
     }
 
-    fn poll_spread_shift_service(&mut self) {
+    pub(crate) fn poll_spread_shift_service(&mut self) {
         let Some(service) = &self.spread_shift_service else {
             return;
         };
@@ -49320,6 +49320,13 @@ impl App {
     }
 
     pub(crate) fn poll_book_bookmarks(&mut self) {
+        self.poll_book_bookmark_service_responses();
+        self.poll_book_bookmark_context_projections();
+    }
+
+    /// Single shared receiver/router for local and Remote replies. The legacy
+    /// owner updates still use UI mount boundaries until stage 1b-3b.
+    pub(crate) fn poll_book_bookmark_service_responses(&mut self) {
         loop {
             let event = match self
                 .book_bookmark_service
@@ -49450,6 +49457,9 @@ impl App {
                 }
             }
         }
+    }
+
+    fn poll_book_bookmark_context_projections(&mut self) {
         for owner in self.viewer_context_ids() {
             if self.book_bookmark_context_matches(owner, |_, _, request| request.is_some()) {
                 self.with_book_bookmark_context(owner, |app| {
