@@ -1,3 +1,8 @@
+mod physical;
+
+pub(crate) use physical::GamepadPhysicalInput;
+use physical::{PadPhysicalEvent, PadPhysicalHandoff};
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,7 +16,9 @@ use super::{
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
-use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
+#[cfg(test)]
+use crate::gamepad::PadEvent;
+use crate::gamepad::{GamepadInputState, PadAxis, PadButton, WestReleaseOutcome};
 use crate::grid_item::GridItem;
 use crate::keymap::KeyAction;
 use crate::ring_shortcut::{
@@ -762,14 +769,14 @@ impl App {
         full_rect: egui::Rect,
         surface: crate::app::ActionSurface,
     ) {
-        if self.ring_picker.is_some() || !self.gamepad_state.west_ring_active() {
+        if self.ring_picker.is_some() || !self.gamepad.state.west_ring_active() {
             return;
         }
         if self.dispatched_input_surface() != surface {
             return;
         }
         let context = self.ring_shortcut_context_for_surface(surface);
-        let selected = self.gamepad_state.west_ring_direction();
+        let selected = self.gamepad.state.west_ring_direction();
         let painter = ui.painter();
         let center = full_rect.center();
         let radius = ring_guide_radius_for_rect(full_rect);
@@ -2101,7 +2108,8 @@ impl App {
 
     /// デバイスを読んで、この frame の操作を作る。**配り先はまだ決めない。**
     ///
-    /// 物理デバイスは 1 つなので、drain・ボタン状態・リピート生成は App-global に置く。
+    /// 物理デバイスは 1 つなので、drain・保持状態は App-global の物理 owner に置く。
+    /// リピート生成・frame 内配送/replay はこの UI batch 側に残す。
     /// context と一緒に入れ替えると、別ウィンドウへ切り替えた瞬間にリピートや軸の保持が
     /// 飛ぶ。配り先 (= 前面の viewer) を決めて消費するのは
     /// [`Self::dispatch_gamepad_batch`] の仕事で、そちらは context を mount した状態で
@@ -2133,103 +2141,20 @@ impl App {
             0
         };
         let now = Instant::now();
-        // 無効なら読まない。runtime 側が読み取りスレッドごと止めるので、
-        // 「反応しないのに UI だけ起き続ける」状態にはならない。
         let enabled = self.settings.gamepad_enabled;
-        let events = self.gamepad.drain(ctx, enabled);
-        // **無効化は物理切断と同じ終端。** 読み捨てるだけでは、握ったボタンと倒した軸が
-        // consumer 側に残ったまま `due_button_repeat` / `dispatch_gamepad_analog` が動き続け、
-        // 停止したスレッドから中立イベントは二度と届かない。スティックがずれている状態で
-        // 設定を OFF にすると、移動やズームと再描画が止まらなくなる (v3.5.0 レビュー F06)。
-        // パッドでしか閉じられない操作 UI も、同じ遷移でここで終わらせる。
-        if !enabled {
-            self.release_gamepad_input_holds(ctx);
-            return GamepadFrameBatch {
-                operation_batch,
-                delivery: PadBatchDelivery::Fresh,
-                analog_operation: false,
-                now,
-                actions: Vec::new(),
-                saw_input_event: false,
-                session_ended: true,
-            };
-        }
-        let mut actions = Vec::new();
-        let mut saw_input_event = false;
-        let mut session_ended = false;
-        let mut analog_operation = track_presentation && self.gamepad_analog_active();
-
-        for event in events {
-            match event {
-                PadEvent::ButtonPressed(button) => {
-                    saw_input_event = true;
-                    if self.gamepad_state.set_button_down(button, true, now) {
-                        actions.push(PadAction {
-                            operation_id: PadOperationId {
-                                batch: operation_batch,
-                                ordinal: actions.len() as u32,
-                            },
-                            button,
-                            kind: PadActionKind::Press,
-                        });
-                    }
-                }
-                PadEvent::ButtonReleased(button) => {
-                    saw_input_event = true;
-                    if self.gamepad_state.set_button_down(button, false, now) {
-                        actions.push(PadAction {
-                            operation_id: PadOperationId {
-                                batch: operation_batch,
-                                ordinal: actions.len() as u32,
-                            },
-                            button,
-                            kind: PadActionKind::Release,
-                        });
-                    }
-                }
-                PadEvent::AxisChanged(axis, value) => {
-                    saw_input_event = true;
-                    self.gamepad_state.set_axis(axis, value);
-                    if track_presentation {
-                        analog_operation |= self.gamepad_analog_active();
-                    }
-                }
-                PadEvent::Connected => {
-                    saw_input_event = true;
-                }
-                PadEvent::Disconnected => {
-                    saw_input_event = true;
-                    // 握ったまま切断すると保持状態が残りリピート/アナログが止まらない。
-                    // 設定 OFF と同じ終端を通す。
-                    session_ended = true;
-                    self.release_gamepad_input_holds(ctx);
-                }
-            }
-        }
-
-        for button in REPEAT_BUTTONS {
-            let interval = repeat_interval_for_button(button);
-            if self.gamepad_state.due_button_repeat(button, now, interval) {
-                actions.push(PadAction {
-                    operation_id: PadOperationId {
-                        batch: operation_batch,
-                        ordinal: actions.len() as u32,
-                    },
-                    button,
-                    kind: PadActionKind::Repeat,
-                });
-            }
-        }
-
-        let batch = GamepadFrameBatch {
-            operation_batch,
-            delivery: PadBatchDelivery::Fresh,
-            analog_operation,
+        self.drain_gamepad_physical_input(ctx, now);
+        let physical = self.gamepad.take_pending();
+        let batch = self.gamepad_batch_from_physical_input(
+            ctx,
+            physical,
+            enabled,
             now,
-            actions,
-            saw_input_event,
-            session_ended,
-        };
+            operation_batch,
+            track_presentation,
+        );
+        if !enabled {
+            return batch;
+        }
         if track_presentation {
             // The sampled immutable batch is the application ingress owner;
             // dispatch/replay must not replace arrival with acceptance time.
@@ -2274,6 +2199,85 @@ impl App {
             });
         }
         batch
+    }
+
+    /// Physical ingress only: no egui input/pass/frame reads and no mounted-context work.
+    /// Stage 3 connects logic here; 0.33.3 still calls it once from sample, after replay.
+    pub(crate) fn drain_gamepad_physical_input(&mut self, ctx: &egui::Context, now: Instant) {
+        self.gamepad.drain(ctx, self.settings.gamepad_enabled, now);
+    }
+
+    /// Take physical facts into one UI batch. Repeat, operation identity and modal
+    /// delivery stay on the UI side; the physical owner retains facts until taken.
+    fn gamepad_batch_from_physical_input(
+        &mut self,
+        ctx: &egui::Context,
+        physical: PadPhysicalHandoff,
+        enabled: bool,
+        now: Instant,
+        operation_batch: u64,
+        track_presentation: bool,
+    ) -> GamepadFrameBatch {
+        let session_ended = physical.events.contains(&PadPhysicalEvent::SessionEnded);
+        if session_ended {
+            // Holds were cleared at each terminal's position in physical ingress.
+            // Do not clear again: a later press in the same drain must survive.
+            self.clear_gamepad_input_overlays(ctx);
+        }
+        // Disabled input still produces only a terminal, with no ingress trace/cache.
+        if !enabled {
+            return GamepadFrameBatch {
+                operation_batch,
+                delivery: PadBatchDelivery::Fresh,
+                analog_operation: false,
+                now,
+                actions: Vec::new(),
+                saw_input_event: false,
+                session_ended: true,
+            };
+        }
+        let saw_input_event = physical.saw_input_event;
+        let analog_operation = track_presentation && physical.analog_operation;
+        let mut actions = Vec::new();
+        for event in physical.events {
+            let (button, kind) = match event {
+                PadPhysicalEvent::ButtonPressed(button) => (button, PadActionKind::Press),
+                PadPhysicalEvent::ButtonReleased(button) => (button, PadActionKind::Release),
+                PadPhysicalEvent::SessionEnded => continue,
+            };
+            actions.push(PadAction {
+                operation_id: PadOperationId {
+                    batch: operation_batch,
+                    ordinal: actions.len() as u32,
+                },
+                button,
+                kind,
+            });
+        }
+
+        for button in REPEAT_BUTTONS {
+            let interval = repeat_interval_for_button(button);
+            if self.gamepad.state.due_button_repeat(button, now, interval) {
+                actions.push(PadAction {
+                    operation_id: PadOperationId {
+                        batch: operation_batch,
+                        ordinal: actions.len() as u32,
+                    },
+                    button,
+                    kind: PadActionKind::Repeat,
+                });
+            }
+        }
+
+        GamepadFrameBatch {
+            operation_batch,
+            delivery: PadBatchDelivery::Fresh,
+            analog_operation,
+            now,
+            actions,
+            saw_input_event,
+            session_ended,
+        }
     }
 
     /// 前面の context へ操作を配る。**その context を mount した状態で呼ぶこと。**
@@ -2337,7 +2341,7 @@ impl App {
         if self.sidecar_restore_active() {
             self.finish_gamepad_input_for_sidecar_restore(ctx);
             self.reset_gamepad_continuous_steps(now);
-            self.gamepad_state.suppress_pending_actions();
+            self.gamepad.state.suppress_pending_actions();
             return GamepadDispatchOutcome {
                 nav: None,
                 dispatched: false,
@@ -2404,7 +2408,7 @@ impl App {
         } else {
             self.reset_gamepad_continuous_steps(now);
             // ブロック中に押されたボタンが解除後に遅れて発火しないよう抑止する。
-            self.gamepad_state.suppress_pending_actions();
+            self.gamepad.state.suppress_pending_actions();
         }
 
         GamepadDispatchOutcome {
@@ -2494,8 +2498,8 @@ impl App {
             Some(ctx),
         );
         self.release_gamepad_input_holds(ctx);
-        self.gamepad_state.clear();
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.clear();
+        self.gamepad.state.require_directional_neutral();
     }
 
     /// frame 全体の後始末。activity gate と repaint は App-global なので、配り先に
@@ -2559,20 +2563,22 @@ impl App {
     }
 
     fn reset_gamepad_continuous_steps(&mut self, now: Instant) {
-        let _ = self.gamepad_state.analog_dt(false, now);
+        let _ = self.gamepad.state.analog_dt(false, now);
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(false, now, STICK_STEP_INTERVAL);
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .trigger_step_due(false, now, TRIGGER_STEP_INTERVAL);
     }
 
     fn gamepad_needs_repaint(&self) -> bool {
-        self.gamepad_state.repeat_active()
+        self.gamepad.state.repeat_active()
             || self.gamepad_analog_active()
-            || self.gamepad_state.button_down(PadButton::North)
-            || self.gamepad_state.button_down(PadButton::West)
+            || self.gamepad.state.button_down(PadButton::North)
+            || self.gamepad.state.button_down(PadButton::West)
             || self.ring_picker.is_some()
             || self.gamepad_favorite_picker.is_some()
             || self.gamepad_location_picker.is_some()
@@ -2580,12 +2586,7 @@ impl App {
     }
 
     fn gamepad_analog_active(&self) -> bool {
-        let left = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
-        let right = stick_pair(&self.gamepad_state, PadAxis::RightX, PadAxis::RightY);
-        left.length_sq() > 0.0
-            || right.length_sq() > 0.0
-            || self.gamepad_state.trigger_value(true) > TRIGGER_THRESHOLD
-            || self.gamepad_state.trigger_value(false) > TRIGGER_THRESHOLD
+        self.gamepad.analog_active()
     }
 
     fn dispatch_gamepad_button(
@@ -2607,7 +2608,7 @@ impl App {
             self.dispatch_gamepad_picker_button(ctx, action);
             return None;
         }
-        if self.gamepad_state.directional_neutral_required()
+        if self.gamepad.state.directional_neutral_required()
             && (button_dir(action.button).is_some() || action.button == PadButton::West)
         {
             return None;
@@ -2615,30 +2616,30 @@ impl App {
         match action.kind {
             PadActionKind::Release if action.button == PadButton::West => {
                 if let Some(direction) = self.current_ring_gamepad_direction() {
-                    self.gamepad_state.mark_west_ring_direction(direction);
+                    self.gamepad.state.mark_west_ring_direction(direction);
                 }
                 self.finish_gamepad_west_release(ctx)
             }
             PadActionKind::Release if action.button == PadButton::North => {
-                if !self.gamepad_state.y_modifier_used() {
+                if !self.gamepad.state.y_modifier_used() {
                     self.handle_gamepad_y_tap(ctx);
                 }
                 None
             }
             PadActionKind::Release => None,
             PadActionKind::Press | PadActionKind::Repeat => {
-                if self.gamepad_state.west_ring_active() {
+                if self.gamepad.state.west_ring_active() {
                     if let Some(dir) = button_dir(action.button) {
                         let direction = self
                             .current_ring_gamepad_direction()
                             .unwrap_or_else(|| ring_direction_from_pad_dir(dir));
-                        self.gamepad_state.mark_west_ring_direction(direction);
+                        self.gamepad.state.mark_west_ring_direction(direction);
                         self.sync_native_video_ring_guide_overlay(ctx);
                         ctx.request_repaint();
                     } else if action.button == PadButton::East
                         && action.kind == PadActionKind::Press
                     {
-                        self.gamepad_state.cancel_west_ring();
+                        self.gamepad.state.cancel_west_ring();
                         self.clear_native_video_ring_guide_overlay(ctx);
                         ctx.request_repaint();
                     }
@@ -2711,9 +2712,9 @@ impl App {
         if self.consume_gamepad_directional_neutral_gate(now) {
             return false;
         }
-        if self.gamepad_state.west_ring_active() {
+        if self.gamepad.state.west_ring_active() {
             if let Some(direction) = self.current_ring_gamepad_direction() {
-                self.gamepad_state.mark_west_ring_direction(direction);
+                self.gamepad.state.mark_west_ring_direction(direction);
             }
             self.sync_native_video_ring_guide_overlay(ctx);
             return true;
@@ -2731,20 +2732,21 @@ impl App {
     }
 
     fn gamepad_directional_neutral(&self) -> bool {
-        !self.gamepad_state.dpad_direction_down()
-            && stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY).length_sq() == 0.0
+        !self.gamepad.state.dpad_direction_down()
+            && stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY).length_sq() == 0.0
     }
 
     fn consume_gamepad_directional_neutral_gate(&mut self, now: Instant) -> bool {
-        if !self.gamepad_state.directional_neutral_required() {
+        if !self.gamepad.state.directional_neutral_required() {
             return false;
         }
-        let _ = self.gamepad_state.analog_dt(false, now);
+        let _ = self.gamepad.state.analog_dt(false, now);
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(false, now, STICK_STEP_INTERVAL);
         if self.gamepad_directional_neutral() {
-            self.gamepad_state.clear_directional_neutral_required();
+            self.gamepad.state.clear_directional_neutral_required();
             false
         } else {
             true
@@ -2752,11 +2754,11 @@ impl App {
     }
 
     fn current_ring_gamepad_direction(&self) -> Option<RingDirection> {
-        ring_direction_from_dpad_buttons(&self.gamepad_state).or_else(|| {
-            let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        ring_direction_from_dpad_buttons(&self.gamepad.state).or_else(|| {
+            let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
             ring_direction_from_stick_with_hysteresis(
                 stick,
-                self.gamepad_state.west_ring_direction(),
+                self.gamepad.state.west_ring_direction(),
             )
         })
     }
@@ -2767,25 +2769,28 @@ impl App {
             return false;
         }
         let mut changed = false;
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let stick_active = stick_dir.is_some();
         if self.folder_pane_blocks_grid_keyboard() {
             if self
-                .gamepad_state
+                .gamepad
+                .state
                 .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
                 && let Some(dir) = stick_dir
             {
                 changed = self.handle_gamepad_folder_tree_direction(dir);
             }
             let _ = self
-                .gamepad_state
+                .gamepad
+                .state
                 .trigger_step_due(false, now, Duration::from_millis(70));
-            let _ = self.gamepad_state.analog_dt(stick_active, now);
+            let _ = self.gamepad.state.analog_dt(stick_active, now);
             return changed;
         }
         if self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
             && let Some(dir) = stick_dir
         {
@@ -2793,12 +2798,13 @@ impl App {
             changed = true;
         }
 
-        let lt = self.gamepad_state.trigger_value(true);
-        let rt = self.gamepad_state.trigger_value(false);
+        let lt = self.gamepad.state.trigger_value(true);
+        let rt = self.gamepad.state.trigger_value(false);
         let trigger_delta = rt - lt;
         let trigger_active = trigger_delta.abs() > TRIGGER_THRESHOLD;
         if self
-            .gamepad_state
+            .gamepad
+            .state
             .trigger_step_due(trigger_active, now, Duration::from_millis(70))
         {
             self.scroll_gamepad_grid(trigger_delta.signum());
@@ -2806,22 +2812,23 @@ impl App {
         }
 
         let _ = self
-            .gamepad_state
+            .gamepad
+            .state
             .analog_dt(stick_active || trigger_active, now);
         changed
     }
 
     fn dispatch_gamepad_still_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
-        let left = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
-        let right = stick_pair(&self.gamepad_state, PadAxis::RightX, PadAxis::RightY);
-        let lt = self.gamepad_state.trigger_value(true);
-        let rt = self.gamepad_state.trigger_value(false);
+        let left = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
+        let right = stick_pair(&self.gamepad.state, PadAxis::RightX, PadAxis::RightY);
+        let lt = self.gamepad.state.trigger_value(true);
+        let rt = self.gamepad.state.trigger_value(false);
         let pan_active = left.length_sq() > 0.0;
         let zoom_axis = (right.y * RIGHT_STICK_ZOOM_MULTIPLIER + rt - lt)
             .clamp(-RIGHT_STICK_ZOOM_MULTIPLIER, RIGHT_STICK_ZOOM_MULTIPLIER);
         let zoom_active = zoom_axis.abs() > 0.05;
         let active = pan_active || zoom_active;
-        let dt = self.gamepad_state.analog_dt(active, now);
+        let dt = self.gamepad.state.analog_dt(active, now);
         if !active || dt <= 0.0 {
             return false;
         }
@@ -2880,7 +2887,8 @@ impl App {
         let stick_dir = dominant_stick_dir(stick);
         let stick_active = stick_dir.is_some();
         if self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
             && let Some(fs_idx) = self.fullscreen_idx
             && let Some(dir) = stick_dir
@@ -2898,14 +2906,15 @@ impl App {
         fs_idx: usize,
         now: Instant,
     ) -> bool {
-        let lt = self.gamepad_state.trigger_value(true);
-        let rt = self.gamepad_state.trigger_value(false);
+        let lt = self.gamepad.state.trigger_value(true);
+        let rt = self.gamepad.state.trigger_value(false);
         let trigger_delta = rt - lt;
         let trigger_active = trigger_delta.abs() > TRIGGER_THRESHOLD;
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .trigger_step_due(trigger_active, now, TRIGGER_STEP_INTERVAL);
-        let _ = self.gamepad_state.analog_dt(trigger_active, now);
+        let _ = self.gamepad.state.analog_dt(trigger_active, now);
         if !due {
             return false;
         }
@@ -2955,20 +2964,20 @@ impl App {
 
     fn finish_gamepad_west_release(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         self.clear_native_video_ring_guide_overlay(ctx);
-        match self.gamepad_state.finish_west_release() {
+        match self.gamepad.state.finish_west_release() {
             WestReleaseOutcome::Picker => {
                 self.open_gamepad_ring_picker(ctx);
                 None
             }
             WestReleaseOutcome::Ring(direction) => {
-                self.gamepad_state.require_directional_neutral();
+                self.gamepad.state.require_directional_neutral();
                 self.trigger_gamepad_ring_action(ctx, direction)
             }
             WestReleaseOutcome::Suppressed => {
                 // 抑止されたリング操作 (ブロック中に suppress された等) でも、リング用に
                 // 倒したままのスティックが通常アナログ操作へ漏れないようニュートラル通過を
                 // 要求する (review-v2.3.0 hunt P2。Ring 側と対称)。
-                self.gamepad_state.require_directional_neutral();
+                self.gamepad.state.require_directional_neutral();
                 None
             }
         }
@@ -3254,11 +3263,12 @@ impl App {
             self.close_stale_ring_picker(ctx);
             return false;
         }
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir) = stick_dir {
             self.handle_ring_picker_direction(ctx, dir);
@@ -3287,7 +3297,7 @@ impl App {
                     PadButton::East | PadButton::Select if action.kind == PadActionKind::Press => {
                         self.gamepad_video_marker_picker = None;
                         self.clear_native_video_picker_overlay(ctx);
-                        self.gamepad_state.require_directional_neutral();
+                        self.gamepad.state.require_directional_neutral();
                         ctx.request_repaint();
                     }
                     _ => {}
@@ -3301,11 +3311,12 @@ impl App {
         ctx: &egui::Context,
         now: Instant,
     ) -> bool {
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir @ (PadDir::Up | PadDir::Down)) = stick_dir {
             self.move_gamepad_video_marker_picker(ctx, dir);
@@ -3317,7 +3328,7 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         };
@@ -3325,7 +3336,7 @@ impl App {
         if len == 0 {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         }
@@ -3342,7 +3353,7 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         };
@@ -3356,13 +3367,13 @@ impl App {
         let Some(marker) = markers.get(selected).cloned() else {
             self.gamepad_video_marker_picker = None;
             self.clear_native_video_picker_overlay(ctx);
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         };
         self.gamepad_video_marker_picker = None;
         self.clear_native_video_picker_overlay(ctx);
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.require_directional_neutral();
         if let Some(player) = self.fs_video_player(fs_idx) {
             player.seek(marker.pts);
         }
@@ -3411,7 +3422,7 @@ impl App {
                     PadButton::East | PadButton::Start if action.kind == PadActionKind::Press => {
                         self.gamepad_favorite_picker = None;
                         self.clear_native_video_picker_overlay(ctx);
-                        self.gamepad_state.require_directional_neutral();
+                        self.gamepad.state.require_directional_neutral();
                         ctx.request_repaint();
                         None
                     }
@@ -3426,11 +3437,12 @@ impl App {
         ctx: &egui::Context,
         now: Instant,
     ) -> bool {
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir) = stick_dir {
             match dir {
@@ -3515,7 +3527,7 @@ impl App {
         }
         self.gamepad_favorite_picker = None;
         self.clear_native_video_picker_overlay(ctx);
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.require_directional_neutral();
         if self.fullscreen_idx.is_some() {
             self.close_fullscreen();
         }
@@ -3561,7 +3573,7 @@ impl App {
                     }
                     PadButton::East | PadButton::Select if action.kind == PadActionKind::Press => {
                         self.gamepad_location_picker = None;
-                        self.gamepad_state.require_directional_neutral();
+                        self.gamepad.state.require_directional_neutral();
                         ctx.request_repaint();
                         None
                     }
@@ -3576,11 +3588,12 @@ impl App {
         ctx: &egui::Context,
         now: Instant,
     ) -> bool {
-        let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
+        let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let active = stick_dir.is_some();
         let due = self
-            .gamepad_state
+            .gamepad
+            .state
             .left_stick_step_due(active, now, STICK_STEP_INTERVAL);
         if due && let Some(dir @ (PadDir::Up | PadDir::Down)) = stick_dir {
             self.move_gamepad_location_picker(ctx, dir);
@@ -3595,7 +3608,7 @@ impl App {
         let len = picker.entries.len();
         if len == 0 {
             self.gamepad_location_picker = None;
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
             return;
         }
@@ -3617,7 +3630,7 @@ impl App {
             .and_then(|picker| picker.entries.get(selected))
             .map(|entry| entry.nav.clone());
         self.gamepad_location_picker = None;
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.require_directional_neutral();
         ctx.request_repaint();
 
         let Some(nav) = nav else {
@@ -3655,23 +3668,27 @@ impl App {
         })
     }
 
-    /// パッド入力が終わったときの**物理側**の終端。無効化と切断の共通の出口。
+    /// sidecar restoreから保持とoverlayを一緒に終わらせる既存入口。
+    /// 無効化/切断の保持解除は物理owner、overlay終了はUI batch作成側で行う。
     ///
-    /// 保持中のボタン / 軸 / リピート予約を落とし、パッドでしか閉じられない overlay を
-    /// 閉じる。何も残っていなければ何もしない (毎フレーム呼ばれるので再描画も要求しない)。
-    ///
-    /// **リングの確定はここでやらない。** ここは sample の中 = root 投影で走るが、リングの
-    /// 確定はフォルダ評価のように**所有 context の保存先**へ書く。root のまま確定すると、
-    /// 別ウィンドウで変えた評価がメイン側のフォルダへ書かれる (v3.5.0 レビュー N01)。
-    /// 確定は通常の配送と同じ経路 ([`Self::dispatch_gamepad_batch`]) が担う。
+    /// **リングの確定はここでやらない。** 通常終端は所有contextの保存先/Undoへ書く
+    /// [`Self::dispatch_gamepad_batch`] が担う。sidecar restoreはその前に既存の
+    /// commitしない終端を通す。root投影で別contextの編集を確定しない。
     fn release_gamepad_input_holds(&mut self, ctx: &egui::Context) {
         let had_overlay = self.gamepad_favorite_picker.is_some()
             || self.gamepad_location_picker.is_some()
             || self.gamepad_video_marker_picker.is_some();
-        if !had_overlay && self.ring_picker.is_none() && self.gamepad_state.is_idle() {
+        if !had_overlay && self.ring_picker.is_none() && self.gamepad.state.is_idle() {
             return;
         }
-        self.gamepad_state.clear();
+        self.gamepad.state.clear();
+        self.clear_gamepad_input_overlays(ctx);
+    }
+
+    fn clear_gamepad_input_overlays(&mut self, ctx: &egui::Context) {
+        let had_overlay = self.gamepad_favorite_picker.is_some()
+            || self.gamepad_location_picker.is_some()
+            || self.gamepad_video_marker_picker.is_some();
         if had_overlay {
             self.gamepad_favorite_picker = None;
             self.gamepad_location_picker = None;
@@ -3687,8 +3704,8 @@ impl App {
                 crate::rating_membership::RatingAdoptionIntent::Reconcile,
                 Some(ctx),
             );
-            self.gamepad_state.cancel_west_ring();
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.cancel_west_ring();
+            self.gamepad.state.require_directional_neutral();
             ctx.request_repaint();
         }
     }
@@ -4653,11 +4670,11 @@ impl App {
             return None;
         }
         let (selected, heading, detail, center_client_px, slot_labels) =
-            if owner == RightDragOwner::Root && self.gamepad_state.west_ring_active() {
+            if owner == RightDragOwner::Root && self.gamepad.state.west_ring_active() {
                 if self.ring_picker.is_some() {
                     return None;
                 }
-                let selected = self.gamepad_state.west_ring_direction();
+                let selected = self.gamepad.state.west_ring_direction();
                 let (heading, detail) = ring_guide_heading_detail(
                     &self.settings.ring_shortcuts.profile(context).slots,
                     context,
@@ -4760,8 +4777,8 @@ impl App {
             return;
         };
         // 物理側は App-global。パッドはもう無いかもしれないので mount に依存させない。
-        self.gamepad_state.cancel_west_ring();
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.cancel_west_ring();
+        self.gamepad.state.require_directional_neutral();
         let owner = picker.owner;
         let applied = self.with_owner_viewer_context(owner, |app| {
             let (item_rating_changes, container_rating_record) =
@@ -4848,8 +4865,8 @@ impl App {
             }
             #[cfg(windows)]
             self.set_native_video_ring_picker_overlay(None);
-            self.gamepad_state.cancel_west_ring();
-            self.gamepad_state.require_directional_neutral();
+            self.gamepad.state.cancel_west_ring();
+            self.gamepad.state.require_directional_neutral();
             return;
         };
         let owner = picker.owner;
@@ -4884,8 +4901,8 @@ impl App {
                 picker.rating_origin.clone(),
             );
         }
-        self.gamepad_state.cancel_west_ring();
-        self.gamepad_state.require_directional_neutral();
+        self.gamepad.state.cancel_west_ring();
+        self.gamepad.state.require_directional_neutral();
     }
 
     fn picker_success_rating_toast(picker: &RingPickerState) -> Option<String> {
@@ -6994,9 +7011,9 @@ impl App {
     fn handle_gamepad_direction(&mut self, ctx: &egui::Context, dir: PadDir, repeat: bool) {
         let route = self.dpad_route();
         self.log_dpad_route_if_changed(route);
-        let y_modifier = self.gamepad_state.button_down(PadButton::North);
+        let y_modifier = self.gamepad.state.button_down(PadButton::North);
         if y_modifier {
-            self.gamepad_state.mark_y_modifier_used();
+            self.gamepad.state.mark_y_modifier_used();
         }
         match (route, y_modifier) {
             (DpadRoute::Grid, _) => self.handle_gamepad_direction_for_grid(dir),
@@ -9726,7 +9743,7 @@ mod tests {
         assert_eq!(facts[0].1, super::OperationPhase::Press);
         assert_eq!(facts[1].1, super::OperationPhase::Press);
         assert_ne!(facts[0].0, facts[1].0);
-        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+        assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
         let next = app.sample_gamepad_input(&ctx);
         assert!(next.presentation_operations().is_empty());
         assert_ne!(next.operation_batch, batch.operation_batch);
@@ -9741,13 +9758,13 @@ mod tests {
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
         let initial = app.sample_gamepad_input(&ctx);
-        assert!(app.gamepad_state.button_down(PadButton::DPadRight));
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
         assert_eq!(
             initial.presentation_operations()[0].1,
             super::OperationPhase::Press
         );
-        app.gamepad_state.clear();
-        app.gamepad_state.set_button_down(
+        app.gamepad.state.clear();
+        app.gamepad.state.set_button_down(
             PadButton::DPadRight,
             true,
             Instant::now() - std::time::Duration::from_secs(1),
@@ -9790,7 +9807,7 @@ mod tests {
                     super::PadBatchDelivery::Replay
                 }
             );
-            assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+            assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
             assert!(!app.gamepad_analog_active());
             let facts = batch.presentation_operations();
             assert_eq!(facts.len(), 2);
@@ -9845,7 +9862,7 @@ mod tests {
             kinds,
             vec![super::PadActionKind::Press, super::PadActionKind::Release]
         );
-        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+        assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
     }
 
     #[test]
@@ -9889,7 +9906,7 @@ mod tests {
         let batch = app.sample_gamepad_input(&ctx);
         assert!(!batch.actions.is_empty(), "押した frame は届く");
         assert!(
-            !app.gamepad_state.is_idle(),
+            !app.gamepad.state.is_idle(),
             "押しっぱなし / 倒しっぱなしが残っている"
         );
 
@@ -9902,7 +9919,7 @@ mod tests {
             "OFF の frame は入力があったことにしない (再描画を続けない)"
         );
         assert!(
-            app.gamepad_state.is_idle(),
+            app.gamepad.state.is_idle(),
             "OFF は保持中のボタン / 軸 / リピート予約をすべて終わらせる"
         );
 
@@ -9996,11 +10013,11 @@ mod tests {
         assert!(!outcome.dispatch_allowed);
         assert!(!outcome.dispatched);
         assert!(app.ring_picker.is_none(), "picker ownership must terminate");
-        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
-        assert_eq!(app.gamepad_state.axis(PadAxis::LeftX), 0.0);
-        assert!(!app.gamepad_state.repeat_active());
+        assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.0);
+        assert!(!app.gamepad.state.repeat_active());
         assert!(
-            app.gamepad_state.directional_neutral_required(),
+            app.gamepad.state.directional_neutral_required(),
             "resume must start behind a fresh-neutral re-arm gate"
         );
         assert_eq!(
@@ -10995,10 +11012,12 @@ mod next_input_tests {
             }
             Route::PadRing => {
                 let now = Instant::now();
-                app.gamepad_state
+                app.gamepad
+                    .state
                     .set_button_down(PadButton::West, true, now);
-                app.gamepad_state.mark_west_ring_direction(direction);
-                app.gamepad_state
+                app.gamepad.state.mark_west_ring_direction(direction);
+                app.gamepad
+                    .state
                     .set_button_down(PadButton::West, false, now);
                 app.finish_gamepad_west_release(ctx);
             }
@@ -11386,5 +11405,123 @@ mod next_input_tests {
                 assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod physical_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn gamepad_ui_take_preserves_split_drain_edges_without_another_poll() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        let now = Instant::now();
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::South));
+        app.drain_gamepad_physical_input(&ctx, now);
+        app.gamepad
+            .push_for_test(PadEvent::ButtonReleased(PadButton::South));
+        app.drain_gamepad_physical_input(&ctx, now);
+        let physical = app.gamepad.take_pending();
+        let batch = app.gamepad_batch_from_physical_input(&ctx, physical, true, now, 42, true);
+        assert_eq!(batch.actions.len(), 2);
+        assert_eq!(batch.actions[0].kind, PadActionKind::Press);
+        assert_eq!(batch.actions[1].kind, PadActionKind::Release);
+        assert_eq!(
+            batch.actions[0].operation_id,
+            PadOperationId {
+                batch: 42,
+                ordinal: 0
+            }
+        );
+        assert_eq!(
+            batch.actions[1].operation_id,
+            PadOperationId {
+                batch: 42,
+                ordinal: 1
+            }
+        );
+        assert!(!app.gamepad.state.button_down(PadButton::South));
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    fn gamepad_disconnect_overlay_cleanup_keeps_later_press_in_same_drain() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.gamepad_favorite_picker = Some(GamepadFavoritePickerState {
+            tab: GamepadFavoritePickerTab::Favorites,
+            favorites: GamepadListCursor::new(0),
+            smart_folders: GamepadListCursor::new(0),
+        });
+        for event in [
+            PadEvent::ButtonPressed(PadButton::West),
+            PadEvent::Disconnected,
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+        ] {
+            app.gamepad.push_for_test(event);
+        }
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(batch.session_ended);
+        assert!(batch.saw_input_event);
+        assert_eq!(batch.actions.len(), 2);
+        assert!(app.gamepad_favorite_picker.is_none());
+        assert!(!app.gamepad.state.button_down(PadButton::West));
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+    }
+
+    #[test]
+    fn gamepad_disabled_ui_discards_handoff_actions_without_tracking_cache() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::South));
+        app.drain_gamepad_physical_input(&ctx, Instant::now());
+        app.settings.gamepad_enabled = false;
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(batch.actions.is_empty());
+        assert!(!batch.saw_input_event);
+        assert!(!batch.analog_operation);
+        assert!(batch.session_ended);
+        assert!(
+            ctx.data(|data| data
+                .get_temp::<SampledPadTransaction>(egui::Id::new("gamepad_operation_ingress")))
+                .is_none()
+        );
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    fn gamepad_blocked_dispatch_keeps_held_axis_for_admitted_resume() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("pad-axis.jpg");
+        app.items = vec![GridItem::Image(path)];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.settings.gamepad_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
+        let batch = app.sample_gamepad_input(&ctx);
+        let blocked = app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| false);
+        assert!(!blocked.dispatch_allowed);
+        assert!(!blocked.dispatched);
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        assert!(!app.gamepad.state.directional_neutral_required());
+
+        // No new axis event or neutral crossing is required after admission resumes.
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(!batch.saw_input_event);
+        let resumed = app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+        assert!(resumed.dispatch_allowed);
+        assert!(resumed.dispatched);
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
     }
 }

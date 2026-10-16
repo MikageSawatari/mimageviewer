@@ -100759,13 +100759,13 @@ mod rating_write_failure_tests {
                 0.9,
             ));
         let _ = app.sample_gamepad_input(&ctx);
-        assert!(!app.gamepad_state.is_idle());
+        assert!(!app.gamepad.state.is_idle());
 
         app.settings.gamepad_enabled = false;
         let batch = app.sample_gamepad_input(&ctx);
 
         assert!(batch.session_ended_for_test(), "区切りを batch で伝える");
-        assert!(app.gamepad_state.is_idle(), "物理側は sample が終わらせる");
+        assert!(app.gamepad.state.is_idle(), "物理側は sample が終わらせる");
         assert!(
             app.ring_picker.is_some(),
             "編集の確定は sample の中でやらない"

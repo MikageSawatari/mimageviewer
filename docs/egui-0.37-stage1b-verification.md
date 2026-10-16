@@ -279,3 +279,96 @@ font-resync識別子、borderless二種の直接代入、TRT直接start、EPUB�
 lib全件・snapshot・製品build・起動・live試験は依頼に従って再実行しない。
 前節のlib全件結果は段1b-1基点の履歴として保持し、今回のテスト変更後の全件成功とは主張しない。
 未コミットで引き渡す。
+
+## 段1b-2: gamepadの物理取込み・UI batch境界（2026-10-16）
+
+開始: `egui-036` / `9453bd3c9`。Rust 1.99.0 / egui 0.33.3のまま、旧呼出順の抽出だけを行う。
+更新計画§4.2のゲームパッド項目1〜11、detached構造合意の範囲に従う。
+境界案を独立レビューしてから実装した。利用者決定の最小化案Bは段3以降の接続条件であり、
+今回の最小化/repaint/foreground挙動を変更しない。更新設計書・manifest/lock/vendorは編集しない。
+対象外DSPは段1b-1冒頭と同じSHA-256を保護する。製品build/起動・live試験・PNG更新・コミットは行わない。
+
+### 分けた境界と旧順序
+
+| 順 | 境界 | 所有・処理 | 0.37接続予定 |
+| --- | --- | --- | --- |
+| B2-1 | `sample_gamepad_input`のtracking / pass / frame cache判定 | UIの`SampledPadTransaction`。追跡ONの再passはdrain前に同一batchをReplayとして返す。追跡OFFは従来どおりdiscard後のpassでもlive poll | ui。logicへframe/pass gateを移さない |
+| B2-2 | `drain_gamepad_physical_input` → `GamepadPhysicalInput::drain/ingest` | App-global単一owner。既存runtimeを1回drainし、押下/軸/repeat予約の保持更新、無効化/disconnectで保持解除、未配送edge/終端を追記。Contextはruntimeの既存wake登録にだけ渡す | logicの物理取込み入口。今回もB2-1の後からだけ呼ぶ |
+| B2-3 | `take_pending` → `gamepad_batch_from_physical_input` | 同ownerから一度移譲。終端のoverlay後始末、旧`PadAction`/operation ID生成、既存UI repeat生成、batch作成。設定OFFは操作・activity・analogを作らず終端だけ返す | ui。段3でB2-2を別駆動するときはここでtakeし、UI側からの二重drainを除く |
+| B2-4 | ingress trace / `SampledPadTransaction`固定 | UI frameのimmutable batch。OFFの早期returnは従来どおりtrace/cacheを作らない | ui |
+| B2-5 | 既存root / mounted配送・fallback / finish | `dispatch_gamepad_batch_with_admission`のmodal/OS foreground判定、continuous timer抑止、`suppress_pending_actions`、ring終端/Undoを既存context内で実行 | ui。今回呼出元・配送順・判定を変更しない |
+
+`src/app.rs`のruntimeと保持stateの2フィールドを`GamepadPhysicalInput`へ集約した。
+物理ownerはroot / mounted / parkedの切替対象ではなく、viewer contextを進めない。
+配送先は既存active viewerのmountが決め、成立しなければ既存root fallbackへbatchを返す。
+parked viewerへ追加配送しない。`update_phases.rs`/viewport経路も変更しない。
+
+`src/app/gamepad_input/physical.rs`の`PadPhysicalHandoff`は、順序付き
+`Vec<PadPhysicalEvent>`（`ButtonPressed` / `ButtonReleased` / `SessionEnded`）と
+受信activity・analog観測の集約値を持つ。最終保持レベルや最新batchで過去edge/終端を置き換えない。
+`take_pending`は`mem::take`で一度だけ所有権を移し、次のtakeは空になる。
+`SampledPadTransaction`は未配送ownerに流用しない。新App pending bool・時間窓・第二drainはない。
+
+意味終端の**保持**と**実行**を分けた。無効化/disconnectの保持解除は物理owner内のイベント位置で行う。
+UIではoverlayだけを後始末し、同drain内のdisconnect後に届いたpressを再clearしない。
+ringは引き続きFresh batchの既存`session_ended`判断で、mounted配送先のadmission前に確定する。
+sidecar restoreのcommitしない終端、contextの保存先・Undo構築も変更しない。
+現UI batchは従来どおり終端をboolへ集約する。複数logic drainで保持した終端を将来どの操作順で実行するかは、
+段3でこの順序付きhandoffから接続する。今回、その複数drainの製品配送は有効化しない。
+
+非前面/modal時の既存`reset_gamepad_continuous_steps`と`suppress_pending_actions`は移動・変更しない
+（保持stateへの参照パスだけ変更）。通常の保持軸は保持し、復帰時の中立通過を追加しない。
+West ring操作の既存neutral要求はそのまま残す。gilrs producerの受付/foreground判定も変更しない。
+
+### 追加回帰と段3への引継ぎ
+
+物理owner4件、UI境界4件の回帰を追加した。
+
+- 実runtimeのテストqueueから2回drainしたpress→releaseが順序通り残り、take後は空になる。
+- 複数disconnectの終端がedge間に残り、disconnect後の新pressの保持を消さない。
+- ON press/軸→OFFで保持を解除しても、未配送edgeと終端を上書きしない。
+- 軸active→別drainでneutralになってもanalog観測事実を保持する。
+- UIは追加pollなしのtakeから両edgeと異なるordinalを作る。
+- overlayの終端後始末が同drain内の後続pressを消さない。
+- OFFのUIは既に未配送edgeがあっても操作を作らず、tracking cacheも作らない。
+- admission不成立時の抑止後、追加axisイベント/中立通過なしで保持軸の操作を再開する（headless admission注入）。
+
+段3ではB2-2だけをlogicへ接続し、B2-1/B2-3/B2-4/B2-5をUIへ残す。
+producer側の受付事実と離散edge抑止（項目4/5/7）、複数drainの意味終端配送（項目10/11）、
+sidecar restore終端と未配送ownerの接続は今回未実装であり、logic-ready全体の受入れとはしない。
+保持値更新とrepeat予約は物理側、repeatの期限確認/操作化は今回もUI側に残すため、
+段3の接続時にもcadenceとOFF/再passの既存契約を確認する。
+最小化案Bの決定とこの構造抽出の間に矛盾はない。
+
+### 検証
+
+実行記録は`target/egui037-stage1b-2/`へ保存する。通常feature / Rust 1.99.0、
+`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。結果は完了後に追記する。
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功（16.090秒 / 15.252秒） | 0 / 0 |
+| core check 通常 / test-script | 成功（50.153秒 / 50.538秒） | 0 / 0 |
+| 焦点nextest | 223 passed / 0 failed、実行14.919秒（compile込み335.241秒）。追加8件も全てpassed | 0 |
+| 旧snapshotの通常比較 | 295 passed / 0 failed（統合181 + 11、lib明示filter 50本で103件）。PNG 445枚のSHA-256不変、更新なし | 全52コマンド 0 |
+| `scripts/test-lib-full.ps1` | 13,285 passed / 0 failed / 59 skipped、実行357.814秒（wrapper込み362.620秒）。成功台帳の再利用でなく今回のsourceで実行 | 0 |
+| `git diff --check` | 成功。結果追記後にも確認 | 0 |
+
+焦点filterは`test(gamepad) | test(pad_operation) | test(app::gamepad_input::) | test(sidecar_restore) | test(tray) | test(still_window_pad) | test(ring_picker) | test(rating_undo)`。
+追跡ONのreplayと追跡OFFのdiscard後poll、設定OFFの保持/overlay終端、sidecar終端、
+ring/context/Undoの既存回帰を含む。fullの件数は段1b-1の13,277件から追加8件分増え、skip数は59のまま。
+既存の5件のslow表示は打ち切りでなく、すべて完了した。
+
+独立の境界設計レビュー・実装レビューともACCEPT（`gpt-6.1-sol` / `xhigh`）。
+軽微な旧入口コメントの指摘は現行のsidecar入口・物理owner/overlay分離の説明へ修正した。
+reviewerはテストを重複実行せず、上記実装担当の結果を再利用する。
+command/exit/時間は`checks-focused-results.json` / `snapshots-results.json` / `full-results.json`、
+件数は`focused-summary.json` / `snapshot-summary.json` / `full-summary.json`、実行sourceは`source-hashes.json`。
+fullの元runは`target/test-lib-full/runs/20261016T112422610Z-90304c4d/`、
+成功receiptは`target/test-lib-full/0e949feeb8a049c41c6a20f2c1a6829045923f6d41571e753f229f246434afc4.json`。
+
+実行中に設計担当の計画第4.3版commit `b14571d8d` が入りHEADが進んだ。
+`9453bd3c9..b14571d8d`は`docs/egui-0.37-update-plan.md`だけの変更であり、実装担当は同ファイルを編集していない。
+Rust実行source/テストsource、manifest/lock/toolchain、対象外DSPは保存したSHA-256と全件後も一致した。
+以後はこの台帳の結果追記だけで、実行コード・依存・fixtureを変更しない。
+今回の段1b-2変更は未コミット。段1b-3・段3・最小化案Bの接続は未着手で、上記留保以外に設計との食い違いはない。
