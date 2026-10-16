@@ -683,6 +683,8 @@ v4.2.0 の staged 化で背景用の同期列挙（Normal）を通るように�
 （HighNormal）を待つ退行が入っていた。背景の metadata／cache／Remote 等は Normal を維持する。
 preflight worker は結果と取消通知を channel select で待ち、取消時はその待ち手の lease だけを
 離脱させる。最後の待ち手だけが既存の source cancel を立てる。候補間で待ち手を持ち越さない。
+登録で `Start` を得た admission は、起点の UI 待ち手が取り消されても共有 worker の起動責任を保つ。
+起動を省略するのは、全待ち手の離脱で `source_cancel` が立った場合だけとし、合流済み待ち手を残して起動を捨てない。
 read target は従来と同じ worker 解決・EPUB lease を使い、合流キーは
 `(read_path, password, want_direction)` のまま。取消監視の polling や新しい優先度枠は追加しない。
 既存の連続ナビを保つためモーダル化は行わず、列挙と取消の所有を既存 coordinator に揃える。
