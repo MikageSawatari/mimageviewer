@@ -231,10 +231,13 @@ fn finish_turn(app: &mut App, ctx: &egui::Context) {
         app.begin_page_turn_viewer_frame(ctx, false, None);
         assert!(draw(app, ui, ctx));
     });
-    let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state else {
+    let PresentationState::Turning { clock, offer, .. } = &mut app.page_turn_presentation.state
+    else {
         panic!("turn started")
     };
-    offer.accepted_at -= offer.duration + Duration::from_millis(1);
+    *clock = MotionClock::Running {
+        start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+    };
     frame(ctx, |ui, ctx| {
         app.begin_page_turn_viewer_frame(ctx, false, None);
         assert!(!draw(app, ui, ctx));
@@ -460,24 +463,28 @@ fn page_turn_permission_service_vacant_composed_handler_starts_and_completes_bot
                 });
                 assert_eq!(tracker.status(), SubmissionStatus::Started);
                 for progress in [0.25, 0.75] {
-                    let PresentationState::Turning { offer, .. } =
+                    let PresentationState::Turning { clock, offer, .. } =
                         &mut app.page_turn_presentation.state
                     else {
                         panic!("effect remains active");
                     };
-                    offer.accepted_at = Instant::now() - offer.duration.mul_f32(progress);
+                    *clock = MotionClock::Running {
+                        start_at: Instant::now() - offer.duration.mul_f32(progress),
+                    };
                     viewport_frame(&ctx, size, ppp, |ui, ctx| {
                         app.begin_page_turn_viewer_frame(ctx, false, None);
                         assert!(draw(&mut app, ui, ctx));
                     });
                     assert_eq!(tracker.status(), SubmissionStatus::Started);
                 }
-                let PresentationState::Turning { offer, .. } =
+                let PresentationState::Turning { clock, offer, .. } =
                     &mut app.page_turn_presentation.state
                 else {
                     panic!("effect survives the next ordinary frame");
                 };
-                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                *clock = MotionClock::Running {
+                    start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                };
                 for _ in 0..2 {
                     viewport_frame(&ctx, size, ppp, |ui, ctx| {
                         app.begin_page_turn_viewer_frame(ctx, false, None);

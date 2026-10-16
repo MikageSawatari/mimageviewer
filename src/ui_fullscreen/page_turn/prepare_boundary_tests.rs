@@ -197,10 +197,13 @@ fn publish_quality(
 // Actual draw_current reads the real clock. Keep the fixture far from expiry so these
 // prepare tests cannot turn a scheduler stall into an unrelated duration assertion.
 fn retain_turn_clock(app: &mut App) {
-    let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state else {
+    let PresentationState::Turning { clock, offer, .. } = &mut app.page_turn_presentation.state
+    else {
         panic!("turning");
     };
-    offer.accepted_at = Instant::now();
+    *clock = MotionClock::Running {
+        start_at: Instant::now(),
+    };
     offer.duration = Duration::from_secs(60);
 }
 

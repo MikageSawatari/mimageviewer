@@ -20,7 +20,7 @@ fn metadata_texture(ctx: &egui::Context, idx: usize, size: [usize; 2]) -> egui::
     egui::TextureHandle::new(manager, id)
 }
 
-fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64, expired: bool) {
+fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64, delayed: bool) {
     let ctx = egui::Context::default();
     install(&ctx);
     let budget = VramPoolBudget::from_pool_bytes(Some(12_655_263_744), VramBudgetMode::Fullscreen);
@@ -111,10 +111,9 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
         let accepted_at = offer.accepted_at;
         let duration = offer.duration;
         app.fullscreen_idx = Some(2);
-        // This clock seam is at the unchanged accepted_at expiry test. A long
-        // test machine stall cannot confuse pin acceptance with expiry/finish.
+        // Preparation latency does not spend the motion duration.
         let now = accepted_at
-            + if expired {
+            + if delayed {
                 duration
             } else {
                 Duration::from_millis(1)
@@ -122,13 +121,8 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
         let receipt = app
             .submit_paged_display_unit_with_clock(ctx, &templates[1], None, || now)
             .unwrap();
-        assert_eq!(receipt.curl, !expired);
-        if expired {
-            assert!(matches!(
-                app.page_turn_presentation.state,
-                PresentationState::Flat(_)
-            ));
-        } else {
+        assert!(receipt.curl);
+        {
             let PresentationState::Turning {
                 offer, incoming, ..
             } = &app.page_turn_presentation.state
@@ -168,7 +162,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
             .iter()
             .filter(|(_, kind, _)| *kind == "start")
             .count(),
-        usize::from(!expired)
+        1
     );
     assert_eq!(
         events
@@ -180,9 +174,9 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
     assert_eq!(
         events
             .iter()
-            .filter(|(_, _, reason)| *reason == "offer_mismatch_or_expired")
+            .filter(|(_, _, reason)| *reason == "offer_binding_or_source_mismatch")
             .count(),
-        usize::from(expired)
+        0
     );
     drop(templates);
     app.fs_cache.clear();
@@ -199,10 +193,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
     // source-free selection/preparation/drawing after eviction.
     let mut accountant = VramAccountant::default();
     app.page_turn_leases.account(&mut accountant);
-    assert_eq!(
-        accountant.finish().total_bytes(),
-        if expired { 2 } else { 4 } * output_bytes
-    );
+    assert_eq!(accountant.finish().total_bytes(), 4 * output_bytes);
 }
 
 #[test]
@@ -305,8 +296,10 @@ fn demand_matched_native_materials_survive_eviction_through_real_next_frame_draw
             "source {id:?} still pinned"
         );
     }
-    if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state {
-        offer.accepted_at = Instant::now();
+    if let PresentationState::Turning { clock, offer, .. } = &mut app.page_turn_presentation.state {
+        *clock = MotionClock::Running {
+            start_at: Instant::now(),
+        };
         offer.duration = Duration::from_millis(600);
     }
     app.fs_lanczos_cache.take_test_resolve_input_ids();
@@ -347,7 +340,7 @@ fn measured_03_04_native_materials_pass_real_offer_and_prepared_pin_recheck() {
 }
 
 #[test]
-fn measured_native_pin_acceptance_does_not_change_legacy_offer_expiry() {
+fn measured_native_pin_acceptance_survives_preparation_duration() {
     measured_offer([6144, 8192], [1620, 2160], 1_101_735_408, true);
 }
 

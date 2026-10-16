@@ -340,8 +340,10 @@ fn source_quality_publication_stays_frozen_until_canonical_flat_is_adopted() {
     });
     assert_eq!(tracker.status(), SubmissionStatus::Started);
 
-    if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state {
-        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+    if let PresentationState::Turning { clock, offer, .. } = &mut app.page_turn_presentation.state {
+        *clock = MotionClock::Running {
+            start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+        };
     } else {
         panic!("a raster upgrade must preserve the turn until its deadline")
     }
@@ -689,9 +691,12 @@ fn resampleable_quality_upgrade_retains_single_and_spread_sources_and_accepts_he
                 }
             });
             assert_eq!(tracker.status(), SubmissionStatus::Started);
-            if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state
+            if let PresentationState::Turning { clock, offer, .. } =
+                &mut app.page_turn_presentation.state
             {
-                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                *clock = MotionClock::Running {
+                    start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                };
             } else {
                 panic!("publication must keep the single/spread turn active")
             }
