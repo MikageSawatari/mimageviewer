@@ -380,6 +380,21 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 
 再現手段が無い、利用者の確認を待っている、実機計測を待っている、原因が未確定のもの。
 
+### 1.388 別ウィンドウの promote で `plan_promote` のアサーションが落ちる — panic.log の記録、操作不明 (2026-10-16 起票)
+
+- 出どころ: v4.7.1 のリリース前の `check-panic-log.ps1` で見つかった未分類の 1 件。
+  `%APPDATA%\mimageviewer\logs\panic.log` に、2026-10-15 17:33 (日本時間) の
+  `PANIC at src\app\viewer_context_registry.rs:590:9: assertion left == right failed` (`left: ViewerContextId(0)`、
+  `right: ViewerContextId(1)`) が 1 回だけ記録されている。スタックはシンボル無し。
+- コード参照: 該当行は `plan_promote` の `assert_eq!(stashed, self.main)`。表示中 (Mounted) の context が 0、
+  main として記録されている context が 1 で食い違ったまま promote が始まった。この行は v4.7.0 と v4.7.1 で同じ。
+- 何の操作で起きたかは不明。その時点の通常ログ (`mimageviewer.log`) は残っておらず、どのビルド (開発版か v4.7.0 か) かも分からない。
+  同じ日に §1.384 (倍率の違うモニターで、別ウィンドウの動画の promote / F11 / F12 を試していた) の実機観測があり、
+  関係する可能性はあるが未確認。
+- 分類 (detached リワーク §2): projection と main の所有が別々に記録されている前提の破れで、BA-7 の候補。未確定。
+- 次に必要なもの: 再発したときの `mimageviewer.log` (promote の前後) と操作手順。症状パッチ (アサーションを外す、
+  食い違いを黙って直す) は入れない。
+
 ### 1.348 H.265 動画だけ一覧サムネイルが出ない — mIV スレ >>522、>>524、環境情報待ち (2026-10-07)
 
 - 動画再生は mIV の FFmpeg 経路、一覧サムネイルは Windows Shell の `IShellItemImageFactory` を使う別経路。再生できても Windows 側が抽出できなければサムネイルは出ない。H.265 自体を再生対象外にしているわけではない。
