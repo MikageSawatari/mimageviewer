@@ -16,7 +16,7 @@ Rust 1.99.0 / egui 0.33.3 / wgpu 27.0.1を維持し、manifest / lock / vendor�
 `App::update` と `update_frame` は旧順序・条件・早期returnを保持する呼出driverである。
 serviceを先頭へ集めず、UIが作ったmodalやnavigationとの前後関係を維持する。
 `MainFrameNavigation` は既存のframe-local変数を渡す引数束だけで、Appのフィールド・pending・queueを増やさない。
-独立reviewで、移動body内に呼出元へ抜けるreturn / break / continueがないことも確認する。
+実装担当の内部確認で、移動body内に呼出元へ抜けるreturn / break / continueがないことも確認した。
 
 `service_*` はUI入力を読まない進行の断片、`input_*` はpass入力・診断、
 `render_*` は描画とUIに依存する準備/worker採用継続、`post_render_*` は描画後の処理である。
@@ -175,11 +175,13 @@ service後置/worker処理削除が検査で拒否されることを確認する
 `src/app/tests.rs` のroot Close producer監査もapp+phaseへ検索を広げ、1件/ROOT限定の期待値を維持する。
 製品の動作・期待値・待機時間・ignoreは変更しない。
 
-独立review（別contextのGPT-6.1 Sol / xhigh）は製品抽出と上記監査追従の双方をACCEPT。
+実装担当の内部確認（別contextのGPT-6.1 Sol / xhigh）では、製品抽出と上記監査追従に問題なしと判断した。
+これは正式な独立レビューではない。正式な独立レビューは`01ad17ca9`に対しACCEPT WITH CHANGES
+（P2二件・P3一件）で、指摘への修正は下の追補に記録する。
 `review-reconstruction.json` に44連続ブロックの本文保存、外側return/break/continue不在、
 App呼出しを元bodyへ展開したHEADとの一致、fullscreen drainの同等再構成を記録した。
 追加のsidecar wrapperを含めApp helperは45関数、passive drain helperは1関数。
-レビュー担当はテストを重複実行していない。
+内部確認担当はテストを重複実行していない。
 
 最終検証は以下のとおり。環境は通常feature / Rust 1.99.0、
 `MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`、snapshot更新変数なし。
@@ -216,8 +218,8 @@ lib全件は新規実行（MISS）。runは
 `lib-full.log` / `full-results.json` / `full-summary.json` に結果を保存した。
 過去段の間欠失敗候補を成功扱いで省略せず、今回の全件で実行して成功した。
 
-製品3ソースは独立review時のSHA-256と一致。監査追従3テストファイルも独立reviewはACCEPT
-（`review-tests.json`）。全件後に `source-hashes.json` のRust6ファイルとmanifest/lockの一致を確認した。
+製品3ソースは実装担当の内部確認時のSHA-256と一致。監査追従3テストファイルも内部確認では問題なしと判断した
+（`review-tests.json`。正式な独立レビューの判定とは別）。全件後に `source-hashes.json` のRust6ファイルとmanifest/lockの一致を確認した。
 以後の追記は本台帳の検証結果のみで、実行ソース・依存・fixture・条件は変えていない。
 今回の残課題は下記とC1〜C5 / D3 / L1であり、全logic-readyの受入れを意味しない。
 
@@ -284,7 +286,7 @@ lib全件・snapshot・製品build・起動・live試験は依頼に従って再
 
 開始: `egui-036` / `9453bd3c9`。Rust 1.99.0 / egui 0.33.3のまま、旧呼出順の抽出だけを行う。
 更新計画§4.2のゲームパッド項目1〜11、detached構造合意の範囲に従う。
-境界案を独立レビューしてから実装した。利用者決定の最小化案Bは段3以降の接続条件であり、
+境界案は実装担当の内部確認を経て実装した。利用者決定の最小化案Bは段3以降の接続条件であり、
 今回の最小化/repaint/foreground挙動を変更しない。更新設計書・manifest/lock/vendorは編集しない。
 対象外DSPは段1b-1冒頭と同じSHA-256を保護する。製品build/起動・live試験・PNG更新・コミットは行わない。
 
@@ -359,9 +361,13 @@ sidecar restore終端と未配送ownerの接続は今回未実装であり、log
 ring/context/Undoの既存回帰を含む。fullの件数は段1b-1の13,277件から追加8件分増え、skip数は59のまま。
 既存の5件のslow表示は打ち切りでなく、すべて完了した。
 
-独立の境界設計レビュー・実装レビューともACCEPT（`gpt-6.1-sol` / `xhigh`）。
-軽微な旧入口コメントの指摘は現行のsidecar入口・物理owner/overlay分離の説明へ修正した。
-reviewerはテストを重複実行せず、上記実装担当の結果を再利用する。
+実装担当の内部確認（別contextの`gpt-6.1-sol` / `xhigh`）では、境界案・実装に問題なしと判断した。
+これは正式な独立レビューではない。内部確認の軽微な旧入口コメントの指摘は、現行のsidecar入口・
+物理owner/overlay分離の説明へ修正した。内部確認担当はテストを重複実行せず、上記の結果を再利用した。
+
+正式な独立レビューは`4ed025839`に対し**ACCEPT WITH CHANGES（P3二件）**。
+台帳の内部確認/正式レビューの区別と、UI batch化の余分なdrainを検出する回帰の補強を指摘された。
+今回の修正・検証は下の追補に記録し、先行の内部確認と分けて扱う。
 command/exit/時間は`checks-focused-results.json` / `snapshots-results.json` / `full-results.json`、
 件数は`focused-summary.json` / `snapshot-summary.json` / `full-summary.json`、実行sourceは`source-hashes.json`。
 fullの元runは`target/test-lib-full/runs/20261016T112422610Z-90304c4d/`、
@@ -372,3 +378,44 @@ fullの元runは`target/test-lib-full/runs/20261016T112422610Z-90304c4d/`、
 Rust実行source/テストsource、manifest/lock/toolchain、対象外DSPは保存したSHA-256と全件後も一致した。
 以後はこの台帳の結果追記だけで、実行コード・依存・fixtureを変更しない。
 今回の段1b-2変更は未コミット。段1b-3・段3・最小化案Bの接続は未着手で、上記留保以外に設計との食い違いはない。
+
+## 段1b-2 正式独立レビュー後の修正（対象4ed025839）
+
+正式判定はACCEPT WITH CHANGES（P3二件）。製品コードの挙動不変との判定を受け、
+以下の文書・テストだけを修正する。作業開始HEADは`a50dcc37f`（`4ed025839`の後は更新計画だけのcommit）。
+
+- 先行の別contextでの確認は「実装担当の内部確認」と訂正し、正式な独立レビューと区別した。
+  段1b-1の同種表記も訂正し、`01ad17ca9`に対する正式判定を別記した。
+- `gamepad_ui_take_preserves_split_drain_edges_without_another_poll`を補強した。
+  press→releaseの2回drainからtakeした直後に、別ボタンEastのpressをruntime queueへ追加する。
+  UI batch化後もEastの保持が変わらず未配送handoffも空であること、後続の明示drainで初めて
+  Eastの保持とedgeが更新され、次のUI batchへ1件だけ届くことを検査する。
+
+証跡は`target/egui037-stage1b-2/review-changes/`。
+通常feature / Rust 1.99.0、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`で検証する。
+余分なdrainを`gamepad_batch_from_physical_input`先頭へ一時挿入する変異を検査し、復元後に
+core check / fmt check / gamepad焦点nextestを実行する。結果は完了後に追記する。
+全件lib・snapshot・製品build/起動・live試験は今回の依頼に従い再実行しない。
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功、23.836秒 / 14.783秒 | 0 / 0 |
+| core check | 成功、14.260秒 | 0 |
+| 余分なdrainありの単独nextest | 0 passed / 1 failed。補強した保持stateのassertで期待どおり失敗、compile込み150.141秒 | 100（期待値） |
+| 復元後のgamepad焦点nextest | 94 passed / 0 failed、実行6.219秒、compile込み83.941秒 | 0 |
+| `git diff --check` | 成功。結果追記後にも再確認 | 0 |
+
+変異はUI batch化の先頭に`self.drain_gamepad_physical_input(ctx, now)`を一時追加した。
+対象テストが`UI batch construction must leave queued input untouched`で失敗したことを確認した。
+コンパイルエラーや0件一致による失敗ではない。変異後は保存したfmt済みソースをバイト単位で復元し、
+復元後のソースから再compileして焦点テストを実行した。
+焦点filterは`test(gamepad) | test(pad_operation) | test(app::gamepad_input::)`。
+command/exit/時間は`results.json`、JUnitと件数は`*-nextest-junit.xml` / `summary.json`、
+変異の失敗理由と復元SHA-256は`mutation-restored.json`に保存した。
+
+`4ed025839`の元ソースとの比較で、Rust差分が上記の`#[cfg(test)]`内の1関数だけであることを確認した。
+物理owner・App・既存テスト・runtime・manifest/lock/toolchain・対象外DSPのSHA-256も開始時と一致した。
+検証中に設計担当の文書commit `b86cce154` / `6ee226289`が入りHEADが進んだ。
+`a50dcc37f..6ee226289`の差分は更新計画とdetached設計の文書だけで、実行/テストsourceは変わっていない。
+両設計文書は現在のHEADと一致し、実装担当の編集はない。製品実行コード・一時変異は最終diffに含まれない。
+今回の修正は未コミットで返す。この追補は修正と検証の記録であり、正式独立レビューの再判定ではない。

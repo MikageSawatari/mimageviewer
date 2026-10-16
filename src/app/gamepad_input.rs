@@ -11425,7 +11425,15 @@ mod physical_boundary_tests {
             .push_for_test(PadEvent::ButtonReleased(PadButton::South));
         app.drain_gamepad_physical_input(&ctx, now);
         let physical = app.gamepad.take_pending();
+        // Input arriving after take belongs to the next explicit physical drain.
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::East));
+        assert!(!app.gamepad.state.button_down(PadButton::East));
         let batch = app.gamepad_batch_from_physical_input(&ctx, physical, true, now, 42, true);
+        assert!(
+            !app.gamepad.state.button_down(PadButton::East),
+            "UI batch construction must leave queued input untouched"
+        );
         assert_eq!(batch.actions.len(), 2);
         assert_eq!(batch.actions[0].kind, PadActionKind::Press);
         assert_eq!(batch.actions[1].kind, PadActionKind::Release);
@@ -11444,6 +11452,20 @@ mod physical_boundary_tests {
             }
         );
         assert!(!app.gamepad.state.button_down(PadButton::South));
+        assert!(app.gamepad.take_pending().events.is_empty());
+
+        app.drain_gamepad_physical_input(&ctx, now);
+        assert!(app.gamepad.state.button_down(PadButton::East));
+        let physical = app.gamepad.take_pending();
+        assert_eq!(
+            physical.events,
+            [PadPhysicalEvent::ButtonPressed(PadButton::East)]
+        );
+        let next = app.gamepad_batch_from_physical_input(&ctx, physical, true, now, 43, true);
+        assert_eq!(next.actions.len(), 1);
+        assert_eq!(next.actions[0].button, PadButton::East);
+        assert_eq!(next.actions[0].kind, PadActionKind::Press);
+        assert!(next.saw_input_event);
         assert!(app.gamepad.take_pending().events.is_empty());
     }
 
