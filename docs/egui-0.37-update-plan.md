@@ -1,6 +1,19 @@
-> 状態: 設計 第4.2版 (2026-10-16)。Sol (gpt-6.1-sol / xhigh) の独立レビュー 3 回と、利用者の希望による追加の独立レビュー Astra (gpt-6-astra / xhigh) 4 回を経て、Astra が ACCEPT (残る P1/P2 なし)。実装前。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
+> 状態: 設計案 第4.3版 (2026-10-16、利用者決定の案B = Windows の最小化中も UI pass を続ける、と段1b-1 の C1〜C5・D3 を反映、独立レビュー前)。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
 
 # 改訂履歴
+
+## 第4.3版 — 2026-10-16
+
+対象は第4.2版、HEAD `9453bd3c9`。利用者が2026-10-16に採択した案Bと、段1b検証台帳のC1〜C5・D3を反映する。先に提示した案A前提の第4.3版追補は未採用であり、本版へ取り込まない。本追補の実装・独立レビュー・ビルド・テスト・製品起動は未実施。
+
+- **案B — 反映:** Windowsの最小化中も、要求済みFullをUI passとして消化する。UI実行とsurface描画の条件を分け、`is_visible`を偽装しない。要求なしのsleep、既存のrepaint間隔・outer phaseを維持する。
+- **期限超過 — 維持:** RedrawRequestedの期限超過によるlogic-onlyは残す。これをFullや強制描画へ置き換えない。
+- **出力契約 — 反映:** UIを実行して描画しない場合もtexture delta・platform output・viewport commandsを完結させる。Cut／Copy／Pasteを描画分岐から分離し、screenshot等の明示描画要求と実表示ACKの条件を保持する。wgpu／glowを揃える。
+- **C1 — 反映:** Remoteの取得・受信・取消・保存完了・ACK・drainはlogicで進める。PC表示継続だけを既存Remote ownerへ残す。
+- **C2〜C5 — 反映:** C2・C4・C5とC3の表示用pollは、既存owner・旧順序のままuiに残す。通常の最小化中は進め、期限超過のlogic-only中は次の対象Fullまで保留する。保存・取消・寿命終端はlogicへ分ける。
+- **D3 — 反映:** hydration要求IDをframe／input計装から独立させ、既存hydration ownerで一度だけ採番する。
+
+第4.2版の保留RawInput、IME、非表示子Close、texture delta・surfaceの所有契約は維持する。scheduler方針の変更と残る期限超過経路をdetached計画§11の構造合意へ追記する前提とし、段1b・段2c・段3の範囲、回帰、見積りを更新する。
 
 ## 第4.2版 — 2026-10-16
 
@@ -142,6 +155,25 @@ mIVの行番号は今回照合した製品ソースに対するもの。件数�
 
 まれな失敗は割り切り、ログ＋通知［＋作り直し］を基本とする。更新専用の回復機構は作らない。
 
+### 第4.3版: 案Bによる非表示処理の具体化
+
+本節の「本家のpass省略を使う」は、Windowsの最小化によるUI省略には適用しない。利用者採択の案Bにより、要求済みFullは最小化中もUI passとして消化し、surfaceへ描画する条件は別に維持する。RedrawRequested期限超過のlogic-onlyは本家どおり残す。
+
+「worker結果をlogicへ分ける」は、表示継続へ到達するすべてのpollをlogicへ移すという意味にはしない。C1〜C5・D3は§4.2の個別境界に従う。
+
+| 対象 | 採る案と理由 | 採らない案と理由 |
+|---|---|---|
+| Windows最小化 | 要求済みFullを従来と同じUI進行へ揃える。ローカル表示準備を復元待ちにしない | 最小化中のUI省略に合わせて、各表示継続を細分化する案A。通常操作の進行条件を変え、受渡し状態を増やす |
+| UIとsurface描画 | UI実行資格と描画資格を分ける。不可視metadataと実表示ACKを保持する | `is_visible`をtrueへ偽装する。不要な描画や誤った表示確定を招く |
+| 期限超過 | logic-onlyを維持し、Remote・保存・取消終端だけを非描画で進める | 期限超過を無条件Fullへ変える。presentがblockし得る経路まで描画することになる |
+| C2・C4・C5とC3の表示用poll | 既存receiver・要求ownerのままuiへ残す。受信から表示継続まで同じ入口で進める | logicで全結果を取り出す共通表示待ちqueue、別のdecision cache、入力snapshot |
+| C1と共有終端 | Remoteサービス進行、送信済み保存、破棄済み要求の終端をlogicへ分ける | 最小化中にUIが動くことを理由に、期限超過中のRemote・保存・終了までuiへ依存させる |
+| D3 | hydration要求ownerに単一の採番を持たせる | frame_counterやinput_seqを要求IDの発行源にする |
+
+C4の進捗だけをlogicへ移す分割は必須としない。完成採用からeditor再開までの既存経路を保つ方を先に採る。
+
+新しいpending bool、時間窓、常時tick、追加repaint、logicからの強制UI呼出しは設けない。最小化中のUI継続はbackendの実行方針であり、Appがlogicからuiを呼ぶ回避策ではない。
+
 ## 2. 前提・更新履歴要約との相違
 
 | 前提・要約 | ソース確認 | 反映 |
@@ -257,20 +289,25 @@ schedulerのHWND可視判定と、UI省略の`ViewportInfo::visible()`を区別�
 
 #### SW_HIDE／最小化／子窓／期限超過の条件表
 
-以下はソースからの見立てであり、製品起動による確認結果ではない。
+以下はソースからの見立てと、第4.3版で採択したvendor方針であり、製品起動による確認結果ではない。案Bの変更はWindowsの最小化に適用し、他OSのocclusion等の契約を一括変更しない。
 
-| 条件 | scheduler／pass | logic・UI | 未消費入力 |
+| 条件 | scheduler／pass | logic・UI | 未消費入力・描画 |
 |---|---|---|---|
-| 非最小化rootを直接SW_HIDE | 隠れた窓の要求済みrepaintをFullで直接実行 | 通常はroot logic＋UI | SW_HIDEだけを理由に保留が累積するとはいえない |
-| root最小化、visible扱いの子なし、強制paintなし | Full要求でもshow_ui=false | root logic-only | root ownerに保持 |
-| root最小化、visible扱いの子あり | Fullなら親UIも実行 | root logic＋UI | 各viewportが自身の入力を消費 |
-| screenshot／RequestPaintWhileHiddenあり | Fullでwants_paintが成立 | UI実行可能 | 既存capture ownerを維持 |
-| rootのRedrawRequested期限超過 | 可視性・子の可視性と別にLogicOnly | root logicのみ | root ownerに保持 |
-| childのUIが最小化・期限超過等でskip | child callbackなし。App::logicも呼ばれない | 子UIなし | 通常入力は子のStateからtakeせず保持。Closeは下記lifecycle経路で処理 |
-| 最小化childへCloseRequested | 本家ではCloseを積み、子と親へrepaintを要求するだけ | 子UIの省略は解除されない | 第4.2版ではUI復帰待ちにせず、既存終了ownerへ配送・消費 |
+| 非最小化rootを直接SW_HIDE | 隠れた窓の要求済みrepaintをFullで直接実行 | 通常はroot logic＋UI | SW_HIDEだけを理由に保留が累積するとはいえない。描画資格は別判定 |
+| Windowsのroot最小化、visible扱いの子なし、明示描画要求なし | 要求済みFullを直接実行。最小化を理由にUIを省略しない | root logic＋UI | rootの入力をrootで消費。最小化したsurfaceの通常描画は省く |
+| Windowsのroot最小化、visible扱いの子あり | Fullで親UIも実行 | root logic＋UI | 各viewportが自身の入力を消費。親のsurface描画とvisibleな子の描画を区別 |
+| Windowsの最小化deferred childへFull | 子callbackを実行 | 子UIあり。子のためにApp::logicを重複実行しない | 子自身の入力を消費。子surfaceの通常描画は省く |
+| screenshot／RequestPaintWhileHiddenあり | Fullでwants_paintが成立 | UI実行可能 | 明示描画要求と既存capture ownerを維持。不可視を理由に要求を捨てない |
+| rootのRedrawRequested期限超過 | 可視性・子の可視性と別にLogicOnly | root logicのみ | root ownerに保持。C1・保存・取消終端は進み、表示用pollは次の対象Fullまで保留 |
+| childの期限超過等でUIをskip | child callbackなし。App::logicも呼ばれない | 子UIなし | 通常入力は子のStateからtakeせず保持。Windows最小化単独をskip条件にしない |
+| 最小化childへCloseRequested | 案Bでは後続Fullで子UIも実行可能。ただしCloseの進行をその到着に依存させない | 既存終了ownerへの非描画受付を維持 | UI復帰待ちにせず配送・消費し、承認後は対象限定で退役 |
 | repaint・wake等の要求なし | Wait等でsleep | 呼出なし | 常時UI／logicとは扱わない |
 
-根拠: `eframe-0.37.0/src/native/run.rs:216`、`:243`、`:266`、`src/native/wgpu_integration.rs:682`、`:702`、`:717`、`:1031`、`:1189`、`egui-winit-0.37.0/src/lib.rs:1507`。
+本家の境界は`eframe-0.37.0/src/native/run.rs:216`、`:243`、`:266`、`src/native/wgpu_integration.rs:682`、`:702`、`:717`、`:821`、`:1031`、`:1189`、`egui-winit-0.37.0/src/lib.rs:1507`。案BではFull時のUI実行条件だけにWindows最小化の継続方針を加え、明示的なLogicOnlyをFullへ変更しない。
+
+旧vendorはhiddenと最小化を同じ判定に含め、要求済みrepaintを100 ms以上先へ調整し、OSのRedrawRequestedを待たずouter phaseでUIへ渡す。根拠: `vendor/eframe/src/native/winit_integration.rs:17`、`native/run.rs:139`、`:549`、`:575`、`native/wgpu_integration.rs:804`、`native/epi_integration.rs:279`。
+
+この要求済みrepaintの下限・集約・sleep契約を移植する。常時10 Hzではなく、要求がある場合だけ実行する。bootstrap／resize等の既存入口まで一律100 msへ変えず、トレイmediaの50 ms WM_PAINT bridgeを通常最小化へ拡張しない。
 
 winit Windowsのis_visibleはIsWindowVisible、is_minimizedはIsIconicを読む。WindowsではOccludedは未対応で、WM_SIZEも生成しない。
 
@@ -279,6 +316,23 @@ winit Windowsのis_visibleはIsWindowVisible、is_minimizedはIsIconicを読む�
 mIVのトレイ退避は`src/tray_integration.rs:276`、`:323`の直接SW_HIDEである。
 
 Closeの配送・拒否・承認・退役は、以下の「非表示子のCloseとlifecycle要求」に従う。通常入力を保持する契約だけでは、終了要求の進行を保証できない。
+
+##### UI実行とsurface描画の分離
+
+1. `PassMode::Full`、viewportのmetadata、visible descendant、明示描画要求から、UI実行とsurface描画を別々に決める。新しいApp側の保持フラグは作らない。
+2. Windowsの最小化中もFullではUIを実行するが、`ViewportInfo::visible()`やbackendの`is_visible`をtrueへ偽装しない。実際のminimized／occluded情報をAppと入力へ渡す。
+3. 不可視surfaceの通常tessellation・render・presentは省く。UI内のtexture生成やApp側GPU処理まで「GPU負荷ゼロ」とは扱わない。
+4. FullOutputを生成した場合は、描画の有無にかかわらずtexture deltaを§4.9の共通ownerへ渡し、upload／submission／freeまたは既存ownerへの引継ぎを完結させる。無条件clearや、可視化までの無期限保留で代用しない。
+5. platform outputとviewport commandsを描画分岐の外で対象ownerへ配送する。IME出力、終了、可視性変更等をsurface描画待ちにしない。
+6. Cut／Copy／Pasteのaction処理は描画要否から分離する。現在の本家wgpuでは`:843`以降、glowでは`:889`以降の描画分岐内にある。対象Stateの次回入力へ一度だけ配送する既存規則を保ち、別viewportへ流さず、同じactionを後の描画で再実行しない。
+7. Screenshot／PaintWhileHiddenは描画を必要とするactionとして区別し、対応する描画処理まで保持する。全actionを一括drainして、描画しなかった要求まで完了扱いにしない。
+8. UI実行だけでは、present成功・初回visible commit・実表示ACKを発行しない。既存のUI境界ACKと実表示ACKも混同しない。
+9. immediate childが別surfaceへ描画する場合も、最小化した親surfaceの描画と区別する。登録・GC・寿命処理を親のpresent成功へ結び付けない。
+10. wg​​puとglowで同じ方針を使う。glowのUI判定は`eframe-0.37.0/src/native/glow_integration.rs:692`、描画分岐は`:860`。renderer固有の資源適用方法は各既存ownerへ残す。
+
+本家にも、最小化した親のUIをvisible descendantのために実行し、親surfaceは描画しない経路がある。根拠: `eframe-0.37.0/src/native/wgpu_integration.rs:702`、`:821`、`:1189`。案Bはこの責務分離を利用し、UI実行のためにsurface可視性を偽装しない。
+
+RedrawRequested期限超過は本家の250 ms判定を残す。根拠: `eframe-0.37.0/src/native/run.rs:29`、`:233`、`:266`。新しい時間窓は追加せず、最小化前の未到着deadline等によるLogicOnlyも排除されたとは扱わない。
 
 #### root LogicOnlyとvisible childが共存する経路
 
@@ -325,15 +379,15 @@ mIVは実際にdeferred childを使う。根拠: `src/ui_fullscreen.rs:22139`。
 
 | 処理 | 移行先 |
 |---|---|
-| worker結果、取消・保存終端、Remote完了、トレイ要求 | UI入力を読まないlogic service |
+| UI入力・表示継続へ到達しないworker結果、取消・保存終端、Remote完了、トレイ要求 | UI入力を読まないlogic service。C1〜C5は下記の個別境界に従い、一括移動しない |
 | 子のOS／programmatic Close要求 | 非描画のlifecycle受付から、対象windowの既存modal判断・終了ownerへ。一度処理した要求を子UIへ再配送しない |
 | gamepad物理drain・保持更新 | logicから進めるApp-global単一owner |
 | gamepad操作batch・multi-pass配送 | 既存batch ownerとmounted context |
 | key／wheel／pointer／focus／IMEのpass処理 | ui／対象viewport |
-| panel／dialog／viewport登録・paint | ui |
+| panel／dialog／viewport登録・paint | ui。UI実行とbackendのsurface描画資格は区別 |
 | 承認済みviewportの退役 | 既存寿命ownerの終了確定からbackend／Contextの対象限定cleanupへ。描画passを前提にしない |
 | 表示済み前提のACK等 | 実際の描画側 |
-| contextごとの結果採用 | 既存registry／mount owner |
+| contextごとの結果採用 | 既存registry／mount owner。表示継続へ到達する採用はuiに残す |
 | native動画frame | 既存presenter thread |
 
 旧updateを丸ごとlogic／uiへ改名しない。logicは古いevents・キーlevel・時刻を操作として読まず、UI pass counterをservice進行条件にしない。
@@ -341,6 +395,106 @@ mIVは実際にdeferred childを使う。根拠: `src/ui_fullscreen.rs:22139`。
 post-render終端を前へ移す際は、そのframeのmodal gateを早く外さない。
 
 Close専用の非描画受付は、通常入力の消費や子UIの代行ではない。既存の終了判断・取消・cleanupを呼ぶ入口を揃えるものであり、App側に別のclose待ち状態を追加しない。
+
+##### C1〜C5の共通境界
+
+段1b検証台帳の`service_*`という関数名はlogic接続の証明ではない。表示用pollは、既存要求ownerとreceiverを保持し、受信から表示継続までをuiの旧位置へ残す。
+
+案Bでは通常のWindows最小化中も対象Fullで進む。RedrawRequested期限超過のLogicOnly中だけは表示用pollを呼ばず、次の対象Fullまで結果を既存receiverへ保持する。worker自体の計算・I/Oは既存threadで進む。別の子のFullを、rootや兄弟contextの表示継続を消費する資格にしない。
+
+Fullではlogic→ui、LogicOnlyではlogicだけが呼ばれる。根拠: `eframe-0.37.0/src/native/epi_integration.rs:337`、`:384`。後者のContext入力はUI passの入力更新を伴わない。根拠: `egui-0.37.0/src/context.rs:1174`。
+
+##### C1: Remote
+
+代表: `src/app/update_phases.rs:27`、`src/remote_ipc/ui.rs:1068`。
+
+**logicに置くもの**
+
+- session snapshot、取得・返却sequenceの採用、旧ownerのstream取消、AI barrierの取得・解放。
+- AcquiringRemoteでの既存全context終了、editor取消、遅延openの失効。既存の終了ownerを呼び、UIを強制実行して閉じない。
+- 取得barrierへ必要な送信済みsave ticket、resume／shift完了・snapshot公開の確認、FinishAcquireと既存abort。
+- Remote要求の受信・admission・書込み投入、headless player／streamの進行。
+- read／write／bookmark／shift応答、取消、ACK、DrainingRemoteとApp終了時のdrain。
+
+代表: `src/remote_ipc/ui.rs:1160`以降、`:2012`、`:2073`、`:2103`、`:3671`、`src/app.rs:19057`、`src/app/book_composition_editor.rs:513`。
+
+「UI request」という既存型名を、PC描画が必要である根拠にしない。共有serviceの応答receiverは既存routerを単一consumerとしてlogicでdrainする。RemoteのACKに必要なreceiptをuiへ残さず、local一覧の表示採用とは区別する。
+
+**uiに残すものと受渡しowner**
+
+Local返却後のPC一覧再読込・既定起動先表示と、その先の本準備・fullscreen openはuiへ残す。通常最小化中はFullの旧`render_update_begin`相当位置で進め、期限超過中だけ次の対象Fullまで保持する。
+
+受渡しは既存`remote_session_ui`のPC表示継続slotへ集約する。現在の`pending_fullscreen_restore`を、取得・返却identityと再読込対象を持つLocal返却後の一覧表示継続へ置き換える。第二queueや「返却待ち」boolを追加しない。返却sequenceの採用と同じlogic境界で一度だけ登録し、uiで既存再読込入口へ渡す。再取得時は既存の失効経路で取り消し、古いLocal表示を後から実行しない。
+
+この表示継続をRemoteのACK・取得・drain完了条件にしない。返却と再取得がUIなしで完結した場合は、既存coalesced reacquireの契約を維持する。
+
+`docs/web-remote-plan.md` §2.1の単一writer、§2.2の取得時の全ローカル閲覧終了と、返却後の一覧再読込・閉じた閲覧窓の非復元を維持する。RemoteActive／DrainingRemote中にPC閲覧窓を開く仕様は追加しない。
+
+`src/remote_ipc/ui.rs:4534`の返却処理は旧復元要求を消している。`:4587`以降に復元pollは残るが、今回照合した本番コードには新規`Some(PendingFullscreenRestore { ... })`生成元がなく、直接生成は`:6538`のテストfixtureである。slot置換では旧復元専用の`wait_frames`を継承せず、終了drainのfixtureを新しい一覧表示継続の所有・破棄へ合わせる。
+
+##### C2: play-testと起動worker
+
+代表: `src/app/update_phases.rs:335`、`src/app.rs:31164`。
+
+`poll_play_test`はフォルダ準備・対象採用・open・起動済み状態の確定を含め、全体をuiへ残す。受渡しownerは既存`PlayTestState`とし、表示開始用の第二要求を作らない。通常最小化中もFullで進み、期限超過中は次のFullまでApp側の診断進行を保留する。経過時間の停止・補正や新タイマーは追加しない。
+
+VST／EffeTune／更新確認は、非描画完了・資源終端と実GUI操作を区別する。`render_startup_workers`全体を関数名だけでlogicへ移さない。通常の動画／音声制御やnative presenterのframe進行をplay-testのUI待ちへ巻き込まない。
+
+##### C3: ローカルopen・一覧採用・本準備・composition
+
+代表: `src/app/update_phases.rs`の`render_update_before_frame`、`render_initial_open`、`render_search_and_metadata_results`、`render_update_after_frame`、`src/app/startup_ops.rs:473`、`src/app.rs:24101`付近、`src/app/sidecar_restore.rs:1268`、`src/app/book_composition_runtime.rs:731`。
+
+startup／activation open、mounted document／collection navigation、bookmark open、tag／ratingからのrebuild、composition projection／permission、本準備・表示再開は、既存receiver・typed state・registry／mount ownerのままuiへ残す。liveなsidecar hydrationも、最小化対応のために全phaseを分割しない。結果受信から同passの表示継続までを旧入口で進める。
+
+F13の`service_initial_worker_results`も例外ではない。段1b台帳が追記したcache Cleared→materialization解除→context mount→rating採用→fullscreen再openは表示継続であり、関数名を理由に全体をlogicへ移さない。
+
+通常最小化中はFullで進む。期限超過中は結果を既存要求ownerへ残し、live要求のmodal・continuation・deferred fullscreenを保持する。gateだけ先に解除して別openを受け付けない。
+
+次はui保留から外し、logicで進める。
+
+1. 送信済みcomposition save ticket等の保存receipt、失敗終端、共有resume書込み。既存App-global ticket ownerで一度だけ収穫する。
+2. Remote取得・Closeで破棄された表示要求の取消・drain・予約解放。既存取消ownerとdiscarded sidecar等の終端へ合流し、表示continuationを復活させない。
+3. C1のACKへ必要な共有service応答。
+
+`poll_composition_editor_operations`は送信済みticket収穫と、editor準備・Reloading継続を分ける。保存receiptは既存Reloading等へ確定し、表示reloadとmodal解除は旧ui終端で行う。Remote取得では既存editor closeが表示ownerを終了し、送信済みticketは共通ownerへ残す。
+
+`poll_book_composition_service`のchanged scopeをlogicで先にdrainして失わない。receipt→publicationの既存順序を維持し、projection／permissionの表示採用はuiへ残す。共有cacheのACK・取消終端から表示再採用へ到達する部分も、同じ原則で切り分ける。
+
+##### C4: 原画完成とeditor再開
+
+代表: `src/ui_erase.rs:3554`、`src/app.rs:75749`、`src/ui_view_trim.rs:1118`。
+
+`poll_erase_inpaint`は既存進捗受信、最終結果受信、世代・path・mask検証、texture／cache採用、`resume_original_material_entry`からeditor再開までをuiへ残す。既存`erase_inpaint_pending`とreceiverをownerとし、完成pixelsの第二slotを作らない。進捗だけのlogic抽出は必須としない。
+
+通常最小化中はUI入力が更新されたFullで採用・再開する。期限超過中はworkerだけが進み、結果・進捗は既存channelへ残る。次の対象Fullで要求資格を検証し、そのpassのpointer状態を使う。logicから古い`pointer.primary_down`を読まない。
+
+明示取消、Remote取得、対象context終了は既存ownerのlogic終端から進める。これを完成結果の表示採用待ちにしない。既存の1-frame採用上限をlogic呼出し回数の予算へ置き換えない。
+
+##### C5: 表示準備とページめくり決定
+
+対象は段1b台帳C5のprefetch／final-effects、panorama source解決・最終合成、open継続から、`fs_page_turn_decision_for_frame`、`original_preview_frame_observation`、`fs_page_turn_physical_input_for_frame`へ到達する経路とする。
+
+表示用結果の受信・cache採用・後続合成投入・decision・preview観測はuiへ残す。受渡しownerは既存の要求receiverとcontext所有cacheであり、logic用decision cacheや共通完成queueは追加しない。
+
+通常最小化中はFullで進み、期限超過中は次の対象Fullまで保留する。復帰先は「窓の復元」ではなく「当該ownerを処理する次のFull」である。対象contextが閉じた場合は既存取消へ渡し、兄弟へ採用しない。
+
+Runtimeの取消・lease解放・Remote取得barrierへ必要な静止終端はlogicで進める。native presenter、既存動画／音声制御、Remote headless playerを表示用poll待ちへ変更しない。
+
+台帳G1のPDF昇格再試行、G2のmaterialize／upload予算、G3の要約計算予算は、この表示用経路と同じui側へ残す。単に`frame_counter`が止まることを理由に新しいservice counterを作らない。G4の外部ツールのUI分割準備・Cancel／launch ACK、G5のactivation入力資格も、表示・入力側の既存条件を維持する。保存・取消・寿命終端へこれらのgateを流用しない。
+
+##### D3: 外部再走査とhydration要求ID
+
+代表: `src/app/update_phases.rs:287`、`src/app.rs:25646`、`:26068`、`:26246`以降、`src/app/sidecar_restore.rs:1350`、`:1503`、`:1515`。
+
+watcher通知collect・既存走査投入・取消・周期保存はlogicへ分け、`poll_external_rescan`の結果受信からEqual／Different採用、一覧install・hydration、cutoff ACKまではuiへ残す。Equalだけをlogicへ先行させる分割は作らない。
+
+通常最小化中はFullで進み、期限超過中は既存`external_rescan_pending`のreceiverへ結果を保持する。採用前に適用済みmtime／signature・cutoff ACKを進めず、dirty・cause・既存restart_requestedを保持する。新しいdebounceやrepaintは加えない。`Some(scan)`からPDFの`pre_scan.is_none()`枝へ到達するという推論は採らない。
+
+`frame_counter + input_seq + 1`は要求IDとして廃止する。同じcounter値からの取消・再開始やIndexOnly置換に対して一意性を保証しない。案Bでも期限超過中の複数logicは残り、UI側へpollを残すこととIDを正しくすることは別である。
+
+採番は既存のApp-globalなhydration要求ownerへ集約する。通常とIndexOnlyが同じ単一sequenceを使い、一要求につき一度だけ払い出し、`Common.request_id`と対応する`begin_book_shift_restore`へ同じ値を渡す。context mountや要求取消で巻き戻さず、番号を再利用しない。
+
+現ownerには独立採番counterがないため、このownerに要求sequenceを持たせる。入力計装を進めて代用せず、無関係なbookmark等の採番ownerを借用しない。これは要求identityの発行源であり、進行状態を表すpending flagや第二ownerではない。番号枯渇をwrapによる再利用で処理せず、永続データ形式は変更しない。
 
 #### 非表示子のCloseとlifecycle要求
 
@@ -434,6 +588,10 @@ Appが登録を外しても、親の次のFull passだけを待ってbackendを�
 追加repaintやRequestPaintWhileHiddenで閉じる動作を成立させる試験にはしない。既存終了処理が通常の状態反映として行うrepaintは保持できるが、その到着やFull passを終了完了の必要条件にしない。
 
 この受付・消費・非描画退役はdetachedの構造修正として、着手前の双方合意と§11記録を必要とする。
+
+第4.3版の案Bでは、Windowsの最小化単独では要求済みFullの子callbackを省略しなくなる。上記の本家調査は変更前の事実として保持するが、通常最小化のUI省略をmIVの採用仕様にはしない。
+
+Close専用の非描画受付・消費・退役は維持する。期限超過や初回callback前、親Fullなしでも終了を進める必要があり、子UIが通常動くことだけをCloseの完了保証にはしない。案Bの通常UI継続と、Closeを成立させるための強制UI passは別である。既存Close回帰は後者へ依存せず通す。
 
 #### 保留RawInputの最小修正
 
@@ -1006,6 +1164,8 @@ IME修正の本家境界は`egui-0.37.0/src/memory/mod.rs:124`、`:503`、`:799`
 |---|---|
 | #7905 hidden repaint基本修正 | (a) 本家採用 |
 | dirty／painting、surface generation、outer phase | (b) `native/run.rs:45`、`:118`、`:425` |
+| Windows最小化中のUI継続 | **(b・新規)** 利用者採択の案B。要求済みFullでは最小化を理由にUIを省略せず、surface描画資格は別判定。要求なしのsleepと既存100 ms下限を維持 |
+| 非描画Fullの出力・action完結 | **(b・新規)** platform output／viewport commandsを配送し、deltaは共通完結ownerへ。Cut／Copy／Pasteを描画分岐から分離。明示描画要求・実表示ACKを保持 |
 | 非ゼロresize inline provenance | (b) 同`:1282`、`native/wgpu_integration.rs:978` |
 | 初回visible commit／Frame getter | (b) `src/epi.rs:736`、`native/epi_integration.rs:305` |
 | startup window observer | (b) `src/startup_window_observer.rs:8` |
@@ -1032,6 +1192,14 @@ App hookはbackend borrow／lockの外で呼ぶ。承認・拒否した要求を
 通常版immediate計測はstartup／test-script診断と別責務として保持し、常時I/Oへ拡大しない。
 
 本家pending deltaは`eframe-0.37.0/src/native/wgpu_integration.rs:795`、`:1290`。保持だけを完結と扱わない。
+
+案Bの本家変更点はwgpuのUI判定`:702`と描画分岐`:821`、glowのUI判定`:692`と描画分岐`:860`である。Cut／Copy／Pasteはwgpu `:843`以降、glow `:889`以降から、描画不要actionの共通処理へ分ける。`is_visible`やRawInputのminimized情報は偽装しない。
+
+screenshot／RequestPaintWhileHiddenは従来どおり描画資格へ反映する。描画しないFullでもplatform outputとviewport commandsを処理し、texture deltaは§4.9へ接続する。実presentなしのvisible commit・表示ACKを発行しない。
+
+RedrawRequested期限超過は`eframe-0.37.0/src/native/run.rs:29`、`:233`、`:266`の本家契約を維持する。Windows最小化のUI継続を理由に、LogicOnlyの保留RawInputやchild skip修正を撤去しない。
+
+案Bはscheduler方針の明示的な変更として、App責務分離とともにdetached計画§11へ追記する。既存の11項目の合意を破棄せず、変更箇所と残る期限超過経路について設計担当・独立レビュー担当が整合を確認する。
 
 #### egui-wgpu
 
@@ -1223,6 +1391,16 @@ Close追加分では、対象window／contextの既存modal判断と終了処理
 
 rect捕捉条件、geometry由来recreate、新detached pending bool、時間窓、兄弟資源の一括resetを追加しない。
 
+第4.3版では、利用者採択の案Bについて、§11のApp責務分離・scheduler項目へ次を追記する前提とする。§11本文は設計担当が更新する。
+
+- Windows最小化中も要求済みFullをUIとして消化し、UI実行とsurface描画を分ける。不可視metadataと実表示ACKを偽装しない。
+- 要求なしのsleep、既存repaint下限、outer phase、surface所有を保持する。追加repaintやAppからの強制UI呼出しを使わない。
+- RedrawRequested期限超過のLogicOnlyと、root LogicOnly→child Full→root Full、child skipの経路は残る。
+- C1・送信済み保存・取消・寿命終端はlogic、C2・C4・C5とC3の表示用pollは既存registry／mount ownerのuiへ残す。
+- Closeの非描画受付・消費・退役、viewport別RawInput、IME、deltaの既存構造合意は維持する。
+
+これは合意済み11項目の適用範囲を具体化し、scheduler方針の変更を記録するものである。利用者の案B採択と、設計担当・独立レビュー担当の構造整合確認を区別し、本追補だけで追加範囲の独立レビュー完了を主張しない。
+
 ### 4.12 Rust 1.99警告とMSRV
 
 既存ログはf32 fallback 445件／36ファイル、lib全体688警告。今回の実行結果ではない。
@@ -1285,6 +1463,9 @@ root・各crate・ラボmanifestを棚卸しし、旧新版eguiの型を分裂�
 受信済みキー取消、release確定抑止、gamepad軸への中立要求は、具体的な操作差を示して相談する。本版は必須化しない。
 
 clipboard保持や保留所有修正のために版選択を再確認しない。Ctrl+Q追加、OS直読み撤去、動画方式変更、パネル本文省略は自動採用しない。
+
+**2026-10-16、利用者は案Bを採択した。** Windows最小化中も要求済みFullでUI処理を続けるため、現行と同様にそのCPU負荷が残る（更新後の実負荷の同値は未測定）。
+案Aの「最小化中の表示継続をUI復帰まで保留」は採用せず、相談事項から外す。期限超過中の表示用pollは次の対象Fullまで保留する。
 
 ## 6. 段階設計
 
@@ -1367,7 +1548,94 @@ cargo test -p mimageviewer --lib gamepad
 
 core check、旧snapshot、focus喪失後のrouted edge、gamepad終端を含める。
 
-**規模:** 14～30ファイル、700～1500行。service、gamepad、描画出力を分けてコミットする。
+当初見積りは14～30ファイル、700～1500行。第4.3版では完了済み1b-1の純移動と、残るowner境界の整理を分けて再見積りする。service、gamepad、描画出力を分けてコミットする。
+
+#### 段1b-1: 旧順序の責務抽出 — 証拠を再利用
+
+実装・独立レビュー後の監査追従と検証は[段1b検証台帳](egui-0.37-stage1b-verification.md)を正とする。成功記録を全logic-readyの証明へ読み替えない。
+
+C1〜C5・D3、F13の表示継続、G1〜G5のframe依存、L1のcallback fact留保を、次段の接続条件として維持する。今回の追補を理由に完了済み検証を繰り返さない。
+
+#### 段1b-2: gamepad owner／batch — 並行実装の範囲を維持
+
+物理drain、押下／軸／disconnect更新、受付事実、未配送edge・意味終端、UI batchの既存ownerを整理する。案Bでも期限超過LogicOnlyは残るため、物理更新とUI配送の分離は縮小しない。
+
+0.33.3では旧呼出位置・受付条件・保持軸継続を維持する。最小化対応の製品接続を前倒しせず、C1〜C5やbackend変更を混ぜない。本追補は、進行中の実装へ別の所有モデルを追加する指示ではない。
+
+**受入:** 通常／test-scriptのcore check、gamepad焦点試験、focus／tray／keyboard回帰。同じframe番号の複数取込み、press→release引継ぎ、disconnect／ring／Undo、保持軸復帰を検査する。完了・検証結果は実装担当の台帳へ記録し、ここで先取りしない。
+
+**規模:** 4～8ファイル、250～500行。純移動を除く。実装実績で再評価する。
+
+#### 段1b-3a: C1 Remoteと共有完了の境界
+
+Remoteのサービス進行とPC表示継続を分ける。0.33.3 driverでは旧位置で両方を従来順に呼び、最小化時の表示延期を導入しない。
+
+- 取得・全context終了・AI／保存barrier、要求受信、headless動画、read／write／bookmark／shift応答、取消・drainを非描画serviceとして抽出する。
+- 共有応答receiverは既存routerの単一drainを維持する。
+- PC表示は既存Remote表示継続slotをLocal返却後の一覧継続へ置換し、ui側へ残す。旧fullscreen復元用のwait_frames、第二queue、新pending boolは持ち込まない。
+- 返却sequenceと表示継続の登録を一度だけ採用し、再取得で古いLocal表示を失効させる。
+- App終了drainは表示継続の消費を待たない。
+
+**受入:** 通常core check、Remote／session／reading write／composition editor焦点試験。表示継続を呼ばずserviceだけを複数回呼び、取得・保存ACK・取消・drainが進むことをfake session／workerで検査する。返却→再取得→遅いUIで旧Local表示が出ないこと、通常driverの旧順序も検査する。
+
+**規模:** 4～8ファイル、350～650行。純移動を除く。
+
+#### 段1b-3b: 保存・取消終端とD3
+
+C2・C4・C5とC3のlive表示用pollはuiに残す分類を固定し、通常最小化用の細分化を行わない。C4の進捗だけをlogicへ移す追加分割も必須としない。
+
+- compositionの送信済みsave ticket収穫と、editor表示準備・Reloading・publication／permissionを分ける。receipt→publicationの順序とmodal gateを維持する。
+- Remote取得・Closeで破棄された要求の取消・global終端は、既存ownerから非描画で進められるようにする。
+- F13のcache Clearedからmount・rating採用・再openへ進む表示継続を、関数名だけでlogicへ移さない。必要な共有ACK・取消終端と表示採用を区別する。
+- watcher／周期保存と、走査結果採用・hydration・cutoff ACKを分ける。
+- 通常／IndexOnly hydrationのIDを既存ownerの単一採番へ集約する。
+- G1〜G3の表示準備・upload予算と、G4のUI分割準備・Cancel／ACK、G5のactivation入力資格は既存UI側へ残す。新しいservice counterへ一括置換しない。
+
+**受入:**
+
+- startup／activation／collection／bookmark／sidecar_restore／compositionの既存回帰を維持する。
+- 保存receiptをpublicationより先に採用し、Remote取得時は未保存draft取消と送信済みsave終端を区別する。
+- 表示用結果を既存receiverへ保持後、同じownerで一度だけ継続する。
+- Close／Remote取得時は元ownerの取消・終端だけを進め、兄弟へ表示継続しない。
+- watcherのcutoff ACKは採用後だけ。通知、cause、restart要求を失わない。
+- frame_counter・input_seqを固定して通常／IndexOnly要求の開始・取消・再開始を行い、別要求は別ID、同じ要求のCommonとbook restoreは同じIDとなる。mountで採番が戻らない。
+- C4・C5の既存pointer／decision／frame予算回帰を弱体化しない。
+
+追加境界回帰は共通filter `egui037_continuation`で選択可能にする。実ownerの未受信保持・単一消費・終端・採番を検査し、source grepだけを証拠にしない。
+
+**規模:** 5～10ファイル、250～500行。純移動を除く。
+
+#### 段1b-3c: 入力投影・clipboard・native出力
+
+foreground、wheel消費位置、clipboard条件、native IME出力変換・intent配送、texture output完結入口を既存owner・旧順序で抽出する。新IME中断、新版delta、案Bのbackend条件変更は段2・段3へ残す。
+
+**受入:** 通常core check、関係する入力／native／output焦点試験、旧snapshot通常比較。Win32 queue・WH_GETMESSAGEの既存drain条件を維持する。
+
+**規模:** 6～12ファイル、300～650行。純移動を除く。
+
+#### 段1b残作業の再見積りと共通受入
+
+| 内訳 | ファイル数 | 概算変更行 |
+|---|---:|---:|
+| 1b-2 gamepad | 4～8 | 250～500 |
+| 1b-3a Remote | 4～8 | 350～650 |
+| 1b-3b 保存・取消終端／D3 | 5～10 | 250～500 |
+| 1b-3c 入力・出力 | 6～12 | 300～650 |
+| **残作業合計** | **重複を除き15～30程度** | **1150～2300** |
+
+完了済み1b-1の純移動、段2のvendor、段3の正式接続、PNG更新は含めない。小段ごとにビルド可能な状態でコミットする。
+
+```powershell
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo check -p mimageviewer --bin mimageviewer-core --features test-script
+cargo fmt --check
+.\scripts\test-focused.ps1
+cargo test -p mimageviewer --lib egui037_continuation
+```
+
+追加filterは実装後の選択件数を記録し、0件を成功としない。段1b全体の終わりでtest-lib-fullと旧snapshot通常比較を行う。同source・同条件の有効な成功台帳を再利用し、無filter main libを直接cargo testへ置き換えない。
+
+受信・採用・取消・ACK・mount ownerの対応を台帳へ記録する。「全serviceの入力依存0件」という名称ベースの完了条件にはしない。実ウィンドウ試験は自動gateへ混ぜない。
 
 ### 段2: 新版vendor再構築
 
@@ -1377,13 +1645,15 @@ core check、旧snapshot、focus喪失後のrouted edge、gamepad終端を含め
 |---|---|---|
 | 2a | egui既存API、IME中断要求のviewport所有・pass出力集約、承認済みviewportの非描画退役入口、クリックfixture、egui-winit IME配送・Disabled互換・trace・clipboard、共有IME fixture | 11～20ファイル、900～1850行 |
 | 2b | egui-wgpu mipmap、delta完結、surface、診断 | 10～16ファイル、1100～2100行 |
-| 2c | eframe scheduler、viewport入力所有、skip保持、子Close受付・消費・非描画退役、visible commit、delta、計測・診断 | 14～24ファイル、1700～3350行 |
+| 2c | eframe scheduler、案Bの最小化UI継続と非描画出力・action完結、viewport入力所有、skip保持、子Close受付・消費・非描画退役、visible commit、delta、計測・診断 | 16～28ファイル、1900～3850行 |
 
 原本置換は別計上する。
 
 第4.1版では段2aに約200～400行を追加した。主な増分はegui内の限定修正と、実入れ子run_ui・実discardのheadless回帰である。App側の新しい入力状態や配送queueは含めない。
 
 第4.2版では、通常GCと共有する非描画退役入口・回帰として段2aへ約100～200行、wgpu／glowのClose受付・消費・対象限定退役と回帰として段2cへ約250～500行を追加した。App側の終了owner接続は段3へ別計上する。
+
+第4.3版では案Bの判断条件・共通action処理・コメントに約40～120行、非対話回帰に約150～350行を見込み、段2cを丸めて約200～500行増とした。既存scheduler／delta修正は重複計上しない。案Bの方針変更と残る期限超過経路を§11へ追記する前提とする。
 
 #### 段2aの順序・受入条件
 
@@ -1434,6 +1704,23 @@ whole／partial／free、no-surface、submission、mipmap、headless readback、
 各段でstandalone非対話試験と旧root core checkを維持する。live compileは可能だが実行は段7。全差分を台帳化する。
 
 Close回帰はbackendの実際の受付・消費・退役helperとfake App／resource ownerを接続して行い、単に「close予定になった」だけで成功としない。追加repaintや強制UI passを必要とせず登録・資源が退役することを非対話で検査し、実HWNDの結果は段7で確認する。
+
+案Bについて、次を追加する。
+
+1. Windows最小化rootの要求済みFullでlogic・uiが実行され、最小化deferred childのFullで子callbackが実行される。
+2. UI実行時にもminimized／visible情報は真の値のままで、不可視surfaceの通常render／presentは呼ばれない。visible childの描画は維持する。
+3. 同じ最小化条件でも明示的LogicOnlyではui・子callbackを実行しない。deadlineは本家250 msとし、独自の延期・retryを足さない。
+4. generic repaintの100 ms下限、遅い要求を早めないこと、要求なしのsleep、outer phaseとbootstrap／resizeの既存例外を維持する。
+5. 非描画Fullのtexture deltaが共通ownerへ一度だけ渡り、submission／freeまたは既存ownerへの引継ぎまで成立する。無条件clear、二重適用、可視化待ちの放置がない。
+6. platform output・IME出力・viewport commandsが描画なしでも対象ownerへ届く。present／visible commit／実表示ACKは発行されない。
+7. Cut／Copy／Pasteのactionが描画なしでも対象Stateの次回入力へ一度だけ渡り、後続描画で重複しない。通常／nativeのclipboard条件は維持する。
+8. Screenshot／PaintWhileHiddenを描画不要actionのdrainで失わず、明示描画と既存capture完了契約を維持する。
+9. wg​​pu／glowに同じ判定と出力・action回帰を置く。実backendが使う判断・配送helperを検査し、未接続の純粋関数だけで成功としない。
+10. child skipのfixtureは期限超過等を明示し、Windows最小化単独をskipの期待値にしない。
+11. 案Bの通常Full回帰とは別に、CloseはUI／callbackを実行しない試験でも受付・消費・退役できる。
+12. §11へscheduler方針変更、UI／surface分離、残る期限超過経路が追記され、構造整合を確認している。
+
+準備graphの回帰名に`minimized_full`を含め、正式graphでも選択できるようにする。scheduler／App呼出し・出力適用はfake window／painterと実integration入口で検査する。surfaceを使う検査は既存offscreen契約を利用し、desktop操作を自動gateへ混ぜない。
 
 ### 段3: 依存と必須契約の原子的切替
 
@@ -1504,9 +1791,10 @@ graphの旧egui混入・型分裂・古いpathを確認する。compileだけで
 | viewport入力所有・IME producerの本体接続回帰 | 100～250 |
 | native IME出力・control配送・必須回帰。生成・集約済み出力の接続確認を含む | 250～550 |
 | 子CloseのApp終了owner接続・入口統一・接続回帰 | 200～400 |
-| **合計** | **3050～6250** |
+| 案BとC1〜C5・D3の正式接続・追加接続回帰 | 100～250 |
+| **合計** | **3150～6500** |
 
-**105～185ファイル程度。**
+**108～192ファイル程度。**
 
 第3.1版のgamepad引継ぎを再評価し、Astra指摘の接続・回帰を追加した。段2a／2cのvendor実装は上表へ重ねて計上しない。
 
@@ -1514,7 +1802,45 @@ graphの旧egui混入・型分裂・古いpathを確認する。compileだけで
 
 第4.2版では、子Closeの既存終了ownerへの接続、OS／bar／watcher入口の統一、modal拒否後の非再発火と兄弟不変の接続回帰として約200～400行を追加した。非描画退役のvendor実装・単体回帰は段2a／2cへ計上する。
 
+第4.3版では、案Bの正式接続、最小化Fullでの表示継続、期限超過中のRemote・保存・取消終端、次の対象Fullへの引継ぎの追加接続回帰として約100～250行を追加した。Remote owner整理・共有終端抽出・D3採番は段1b、案Bのvendor判断・action配送と最小回帰は段2cへ計上し、上表へ重複計上しない。
+
+C2・C4・C5とC3の表示用pollをuiへ残すため、全完成結果のlogic受信、共通表示待ちqueue、C4進捗のみの必須分割は見積りに含めない。一方、期限超過が残るのでC1と保存・取消終端を一括削除して減額することもしない。
+
 段1b後に実差分で再評価する。gamepadやnative配送の抽出が不足する場合は、旧版上の挙動不変抽出を追加し、原子切替へ未整理の大改修を押し込まない。
+
+#### 第4.3版追加範囲・受入条件
+
+段1bの抽出を、案Bの正式backendへ接続する。「logic service」は§4.2の個別境界を意味し、全`service_*`の一括移動は行わない。
+
+- C1 Remote、送信済み保存、共有ACK、取消・寿命終端、watcher等をlogicへ接続する。
+- C2・C4・C5とC3のlive表示用poll、D3の走査採用を既存owner・旧順序のuiへ残す。
+- Windows最小化中もFullで表示継続を進める。surface描画の有無をAppのpoll許可へ流用しない。
+- RedrawRequested期限超過中はlogicだけで必要な終端を進め、表示用結果を既存receiverへ保持する。別viewportのFullでは消費しない。
+- 旧outer tailは既存のui本体の早期returnでも実行する。logicからUI tailを強制実行しない。
+- frame_counterは表示・入力・予算の既存ownerへ残し、D3の採番だけを分離する。F13、G1〜G5の留保を無視したlogic接続をしない。
+
+正式graphの必須接続回帰:
+
+1. 最小化root FullでC2〜C5・D3の代表結果が旧順序で採用され、復元を必要としない。UI側の要求は一度だけ継続し、surface描画なしでも失われない。
+2. 同じframe番号でLogicOnlyを複数回実行しても、Remote取得・受信・保存ACK・取消・drainが進む。C2〜C5の表示用receiverとUI decisionは消費・更新しない。
+3. LogicOnly→対象Fullで保留結果を一度だけ採用する。discard再pass・後続Fullで同じ結果やACKを再採用しない。
+4. Remote取得中の送信済みcomposition save、resume／shiftの完了をUIなしで収穫し、barrierを早く通さない。PC表示継続はRemote完了条件に含めない。
+5. Remote返却→再取得→遅いFullで旧Local一覧継続やfullscreenが割り込まない。
+6. C3のlive表示保留中にClose／Remote取得を行い、元ownerの取消・global終端だけが進む。兄弟へ表示採用しない。
+7. C4は新しいFullのpointer状態でeditorを再開する。期限超過前のprimary_downをlogicから再利用しない。
+8. C5のページめくり・preview・PDF昇格／upload予算はUI側で保ち、Runtimeの取消・lease終端を表示待ちへ巻き込まない。
+9. D3は採用前のcutoff ACK／mtime／signature更新を行わず、cause・restartを保持する。通常／IndexOnly要求のIDはframeを進めず再開始しても異なる。
+10. 非描画Fullのdelta・platform output・commands・clipboard action、明示screenshot、実表示ACKを実接続点で検査する。
+11. 期限超過root LogicOnly→child Full→root Full、child skip後の終端保持と、非描画Close退役の既存回帰を維持する。
+
+```powershell
+cargo test -p mimageviewer --lib egui037_continuation
+.\scripts\test-focused.ps1
+```
+
+段2cの`minimized_full`回帰も正式vendor graphで実行する。manifest／featureは段2c台帳の成立したコマンドを用い、0件選択を成功としない。vendorの判断・出力回帰と、上記App owner接続回帰を区別する。
+
+追加repaint、新pending bool、時間窓、logicからの強制UIで成立させない。実Windowsの最小化・復元・負荷とRemote操作は段7へ残す。
 
 ### 段4a: 入力・非表示・popupの等価経路確認
 
@@ -1697,6 +2023,15 @@ root LogicOnly→child Full→root Full、短い退避、同一batch順序、期
 
 modal拒否・初回callback前・兄弟Fullとの順序網羅は非対話回帰を主証拠とする。実機のmodal条件は既存機能で再現できる代表一例に絞り、試験のための保存失敗や設定破損を作らない。エージェント実行の場合は追加したCloseシナリオも承認suiteへ明示する。
 
+案Bの実機確認を追加する。既存の非描画Close確認と混同しない。
+
+15. 本を開く準備中、または原画を待つ編集開始中にWindowsのrootを最小化する。処理後に復元し、最小化中のFullで表示準備が進んだことを既存診断と画面結果で照合する。新しい要求・タイマーを試験のために製品へ追加しない。
+16. 最小化したままRemoteで取得・一覧表示・ページ送り・保存を一つ行い、PC復元なしで応答することを確認する。返却後は従来の一覧へ戻り、閉じた閲覧窓を自動復元しない。
+17. 原画待ちの表示トリム再開でmouse buttonを離してから復元し、古いdragが残らないことを確認する。
+18. 最小化中のidle／処理中の負荷を旧版条件と比較する。UI処理がある間の負荷と、要求なしのidleを分ける。UI継続自体を新しい退行と扱わず、更新による負荷増の有無を記録する。
+
+厳密な100 ms境界、250 ms期限超過、pass交互順序、非描画Fullの出力完結は非対話回帰を主証拠とする。全C3入口・画像形式の手操作マトリクスを増やさない。既存ReleaseChecksへ最小化が含まれない場合は、この追加範囲を別の承認済み検証として記録し、未実施をPASSにしない。
+
 ### 7.5 動画HUD・GPU
 
 1. 再生、HUD文字、時間、速度、音量、track。
@@ -1752,3 +2087,20 @@ modal拒否・初回callback前・兄弟Fullとの順序網羅は非対話回帰
 更新対象はdisplay-pipeline、video-architecture、coding-conventions、keymap-spec、ime-process-keys-plan、ui-snapshot-policy、development-build-and-test、interactive-release-verification、detached-rework-plan §11、vendor台帳、backlog §1.382。
 
 §1.380は個別解決の証拠があるものだけ更新する。採択した外観・操作差はマニュアルと製品ページへ反映し、版更新だけを理由に未確認の改善・互換性を告知しない。
+
+第4.3版の追加完了条件:
+
+- 利用者採択の案Bが正式vendorへ接続され、Windows最小化の要求済みFullでroot UI／deferred子callbackが進む。
+- UI実行とsurface描画が分離され、minimized／visible情報、実表示ACKを偽装しない。
+- 要求なしのsleep、既存100 ms下限、outer phase、bootstrap／resizeの既存契約を保持する。
+- 非描画Fullでもtexture delta・platform output・viewport commandsを完結し、Cut／Copy／Pasteを描画待ちにしない。screenshot等の明示描画要求は失わない。
+- wg​​pu／glowが同じ方針を満たし、他OSのocclusion等を一括変更していない。
+- RedrawRequested期限超過のLogicOnlyが残り、その間もC1・送信済み保存・取消・寿命終端が進む。
+- C2・C4・C5とC3の表示用pollは既存owner・旧順序のuiへ残り、期限超過中の結果は次の対象Fullで一度だけ採用する。
+- F13の表示継続とG1〜G5のframe依存を、関数名だけでlogic-readyと扱っていない。
+- D3の通常／IndexOnly要求IDが独立採番となり、取消・再開始やcontext mountで再利用されない。cutoff ACKは採用後に行う。
+- 案Bを理由にviewport別RawInput、child skip保持、非描画Close、gamepad・IME・delta・surfaceの既存回帰を撤去していない。
+- 案Aの通常最小化中の表示保留仕様、共通表示待ちqueue、新pending bool、時間窓、追加repaint、logicからの強制UIを導入していない。
+- scheduler方針変更と残る期限超過経路、C1〜C5の責務境界について、設計担当・独立レビュー担当の整合確認とdetached計画§11記録がある。
+
+段1b検証台帳へ入口・receiver・採用・取消・ACK・mount ownerの対応を追記する。`docs/web-remote-plan.md`では単一writer、取得時の全ローカル閲覧終了、返却後の非復元を保持する。案Bの採択を負荷同値・実機確認・追加構造レビューの完了証拠へ読み替えない。
