@@ -13265,6 +13265,23 @@ pub(crate) mod phase_c_support {
     use super::{App, AppTestConfig};
     use tempfile::TempDir;
 
+    /// Prove that the last admitted position write has committed before a test
+    /// reads the separate resume DB connection. Navigation and tray hide do not
+    /// promise writer completion; no UI pass or polling is needed for this ACK.
+    pub(crate) fn wait_for_book_resume_write(app: &App, book: &std::path::Path) {
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let cutoff = writer.watermarks().admitted;
+        let receipt = writer
+            .read_position_after(&crate::path_key::normalize(book), cutoff)
+            .recv()
+            .expect("resume write completion");
+        receipt.status.expect("resume write succeeded");
+        assert!(
+            receipt.completed_through >= cutoff,
+            "resume receipt must cover the last admitted position write"
+        );
+    }
+
     /// 外部変更の再走査は worker が返すので、テストは結果が届くまで poll する。
     /// UI スレッドで read_dir しない契約 (F14) を、テスト側でも同じ形で待つ。
     pub(crate) fn wait_for_external_rescan(app: &mut App) {

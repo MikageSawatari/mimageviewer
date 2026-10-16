@@ -928,3 +928,138 @@ run内stdout／stderr／JUnitと、`lib-full.log`／`lib-full-result.json`／
 最終差分は依存manifest・vendorパッチ台帳・本台帳の3ファイル。
 設計書、製品Rustソース、既存テスト、root manifest／lock、toolchainと対象外DSPは内容不変。
 全件後は本台帳の結果追記と`git diff --check`だけを行い、HEAD `8cb951deb`のまま未コミットで返す。
+
+## resume DB assertionの完了前提訂正（2026-10-17）
+
+対象HEADは`b1c9e4d96`。前節の「将来のテスト訂正案」を利用者の追加指示で実装する。
+以下は**実装担当の内部確認**。既存の正式な独立レビュー結果とは別の記録である。
+
+### 変更対象と共通helper
+
+`app::tests::phase_c_support::wait_for_book_resume_write`を1か所に定義した。
+最後の位置要求後、DB読取り直前の`watermarks().admitted`をcutoffとして捕捉し、
+`read_position_after(normalize(book), cutoff)`のreceiptを受信する。
+`status`の成功と`completed_through >= cutoff`を確認してから元のDB assertionを実行する。
+UI pass・App poll・flush・writer停止は行わず、製品の非同期契約を変えない。
+receiptは一度だけ`recv`し、ownerの成功／失敗・channel切断で終端する。
+新しい時間gateを置かず、既存の時間上限・期待値・sleep・再試行回数は変更しない。
+
+| 訂正するテスト（`app::tests::startup_restore_tests::`以下） | 完了確認を追加した読取り |
+| --- | --- |
+| `section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_keeps_resume` | トレイ退避後の直接DB get、復帰後に新設定でbookを開き直した後の`resume_page_for_container`の2か所 |
+| `section1335_tray_image_folder_book_setting_changed_in_f12_keeps_backspace_explicit_list` | トレイ復帰後の`resume_page_for_container`の1か所 |
+
+`settle_book`へ広く待機を混ぜず、永続値を検査する3か所で完了を証明する。
+元のSome(1) assertion、navigation／fullscreen／cursor／settingsの検査は全て維持する。
+
+負荷中に共通fixtureの初期resume読込みでも完了前提の欠落を確認したため、
+`direct_tray_image_folder_book_env`では親一覧準備後・最初のbook open前にも同じhelperを使う。
+後続のRecord(0)／Record(1)より前の初期化確認なので、上記3か所のwrite完了確認は別途必要。
+fixtureを共有する次の4テストにも、この初期化前提だけが適用される。
+`section1335_tray_image_folder_book_`以下の
+`direct_hide_restore_preserves_parent_cursor_and_resume`、
+`direct_quit_restarts_parent_and_preserves_resume`、
+`backspace_hide_restore_keeps_explicit_book_list`、
+`backspace_quit_restarts_explicit_book_list`。これらのassertは変更しない。
+
+### 同型の読取りの棚卸し
+
+以下は`b1c9e4d96`時点のテスト名。startup_restore外に追加訂正が必要なケースはなかった。
+完了済み・同期seed・意図的な未完了観測は、それぞれの既存契約を保持する。
+
+| ファイル／テスト | 追加訂正しない根拠 |
+| --- | --- |
+| `app/tests.rs`：`clear_quick_folder_slots_command_clears_all_positions_and_preserves_content_state` | 同期DB seedのみで非同期Recordを発行しない |
+| `app/book_resume_meter_tests.rs`：`book_resume_identity_write_retains_exact_page_and_raw_record_together` | 既存`settle`が`read_all` ACKを取得してからget_position |
+| 同：`book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key` | 既存`settle`のACKと旧App drop後にDBコピー |
+| 同：`book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_key` | 最後のRecord後の`settle`でACK済み |
+| `app/rar_archive_cache_tests.rs`：`rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_key` | 既存`settle_resume`でFIFO `read_all` ACK済み |
+| `app/spread_shift_owner_tests.rs`：`fresh_common_resume_fence_ends_before_later_session_resume_reads` | 最新Recordの位置receipt・成功・page 4を先に検査済み |
+| 同：`collapsed_zip_root_and_converted_archive_keep_producer_resume_key_and_fixed_read` | 保持した初回openの固定位置2を読む意図的な検査。DB接続なし、最新位置4のreceiptも取得済み |
+| 同：`book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open` | 前半はFIFO receipt済み、後半は明示停止中writerの旧位置0を検査。後半へ待機を入れるとテスト目的が壊れる |
+| `app/sidecar_restore.rs`：`visibility_current_listing_disconnect_closes_stale_fullscreen_and_preserves_snapshot_maps` | 同期seed 7。失敗したdeferred openはRecordを発行しない |
+| 同：`visibility_live_page_index_disconnect_cancels_display_without_substitution` | 同期seed 0。失敗した初回表示はRecordを発行しない |
+| 同：`visibility_detached_folder_auto_first_display_completes_or_terminates_its_owner` | fresh-open FIFO fenceを含むhydration完了後、表示拒否分岐でDBを検査 |
+| `remote_ipc/ui.rs`：`remote_static_page_progress_is_the_next_pc_open_position` | `settle_book_resume_meter`で`read_all` ACK後、writer dropによるdrain／joinも完了 |
+| `spread_shift/model.rs`：`accepted_set_and_record_reopen_waits_for_real_writer_fences_in_both_orders` | 位置receiptとwriter drop完了後のDB読取り |
+
+App外も確認した。`content_identity/restore.rs::create_production_store_schemas`はschema初期化のみ。
+`book_resume_db.rs`の直接DB読取りは、同期操作／migration、`normal_drop_drains_record_clear_record`の
+drop後、位置receipt取得後、または意図的な未完了fence拒否の検査だった。
+`position_read_waits_for_pending_clear_and_external_read_cannot_bypass_it`、
+`failed_record_is_terminal_but_position_reply_is_not_successful_absence`、
+`existing_meter_reload_refreshes_externally_changed_positions`、
+`pending_reload_fences_warm_retained_snapshot_and_external_transaction`も追加不要。
+folder ZIPとmeter workerは既存のFIFO応答を完了証明としている。
+
+### 負荷比較・変異確認・検証
+
+前節の再現器`target/egui037-stage1b-3c-followup/stress.py`を変更せず再利用する。
+通常負荷は6件×300反復、48並列＋CPU負荷24。追加のLOWESTは2件×100反復、
+IDLEは親へ帰る1件×100反復で、ともに16並列＋CPU負荷24。
+優先度変更は再現器のtest子に属するbook-resume-writerのみ。live／製品は起動しない。
+修正後の結果と、ACK呼出し4か所を一時的に元へ戻した結果を比較し、固定したsourceへ復元する。
+検証結果を後記。製品コード・設計書の変更、commit／branch操作は行わない。
+
+初版helperは、新設した`recv_timeout(10秒)`でownerの応答を打ち切っていた。
+その不採用版（`ack-fixed-*`）は通常負荷1,800 passed / 0 failedだったが、
+LOWESTで192 passed / 8 failed、IDLEで86 passed / 14 failed。
+全て新helper自身のTimeoutで、元のDB値assertではない。
+ここへ秒数を足す修正はせず、新しい時間gate自体を置かない一度の`recv`へ訂正した。
+既存のhistory／ZIP待機や再現器の子プロセス180秒上限は変更しない。
+この時点の終端応答版は`ack-receipt-*`、ACK呼出しを外す変異は`ack-without-*`として区別する。
+
+DB参照前のみACKを加えた版（`ack-receipt-*`）は通常1,800 passed、LOWEST 200 passed。
+IDLEは99 passed / 1 failedで、DB assertionではなく既存history preflightの未完了だった。
+`RUST_BACKTRACE=1`だけを加えた同条件の診断200反復（`ack-preflight-trace`）は195 passed / 5 failed。
+5件全て`direct_tray_image_folder_book_env`→最初の`open_selected_image_folder_book`→
+`settle_book`→history helperの10秒上限であり、テスト本体の位置要求／DB確認より前だった。
+この根拠でfixture初期resume読込みの受領確認を追加した版を最終版`ack-final-*`とする。
+既存上限・再現器の条件・元のassertを緩めず、途中結果を成功へ読み替えない。
+
+最終版と、startup_restoreを`b1c9e4d96`の元bytesへ一時復元してACK4か所を外した版の比較は次のとおり。
+再現器のコード・filter・反復数・並列数・CPU負荷数・子の180秒上限は同じ。
+
+| 条件 | ACKなし（変異） | ACKあり（最終版） |
+| --- | --- | --- |
+| 通常：6件×300反復、48並列＋CPU24 | 1,793 passed / 7 failed。全て元のresume assertion、Some(0) / Some(1) | 1,800 passed / 0 failed |
+| LOWEST：2件×100反復、16並列＋CPU24 | 175 passed / 25 failed。resume assertion 24件、fixtureのhistory preflight 1件 | 200 passed / 0 failed |
+| IDLE：親へ帰る1件×100反復、16並列＋CPU24 | 62 passed / 38 failed。全て元のresume assertion（Some(0) 1件／None 37件） | 100 passed / 0 failed |
+
+最終版は計2,100 passed / 0 failed。変異は計70 failed（resume 69件、初期化1件）を検出した。
+失敗したlib test子のexit 101を保持し、収集器のexit 0をテスト成功と扱わない。
+優先度負荷の捕捉数は最終版LOWEST 3／IDLE 73、変異LOWEST 90／IDLE 89。
+外部から生成済みthreadを捕捉するため捕捉数は揃わないが、条件を弱めたり成功するまで再実行したりしていない。
+最終版と変異の実行体・sourceのSHA-256は`ack-final-source.json`／`ack-without-source.json`。
+変異後はfinallyで最終版へ戻し、`ack-mutation-restoration.json`でbytes一致を確認した。
+共通helperを含む最終sourceとの一致、設計書・対象外DSPの不変も`ack-verification-summary.json`へ記録する。
+各runのstdoutと`*-result.json`、失敗種別の`ack-stress-summary.json`を同じ再現器directoryに保持する。
+
+復元後の通常検証は`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`。
+負荷用子プロセス・優先度変更は終了済みで、次のgateには加えていない。
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、0.719秒 |
+| `cargo fmt`／`cargo fmt --check` | 両方exit 0 |
+| `git diff --check` | exit 0 |
+| 関連する焦点nextest（本体lib、default profile、retry 0） | 116 passed / 0 failed、exit 0。実行6.272秒、build込み126.182秒 |
+| `scripts/test-lib-full.ps1` | 13,326 passed / 0 failed / 59 skipped、exit 0。実行404.392秒、command全体408.970秒 |
+
+焦点はfixture共有の6件、book_resume、spread_shift_owner_testsと、棚卸し表のrar／Remote／visibility／
+spread_shift model／quick-folderの対象を選択した。正確なfilterとJUnitは
+`ack-focused-result.json`／`ack-focused-junit.xml`、他のcommand・exit・時間は`ack-*-result.json`。
+集計は`ack-verification-summary.json`。製品コード・既存assert・既存時間上限は変更していない。
+
+最後の全件runは`target/test-lib-full/runs/20261016T161635973Z-492df8ed/`、
+source IDは`9ca57266a5a0aec4ba8b1dec2be5df8ab3467705c2fab7baa1c5ad99506b299f`。
+成功receiptは`target/test-lib-full/f30479ab4a0abaeea34d80a0ede368940aadab82707774f9666add33dd906380.json`。
+run内stdout／stderr／JUnitと`ack-lib-full.log`／`ack-lib-full-result.json`／
+`ack-lib-full-junit.xml`を保持した。対象2件も成功し、無関係な失敗もなかった。
+全件後は本台帳への結果追記と最終`git diff --check`・照合のみで、検証済みのRustソースは不変。
+
+差分は`src/app/tests.rs`の共通helper、`src/app/tests/startup_restore.rs`の完了前提、
+本台帳の3ファイル。共通fixtureの初期化は6件へ適用し、直接DB assertionを訂正したのは指定2件。
+同型読取りの他のテストは既存の完了証明・同期seed・意図的な未完了観測を維持した。
+設計書・製品コード・対象外DSPは内容不変。確認用製品build／live起動は行わず、
+HEAD `b1c9e4d96`のまま未コミットで返す。

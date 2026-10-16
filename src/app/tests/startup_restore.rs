@@ -3454,6 +3454,9 @@ fn direct_tray_image_folder_book_env() -> (phase_c_support::AppTestEnv, PathBuf,
     env.last_cell_h = 40.0;
     env.scroll_offset_y = 80.0;
     env.selected = Some(index);
+    // Finish startup's resume read before the fixture's timed navigation.
+    // Later position writes still need their own receipt before DB assertions.
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     open_selected_image_folder_book(&mut env, &book);
     assert_eq!(
         restore_cursor(&env),
@@ -3621,6 +3624,7 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_
         crate::settings::Settings::load().startup_list_restore,
         before
     );
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     assert_eq!(env.book_resume_db.as_ref().unwrap().get(&book), Some(1));
     let generation = env.items_generation;
     env.sync_after_restore(&egui::Context::default());
@@ -3640,6 +3644,7 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_
     settle_book(&mut env);
     assert_eq!(env.current_folder.as_ref(), Some(&book));
     assert!(env.fullscreen_idx.is_none());
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     assert_eq!(env.resume_page_for_container(), Some(1));
 }
 
@@ -3663,5 +3668,6 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_keeps_backspace_exp
     assert_eq!(env.current_folder.as_ref(), Some(&book));
     assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
     assert_eq!(env.settings.startup_list_restore, before);
+    phase_c_support::wait_for_book_resume_write(&env, &book);
     assert_eq!(env.resume_page_for_container(), Some(1));
 }
