@@ -2330,6 +2330,38 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    /// Normal cache ownership is inspected without mounting or mutating a parked context.
+    pub(in crate::app) fn texture_caches(self) -> super::vram_accounting::ViewerTextureCaches<'a> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.viewer_texture_caches(),
+            ContextRefSource::AtRest(bundle) => super::vram_accounting::ViewerTextureCaches {
+                fs_lanczos_cache: &bundle.fs_lanczos_cache,
+                similar_panel: &bundle.similar_panel,
+                fs_cache: &bundle.fs_cache,
+                final_composite_cache: &bundle.final_composite_cache,
+                adjustment_cache: &bundle.adjustment_cache,
+                erase_result_cache: &bundle.erase_result_cache,
+                erase_preview_cache: &bundle.erase_preview_cache,
+                analysis_overlay_texture: bundle
+                    .analysis_overlay_cache
+                    .as_ref()
+                    .map(|entry| &entry.0),
+                analysis_sv_texture: bundle.analysis_sv_cache.as_ref().map(|entry| &entry.3),
+                snapshot: bundle.snapshot.as_ref(),
+                composition_editor: &bundle.composition_editor,
+                local_adjust_cache: &bundle.local_adjust_cache,
+                conceal_cache: &bundle.conceal_cache,
+                comic_cache: &bundle.comic_cache,
+                edit_result_cache: &bundle.edit_result_cache,
+                continuous_page_transitions: &bundle.continuous_page_transitions,
+                passthrough_rendition_cache: &bundle.passthrough_rendition_cache,
+                fs_holdover_tex: &bundle.fs_holdover_tex,
+                thumbnails: &bundle.thumbnails,
+                thumb_adjust_tex: &bundle.thumb_adjust_tex,
+            },
+        }
+    }
+
     pub(in crate::app) fn fs_cache(self) -> &'a ItemsGenerationMap<FsCacheEntry> {
         match self.source {
             ContextRefSource::Mounted(app) => &app.fs_cache,

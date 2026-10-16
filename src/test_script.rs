@@ -172,12 +172,41 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Read-only submission evidence; presentation materials do not need their original source.
+#[cfg(feature = "test-script")]
+pub(crate) trait TestScriptPaintResource {
+    fn paint_texture_id(&self) -> egui::TextureId;
+    fn test_script_content_proof(&self) -> Option<&TestScriptContentProof>;
+}
+
+#[cfg(feature = "test-script")]
+impl TestScriptPaintResource for crate::gpu_lanczos::FullscreenPaintResource {
+    fn paint_texture_id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    fn test_script_content_proof(&self) -> Option<&TestScriptContentProof> {
+        self.test_script_content_proof()
+    }
+}
+
+#[cfg(feature = "test-script")]
+impl TestScriptPaintResource for crate::gpu_lanczos::FullscreenPaintPayload {
+    fn paint_texture_id(&self) -> egui::TextureId {
+        self.paint_texture_id()
+    }
+
+    fn test_script_content_proof(&self) -> Option<&TestScriptContentProof> {
+        self.test_script_content_proof()
+    }
+}
+
+#[cfg(feature = "test-script")]
 /// Called immediately after the paint resource submits its mesh. Read the
 /// actual egui shape rather than recomputing geometry from a layout DTO.
-#[cfg(feature = "test-script")]
-pub(crate) fn record_drawn_paint(
+pub(crate) fn record_drawn_paint<R: TestScriptPaintResource + ?Sized>(
     painter: &egui::Painter,
-    resource: &crate::gpu_lanczos::FullscreenPaintResource,
+    resource: &R,
     placement: String,
 ) {
     let Some(content) = resource.test_script_content_proof().cloned() else {
@@ -8038,6 +8067,57 @@ mod tests {
         )
         .unwrap();
         build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn drawn_paint_records_native_presentation_after_source_release() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "native-paint-observation",
+            egui::ColorImage::filled([8, 8], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let source_texture_id = texture.id();
+        let proof = TestScriptContentProof {
+            context_serial: 7,
+            items_generation: 3,
+            page_index: 2,
+            item_identity: "captured-page".into(),
+            source_texture_id,
+            source_kind: TestScriptPaintSourceKind::FullOrProcessed,
+            final_composite_complete: false,
+        };
+        let source = crate::gpu_lanczos::test_native_resource(
+            crate::gpu_lanczos::FullscreenPaintResource::resampleable(
+                2,
+                texture,
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 3, input: 5 },
+            )
+            .with_test_script_content_proof(proof.clone()),
+            [4, 4],
+        );
+        let payload = crate::gpu_lanczos::FullscreenPaintPayload::PresentationMaterial(
+            source.capture_presentation(&ctx),
+        );
+        drop(source);
+        assert!(ctx.tex_manager().read().meta(source_texture_id).is_none());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.image(
+                payload.paint_texture_id(),
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(8.0, 8.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            record_drawn_paint(&painter, &payload, "presentation".into());
+        });
+        let paints = take_drawn_paint(egui::ViewportId::ROOT);
+        assert_eq!(paints.len(), 1);
+        assert_eq!(paints[0].content, proof);
+        assert_eq!(paints[0].texture, payload.paint_texture_id());
+        assert_eq!(paints[0].placement, "presentation");
+        assert!(payload.source_texture().is_none());
     }
 
     #[cfg(feature = "test-script")]

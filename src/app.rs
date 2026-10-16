@@ -91991,8 +91991,12 @@ impl App {
     }
 
     pub(crate) fn is_passthrough_rendition_texture(&self, texture: &egui::TextureHandle) -> bool {
+        self.is_passthrough_rendition_texture_id(texture.id())
+    }
+
+    pub(crate) fn is_passthrough_rendition_texture_id(&self, texture_id: egui::TextureId) -> bool {
         self.passthrough_rendition_cache
-            .contains_texture(texture.id())
+            .contains_texture(texture_id)
     }
 
     pub(crate) fn cached_passthrough_rendition(&self, idx: usize) -> Option<egui::TextureHandle> {

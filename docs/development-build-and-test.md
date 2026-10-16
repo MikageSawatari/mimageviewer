@@ -97,7 +97,8 @@ nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --d
 導入時の件数突合・時間比較とテスト模擬の修正は [検証記録](test-speed-report.md) を参照する。
 
 - 全件: `-Features test-script`、`-CargoProfile test`、`-NextestProfile default` を指定可能。
-  `-Force` だけが有効な同一結果を再実行する指定。既定の成功閾値は実行9,000件以上。
+  `-Force` だけが有効な同一結果を再実行する指定で、ファイルハッシュのキャッシュも使わず再計算する
+  （実行前・実行後の照合とも）。既定の成功閾値は実行9,000件以上。
   ignore以外の全件を選び、default filter・retry・fail-fastによる取りこぼしを防ぐ。
 - 台帳と各実行のcommand・JUnit・stdout/stderrは `target/test-lib-full/`。
   同じworktreeの読み取り専用レビューから参照可能。別worktreeとの共有はしない。
@@ -106,6 +107,19 @@ nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --d
 - 識別子はGitが列挙した全追跡ファイルと未追跡ファイルの**現在の内容**をSHA-256化する。
   stagingの有無・HEADの移動だけでは変えず、未コミット編集・削除・新規ファイルを検知する。
   ignoredでも `vendor` / `testdata` / `testimage` 等のnative入力・実fixtureを含める。
+  各ファイルのSHA-256は `target/test-lib-full/source-hashes-v1.tsv` にキャッシュする。
+  相対パスをキーに、サイズ・`LastWriteTimeUtc` ticks・`CreationTimeUtc` ticksがすべて一致し、
+  更新日時がハッシュ記録時刻より2秒超古い場合だけ再利用する。入れ子repository内も同じ規則。
+  記録直後の更新日時（racyなエントリ）や未来の更新日時は再計算し、HITで記録時刻を進めない。
+  通常列挙されたファイルのreparse pointは、リンク先の変更を逃さないよう毎回内容を読み、
+  キャッシュしない。入れ子repository内のreparse pointは従来どおり照合を拒否する。
+  毎回のGit列挙と存在確認は省略せず、キャッシュの有無でsource識別子の形式・値を変えない。
+  キャッシュはUTF-8のタブ区切り（パスだけBase64）とDictionaryを用い、JSON変換を避ける。
+  読み書き失敗・不正形式は警告し、その照合をキャッシュなしの全ハッシュで行う。
+  自動再試行・回復状態は追加せず、壊れた原本を失敗処理で削除・再作成しない。
+  **サイズ・更新日時・作成日時をすべて保った内容変更は検知できない**
+  （racyとして再計算する場合を除く）。同じstat情報を信頼するgitと同様の前提であり、
+  疑わしい場合は `test-lib-full.ps1 -Force` で全ハッシュ・テストをやり直す。
   rootの`target` / `target-*`、入れ子の`target/`、native build/object、snapshot比較用の
   `.new/.old/.diff.png`、計測出力 `docs/test-speed-report.md` は除外する。
   ただし実行体の隣のnative DLLは別の識別子へ含める。`cargo metadata` のtarget directoryから、
@@ -132,6 +146,10 @@ nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --d
 
 道具の回帰確認は `powershell -NoProfile -File scripts/test-test-tools.ps1`。
 使い捨て小規模crateで本物のGit/nextestを使い、台帳hit/miss・差分・失敗・0件・選択を検査する。
+statキャッシュの識別子一致・サイズ/作成日時/racy更新・`-Force`・破損/I/O失敗も検査する。
+`-Benchmark` を付けると、`target/` 配下の使い捨てrepositoryに21,247件・約1.39 GBの
+ignored fixture（うち1,247件は入れ子repository）を生成し、キャッシュなし/ありと台帳HITを測る。
+fixtureとログは残し、約1.4 GBの空き容量が必要。実画像59.1 GBを持つ本体の最終測定とは区別する。
 ツールの導入・commit・アプリ起動・通常設定へのアクセスは行わない。
 仕様根拠: [nextest JUnit](https://nexte.st/docs/machine-readable/junit/)、
 [filterset](https://nexte.st/docs/filtersets/reference/)。

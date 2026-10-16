@@ -2307,8 +2307,16 @@ impl App {
         idx: usize,
         texture: &egui::TextureHandle,
     ) -> bool {
+        self.fs_page_layout_uses_source_id(idx, texture.id())
+    }
+
+    pub(crate) fn fs_page_layout_uses_source_id(
+        &self,
+        idx: usize,
+        source_id: egui::TextureId,
+    ) -> bool {
         self.is_raw_page(idx)
-            || self.is_passthrough_rendition_texture(texture)
+            || self.is_passthrough_rendition_texture_id(source_id)
             || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
     }
 

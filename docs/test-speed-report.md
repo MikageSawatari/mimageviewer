@@ -603,3 +603,83 @@ commit／merge／pushは行わず、6ファイルを作業ツリーに残す。
 
 CLAUDE.mdの必須変更は見つからず未編集。AGENTS.md:248の「最終gateはcargo testのまま」という
 旧記述は設計担当側で更新が必要（今回のbriefを優先し、同ファイルは未編集）。
+
+## ファイルstatによるハッシュキャッシュ（2026-10-16）
+
+対象: `ledger-stat-cache` worktree、製品コード・依存関係は変更なし。
+本体worktreeでの既存測定は台帳HIT 63秒、うちsource計算49.9秒・21,247件・59.1 GB
+（設計担当からの報告）。ignored `testimage/` を照合対象に残し、変更のないファイルの
+SHA-256再計算を省く。DLL識別子・成功台帳の形式・source manifestの形式は維持した。
+
+相対パス→サイズ・更新日時UTC ticks・作成日時UTC ticks・SHA-256・記録時刻を
+`target/test-lib-full/source-hashes-v1.tsv` に保存する。PowerShell 5.1向けに
+タブ区切りとDictionaryを使用し、パスはUnicodeやタブを壊さないBase64とした。
+サイズ/更新日時/作成日時が一致し、更新日時が記録時刻より2秒超古い場合だけ再利用する。
+記録時刻は内容を読む直前に採り、再利用時には更新しない。読み取り中にstatが変わった
+エントリは保存しない。入れ子repositoryも同じ経路を通る。
+通常ファイルのreparse pointはキャッシュせず従来どおり内容を読む。
+
+まれな失敗は既定の割り切り方針: キャッシュの読み書き・形式検証に失敗したら警告し、
+そのsource照合をキャッシュなしの全ハッシュで行う。自動再試行や回復状態は追加しない。
+壊れた原本は失敗処理で削除・再作成しない。`-Force` の明示実行は、キャッシュを読まず
+実行前後を全ハッシュし、正常に書ける場合は新しいキャッシュを保存する。
+
+### 再現用fixtureと検証
+
+```powershell
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-test-tools.ps1 -Benchmark
+```
+
+Windows PowerShell 5.1.26100.9711、使い捨てrepositoryに21,247ファイル×64 KiBを実生成。
+総量1,392,443,392 bytes（約1.39 GB）、20,000件はignored `testimage/flat/`、
+1,247件はignored `testimage/nested/` 内の入れ子repository。Cargo等の入力4件を合わせ
+source照合は21,251件。更新日時は1日前へ設定し、初回から非racy条件を満たす。
+OSのファイルキャッシュは消去していない。「キャッシュなし」は今回のSHA-256キャッシュを
+使わない意味であり、cold diskの測定ではない。台帳HITはPowerShell子プロセスの起動、
+source/env/native識別子、JUnit照合を含むwall時間を計測する。準備用の1件テスト実行は別枠。
+HIT各回はexit 0・同じsource・新規run directoryなしをassertする。
+
+最終測定（リンク非キャッシュ化・公開`-Force`回帰を含む未コミット差分）:
+
+| 対象 | 秒 |
+| --- | ---: |
+| source、キャッシュなし | 4.787 |
+| source、キャッシュ初回作成 | 5.096 |
+| source、キャッシュあり3回 | 2.993 / 2.975 / 2.980 |
+| 台帳HIT全体3回 | **3.770 / 3.736 / 3.752** |
+
+台帳HITは3回とも目標5秒以内。全条件でsource識別子は
+`cf1ae86b8b66ff0fe644a6668b6444de755b4ddca686d119de86be406e9f17b5`。
+最終コマンドは **exit 0、回帰全体PASS**。
+ログ: `target/stat-cache-regression-final.log`。
+fixture: `target/test-tools-regression-4e78bea217454978bac6c452d7f43dd1/target/stat-cache-benchmark/`。
+その`target/measurements.json`と`target/hit-{1,2,3}.log`に数値・source・HIT結果を保存した。
+初回も回帰PASS・台帳HIT 3.741〜3.842秒（`target/stat-cache-regression.log`）。
+上記2点のスクリプト追補によって検証条件が変わったため最終版で再実行した。
+
+回帰はキャッシュ有無の識別子一致、温まった入力の内容を読まないこと（排他ロックで検査）、
+内容/サイズ変更、古い更新日時へ戻したサイズ変更、作成日時のみの変更、racyな同サイズ編集、
+racyエントリの再照合、`ForceHash`、破損/切り詰め・キャッシュ読込/書込失敗を検査する。
+既存のGit index無変更、ignored/nested入力、削除、新規Unicodeパス、台帳HIT/MISS、
+native DLL追加/差替え/削除、環境、feature、失敗台帳、0件、focused選択の回帰も維持する。
+シンボリックリンク作成はこのsandboxでは権限不足のため、既存のnested file-link実検査はskip。
+変更した3本の`.ps1`はASCII以外0バイト、PowerShell 5.1の構文parseエラー0。
+`git diff --check`も成功。
+実装者とは別のGPT-6.1 Sol / xhighが3スクリプト・文書2本を独立レビューし、
+**P1/P2指摘なし**。最終ログ・source一致・測定値を突合し、テストは重複実行していない。
+
+### 検知範囲と引き継ぎ
+
+サイズ・更新日時・作成日時をすべて保った内容変更は、非racyなエントリでは検知できない。
+statを信頼するgitと同様の前提で、疑わしければ `test-lib-full.ps1 -Force` を使う。
+公開`-Force`経路にも、同stat編集が通常HITした後で全ハッシュしてMISSになる回帰を追加した。
+本体の59.1 GB・実画像での最終測定は利用者側の担当であり、この約1.39 GBのfixture値から
+本体の絶対時間は断定しない。スクリプトと文書だけの変更のため製品全体gate・確認用build・
+アプリ起動は行わない。
+
+コミットは行わず、次の論理単位で作業ツリーに残す。
+
+| 対象 | commitメッセージ案 |
+| --- | --- |
+| `scripts/test-tools-common.ps1`, `scripts/test-lib-full.ps1`, `scripts/test-test-tools.ps1` | `test: Cache source hashes by file stat for faster ledger hits` |
+| `docs/development-build-and-test.md`, `docs/test-speed-report.md` | `docs: Document stat-cache limits and ledger hit benchmarks` |

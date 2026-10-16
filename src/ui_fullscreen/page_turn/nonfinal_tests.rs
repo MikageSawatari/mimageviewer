@@ -522,7 +522,7 @@ fn accepted_thumbnail_is_accounted_before_prepare_and_lease_released_after_cance
     app.page_turn_leases.account(&mut before);
     let before_bytes = before.finish().total_bytes();
     let mut incoming = VramAccountant::default();
-    incoming.add_texture(VramSubsystem::PageTurnPresentation, &accepted, true);
+    incoming.add_texture(VramSubsystem::PageTurnPresentation, &accepted, false);
     let incoming_bytes = incoming.finish().total_bytes();
     frame(&ctx, |_, ctx| {
         let operation = ViewerOperationId::Pad {
@@ -558,13 +558,18 @@ fn accepted_thumbnail_is_accounted_before_prepare_and_lease_released_after_cance
         // Ordinary owners and presentation owners share TextureIds. Outgoing
         // sources and the newly accepted incoming source must each count once.
         for page in &outgoing.pages {
-            deduplicated.add_texture(
-                VramSubsystem::FinalCompositeCache,
-                page.resource.source_texture(),
-                true,
-            );
+            let texture = page.resource.source_texture().unwrap();
+            let mipmapped = ctx
+                .tex_manager()
+                .read()
+                .meta(texture.id())
+                .unwrap()
+                .options
+                .mipmap_mode
+                .is_some();
+            deduplicated.add_texture(VramSubsystem::FinalCompositeCache, texture, mipmapped);
         }
-        deduplicated.add_texture(VramSubsystem::Thumbnails, &accepted, true);
+        deduplicated.add_texture(VramSubsystem::Thumbnails, &accepted, false);
         app.page_turn_leases.account(&mut deduplicated);
         assert_eq!(
             deduplicated.finish().total_bytes(),
@@ -778,7 +783,7 @@ fn held_thumbnail_yields_to_original_preview_and_ineligible_editor_views() {
         PresentationState::Turning { incoming, .. } => incoming.pages[0].clone(),
         _ => panic!("original preview must not replace the presentation owner itself"),
     };
-    preview_page.resource = preview_resource;
+    preview_page.resource = preview_resource.into();
     preview_page.live = false;
     let prepared = app.page_turn_bind_prepared(preview_page);
     assert!(!prepared.live);
