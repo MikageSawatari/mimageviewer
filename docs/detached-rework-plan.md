@@ -5518,3 +5518,21 @@ visible commit・実表示ACKを発行しない。App flag／新queue／pending 
 今回はコミット分割のため主経路だけ。immediate子自身の描画資格と出力完結は2c-3b、
 子Closeの受付・消費・pass外退役とroot LogicOnly Close回帰は2c-4へ残す。
 root製品graph・Appの判断は不変、実window・live試験は実行していない。
+
+#### 2026-10-17 段2c-3bの準備graph実装記録
+
+合意済み案Bのimmediate子の範囲を`vendor-next/eframe`の両backendへ実装した。
+実登録callbackが共通driverを通り、子自身の最新metadataとScreenshot／PaintWhileHiddenから
+surface描画を判断する。親最小化でもvisibleな子は描画し、親子最小化なら子UIだけを進める。
+親Fullから実際に呼ばれた子だけを扱い、LogicOnlyに子UIを強制する経路は追加しない。
+子UI中にnative borrowを保持せず、共有deltaを先に受領してから対象Stateへplatform／IME・
+clipboard actionを渡し、描画しない場合も資源適用と通常viewport commands配送を行う。
+glowは既存rendererのdelta ownerをRcで共有し、viewport別ownerを除いてGL資源とsurface描画を分離する。
+実入れ子passのcommandsはegui既存の親FullOutput集約に従い、通常配送後の必要な既存Fullの列で
+子Screenshotを完了する。Contextの規則・schedulerを変更せず、新queue／pending bool／retry・
+追加repaint・強制UI・App補助flagで補っていない。非描画でpresent／visible commitを発行しない。
+**実装担当の内部確認**として両実immediate入口とfake window／painter、実Contextを使い、
+親／子のpaint・callbackを分けた回帰と部分復元での失敗を確認した。詳細は段2台帳。
+正式な独立ACCEPTではなく、実HWND／GL surfaceは未実施。owner不在fixtureは資源配送の検査であり、
+Close／退役・再作成防止の検査ではない。Close受付・消費・非描画退役とroot Close回帰は2c-4へ残す。
+root製品graph・App・lockは不変。実window・live・製品は起動していない。

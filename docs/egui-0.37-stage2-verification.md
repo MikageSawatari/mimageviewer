@@ -1029,3 +1029,93 @@ live試験synchronous_damage_returns_before_outer_paint_gateはignoreと内部�
 2c-4へ残す。native GL／HWNDの実機確認と正式な独立レビューは別工程。
 追加repaint・強制UI・App補助flag・新queue／pending bool・retryは追加しない。
 依存取得・ネットワーク・製品build／起動・test-full.ps1・git add／commit／branch操作は行っていない。
+
+## 段2c-3b immediate子自身の描画資格と非描画出力（2026-10-17）
+
+開始HEAD `fb43c743f`。段2c-3aは設計担当がコミット済み、独立レビュー中との引継ぎで着手。
+設計書第4.4版§4.2のimmediate追加条件、段2c受入条件の案B13〜14、glowの資源／surface分離、
+immediateとroot Close回帰の独立コミット分割を照合した。以下は**実装担当の内部確認**であり、
+正式な独立レビュー・ACCEPTではない。今回分は未ステージ・未コミット。
+
+### 実装と所有境界（b・新規）
+
+両backendの実登録callback→render_immediate_viewport→共通run_immediate_viewportを接続した。
+native adapterのprepare後にはborrowを残さず、実Context::run_uiの子callbackを実行する。
+子UIのdeltaを先に共有renderer ownerへ移し、子自身のStateへplatform／IME・clipboard actionを
+2c-3aのfinish_main_viewport_outputで配送した後、子の最新metadataと既存明示描画要求でpaintを判定する。
+子visibleなら親最小化でも描画し、親子最小化なら子UIは進めるが通常描画しない。
+Screenshot／PaintWhileHiddenは子自身のpaint資格となり、親の資格を流用しない。
+子を呼んだ既存Fullの範囲だけを扱い、親LogicOnlyへUIを強制しない。metadataも偽装しない。
+
+非描画時はwgpuの既存apply_textures_deltaへ渡し、set→submission→freeを同consumerで完結する。
+glowは既存renderer ownerのpending_deltasをRcでroot／deferred／immediateへ共有し、旧viewport別
+pending_deltaを除いた。同じdeltaを有効GL contextでset／freeし、clear／paint／swapとは分離する。
+context無しでは既存ownerへ保持し、通常commandsでcontextが利用可能になれば同ownerを適用する。
+空deltaへ重複処理をせず、第二queue・新pending bool・wake／retryを追加しない。
+描画先／出力元が無くても共有deltaを受け、他viewport宛commandsは通常handlerへ配送する。
+非描画経路はtessellation・capture・present・visible commit・実表示ACKを呼ばない。
+wgpuの段階別時間・delta bytes・遅延ログと診断witness／capture接続は維持した。
+
+当該子出力にScreenshot／PaintWhileHiddenがある場合はpaint前に既存action ownerへ移して元列から除く。
+実入れ子passではeguiがviewport commandsを最外の親FullOutputへ集約するため、その通常配送で
+子の既存ownerへ渡し、必要な既存Fullの列でcaptureを一度だけ完了する。既存保留とのidentity・順序を保つ。
+入れ子子pass自身の出力にcommandsが含まれるとは仮定しない。Contextの出力規則を変更したり、
+専用repaint／retryで次のFullを作ることはしない。これは設計書の「必要な既存Fullの列」の範囲である。
+
+### 窓なし回帰と証拠の範囲
+
+新規2件は名前に`minimized_full_immediate`を含み、各backendの実render_immediate_viewportへ
+fake native effectsを渡す。登録callback・実Context／show_viewport_immediate・実入れ子run_uiと
+production driverの判断／配送順序を通す。未接続の判定関数を再実装するfixtureではない。
+
+各backendで8種×3 Full＝24回の子UIを検査する。親最小化／子visible、親子最小化、子の既存保留
+Screenshot、当該子UIのScreenshot、両者併存、既存／当該UIのPaintWhileHidden、親だけのScreenshot。
+子UI・子paint・子callbackと親paint・親callbackを別々に数え、画像寸法とcallback identityでもownerを確認する。
+第三Fullまでに重複capture／clipboard入力が無いこと、親Stateへ子入力が混ざらないこと、実TextEditの
+IME／platform出力、native command一回配送、texture set／free、UI中の再borrowを検査する。
+
+加えて当該子出力にcommandsが含まれる直接入口1回で同passのScreenshotとclipboard配送を検査し、
+surface不在／callback中owner除去の2回でdelta先受け・resources・他target commandsの継続を検査する。
+合計各27回、両backendで54回の子UI。headless FullOutput／deltaは検査後に明示破棄する。
+owner除去fixtureのcommand配送は削除対象を再作成しないfakeであり、Close・退役／再作成防止の証拠ではない。
+native adapterのsource接続は内部確認したが、実HWND／GL context／surfaceとeframe→実GPU一体実行は未実施。
+親surfaceは実主経路のPassDecisionとfake effectで数えており、親native run_ui_and_paint全体を起動していない。
+実GPUのsubmission／readbackは同graphのegui-wgpu16件を別に実行した。
+
+### 部分復元での失敗と復元後の検証
+
+次の3種を一時変更し、各回finallyで元byteへ戻した。各変異で両backendの新規2件が失敗
+（0 passed／2 failed、各exit 101）し、復元後の全suiteは成功した。
+
+| 部分復元 | 検出内容 |
+| --- | --- |
+| 子metadataの代わりに復帰後の親Context metadataを使う | 親最小化・子visibleの子paintが消える |
+| 非描画時のapply_resourcesを除く | 実driverの資源配送が欠落する |
+| finish_viewportsを除く | 実driverの通常command配送が欠落する |
+
+command／件数／exit code／所要時間は`target/egui037-stage2c3b-results.json`、個別ログは同prefix。
+変異scriptは`target/mutate-stage2c3b.py`、最終14項目は`target/verify-stage2c3b.py`。
+Rust 1.99.0、cargoはlocked／offline、MSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=1で実行した。
+
+| 検証 | 最終結果 |
+| --- | --- |
+| eframe lib default＋glow／persistence | 46 passed／0 failed／1 ignored、exit 0 |
+| eframe lib 上記＋miv-test-script-window-witness | 50 passed／0 failed／1 ignored、exit 0 |
+| eframe lib glow／default_fontsのみ | 39 passed／0 failed／0 ignored、exit 0 |
+| egui-wgpu lib（winit） | 16 passed／0 failed／0 ignored、exit 0、GPU skipなし |
+| egui／egui-winit／egui-ime lib | 106／43／28 passed、失敗・ignoreなし、各exit 0 |
+| root core check 通常／test-script | 両方exit 0、旧graph |
+| root fmt／fmt --check、準備fmt --all／fmt --all --check | すべてexit 0 |
+| git diff --check、検証後source hash／保護対象／index照合 | 成功 |
+
+最終source hashはtested-source.json、変更範囲と保護対象はaudit.jsonに保存する（同prefix）。
+root fmtの対象外である準備graphも明示fmtした。live試験はignoreと子再実行用--ignoredを維持し、
+今回の実行に--ignoredは付けていない。既存警告は残るが、新しい依存の取得は不要だった。
+
+### 残作業と設計の照合
+
+設計との重大な食い違いはない。入れ子commandsの実際の配送時点と試験境界は上記のとおり。
+native/run.rs・scheduler・EpiIntegration・製品コード・旧vendor・両graphのmanifest／lockは不変。
+追加repaint・強制UI・App補助flag・新queue／pending bool・独自延期／retryは追加しない。
+Close受付・消費・非描画退役とroot LogicOnly Close回帰は2c-4へ残した。実機確認・正式独立レビューは別工程。
+依存取得・ネットワーク・live・製品build／起動・test-full.ps1・git add／commit／branch操作は行っていない。

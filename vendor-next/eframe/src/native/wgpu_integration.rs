@@ -475,7 +475,10 @@ impl<'app> WgpuWinitApp<'app> {
 
             egui::Context::set_immediate_viewport_renderer(move |_egui_ctx, immediate_viewport| {
                 if let Some(shared) = shared.upgrade() {
-                    render_immediate_viewport(beginning, &shared, immediate_viewport);
+                    render_immediate_viewport(
+                        &mut NativeWgpuImmediateBackend::new(beginning, &shared),
+                        immediate_viewport,
+                    );
                 } else {
                     log::warn!("render_sync_callback called after window closed");
                 }
@@ -1464,23 +1467,55 @@ fn is_viewport_or_descendant_visible(viewports: &Viewports, viewport_id: Viewpor
 }
 
 fn render_immediate_viewport(
-    beginning: Instant,
-    shared: &RefCell<SharedState>,
+    backend: &mut impl super::frame_output::ImmediateViewportBackend,
     immediate_viewport: ImmediateViewport<'_>,
 ) {
     profiling::function_scope!();
+    super::frame_output::run_immediate_viewport(backend, immediate_viewport);
+}
 
-    let ImmediateViewport {
-        ids,
-        builder,
-        mut viewport_ui_cb,
-    } = immediate_viewport;
+#[derive(Default)]
+struct ImmediateWgpuTimings {
+    input_max_tex: Option<usize>,
+    input_ms: f64,
+    run_ms: f64,
+    set_window_ms: f64,
+    tessellate_ms: f64,
+    paint_ms: f64,
+    resource_ms: f64,
+    platform_ms: f64,
+    viewport_out_ms: f64,
+    delta_set: usize,
+    delta_free: usize,
+    delta_bytes: usize,
+    primitive_count: usize,
+}
 
-    // mIV probe (backlog 1.129): painting one immediate viewport costs a constant ~38ms of
-    // CPU regardless of its size or contents. Split this function so the stage that owns it
-    // is named rather than guessed.
-    let t_all = Instant::now();
-    let input = {
+struct NativeWgpuImmediateBackend<'a> {
+    beginning: Instant,
+    shared: &'a RefCell<SharedState>,
+    started: Instant,
+    timings: ImmediateWgpuTimings,
+}
+
+impl<'a> NativeWgpuImmediateBackend<'a> {
+    fn new(beginning: Instant, shared: &'a RefCell<SharedState>) -> Self {
+        Self {
+            beginning,
+            shared,
+            started: Instant::now(),
+            timings: Default::default(),
+        }
+    }
+}
+
+impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBackend<'_> {
+    fn prepare(
+        &mut self,
+        ids: ViewportIdPair,
+        builder: ViewportBuilder,
+    ) -> Option<(egui::Context, egui::RawInput)> {
+        profiling::function_scope!();
         let SharedState {
             egui_ctx,
             viewports,
@@ -1488,8 +1523,7 @@ fn render_immediate_viewport(
             viewport_from_window,
             clipboard_shortcuts,
             ..
-        } = &mut *shared.borrow_mut();
-
+        } = &mut *self.shared.borrow_mut();
         let viewport = initialize_or_update_viewport(
             viewports,
             ids,
@@ -1509,186 +1543,248 @@ fn render_immediate_viewport(
                 );
             });
         }
-
-        let (Some(window), Some(egui_winit)) = (&viewport.window, &mut viewport.egui_winit) else {
-            return;
+        let (Some(window), Some(state)) = (&viewport.window, &mut viewport.egui_winit) else {
+            return None;
         };
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
-
-        // mIV (backlog 1.129): keep this viewport's max_texture_side equal to the root's.
-        // See the note on the same call in `run_ui_and_paint`.
+        // All viewports use the same renderer/font atlas limit.
         if let Some(max_texture_side) = painter.max_texture_side() {
-            egui_winit.set_max_texture_side(max_texture_side);
+            state.set_max_texture_side(max_texture_side);
         }
         let mut input =
             super::epi_integration::take_viewport_input(&mut viewport.pending_raw_input, || {
-                egui_winit.take_egui_input(window)
+                state.take_egui_input(window)
             });
         input.viewports = viewports
             .iter()
             .map(|(id, viewport)| (*id, viewport.info.clone()))
             .collect();
-        input.time = Some(beginning.elapsed().as_secs_f64());
-        input
-    };
-
-    let input_max_tex = input.max_texture_side;
-    let input_ms = t_all.elapsed().as_secs_f64() * 1000.0;
-    let egui_ctx = shared.borrow().egui_ctx.clone();
-    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-    if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
-        egui_wgpu::atlas_diag::log_line(format!(
-            "[capture-probe] eframe_pass viewport={:?} class=immediate",
-            ids.this
-        ));
+        input.time = Some(self.beginning.elapsed().as_secs_f64());
+        self.timings.input_max_tex = input.max_texture_side;
+        self.timings.input_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        Some((egui_ctx.clone(), input))
     }
-    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-    let callback_window = shared
-        .borrow()
-        .viewports
-        .get(&ids.this)
-        .and_then(|viewport| viewport.window.clone());
 
-    // ------------------------------------------
-
-    // Run the user code, which could re-entrantly call this function again (!).
-    // Make sure no locks are held during this call.
-    let run_ms;
-    let egui::FullOutput {
-        platform_output,
-        textures_delta,
-        shapes,
-        pixels_per_point,
-        viewport_output,
-    } = {
-        let t_run = Instant::now();
+    fn run_ui(
+        &mut self,
+        ids: ViewportIdPair,
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        callback: &mut dyn FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let started = Instant::now();
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[capture-probe] eframe_pass viewport={:?} class=immediate",
+                ids.this
+            ));
+        }
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        let callback_window = self
+            .shared
+            .borrow()
+            .viewports
+            .get(&ids.this)
+            .and_then(|viewport| viewport.window.clone());
         #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
         let _window_witness_scope = crate::miv_test_script_window_witness::enter_native_window(
-            &egui_ctx,
+            ctx,
             ids.this,
             callback_window.as_ref(),
         );
         #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
         drop(callback_window);
-        let output = egui_ctx.run_ui(input, |ui| {
-            viewport_ui_cb(ui);
-        });
-        run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
+        let _ = ids;
+        // No backend borrow is held: this callback may recursively open a child.
+        let output = ctx.run_ui(input, callback);
+        self.timings.run_ms = started.elapsed().as_secs_f64() * 1000.0;
         output
-    };
+    }
 
-    // mIV: same ledger as the main path - an immediate viewport's `run` takes deltas out of the
-    // shared texture manager too, including any the parent pass had accumulated so far.
-    egui_wgpu::atlas_diag::record_produced(
-        egui_wgpu::atlas_diag::Site::ProducedImmediate,
-        &textures_delta,
-        Some(ids.this.0.value()),
-        egui_installed_atlas_size(&egui_ctx),
-    );
+    fn accept_textures(&mut self, ids: ViewportIdPair, ctx: &egui::Context, delta: TexturesDelta) {
+        egui_wgpu::atlas_diag::record_produced(
+            egui_wgpu::atlas_diag::Site::ProducedImmediate,
+            &delta,
+            Some(ids.this.0.value()),
+            egui_installed_atlas_size(ctx),
+        );
+        (
+            self.timings.delta_set,
+            self.timings.delta_free,
+            self.timings.delta_bytes,
+        ) = texture_delta_stats(&delta);
+        // Transfer before looking up the producing viewport; its lifetime may end in UI.
+        self.shared.borrow_mut().pending_deltas.append(delta);
+    }
 
-    // ------------------------------------------
+    fn finish_output(
+        &mut self,
+        ids: ViewportIdPair,
+        ctx: &egui::Context,
+        platform: egui::PlatformOutput,
+        outputs: &mut OrderedViewportIdMap<ViewportOutput>,
+    ) -> Option<(ViewportInfo, bool)> {
+        let started = Instant::now();
+        let mut shared = self.shared.borrow_mut();
+        let viewport = shared.viewports.get_mut(&ids.this)?;
+        viewport.info.events.clear();
+        let (Some(window), Some(state)) = (&viewport.window, &mut viewport.egui_winit) else {
+            return None;
+        };
+        let output = outputs.get_mut(&ids.this)?;
+        super::frame_output::finish_main_viewport_output(
+            platform,
+            &mut output.commands,
+            &mut viewport.actions_requested,
+            &mut super::frame_output::WinitImmediateOutputTarget { state, window },
+        );
+        egui_winit::update_viewport_info(&mut viewport.info, ctx, window, false);
+        self.timings.platform_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Some((
+            viewport.info.clone(),
+            viewport
+                .actions_requested
+                .iter()
+                .any(ActionRequested::wants_paint),
+        ))
+    }
 
-    let mut shared_mut = shared.borrow_mut();
-    let SharedState {
-        viewports,
-        painter,
-        viewport_from_window,
-        pending_deltas,
-        ..
-    } = &mut *shared_mut;
+    fn tessellate(
+        &mut self,
+        ctx: &egui::Context,
+        shapes: Vec<egui::epaint::ClippedShape>,
+        pixels_per_point: f32,
+    ) -> Vec<egui::ClippedPrimitive> {
+        let started = Instant::now();
+        let primitives = ctx.tessellate(shapes, pixels_per_point);
+        self.timings.tessellate_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.timings.primitive_count = primitives.len();
+        primitives
+    }
 
-    let (delta_set, delta_free, delta_bytes) = texture_delta_stats(&textures_delta);
-    pending_deltas.append(textures_delta);
-
-    // mIV: same rule as the main render path - an immediate viewport whose window went away
-    // during the user callback still owns this frame's texture deltas, and egui will not
-    // hand them over again. See Painter::apply_textures_delta.
-    let Some(viewport) = viewports.get_mut(&ids.this) else {
-        painter.apply_textures_delta(pending_deltas);
-        return;
-    };
-    viewport.info.events.clear(); // they should have been processed
-    let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
-        painter.apply_textures_delta(pending_deltas);
-        return;
-    };
-
-    let t_set_window = Instant::now();
-    {
-        profiling::scope!("set_window");
-        if let Err(err) = pollster::block_on(painter.set_window(ids.this, Some(window.clone()))) {
-            log::error!(
-                "when rendering viewport_id={:?}, set_window Error {err}",
-                ids.this
-            );
+    fn paint(
+        &mut self,
+        ids: ViewportIdPair,
+        _ctx: &egui::Context,
+        primitives: Vec<egui::ClippedPrimitive>,
+        pixels_per_point: f32,
+    ) {
+        let mut shared = self.shared.borrow_mut();
+        let SharedState {
+            viewports,
+            painter,
+            pending_deltas,
+            ..
+        } = &mut *shared;
+        let Some(viewport) = viewports.get_mut(&ids.this) else {
+            painter.apply_textures_delta(pending_deltas);
+            return;
+        };
+        let Some(window) = viewport.window.as_ref() else {
+            painter.apply_textures_delta(pending_deltas);
+            return;
+        };
+        let started = Instant::now();
+        {
+            profiling::scope!("set_window");
+            if let Err(err) =
+                pollster::block_on(painter.set_window(ids.this, Some(Arc::clone(window))))
+            {
+                log::error!(
+                    "when rendering viewport_id={:?}, set_window Error {err}",
+                    ids.this
+                );
+                painter.apply_textures_delta(pending_deltas);
+                return;
+            }
         }
+        self.timings.set_window_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        let screenshots = take_screenshot_requests(&mut viewport.actions_requested);
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        let count = screenshots.len();
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[capture-probe] painter_request viewport={:?} class=immediate count={count}",
+                ids.this
+            ));
+        }
+        painter.paint_and_update_textures(
+            ids.this,
+            pixels_per_point,
+            [0.0; 4],
+            &primitives,
+            pending_deltas,
+            screenshots,
+            window,
+        );
+        viewport
+            .actions_requested
+            .retain(|action| !matches!(action, ActionRequested::PaintWhileHidden));
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[capture-probe] painter_return viewport={:?} class=immediate request_count={count} image_delivery=async",
+                ids.this
+            ));
+        }
+        self.timings.paint_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
-    let set_window_ms = t_set_window.elapsed().as_secs_f64() * 1000.0;
 
-    let t_tessellate = Instant::now();
-    let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-    let tessellate_ms = t_tessellate.elapsed().as_secs_f64() * 1000.0;
-    let t_paint = Instant::now();
-    // Screenshot commands addressed to an immediate child are queued by
-    // handle_viewport_output just like root commands. Forward them with this
-    // child's paint so egui-wgpu completes its original one-shot callback.
-    let screenshot_commands = take_screenshot_requests(&mut viewport.actions_requested);
-    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-    let screenshot_commands_count = screenshot_commands.len();
-    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-    if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
-        egui_wgpu::atlas_diag::log_line(format!(
-            "[capture-probe] painter_request viewport={:?} class=immediate count={screenshot_commands_count}",
-            ids.this
-        ));
+    fn apply_resources(&mut self, _ids: ViewportIdPair, _ctx: &egui::Context) {
+        let started = Instant::now();
+        let mut shared = self.shared.borrow_mut();
+        let SharedState {
+            painter,
+            pending_deltas,
+            ..
+        } = &mut *shared;
+        painter.apply_textures_delta(pending_deltas);
+        self.timings.resource_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
-    painter.paint_and_update_textures(
-        ids.this,
-        pixels_per_point,
-        [0.0, 0.0, 0.0, 0.0],
-        &clipped_primitives,
-        pending_deltas,
-        screenshot_commands,
-        window,
-    );
-    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
-    if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
-        egui_wgpu::atlas_diag::log_line(format!(
-            "[capture-probe] painter_return viewport={:?} class=immediate request_count={screenshot_commands_count} image_delivery=async",
-            ids.this
-        ));
+
+    fn finish_viewports(
+        &mut self,
+        _ids: ViewportIdPair,
+        ctx: &egui::Context,
+        outputs: OrderedViewportIdMap<ViewportOutput>,
+    ) {
+        let started = Instant::now();
+        let SharedState {
+            viewports,
+            painter,
+            viewport_from_window,
+            ..
+        } = &mut *self.shared.borrow_mut();
+        handle_viewport_output(ctx, &outputs, viewports, painter, viewport_from_window);
+        self.timings.viewport_out_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
-    let paint_ms = t_paint.elapsed().as_secs_f64() * 1000.0;
 
-    let t_platform = Instant::now();
-    egui_winit.handle_platform_output(window, platform_output);
-    let platform_ms = t_platform.elapsed().as_secs_f64() * 1000.0;
-
-    let t_viewport_out = Instant::now();
-    handle_viewport_output(
-        &egui_ctx,
-        &viewport_output,
-        viewports,
-        painter,
-        viewport_from_window,
-    );
-    let viewport_out_ms = t_viewport_out.elapsed().as_secs_f64() * 1000.0;
-
-    // mIV (backlog 1.129): a slow viewport paint that also carries a texture delta is the
-    // shape this bug had -- a whole font atlas re-uploaded every frame because two viewports
-    // disagreed on max_texture_side. Keep the line as the regression signal; a paint that
-    // uploads nothing stays silent.
-    let total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
-    if total_ms >= 8.0 && delta_bytes > 0 {
-        egui_wgpu::atlas_diag::log_line(format!(
-            "[eframe] immediate_viewport id={} total={total_ms:.1}ms input={input_ms:.1} \
-             run={run_ms:.1} set_window={set_window_ms:.1} tessellate={tessellate_ms:.1} \
-             paint={paint_ms:.1} platform_out={platform_ms:.1} viewport_out={viewport_out_ms:.1} \
-             prims={} delta_set={delta_set} delta_free={delta_free} delta_bytes={delta_bytes} \
-             max_tex={input_max_tex:?}",
-            ids.this.0.value(),
-            clipped_primitives.len(),
-        ));
+    fn finished(&mut self, ids: ViewportIdPair, _ctx: &egui::Context) {
+        let total_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let m = &self.timings;
+        // Keep the ordinary (non-feature-gated) slow immediate delta witness.
+        if total_ms >= 8.0 && m.delta_bytes > 0 {
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[eframe] immediate_viewport id={} total={total_ms:.1}ms input={:.1} run={:.1} set_window={:.1} tessellate={:.1} paint={:.1} resource={:.1} platform_out={:.1} viewport_out={:.1} prims={} delta_set={} delta_free={} delta_bytes={} max_tex={:?}",
+                ids.this.0.value(),
+                m.input_ms,
+                m.run_ms,
+                m.set_window_ms,
+                m.tessellate_ms,
+                m.paint_ms,
+                m.resource_ms,
+                m.platform_ms,
+                m.viewport_out_ms,
+                m.primitive_count,
+                m.delta_set,
+                m.delta_free,
+                m.delta_bytes,
+                m.input_max_tex
+            ));
+        }
     }
 }
 
@@ -1921,6 +2017,13 @@ mod minimized_full_tests {
         ClipboardInput, MainOutputTarget, PassDecision, finish_main_viewport_output,
     };
     use super::*;
+
+    #[test]
+    fn minimized_full_immediate_real_entry_preserves_child_output_and_paint_ownership() {
+        super::super::frame_output::immediate_tests::check_immediate_entry(|backend, viewport| {
+            render_immediate_viewport(backend, viewport);
+        });
+    }
 
     #[derive(Default)]
     struct FakeWindow {

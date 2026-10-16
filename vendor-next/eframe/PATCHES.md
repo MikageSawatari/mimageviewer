@@ -118,3 +118,30 @@ GPU consumerは同graphのegui-wgpu回帰で別に確認する。詳細・変異
 native/run.rsと両render_immediate_viewport本体は不変。100ms下限、遅い要求の非加速、sleep、
 outer phase・bootstrap／resize例外、250ms deadlineを維持する。
 immediate子の描画資格と非描画出力・当該子UI action完結は2c-3b、Close契約は2c-4へ残す。
+
+## 段2c-3b: immediate子自身の描画資格と出力完結（2026-10-17）
+
+`fb43c743f`上へ合意済み案Bのimmediate部分を実装した（b・新規）。
+以下は**実装担当の内部確認**であり、正式な独立レビュー・ACCEPTではない。
+
+- 両backendの登録callbackとrender_immediate_viewportを共通driverへ接続する。
+  子UIの実行後、子自身の最新ViewportInfoと既存Screenshot／PaintWhileHiddenでpaintを決める。
+  親のpaint資格を流用せず、metadataも偽装しない。UI callback中はnative borrowを保持しない。
+- 共有deltaの受領を出力元の再検索より前に置く。platform／IME・clipboard actionは
+  2c-3aのfinish_main_viewport_outputで対象Stateへ完結し、native commandsは通常handlerへ渡す。
+  子のpaintが不要でも資源とcommandsを処理し、present／visible commitを発行しない。
+- glowの既存renderer所有pending_deltasをRcで共有し、旧viewport別pending_deltaを除いた。
+  root／deferred／immediateが同じownerを使用し、有効GL contextでのset／freeと
+  clear／paint／swapを分離する。context無しでは既存ownerへ残す。別queueは追加しない。
+  通常commandsで初めてcontextが利用可能になった場合も同ownerを適用し、空なら何もしない。
+- 子出力に当該UIの明示描画commandがあればpaint前に既存action ownerへ移す。
+  実入れ子passではeguiがcommandsを親FullOutputまで保持するため、通常の親出力配送から
+  子の既存ownerへ渡し、必要な既存Fullの列で一度だけcaptureする。Contextの配送規則は不変。
+  既存保留と当該UIのScreenshotはcallback identity／順序を保ち、後続Fullで重複しない。
+
+回帰2件は各backendの実immediate入口・実Context／入れ子run_uiを通し、fake window／painterで
+各27回の子UIを検査する。親／子のpaint・callbackを別に数える。描画先不在時の資源配送も検査するが、
+Close／退役・再作成防止の証拠とはしない。実native HWND／GL実動作は未実施。
+3種の部分復元で両回帰の失敗を確認し、byte復元後の全検証は段2台帳へ記録する。
+native/run.rs・scheduler・root製品graph・双方のlockは不変。追加repaint・強制UI・App flag・
+新pending bool・retryは追加せず、Closeの受付・消費・退役とroot Close回帰は2c-4へ残す。

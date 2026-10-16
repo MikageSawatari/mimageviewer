@@ -32,11 +32,13 @@ use egui::{
 };
 #[cfg(feature = "accesskit")]
 use egui_winit::accesskit_winit;
-use log::warn;
 
 use super::{
     epi_integration, event_loop_context,
-    frame_output::{PassDecision, WinitOutputTarget, finish_main_viewport_output},
+    frame_output::{
+        ImmediateViewportBackend, PassDecision, WinitImmediateOutputTarget, WinitOutputTarget,
+        finish_main_viewport_output, run_immediate_viewport,
+    },
     winit_integration::{EventResult, PassMode, UserEvent, WinitApp, create_egui_context},
 };
 use crate::epaint::textures::TexturesDelta;
@@ -78,13 +80,13 @@ struct GlowWinitRunning<'app> {
     painter: Rc<RefCell<egui_glow::Painter>>,
 
     /// Any not yet applied deltas for this app.
-    pending_deltas: TexturesDelta,
+    pending_deltas: Rc<RefCell<TexturesDelta>>,
 }
 
 impl Drop for GlowWinitRunning<'_> {
     fn drop(&mut self) {
         // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_deltas.clear();
+        self.pending_deltas.borrow_mut().clear();
     }
 }
 
@@ -143,9 +145,6 @@ struct Viewport {
     /// Input not consumed by a UI pass yet, owned only by this viewport.
     pending_raw_input: egui::RawInput,
 
-    /// Any not yet applied deltas for this viewport.
-    pending_delta: TexturesDelta,
-
     /// The user-callback that shows the ui.
     /// None for immediate viewports.
     viewport_ui_cb: Option<Arc<DeferredViewportUiCallback>>,
@@ -184,13 +183,6 @@ impl Viewport {
                 &mut self.actions_requested,
             );
         }
-    }
-}
-
-impl Drop for Viewport {
-    fn drop(&mut self) {
-        // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_delta.clear();
     }
 }
 
@@ -436,21 +428,30 @@ impl<'app> GlowWinitApp<'app> {
         };
 
         let glutin = Rc::new(RefCell::new(glutin));
+        let pending_deltas = Rc::new(RefCell::new(TexturesDelta::default()));
 
         {
             // Create weak pointers so that we don't keep
             // state alive for too long.
             let glutin = Rc::downgrade(&glutin);
             let painter = Rc::downgrade(&painter);
+            let pending_deltas = Rc::downgrade(&pending_deltas);
             let beginning = integration.beginning;
 
             egui::Context::set_immediate_viewport_renderer(move |egui_ctx, immediate_viewport| {
-                if let (Some(glutin), Some(painter)) = (glutin.upgrade(), painter.upgrade()) {
+                if let (Some(glutin), Some(painter), Some(pending_deltas)) = (
+                    glutin.upgrade(),
+                    painter.upgrade(),
+                    pending_deltas.upgrade(),
+                ) {
                     render_immediate_viewport(
-                        egui_ctx,
-                        &glutin,
-                        &painter,
-                        beginning,
+                        &mut NativeGlowImmediateBackend {
+                            egui_ctx,
+                            glutin: &glutin,
+                            painter: &painter,
+                            pending_deltas: &pending_deltas,
+                            beginning,
+                        },
                         immediate_viewport,
                     );
                 } else {
@@ -464,7 +465,7 @@ impl<'app> GlowWinitApp<'app> {
             app,
             glutin,
             painter,
-            pending_deltas: Default::default(),
+            pending_deltas,
         }))
     }
 }
@@ -852,6 +853,7 @@ impl GlowWinitRunning<'_> {
 
         let mut glutin = glutin.borrow_mut();
         let mut painter = painter.borrow_mut();
+        let mut pending_deltas = pending_deltas.borrow_mut();
 
         let egui::FullOutput {
             platform_output,
@@ -941,7 +943,7 @@ impl GlowWinitRunning<'_> {
                 screen_size_in_pixels,
                 pixels_per_point,
                 &clipped_primitives,
-                pending_deltas,
+                &mut pending_deltas,
             );
 
             {
@@ -1003,7 +1005,7 @@ impl GlowWinitRunning<'_> {
             finish_glow_texture_delta(
                 glutin.make_resource_context_current(viewport_id),
                 &mut *painter,
-                pending_deltas,
+                &mut pending_deltas,
             );
         }
 
@@ -1439,7 +1441,6 @@ impl GlutinWindowContext {
                 info: viewport_info,
                 actions_requested: Default::default(),
                 pending_raw_input: Default::default(),
-                pending_delta: Default::default(),
                 viewport_ui_cb: None,
                 gl_surface: None,
                 window: window.map(Arc::new),
@@ -1765,7 +1766,6 @@ fn initialize_or_update_viewport<'a>(
                 info: Default::default(),
                 actions_requested: Default::default(),
                 pending_raw_input: Default::default(),
-                pending_delta: Default::default(),
                 viewport_ui_cb,
                 window: None,
                 egui_winit: None,
@@ -1836,26 +1836,29 @@ fn is_viewport_or_descendant_visible(
 /// This is called (via a callback) by user code to render immediate viewports,
 /// i.e. viewport that are directly nested inside a parent viewport.
 fn render_immediate_viewport(
-    egui_ctx: &egui::Context,
-    glutin: &RefCell<GlutinWindowContext>,
-    painter: &RefCell<egui_glow::Painter>,
-    beginning: Instant,
+    backend: &mut impl ImmediateViewportBackend,
     immediate_viewport: ImmediateViewport<'_>,
 ) {
     profiling::function_scope!();
+    run_immediate_viewport(backend, immediate_viewport);
+}
 
-    let ImmediateViewport {
-        ids,
-        builder,
-        mut viewport_ui_cb,
-    } = immediate_viewport;
+struct NativeGlowImmediateBackend<'a> {
+    egui_ctx: &'a egui::Context,
+    glutin: &'a RefCell<GlutinWindowContext>,
+    painter: &'a RefCell<egui_glow::Painter>,
+    pending_deltas: &'a RefCell<TexturesDelta>,
+    beginning: Instant,
+}
 
-    let viewport_id = ids.this;
-
-    {
-        let mut glutin = glutin.borrow_mut();
+impl ImmediateViewportBackend for NativeGlowImmediateBackend<'_> {
+    fn prepare(
+        &mut self,
+        ids: ViewportIdPair,
+        builder: ViewportBuilder,
+    ) -> Option<(egui::Context, egui::RawInput)> {
+        let mut glutin = self.glutin.borrow_mut();
         let glutin = &mut *glutin;
-
         initialize_or_update_viewport(
             &mut glutin.viewports,
             &mut glutin.current_viewport,
@@ -1864,138 +1867,177 @@ fn render_immediate_viewport(
             builder,
             None,
         );
-
         let ret = event_loop_context::with_current_event_loop(|event_loop| {
-            glutin.initialize_window(viewport_id, event_loop)
+            glutin.initialize_window(ids.this, event_loop)
         });
-
         if let Some(Err(err)) = ret {
             log::error!(
-                "Failed to initialize a window for immediate viewport {viewport_id:?}: {err}"
+                "Failed to initialize a window for immediate viewport {:?}: {err}",
+                ids.this
             );
-            return;
+            return None;
         }
-    }
 
-    let input = {
-        let mut glutin = glutin.borrow_mut();
-
-        let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
-            return;
+        let viewport = glutin.viewports.get_mut(&ids.this)?;
+        let (Some(state), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
+            return None;
         };
-        let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
-            return;
-        };
-        egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
-
-        let mut raw_input =
+        egui_winit::update_viewport_info(&mut viewport.info, self.egui_ctx, window, false);
+        let mut input =
             epi_integration::take_viewport_input(&mut viewport.pending_raw_input, || {
-                egui_winit.take_egui_input(window)
+                state.take_egui_input(window)
             });
-        raw_input.viewports = glutin
+        input.viewports = glutin
             .viewports
             .iter()
             .map(|(id, viewport)| (*id, viewport.info.clone()))
             .collect();
-        raw_input.time = Some(beginning.elapsed().as_secs_f64());
-        raw_input
-    };
-
-    // ---------------------------------------------------
-    // Call the user ui-code, which could re-entrantly call this function again!
-    // No locks may be hold while calling this function.
-
-    let egui::FullOutput {
-        platform_output,
-        textures_delta,
-        shapes,
-        pixels_per_point,
-        viewport_output,
-    } = egui_ctx.run_ui(input, |ui| {
-        viewport_ui_cb(ui);
-    });
-
-    // ---------------------------------------------------
-
-    let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-
-    let mut glutin = glutin.borrow_mut();
-
-    let GlutinWindowContext {
-        current_gl_context,
-        not_current_gl_context,
-        current_viewport,
-        viewports,
-        ..
-    } = &mut *glutin;
-
-    let Some(viewport) = viewports.get_mut(&viewport_id) else {
-        warn!("Viewport disappeared unexpectedly!");
-        return;
-    };
-    viewport.pending_delta.append(textures_delta);
-
-    viewport.info.events.clear(); // they should have been processed
-
-    let (Some(egui_winit), Some(window), Some(gl_surface)) = (
-        &mut viewport.egui_winit,
-        &viewport.window,
-        &viewport.gl_surface,
-    ) else {
-        return;
-    };
-
-    let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
-
-    change_gl_context(
-        current_gl_context,
-        not_current_gl_context,
-        current_viewport,
-        viewport_id,
-        gl_surface,
-    );
-
-    let current_gl_context = current_gl_context.as_ref().unwrap();
-
-    if !gl_surface.is_current(current_gl_context) {
-        log::error!(
-            "egui::show_viewport_immediate: viewport {:?} ({:?}) was not created on main thread.",
-            viewport.ids.this,
-            viewport.builder.title
-        );
+        input.time = Some(self.beginning.elapsed().as_secs_f64());
+        Some((self.egui_ctx.clone(), input))
+        // All native borrows end before the shared driver calls user UI.
     }
 
-    egui_glow::painter::clear(
-        painter.borrow().gl(),
-        screen_size_in_pixels,
-        [0.0, 0.0, 0.0, 0.0],
-    );
+    fn accept_textures(
+        &mut self,
+        _ids: ViewportIdPair,
+        _ctx: &egui::Context,
+        textures_delta: TexturesDelta,
+    ) {
+        // This renderer owner survives a child's disappearance or missing surface.
+        self.pending_deltas.borrow_mut().append(textures_delta);
+    }
 
-    painter.borrow_mut().paint_and_update_textures(
-        screen_size_in_pixels,
-        pixels_per_point,
-        &clipped_primitives,
-        &mut viewport.pending_delta,
-    );
+    fn finish_output(
+        &mut self,
+        ids: ViewportIdPair,
+        ctx: &egui::Context,
+        platform: egui::PlatformOutput,
+        viewport_output: &mut OrderedViewportIdMap<ViewportOutput>,
+    ) -> Option<(ViewportInfo, bool)> {
+        let mut glutin = self.glutin.borrow_mut();
+        let viewport = glutin.viewports.get_mut(&ids.this)?;
+        viewport.info.events.clear();
+        let (Some(state), Some(window), Some(output)) = (
+            &mut viewport.egui_winit,
+            &viewport.window,
+            viewport_output.get_mut(&ids.this),
+        ) else {
+            return None;
+        };
+        finish_main_viewport_output(
+            platform,
+            &mut output.commands,
+            &mut viewport.actions_requested,
+            &mut WinitImmediateOutputTarget { state, window },
+        );
+        egui_winit::update_viewport_info(&mut viewport.info, ctx, window, false);
+        // Metadata stays truthful. A missing native surface has no paint target,
+        // but its output and shared texture work have already been accepted.
+        viewport.gl_surface.as_ref()?;
+        Some((
+            viewport.info.clone(),
+            viewport
+                .actions_requested
+                .iter()
+                .any(ActionRequested::wants_paint),
+        ))
+    }
 
-    // Preserve the queued immediate child's screenshot request on its own surface.
-    // Requests emitted by this UI's viewport output still enter the existing action path below.
-    complete_immediate_screenshots(&mut viewport.actions_requested, || {
-        Arc::new(painter.borrow().read_screen_rgba(screen_size_in_pixels))
-    });
-
-    {
+    fn paint(
+        &mut self,
+        ids: ViewportIdPair,
+        ctx: &egui::Context,
+        clipped_primitives: Vec<egui::ClippedPrimitive>,
+        pixels_per_point: f32,
+    ) {
+        let mut glutin = self.glutin.borrow_mut();
+        if glutin
+            .viewports
+            .get(&ids.this)
+            .is_none_or(|viewport| viewport.window.is_none() || viewport.gl_surface.is_none())
+        {
+            drop(glutin);
+            self.apply_resources(ids, ctx);
+            return;
+        }
+        let GlutinWindowContext {
+            current_gl_context,
+            not_current_gl_context,
+            current_viewport,
+            viewports,
+            ..
+        } = &mut *glutin;
+        let viewport = viewports.get_mut(&ids.this).unwrap();
+        let window = viewport.window.as_ref().unwrap();
+        let gl_surface = viewport.gl_surface.as_ref().unwrap();
+        let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
+        change_gl_context(
+            current_gl_context,
+            not_current_gl_context,
+            current_viewport,
+            ids.this,
+            gl_surface,
+        );
+        let current_gl_context = current_gl_context.as_ref().unwrap();
+        if !gl_surface.is_current(current_gl_context) {
+            log::error!(
+                "egui::show_viewport_immediate: viewport {:?} ({:?}) was not created on main thread.",
+                viewport.ids.this,
+                viewport.builder.title
+            );
+        }
+        let mut painter = self.painter.borrow_mut();
+        painter.clear(screen_size_in_pixels, [0.0, 0.0, 0.0, 0.0]);
+        painter.paint_and_update_textures(
+            screen_size_in_pixels,
+            pixels_per_point,
+            &clipped_primitives,
+            &mut self.pending_deltas.borrow_mut(),
+        );
+        complete_immediate_screenshots(&mut viewport.actions_requested, || {
+            Arc::new(painter.read_screen_rgba(screen_size_in_pixels))
+        });
+        viewport
+            .actions_requested
+            .retain(|action| !matches!(action, ActionRequested::PaintWhileHidden));
         profiling::scope!("swap_buffers");
         if let Err(err) = gl_surface.swap_buffers(current_gl_context) {
             log::error!("swap_buffers failed: {err}");
         }
     }
 
-    egui_winit.handle_platform_output(window, platform_output);
+    fn apply_resources(&mut self, ids: ViewportIdPair, _ctx: &egui::Context) {
+        if !self.pending_deltas.borrow().is_empty() {
+            let has_context = self
+                .glutin
+                .borrow_mut()
+                .make_resource_context_current(ids.this);
+            finish_glow_texture_delta(
+                has_context,
+                &mut *self.painter.borrow_mut(),
+                &mut self.pending_deltas.borrow_mut(),
+            );
+        }
+    }
 
-    event_loop_context::with_current_event_loop(|event_loop| {
-        glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
-    });
+    fn finish_viewports(
+        &mut self,
+        _ids: ViewportIdPair,
+        ctx: &egui::Context,
+        viewport_output: OrderedViewportIdMap<ViewportOutput>,
+    ) {
+        event_loop_context::with_current_event_loop(|event_loop| {
+            self.glutin
+                .borrow_mut()
+                .handle_viewport_output(event_loop, ctx, &viewport_output);
+        });
+    }
+
+    fn finished(&mut self, ids: ViewportIdPair, ctx: &egui::Context) {
+        // Command processing can create the first available shared-context
+        // surface. Finish retained work there without repainting that surface.
+        self.apply_resources(ids, ctx);
+    }
 }
 
 fn complete_immediate_screenshots(
@@ -2404,6 +2446,13 @@ mod viewport_input_tests {
 mod immediate_screenshot_tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn minimized_full_immediate_real_entry_preserves_child_output_and_paint_ownership() {
+        super::super::frame_output::immediate_tests::check_immediate_entry(|backend, viewport| {
+            render_immediate_viewport(backend, viewport);
+        });
+    }
 
     #[test]
     fn queued_child_screenshots_complete_once_and_preserve_other_actions() {
