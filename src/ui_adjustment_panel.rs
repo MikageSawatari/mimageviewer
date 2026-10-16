@@ -3299,6 +3299,7 @@ mod local_adjust_fold_audit {
                 && (trimmed.starts_with("fn ")
                     || trimmed.starts_with("pub fn ")
                     || trimmed.starts_with("pub(crate) fn ")
+                    || trimmed.starts_with("pub(super) fn ")
                     || trimmed.starts_with("async fn ")
                     || trimmed.starts_with("pub(crate) async fn "));
             if is_fn_header {
@@ -3457,28 +3458,65 @@ mod local_adjust_fold_audit {
     /// 到達可能性は実行時テストでは見えないので、位置をソースで固定する。
     #[test]
     fn the_key_run_settle_runs_before_the_embedded_fullscreen_early_return() {
-        let source = std::fs::read_to_string("src/app.rs").unwrap();
-        let update = source
-            .split("fn update_frame(&mut self, ctx: &egui::Context")
-            .nth(1)
-            .expect("App::update_frame が見つからない");
-        let settle = update
-            .find("self.settle_local_adjust_shape_key_edit()")
-            .expect("無操作判定が `App::update_frame` から呼ばれていない");
-        let poll = update
-            .find("self.poll_local_adjust_write_results()")
-            .expect("保存結果の回収が `App::update_frame` から呼ばれていない");
-        let gate = update
-            .find("if embedded_fs_active || embedded_fs_pending {")
-            .expect("in-window フルスクリーンの gate が見つからない");
-        assert!(
-            settle < gate,
-            "無操作判定が in-window フルスクリーンの early return より後ろにある"
-        );
-        assert!(
-            poll < gate,
-            "保存結果の回収が in-window フルスクリーンの early return より後ろにある"
-        );
+        assert!(key_run_settle_precedes_embedded_return(
+            include_str!("app.rs"),
+            include_str!("app/update_phases.rs"),
+        ));
+    }
+
+    fn key_run_settle_precedes_embedded_return(app: &str, phases: &str) -> bool {
+        let method = |source: &str, name: &str| {
+            enclosing_functions(source)
+                .into_iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, lines)| {
+                    lines
+                        .into_iter()
+                        .map(|(_, line)| line)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        };
+        let Some(update) = method(app, "update_frame") else {
+            return false;
+        };
+        let Some(service) = method(phases, "service_edit_completions") else {
+            return false;
+        };
+        let Some(call) = update.find("self.service_edit_completions(ctx, now);") else {
+            return false;
+        };
+        let Some(gate) = update.find("if embedded_fs_active || embedded_fs_pending {") else {
+            return false;
+        };
+        let Some(poll) = service.find("self.poll_local_adjust_write_results()") else {
+            return false;
+        };
+        let Some(settle) = service.find("self.settle_local_adjust_shape_key_edit()") else {
+            return false;
+        };
+        call < gate && poll < settle
+    }
+
+    #[test]
+    fn the_key_run_audit_rejects_late_service_and_missing_work() {
+        let app = include_str!("app.rs");
+        let phases = include_str!("app/update_phases.rs");
+        let call = "self.service_edit_completions(ctx, now);";
+        let gate = "if embedded_fs_active || embedded_fs_pending {";
+        let late = app
+            .replace(call, "")
+            .replace(gate, &format!("{gate}\n{call}"));
+        assert!(!key_run_settle_precedes_embedded_return(&late, phases));
+        for missing in [
+            "self.poll_local_adjust_write_results()",
+            "self.settle_local_adjust_shape_key_edit()",
+        ] {
+            assert!(!key_run_settle_precedes_embedded_return(
+                app,
+                &phases.replace(missing, "REMOVED_WORK"),
+            ));
+        }
     }
 
     /// 確定と取り消しは、保留の種類を同じだけ**扱う** (同じ結末にする、ではない)。

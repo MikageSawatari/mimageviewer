@@ -22181,12 +22181,12 @@ impl App {
         ctx.request_repaint();
     }
 
-    #[cfg(all(windows, test))]
-    pub(crate) fn process_deferred_detached_image_window_events_for_test(
-        &mut self,
-        ctx: &egui::Context,
-    ) {
-        let mut batch = DetachedImageWindowEventBatch::default();
+    /// Drain callback-produced lifecycle/input facts at the existing owner boundary.
+    /// No current Context input, synthetic callback or presentation ACK is read here.
+    /// Stage 3 will connect the Close-only backend hook to the same modal/close owner.
+    #[cfg(windows)]
+    pub(crate) fn service_deferred_detached_window_events(&mut self, ctx: &egui::Context) {
+        let mut deferred_batch = DetachedImageWindowEventBatch::default();
         let shared_views = self
             .deferred_detached_image_window_views
             .values()
@@ -22194,10 +22194,18 @@ impl App {
             .collect::<Vec<_>>();
         for shared in shared_views {
             for event in shared.drain_events() {
-                self.queue_deferred_detached_image_window_event(ctx, event, &mut batch);
+                self.queue_deferred_detached_image_window_event(ctx, event, &mut deferred_batch);
             }
         }
-        self.apply_detached_image_window_event_batch(ctx, batch, true);
+        self.apply_detached_image_window_event_batch(ctx, deferred_batch, true);
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn process_deferred_detached_image_window_events_for_test(
+        &mut self,
+        ctx: &egui::Context,
+    ) {
+        self.service_deferred_detached_window_events(ctx);
     }
 
     #[cfg(all(windows, test))]
@@ -22297,18 +22305,7 @@ impl App {
             }
         }
 
-        let mut deferred_batch = DetachedImageWindowEventBatch::default();
-        let shared_views = self
-            .deferred_detached_image_window_views
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for shared in shared_views {
-            for event in shared.drain_events() {
-                self.queue_deferred_detached_image_window_event(ctx, event, &mut deferred_batch);
-            }
-        }
-        self.apply_detached_image_window_event_batch(ctx, deferred_batch, true);
+        self.service_deferred_detached_window_events(ctx);
 
         if self.detached_image_windows.is_empty() {
             self.prune_deferred_detached_image_window_views();

@@ -1,0 +1,207 @@
+# egui 0.37 更新・段1b 検証台帳
+
+## 段1b-1: App の責務抽出（2026-10-16）
+
+開始: `egui-036` / `a5f8887b5`。実装・検証 owner は今回の Codex 実装担当。
+[更新計画第4.2版](egui-0.37-update-plan.md) §1・§4.2・§4.11・段1bに従う。
+Rust 1.99.0 / egui 0.33.3 / wgpu 27.0.1を維持し、manifest / lock / vendorを変更しない。
+段1b-2・1b-3、非表示logic接続、新Close hookとbackend退役は実装しない。
+製品起動・live試験・製品build・`test-full.ps1`・PNG更新・コミット・branch操作・pushは行わない。
+開始時に変更表示のあった `src/video/dsp/mod.rs` は対象外で、SHA-256
+`2f099cbba3855cbce0f5ae1a5034b9ccea668b0ff6cfae98e8b5bca2a09a8ae0` のバイト列を保護する。
+
+### 実装境界と不変条件
+
+`src/app/update_phases.rs` に連続ブロックを関数として抽出した。
+`App::update` と `update_frame` は旧順序・条件・早期returnを保持する呼出driverである。
+serviceを先頭へ集めず、UIが作ったmodalやnavigationとの前後関係を維持する。
+`MainFrameNavigation` は既存のframe-local変数を渡す引数束だけで、Appのフィールド・pending・queueを増やさない。
+独立reviewで、移動body内に呼出元へ抜けるreturn / break / continueがないことも確認する。
+
+`service_*` はUI入力を読まない進行の断片、`input_*` はpass入力・診断、
+`render_*` は描画とUIに依存する準備/worker採用継続、`post_render_*` は描画後の処理である。
+**`render_*` にworker pollがあることは意図的**。worker pollという名前だけではlogicへ移せない。
+transitiveな表示継続の依存が確認できた入口は、非表示serviceと誤認しないようrender側へ分類した。
+下記は段3の接続予定であり、今回logic-only動作を実装・検証したことは意味しない。
+
+簡素化:既存modal、registry/mount、終了ownerをそのまま使う。
+非表示用の第二poll owner、保存終端の前倒し、callbackの偽造、追加repaint、guard / retry / delayは設けない。
+今回のために変換/保存の新しい並行組合せを作らない。
+
+### 分類と実行順
+
+表は上から旧実行順。Rはrootで現在投影されるviewer（通常main）、Mは既存ownerが一時mountするcontext、
+PはParkedLive media、AはApp-global。rootのContextとviewerのcontext identityは別概念である。
+`logic候補` も、採用先のregistry/mountと既存gateを保って段3で接続する。呼出を一括前倒ししない。
+`ui継続あり` は下記の未解消依存を整理するまでlogicへ直接接続できない。
+
+| 順 | 入口 / 残したdriver処理 | 分類・内容 | 進行先 | 0.37 接続予定 |
+| --- | --- | --- | --- | --- |
+| O1 | diagnostics export poll → begin_grid_click_input_frame | service → input | A / R | logic / ui |
+| O2 | startup visibility / present watch / owner / notice / geometry / deferred size | serviceと実表示ACK・frame操作の既存順序 | A / root HWND | owner pollはlogic候補、表示ACK・geometry frameはui |
+| O3 | service_update_registered_writers | page-edit/rating/tag repaint登録とreconciliation | A / R、既存registry | logic候補 |
+| O4 | clipboard / captureの既存poll | process clipboard snapshotと選択 | A | 段1b-3で整理、今回順序不変 |
+| O5 | render_update_before_frame | pin refresh prune、collection UI、mounted document owner | A / R | ui継続あり（C3） |
+| O6 | defer_*_root_close 3本 | settings/composition/ZIP modal中のroot Close消費 | root | ui。子Close hookとは別契約 |
+| O7 | non-Windows preview poll、poll_image_folder_zip | 元のcontextでcancel/worker/変換進行 | R / operation起点のM | 非表示候補。ただし採用継続を含め段3で再監査 |
+| F1 | render_update_begin | tray wake ACK、heartbeat、Remote進行、modal診断 | A / R、既存Remote close owner | ui継続あり（C1） |
+| F2 | input_update_begin → input_test_script_actions | sidecar中入力消費、keyboard pass owner、診断featureのaction | R | ui（test-script cfg維持） |
+| F3 | service_creative_luts → detect_scroll_input_intent | LUT完成採用 → 同passのscroll intent | A / R | logic候補 → ui |
+| F4 | heartbeat gap → service_edit_completions | 診断、brush deferred、local-adjust保存採用/idle編集終端 | A / R | 診断はui、進行はlogic候補 |
+| F5 | font適用 → service_capture_main_window → key_input begin_frame | font output、main HWND初回捕捉/既存hook設定 → Win32 pass入口 | root HWND / R | outputはui、HWND設定はlogic候補、入力はui |
+| F6 | service_tray_requests → maybe_intercept_close → sync_tray_resident_media_wake | tray設定/要求、root Close、media wake投影 | A / root、対象窓は既存tray owner | logic候補 / ui / logic候補。tray_active gate維持 |
+| F7 | input_main_focus_resume → service_folder_observation | focus復帰判定、watch/rescan/prewarm/sidecar周期flush | R | ui → logic候補 |
+| F8 | input_frame_diagnostics → service_startup_notifications | frame counter/性能診断、indexer/housekeeping/VST fullscreen状態反映 | A / R | ui → logic候補（minimized metadataのみ） |
+| F9 | startup overlay / preparing panel | 描画とstartup入力破棄、従来早期return | root | ui。outer終端は続行 |
+| F10 | render_startup_workers | VST/EffeTune/play-test/update check | A / R | ui継続あり（C2） |
+| F11 | input_pointer_and_ime → service_page_edit_completion → touch診断 → input_drop_and_activity | D&D pointer終端、IME pass、spread/sidecar終端、外部drop・activity入力 | R | ui / logic候補 / ui |
+| F12 | render_apply_theme → render_initial_open → track_window_rect / selected_cell_rect | theme、初回open/activation採用、表示geometry | A / R | ui継続あり（C3）、geometryはui |
+| F13 | service_initial_worker_results | preview、content identity、pinned調整、Smart metadata結果 | R（既存ownerは保持） | logic候補 |
+| F14 | poll_thumbnails → reconcile preview → fs nav lock → thumbnail bookkeeping / VRAM / tag prewarm | 現在表示に応じた回収と要求/会計 | R | 表示依存prepareはui、結果採用と分離が必要 |
+| F15 | FullscreenDecode.service / non-Windows prefetch | 既存context async owner | R | 既存ownerを維持し、C5の表示決定を分けてlogicへ |
+| F16 | render_media_and_edit_results | media / AI / erase / local-adjust結果 | R（media owner選別を保持） | ui継続あり（C4・C5） |
+| F17 | render_search_and_metadata_results | 検索、facet、評価、bookmark、metadata | R | ui継続あり（C3・C5） |
+| F18 | render_other_worker_results | stack、subfolder、Smart、pano、file操作/変換/export/cache等 | R / A、元の要求owner | ui継続あり（C3・C5） |
+| F19 | render_prepare_fullscreen_materials → render_main_title → modifiers | 表示決定、AI/prefetch/調整準備、title、修飾キー同期 | R | ui。modifiers内部は1b-3まで不変更 |
+| F20 | input_root_keyboard → sample/dispatch_gamepad_batch | rootに配送されたfullscreen key / focus / clipboard / keyboard、pad | R、padは下記Mへ保留可 | ui。gamepad内部は1b-2まで不変更 |
+| F21 | liveness / activation watcher / commit → update_active_viewer_context | 寿命・activation、active viewerの既存mount更新 | M → Rへ復帰 | poll/input/renderを同owner内で分離してlogic/uiへ。今回は呼出不変更 |
+| F22 | gamepad fallback / finish → poll_parked_live_detached_windows | mounted配送不成立時の既存返却、pad終端、parked media回収 | R / P | padは1b-2、Pのpollは既存mount owner（C3・C5監査要） |
+| F23 | keep_fullscreen_viewport_alive → embedded transition polls → fullscreen render | viewport維持、描画前folder/PDF/ZIP/nav-lock、登録/paint | R / Mで描画済みならskip | 登録はui、採用継続はui依存を分離してlogicへ |
+| F24 | render_detached_image_windows 内 service_deferred_detached_window_events → callback登録/paint → active backstop | 既存イベントdrain/終了判断と描画を分離 | 対象window ID → 既存寿命/gesture/context owner | drainはlogic候補（L1留保）、登録/実callback ACKはui |
+| F25 | fullscreen close-nav / native front・VST・HUD → backdrop / holdover / embedded branches | 表示後navigationとnative出力、既存早期return | R / native既存owner | ui / post-render。inputを含むnative入口は段1b-3対象 |
+| F26 | render_menubar → render_main_overlays → render_menu_worker_results | menu、overlay、tag/rating/video-upscale結果 | R / A | ui → ui継続あり（C3・C5） |
+| F27 | render_main_dialogs_before_open → open-folder → render_main_file_dialogs → spread-shift poll → render_main_conversion_dialogs | 元のmodal生成順とopen候補 | R / A | 描画はui、pollは既存ownerのlogic候補 |
+| F28 | service_thumb_quality_results → render_main_settings_dialogs → service_pdf_worker_notices | thumbnail quality結果、設定/VST UI、PDF失敗通知 | R / A | logic候補 / ui / logic候補 |
+| F29 | PDF/Susie/TRT notice poll/show → addon/stats/context menu → render_main_dialogs_after_context → PDF/ZIP enumerate | noticeと後半dialog/変換/保存UI、列挙採用 | R / A | showはui、pollはlogic候補だが列挙のC3・C5を分離 |
+| F30 | stack reconcile → toolbar → refresh消費 → input_main_grid_shortcuts | 同frameのmenu結果/refreshとkey順序を保持 | R | ui / UI継続。main_viewer_blockedの同じsnapshotを引数で渡す |
+| F31 | render_main_bars → popup/folder pane wheel guard → process_scroll | 検索/facet/info/pane/選択overlay、wheel消費 | R | ui。wheel内部は1b-3まで不変更 |
+| F32 | root startup tag → render_grid → details/調整budget → selection info → delete key → reload | grid paint、表示後採用と入力 | R | ui / post-render |
+| F33 | post_render_main_navigation | 既存nav候補の優先裁定、folder/pane結果、open | R | uiの後処理（入力を再取得しないがopen先のUI継続あり） |
+| F34 | late-generation repaint → detached selection sync → tail repaint / perf | 同frameのmutation、要求/診断 | R / 対象detached | 表示同期はui、非表示進行は既存owner（C5分離要） |
+| F35 | post_render_native_drag → post_render_scroll_bookkeeping | native D&D境界、settle/auto-aspect deadline | R / root HWND | ui後処理。既存modal/時計を維持 |
+| F36 | key overlay / Remote dialogs → external-tool authorize → perf finish | 実際のUI Cancel/Esc通過後のspawn境界ACK | R / A | ui後処理。前倒し禁止 |
+| O8 | render_update_after_frame | composition operation/save/read採用 | A / R / 既存registryが選ぶM | ui継続あり（C3・C5）。update_frameの全return後も実行 |
+| O9 | render_update_owner_dialogs | composition/ZIP/capture/EPUB/password UI | R、専用viewportは既存callbackのM | ui。parkedへの新しいdialog serviceはしない |
+| O10 | post_render_sidecar_restore → test-script finish → post_render_favorite_writes | 復旧取消/保存終端、favorite保存差分検出 | 復旧要求のcontextをM、favoriteはR | 非表示候補でもterminal frameのmodal gateを前倒ししない |
+| O11 | render_update_external_tool_checkpoint → maximize/normal-present/runtime cleanup ACK → outer perf/trace finish | 早期return時UI補完、実表示後の終端 | root / A | ui後処理。cumulative_frame_nr > 0は実表示前cleanup抑止として維持 |
+
+### service の入力依存監査と設計担当への返却
+
+直接のevents消費、key level、focusによる操作、pass/frame条件をservice断片へ混ぜない。
+sidecar入力消費とkeyboard所有は`input_update_begin`、scroll intentは旧位置のinput、
+root Closeは`maybe_intercept_close`、pointer/IMEは`input_pointer_and_ime`、
+activity event判定は`input_drop_and_activity`、frame計装は`input_frame_diagnostics`へ区分した。
+startup geometry / runtime cleanup / external-tool UI ACK のframe条件は表示側へ残した。
+`service_startup_notifications` が読む `viewport().minimized` はwindow metadataだけであり、
+events / pass counter / frame counterを操作の条件にしない。
+
+さらに呼出先を静的に追うと、単純なpollのlogic移動では断てない依存があった。
+下記は旧0.33.3のコード事実であり、hidden runtimeの観測結果や今回の不具合診断ではない。
+frame/passの引数化だけで古い値への依存が解消したとは扱わない。
+
+| ID | 到達経路・依存 | 今回の扱い / 段3より前に必要な整理 |
+| --- | --- | --- |
+| C1 | poll_remote_session → poll_remote_fullscreen_restore → open_fullscreen → book hydration / target採用 → fs_page_turn_decision_for_frame_with_perf | Remoteサービスと表示復帰継続が同じ入口。`render_update_begin`に区分。Remote進行そのものをUI待ちにする修正はしない。受信/取消/ACKと表示継続の所有境界を設計担当へ返す |
+| C2 | poll_play_test → open_fullscreen → 同じ表示継続 | `render_startup_workers`。VST/更新pollも同順のまま。表示open完了の切り分けが必要 |
+| C3 | startup/activation open、mounted document/collection navigation、bookmark open、tag/rating採用のrebuild、composition operation/service → book prepare / permission → resume_qualified_book_target / complete_book_navigation_target → fullscreen open | `render_initial_open` / `render_update_before_frame` / `render_search_and_metadata_results` / `render_menu_worker_results` / `render_update_after_frame`等に区分。現在の完了採用は同passで表示継続も行うため、それだけを後回しにすると挙動が変わる。要求ownerやmodalを変えず分離する小設計が必要 |
+| C4 | poll_erase_inpaint → resume_original_material_entry → resume_view_trim_after_original → ctx.input(pointer.primary_down) | `render_media_and_edit_results`。表示トリムのドラッグ終端を古いpointer levelで決める非表示serviceにはしない。原画完成と入力に依存するeditor再開の切り分けが必要 |
+| C5 | prefetch/final-effects、pano high-res→resolve_pano_source→final composite、上記open継続 → fs_page_turn_decision_for_frame / original_preview_frame_observation / fs_page_turn_physical_input_for_frame | frame/passをキーとしたdecision cache、focus/物理入力sampleを参照。`render_prepare_fullscreen_materials`等のUI準備に区分。既存registry async ownerも内部までlogic-readyとは断言しない。紙めくり/原画previewとの境界整理が必要 |
+| D1 | main/parkedのpollにあるframe_counter % 60 / % 600 | ログ間引きだけ。worker採用や取消/終了をこのcounterでgateしていない。新しいservice counterに置換しない |
+| D2 | poll_indexer_notifications / startup notice / log writer noticeのminimized | current viewport metadata。古いeventsを操作として使う依存ではない。従来の通知抑止条件を保持 |
+| D3 | service_folder_observation → poll_external_rescan → prepared listing install / hydrate → begin_sidecar_restore | request_idをframe_counter + input_seq + 1から生成する。操作/進行gateではなく既存要求identityであり、今段は不変更。段3の同frame内の複数logic実行に対する一意性を要確認。Some(scan)なのでPDFのpre_scan.is_none()枝への静的到達は成立しない |
+
+監査補助: `target/egui037-stage1b-1/service-input-audit.json` と `service-audit.txt`。
+self/appメソッド呼出をたどる検索補助であり、Rustの全call graphを証明するものではない。
+名前が同じメソッド、callback/closure、native出力は別途sourceを確認する。
+このため「service依存0件」をApp全体の完了条件として主張しない。
+非表示serviceへの接続を今回先行せず、現0.33.3の呼出条件のまま返す。
+
+### 子Close / lifecycleの入口（L1）
+
+`service_deferred_detached_window_events` は、既存のshared viewイベントdrain →
+`queue_deferred_detached_image_window_event` → `apply_detached_image_window_event_batch`を抽出しただけである。
+`render_detached_image_windows` の空チェック/診断後、登録前という従来位置を保持する。
+既存test入口も同じproduction serviceを呼ぶようにし、drainを二重に持たない。
+FrameのClose/独自bar、右drag Cancel/input、placement/focus、FirstCallbackは既存のfactをそのまま渡す。
+modal判断、close_idsの重複除去、寿命/gesture/media cleanupは既存ownerが行う。
+新しいContext input読取やpass条件、表示ACKの偽造は加えていない。
+
+**L1留保:** この入口にはClose以外のcallback factも含まれる。現在のOS Close検出は子callback内であり、
+0.33.3上で非表示子のOS Closeを新たに検出・消費する実装ではない。
+将来のClose-only hookは対象ViewportIdから既存window/contextを解決し、同じmodal/終了ownerへ合流させる。
+active/parkedはpassive画像cleanupで代用せず、既存のactive終了/取消とParkedLive mount後終端へ委譲する。
+承認/拒否の一回消費、backend/Contextの非描画退役、兄弟資源不変の回帰は段2・段3で接続する。
+FirstCallback / 初期配置 / 実表示ACK / focus由来右drag Cancelは通常callbackの通知として保持する。
+
+### 検証
+
+初回焦点nextestは1,065件中1,062 passed / 3 failed、exit 100（全体268.367秒、実行42.528秒）。
+失敗は `external_tool::tests::the_external_tool_modals_are_drawn_from_one_place_only`、
+`the_launch_boundary_is_acked_even_when_the_frame_body_returns_early`、
+`ui_adjustment_panel::local_adjust_fold_audit::the_key_run_settle_runs_before_the_embedded_fullscreen_early_return`。
+いずれも旧app.rsへの直書きを前提とするsource監査で、移動したbodyを追えていなかった。
+初回結果は `checks-focused-results-initial.json` / `focused-nextest-initial.log` / `focused-junit-initial.xml` に保存する。
+
+監査を新境界へ追従させ、制約を保持した。
+`src/external_tool.rs` はappとphaseの合算で単一描画owner数を維持し、outer tailのcheckpoint呼出しと
+helper内のdraw→ACK順を検査する。`src/ui_adjustment_panel.rs` はdriverのservice呼出しがembedded gateより前で、
+helper内poll→settle順であることを検査し、既存parserもpub(super) fnを関数境界として扱う。
+両監査へ変異したsourceを渡すnegativeテストを2件追加し、呼出し削除/前倒し/順序逆転/ACK削除、
+service後置/worker処理削除が検査で拒否されることを確認する。
+`src/app/tests.rs` のroot Close producer監査もapp+phaseへ検索を広げ、1件/ROOT限定の期待値を維持する。
+製品の動作・期待値・待機時間・ignoreは変更しない。
+
+独立review（別contextのGPT-6.1 Sol / xhigh）は製品抽出と上記監査追従の双方をACCEPT。
+`review-reconstruction.json` に44連続ブロックの本文保存、外側return/break/continue不在、
+App呼出しを元bodyへ展開したHEADとの一致、fullscreen drainの同等再構成を記録した。
+追加のsidecar wrapperを含めApp helperは45関数、passive drain helperは1関数。
+レビュー担当はテストを重複実行していない。
+
+最終検証は以下のとおり。環境は通常feature / Rust 1.99.0、
+`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`、snapshot更新変数なし。
+証跡は `target/egui037-stage1b-1/`。詳細command・exit・時間・件数を保存する。
+
+| 検査 | 最終結果 | exit code |
+| --- | --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功。監査追従後にも実施、check 15.391秒 | 0 / 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、17.309秒 | 0 |
+| 同 `--features test-script` | 成功、17.238秒 | 0 |
+| `git diff --check` | 成功。台帳追記後にも再確認 | 0 |
+| 焦点nextest | 1,068 passed / 0 failed、実行38.443秒、compile込み210.484秒 | 0 |
+| integration snapshot 2本 | 181 + 11 = 192 passed、compile込み175.094 / 11.690秒 | 各0 |
+| lib snapshot 50 filter | 103 passed、全filterが1件以上を選択、計93.038秒 | 各0 |
+| 基準PNG SHA-256 | 445枚すべて一致、更新0枚 | 0 |
+| `scripts/test-lib-full.ps1` | 13,277 passed / 0 failed / 59 skipped、実行350.562秒、全体356.698秒 | 0 |
+
+焦点は `tray` 47 / `startup` 269 / `keyboard` 50 / `sidecar_restore` 62 / `gamepad` 86件を含む
+（substring集計、重複あり）。追加したnegative監査2件とroot Close監査も成功した。
+その他の対象はpassive/deferred detached、book composition、external tool、Remote session、local adjust、
+original material、view trim、update perf。全commandは `checks-focused-results.json`、
+件数は `focused-summary.json`、実行ログ/JUnitは `focused-nextest.log` / `focused-junit.xml`。
+通常/診断check・fmt/diffの個別ログも同directoryへ保存した。
+
+snapshotは段0b/段1aの同じ50 lib filterと2 integrationを更新なしで比較した。
+`snapshots-results.json` / `snapshot-summary.json` / `lib-snapshot-filters.json` と52個別ログに結果を保存した。
+全件後にも445 PNGと対象外DSPのバイト列を再照合して一致した。
+
+lib全件は新規実行（MISS）。runは
+`target/test-lib-full/runs/20261016T084732071Z-ffbbc96a/`、source IDは
+`5a4a8b29789d9dd78f18358c4d3044059e961e6d1c6bba760c7738b386a163cb`。
+成功receiptは `target/test-lib-full/c09e30e9c91f7eefe7a02cd5500eba66a195be9191a22ff1c8b54578f40836bd.json`。
+同runのJUnitを再集計し、13,277成功 / 失敗0 / skip59と一致した。
+`lib-full.log` / `full-results.json` / `full-summary.json` に結果を保存した。
+過去段の間欠失敗候補を成功扱いで省略せず、今回の全件で実行して成功した。
+
+製品3ソースは独立review時のSHA-256と一致。監査追従3テストファイルも独立reviewはACCEPT
+（`review-tests.json`）。全件後に `source-hashes.json` のRust6ファイルとmanifest/lockの一致を確認した。
+以後の追記は本台帳の検証結果のみで、実行ソース・依存・fixture・条件は変えていない。
+今回の残課題は下記とC1〜C5 / D3 / L1であり、全logic-readyの受入れを意味しない。
+
+### 未実施・設計との差異
+
+gamepadのowner/batch、foreground/wheel/clipboard/native IME/output内部は未変更。
+抽出はApp本体とpassiveイベントdrainに限定し、各ラボは今回対象外。
+上記C1〜C5は設計書の「UI入力を読まないlogic service」へ移す前の追加整理点である。
+旧updateの分類だけで全worker採用がlogic-readyになる、という前提は成立しない。
+挙動不変の範囲を越えて表示継続を延期/取消する変更をせず、設計担当へ返す。
+段1b全体や段3の受入完了とはしない。

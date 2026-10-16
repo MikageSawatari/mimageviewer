@@ -5571,7 +5571,7 @@ fn borderless_runtime_state_writes_stay_on_the_observed_path() {
 #[test]
 #[cfg(windows)]
 fn detached_child_teardown_has_no_programmatic_viewport_close_producers() {
-    let app_source = include_str!("../app.rs");
+    let app_source = concat!(include_str!("../app.rs"), include_str!("update_phases.rs"));
     let native_video_source = include_str!("native_video.rs");
     let fullscreen_source = include_str!("../ui_fullscreen.rs");
 

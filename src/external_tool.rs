@@ -5109,7 +5109,7 @@ mod tests {
     #[test]
     fn the_external_tool_modals_are_drawn_from_one_place_only() {
         let source = include_str!("external_tool.rs");
-        let app = include_str!("app.rs");
+        let app = concat!(include_str!("app.rs"), include_str!("app/update_phases.rs"));
         let fullscreen = include_str!("ui_fullscreen.rs");
 
         for name in [
@@ -5178,23 +5178,70 @@ mod tests {
     /// 動画を閉じるまで外部ツールが起動しない状態になっていた (Codex Sol 指摘 #2)。
     #[test]
     fn the_launch_boundary_is_acked_even_when_the_frame_body_returns_early() {
+        assert!(launch_boundary_ack_survives_early_return(
+            include_str!("app.rs"),
+            include_str!("app/update_phases.rs"),
+        ));
+    }
+
+    fn launch_boundary_ack_survives_early_return(app: &str, phases: &str) -> bool {
+        let Some((_, wrapper)) = app.split_once("self.update_frame(ctx, frame);") else {
+            return false;
+        };
+        let Some((tail, _)) = wrapper.split_once("fn on_exit(") else {
+            return false;
+        };
+        if !tail.contains("self.render_update_external_tool_checkpoint(ctx);") {
+            return false;
+        }
+        let Some((_, checkpoint)) = phases.split_once("fn render_update_external_tool_checkpoint(")
+        else {
+            return false;
+        };
+        let Some((checkpoint, _)) = checkpoint.split_once("\n    }") else {
+            return false;
+        };
+        let Some(draw) = checkpoint.find("self.show_external_tool_modals(ctx);") else {
+            return false;
+        };
+        let Some(ack) =
+            checkpoint.find("self.authorize_external_tool_launch_boundaries_after_ui();")
+        else {
+            return false;
+        };
+        draw < ack
+    }
+
+    #[test]
+    fn the_launch_boundary_audit_rejects_a_skipped_or_reversed_checkpoint() {
         let app = include_str!("app.rs");
-        let wrapper = app
-            .split_once("self.update_frame(ctx, frame);")
-            .expect("`eframe::App::update` は本体を update_frame へ委譲すること")
-            .1;
-        let tail = wrapper
-            .split_once("fn on_exit(")
-            .expect("update の terminal tail は on_exit より前にあること")
-            .0;
-        assert!(
-            tail.contains("self.show_external_tool_modals(ctx);"),
-            "早期 return を飛び越える tail で modal を描いていない"
+        let phases = include_str!("app/update_phases.rs");
+        let call = "self.render_update_external_tool_checkpoint(ctx);";
+        let missing_call = app.replace(call, "");
+        assert!(!launch_boundary_ack_survives_early_return(
+            &missing_call,
+            phases
+        ));
+        // Moving the call into update_frame would lose it on native/fullscreen returns.
+        let before_frame = missing_call.replace(
+            "self.update_frame(ctx, frame);",
+            &format!("{call}\nself.update_frame(ctx, frame);"),
         );
-        assert!(
-            tail.contains("self.authorize_external_tool_launch_boundaries_after_ui();"),
-            "早期 return を飛び越える tail で spawn 境界を ACK していない"
-        );
+        assert!(!launch_boundary_ack_survives_early_return(
+            &before_frame,
+            phases
+        ));
+        let draw = "self.show_external_tool_modals(ctx);";
+        let ack = "self.authorize_external_tool_launch_boundaries_after_ui();";
+        let reversed = phases
+            .replace(draw, "SWAP_DRAW")
+            .replace(ack, draw)
+            .replace("SWAP_DRAW", ack);
+        assert!(!launch_boundary_ack_survives_early_return(app, &reversed));
+        assert!(!launch_boundary_ack_survives_early_return(
+            app,
+            &phases.replace(ack, ""),
+        ));
     }
 
     /// supersede 済みの要求は進捗 modal に出ない。**入力ブロックも同じ述語から導く**ので、

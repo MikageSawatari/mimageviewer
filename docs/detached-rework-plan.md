@@ -5345,6 +5345,11 @@ D2実装承認を受けた。実装差分・自動検証・未確認事項の正
 旧版の静的調査・非対話検査は[段0b基準台帳](egui-0.37-baseline.md)へ分ける。
 以下のBA番号は§2が参照する[提案書§2](detached-viewer-lifecycle-redesign-proposal.md#2-初期診断の壊れた前提と現在の解消状況)への対応であり、各BA全体の解消を主張しない。
 
+段1b-1の旧版上の抽出記録は[段1b検証台帳](egui-0.37-stage1b-verification.md)を参照。
+Appの旧呼出順・早期return・mount先を保持し、passiveイベントdrainを非描画関数へ抽出する。
+非表示Close hook/退役の接続はまだ行わず、UI依存のworker採用継続も台帳へ返す。
+症状パッチではなく、上記合意済みのApp責務境界の切り出しである。
+
 - **Appのlogic/ui分離（BA-5 / BA-7）**: `src/app.rs`のservice/input/render/post-renderと
   eframe App接続、各ラボ・`vst3-host-tester`のApp実装を対象とする。worker結果・取消/保存終端・
   Remote完了・tray要求をUI入力に依存しないserviceへ分け、結果採用は既存registry/mount ownerへ戻す。
