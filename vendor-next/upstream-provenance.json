@@ -180,5 +180,34 @@
     },
     "checksum_reference": "C:\\Users\\mikag\\.cargo\\registry\\index\\index.crates.io-1949cf8c6b5b557f\\.cache\\eg\\ui\\egui-winit",
     "upstream_repository": "https://github.com/emilk/egui"
+  },
+  "egui-wgpu": {
+    "version": "0.37.0",
+    "archive": "C:\\Users\\mikag\\.cargo\\registry\\cache\\index.crates.io-1949cf8c6b5b557f\\egui-wgpu-0.37.0.crate",
+    "registry_source": "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\egui-wgpu-0.37.0",
+    "package_sha256": "0309cbe1febed48af5b974e4bcc424b35e9664863a4d402697147b57a488c864",
+    "checksum_reference": "C:\\Users\\mikag\\.cargo\\registry\\index\\index.crates.io-1949cf8c6b5b557f\\.cache\\eg\\ui\\egui-wgpu",
+    "vcs": {
+      "git": {
+        "sha1": "7c0b40402271e8d40cda69f87cf3c2617c2e4382"
+      },
+      "path_in_vcs": "crates/egui-wgpu"
+    },
+    "license": "MIT OR Apache-2.0",
+    "upstream_repository": "https://github.com/emilk/egui",
+    "files": {
+      ".cargo_vcs_info.json": "523dceaef4807f104775c0bb44e462a6f8be20a794c3642e3b90f42c7dd4eb4d",
+      "Cargo.lock": "ee14ac72f7c7b315b8349ec41f3acc72e098e967e5afa3d9723fd9780fbfe1a4",
+      "Cargo.toml": "5ccb25a26861a5781b5c069be6a66021290865f7d23850adba3beeb78053e51e",
+      "Cargo.toml.orig": "70b8dc7ec418a004997cb3c039c707a430c00942952ec143cd093a49146c2146",
+      "README.md": "e7a1c61629bffc2b4ebc0fe9531d2c8fe511ce40b43f77e91546af9aede3e6dd",
+      "src/capture.rs": "545075e0543804ae2a8efc87fc71d355c1de40f4284afc671f5874cf84703a58",
+      "src/egui.wgsl": "70d31d5eed11e069f53c0c2bf6aca225242c2716806760ffdd1d74dc3c667998",
+      "src/lib.rs": "5e8b591cafa794b106bb3fdb6bdefb4644f220ec5b95396503ccfb65feb7c33e",
+      "src/renderer.rs": "f0c9b669f71d6eec03731e5eeafdd25ab9f20f64216c730d94776435e48f57cc",
+      "src/setup.rs": "c438389fc2b4e8a4d5dfe2eef57c76caed3cb2c199f9f15d7f80b105cf4246bf",
+      "src/texture_copy.wgsl": "b5f7873cceca89e13932ce8d32e487feed2124f414e9959fc7dbe4a5d33939c6",
+      "src/winit.rs": "3f9f39150119a4ef071ab9e0ed9384edbebad36cc72bc35a90ac1639d165be51"
+    }
   }
 }

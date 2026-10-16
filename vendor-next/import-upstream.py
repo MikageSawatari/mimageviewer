@@ -1,9 +1,10 @@
-"""Offline, byte-preserving import for the stage 2a-1 pristine checkpoint.
+"""Offline, byte-preserving import for pristine vendor checkpoints.
 
-Run before applying local patches, in a checkout without vendor-next/egui*.
+Run before applying local patches; existing package directories are never overwritten.
 The package file inventories also identify every pristine/modified file later.
 """
 
+import argparse
 import hashlib
 import json
 import tarfile
@@ -19,8 +20,15 @@ def sha256(data):
 
 
 def main():
-    records = {}
-    for name in ("egui", "egui-winit"):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("packages", nargs="*", default=["egui", "egui-winit"])
+    args = parser.parse_args()
+    provenance = BASE / "upstream-provenance.json"
+    records = json.loads(provenance.read_text(encoding="utf-8")) if provenance.exists() else {}
+    imported = {}
+    for name in args.packages:
+        if name not in ("egui", "egui-winit", "egui-wgpu"):
+            raise RuntimeError(f"Unsupported package: {name}")
         package = f"{name}-0.37.0"
         source = REGISTRY / "src" / INDEX / package
         archive = REGISTRY / "cache" / INDEX / f"{package}.crate"
@@ -62,10 +70,11 @@ def main():
             "upstream_repository": "https://github.com/emilk/egui",
             "files": files,
         }
-    (BASE / "upstream-provenance.json").write_text(
+        imported[name] = len(files)
+    provenance.write_text(
         json.dumps(records, indent=2) + "\n", encoding="utf-8"
     )
-    print({name: len(record["files"]) for name, record in records.items()})
+    print(imported)
 
 
 if __name__ == "__main__":
