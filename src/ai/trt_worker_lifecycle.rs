@@ -2080,6 +2080,7 @@ mod tests {
         let product_sources = [
             ("runtime", include_str!("runtime.rs")),
             ("app", include_str!("../app.rs")),
+            ("app phases", include_str!("../app/update_phases.rs")),
             ("preferences", include_str!("../ui_dialogs/preferences.rs")),
             ("notice", include_str!("../ui_dialogs/trt_worker_notice.rs")),
             ("install", include_str!("../ui_dialogs/trt_install.rs")),

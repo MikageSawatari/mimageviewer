@@ -22,6 +22,8 @@ serviceを先頭へ集めず、UIが作ったmodalやnavigationとの前後関�
 `render_*` は描画とUIに依存する準備/worker採用継続、`post_render_*` は描画後の処理である。
 **`render_*` にworker pollがあることは意図的**。worker pollという名前だけではlogicへ移せない。
 transitiveな表示継続の依存が確認できた入口は、非表示serviceと誤認しないようrender側へ分類した。
+レビュー追補でF13にもUI継続が判明した。`service_initial_worker_results`という既存名も
+logic-readyの保証にはならず、今回の修正では製品コード/名前を変更せず台帳で明示する。
 下記は段3の接続予定であり、今回logic-only動作を実装・検証したことは意味しない。
 
 簡素化:既存modal、registry/mount、終了ownerをそのまま使う。
@@ -51,14 +53,14 @@ PはParkedLive media、AはApp-global。rootのContextとviewerのcontext identi
 | F5 | font適用 → service_capture_main_window → key_input begin_frame | font output、main HWND初回捕捉/既存hook設定 → Win32 pass入口 | root HWND / R | outputはui、HWND設定はlogic候補、入力はui |
 | F6 | service_tray_requests → maybe_intercept_close → sync_tray_resident_media_wake | tray設定/要求、root Close、media wake投影 | A / root、対象窓は既存tray owner | logic候補 / ui / logic候補。tray_active gate維持 |
 | F7 | input_main_focus_resume → service_folder_observation | focus復帰判定、watch/rescan/prewarm/sidecar周期flush | R | ui → logic候補 |
-| F8 | input_frame_diagnostics → service_startup_notifications | frame counter/性能診断、indexer/housekeeping/VST fullscreen状態反映 | A / R | ui → logic候補（minimized metadataのみ） |
+| F8 | input_frame_diagnostics → service_startup_notifications | frame counter/性能診断、indexer/housekeeping/VST fullscreen状態反映 | A / R | ui → logic候補（minimized metadataのみ）。counter増分をUIへ残したままG1〜G4のserviceをlogicへ移すと進行が止まり得るため、counter/予算ownerの分離を接続前に確認 |
 | F9 | startup overlay / preparing panel | 描画とstartup入力破棄、従来早期return | root | ui。outer終端は続行 |
 | F10 | render_startup_workers | VST/EffeTune/play-test/update check | A / R | ui継続あり（C2） |
 | F11 | input_pointer_and_ime → service_page_edit_completion → touch診断 → input_drop_and_activity | D&D pointer終端、IME pass、spread/sidecar終端、外部drop・activity入力 | R | ui / logic候補 / ui |
 | F12 | render_apply_theme → render_initial_open → track_window_rect / selected_cell_rect | theme、初回open/activation採用、表示geometry | A / R | ui継続あり（C3）、geometryはui |
-| F13 | service_initial_worker_results | preview、content identity、pinned調整、Smart metadata結果 | R（既存ownerは保持） | logic候補 |
+| F13 | service_initial_worker_results | preview、content identity、pinned調整、Smart metadata結果 | R / cache Clearedは既存registryが選ぶM | UI 継続あり（C3・C5）。現在の関数名にかかわらずlogicへ直接接続しない |
 | F14 | poll_thumbnails → reconcile preview → fs nav lock → thumbnail bookkeeping / VRAM / tag prewarm | 現在表示に応じた回収と要求/会計 | R | 表示依存prepareはui、結果採用と分離が必要 |
-| F15 | FullscreenDecode.service / non-Windows prefetch | 既存context async owner | R | 既存ownerを維持し、C5の表示決定を分けてlogicへ |
+| F15 | FullscreenDecode.service / non-Windows prefetch | 既存context async owner | R | 既存ownerを維持し、C5の表示決定とG1のPDF昇格再試行、G2/G3の予算gateを確認・分離してlogicへ。F8のcounter増分との関係を保持 |
 | F16 | render_media_and_edit_results | media / AI / erase / local-adjust結果 | R（media owner選別を保持） | ui継続あり（C4・C5） |
 | F17 | render_search_and_metadata_results | 検索、facet、評価、bookmark、metadata | R | ui継続あり（C3・C5） |
 | F18 | render_other_worker_results | stack、subfolder、Smart、pano、file操作/変換/export/cache等 | R / A、元の要求owner | ui継続あり（C3・C5） |
@@ -103,12 +105,34 @@ frame/passの引数化だけで古い値への依存が解消したとは扱わ�
 | --- | --- | --- |
 | C1 | poll_remote_session → poll_remote_fullscreen_restore → open_fullscreen → book hydration / target採用 → fs_page_turn_decision_for_frame_with_perf | Remoteサービスと表示復帰継続が同じ入口。`render_update_begin`に区分。Remote進行そのものをUI待ちにする修正はしない。受信/取消/ACKと表示継続の所有境界を設計担当へ返す |
 | C2 | poll_play_test → open_fullscreen → 同じ表示継続 | `render_startup_workers`。VST/更新pollも同順のまま。表示open完了の切り分けが必要 |
-| C3 | startup/activation open、mounted document/collection navigation、bookmark open、tag/rating採用のrebuild、composition operation/service → book prepare / permission → resume_qualified_book_target / complete_book_navigation_target → fullscreen open | `render_initial_open` / `render_update_before_frame` / `render_search_and_metadata_results` / `render_menu_worker_results` / `render_update_after_frame`等に区分。現在の完了採用は同passで表示継続も行うため、それだけを後回しにすると挙動が変わる。要求ownerやmodalを変えず分離する小設計が必要 |
+| C3 | startup/activation open、mounted document/collection navigation、bookmark open、tag/rating採用のrebuild、composition operation/service → book prepare / permission → resume_qualified_book_target / complete_book_navigation_target → fullscreen open | `render_initial_open` / `render_update_before_frame` / `render_search_and_metadata_results` / `render_menu_worker_results` / `render_update_after_frame`等に区分。F13にも `poll_edit_preview_cache(Cleared)` → `clear_all_edit_preview_materializations` → `with_viewer_context` → mount境界の評価反映 → `adopt_rating_membership` → fullscreen再openの経路がある。現在の完了採用は同passで表示継続も行うため、それだけを後回しにすると挙動が変わる。要求ownerやmodalを変えず分離する小設計が必要 |
 | C4 | poll_erase_inpaint → resume_original_material_entry → resume_view_trim_after_original → ctx.input(pointer.primary_down) | `render_media_and_edit_results`。表示トリムのドラッグ終端を古いpointer levelで決める非表示serviceにはしない。原画完成と入力に依存するeditor再開の切り分けが必要 |
-| C5 | prefetch/final-effects、pano high-res→resolve_pano_source→final composite、上記open継続 → fs_page_turn_decision_for_frame / original_preview_frame_observation / fs_page_turn_physical_input_for_frame | frame/passをキーとしたdecision cache、focus/物理入力sampleを参照。`render_prepare_fullscreen_materials`等のUI準備に区分。既存registry async ownerも内部までlogic-readyとは断言しない。紙めくり/原画previewとの境界整理が必要 |
+| C5 | prefetch/final-effects、pano high-res→resolve_pano_source→final composite、上記open継続 → fs_page_turn_decision_for_frame / original_preview_frame_observation / fs_page_turn_physical_input_for_frame | frame/passをキーとしたdecision cache、focus/物理入力sampleを参照。`render_prepare_fullscreen_materials`等のUI準備に区分。既存registry async ownerも内部までlogic-readyとは断言しない。F13のcache Cleared→mount境界の評価反映→fullscreen再openも同じ表示決定へ到達する。紙めくり/原画previewとの境界整理に加え、下記G1〜G3のframe進行gateも分離前提として確認する |
 | D1 | main/parkedのpollにあるframe_counter % 60 / % 600 | ログ間引きだけ。worker採用や取消/終了をこのcounterでgateしていない。新しいservice counterに置換しない |
 | D2 | poll_indexer_notifications / startup notice / log writer noticeのminimized | current viewport metadata。古いeventsを操作として使う依存ではない。従来の通知抑止条件を保持 |
 | D3 | service_folder_observation → poll_external_rescan → prepared listing install / hydrate → begin_sidecar_restore | request_idをframe_counter + input_seq + 1から生成する。操作/進行gateではなく既存要求identityであり、今段は不変更。段3の同frame内の複数logic実行に対する一意性を要確認。Some(scan)なのでPDFのpre_scan.is_none()枝への静的到達は成立しない |
+
+#### UI frame counterを進行gateに使う依存（独立レビュー追補）
+
+以下はD1のログ間引きやD3の要求identityとは異なり、処理の実行/回収を抑止する。
+`input_frame_diagnostics`（F8）が更新するAppの`frame_counter`は、logic-onlyではUIと一緒に
+止まる想定になる。複数logic呼出しが同じcounterを見る場合の進行と、UIの重複実行/予算を守る
+条件を分ける必要がある。今回counter・再試行・予算・配送の挙動は変更しない。
+
+| ID | 所在・条件 | 進行への効果 / logic接続時の確認事項 |
+| --- | --- | --- |
+| G1 | `src/app.rs:84154` `refresh_fullscreen_pdf_promotion_with` の `last_attempt_frame == self.frame_counter` | 同じdisplay/pending集合でnot-found再試行を抑止。prefetch/fullscreen openから到達する。F8/F15をlogicへ分ける前に、UI counterが止まっても必要な後続昇格を進めるownerと同一試行重複防止の境界を整理する |
+| G2 | `src/app.rs:81920` `poll_local_adjust_render`、`:82179` `poll_local_adjust_layer_bypass_preview`、`:82248` `poll_local_adjust_prefix_preview`、`:83009`/`:83029` `ensure_edit_result_pixels` の `last_edit_materialize_upload_frame` 比較 | 前者は完成結果の適用/receiver drainを延期し、後者はtexture uploadを省略する共通1-frame予算。F8/F15/F16/F19の接続ではworker完了進行とUI/GPU upload予算を区別する。同counterのままでは後続の完成処理が留まり得る |
+| G3 | `src/app.rs:91618` `reconcile_colorize_mono_summaries` の `colorize_mono_summary_last_reconcile_frame == self.frame_counter` | prefetchから呼ぶ近モノクロ要約の1-frame計算予算を抑止。F8/F15のlogic接続では、UI counter更新なしで未処理要約が進める境界と既存予算を確認する |
+| G4 | `src/external_tool.rs:3101` `advance_external_preparation` の `preparing.last_frame == Some(self.frame_counter)` | file-list等のフレーム分割準備を同frameに一度だけ進める。F18/F36/O11のサービス/描画分離では、完了待ちをUI counterに結び付けない進行単位とUIのCancel/ACK順序を分けて確認する |
+| G5 | `src/app.rs:3452` `deferred_detached_activation_watch_targets` の `frame_counter >= activation_ready_frame`（生成は`:65325`/`:65371`で`frame_counter + 1`） | watcher activationの受付資格を抑止する既存入力gate。F21/F24を非描画へ接続する際、UI frame前提の資格をserviceの進行条件と混同しない。今回の凍結範囲では変更しない |
+
+描画の重複防止/実表示ACKである `active_detached_viewport_rendered_this_frame`
+（`src/app.rs:60735`）、`show_external_tool_modals` とouter checkpoint
+（`src/external_tool.rs:3528` / `src/app/update_phases.rs:1668`）もframeを比較するが、
+G1〜G4のworker/準備進行と同じものではない。F24/F36/O11の実描画側に保持する。
+`frame_counter == 1` のstartup性能ログと、`passthrough_last_call`の経過frameは診断のみ。
+Contextのframe/passを使うgamepad/keyboard/原画previewの既存UI batchは別のC5/段1b-2対象として残す。
 
 監査補助: `target/egui037-stage1b-1/service-input-audit.json` と `service-audit.txt`。
 self/appメソッド呼出をたどる検索補助であり、Rustの全call graphを証明するものではない。
@@ -205,3 +229,53 @@ gamepadのowner/batch、foreground/wheel/clipboard/native IME/output内部は未
 旧updateの分類だけで全worker採用がlogic-readyになる、という前提は成立しない。
 挙動不変の範囲を越えて表示継続を延期/取消する変更をせず、設計担当へ返す。
 段1b全体や段3の受入完了とはしない。
+
+
+## 段1b-1 独立レビュー後の修正（基点01ad17ca9）
+
+ACCEPT WITH CHANGESのP2二件/P3一件へ対応する。F13のUI継続とC3/C5、
+F8/F15の進行gateおよびG1〜G5を上記へ追記した。製品の実行コード、counter、関数名、
+依存/PNGを変更しない。更新設計書は設計担当の並行read-only比較対象なので変更しない。
+
+### App source監査の棚卸し
+
+| 対象テスト | 扱い |
+| --- | --- |
+| `borderless_runtime_state_writes_stay_on_the_observed_path` | app.rs + update_phases.rsの合算で既存の各1書込を検査 |
+| `app_has_no_viewport_lifecycle_font_resync_state_machine` | App禁止識別子の対象を両ファイルへ拡張 |
+| `product_consumers_do_not_bypass_the_lifecycle_owner`（TRT） | product_sourcesへapp/update_phases.rsを追加 |
+| `epub_pending_and_visible_owner_inventory_is_explicit` | RAII外のsync_epub_ui_read_leases禁止を両ファイルへ拡張。型宣言の存在inventoryは元の宣言ファイルを維持 |
+| `promotion_only_asks_one_predicate_whether_a_page_is_displayed` | 共有述語を通らない昇格判定の走査へupdate_phases.rsを追加 |
+| root Close producer / external-tool単一描画owner | 01ad17ca9で両ファイルを対象化済み。今回変更なし |
+| update/early-tail順序、local-adjust settle順序 | 01ad17ca9でdriverとphase本文の両方を検査済み。今回変更なし |
+| media resumeのsave_all/poll_video、poll_prefetchのループ、close-and-retire seam、settings restoreのupdate/on_exit順序 | 特定関数の本文/順序の検査でありApp全体の禁止監査ではない。対象関数は移動しておらず、旧ファイルを維持 |
+
+`include_str!` / `read_to_string` / `src/app.rs`のファイル列挙を`src` / `tests`で検索して上記を確認した。
+UI/製品の期待値や監査の禁止条件・許容件数は変更しない。
+証跡は`target/egui037-stage1b-1/review-changes/`。
+
+### 修正後の検証
+
+通常feature / Rust 1.99.0、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。
+変更した上記5監査をnextestの明示filterで選択した。command/exit/時間は`results.json`、
+各実行のlog / JUnit / summaryも同directoryに保存した。
+
+| 検査 | 結果 | exit code |
+| --- | --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功、後者13.978秒 | 0 / 0 |
+| core check | 成功、13.122秒 | 0 |
+| 変異ありの焦点nextest | 対象5件すべて期待した禁止監査で失敗、compile込み142.517秒 | 100（期待値） |
+| 復元後の焦点nextest | 5 passed / 0 failed、実行0.156秒、compile込み62.758秒 | 0 |
+| `git diff --check` | 成功。結果追記後にも確認 | 0 |
+
+変異は移動先`service_creative_luts`内に、`#[cfg(any())]`で実行/型検査から除外した
+font-resync識別子、borderless二種の直接代入、TRT直接start、EPUB同期、共有述語を通さない昇格条件を
+一時的に挿入した。5件がコンパイルエラーでなく各監査のassertで失敗したことを確認した。
+終了時には元の`update_phases.rs`をバイト単位で復元し、復元したソースから再compileして5件を実行した。
+一時変異は最終diffに含まれない。
+
+製品source（app.rs / update_phases.rs / ui_fullscreen.rs / external_tool.rs）、更新設計書、
+対象外DSPのSHA-256は開始時と一致。今回のRust差分は3テストファイル内の監査対象一覧だけである。
+lib全件・snapshot・製品build・起動・live試験は依頼に従って再実行しない。
+前節のlib全件結果は段1b-1基点の履歴として保持し、今回のテスト変更後の全件成功とは主張しない。
+未コミットで引き渡す。

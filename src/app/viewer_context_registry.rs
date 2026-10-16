@@ -7809,7 +7809,10 @@ mod tests {
         );
         // The cache manager must rely on RAII owners rather than a post-hoc UI sweep.
         let sync_name = concat!("sync_epub", "_ui_read_leases");
-        assert!(!include_str!("../app.rs").contains(sync_name));
+        assert!(
+            !concat!(include_str!("../app.rs"), include_str!("update_phases.rs"))
+                .contains(sync_name)
+        );
         assert!(!include_str!("../ui_dialogs/archive_cache_manager.rs").contains(sync_name));
     }
 

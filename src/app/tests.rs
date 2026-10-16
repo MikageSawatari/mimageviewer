@@ -5551,7 +5551,7 @@ fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
 #[test]
 #[cfg(windows)]
 fn borderless_runtime_state_writes_stay_on_the_observed_path() {
-    let source = include_str!("../app.rs");
+    let source = concat!(include_str!("../app.rs"), include_str!("update_phases.rs"));
     assert_eq!(
         source
             .matches("self.detached_viewer_borderless_fullscreen =")
@@ -57896,7 +57896,11 @@ mod pipeline_cache_refactor_tests {
     fn promotion_only_asks_one_predicate_whether_a_page_is_displayed() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
-        for relative in ["src/app.rs", "src/ui_fullscreen.rs"] {
+        for relative in [
+            "src/app.rs",
+            "src/app/update_phases.rs",
+            "src/ui_fullscreen.rs",
+        ] {
             let source = std::fs::read_to_string(manifest_dir.join(relative))
                 .expect("read Rust source as UTF-8");
             let lines: Vec<&str> = source.lines().collect();
@@ -81086,7 +81090,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn app_has_no_viewport_lifecycle_font_resync_state_machine() {
-        const APP_SOURCE: &str = include_str!("../app.rs");
+        const APP_SOURCE: &str =
+            concat!(include_str!("../app.rs"), include_str!("update_phases.rs"));
         const VIEWPORT_SOURCE: &str = include_str!("../ui_fullscreen.rs");
         const NATIVE_VIDEO_SOURCE: &str = include_str!("native_video.rs");
 
