@@ -551,3 +551,11 @@ Remote断片をslot受渡し・旧dead restoreの明示差分だけで再構成�
 
 今回の7ファイルの差分は未コミットで返す。1b-3b/3c、段2・3の正式接続は未着手。
 上記のmount/Close等の接続前提と、全件ゲートの失敗3件の原因確認を残課題とする。
+
+#### 段1b-3aの受入れ（2026-10-16、設計担当）
+
+HEAD `c02e62349` で、他のcargo/nextestプロセスが無いことを確かめてから設計担当が`scripts/test-lib-full.ps1`を実行した。
+結果は **13,294 passed / 0 failed / 59 skipped、374.818秒、exit 0**（run dir `target/test-lib-full/runs/20261016T122757583Z-61166b76`）。
+実装担当の全件で落ちた3件はすべて成功した。原因の断定はしない。
+独立レビュー（GPT-6.1 Sol / xhigh）は`c02e62349`をACCEPT（指摘なし）。以上で段1b-3aを受け入れる。
+台帳の留保（mount前後の表示副作用、bookmarkのlocal採用、AI取消終端の表示poll依存、Closeの`show_viewport_immediate`依存）は1b-3bと段2・3で扱う。
