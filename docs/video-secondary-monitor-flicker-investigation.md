@@ -724,7 +724,7 @@ video transformは同じ確定layout/targetから描画と診断へ渡し、診�
 | 通常core check・fmt・diff・test-script | `cargo check -p mimageviewer --bin mimageviewer-core`、引数なし全workspace `cargo fmt`、`cargo fmt --check`、`git diff --check`: exit 0。`test-focused.ps1 -Features test-script -Path`はrender_core 173＋pump 7＋window 20＋native_ui_smoke 47件成功、exit 0 | 最新inventory assertを含むrender_coreは`target/test-focused/runs/20261016T032016232Z-bffc992f/`で再確認。UI文言変更なしのためglyph検査は対象外 |
 | `scripts/test-lib-full.ps1`本体lib最終gate | `$env:NEXTEST_TEST_THREADS='4'; .\scripts\test-lib-full.ps1`: **13,245成功、59除外、0失敗、1295.369秒、exit 0**。`target/test-lib-full/runs/20261016T033708384Z-c2ef5c2b/`。receipt: `target/test-lib-full/144fd8232b5368b881b7b8fc904e40f0fa5daaa408a936ea628ecc1f4e11589d.json` | I1の明示的なsuite実行指示に基づき、defaultの非activate fixtureを含めた。実foreground切替/OS入力を行うignoredテストは従来どおり除外。再試行回数0・assert/timeout/ignore変更なし |
 | `scripts/test-full.ps1` workspace/vendor/doctest | I1では未実施 | I1の利用者指定は本体lib全件。後続gateとして設計leadへ引き継ぐ |
-| 独立実装レビュー・ClaudeCode検収 | 独立`gpt-6.1-sol` / `xhigh`のソースレビューは指摘対応後ACCEPT。変異XMLと復元greenも照合済み | D1 ACCEPTと区別する。ClaudeCode検収と実機受入は未実施 |
+| 独立実装レビュー・ClaudeCode検収 | I1担当内の独立`gpt-6.1-sol` / `xhigh`ソースレビューは指摘対応後ACCEPT。変異XMLと復元greenも照合済み。その後の完成時独立レビューはA1のP2二件によりREVISE（利用者引継ぎ、§8.10） | D1 ACCEPT・担当内レビュー・完成時レビューを区別する。実機受入は未実施 |
 | perf OFF/ON前後の行数・pump遅延/CPU・render所要時間 | 未記入 | 未測定。低負荷の達成は未判定 |
 | 確認用binary・実画面suite | binary作成/起動とも未実施 | 利用者の明示指示でI1担当の`build-dev.ps1`を省略し、設計lead側で後に扱う。agent起動・入力はsuiteごとの明示承認が必要 |
 
@@ -754,3 +754,75 @@ branchと対象file hashも確認する。`git add -A`、master統合、pushは�
 
 実画面では§8.6/§8.7のF11/F12・park/promote・兄弟窓・monitor/DPI・HUD/panel/strip・
 VST/EffeTune・IME/focus・close/reopenを確認する。現時点では実機結果を記録していない。
+
+### 8.10 I1完成時レビューのA1 P2二件への対応（2026-10-16）
+
+利用者引継ぎ: 設計担当がI1を検証し、製品`53c57394d`・文書`5c9a83ada`としてcommitした。
+完成時の独立レビュー（`gpt-6.1-sol` / `xhigh`）は**REVISE**。A1の下記二件を設計担当も
+妥当と判断し、修正・production snapshot回帰・変異検証を指示した。A2/A3には修正要求がなく、
+detachedの変更も構造的修正との明示合意を得た。§8.9の担当内ACCEPTと後続REVISEを混同しない。
+今回の対象は`5c9a83ada`からの診断内容の修正だけで、commitは利用者指示により試みない。
+
+1. **surface交換の適用済みtransform**: `present_with_surface_swap`と
+   `update_video_visual_transform`を共通の`commit_video_visual_transform`へ通す。
+   描画のために一度算出したtarget/行列を実COM closureへ渡し、Commit成功後だけ
+   同じ値とsurface寸法/revisionを`video_transform`へ記録する。swapは確定前のnew値を使い、
+   geometry-only更新も同じsample形式で記録する。失敗時は古い適用済みsnapshotを保つ。
+   SetContent→SetTransform2→Commit、既存の待機、surface状態確定/退役の順序は維持し、
+   診断用の再計算・Commit・GPU待機は追加しない。
+2. **HUD各部の実描画rect**: `NativeOverlayDrawFacts`へ上下バー・左右panel・stripの
+   固定5個のoptional rectを追加する。描画helperが実際にpaintへ渡したrectを採り、
+   logical output→最終batch→productionの`record_native_overlay_drawn_rects`へ渡す。
+   popup類の既存rectと同じHUD client物理pxで記録し、非描画部位はfalseにする。
+   各logical passとegui再passで初期化するため、最終hiddenへ中間の矩形が残らない。
+   drag時の全面入力region・hover・可視性boolから位置を推定しない。描画/入力所有・IME・
+   コマンド・delta・A2/A3の契約は変更しない。
+
+固定counter 128・snapshot 32・field 32・詳細8件/owner/区間は変更なし。
+`drawn_rects`はpppと17部位の計18fieldで上限内に収まる。perf OFFではrect採取を無効にし、
+sample closure/JSON/時計/同期I/O/新しいtickを追加しない。診断helperへのtest-only注入で
+production snapshot tableを直接検査し、process-global perfやGPU/実アプリ起動を使わない。
+detached述語・viewport/placement経路は変更せず、既存render owner内の診断の完備化である。
+まれなGPU失敗は既存のログ＋通知・終端を維持し、回復機構は追加しない。
+
+新規回帰は、productionと共通のcommit境界・snapshot tableを使う
+`diagnostic_snapshot_tracks_surface_swap_applied_transform_and_failed_commit`と、実CPU描画・
+最終logical output・production snapshotを通す
+`diagnostic_snapshot_contains_final_painted_hud_rects_independent_of_drag_region`の2件。
+前者はSAR/90度回転/viewport/surface/revision更新、実COM closureへ渡した6成分、
+target、geometry-only更新、失敗時の前snapshot保持、OFF時の描画継続を検査する。
+後者はpaint shapeとの一致、ppp 1.5での物理px、strip有無と通常seek行Show/Hide、
+全面drag regionとの独立、最終hiddenへの置換、表示中OFFの5rect未採取、field省略なしを検査する。
+
+| 検証 | 結果・証拠 | 限界 |
+| --- | --- | --- |
+| 新規snapshot回帰の正常版 | 明示nextest filterで2成功・0失敗、exit 0。`target/hud-flicker-i1-a1-review/baseline.xml` | GPU/実アプリは使わず、production境界のCOM closureを記録adapterへ置換 |
+| 記録内容の変異 | surface revision 0以外のtransform snapshot更新を一時停止し、HUD5部位の記録をNoneへ置換。上記2件がそれぞれ旧snapshot残留・top_barのfalseを検出し、2失敗・exit 100。`target/hud-flicker-i1-a1-review/mutation.xml` | 描画/COM操作は変異させず、診断の欠落を検出することを確認 |
+| 変異の復元 | `render_core.rs`を保存byteへ戻し、SHA-256 `86c1d9bd663f29b89ceb570f8e65ade9dd7c5e54f2304df8d41cfce35861987e`の一致を確認 | 復元後focusedと本体lib全件も成功（下記） |
+| 復元後の通常focused | `scripts/test-focused.ps1 -Path`で変更した3Rust fileを指定。診断4＋render_core 171＋overlay_draw 43＝218成功・0失敗、exit 0。ログは`target/test-focused/runs/20261016T044407805Z-a7e0707c/`、`20261016T044741921Z-cba48c7b/`、`20261016T044748949Z-5c438d6a/` | 新規2回帰の復元後成功を含む。全libの代用にはしない |
+| 復元後のtest-script focused | 同じ3fileを`-Features test-script`で指定。診断4＋render_core 175＋overlay_draw 45＝224成功・0失敗、exit 0。ログは`target/test-focused/runs/20261016T044849359Z-2d265428/`、`20261016T045316327Z-d56329d7/`、`20261016T045323714Z-c8c66171/` | feature固有のlogical output/UI inventory・draw helperも確認 |
+| 整形・通常core check | 引数なし全workspace `cargo fmt`、`cargo fmt --check`と`cargo check -p mimageviewer --bin mimageviewer-core`: exit 0（check 17.62秒）。`git diff --check`: exit 0 | UI文言変更なし。glyph検査、build-dev、製品起動は実施しない |
+| 本体lib全件の最終gate | `$env:NEXTEST_TEST_THREADS='4'; .\scripts\test-lib-full.ps1`: **13,247成功・59除外・0失敗、1221.054秒、exit 0**。通常feature / test profile / nextest default、retries 0。`target/test-lib-full/runs/20261016T045504307Z-e7e422f2/`。receiptは`target/test-lib-full/cf4a4f562095c0c1c542d11a2c724a83f26b15aae60084376e6dfeadbb45ba7a.json` | JUnit総数13,306・除外59・failure/error 0、新規2回帰の成功、receiptのsource/件数/exitを照合。今回の全件完走は一回。workspace/vendor/doctest・実機/負荷測定は含まない |
+
+全lib成功時のsource fingerprintは
+`7b95f029ab99cf73fdab1f91477a12f0f145f59823b95f6565a3365d985ed355`。
+変更した製品Rust 3fileのbyte hash一覧は`target/hud-flicker-i1-a1-review/source-manifest.txt`、
+そのfile自体のSHA-256は`46c2578a08c9aa0d3f3a476241eadd16dcde1a42886dba246a8b75d5096df9eb`。
+全lib前後で3fileとも一致を確認し、実行中は文書も含めてfreezeした。実行後の更新は本節の
+検証記録だけで、receiptを書き換えず同じ製品sourceの成功証拠として扱う。
+今回の変更は製品Rust 3fileと本書・`video-architecture.md`の計5file。
+利用者指示によりcommitを試みず、設計担当へ変更一覧と英語commit案を引き継ぐ。
+
+新規HUD回帰の初回はfixtureの誤前提（strip中に下バー全体が消えると想定）で失敗した。
+正本`VideoSeekBarWithStrip`と`resolved_video_bottom_bar_height`を確認し、Showでは64pt、
+Hideでも操作行40ptが残る既存仕様を検査する期待値へ訂正した。製品の描画をテストへ合わせて
+変更していない。初回XMLは`target/hud-flicker-i1-a1-review/iteration-strip-default.xml`。
+誤前提の中間版の再compile一回は中断し、成功証拠に数えない。
+
+今回の独立`gpt-6.1-sol` / `xhigh`レビューでは、旧ACCEPTを流用せずこの差分とtest修正・文書を
+確認し、正常2件・変異2件失敗のXMLと復元byte SHAも照合して指摘なし・ACCEPT。
+復元後の通常218件・test-script 224件と3file hashも独立照合済み。
+本体lib 13,247成功・59除外・0失敗のreceipt/JUnit、新規2回帰の成功と現sourceのhash一致も
+独立照合し、今回のA1修正・回帰・自動検証証拠・文書は未解決指摘なし・最終ACCEPT。
+完成時レビューのREVISEを受けた再修正であり、設計担当の
+検収・実機/負荷測定・点滅解消確認は別の受入として残す。

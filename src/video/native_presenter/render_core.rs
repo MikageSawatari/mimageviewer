@@ -1,4 +1,6 @@
-use crate::video::native_diagnostics::{DiagnosticSample, NativeDiagnostics};
+use crate::video::native_diagnostics::{
+    DiagnosticClock, DiagnosticSample, DiagnosticSink, NativeDiagnostics,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
@@ -1054,6 +1056,7 @@ fn draw_native_seek_strip(
     wave_texture_id: Option<egui::TextureId>,
     drag_origin: &mut Option<crate::video::seek_strip::SeekStripDragOrigin>,
     commands: &mut Vec<NativeOverlayCommand>,
+    painted_rect_out: Option<&mut Option<egui::Rect>>,
 ) -> NativeSeekStripPreviewHover {
     use crate::video::seek_strip_layout::SeekStripSpan;
 
@@ -1128,6 +1131,9 @@ fn draw_native_seek_strip(
         .show(ctx, |ui| {
             ui.set_min_size(strip_rect.size());
             let local_rect = ui.min_rect();
+            if let Some(out) = painted_rect_out {
+                *out = Some(local_rect);
+            }
             // Strip body chrome is always clipped to the fitted body. Hover preview rendering is
             // intentionally outside this function/clip so it can remain above the strip.
             let painter = ui.painter().with_clip_rect(local_rect);
@@ -3705,6 +3711,58 @@ struct NativeOverlayDrawFacts {
     strip: bool,
     tile: bool,
     preview: bool,
+    top_rect: Option<egui::Rect>,
+    bottom_rect: Option<egui::Rect>,
+    left_rect: Option<egui::Rect>,
+    right_rect: Option<egui::Rect>,
+    strip_rect: Option<egui::Rect>,
+}
+
+/// Final logical output, independent of the pump's drag-expanded hit region.
+fn record_native_overlay_drawn_rects<C: DiagnosticClock, S: DiagnosticSink>(
+    diagnostics: &NativeDiagnostics<C, S>,
+    state: &NativeEguiOverlayState,
+    facts: NativeOverlayDrawFacts,
+) {
+    diagnostics.snapshot("drawn_rects", || {
+        let mut sample = DiagnosticSample::new().f64("ppp", state.pixels_per_point as f64);
+        for (name, rect) in [
+            ("top_bar", facts.top_rect),
+            ("bottom_bar", facts.bottom_rect),
+            ("left_panel", facts.left_rect),
+            ("right_panel", facts.right_rect),
+            ("strip", facts.strip_rect),
+            ("preview", state.last_drawn_preview_rect),
+            ("vst_panel", state.last_drawn_vst3_panel_rect),
+            ("toast", state.last_drawn_toast_rect),
+            ("speed_popup", state.last_drawn_speed_popup_rect),
+            ("strip_menu", state.last_drawn_seek_strip_menu_rect),
+            ("audio_menu", state.last_drawn_audio_track_menu_rect),
+            (
+                "projection_popup",
+                state.last_drawn_panorama_projection_popup_rect,
+            ),
+            ("bookmark_editor", state.last_drawn_bookmark_editor_rect),
+            ("bulk_bookmark", state.last_drawn_bulk_bookmark_dialog_rect),
+            ("shortcut_help", state.last_drawn_shortcut_help_rect),
+            ("ring_picker", state.last_drawn_ring_picker_rect),
+            ("ring_guide", state.last_drawn_ring_guide_rect),
+        ] {
+            sample = match rect {
+                Some(rect) => sample.rect(
+                    name,
+                    [
+                        (rect.min.x * state.pixels_per_point).round() as i32,
+                        (rect.min.y * state.pixels_per_point).round() as i32,
+                        (rect.max.x * state.pixels_per_point).round() as i32,
+                        (rect.max.y * state.pixels_per_point).round() as i32,
+                    ],
+                ),
+                None => sample.bool(name, false),
+            };
+        }
+        sample
+    });
 }
 
 struct NativeOverlayLogicalOutput {
@@ -7102,60 +7160,54 @@ impl NativeRenderCore {
         //    (Codex P2)。`self.*` の更新は Commit 成功後 (手順 6) に一括で行う。
         let (transform_sar_num, transform_sar_den, transform_orientation) =
             transform_geometry_for_surface(new_content, new_sar_num, new_sar_den, new_orientation);
-        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform_for_surface(
-            new_w,
-            new_h,
-            self.width,
-            self.height,
-            transform_sar_num,
-            transform_sar_den,
-            transform_orientation,
-            self.video_visual_layout(),
-            new_content == VideoSurfaceContent::PanoramaResolved,
-        );
-        let transform = Matrix3x2 {
-            M11: m11,
-            M12: m12,
-            M21: m21,
-            M22: m22,
-            M31: offset_x,
-            M32: offset_y,
+        let new_surface_revision = self.surface_swap_count.saturating_add(1);
+        let geometry = VideoVisualTransformGeometry {
+            viewport: [self.width, self.height],
+            surface: [new_w, new_h],
+            surface_revision: new_surface_revision,
+            sar: [transform_sar_num, transform_sar_den],
+            orientation: transform_orientation,
+            layout: self.video_visual_layout(),
+            panorama_resolved: new_content == VideoSurfaceContent::PanoramaResolved,
         };
         let commit_operation = self
             .health
             .begin_render_operation(NativeRenderOperation::DCompCommit, self.window_epoch);
-        unsafe {
-            native_gpu_operation(
-                &self.diagnostics,
-                "SetContent",
-                "video_surface_swap",
-                || {
-                    self._video_visual.SetContent(&new_swap_chain).map_err(|e| {
-                        format!("IDCompositionVisual::SetContent (surface swap): {e:?}")
-                    })
-                },
-            )?;
-            native_gpu_operation(
-                &self.diagnostics,
-                "SetTransform2",
-                "video_surface_swap",
-                || {
-                    self._video_visual.SetTransform2(&transform).map_err(|e| {
-                        format!("IDCompositionVisual::SetTransform2 (surface swap): {e:?}")
-                    })
-                },
-            )?;
-            native_gpu_operation(
-                &self.diagnostics,
-                "Commit",
-                "video_surface_or_transform",
-                || {
-                    self._dcomp_device
-                        .Commit()
-                        .map_err(|e| format!("IDCompositionDevice::Commit (surface swap): {e:?}"))
-                },
-            )?;
-        }
+        commit_video_visual_transform(&self.diagnostics, geometry, |transform| {
+            unsafe {
+                native_gpu_operation(
+                    &self.diagnostics,
+                    "SetContent",
+                    "video_surface_swap",
+                    || {
+                        self._video_visual.SetContent(&new_swap_chain).map_err(|e| {
+                            format!("IDCompositionVisual::SetContent (surface swap): {e:?}")
+                        })
+                    },
+                )?;
+                native_gpu_operation(
+                    &self.diagnostics,
+                    "SetTransform2",
+                    "video_surface_swap",
+                    || {
+                        self._video_visual.SetTransform2(transform).map_err(|e| {
+                            format!("IDCompositionVisual::SetTransform2 (surface swap): {e:?}")
+                        })
+                    },
+                )?;
+                native_gpu_operation(
+                    &self.diagnostics,
+                    "Commit",
+                    "video_surface_or_transform",
+                    || {
+                        self._dcomp_device.Commit().map_err(|e| {
+                            format!("IDCompositionDevice::Commit (surface swap): {e:?}")
+                        })
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
 
         // 5. Commit が DWM の compositor tick まで反映され切るまで待つ。
         let commit_sync_ms = self.wait_for_video_transform_commit();
@@ -7168,7 +7220,7 @@ impl NativeRenderCore {
         self.surface_width = new_w;
         self.surface_height = new_h;
         self.surface_content = new_content;
-        self.surface_swap_count = self.surface_swap_count.saturating_add(1);
+        self.surface_swap_count = new_surface_revision;
         self.diagnostics.event("surface_swap", || {
             DiagnosticSample::new()
                 .u64("surface_revision", self.surface_swap_count)
@@ -8665,67 +8717,38 @@ impl NativeRenderCore {
             self.sar_den,
             self.orientation,
         );
-        let layout = self.video_visual_layout();
-        let target = compute_video_visual_target_rect(win_w, win_h, layout);
-        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform_for_target(
-            self.surface_width,
-            self.surface_height,
-            sar_num,
-            sar_den,
+        let geometry = VideoVisualTransformGeometry {
+            viewport: [win_w, win_h],
+            surface: [self.surface_width, self.surface_height],
+            surface_revision: self.surface_swap_count,
+            sar: [sar_num, sar_den],
             orientation,
-            target,
-            self.surface_content == VideoSurfaceContent::PanoramaResolved,
-        );
-        let transform = Matrix3x2 {
-            M11: m11,
-            M12: m12,
-            M21: m21,
-            M22: m22,
-            M31: offset_x,
-            M32: offset_y,
+            layout: self.video_visual_layout(),
+            panorama_resolved: self.surface_content == VideoSurfaceContent::PanoramaResolved,
         };
-        self.diagnostics.snapshot("video_transform", || {
-            DiagnosticSample::new()
-                .u64("viewport_width", win_w as u64)
-                .u64("viewport_height", win_h as u64)
-                .u64("surface_width", self.surface_width as u64)
-                .u64("surface_height", self.surface_height as u64)
-                .u64("surface_revision", self.surface_swap_count)
-                .f64("m11", m11 as f64)
-                .f64("m12", m12 as f64)
-                .f64("m21", m21 as f64)
-                .f64("m22", m22 as f64)
-                .f64("offset_x", offset_x as f64)
-                .f64("offset_y", offset_y as f64)
-                .f64("target_x", target.x as f64)
-                .f64("target_y", target.y as f64)
-                .f64("target_width", target.width as f64)
-                .f64("target_height", target.height as f64)
-                .bool("top_locked", layout.top_bar_locked)
-                .bool("bottom_locked", layout.bottom_lock.bar_locked())
-                .f64("ppp", layout.pixels_per_point as f64)
-                .bool("compact", layout.compact)
-        });
         let _operation = self
             .health
             .begin_render_operation(NativeRenderOperation::DCompCommit, self.window_epoch);
-        unsafe {
-            native_gpu_operation(&self.diagnostics, "SetTransform2", "video_geometry", || {
-                self._video_visual
-                    .SetTransform2(&transform)
-                    .map_err(|e| format!("IDCompositionVisual::SetTransform2 video: {e:?}"))
-            })?;
-            native_gpu_operation(
-                &self.diagnostics,
-                "Commit",
-                "video_surface_or_transform",
-                || {
-                    self._dcomp_device
-                        .Commit()
-                        .map_err(|e| format!("IDCompositionDevice::Commit video transform: {e:?}"))
-                },
-            )?;
-        }
+        commit_video_visual_transform(&self.diagnostics, geometry, |transform| {
+            unsafe {
+                native_gpu_operation(&self.diagnostics, "SetTransform2", "video_geometry", || {
+                    self._video_visual
+                        .SetTransform2(transform)
+                        .map_err(|e| format!("IDCompositionVisual::SetTransform2 video: {e:?}"))
+                })?;
+                native_gpu_operation(
+                    &self.diagnostics,
+                    "Commit",
+                    "video_surface_or_transform",
+                    || {
+                        self._dcomp_device.Commit().map_err(|e| {
+                            format!("IDCompositionDevice::Commit video transform: {e:?}")
+                        })
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -12493,9 +12516,10 @@ impl NativeEguiOverlay {
         &mut self,
         preserve_earlier_repaint_deadline: bool,
     ) -> Result<NativeOverlayLogicalOutput, String> {
-        let output = self
-            .state
-            .render_logical_once(preserve_earlier_repaint_deadline)?;
+        let output = self.state.render_logical_once(
+            preserve_earlier_repaint_deadline,
+            self.gpu.diagnostics.is_enabled(),
+        )?;
         self.gpu.diagnostics.count("logical_pass", 1);
         self.gpu.diagnostics.count(
             if output.overlay_visible {
@@ -12543,6 +12567,7 @@ impl NativeEguiOverlayState {
     fn render_logical_once(
         &mut self,
         preserve_earlier_repaint_deadline: bool,
+        record_draw_rects: bool,
     ) -> Result<NativeOverlayLogicalOutput, String> {
         let mut window_intents = Vec::new();
         let render_t0 = Instant::now();
@@ -12914,10 +12939,12 @@ impl NativeEguiOverlayState {
         if let Some(viewport) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
             viewport.native_pixels_per_point = Some(ppp);
         }
+        let mut draw_facts = NativeOverlayDrawFacts::default();
         let mut seek_strip_area_ran = false;
         let mut seek_strip_preview_hover = NativeSeekStripPreviewHover::Outside;
         let egui_run_t0 = Instant::now();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            draw_facts = NativeOverlayDrawFacts::default();
             if !overlay_visible {
                 return;
             }
@@ -12945,7 +12972,7 @@ impl NativeEguiOverlayState {
                     &tile_texture_ids,
                     &mut commands,
                 );
-                draw_native_top_bar_tile(
+                let top_layout = draw_native_top_bar_tile(
                     ctx,
                     overlay_width_points,
                     video_metadata.as_ref(),
@@ -12953,6 +12980,9 @@ impl NativeEguiOverlayState {
                     hud_dimmed,
                     &mut commands,
                 );
+                if record_draw_rects {
+                    draw_facts.top_rect = top_layout.painted_rect;
+                }
                 // タイル表示中も境界トースト (= 「末尾です」「次のフォルダが見つかりません」
                 // 等) は出す。元実装は早期 return で line 4342 の draw_native_toast に
                 // 到達しなかったため、タイル末尾に達してもユーザーへの feedback がゼロだった。
@@ -13002,7 +13032,7 @@ impl NativeEguiOverlayState {
                 return;
             }
             if let Some(preview) = navigation_preview.as_ref() {
-                draw_native_navigation_preview(
+                let top_layout = draw_native_navigation_preview(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
@@ -13011,6 +13041,9 @@ impl NativeEguiOverlayState {
                     navigation_preview_texture_id,
                     &mut commands,
                 );
+                if record_draw_rects {
+                    draw_facts.top_rect = top_layout.painted_rect;
+                }
                 if let Some(toast) = toast.as_ref() {
                     last_drawn_toast_rect =
                         draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);
@@ -13117,6 +13150,9 @@ impl NativeEguiOverlayState {
                     #[cfg(feature = "test-script")]
                     &mut ui_smoke_command_attribution,
                 );
+                if record_draw_rects {
+                    draw_facts.top_rect = top_layout.painted_rect;
+                }
                 last_drawn_vst_button_rect = top_layout.vst_button_rect;
             }
             if checked {
@@ -13182,6 +13218,7 @@ impl NativeEguiOverlayState {
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
                     self.info_panel_locked,
                     effective_info_panel_locked,
+                    record_draw_rects.then_some(&mut draw_facts.right_rect),
                 );
             }
             if jump_panel_visible {
@@ -13207,6 +13244,7 @@ impl NativeEguiOverlayState {
                     &creative_lut_choices,
                     &mut commands,
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
+                    record_draw_rects.then_some(&mut draw_facts.left_rect),
                 );
                 if close_left {
                     left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
@@ -13391,6 +13429,7 @@ impl NativeEguiOverlayState {
                         seek_strip_wave_texture_id,
                         &mut seek_strip_drag_origin,
                         &mut commands,
+                        record_draw_rects.then_some(&mut draw_facts.strip_rect),
                     );
                 }
             }
@@ -13402,6 +13441,9 @@ impl NativeEguiOverlayState {
                     .show(ctx, |ui| {
                         ui.set_min_size(seek_geometry.normal_bar_rect.size());
                         let hud_rect = ui.min_rect();
+                        if record_draw_rects {
+                            draw_facts.bottom_rect = Some(hud_rect);
+                        }
                         let (hud_painter, preview_painter) = native_seek_hud_painters(ui, hud_rect);
                         let painter = &hud_painter;
                         painter.rect_filled(
@@ -14141,6 +14183,7 @@ impl NativeEguiOverlayState {
                 strip: seek_strip_area_ran,
                 tile: tile_overlay_visible,
                 preview: navigation_preview_visible && !tile_overlay_visible,
+                ..draw_facts
             },
             full_output,
             commands: retained_commands,
@@ -14222,40 +14265,7 @@ impl NativeEguiOverlay {
                 .bool("modal", state.modal_dialog_active_for_routing())
                 .f64("os_ppp", f64::from(state.pixels_per_point / state.ui_scale))
         });
-        self.gpu.diagnostics.snapshot("drawn_rects", || {
-            let mut sample = DiagnosticSample::new().f64("ppp", state.pixels_per_point as f64);
-            for (name, rect) in [
-                ("preview", state.last_drawn_preview_rect),
-                ("vst_panel", state.last_drawn_vst3_panel_rect),
-                ("toast", state.last_drawn_toast_rect),
-                ("speed_popup", state.last_drawn_speed_popup_rect),
-                ("strip_menu", state.last_drawn_seek_strip_menu_rect),
-                ("audio_menu", state.last_drawn_audio_track_menu_rect),
-                (
-                    "projection_popup",
-                    state.last_drawn_panorama_projection_popup_rect,
-                ),
-                ("bookmark_editor", state.last_drawn_bookmark_editor_rect),
-                ("bulk_bookmark", state.last_drawn_bulk_bookmark_dialog_rect),
-                ("shortcut_help", state.last_drawn_shortcut_help_rect),
-                ("ring_picker", state.last_drawn_ring_picker_rect),
-                ("ring_guide", state.last_drawn_ring_guide_rect),
-            ] {
-                sample = match rect {
-                    Some(rect) => sample.rect(
-                        name,
-                        [
-                            (rect.min.x * state.pixels_per_point).round() as i32,
-                            (rect.min.y * state.pixels_per_point).round() as i32,
-                            (rect.max.x * state.pixels_per_point).round() as i32,
-                            (rect.max.y * state.pixels_per_point).round() as i32,
-                        ],
-                    ),
-                    None => sample.bool(name, false),
-                };
-            }
-            sample
-        });
+        record_native_overlay_drawn_rects(&self.gpu.diagnostics, state, draw_facts);
         let first_render = state.render_count == 0;
         let ppp = state.pixels_per_point;
         let event_count = state.event_count;
@@ -15620,6 +15630,262 @@ mod chrome_suppression_interaction_tests {
         NativeVideoWindowSource,
     };
 
+    #[test]
+    fn diagnostic_snapshot_tracks_surface_swap_applied_transform_and_failed_commit() {
+        use crate::video::native_diagnostics::test_support::{latest, recorder};
+        let diagnostics = recorder(true);
+        let old = VideoVisualTransformGeometry {
+            viewport: [1280, 720],
+            surface: [1920, 1080],
+            surface_revision: 0,
+            sar: [1, 1],
+            orientation: VideoOrientation::IDENTITY,
+            layout: VideoVisualLayout::from(false),
+            panorama_resolved: false,
+        };
+        commit_video_visual_transform(&diagnostics, old, |_| Ok(())).unwrap();
+        let before = latest(&diagnostics, "video_transform").unwrap();
+        // A normal surface replacement carries its new SAR/orientation before self.* changes.
+        let swapped = VideoVisualTransformGeometry {
+            viewport: [1920, 1080],
+            surface: [720, 480],
+            surface_revision: 1,
+            sar: [8, 9],
+            orientation: VideoOrientation::new(90, false),
+            layout: VideoVisualLayout {
+                top_bar_locked: true,
+                pixels_per_point: 1.5,
+                ..VideoVisualLayout::from(false)
+            },
+            ..old
+        };
+        let mut applied = None;
+        commit_video_visual_transform(&diagnostics, swapped, |matrix| {
+            applied = Some([
+                matrix.M11, matrix.M12, matrix.M21, matrix.M22, matrix.M31, matrix.M32,
+            ]);
+            Ok(())
+        })
+        .unwrap();
+        let snapshot = latest(&diagnostics, "video_transform").unwrap();
+        assert_ne!(snapshot, before);
+        for (key, value) in ["m11", "m12", "m21", "m22", "offset_x", "offset_y"]
+            .into_iter()
+            .zip(applied.unwrap())
+        {
+            assert_eq!(snapshot[key], serde_json::json!(f64::from(value)), "{key}");
+        }
+        for (key, value) in [
+            ("viewport_width", 1920),
+            ("viewport_height", 1080),
+            ("surface_width", 720),
+            ("surface_height", 480),
+            ("surface_revision", 1),
+        ] {
+            assert_eq!(snapshot[key], value, "{key}");
+        }
+        for (key, value) in [
+            ("target_x", 0.0),
+            ("target_y", 81.0),
+            ("target_width", 1920.0),
+            ("target_height", 999.0),
+        ] {
+            assert_eq!(snapshot[key], value, "{key}");
+        }
+        assert_eq!(snapshot["m11"], 0.0);
+        assert_eq!(snapshot["m22"], 0.0);
+        // Geometry-only updates use the same production boundary and keep the surface revision.
+        commit_video_visual_transform(
+            &diagnostics,
+            VideoVisualTransformGeometry {
+                viewport: [1600, 900],
+                ..swapped
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let resized = latest(&diagnostics, "video_transform").unwrap();
+        assert_eq!(resized["surface_revision"], 1);
+        assert_eq!(resized["viewport_width"], 1600);
+        assert!(
+            commit_video_visual_transform(
+                &diagnostics,
+                VideoVisualTransformGeometry {
+                    surface_revision: 2,
+                    ..swapped
+                },
+                |_| Err("injected Commit failure".into())
+            )
+            .is_err()
+        );
+        assert_eq!(latest(&diagnostics, "video_transform").unwrap(), resized);
+        assert!(snapshot.get("omitted_fields").is_none());
+
+        let disabled = recorder(false);
+        let mut applied_off = false;
+        commit_video_visual_transform(&disabled, swapped, |_| {
+            applied_off = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(applied_off);
+        assert!(latest(&disabled, "video_transform").is_none());
+    }
+
+    #[test]
+    fn diagnostic_snapshot_contains_final_painted_hud_rects_independent_of_drag_region() {
+        use crate::video::native_diagnostics::test_support::{latest, recorder};
+        fn painted(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> bool {
+            fn matches(shape: &egui::Shape, rect: egui::Rect) -> bool {
+                match shape {
+                    egui::Shape::Rect(shape) => shape.rect == rect,
+                    egui::Shape::Vec(shapes) => shapes.iter().any(|shape| matches(shape, rect)),
+                    _ => false,
+                }
+            }
+            shapes.iter().any(|shape| matches(&shape.shape, rect))
+        }
+        for (strip, show_bar) in [(false, true), (true, true), (true, false)] {
+            let diagnostics = recorder(true);
+            let (mut overlay, mut chrome) = fixture(strip);
+            chrome.policy.bars.top_locked = true;
+            chrome.detached.as_mut().unwrap().borderless_applied = true;
+            overlay.set_chrome_state(chrome);
+            overlay.set_effective_pixels_per_point(1.5);
+            overlay.resize_dimensions(1920, 1080);
+            overlay.seek_bar_with_strip = if show_bar {
+                crate::settings::VideoSeekBarWithStrip::Show
+            } else {
+                crate::settings::VideoSeekBarWithStrip::Hide
+            };
+            overlay.set_metadata(Some(native_hud_multitrack_fixture_metadata()));
+            overlay.set_side_panel_state(
+                FsSidePanelMode::ClickToShow,
+                crate::ui_helpers::MetadataPanelOpenState::ByPointer,
+                false,
+            );
+            overlay.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+            for _ in 0..4 {
+                frame(&mut overlay);
+            }
+            let output = frame(&mut overlay);
+            let facts = output.draw_facts;
+            let mut batch = NativeOverlayLogicalBatch::default();
+            batch.append(output);
+            record_native_overlay_drawn_rects(&diagnostics, &overlay, batch.draw_facts);
+            let snapshot = latest(&diagnostics, "drawn_rects").unwrap();
+            for (name, rect) in [
+                ("top_bar", facts.top_rect),
+                ("bottom_bar", facts.bottom_rect),
+                ("left_panel", facts.left_rect),
+                ("right_panel", facts.right_rect),
+                ("strip", facts.strip_rect),
+            ] {
+                if name == "strip" && !strip {
+                    assert!(rect.is_none(), "{name}");
+                    assert_eq!(snapshot[name], false, "{name}");
+                    continue;
+                }
+                let rect = rect.unwrap_or_else(|| panic!("missing painted {name}, strip={strip}"));
+                assert!(
+                    painted(&batch.full_output.as_ref().unwrap().shapes, rect),
+                    "{name} must come from painting"
+                );
+                assert_eq!(
+                    snapshot[name],
+                    serde_json::json!([
+                        (rect.min.x * 1.5).round() as i32,
+                        (rect.min.y * 1.5).round() as i32,
+                        (rect.max.x * 1.5).round() as i32,
+                        (rect.max.y * 1.5).round() as i32,
+                    ]),
+                    "{name}"
+                );
+            }
+            assert_eq!(snapshot["top_bar"], serde_json::json!([0, 0, 1920, 81]));
+            assert_eq!(
+                snapshot["bottom_bar"],
+                serde_json::json!([0, if show_bar { 984 } else { 1020 }, 1920, 1080])
+            );
+            assert!(snapshot.get("omitted_fields").is_none());
+
+            let off = overlay.render_logical_once(false, false).unwrap();
+            assert!(off.overlay_visible);
+            assert!(
+                [
+                    off.draw_facts.top_rect,
+                    off.draw_facts.bottom_rect,
+                    off.draw_facts.left_rect,
+                    off.draw_facts.right_rect,
+                    off.draw_facts.strip_rect,
+                ]
+                .into_iter()
+                .all(|rect| rect.is_none())
+            );
+
+            // The production pump-facing region becomes full-screen during a live HUD drag.
+            let drag_pos = facts.right_rect.unwrap().center();
+            overlay
+                .pending_events
+                .push(egui::Event::PointerMoved(drag_pos));
+            overlay.pending_events.push(egui::Event::PointerButton {
+                pos: drag_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let drag = frame(&mut overlay);
+            overlay.wants_pointer_input = true;
+            let region = overlay.compute_hud_regions();
+            assert_eq!(region.len(), 1);
+            assert_eq!(
+                [
+                    region[0].left,
+                    region[0].top,
+                    region[0].right,
+                    region[0].bottom
+                ],
+                [0, 0, 1920, 1080]
+            );
+            record_native_overlay_drawn_rects(&diagnostics, &overlay, drag.draw_facts);
+            assert_eq!(latest(&diagnostics, "drawn_rects").unwrap(), snapshot);
+
+            // Only the final pass's pixels survive the logical batch, including hidden cleanup.
+            chrome.policy.bars.top_locked = false;
+            chrome.policy.bars.bottom_lock = BottomBarLock::None;
+            overlay.set_chrome_state(chrome);
+            overlay.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+            overlay.set_side_panel_state(
+                FsSidePanelMode::Hover,
+                crate::ui_helpers::MetadataPanelOpenState::Closed,
+                false,
+            );
+            overlay.external_drag_in_progress = true;
+            overlay.pointer_pos = None;
+            overlay.pending_events.push(egui::Event::PointerButton {
+                pos: drag_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            overlay.pending_events.push(egui::Event::PointerGone);
+            let final_hidden = frame(&mut overlay);
+            assert!(!final_hidden.overlay_visible);
+            batch.append(final_hidden);
+            record_native_overlay_drawn_rects(&diagnostics, &overlay, batch.draw_facts);
+            let hidden = latest(&diagnostics, "drawn_rects").unwrap();
+            for name in [
+                "top_bar",
+                "bottom_bar",
+                "left_panel",
+                "right_panel",
+                "strip",
+            ] {
+                assert_eq!(hidden[name], false, "stale intermediate {name}");
+            }
+        }
+    }
+
     fn tag_picker_ime_fixture() -> NativeEguiOverlayState {
         let (mut overlay, _) = fixture(false);
         crate::ime_focus::install_ime_input_policy(&overlay.egui_ctx);
@@ -16322,7 +16588,7 @@ mod chrome_suppression_interaction_tests {
 
     fn frame(overlay: &mut NativeEguiOverlayState) -> NativeOverlayLogicalOutput {
         overlay
-            .render_logical_once(false)
+            .render_logical_once(false, true)
             .expect("real CPU draw and hidden cleanup")
     }
 
@@ -16425,7 +16691,7 @@ mod chrome_suppression_interaction_tests {
             &mut self,
             preserve: bool,
         ) -> Result<NativeOverlayLogicalOutput, String> {
-            let output = self.state.render_logical_once(preserve)?;
+            let output = self.state.render_logical_once(preserve, true)?;
             self.logical_visibility.push(output.overlay_visible);
             Ok(output)
         }
@@ -17579,6 +17845,72 @@ pub(super) struct VideoVisualTargetRect {
     pub(super) height: f32,
 }
 
+/// The same geometry feeds the applied DComp matrix and its diagnostic witness.
+/// A failed SetContent/SetTransform/Commit must leave the last applied snapshot intact.
+#[derive(Clone, Copy)]
+struct VideoVisualTransformGeometry {
+    viewport: [u32; 2],
+    surface: [u32; 2],
+    surface_revision: u64,
+    sar: [u32; 2],
+    orientation: VideoOrientation,
+    layout: VideoVisualLayout,
+    panorama_resolved: bool,
+}
+
+fn commit_video_visual_transform<C: DiagnosticClock, S: DiagnosticSink>(
+    diagnostics: &NativeDiagnostics<C, S>,
+    geometry: VideoVisualTransformGeometry,
+    commit: impl FnOnce(&Matrix3x2) -> Result<(), String>,
+) -> Result<(), String> {
+    let target = compute_video_visual_target_rect(
+        geometry.viewport[0],
+        geometry.viewport[1],
+        geometry.layout,
+    );
+    let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform_for_target(
+        geometry.surface[0],
+        geometry.surface[1],
+        geometry.sar[0],
+        geometry.sar[1],
+        geometry.orientation,
+        target,
+        geometry.panorama_resolved,
+    );
+    let transform = Matrix3x2 {
+        M11: m11,
+        M12: m12,
+        M21: m21,
+        M22: m22,
+        M31: offset_x,
+        M32: offset_y,
+    };
+    commit(&transform)?;
+    diagnostics.snapshot("video_transform", || {
+        DiagnosticSample::new()
+            .u64("viewport_width", geometry.viewport[0] as u64)
+            .u64("viewport_height", geometry.viewport[1] as u64)
+            .u64("surface_width", geometry.surface[0] as u64)
+            .u64("surface_height", geometry.surface[1] as u64)
+            .u64("surface_revision", geometry.surface_revision)
+            .f64("m11", transform.M11 as f64)
+            .f64("m12", transform.M12 as f64)
+            .f64("m21", transform.M21 as f64)
+            .f64("m22", transform.M22 as f64)
+            .f64("offset_x", transform.M31 as f64)
+            .f64("offset_y", transform.M32 as f64)
+            .f64("target_x", target.x as f64)
+            .f64("target_y", target.y as f64)
+            .f64("target_width", target.width as f64)
+            .f64("target_height", target.height as f64)
+            .bool("top_locked", geometry.layout.top_bar_locked)
+            .bool("bottom_locked", geometry.layout.bottom_lock.bar_locked())
+            .f64("ppp", geometry.layout.pixels_per_point as f64)
+            .bool("compact", geometry.layout.compact)
+    });
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct VideoVisualLayout {
     pub(super) compact: bool,
@@ -18262,6 +18594,7 @@ mod tests {
                         wave_texture_id,
                         &mut drag_origin,
                         &mut commands,
+                        None,
                     );
                 },
             )
@@ -18623,6 +18956,7 @@ mod tests {
                         None,
                         &mut drag_origin,
                         &mut commands,
+                        None,
                     );
                     egui::Area::new(egui::Id::new("native_video_seek_hud"))
                         .order(egui::Order::Foreground)
@@ -19456,6 +19790,7 @@ mod tests {
                         None,
                         &mut drag_origin,
                         &mut commands,
+                        None,
                     );
                     wheel_remaining = ctx.input(|input| {
                         input.raw_scroll_delta != egui::Vec2::ZERO
@@ -19567,6 +19902,7 @@ mod tests {
                         None,
                         &mut drag_origin,
                         &mut commands,
+                        None,
                     );
                 },
             );
@@ -19601,6 +19937,7 @@ mod tests {
                 None,
                 &mut drag_origin,
                 &mut commands,
+                None,
             ),
             super::NativeSeekStripPreviewHover::Outside
         );
@@ -19646,6 +19983,7 @@ mod tests {
                     None,
                     &mut drag_origin,
                     &mut commands,
+                    None,
                 );
             },
         );
@@ -19683,6 +20021,7 @@ mod tests {
                     None,
                     &mut drag_origin,
                     &mut commands,
+                    None,
                 );
             },
         );
@@ -20258,6 +20597,7 @@ mod tests {
                         None,
                         &mut drag_origin.lock().unwrap(),
                         &mut commands,
+                        None,
                     );
                     captured_for_ui.lock().unwrap().extend(commands);
                 });
@@ -20372,6 +20712,7 @@ mod tests {
                             None,
                             &mut drag_origin.lock().unwrap(),
                             &mut commands,
+                            None,
                         );
                     }
                     egui::Area::new(egui::Id::new("native_video_seek_hud"))
@@ -21641,6 +21982,7 @@ mod tests {
                         None,
                         &mut drag_origin,
                         &mut commands,
+                        None,
                     );
                 },
             );

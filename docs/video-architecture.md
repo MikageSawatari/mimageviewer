@@ -234,6 +234,16 @@ surface revision等はそのownerが観測したsampleへ記録し、別thread�
 新しい診断thread/tick・同期I/O・共有診断mutex・flush完了待ちは追加しない。
 負荷改善や点滅解消の実測結果は未確定であり、測定とjournal欠落/詳細省略を区別する。
 
+A1の`video_transform`はsurface交換とgeometry-only更新の両方で、同じ
+`commit_video_visual_transform`が算出して実COM操作へ渡した行列・target・surface revisionを
+Commit成功後に記録する。交換予定のsurface寸法/SAR/orientationを使い、失敗時は前の適用済み
+snapshotを保つ。通常frameでgeometry更新が省略されても、交換後の診断値が旧行列に残らない。
+上下バー・左右panel・stripの描画rectはpaint時の値を最終logical output/batchへ渡し、
+`drawn_rects`へHUD client物理px（pppを乗じた4辺）で記録する。描かなかった部位はfalse。
+logical passとeguiの再passごとに初期化し、中間passの矩形を最終非表示へ残さない。
+drag中に全面へ拡張するpumpの入力regionは描画矩形の代用にしない。perf OFFでは新しい
+rect採取を無効にし、固定table/field/詳細8件の上限・既存非同期配送を維持する。
+
 `VideoPlayer::tick(ctx)` は再生制御 / 意味的 deadline / ホバーサムネイル要求を扱う。
 フレームの実体描画は native presenter 内のスレッドが行うため、native 経路では
 フレームレート cadence を返さない。`ctx` は player ごとの `VideoUiWake` に一度結び、

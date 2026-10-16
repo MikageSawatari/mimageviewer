@@ -506,6 +506,52 @@ impl<C: DiagnosticClock, S: DiagnosticSink> Drop for NativeDiagnostics<C, S> {
     }
 }
 
+/// Test-only access to the production snapshot table; no process-global perf switch or I/O.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) struct Clock(bool);
+    impl DiagnosticClock for Clock {
+        fn enabled(&self) -> bool {
+            self.0
+        }
+        fn now_us(&self) -> u64 {
+            42
+        }
+        fn at_us(&self, _: Instant) -> u64 {
+            42
+        }
+    }
+    pub(crate) struct Sink;
+    impl DiagnosticSink for Sink {
+        fn emit(&self, _: &'static str, _: Value) {}
+    }
+    pub(crate) fn recorder(enabled: bool) -> NativeDiagnostics<Clock, Sink> {
+        NativeDiagnostics::with_backend(
+            DiagnosticOutputId(1),
+            7,
+            "presenter",
+            "render",
+            Clock(enabled),
+            Sink,
+            enabled,
+        )
+    }
+    pub(crate) fn latest<C: DiagnosticClock, S: DiagnosticSink>(
+        diagnostics: &NativeDiagnostics<C, S>,
+        kind: &'static str,
+    ) -> Option<Value> {
+        let state = diagnostics.state.as_ref()?.borrow();
+        state
+            .snapshots
+            .iter()
+            .flatten()
+            .find(|s| s.kind == kind)
+            .map(|s| s.latest.sample.json())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
