@@ -275,3 +275,20 @@ acceptance and command results belong in the stage-3 verification ledger.
   pending behavior. Glow's real resource-consumer function is exercised with
   fake GL calls, explicitly not real-GL evidence. egui-wgpu tests separately
   prove actual upload/submission/free and offscreen pixel content.
+
+### Review A: idle retirement resource delivery
+
+Both native finish_retirement adapters collect Context cleanup deltas through
+the shared finish_retirement_texture_delta dispatcher. Only a nonempty shared
+batch enters the lazy resource consumer; free-only remains nonempty. Ordinary
+WindowEvent completion without retirement work therefore creates neither a wgpu
+delivery owner/fallback submit nor a GL context-selection attempt. Full rendering
+and its upstream fallback submission contract are unchanged.
+
+The retirement_texture_delivery regressions exercise that production dispatcher
+with a prepared offscreen RenderState/real Renderer and queue (including returned
+submit counts), and with the production Glow consumer/fake GL calls. They check
+empty repeated delivery, manager-generated sets and free-only cleanup without a
+UI pass, and no duplicate consumer entry. This is dispatcher/resource evidence,
+not an end-to-end native WindowEvent or real-GL test. A missing GPU adapter fails
+the wgpu regression. Execution/mutation results belong in the stage-3 ledger.

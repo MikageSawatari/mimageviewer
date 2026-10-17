@@ -50466,6 +50466,13 @@ impl App {
         let previous_key = previous_selected
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
+        // The terminal navigation owner now holds the bookmark return snapshot.
+        // Until its UI consumer runs, main is still a live grid: a read-model
+        // install must preserve the user's current position across its list reset.
+        let live_return_scroll = self
+            .pending_return_to_parent
+            .preserves_live_bookmark_grid()
+            .then_some(self.scroll_offset_y);
         let return_grid = self.take_bookmark_restore_grid();
         // Publication starts only after admission succeeds for the owning Bookmark surface.
         self.bookmark_browser_rows = rows;
@@ -50572,7 +50579,17 @@ impl App {
                     .or_else(|| self.visible_indices.first().copied()),
                 crate::app::GridCursorIntent::Automatic,
             );
-            self.scroll_to_selected = self.selected.is_some();
+            if let Some(scroll) = live_return_scroll {
+                self.scroll_offset_y = scroll;
+                self.pending_grid_scroll = None;
+                self.scroll_to_selected = previous_key.is_some_and(|key| {
+                    self.selected
+                        .and_then(|idx| self.bookmark_browser_rows.get(idx))
+                        .is_none_or(|row| row.stable_key() != key)
+                });
+            } else {
+                self.scroll_to_selected = self.selected.is_some();
+            }
         }
         true
     }
@@ -51010,13 +51027,20 @@ impl App {
                         self.invalidate_current_book_bookmarks_for_container(&container);
                     }
                     let key_set: std::collections::HashSet<_> = keys.iter().copied().collect();
-                    self.bookmark_browser_rows
-                        .retain(|row| !key_set.contains(&row.stable_key()));
+                    // Keep old rows until the installer captures the selected key.
+                    let rows = self
+                        .bookmark_browser_rows
+                        .iter()
+                        .filter(|row| !key_set.contains(&row.stable_key()))
+                        .cloned()
+                        .collect();
                     self.current_book_bookmarks
                         .retain(|bookmark| !key_set.contains(&(1, bookmark.id)));
                     self.checked.clear();
                     if self.items_are_bookmark_view {
-                        self.install_bookmark_view_rows();
+                        self.install_bookmark_view_rows_with_sources(rows, None);
+                    } else {
+                        self.bookmark_browser_rows = rows;
                     }
                     self.notify_bookmarks_changed();
                     self.show_feedback_toast(format!(

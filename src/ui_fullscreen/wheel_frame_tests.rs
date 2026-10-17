@@ -986,3 +986,222 @@ fn egui037_wheel_frame_true_close_stops_only_projected_timer_and_manual_stop_clo
     assert!(!app.stop_slideshow_playback());
     assert!(!app.slideshow_popup_open);
 }
+
+/// Real nested immediate passes: returning from the child switches this same
+/// Context back to root before the production merge applies its owned proposal.
+fn install_immediate_child_input(ctx: &egui::Context, focused: bool, events: Vec<egui::Event>) {
+    ctx.set_embed_viewports(false);
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("wheel_immediate_child_input"),
+            (focused, events),
+        )
+    });
+    egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
+        let (focused, events) = ctx.data(|data| {
+            data.get_temp::<(bool, Vec<egui::Event>)>(egui::Id::new("wheel_immediate_child_input"))
+                .unwrap()
+        });
+        let mut raw = egui::RawInput {
+            viewport_id: viewport.ids.this,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            focused,
+            events,
+            ..Default::default()
+        };
+        raw.viewports.insert(
+            viewport.ids.this,
+            egui::ViewportInfo {
+                parent: Some(viewport.ids.parent),
+                focused: Some(focused),
+                ..Default::default()
+            },
+        );
+        ctx.run_ui(raw, |ui| (viewport.viewport_ui_cb)(ui))
+            .drop_without_applying_deltas();
+    });
+}
+
+#[test]
+fn egui037_wheel_frame_actual_immediate_child_keeps_zoom_anchor_and_root_wheel() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    install(&ctx);
+    let mut app = ready_app(&ctx, SpreadMode::Single);
+    app.settings.page_turn_animation_enabled = true;
+    let child_pointer = egui::pos2(180.0, 160.0);
+    install_immediate_child_input(
+        &ctx,
+        true,
+        vec![
+            egui::Event::PointerMoved(child_pointer),
+            wheel(-120.0, egui::Modifiers::NONE),
+            wheel(120.0, egui::Modifiers::CTRL),
+            wheel(-120.0, egui::Modifiers::NONE),
+        ],
+    );
+    frame(
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(egui::pos2(510.0, 310.0)),
+            wheel(73.0, egui::Modifiers::CTRL),
+            wheel(-41.0, egui::Modifiers::NONE),
+        ],
+        |root_ui| {
+            let root_before = ctx.input(|input| {
+                (
+                    input.events.clone(),
+                    input.raw.events.clone(),
+                    input.smooth_scroll_delta,
+                )
+            });
+            let mut proposal = None;
+            let mut operation = None;
+            let mut expected = (1.0, egui::Vec2::ZERO);
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("wheel-child"),
+                egui::ViewportBuilder::default(),
+                |ui, class| {
+                    assert!(class == egui::ViewportClass::Immediate);
+                    let geometry = app.still_seek_geometry_for_idx(ctx.content_rect(), 1, false);
+                    let image_rect = app.fullscreen_media_rect_with_geometry(
+                        ctx.content_rect(),
+                        1,
+                        false,
+                        geometry,
+                    );
+                    App::apply_wheel_zoom(
+                        &mut expected.0,
+                        &mut expected.1,
+                        120.0,
+                        Some(child_pointer),
+                        image_rect.center(),
+                    );
+                    let (mut result, current_operation) = collect_actual_merge(&mut app, ui, false);
+                    let mut owned = result.deferred.take().expect("mixed child delivery");
+                    app.claim_fs_wheel_frame_after_ui(&mut owned);
+                    assert!(ctx.input(|input| {
+                        !input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                    }));
+                    proposal = Some(owned);
+                    operation = current_operation;
+                },
+            );
+            assert_eq!(ctx.viewport_id(), egui::ViewportId::ROOT);
+            let result =
+                app.apply_fs_wheel_frame_proposal(proposal.take().unwrap(), false, &mut operation);
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert_eq!(app.fs_zoom, expected.0);
+            assert!(
+                (app.fs_pan - expected.1).length() < 0.001,
+                "child pointer anchors zoom: actual={:?}, expected={:?}",
+                app.fs_pan,
+                expected.1
+            );
+            assert_eq!(result.page_nav, FsPageNav::Delta(1));
+            assert_eq!(
+                ctx.input(|input| (
+                    input.events.clone(),
+                    input.raw.events.clone(),
+                    input.smooth_scroll_delta
+                )),
+                root_before,
+                "child-owned ordinals cannot consume root events or deltas"
+            );
+            assert!(matches!(
+                operation,
+                Some(ViewerOperationId::Pointer { ordinal: 3, .. })
+            ));
+            finish(&mut app, root_ui, &result, operation);
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(1),
+                "the existing unpainted Display sequence rejects the final target"
+            );
+            assert_eq!(app.fs_zoom, expected.0);
+            assert!((app.fs_pan - expected.1).length() < 0.001);
+        },
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn egui037_wheel_frame_actual_immediate_child_music_gate_uses_child_focus() {
+    let _serial = crate::key_input::lock_test_input();
+    crate::key_input::clear_test_frame();
+    for child_focused in [false, true] {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.page_turn_animation_enabled = true;
+        let audio = app.tmp.path().join("immediate-wheel.flac");
+        app.items[1] = GridItem::Audio(audio.clone());
+        app.fs_cache.insert(
+            1,
+            FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(audio),
+                ),
+                load_seq: 1,
+            },
+        );
+        install_immediate_child_input(
+            &ctx,
+            child_focused,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(180.0, 160.0)),
+                wheel(-120.0, egui::Modifiers::NONE),
+                wheel(120.0, egui::Modifiers::CTRL),
+            ],
+        );
+        let before = app.music_timeline_row_secs;
+        frame(&ctx, vec![wheel(73.0, egui::Modifiers::CTRL)], |_| {
+            let root_before = ctx.input(|input| {
+                (
+                    input.events.clone(),
+                    input.raw.events.clone(),
+                    input.smooth_scroll_delta,
+                )
+            });
+            let mut proposal = None;
+            let mut operation = None;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("wheel-music-child"),
+                egui::ViewportBuilder::default(),
+                |ui, _| {
+                    let (mut result, current_operation) = collect_actual_merge(&mut app, ui, false);
+                    let mut owned = result.deferred.take().expect("mixed child delivery");
+                    owned.music_ctrl_wheel_gate_reached = true;
+                    app.claim_fs_wheel_frame_after_ui(&mut owned);
+                    proposal = Some(owned);
+                    operation = current_operation;
+                },
+            );
+            // Root remains focused; child admission must not read this permit.
+            assert!(
+                crate::keyboard_input::keyboard_input_permits(&ctx)
+                    .discrete
+                    .is_some()
+            );
+            let _ =
+                app.apply_fs_wheel_frame_proposal(proposal.take().unwrap(), false, &mut operation);
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert_eq!(app.music_timeline_row_secs != before, child_focused);
+            assert_eq!(
+                ctx.input(|input| (
+                    input.events.clone(),
+                    input.raw.events.clone(),
+                    input.smooth_scroll_delta
+                )),
+                root_before
+            );
+        });
+    }
+}

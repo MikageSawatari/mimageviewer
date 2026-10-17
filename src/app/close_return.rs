@@ -23,6 +23,13 @@ impl FullscreenCloseContinuation {
     pub(crate) fn is_pending(&self) -> bool {
         matches!(self, Self::Live(_) | Self::Terminal(_))
     }
+    pub(super) fn preserves_live_bookmark_grid(&self) -> bool {
+        matches!(
+            self,
+            Self::Terminal(request)
+                if matches!(request.effect, CloseReturnEffect::BookmarkRefresh { .. })
+        )
+    }
     pub(crate) fn clear(&mut self) {
         *self = Self::None;
     }
@@ -351,6 +358,13 @@ impl App {
                 match request.effect {
                     CloseReturnEffect::BookmarkRefresh { target, mut grid } => {
                         // A user can keep selecting/scrolling while logic-only returns wait.
+                        // A completed read-model may also have replaced the live main rows
+                        // before this consumer. Restore that adopted grid, not its predecessor.
+                        grid.row_keys = self
+                            .bookmark_browser_rows
+                            .iter()
+                            .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key)
+                            .collect();
                         grid.selected_key = self
                             .selected
                             .and_then(|idx| self.bookmark_browser_rows.get(idx))

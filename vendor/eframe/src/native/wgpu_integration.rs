@@ -2028,14 +2028,15 @@ impl super::viewport_lifecycle::ChildCloseBackend for Rc<RefCell<SharedState>> {
     }
 
     fn finish_retirement(&mut self, ctx: &egui::Context) {
-        super::viewport_lifecycle::ChildCloseBackend::collect_retirement_delta(self, ctx);
         let mut shared = self.borrow_mut();
         let SharedState {
             painter,
             pending_deltas,
             ..
         } = &mut *shared;
-        painter.apply_textures_delta(pending_deltas);
+        super::viewport_lifecycle::finish_retirement_texture_delta(ctx, pending_deltas, |delta| {
+            painter.apply_textures_delta(delta);
+        });
     }
 }
 
@@ -3183,6 +3184,111 @@ mod viewport_retirement_tests {
     use super::super::viewport_lifecycle::viewport_retirement_tests::{self as scenarios, Adapter};
     use super::*;
     type Headless = Rc<RefCell<SharedState>>;
+
+    #[test]
+    fn retirement_texture_delivery_prepared_wgpu_skips_empty_and_delivers_free_only() {
+        use super::super::viewport_lifecycle::{
+            append_texture_delta, finish_retirement_texture_delta,
+        };
+        use egui_wgpu::{RenderState, RendererOptions, TextureUpdateSubmission, WgpuSetup};
+
+        let mut config = egui_wgpu::WgpuConfiguration::default();
+        let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup else {
+            unreachable!()
+        };
+        setup.instance_descriptor.backends = if cfg!(target_os = "windows") {
+            egui_wgpu::wgpu::Backends::DX12
+        } else {
+            egui_wgpu::wgpu::Backends::PRIMARY
+        };
+        let instance = pollster::block_on(config.wgpu_setup.new_instance());
+        let state = pollster::block_on(RenderState::create(
+            &config,
+            &instance,
+            None,
+            RendererOptions::default(),
+        ))
+        .expect("retirement resource regression requires a headless wgpu adapter");
+        let validation = state
+            .device
+            .push_error_scope(egui_wgpu::wgpu::ErrorFilter::Validation);
+
+        // This is the exact lazy dispatcher used by native finish_retirement.
+        // Its consumer uses a prepared real Renderer/queue, without inventing a
+        // windowless Painter setter. Painter's completion order has separate
+        // egui-wgpu coverage; this checks whether resource processing is entered.
+        // Counts are consumer entry, uploads, returned submits, and frees.
+        fn deliver(
+            ctx: &egui::Context,
+            pending: &mut TexturesDelta,
+            state: &RenderState,
+            counts: &mut [usize; 4],
+        ) {
+            finish_retirement_texture_delta(ctx, pending, |delta| {
+                counts[0] += 1;
+                let mut renderer = state.renderer.write();
+                for (id, updates) in delta.set.drain() {
+                    for update in updates {
+                        assert!(matches!(
+                            renderer.update_texture_with_submission(
+                                &state.device,
+                                &state.queue,
+                                id,
+                                &update,
+                            ),
+                            TextureUpdateSubmission::Pending
+                        ));
+                        counts[1] += 1;
+                    }
+                }
+                state.queue.submit([]);
+                counts[2] += 1; // Count only after the actual submit returned.
+                for id in delta.free.drain() {
+                    renderer.free_texture(&id);
+                    counts[3] += 1;
+                }
+            });
+        }
+
+        let ctx = egui::Context::default();
+        let mut pending = TexturesDelta::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.label("Initialize the font atlas before idle resource checks");
+        });
+        append_texture_delta(&mut pending, core::mem::take(&mut output.textures_delta));
+        output.drop_without_applying_deltas();
+        let mut counts = [0; 4];
+        deliver(&ctx, &mut pending, &state, &mut counts); // Initialize the font texture.
+        assert!(pending.is_empty());
+        counts = [0; 4];
+        for _ in 0..32 {
+            deliver(&ctx, &mut pending, &state, &mut counts);
+        }
+        assert_eq!(counts, [0; 4], "idle events must not enter a GPU consumer");
+
+        let texture = ctx.load_texture(
+            "retirement-delivery",
+            egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        let id = texture.id();
+        deliver(&ctx, &mut pending, &state, &mut counts);
+        assert_eq!(counts, [1, 1, 1, 0], "collect before testing the batch");
+        assert!(state.renderer.read().texture(&id).is_some());
+        drop(texture);
+        deliver(&ctx, &mut pending, &state, &mut counts);
+        let free_batch_consumed = pending.is_empty();
+        // Headless negative-control cleanup avoids a second panic from dropping
+        // an unapplied delta, while retaining the consumption assertion below.
+        pending.clear();
+        assert_eq!(counts, [2, 1, 2, 1], "free-only is a nonempty batch");
+        assert!(free_batch_consumed, "free-only batch must be consumed");
+        assert!(state.renderer.read().texture(&id).is_none());
+        deliver(&ctx, &mut pending, &state, &mut counts);
+        assert_eq!(counts, [2, 1, 2, 1], "consumed work must not be repeated");
+        assert!(pending.is_empty());
+        assert!(pollster::block_on(validation.pop()).is_none());
+    }
 
     impl Adapter for Headless {
         fn new(ctx: &egui::Context) -> Self {

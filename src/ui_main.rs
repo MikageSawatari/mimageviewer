@@ -30177,7 +30177,15 @@ mod section207_tests {
                                     ctx.request_repaint();
                                     return;
                                 }
-                                render.borrow_mut().render_toolbar(root_ui);
+                                // Production receives the full viewport root Ui. kittest's
+                                // build_ui adds an outer 8pt frame around this closure.
+                                root_ui.scope_builder(
+                                    egui::UiBuilder::new().max_rect(ctx.content_rect()),
+                                    |viewport_ui| {
+                                        assert_eq!(viewport_ui.max_rect(), ctx.content_rect());
+                                        render.borrow_mut().render_toolbar(viewport_ui);
+                                    },
+                                );
                             });
                         harness.run();
                         let field = harness.get_by_role(egui::accesskit::Role::TextInput);
@@ -30190,7 +30198,7 @@ mod section207_tests {
                         let left = harness.get_by_label("場所▼").rect();
                         let right = harness.get_by_label("履歴▼").rect();
                         let panel = state.borrow().toolbar_content_rect.unwrap();
-                        let panel = egui::Rect::from_min_max(panel.min * zoom, panel.max * zoom);
+                        let viewport = harness.ctx.content_rect();
                         let case =
                             format!("width={width} zoom={zoom} row={new_row} changed={changed}");
                         if width == 360.0 && zoom == 1.0 && new_row {
@@ -30206,7 +30214,10 @@ mod section207_tests {
                                 }))
                                 .unwrap();
                         }
-                        assert!(input.width() >= 160.0 * zoom, "{case}: {input:?}");
+                        assert!(
+                            input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH,
+                            "{case}: {input:?}"
+                        );
                         let precedes = |a: egui::Rect, b: egui::Rect| {
                             a.bottom() <= b.top() + 0.5
                                 || (a.right() <= b.left() + 0.5
@@ -30233,10 +30244,7 @@ mod section207_tests {
                                 panel.expand(0.5).contains_rect(rect),
                                 "{case}: {panel:?} {rect:?}"
                             );
-                            assert!(
-                                rect.left() >= 0.0 && rect.right() <= width * zoom,
-                                "{case}: {rect:?}"
-                            );
+                            assert!(viewport.contains_rect(rect), "{case}: {rect:?}");
                         }
                     }
                 }
@@ -30297,7 +30305,15 @@ mod section207_tests {
                             ctx.request_repaint();
                             return;
                         }
-                        render.borrow_mut().render_toolbar(root_ui);
+                        // Production receives the full viewport root Ui. kittest's
+                        // build_ui adds an outer 8pt frame around this closure.
+                        root_ui.scope_builder(
+                            egui::UiBuilder::new().max_rect(ctx.content_rect()),
+                            |viewport_ui| {
+                                assert_eq!(viewport_ui.max_rect(), ctx.content_rect());
+                                render.borrow_mut().render_toolbar(viewport_ui);
+                            },
+                        );
                     });
                 harness.run();
                 let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
@@ -30312,7 +30328,7 @@ mod section207_tests {
                 if width / zoom >= 950.0 {
                     assert!(
                         left.top() < input.bottom() && input.top() < left.bottom(),
-                        "all controls fit on one row"
+                        "all controls fit on one row: width={width} zoom={zoom} row={new_row} left={left:?} input={input:?} favorite={favorite:?}"
                     );
                     assert!(
                         favorite.top() < input.bottom() && input.top() < favorite.bottom(),
@@ -30338,7 +30354,8 @@ mod section207_tests {
                     left.height() <= input.height() + 0.5,
                     "place caption must not wrap internally: {left:?}"
                 );
-                assert!(left.left() >= 0.0 && left.right() <= width);
+                let viewport = harness.ctx.content_rect();
+                assert!(viewport.contains_rect(left));
                 assert!(precedes(left, input), "left/input: {left:?} {input:?}");
                 for label in [
                     "♡",
@@ -30355,7 +30372,7 @@ mod section207_tests {
                         "right caption must not wrap internally: {label} {right:?}"
                     );
                     assert!(
-                        right.left() >= 0.0 && right.right() <= width,
+                        viewport.contains_rect(right),
                         "right control escaped the panel: {label} {right:?}"
                     );
                     assert!(
@@ -30363,7 +30380,7 @@ mod section207_tests {
                         "width={width} zoom={zoom} row={new_row} input/right={label}: {input:?} {right:?}"
                     );
                 }
-                assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH * zoom);
+                assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH);
                 if new_row {
                     let evidence = std::path::Path::new("target/section207-wrap-rendering");
                     std::fs::create_dir_all(evidence).unwrap();

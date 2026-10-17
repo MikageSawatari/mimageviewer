@@ -4104,6 +4104,7 @@ impl crate::app::App {
         let mut begin_tailscale_serve_setup = false;
         let mut begin_session_logout = false;
         egui::Window::new("リモート接続")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("remote_connection_dialog"))
             .collapsible(false)
             .resizable(false)
@@ -5267,6 +5268,65 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui;
+
+    #[test]
+    fn egui037_remote_connection_body_mouse_drag_moves_window() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.remote_session_ui.connection_dialog = Some(RemoteConnectionDialogState::new(true));
+        let id = egui::Id::new("remote_connection_dialog");
+        let draw = |app: &mut crate::app::App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 760.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.show_remote_connection_dialog(&ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..4 {
+            draw(&mut app, vec![]);
+        }
+        let before = ctx
+            .memory(|memory| memory.area_rect(id))
+            .expect("production Window");
+        // Label/body padding, below the title bar and away from buttons and resize edges.
+        let start = egui::pos2(before.right() - 28.0, before.top() + 60.0);
+        let delta = egui::vec2(65.0, 45.0);
+        draw(&mut app, vec![egui::Event::PointerMoved(start)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![egui::Event::PointerMoved(start + delta)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start + delta,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![]);
+        let after = ctx.memory(|memory| memory.area_rect(id)).unwrap();
+        assert!(
+            (after.min - before.min - delta).length() < 2.0,
+            "body mouse drag must move the actual movable Window: before={before:?}, after={after:?}"
+        );
+    }
+
     use super::*;
 
     include!("spread_shift_ui_tests.rs");

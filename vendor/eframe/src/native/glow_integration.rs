@@ -1346,15 +1346,16 @@ impl ChildCloseBackend for GlowChildCloseBackend<'_> {
     }
 
     fn finish_retirement(&mut self, ctx: &egui::Context) {
-        self.collect_retirement_delta(ctx);
-        let current = self
-            .glutin
-            .borrow_mut()
-            .make_resource_context_current(ViewportId::ROOT);
-        finish_glow_texture_delta(
-            current,
-            &mut *self.painter.borrow_mut(),
+        super::viewport_lifecycle::finish_retirement_texture_delta(
+            ctx,
             &mut self.pending_deltas.borrow_mut(),
+            |delta| {
+                let current = self
+                    .glutin
+                    .borrow_mut()
+                    .make_resource_context_current(ViewportId::ROOT);
+                finish_glow_texture_delta(current, &mut *self.painter.borrow_mut(), delta);
+            },
         );
     }
 }
@@ -3688,5 +3689,60 @@ mod viewport_retirement_tests {
             ]
         );
         assert!(pending.borrow().is_empty());
+    }
+
+    #[test]
+    fn retirement_texture_delivery_glow_skips_empty_context_and_delivers_free_only() {
+        // Fake GL calls through the real consumer and lazy retirement dispatcher.
+        // No GL context or native window is created by this regression.
+        #[derive(Default)]
+        struct Painter(Vec<(egui::TextureId, bool)>);
+        impl GlowTexturePainter for Painter {
+            fn set_texture(&mut self, id: egui::TextureId, _: &egui::epaint::ImageDelta) {
+                self.0.push((id, false));
+            }
+            fn free_texture(&mut self, id: egui::TextureId) {
+                self.0.push((id, true));
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut painter = Painter::default();
+        let mut pending = TexturesDelta::default();
+        let mut context_entries = 0;
+        let deliver = |pending: &mut TexturesDelta, painter: &mut Painter, entries: &mut usize| {
+            lifecycle::finish_retirement_texture_delta(&ctx, pending, |delta| {
+                *entries += 1; // Represents make_resource_context_current, before GL calls.
+                finish_glow_texture_delta(true, painter, delta);
+            });
+        };
+        deliver(&mut pending, &mut painter, &mut context_entries);
+        painter.0.clear(); // Initial font texture was consumed by the fake GL renderer.
+        context_entries = 0;
+        for _ in 0..32 {
+            deliver(&mut pending, &mut painter, &mut context_entries);
+        }
+        assert_eq!(context_entries, 0, "idle events must not switch GL context");
+        assert!(painter.0.is_empty());
+
+        let texture = ctx.load_texture(
+            "retirement-delivery",
+            egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        let id = texture.id();
+        deliver(&mut pending, &mut painter, &mut context_entries);
+        assert_eq!(painter.0, [(id, false)]);
+        drop(texture);
+        deliver(&mut pending, &mut painter, &mut context_entries);
+        let free_batch_consumed = pending.is_empty();
+        // Headless negative-control cleanup avoids masking the primary assertion
+        // with a second panic from an unapplied TexturesDelta's Drop.
+        pending.clear();
+        assert_eq!(painter.0, [(id, false), (id, true)]);
+        assert!(free_batch_consumed, "free-only batch must be consumed");
+        assert_eq!(context_entries, 2, "free-only must enter the consumer");
+        deliver(&mut pending, &mut painter, &mut context_entries);
+        assert_eq!(context_entries, 2);
+        assert!(pending.is_empty());
     }
 }

@@ -18140,6 +18140,7 @@ struct FsWheelFrameResult {
 
 struct FsWheelFrameProposal {
     context: egui::Context,
+    viewport: egui::ViewportId,
     frame_navigation_allowed: bool,
     music_ctrl_wheel_gate_reached: bool,
     route_music_intervals: bool,
@@ -18163,7 +18164,40 @@ struct FsWheelFrameProposal {
 
 enum FsWheelFrameInput {
     Unconsumed(Vec<FsWheelAction>),
-    Owned(Vec<FsWheelAction>),
+    Owned {
+        actions: Vec<FsWheelAction>,
+        input: FsWheelFrameSemanticInput,
+    },
+}
+
+/// Immutable semantic facts from the owning viewport. A Context clone follows
+/// the current viewport and cannot carry child input past an immediate callback.
+struct FsWheelFrameSemanticInput {
+    pointer_pos: Option<egui::Pos2>,
+    modifiers: egui::Modifiers,
+    primary_started: bool,
+    primary_dragged: bool,
+    primary_stopped: bool,
+    total_drag_delta: Option<egui::Vec2>,
+    drag_delta: egui::Vec2,
+    double_clicked: bool,
+    music_context_allowed: bool,
+}
+
+impl FsWheelFrameSemanticInput {
+    fn capture(app: &App, ctx: &egui::Context, response: &egui::Response) -> Self {
+        Self {
+            pointer_pos: ctx.input(|input| input.pointer.hover_pos()),
+            modifiers: ctx.input(|input| input.modifiers),
+            primary_started: response.drag_started_by(egui::PointerButton::Primary),
+            primary_dragged: response.dragged_by(egui::PointerButton::Primary),
+            primary_stopped: response.drag_stopped_by(egui::PointerButton::Primary),
+            total_drag_delta: fullscreen_drag_pan_proposal(response, egui::Vec2::ZERO),
+            drag_delta: response.drag_delta(),
+            double_clicked: response.double_clicked(),
+            music_context_allowed: app.music_timeline_ctrl_wheel_context_allowed(ctx),
+        }
+    }
 }
 
 struct FsWheelAction {
@@ -38426,6 +38460,7 @@ impl App {
         let mixed_navigation = accepted_wheel.len() > 1 && wheel_navigation_produced;
         let proposal = FsWheelFrameProposal {
             context: ctx.clone(),
+            viewport: ctx.viewport_id(),
             frame_navigation_allowed: true,
             music_ctrl_wheel_gate_reached: false,
             route_music_intervals: merge_at_frame_tail && mixed_navigation,
@@ -38539,11 +38574,14 @@ impl App {
 
     fn claim_fs_wheel_frame_after_ui(&self, proposal: &mut FsWheelFrameProposal) {
         if let FsWheelFrameInput::Unconsumed(eligible) = &proposal.wheel_input {
+            assert_eq!(proposal.context.viewport_id(), proposal.viewport);
+            let input =
+                FsWheelFrameSemanticInput::capture(self, &proposal.context, &proposal.fs_response);
             let actions = self.remaining_fs_wheel_frame_actions(&proposal.context, eligible);
             for action in &actions {
                 crate::wheel_input::consume_wheel_segment(&proposal.context, action.segment);
             }
-            proposal.wheel_input = FsWheelFrameInput::Owned(actions);
+            proposal.wheel_input = FsWheelFrameInput::Owned { actions, input };
         }
     }
 
@@ -38555,6 +38593,7 @@ impl App {
     ) -> FsWheelFrameResult {
         let FsWheelFrameProposal {
             context,
+            viewport,
             frame_navigation_allowed: _,
             music_ctrl_wheel_gate_reached,
             route_music_intervals,
@@ -38580,10 +38619,27 @@ impl App {
         // Popup/HUD owners ran before this merge. Project only the events which
         // they left; the earlier proposal contributes eligibility and identity,
         // never motion resurrected from a pre-consumption snapshot.
-        let accepted_wheel = match wheel_input {
-            FsWheelFrameInput::Owned(actions) => actions,
+        let (accepted_wheel, input) = match wheel_input {
+            FsWheelFrameInput::Owned { actions, input } => (actions, input),
             FsWheelFrameInput::Unconsumed(eligible) => {
-                self.remaining_fs_wheel_frame_actions(ctx, &eligible)
+                assert_eq!(ctx.viewport_id(), viewport);
+                let input = FsWheelFrameSemanticInput::capture(self, ctx, &fs_response);
+                let actions = self.remaining_fs_wheel_frame_actions(ctx, &eligible);
+                // The queue belongs to this viewport. Consume here once, before
+                // semantic dispatch can leave its immediate callback.
+                for action in &actions {
+                    // A music-only immediate pass still leaves Ctrl wheel for
+                    // the ordinary timeline owner after its HUD has drawn.
+                    if route_music_intervals
+                        || !action.input.modifiers.ctrl
+                        || !self
+                            .fullscreen_idx
+                            .is_some_and(|idx| self.fs_music_view_active(idx))
+                    {
+                        crate::wheel_input::consume_wheel_segment(ctx, action.segment);
+                    }
+                }
+                (actions, input)
             }
         };
         let suppress_intermediate_navigation = suppress_wheel_navigation
@@ -38607,18 +38663,17 @@ impl App {
             {
                 if route_music_intervals {
                     let idx = self.fullscreen_idx.unwrap();
-                    if self.music_timeline_ctrl_wheel_allowed(
-                        ctx,
-                        idx,
-                        music_ctrl_wheel_gate_reached,
-                    ) {
+                    if input.music_context_allowed
+                        && self.music_timeline_ctrl_wheel_state_allowed(
+                            idx,
+                            music_ctrl_wheel_gate_reached,
+                        )
+                    {
                         self.apply_music_timeline_ctrl_wheel_delta(wheel_y);
-                        crate::wheel_input::consume_wheel_segment(ctx, wheel_action.segment);
                     }
                 }
                 continue;
             }
-            crate::wheel_input::consume_wheel_segment(ctx, wheel_action.segment);
             let continuous_active = self
                 .fullscreen_idx
                 .is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
@@ -38644,7 +38699,7 @@ impl App {
             } else if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "analysis");
-                let mouse = ctx.input(|i| i.pointer.hover_pos());
+                let mouse = input.pointer_pos;
                 let image_rect = analysis_image_rect(full_rect);
                 let changed = Self::apply_wheel_zoom(
                     &mut self.analysis_zoom,
@@ -38663,7 +38718,8 @@ impl App {
                 // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
                 // FOV 操作に振る。前後ナビは矢印キーで行う。
             } else if !ctrl_held && continuous_active {
-                let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
+                // Use the source viewport geometry after an immediate child returns.
+                let delta = self.continuous_reading_wheel_delta_px(default_image_rect, wheel_y);
                 self.scroll_vertical_reading_by(ctx, delta, crate::app::HistoryTrigger::UserChosen);
             } else {
                 if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
@@ -38672,7 +38728,7 @@ impl App {
                     // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
                     // パネルスクロールを維持できる。
                     crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "edit_mode");
-                    let mouse = ctx.input(|i| i.pointer.hover_pos());
+                    let mouse = input.pointer_pos;
                     let mut proposed_zoom = self.fs_zoom;
                     let mut proposed_pan = self.fs_pan;
                     let changed = Self::apply_wheel_zoom(
@@ -38769,22 +38825,28 @@ impl App {
         } else if self.analysis_mode {
             // 分析モード: 左クリックでのナビを無効化（パン用のドラッグは analysis_panel 側）
             // ダブルクリックでズームリセット
-            if fs_response.double_clicked() {
+            if input.double_clicked {
                 self.analysis_zoom = 1.0;
                 self.analysis_pan = egui::Vec2::ZERO;
                 self.maybe_rerender_pdf(1.0);
             }
             // 右クリックは analysis_panel 側で処理
-        } else if self.handle_panorama_drag_if_active(ctx, full_rect, &fs_response) {
+        } else if self.handle_panorama_drag_if_active(
+            ctx,
+            full_rect,
+            input.primary_dragged,
+            input.drag_delta,
+            input.double_clicked,
+        ) {
             // 360 度パノラマビュー: 左ドラッグ → yaw/pitch、ダブルクリック → reset (§5.2)。
             // 通常モードの zoom/pan/rotation ドラッグはスキップ。
         } else {
             // ── 通常モード: ドラッグ操作 ──
-            let mods = ctx.input(|i| i.modifiers);
-            let primary_pressed = fs_response.drag_started_by(egui::PointerButton::Primary);
-            let primary_down = fs_response.dragged_by(egui::PointerButton::Primary);
-            let primary_released = fs_response.drag_stopped_by(egui::PointerButton::Primary);
-            let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            let mods = input.modifiers;
+            let primary_pressed = input.primary_started;
+            let primary_down = input.primary_dragged;
+            let primary_released = input.primary_stopped;
+            let pointer_pos = input.pointer_pos;
             let pointer_in_seek_panel =
                 pointer_pos.is_some_and(|p| seek_panel_interactive && seek_panel_rect.contains(p));
 
@@ -38844,14 +38906,13 @@ impl App {
                 // 画面内に残る範囲で動く。
                 // 連結読みのドラッグは直前の分岐で、主軸スクロールと直交パンに分けて扱う。
                 if primary_pressed
-                    && let (Some(pos), Some(total_delta)) =
-                        (pointer_pos, fs_response.total_drag_delta())
+                    && let (Some(pos), Some(total_delta)) = (pointer_pos, input.total_drag_delta)
                 {
                     self.fs_pan_drag_start = Some((pos - total_delta, self.fs_pan));
                 }
                 if let Some((_, start_pan)) = self.fs_pan_drag_start
                     && let Some(proposed_pan) =
-                        fullscreen_drag_pan_proposal(&fs_response, start_pan)
+                        input.total_drag_delta.map(|delta| start_pan + delta)
                 {
                     self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
                 }
@@ -42206,10 +42267,15 @@ impl App {
                 / 100.0)
     }
 
-    fn continuous_reading_wheel_delta_px(&mut self, ctx: &egui::Context, wheel_y: f32) -> f32 {
+    fn continuous_reading_wheel_delta_px(&self, viewport: egui::Rect, wheel_y: f32) -> f32 {
         let notches = wheel_y / CONTINUOUS_READING_WHEEL_REFERENCE_DELTA;
+        let viewport_len = if self.reading_flow.is_horizontal() {
+            viewport.width().max(1.0)
+        } else {
+            viewport.height().max(1.0)
+        };
         -notches
-            * self.continuous_reading_viewport_len_for_flow(ctx)
+            * viewport_len
             * (self
                 .settings
                 .continuous_reading_wheel_scroll_percent
@@ -46124,7 +46190,9 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-        fs_response: &egui::Response,
+        primary_dragged: bool,
+        drag_delta: egui::Vec2,
+        double_clicked: bool,
     ) -> bool {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
@@ -46147,15 +46215,15 @@ impl App {
             //    **累積差分ではない** ので毎フレ加算で OK。累積版が必要なら
             //    `total_drag_delta()`。Codex P1 第 18 ラウンドで「累積」と誤指摘あり、
             //    egui ソース (src/response.rs 該当行) で fetch 確認済み。
-            let primary_down = fs_response.dragged_by(egui::PointerButton::Primary);
+            let primary_down = primary_dragged;
             if primary_down {
-                let delta = fs_response.drag_delta();
+                let delta = drag_delta;
                 if pano.apply_drag_delta(delta, viewport_h) {
                     ctx.request_repaint();
                 }
             }
             // ダブルクリック → 初期視点に戻す (GPano hint or 0)
-            if fs_response.double_clicked() {
+            if double_clicked {
                 pano.reset();
                 ctx.request_repaint();
             }
@@ -55425,18 +55493,29 @@ impl App {
         fs_idx: usize,
         key_gate_reached: bool,
     ) -> bool {
-        if !key_gate_reached
-            || crate::keyboard_input::keyboard_input_permits(ctx)
-                .discrete
-                .is_none()
-            || self.any_modal_dialog_open_for_fullscreen_keys()
-            || fs_still_seek_strip_popup_open(ctx)
-            || self.fs_context_menu_idx.is_some()
-            || self.music_fullscreen_editor_or_modal_blocks_input(ctx, fs_idx)
-        {
-            return false;
-        }
-        true
+        self.music_timeline_ctrl_wheel_context_allowed(ctx)
+            && self.music_timeline_ctrl_wheel_state_allowed(fs_idx, key_gate_reached)
+    }
+
+    fn music_timeline_ctrl_wheel_context_allowed(&self, ctx: &egui::Context) -> bool {
+        crate::keyboard_input::keyboard_input_permits(ctx)
+            .discrete
+            .is_some()
+            && !fs_still_seek_strip_popup_open(ctx)
+            && !ctx.egui_wants_keyboard_input()
+            && !self.ime_input_active(ctx)
+    }
+
+    fn music_timeline_ctrl_wheel_state_allowed(
+        &self,
+        fs_idx: usize,
+        key_gate_reached: bool,
+    ) -> bool {
+        key_gate_reached
+            && !self.any_modal_dialog_open_for_fullscreen_keys()
+            && self.fs_context_menu_idx.is_none()
+            && !self.music_bookmark_modal_open()
+            && !self.music_normalize_modal_active(fs_idx)
     }
 
     fn apply_music_timeline_ctrl_wheel_delta(&mut self, wheel_y: f32) {
@@ -63084,12 +63163,11 @@ mod tests {
         }
     }
 
-    fn snapshot_fullscreen_overflow_panel(
-        name: &str,
+    fn fullscreen_overflow_panel_harness(
         state: FsOverflowPanelState,
         size: egui::Vec2,
         animation_enabled: bool,
-    ) {
+    ) -> egui_kittest::Harness<'static> {
         let mut app = crate::app::setup_app_for_test();
         app.settings.page_turn_animation_enabled = animation_enabled;
         let animation_row = app
@@ -63171,7 +63249,7 @@ mod tests {
                             composition_managed: false,
                             music_note_color_scheme: Default::default(),
                         };
-                        let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
+                        let panel_rect = fs_overflow_panel_rect(ctx.content_rect(), state).unwrap();
                         let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
                     });
             });
@@ -63192,7 +63270,25 @@ mod tests {
                 harness.ctx.pixels_per_point(),
             );
         }
-        harness.snapshot(name);
+        harness
+    }
+
+    fn snapshot_fullscreen_overflow_panel(
+        name: &str,
+        state: FsOverflowPanelState,
+        size: egui::Vec2,
+        animation_enabled: bool,
+    ) {
+        fullscreen_overflow_panel_harness(state, size, animation_enabled).snapshot(name);
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height() {
+        for size in [egui::vec2(720.0, 520.0), egui::vec2(720.0, 720.0)] {
+            // The shared fixture retains its original Fits assertion; no PNG is
+            // needed to detect the 8pt viewport shrink from build_ui's outer frame.
+            let _ = fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
+        }
     }
 
     #[test]

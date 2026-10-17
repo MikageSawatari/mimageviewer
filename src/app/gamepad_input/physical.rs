@@ -37,6 +37,17 @@ pub(crate) struct GamepadPhysicalInput {
 }
 
 impl GamepadPhysicalInput {
+    fn end_pending_session(&mut self) {
+        // Repeated disabled/inputless logic polls describe the same terminal.
+        // Only adjacent terminals coalesce; intervening edges keep their order.
+        if !matches!(
+            self.pending.events.last(),
+            Some(PadPhysicalEvent::SessionEnded)
+        ) {
+            self.pending.events.push(PadPhysicalEvent::SessionEnded);
+        }
+    }
+
     pub(super) fn drain(&mut self, ctx: &egui::Context, enabled: bool, now: Instant) {
         let events = self.runtime.drain(ctx, enabled);
         self.ingest(enabled, events, now);
@@ -55,7 +66,7 @@ impl GamepadPhysicalInput {
     fn ingest(&mut self, enabled: bool, events: Vec<PadEventReceipt>, now: Instant) {
         if !enabled {
             self.state.clear_physical();
-            self.pending.events.push(PadPhysicalEvent::SessionEnded);
+            self.end_pending_session();
             return;
         }
         self.pending.analog_operation |= self.analog_active();
@@ -101,7 +112,7 @@ impl GamepadPhysicalInput {
                     // Clear here, before any subsequent press in this drain.
                     // UI overlay cleanup and context-owned ring commit are separate.
                     self.state.clear_physical();
-                    self.pending.events.push(PadPhysicalEvent::SessionEnded);
+                    self.end_pending_session();
                 }
             }
         }
@@ -301,6 +312,63 @@ mod tests {
         );
         assert!(handoff.saw_input_event);
         assert!(handoff.analog_operation);
+    }
+
+    #[test]
+    fn gamepad_physical_disabled_inputless_logic_keeps_bounded_terminal() {
+        let ctx = egui::Context::default();
+        let mut input = GamepadPhysicalInput::default();
+        let now = Instant::now();
+        for _ in 0..4096 {
+            input.drain(&ctx, false, now);
+        }
+        let handoff = input.take_pending();
+        assert_eq!(handoff.events, [PadPhysicalEvent::SessionEnded]);
+        assert!(!handoff.saw_input_event);
+        assert!(!handoff.analog_operation);
+        assert!(input.state.is_idle());
+        for _ in 0..4096 {
+            input.drain(&ctx, false, now);
+        }
+        assert_eq!(
+            input.take_pending().events,
+            [PadPhysicalEvent::SessionEnded]
+        );
+    }
+
+    #[test]
+    fn gamepad_physical_disabled_polls_preserve_reconnect_press_and_terminal_order() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut input = GamepadPhysicalInput::default();
+        let now = Instant::now();
+        input.push_for_test(PadEvent::ButtonPressed(PadButton::West));
+        input.drain(&ctx, true, now);
+        for _ in 0..128 {
+            input.drain(&ctx, false, now);
+        }
+        input.push_for_test(PadEvent::Connected);
+        input.push_for_test(PadEvent::ButtonPressed(PadButton::North));
+        input.push_for_test(PadEvent::Disconnected);
+        input.drain(&ctx, true, now);
+        for _ in 0..128 {
+            input.drain(&ctx, false, now);
+        }
+        input.push_for_test(PadEvent::Connected);
+        input.push_for_test(PadEvent::ButtonPressed(PadButton::South));
+        input.drain(&ctx, true, now);
+        assert_eq!(
+            input.take_pending().events,
+            [
+                PadPhysicalEvent::ButtonPressed(PadButton::West),
+                PadPhysicalEvent::SessionEnded,
+                PadPhysicalEvent::ButtonPressed(PadButton::North),
+                PadPhysicalEvent::SessionEnded,
+                PadPhysicalEvent::ButtonPressed(PadButton::South),
+            ]
+        );
+        assert!(input.state.button_down(PadButton::South));
+        assert!(input.take_pending().events.is_empty());
     }
 
     #[test]

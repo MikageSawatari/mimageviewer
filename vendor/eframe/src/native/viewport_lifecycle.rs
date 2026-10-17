@@ -86,6 +86,21 @@ pub(super) fn append_texture_delta(
     pending.free.extend(core::mem::take(&mut newer.free));
 }
 
+/// Retirement runs after ordinary native events too. Collect cleanup work first,
+/// then enter the resource consumer only for an actual batch, including free-only.
+/// The consumer is lazy so an idle event cannot create a GPU delivery owner or
+/// switch the current GL context.
+pub(super) fn finish_retirement_texture_delta(
+    ctx: &Context,
+    pending: &mut egui::TexturesDelta,
+    consume: impl FnOnce(&mut egui::TexturesDelta),
+) {
+    append_texture_delta(pending, ctx.take_viewport_retirement_texture_delta());
+    if !pending.is_empty() {
+        consume(pending);
+    }
+}
+
 /// Final non-drawing delivery before a shared renderer/Context ends.
 /// Does not create new App close requests during root shutdown.
 pub(super) fn finish_pending_retirements(ctx: &Context, backend: &mut impl ChildCloseBackend) {

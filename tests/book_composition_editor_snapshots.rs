@@ -9,6 +9,9 @@ use mimageviewer::ui_composition_editor::*;
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 
+#[path = "support/logical_bounds.rs"]
+mod logical_bounds;
+
 fn fixture(phase: EditorPhase) -> EditorView {
     let pages = (0..600)
         .map(|id| EditorPageView {
@@ -377,8 +380,39 @@ fn composition_editor_confirmation_modals_small_screen_and_background_isolation(
     }
 }
 
-// egui raw input uses logical points; AccessKit Node::click sends physical
-// bounds unchanged. Exercise real pointer hit testing at the response rect.
+#[test]
+fn composition_editor_high_dpi_controls_receive_pointer_clicks() {
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        let mut h = harness(
+            size,
+            2.0,
+            mimageviewer::os_theme::ResolvedTheme::Light,
+            EditorPhase::Editing,
+        );
+        h.run();
+        for label in ["保存", "キャンセル", "元に戻す", "やり直す", "Close window"] {
+            assert_control_inside(&h, label, "200% editor boundary");
+        }
+        let remove = assert_control_inside(&h, "構成を解除", "200% remove entry");
+        click_logical_response(&mut h, &remove);
+        h.run_steps(4);
+        let cancel = assert_control_inside(&h, "キャンセル", "200% confirmation cancel");
+        click_logical_response(&mut h, &cancel);
+        h.run_steps(4);
+        assert!(h.query_by_label("解除する").is_none());
+        assert!(!h.state().contains(&EditorUiAction::Cancel));
+        let remove = assert_control_inside(&h, "構成を解除", "200% remove reentry");
+        click_logical_response(&mut h, &remove);
+        h.run_steps(4);
+        let accept = assert_control_inside(&h, "解除する", "200% confirmation accept");
+        click_logical_response(&mut h, &accept);
+        h.step();
+        assert!(h.state().contains(&EditorUiAction::Remove));
+        assert!(!h.state().contains(&EditorUiAction::Save));
+    }
+}
+
+// Exercise real pointer hit testing at the logical response rect.
 fn click_logical_response(h: &mut Harness<'_, Vec<EditorUiAction>>, response: &egui::Response) {
     let pos = response.rect.center();
     h.event(egui::Event::PointerMoved(pos));
@@ -392,7 +426,7 @@ fn click_logical_response(h: &mut Harness<'_, Vec<EditorUiAction>>, response: &e
     }
 }
 
-/// AccessKit exports physical-pixel bounds; egui responses use logical points.
+/// Node::rect and egui responses both use logical points.
 /// Check both, including the actual unclipped pointer interaction rectangle.
 fn assert_control_inside(
     h: &Harness<'_, Vec<EditorUiAction>>,
@@ -412,15 +446,7 @@ fn assert_control_inside(
         })
         .unwrap_or(&nodes[0]);
     let logical_screen = h.ctx.content_rect();
-    let physical_screen = egui::Rect::from_min_max(
-        logical_screen.min * h.ctx.pixels_per_point(),
-        logical_screen.max * h.ctx.pixels_per_point(),
-    );
-    assert!(
-        physical_screen.contains_rect(node.rect()),
-        "{detail} {label}: physical screen={physical_screen:?} bounds={:?}",
-        node.rect()
-    );
+    logical_bounds::assert_node_inside(&h.ctx, node.rect(), &format!("{detail} {label}"));
     // AccessKit stores the original egui widget id (same bridge as ui_snapshot).
     let id = egui_id_from_accesskit(node.accesskit_node().id());
     let response = h

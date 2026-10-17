@@ -2,7 +2,9 @@
 
 ## 状態（2026-10-17）
 
-**最新状態:** 第4.6版と双方の構造合意（97ab24ae1 / 5c1584d8a）に基づく段3の実装・指定自動確認を完了。**実装担当の内部確認では、未分類・残る段3契約違反は0件**。設計担当による最終受入とは区別する。最後に1回実行したlib全件は290失敗で、その後の限定検証により179件の移行不備を解消し、PNG比較102件と段4のlayout/挙動差9件へ分類した。全件を最終ソースで再実行したとは扱わない。後述の最終コマンド表と残課題を正本とし、過去の論点・未達記録は履歴として残す。HEAD `5c1584d8a`、ブランチ`egui-036`を維持し、未コミット・未ステージで返す。
+**最新状態:** 設計担当の段3コミット`1e55235f1`に対する独立レビューA〜Dの9指摘を補修し、変異による検出と指定の限定確認を完了した。末尾の「独立レビュー指摘への対応」を今回の正本とする。旧9件を再分類し、元の全件290失敗は補修成功180・PNG比較103・段4のlayout/挙動差7とした。lib全件は利用者指定により再実行していない。全test targetコンパイル（23 executable）・core/test-script check・fmtは成功。HEADとブランチを維持し、未コミット・未ステージで返す。これは実装担当の内部確認であり、設計担当の最終受入とは区別する。
+
+**独立レビュー前の報告（履歴・分類第1版）:** 第4.6版と双方の構造合意（97ab24ae1 / 5c1584d8a）に基づく段3の実装・指定自動確認を完了。**実装担当の内部確認では、未分類・残る段3契約違反は0件**。設計担当による最終受入とは区別する。最後に1回実行したlib全件は290失敗で、その後の限定検証により179件の移行不備を解消し、PNG比較102件と段4のlayout/挙動差9件へ分類した。全件を最終ソースで再実行したとは扱わない。後述の最終コマンド表と残課題を正本とし、過去の論点・未達記録は履歴として残す。HEAD `5c1584d8a`、ブランチ`egui-036`を維持し、未コミット・未ステージで返す。
 
 以下の初回停止記録は履歴として保持する。
 
@@ -820,3 +822,145 @@ PNG baseline差分0、index差分0、HEAD/branchの変更0を最終確認した�
 baselineから存在するearly ALL pollと実`App.frame_counter`の予算境界を維持した。
 段4へは上記9件と外観比較、段5へはPNG baseline更新と残る警告整理、実機/live検証は計画の後段へ渡す。
 live ignoreと`test-live-windows.ps1`は維持し、この作業ではlive・製品build/launch・`test-full.ps1`を実行していない。
+
+## 独立レビュー指摘への対応（1e55235f1後、分類第2版）
+
+以下は**実装担当の内部確認**。設計担当がコミットした`1e55235f1`を開始点とし、A〜Dの9指摘をsourceで確認した。誤指摘と判断したものはない。
+第4.6版の契約内で補修し、設計変更・新しいpending状態・入力延期・追加repaint・retryを加えていない。
+修正版と旧処理へ戻した変異を別ログへ保存し、変異は`finally`で元の修正版のbyte列へ戻した。
+本文の第1版の9件・290件の分類と実行記録は履歴として残す。今回lib全件は再実行しない。
+
+### 分野別の判断と修正
+
+- **A / GPU出力・依存宣言:** `vendor/eframe/src/native/viewport_lifecycle.rs`の共通dispatcherがContext deltaを既存共有ownerへ回収し、非空batchだけlazy consumerへ渡す。wgpu / glowの通常イベントで空consumerを作らず、free-onlyは配送する。通常Fullのrenderer owner・submission順は保持。`PATCHES.md`へ追記した。`crates/vst3-host-tester/Cargo.toml`はworkspace MSRV 1.95を継承。`scripts/test-egui-msrv.py`は新しいcompilerでは検出できない宣言不整合を、GUI依存7 packageと正式vendorのMSRV比較で検査する。
+- **B / Close帰還・gamepad:** `src/app.rs`のbookmark installは、既存の型付きterminal帰還ownerが持つ「存続するmainのlive grid」という意味を使い、一覧置換前のstable keyとscrollを保持する。`src/app/close_return.rs`のconsumerは採用済みrowsへ復元keysを合わせる。同型producerの削除receiptも、旧rowsを先にretainせず新rowsをinstallerへ渡す。`gamepad_input/physical.rs`では既存handoff内の隣接した同じSessionEndedだけを集約し、間のpress・release・axisを越えてまとめない。
+- **C / 子入力・Window操作:** `src/ui_fullscreen.rs`のpass-local proposalへviewport identity、pointer、modifier、Responseのdrag/click事実、音楽入力許可を捕捉する。子のqueueは子のclaimで一度消費し、遅延したOwned処理はroot queueを再消費しない。連結・panoramaのgeometry/dragも捕捉値を使う。aboutの内蔵ScrollAreaは`DragScroll::Always`、Remote接続窓とtray案内窓は`WindowDrag::Anywhere`を明示した。
+- **D / test fixture・論理座標:** `src/ui_main.rs`の対象2 fixtureは全viewportのroot Uiを明示し、kittestの外余白8ptを製品Panelの予算へ混ぜない。最小幅は論理定数、Panel / viewport / Node矩形も論理単位へ統一した。両integration targetは`ctx.content_rect()`で境界を検査し、共有`tests/support/logical_bounds.rs`へ画面外の実Nodeを拒否する負例を置いた。fullscreenは製品同様の全viewportを使う共有fixtureへまとめ、既存Fitsと4つのsnapshotを維持したままPNG不要の高さ回帰を追加した。
+
+### 指摘・回帰対応表
+
+選択件数はRust test数。loop内のケース数や未実行のtestを成功件数へ加算しない。manifest検査はRust testとは区別する。
+
+| 指摘 | 判断・検査する失敗 | 回帰名と選択件数 |
+| --- | --- | --- |
+| A1 P2 | 真。空batchでもGPU consumer / submission、GL context選択を実行 | `retirement_texture_delivery_prepared_wgpu_skips_empty_and_delivers_free_only` 1、`retirement_texture_delivery_glow_skips_empty_context_and_delivers_free_only` 1 |
+| A2 P3 | 真。testerのMSRV宣言だけ1.88 | `python scripts/test-egui-msrv.py`、GUI依存7 packageの宣言検査 |
+| B1 P1 | 真。Close待ちの変更ありinstallがscrollを0へ戻し、consumerが保存値を上書き | `close_return_changed_bookmark_poll_preserves_live_main_position_before_consumer` 1（book/media × rename/add/removeの6ケース）、`close_return_bookmark_delete_receipt_preserves_live_main_position_before_consumer` 1。Close全filterは15 |
+| B2 P2 | 真。無効・無入力の反復logicで終端が無制限増殖 | `gamepad_physical_disabled_inputless_logic_keeps_bounded_terminal` 1、`gamepad_physical_disabled_polls_preserve_reconnect_press_and_terminal_order` 1。physical filterは6 |
+| C1 P1 | 真。Context cloneは子viewportを固定せず、遅延処理が親pointer / wheel / 許可を参照 | `egui037_wheel_frame_actual_immediate_child_keeps_zoom_anchor_and_root_wheel` 1、`egui037_wheel_frame_actual_immediate_child_music_gate_uses_child_focus` 1 |
+| C2 P2 | 真。Window内蔵ScrollAreaのmouse drag指定漏れ | `egui037_about_builtin_scrollarea_mouse_drag_changes_offset` 1 |
+| C3 P2 | 真。2窓の本文mouse drag指定漏れ | `egui037_remote_connection_body_mouse_drag_moves_window` 1、`egui037_tray_notice_body_mouse_drag_moves_window` 1 |
+| D1 P2 | 真。Nodeの論理座標と物理単位の比較が混在 | `section207_tests` 17、両integrationの`logical_bounds::high_dpi_node_bounds_reject_a_control_outside_the_logical_viewport` 各1。高DPI境界・操作到達性の限定filterは2 target合計7 |
+| D2 P2 | 真。fixture外余白による8ptの不要scrollを製品差と誤分類 | `fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height` 1（720×520 / 720×720）、既存snapshot 4を含む`fullscreen_overflow_panel` filterは7 |
+
+### 変異による検出力の確認
+
+| 変異 | 選択・観測 | exit |
+| --- | --- | ---: |
+| A: 共通dispatcherを無条件consumer呼出しへ戻す | wg​​pu 1失敗（空32回でconsumer/submit各32）、glow 1失敗（context entry32） | 各101 |
+| A: set非空だけを配送しfree-onlyを落とす | wg​​pu 1失敗（free配送なし）、glow 1失敗 | 各101 |
+| A: testerの宣言を1.88へ戻す | MSRV検査がtesterの不整合で停止 | 1 |
+| B/C/D: live grid保持を無効化、削除producerを先行retain、終端を無条件push、遅延zoomを親pointer参照、drag指定を削除、viewportをui.max_rect、幅をzoom倍へ戻す | 10選択 / 10 assert失敗。scroll0、選択keyずれ、終端増殖、zoom中心ずれ、2窓の不動、aboutのwindow移動、8pt scroll、物理最小幅をそれぞれ検出 | 100 |
+| B/C: consumerのrow_keys更新を削除、Owned区間を再消費、音楽許可を親参照へ戻す | 3選択 / 3 assert失敗。追加行keys不一致、親wheel消失、非focus子でもtimeline変更を検出 | 100 |
+| D: 論理境界をpixels_per_point倍の物理矩形へ戻す | 両integration targetで2選択 / 2失敗。論理viewport外・物理矩形内の実ボタンを誤許容 | 100 |
+
+Rust回帰のassert失敗は延べ19件。上記に加えMSRV宣言検査の失敗を確認した。compile失敗・0件一致を変異成功には含めない。
+ログは`target/egui037-stage3-review-mut-*`のJSON/log/JUnit。初回free-only変異は未配送deltaのDropが二次panicしたため、
+test側で未消費状態を保存してからheadless明示破棄を行い、同じassertを維持して再実行した。二次panicの結果は検出力の証拠に使わない。
+実prepared RenderState / Renderer / queueのA回帰は共通dispatcherと実GPU resource処理の入口を検査する。
+native WindowEventと実GLを一体で動かした証明ではなく、製品Painterの完結順は既存vendor回帰とsource照合で補う。
+
+### fixture補修・限定独立確認
+
+初回追加回帰のcompile失敗（旧raw_scroll_delta参照、ViewportClassのDebug要求、App型の修飾不足）は修正した。
+Bの第二read-model結果は、第一installが始めた既存identity hydration中には保留されるのが正常である。
+同passのconsumerとkeysのassertは維持し、既存`finish_page_identity_preparation_for_test`で準備を完了してから次の結果へ進め、両完了後の位置も検査する。
+Remote退役の既存fixtureは、App構築で受付済みのresume ReadのACKを前提化してからacquireし、元の正確な2回のlogic検査を維持した。
+製品のreadinessを緩めたり、完了までlogicを再送するfixtureへ変えたりしていない。
+Trayの自動IdはWindowのAtoms.text()と同じOption値、wheelの期待geometryはtargetの実seek geometryを使う。
+実子wheelは通常→Ctrl→通常を配送し、最後の要求のordinalとDeltaを検査する。未提示Display sequenceが次targetを拒否する既存gateも保持する。
+
+別contextのSol / xhighによる読み取り専用の限定source確認はA/C/D2とB/Dに分けて実施し、追加発見の削除producer・無効取消の期待・上記fixture補修の再確認後、いずれもACCEPT。
+Cargo・GPU・テストの実行証拠は以下の実装担当の記録であり、このsource確認による実行証拠ではない。
+
+### 全件失敗の追跡分類・第2版
+
+元のlib全件結果は変えない（13,481件、13,132成功 / 290失敗 / 既存skip59）。
+以下は保存した失敗290件を、今回の限定実行で追跡した分類であり、全件を再実行した結果ではない。
+第1版の「段4差9件／未分類・段3違反0」という完了判断は独立レビュー前の記録として区別する。
+
+| 分類 | 第1版 | 第2版 | 判断 |
+| --- | ---: | ---: | --- |
+| 段3移行不備を補修し、対象test成功 | 179 | 180 | section207 snapshot-labelを追加。今回の新規回帰数を混ぜない |
+| PNG比較由来 | 102 | 103 | fullscreen tallはFits成功後、実際の画像比較不一致まで到達 |
+| 0.37のlayout / 挙動差 | 9 | 7 | 旧9件の扱いは次表。reported-controlsは座標補修後の別assertを再分類 |
+| 未分類・残る段3契約違反 | 0 | 0 | 今回9指摘は別途全て補修・変異確認。旧0件判断を解消証拠に使わない |
+
+第2版の根拠は`target/egui037-stage3-review-classification-v2.json`と`-evidence.json`。
+第1版JSONを保持し、元JUnitと同じ290名に重複・欠落がないことを検査した。
+更新元は`review-final-lib`のJUnit。今回の限定libは**256選択 / 247成功 / 9失敗 / exit100**で、
+残る9失敗はPNG 7とlayout 2（section207の下記2件）。新規回帰・Close15・wheel21・gamepad105・App退役10は成功している。
+
+| 旧「段4へ渡す9件」の再分類（第2版） | 今回の扱い・残る差 |
+| --- | --- |
+| `ui_adjustment_panel::adjust_scope_selector_tests::adjust_scope_action_labels_fit_258px_body` | 段4。自然button高25pt / 旧24pt。今回の影響外の証拠を継続使用 |
+| `ui_fullscreen::tests::fullscreen_overflow_panel_snapshot_root_tall_without_scrollbar` | **段3 fixture不備を補修。** content384 / viewport384でFits成功、その後のPNG比較不一致へ再分類。新しい高さtestも成功 |
+| `ui_dialogs::whats_new::tests::version_highlights_initial_width_keeps_previous_reading_area` | 段4。scale2初期外寸537 / intended546pt。今回の影響外 |
+| `ui_main::section207_tests::section207_reported_controls_keep_left_input_right_order` | **段3の座標単位とfixture予算を補修後、別のlayout assertへ到達。** 全viewportの論理991.33pt（physical1487 / zoom1.5）で、left y38.7〜63.3、input y67.2〜92.0となり旧「950pt以上なら同じ行」に不一致。元assertを維持して段4へ |
+| `ui_main::section207_tests::section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds` | **段3移行不備を補修し成功。** 論理幅定数・論理bounds・全viewportを検査。旧zoom倍の比較へ戻した変異はwidth360 / zoom1.5で失敗 |
+| `ui_main::section207_tests::section207_default_folder_geometry_matches_the_separate_panels` | 段4。今回も統合Panel y49.5 / 旧別Panel y50.5の1pt差で失敗 |
+| `ui_text::tests::bubble_body_stays_within_panel_width_with_fill_on_or_off` | 段4。268pt枠 / 自然幅268.21875pt。今回の影響外 |
+| `ui_main::toolbar_wrap_tests::a_combo_stays_inside_the_panel_only_when_we_reserve_its_place` | 段4。新WidgetAtomでは裸Comboもwrapするため旧negative controlのoverflow0。今回の影響外 |
+| `ui_dialogs::preferences::name_colors::tests::hex_focus_transfer_keeps_the_new_editors_partial_input` | 段4。同batch pointer focus移動とTextの処理順差。今回の影響外 |
+
+段4へ残るlayout / 挙動testは上表の7件。PNG比較103件は段4bで比較し、更新は段5へ残す。
+既存assertの弱化・ignore追加・PNG baseline更新は行わない。警告整理も段5へ残す。
+
+### 最終の限定確認コマンド（実装担当の内部確認）
+
+すべてoffline。Cargo実行は直列、`CARGO_NET_OFFLINE=true`、`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1`、
+`CARGO_TARGET_DIR`はこのworktreeの`target`、`UPDATE_SNAPSHOTS`は未設定とした。
+各labelの完全なcommand / 秒 / exit / logは`target/egui037-stage3-<label>.json`、
+nextestの選択・失敗内容は同名`-tests.json`と`-junit.xml`へ保存した。
+
+`review-final-lib`のfilterは次のとおり。他のnextest共通引数は表の完全command JSONを参照する。
+
+```powershell
+$filter = 'test(close_return) | test(gamepad) | test(egui037_) | test(section207_tests) | test(fullscreen_overflow_panel) | test(bookmark_return) | test(unchanged_bookmark_refresh) | test(native_immediate_close_consumes_bookmark_return_in_same_dispatch) | test(root_lifecycle) | test(context_state) | test(viewport_retirement) | test(music_ctrl_wheel) | test(music_overflow_real_input_wheel) | test(bookmark_build_) | test(native_bookmark_delete_and_title) | test(bookmark_browser_delete_admits)'
+cargo nextest run -p mimageviewer --lib -E $filter --no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --offline
+```
+
+| filter / 必須契約 | 最終選択・結果 | 既存対応表への補足 |
+| --- | --- | --- |
+| `egui037_continuation` | 47 / 47成功 | C1〜C5・D3・旧順序 / pointer / 予算 / cutoffの正式Full接続は維持 |
+| `root_lifecycle` / `context_state` | 11 / 11成功、8 / 8成功 | 第4.4版の非描画受付と対象限定状態は維持 |
+| `close_return` | 15 / 15成功 | 第4.6版帰還に、変更ありread-model・削除receipt・hydration尾を追加 |
+| `bookmark_return` / `unchanged_bookmark_refresh` / `bookmark_build_` | 5 / 5成功、1 / 1成功、9 / 9成功 | 従来のRestoringと同内容refresh、source adoptionも保持 |
+| `viewport_retirement`（App） | 10 / 10成功 | 第4.5版のRemote配送待ち・既存ACK / readinessを維持 |
+| `gamepad`（nextest） / `gamepad_physical_` | 105 / 105成功、うちphysical 6 / 6成功 | 反復logicの終端容量とpress/reconnect順を追加 |
+| `egui037_wheel_frame_` | 21 / 21成功 | 実immediate子のpointer / 親queue不変 / 音楽許可2件を追加 |
+| `section207_tests` | 17 / 12成功 / 5失敗 | PNG 3、上記layout 2。snapshot-labelの座標回帰は成功 |
+| `fullscreen_overflow_panel` | 7 / 3成功 / 4 PNG失敗 | 新しい高さ回帰成功、旧tallのFitsも成功後PNGへ到達 |
+| `calculated_overflow_panel_height_matches_all_states_and_scrolls_when_constrained` | 1 / 1成功 | 4状態×3サイズ×2 spacingの既存24ケース |
+
+第4.3版16項目・第4.5版13項目・第4.6版の元対応表は維持し、上の補足を今回の最新件数とする。
+vendor全libの実行には既存`minimized_full`（wgpu9 / glow11）、viewport入力・Close・discard delta回帰も含まれ、
+新しい空batch回帰は`retirement_texture_delivery`で各backend 1件。liveの既存ignoreは実行していない。
+
+| label | コマンド | 選択・結果 | exit / 秒 |
+| --- | --- | --- | --- |
+| `review-final-lib` | `cargo nextest run -p mimageviewer --lib -E $filter --no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --offline` | 256 selected / 247 passed / 9 failed | 100 / 102.91 |
+| `review-final-integration` | `cargo nextest run -p mimageviewer --test ui_snapshot --test book_composition_editor_snapshots -E 'test(high_dpi) \| test(image_folder_zip_small_viewport_controls) \| test(startup_dialogs_refit_after_viewport_resize) \| test(composition_editor_all_phases_keep_cancel_reachable)' --no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --offline` | 7 selected / 7 passed / 0 failed | 0 / 14.83 |
+| `review-final-overflow-sizes` | `cargo nextest run -p mimageviewer --lib -E 'test(calculated_overflow_panel_height_matches_all_states_and_scrolls_when_constrained)' --no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --offline` | 1 selected / 1 passed / 0 failed | 0 / 4.29 |
+| `review-final-eframe-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib --offline` | test result: ok. 53 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.88s | 0 / 5.17 |
+| `review-final-eframe-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,glow --lib --offline` | test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s | 0 / 2.08 |
+| `review-final-msrv` | `python scripts/test-egui-msrv.py` | 7 GUI MSRV declarations passed | 0 / 0.05 |
+| `review-final-core` | `cargo check -p mimageviewer --bin mimageviewer-core --offline` | check | 0 / 38.78 |
+| `review-final-test-script` | `cargo check -p mimageviewer --bin mimageviewer-core --features test-script --offline` | check | 0 / 37.91 |
+| `review-final-tester` | `cargo check -p vst3-host-tester --all-targets --offline` | check | 0 / 28.9 |
+| `review-final-tests-no-run` | `cargo test -p mimageviewer --tests --no-run --offline` | 23 executables; no run | 0 / 67.06 |
+| `review-final-fmt` | `cargo fmt --check` | check | 0 / 25.95 |
+| `review-final-vendor-fmt` | `rustfmt --edition 2024 --check --config skip_children=true vendor/eframe/src/native/viewport_lifecycle.rs vendor/eframe/src/native/wgpu_integration.rs vendor/eframe/src/native/glow_integration.rs` | check | 0 / 0.21 |
+| `review-final-glyphs` | `python scripts/check_ui_glyphs.py` | check | 0 / 3.56 |
+| `review-final-tree` | `cargo tree -d --offline` | check | 0 / 0.82 |
+| `review-final-diff` | `git diff --check` | check | 0 / 0.39 |

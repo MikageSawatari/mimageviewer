@@ -325,6 +325,24 @@ fn viewport_retirement_remote_standalone_fullscreen_keeps_exact_authority_after_
                 .drop_without_applying_deltas();
             assert!(ctx.viewport_registration(id).is_none());
         }
+        // Establish the fixture's idle writer premise before Remote admission.
+        // App construction queues a resume Read; its ACK is asynchronous too.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        writer
+            .read_all()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while writer.is_busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup resume read did not complete"
+            );
+            std::thread::yield_now();
+        }
+        let watermarks = writer.watermarks();
+        assert_eq!(watermarks.admitted, watermarks.completed_through);
         let session = SessionHandle::new();
         app.set_remote_session_handle(session.clone());
         session.acquire(mimageviewer_ipc::SessionAcquireRequest {

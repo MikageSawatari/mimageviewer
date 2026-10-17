@@ -30,6 +30,9 @@ use egui_kittest::{Harness, kittest::Queryable};
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 
+#[path = "support/logical_bounds.rs"]
+mod logical_bounds;
+
 #[cfg(windows)]
 #[test]
 fn effetune_show_only_active_tooltip_dark() {
@@ -122,7 +125,7 @@ fn everything_search_bar_snapshot(
         size,
         mimageviewer::draw_everything_search_snapshot_fixture,
         |harness| {
-            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let viewport = harness.ctx.content_rect();
             for label in ["検索", "×"] {
                 assert!(
                     viewport.contains_rect(harness.get_by_label(label).rect()),
@@ -174,7 +177,7 @@ fn everything_search_progress_snapshot(
     // The shared production body has an intentionally animated progress spinner.
     harness.run_steps(12);
     assert!((harness.ctx.content_rect().size() * scale - size).length() < 1.0);
-    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    let viewport = harness.ctx.content_rect();
     for label in ["取消", "Close window"] {
         assert!(
             viewport.contains_rect(harness.get_by_label(label).rect()),
@@ -437,7 +440,7 @@ fn startup_dialogs_small_viewport() {
                     let node = harness.get_by_label(button);
                     let rect = node.rect();
                     assert!(
-                        egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect),
+                        viewport.contains_rect(rect),
                         "{kind} {size:?} scale {scale} {button}: {rect:?}"
                     );
                     // AccessKit stores egui's original high-entropy widget id.
@@ -449,8 +452,7 @@ fn startup_dialogs_small_viewport() {
                         "{kind} {button}: logical viewport"
                     );
                     assert_eq!(response.enabled(), !disabled);
-                    // AccessKit bounds are physical pixels; raw egui events use
-                    // logical points. Node::hover/click does not convert at zoom2.
+                    // Node::rect and raw egui pointer events both use logical points.
                     harness.hover_at(response.rect.center());
                     harness.run_steps(3);
                     let response = harness.ctx.read_response(id).unwrap();
@@ -1839,7 +1841,7 @@ fn preferences_effetune_taskbar_narrow_dark() {
         size,
         mimageviewer::draw_effetune_input_limit_snapshot_fixture,
         |harness| {
-            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let viewport = harness.ctx.content_rect();
             for label in [
                 "音響調整の窓をタスクバーに表示する",
                 "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -4000,7 +4002,7 @@ fn image_folder_zip_snapshot(name: &str, phase: &'static str, scale: f32, light:
     let mut harness = image_folder_zip_harness(phase, egui::vec2(1093.0, 614.0), scale, light);
     harness.run_steps(12);
     assert!((harness.ctx.content_rect().size() * scale - egui::vec2(1093.0, 614.0)).length() < 1.0);
-    assert_image_folder_zip_controls(&harness, phase, name, egui::vec2(1093.0, 614.0));
+    assert_image_folder_zip_controls(&harness, phase, name);
     harness.snapshot(name);
 }
 
@@ -4023,8 +4025,69 @@ fn image_folder_zip_small_viewport_controls() {
                     let mut harness = image_folder_zip_harness(phase, size, scale, light);
                     harness.run_steps(12);
                     assert!((harness.ctx.content_rect().size() * scale - size).length() < 1.0);
-                    assert_image_folder_zip_controls(&harness, phase, "ZIP modal controls", size);
+                    assert_image_folder_zip_controls(&harness, phase, "ZIP modal controls");
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn image_folder_zip_high_dpi_controls_receive_pointer_clicks() {
+    use egui_kittest::kittest::NodeT;
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        for phase in [
+            "notice",
+            "preparing",
+            "waiting",
+            "confirm",
+            "copying",
+            "saving",
+            "adopting",
+            "result",
+            "error",
+        ] {
+            let mut h = image_folder_zip_harness(phase, size, 2.0, true);
+            h.run_steps(12);
+            assert_image_folder_zip_controls(&h, phase, "200% pointer reachability");
+            let labels = match phase {
+                "notice" | "confirm" => vec!["ZIP に変換", "取消", "Close window"],
+                "result" | "error" => vec!["閉じる", "Close window"],
+                _ => vec!["取消", "Close window"],
+            };
+            for label in labels {
+                let node = h.get_by_label(label);
+                let id = egui_id_from_accesskit(node.accesskit_node().id());
+                let response = h.ctx.read_response(id).expect("ZIP control response");
+                let enabled = !(label == "取消" && matches!(phase, "saving" | "adopting"));
+                assert_eq!(response.enabled(), enabled, "{phase}/{label}");
+                assert!(response.interact_rect.contains_rect(response.rect));
+                h.hover_at(node.rect().center());
+                h.step();
+                assert!(
+                    h.ctx.read_response(id).unwrap().contains_pointer(),
+                    "{phase}/{label}"
+                );
+                assert_eq!(
+                    h.ctx.read_response(id).unwrap().hovered(),
+                    enabled,
+                    "{phase}/{label}"
+                );
+                let pos = h.ctx.read_response(id).unwrap().rect.center();
+                for pressed in [true, false] {
+                    h.event(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    h.step();
+                }
+                assert_eq!(
+                    h.ctx.read_response(id).unwrap().clicked(),
+                    enabled,
+                    "{phase}/{label}"
+                );
             }
         }
     }
@@ -4057,22 +4120,17 @@ fn image_folder_zip_harness(
     })
 }
 
-fn assert_image_folder_zip_controls(
-    harness: &Harness<'_>,
-    phase: &str,
-    name: &str,
-    size: egui::Vec2,
-) {
+fn assert_image_folder_zip_controls(harness: &Harness<'_>, phase: &str, name: &str) {
     let labels: &[&str] = match phase {
         "notice" | "confirm" => &["ZIP に変換", "取消", "Close window"],
         "result" | "error" => &["閉じる", "Close window"],
         _ => &["取消", "Close window"],
     };
-    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
     for label in labels {
-        assert!(
-            viewport.contains_rect(harness.get_by_label(*label).rect()),
-            "{name}: {phase}/{label} outside viewport at {size:?}"
+        logical_bounds::assert_node_inside(
+            &harness.ctx,
+            harness.get_by_label(*label).rect(),
+            &format!("{name}: {phase}/{label}"),
         );
     }
 }

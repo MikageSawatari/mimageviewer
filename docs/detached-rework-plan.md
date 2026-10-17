@@ -5668,3 +5668,34 @@ lib全件は最後に1回実行し、13,481件中13,132成功・290失敗・既�
 失敗はその後の限定検証で移行不備179を解消、PNG比較102と段4のlayout/挙動差9へ分類し、残る段3契約違反は0とした。
 PNG更新・ignore追加・製品build/launch・live・`test-full.ps1`は行っていない。
 全件の最終ソース再実行や設計担当の最終ACCEPTとは区別し、選択数・exit code・例外と残課題の詳細は段3台帳を正本とする。
+
+#### 2026-10-17 段3・独立レビュー指摘後の補修（1e55235f1後）
+
+上の「段4差9件／段3違反0」は独立レビュー前の実装担当の内部確認として保持する。
+A〜Dの9指摘はsourceで全て成立し、第4.6版の既存owner間の受渡し・入力所有・出力消費の範囲で補修した。
+
+Close帰還待ちのmain bookmark一覧は、変更ありread-modelと削除receiptでも、旧rowsから選択キーを捕捉して
+live scrollを保つ。既存帰還consumerは採用済みrowsへ復元keysを合わせる。hydrationの既存ownerを迂回せず、
+同passのconsumerと準備完了後の位置をともに検査した。AppのClosingやbindingは延命しない。
+
+immediate子のwheelは子の既存queueから一度だけ消費し、pass-localの型付きproposalがviewport identity、
+pointer / modifiers / drag / 音楽入力許可の事実を意味処理へ渡す。Context cloneを入力snapshotと扱わず、
+親へ戻った後の再消費を廃した。通常→Ctrl→通常の順序と、未提示Display sequenceの既存target gateを保つ。
+新しい非表示入力機構・queue・pending状態・repaint・retryは作っていない。
+
+backendの退役deltaは既存共有ownerへ回収後、非空batchだけresource consumerへ渡す。free-onlyを維持し、
+空の通常イベントでGPU submissionやGL context選択を発生させない。登録寿命・退役権限・pass外cleanupは変えない。
+gamepadも既存handoff内の隣接した同じ終端だけを集約し、UIなしlogicの反復で蓄積量を増やさない。
+
+これらは症状パッチではなく、第4.6版の既存所有境界の取りこぼしを補う構造的修正として実装した。
+限定独立source確認（Sol / xhigh、読み取り専用）はA/C/D2とB/Dに分け、補修後いずれもACCEPT。
+設計担当の最終受入や実機の証明とは区別する。実装担当の実行では、旧処理へ戻した変異でRust回帰のassert失敗を延べ19件、
+MSRV宣言不整合の検査失敗を確認し、変異を全て戻してから最終の指定確認を実行した。
+
+限定libは256件中247成功、残る9失敗はPNG7と既知layout2。Close15、wheel21、gamepad105、
+continuation47、root lifecycle11、context-state8、App退役10は成功。両integrationの高DPI検証7件、
+fullscreen高さの既存サイズ別試験1件も成功した。vendor eframeはwgpu53成功・既存ignore1、glow57成功。
+core / test-script / testerのcheck、全23 test executableのno-run、fmtも成功した。
+lib全件は利用者指定により再実行せず、旧290失敗の追跡分類を第2版（補修180 / PNG103 / 段4差7）へ更新した。
+PNG更新・新ignore・製品build/launch・live・test-fullは行わず、未コミット・未ステージで返す。
+詳細と各指摘の回帰対応表・実command / 件数 / exitは[段3台帳](egui-0.37-stage3-verification.md#独立レビュー指摘への対応1e55235f1後分類第2版)を参照する。

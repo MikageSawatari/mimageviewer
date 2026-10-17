@@ -59,10 +59,18 @@ fn main_bookmarks(env: &mut AppTestEnvForTest, target: BookmarkViewReturnTarget)
 fn ready_read_model(
     app: &mut App,
 ) -> mpsc::Sender<Result<crate::bookmark_browser::BookmarkBrowserBuildResult, String>> {
+    let rows = app.bookmark_browser_rows.clone();
+    ready_read_model_with_rows(app, rows)
+}
+
+fn ready_read_model_with_rows(
+    app: &mut App,
+    rows: Vec<BookmarkBrowserRow>,
+) -> mpsc::Sender<Result<crate::bookmark_browser::BookmarkBrowserBuildResult, String>> {
     let (tx, rx) = mpsc::channel();
     tx.send(Ok(crate::bookmark_browser::BookmarkBrowserBuildResult {
-        registered_total: app.bookmark_browser_rows.len(),
-        rows: app.bookmark_browser_rows.clone(),
+        registered_total: rows.len(),
+        rows,
         video_thumb_overrides: app.video_thumb_overrides.clone(),
         visibility_notice: None,
     }))
@@ -392,6 +400,165 @@ fn close_return_main_selection_scroll_and_same_list_refresh_survive_until_consum
     assert_eq!(env.selected, Some(9));
     assert_eq!(env.scroll_offset_y, 420.0);
     assert!(env.take_pending_return_to_parent_nav().is_none());
+}
+
+#[test]
+fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consumer() {
+    for book in [false, true] {
+        for change in ["rename", "add", "remove"] {
+            let mut env = app();
+            let path = env
+                .tmp
+                .path()
+                .join(if book { "book.pdf" } else { "target.mp4" });
+            let target = if book {
+                BookmarkViewReturnTarget::Book(path)
+            } else {
+                BookmarkViewReturnTarget::Media(path)
+            };
+            main_bookmarks(&mut env, target.clone());
+            env.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::CreatedAtAsc;
+            active(&mut env, 94_003, target, None);
+            let ctx = egui::Context::default();
+            let viewport = register(&mut env, &ctx, 94_003);
+            let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            close_logic(&mut backend, &mut env, viewport);
+            env.selected = Some(9);
+            env.scroll_offset_y = 420.0;
+            let selected_key = env.bookmark_browser_rows[9].stable_key();
+            let mut rows = env.bookmark_browser_rows.clone();
+            match change {
+                "rename" => {
+                    let crate::bookmark_browser::BookmarkRowSource::Media { title, .. } =
+                        &mut rows[9].source
+                    else {
+                        unreachable!()
+                    };
+                    *title = Some("renamed while viewer closed".into());
+                }
+                "add" => rows.push(row(env.tmp.path(), 31)),
+                "remove" => {
+                    rows.remove(0);
+                }
+                _ => unreachable!(),
+            }
+            let generation = env.items_generation;
+            let tx = ready_read_model_with_rows(&mut env, rows);
+            ctx.run_ui(Default::default(), |ui| env.poll_bookmark_browser(ui.ctx()))
+                .drop_without_applying_deltas();
+            assert!(tx.send(Err("already consumed".into())).is_err());
+            assert_ne!(
+                env.items_generation, generation,
+                "{book}/{change}: changed result installed"
+            );
+            assert_eq!(
+                env.selected
+                    .map(|idx| env.bookmark_browser_rows[idx].stable_key()),
+                Some(selected_key)
+            );
+            assert_eq!(
+                env.scroll_offset_y, 420.0,
+                "{book}/{change}: live grid before consumer"
+            );
+            assert!(!env.scroll_to_selected);
+            assert!(matches!(
+                env.pending_return_to_parent,
+                FullscreenCloseContinuation::Terminal(_)
+            ));
+
+            assert!(env.take_pending_return_to_parent_nav().is_none());
+            let Some(BookmarkViewState::Restoring { grid }) = env.bookmark_view_state.as_ref()
+            else {
+                panic!("existing bookmark restoration owns the adopted grid");
+            };
+            assert_eq!(grid.selected_key, Some(selected_key));
+            assert_eq!(grid.scroll_offset_y, 420.0);
+            assert_eq!(grid.opened_key, (0, 2));
+            assert_eq!(
+                grid.row_keys,
+                env.bookmark_browser_rows
+                    .iter()
+                    .map(BookmarkBrowserRow::stable_key)
+                    .collect::<Vec<_>>()
+            );
+
+            // The install starts the ordinary asynchronous page-index hydration.
+            // Complete that owner before admitting another read-model result.
+            env.finish_page_identity_preparation_for_test();
+            assert_eq!(env.scroll_offset_y, 420.0);
+            assert_eq!(
+                env.selected
+                    .map(|idx| env.bookmark_browser_rows[idx].stable_key()),
+                Some(selected_key)
+            );
+
+            // A further changed result exercises real install/restoration after the
+            // consumer too. Old pre-install keys would restore the originally opened row.
+            let mut rows = env.bookmark_browser_rows.clone();
+            let crate::bookmark_browser::BookmarkRowSource::Media { title, .. } =
+                &mut rows[0].source
+            else {
+                unreachable!()
+            };
+            *title = Some("next read-model revision".into());
+            let generation = env.items_generation;
+            let tx = ready_read_model_with_rows(&mut env, rows);
+            ctx.run_ui(Default::default(), |ui| env.poll_bookmark_browser(ui.ctx()))
+                .drop_without_applying_deltas();
+            assert!(tx.send(Err("already consumed".into())).is_err());
+            assert_ne!(env.items_generation, generation);
+            env.finish_page_identity_preparation_for_test();
+            assert_eq!(
+                env.selected
+                    .map(|idx| env.bookmark_browser_rows[idx].stable_key()),
+                Some(selected_key)
+            );
+            assert_eq!(
+                env.scroll_offset_y, 420.0,
+                "{book}/{change}: restored adopted grid"
+            );
+            assert!(!env.scroll_to_selected);
+            assert!(!env.pending_return_to_parent.is_pending());
+            assert!(env.take_pending_return_to_parent_nav().is_none());
+        }
+    }
+}
+
+#[test]
+fn close_return_bookmark_delete_receipt_preserves_live_main_position_before_consumer() {
+    let mut env = app();
+    let target = BookmarkViewReturnTarget::Media(env.tmp.path().join("target.mp4"));
+    main_bookmarks(&mut env, target.clone());
+    env.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::CreatedAtAsc;
+    active(&mut env, 94_004, target, None);
+    let ctx = egui::Context::default();
+    let viewport = register(&mut env, &ctx, 94_004);
+    let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    close_logic(&mut backend, &mut env, viewport);
+    env.selected = Some(9);
+    env.scroll_offset_y = 420.0;
+    let selected_key = env.bookmark_browser_rows[9].stable_key();
+    let (tx, rx) = mpsc::channel();
+    tx.send(Ok(())).unwrap();
+    env.bookmark_delete_pending = Some(crate::bookmark_browser::BookmarkDeletePending {
+        keys: vec![(0, 1)],
+        book_containers: vec![],
+        rx,
+    });
+    ctx.run_ui(Default::default(), |ui| env.poll_bookmark_browser(ui.ctx()))
+        .drop_without_applying_deltas();
+    assert!(env.bookmark_delete_pending.is_none());
+    assert_eq!(env.bookmark_browser_rows.len(), 29);
+    assert_eq!(env.selected, Some(8));
+    assert_eq!(env.bookmark_browser_rows[8].stable_key(), selected_key);
+    assert_eq!(env.scroll_offset_y, 420.0);
+    assert!(!env.scroll_to_selected);
+    assert!(env.take_pending_return_to_parent_nav().is_none());
+    let Some(BookmarkViewState::Restoring { grid }) = &env.bookmark_view_state else {
+        panic!("bookmark return must own the updated live grid");
+    };
+    assert_eq!(grid.selected_key, Some(selected_key));
+    assert_eq!(grid.scroll_offset_y, 420.0);
 }
 
 #[test]

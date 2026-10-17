@@ -578,6 +578,7 @@ impl App {
         let mut close_req = false;
         let dialog_pos = ctx.content_rect().min + egui::vec2(80.0, 60.0);
         egui::Window::new("タスクトレイ常駐を有効にしました")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -672,7 +673,66 @@ fn root_tray_hide_modal_owner(
 
 #[cfg(test)]
 mod tests {
-    use super::{root_tray_hide_modal_owner, should_close_fullscreen_for_tray};
+    use eframe::egui;
+
+    #[test]
+    fn egui037_tray_notice_body_mouse_drag_moves_window() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.show_tray_enabled_notice = true;
+        let id = egui::Id::unique(Some("タスクトレイ常駐を有効にしました"));
+        let draw = |app: &mut App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 760.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.show_tray_enabled_notice_dialog(&ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..4 {
+            draw(&mut app, vec![]);
+        }
+        let before = ctx
+            .memory(|memory| memory.area_rect(id))
+            .expect("production Window");
+        // Label/body padding, below the title bar and away from buttons and resize edges.
+        let start = egui::pos2(before.right() - 28.0, before.top() + 60.0);
+        let delta = egui::vec2(65.0, 45.0);
+        draw(&mut app, vec![egui::Event::PointerMoved(start)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![egui::Event::PointerMoved(start + delta)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start + delta,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![]);
+        let after = ctx.memory(|memory| memory.area_rect(id)).unwrap();
+        assert!(
+            (after.min - before.min - delta).length() < 2.0,
+            "body mouse drag must move the actual movable Window: before={before:?}, after={after:?}"
+        );
+    }
+
+    use super::{App, root_tray_hide_modal_owner, should_close_fullscreen_for_tray};
 
     #[test]
     fn tray_residency_closes_plain_still_fullscreen_sessions() {

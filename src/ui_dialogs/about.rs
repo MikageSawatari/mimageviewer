@@ -111,10 +111,18 @@ impl App {
             .collapsible(false)
             .resizable(true)
             .vscroll(true)
+            .drag_to_scroll(egui::scroll_area::DragScroll::Always)
             .default_width(620.0)
             .max_height((ctx.content_rect().height() - 80.0).max(320.0))
             .default_pos(dialog_pos)
             .show(ctx, |ui| {
+                #[cfg(test)]
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("about_outer_scroll_geometry"),
+                        (ui.clip_rect(), ui.cursor().min.y),
+                    )
+                });
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
                     ui.heading("mImageViewer");
@@ -340,6 +348,70 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn egui037_about_builtin_scrollarea_mouse_drag_changes_offset() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.show_about_dialog = true;
+        let draw = |app: &mut crate::app::App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.show_about_dialog_window(&ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..4 {
+            draw(&mut app, vec![]);
+        }
+        let geometry = || {
+            ctx.data(|data| {
+                data.get_temp::<(egui::Rect, f32)>(egui::Id::new("about_outer_scroll_geometry"))
+                    .unwrap()
+            })
+        };
+        let (clip, before) = geometry();
+        let start = egui::pos2(clip.right() - 28.0, clip.center().y);
+        let end = start - egui::vec2(0.0, 75.0);
+        draw(&mut app, vec![egui::Event::PointerMoved(start)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![]);
+        let (after_clip, after) = geometry();
+        assert!(
+            (after_clip.min - clip.min).length() < 1.0,
+            "drag scroll must retain the Window position"
+        );
+        assert!(
+            before - after > 20.0,
+            "actual built-in ScrollArea offset must advance on mouse drag: before={before}, after={after}"
+        );
+    }
+
     use super::{
         EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, IJG_ATTRIBUTION, LIBJPEG_TURBO_LICENSE,
         LIBRAW_LICENSE, ZLIB_LICENSE,
