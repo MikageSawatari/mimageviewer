@@ -210,10 +210,20 @@ function Invoke-ScriptedRun {
         Remove-Item -LiteralPath $perfLog -Force
     }
 
+    # Scripted runs refuse to start without an evidence directory. The app accepts exactly
+    # one level below target\ui-smoke-runs (the layout ui-smoke.ps1 uses) and requires it
+    # to exist already, so create a fresh one per run.
+    $runsRoot = Resolve-RepoPath "target\ui-smoke-runs"
+    $null = New-Item -ItemType Directory -Force -Path $runsRoot
+    $runName = 'page-turn-{0}-{1}-{2}' -f [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'), $PID, ([Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $evidenceDir = Join-Path $runsRoot $runName
+    $null = New-Item -ItemType Directory -Path $evidenceDir
+
     $arguments = @(
         "--data-dir", $RunDataDir,
         "--perf-log",
-        "--test-script", $ScriptPath
+        "--test-script", $ScriptPath,
+        "--test-evidence-dir", $evidenceDir
     )
     if ($SettingsJson) {
         # Inline JSON cannot go on the command line: Join-NativeArguments refuses quotes, and
@@ -247,6 +257,7 @@ function Invoke-ScriptedRun {
     Write-Host "[page-turn-smoke] starting scripted core"
     Write-Host "  data-dir : $RunDataDir"
     Write-Host "  script   : $ScriptPath"
+    Write-Host "  evidence : $evidenceDir"
     $proc = Start-Process -FilePath $exeFull `
         -ArgumentList (Join-NativeArguments $arguments) -PassThru
     # Synthetic routing deliberately follows the production foreground/focus

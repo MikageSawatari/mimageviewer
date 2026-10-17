@@ -2548,6 +2548,12 @@ impl RunnerBridge {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let (move_receipt, target_receipt) = self.reveal_native_top_panorama_receipts(remaining)?;
         self.validate_selected_owner_fresh(&identity, deadline)?;
+        let (target_move_receipt, target_receipt) =
+            crate::video::native_ui_smoke::move_to_native_top_panorama(
+                &target_receipt,
+                deadline,
+                || self.validate_selected_owner_fresh(&identity, deadline),
+            )?;
         let prepared = crate::video::native_ui_smoke::prepare_native_top_panorama_click(
             &target_receipt,
             host_incarnation,
@@ -2572,6 +2578,10 @@ impl RunnerBridge {
         result.insert(
             "click".into(),
             Dynamic::from(native_top_panorama_click_receipt_to_rhai_map(click_receipt)),
+        );
+        result.insert(
+            "target_mouse".into(),
+            Dynamic::from(native_mouse_receipt_to_rhai_map(target_move_receipt)),
         );
         Ok(result)
     }

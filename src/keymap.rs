@@ -9268,9 +9268,13 @@ impl Keymap {
     /// KeyHold actions. This is evidence-only: it does not consume input or
     /// alter routing.
     #[cfg(all(windows, feature = "test-script"))]
-    pub(crate) fn test_script_key_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        crate::keyboard_input::focused_key_state_permit(ctx)
-            .is_some_and(|permit| self.key_held_chord(ctx, permit, chord))
+    pub(crate) fn test_script_key_held_chord(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        chord: Chord,
+    ) -> bool {
+        self.key_held_chord(ctx, permit, chord)
     }
 
     fn modifier_held_chord(

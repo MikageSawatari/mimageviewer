@@ -33,11 +33,15 @@ namespace Miv.UiSmoke.ButtonHelperDraft
     public sealed class ButtonHelperRunnerHandle
     {
         private ButtonHelperHost host;
+        private readonly ButtonInputDiagnosticTrace inputTrace;
 
-        internal ButtonHelperRunnerHandle(ButtonHelperHost host)
+        internal ButtonHelperRunnerHandle(ButtonHelperHost host, ButtonInputDiagnosticTrace inputTrace)
         {
             this.host = host;
+            this.inputTrace = inputTrace;
         }
+
+        public string InputTrace() { return inputTrace.Snapshot(); }
 
         public ButtonHelperRunnerStatus CancelAndJoin(string reason, int timeoutMilliseconds)
         {
@@ -147,8 +151,9 @@ namespace Miv.UiSmoke.ButtonHelperDraft
                 25,
                 8,
                 8);
+            NativeButtonHostComponentFactory factory = new NativeButtonHostComponentFactory();
             return new ButtonHelperRunnerHandle(
-                ButtonHelperHost.Start(options, clock, new NativeButtonHostComponentFactory()));
+                ButtonHelperHost.Start(options, clock, factory), factory.InputTrace);
         }
     }
 
@@ -170,6 +175,7 @@ namespace Miv.UiSmoke.ButtonHelperDraft
 
     internal sealed class NativeButtonHostComponentFactory : IButtonHelperHostComponentFactory
     {
+        internal readonly ButtonInputDiagnosticTrace InputTrace = new ButtonInputDiagnosticTrace();
         public IAppProcessLease OpenAppLease(uint expectedProcessId)
         {
             return new PinnedAppProcessLease(expectedProcessId);
@@ -181,7 +187,7 @@ namespace Miv.UiSmoke.ButtonHelperDraft
             ButtonOsObserver observer = new ButtonOsObserver(platform);
             Win32ButtonInputBackend input = new Win32ButtonInputBackend(
                 new NativeButtonInputFactSource(platform),
-                new NativeButtonEventInserter());
+                new NativeButtonEventInserter(InputTrace));
             return new ButtonHelperHostOwnerComponents(
                 input,
                 observer,

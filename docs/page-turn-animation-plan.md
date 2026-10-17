@@ -3996,3 +3996,68 @@ fixture不備だったため、実経路と同じ通知を追加した。限定�
   D3a / D3b (§27.5) の対象。D4 で解消したとは扱わない。
 - 計測中に `scripts/page-turn-smoke.ps1` が現行の `--test-evidence-dir` 必須条件を渡しておらず起動直後に exit 2 になることが分かった
   (バックログ §1.390)。今回は一時的な写しで証跡先 (`target/ui-smoke/runs/` の 2 階層下、事前作成) を足して実行した。
+
+### 27.14 無補正 source→edit→final の handle 共有（2026-10-17）
+
+利用者は `a460aded7` の静的調査で提案した最小案を採択した。設計担当は edit 登録の
+1 frame 1枚制限と既存の edit→final Arc 一致共有をコードで確認済み。調査対象04の無補正画像では
+CPU pixels は source と同じ Arc のまま、edit の texture だけが再登録されていた。
+同 frame の見開き2頁目は予算超過で final が別登録され、次 frame に edit が追加登録される。
+
+修正は `ensure_edit_result_pixels` の新規組立て・CPU-only entry 表示昇格の2経路だけで、
+upload 枚数制限前に現在 context の静止画 source handle を借りる。現在 key/item identity、
+pixels の Arc 一致、texture の寸法/options、既存 display identity gate を条件にし、
+不一致なら従来 upload へ進む。共有は upload budget を消費しない。final の entry/完成判定と
+resolver は変更せず、既存の edit→final 共有へ接続する。契約は [display-pipeline §3.1](display-pipeline.md#31-詳細)。
+
+新しい worker/queue/state field は不要で、表示操作や通常 producer を止める簡素化は採らない。
+通常表示・一覧からの初回表示・演出OFFにも適用する。raw preview/animation、編集や透過 flatten の別 Arc、
+Nearest 等の final sampler は従来経路を維持し、共有を理由に AI 未完了を complete にしない。
+D2 の Native 素材には source handle を残さず、通常 cache の共有allocationは既存会計で一度だけ数える。
+detached predicate/viewport と Remote の CPU adapter は変更しない。
+
+回帰は小画像による ID・delta・世代・寿命の検査とし、同 frame の2頁、CPU先読み、upload予算消費済み、
+Arc/寸法/options/key/identity の拒否、補正/AI/sharpen/post/Nearest、AI pending、編集待ち・透過、
+source退去/通常再読込/兄弟context、VRAMと最後のowner解放、実drawのON/OFF・Single/LTR/RTL・resize、
+Native ROI素材のsource解放を確認する。既存のROI/resize/canonical/ready回帰も関連focusedで検証する。
+共有を壊す一時変異は復元後に最終gateを行い、結果・件数・終了コードは完了報告と
+`target/texshare-*`、`target/test-lib-full/`の台帳/JUnitを正本とする。
+
+新worktreeの検証準備では、固定SHA-256のLibRaw 0.22.2/zlib 1.3.1アーカイブを既存checkoutから
+実体コピー・検証して展開した。RAW CC0 fixture 27件もmanifestのサイズ/SHA-256を照合して配置し、
+FFmpeg 6 DLLを`target/debug/deps/`へコピーした。TurboJPEGのtest graph初回構築はMSBuildの
+exit 1・診断なしで失敗したため、先行D4と同じturbojpeg-sys 1.2.0 / Debug / SIMD / static CRTの
+静的出力を記録済みSHA-256と照合して実体コピーし、explicit static指定を用いる。
+環境指定と準備scriptはGit管理外の`target/texshare-env.ps1`等に保存する。
+これらの失敗はテスト0件のnative準備失敗として、製品テストの失敗と区別する。
+全件は既知の同時負荷問題を避けるため初回から`NEXTEST_TEST_THREADS=4`で実行し、retryは追加しない。
+
+独立Sol / xhighの静的完成レビューはACCEPT、未解消P1/P2なし（reviewerはテストを実行しない）。
+追加fixtureの初回compileは`FsCacheEntry`（Dropあり）からのmoveでE0509となり、借用とhandle cloneへ
+修正した。修正後の新規12回帰は全成功・終了コード0。共有を無効化する一時変異では同frame2頁と
+CPU-only昇格の2件が失敗、Arc条件を外す変異では別Arc拒否の1件が失敗し、どちらも終了100だった。
+`target/texshare-mutations.py`のfinallyで`app.rs`を変異前bytes/SHA-256と照合して復元した。
+復元後はコメント整備と引数なしfmt、core check、関連pipeline/workerの限定検査、明示Pathのfocused、
+UI snapshot、diff check、本体lib全件の順に実行する。`test-focused.ps1`の自動選択は広域入力を
+検出して規定の終了2（実行0件）となるため、関連moduleを明示し、共有変更の保証はlib全件で行う。
+
+利用者指示により build-dev・製品起動・コミットは実施しない。実GPU/present、04の改善幅、
+滑らかさと実機F12は今回の自動検証では未確認。調査の登録時間・500/250MiB等は削減対象の見積りであり、
+改修後のframe時間や改善率の実測値として扱わない。D3a/D3bの未解決契約は本変更で解消したとはしない。
+
+### 27.14 source テクスチャ共有後の実アプリ計測（2026-10-17、ClaudeCode が隔離 portable で実行）
+
+`94c6cdab2` (D2 + D4 + 無補正画像の source テクスチャ共有) の `build-dev.ps1 -TestScript` 診断ビルドで、§27.13 と同じ条件
+(03 / 04、演出 ON 200ms、1 回ずつ 8 回、2.5 秒間隔) を測った。利用者の実機での見え方の確認ではない。証跡は `target/page-turn-smoke/ts-*/logs/`。
+
+| 条件 | 1 回の演出の curl frame 数 | 受理から初回 curl | frame 間隔の最大 |
+| --- | --- | --- | --- |
+| 04 単ページ | 32〜33 | 3〜4ms | 10〜13ms |
+| 04 見開き (RtlCover) | 31〜34 (初回だけ 18) | 4〜14ms | 7〜26ms |
+| 03 単ページ | 32〜33 | 3〜8ms | 8〜13ms |
+| 03 見開き (RtlCover) | 31〜33 | 3〜11ms | 10〜20ms |
+
+§27.13 (共有前) の見開きで残っていた 90〜110ms の停止と、めくり始めの 200〜240ms の frame は出なくなった。原因は、無補正でも
+edit-result / final が source と同じ画素の原寸テクスチャを登録し直していたこと (調査は本書の記録と `5ceb32dc0` のコミットを参照)。
+補正・AI・カラー化などで画素が変わるページは従来どおり別テクスチャを作るので、その場合の滑らかさは別に測る必要がある (D3 の対象)。
+利用者の観測 (2026-10-17): この計測中のテスト画面を見て「滑らかだった」。通常の利用データ・補正ありのページでの確認はまだ。

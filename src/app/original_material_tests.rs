@@ -6,6 +6,99 @@ use super::composite_pixels_revision_tests::{
 use super::*;
 use crate::page_dims::{CanonicalPageDimensions, PagePixelDimensions};
 
+#[test]
+fn source_texture_sharing_survives_source_eviction_and_normal_reload_invalidates() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::from("C:/shared/lifetime.jpg"))];
+    app.fullscreen_idx = Some(0);
+    let id = super::source_texture_test_support::seed(&mut app, &ctx, 0);
+    drop(app.ensure_final_composite_texture(&ctx, 0).unwrap());
+    let old_key = app.current_edit_result_key(0);
+    let old_final = app.final_composite_key_for_pixels(old_key, [4, 6], app.effective_params(0));
+    ctx.tex_manager().write().take_delta();
+    app.fs_cache.remove(&0);
+    assert!(app.current_raw_source_pixels(0).is_none());
+    assert!(ctx.tex_manager().read().meta(id).is_some());
+    assert_eq!(
+        app.ensure_final_composite_texture(&ctx, 0).unwrap().id(),
+        id
+    );
+    assert!(ctx.tex_manager().write().take_delta().is_empty());
+
+    // Normal source adoption must invalidate the logical stages even when all
+    // three used one allocation. Original demand remains the existing loader.
+    let generation = app.items_generation;
+    app.fs_upload_backlog.push_for_generation(
+        generation,
+        FsUploadResult::new(0, original_result(), 9, FsLoadPurpose::Display),
+    );
+    app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+    assert_ne!(
+        app.current_edit_result_key(0).source_gen,
+        old_key.source_gen
+    );
+    assert!(!app.edit_result_cache.contains_key(&old_key));
+    assert!(!app.final_composite_cache.contains_key(&old_final));
+    assert!(ctx.tex_manager().read().meta(id).is_none());
+    let source = app.current_raw_source_pixels(0).unwrap();
+    let new_texture = app.ensure_final_composite_texture(&ctx, 0).unwrap();
+    assert_ne!(new_texture.id(), id);
+    let FsCacheEntry::Static { tex, .. } = app.fs_cache.get(&0).unwrap() else {
+        panic!()
+    };
+    assert_eq!(new_texture.id(), tex.id());
+    assert_eq!(source.pixels[0], egui::Color32::BLUE);
+}
+
+#[cfg(windows)]
+#[test]
+fn source_texture_sharing_context_reload_leaves_parked_sibling_unchanged() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    let seed = |owner: &mut App| {
+        owner.items = vec![GridItem::Image(PathBuf::from("C:/shared/same.jpg"))];
+        super::source_texture_test_support::seed(owner, &ctx, 0);
+        owner.ensure_final_composite_texture(&ctx, 0).unwrap();
+    };
+    let a = app.build_window_context_for_test(28101, seed);
+    let b = app.build_window_context_for_test(28102, seed);
+    let before = app
+        .with_viewer_context(b, |owner| {
+            (
+                owner.current_edit_result_key(0),
+                owner.current_final_composite_texture(0).unwrap().id(),
+                owner.current_raw_source_pixels(0).unwrap(),
+            )
+        })
+        .unwrap();
+    app.with_viewer_context(a, |owner| {
+        let own = owner.current_final_composite_texture(0).unwrap().id();
+        assert_ne!(
+            own, before.1,
+            "source lookup must stay in the mounted owner"
+        );
+        owner.bump_input_generation_for_fs_cache_reload(0);
+        owner.fs_cache.clear();
+        assert!(owner.edit_result_cache.is_empty());
+        assert!(owner.final_composite_cache.is_empty());
+    })
+    .unwrap();
+    app.with_viewer_context(b, |owner| {
+        assert_eq!(owner.current_edit_result_key(0), before.0);
+        assert_eq!(owner.current_edit_result_texture(0).unwrap().id(), before.1);
+        assert_eq!(
+            owner.current_final_composite_texture(0).unwrap().id(),
+            before.1
+        );
+        assert!(Arc::ptr_eq(
+            &owner.current_raw_source_pixels(0).unwrap(),
+            &before.2
+        ));
+    })
+    .unwrap();
+}
+
 fn completed_only(ctx: &egui::Context) -> (AppTestEnvForTest, FinalCompositeKey) {
     let (mut app, keys) = warm_final_pair(ctx);
     evict_pair_cpu(&mut app);
