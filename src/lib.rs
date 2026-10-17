@@ -21,6 +21,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(test)]
+mod egui037_stage4_gpu_tests;
 mod egui_output;
 #[cfg(test)]
 mod test_native_focus;

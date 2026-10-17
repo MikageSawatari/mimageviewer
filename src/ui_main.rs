@@ -3403,14 +3403,20 @@ fn selection_info_bar_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::side_top_panel(style)
 }
 
+// Match Panel::resolve_frame: a persistent separator reserves its rounded stroke
+// in the frame's outer margin on the edge facing the remaining viewport.
+fn panel_separator_outer_margin(style: &egui::Style, outer_margin: i8) -> i8 {
+    let separator_width = style.visuals.widgets.noninteractive.bg_stroke.width.round() as i8;
+    outer_margin.saturating_add(separator_width)
+}
+
 fn selection_info_bar_height(style: &egui::Style) -> f32 {
     let mut frame = selection_info_bar_frame(style);
     // Panel::exact_size includes the frame and the separator's outer margin.
     // Reserve both before allocating the two fixed rows and the horizontal bar;
     // otherwise the overflowing content grows past the bottom edge before Panel
     // clamps its response, leaving the grid with an incorrect height reservation.
-    let separator_width = style.visuals.widgets.noninteractive.bg_stroke.width.round() as i8;
-    frame.outer_margin.top = frame.outer_margin.top.saturating_add(separator_width);
+    frame.outer_margin.top = panel_separator_outer_margin(style, frame.outer_margin.top);
     App::DETAILS_HEADER_H
         + App::DETAILS_ROW_H
         + frame.total_margin().sum().y
@@ -14736,13 +14742,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             input_widths.label(ui, suffix);
         }
         let minimum_width = (widths.width() + right_widths.width()).ceil();
-        // Preserve the interior margins of the former two panels and the toolbar's
-        // trailing padding when the folder bar is explicitly on a separate row.
+        // The former top toolbar panel reserved its separator in the bottom outer
+        // margin. Keep the same resolved frame for the integrated row's spacing,
+        // border and background boundary; the following folder panel starts after
+        // that reservation, not at the preceding frame's outline.
+        let mut former_toolbar_frame = egui::Frame::side_top_panel(ui.style());
+        former_toolbar_frame.outer_margin.bottom =
+            panel_separator_outer_margin(ui.style(), former_toolbar_frame.outer_margin.bottom);
         let separate_row_padding =
             if new_row && ui.available_rect_before_wrap().width() < ui.max_rect().width() - 0.5 {
-                f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.top)
-                    + f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.bottom)
-                    + 2.0
+                former_toolbar_frame.total_margin().sum().y + 2.0
             } else {
                 0.0
             };
@@ -14759,11 +14768,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             let former_toolbar_bottom = (ui.min_rect().bottom()
                 + ui.spacing().item_spacing.y
                 + 2.0
-                + f32::from(egui::Frame::side_top_panel(ui.style()).inner_margin.bottom))
+                + f32::from(former_toolbar_frame.inner_margin.bottom)
+                + former_toolbar_frame.stroke.width
+                + f32::from(former_toolbar_frame.outer_margin.bottom))
             .round_ui();
+            // Panel paints the separator just outside the outline, inside its
+            // reserved outer margin. Use its actual stroke even when fractional
+            // stroke widths reserve a different rounded number of points.
+            let outline_bottom =
+                former_toolbar_bottom - f32::from(former_toolbar_frame.outer_margin.bottom);
             ui.painter().hline(
                 ui.clip_rect().x_range(),
-                former_toolbar_bottom - stroke.width * 0.5,
+                outline_bottom + stroke.width * 0.5,
                 stroke,
             );
             // In the two-panel layout the folder panel's background was painted
@@ -14775,7 +14791,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ui.clip_rect().max,
                 ),
                 0.0,
-                egui::Frame::side_top_panel(ui.style()).fill,
+                former_toolbar_frame.fill,
             );
         }
         let result = crate::ui_toolbar_layout::flexible_section(
@@ -30316,6 +30332,15 @@ mod section207_tests {
                         );
                     });
                 harness.run();
+                let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+                std::fs::create_dir_all(dir).unwrap();
+                harness
+                    .render()
+                    .unwrap()
+                    .save(dir.join(format!(
+                        "folder-reported-{width}-zoom{zoom}-row{new_row}.png"
+                    )))
+                    .unwrap();
                 let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
                 let left = harness.get_by_label("場所▼").rect();
                 let precedes = |a: egui::Rect, b: egui::Rect| {
@@ -30908,6 +30933,20 @@ mod section207_tests {
 
     #[test]
     fn section207_default_folder_geometry_matches_the_separate_panels() {
+        assert_section207_folder_geometry_matches_the_separate_panels(None);
+    }
+
+    #[test]
+    fn section207_folder_separator_reservation_matches_the_separate_panels() {
+        // Zero catches an unconditional +1; fractional/wider strokes catch a
+        // hard-coded default reservation and an incorrect half-stroke inset.
+        // Each case retains the real two-panel oracle at 100%/150%, Light/Dark.
+        for width in [0.0, 1.5, 2.0] {
+            assert_section207_folder_geometry_matches_the_separate_panels(Some(width));
+        }
+    }
+
+    fn assert_section207_folder_geometry_matches_the_separate_panels(separator_width: Option<f32>) {
         let mut env = crate::app::setup_app_for_test();
         only_folder_and_tree(&mut env);
         let app = Rc::new(RefCell::new(env));
@@ -30936,10 +30975,13 @@ mod section207_tests {
                     app.render_toolbar(root_ui);
                 }
             });
-        for (theme, visuals) in [
+        for (theme, mut visuals) in [
             ("dark", egui::Visuals::dark()),
             ("light", egui::Visuals::light()),
         ] {
+            if let Some(width) = separator_width {
+                visuals.widgets.noninteractive.bg_stroke.width = width;
+            }
             harness.ctx.set_visuals(visuals);
             for zoom in [1.0, 1.5] {
                 harness.ctx.set_zoom_factor(zoom);
@@ -30965,8 +31007,15 @@ mod section207_tests {
                         new, old,
                         "default geometry must survive tree_visible={tree_visible}"
                     );
-                    let evidence = std::path::Path::new("target/section207-review-rendering/final");
-                    std::fs::create_dir_all(evidence).unwrap();
+                    let evidence = separator_width.map_or_else(
+                        || std::path::PathBuf::from("target/section207-review-rendering/final"),
+                        |width| {
+                            std::path::PathBuf::from(format!(
+                                "target/section207-review-rendering/separator_{width}"
+                            ))
+                        },
+                    );
+                    std::fs::create_dir_all(&evidence).unwrap();
                     old_image
                         .save(evidence.join(format!(
                             "legacy_{theme}_zoom_{zoom}_tree_{tree_visible}.png"

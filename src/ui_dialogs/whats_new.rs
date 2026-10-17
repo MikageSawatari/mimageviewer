@@ -104,6 +104,13 @@ mod tests {
                             draw_whats_new_dialog(ctx, &mut true, &entries);
                         });
                 harness.run_steps(12);
+                let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+                std::fs::create_dir_all(dir).unwrap();
+                harness
+                    .render()
+                    .unwrap()
+                    .save(dir.join(format!("whats-new-{}x{}-scale{scale}.png", size.x, size.y)))
+                    .unwrap();
                 let viewport = harness.ctx.content_rect();
                 let intended_width = 650.0_f32.min(viewport.width()).floor();
                 for frame in 0..8 {

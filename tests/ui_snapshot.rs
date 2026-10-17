@@ -408,13 +408,15 @@ fn startup_dialogs_small_viewport() {
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ui, |ui| {
-                                mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
-                                    ui, kind,
-                                );
-                            });
+                        test_ui::full_viewport_ui(ui, |ui| {
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE)
+                                .show(ui, |ui| {
+                                    mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
+                                        ui, kind,
+                                    );
+                                });
+                        });
                         for &id in &actions.watched {
                             if ctx.read_response(id).is_some_and(|r| r.clicked()) {
                                 actions.clicked.insert(id);
@@ -484,6 +486,19 @@ fn startup_dialogs_small_viewport() {
                     ))
                     || (kind == "whats_new" && scale == 1.0);
                 if snapshot {
+                    if kind == "archive_confirm" {
+                        // This Context-root fixture has Frame::NONE behind its
+                        // floating window. Detect an allocating Ui wrapper's
+                        // background before treating its pixels as an egui change.
+                        // The probe is inside an 8pt wrapper at both tested scales,
+                        // and outside this window and its shadow.
+                        let pixels = harness.render().unwrap();
+                        assert_eq!(
+                            pixels.get_pixel(pixels.width() - 24, 24).0,
+                            [0, 0, 0, 0],
+                            "startup Context-root capture must not paint the Harness wrapper"
+                        );
+                    }
                     let suffix = if scale == 1.0 { "" } else { "_ui200" };
                     results.add(
                         harness.try_snapshot(&format!("startup_{kind}_{width}x{height}{suffix}")),
@@ -533,13 +548,15 @@ fn startup_dialogs_refit_after_viewport_resize() {
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ui, |ui| {
-                                mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
-                                    ui, kind,
-                                );
-                            });
+                        test_ui::full_viewport_ui(ui, |ui| {
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE)
+                                .show(ui, |ui| {
+                                    mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
+                                        ui, kind,
+                                    );
+                                });
+                        });
                         // Capture the current pass rather than read_response after
                         // Context::run, which can prefer discarded-pass widgets.
                         state.1 = state
@@ -710,28 +727,30 @@ fn folder_toolbar_snapshot_status_label() {
                             ctx.request_repaint();
                             return;
                         }
-                        let panel = egui::Panel::top("folder").show(ui, |ui| {
-                            let input = layout::address_input(
-                                ui,
-                                Some(
-                                    egui::RichText::new(label)
-                                        .color(egui::Color32::from_rgb(58, 110, 165))
-                                        .into(),
-                                ),
-                                |ui| {
-                                    ui.add_enabled(
-                                        false,
-                                        egui::TextEdit::singleline(&mut path)
-                                            .desired_width(f32::INFINITY),
-                                    )
-                                    .accessible_name("Folder address")
-                                    .rect
-                                },
-                            );
-                            assert!(input.inner.width() >= layout::ADDRESS_INPUT_MIN_WIDTH);
-                            input.response.rect
+                        test_ui::full_viewport_ui(ui, |ui| {
+                            let panel = egui::Panel::top("folder").show(ui, |ui| {
+                                let input = layout::address_input(
+                                    ui,
+                                    Some(
+                                        egui::RichText::new(label)
+                                            .color(egui::Color32::from_rgb(58, 110, 165))
+                                            .into(),
+                                    ),
+                                    |ui| {
+                                        ui.add_enabled(
+                                            false,
+                                            egui::TextEdit::singleline(&mut path)
+                                                .desired_width(f32::INFINITY),
+                                        )
+                                        .accessible_name("Folder address")
+                                        .rect
+                                    },
+                                );
+                                assert!(input.inner.width() >= layout::ADDRESS_INPUT_MIN_WIDTH);
+                                input.response.rect
+                            });
+                            assert!(panel.response.rect.expand(0.5).contains_rect(panel.inner));
                         });
-                        assert!(panel.response.rect.expand(0.5).contains_rect(panel.inner));
                     });
                 harness.run();
                 let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
@@ -824,10 +843,12 @@ fn folder_toolbar_flexible_snapshots() {
                                 ctx.request_repaint();
                                 return;
                             }
-                            egui::Panel::top("toolbar").show(ui, |ui| {
-                                draw_folder_toolbar_fixture(
-                                    ui, before, new_row, buttons, &mut path,
-                                );
+                            test_ui::full_viewport_ui(ui, |ui| {
+                                egui::Panel::top("toolbar").show(ui, |ui| {
+                                    draw_folder_toolbar_fixture(
+                                        ui, before, new_row, buttons, &mut path,
+                                    );
+                                });
                             });
                         });
                     harness.run();
@@ -859,6 +880,65 @@ fn folder_toolbar_flexible_snapshots() {
                 }
             }
         }
+    }
+}
+
+/// Generate decision material without adopting the old matrix's alias policy.
+/// The original alias assert stays active in folder_toolbar_flexible_snapshots.
+#[test]
+fn egui037_stage4_folder_toolbar_comparison_materials() {
+    use egui_kittest::kittest::NodeT;
+    for (name, width, zoom, before) in [
+        ("folder_toolbar_normal_first_row", 1120.0, 1.0, 0),
+        ("folder_toolbar_narrow_middle_row", 360.0, 1.0, 1),
+        ("folder_toolbar_dpi150_middle_row", 1080.0, 1.5, 1),
+    ] {
+        let mut fonts_ready = false;
+        let mut path = String::from(r"C:\Pictures\日本語フォルダ");
+        let mut harness = test_ui::builder()
+            .with_size(egui::vec2(width, 240.0 * zoom))
+            .build_ui(move |ui| {
+                let ctx = ui.ctx().clone();
+                ctx.set_zoom_factor(zoom);
+                mimageviewer::os_theme::apply_resolved(
+                    &ctx,
+                    mimageviewer::os_theme::ResolvedTheme::Dark,
+                );
+                if !fonts_ready {
+                    install_app_fonts(&ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                test_ui::full_viewport_ui(ui, |ui| {
+                    egui::Panel::top("toolbar").show(ui, |ui| {
+                        draw_folder_toolbar_fixture(ui, before, true, true, &mut path);
+                    });
+                });
+            });
+        harness.run();
+        let viewport = harness.ctx.content_rect();
+        let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+        assert!(viewport.contains_rect(input));
+        assert!(input.width() >= mimageviewer::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH);
+        for label in ["場所▼", "♡", "履歴▼", "📌", "サブ展開", "スタック"] {
+            let node = harness.get_by_label(label);
+            let rect = node.rect();
+            let id = egui_id_from_accesskit(node.accesskit_node().id());
+            assert!(viewport.contains_rect(rect), "{name} {label}: {rect:?}");
+            harness.hover_at(rect.center());
+            harness.run();
+            assert!(harness.ctx.read_response(id).unwrap().contains_pointer());
+        }
+        harness.hover_at(egui::Pos2::ZERO);
+        harness.run();
+        let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+        std::fs::create_dir_all(dir).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(dir.join(format!("{name}.png")))
+            .unwrap();
     }
 }
 
@@ -990,6 +1070,7 @@ fn draw_folder_toolbar_fixture(
                                         egui::TextEdit::singleline(&mut *path)
                                             .desired_width(f32::INFINITY),
                                     )
+                                    .accessible_name("Folder address")
                                     .rect,
                                 );
                             });
@@ -1528,14 +1609,16 @@ fn snapshot_with_theme_options_collect(
             ctx.request_repaint();
             return;
         }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| {
-                egui::Frame::central_panel(ui.style())
-                    .outer_margin(8.0)
-                    .inner_margin(0.0)
-                    .show(ui, |ui| build_ui(ui));
-            });
+        test_ui::full_viewport_ui(ui, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    egui::Frame::central_panel(ui.style())
+                        .outer_margin(8.0)
+                        .inner_margin(0.0)
+                        .show(ui, |ui| build_ui(ui));
+                });
+        });
     });
     if let Some(steps) = animated_steps {
         harness.run_steps(steps); // A production spinner intentionally never settles.
@@ -1568,7 +1651,9 @@ fn snapshot_with_ui_font(
                 ctx.request_repaint();
                 return;
             }
-            egui::CentralPanel::default().show(ui, |ui| build_ui(ui));
+            test_ui::full_viewport_ui(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| build_ui(ui));
+            });
         });
     harness.run();
     harness.snapshot(name);

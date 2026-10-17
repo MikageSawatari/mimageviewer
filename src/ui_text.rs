@@ -10860,6 +10860,17 @@ mod tests {
                 });
             });
         harness.run();
+        let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+        std::fs::create_dir_all(dir).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(dir.join(if fill.is_some() {
+                "bubble-body-fill.png"
+            } else {
+                "bubble-body-no-fill.png"
+            }))
+            .unwrap();
         let width = *measured.lock().expect("width result");
         assert!(width > 0.0, "bubble body was not rendered");
         width
@@ -11022,16 +11033,18 @@ mod tests {
                         cursor_thumbs.insert(cache_key, texture);
                     }
                 }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    let _ = annotation_dialog_contents_ui(
-                        ui,
-                        &mut preset,
-                        &mut shape_color,
-                        &mut marker_color,
-                        &mut stroke,
-                        &cursor_thumbs,
-                        1920.0,
-                    );
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let _ = annotation_dialog_contents_ui(
+                            ui,
+                            &mut preset,
+                            &mut shape_color,
+                            &mut marker_color,
+                            &mut stroke,
+                            &cursor_thumbs,
+                            1920.0,
+                        );
+                    });
                 });
             });
         harness.run();

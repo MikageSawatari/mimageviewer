@@ -282,7 +282,19 @@ mod adjust_scope_selector_tests {
             });
         harness.run();
 
+        let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
+        std::fs::create_dir_all(dir).unwrap();
+        harness
+            .render()
+            .unwrap()
+            .save(dir.join("adjust-scope-actions.png"))
+            .unwrap();
         let sizes = measured.lock().unwrap();
+        std::fs::write(
+            dir.join("adjust-scope-actions-sizes.txt"),
+            format!("{sizes:?}"),
+        )
+        .unwrap();
         assert_eq!(sizes.len(), 5, "all action labels were rendered");
         for (label, size) in sizes.iter() {
             assert!(size.x <= 258.0, "{label} was {}px wide", size.x);
@@ -1760,34 +1772,36 @@ mod local_adjust_segmentation_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    let mut add_layer_dialog_open = false;
-                    let mut select_layer: Option<usize> = None;
-                    let mut set_enabled: Option<(usize, bool)> = None;
-                    let mut update_layer: Option<(
-                        usize,
-                        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
-                    )> = None;
-                    let mut move_layer: Option<(usize, usize)> = None;
-                    let mut duplicate_layer: Option<usize> = None;
-                    let mut delete_layer: Option<usize> = None;
-                    let mut preview_flag = preview_to_selected_layer;
-                    super::draw_local_adjust_layer_list(
-                        ui,
-                        260.0,
-                        &layers_for_render,
-                        selected_layer,
-                        (1920, 1080),
-                        None,
-                        &mut add_layer_dialog_open,
-                        &mut select_layer,
-                        &mut set_enabled,
-                        &mut update_layer,
-                        &mut move_layer,
-                        &mut duplicate_layer,
-                        &mut delete_layer,
-                        &mut preview_flag,
-                    );
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut add_layer_dialog_open = false;
+                        let mut select_layer: Option<usize> = None;
+                        let mut set_enabled: Option<(usize, bool)> = None;
+                        let mut update_layer: Option<(
+                            usize,
+                            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                        )> = None;
+                        let mut move_layer: Option<(usize, usize)> = None;
+                        let mut duplicate_layer: Option<usize> = None;
+                        let mut delete_layer: Option<usize> = None;
+                        let mut preview_flag = preview_to_selected_layer;
+                        super::draw_local_adjust_layer_list(
+                            ui,
+                            260.0,
+                            &layers_for_render,
+                            selected_layer,
+                            (1920, 1080),
+                            None,
+                            &mut add_layer_dialog_open,
+                            &mut select_layer,
+                            &mut set_enabled,
+                            &mut update_layer,
+                            &mut move_layer,
+                            &mut duplicate_layer,
+                            &mut delete_layer,
+                            &mut preview_flag,
+                        );
+                    });
                 });
             });
 

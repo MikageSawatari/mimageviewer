@@ -4296,6 +4296,11 @@ impl NativeOverlayInputOutcome {
 /// OS clipboard から UTF-16 テキストを読み出す。空 / 失敗時は None。
 /// text input ダイアログ (一括ブックマーク登録 / bookmark title 編集) の Ctrl+V から呼ぶ。
 fn read_clipboard_text_windows() -> Option<String> {
+    #[cfg(test)]
+    if let Some(text) = chrome_suppression_interaction_tests::read_scoped_clipboard_text() {
+        return text;
+    }
+
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -16140,6 +16145,174 @@ mod chrome_suppression_interaction_tests {
             alt,
             repeat: false,
         }
+    }
+
+    struct NativeClipboardFixture {
+        text: Option<String>,
+        reads: usize,
+    }
+
+    thread_local! {
+        static CLIPBOARD_FIXTURE: std::cell::RefCell<Option<NativeClipboardFixture>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    struct ScopedNativeClipboard {
+        previous: Option<NativeClipboardFixture>,
+    }
+
+    impl ScopedNativeClipboard {
+        fn new(text: Option<&str>) -> Self {
+            let previous = CLIPBOARD_FIXTURE.with(|slot| {
+                slot.replace(Some(NativeClipboardFixture {
+                    text: text.map(str::to_owned),
+                    reads: 0,
+                }))
+            });
+            Self { previous }
+        }
+
+        fn reads(&self) -> usize {
+            CLIPBOARD_FIXTURE.with(|slot| slot.borrow().as_ref().unwrap().reads)
+        }
+    }
+
+    impl Drop for ScopedNativeClipboard {
+        fn drop(&mut self) {
+            CLIPBOARD_FIXTURE.with(|slot| {
+                let _ = slot.replace(self.previous.take());
+            });
+        }
+    }
+
+    // The outer Option selects the test override; None inside models an empty
+    // clipboard. An unscoped unit-test read fails before any user clipboard I/O.
+    pub(super) fn read_scoped_clipboard_text() -> Option<Option<String>> {
+        CLIPBOARD_FIXTURE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let fixture = slot
+                .as_mut()
+                .expect("native clipboard reads require a scoped fake in unit tests");
+            fixture.reads += 1;
+            Some(fixture.text.clone())
+        })
+    }
+
+    #[test]
+    fn native_clipboard_ctrl_shift_paste_normalizes_once_and_suppresses_raw_v() {
+        let clipboard = ScopedNativeClipboard::new(Some("first\r\nsecond\rthird\nlast"));
+        let (mut overlay, _) = fixture(false);
+        overlay.tag_picker_open = true;
+        overlay.pending_events.clear();
+        let key = native_clipboard_key(0x56, false);
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        let modifiers = egui_modifiers(true, true, false);
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Paste("first\nsecond\nthird\nlast".to_owned()),
+                egui::Event::ModifiersChanged(modifiers),
+            ],
+            "one press reads once and release emits neither Paste nor raw V"
+        );
+        assert_eq!(clipboard.reads(), 1);
+
+        // Nested fixtures restore the outer owner without changing its reads.
+        {
+            let nested = ScopedNativeClipboard::new(None);
+            assert_eq!(read_clipboard_text_windows(), None);
+            assert_eq!(nested.reads(), 1);
+        }
+        assert_eq!(clipboard.reads(), 1);
+        assert_eq!(
+            read_clipboard_text_windows().as_deref(),
+            Some("first\r\nsecond\rthird\nlast")
+        );
+    }
+
+    #[test]
+    fn native_clipboard_empty_ctrl_shift_paste_suppresses_raw_v_and_release_read() {
+        let clipboard = ScopedNativeClipboard::new(None);
+        let (mut overlay, _) = fixture(false);
+        overlay.tag_picker_open = true;
+        overlay.pending_events.clear();
+        let key = native_clipboard_key(0x56, false);
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        let modifiers = egui_modifiers(true, true, false);
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::ModifiersChanged(modifiers),
+            ],
+            "recognized empty paste emits neither Paste, Text nor raw V"
+        );
+        assert_eq!(clipboard.reads(), 1);
+    }
+
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "Disabled remains the native IME cancellation terminal"
+    )]
+    fn native_clipboard_paste_waits_for_pending_ime_commit_before_reading() {
+        use crate::video::native_window::NativeVideoImeEvent;
+
+        let clipboard = ScopedNativeClipboard::new(Some("pasted\r\ntext"));
+        let mut overlay = tag_picker_ime_fixture();
+        overlay.pending_events.clear();
+        let key = native_clipboard_key(0x56, false);
+        let modifiers = egui_modifiers(true, true, false);
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: Some(egui::Key::V),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: Some(egui::Key::V),
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+            ]
+        );
+        assert_eq!(clipboard.reads(), 0, "composition owns both raw key edges");
+        assert!(overlay.ime_composing());
+
+        overlay.pending_events.clear();
+        overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Commit(
+            "かな".to_owned(),
+        )));
+        overlay.push_native_event(NativeVideoWindowEvent::Ime(NativeVideoImeEvent::Disabled));
+        assert!(!overlay.ime_composing());
+        overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+        overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+        assert_eq!(
+            overlay.pending_events,
+            [
+                egui::Event::Ime(egui::ImeEvent::Commit("かな".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Paste("pasted\ntext".to_owned()),
+                egui::Event::ModifiersChanged(modifiers),
+            ],
+            "pending commit admits exactly one normalized paste before the next UI pass"
+        );
+        assert_eq!(clipboard.reads(), 1);
     }
 
     #[test]
