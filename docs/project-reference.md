@@ -5,7 +5,7 @@
 ## Tech Stack
 
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
-- **GUI**: eframe 0.33 + egui 0.33 (wgpu backend)
+- **GUI**: eframe 0.37 + egui 0.37 (wgpu 30 backend)。Rust 1.99 を `rust-toolchain.toml` で固定 (MSRV 1.95)
 - **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
 - **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。サムネ生成時は **DCT スケール (1/8〜1/1)** で decode して 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](dct-scale-plan.md))。圧縮入力 128MB 超は image クレート / WIC chain にフォールバック (並列ワーカー × 圧縮 buffer の積算メモリ圧迫を回避)。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
