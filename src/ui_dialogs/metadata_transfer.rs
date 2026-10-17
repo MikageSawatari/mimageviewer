@@ -1096,6 +1096,7 @@ fn progress_widget_height(progress: TransferProgress) -> f32 {
     let height = Arc::new(Mutex::new(None));
     let captured_height = Arc::clone(&height);
     let mut harness = crate::test_ui::builder()
+        .with_context_setup(crate::ui_fonts::configure_fonts)
         .with_size(egui::vec2(430.0, 240.0))
         .build_ui(move |root_ui| {
             let ctx = &root_ui.ctx().clone();
@@ -1721,6 +1722,7 @@ mod tests {
         });
         let render_state = std::rc::Rc::clone(&state);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();

@@ -71,10 +71,10 @@ pub(super) fn finish_full_output(
     backend.collect_retirement_delta(ctx);
 }
 
-/// Cleanup adds frees after earlier Full/immediate output was already accepted.
+/// Accept Full, immediate, discard and cleanup deltas into the one shared owner.
 /// TexturesDelta::append intentionally discards earlier sets for newer frees;
 /// that optimization must not erase this renderer-owned submission batch.
-pub(super) fn append_retirement_delta(
+pub(super) fn append_texture_delta(
     pending: &mut egui::TexturesDelta,
     mut newer: egui::TexturesDelta,
 ) {
@@ -284,11 +284,17 @@ pub(super) mod viewport_retirement_tests {
     }
 
     pub fn stale_texture(ctx: &Context) -> egui::TextureHandle {
-        ctx.load_texture(
+        let mut texture = ctx.load_texture(
             "stale-native-texture",
-            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
-            Default::default(),
-        )
+            egui::ColorImage::filled([2, 2], egui::Color32::BLACK),
+            egui::TextureOptions::NEAREST,
+        );
+        texture.set_partial(
+            [1, 0],
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::NEAREST,
+        );
+        texture
     }
 
     pub fn stale_event() -> egui::Event {
@@ -788,6 +794,110 @@ pub(super) mod viewport_retirement_tests {
             "old native callback drop delta stayed with shared renderer"
         );
         delta.clear();
+    }
+
+    /// Headless native ownership evidence, distinct from the real wgpu readback
+    /// in egui-wgpu. Uses real State, callback captures, registration GC and
+    /// backend cleanup; it does not claim an OS surface or GL context.
+    pub fn discard_texture_delivery_native_reopen<A: Adapter + 'static>() {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let (integration, mut adapter) = fixture::<A>();
+        let ctx = &integration.egui_ctx;
+        let (child, descendant, sibling) = ids();
+        let old = ctx.viewport_registration(child).unwrap();
+        let texture_id = adapter.seed_stale_native(ctx, child);
+        let adapter = Rc::new(RefCell::new(adapter));
+        let deliveries = Rc::new(Cell::new(0));
+        let got = deliveries.clone();
+        let receiver = Rc::downgrade(&adapter);
+        let _scope = ctx.enter_discard_texture_delivery(move |delta| {
+            assert_eq!(
+                delta.set[&texture_id].len(),
+                2,
+                "whole and partial move before retry"
+            );
+            assert!(!delta.free.contains(&texture_id));
+            let receiver = receiver.upgrade().unwrap();
+            receiver.borrow_mut().accept_delta(delta);
+            got.set(got.get() + 1);
+        });
+        let observed = deliveries.clone();
+        let receiver = Rc::downgrade(&adapter);
+        Context::set_immediate_viewport_renderer(move |ctx, mut immediate| {
+            assert_eq!(
+                observed.get(),
+                1,
+                "pass-1 delta delivered before native callback drop"
+            );
+            let receiver = receiver.upgrade().unwrap();
+            {
+                let mut adapter = receiver.borrow_mut();
+                adapter.replace_stale_native(ctx, child);
+                assert!(adapter.registration_for(child).is_none());
+                assert!(adapter.registration_for(descendant).is_none());
+                let mut delta = adapter.take_delta();
+                assert!(
+                    delta.free.contains(&texture_id),
+                    "last native callback handle really dropped"
+                );
+                assert_eq!(
+                    delta.set[&texture_id].len(),
+                    2,
+                    "pending preserves older sets despite later free"
+                );
+                assert_eq!(delta.set[&texture_id][0].pos, None);
+                assert_eq!(delta.set[&texture_id][1].pos, Some([1, 0]));
+                delta.clear(); // resource-consumer GPU evidence is a separate offscreen test
+                let registration = ctx.viewport_registration(child).unwrap();
+                let initial = egui::ViewportOutput {
+                    registration,
+                    parent_registration: ctx.viewport_registration(immediate.ids.parent),
+                    parent: immediate.ids.parent,
+                    class: egui::ViewportClass::Immediate,
+                    builder: immediate.builder.clone(),
+                    viewport_ui_cb: None,
+                    commands: Vec::new(),
+                    repaint_delay: Default::default(),
+                };
+                adapter.sync(ctx, &OrderedViewportIdMap::from_iter([(child, initial)]));
+                assert!(!adapter.native_input(child).contains(&stale_event()));
+            }
+            let mut output = ctx.run_ui(input(child, false), |ui| (immediate.viewport_ui_cb)(ui));
+            let mut adapter = receiver.borrow_mut();
+            adapter.accept_delta(core::mem::take(&mut output.textures_delta));
+            adapter.sync(ctx, &output.viewport_output);
+            output.drop_without_applying_deltas();
+        });
+        let mut passes = 0;
+        let output = ctx.run_ui(input(ViewportId::ROOT, false), |ui| {
+            declare(ui.ctx(), sibling);
+            if passes == 0 {
+                ui.ctx().request_discard("delivery and native reopen");
+            } else {
+                ui.ctx()
+                    .show_viewport_immediate(child, Default::default(), |_, _| {});
+            }
+            passes += 1;
+        });
+        assert_eq!(passes, 2);
+        assert_eq!(deliveries.get(), 1);
+        assert!(!output.textures_delta.set.contains_key(&texture_id));
+        deliver(ctx, &mut *adapter.borrow_mut(), output);
+        assert_ne!(ctx.viewport_registration(child), Some(old));
+        assert_eq!(
+            adapter.borrow().registration_for(child),
+            ctx.viewport_registration(child)
+        );
+        assert!(ctx.viewport_registration(sibling).is_some());
+        assert!(
+            egui_ime::ime_input_active_in_viewport(ctx, sibling),
+            "real IME plugin sibling ownership survives"
+        );
+        let mut pending = adapter.borrow_mut().take_delta();
+        pending.clear();
     }
 
     pub fn legacy_hook_captures_lifetime_before_reopen<A: Adapter>() {

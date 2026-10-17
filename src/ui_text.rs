@@ -10888,6 +10888,7 @@ mod tests {
             ..BubbleObject::default()
         };
         let harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(PANEL_W, 720.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10923,6 +10924,7 @@ mod tests {
             ..BubbleObject::default()
         };
         let harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(PANEL_W, 360.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10959,6 +10961,7 @@ mod tests {
             ..BubbleObject::default()
         };
         let harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(PANEL_W, 420.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {

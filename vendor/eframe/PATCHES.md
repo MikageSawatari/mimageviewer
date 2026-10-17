@@ -253,3 +253,25 @@ The shared IME implementation lives in crates/egui-ime; egui-winit and
 eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
 were moved to vendor/upstream-provenance.json. Graph migration is not evidence
 that runtime checks or release gates have passed.
+
+
+## Stage 3: discard texture delivery (design revision 4.6, 2026-10-17)
+
+Implementation record and implementer internal inspection only. Independent
+acceptance and command results belong in the stage-3 verification ledger.
+
+- Native Full operations in wgpu and glow install the Context-bound discard
+  scope through their output-processing lifetime. Consumers upgrade Weak native
+  resource owners, receive into the existing shared pending delta, and use the
+  existing no-paint resource consumer. Native immediate entry asserts the scope
+  invariant before native lifetime replacement. No cleanup is delayed.
+- append_retirement_delta is generalized to append_texture_delta. Full,
+  immediate, discard and retirement acceptance preserve old set/partial lists
+  when a later free arrives, including renderer / GL-context unavailability.
+  The generic epaint append and TextureManager metadata API remain unchanged.
+- discard_texture_delivery tests check actual registration GC, native callback
+  capture drop (last TextureHandle), State/input separation, same-ID reopen,
+  sibling IME ownership, and the production wgpu scope's Weak/uninitialized
+  pending behavior. Glow's real resource-consumer function is exercised with
+  fake GL calls, explicitly not real-GL evidence. egui-wgpu tests separately
+  prove actual upload/submission/free and offscreen pixel content.

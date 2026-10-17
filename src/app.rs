@@ -74,17 +74,22 @@ mod clipboard_capture_admission_tests {
         let received = requests.clone();
         ctx.set_request_repaint_callback(move |info| received.lock().unwrap().push(info));
         // Model a quiet notification stream without reading the real clipboard.
-        // Consume egui's initial settling repaint before checking the UI drains.
-        let _ = ctx.run_pass(Default::default(), |_| {});
+        // A cold Context's theme/font setup requests the documented second settling repaint.
+        for _ in 0..2 {
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
+        }
         requests.lock().unwrap().clear();
         for _ in 0..40 {
-            let _ = ctx.run_pass(Default::default(), |ctx| {
-                app.poll_clipboard_capture_with_activation(ctx, |_, _| {
-                    panic!("idle monitoring activated main")
-                });
-                app.poll_capture_selection(ctx);
-                app.show_capture_selection_dialog(ctx);
-            });
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    app.poll_clipboard_capture_with_activation(ctx, |_, _| {
+                        panic!("idle monitoring activated main")
+                    });
+                    app.poll_capture_selection(ctx);
+                    app.show_capture_selection_dialog(ctx);
+                })
+                .drop_without_applying_deltas();
         }
         assert!(requests.lock().unwrap().is_empty());
         assert!(!app.capture_selection_open());
@@ -610,6 +615,7 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 use raw_page_store::*;
 mod ai_terminal_service;
+mod close_return;
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
@@ -617,6 +623,11 @@ pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
 mod update_phases;
+pub(crate) use close_return::{FullscreenCloseContinuation, ViewerCloseCause};
+#[cfg(all(test, windows))]
+mod close_return_tests;
+#[cfg(test)]
+mod egui037_connection_tests;
 mod viewport_retirement;
 #[cfg(all(test, windows))]
 mod viewport_retirement_tests;
@@ -4188,16 +4199,27 @@ struct ClosedBookmarkSummary {
 #[cfg(windows)]
 impl ClosedBookmarkSummary {
     fn read(context: ContextRef<'_>) -> Self {
-        let selected_media_path = context.selected().and_then(|idx| {
-            context.items().get(idx).and_then(|item| match item {
-                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
-                _ => None,
-            })
-        });
+        let selected_media_path = context
+            .fullscreen_idx()
+            .or(context.selected())
+            .and_then(|idx| {
+                context.items().get(idx).and_then(|item| match item {
+                    GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                    _ => None,
+                })
+            });
         Self {
             bookmark_target: context
                 .bookmark_view_state()
                 .and_then(BookmarkViewState::target)
+                .filter(|target| match target {
+                    crate::bookmark_browser::BookmarkViewReturnTarget::Media(path) => {
+                        selected_media_path
+                            .as_ref()
+                            .is_some_and(|current| crate::path_key::eq_keep_drive(path, current))
+                    }
+                    crate::bookmark_browser::BookmarkViewReturnTarget::Book(_) => true,
+                })
                 .cloned(),
             selected_media_path,
             destination: context
@@ -17614,7 +17636,7 @@ pub struct App {
     /// その場で `close_fullscreen` すると一瞬ページ一覧 (L2) が出るため、
     /// フルスクリーン handler はこの予約だけを立てる。`App::update` の入力ナビ合流点が
     /// `AddressBarNav::Direct(parent)` として通常ナビ経路へ流す。
-    pub(crate) pending_return_to_parent: bool,
+    pub(crate) pending_return_to_parent: FullscreenCloseContinuation,
 
     /// PDF メタキャッシュ (v1.0.0) ヒット時、placeholder grid を立てた page_count を覚えておく。
     ///
@@ -20800,7 +20822,7 @@ impl App {
             smart_folder_metadata_refresh_due: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
-            pending_return_to_parent: false,
+            pending_return_to_parent: FullscreenCloseContinuation::default(),
             pdf_placeholder_count: None,
             cached_handlers: std::collections::HashMap::new(),
             association_prewarm: None,
@@ -23432,51 +23454,17 @@ impl App {
     /// では `effective_folder() == current_folder` なので挙動不変)。親が取れない
     /// (ドライブ root 等) ときは `None` を返し、呼び出し側が close にフォールバックする。
     pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
-        if let Some(nav) = self.collection_grid_parent_nav() {
-            return Some(nav);
+        let (nav, selection) = self.resolve_close_return_navigation()?;
+        if selection.is_some() {
+            self.select_after_load = selection;
         }
-        if let Some(nav) = self.bookmark_view_back_nav() {
-            return Some(nav);
-        }
-        if let Some(nav) = self.reading_history_back_nav() {
-            return Some(nav);
-        }
-        if self.rating_view_parent_nav_available() {
-            return Some(crate::ui_main::AddressBarNav::RatingViewBack);
-        }
-        if let Some(nav) = self.subfolder_expansion_back_nav() {
-            return Some(nav);
-        }
-        if let Some(nav) = self.smart_folder_parent_nav_target() {
-            return Some(nav);
-        }
-        if self.items_are_smart_folder_view {
-            return None;
-        }
-        let cur = self.effective_folder()?;
-        let parent = cur.parent()?;
-        self.select_after_load = cur
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string());
-        Some(crate::ui_main::AddressBarNav::Direct(
-            parent.to_path_buf(),
-            StartupListIntent::ExplicitList,
-        ))
+        Some(nav)
     }
 
     pub(crate) fn take_pending_return_to_parent_nav(
         &mut self,
     ) -> Option<crate::ui_main::AddressBarNav> {
-        if !std::mem::take(&mut self.pending_return_to_parent) {
-            return None;
-        }
-        if let Some(nav) = self.resolve_return_to_parent_nav() {
-            return Some(nav);
-        }
-        // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
-        self.change_main_context_for_visible_grid(false);
-        None
+        self.take_close_return_navigation()
     }
 
     fn apply_collection_input_nav(
@@ -33515,6 +33503,7 @@ impl App {
         if !self.main_folder_history_available() {
             return;
         }
+        self.retire_close_returns_for_main_admission();
         if retained != Some(MainListRequestOwner::Classification) {
             self.top_level_grid_view.set_open_path_classification(None);
         }
@@ -45783,11 +45772,19 @@ impl App {
                     "[removed-path] close active detached reason={reason}"
                 ));
                 if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
-                    self.take_and_close_current_active_viewer_context_with_metadata_boundary(
-                        ctx, reason, boundary,
+                    self.take_and_close_active_context_with_cause(
+                        ctx,
+                        reason,
+                        boundary,
+                        ViewerCloseCause::Replaced,
                     );
                 } else {
-                    self.close_current_active_viewer_context(ctx);
+                    self.take_and_close_active_context_with_cause(
+                        ctx,
+                        reason,
+                        FsMetadataBoundary::Manual,
+                        ViewerCloseCause::Replaced,
+                    );
                 }
             }
 
@@ -45826,7 +45823,11 @@ impl App {
                 }
                 // passive/parked の直接 retain-drop でも共通 teardown seam を通し、最終
                 // resume を保存してから rename の path 移行へ渡す (review-v2.3.0 追補3: A-4)。
-                let _ = self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
+                let _ = self.teardown_paused_media_bundles_with_cause(
+                    &ids,
+                    reason,
+                    ViewerCloseCause::Replaced,
+                );
                 self.detached_image_windows
                     .retain(|window| !ids.contains(&window.id));
                 for id in ids {
@@ -50716,6 +50717,7 @@ impl App {
         {
             return;
         }
+        self.retire_close_returns_for_main_admission();
         if let Some(previous_request_id) = self
             .bookmark_open_pending
             .as_ref()
@@ -61198,9 +61200,20 @@ impl App {
         reason: &'static str,
         boundary: FsMetadataBoundary,
     ) -> Option<ClosedBookmarkSummary> {
-        let Some(id) = self.active_viewer_context_id() else {
-            return None;
-        };
+        self.take_and_close_active_context_with_cause(ctx, reason, boundary, ViewerCloseCause::User)
+    }
+
+    #[cfg(windows)]
+    fn take_and_close_active_context_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+        boundary: FsMetadataBoundary,
+        cause: ViewerCloseCause,
+    ) -> Option<ClosedBookmarkSummary> {
+        let id = self.active_viewer_context_id()?;
+        let summary_before = self.with_viewer_context_ref(id, ClosedBookmarkSummary::read)?;
+        self.transfer_terminal_close_return(id, cause);
 
         // book context の明示 close = detached セッション終了 (§3.7 closing)。desired set から
         // 外す前に closing を立て、teardown 後に finish して backstop が窓を復活させない。
@@ -61249,7 +61262,7 @@ impl App {
             self.pdf_password_error = None;
             self.pdf_password_save = false;
         }
-        Some(summary)
+        Some(summary_before)
     }
 
     #[cfg(windows)]
@@ -61263,6 +61276,16 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> Result<bool, LocalViewerCloseFailure> {
+        self.close_all_detached_viewers_with_cause(ctx, ViewerCloseCause::Replaced)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_all_detached_viewers_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        cause: ViewerCloseCause,
+    ) -> Result<bool, LocalViewerCloseFailure> {
+        self.retire_close_return_owners(cause);
         self.close_local_composition_editor(CompositionEditorCloseReason::OwnerClosed);
         let had_detached = self.fullscreen_viewport_binding.is_some()
             || self.active_detached_context_is_at_rest()
@@ -61304,7 +61327,15 @@ impl App {
         crate::dwm_transitions::disable_transitions_for_thread_windows();
 
         if self.active_detached_context_is_at_rest() {
-            if !self.close_current_active_viewer_context(ctx) {
+            if self
+                .take_and_close_active_context_with_cause(
+                    ctx,
+                    "mode_change_close_all",
+                    FsMetadataBoundary::Manual,
+                    cause,
+                )
+                .is_none()
+            {
                 close_failure = Some(LocalViewerCloseFailure::ActiveContextRetire);
             }
         }
@@ -61346,9 +61377,10 @@ impl App {
             );
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
-        if let Err(error) = self.teardown_paused_media_bundles_for_window_ids(
+        if let Err(error) = self.teardown_paused_media_bundles_with_cause(
             &passive_ids,
             "mode_change_close_all_passive",
+            cause,
         ) {
             close_failure.get_or_insert(error);
         }
@@ -62233,6 +62265,21 @@ impl App {
         window_ids: &[u64],
         reason: &'static str,
     ) -> Result<(), LocalViewerCloseFailure> {
+        self.teardown_paused_media_bundles_with_cause(window_ids, reason, ViewerCloseCause::User)
+    }
+
+    #[cfg(windows)]
+    fn teardown_paused_media_bundles_with_cause(
+        &mut self,
+        window_ids: &[u64],
+        reason: &'static str,
+        cause: ViewerCloseCause,
+    ) -> Result<(), LocalViewerCloseFailure> {
+        for &window_id in window_ids {
+            if let Some((id, _)) = self.locate_window_context(window_id) {
+                self.transfer_terminal_close_return(id, cause);
+            }
+        }
         let clears_tile_companion = window_ids
             .iter()
             .any(|&window_id| self.parked_window_owns_video_tile_companion(window_id));
@@ -62550,6 +62597,7 @@ impl App {
     /// Retire local viewer-open intentions admitted before Remote began acquiring ownership.
     /// A late PDF/ZIP completion may still install list data, but it cannot reopen a viewer.
     pub(crate) fn invalidate_local_viewer_open_intents_for_remote(&mut self) {
+        self.retire_close_return_owners(ViewerCloseCause::RemoteAcquire);
         self.cancel_everything_search();
         self.cancel_unresolved_open_for_remote_session();
         self.cancel_archive_view_open_for_remote_session();
@@ -62562,7 +62610,7 @@ impl App {
         self.pending_auto_fs_open = false;
         self.fs_nav_after_pdf_enumerate = None;
         self.pending_rating_view_zipdir_open = None;
-        self.pending_return_to_parent = false;
+        self.pending_return_to_parent.clear();
         self.cancel_pending_folder_nav();
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
@@ -62770,7 +62818,8 @@ impl App {
             self.transition_detached_window_state(*id, DetachedWindowState::Closing, reason);
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
-        let _ = self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
+        let _ =
+            self.teardown_paused_media_bundles_with_cause(&ids, reason, ViewerCloseCause::Replaced);
         self.detached_image_windows
             .retain(|window| !ids.contains(&window.id));
         for id in ids {
@@ -63327,7 +63376,14 @@ impl App {
             self.log_detached_image_window_debug(
                 "park_current_active_detached result=close_active_context".to_string(),
             );
-            return self.close_current_active_viewer_context(ctx);
+            return self
+                .take_and_close_active_context_with_cause(
+                    ctx,
+                    "park_without_snapshot",
+                    FsMetadataBoundary::Manual,
+                    ViewerCloseCause::Replaced,
+                )
+                .is_some();
         } else if self.viewer_session_is_detached() {
             if self.preserve_active_detached_image_window_for_main_context_change_inner(
                 preserve_fullfeature_linked_still,
@@ -64870,83 +64926,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn reconcile_closed_bookmark_detached_context(&mut self, closed: &ClosedBookmarkSummary) {
-        let Some(BookmarkViewState::Opening {
-            target: main_target,
-            ..
-        }) = self.bookmark_view_state.as_ref()
-        else {
-            return;
-        };
-        let main_target = main_target.clone();
-        // main が別の場所へ移動済みなら、その後のユーザー操作を detached close で巻き戻さない。
-        if !self.items_are_bookmark_view {
-            return;
-        }
-
-        let stayed_at_opened_bookmark = closed.bookmark_target.as_ref() == Some(&main_target);
-        let keep_origin_grid = matches!(
-            main_target,
-            crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
-        ) || stayed_at_opened_bookmark;
-        if keep_origin_grid {
-            // 一覧は main に表示されたままなので enter_bookmark_view は不要。viewer 中の
-            // 名称変更・追加・削除だけを非同期再構築し、保存済み grid snapshot で位置を戻す。
-            // 別ウィンドウ再生中も main は操作できるため、選択・スクロールは「開く直前」より
-            // 現在の main 状態を優先する。row_keys / opened_key は増減検知と可視化用に維持する。
-            let current_selected_key = self
-                .selected
-                .and_then(|idx| self.bookmark_browser_rows.get(idx))
-                .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
-            if let Some(return_grid) = self
-                .bookmark_view_state
-                .as_mut()
-                .and_then(BookmarkViewState::origin_grid_mut)
-            {
-                return_grid.selected_key = current_selected_key;
-                return_grid.scroll_offset_y = self.scroll_offset_y;
-            }
-            self.bookmark_view_begin_restore();
-            crate::logger::log(
-                "[bookmark-open] detached viewer closed; refresh main bookmark grid",
-            );
-            self.refresh_bookmark_browser();
-            return;
-        }
-
-        // Ctrl+↑↓ や前後ファイル移動で対象を離れた場合は、従来仕様どおり viewer が最後に
-        // 表示していた実フォルダへ main を移す。close_fullscreen は cursor を selected へ戻すため、
-        // bundle の selected item を再選択すれば同じファイルを可視範囲へ戻せる。
-        let selected_media_path = closed.selected_media_path.clone();
-        let destination = closed.destination.clone();
-        self.clear_bookmark_view_return_state();
-        let Some(destination) = destination else {
-            return;
-        };
-        crate::logger::log(format!(
-            "[bookmark-open] detached media closed after navigation; load main folder={}",
-            destination.display()
-        ));
-        if !matches!(
-            self.load_folder_or_convert_archive_with_auto_fullscreen(destination, false),
-            FolderOpenOutcome::Loaded
-        ) {
-            return;
-        }
-        if let Some(path) = selected_media_path
-            && let Some(idx) = self.items.iter().position(|item| match item {
-                GridItem::Video(candidate) | GridItem::Audio(candidate) => {
-                    crate::path_key::eq_keep_drive(candidate, &path)
-                }
-                _ => false,
-            })
-        {
-            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
-        }
-    }
-
-    #[cfg(windows)]
     pub(crate) fn update_active_viewer_context(
         &mut self,
         ui: &mut egui::Ui,
@@ -65093,7 +65072,13 @@ impl App {
                 app.keep_fullscreen_viewport_alive(ctx);
                 app.render_fullscreen_viewport(ui);
 
-                if std::mem::take(&mut app.pending_return_to_parent) {
+                if matches!(
+                    app.pending_return_to_parent,
+                    FullscreenCloseContinuation::Live(_)
+                ) {
+                    let id = app.projected_viewer_context_id();
+                    app.transfer_terminal_close_return(id, ViewerCloseCause::User);
+                    app.pending_return_to_parent.clear();
                     app.close_fullscreen();
                 }
 
@@ -65141,7 +65126,9 @@ impl App {
                     self.pdf_password_error = None;
                     self.pdf_password_save = false;
                 }
-                self.reconcile_closed_bookmark_detached_context(&closed);
+                if let Some(nav) = self.take_pending_return_to_parent_nav() {
+                    self.apply_fullscreen_close_nav_immediate(nav);
+                }
             }
         }
         crate::app::gamepad_input::ActiveContextUpdate {
@@ -77609,16 +77596,23 @@ impl App {
             return;
         }
         self.finish_fullscreen_navigation_for_true_close();
+        #[cfg(windows)]
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            let id = self.projected_viewer_context_id();
+            self.transfer_terminal_close_return(id, ViewerCloseCause::User);
+        }
         // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
         // origin grid is still mounted in main. Embedded viewers instead use the normal Bookmarks
         // navigation transition. Ownership is explicit in BookmarkViewState, not inferred from a
         // missing grid snapshot.
-        if !matches!(
-            self.bookmark_view_state,
-            Some(BookmarkViewState::Detached { .. })
-        ) && self.bookmark_view_close_nav().is_some()
+        if self.projected_viewer_context_id() == self.viewer_context_main()
+            && !matches!(
+                self.bookmark_view_state,
+                Some(BookmarkViewState::Detached { .. })
+            )
+            && self.bookmark_view_close_nav().is_some()
         {
-            self.pending_return_to_parent = true;
+            self.pending_return_to_parent.request_live();
             return;
         }
         if let Some(BookmarkViewState::Detached {
@@ -77631,8 +77625,10 @@ impl App {
             // origin grid even after page/container navigation.
             self.bookmark_view_state = None;
         }
-        if self.auto_open_for_current_container() {
-            self.pending_return_to_parent = true;
+        if self.projected_viewer_context_id() == self.viewer_context_main()
+            && self.auto_open_for_current_container()
+        {
+            self.pending_return_to_parent.request_live();
             return;
         }
         self.accept_current_page_list_request();
@@ -77655,13 +77651,28 @@ impl App {
     /// ナビをここで消化し、ブックマーク一覧への復帰を次フレームへ取り残さない。
     pub(crate) fn handle_fullscreen_close_request_immediate(&mut self) {
         self.handle_fullscreen_close_request();
+        #[cfg(windows)]
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            let main = self.viewer_context_main();
+            let _ = self.with_viewer_context(main, |app| {
+                if matches!(
+                    app.pending_return_to_parent,
+                    FullscreenCloseContinuation::Terminal(_)
+                ) {
+                    if let Some(nav) = app.take_pending_return_to_parent_nav() {
+                        app.apply_fullscreen_close_nav_immediate(nav);
+                    }
+                }
+            });
+            return;
+        }
         let Some(nav) = self.take_pending_return_to_parent_nav() else {
             return;
         };
         if !self.apply_fullscreen_close_nav_immediate(nav) {
             // 現在 resolve_return_to_parent_nav が返すナビはすべて即時適用可能だが、
             // 将来対象外のナビが増えても要求を失わず通常の update 経路へ戻す。
-            self.pending_return_to_parent = true;
+            self.pending_return_to_parent.request_live();
         }
     }
 
@@ -94733,6 +94744,10 @@ impl App {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
             self.native_video_front_recover_after_external_foreground = false;
+            self.transfer_terminal_close_return(
+                self.projected_viewer_context_id(),
+                ViewerCloseCause::User,
+            );
             self.close_fullscreen();
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、return 後の
@@ -96181,6 +96196,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.retire_close_return_owners(ViewerCloseCause::AppExit);
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();
         self.retire_pending_startup_result();
@@ -98893,7 +98909,9 @@ mod index_full_check_tests {
                 disposal_witness: None,
             });
             let ctx = egui::Context::default();
-            let _ = ctx.run_pass(egui::RawInput::default(), |ctx| app.poll_startup_owner(ctx));
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| app.poll_startup_owner(ctx))
+                .drop_without_applying_deltas();
             if terminal {
                 tx.send(crate::indexer_manager::StartupInitOutcome::Unavailable)
                     .unwrap_or_else(|_| panic!("live receiver"));
@@ -98905,14 +98923,18 @@ mod index_full_check_tests {
                 events: vec![egui::Event::Text("queued input".into())],
                 ..Default::default()
             };
-            let _ = ctx.run_pass(input(), |ctx| {
-                app.poll_startup_owner(ctx);
-                assert!(ctx.input(|i| i.events.is_empty()));
-            });
-            let _ = ctx.run_pass(input(), |ctx| {
-                app.poll_startup_owner(ctx);
-                assert!(ctx.input(|i| !i.events.is_empty()));
-            });
+            let _ = ctx
+                .run_pass(input(), |ctx| {
+                    app.poll_startup_owner(ctx);
+                    assert!(ctx.input(|i| i.events.is_empty()));
+                })
+                .drop_without_applying_deltas();
+            let _ = ctx
+                .run_pass(input(), |ctx| {
+                    app.poll_startup_owner(ctx);
+                    assert!(ctx.input(|i| !i.events.is_empty()));
+                })
+                .drop_without_applying_deltas();
         }
     }
 

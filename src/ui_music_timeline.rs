@@ -813,8 +813,9 @@ fn timeline_manual_scroll_requested(
     if !pointer_over_timeline {
         return false;
     }
+    let input_options = ui.ctx().options(|o| o.input_options);
     ui.input(|input| {
-        crate::wheel_input::remaining_wheel_delta(input, ui.ctx().options(|o| o.input_options))
+        crate::wheel_input::remaining_wheel_delta(input, input_options)
             .y
             .abs()
             > 0.0

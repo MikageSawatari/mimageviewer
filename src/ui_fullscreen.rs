@@ -26,6 +26,8 @@ mod prefetch_revision_tests;
 #[cfg(test)]
 mod retained_material_entry_tests;
 #[cfg(test)]
+mod wheel_frame_tests;
+#[cfg(test)]
 pub(crate) use page_turn::take_test_events as take_page_turn_test_events;
 pub(crate) use page_turn::{
     OperationPhase, PageTurnLeaseInventory, PageTurnPresentation, PresentationDestination,
@@ -7384,11 +7386,10 @@ fn music_panel_open_state_after_reach(
 
 const MUSIC_VIEW_BACKING_UI_SALT: &str = "music_view_backing";
 
-/// UiBuilder hashes the salt into an Id before mixing it with its parent's Id.
-/// Input consumers must use that same route rather than hashing the raw string
-/// directly into the parent, so they observe the actual child popup/widget IDs.
+/// UiBuilder first wraps the raw salt in IdSalt; new_child then passes that
+/// value to Id::with. Preserve both steps to match the actual popup/widget IDs.
 fn music_view_backing_ui_id(parent: egui::Id) -> egui::Id {
-    parent.with(egui::Id::new(MUSIC_VIEW_BACKING_UI_SALT))
+    parent.with(egui::IdSalt::new(MUSIC_VIEW_BACKING_UI_SALT))
 }
 
 // HUD drawing and widget hit areas share the original viewport, never the
@@ -18129,6 +18130,117 @@ pub(crate) enum FsPageNav {
     Split(crate::page_split::PresentationStep),
 }
 
+#[derive(Default)]
+struct FsWheelFrameResult {
+    page_nav: FsPageNav,
+    close: bool,
+    wheel_navigation_produced: bool,
+    deferred: Option<FsWheelFrameProposal>,
+}
+
+struct FsWheelFrameProposal {
+    context: egui::Context,
+    frame_navigation_allowed: bool,
+    music_ctrl_wheel_gate_reached: bool,
+    route_music_intervals: bool,
+    wheel_input: FsWheelFrameInput,
+    page_nav: FsPageNav,
+    canvas_click: FsCanvasClickAction,
+    secondary_action: FsSecondaryAction,
+    full_rect: egui::Rect,
+    default_image_rect: egui::Rect,
+    primary_suppression: FullscreenPrimarySuppressionDecision,
+    fs_response: egui::Response,
+    is_spread_double: bool,
+    seek_panel_interactive: bool,
+    seek_panel_rect: egui::Rect,
+    continuous_active: bool,
+    cursor_in_panel: bool,
+    touch_activity: bool,
+    continuous_touch_delta: egui::Vec2,
+    continuous_pointer_delta: egui::Vec2,
+}
+
+enum FsWheelFrameInput {
+    Unconsumed(Vec<FsWheelAction>),
+    Owned(Vec<FsWheelAction>),
+}
+
+struct FsWheelAction {
+    input: crate::wheel_input::WheelInput,
+    segment: crate::wheel_input::WheelSegment,
+    operation: Option<ViewerOperationId>,
+}
+
+/// Pass-local input proposals. Existing recognizers retain gesture ownership;
+/// only their semantic effects wait for the current frame's arbitration.
+enum FsSecondaryAction {
+    None,
+    ShortTap {
+        context: crate::ring_shortcut::RightDragContext,
+        pos: egui::Pos2,
+    },
+    LongPress(egui::Pos2),
+    Recognized {
+        context: crate::ring_shortcut::RightDragContext,
+        pos: egui::Pos2,
+        recognition: crate::ring_shortcut::RightDragRecognition,
+    },
+}
+
+enum FsSecondaryInputOutcome {
+    Continue,
+    CloseRequested,
+    ViewerReplaced,
+}
+
+impl FsSecondaryAction {
+    fn executes_before_final_navigation(&self) -> bool {
+        matches!(
+            self,
+            Self::Recognized {
+                recognition: crate::ring_shortcut::RightDragRecognition {
+                    command: Some(_),
+                    ..
+                },
+                ..
+            }
+        )
+    }
+
+    fn closes_viewer(&self, app: &App) -> bool {
+        let context = match self {
+            Self::ShortTap { context, .. } => *context,
+            Self::Recognized {
+                context,
+                recognition,
+                ..
+            } if recognition.outcome == crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
+                *context
+            }
+            _ => return false,
+        };
+        matches!(
+            app.settings
+                .ring_shortcuts
+                .viewer_short_right_click_action(context),
+            Some(
+                crate::ring_shortcut::ViewerShortRightClickAction::CloseFullscreen
+                    | crate::ring_shortcut::ViewerShortRightClickAction::Unknown(_)
+            )
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FsCanvasClickAction {
+    None,
+    ResetTransform,
+    ToggleVideo(usize),
+    DismissOverflow,
+    PageSide(i32),
+}
+
 pub(crate) struct FullscreenRootFrameInput {
     context: egui::Context,
     destination: PresentationDestination,
@@ -24634,6 +24746,8 @@ impl App {
             self.fs_viewport_shown = true;
             self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
             if cancel {
+                #[cfg(windows)]
+                self.transfer_projected_terminal_close_return(crate::app::ViewerCloseCause::User);
                 self.cancel_detached_initial_open_for_lease(
                     Self::detached_session_lease(window_id),
                     "detached_loading_shell_cancel",
@@ -24798,6 +24912,8 @@ impl App {
                 // `poll_fs_nav_lock` の解放経路に乗らず lock/holdover が居座る。
                 // 明示 release で確実に状態をクリーンにする (embedded 用ヘルパと対称、
                 // Codex 第 3 ラウンド P2)。
+                #[cfg(windows)]
+                self.transfer_projected_terminal_close_return(crate::app::ViewerCloseCause::User);
                 #[cfg(windows)]
                 if let Some(lease) = preparing_lease {
                     self.cancel_detached_initial_open_for_lease(
@@ -25415,6 +25531,7 @@ impl App {
         let mut mouse_nav: Option<crate::ui_main::AddressBarNav> = None;
         let mut jump_to: Option<usize> = None;
         let mut navigation_operation: Option<ViewerOperationId> = None;
+        let mut wheel_frame_proposal: Option<FsWheelFrameProposal> = None;
         // 境界ヒント即時消去のため、フレーム先頭の状態を捕捉する。
         // handle_fs_navigation 実行後に、ヒントが同じ start_time のまま残って
         // いれば「このフレームで再設定されていない」= 打ち切ってよい、と判定する。
@@ -26335,7 +26452,7 @@ impl App {
 
                         // ── ホイール & クリック ──
                         let mut similar_preview_navigator_input = None;
-                        let (wheel_nav, click_close) = self.handle_fs_wheel_and_click_with_geometry_and_operation(
+                        let mut wheel_result = self.handle_fs_wheel_and_click_frame(
                             ui,
                             ctx,
                             full_rect,
@@ -26347,15 +26464,27 @@ impl App {
                             hud_popup_wheel.as_ref(),
                             music_overflow_input.owns_pointer,
                             &mut navigation_operation,
+                            continuation_committed || close_fs || close_to_page_list
+                                || ctrl_nav.is_some() || sibling_nav.is_some()
+                                || mouse_nav.is_some() || jump_to.is_some(),
+                            true,
                         );
-                        if !continuation_committed && !wheel_nav.is_none() {
+                        if let Some(mut proposal) = wheel_result.deferred.take() {
+                            proposal.frame_navigation_allowed = !continuation_committed;
+                            proposal.music_ctrl_wheel_gate_reached = key_action.music_ctrl_wheel_gate_reached;
+                            wheel_frame_proposal = Some(proposal);
+                        }
+                        let wheel_nav = wheel_result.page_nav;
+                        let click_close = wheel_result.close;
+                        if wheel_frame_proposal.is_none() && !continuation_committed
+                            && (wheel_result.wheel_navigation_produced || !wheel_nav.is_none()) {
                             page_nav = wheel_nav;
                         }
                         if click_close {
                             close_fs = true;
                         }
                         // perf: ホイール/クリック起因のナビ
-                        if !wheel_nav.is_none() {
+                        if wheel_result.wheel_navigation_produced || !wheel_nav.is_none() {
                             self.bump_input_seq(
                                 "fs_wheel",
                                 Some(&format!("page_nav={wheel_nav:?}")),
@@ -26365,7 +26494,8 @@ impl App {
                         }
                         // ホイール/キーでページ移動が確定済みなら、
                         // ホバーバーのボタンホバーで上書きされないよう保護
-                        let nav_locked = !page_nav.is_none();
+                        let nav_locked = wheel_result.wheel_navigation_produced || !page_nav.is_none();
+
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
                         #[cfg(windows)]
@@ -26543,7 +26673,7 @@ impl App {
                                             image_rect,
                                             reserved_panel_width,
                                             paint_idx,
-                                            key_action.music_ctrl_wheel_gate_reached,
+                                            key_action.music_ctrl_wheel_gate_reached && wheel_frame_proposal.is_none(),
                                             music_overflow_input,
                                         );
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
@@ -28051,6 +28181,10 @@ impl App {
                     crate::test_script::pointer_input::finish_pass(ctx);
                 }
 
+                if let Some(proposal) = wheel_frame_proposal.as_mut() {
+                    self.claim_fs_wheel_frame_after_ui(proposal);
+                }
+
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
                 fs_closure_cycles = Self::thread_cycles_now().saturating_sub(closure_cycles_t0);
@@ -28287,6 +28421,27 @@ impl App {
         );
 
         // ── ナビゲーション & スライドショー処理 ──
+        if let Some(proposal) = wheel_frame_proposal {
+            let navigation_allowed = proposal.frame_navigation_allowed;
+            let result = self.apply_fs_wheel_frame_proposal(
+                proposal,
+                !navigation_allowed
+                    || close_fs
+                    || close_to_page_list
+                    || ctrl_nav.is_some()
+                    || sibling_nav.is_some()
+                    || mouse_nav.is_some()
+                    || jump_to.is_some(),
+                &mut navigation_operation,
+            );
+            if navigation_allowed
+                && (result.wheel_navigation_produced || !result.page_nav.is_none())
+            {
+                page_nav = result.page_nav;
+            }
+            close_fs |= result.close;
+        }
+        let navigation_idx = self.fullscreen_idx.unwrap_or(fs_idx);
         self.handle_fs_navigation_with_render_perf(
             ctx,
             close_fs,
@@ -28296,7 +28451,7 @@ impl App {
             mouse_nav,
             page_nav,
             jump_to,
-            fs_idx,
+            navigation_idx,
             navigation_operation,
             &mut fs_render_perf,
         );
@@ -28590,6 +28745,37 @@ impl App {
                     KeyAction::FsStackJumpPrev | KeyAction::FsStackJumpNext
                 ) && !self.stack_showing_flat)
                 && self.keymap.effective_chords(action).contains(&chord)
+        })
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn egui037_connection_frame_samples(
+        &self,
+        ctx: &egui::Context,
+    ) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        ctx.data(|data| {
+            (
+                data.get_temp::<FsPageTurnFrameDecision>(egui::Id::new((
+                    "fs_page_turn_decision",
+                    viewport,
+                )))
+                .map(|sample| sample.frame_nr),
+                data.get_temp::<FsOriginalPreviewFrameSample>(egui::Id::new((
+                    "fs_original_preview_active",
+                    viewport,
+                )))
+                .map(|sample| sample.frame_nr),
+                data.get_temp::<FsPageTurnPhysicalInputFrameSample>(egui::Id::new((
+                    "fs_page_turn_physical_input_held",
+                    viewport,
+                )))
+                .map(|sample| sample.frame_nr),
+            )
         })
     }
 
@@ -31423,7 +31609,7 @@ impl App {
         {
             #[cfg(windows)]
             if self.fullscreen_embedded_still_active() {
-                return (!self.pending_return_to_parent, None);
+                return (!self.pending_return_to_parent.is_pending(), None);
             }
             return (
                 true,
@@ -31455,7 +31641,7 @@ impl App {
         // その予約を消化できず閉じられない。
         #[cfg(windows)]
         if self.fullscreen_embedded_still_active() {
-            return !self.pending_return_to_parent;
+            return !self.pending_return_to_parent.is_pending();
         }
         // モーダル表示中に main/root 側へ漏れたキーは背面操作へ流さず捨てる。
         if self.any_modal_dialog_open_for_fullscreen_keys() {
@@ -33234,9 +33420,8 @@ impl App {
 
         // The Ctrl+wheel action is drawn after the HUD so popups can consume it first.
         // Carry the exact old key-pass reachability across the intervening UI pass.
-        action.music_ctrl_wheel_gate_reached = fs_music_view_active
-            && self.fs_context_menu_idx.is_none()
-            && !self.music_bookmark_modal_open();
+        action.music_ctrl_wheel_gate_reached =
+            self.fs_context_menu_idx.is_none() && !self.music_bookmark_modal_open();
 
         // 音楽ビュー: ←→ でシーク (動画と同じ Small / Medium / Large 設定を使う)。
         // 動画は handle_video_input で処理するが音声は egui 経路なのでここで消費する。プレーン ←→
@@ -37060,6 +37245,40 @@ impl App {
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
+        let result = self.handle_fs_wheel_and_click_frame(
+            ui,
+            ctx,
+            full_rect,
+            state,
+            seek_geometry,
+            is_spread_double,
+            prev_foreground_hwnd,
+            navigator_reservation,
+            front_wheel_owner,
+            music_front_pointer_owned,
+            navigation_operation,
+            false,
+            false,
+        );
+        (result.page_nav, result.close)
+    }
+
+    fn handle_fs_wheel_and_click_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        state: &FsFrameState,
+        seek_geometry: StillSeekGeometry,
+        is_spread_double: bool,
+        prev_foreground_hwnd: usize,
+        navigator_reservation: &mut Option<FsNavigatorInputReservation>,
+        front_wheel_owner: Option<&FsHudPopupWheelInput>,
+        music_front_pointer_owned: bool,
+        navigation_operation: &mut Option<ViewerOperationId>,
+        suppress_wheel_navigation: bool,
+        merge_at_frame_tail: bool,
+    ) -> FsWheelFrameResult {
         *navigator_reservation = None;
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx);
         if front_wheel_owner.is_some() {
@@ -37114,7 +37333,7 @@ impl App {
                 .fullscreen_idx
                 .is_some_and(|idx| self.fs_music_view_active(idx))
         {
-            return (FsPageNav::None, false);
+            return FsWheelFrameResult::default();
         }
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、
@@ -37187,7 +37406,7 @@ impl App {
                             && touch_frame.has_touch_derived_pointer_activity(),
                         cancelled: touch_frame.touch_cancelled(),
                     });
-            return (FsPageNav::None, false);
+            return FsWheelFrameResult::default();
         }
         let seek_panel_rect = seek_geometry.panel_rect(full_rect);
         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
@@ -37348,7 +37567,7 @@ impl App {
                         StillTouchForegroundReclaimAction::None => {}
                     }
                 }
-                return (FsPageNav::None, false);
+                return FsWheelFrameResult::default();
             }
         }
 
@@ -37630,7 +37849,7 @@ impl App {
                     },
                 );
             }
-            return (FsPageNav::None, false);
+            return FsWheelFrameResult::default();
         }
 
         let side_panel_visible =
@@ -37925,7 +38144,7 @@ impl App {
             self.fs_secondary_press.cancel();
             self.fs_pan_drag_start = None;
             self.fs_rotation_drag_start = None;
-            return (FsPageNav::None, false);
+            return FsWheelFrameResult::default();
         }
 
         // Wipe のドラッグ基準は、白線 / clip / シェーダー合成境界と同じ「フィット後の実表示
@@ -37964,7 +38183,7 @@ impl App {
         if !cursor_in_panel
             && self.handle_compare_wipe_drag(ctx, compare_drag_rect, compare_base_rect)
         {
-            return (FsPageNav::None, false);
+            return FsWheelFrameResult::default();
         }
 
         // ── 中ボタン (ホイール押し込み) ドラッグでズーム ──
@@ -37997,10 +38216,43 @@ impl App {
         let in_video_tile = self.video_tile_mode_active;
         #[cfg(not(windows))]
         let in_video_tile = false;
+        let fs_response = ui.interact(
+            full_rect,
+            egui::Id::new("fs_click"),
+            egui::Sense::click_and_drag(),
+        );
+        let continuous_touch_delta = continuous_reading_response_drag_delta(
+            ctx,
+            &fs_response,
+            touch_activity
+                .then(|| continuous_reading_coalesced_touch_drag_total(ctx, &touch_frame))
+                .flatten(),
+            self.fullscreen_opened_at(),
+            self.frame_counter,
+            continuous_active && touch_activity,
+            pointer_primary_down,
+        );
+        // Keep the established mouse path byte-for-byte in meaning: while
+        // Response owns the drag, apply egui's per-frame pointer delta. Only
+        // a positively correlated touch stream needs cumulative accounting.
+        let continuous_pointer_delta = if touch_activity {
+            continuous_touch_delta
+        } else {
+            ctx.input(|input| input.pointer.delta())
+        };
+        if touch_input_enabled && touch_frame.should_suppress_response(&fs_response) {
+            // Positive raw-event correlation is required before the
+            // recognizer may suppress this response. This is terminal-frame
+            // evidence, not a new cross-frame owner.
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
+        }
+        // ── フォーカス復帰クリック / touch replacement の抑制 ──
         let wheel_options = ctx.options(|o| o.input_options);
         let wheel_segments =
-            ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, wheel_options));
-        for wheel in wheel_segments {
+            ctx.input(|input| crate::wheel_input::remaining_wheel_segments(input, wheel_options));
+        let mut accepted_wheel = Vec::new();
+        for segment in wheel_segments {
+            let wheel = segment.input;
             let (wheel_y, modifiers) = (wheel.delta.y, wheel.modifiers);
             let ctrl_held = modifiers.ctrl;
             #[cfg(windows)]
@@ -38053,7 +38305,7 @@ impl App {
                     || fs_still_seek_strip_popup_open(ctx)
                     || (music_view_active
                         && (music_audio_popup_open || self.music_speed_popup_open)),
-            ) && !(music_view_active && ctrl_held);
+            );
             #[cfg(windows)]
             if self.viewer_session_is_detached_or_switching()
                 && Self::detached_image_window_debug_enabled()
@@ -38124,173 +38376,391 @@ impl App {
                 // F12 detached 動画では native presenter child HWND がホイールを
                 // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
                 // 同じ wheel が届く環境があるため、ここでは消費だけして二重ナビを防ぐ。
-                crate::wheel_input::consume_remaining_wheel_inputs(ctx, |input| {
-                    input.modifiers == wheel.modifiers
-                        && input.source == wheel.source
-                        && input.phase == wheel.phase
-                });
+                crate::wheel_input::consume_wheel_segment(ctx, segment);
             } else if wheel_y.abs() > 0.5 && handle_wheel_here {
-                crate::wheel_input::consume_remaining_wheel_inputs(ctx, |input| {
-                    input.modifiers == wheel.modifiers
-                        && input.source == wheel.source
-                        && input.phase == wheel.phase
+                accepted_wheel.push(FsWheelAction {
+                    input: wheel,
+                    segment,
+                    operation: self
+                        .page_turn_wheel_navigation_operation(ctx, segment.last_raw_ordinal),
                 });
-                if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
-                    // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
-                    // Ctrl+ホイールのときだけ倍率変更。
-                    crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
-                    self.adjust_fs_zoom_factor(wheel_y);
-                } else if self.fs_zoom_active {
-                    // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
-                    let base = if wheel_y < 0.0 { 1 } else { -1 };
-                    page_nav = self.spread_page_nav(base);
-                    *navigation_operation =
-                        self.page_turn_pointer_navigation_operation(ctx, "wheel");
-                } else if self.analysis_mode {
-                    // 分析モード: ホイールでズーム
-                    crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "analysis");
+            }
+
+            // ── クリック & ドラッグ ──
+        }
+        let secondary_action = self.recognize_fs_secondary_input(
+            ctx,
+            full_rect,
+            state.is_video,
+            top_bar_visible,
+            seek_panel_rect,
+            seek_panel_interactive,
+            prev_foreground_hwnd,
+        );
+        // Preserve the released wheel-before-click classification without mutating
+        // a page which an intermediate navigation has already left.
+        let (click_zoom, click_pan) =
+            self.propose_fs_wheel_click_transform(ctx, default_image_rect, &accepted_wheel);
+        let canvas_click = self.plan_fs_canvas_click(
+            ctx,
+            &fs_response,
+            full_rect,
+            seek_geometry,
+            state.is_video,
+            primary_suppression.suppresses_current_frame(),
+            continuous_active,
+            side_panel_chrome_enabled,
+            navigator_exclusion,
+            seek_panel_interactive,
+            click_zoom,
+            click_pan,
+        );
+        let wheel_navigation_produced = accepted_wheel
+            .iter()
+            .any(|action| self.fs_wheel_action_requests_navigation(action));
+        let close = secondary_action.closes_viewer(self);
+        let pointer_nav = match canvas_click {
+            FsCanvasClickAction::PageSide(base) => self.spread_page_nav(base),
+            _ => page_nav,
+        };
+        let mixed_navigation = accepted_wheel.len() > 1 && wheel_navigation_produced;
+        let proposal = FsWheelFrameProposal {
+            context: ctx.clone(),
+            frame_navigation_allowed: true,
+            music_ctrl_wheel_gate_reached: false,
+            route_music_intervals: merge_at_frame_tail && mixed_navigation,
+            wheel_input: FsWheelFrameInput::Unconsumed(accepted_wheel),
+            page_nav,
+            canvas_click,
+            secondary_action,
+            full_rect,
+            default_image_rect,
+            primary_suppression,
+            fs_response,
+            is_spread_double,
+            seek_panel_interactive,
+            seek_panel_rect,
+            continuous_active,
+            cursor_in_panel,
+            touch_activity,
+            continuous_touch_delta,
+            continuous_pointer_delta,
+        };
+        if merge_at_frame_tail && mixed_navigation {
+            FsWheelFrameResult {
+                page_nav: pointer_nav,
+                close,
+                wheel_navigation_produced,
+                deferred: Some(proposal),
+            }
+        } else {
+            self.apply_fs_wheel_frame_proposal(
+                proposal,
+                suppress_wheel_navigation,
+                navigation_operation,
+            )
+        }
+    }
+
+    fn fs_wheel_action_requests_navigation(&self, action: &FsWheelAction) -> bool {
+        let ctrl = action.input.modifiers.ctrl;
+        if self.fs_zoom_aiming
+            || (self.fs_zoom_active && ctrl)
+            || self.analysis_mode
+            || self
+                .fullscreen_idx
+                .is_some_and(|idx| self.is_panorama_mode_active(idx))
+            || (!ctrl
+                && self
+                    .fullscreen_idx
+                    .is_some_and(|idx| self.continuous_reading_active_for_idx(idx)))
+        {
+            return false;
+        }
+        if self.fs_zoom_active {
+            return true;
+        }
+        if should_zoom_fullscreen_wheel(ctrl, self.is_overlay_edit_mode_active()) {
+            return false;
+        }
+        let unmodified = !action.input.modifiers.shift && !ctrl && !action.input.modifiers.alt;
+        !(unmodified
+            && self.fullscreen_idx.is_some_and(|idx| {
+                matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                )
+            })
+            && matches!(
+                self.settings
+                    .ring_shortcuts
+                    .video_normal_wheel_action
+                    .resolve(action.input.delta.y),
+                Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(_))
+            ))
+    }
+
+    fn remaining_fs_wheel_frame_actions(
+        &self,
+        ctx: &egui::Context,
+        eligible: &[FsWheelAction],
+    ) -> Vec<FsWheelAction> {
+        let options = ctx.options(|options| options.input_options);
+        ctx.input(|input| crate::wheel_input::remaining_wheel_segments(input, options))
+            .into_iter()
+            .filter(|segment| {
+                eligible.iter().any(|accepted| {
+                    match (
+                        segment.first_raw_ordinal,
+                        segment.last_raw_ordinal,
+                        accepted.segment.first_raw_ordinal,
+                        accepted.segment.last_raw_ordinal,
+                    ) {
+                        (Some(first), Some(last), Some(start), Some(end)) => {
+                            first >= start && last <= end
+                        }
+                        _ => false,
+                    }
+                })
+            })
+            .map(|segment| FsWheelAction {
+                input: segment.input,
+                segment,
+                // A bar action may have changed the projected destination by
+                // now. Retain the immutable ingress fact captured by its owner,
+                // rather than attributing this input to the new destination.
+                operation: eligible
+                    .iter()
+                    .find(|accepted| accepted.segment.last_raw_ordinal == segment.last_raw_ordinal)
+                    .and_then(|accepted| accepted.operation),
+            })
+            .collect()
+    }
+
+    fn claim_fs_wheel_frame_after_ui(&self, proposal: &mut FsWheelFrameProposal) {
+        if let FsWheelFrameInput::Unconsumed(eligible) = &proposal.wheel_input {
+            let actions = self.remaining_fs_wheel_frame_actions(&proposal.context, eligible);
+            for action in &actions {
+                crate::wheel_input::consume_wheel_segment(&proposal.context, action.segment);
+            }
+            proposal.wheel_input = FsWheelFrameInput::Owned(actions);
+        }
+    }
+
+    fn apply_fs_wheel_frame_proposal(
+        &mut self,
+        proposal: FsWheelFrameProposal,
+        suppress_wheel_navigation: bool,
+        navigation_operation: &mut Option<ViewerOperationId>,
+    ) -> FsWheelFrameResult {
+        let FsWheelFrameProposal {
+            context,
+            frame_navigation_allowed: _,
+            music_ctrl_wheel_gate_reached,
+            route_music_intervals,
+            wheel_input,
+            mut page_nav,
+            canvas_click,
+            secondary_action,
+            full_rect,
+            default_image_rect,
+            primary_suppression,
+            fs_response,
+            is_spread_double,
+            seek_panel_interactive,
+            seek_panel_rect,
+            continuous_active,
+            cursor_in_panel,
+            touch_activity,
+            continuous_touch_delta,
+            continuous_pointer_delta,
+        } = proposal;
+        let ctx = &context;
+        let mut close = false;
+        // Popup/HUD owners ran before this merge. Project only the events which
+        // they left; the earlier proposal contributes eligibility and identity,
+        // never motion resurrected from a pre-consumption snapshot.
+        let accepted_wheel = match wheel_input {
+            FsWheelFrameInput::Owned(actions) => actions,
+            FsWheelFrameInput::Unconsumed(eligible) => {
+                self.remaining_fs_wheel_frame_actions(ctx, &eligible)
+            }
+        };
+        let suppress_intermediate_navigation = suppress_wheel_navigation
+            || secondary_action.closes_viewer(self)
+            // This existing command owner can change the page, context, mode,
+            // or input admission. Preserve its order before the single final
+            // navigation as a whole, including future command actions.
+            || secondary_action.executes_before_final_navigation()
+            || matches!(canvas_click, FsCanvasClickAction::PageSide(_));
+        let mut wheel_navigation_produced = false;
+        let mut wheel_actions = accepted_wheel.into_iter().peekable();
+        while let Some(wheel_action) = wheel_actions.next() {
+            let wheel = wheel_action.input;
+            let wheel_y = wheel.delta.y;
+            let modifiers = wheel.modifiers;
+            let ctrl_held = modifiers.ctrl;
+            if ctrl_held
+                && self
+                    .fullscreen_idx
+                    .is_some_and(|idx| self.fs_music_view_active(idx))
+            {
+                if route_music_intervals {
+                    let idx = self.fullscreen_idx.unwrap();
+                    if self.music_timeline_ctrl_wheel_allowed(
+                        ctx,
+                        idx,
+                        music_ctrl_wheel_gate_reached,
+                    ) {
+                        self.apply_music_timeline_ctrl_wheel_delta(wheel_y);
+                        crate::wheel_input::consume_wheel_segment(ctx, wheel_action.segment);
+                    }
+                }
+                continue;
+            }
+            crate::wheel_input::consume_wheel_segment(ctx, wheel_action.segment);
+            let continuous_active = self
+                .fullscreen_idx
+                .is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
+            let default_image_rect = self
+                .fullscreen_idx
+                .map(|idx| {
+                    let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
+                    let geometry = self.still_seek_geometry_for_idx(full_rect, idx, is_video);
+                    self.fullscreen_media_rect_with_geometry(full_rect, idx, is_video, geometry)
+                })
+                .unwrap_or(default_image_rect);
+            let mut wheel_navigation = FsPageNav::None;
+            if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
+                // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
+                // Ctrl+ホイールのときだけ倍率変更。
+                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
+                self.adjust_fs_zoom_factor(wheel_y);
+            } else if self.fs_zoom_active {
+                // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
+                let base = if wheel_y < 0.0 { 1 } else { -1 };
+                wheel_navigation = self.spread_page_nav(base);
+                *navigation_operation = wheel_action.operation;
+            } else if self.analysis_mode {
+                // 分析モード: ホイールでズーム
+                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "analysis");
+                let mouse = ctx.input(|i| i.pointer.hover_pos());
+                let image_rect = analysis_image_rect(full_rect);
+                let changed = Self::apply_wheel_zoom(
+                    &mut self.analysis_zoom,
+                    &mut self.analysis_pan,
+                    wheel_y,
+                    mouse,
+                    image_rect.center(),
+                );
+                if changed {
+                    self.maybe_rerender_pdf(self.analysis_zoom);
+                }
+            } else if self.handle_panorama_wheel_if_active(ctx, wheel_y, ctrl_held) {
+                // 360 度パノラマビュー: ホイールを FOV 調整に転用 (Ctrl 有無に関わらず)。
+                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "panorama_fov");
+                // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
+                // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
+                // FOV 操作に振る。前後ナビは矢印キーで行う。
+            } else if !ctrl_held && continuous_active {
+                let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
+                self.scroll_vertical_reading_by(ctx, delta, crate::app::HistoryTrigger::UserChosen);
+            } else {
+                if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
+                    // 通常モード: Ctrl+ホイールでズーム。
+                    // 消しゴム / 隠蔽加工モード中は画像上の修飾なしホイールも
+                    // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
+                    // パネルスクロールを維持できる。
+                    crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "edit_mode");
                     let mouse = ctx.input(|i| i.pointer.hover_pos());
-                    let image_rect = analysis_image_rect(full_rect);
+                    let mut proposed_zoom = self.fs_zoom;
+                    let mut proposed_pan = self.fs_pan;
                     let changed = Self::apply_wheel_zoom(
-                        &mut self.analysis_zoom,
-                        &mut self.analysis_pan,
+                        &mut proposed_zoom,
+                        &mut proposed_pan,
                         wheel_y,
                         mouse,
-                        image_rect.center(),
+                        default_image_rect.center(),
                     );
                     if changed {
-                        self.maybe_rerender_pdf(self.analysis_zoom);
+                        self.fs_zoom = proposed_zoom;
+                        self.set_fs_pan_from_input(proposed_zoom, proposed_pan);
+                        self.maybe_rerender_pdf(self.fs_zoom);
                     }
-                } else if self.handle_panorama_wheel_if_active(ctx, wheel_y, ctrl_held) {
-                    // 360 度パノラマビュー: ホイールを FOV 調整に転用 (Ctrl 有無に関わらず)。
-                    crate::modifier_probe::record_modified_action(
-                        ctx,
-                        "FsWheelZoom",
-                        "panorama_fov",
-                    );
-                    // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
-                    // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
-                    // FOV 操作に振る。前後ナビは矢印キーで行う。
-                } else if !ctrl_held && continuous_active {
-                    let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
-                    self.scroll_vertical_reading_by(
-                        ctx,
-                        delta,
-                        crate::app::HistoryTrigger::UserChosen,
-                    );
                 } else {
-                    if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
-                        // 通常モード: Ctrl+ホイールでズーム。
-                        // 消しゴム / 隠蔽加工モード中は画像上の修飾なしホイールも
-                        // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
-                        // パネルスクロールを維持できる。
-                        crate::modifier_probe::record_modified_action(
-                            ctx,
-                            "FsWheelZoom",
-                            "edit_mode",
-                        );
-                        let mouse = ctx.input(|i| i.pointer.hover_pos());
-                        let mut proposed_zoom = self.fs_zoom;
-                        let mut proposed_pan = self.fs_pan;
-                        let changed = Self::apply_wheel_zoom(
-                            &mut proposed_zoom,
-                            &mut proposed_pan,
-                            wheel_y,
-                            mouse,
-                            default_image_rect.center(),
-                        );
-                        if changed {
-                            self.fs_zoom = proposed_zoom;
-                            self.set_fs_pan_from_input(proposed_zoom, proposed_pan);
-                            self.maybe_rerender_pdf(self.fs_zoom);
-                        }
-                    } else {
-                        let unmodified = !modifiers.shift && !modifiers.ctrl && !modifiers.alt;
-                        let normal_media_action = self
-                            .fullscreen_idx
-                            .filter(|idx| state.is_video || self.fs_music_view_active(*idx))
-                            .filter(|_| unmodified)
-                            .and_then(|_| {
-                                self.settings
-                                    .ring_shortcuts
-                                    .video_normal_wheel_action
-                                    .resolve(wheel_y)
-                            });
-                        match normal_media_action {
-                            Some(
-                                crate::ring_shortcut::VideoNormalWheelResolvedAction::NavigateDelta(
-                                    delta,
-                                ),
-                            ) => page_nav = self.spread_page_nav(delta),
-                            Some(
-                                crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(
+                    let unmodified = !modifiers.shift && !modifiers.ctrl && !modifiers.alt;
+                    let normal_media_action = self
+                        .fullscreen_idx
+                        .filter(|idx| {
+                            matches!(self.items.get(*idx), Some(GridItem::Video(_)))
+                                || self.fs_music_view_active(*idx)
+                        })
+                        .filter(|_| unmodified)
+                        .and_then(|_| {
+                            self.settings
+                                .ring_shortcuts
+                                .video_normal_wheel_action
+                                .resolve(wheel_y)
+                        });
+                    match normal_media_action {
+                        Some(
+                            crate::ring_shortcut::VideoNormalWheelResolvedAction::NavigateDelta(
+                                delta,
+                            ),
+                        ) => wheel_navigation = self.spread_page_nav(delta),
+                        Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(
+                            step,
+                        )) => {
+                            let new_volume = self.fullscreen_idx.and_then(|idx| {
+                                let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&idx)?
+                                else {
+                                    return None;
+                                };
+                                let value = crate::settings::step_video_volume_by_fader_key_step(
+                                    player.volume(),
                                     step,
-                                ),
-                            ) => {
-                                let new_volume = self.fullscreen_idx.and_then(|idx| {
-                                    let FsCacheEntry::Video { player, .. } =
-                                        self.fs_cache.get(&idx)?
-                                    else {
-                                        return None;
-                                    };
-                                    let value =
-                                        crate::settings::step_video_volume_by_fader_key_step(
-                                            player.volume(),
-                                            step,
-                                        );
-                                    player.set_volume(value);
-                                    Some(value)
-                                });
-                                if let Some(value) = new_volume {
-                                    self.settings.video_volume = value;
-                                    self.settings.save();
-                                }
+                                );
+                                player.set_volume(value);
+                                Some(value)
+                            });
+                            if let Some(value) = new_volume {
+                                self.settings.video_volume = value;
+                                self.settings.save();
                             }
-                            None => {
-                                let base = if wheel_y < 0.0 { 1 } else { -1 };
-                                page_nav = self.spread_page_nav(base);
-                                *navigation_operation =
-                                    self.page_turn_pointer_navigation_operation(ctx, "wheel");
-                            }
+                        }
+                        None => {
+                            let base = if wheel_y < 0.0 { 1 } else { -1 };
+                            wheel_navigation = self.spread_page_nav(base);
+                            *navigation_operation = wheel_action.operation;
                         }
                     }
                 }
             }
 
-            // ── クリック & ドラッグ ──
+            if !wheel_navigation.is_none() {
+                wheel_navigation_produced = true;
+                *navigation_operation = wheel_action.operation;
+                page_nav = wheel_navigation;
+                if !suppress_intermediate_navigation && wheel_actions.peek().is_some() {
+                    if let Some(from) = self.fullscreen_idx {
+                        self.handle_fs_navigation_with_operation(
+                            ctx,
+                            false,
+                            false,
+                            None,
+                            None,
+                            None,
+                            wheel_navigation,
+                            None,
+                            from,
+                            wheel_action.operation,
+                        );
+                    }
+                    page_nav = FsPageNav::None;
+                }
+            }
         }
 
-        let fs_response = ui.interact(
-            full_rect,
-            egui::Id::new("fs_click"),
-            egui::Sense::click_and_drag(),
-        );
-        let continuous_touch_delta = continuous_reading_response_drag_delta(
-            ctx,
-            &fs_response,
-            touch_activity
-                .then(|| continuous_reading_coalesced_touch_drag_total(ctx, &touch_frame))
-                .flatten(),
-            self.fullscreen_opened_at(),
-            self.frame_counter,
-            continuous_active && touch_activity,
-            pointer_primary_down,
-        );
-        // Keep the established mouse path byte-for-byte in meaning: while
-        // Response owns the drag, apply egui's per-frame pointer delta. Only
-        // a positively correlated touch stream needs cumulative accounting.
-        let continuous_pointer_delta = if touch_activity {
-            continuous_touch_delta
-        } else {
-            ctx.input(|input| input.pointer.delta())
-        };
-        if touch_input_enabled && touch_frame.should_suppress_response(&fs_response) {
-            // Positive raw-event correlation is required before the
-            // recognizer may suppress this response. This is terminal-frame
-            // evidence, not a new cross-frame owner.
-            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
-        }
-        // ── フォーカス復帰クリック / touch replacement の抑制 ──
         if primary_suppression.suppresses_current_frame() {
             // フォーカス復帰クリック: 左ボタン経由の分岐をすべてスキップ。
             // 右クリック処理 (下の secondary ブロック) は別系統なので走らせる
@@ -38392,122 +38862,26 @@ impl App {
             }
 
             // ダブルクリック → ズーム/パン/回転リセット
-            let has_transform = self.fs_zoom > ZOOM_NEAR_ONE
-                || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
-                || self.fs_pan.length_sq() > PAN_EPSILON_SQ;
-            // ダブルクリックでの復帰は `has_transform` のままなので、動かした位置からは
-            // これまでどおり戻せる。クリックの判定だけがパンを見ない。
-            let click_belongs_to_view =
-                fullscreen_click_belongs_to_view(self.fs_zoom, self.fs_free_rotation);
-            if fs_response.double_clicked() && has_transform {
-                self.fs_zoom = 1.0;
-                self.fs_pan = egui::Vec2::ZERO;
-                self.fs_free_rotation = 0.0;
-                self.maybe_rerender_pdf(1.0);
-            } else if !click_belongs_to_view && self.fs_context_menu_idx.is_none() {
-                // 変形なし: 従来の動画/画像クリック動作（コンテキストメニュー表示中は無効）
-                let was_dragging = fs_response.dragged() && fs_response.drag_delta().length() > 3.0;
-                if !was_dragging {
-                    if state.is_video {
-                        // 動画: クリックで再生/一時停止トグル (一般的な動画プレイヤー慣例)。
-                        // 外部プレイヤーで開きたい場合は Shift+Enter。
-                        // ただし下部 HUD バーの矩形内のクリックは play/pause / シーク /
-                        // 音量等のウィジェット側で処理させたいので除外する。
-                        // Phase 5.4 追加: 左ジャンプパネル / 右メタ情報パネルの上で
-                        // クリックしたら toggle_play しない (Codex P5.4 M1 反映)。
-                        // Phase 5.5 追加: タイルモード中はオーバーレイのタイルクリック
-                        // で seek + close を行うため、background catch-all は完全抑止
-                        // (Codex P5.5 H1 反映)。
-                        #[cfg(windows)]
-                        let tile_active = self.video_tile_mode_active;
-                        #[cfg(not(windows))]
-                        let tile_active = false;
-                        let pos_opt = fs_response.interact_pointer_pos();
-                        // 旧 egui HUD は撤去済 (native presenter overlay が代替)。
-                        // egui main window 側で intercept すべき HUD 矩形は無いので常に false。
-                        let in_hud = false;
-                        let in_video_panel = pos_opt
-                            .map(|p| {
-                                let left_thresh = full_rect.min.x + full_rect.width() * 0.25;
-                                let right_thresh = full_rect.max.x - full_rect.width() * 0.25;
-                                (p.x < left_thresh || p.x > right_thresh)
-                                    && p.y >= full_rect.min.y + 44.0
-                            })
-                            .unwrap_or(false);
-                        if fs_response.clicked()
-                            && !tile_active
-                            && !in_hud
-                            && !in_video_panel
-                            && let Some(idx) = self.fullscreen_idx
-                            && let Some(p) = self.fs_video_player(idx)
-                        {
-                            p.toggle_play();
-                        }
-                    } else if fs_response.clicked() {
-                        // ポップアップ表示中はクリックでのページ送りを抑制
-                        // The overflow panel goes away on the click that lands outside it, and
-                        // that click is spent doing so rather than also turning the page - the
-                        // same bargain the other top-bar popups make.
-                        let overflow_panel_dismissed = self.fs_overflow_panel_state.is_open();
-                        if overflow_panel_dismissed {
-                            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
-                        }
-                        let any_popup = self.spread_popup_open
-                            || self.fit_popup_open
-                            || self.slideshow_popup_open
-                            || self.panorama_projection_popup_open
-                            || overflow_panel_dismissed
-                            || fs_rotation_popup_open(ctx)
-                            || fs_still_seek_strip_popup_open(ctx);
-                        if !any_popup {
-                            if let Some(pos) = fs_response.interact_pointer_pos() {
-                                let has_right_panel = self.metadata_panel_click_shown()
-                                    || self.fs_info_panel.hover_active
-                                    || self.fullscreen_tag_picker_open;
-                                let in_side_panel =
-                                    fullscreen_side_panel_contains_pointer_with_seek_height(
-                                        full_rect,
-                                        pos,
-                                        side_panel_chrome_enabled,
-                                        self.settings.fullscreen_side_panel_mode,
-                                        has_right_panel,
-                                        self.adjustment_mode.is_open(),
-                                        navigator_exclusion,
-                                        seek_geometry.total_height,
-                                    );
-                                let in_seek_panel =
-                                    seek_panel_interactive && seek_panel_rect.contains(pos);
-                                // Mouse clicks stay suppressed in continuous reading. The wheel is
-                                // the natural continuous-scroll input for a mouse, and preserving
-                                // this guard also prevents a stray click in a transient untransformed
-                                // frame from jumping pages. A recognizer-confirmed touch tap is
-                                // intentional rather than incidental, so PageSide is deliberately
-                                // dispatched above even in continuous reading (touch/mouse parity is
-                                // not required here; see touch-support-plan §5.14-11).
-                                // 表示モードがキャンバスを持っているときは、クリックは
-                                // そのモードの操作。ページ送りへ流さない。
-                                let display_mode_owns_canvas = fs_display_mode_owns_canvas(
-                                    self.fullscreen_idx
-                                        .is_some_and(|idx| self.is_panorama_mode_active(idx)),
-                                    self.analysis_mode,
-                                );
-                                if !in_side_panel
-                                    && !in_seek_panel
-                                    && !continuous_active
-                                    && !display_mode_owns_canvas
-                                {
-                                    let base = fullscreen_click_nav_base_delta(
-                                        pos.x,
-                                        full_rect.center().x,
-                                        self.spread_mode.advances_right_to_left(),
-                                    );
-                                    page_nav = self.spread_page_nav(base);
-                                    *navigation_operation =
-                                        self.page_turn_pointer_navigation_operation(ctx, "pointer");
-                                }
-                            }
-                        }
+            match canvas_click {
+                FsCanvasClickAction::None => {}
+                FsCanvasClickAction::ResetTransform => {
+                    self.fs_zoom = 1.0;
+                    self.fs_pan = egui::Vec2::ZERO;
+                    self.fs_free_rotation = 0.0;
+                    self.maybe_rerender_pdf(1.0);
+                }
+                FsCanvasClickAction::ToggleVideo(idx) => {
+                    if let Some(player) = self.fs_video_player(idx) {
+                        player.toggle_play();
                     }
+                }
+                FsCanvasClickAction::DismissOverflow => {
+                    self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                }
+                FsCanvasClickAction::PageSide(base) => {
+                    page_nav = self.spread_page_nav(base);
+                    *navigation_operation =
+                        self.page_turn_pointer_navigation_operation(ctx, "pointer");
                 }
             }
         }
@@ -38532,13 +38906,180 @@ impl App {
         // must run this egui block instead — otherwise right-click (close) and the right-drag
         // ring shortcut do nothing (実機 FB 2026-07). The context is `current_right_drag_context()`
         // = VideoFullscreen (item is Video), so it shows the video ring, not the image ring.
+        match self.apply_fs_secondary_input(ctx, secondary_action) {
+            FsSecondaryInputOutcome::Continue => {}
+            FsSecondaryInputOutcome::CloseRequested => close = true,
+            FsSecondaryInputOutcome::ViewerReplaced => {
+                // A live return can retain this page until main consumes it.
+                // It still ends this input owner's navigation, just like a
+                // completed viewer or replaced destination/items.
+                page_nav = FsPageNav::None;
+                *navigation_operation = None;
+            }
+        }
+
+        FsWheelFrameResult {
+            page_nav,
+            close,
+            wheel_navigation_produced,
+            deferred: None,
+        }
+    }
+
+    fn propose_fs_wheel_click_transform(
+        &self,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        actions: &[FsWheelAction],
+    ) -> (f32, egui::Vec2) {
+        let mut zoom = self.fs_zoom;
+        let mut pan = self.fs_pan;
+        let ordinary_zoom = !self.fs_zoom_mode_engaged()
+            && !self.analysis_mode
+            && !self
+                .fullscreen_idx
+                .is_some_and(|idx| self.is_panorama_mode_active(idx));
+        if ordinary_zoom {
+            let mouse = ctx.input(|input| input.pointer.hover_pos());
+            for action in actions {
+                if action.input.modifiers.ctrl
+                    && self
+                        .fullscreen_idx
+                        .is_some_and(|idx| self.fs_music_view_active(idx))
+                {
+                    continue;
+                }
+                if should_zoom_fullscreen_wheel(
+                    action.input.modifiers.ctrl,
+                    self.is_overlay_edit_mode_active(),
+                ) && Self::apply_wheel_zoom(
+                    &mut zoom,
+                    &mut pan,
+                    action.input.delta.y,
+                    mouse,
+                    image_rect.center(),
+                ) {
+                    pan = clamp_fullscreen_pan_from_layout(&self.fullscreen_page_layout, zoom, pan);
+                }
+            }
+        }
+        (zoom, pan)
+    }
+
+    fn plan_fs_canvas_click(
+        &self,
+        _ctx: &egui::Context,
+        response: &egui::Response,
+        full_rect: egui::Rect,
+        seek_geometry: StillSeekGeometry,
+        is_video: bool,
+        primary_suppressed: bool,
+        continuous_active: bool,
+        side_panel_chrome_enabled: bool,
+        navigator_exclusion: Option<egui::Rect>,
+        seek_panel_interactive: bool,
+        zoom: f32,
+        pan: egui::Vec2,
+    ) -> FsCanvasClickAction {
+        if primary_suppressed
+            || self.is_overlay_edit_mode_active()
+            || self.analysis_mode
+            || self
+                .fullscreen_idx
+                .is_some_and(|idx| self.is_panorama_mode_active(idx))
+        {
+            return FsCanvasClickAction::None;
+        }
+        let has_transform = zoom > ZOOM_NEAR_ONE
+            || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
+            || pan.length_sq() > PAN_EPSILON_SQ;
+        if response.double_clicked() && has_transform {
+            return FsCanvasClickAction::ResetTransform;
+        }
+        if fullscreen_click_belongs_to_view(zoom, self.fs_free_rotation)
+            || self.fs_context_menu_idx.is_some()
+            || (response.dragged() && response.drag_delta().length() > 3.0)
+            || !response.clicked()
+        {
+            return FsCanvasClickAction::None;
+        }
+        if is_video {
+            #[cfg(windows)]
+            let tile_active = self.video_tile_mode_active;
+            #[cfg(not(windows))]
+            let tile_active = false;
+            let in_video_panel = response.interact_pointer_pos().is_some_and(|pos| {
+                (pos.x < full_rect.min.x + full_rect.width() * 0.25
+                    || pos.x > full_rect.max.x - full_rect.width() * 0.25)
+                    && pos.y >= full_rect.min.y + 44.0
+            });
+            return if !tile_active && !in_video_panel {
+                self.fullscreen_idx
+                    .map(FsCanvasClickAction::ToggleVideo)
+                    .unwrap_or(FsCanvasClickAction::None)
+            } else {
+                FsCanvasClickAction::None
+            };
+        }
+        if self.fs_overflow_panel_state.is_open() {
+            return FsCanvasClickAction::DismissOverflow;
+        }
+        if self.spread_popup_open
+            || self.fit_popup_open
+            || self.slideshow_popup_open
+            || self.panorama_projection_popup_open
+            || fs_rotation_popup_open(_ctx)
+            || fs_still_seek_strip_popup_open(_ctx)
+            || continuous_active
+        {
+            return FsCanvasClickAction::None;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return FsCanvasClickAction::None;
+        };
+        let has_right_panel = self.metadata_panel_click_shown()
+            || self.fs_info_panel.hover_active
+            || self.fullscreen_tag_picker_open;
+        let in_side_panel = fullscreen_side_panel_contains_pointer_with_seek_height(
+            full_rect,
+            pos,
+            side_panel_chrome_enabled,
+            self.settings.fullscreen_side_panel_mode,
+            has_right_panel,
+            self.adjustment_mode.is_open(),
+            navigator_exclusion,
+            seek_geometry.total_height,
+        );
+        if in_side_panel
+            || (seek_panel_interactive && seek_geometry.panel_rect(full_rect).contains(pos))
+        {
+            FsCanvasClickAction::None
+        } else {
+            FsCanvasClickAction::PageSide(fullscreen_click_nav_base_delta(
+                pos.x,
+                full_rect.center().x,
+                self.spread_mode.advances_right_to_left(),
+            ))
+        }
+    }
+
+    fn recognize_fs_secondary_input(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        is_video: bool,
+        top_bar_visible: bool,
+        seek_panel_rect: egui::Rect,
+        seek_panel_interactive: bool,
+        prev_foreground_hwnd: usize,
+    ) -> FsSecondaryAction {
         let dialog_open_for_right_drag = self.any_dialog_open();
         if dialog_open_for_right_drag {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
             self.fs_secondary_press.cancel();
         }
-        let video_in_audio_mode = state.is_video
+        let video_in_audio_mode = is_video
             && self
                 .fullscreen_idx
                 .is_some_and(|idx| self.fs_music_view_active(idx));
@@ -38573,7 +39114,7 @@ impl App {
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
             || fs_still_seek_strip_popup_open(ctx);
-        let right_drag_gate_reject = if state.is_video && !video_in_audio_mode {
+        let right_drag_gate_reject = if is_video && !video_in_audio_mode {
             Some("native_video")
         } else if self.analysis_mode {
             Some("analysis")
@@ -38674,7 +39215,7 @@ impl App {
                     self.active_detached_window_id(),
                     self.active_detached_window_state(),
                     self.active_detached_session,
-                    state.is_video,
+                    is_video,
                     video_in_audio_mode,
                     self.analysis_mode,
                     dialog_open_for_right_drag,
@@ -38698,7 +39239,7 @@ impl App {
                 ));
             }
         }
-        if (!state.is_video || video_in_audio_mode)
+        if (!is_video || video_in_audio_mode)
             && !self.analysis_mode
             && !dialog_open_for_right_drag
             && self.fs_context_menu_idx.is_none()
@@ -38712,7 +39253,7 @@ impl App {
             match right_drag_mode {
                 crate::ring_shortcut::RightDragMode::RingShortcut => {
                     let Some(ring_context) = right_drag_context.ring_context() else {
-                        return (page_nav, close);
+                        return FsSecondaryAction::None;
                     };
                     if secondary_in_overlay_chrome {
                         self.cancel_mouse_ring_flick();
@@ -38725,25 +39266,19 @@ impl App {
                             None,
                         );
                     }
-                    match self.update_mouse_ring_flick_with_pos(
+                    let recognition = self.recognize_mouse_ring_flick_with_pos(
                         ctx,
                         crate::ring_shortcut::RightDragOwner::Root,
                         ring_context,
                         secondary_pos,
                         secondary_down,
                         secondary_released,
-                    ) {
-                        crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                            close |= self.apply_viewer_short_right_click_action(
-                                right_drag_context,
-                                self.fullscreen_idx,
-                                secondary_pos,
-                            );
-                        }
-                        crate::ring_shortcut::MouseFlickOutcome::Fired
-                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
-                        | crate::ring_shortcut::MouseFlickOutcome::None => {}
-                    }
+                    );
+                    return FsSecondaryAction::Recognized {
+                        context: right_drag_context,
+                        pos: secondary_pos,
+                        recognition,
+                    };
                 }
                 crate::ring_shortcut::RightDragMode::MouseGesture => {
                     if secondary_in_overlay_chrome {
@@ -38757,42 +39292,34 @@ impl App {
                             None,
                         );
                     }
-                    match self.update_mouse_gesture_with_pos(
+                    let recognition = self.recognize_mouse_gesture_with_pos(
                         ctx,
                         crate::ring_shortcut::RightDragOwner::Root,
                         right_drag_context,
                         secondary_pos,
                         secondary_down,
                         secondary_released,
-                    ) {
-                        crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                            close |= self.apply_viewer_short_right_click_action(
-                                right_drag_context,
-                                self.fullscreen_idx,
-                                secondary_pos,
-                            );
-                        }
-                        crate::ring_shortcut::MouseFlickOutcome::Fired
-                        | crate::ring_shortcut::MouseFlickOutcome::Cancelled
-                        | crate::ring_shortcut::MouseFlickOutcome::None => {}
-                    }
+                    );
+                    return FsSecondaryAction::Recognized {
+                        context: right_drag_context,
+                        pos: secondary_pos,
+                        recognition,
+                    };
                 }
                 crate::ring_shortcut::RightDragMode::Disabled
                 | crate::ring_shortcut::RightDragMode::Unknown(_) => {
                     if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
-                        return (page_nav, close);
+                        return FsSecondaryAction::None;
                     }
                     match passive_press_outcome {
                         FullscreenSecondaryPressOutcome::ShortTap(pos) => {
-                            close |= self.apply_viewer_short_right_click_action(
-                                right_drag_context,
-                                self.fullscreen_idx,
+                            return FsSecondaryAction::ShortTap {
+                                context: right_drag_context,
                                 pos,
-                            );
+                            };
                         }
                         FullscreenSecondaryPressOutcome::LongPress(pos) => {
-                            self.fs_context_menu_idx = self.fullscreen_idx;
-                            self.fs_context_menu_pos = pos;
+                            return FsSecondaryAction::LongPress(pos);
                         }
                         FullscreenSecondaryPressOutcome::Cancelled
                         | FullscreenSecondaryPressOutcome::None => {}
@@ -38801,7 +39328,60 @@ impl App {
             }
         }
 
-        (page_nav, close)
+        FsSecondaryAction::None
+    }
+
+    fn apply_fs_secondary_input(
+        &mut self,
+        ctx: &egui::Context,
+        action: FsSecondaryAction,
+    ) -> FsSecondaryInputOutcome {
+        let short_click_outcome = |close| {
+            if close {
+                FsSecondaryInputOutcome::CloseRequested
+            } else {
+                FsSecondaryInputOutcome::Continue
+            }
+        };
+        match action {
+            FsSecondaryAction::None => FsSecondaryInputOutcome::Continue,
+            FsSecondaryAction::LongPress(pos) => {
+                self.fs_context_menu_idx = self.fullscreen_idx;
+                self.fs_context_menu_pos = pos;
+                FsSecondaryInputOutcome::Continue
+            }
+            FsSecondaryAction::ShortTap { context, pos } => short_click_outcome(
+                self.apply_viewer_short_right_click_action(context, self.fullscreen_idx, pos),
+            ),
+            FsSecondaryAction::Recognized {
+                context,
+                pos,
+                recognition,
+            } => {
+                if let Some(command) = recognition.command {
+                    let destination = self.page_turn_destination();
+                    let items = self.items_generation;
+                    if let Some(nav) = self.execute_right_drag_command(ctx, command) {
+                        self.mouse_ring_nav = Some(nav);
+                    }
+                    if self.pending_return_to_parent.is_pending()
+                        || self.fullscreen_idx.is_none()
+                        || self.page_turn_destination() != destination
+                        || self.items_generation != items
+                    {
+                        return FsSecondaryInputOutcome::ViewerReplaced;
+                    }
+                }
+                short_click_outcome(
+                    recognition.outcome == crate::ring_shortcut::MouseFlickOutcome::ShortTap
+                        && self.apply_viewer_short_right_click_action(
+                            context,
+                            self.fullscreen_idx,
+                            pos,
+                        ),
+                )
+            }
+        }
     }
 
     /// Apply the configurable short right-click action only after the caller's
@@ -38933,15 +39513,22 @@ impl App {
         }
     }
 
-    /// 既存の手動停止と remote session lock が共有する停止入口。
-    /// 表示位置と fullscreen/window 構成は保持し、タイマーだけを止める。
-    pub(crate) fn stop_slideshow_playback(&mut self) -> bool {
+    /// 投影中の viewer に属する自動ナビゲーションとタイマーを止める。
+    /// App 全体の popup 状態は変更しない。
+    pub(crate) fn stop_projected_slideshow_playback(&mut self) -> bool {
         self.cancel_collection_slideshow_navigation_intent();
         let was_playing = self.slideshow_playing;
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
+        was_playing
+    }
+
+    /// 既存の手動停止と remote session lock が共有する停止入口。
+    /// 表示位置と fullscreen/window 構成は保持し、popup も閉じる。
+    pub(crate) fn stop_slideshow_playback(&mut self) -> bool {
+        let was_playing = self.stop_projected_slideshow_playback();
         self.slideshow_popup_open = false;
         was_playing
     }
@@ -54832,12 +55419,12 @@ impl App {
             || self.music_normalize_modal_active(fs_idx)
     }
 
-    fn handle_music_timeline_ctrl_wheel_after_hud(
-        &mut self,
+    fn music_timeline_ctrl_wheel_allowed(
+        &self,
         ctx: &egui::Context,
         fs_idx: usize,
         key_gate_reached: bool,
-    ) {
+    ) -> bool {
         if !key_gate_reached
             || crate::keyboard_input::keyboard_input_permits(ctx)
                 .discrete
@@ -54847,6 +55434,29 @@ impl App {
             || self.fs_context_menu_idx.is_some()
             || self.music_fullscreen_editor_or_modal_blocks_input(ctx, fs_idx)
         {
+            return false;
+        }
+        true
+    }
+
+    fn apply_music_timeline_ctrl_wheel_delta(&mut self, wheel_y: f32) {
+        let delta = if wheel_y > 0.0 { -1 } else { 1 };
+        let new_secs = crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
+        if self.set_music_timeline_row_secs_from_input(new_secs) {
+            self.show_feedback_toast(format!(
+                "Row {}",
+                crate::ui_music_timeline::format_row_secs(new_secs)
+            ));
+        }
+    }
+
+    fn handle_music_timeline_ctrl_wheel_after_hud(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        key_gate_reached: bool,
+    ) {
+        if !self.music_timeline_ctrl_wheel_allowed(ctx, fs_idx, key_gate_reached) {
             return;
         }
         // The HUD popups have consumed their wheel events by this point. Wheel up
@@ -54858,15 +55468,7 @@ impl App {
             if !wheel.modifiers.ctrl || wheel.delta.y.abs() <= 0.5 {
                 continue;
             }
-            let delta = if wheel.delta.y > 0.0 { -1 } else { 1 };
-            let new_secs =
-                crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
-            if self.set_music_timeline_row_secs_from_input(new_secs) {
-                self.show_feedback_toast(format!(
-                    "Row {}",
-                    crate::ui_music_timeline::format_row_secs(new_secs)
-                ));
-            }
+            self.apply_music_timeline_ctrl_wheel_delta(wheel.delta.y);
         }
         crate::wheel_input::consume_remaining_wheel_inputs(ctx, |wheel| {
             wheel.modifiers.ctrl && wheel.delta.y.abs() > 0.5
@@ -62674,10 +63276,17 @@ mod tests {
         let duration = app.settings.page_turn_animation_duration_ms;
         for enabled in [true, false] {
             {
+                let mut fonts_ready = false;
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(800.0, 600.0))
                     .build_ui(|root_ui| {
                         let ctx = &root_ui.ctx().clone();
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
                         egui::CentralPanel::default().show(root_ui, |ui| {
                             app.draw_fs_overflow_panel(ui, ctx, ui.max_rect(), false);
                         });
@@ -87856,10 +88465,14 @@ mod specified_scale_consumer_tests {
                     data.get_temp::<egui::Rect>(egui::Id::new("specified_scale_max_response"))
                 })
                 .unwrap();
-            assert!(
-                painted_label(&output, "5.0 倍").is_some(),
-                "cap editor is actually visible"
-            );
+            // DragValue paints its numeric and suffix atoms separately in 0.37.
+            for text in ["5.0", " 倍"] {
+                let painted = painted_label(&output, text).expect("cap editor is actually visible");
+                assert!(
+                    cap.contains_rect(painted),
+                    "cap value and unit are inside the real editor"
+                );
+            }
             let press = cap.center();
             draw(
                 &mut app,
@@ -89042,6 +89655,7 @@ mod specified_scale_consumer_tests {
         with_ime: bool,
     ) {
         let ctx = egui::Context::default();
+        ctx.enable_accesskit();
         install_fs_navigator_input_tracking(&ctx);
         crate::ime_focus::install_ime_input_policy(&ctx);
         let mut app = pdf_app(&ctx, 1);
@@ -89099,20 +89713,37 @@ mod specified_scale_consumer_tests {
         let number = painted_label(&output, "80.0").expect("real popup numeric control is visible");
         assert!(rect.contains_rect(number));
         draw(&mut app, click(number.center()));
-        draw(&mut app, vec![]);
+        output = draw(&mut app, vec![]);
         let edit_id = ctx
             .memory(|memory| memory.focused())
             .expect("click starts numeric editing");
         assert!(ctx.egui_wants_keyboard_input());
         assert!(egui::TextEdit::load_state(&ctx, edit_id).is_some());
+        // DragValue retains a private EditState in 0.37. Read the real focused
+        // TextEdit's public value, including empty/preedit text, rather than
+        // assuming its old temp<String> representation.
+        let numeric_text = |output: &egui::FullOutput| {
+            output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("real popup accessibility output")
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == edit_id.accesskit_id())
+                .expect("focused real numeric TextEdit")
+                .1
+                .value()
+                .map(str::to_owned)
+        };
         assert_eq!(
-            ctx.data(|data| data.get_temp::<String>(edit_id)),
+            numeric_text(&output),
             Some("80.0".to_owned()),
             "focus must belong to the real DragValue text buffer"
         );
         let before = app.settings.common_fullscreen_specified_scale();
         if with_ime {
-            draw(
+            output = draw(
                 &mut app,
                 vec![
                     egui::Event::Ime(egui::ImeEvent::Enabled),
@@ -89124,7 +89755,7 @@ mod specified_scale_consumer_tests {
             );
             assert!(app.ime_input_active(&ctx));
             assert_eq!(
-                ctx.data(|data| data.get_temp::<String>(edit_id)),
+                numeric_text(&output),
                 Some("１２５".to_owned()),
                 "the numeric TextEdit must receive real IME preedit"
             );
@@ -89156,7 +89787,7 @@ mod specified_scale_consumer_tests {
         if same_pass {
             end_events.push(key_event(true));
         }
-        draw(&mut app, end_events);
+        output = draw(&mut app, end_events);
         assert!(!app.ime_input_active(&ctx));
         assert_eq!(
             app.fullscreen_idx,
@@ -89174,7 +89805,7 @@ mod specified_scale_consumer_tests {
                 "IME end without an ordinary press keeps numeric editing"
             );
             assert_eq!(
-                ctx.data(|data| data.get_temp::<String>(edit_id)),
+                numeric_text(&output),
                 Some(
                     if !with_ime {
                         "80.0"

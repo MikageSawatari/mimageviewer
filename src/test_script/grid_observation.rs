@@ -124,6 +124,10 @@ mod tests {
                     let ctx = &ui.ctx().clone();
                     egui::CentralPanel::default().show(ui, |ui| {
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .vertical_scroll_offset(offset)
                             .show_viewport(ui, |ui, viewport| {
                                 let (content, _) = ui.allocate_exact_size(

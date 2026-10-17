@@ -422,10 +422,10 @@ fn run_root_app_update(
     frame: &mut eframe::Frame,
     input: egui::RawInput,
 ) -> egui::FullOutput {
-    ctx.run_pass(input, |ctx| {
+    crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
         <App as eframe::App>::logic(app, ctx, frame);
         ctx.root_ui(|ui| <App as eframe::App>::ui(app, ui, frame));
-    })
+    }))
 }
 
 #[cfg(windows)]

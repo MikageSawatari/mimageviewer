@@ -51,6 +51,25 @@ impl PageTurnPresentation {
 }
 
 impl App {
+    pub(crate) fn page_turn_wheel_navigation_operation(
+        &self,
+        ctx: &egui::Context,
+        raw_ordinal: Option<u32>,
+    ) -> Option<ViewerOperationId> {
+        let ordinal = raw_ordinal?;
+        self.page_turn_presentation
+            .transaction
+            .facts
+            .iter()
+            .find(|fact| {
+                fact.destination == self.page_turn_destination()
+                    && fact.source == ctx.viewport_id()
+                    && fact.cause == "wheel"
+                    && matches!(fact.operation_id, ViewerOperationId::Pointer { ordinal: actual, .. } if actual == ordinal)
+            })
+            .map(|fact| fact.operation_id)
+    }
+
     pub(crate) fn page_turn_pointer_navigation_operation(
         &self,
         ctx: &egui::Context,

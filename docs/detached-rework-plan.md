@@ -5634,3 +5634,37 @@ vendor退役はegui14・eframe両backend各10、最小化Fullはwgpu9・glow11�
 deltaは既存shared TextureManagerへ戻す案も検討したが、現epaint APIにはmetadata非変更の返却がなく、
 限定API追加・年代順合流・出力hook観測の契約が必要であることを双方がsourceで確認した。
 新callback案だけを必須の結論とせず、いずれの新経路も設計判断前には実装していない。
+
+#### 2026-10-17 段3再開・第4.6版の実装記録
+
+第4.6版（97ab24ae1）と独立設計ACCEPT・双方の構造合意（5c1584d8a）を受けて実装を再開した。
+上のClose帰還・delta配送の設計待ちはこの改訂で解決済みであり、過去の停止記録は残す。
+
+既存帰還boolを型付き状態へ置き換え、teardown前に既存bookmark／main navigationのidentityと所有値を捕捉し、
+存続するmainの既存navigation帰還ownerへ移す。active／standalone／parkedの真Closeを同じ帰還生成へ接続し、
+表示採用は既存main UI consumerへ残す。Remote・新navigation・新bookmarkは受付で旧ownerを失効し、
+型付きcauseによって置換／取得／App終了から通常Close帰還を生成しない。Closing／bindingの延命はしない。
+
+deltaは候補(a)を採用した。実discard再pass直前にContext一致のTLS RAII scopeを通し、
+生成済みdeltaを既存backend共有renderer ownerへ一度だけ移譲する。
+Weakとlock外callback、既存pendingの非相殺受入、描画なしのresource消費によって、
+旧set／partial→submission→後発freeを完結させる。epaint変更、第二queue、cleanup遅延、追加repaintは行わない。
+
+分野別ファイル・判断、限定独立レビューと実コマンド結果、Close／deltaそれぞれの必須回帰対応は
+[段3台帳](egui-0.37-stage3-verification.md)へ追記する。**実装担当の内部確認**を独立ACCEPTと読み替えない。
+
+初期media resolver取消では、既存Preparing sessionにまだ表示itemがなくても、exact leaseがClose用に保持したDetached bookmark targetを失ってはならない。
+第4.6版の共通transfer捕捉点で、既存Preparing・projected window・window/context bindingの同一ownerを確認してこの所有値を捕捉する。
+Ready時の実media照合、main origin/request/置換による失効は維持し、Ready空状態・別context Preparingを拒む回帰を追加した。
+これはteardown前の同じ帰還ownerの取りこぼしの補修であり、新しいqueue、pending状態、寿命延長ではない。
+分野別の限定独立source確認と正式実行の結果は台帳に分けて残す。
+
+段3の実装担当による最終内部確認では、core/test-script/workspace（利用者指定のlauncher除外）/全target check、
+本体全23 test executableとsnapshot2 targetのno-runが成功した。
+continuation47、root lifecycle11、context-state8、Close13、混在wheel19、App退役10が成功。
+正式vendorではegui退役14、eframe退役はwgpu/glow各12、minimized Fullは9/11、
+discard deltaはegui4・eframe各2・実GPU readback2が成功した。
+lib全件は最後に1回実行し、13,481件中13,132成功・290失敗・既存skip59。
+失敗はその後の限定検証で移行不備179を解消、PNG比較102と段4のlayout/挙動差9へ分類し、残る段3契約違反は0とした。
+PNG更新・ignore追加・製品build/launch・live・`test-full.ps1`は行っていない。
+全件の最終ソース再実行や設計担当の最終ACCEPTとは区別し、選択数・exit code・例外と残課題の詳細は段3台帳を正本とする。

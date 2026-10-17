@@ -4309,6 +4309,7 @@ mod tests {
         let mut state = preferences_state_for_test(&live);
         state.selected = PreferencesPage::FileTypeVisibility;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(700.0, 650.0))
             .build_ui_state(
                 |root_ui, state| {
@@ -4370,6 +4371,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -4432,6 +4434,7 @@ mod tests {
         let old = app.settings.details_name_colors.clone();
         app.open_preferences_page(PreferencesPage::General);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -4574,6 +4577,7 @@ mod tests {
             }
             app.open_preferences_page(PreferencesPage::RawDevelop);
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_ui_state(
                     |root_ui, app| {
@@ -5017,6 +5021,7 @@ mod tests {
 
         app.open_preferences_page(PreferencesPage::Folder);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -6042,6 +6047,7 @@ mod tests {
         state.selected = PreferencesPage::ContextMenuLayout;
         let expected = serde_json::to_value(&state.settings).unwrap();
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(700.0, 520.0))
             .build_ui_state(
                 |root_ui, state| {
@@ -6433,13 +6439,10 @@ mod tests {
 
     fn video_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
         let mut settings = crate::settings::Settings::default();
-        let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder().with_size(size).build_ui(|ui| {
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ui.ctx());
-                fonts_ready = true;
-            }
-            ui.ctx().root_ui(|root_ui| {
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(size)
+            .build_ui(|root_ui| {
                 egui::CentralPanel::default().show(root_ui, |ui| {
                     egui::ScrollArea::vertical()
                         .scroll_source(egui::scroll_area::ScrollSource {
@@ -6452,9 +6455,8 @@ mod tests {
                             draw_video_seek_strip_height_settings(ui, &mut settings);
                             draw_video_seek_preview_size_settings(ui, &mut settings);
                         });
-                })
+                });
             });
-        });
         harness.run();
         harness.snapshot(name);
     }
@@ -6526,6 +6528,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_page(PreferencesPage::Cache);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -6554,6 +6557,7 @@ mod tests {
             .collect();
         app.open_preferences_page(page);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -7275,6 +7279,7 @@ mod tests {
             .collect();
         app.open_preferences_page(PreferencesPage::Vst3);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -7474,6 +7479,7 @@ mod tests {
         app.settings.preferences_restore_position = false;
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -7583,6 +7589,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -7745,6 +7752,7 @@ mod tests {
         };
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 900.0))
             .build_ui_state(
                 |root_ui, (app, saved_ctx)| {
@@ -7756,7 +7764,7 @@ mod tests {
             );
         harness.run();
         let before_y = harness.state().0.preferences_view_position.scroll_y;
-        let window_id = egui::Id::new("環境設定");
+        let window_id = egui::Id::unique(Some("環境設定"));
         let before_rect = harness
             .state()
             .1
@@ -7819,6 +7827,7 @@ mod tests {
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Thumbnail;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(600.0, 2400.0))
             .build_ui_state(
                 |root_ui, state| {
@@ -7859,6 +7868,7 @@ mod tests {
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Parallelism;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(600.0, 400.0))
             .build_ui_state(
                 |root_ui, state| {
@@ -8245,6 +8255,7 @@ mod tests {
                 "spread/specified-scale",
             ));
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_ui_state(
                     |root_ui, app| {
@@ -8393,6 +8404,7 @@ mod tests {
             "video/effetune-input-limit",
         ));
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -8482,6 +8494,7 @@ mod tests {
             "video/effetune-auto-open",
         ));
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -8568,6 +8581,7 @@ mod tests {
             "video/effetune-taskbar",
         ));
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -8669,6 +8683,7 @@ mod tests {
         let app = crate::app::App::new_from_settings(app.settings.clone());
         assert!(app.effetune.keep_visible_when_minimized());
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -8741,6 +8756,7 @@ mod tests {
 
         app.open_preferences_page(PreferencesPage::Cache);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -8847,6 +8863,7 @@ mod tests {
         app.open_preferences_page(PreferencesPage::Cache);
 
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -8924,6 +8941,7 @@ mod tests {
 
             app.open_preferences_page(PreferencesPage::Cache);
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_ui_state(
                     |root_ui, app| {
@@ -8964,6 +8982,7 @@ mod tests {
         let mut state = preferences_state_for_test(&crate::settings::Settings::default());
         state.selected = PreferencesPage::Cache;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(760.0, 950.0))
             .build_ui_state(
                 |root_ui, state| {
@@ -9046,6 +9065,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_page(PreferencesPage::ClipboardCapture);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {

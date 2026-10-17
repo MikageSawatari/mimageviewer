@@ -320,14 +320,12 @@ pub fn render_file_organize_contents(
                     .max_height(height)
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, false]);
+                let scroll_id = ui.make_persistent_id(egui::IdSalt::new("organize_destinations"));
                 if let Some(row) = reveal_row {
-                    let offset = egui::scroll_area::State::load(
-                        ui.ctx(),
-                        ui.make_persistent_id(egui::Id::new("organize_destinations")),
-                    )
-                    .unwrap_or_default()
-                    .clamped_offset()
-                    .y;
+                    let offset = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+                        .unwrap_or_default()
+                        .clamped_offset()
+                        .y;
                     let top = row as f32 * (row_height + spacing.y);
                     // Set the nearest visible offset before show_rows chooses
                     // which rows to draw, including an offscreen selection.
@@ -335,7 +333,7 @@ pub fn render_file_organize_contents(
                         offset.clamp((top + row_height - height).max(0.0), top),
                     );
                 }
-                scroll.show_rows(ui, row_height, destinations.len(), |ui, rows| {
+                let _output = scroll.show_rows(ui, row_height, destinations.len(), |ui, rows| {
                     for row in rows {
                         let destination = &destinations[row];
                         let response = ui
@@ -390,6 +388,11 @@ pub fn render_file_organize_contents(
                         }
                     }
                 });
+                #[cfg(test)]
+                assert_eq!(
+                    _output.id, scroll_id,
+                    "keyboard reveal reads the real ScrollArea owner"
+                );
             },
         );
     }
@@ -799,6 +802,7 @@ mod tests {
     fn file_organize_table_buttons_keep_pointer_focus_and_action() {
         use egui_kittest::kittest::Queryable;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1000.0, 720.0))
             .build_ui_state(
                 |root_ui,

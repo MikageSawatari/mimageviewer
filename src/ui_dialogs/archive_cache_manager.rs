@@ -753,7 +753,7 @@ mod tests {
                 .drop_without_applying_deltas();
         }
         let rect = ctx
-            .memory(|memory| memory.area_rect(egui::Id::new("EPUB 変換キャッシュ管理")))
+            .memory(|memory| memory.area_rect(egui::Id::unique(Some("EPUB 変換キャッシュ管理"))))
             .expect("manager window must be laid out");
         let style = ctx.global_style();
         let frame = egui::Frame::window(&style);

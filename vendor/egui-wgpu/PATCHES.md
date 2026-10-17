@@ -93,3 +93,21 @@ native presenterが既存renderer ownerでtexture更新のGPU commandを提出�
 `renderer::TextureUpdateSubmission` をcrate rootから明示公開した。新しいrendererやdelta queueは追加しない。
 製品の各FullOutput consumerはmap型deltaを順序どおりdrainし、必要なsubmissionの後でfreeする。
 正式graphでの検証結果は [段3台帳](../../docs/egui-0.37-stage3-verification.md) に記録する。
+
+
+## Stage 3: discard texture delivery (design revision 4.6, 2026-10-17)
+
+Implementation record and implementer internal inspection only. Independent
+acceptance and command results belong in the stage-3 verification ledger.
+
+No production renderer change is needed. Existing Painter::apply_textures_delta
+and TextureDelivery complete early-discard delivery without a surface.
+
+Two discard_texture_delivery offscreen tests exercise actual Context retries,
+whole/partial updates, existing older pending work, last callback TextureHandle
+Drop inside the immediate renderer, returned upload submit counts, real rendered
+pixel readback before later free, and sibling texture retention. An unavailable
+renderer test retains whole/partial and merges a later free non-cancellatively,
+then completes through the existing consumer once the resource state is ready.
+A missing headless adapter fails these tests instead of being counted as PASS.
+No OS window, application/profile, present, or snapshot PNG is involved.

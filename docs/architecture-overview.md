@@ -269,7 +269,9 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 | --- | --- |
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
-| `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
+| `app.rs` | `App` 構造体と `eframe::App` 実装。非描画の`logic`と、root Uiを受ける`ui`へ状態遷移を接続する |
+| `app/update_phases.rs` | service・input・render・post-renderの既存順序を所有。表示採用とGPU uploadはUI側へ残す |
+| `app/close_return.rs` / `app/root_lifecycle.rs` | teardown前に捕捉したClose帰還を存続mainの既存navigation ownerへ移し、root Closeをlogic直後のbackend終了判定へ接続する |
 | `crates/startup-diagnostics` | launcher/core共通の常時起動timeline。UIは固定容量のmemoryへ非blockingで公開し、独立writerがJSONLを保存する。UI heartbeatと独立した限定watchdog、同runの引継ぎ、保存先分類を所有する。詳細は [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §3・§10 |
 | `ui_startup.rs` | 起動stage/経過時間と「検索の準備中」の純粋描画。Indexerの5秒overlay上限・worker継続・単一採用はAppの `IndexerInit` が所有する |
 | `raw_format.rs` | 23 種の RAW 拡張子の単一リスト。フォルダ列挙はこれを含み、WIC はこの集合を拒否する |
@@ -350,9 +352,9 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
 | `fullscreen_specified_scale.rs` | `FullscreenFitInput` が legacy fit と指定値＋`FullscreenFitBasis` を型で区別する。A（canonical aspect）と O（AI 前の物理原寸）を正規化し、任意軸の％ / logical px、合成 unit の実効 gap、既存倍率制限と指定方式だけの自動 5 倍上限を純粋計算する。PDF の O は page metadata と既存 Original 長辺 / native cap から解き、現在 raster へ依存しない |
 | `displayed_image_transform.rs` | identity に依存しない `DisplayedImageGeometry` が fit descriptor / scale limit / trim / 90 度・free rotation / 通常または Z の zoom-pan から paint・hit・UV rect、source↔screen 写像、total scale を一度に解決する。指定方式の `layout_full_image_rect` は A/O 由来の安定した fit 枠で、実 raster の縦横比丸めは枠内の contain と sampling へ閉じる。ページは `DisplayedImageTransform` が page idx を付け、類似候補はページへ偽装せず geometry を利用する。見開き端の単ページは `SingletonSpreadPlacement` と同じページ寸法の仮想 2-slot canvasをlayoutにだけ持ち、page/sourceを増やさず既存 4 方式・SpecifiedScale と Z を解く。`FullscreenPageLayout` は各 viewer の最後に描いた Single / Spread / Continuous の transform を paint 順で保持し、`ViewerContextBundle` とともに交換する。navigator・ルーペ・範囲コピーはその viewer の layout を参照する。見開き・連結読みの配置計算自体は `ui_fullscreen.rs` が担当する |
-| `vendor/egui` | egui 0.33.3 の判定済み全 pointer release 列を、非 click を含めて順序どおり読み取る API を追加したローカルパッチ。クリック判定は変えず、アプリの ordered focus / hit / gesture 所有と対応付ける。root と standalone vendor の path patch を統一し、`test-full.ps1` でこの crate の lib test も無 filter 実行する。navigator 側への接続・検証状況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
-| `vendor/eframe` | eframe 0.33.3 の Windows hidden/minimized repaint scheduler に upstream PR #7905 を backport するローカルパッチ。不可視 HWND へ `ControlFlow::Poll` + OS redraw を要求せず direct UI pass で pending command を消化し、アプリが要求した repaint だけを `max(要求済み時刻, now + 100ms)` へ制限し、先の予定は早めない。要求が無ければ heartbeat を作らず sleep する。App / tray / detached の状態 ownership は変更しない。**もう 1 件**: wgpu backend は `max_texture_side` を `State::new` で 1 度スナップショットするだけだったのを、glow backend と同じく毎フレーム painter の値へ同期するようにした。egui は font atlas を `Context` に 1 つしか持たず、`max_texture_side` が変わると全フォントを再パースして atlas を作り直すので、2 つの viewport が 2048 と 8192 を交互に報告すると毎パス rebuild (実測 38.6ms) になる。詳細と実測は [next-release-backlog.md](next-release-backlog.md) §1.129。上流還元候補なので vendored crate 更新時はこの差分を持ち越す |
-| `vendor/egui-wgpu` | egui 0.33.3 の managed texture に opt-in GPU mipmap を追加するローカルパッチ。`TextureOptions::mipmap_mode` 指定時だけ完全な mip chain を確保・生成し、静止画の論理 `TextureHandle` / cache 構造は変えない。`Rgba8Unorm`生成器は比較callbackと360度パノラマの独自textureにも公開して共用する。上流の`LICENSE-MIT` / `LICENSE-APACHE`本文をcrate内に保持し、アプリ内表示と配布物同梱の正本にする |
+| `vendor/egui` | egui 0.37.0の判定済みpointer release列、viewport別IME中断、寿命を持つ承認済み退役commandを所有。連続clickは上流の距離6points条件を採用する。実discard再pass直前の生成済みdeltaを、Contextに対応する既存backend rendererへ一度だけ移譲する。原本記録と差分は`vendor/upstream-provenance.json`とcrate内`PATCHES.md`を参照 |
+| `vendor/eframe` | eframe 0.37.0。非表示・最小化時のlogicとFull UI pass、surface描画を別判定にする。承認済み退役をpass外で完結し、immediate子を含むdeltaは既存共有rendererで描画またはresource消費する。`max_texture_side`同期など既存差分も保持。App/tray/detachedの終了判断は既存ownerへ残す。正式経路と回帰は[egui更新計画](egui-0.37-update-plan.md)と各`PATCHES.md`を参照 |
+| `vendor/egui-wgpu` | egui-wgpu 0.37.0 / wgpu 30のmanaged textureにopt-in GPU mipmapを追加するローカルパッチ。`TextureOptions::mipmap_mode`指定時だけ完全なmip chainを生成し、静止画の論理`TextureHandle` / cache構造は変えない。map化deltaの同一texture内順序を保持し、旧set/partial→submission→後発freeを完結させる。`Rgba8Unorm`生成器は比較callbackと360度パノラマにも共用。上流license本文をcrate内に保持する |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は source identity / 編集 snapshot / preset を固定し、元画像の decode、選択段までの合成、見開き結合、画像エンコード、メタデータ転記は worker が担当 |
 | `ui_helpers.rs` | メニューバー、ツールバー、アドレスバー等の共通 UI |
@@ -535,7 +537,7 @@ GPU テクスチャの利用許容量は `vram_budget.rs` の共有 pool だけ�
 ユーザー操作 (キー/マウス)
     │
     ▼
-App::update() 内のハンドラ
+App::ui() 内の入力ハンドラ
     │  ├─ load_folder(path)         → フォルダ/ZIP/PDF 切替
     │  ├─ start_fs_load(idx)        → フルスクリーン画像ロード
     │  ├─ apply_rotation(idx)       → 回転の DB 更新

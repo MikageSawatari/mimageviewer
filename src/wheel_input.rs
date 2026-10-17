@@ -14,6 +14,35 @@ pub(crate) struct WheelInput {
     pub(crate) source: egui::MouseWheelSource,
 }
 
+/// Identity is only an annotation of an unconsumed projection. The raw list is
+/// never a source of movement. Existing earlier owners consume either the whole
+/// wheel stream or a distinct modifier route, so equal remaining events retain
+/// their order within that route.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WheelSegment {
+    pub(crate) input: WheelInput,
+    pub(crate) first_raw_ordinal: Option<u32>,
+    pub(crate) last_raw_ordinal: Option<u32>,
+}
+
+fn remaining_wheel_ordinals(input: &egui::InputState) -> Vec<Option<u32>> {
+    let mut ordinals = vec![None; input.events.len()];
+    let mut raw_end = input.raw.events.len();
+    for (index, event) in input.events.iter().enumerate().rev() {
+        if !matches!(event, egui::Event::MouseWheel { .. }) {
+            continue;
+        }
+        if let Some(ordinal) = input.raw.events[..raw_end]
+            .iter()
+            .rposition(|raw| raw == event)
+        {
+            ordinals[index] = Some(ordinal as u32);
+            raw_end = ordinal;
+        }
+    }
+    ordinals
+}
+
 fn project_wheel_event(
     event: &egui::Event,
     options: egui::InputOptions,
@@ -60,8 +89,19 @@ pub(crate) fn remaining_wheel_inputs(
     input: &egui::InputState,
     options: egui::InputOptions,
 ) -> Vec<WheelInput> {
-    let mut segments: Vec<WheelInput> = Vec::new();
-    for event in &input.events {
+    remaining_wheel_segments(input, options)
+        .into_iter()
+        .map(|segment| segment.input)
+        .collect()
+}
+
+pub(crate) fn remaining_wheel_segments(
+    input: &egui::InputState,
+    options: egui::InputOptions,
+) -> Vec<WheelSegment> {
+    let ordinals = remaining_wheel_ordinals(input);
+    let mut segments: Vec<WheelSegment> = Vec::new();
+    for (index, event) in input.events.iter().enumerate() {
         let Some(projected) = project_wheel_event(event, options, input.viewport_rect().height())
         else {
             continue;
@@ -73,22 +113,53 @@ pub(crate) fn remaining_wheel_inputs(
             source,
         } = projected;
         if let Some(previous) = segments.last_mut()
-            && previous.modifiers == modifiers
-            && previous.phase == phase
-            && previous.source == source
+            && previous.input.modifiers == modifiers
+            && previous.input.phase == phase
+            && previous.input.source == source
             && phase == egui::TouchPhase::Move
         {
-            previous.delta += delta;
+            previous.input.delta += delta;
+            previous.last_raw_ordinal = ordinals[index];
         } else {
-            segments.push(WheelInput {
-                delta,
-                modifiers,
-                phase,
-                source,
+            segments.push(WheelSegment {
+                input: WheelInput {
+                    delta,
+                    modifiers,
+                    phase,
+                    source,
+                },
+                first_raw_ordinal: ordinals[index],
+                last_raw_ordinal: ordinals[index],
             });
         }
     }
     segments
+}
+
+/// Claim exactly the projected interval. An equal modifier/source route later
+/// in the pass may belong to a different page or to its music HUD.
+pub(crate) fn consume_wheel_segment(ctx: &egui::Context, segment: WheelSegment) {
+    let (Some(first), Some(last)) = (segment.first_raw_ordinal, segment.last_raw_ordinal) else {
+        debug_assert!(
+            false,
+            "projected wheel interval must retain its delivered identity"
+        );
+        return;
+    };
+    ctx.input_mut(|input| {
+        let ordinals = remaining_wheel_ordinals(input);
+        let mut index = 0;
+        let mut consumed = false;
+        input.events.retain(|_| {
+            let accepted = ordinals[index].is_some_and(|ordinal| (first..=last).contains(&ordinal));
+            index += 1;
+            consumed |= accepted;
+            !accepted
+        });
+        if consumed {
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+        }
+    });
 }
 
 /// Sum the current event projection for diagnostics and hover guards only.
@@ -379,6 +450,108 @@ mod tests {
                 .is_empty()
         );
         assert!(ctx.input(|input| matches!(input.events.as_slice(), [egui::Event::Copy])));
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn egui037_wheel_interval_claim_keeps_later_equal_plain_event_and_identity() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, -4.0),
+                    egui::Modifiers::NONE,
+                ),
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, 2.0),
+                    egui::Modifiers::CTRL,
+                ),
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, -4.0),
+                    egui::Modifiers::NONE,
+                ),
+            ],
+            ..Default::default()
+        });
+        let segments = ctx.input(|input| remaining_wheel_segments(input, options()));
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].last_raw_ordinal, Some(0));
+        assert_eq!(segments[2].last_raw_ordinal, Some(2));
+        consume_wheel_segment(&ctx, segments[0]);
+        let remaining = ctx.input(|input| remaining_wheel_segments(input, options()));
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[1].last_raw_ordinal, Some(2));
+        consume_wheel_segment(&ctx, segments[1]);
+        assert_eq!(
+            ctx.input(|input| remaining_wheel_segments(input, options())),
+            vec![segments[2]]
+        );
+        consume_wheel_segment(&ctx, segments[2]);
+        assert!(
+            ctx.input(|input| remaining_wheel_segments(input, options()))
+                .is_empty()
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn egui037_wheel_shift_owner_preserves_every_plain_ctrl_identity() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, 2.0),
+                    egui::Modifiers::SHIFT,
+                ),
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, -4.0),
+                    egui::Modifiers::NONE,
+                ),
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, 2.0),
+                    egui::Modifiers::CTRL,
+                ),
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, 2.0),
+                    egui::Modifiers::SHIFT,
+                ),
+                wheel(
+                    egui::MouseWheelUnit::Point,
+                    egui::vec2(0.0, -4.0),
+                    egui::Modifiers::NONE,
+                ),
+            ],
+            ..Default::default()
+        });
+        consume_remaining_wheel_inputs(&ctx, |wheel| wheel.modifiers.shift);
+        let segments = ctx.input(|input| remaining_wheel_segments(input, options()));
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.last_raw_ordinal)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(4)]
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.input.delta.y)
+                .collect::<Vec<_>>(),
+            vec![-4.0, 2.0, -4.0]
+        );
+        consume_wheel_input(&ctx);
+        assert!(
+            ctx.input(|input| remaining_wheel_segments(input, options()))
+                .is_empty(),
+            "whole-stream front owner leaves no projection to revive from raw identity data"
+        );
         ctx.end_pass().drop_without_applying_deltas();
     }
 }

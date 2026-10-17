@@ -1210,7 +1210,12 @@ impl crate::app::App {
             self.invalidate_local_viewer_open_intents_for_remote();
             #[cfg(windows)]
             let close_failure = {
-                let detached_failure = self.close_all_detached_viewers_for_mode_change(ctx).err();
+                let detached_failure = self
+                    .close_all_detached_viewers_with_cause(
+                        ctx,
+                        crate::app::ViewerCloseCause::RemoteAcquire,
+                    )
+                    .err();
                 let fullscreen_failure = if self.fullscreen_idx.is_some()
                     || self.fs_cache.len() != 0
                     || self.video_presentation_transition.is_transitioning()

@@ -13607,34 +13607,36 @@ mod tests {
             });
         })
         .drop_without_applying_deltas();
-        ctx.begin_pass(egui::RawInput {
-            events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
-            ..Default::default()
-        });
-        cache_test_keyboard_owner(&ctx);
-        crate::key_input::set_test_frame(vec![tab_edge(false)]);
-
-        assert!(ctx.egui_wants_keyboard_input());
-        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert_eq!(
-            ctx.input(|i| i
-                .events
-                .iter()
-                .filter(|event| matches!(event, egui::Event::Key { .. }))
-                .count()),
-            1
-        );
-        assert!(crate::key_input::pressed_key_down(
-            ctx.viewport_id(),
-            |edge| edge.virtual_key == 0x09
-        ));
-        ctx.root_ui(|root_ui| {
-            egui::CentralPanel::default().show(root_ui, |ui| {
-                let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
-                let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
-            })
-        });
-        ctx.end_pass().drop_without_applying_deltas();
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |root_ui| {
+                // The focus-policy plugin runs at the real Ui begin-pass boundary.
+                cache_test_keyboard_owner(&ctx);
+                crate::key_input::set_test_frame(vec![tab_edge(false)]);
+                assert!(ctx.egui_wants_keyboard_input());
+                assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+                assert_eq!(
+                    ctx.input(|i| i
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event, egui::Event::Key { .. }))
+                        .count()),
+                    1
+                );
+                assert!(crate::key_input::pressed_key_down(
+                    ctx.viewport_id(),
+                    |edge| edge.virtual_key == 0x09
+                ));
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
+                    let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
+                });
+            },
+        )
+        .drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 
@@ -13647,26 +13649,41 @@ mod tests {
         let ctx = egui::Context::default();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
         let focused_id = egui::Id::new("modal_focus_surface");
-        ctx.memory_mut(|memory| memory.request_focus(focused_id));
-        ctx.begin_pass(egui::RawInput {
-            events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
-            ..Default::default()
-        });
-        cache_test_keyboard_owner(&ctx);
-        crate::key_input::set_test_frame(vec![tab_edge(false)]);
+        ctx.run_ui(Default::default(), |root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+                ui.interact(rect, focused_id, egui::Sense::click_and_drag())
+                    .request_focus();
+            });
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(focused_id));
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |root_ui| {
+                cache_test_keyboard_owner(&ctx);
+                crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
-        assert!(ctx.egui_wants_keyboard_input());
-        assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert_eq!(
-            ctx.input(|input| input
-                .events
-                .iter()
-                .filter(|event| matches!(event, egui::Event::Key { .. }))
-                .count()),
-            1
-        );
-        draw_test_focusable(&ctx, "modal_focus_surface");
-        ctx.end_pass().drop_without_applying_deltas();
+                assert!(ctx.egui_wants_keyboard_input());
+                assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
+                assert_eq!(
+                    ctx.input(|input| input
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event, egui::Event::Key { .. }))
+                        .count()),
+                    1
+                );
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+                    let _ = ui.interact(rect, focused_id, egui::Sense::click_and_drag());
+                });
+            },
+        )
+        .drop_without_applying_deltas();
         assert!(ctx.egui_wants_keyboard_input());
     }
 

@@ -1760,7 +1760,7 @@ pub(in crate::app) struct ViewerContextBundle {
     zip_enumerate_pending: Option<ZipEnumeratePending>,
     fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
     pending_auto_fs_open: bool,
-    pending_return_to_parent: bool,
+    pending_return_to_parent: super::FullscreenCloseContinuation,
     pdf_placeholder_count: Option<u32>,
     viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches,
     fs_nav_locked_gen: Option<u64>,
@@ -2971,7 +2971,7 @@ impl ViewerContextBundle {
             zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
-            pending_return_to_parent: false,
+            pending_return_to_parent: Default::default(),
             pdf_placeholder_count: None,
             viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
             fs_nav_locked_gen: None,
@@ -3078,7 +3078,7 @@ impl App {
         self.fs_seek_gesture.interrupt();
         self.fs_seek_overlay_visible = false;
         self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
+        self.pending_return_to_parent.cancel_live_request();
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
@@ -3109,7 +3109,7 @@ impl App {
         self.last_viewer_sync_stamp = None;
         self.fs_open_intent_from_grid = false;
         self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
+        self.pending_return_to_parent.cancel_live_request();
         self.pdf_prefetch_grace_until = None;
     }
 
@@ -5392,11 +5392,13 @@ impl App {
         reason: &'static str,
         f: impl FnOnce(&mut Self, ViewerContextId) -> BuildOutcome,
     ) -> Option<ViewerContextId> {
+        let return_origin = self.close_return_origin();
         self.publish_mounted_context_rating_writes_at_boundary("build_outgoing");
         let (reserved, ops) = self.viewer_contexts.table.plan_begin_build();
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_begin_build();
         self.set_items_generation(Self::items_generation_for_viewer_context(reserved));
+        self.install_close_return_origin(return_origin);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, reserved)));
         match result {
             Ok(outcome) => self.finish_viewer_context_build(reserved, reason, outcome),
@@ -5496,6 +5498,7 @@ impl App {
                 .find(|candidate| self.page_path_key(*candidate).as_ref() == Some(key))
                 .expect("materialized fork target must remain installed during publication");
         }
+        let return_origin = self.close_return_origin();
         let source = self.projected_viewer_context_id();
         let scan_candidate = self.normalize_state.as_ref().and_then(|state| {
             (state.owner_context_id == source).then(|| (state.fs_idx, state.file_path.clone()))
@@ -5509,6 +5512,8 @@ impl App {
         self.execute_viewer_context_ops(ops, Some(spec));
         let finished = self.viewer_contexts.table.finish_fork();
         assert_eq!(finished, id);
+        self.with_viewer_context_state(id, |app| app.install_close_return_origin(return_origin))
+            .expect("new fork retains its return owner");
         self.publish_mounted_context_rating_writes_at_boundary("fork_incoming");
         // Music analysis lives on App, outside the viewer bundle. Transfer its exact
         // source and worker inbox only when the same player and applied track moved.
@@ -8043,7 +8048,9 @@ mod tests {
         let retained = app
             .with_viewer_context(stashed, |app| {
                 let ctx = egui::Context::default();
-                let _ = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+                let _ = ctx
+                    .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+                    .drop_without_applying_deltas();
                 assert_eq!(
                     std::ptr::from_ref(ContextRef::mounted(app).epub_convert().unwrap()),
                     allocation
@@ -9449,7 +9456,7 @@ mod tests {
         assert_eq!(app.last_viewer_sync_stamp, None);
         assert!(!app.fs_open_intent_from_grid);
         assert!(!app.pending_auto_fs_open);
-        assert!(!app.pending_return_to_parent);
+        assert!(!app.pending_return_to_parent.is_pending());
         assert_eq!(app.pdf_prefetch_grace_until, None);
     }
 

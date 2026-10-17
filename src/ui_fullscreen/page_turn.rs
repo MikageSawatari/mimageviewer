@@ -3864,6 +3864,67 @@ mod tests {
             .drop_without_applying_deltas();
         assert_eq!(tracker.status(), SubmissionStatus::Finished);
     }
+
+    #[test]
+    fn egui037_continuation_submission_plugin_discard_texture_delivery_is_not_acceptance() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        for delivery in [false, true] {
+            let ctx = egui::Context::default();
+            install(&ctx);
+            let tracker = Arc::new(SubmissionTracker::new(fact(1)));
+            let receipts = Rc::new(RefCell::new(Vec::<SubmittedUnitReceipt>::new()));
+            let deliveries = Rc::new(Cell::new(0));
+            let scope = delivery.then(|| {
+                let tracker = tracker.clone();
+                let receipts = receipts.clone();
+                let deliveries = deliveries.clone();
+                ctx.enter_discard_texture_delivery(move |mut delta| {
+                    assert!(!delta.is_empty());
+                    assert_eq!(tracker.status(), SubmissionStatus::Offered);
+                    assert!(
+                        receipts
+                            .borrow()
+                            .iter()
+                            .all(|receipt| !receipt.was_accepted())
+                    );
+                    deliveries.set(deliveries.get() + 1);
+                    delta.clear(); // Explicit headless consumer; no renderer/present occurs.
+                })
+            });
+            let texture = ctx.load_texture(
+                "submission-delta",
+                egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+                Default::default(),
+            );
+            let output = ctx.run_ui(Default::default(), |ui| {
+                let proof = receipt(ui.ctx(), 1);
+                queue_submission(
+                    ui.ctx(),
+                    proof.clone(),
+                    Some(event(&tracker, SubmissionKind::Curl)),
+                );
+                receipts.borrow_mut().push(proof);
+                if ui.ctx().current_pass_index() == 0 {
+                    ui.ctx().request_discard("submission delivery regression");
+                }
+            });
+            assert_eq!(deliveries.get(), usize::from(delivery));
+            let receipts = receipts.borrow();
+            assert_eq!(receipts.len(), 2);
+            assert!(!receipts[0].was_accepted());
+            assert!(receipts[1].was_accepted());
+            assert_eq!(tracker.status(), SubmissionStatus::Started);
+            assert_eq!(
+                output.textures_delta.set.contains_key(&texture.id()),
+                !delivery
+            );
+            output.drop_without_applying_deltas();
+            drop(receipts);
+            drop(scope);
+        }
+    }
     #[test]
     fn discarded_canonical_completion_requires_same_actual_next_flat_output() {
         for matching in [true, false] {

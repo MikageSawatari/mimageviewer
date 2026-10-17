@@ -644,6 +644,10 @@ fn draw_native_video_adjustment_body(
     let mut changed = false;
     let mut persist = false;
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("native_video_adjustment_scroll")
         .auto_shrink([false; 2])
         .max_height(body_rect.height())
@@ -1159,6 +1163,10 @@ pub(crate) fn draw_native_jump_panel_body(
             .layout(egui::Layout::top_down(egui::Align::LEFT)),
     );
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .auto_shrink([false; 2])
         .max_height(content_rect.height())
         .show(&mut content_ui, |ui| {
@@ -1824,6 +1832,10 @@ pub(super) fn draw_native_shortcut_help_dialog(
                     ui.add_space(6.0);
 
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("native_video_shortcut_help_scroll")
                         .max_height(scroll_max_h)
                         .auto_shrink([false, false])
@@ -2058,6 +2070,10 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
                     // フォーカスが取れず Ctrl+V (Event::Paste) が無視される (egui の TextEdit
                     // は `has_focus(id)` のときだけ Paste を処理する仕様、2026-05-24 ユーザー報告)。
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("bulk_bookmark_textarea_scroll")
                         .max_height(textarea_max_h)
                         .auto_shrink([false, true])
@@ -5442,6 +5458,10 @@ pub(super) fn draw_native_vst3_panel(
 
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("native_vst3_panel_scroll")
                     .max_height(native_vst3_slot_list_height(panel))
                     .auto_shrink([false, false])
@@ -6390,6 +6410,10 @@ pub(super) fn draw_native_metadata_panel(
             );
             content_ui.spacing_mut().scroll = native_metadata_panel_scroll_style();
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .id_salt("native_video_metadata_scroll")
                 .auto_shrink([false; 2])
                 .max_height(content_rect.height())

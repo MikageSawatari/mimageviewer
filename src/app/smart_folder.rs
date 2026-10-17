@@ -10268,7 +10268,9 @@ mod tests {
             .fake_published_sender_for_test();
         publish();
         let ctx = egui::Context::default();
-        let _ = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert_eq!(app.fs_nav_locked_gen, None);
         assert!(
@@ -10421,7 +10423,9 @@ mod tests {
         app.epub_convert.as_mut().unwrap().phase =
             crate::ui_dialogs::epub_convert::EpubConvertPhase::Error("test".into());
         let ctx = egui::Context::default();
-        let _ = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_some());
         assert!(smart_epub_waiting(&app));
         let input = egui::RawInput {
@@ -10434,7 +10438,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let _ = ctx.run_pass(input, |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(input, |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert!(app.smart_folder_transition.is_none());
     }

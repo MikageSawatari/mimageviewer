@@ -3565,6 +3565,10 @@ impl crate::app::App {
             });
             ui.add_space(8.0);
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(360.0)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -5185,8 +5189,7 @@ mod tests {
     }
 
     fn launch_boundary_ack_survives_early_return(app: &str, phases: &str) -> bool {
-        let Some((_, wrapper)) = app.split_once("self.update_frame(ctx, frame, root_lifecycle);")
-        else {
+        let Some((_, wrapper)) = app.split_once("self.update_frame(ui, frame);") else {
             return false;
         };
         let Some((tail, _)) = wrapper.split_once("fn on_exit(") else {
@@ -5225,8 +5228,8 @@ mod tests {
         ));
         // Moving the call into update_frame would lose it on native/fullscreen returns.
         let before_frame = missing_call.replace(
-            "self.update_frame(ctx, frame, root_lifecycle);",
-            &format!("{call}\nself.update_frame(ctx, frame, root_lifecycle);"),
+            "self.update_frame(ui, frame);",
+            &format!("{call}\nself.update_frame(ui, frame);"),
         );
         assert_ne!(
             before_frame, missing_call,

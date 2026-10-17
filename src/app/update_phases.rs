@@ -25,6 +25,8 @@ pub(super) struct MainFrameNavigation {
 impl App {
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_update_begin(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("update_begin", self, ctx);
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         // Remote service runs in logic. Display continuation stays at the old
@@ -337,6 +339,8 @@ impl App {
 
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_startup_workers(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("startup_before", self, ctx);
         #[cfg(windows)]
         self.poll_vst3_startup_load(ctx);
         #[cfg(windows)]
@@ -351,6 +355,8 @@ impl App {
         if self.update_check_pending.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("startup_after", self, ctx);
     }
 
     pub(super) fn input_pointer_and_ime(&mut self, ctx: &egui::Context) {
@@ -453,6 +459,8 @@ impl App {
 
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_initial_open(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("initial_open", self, ctx);
         // 初回フレームで設定された開始フォルダを開く。起動引数の explicit path は
         // UI スレッド外で解決し、前回フォルダ / Desktop / 指定フォルダの優先順位と
         // fallback は known_folders::startup_folder に集約する。
@@ -486,6 +494,8 @@ impl App {
         ctx: &egui::Context,
         update_perf: &mut Option<UpdatePerfRecorder>,
     ) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("initial_workers", self, ctx);
         self.poll_edit_preview_cache(ctx);
         self.poll_content_identity_detection(ctx);
         self.poll_content_identity_restore(ctx);
@@ -495,6 +505,8 @@ impl App {
     }
 
     pub(super) fn render_media_and_edit_results(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("media_before", self, ctx);
         self.poll_main_video_context(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_final_ai(ctx);
@@ -504,9 +516,13 @@ impl App {
         self.poll_local_adjust_prefix_preview(ctx);
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("media_after", self, ctx);
     }
 
     pub(super) fn render_search_and_metadata_results(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("search_before", self, ctx);
         self.poll_search(ctx);
         self.poll_facet_name_debounce(ctx);
         self.poll_facet_name_cache(ctx);
@@ -521,10 +537,14 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.poll_metadata_load();
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("search_after", self, ctx);
     }
 
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_other_worker_results(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("other_workers", self, ctx);
         // スタックスクリプトは items generation を差し替える。復旧中は receiver を保持し、
         // terminal 後に既存 poll へ一度だけ戻す。
         if !self.sidecar_restore_active() {
@@ -1593,6 +1613,8 @@ impl App {
     }
 
     pub(super) fn render_update_before_frame(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("before_frame", self, ctx);
         // Retired asset requests must cancel even when presentation returns early.
         self.prune_current_view_pin_refreshes();
         // Collection startup/revision/worker responses must likewise progress even when
@@ -1603,6 +1625,8 @@ impl App {
 
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_update_after_frame(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("after_frame", self, ctx);
         // Keep sent-ticket receipts before UI preparation and publication.
         // The receipt entry is split, while legacy owner mounts remain until 1b-3b.
         // Run at the old post-presentation position, including early-return frames.
@@ -1676,6 +1700,8 @@ impl App {
     }
 
     pub(super) fn input_frame_diagnostics(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("rescan_after", self, ctx);
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);
         #[cfg(windows)]
@@ -1884,6 +1910,8 @@ impl App {
     }
 
     pub(super) fn render_prepare_fullscreen_materials(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("materials_before", self, ctx);
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {
             // 360 の意図と実際の状態を突き合わせる。素材が 360 だと分かる時刻が
@@ -1962,6 +1990,8 @@ impl App {
         bool,
         Option<crate::ui_fullscreen::FullscreenRootFrameInput>,
     ) {
+        #[cfg(test)]
+        super::egui037_connection_tests::observe("materials_after", self, ctx);
         // フルスクリーンのキーが main/root 側に届いた場合は、main focus guard より先に
         // 処理する。F11 の window/fullscreen 切替など、main が focused になること自体が
         // 操作の副作用であるキーを、一覧へ戻りたい意図と誤認しないため。
@@ -2002,7 +2032,7 @@ impl App {
         }
 
         let keyboard_nav_from_fullscreen_close =
-            !fullscreen_root_key_handled && self.pending_return_to_parent;
+            !fullscreen_root_key_handled && self.pending_return_to_parent.is_pending();
         let keyboard_nav = if fullscreen_root_key_handled {
             None
         } else {

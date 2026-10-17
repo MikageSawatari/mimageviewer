@@ -347,7 +347,7 @@ fn section1335_normal_close_parent_branch_never_accepts_intermediate_book_list()
     open_zip(&mut env, &book, true);
     let before = env.settings.startup_list_restore.clone();
     env.handle_fullscreen_close_request();
-    assert!(env.pending_return_to_parent);
+    assert!(env.pending_return_to_parent.is_pending());
     assert!(env.fullscreen_idx.is_some());
     assert_eq!(env.settings.startup_list_restore, before);
     let nav = env.take_pending_return_to_parent_nav().unwrap();
@@ -3235,7 +3235,7 @@ fn section1335_extra_video_normal_parent_return_still_restores_parent_list() {
     open_zip(&mut env, &book, true);
     let before = env.settings.startup_list_restore.clone();
     env.handle_fullscreen_close_request();
-    assert!(env.pending_return_to_parent);
+    assert!(env.pending_return_to_parent.is_pending());
     assert!(env.fullscreen_idx.is_some());
     assert_eq!(env.settings.startup_list_restore, before);
     let nav = env.take_pending_return_to_parent_nav().unwrap();

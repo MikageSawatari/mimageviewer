@@ -16463,6 +16463,7 @@ mod startup_open_path_resolve_tests {
         let app_for_ui = Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
 
@@ -21971,8 +21972,12 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn staged_fullscreen_hydration_keeps_pdf_zip_and_required_viewports_alive() {
-        for (pdf, required) in [(true, false), (false, false), (true, true)] {
+        // Native immediate callbacks are thread-local. Isolate the fake adapter from other tests.
+        std::thread::spawn(|| {
+            for (pdf, required) in [(true, false), (false, false), (true, true)] {
             let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            ctx.set_embed_viewports(false);
             let mut app = setup_app();
             stage_fullscreen_hydration_for_test(&mut app, &ctx, pdf, required);
             assert!(app.fs_nav_deferred_reopen_wait_active());
@@ -21983,9 +21988,36 @@ mod phase_c_folder_nav_history_tests {
                 "old page survives hydration"
             );
             let old_texture = app.fs_holdover_tex.as_ref().unwrap().primary_texture_id();
-            let mut output = ctx.run_pass(Default::default(), |ctx| {
-                app.keep_fullscreen_viewport_alive(ctx)
+            let child_paints = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = child_paints.clone();
+            egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+                let mut child_output = crate::test_ui::headless_paint_output(ctx.run_ui(
+                    egui::RawInput {
+                        viewport_id: viewport.ids.this,
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+                        viewports: [
+                            (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                            (viewport.ids.this, egui::ViewportInfo { parent: Some(egui::ViewportId::ROOT), ..Default::default() }),
+                        ].into_iter().collect(),
+                        ..Default::default()
+                    },
+                    |ui| (viewport.viewport_ui_cb)(ui),
+                ));
+                let painted_old_texture = ctx.tessellate(std::mem::take(&mut child_output.shapes), child_output.pixels_per_point).iter().any(|clipped| {
+                    matches!(&clipped.primitive, egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == old_texture)
+                });
+                let hidden = child_output.viewport_output.values().any(|output| output.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Visible(false))));
+                observed.borrow_mut().push((viewport.ids.this, painted_old_texture, hidden));
+                child_output.drop_without_applying_deltas();
             });
+            let viewport_id = app.fullscreen_viewport_id();
+            let output =
+                crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    app.keep_fullscreen_viewport_alive(ctx)
+                }));
             assert!(app.fs_viewport_shown);
             assert!(!output.viewport_output.values().any(|output| {
                 output
@@ -21993,14 +22025,14 @@ mod phase_c_folder_nav_history_tests {
                     .iter()
                     .any(|command| matches!(command, egui::ViewportCommand::Visible(false)))
             }));
-            assert!(ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point).iter().any(|clipped| {
-                matches!(&clipped.primitive, egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == old_texture)
-            }), "the keep-alive frame draws the old page texture");
+            assert_eq!(*child_paints.borrow(), vec![(viewport_id, true, false)],
+                "the actual keep-alive child frame must draw the retained texture without hiding");
             finish_staged_physical_history_for_test(&mut app);
             assert_eq!(app.fullscreen_idx, Some(0));
             assert!(!app.fs_nav_deferred_reopen_wait_active());
             output.drop_without_applying_deltas();
-        }
+            }
+        }).join().expect("headless hydration holdover adapter");
     }
 
     #[test]
@@ -24735,7 +24767,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.handle_fullscreen_root_key_input(&ctx));
         ctx.end_pass().drop_without_applying_deltas();
         assert!(app.fullscreen_idx.is_none());
-        assert!(!app.pending_return_to_parent);
+        assert!(!app.pending_return_to_parent.is_pending());
         assert_eq!(app.visible_indices.len(), 4);
         for _ in 0..3 {
             // Toolbar arrows feed this same dispatcher after input merge.
@@ -32661,7 +32693,7 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
         Some(crate::ui_main::AddressBarNav::Bookmarks)
     ));
     app.handle_fullscreen_close_request();
-    assert!(app.pending_return_to_parent);
+    assert!(app.pending_return_to_parent.is_pending());
     assert!(matches!(
         app.take_pending_return_to_parent_nav(),
         Some(crate::ui_main::AddressBarNav::Bookmarks)
@@ -32762,7 +32794,7 @@ fn native_immediate_close_consumes_bookmark_return_in_same_dispatch() {
 
     app.handle_fullscreen_close_request_immediate();
 
-    assert!(!app.pending_return_to_parent);
+    assert!(!app.pending_return_to_parent.is_pending());
     assert!(app.items_are_bookmark_view);
     assert!(matches!(
         app.bookmark_view_state,
@@ -34210,7 +34242,9 @@ mod phase_c_drill_address_tests {
 
     fn settle_repaint_state(ctx: &egui::Context) {
         for _ in 0..4 {
-            let output = ctx.run_pass(egui::RawInput::default(), |_| {});
+            let output = crate::test_ui::headless_paint_output(
+                ctx.run_pass(egui::RawInput::default(), |_| {}),
+            );
             if root_repaint_delay(&output) == std::time::Duration::MAX {
                 output.drop_without_applying_deltas();
                 return;
@@ -34419,9 +34453,10 @@ mod phase_c_drill_address_tests {
         })
         .unwrap();
         settle_repaint_state(&ctx);
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_events(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_events(ctx);
+            }));
         assert!(app.global_search.done);
         assert!(!app.address.contains("件を確認"), "{}", app.address);
         assert!(!app.address.contains("検索中"), "{}", app.address);
@@ -34482,9 +34517,10 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_debounce(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_debounce(ctx);
+            }));
         let delay = root_repaint_delay(&output);
         assert!(delay > std::time::Duration::ZERO, "delay={delay:?}");
         assert!(
@@ -34506,9 +34542,10 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_events(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_events(ctx);
+            }));
         let delay = root_repaint_delay(&output);
         assert!(
             delay > std::time::Duration::ZERO,
@@ -34542,9 +34579,10 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.poll_global_search_events(ctx);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.poll_global_search_events(ctx);
+            }));
         assert_eq!(
             root_repaint_delay(&output),
             std::time::Duration::ZERO,
@@ -36931,9 +36969,13 @@ mod favorite_adjustment_defaults_tests {
     fn always_on_top_toggle_has_one_root_command_and_origin_feedback() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.toggle_always_on_top(ctx, crate::app::ActionSurface::MainWindow);
-        });
+        // A cold 0.37 Context emits an independent initial SetTheme command.
+        ctx.run_pass(Default::default(), |_| {})
+            .drop_without_applying_deltas();
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.toggle_always_on_top(ctx, crate::app::ActionSurface::MainWindow);
+            }));
         assert!(app.settings.always_on_top);
         let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
         assert_eq!(commands.len(), 1);
@@ -36947,9 +36989,10 @@ mod favorite_adjustment_defaults_tests {
         );
 
         output.drop_without_applying_deltas();
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.set_always_on_top(ctx, true, crate::app::ActionSurface::Viewer);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.set_always_on_top(ctx, true, crate::app::ActionSurface::Viewer);
+            }));
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
@@ -36957,9 +37000,10 @@ mod favorite_adjustment_defaults_tests {
         );
 
         output.drop_without_applying_deltas();
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
+            }));
         assert!(!app.settings.always_on_top);
         assert!(matches!(
             output.viewport_output[&egui::ViewportId::ROOT]
@@ -40063,12 +40107,12 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = true;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip")); // コンテナページ
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
 
         app.handle_fullscreen_close_request();
 
         assert!(
-            app.pending_return_to_parent,
+            app.pending_return_to_parent.is_pending(),
             "設定ON+コンテナは親 (L1) へ戻る予約"
         );
         assert_eq!(
@@ -40093,7 +40137,7 @@ mod favorite_adjustment_defaults_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.settings.auto_fullscreen_zip_pdf = true;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.pdf"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
 
         app.handle_fs_navigation(
             &egui::Context::default(),
@@ -40108,7 +40152,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         assert!(
-            app.pending_return_to_parent,
+            app.pending_return_to_parent.is_pending(),
             "detached viewer close must request parent list return in direct-page mode"
         );
         assert_eq!(
@@ -40126,7 +40170,7 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(parent, std::path::PathBuf::from("c:/manga"));
         assert_eq!(app.select_after_load.as_deref(), Some("book.pdf"));
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "parent return request should be consumed once it is merged"
         );
     }
@@ -40151,7 +40195,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = true;
         app.folder_history.insert(parent.clone(), (240.0, None));
-        app.pending_return_to_parent = true;
+        app.pending_return_to_parent.request_live();
 
         let nav = app
             .take_pending_return_to_parent_nav()
@@ -40190,13 +40234,13 @@ mod favorite_adjustment_defaults_tests {
         app.native_video_in_window_active = true;
         app.current_folder = Some(book.clone());
 
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
         assert!(
             app.handle_fullscreen_root_key_input(&egui::Context::default()),
             "embedded still normally suppresses main-grid keyboard handling"
         );
 
-        app.pending_return_to_parent = true;
+        app.pending_return_to_parent.request_live();
         assert!(
             !app.handle_fullscreen_root_key_input(&egui::Context::default()),
             "parent-return reservation must reach handle_keyboard on the next frame"
@@ -40218,7 +40262,7 @@ mod favorite_adjustment_defaults_tests {
             "parent list load closes fullscreen immediately"
         );
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "parent return request should not survive after the early-return path consumes it"
         );
     }
@@ -40232,10 +40276,10 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = false;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
         app.handle_fullscreen_close_request();
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "設定OFF は親復帰予約を立てない"
         );
         assert_eq!(app.fullscreen_idx, None, "その場で close");
@@ -40249,10 +40293,10 @@ mod favorite_adjustment_defaults_tests {
         app.settings.auto_fullscreen_zip_pdf = true;
         app.settings.auto_fullscreen_image_folders = false;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
         app.handle_fullscreen_close_request();
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "画像フォルダ追加設定 OFF の通常フォルダは親復帰予約を立てない"
         );
         assert_eq!(app.fullscreen_idx, None, "その場で close");
@@ -40269,12 +40313,12 @@ mod favorite_adjustment_defaults_tests {
         app.settings.auto_fullscreen_zip_pdf = true;
         app.settings.auto_fullscreen_image_folders = true;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
-        app.pending_return_to_parent = false;
+        app.pending_return_to_parent.clear();
 
         app.handle_fullscreen_close_request();
 
         assert!(
-            app.pending_return_to_parent,
+            app.pending_return_to_parent.is_pending(),
             "追加設定 ON の画像のみ通常フォルダは親 (L1) へ戻る予約"
         );
         assert_eq!(app.fullscreen_idx, Some(0), "その場では close しない");
@@ -66409,8 +66453,10 @@ mod still_window_mode_key_tests {
         };
 
         let baseline = ctx.run_pass(egui::RawInput::default(), draw_probe_text);
+        let baseline_has_delta = !baseline.textures_delta.set.is_empty();
+        baseline.drop_without_applying_deltas();
         assert!(
-            !baseline.textures_delta.set.is_empty(),
+            baseline_has_delta,
             "the baseline pass must materialize its initial atlas"
         );
 
@@ -66422,8 +66468,10 @@ mod still_window_mode_key_tests {
         );
 
         ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.apply_pending_main_font_update(ctx);
+            // 0.37 applies new definitions immediately if no text has used the old ones.
+            // Exercise the deferred contract with a real old-font glyph laid out first.
             draw_probe_text(ctx);
+            app.apply_pending_main_font_update(ctx);
             assert!(
                 !app.main_font_update_pending,
                 "the single settings application must consume its pending state"
@@ -66436,27 +66484,26 @@ mod still_window_mode_key_tests {
         .drop_without_applying_deltas();
 
         let applied = ctx.run_pass(egui::RawInput::default(), draw_probe_text);
+        let applied_has_delta = !applied.textures_delta.set.is_empty();
+        applied.drop_without_applying_deltas();
         assert!(
-            !applied.textures_delta.set.is_empty(),
+            applied_has_delta,
             "the next begin_pass must apply the requested definitions and emit their atlas delta"
         );
         let stable = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.apply_pending_main_font_update(ctx);
             draw_probe_text(ctx);
         });
+        let stable_has_delta = !stable.textures_delta.set.is_empty();
+        stable.drop_without_applying_deltas();
         assert!(
-            stable.textures_delta.set.is_empty(),
+            !stable_has_delta,
             "a consumed setting update must not rebuild the atlas again on a later pass"
         );
         assert!(
             !app.main_font_update_pending,
             "font settings must not re-arm themselves for later frames"
         );
-        applied.drop_without_applying_deltas();
-
-        baseline.drop_without_applying_deltas();
-
-        stable.drop_without_applying_deltas();
     }
     #[test]
     fn still_image_root_f11_repeat_is_ignored() {
@@ -69329,35 +69376,41 @@ mod still_window_mode_key_tests {
         let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(media.clone());
         app.bookmark_open_request_seq = request_id.0;
         app.items_are_bookmark_view = true;
+        app.scroll_offset_y = 145.0;
+        let return_grid = BookmarkViewReturnGridState {
+            row_keys: vec![(2, 2)],
+            selected_key: Some((2, 2)),
+            opened_key: (2, 2),
+            scroll_offset_y: app.scroll_offset_y,
+        };
         app.bookmark_view_state = Some(BookmarkViewState::Opening {
             target: target.clone(),
-            grid: BookmarkViewReturnGridState {
-                row_keys: vec![(2, 2)],
-                selected_key: Some((2, 2)),
-                opened_key: (2, 2),
-                scroll_offset_y: 0.0,
-            },
+            grid: return_grid.clone(),
         });
         let pending_media = media.clone();
         let detached_target = target.clone();
-        app.build_active_context_for_test(Some(window_id), DetachedSource::Video, move |context| {
-            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-            context.viewer_presentation = ViewerPresentation::DetachedWindow;
-            context.detached_viewer_independent_active = true;
-            context.bookmark_open_pending =
-                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
-                    crate::bookmark_browser::PendingMediaOpen {
-                        request_id,
-                        path: pending_media,
-                        pts_secs: 3.0,
-                        started_at: std::time::Instant::now(),
-                        last_wait: None,
-                    },
-                ));
-            context.bookmark_view_state = Some(BookmarkViewState::Detached {
-                target: detached_target,
-            });
-        });
+        let retired_owner = app.build_active_context_for_test(
+            Some(window_id),
+            DetachedSource::Video,
+            move |context| {
+                context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                context.viewer_presentation = ViewerPresentation::DetachedWindow;
+                context.detached_viewer_independent_active = true;
+                context.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+                        crate::bookmark_browser::PendingMediaOpen {
+                            request_id,
+                            path: pending_media,
+                            pts_secs: 3.0,
+                            started_at: std::time::Instant::now(),
+                            last_wait: None,
+                        },
+                    ));
+                context.bookmark_view_state = Some(BookmarkViewState::Detached {
+                    target: detached_target,
+                });
+            },
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let resolver_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
@@ -69383,6 +69436,9 @@ mod still_window_mode_key_tests {
         assert!(app.startup_open_path_resolve_pending.is_none());
         app.with_active_viewer_context(|context| {
             assert!(context.bookmark_open_pending.is_none());
+            assert!(context.items.is_empty());
+            assert!(context.selected.is_none());
+            assert!(context.fullscreen_idx.is_none());
             assert!(matches!(
                 context.bookmark_view_state.as_ref(),
                 Some(BookmarkViewState::Detached {
@@ -69391,6 +69447,16 @@ mod still_window_mode_key_tests {
             ));
         })
         .expect("cancel must retire the exact detached owner, not the main bundle");
+        let session = app.active_detached_session.unwrap();
+        assert_eq!(session.window_id, window_id);
+        assert_eq!(
+            session.content_phase,
+            DetachedSessionContentPhase::Preparing
+        );
+        assert_eq!(
+            app.locate_window_context(window_id).map(|(owner, _)| owner),
+            Some(retired_owner)
+        );
         assert!(
             tx.send(StartupOpenPathResolveResult {
                 rar_volume_proof: None,
@@ -69407,10 +69473,28 @@ mod still_window_mode_key_tests {
         run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.active_detached_session.is_none());
-        assert!(matches!(
-            app.bookmark_view_state,
-            Some(BookmarkViewState::Restoring { .. })
-        ));
+        assert!(app.with_viewer_context_ref(retired_owner, |_| ()).is_none());
+        // This is a root UI dispatch: update_active_viewer_context retires the child and
+        // invokes the existing main consumer in that same dispatch. Non-drawing Close's
+        // Terminal retention is covered separately by close_return_tests.
+        assert_eq!(app.bookmark_open_request_seq, request_id.0);
+        assert!(!app.pending_return_to_parent.is_pending());
+        let Some(BookmarkViewState::Restoring { grid }) = &app.bookmark_view_state else {
+            panic!(
+                "the same-dispatch main consumer must resume bookmark-grid restoration: state={:?}, return={:?}",
+                app.bookmark_view_state, app.pending_return_to_parent
+            );
+        };
+        let mut expected_grid = return_grid;
+        // Main selection can change before the delayed consumer; it is authoritative.
+        expected_grid.selected_key = None;
+        assert_eq!(grid, &expected_grid);
+        let restored = app.bookmark_view_state.clone();
+        assert!(app.take_pending_return_to_parent_nav().is_none());
+        assert_eq!(
+            app.bookmark_view_state, restored,
+            "the same return cannot be consumed twice"
+        );
     }
 
     #[test]
@@ -73893,35 +73977,53 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         let viewport_id = app.fullscreen_viewport_id();
         ctx.set_embed_viewports(false);
-        ctx.begin_pass(egui::RawInput::default());
+        ctx.run_ui(Default::default(), |ui| {
+            ctx.show_viewport_deferred(
+                viewport_id,
+                egui::ViewportBuilder::default(),
+                |_ui, _class| {},
+            );
+            // A shown viewport has an actual lifetime and an App-owned command binding.
+            app.fullscreen_viewport_binding =
+                viewport_retirement::ViewportCommandBinding::capture(ui.ctx(), viewport_id);
+        })
+        .drop_without_applying_deltas();
+        let registration = ctx
+            .viewport_registration(viewport_id)
+            .expect("shown loading viewport lifetime");
+        assert!(app.fullscreen_viewport_binding.is_some());
         assert_eq!(
             app.close_all_detached_viewers_for_mode_change(&ctx),
             Ok(true)
         );
-        ctx.show_viewport_deferred(
-            viewport_id,
-            egui::ViewportBuilder::default(),
-            |_ctx, _class| {},
-        );
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.run_ui(Default::default(), |_| {}));
         assert!(!app.fs_viewport_shown);
         assert_eq!(
             app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
+        let retired: Vec<_> = output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter_map(|command| {
+                if let egui::ViewportCommand::RetireApproved(approval) = command {
+                    Some(approval.registrations())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            retired,
+            vec![registration],
+            "the exact shown loading viewport must be retired before acquisition"
+        );
+        assert!(ctx.viewport_registration(viewport_id).is_none());
         assert!(
-            output
-                .viewport_output
-                .get(&viewport_id)
-                .is_some_and(|viewport| viewport
-                    .commands
-                    .contains(&egui::ViewportCommand::Visible(false))),
-            "a detached loading viewport must receive the real hide command before acquisition: {:?}",
-            output
-                .viewport_output
-                .iter()
-                .map(|(id, viewport)| (id, &viewport.commands))
-                .collect::<Vec<_>>()
+            !output.viewport_output.contains_key(&viewport_id),
+            "terminal close must not recreate a hidden child"
         );
         output.drop_without_applying_deltas();
     }
@@ -81235,35 +81337,90 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn eframe_delivers_texture_delta_at_all_unpainted_viewport_returns() {
-        // egui-wgpu の headless test は surface-less Painter を実動作で検査する。
-        // ここでは一段手前の eframe が、FullOutput 取得後の4つの early return すべてで
-        // その Painter API を呼ぶことを vendored caller の source shape として固定する。
+        // Surface-less Painter の実動作回帰に加え、native caller の配送を固定する。
+        // immediate の共通driver抽出後も、消えたviewport/windowがdeltaを落とせない。
         const SOURCE: &str = include_str!("../../vendor/eframe/src/native/wgpu_integration.rs");
+        const DRIVER: &str = include_str!("../../vendor/eframe/src/native/frame_output.rs");
+        let compact = |source: &str| source.split_whitespace().collect::<String>();
         let main_path = SOURCE
-            .split_once("fn run_ui_and_paint")
-            .and_then(|(_, rest)| rest.split_once("fn render_immediate_viewport"))
+            .split_once("// Completing this output never depends on a live surface.")
+            .and_then(|(_, rest)| rest.split_once("handle_viewport_output("))
             .map(|(section, _)| section)
             .expect("eframe main viewport delivery section");
-        let immediate_path = SOURCE
-            .split_once("fn render_immediate_viewport")
-            .and_then(|(_, rest)| rest.split_once("fn egui_installed_atlas_size"))
-            .map(|(section, _)| section)
-            .expect("eframe immediate viewport delivery section");
-
+        let main_path = compact(main_path);
         assert_eq!(
             main_path
-                .matches("painter.apply_textures_delta(&textures_delta);")
+                .matches("}else{painter.apply_textures_delta(pending_deltas);0.0}")
                 .count(),
             2,
-            "missing viewport and missing window/state must both deliver the main FullOutput"
+            "missing viewport and missing window/state must both deliver the pending main delta"
         );
-        assert_eq!(
-            immediate_path
-                .matches("painter.apply_textures_delta(&textures_delta);")
-                .count(),
-            2,
-            "missing viewport and missing window/state must both deliver immediate FullOutput"
+        assert!(
+            main_path
+                .contains("|painter,pending_deltas|painter.apply_textures_delta(pending_deltas),"),
+            "the present-but-unpainted main branch must deliver resources too"
         );
+        assert!(SOURCE.contains(
+            "super::viewport_lifecycle::append_texture_delta(pending_deltas, textures_delta);"
+        ));
+
+        let wrapper = SOURCE
+            .split_once("fn render_immediate_viewport(")
+            .unwrap()
+            .1
+            .split_once("#[derive(Default)]")
+            .unwrap()
+            .0;
+        assert!(
+            compact(wrapper).contains(
+                "super::frame_output::run_immediate_viewport(backend,immediate_viewport);"
+            )
+        );
+        let driver = DRIVER
+            .split_once("pub(super) fn run_immediate_viewport(")
+            .unwrap()
+            .1
+            .split_once("/// Extract actions")
+            .unwrap()
+            .0;
+        let driver = compact(driver);
+        let accepted = driver
+            .find("backend.accept_textures(ids,&ctx,textures_delta);")
+            .expect("immediate must accept the produced delta");
+        let finished = driver
+            .find(".finish_output(ids,&ctx,platform_output,&mutviewport_output)")
+            .expect("immediate output owner");
+        let resources = driver
+            .find("}else{backend.apply_resources(ids,&ctx);}")
+            .expect("missing viewport/window must route to resource delivery");
+        let viewports = driver
+            .find("backend.finish_viewports(ids,&ctx,viewport_output);")
+            .unwrap();
+        assert!(accepted < finished && finished < resources && resources < viewports);
+        assert!(
+            !driver[accepted..].contains("return;"),
+            "an accepted immediate delta must reach paint or resource delivery"
+        );
+
+        let immediate = SOURCE
+            .split_once("impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBackend<'_>")
+            .and_then(|(_, rest)| rest.split_once("fn texture_delta_stats"))
+            .map(|(section, _)| section)
+            .expect("native WGPU immediate output owner");
+        let immediate = compact(immediate);
+        assert!(immediate.contains("super::viewport_lifecycle::append_texture_delta(&mutself.shared.borrow_mut().pending_deltas,delta,);"));
+        assert!(immediate.contains("letviewport=shared.viewports.get_mut(&ids.this)?;"));
+        assert!(immediate.contains("let(Some(window),Some(state))=(&viewport.window,&mutviewport.egui_winit)else{returnNone;};"));
+        let resources = immediate
+            .split_once("fnapply_resources(")
+            .unwrap()
+            .1
+            .split_once("fnfinish_viewports(")
+            .unwrap()
+            .0;
+        assert!(resources.contains("painter.apply_textures_delta(pending_deltas);"));
+        assert!(immediate.contains("letSome(viewport)=viewports.get_mut(&ids.this)else{painter.apply_textures_delta(pending_deltas);return;};"));
+        assert!(immediate.contains("letSome(window)=viewport.window.as_ref()else{painter.apply_textures_delta(pending_deltas);return;};"));
     }
 
     #[test]
@@ -88756,7 +88913,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(handled);
         assert_eq!(app.fullscreen_idx, None);
         assert!(
-            !app.pending_return_to_parent,
+            !app.pending_return_to_parent.is_pending(),
             "Backspace must stop at the direct RAR page list instead of using generic close"
         );
         assert_eq!(
@@ -90708,6 +90865,27 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
     assert!(!app.any_dialog_open());
 
     let ctx = egui::Context::default();
+    let draw_window = |ctx: &egui::Context| {
+        egui::Window::new("future_dialog_not_in_registry")
+            .fixed_pos(egui::pos2(40.0, 40.0))
+            .fixed_size(egui::vec2(240.0, 160.0))
+            .show(ctx, |ui| {
+                ui.label("dialog body");
+            });
+    };
+    // 0.37 Area's first pass measures an invisible, non-interactable window.
+    // The wheel scenario concerns an existing painted window, independently of App's registry.
+    ctx.run_pass(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        },
+        draw_window,
+    )
+    .drop_without_applying_deltas();
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -90727,12 +90905,7 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
     });
 
     ctx.run_pass(input, |ctx| {
-        egui::Window::new("future_dialog_not_in_registry")
-            .fixed_pos(egui::pos2(40.0, 40.0))
-            .fixed_size(egui::vec2(240.0, 160.0))
-            .show(ctx, |ui| {
-                ui.label("dialog body");
-            });
+        draw_window(ctx);
         assert!(App::floating_ui_blocks_background_scroll(ctx));
         app.process_scroll(ctx);
     })
@@ -102865,7 +103038,20 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
         "通常 close が metadata 境界付きの共有 seam を通っていない"
     );
     let body = method_body("take_and_close_current_active_viewer_context_with_metadata_boundary");
+    assert!(body.contains("self.take_and_close_active_context_with_cause(ctx, reason, boundary, ViewerCloseCause::User)"),
+        "metadata境界付きseamがUser causeを持つterminal ownerへ配送されていない");
+    let body = method_body("take_and_close_active_context_with_cause");
     let body = body.as_str();
+    let transfer = body
+        .find("self.transfer_terminal_close_return(id, cause);")
+        .expect("teardown前の帰還移譲がない");
+    let retire = body
+        .find("self.close_and_retire_context(")
+        .expect("typed cause ownerがretire seamを通っていない");
+    assert!(
+        transfer < retire,
+        "帰還の所有値はviewer teardownより前に移譲する"
+    );
     let terminal_closure = body
         .split_once("self.close_and_retire_context(")
         .expect("共有 seam が close-and-retire owner を通っていない")
@@ -105440,6 +105626,7 @@ mod background_click_scroll_regression_tests {
         navs: Vec<crate::ui_main::AddressBarNav>,
         wheels_consumed: Vec<bool>,
         parent_return_scroll: Vec<f32>,
+        root_ui_origin: egui::Pos2,
     }
 
     fn install_items(app: &mut App, folder: &Path, count: usize) {
@@ -105453,13 +105640,20 @@ mod background_click_scroll_regression_tests {
     }
 
     fn harness(app: AppTestEnvForTest) -> Harness<'static, State> {
+        harness_with_size(app, egui::vec2(2000.0, 480.0))
+    }
+
+    fn harness_with_size(app: AppTestEnvForTest, size: egui::Vec2) -> Harness<'static, State> {
         let mut fonts_set = false;
         crate::test_ui::builder()
-            .with_size(egui::vec2(2000.0, 480.0))
+            .with_size(size)
             .with_step_dt(0.01)
             .build_ui_state(
                 move |root_ui, state| {
                     let ctx = &root_ui.ctx().clone();
+                    // kittest's Ui API wraps the callback in its own outer-margin frame.
+                    // Grid-local probes must include that observed origin, including at DPI.
+                    state.root_ui_origin = root_ui.available_rect_before_wrap().min;
 
                     if !fonts_set {
                         crate::ui_fonts::configure_fonts(ctx);
@@ -105508,6 +105702,7 @@ mod background_click_scroll_regression_tests {
                     navs: Vec::new(),
                     wheels_consumed: Vec::new(),
                     parent_return_scroll: Vec::new(),
+                    root_ui_origin: egui::Pos2::ZERO,
                 },
             )
     }
@@ -105646,7 +105841,9 @@ mod background_click_scroll_regression_tests {
         app.settings.grid_cols = 4;
         app.settings.grid_background_double_click_parent = true;
         app.selected = Some(0);
-        let mut harness = harness(app);
+        // A square four-column row at this width is taller than the old 480pt viewport.
+        // Keep the complete painted cell, including its bottom badges/caption, visible.
+        let mut harness = harness_with_size(app, egui::vec2(2000.0, 720.0));
         harness.run_steps(6);
         let tex = harness.ctx.load_texture(
             "letterbox-test",
@@ -105662,13 +105859,18 @@ mod background_click_scroll_regression_tests {
             layout_dims: None,
         };
         harness.run_steps(6);
+        assert!(
+            harness.state().app.last_cell_h <= harness.state().app.last_viewport_h,
+            "letterbox probes require the whole cell, including the lower plates, in view"
+        );
         harness
     }
 
     #[test]
     fn letterbox_real_grid_portrait_single_click_clears_selection() {
         let mut harness = letterbox_harness([40, 120]);
-        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        let cell = cell_rect(&harness);
+        let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
         click(&mut harness, pos);
         assert_eq!(harness.state().app.selected, None);
     }
@@ -105677,7 +105879,8 @@ mod background_click_scroll_regression_tests {
     fn letterbox_real_grid_portrait_double_click_requests_parent() {
         let mut harness = letterbox_harness([40, 120]);
         let parent = harness.state().app.tmp.path().to_path_buf();
-        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        let cell = cell_rect(&harness);
+        let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
         click(&mut harness, pos);
         click(&mut harness, pos);
         assert_eq!(harness.state().navs.len(), 1);
@@ -105688,7 +105891,7 @@ mod background_click_scroll_regression_tests {
 
     fn cell_rect(harness: &Harness<'_, State>) -> egui::Rect {
         egui::Rect::from_min_size(
-            egui::pos2(8.0, 8.0),
+            harness.state().root_ui_origin + egui::vec2(8.0, 8.0),
             egui::vec2(
                 harness.state().app.last_cell_size,
                 harness.state().app.last_cell_h,

@@ -949,6 +949,7 @@ impl WgpuWinitRunning<'_> {
             .viewports
             .get(&viewport_id)
             .and_then(|viewport| viewport.window.clone());
+        let _discard_texture_scope = enter_discard_texture_delivery(&integration.egui_ctx, shared);
         let mut full_output = {
             #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
             let _window_witness_scope = crate::miv_test_script_window_witness::enter_native_window(
@@ -970,10 +971,10 @@ impl WgpuWinitRunning<'_> {
             Some(viewport_id.0.value()),
             egui_installed_atlas_size(&integration.egui_ctx),
         );
-        shared
-            .borrow_mut()
-            .pending_deltas
-            .append(core::mem::take(&mut full_output.textures_delta));
+        super::viewport_lifecycle::append_texture_delta(
+            &mut shared.borrow_mut().pending_deltas,
+            core::mem::take(&mut full_output.textures_delta),
+        );
         super::viewport_lifecycle::finish_full_output(
             &integration.egui_ctx,
             shared,
@@ -1003,7 +1004,7 @@ impl WgpuWinitRunning<'_> {
             mut viewport_output,
         } = full_output;
 
-        pending_deltas.append(textures_delta);
+        super::viewport_lifecycle::append_texture_delta(pending_deltas, textures_delta);
 
         // Synchronization between the integration layer and the painter layer
         if let Some(surface_config) = integration.frame.wgpu_surface_config {
@@ -1573,6 +1574,10 @@ impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBacken
     ) -> Option<(egui::Context, egui::RawInput)> {
         profiling::function_scope!();
         let ctx = self.shared.borrow().egui_ctx.clone();
+        assert!(
+            ctx.has_discard_texture_delivery(),
+            "native immediate requires its Full resource scope"
+        );
         replace_stale_wgpu_viewport(self.shared, &ctx, ids.this);
         let SharedState {
             egui_ctx,
@@ -1675,7 +1680,10 @@ impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBacken
             self.timings.delta_bytes,
         ) = texture_delta_stats(&delta);
         // Transfer before looking up the producing viewport; its lifetime may end in UI.
-        self.shared.borrow_mut().pending_deltas.append(delta);
+        super::viewport_lifecycle::append_texture_delta(
+            &mut self.shared.borrow_mut().pending_deltas,
+            delta,
+        );
     }
 
     fn finish_output(
@@ -2013,7 +2021,7 @@ impl super::viewport_lifecycle::ChildCloseBackend for Rc<RefCell<SharedState>> {
     }
 
     fn collect_retirement_delta(&mut self, ctx: &egui::Context) {
-        super::viewport_lifecycle::append_retirement_delta(
+        super::viewport_lifecycle::append_texture_delta(
             &mut self.borrow_mut().pending_deltas,
             ctx.take_viewport_retirement_texture_delta(),
         );
@@ -2029,6 +2037,28 @@ impl super::viewport_lifecycle::ChildCloseBackend for Rc<RefCell<SharedState>> {
         } = &mut *shared;
         painter.apply_textures_delta(pending_deltas);
     }
+}
+
+fn enter_discard_texture_delivery(
+    ctx: &egui::Context,
+    shared: &Rc<RefCell<SharedState>>,
+) -> impl Drop + use<> {
+    let shared = Rc::downgrade(shared);
+    ctx.enter_discard_texture_delivery(move |delta| {
+        let shared = shared
+            .upgrade()
+            .expect("native Full resource owner must outlive its scope");
+        let mut shared = shared.borrow_mut();
+        let SharedState {
+            painter,
+            pending_deltas,
+            ..
+        } = &mut *shared;
+        super::viewport_lifecycle::append_texture_delta(pending_deltas, delta);
+        if !pending_deltas.is_empty() {
+            painter.apply_textures_delta(pending_deltas);
+        }
+    })
 }
 
 fn replace_stale_wgpu_viewport(shared: &RefCell<SharedState>, ctx: &egui::Context, id: ViewportId) {
@@ -2047,7 +2077,7 @@ fn replace_stale_wgpu_viewport(shared: &RefCell<SharedState>, ctx: &egui::Contex
         // paused. Transfer those deltas now; the existing renderer submission
         // still owns when sets/frees actually run.
         let delta = ctx.tex_manager().write().take_delta();
-        super::viewport_lifecycle::append_retirement_delta(
+        super::viewport_lifecycle::append_texture_delta(
             &mut shared.borrow_mut().pending_deltas,
             delta,
         );
@@ -3221,7 +3251,10 @@ mod viewport_retirement_tests {
                 .clone()
         }
         fn accept_delta(&mut self, delta: egui::TexturesDelta) {
-            self.borrow_mut().pending_deltas.append(delta);
+            super::super::viewport_lifecycle::append_texture_delta(
+                &mut self.borrow_mut().pending_deltas,
+                delta,
+            );
         }
         fn take_delta(&mut self) -> egui::TexturesDelta {
             core::mem::take(&mut self.borrow_mut().pending_deltas)
@@ -3307,5 +3340,54 @@ mod viewport_retirement_tests {
     #[test]
     fn viewport_retirement_wgpu_discard_immediate_reopen_replaces_native() {
         scenarios::discard_immediate_reopen_replaces_native::<Headless>();
+    }
+    #[test]
+    fn discard_texture_delivery_wgpu_native_callback_drop_gc_reopen_ime() {
+        scenarios::discard_texture_delivery_native_reopen::<Headless>();
+    }
+
+    #[test]
+    fn discard_texture_delivery_wgpu_production_scope_weak_pending_and_restore() {
+        let ctx = egui::Context::default();
+        let shared = <Headless as Adapter>::new(&ctx);
+        let scope = enter_discard_texture_delivery(&ctx, &shared);
+        let mut handle = Some(ctx.load_texture(
+            "pending",
+            egui::ColorImage::filled([2, 2], egui::Color32::BLACK),
+            egui::TextureOptions::NEAREST,
+        ));
+        handle.as_mut().unwrap().set_partial(
+            [1, 0],
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::NEAREST,
+        );
+        let id = handle.as_ref().unwrap().id();
+        let mut pass = 0;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            if pass == 0 {
+                ui.ctx().request_discard("production sink pending");
+            } else {
+                drop(handle.take());
+            }
+            pass += 1;
+        });
+        // No renderer exists: the production sink transfers to the existing
+        // pending owner. Later free acceptance must not cancel whole/partial.
+        assert!(shared.borrow().painter.render_state().is_none());
+        super::super::viewport_lifecycle::append_texture_delta(
+            &mut shared.borrow_mut().pending_deltas,
+            core::mem::take(&mut output.textures_delta),
+        );
+        assert_eq!(shared.borrow().pending_deltas.set[&id].len(), 2);
+        assert!(shared.borrow().pending_deltas.free.contains(&id));
+        output.drop_without_applying_deltas();
+        drop(scope);
+        assert!(!ctx.has_discard_texture_delivery());
+        // The scope captures Weak; it does not extend the backend lifetime.
+        let scope = enter_discard_texture_delivery(&ctx, &shared);
+        let weak = Rc::downgrade(&shared);
+        drop(shared);
+        assert!(weak.upgrade().is_none());
+        drop(scope);
     }
 }

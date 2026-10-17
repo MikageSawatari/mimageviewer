@@ -60,6 +60,10 @@ impl App {
         if self.active_detached_context_is_at_rest() {
             return Some(self.close_current_active_viewer_context(ctx));
         }
+        self.transfer_terminal_close_return(
+            self.projected_viewer_context_id(),
+            super::ViewerCloseCause::User,
+        );
         self.begin_active_detached_session_close(reason);
         self.finish_active_detached_session_close(reason);
         if let Err(error) = self.close_fullscreen_to_completion(ctx) {
@@ -112,6 +116,10 @@ impl App {
             }
             // A Context GC may already have removed the registration. The
             // existing fullscreen owner retains its exact command authority.
+            self.transfer_terminal_close_return(
+                self.projected_viewer_context_id(),
+                super::ViewerCloseCause::User,
+            );
             self.transfer_fullscreen_viewport_retirement();
             if let Err(error) = self.close_fullscreen_to_completion(ctx) {
                 crate::logger::log(format!("fullscreen_viewport_close_failed error={error:?}"));

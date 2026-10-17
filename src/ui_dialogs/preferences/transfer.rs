@@ -514,6 +514,7 @@ mod tests {
 
         app.show_settings_restore = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -546,6 +547,9 @@ mod tests {
             target_db.load_into_settings().unwrap().ui_theme,
             UiTheme::Light
         );
+        // The worker can finish in the first invisible sizing pass of the newly opened Window.
+        // Finish its requested UI work before querying the real, visible confirmation control.
+        harness.run();
         harness.get_by_label("  OK  ").click();
         harness.run();
         assert!(!harness.state().show_preferences);
@@ -629,6 +633,7 @@ mod tests {
         .unwrap();
         app.show_settings_restore = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -656,6 +661,9 @@ mod tests {
             crate::settings::UiTheme::Light
         );
 
+        // The worker can finish in the first invisible sizing pass of the newly opened Window.
+        // Finish its requested UI work before querying the real, visible confirmation control.
+        harness.run();
         harness.get_by_label("  OK  ").click();
         harness.run();
         assert!(!harness.state().show_preferences);
@@ -677,6 +685,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.show_settings_restore = true;
         crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -701,6 +710,7 @@ mod tests {
                 app.open_preferences_page(PreferencesPage::General);
             }
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1200.0, 900.0))
                 .build_ui_state(
                     |root_ui, app| {
@@ -793,6 +803,7 @@ mod tests {
             _ => panic!("import must terminate with a notification"),
         }
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {
@@ -855,6 +866,7 @@ mod tests {
             app.show_operation_customize = true;
             app.open_settings_restore_dialog();
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1200.0, 950.0))
                 .build_ui_state(
                     |root_ui, app| {
@@ -961,6 +973,7 @@ mod tests {
         let before = serde_json::to_value(&state.settings).unwrap();
         let generation = crate::settings::save_generation();
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
             .build_ui_state(
                 |root_ui, app| {

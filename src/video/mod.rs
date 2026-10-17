@@ -8768,6 +8768,13 @@ fn eof_freeze_position(known_duration_secs: Option<f64>, current_secs: f64) -> f
 }
 
 impl VideoPlayer {
+    #[cfg(all(test, windows))]
+    pub(crate) fn mark_native_presenter_closed_for_test(&self) {
+        self.native_output
+            .as_ref()
+            .expect("fixture native output")
+            .mark_closed_for_test();
+    }
     /// ParkedLive teardown の resume 保存テスト用。worker / native HWND を起動しない。
     #[cfg(test)]
     pub(crate) fn disconnected_for_test(path: PathBuf, position_secs: f64) -> Self {

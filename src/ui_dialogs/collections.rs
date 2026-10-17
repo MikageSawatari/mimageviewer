@@ -6313,6 +6313,7 @@ mod tests {
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
@@ -7490,6 +7491,7 @@ mod tests {
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
@@ -7548,6 +7550,7 @@ mod tests {
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
@@ -8962,6 +8965,7 @@ mod tests {
         };
         let ui_app = std::rc::Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
@@ -9016,6 +9020,7 @@ mod tests {
         };
         let ui_app = std::rc::Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();

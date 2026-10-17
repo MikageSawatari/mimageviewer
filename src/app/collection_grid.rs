@@ -7276,10 +7276,10 @@ mod tests {
             app.visible_indices = vec![0];
             app.items_generation = app.items_generation.wrapping_add(1);
             app.fullscreen_idx = Some(0);
-            app.pending_return_to_parent = false;
+            app.pending_return_to_parent.clear();
 
             app.handle_fullscreen_close_request();
-            assert!(app.pending_return_to_parent);
+            assert!(app.pending_return_to_parent.is_pending());
             assert_eq!(app.fullscreen_idx, Some(0));
             let close_consumed_before_render = source == &pdf;
             let nav = if close_consumed_before_render {

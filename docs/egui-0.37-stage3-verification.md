@@ -2,7 +2,7 @@
 
 ## 状態（2026-10-17）
 
-**再開後の最新状態:** 第4.5版の型付き退役と正式接続を実装中。初回の設計論点は解決済みだが、独立実装レビューでCloseの表示継続・dirty消費とdiscard/immediate間delta配送のP1を確認した。dirty消費は既存owner内で補修し、回帰を追加した。Close表示継続とdelta配送は追加の構造契約が未解決。末尾「再開後の設計担当へ返す論点」とその補修追記を参照。段3完了・独立ACCEPTではない。
+**最新状態:** 第4.6版と双方の構造合意（97ab24ae1 / 5c1584d8a）に基づく段3の実装・指定自動確認を完了。**実装担当の内部確認では、未分類・残る段3契約違反は0件**。設計担当による最終受入とは区別する。最後に1回実行したlib全件は290失敗で、その後の限定検証により179件の移行不備を解消し、PNG比較102件と段4のlayout/挙動差9件へ分類した。全件を最終ソースで再実行したとは扱わない。後述の最終コマンド表と残課題を正本とし、過去の論点・未達記録は履歴として残す。HEAD `5c1584d8a`、ブランチ`egui-036`を維持し、未コミット・未ステージで返す。
 
 以下の初回停止記録は履歴として保持する。
 
@@ -388,3 +388,435 @@ App/ラボ/test APIの移行を進め、上記の正式graphの選択件数とde
 indexは空、コミット・git add・branch操作・push・ネットワーク取得なし。
 live・製品起動・`test-full.ps1`・確認用build/release buildは行っていない。
 通常のbuild-dev引継ぎは今回の段3未完・計画上のbuild前提未達のため行わない。
+
+## 第4.6版の再開記録（実装担当の内部確認）
+
+再開時のHEADは `5c1584d8a`、作業ツリーはclean。2回目のWIP `fe32f2e88`、第4.6版 `97ab24ae1`、独立設計ACCEPTと§11の双方合意 `5c1584d8a` を前提とした。
+前掲「設計担当へ返す論点」のClose帰還とdelta配送は、第4.6版で設計上解決した。過去の論点・失敗・未達記録は削除しない。
+
+### Close帰還の所有と接続
+
+主なファイル: `src/app/close_return.rs`、`src/app.rs`、`src/app/viewer_context_registry.rs`、`src/app/viewport_retirement.rs`、`src/app/snapshot_ops.rs`、`src/app/collection_navigation.rs`、`src/remote_ipc/ui.rs`、`src/ui_fullscreen.rs`。
+
+- 既存 `pending_return_to_parent` boolを一つの型付き状態に変更した。要求なし／originだけを保持するViewing／生存viewerのLive／終端viewerから移譲済みのTerminalを区別する。新しいApp field・採番・queueは追加していない。
+- originは既存MainListNavigation proof、main context、quick-folder切替identity、BookmarkOpenRequestIdとtargetを保持する。Opening／Detachedと同じcontext bundleで移動し、build・forkで捕捉、park／resumeで保持する。mediaの内部移動でBookmarkViewStateが消えても元ownerを失わない。
+- Closeのmodal判断後、teardown前にsummary・帰還先・選択intentを捕捉して存続mainへ移す。summaryはfullscreenの現在mediaを優先する。親resolverを副作用なしの値生成へ抽出し、変換アーカイブの元pathと既存の優先順を共有した。
+- bookmark帰還の判断を `bookmark_close_return_effect` に一本化した。logicはread-modelを採用・再構築せず、mainの既存UI consumerがrefresh／Bookmarks／Direct navigationへ一度だけ渡す。現在のmainの選択・scrollを優先し、row keysとopened keyを維持する。
+- active at-rest、standalone、parked／passive、通常UI、早期return、native即時consumerを接続する。loading shell／holdoverの真Closeとnative hard-closeも、通常helperを迂回する入口として棚卸しした。
+- Remote、新main navigation、同pathへのnavigation、新bookmarkは受付境界で旧要求・旧originを失効する。Close causeはUser／Replaced／RemoteAcquire／AppExitで渡し、reason文字列から推測しない。parkingのsnapshot不可・removed-pathの置換にもReplacedを渡す。
+- `src/app/close_return_tests.rs` の11件は、実EpiIntegrationのLogicOnlyとFull、production native poll、実immediate child UIを使う。headless adapterにはnative OS Close loopがないため、LogicOnly wrapperが製品Close callbackを呼ぶ点を実OS受付の証拠とはしない。
+- Live帰還のCloseではteardownまでにslideshow timerが進み得る既存経路を確認した。真Close入口から既存の停止処理を呼び、帰還待ちでも対象viewerの自動navigationを終端する。内部folder reopenはこの入口を使わない。
+- この停止処理はbundle外のpopupと共有archive変換も触っていたため、投影中contextの停止本体と既存popup操作を分離した。共有変換の取消は既存requestのorigin contextで2段とも対象限定し、同contextの古い世代のcleanupは維持する。兄弟の変換・receiver・cancel tokenとmainのtimer／popupを壊さない回帰を追加した。新しいcontext採番・状態・待機・一括resetはない。
+
+### discard中のdelta配送
+
+主なファイル: `vendor/egui/src/context.rs`、`vendor/egui/src/discard_texture_delivery_tests.rs`、`vendor/eframe/src/native/{wgpu_integration,glow_integration,viewport_lifecycle}.rs`、`vendor/egui-wgpu/src/winit_tests.rs`、各 `PATCHES.md`。
+
+- 第4.6版の候補(a)を実装した。実際のdiscard再pass直前、output hook変更後の蓄積deltaだけをContext束縛TLS RAII scopeへmoveする。最終pass・limit到達・direct begin/end・scopeなしは通常FullOutputに所有を残す。
+- scopeは既存backend共有renderer ownerへのWeakを持ち、TLS／Context／texture managerのborrowやlockを保持せずconsumerを呼ぶ。正常終了・早期return・unwindで登録を復元し、Context間・入れ子scopeを分離する。scopeに第二のpending deltaは置かない。
+- root／immediate／retirement／discardを既存shared pendingと非相殺の受入へ合流した。古いset／partialを先に処理し、wgpuは描画なしでもupload／submission／freeを完結、glowも既存resource consumerを使う。cleanup遅延・追加present・repaint・UI強制・epaint変更はない。
+- egui 4件、eframe wgpu 2件／glow 2件、egui-wgpu 2件を追加した。egui-wgpuは実resource consumerとoffscreen readbackを検査し、GPU前提不成立を成功skipしない。glowはnative adapterとfake GL callsによるresource順序の証拠であり、実GL環境の成功とは扱わない。
+- 製品SubmissionPluginのscopeあり／なし比較は `src/ui_fullscreen/page_turn.rs` に別の回帰を追加した。IME・receipt・表示ACKの観測をdelta受入と混同しない。
+
+### 製品Fullと入力の追加接続
+
+主なファイル: `src/app/egui037_connection_tests.rs`、`src/app/update_phases.rs`、`src/app/sidecar_restore.rs`、`src/ui_fullscreen/page_turn.rs`、`src/ui_fullscreen.rs`、`src/wheel_input.rs`、`src/ui_fullscreen/page_turn/barrier.rs`。
+
+Full接続10件は、旧checkpointへのtest専用read-only observerを使い、実App::uiとEpiIntegrationでC2〜C5／D3の結果採用を検査する。新しいpointer両反転、C5のframe予算、D3 cutoff・cause・restart・hydration IDを含む。test observerを製品のpollやgateの代用にはしない。
+fullscreen混在wheelはpass-localの順序付き値と既存frame調停・navigation ownerを接続し、bar／HUD／click／key／Closeの既存優先、page-turn barrierの受理・拒否を保つ範囲で実装する。永続queue・新pending fieldを追加しない。実選択結果は後述のコマンド表へ記録する。music timelineのwheel投影は `src/ui_music_timeline.rs` のoptions取得もinput closure外へ移した。
+
+### 検証方針の今回の明示変更
+
+launcherのrelease入力3本不足は既知の前提であるため、利用者の今回の明示指示に従い、`cargo check --workspace --exclude mimageviewer-launcher` とlauncher以外の全target compileをworkspace受入の代替gateとする。前掲の「代用しない」は前回時点の判断の履歴である。代用exeの配置、launcherのbuild規則変更、先取りrelease buildは行わない。
+vendor standalone lockは原本ではなく、正式manifest graphを通常のoffline Cargoで解決した記録である（各PATCHESの既存説明どおり）。原本hashはprovenance inventoryに残す。
+
+### 第4.6版の回帰対応表（実装担当の内部確認）
+
+件数は正式コマンドの選択数であり、表の行を合算しない。`close_return` は新規11件と既存bookmark media 1件の計12件、native同dispatchは別filterの1件である。
+以下の短い名前は `src/app/close_return_tests.rs` の `close_return_` 後のsuffixを表す。最終実行の結果は後続のコマンド表を用いる。
+
+| Close受入 | 回帰名・接続の証拠 |
+| --- | --- |
+| 1 active book/mediaの終端と帰還保持 | `actual_logic_only_active_book_and_media_wait_for_main_full`。book/media各条件で実logic、binding/worker終端、main Fullの一回消費 |
+| 2 media離脱・book内部移動 | `media_departure_uses_last_real_folder_while_book_navigation_keeps_grid`。最後の実folder/mediaとbookmark一覧を区別 |
+| 3 standalone・auto-open・実親path | `standalone_bookmark_navigation_survives_viewer_teardown`、`auto_open_zip_pdf_image_folder_and_converted_source_preserve_parent_selection`。ZIP/PDF/folder/変換元の4条件 |
+| 4 main選択・scroll・row復元 | `main_selection_scroll_and_same_list_refresh_survive_until_consumer`。実read-model receiver採用と既存grid復元を経由 |
+| 5 parked/passive・置換・兄弟 | `parked_sibling_full_cannot_consume_surviving_main_request`、`same_path_navigation_and_new_bookmark_invalidate_old_origins_at_admission`、`replaced_remote_and_app_exit_causes_never_publish_user_return` |
+| 6 Close→Remote→遅いFull | `remote_acquire_and_return_never_resurrects_terminal_request`。取得・ACK・drain・返却は帰還UIを待たない |
+| 7 同path新navigation・新bookmark | `same_path_navigation_and_new_bookmark_invalidate_old_origins_at_admission`。既存request IDと受付時失効を検査 |
+| 8 LogicOnlyの非表示採用 | `actual_logic_only_active_book_and_media_wait_for_main_full`、parked/sibling回帰。items/read-model/dirty/frame不変と終端・移譲を区別 |
+| 9 UI・早期return・native同dispatch | 上記main Full、`loading_and_holdover_shell_escape_and_close_use_actual_child_ui`（loading/holdover × Escape/Closeの4条件）、`native_hard_close_flag_reaches_production_poll_before_teardown`、既存 `native_immediate_close_consumes_bookmark_return_in_same_dispatch` 1件 |
+
+deltaの共通filter `discard_texture_delivery` はegui 4件、eframe wgpu 2件/glow 2件、egui-wgpu 2件を正式manifestで実行し、計10件全て成功（各exit 0）。AppのSubmissionPlugin回帰1件はcontinuationにも含まれる。
+
+| delta受入 | 回帰名・正式選択件数 |
+| --- | --- |
+| 1 実discard→同ID再open→callback handle drop | egui-wgpu `offscreen_actual_retry_immediate_callback_drop_readback` 1件、eframe各 `native_callback_drop_gc_reopen_ime` 1件 |
+| 2 先行whole/partialと後発freeの順 | 同offscreen 1件は実resource consumerを通す。eframe wgpu `production_scope_weak_pending_and_restore`、glow `resource_consumer_pending_unavailable_order` 各1件を併用 |
+| 3 実upload/submission/readback/free | egui-wgpu上記1件。glowは実adapterとfake GL callsによるresource順序であり実GL表示の証拠ではない |
+| 4 既存pending・利用不能・後発free | egui-wgpu `offscreen_unavailable_pending_later_free_not_cancelled` 1件、eframe上記pending回帰各1件 |
+| 5 nested・複数discard・空delta | egui `nested_immediate_discard_uses_same_scope`、`plugins_ime_receipt_and_multiple_retries_once`、`final_limit_direct_and_empty_do_not_call_sink` 各1件 |
+| 6 通常最終outputの所有 | egui `final_limit_direct_and_empty_do_not_call_sink` 1件。discardなし/max_passes/direct begin/endを含む |
+| 7 plugin変更後・IME/receipt/ACK不変 | egui `plugins_ime_receipt_and_multiple_retries_once` 1件、App `egui037_continuation_submission_plugin_discard_texture_delivery_is_not_acceptance` 1件 |
+| 8 Context/scope分離・復元・unwind | egui `context_scope_restore_early_return_and_unwind` 1件、eframe wgpu scope回帰1件 |
+| 9 GC/退役/root終了・新寿命/兄弟 | eframe各 `native_callback_drop_gc_reopen_ime` 1件と既存 `viewport_retirement` 各12件、egui `viewport_retirement` 14件。追加delta2件はeframe退役filterにも含まれる |
+
+### 第4.3版受入1〜16の最終接続対応（実装担当の内部確認）
+
+新規Full接続の共通prefixは `egui037_continuation_real_`、所在は `src/app/egui037_connection_tests.rs`。
+`egui037_continuation` 全体は旧36件、新規Full接続10件、製品SubmissionPlugin 1件の47件。実選択結果・fixture補修の履歴は後続表へ記録する。
+headlessのminimized metadata、fake desktop/native effect、offscreen資源試験を、実OSの最小化・表示・実IMEの成功へ拡大しない。
+
+| 受入 | 回帰名・選択集合 / 接続 |
+| --- | --- |
+| 1 最小化Full・旧順序 | `minimized_full_preserves_checkpoints_and_owner_adoption` 1件でC2 completion/C3 metadata/C4 inpaint/C5 material/D3 Equalを同一製品Fullで採用。両backend `minimized_full` wgpu9/glow11件を併用 |
+| 2 同frame複数LogicOnly | 同新規1件、既存 `remote_service_acquire_ack_and_return_do_not_consume_display`、save/AI/context-state/gamepadのcontinuation。App退役 `remote_logic_waits_for_command_delivery_and_existing_save_ack` |
+| 3 対象Fullで一回採用 | `full_discard_and_sibling_keep_result_owner_exactly_once`、旧順序回帰。既存Remote slot、AI live backlog。receiver切断・texture identity・兄弟不変で検査 |
+| 4 保存/resume/共有ACK | `sent_save_terminal_unblocks_remote_without_editor_ui`、`remote_resume_response_uses_receiver_without_ui`、`remote_shared_bookmark_router_consumes_each_reply_once`、App退役のsave ACK回帰 |
+| 5 返却→再取得→遅いFull | `remote_return_reacquire_late_ui_discards_old_slot`、`remote_old_return_identity_cannot_reload_after_later_return`、第4.6版Close Remote回帰 |
+| 6 C3 live保留・取消・寿命終端 | `egui037_continuation_ai_*` 5件、`app_drain_lease_drop_terminals_every_representative_resource_before_one_ack`、App退役/Closeのowner限定回帰 |
+| 7 C4新pointer | `full_inpaint_resumes_view_trim_with_new_pointer_level` 1件、old-up/new-downとold-down/new-upの両方向で製品再開経路を検査 |
+| 8 C5表示予算/runtime終端 | `minimized_full_retains_material_upload_budget_through_logic`、`full_samples_decision_preview_and_physical_input_only_in_ui`、`full_pdf_promotion_retry_uses_ui_frame_budget`、`full_summary_budget_waits_for_next_ui_frame` 各1件、既存drain/lease終端回帰 |
+| 9 D3 cutoff/cause/restart/ID | `full_equal_rescan_acknowledges_cutoff_and_retains_restart_cause`、`full_different_rescan_installs_and_allocates_hydration_only_in_ui` 各1件、既存 `hydration_*` 3件（context mount/cancel-restart/IndexOnly/枯渇） |
+| 10 非描画output・capture・ACK | backend `minimized_full` 20件中のoutput/action/immediate入口、App SubmissionPlugin1件、delta追加10件、`texture_output_` 2件 |
+| 11 root/child交互・skip・退役 | backend `minimized_full_real_integration_keeps_root_child_input_outputs_and_logic_only_boundary` 各feature、`viewport_input` 各5件、App退役10件、Close sibling回帰 |
+| 12 非描画root Closeとbackend判定 | `root_lifecycle_actual_app_logic_reaches_backend_close_decision_without_ui`、`root_lifecycle_actual_app_save_ack_precedes_resumed_backend_close`、ZIP/settings/trayの既存回帰。root filter11件 |
+| 13 modal拒否・一回延期/優先 | `root_lifecycle_actual_app_modal_rejection_consumes_only_one_delivery`、既存modal/save/tray/explicit quit回帰。root filter11件 |
+| 14 B receipt/ratingを非描画で更新 | `context_state_real_logic_receipt_keeps_sibling_ui_unadopted`、`context_state_real_logic_preserves_unadopted_owner_results`、`context_state_save_receipt_preserves_both_unadopted_views`。context_state filter8件 |
+| 15 正当UIでrating/page-edit採用 | `context_state_retains_rating_and_page_edit_until_ui_boundary`、実logic receiptの同UI復帰検査。context_state filter8件 |
+| 16 immediate子独自描画・最小化capture | 両backend `minimized_full_immediate_real_entry_preserves_child_output_and_paint_ownership` 各1件（親min/子visible、親子min、子screenshot）。親子paint/UI/callbackを別々に検査 |
+
+### 段3必須回帰と第4.5版の再確認（実装担当の内部確認）
+
+段3「実接続点の必須回帰」の順番に対応する。正式manifestは `vendor/*`、IMEは一本化済みの `crates/egui-ime` を使う。
+
+| 必須回帰 | 正式回帰 / 選択数 |
+| --- | --- |
+| delta描画/無描画/早期終了/headless | `texture_output_` 2、backend `minimized_full` wgpu9/glow11、追加delta10。全test fixtureの明示破棄は全target compileと監査を併用 |
+| root/child交互とskip後の終端 | backend `viewport_input` 各5、`minimized_full_real_integration_keeps_root_child_input_outputs_and_logic_only_boundary`、App退役10 |
+| 最小化passive Close | backend `viewport_input`、App managed hook/Close parked-sibling/standalone回帰。非UI callback0を検査 |
+| active/parkedの終了委譲 | App `viewport_retirement_mode_change_transfers_active_parked_and_passive_exact_lifetimes`、第4.6版Close12、collection slideshow cancel3 |
+| modal拒否の消費/新Close受付 | App `viewport_retirement_managed_hook_consumes_modal_reject_then_accepts_new_close`、eframe `close_request_separation` 各1 |
+| OS/programmatic/bar/watcher入口 | App hook/retirementとClose loading/holdover/native hard-closeの実consumer、既存入口棚卸し。Frame OS Close二重読取りは除去済み。実OS操作は段7 |
+| root LogicOnly退役/兄弟維持 | egui退役14、eframe退役各12、App退役10、Close12 |
+| gesture/media/worker終端・非再作成 | 同退役集合、Close/native/parked、wheel true-close scope回帰、collection slideshow cancel3。deltaは追加10 |
+| Disabled producer→実TextEdit | egui-winit lib43中 `disabled_producer_*`、IME共有lib30 |
+| 同Context親子の中断分離 | 正式egui `ime_interrupt` 6（parent/child/neither/both） |
+| 実run_ui discardのIME矩形/中断 | 同6中 `ime_interrupt_discard_keeps_request_and_latest_text_edit_metadata`、delta plugin回帰 |
+| native focus/cursor→intent/control/epoch | `native_ime_interrupt` 3（実TextEdit focus/cursor、visual置換/epoch退役、複数logical pass） |
+| 集約中断の対象配送/他viewport分離 | native上記3、egui IME6、backend `minimized_full` output boundaryと`viewport_input` 各5 |
+| native visual上書き/複数pass/host退役 | native上記3。新hostへ旧intentが漏れないことを検査 |
+| focus前の受信済み離散キー | `keyboard_input::` 17、`synthetic_modifier` 1、egui-winit43中delivery/processedキー回帰 |
+| gamepad同frame/短い退避/edge/disconnect/ring/Undo | `gamepad_` 94、うち実logic接続1件。物理とdelivery ownerを区別 |
+| gamepad保持軸の復帰後継続 | 同94中 `gamepad_blocked_dispatch_keeps_held_axis_for_admitted_resume`、`rating_undo_grid_blocked_pad_and_ring_moves_keep_held_restore` 等。保持値を消さず既存tickで継続 |
+| WH_GETMESSAGE既存drain | `getmessage` 1 |
+
+第4.5版13項目は前掲の対応表を維持し、最終結果に次の補足を適用する。
+egui退役14、eframe退役wgpu12/glow12、App退役10は全て正式graphで選択して成功した。
+項目9の表示継続P1は上記Close帰還12件＋native同dispatch1件で、項目11のdiscard順P1は上記delta10件＋製品SubmissionPlugin1件で補完する。
+項目10ではbackend配送前のFinishAcquire禁止と配送後の既存service/readinessを実App回帰で検査し、Close帰還UI待ちは加えていない。
+項目13はroot lifecycle11件とbackend root終了/重複退役回帰を併用し、tray/save/CancelCloseの製品policyをvendorのfake Appに代えない。
+
+| 第4.5版受入 | 正式回帰・選択数（最終対応） |
+| --- | --- |
+| 1 Full logic→pass外退役 | eframe `viewport_retirement_{wgpu,glow}_full_logic_gc_discard` 各1。退役filterは各12成功 |
+| 2 LogicOnlyのみの退役 | eframe `logic_only` 各1、egui `logic_transfer_exact_descendants_and_no_phantom_registration` 1、App退役10、Close実logic回帰 |
+| 3 GC前の承認保持 | eframe `context_gc_native_descendants_ime` 各1、egui `gc_discard_keeps_authority_in_root_until_outer_return` 1、App `context_gc_preserves_app_binding_authority` 1 |
+| 4 immediate入れ子・最外側配送 | eframe `immediate_nested` 各1、egui `immediate_nested_pass_defers_transfer_and_cleanup` 1、追加delta nested/immediate回帰 |
+| 5 discard再pass・二重終端/早いC1禁止 | eframe `full_logic_gc_discard` 各1、egui GC/discard 1、App `remote_full_and_discard_wait_for_outer_delivery` 1 |
+| 6 exact子孫・兄弟・部分GC | eframe `context_gc_native_descendants_ime` 各1、egui退役14、App mode-change/parking、Close sibling、collection取消3 |
+| 7 旧output/append/同ID再open | eframe `old_output_reopen_duplicate`/`discard_immediate_reopen_replaces_native` 各backend各1、egui `old_output_append_and_reopen_never_mix_lifetimes` 1 |
+| 8 modal消費・新Close・非管理 | eframe `close_request_separation`/`hook_captures_lifetime_before_reopen` 各backend各1、`child_close` wgpu3/glow4、App managed hook 1 |
+| 9 全終了入口・parking存続 | App退役10中mode-change/managed hook/parking/重複/未登録、Close12＋native同dispatch1。bar/watcher→既存判断のsource棚卸しとlib既存回帰も併用 |
+| 10 C1配送完了とreadiness | App `remote_logic_waits_for_command_delivery_and_existing_save_ack`、`remote_standalone_fullscreen_keeps_exact_authority_after_context_gc`、`remote_full_and_discard_wait_for_outer_delivery`、dirty保持、continuationのsave/resume/drain、Close Remote回帰 |
+| 11 whole/partial/freeとdrop追加分 | eframe `delta_callback_drop` 各1、egui unlocked callback/drop free、追加delta10＋製品SubmissionPlugin1。実GPU readbackとsubmit→freeを検査 |
+| 12 通常GC/重複承認/一回終端 | eframe `overlapping_gc_root_close` 各1、egui overlapping/direct-end、App `repeat_terminal_owner_transfers_once` |
+| 13 root同時終了/tray/save/CancelClose | eframe `overlapping_gc_root_close` 各1、root_lifecycle11（製品→実EpiIntegration 3を含む）、backend `minimized_full` wgpu9/glow11中root LogicOnly判定 |
+
+### 追加回帰の初回失敗と限定レビュー
+
+- 新規Full接続の初回はcontinuation47選択/41成功/6失敗。共有headless fixtureにはCreationContextが無く製品begin-pass trackingが未登録だった3件、embedded初期化前のC4 fingerprintとcanvas click混入、初回sizing/discardを通常frame予算と混同したmaterial/summary fixtureを補修した。統合fixtureは無関係なload-folder workerを除き、既存page-index ownerでinstalled baselineを準備する。採用数・予算・pointer両方向の期待と製品poll経路を維持し、製品のgate・max_passesは変更しない。
+- wheel初回19選択/18成功/1失敗はHome/End fixtureの誤前提だった。既存jump ownerはnonsequential landでありDisplay sequenceを開始しない。command直後のtarget 0/3、最終wheel ordinal 3、最終配送後Home→1/End→3を検査する。中間wheelが先にDisplayを作ってcommandを拒否する旧不具合はcommand直後のassertで引き続き検出する。
+- 既存music overflow回帰1件でContext lock再入を検出した。`src/ui_music_timeline.rs::timeline_manual_scroll_requested` の `ui.input` 内に残った `ui.ctx().options` をclosure外へ移した。10秒debug lock診断であり、runner timeoutによる失敗ではない。関連sourceのinput closure内options取得を再走査し、残件0。追加delay・retryでは回避しない。
+- collection slideshow取消の新fixtureに `Option<Box<ArchiveConvertState>>` のBox不足があり、最初のclose/bookmark filterはコンパイルで停止した。Box化後の実選択結果を以下に記録する。コンパイル失敗を0件成功とは扱わない。
+
+Full接続fixture補修後は47選択/45成功/2失敗で、残りはO5の到達経路と予算の誤前提だった。観測付き2件の実行により、`render_update_before_frame` → `poll_mounted_document_open_owners` → `ContextAsyncOwner::ALL` がC4/C5も採用することを確定した。`needs_mounted_service` はpendingのEraseInpaint/LocalAdjustmentを含み、開始HEAD `5c2fd0367` にも同じ経路があり、git blameは `2ff4fe19d1`（2026-09-28）まで遡る。
+
+段1b台帳のO5をC3のみ、C4をF16のみとした到達記録は不完全だった。製品traceは、同じpass内のcounter Nでearly local1件、F8増分後のcounter N+1でmedia local1件を示し、同じcounterで2件採用していない。設計書C4はUI/新pass pointerを要求するがF16専有とはしておらず、G2は既存 `frame_counter` 比較を正本とする。別contextのSol / xhighも独立に履歴・実入口・設計文を照合し、この判断で一致した。製品pollの除去・後置やcounter移動は行わない。
+
+したがって新fixtureの「外側Fullごとに1件」と「C4はmedia入口まで未採用」という未確認前提を訂正する。統合回帰はbefore_frameの未採用→update_beginのearly採用→mediaの再採用なしを固定する。予算回帰はready3件でNの1件→N+1の2件目→同N+1のLogicOnly保持/次Full early抑止→N+2の3件目を検査する。単に上限を2へ変える検査ではない。新しい厳密な1 UI pass/1 Full上限を設けるなら別の仕様変更であり、この移行には混ぜない。初回レビューでこの間接pollを見落としたことも履歴として残す。
+
+別contextのGPT-6.1 Sol / xhighによる限定source reviewは、Close帰還、delta実装・回帰、Full接続fixture、wheel調停・Close scope限定、上記Home/End訂正とmusic hoistをそれぞれACCEPTとした。
+途中で指摘されたloading/holdover/native hard-closeのcapture漏れ、Live Close後のslideshow、共有archive取消の兄弟混入は修正し、対象回帰を追加した。
+これらはソースの限定レビューであり、正式コマンドの成功や段3全体の設計担当による受入と区別する。内部の実行・分類は**実装担当の内部確認**である。
+
+### 最終コマンド結果（実装担当の内部確認）
+
+この表の後に、最後のlib全件実行と、そこで判明した移行不備の限定修正・再検証を追記する。全件実行は1回だけとし、修正後に全件を再実行したとは扱わない。
+
+`target/egui037-stage3-v46-<label>.json/.log` に引数・exit code・秒数と全出力を保存した。
+全Cargo graphはoffline、jobs=1、MSBuild node reuse無効。新しいcrateの取得は不要だった。
+前掲の初回・途中失敗を削除せず、以下は最終または影響範囲が不変で再利用できる実行結果を示す。
+`--no-run` はコンパイル成立の証拠であり、0件テスト成功とは扱わない。egui-imeのdoc 0件もlib30件と区別する。
+`test-focused.ps1` のexit 2はbroad/shared変更による未選択で、成功ではない。要求されたlib全件と個別vendor gateを別々に実行する。
+
+| label | コマンド | 選択・結果 | exit / 秒 |
+| --- | --- | --- | --- |
+| `core-handoff` | `cargo check -p mimageviewer --bin mimageviewer-core --offline` | check / inspect | 0 / 20.6 |
+| `test-script-handoff` | `cargo check -p mimageviewer --bin mimageviewer-core --features test-script --offline` | check / inspect | 0 / 19.92 |
+| `workspace-handoff` | `cargo check --workspace --exclude mimageviewer-launcher --offline` | check / inspect | 0 / 29.9 |
+| `workspace-all-targets-final-source` | `cargo check --workspace --all-targets --exclude mimageviewer-launcher --offline` | check / inspect | 0 / 30.21 |
+| `tests-no-run-handoff` | `cargo test -p mimageviewer --tests --no-run --offline` | 23 executables, no run | 0 / 317.89 |
+| `lib-no-run-handoff` | `cargo test -p mimageviewer --lib --no-run --offline` | 1 executables, no run | 0 / 0.69 |
+| `snapshot-no-run-handoff` | `cargo test -p mimageviewer --test ui_snapshot --test book_composition_editor_snapshots --no-run --offline` | 2 executables, no run | 0 / 0.74 |
+| `ime-interrupt` | `cargo test -p egui --lib ime_interrupt --offline` | 6 passed, 0 failed, 0 ignored | 0 / 6.47 |
+| `egui-ime` | `cargo test -p egui-ime --offline` | 30 passed, 0 failed, 0 ignored / 0 passed, 0 failed, 0 ignored | 0 / 7.03 |
+| `egui-winit` | `cargo test --manifest-path vendor/egui-winit/Cargo.toml --lib --offline` | 43 passed, 0 failed, 0 ignored | 0 / 13.36 |
+| `continuation-handoff` | `cargo test -p mimageviewer --lib egui037_continuation --offline` | 47 passed, 0 failed, 0 ignored | 0 / 10.2 |
+| `root_lifecycle` | `cargo test -p mimageviewer --lib root_lifecycle --offline` | 11 passed, 0 failed, 0 ignored | 0 / 5.9 |
+| `context_state` | `cargo test -p mimageviewer --lib context_state --offline` | 8 passed, 0 failed, 0 ignored | 0 / 2.62 |
+| `minimized_full-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib minimized_full --no-default-features --features default_fonts,wgpu --offline` | 9 passed, 0 failed, 0 ignored | 0 / 0.32 |
+| `minimized_full-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib minimized_full --no-default-features --features default_fonts,glow --offline` | 11 passed, 0 failed, 0 ignored | 0 / 0.48 |
+| `viewport_input-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_input --no-default-features --features default_fonts,wgpu --offline` | 5 passed, 0 failed, 0 ignored | 0 / 1.05 |
+| `viewport_input-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_input --no-default-features --features default_fonts,glow --offline` | 5 passed, 0 failed, 0 ignored | 0 / 0.46 |
+| `child-close-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib child_close --no-default-features --features default_fonts,wgpu --offline` | 3 passed, 0 failed, 0 ignored | 0 / 0.78 |
+| `child-close-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib child_close --no-default-features --features default_fonts,glow --offline` | 4 passed, 0 failed, 0 ignored | 0 / 0.29 |
+| `egui-retirement` | `cargo test --manifest-path vendor/egui/Cargo.toml --lib viewport_retirement --offline` | 14 passed, 0 failed, 0 ignored | 0 / 0.12 |
+| `viewport_retirement-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_retirement --no-default-features --features default_fonts,wgpu --offline` | 12 passed, 0 failed, 0 ignored | 0 / 1.35 |
+| `viewport_retirement-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_retirement --no-default-features --features default_fonts,glow --offline` | 12 passed, 0 failed, 0 ignored | 0 / 0.5 |
+| `viewport_retirement` | `cargo test -p mimageviewer --lib viewport_retirement --offline` | 10 passed, 0 failed, 0 ignored | 0 / 3.17 |
+| `close-final` | `cargo test -p mimageviewer --lib close_return --offline` | 12 passed, 0 failed, 0 ignored | 0 / 6.03 |
+| `bookmark-final` | `cargo test -p mimageviewer --lib bookmark_return --offline` | 5 passed, 0 failed, 0 ignored | 0 / 1.73 |
+| `native_immediate_close_consumes_bookmark_return_in_same_dispatch` | `cargo test -p mimageviewer --lib native_immediate_close_consumes_bookmark_return_in_same_dispatch --offline` | 1 passed, 0 failed, 0 ignored | 0 / 268.56 |
+| `delta-egui-final` | `cargo test --manifest-path vendor/egui/Cargo.toml --lib discard_texture_delivery --offline` | 4 passed, 0 failed, 0 ignored | 0 / 10.84 |
+| `delta-eframe-wgpu-final` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib discard_texture_delivery --no-default-features --features default_fonts,wgpu --offline` | 2 passed, 0 failed, 0 ignored | 0 / 7.84 |
+| `delta-eframe-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib discard_texture_delivery --no-default-features --features default_fonts,glow --offline` | 2 passed, 0 failed, 0 ignored | 0 / 14.61 |
+| `delta-offscreen` | `cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --lib discard_texture_delivery --features winit --offline` | 2 passed, 0 failed, 0 ignored | 0 / 56.3 |
+| `wheel-final` | `cargo test -p mimageviewer --lib egui037_wheel_frame_ --offline` | 19 passed, 0 failed, 0 ignored | 0 / 7.91 |
+| `collection_slideshow_cancel_` | `cargo test -p mimageviewer --lib collection_slideshow_cancel_ --offline` | 3 passed, 0 failed, 0 ignored | 0 / 1.84 |
+| `wheel_input--` | `cargo test -p mimageviewer --lib wheel_input:: --offline` | 8 passed, 0 failed, 0 ignored | 0 / 1.06 |
+| `page_turn_actual_wheel` | `cargo test -p mimageviewer --lib page_turn_actual_wheel --offline` | 1 passed, 0 failed, 0 ignored | 0 / 1.12 |
+| `mixed_key_and_wheel_batch` | `cargo test -p mimageviewer --lib mixed_key_and_wheel_batch --offline` | 1 passed, 0 failed, 0 ignored | 0 / 1.18 |
+| `music_ctrl_wheel` | `cargo test -p mimageviewer --lib music_ctrl_wheel --offline` | 3 passed, 0 failed, 0 ignored | 0 / 1.47 |
+| `music-overflow-final` | `cargo test -p mimageviewer --lib music_overflow_real_input_wheel --offline` | 1 passed, 0 failed, 0 ignored | 0 / 1.6 |
+| `gamepad_` | `cargo test -p mimageviewer --lib gamepad_ --offline` | 94 passed, 0 failed, 0 ignored | 0 / 31.85 |
+| `native_ime_interrupt` | `cargo test -p mimageviewer --lib native_ime_interrupt --offline` | 3 passed, 0 failed, 0 ignored | 0 / 0.94 |
+| `ime_focus--` | `cargo test -p mimageviewer --lib ime_focus:: --offline` | 12 passed, 0 failed, 0 ignored | 0 / 1.24 |
+| `texture_output_` | `cargo test -p mimageviewer --lib texture_output_ --offline` | 2 passed, 0 failed, 0 ignored | 0 / 0.83 |
+| `keyboard_input--` | `cargo test -p mimageviewer --lib keyboard_input:: --offline` | 17 passed, 0 failed, 0 ignored | 0 / 0.8 |
+| `synthetic_modifier` | `cargo test -p mimageviewer --lib synthetic_modifier --offline` | 1 passed, 0 failed, 0 ignored | 0 / 0.87 |
+| `getmessage` | `cargo test -p mimageviewer --lib getmessage --offline` | 1 passed, 0 failed, 0 ignored | 0 / 0.88 |
+| `tree-handoff` | `cargo tree -d --offline` | check / inspect | 0 / 0.52 |
+| `focused-handoff` | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-focused.ps1` | check / inspect | 2 / 0.61 |
+| `fmt-handoff` | `cargo fmt --check` | check / inspect | 0 / 14.51 |
+| `diff-handoff` | `git diff --check` | check / inspect | 0 / 0.27 |
+| `glyphs-handoff` | `python scripts/check_ui_glyphs.py` | check / inspect | 0 / 2.18 |
+| `vendor-fmt` | `rustfmt --edition 2024 --check --config skip_children=true vendor/egui/src/context.rs vendor/egui/src/discard_texture_delivery_tests.rs vendor/eframe/src/native/viewport_lifecycle.rs vendor/eframe/src/native/wgpu_integration.rs vendor/eframe/src/native/glow_integration.rs vendor/egui-wgpu/src/winit_tests.rs` | check / inspect | 0 / 0.21 |
+
+### 最後のlib全件実行と、その後の限定補修（実装担当の内部確認）
+
+`scripts/test-lib-full.ps1 -Force` は最後に1回だけ実行した。exit **100**、495.55秒。
+総数 **13,481**、実行 **13,422**、成功 **13,132**、失敗 **290**、既存skip **59**。
+run directoryは `target/test-lib-full/runs/20261017T034945177Z-04c522be`、
+source hashは `204cffbfed6089ac013bbc28fa0fb997c963e513ca78c52aab452be183d56d61`。
+この全件実行は後述の補修前の証拠であり、補修後の全件成功とは扱わない。
+全件は再実行せず、失敗の一次原因と変更した契約に絞って検証する。
+
+初期分類はPNG不一致96件、missing glyph88件、未完結delta26件、その他80件だった。
+delta26件のうち4件は先行assertの失敗後のdrop panicであり、delta処理だけを直して成功扱いにはしない。
+PNG96件を除いた**194件**をexact nextest filterで再実行した最初の限定結果は、
+**148成功 / 46失敗、exit 100、396.70秒**。
+その実行後に保存した修正（ScrollArea state reader、native panelのsizing、metadataのcold SetTheme等）は、この結果に含めない。
+
+補修分野は次のとおり。元のPNG・操作のassert・欠落glyph検査・既存ignoreは変更しない。
+
+| 分野 | 主なファイル・判断 |
+| --- | --- |
+| headless deltaの消費 | `src/app/paint_record_test_support.rs`、`sidecar_restore.rs`、`similar_navigation_tests.rs`等。描画しないfixture出力は既存の明示破棄ownerへ接続。font atlasの期待boolは保持 |
+| App / root Ui / viewport fixture | `src/app/tests.rs`。kittestが渡す実Ui原点にクリックを相対化。immediate子のmeshは親shapesではなく実child出力で検査。実registrationとbindingの同一lifetimeをroot退役commandまで照合 |
+| IME / Modifiers / test-script | `src/video/native_presenter/render_core.rs`、`src/global_search_ui/everything/shortcut.rs`、`src/keymap.rs`、`src/test_script/capture.rs`。modifier通知の順序を含む正確な列、実plugin pass、viewport所有metadataへ移行 |
+| テストの日本語フォント | UI fixtureの対象builderに既存`ui_fonts::configure_fonts`を接続。共有GPU builder、製品のfont chain、missing glyph検査は変更しない |
+| 一般API / ID / accessibility | Window、UiBuilder、ScrollAreaの実ID生成に合わせてreaderを接続。製品ではmusic backing UIとfile organizeのkeyboard revealが対象。実child/ScrollAreaOutput IDの照合を保持。表示名のないfixture ComboBoxには非視覚のaccessibility名を付与 |
+| 旧mouse dragの保持 | `src/ui_dialogs/mod.rs`、`src/external_tool.rs`、`src/video/native_presenter/overlay_draw.rs`。旧default `ScrollSource::ALL / drag: true`と個別無効指定なしを確認した本文だけ`DragScroll::Always`を明示。新しい入力機構は作らない |
+| cold passの測定条件 | `src/ui_metadata_panel.rs`とnative batch fixture。固定の初回SetTheme/Area sizingを完了し、測定対象の要求・論理pass・present集計へ混ぜない。実panel layer、100ms非zero要求、terminal無要求の期待を保持 |
+
+製品バイナリのbuild/launch、liveテスト、`test-full.ps1`、PNG baseline更新は依頼の禁止どおり実行していない。
+
+#### Panel寸法予算とfixtureの検出力
+
+下部選択情報バーは単なる表示差ではなく、製品の「グリッドより先に高さを確保する」assertが発火した。
+原因は旧58pt（header26＋row28＋frame4）の外寸計算に、0.37 Panelがseparator用に加える外余白1ptが入っていなかったこと。
+`selection_info_bar_frame(style)`と`selection_info_bar_height(style)`を同じ既存ownerに置き、実Frameの余白・separator・header・row・solid横バーから予算を計算する。
+Panel、detailsの予測、回帰は同helperとroot Uiのstyleを使う。線を消す、余白を削る、assertを緩める変更は行わない。
+
+formal egui rlibによる小さなheadless診断（製品ではない）で、次を確認した。
+`target/egui037-stage3-v46-panel-probe.rs/.log`、exit0。正式App回帰とは別の原因確認である。
+
+| overflow / outer予算 | 480pt中の実予約 | Panel response | 結果 |
+| --- | --- | --- | --- |
+| false / 68 | 68 | y412〜480 | 既存正常分岐 |
+| true / 68 | 67 | y413〜481（height68） | 内容が1pt外へ拡張してからclampされ、予約とresponseが不一致 |
+| true / 69 | 69 | y411〜480 | 実内容とframe/separatorを収め、予約とresponseが一致 |
+
+`details_header_right_click_tests`の負例も旧固定座標が実header外へ出ていたため補修した。
+CentralPanelの実Ui原点と実paintのheader矩形・clipを観測し、その可視中心をraw pointerでクリックする。
+可視header内・選択行外の前提assertと行の正例を保持し、製品guardは変更しない。
+独立source確認はP2解消（Cargo・mutation実行の証拠とは区別）。
+
+FullNodeIdのreaderは、実`accesskit_consumer 0.39.1`の`Node::id()`と
+`u128 = (local_id << 64) | tree_index`を確認し、上位64bitを使う。
+途中の下位64bit案は誤りであり、first_setup/settings_restore/whats_newを実producerと一致させた。
+GlobalSearchのrepeat期待は、releaseを送っていないfixtureの初回false・以後trueを正確に区別する。
+その補修中のindex束縛漏れによる`postfull-recheck`は**compile失敗 exit101 / 109.64秒、テスト実行0**として記録し、古いJUnitを成功結果に流用しない。
+
+#### 322件の再検証とClose帰還の初期Preparing補修
+
+`postfull-recheck2`は**322選択 / 300成功 / 22失敗、exit100 / 340.56秒**。
+当初194件に必須契約・変更したfixtureの正例/負例を追加した限定集合であり、lib全件の再実行ではない。
+Fullのcontinuation47、wheel19、root lifecycle/context-state、実header内の右クリック2件、Panelの予約/予測はこの集合で成功した。
+
+残った初期media resolver取消の回帰は、fixtureではなく段3の契約漏れだった。
+`start_detached_bookmark_loading_context`はchildにpending requestとDetached bookmark targetを導入し、
+取消もexact leaseの場合にそのtargetをClose用に保持する。一方、まだ通常contentを提示していないPreparingではitems/selected/fullscreen_idxが空なので、
+selected mediaとの一致だけを要求するsummaryはその所有値を落としていた。
+
+teardown前の共通transferで、既存のtyped Preparing session、projected window、window/context bindingが同じownerを指す場合だけ、
+この初期Detached targetを捕捉する。一般のContextRef reader、Ready時の実media照合、main origin/requestの失効判断は緩めない。
+新しいbool・queue・ID・寿命延長はない。
+`close_return_unpresented_media_fallback_requires_exact_preparing_session`を追加し、Readyの空状態と別contextのPreparingでは旧targetを採用しないことも検査する。
+前掲のClose12件は途中結果であり、この1件追加後の最終filterは13件として後続表に記録する。
+独立source確認はP1/P2なし。正式実行とは区別する。
+
+clipboardの3件はpointer traceで原因を確認した。footerは初期Resize中にy465→502→539→576→613→626へ動き、
+従来fixtureが取得したy588.5のクリックは同じwindow layerのまま実ボタン外へ出ていた。最終footerはy651までで700pt viewport内に収まり、
+WindowDrag競合や保存workerの失敗ではない。
+fixtureだけで通常UI stepによる実ボタン矩形の連続安定（最大16step内、2連続比較）とviewport内包含をassertしてから、
+元のpointer入力を送る。入力再送・AccessKitへの置換・追加repaint・待機・製品layout/viewport変更は行わない。
+保存phase、同release＋Escape、3種類のClose、実保存内容のassertは保持。一時観測hookは診断後に全除去した。
+
+残るHEX欄の同batch focus移動＋Textは、実Id/rect一致とクリック包含を確認しても、
+新fieldがfocus/gained=true・changed=falseとなり、Textが未処理で残ることを実測した。
+0.33のinteraction→focus→eventsに対し、0.37はAtom measure内events→allocate/interact→pointer focusの順である。
+旧期待を維持したまま、段4の上流挙動差へ分類する。既にfocusが確立したownerのキー/IME commitの段3接続とは区別する。
+局所guard、入力延期、追加focus/repaint、広域vendor変更は加えず、一時traceは除去した。
+
+#### 最終の契約検証と全件失敗の分類
+
+`postfull-contract-final`は**128選択 / 127成功 / 1失敗、exit100 / 221.53秒**。
+初期Preparing Close、否定2枝を含むClose13件、clipboardの元pointer3件、保存/Remote/Full接続、wheelなどが成功した。
+残る1件はmetadataのterminal repaint測定だった。
+
+empty passだけのwarmupでは、初めて描くseparator自身のwidget style初期化要求を除外できなかった。
+formal eguiのheadless小診断でlabelsだけなら要求なし、separator追加時だけ要求ありを再現し、
+次beginで保存されたcauseを読み、**`vendor/egui/src/theme/mod.rs:37`（初回widget styleの応答未登録）**と確定した。
+`repaint_on_widget_change`はfalseであり、widget比較が原因という途中仮説は採用しない。
+同じ実terminal drawを固定2pass完了してから、probeと要求記録をresetして同じdrawを測定する。
+製品の要求を抑制せず、spinnerなし・理由表示・要求なしの元assertを保持する。
+最終の`book_query_limit_terminals_draw_reason_without_spinner_or_repaint`は**1選択 / 1成功 / exit0 / 144.35秒**（compile込み）。
+
+全件の失敗290件について、保存したJUnitと上記限定実行を突き合わせた最終分類は次のとおり。
+集計は**失敗test数**であり、PNGファイル数ではない。全件を最終ソースで再実行したという意味でもない。
+
+| 分類 | 件数 | 扱い |
+| --- | ---: | --- |
+| 段3移行不備 | 179 | 所有/入力/API/fixtureの原因を修正し、該当testの限定再実行で成功を確認 |
+| PNG比較由来 | 102 | 初回96件と、機械的前提の補修後にPNG比較まで到達した6件。baselineは更新せず段4b比較・段5更新へ |
+| 0.37のlayout/挙動差 | 9 | 次表。元assertを弱めず、ignoreも加えず段4へ |
+| 未分類・残る段3契約違反 | 0 | 初期Preparing targetの取りこぼしも補修済み |
+
+PNGまで新たに到達した6件は、local adjust popup 1、preferences seek-strip height 2、folder tree sort header 1、folder-bar organize destinations 2。
+全290件の集計根拠は`target/egui037-stage3-v46-final-classification.json`、元JUnitは前記full run、
+限定JUnitは`postfull-194`・`postfull-recheck2`・`postfull-contract-final`、最後のmetadata結果は個別Cargo logへ保存した。
+
+| 段4へ残すtest | 観測した差 |
+| --- | --- |
+| `ui_adjustment_panel::adjust_scope_selector_tests::adjust_scope_action_labels_fit_258px_body` | buttonの自然高25pt、旧期待24pt以下 |
+| `ui_fullscreen::tests::fullscreen_overflow_panel_snapshot_root_tall_without_scrollbar` | content384pt / viewport376pt、余分な縦scroll8pt |
+| `ui_dialogs::whats_new::tests::version_highlights_initial_width_keeps_previous_reading_area` | scale2の初期外寸537pt / intended546pt。外寸APIの二重margin控除は修正済みで、残りはconstrain/min-size比較 |
+| `ui_main::section207_tests::section207_reported_controls_keep_left_input_right_order` | zoom時のaddress input最小幅 |
+| `ui_main::section207_tests::section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds` | width360 / zoom1.5のinput幅・bounds |
+| `ui_main::section207_tests::section207_default_folder_geometry_matches_the_separate_panels` | 統合Panelと旧別Panelのy差1pt |
+| `ui_text::tests::bubble_body_stays_within_panel_width_with_fill_on_or_off` | 268pt枠に対して自然幅268.21875pt |
+| `ui_main::toolbar_wrap_tests::a_combo_stays_inside_the_panel_only_when_we_reserve_its_place` | 新WidgetAtomは裸Comboもwrapし、旧negative controlのoverflowが0になった |
+| `ui_dialogs::preferences::name_colors::tests::hex_focus_transfer_keeps_the_new_editors_partial_input` | 同batchのpointer focus移動とTextの処理順差。前節の実測どおり |
+
+Panelの製品debug assertはこの9件へ含めず修正・正式回帰成功を確認した。
+Id系や残るRust非推奨警告の整理は設計の段5へ残し、IME互換producerを警告削減のために削除しない。
+
+### 第4.6版完了時のコマンド台帳（実装担当の内部確認）
+
+以下は本体最終ソースで再実行したgateと、変更範囲が不変の正式vendor graphで再利用する結果。
+本体の全23 test executable、lib、snapshot2 targetのコンパイルを確認した。
+`egui037_continuation`47、`root_lifecycle`11、`context_state`8、wheel19、Close13はすべて非0選択・全成功。
+段3必須・第4.3版16項目・第4.5版13項目・第4.6版Close/deltaの対応は前掲の各表を参照し、Closeの最終選択数は13へ読み替える。
+
+`cargo check --workspace`はrelease入力3 exeを要求するlauncherを除き、`--all-targets`も同じ除外で実施する。
+これは今回の利用者指定の代替であり、製品バイナリを作って前提を埋めない。
+`cargo test -p egui-winit --lib`はworkspace外packageのdev-dependencyというCargo制約で未選択（前掲exit101）なので、
+正式vendor manifestによる同crate lib43件を用いる。`scripts/test-full.ps1`の検証コマンドもこのmanifestと新featureに合わせてある。
+`test-focused.ps1`のexit2はbroad/shared変更による**0件選択**で、成功ではない。
+指定されたlib全件と個別vendor gateを実施し、禁止された`test-full.ps1`へは進まない。
+
+| label | コマンド | 選択・結果 | exit / 秒 |
+| --- | --- | --- | --- |
+| `final-metadata-terminal` | `cargo test -p mimageviewer --lib book_query_limit_terminals_draw_reason_without_spinner_or_repaint --offline` | 1 passed, 0 failed, 0 ignored | 0 / 144.35 |
+| `final-core-handoff` | `cargo check -p mimageviewer --bin mimageviewer-core --offline` | check / inspect | 0 / 23.03 |
+| `final-test-script-handoff` | `cargo check -p mimageviewer --bin mimageviewer-core --features test-script --offline` | check / inspect | 0 / 21.86 |
+| `final-workspace-handoff` | `cargo check --workspace --exclude mimageviewer-launcher --offline` | check / inspect | 0 / 22.17 |
+| `final-workspace-all-targets-final-source` | `cargo check --workspace --all-targets --exclude mimageviewer-launcher --offline` | check / inspect | 0 / 115.14 |
+| `final-tests-no-run-handoff` | `cargo test -p mimageviewer --tests --no-run --offline` | 23 executables, no run | 0 / 266.46 |
+| `final-lib-no-run-handoff` | `cargo test -p mimageviewer --lib --no-run --offline` | 1 executables, no run | 0 / 0.71 |
+| `final-snapshot-no-run-handoff` | `cargo test -p mimageviewer --test ui_snapshot --test book_composition_editor_snapshots --no-run --offline` | 2 executables, no run | 0 / 0.69 |
+| `final-continuation-handoff` | `cargo test -p mimageviewer --lib egui037_continuation --offline` | 47 passed, 0 failed, 0 ignored | 0 / 12.32 |
+| `final-root_lifecycle` | `cargo test -p mimageviewer --lib root_lifecycle --offline` | 11 passed, 0 failed, 0 ignored | 0 / 6.26 |
+| `final-context_state` | `cargo test -p mimageviewer --lib context_state --offline` | 8 passed, 0 failed, 0 ignored | 0 / 2.1 |
+| `final-wheel-final` | `cargo test -p mimageviewer --lib egui037_wheel_frame_ --offline` | 19 passed, 0 failed, 0 ignored | 0 / 6.79 |
+| `final-close-final` | `cargo test -p mimageviewer --lib close_return --offline` | 13 passed, 0 failed, 0 ignored | 0 / 4.99 |
+| `final-bookmark-final` | `cargo test -p mimageviewer --lib bookmark_return --offline` | 5 passed, 0 failed, 0 ignored | 0 / 1.46 |
+| `final-native_immediate_close_consumes_bookmark_return_in_same_dispatch` | `cargo test -p mimageviewer --lib native_immediate_close_consumes_bookmark_return_in_same_dispatch --offline` | 1 passed, 0 failed, 0 ignored | 0 / 0.89 |
+| `final-viewport_retirement` | `cargo test -p mimageviewer --lib viewport_retirement --offline` | 10 passed, 0 failed, 0 ignored | 0 / 2.56 |
+| `final-collection_slideshow_cancel_` | `cargo test -p mimageviewer --lib collection_slideshow_cancel_ --offline` | 3 passed, 0 failed, 0 ignored | 0 / 1.28 |
+| `final-music_ctrl_wheel` | `cargo test -p mimageviewer --lib music_ctrl_wheel --offline` | 3 passed, 0 failed, 0 ignored | 0 / 1.15 |
+| `final-music-overflow-final` | `cargo test -p mimageviewer --lib music_overflow_real_input_wheel --offline` | 1 passed, 0 failed, 0 ignored | 0 / 1.31 |
+| `final-tree-handoff` | `cargo tree -d --offline` | check / inspect | 0 / 0.48 |
+| `final-focused-handoff` | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-focused.ps1` | 0 selected (broad/shared), not success | 2 / 0.78 |
+| `final-fmt-handoff` | `cargo fmt --check` | check / inspect | 0 / 14.61 |
+| `final-diff-handoff` | `git diff --check` | check / inspect | 0 / 0.37 |
+| `final-glyphs-handoff` | `python scripts/check_ui_glyphs.py` | check / inspect | 0 / 2.22 |
+| `final-vendor-fmt` | `rustfmt --edition 2024 --check --config skip_children=true vendor/egui/src/context.rs vendor/egui/src/discard_texture_delivery_tests.rs vendor/eframe/src/native/viewport_lifecycle.rs vendor/eframe/src/native/wgpu_integration.rs vendor/eframe/src/native/glow_integration.rs vendor/egui-wgpu/src/winit_tests.rs` | check / inspect | 0 / 0.15 |
+| `ime-interrupt` | `cargo test -p egui --lib ime_interrupt --offline` | 6 passed, 0 failed, 0 ignored | 0 / 6.47 |
+| `egui-ime` | `cargo test -p egui-ime --offline` | 30 passed, 0 failed, 0 ignored / 0 passed, 0 failed, 0 ignored | 0 / 7.03 |
+| `egui-winit` | `cargo test --manifest-path vendor/egui-winit/Cargo.toml --lib --offline` | 43 passed, 0 failed, 0 ignored | 0 / 13.36 |
+| `egui-retirement` | `cargo test --manifest-path vendor/egui/Cargo.toml --lib viewport_retirement --offline` | 14 passed, 0 failed, 0 ignored | 0 / 0.12 |
+| `minimized_full-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib minimized_full --no-default-features --features default_fonts,wgpu --offline` | 9 passed, 0 failed, 0 ignored | 0 / 0.32 |
+| `minimized_full-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib minimized_full --no-default-features --features default_fonts,glow --offline` | 11 passed, 0 failed, 0 ignored | 0 / 0.48 |
+| `viewport_input-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_input --no-default-features --features default_fonts,wgpu --offline` | 5 passed, 0 failed, 0 ignored | 0 / 1.05 |
+| `viewport_input-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_input --no-default-features --features default_fonts,glow --offline` | 5 passed, 0 failed, 0 ignored | 0 / 0.46 |
+| `child-close-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib child_close --no-default-features --features default_fonts,wgpu --offline` | 3 passed, 0 failed, 0 ignored | 0 / 0.78 |
+| `child-close-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib child_close --no-default-features --features default_fonts,glow --offline` | 4 passed, 0 failed, 0 ignored | 0 / 0.29 |
+| `viewport_retirement-wgpu` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_retirement --no-default-features --features default_fonts,wgpu --offline` | 12 passed, 0 failed, 0 ignored | 0 / 1.35 |
+| `viewport_retirement-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib viewport_retirement --no-default-features --features default_fonts,glow --offline` | 12 passed, 0 failed, 0 ignored | 0 / 0.5 |
+| `delta-egui-final` | `cargo test --manifest-path vendor/egui/Cargo.toml --lib discard_texture_delivery --offline` | 4 passed, 0 failed, 0 ignored | 0 / 10.84 |
+| `delta-eframe-wgpu-final` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib discard_texture_delivery --no-default-features --features default_fonts,wgpu --offline` | 2 passed, 0 failed, 0 ignored | 0 / 7.84 |
+| `delta-eframe-glow` | `cargo test --manifest-path vendor/eframe/Cargo.toml --lib discard_texture_delivery --no-default-features --features default_fonts,glow --offline` | 2 passed, 0 failed, 0 ignored | 0 / 14.61 |
+| `delta-offscreen` | `cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --lib discard_texture_delivery --features winit --offline` | 2 passed, 0 failed, 0 ignored | 0 / 56.3 |
+| `gamepad_` | `cargo test -p mimageviewer --lib gamepad_ --offline` | 94 passed, 0 failed, 0 ignored | 0 / 31.85 |
+| `native_ime_interrupt` | `cargo test -p mimageviewer --lib native_ime_interrupt --offline` | 3 passed, 0 failed, 0 ignored | 0 / 0.94 |
+| `ime_focus--` | `cargo test -p mimageviewer --lib ime_focus:: --offline` | 12 passed, 0 failed, 0 ignored | 0 / 1.24 |
+| `texture_output_` | `cargo test -p mimageviewer --lib texture_output_ --offline` | 2 passed, 0 failed, 0 ignored | 0 / 0.83 |
+| `keyboard_input--` | `cargo test -p mimageviewer --lib keyboard_input:: --offline` | 17 passed, 0 failed, 0 ignored | 0 / 0.8 |
+| `synthetic_modifier` | `cargo test -p mimageviewer --lib synthetic_modifier --offline` | 1 passed, 0 failed, 0 ignored | 0 / 0.87 |
+| `getmessage` | `cargo test -p mimageviewer --lib getmessage --offline` | 1 passed, 0 failed, 0 ignored | 0 / 0.88 |
+| `wheel_input--` | `cargo test -p mimageviewer --lib wheel_input:: --offline` | 8 passed, 0 failed, 0 ignored | 0 / 1.06 |
+| `page_turn_actual_wheel` | `cargo test -p mimageviewer --lib page_turn_actual_wheel --offline` | 1 passed, 0 failed, 0 ignored | 0 / 1.12 |
+| `mixed_key_and_wheel_batch` | `cargo test -p mimageviewer --lib mixed_key_and_wheel_batch --offline` | 1 passed, 0 failed, 0 ignored | 0 / 1.18 |
+
+最終`cargo tree -d`はegui/eframe/egui-winit/egui-wgpu/egui_kittestが0.37.0、wgpuが30.0.1で、正式vendorを指す。
+旧egui/wgpuの混入・egui型分裂・`vendor-next` pathはない。独立したshader compiler用途のnaga27は旧wgpu混入とは扱わない。
+`vendor-next/`は存在せず、原本provenance/import script/PATCHESは正式vendorに保持している。
+PNG baseline差分0、index差分0、HEAD/branchの変更0を最終確認した。
+
+設計上の未解決相違はない。O5の古い表・段1b台帳のC3限定という説明と実コードの粒度差は前掲の補足に記録し、
+baselineから存在するearly ALL pollと実`App.frame_counter`の予算境界を維持した。
+段4へは上記9件と外観比較、段5へはPNG baseline更新と残る警告整理、実機/live検証は計画の後段へ渡す。
+live ignoreと`test-live-windows.ps1`は維持し、この作業ではlive・製品build/launch・`test-full.ps1`を実行していない。

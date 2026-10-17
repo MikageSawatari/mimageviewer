@@ -890,13 +890,20 @@ impl GlowWinitRunning<'_> {
         // The update function, which could call immediate viewports,
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
+        let _discard_texture_scope = enter_discard_texture_delivery(
+            &self.integration.egui_ctx,
+            &self.glutin,
+            &self.painter,
+            &self.pending_deltas,
+        );
         let mut full_output =
             self.integration
                 .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
 
-        self.pending_deltas
-            .borrow_mut()
-            .append(core::mem::take(&mut full_output.textures_delta));
+        super::viewport_lifecycle::append_texture_delta(
+            &mut self.pending_deltas.borrow_mut(),
+            core::mem::take(&mut full_output.textures_delta),
+        );
         super::viewport_lifecycle::finish_full_output(
             &self.integration.egui_ctx,
             &mut GlowChildCloseBackend {
@@ -929,7 +936,7 @@ impl GlowWinitRunning<'_> {
             pixels_per_point,
             mut viewport_output,
         } = full_output;
-        pending_deltas.append(textures_delta);
+        super::viewport_lifecycle::append_texture_delta(&mut pending_deltas, textures_delta);
 
         let window = glutin
             .viewports
@@ -1332,7 +1339,7 @@ impl ChildCloseBackend for GlowChildCloseBackend<'_> {
     }
 
     fn collect_retirement_delta(&mut self, ctx: &egui::Context) {
-        super::viewport_lifecycle::append_retirement_delta(
+        super::viewport_lifecycle::append_texture_delta(
             &mut self.pending_deltas.borrow_mut(),
             ctx.take_viewport_retirement_texture_delta(),
         );
@@ -1352,6 +1359,39 @@ impl ChildCloseBackend for GlowChildCloseBackend<'_> {
     }
 }
 
+fn enter_discard_texture_delivery(
+    ctx: &egui::Context,
+    glutin: &Rc<RefCell<GlutinWindowContext>>,
+    painter: &Rc<RefCell<egui_glow::Painter>>,
+    pending: &Rc<RefCell<TexturesDelta>>,
+) -> impl Drop + use<> {
+    let glutin = Rc::downgrade(glutin);
+    let painter = Rc::downgrade(painter);
+    let pending = Rc::downgrade(pending);
+    ctx.enter_discard_texture_delivery(move |delta| {
+        let glutin = glutin
+            .upgrade()
+            .expect("native Full GL context must outlive its scope");
+        let painter = painter
+            .upgrade()
+            .expect("native Full painter must outlive its scope");
+        let pending = pending
+            .upgrade()
+            .expect("native Full pending owner must outlive its scope");
+        super::viewport_lifecycle::append_texture_delta(&mut pending.borrow_mut(), delta);
+        if !pending.borrow().is_empty() {
+            let current = glutin
+                .borrow_mut()
+                .make_resource_context_current(ViewportId::ROOT);
+            finish_glow_texture_delta(
+                current,
+                &mut *painter.borrow_mut(),
+                &mut pending.borrow_mut(),
+            );
+        }
+    })
+}
+
 fn replace_stale_glow_viewport(
     glutin: &RefCell<GlutinWindowContext>,
     pending: &RefCell<TexturesDelta>,
@@ -1369,7 +1409,7 @@ fn replace_stale_glow_viewport(
     );
     if !stale.is_empty() {
         retire_glow_native_resources(glutin, &stale);
-        super::viewport_lifecycle::append_retirement_delta(
+        super::viewport_lifecycle::append_texture_delta(
             &mut pending.borrow_mut(),
             ctx.tex_manager().write().take_delta(),
         );
@@ -2167,6 +2207,10 @@ impl ImmediateViewportBackend for NativeGlowImmediateBackend<'_> {
         ids: ViewportIdPair,
         builder: ViewportBuilder,
     ) -> Option<(egui::Context, egui::RawInput)> {
+        assert!(
+            self.egui_ctx.has_discard_texture_delivery(),
+            "native immediate requires its Full resource scope"
+        );
         replace_stale_glow_viewport(self.glutin, self.pending_deltas, self.egui_ctx, ids.this);
         let mut glutin = self.glutin.borrow_mut();
         let glutin = &mut *glutin;
@@ -2218,7 +2262,10 @@ impl ImmediateViewportBackend for NativeGlowImmediateBackend<'_> {
         textures_delta: TexturesDelta,
     ) {
         // This renderer owner survives a child's disappearance or missing surface.
-        self.pending_deltas.borrow_mut().append(textures_delta);
+        super::viewport_lifecycle::append_texture_delta(
+            &mut self.pending_deltas.borrow_mut(),
+            textures_delta,
+        );
     }
 
     fn finish_output(
@@ -3422,7 +3469,7 @@ mod viewport_retirement_tests {
             egui_ime::retire_viewport_ime_policy(ctx, &ids);
         }
         fn collect_retirement_delta(&mut self, ctx: &egui::Context) {
-            lifecycle::append_retirement_delta(
+            lifecycle::append_texture_delta(
                 &mut self.delta,
                 ctx.take_viewport_retirement_texture_delta(),
             );
@@ -3487,7 +3534,7 @@ mod viewport_retirement_tests {
             self.viewports[&id].pending_raw_input.events.clone()
         }
         fn accept_delta(&mut self, delta: egui::TexturesDelta) {
-            self.delta.append(delta);
+            lifecycle::append_texture_delta(&mut self.delta, delta);
         }
         fn take_delta(&mut self) -> egui::TexturesDelta {
             core::mem::take(&mut self.delta)
@@ -3502,7 +3549,7 @@ mod viewport_retirement_tests {
             );
             if !stale.is_empty() {
                 self.remove(&stale);
-                lifecycle::append_retirement_delta(
+                lifecycle::append_texture_delta(
                     &mut self.delta,
                     ctx.tex_manager().write().take_delta(),
                 );
@@ -3583,5 +3630,63 @@ mod viewport_retirement_tests {
     #[test]
     fn viewport_retirement_glow_discard_immediate_reopen_replaces_native() {
         scenarios::discard_immediate_reopen_replaces_native::<Headless>();
+    }
+    #[test]
+    fn discard_texture_delivery_glow_native_callback_drop_gc_reopen_ime() {
+        scenarios::discard_texture_delivery_native_reopen::<Headless>();
+    }
+
+    #[test]
+    fn discard_texture_delivery_glow_resource_consumer_pending_unavailable_order() {
+        // Fake GL calls through the production resource consumer: this proves
+        // adapter order only. No real GL context/window was created.
+        #[derive(Default)]
+        struct Painter(Vec<(egui::TextureId, Option<[usize; 2]>, bool)>);
+        impl GlowTexturePainter for Painter {
+            fn set_texture(&mut self, id: egui::TextureId, delta: &egui::epaint::ImageDelta) {
+                self.0.push((id, delta.pos, false));
+            }
+            fn free_texture(&mut self, id: egui::TextureId) {
+                self.0.push((id, None, true));
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut handle = Some(scenarios::stale_texture(&ctx));
+        let id = handle.as_ref().unwrap().id();
+        let pending = Rc::new(RefCell::new(TexturesDelta::default()));
+        let sink = pending.clone();
+        let _scope = ctx.enter_discard_texture_delivery(move |delta| {
+            lifecycle::append_texture_delta(&mut sink.borrow_mut(), delta);
+        });
+        let mut pass = 0;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            if pass == 0 {
+                ui.ctx().request_discard("GL unavailable");
+            } else {
+                drop(handle.take());
+            }
+            pass += 1;
+        });
+        lifecycle::append_texture_delta(
+            &mut pending.borrow_mut(),
+            core::mem::take(&mut output.textures_delta),
+        );
+        output.drop_without_applying_deltas();
+        let mut painter = Painter::default();
+        finish_glow_texture_delta(false, &mut painter, &mut pending.borrow_mut());
+        assert!(painter.0.is_empty());
+        assert_eq!(pending.borrow().set[&id].len(), 2);
+        assert!(pending.borrow().free.contains(&id));
+        finish_glow_texture_delta(true, &mut painter, &mut pending.borrow_mut());
+        let calls: Vec<_> = painter.0.into_iter().filter(|call| call.0 == id).collect();
+        assert_eq!(
+            calls,
+            [
+                (id, None, false),
+                (id, Some([1, 0]), false),
+                (id, None, true)
+            ]
+        );
+        assert!(pending.borrow().is_empty());
     }
 }

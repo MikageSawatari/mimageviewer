@@ -770,6 +770,15 @@ mod tests {
             let output = ctx.run_ui(
                 egui::RawInput {
                     viewport_id: viewport.ids.this,
+                    viewports: [(
+                        viewport.ids.this,
+                        egui::ViewportInfo {
+                            parent: Some(viewport.ids.parent),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
                     ..Default::default()
                 },
                 |ui| {
@@ -894,6 +903,15 @@ mod tests {
             let output = ctx.run_ui(
                 egui::RawInput {
                     viewport_id: viewport.ids.this,
+                    viewports: [(
+                        viewport.ids.this,
+                        egui::ViewportInfo {
+                            parent: Some(viewport.ids.parent),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
                     ..Default::default()
                 },
                 |ui| {

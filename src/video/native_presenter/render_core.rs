@@ -16150,20 +16150,25 @@ mod chrome_suppression_interaction_tests {
             overlay.pending_events.clear();
             let key = native_clipboard_key(virtual_key, false);
             overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
-            assert!(
-                matches!(
-                    overlay.pending_events.as_slice(),
-                    [egui::Event::Copy] if is_copy
-                ) || matches!(
-                    overlay.pending_events.as_slice(),
-                    [egui::Event::Cut] if !is_copy
-                )
+            let modifiers = egui_modifiers(true, true, false);
+            let action = if is_copy {
+                egui::Event::Copy
+            } else {
+                egui::Event::Cut
+            };
+            assert_eq!(
+                overlay.pending_events,
+                [egui::Event::ModifiersChanged(modifiers), action.clone()]
             );
             overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
             assert_eq!(
-                overlay.pending_events.len(),
-                1,
-                "release must remain suppressed"
+                overlay.pending_events,
+                [
+                    egui::Event::ModifiersChanged(modifiers),
+                    action,
+                    egui::Event::ModifiersChanged(modifiers)
+                ],
+                "release updates modifiers without duplicating the clipboard action or raw key"
             );
 
             overlay.pending_events.clear();
@@ -16173,9 +16178,12 @@ mod chrome_suppression_interaction_tests {
             assert!(
                 matches!(
                     overlay.pending_events.as_slice(),
-                    [egui::Event::Key { pressed: true, modifiers: down, .. },
+                    [egui::Event::ModifiersChanged(before_down),
+                     egui::Event::Key { pressed: true, modifiers: down, .. },
+                     egui::Event::ModifiersChanged(before_up),
                      egui::Event::Key { pressed: false, modifiers: up, .. }]
                         if down.ctrl && down.shift && down.alt && up == down
+                            && before_down == down && before_up == up
                 ),
                 "Ctrl+Alt keeps the ordinary raw-key path"
             );
@@ -16196,9 +16204,12 @@ mod chrome_suppression_interaction_tests {
                 matches!(
                     overlay.pending_events.as_slice(),
                     [
-                        egui::Event::Key { pressed: true, .. },
-                        egui::Event::Key { pressed: false, .. }
-                    ]
+                        egui::Event::ModifiersChanged(before_down),
+                        egui::Event::Key { pressed: true, modifiers: down, .. },
+                        egui::Event::ModifiersChanged(before_up),
+                        egui::Event::Key { pressed: false, modifiers: up, .. }
+                    ] if *down == egui_modifiers(true, true, false)
+                        && before_down == down && up == down && before_up == up
                 ),
                 "active IME must retain both ordinary key events"
             );
@@ -16214,13 +16225,19 @@ mod chrome_suppression_interaction_tests {
                 matches!(
                     overlay.pending_events.as_slice(),
                     [egui::Event::Ime(egui::ImeEvent::Commit(text)),
-                     egui::Event::Ime(egui::ImeEvent::Disabled), egui::Event::Copy]
+                     egui::Event::Ime(egui::ImeEvent::Disabled),
+                     egui::Event::ModifiersChanged(down), egui::Event::Copy,
+                     egui::Event::ModifiersChanged(up)]
                         if text == "かな" && is_copy
+                            && *down == egui_modifiers(true, true, false) && up == down
                 ) || matches!(
                     overlay.pending_events.as_slice(),
                     [egui::Event::Ime(egui::ImeEvent::Commit(text)),
-                     egui::Event::Ime(egui::ImeEvent::Disabled), egui::Event::Cut]
+                     egui::Event::Ime(egui::ImeEvent::Disabled),
+                     egui::Event::ModifiersChanged(down), egui::Event::Cut,
+                     egui::Event::ModifiersChanged(up)]
                         if text == "かな" && !is_copy
+                            && *down == egui_modifiers(true, true, false) && up == down
                 ),
                 "pending commit enables exactly one clipboard event before the next pass"
             );
@@ -21543,6 +21560,10 @@ let ctx = &root_ui.ctx().clone();
                     ui.set_min_size(egui::vec2(220.0, 320.0));
                     ui.set_max_size(egui::vec2(220.0, 320.0));
                     let output = egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("headless_native_wheel_panel")
                         .max_height(320.0)
                         .show(ui, |ui| {
@@ -21566,22 +21587,34 @@ let ctx = &root_ui.ctx().clone();
 
         fn batch_prepare(&mut self) -> Result<(), String> {
             let mut rects = None;
-            let full_output = self.ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(640.0, 360.0),
-                    )),
-                    time: Some(0.0),
-                    ..Default::default()
-                },
-                |root_ui| {
-                    let ctx = root_ui.ctx();
-                    let (strip, panel, _, _) = Self::draw_regions(ctx, false);
-                    rects = Some((strip, panel));
-                },
+            // A new 0.37 Area first measures an invisible, non-interactable sizing pass.
+            // Prepare the existing visible panel before delivering the tested physical input.
+            for _ in 0..2 {
+                let full_output = self.ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(640.0, 360.0),
+                        )),
+                        time: Some(0.0),
+                        ..Default::default()
+                    },
+                    |root_ui| {
+                        let ctx = root_ui.ctx();
+                        let (strip, panel, _, _) = Self::draw_regions(ctx, false);
+                        rects = Some((strip, panel));
+                    },
+                );
+                crate::egui_output::discard_headless_output(full_output);
+            }
+            assert_eq!(
+                self.ctx.layer_id_at(egui::pos2(450.0, 100.0)),
+                Some(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("headless_native_wheel_panel_area"),
+                )),
+                "the wheel fixture requires the actual visible panel layer",
             );
-            crate::egui_output::discard_headless_output(full_output);
             let (strip, panel) = rects.expect("headless regions");
             assert!(
                 !strip.intersects(panel),
@@ -22055,12 +22088,18 @@ let ctx = &root_ui.ctx().clone();
                 target.presented_platform_markers,
                 ["pass-0".to_owned(), "pass-1".to_owned()]
             );
+            assert_eq!(target.presented_texture_ids.len(), 2);
             assert_eq!(
-                target.presented_texture_ids,
-                [
+                target
+                    .presented_texture_ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>(),
+                std::collections::HashSet::from([
                     egui::TextureId::Managed(10_000),
                     egui::TextureId::Managed(10_001)
-                ]
+                ]),
+                "both pass textures survive; the 0.37 map has no cross-ID iteration order"
             );
             assert_eq!(
                 target.presented_shape_count,

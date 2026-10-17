@@ -1624,10 +1624,12 @@ mod row_tests {
                             // egui draws from begin()'s loaded offset, and only
                             // applies this frame's wheel in end(). Output.state
                             // therefore describes the next render's offset.
-                            let rendered_offset = egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("composition_units")))
+                            let scroll_id = ui.make_persistent_id(egui::IdSalt::new("composition_units"));
+                            let rendered_offset = egui::scroll_area::State::load(ctx, scroll_id)
                                 .unwrap_or_default().clamped_offset().y;
                             let output =
                                 unit_list(ui, &view, &mut state, 360.0, true, &mut vec![], &mut vec![]);
+                            assert_eq!(output.id, scroll_id, "rendered offset belongs to the real ScrollArea");
                             let layout = ScrollLayout::from_output(&output);
                             layout.assert_height(
                                 HeightExpectation::Scrolls,

@@ -42,17 +42,9 @@ pub(super) fn draw_whats_new_dialog(
     entries: &[&crate::version_highlights::VersionHighlights],
 ) -> (bool, bool) {
     let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-    // Preserve the previous 650pt outer reading width independently of content.
-    // Window::default_width takes the inner width; use the actual frame margins
-    // and let the existing Window owner handle later user/viewport resizing.
-    // Round the viewport-limited width inward: a half-point logical viewport at
-    // 200% must not gain an outward rounded frame edge.
-    let default_width = (650.0_f32.min(ctx.content_rect().width()).floor()
-        - egui::Frame::window(&ctx.global_style())
-            .total_margin()
-            .sum()
-            .x)
-        .max(1.0);
+    // Window 0.37 sizes are outer dimensions, including the actual frame.
+    // Round the viewport-limited width inward at fractional logical sizes.
+    let default_width = 650.0_f32.min(ctx.content_rect().width()).floor().max(1.0);
     let mut close = false;
     let mut open_changelog = false;
     egui::Window::new("重要な変更点")
@@ -117,7 +109,7 @@ mod tests {
                 for frame in 0..8 {
                     let window = harness
                         .ctx
-                        .memory(|memory| memory.area_rect(egui::Id::new("重要な変更点")))
+                        .memory(|memory| memory.area_rect(egui::Id::unique(Some("重要な変更点"))))
                         .unwrap();
                     assert!(
                         (window.width() - intended_width).abs() < 0.1,
@@ -215,14 +207,14 @@ mod tests {
                     harness.run_steps(12);
                     let window = harness
                         .ctx
-                        .memory(|memory| memory.area_rect(egui::Id::new("重要な変更点")))
+                        .memory(|memory| memory.area_rect(egui::Id::unique(Some("重要な変更点"))))
                         .unwrap();
                     assert!(harness.ctx.content_rect().contains_rect(window));
                     for label in ["Close window", "すべての変更を見る", "閉じる"] {
                         let node = harness.get_by_label(label);
                         let id = unsafe {
                             egui::Id::from_high_entropy_bits(
-                                ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                                (u128::from(node.accesskit_node().id()) >> 64) as u64,
                             )
                         };
                         let initial = harness.ctx.read_response(id).unwrap().rect;
@@ -234,7 +226,14 @@ mod tests {
                                 current.rect, initial,
                                 "extended={extended} scale={scale} size={size:?} {label} frame={frame}"
                             );
-                            assert_eq!(harness.ctx.memory(|memory| memory.area_rect(egui::Id::new("重要な変更点"))).unwrap(), window);
+                            assert_eq!(
+                                harness
+                                    .ctx
+                                    .memory(|memory| memory
+                                        .area_rect(egui::Id::unique(Some("重要な変更点"))))
+                                    .unwrap(),
+                                window
+                            );
                             assert!(current.contains_pointer());
                             assert!(current.interact_rect.contains_rect(current.rect));
                         }

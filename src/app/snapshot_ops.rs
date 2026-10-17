@@ -2227,6 +2227,9 @@ impl App {
     }
 
     pub(crate) fn finish_fullscreen_navigation_for_true_close(&mut self) {
+        // A live return can defer content teardown until the main UI dispatcher.
+        // Its accepted Close already ends this viewer's automatic navigation owner.
+        self.stop_projected_slideshow_playback();
         self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
         self.cancel_inflight_order_dependent_folder_nav();
@@ -3786,22 +3789,24 @@ mod tests {
             content_type: None,
         }];
         let ctx = egui::Context::default();
-        let _ = ctx.run_pass(
-            egui::RawInput {
-                focused: true,
-                events: vec![egui::Event::Key {
-                    key: egui::Key::Backspace,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                assert!(app.handle_keyboard(ctx).is_none());
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.handle_keyboard(ctx).is_none());
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(app.projection_recipe, fixed);
         assert_eq!(app.items, items);
         app.deactivate_snapshot();

@@ -1355,13 +1355,16 @@ impl App {
     }
 
     fn cancel_transferred_collection_archive_navigation(&mut self, reason: &'static str) -> bool {
+        let context_id = self.collection_grid_context_id();
         let transferred = self.archive_convert.as_ref().is_some_and(|state| {
             matches!(
                 &state.completion,
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
                     intent
                 ) if intent.collection_grid_owner.as_ref().is_some_and(|owner| {
-                    owner.navigation_request.is_some()
+                    owner.navigation_request.as_ref().is_some_and(|request| {
+                        request.origin.context_id == context_id
+                    })
                 })
             )
         });
@@ -1369,6 +1372,7 @@ impl App {
     }
 
     pub(crate) fn cancel_collection_slideshow_navigation_intent(&mut self) {
+        let context_id = self.collection_grid_context_id();
         let transferred_slideshow = self.archive_convert.as_ref().is_some_and(|state| {
             matches!(
                 &state.completion,
@@ -1376,7 +1380,9 @@ impl App {
                     intent
                 ) if intent.collection_grid_owner.as_ref().and_then(|owner| {
                     owner.navigation_request.as_ref()
-                }).is_some_and(CollectionNavigationRequest::is_slideshow)
+                }).is_some_and(|request| {
+                    request.origin.context_id == context_id && request.is_slideshow()
+                })
             )
         });
         let is_slideshow = self
@@ -4535,6 +4541,223 @@ mod tests {
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn cancellation_slideshow_request(
+        app: &App,
+        context_id: crate::app::ViewerContextId,
+    ) -> CollectionNavigationRequest {
+        CollectionNavigationRequest {
+            origin: CollectionNavigationOrigin {
+                context_id,
+                collection_id: CollectionId::new(),
+                surface_generation: app.top_level_grid_view.generation(),
+                items_generation: app.items_generation,
+                intent_sequence: app.top_level_grid_view.collection_navigation_sequence(),
+                anchor: None,
+            },
+            action: CollectionNavigationAction::Slideshow {
+                fs_idx: 0,
+                end_action: app.settings.slideshow_end_action,
+                outer: true,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+            lease: navigation_test_lease(),
+            book_owner: None,
+            navigation: None,
+        }
+    }
+
+    fn transferred_archive_for_cancellation(
+        app: &mut App,
+        request: CollectionNavigationRequest,
+    ) -> (
+        Arc<AtomicBool>,
+        std::sync::mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg>,
+    ) {
+        use crate::app::top_level_grid_view::{
+            CollectionGridRequestStamp, CollectionGridSourceOpenOwner,
+        };
+        use crate::ui_dialogs::archive_convert::{
+            ArchiveConvertCompletionPolicy, ArchiveConvertPhase, ArchiveConvertState,
+        };
+        let path = PathBuf::from("C:/fixture/collection-slideshow.7z");
+        let source_key = crate::collection_store::CollectionRegistration::from_trusted_path(
+            &path,
+            CollectionResolvedKind::ConvertibleArchive,
+        )
+        .unwrap()
+        .source_key()
+        .clone();
+        let owner = CollectionGridSourceOpenOwner {
+            stamp: CollectionGridRequestStamp {
+                context_id: request.origin.context_id,
+                surface_generation: request.origin.surface_generation,
+                collection_id: request.origin.collection_id,
+            },
+            accepted_revision: 1,
+            wanted_revision: 1,
+            anchor: CollectionGridViewportAnchor {
+                entry_id: CollectionEntryId::new(),
+                source_key,
+            },
+            navigation_prepared: None,
+            navigation_origin: None,
+            navigation_request: Some(request),
+            navigation_watch: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.archive_convert = Some(Box::new(ArchiveConvertState {
+            src_path: path.clone(),
+            input_seq: 0,
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+            password: None,
+            password_input: String::new(),
+            phase: ArchiveConvertPhase::Scanning,
+            cancel: cancel.clone(),
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            completion: ArchiveConvertCompletionPolicy::MainGridArchive(
+                crate::app::MainGridArchiveTransitionIntent {
+                    source_path: path,
+                    reading_history_return_from: None,
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: false,
+                    smart_folder_owner: crate::app::SmartGridArchiveOwner::None,
+                    rating_grid_owner: None,
+                    collection_grid_owner: Some(owner),
+                    collection_navigation_continuation: None,
+                },
+            ),
+            restore_intent: crate::app::StartupListIntent::PageContinuation,
+            pending_sibling_output: None,
+            auto_fullscreen: true,
+            deferred_fullscreen: None,
+            suppress_confirm: true,
+            suppress_confirm_next_time: false,
+        }));
+        (cancel, tx)
+    }
+
+    fn assert_transferred_archive_still_owned(
+        app: &App,
+        cancel: &Arc<AtomicBool>,
+        context_id: crate::app::ViewerContextId,
+    ) {
+        use crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy;
+        let state = app
+            .archive_convert
+            .as_ref()
+            .expect("foreign archive owner survives");
+        assert!(Arc::ptr_eq(&state.cancel, cancel));
+        assert!(!cancel.load(Ordering::Acquire));
+        let ArchiveConvertCompletionPolicy::MainGridArchive(intent) = &state.completion else {
+            panic!("the same transferred completion owner must remain installed");
+        };
+        let request = intent
+            .collection_grid_owner
+            .as_ref()
+            .unwrap()
+            .navigation_request
+            .as_ref()
+            .unwrap();
+        assert_eq!(request.origin.context_id, context_id);
+        assert!(request.is_slideshow());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_slideshow_cancel_preserves_foreign_transferred_archive_and_local_sequence() {
+        let mut app = setup_app_for_test();
+        let sibling = app.build_window_context_for_test(94_101, |_| {});
+        let request = cancellation_slideshow_request(&app, sibling);
+        let (cancel, tx) = transferred_archive_for_cancellation(&mut app, request);
+        let sequence = app.top_level_grid_view.collection_navigation_sequence();
+        app.cancel_collection_slideshow_navigation_intent();
+        assert_eq!(
+            app.top_level_grid_view.collection_navigation_sequence(),
+            sequence
+        );
+        assert_transferred_archive_still_owned(&app, &cancel, sibling);
+        // General cancellation has its own context-owned sequence, but still cannot take
+        // the process-global archive receiver from a different viewer.
+        app.cancel_collection_navigation_intent();
+        assert_transferred_archive_still_owned(&app, &cancel, sibling);
+        assert!(
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::Rejected {
+                        message: "foreign receiver remains live".into()
+                    }
+                ))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_slideshow_cancel_retires_local_pending_without_cancelling_foreign_archive() {
+        let mut app = setup_app_for_test();
+        let sibling = app.build_window_context_for_test(94_102, |_| {});
+        let transferred = cancellation_slideshow_request(&app, sibling);
+        let (cancel, _tx) = transferred_archive_for_cancellation(&mut app, transferred);
+        let local = cancellation_slideshow_request(&app, app.collection_grid_context_id());
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::RequestNeeded {
+                request: local,
+                watch: None,
+            }));
+        let sequence = app.top_level_grid_view.collection_navigation_sequence();
+        app.cancel_collection_slideshow_navigation_intent();
+        assert!(
+            app.top_level_grid_view
+                .take_collection_navigation_pending()
+                .is_none()
+        );
+        assert_ne!(
+            app.top_level_grid_view.collection_navigation_sequence(),
+            sequence
+        );
+        assert_transferred_archive_still_owned(&app, &cancel, sibling);
+    }
+
+    #[test]
+    fn collection_slideshow_cancel_retires_same_context_archive_despite_stale_generation() {
+        for slideshow_only in [false, true] {
+            let mut app = setup_app_for_test();
+            let mut request =
+                cancellation_slideshow_request(&app, app.collection_grid_context_id());
+            request.origin.items_generation = app.items_generation.wrapping_add(1);
+            request.origin.surface_generation =
+                app.top_level_grid_view.generation().wrapping_add(1);
+            request.origin.intent_sequence = app
+                .top_level_grid_view
+                .collection_navigation_sequence()
+                .wrapping_add(1);
+            let (cancel, tx) = transferred_archive_for_cancellation(&mut app, request);
+            if slideshow_only {
+                app.cancel_collection_slideshow_navigation_intent();
+            } else {
+                app.cancel_collection_navigation_intent();
+            }
+            assert!(app.archive_convert.is_none());
+            assert!(cancel.load(Ordering::Acquire));
+            assert!(
+                tx.send(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                        crate::ui_dialogs::archive_convert::ArchiveScanOutcome::Rejected {
+                            message: "retired receiver".into()
+                        }
+                    ))
+                )
+                .is_err()
+            );
+        }
+    }
 
     fn write_single_page_zip(path: &std::path::Path, page: &str) {
         let file = std::fs::File::create(path).unwrap();

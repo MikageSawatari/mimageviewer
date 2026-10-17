@@ -11918,7 +11918,7 @@ mod tests {
         let applied = apply_ui_scale_factor(&ctx, 1.46);
         assert_f32_close(applied, 1.5);
         ctx.begin_pass(egui::RawInput::default());
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
         assert_f32_close(ctx.zoom_factor(), 1.5);
     }
 

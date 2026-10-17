@@ -526,3 +526,224 @@ fn public_window_removal_paths_keep_sibling_attachments_and_shared_renderer() {
         assert!(retained.renderer.read().texture(&shared_id).is_some());
     }
 }
+
+// Test-only non-cancelling receive, matching the eframe shared owner contract.
+fn receive_discard_delta(pending: &mut TexturesDelta, mut newer: TexturesDelta) {
+    for (id, updates) in newer.set.drain() {
+        for update in updates {
+            pending.push(id, update);
+        }
+    }
+    pending.free.extend(core::mem::take(&mut newer.free));
+}
+
+#[test]
+fn discard_texture_delivery_offscreen_actual_retry_immediate_callback_drop_readback() {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    // Prerequisite failure is a test failure, never a successful skip.
+    let painter =
+        headless_painter().expect("discard_texture_delivery requires a headless wgpu adapter");
+    let state = painter.render_state().unwrap();
+    let validation = state.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let painter = Rc::new(RefCell::new(painter));
+    let pending = Rc::new(RefCell::new(TexturesDelta::default()));
+    let ctx = Context::default();
+    ctx.set_embed_viewports(false);
+    let mut texture = ctx.load_texture(
+        "old native callback",
+        ColorImage::filled([2, 2], Color32::BLACK),
+        TextureOptions::NEAREST,
+    );
+    let id = texture.id();
+    texture.set_partial(
+        [1, 0],
+        ColorImage::filled([1, 1], Color32::RED),
+        TextureOptions::NEAREST,
+    );
+    // This callback is the last TextureHandle owner, retained independently of
+    // Context registration, exactly like a stale native viewport callback.
+    let old_callback: Rc<RefCell<Option<Arc<dyn Fn(&mut egui::Ui) + Send + Sync>>>> =
+        Rc::new(RefCell::new(Some(Arc::new(move |_| {
+            let _ = &texture;
+        }))));
+    let older = TextureId::User(1000);
+    receive_discard_delta(&mut pending.borrow_mut(), full(older, Color32::WHITE));
+    let deliveries = Rc::new(Cell::new(0));
+    let got = deliveries.clone();
+    let resource = Rc::downgrade(&painter);
+    let owner = Rc::downgrade(&pending);
+    let observed_state = state.clone();
+    let _scope = ctx.enter_discard_texture_delivery(move |delta| {
+        assert_eq!(delta.set[&id].len(), 2);
+        let resource = resource.upgrade().unwrap();
+        let owner = owner.upgrade().unwrap();
+        receive_discard_delta(&mut owner.borrow_mut(), delta);
+        let before = submission_counts();
+        resource
+            .borrow_mut()
+            .apply_textures_delta(&mut owner.borrow_mut());
+        assert_submissions(before, 0, 1); // returned consumer upload submit, before readback
+        assert!(owner.borrow().is_empty());
+        assert_pixels(&observed_state, older, &[Color32::WHITE; 4]);
+        assert_pixels(
+            &observed_state,
+            id,
+            &[Color32::BLACK, Color32::RED, Color32::BLACK, Color32::BLACK],
+        );
+        got.set(got.get() + 1);
+    });
+    let observed = deliveries.clone();
+    let resource = Rc::downgrade(&painter);
+    let owner = Rc::downgrade(&pending);
+    let old = old_callback.clone();
+    let observed_state = state.clone();
+    let child = ViewportId::from_hash_of("discard-resource-immediate");
+    Context::set_immediate_viewport_renderer(move |ctx, mut immediate| {
+        assert_eq!(
+            observed.get(),
+            1,
+            "readback and upload submit preceded replacement"
+        );
+        assert!(observed_state.renderer.read().texture(&id).is_some());
+        drop(old.borrow_mut().take()); // last actual TextureHandle drop, no fabricated free
+        let delta = ctx.tex_manager().write().take_delta();
+        assert!(delta.free.contains(&id));
+        let owner = owner.upgrade().unwrap();
+        receive_discard_delta(&mut owner.borrow_mut(), delta);
+        let before = submission_counts();
+        resource
+            .upgrade()
+            .unwrap()
+            .borrow_mut()
+            .apply_textures_delta(&mut owner.borrow_mut());
+        assert_submissions(before, 0, 1);
+        assert!(observed_state.renderer.read().texture(&id).is_none());
+        assert!(
+            observed_state.renderer.read().texture(&older).is_some(),
+            "sibling resource survives"
+        );
+        let mut input = egui::RawInput {
+            viewport_id: immediate.ids.this,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .entry(immediate.ids.this)
+            .or_default()
+            .parent = Some(immediate.ids.parent);
+        let mut output = ctx.run_ui(input, |ui| (immediate.viewport_ui_cb)(ui));
+        assert!(!output.textures_delta.set.contains_key(&id));
+        receive_discard_delta(
+            &mut owner.borrow_mut(),
+            core::mem::take(&mut output.textures_delta),
+        );
+        if !owner.borrow().is_empty() {
+            resource
+                .upgrade()
+                .unwrap()
+                .borrow_mut()
+                .apply_textures_delta(&mut owner.borrow_mut());
+        }
+        output.drop_without_applying_deltas();
+    });
+    let mut pass = 0;
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        if pass == 0 {
+            ui.ctx().request_discard("resource ordering retry");
+        } else {
+            ui.ctx()
+                .show_viewport_immediate(child, Default::default(), |_, _| {});
+        }
+        pass += 1;
+    });
+    assert_eq!(pass, 2);
+    assert_eq!(deliveries.get(), 1);
+    assert!(old_callback.borrow().is_none());
+    assert!(!output.textures_delta.set.contains_key(&id));
+    receive_discard_delta(
+        &mut pending.borrow_mut(),
+        core::mem::take(&mut output.textures_delta),
+    );
+    if !pending.borrow().is_empty() {
+        painter
+            .borrow_mut()
+            .apply_textures_delta(&mut pending.borrow_mut());
+    }
+    output.drop_without_applying_deltas();
+    assert!(
+        painter.borrow().surfaces.is_empty(),
+        "no surface, paint or present used"
+    );
+    assert!(pollster::block_on(validation.pop()).is_none());
+}
+
+#[test]
+fn discard_texture_delivery_offscreen_unavailable_pending_later_free_not_cancelled() {
+    use std::{cell::RefCell, rc::Rc};
+    let ready =
+        headless_painter().expect("discard_texture_delivery requires a headless wgpu adapter");
+    let state = ready.render_state().unwrap();
+    let validation = state.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let ctx = Context::default();
+    let painter = Rc::new(RefCell::new(pollster::block_on(Painter::new(
+        ctx.clone(),
+        Default::default(),
+        false,
+        Default::default(),
+    ))));
+    let pending = Rc::new(RefCell::new(TexturesDelta::default()));
+    let owner = pending.clone();
+    let resource = painter.clone();
+    let _scope = ctx.enter_discard_texture_delivery(move |delta| {
+        receive_discard_delta(&mut owner.borrow_mut(), delta);
+        resource
+            .borrow_mut()
+            .apply_textures_delta(&mut owner.borrow_mut());
+        assert!(
+            !owner.borrow().is_empty(),
+            "existing pending owns unavailable resources"
+        );
+    });
+    let mut handle = Some(ctx.load_texture(
+        "unavailable whole/partial",
+        ColorImage::filled([2, 2], Color32::BLACK),
+        TextureOptions::NEAREST,
+    ));
+    handle.as_mut().unwrap().set_partial(
+        [1, 0],
+        ColorImage::filled([1, 1], Color32::RED),
+        TextureOptions::NEAREST,
+    );
+    let id = handle.as_ref().unwrap().id();
+    let mut pass = 0;
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        if pass == 0 {
+            ui.ctx().request_discard("unavailable renderer");
+        } else {
+            drop(handle.take());
+        }
+        pass += 1;
+    });
+    receive_discard_delta(
+        &mut pending.borrow_mut(),
+        core::mem::take(&mut output.textures_delta),
+    );
+    output.drop_without_applying_deltas();
+    assert_eq!(pending.borrow().set[&id].len(), 2);
+    assert!(pending.borrow().free.contains(&id));
+    painter.borrow_mut().render_state = Some(state.clone());
+    let before = submission_counts();
+    painter
+        .borrow_mut()
+        .apply_textures_delta(&mut pending.borrow_mut());
+    assert_submissions(before, 0, 1);
+    assert!(pending.borrow().is_empty());
+    assert!(state.renderer.read().texture(&id).is_none());
+    assert!(
+        pollster::block_on(validation.pop()).is_none(),
+        "whole/partial submitted before later free"
+    );
+}

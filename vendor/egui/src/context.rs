@@ -783,6 +783,80 @@ impl ContextImpl {
 #[derive(Clone)]
 pub struct Context(Arc<RwLock<ContextImpl>>);
 
+#[derive(Clone)]
+struct DiscardTextureDelivery {
+    context: Context,
+    consume: alloc::rc::Rc<dyn Fn(crate::TexturesDelta)>,
+}
+
+std::thread_local! {
+    // A dispatcher only: texture ownership stays in FullOutput or the renderer.
+    static DISCARD_TEXTURE_DELIVERY: RefCell<Option<DiscardTextureDelivery>> = const { RefCell::new(None) };
+}
+
+struct DiscardTextureDeliveryScope(Option<DiscardTextureDelivery>);
+
+impl Drop for DiscardTextureDeliveryScope {
+    fn drop(&mut self) {
+        let current = DISCARD_TEXTURE_DELIVERY.with(|slot| slot.replace(self.0.take()));
+        // User-owned captures must be dropped outside the TLS registration borrow.
+        drop(current);
+    }
+}
+
+impl Context {
+    /// Install a thread-local integration resource consumer for this Context.
+    ///
+    /// Before an actual discard retry, transfers the completed passes' texture
+    /// delta once, after output plugins and before the next pass starts. Other
+    /// output still returns normally. The consumer must complete resource
+    /// delivery or transfer ownership to its existing renderer pending owner;
+    /// it must not execute UI, plugins, lifecycle cleanup, paint or present.
+    ///
+    /// Keep the returned guard alive through the outer native Full operation.
+    /// Nested immediate passes share this scope. Dropping it restores the prior
+    /// registration, including on unwind. The guard cannot move between threads.
+    /// Contexts without a matching scope keep their usual FullOutput ownership.
+    #[must_use]
+    pub fn enter_discard_texture_delivery<F: Fn(crate::TexturesDelta) + 'static>(
+        &self,
+        consume: F,
+    ) -> impl Drop + use<F> {
+        let registration = DiscardTextureDelivery {
+            context: self.clone(),
+            consume: alloc::rc::Rc::new(consume),
+        };
+        DiscardTextureDeliveryScope(
+            DISCARD_TEXTURE_DELIVERY.with(|slot| slot.replace(Some(registration))),
+        )
+    }
+
+    /// Whether this Context has an integration resource scope on this thread.
+    pub fn has_discard_texture_delivery(&self) -> bool {
+        DISCARD_TEXTURE_DELIVERY.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|sink| sink.context == *self)
+        })
+    }
+
+    fn deliver_discard_textures(&self, delta: &mut crate::TexturesDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        let consume = DISCARD_TEXTURE_DELIVERY.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|sink| sink.context == *self)
+                .map(|sink| sink.consume.clone())
+        });
+        if let Some(consume) = consume {
+            // No Context, texture-manager or registration borrow crosses this call.
+            consume(core::mem::take(delta));
+        }
+    }
+}
+
 impl core::fmt::Debug for Context {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Context").finish_non_exhaustive()
@@ -1134,6 +1208,7 @@ impl Context {
 
                 break;
             }
+            self.deliver_discard_textures(&mut output.textures_delta);
         }
 
         self.write(|ctx| {
@@ -6105,3 +6180,7 @@ mod stage3_viewport_retirement_tests {
         delta.clear(); // inspected headless output, no renderer destination
     }
 }
+
+#[cfg(test)]
+#[path = "discard_texture_delivery_tests.rs"]
+mod discard_texture_delivery_tests;

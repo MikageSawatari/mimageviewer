@@ -209,7 +209,7 @@ mod tests {
                         let node = harness.get_by_label(label);
                         unsafe {
                             egui::Id::from_high_entropy_bits(
-                                ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                                (u128::from(node.accesskit_node().id()) >> 64) as u64,
                             )
                         }
                     })

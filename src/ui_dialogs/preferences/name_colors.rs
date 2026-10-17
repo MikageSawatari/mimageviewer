@@ -313,6 +313,7 @@ mod tests {
             let mut draft = Settings::default();
             draft.text_contrast = contrast;
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(760.0, 1200.0))
                 .build_ui_state(
                     |root_ui, draft| {
@@ -345,6 +346,7 @@ mod tests {
         };
         let before = live.details_name_colors.clone();
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(680.0, 1200.0))
             .build_ui_state(
                 |root_ui, draft| {
@@ -528,12 +530,18 @@ mod tests {
             (ids, rects)
         }
         let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
         crate::ime_focus::install_ime_input_policy(&ctx);
         let mut colors = [[55; 3]; 2];
         let (ids, rects) = pass(&ctx, &mut colors, vec![]);
         ctx.memory_mut(|memory| memory.request_focus(ids[1]));
-        pass(&ctx, &mut colors, vec![]);
+        let (focused_ids, focused_rects) = pass(&ctx, &mut colors, vec![]);
+        assert_eq!(focused_ids, ids);
         let position = rects[0].center();
+        assert!(
+            focused_rects[0].contains(position),
+            "real click remains inside the current editor"
+        );
         let select_all = egui::Modifiers {
             ctrl: true,
             command: true,

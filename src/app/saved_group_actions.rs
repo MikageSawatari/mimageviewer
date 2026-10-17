@@ -813,29 +813,31 @@ mod tests {
         app.open_active_book_from_action(&ime_ctx);
         let first_id = app.saved_group_open_request_id_for_test().unwrap();
 
-        let _ = ime_ctx.run_pass(
-            egui::RawInput {
-                events: vec![
-                    egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit {
-                        text: "未確定".into(),
-                        active_range_chars: None,
-                    }),
-                    egui::Event::Key {
-                        key: egui::Key::Escape,
-                        physical_key: Some(egui::Key::Escape),
-                        pressed: true,
-                        repeat: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                app.update_ime_state(ctx);
-                app.render_saved_group_open_modal(ctx);
-            },
-        );
+        let _ = ime_ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "未確定".into(),
+                            active_range_chars: None,
+                        }),
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            physical_key: Some(egui::Key::Escape),
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.update_ime_state(ctx);
+                    app.render_saved_group_open_modal(ctx);
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(app.saved_group_open_request_id_for_test(), Some(first_id));
         assert_eq!(app.modal_dialog_block_reason(), Some("saved_group_open"));
 
@@ -846,19 +848,21 @@ mod tests {
         let second_id = app.saved_group_open_request_id_for_test().unwrap();
         assert_ne!(first_id, second_id);
         assert!(!app.cancel_saved_group_open_request(first_id));
-        let _ = escape_ctx.run_pass(
-            egui::RawInput {
-                events: vec![egui::Event::Key {
-                    key: egui::Key::Escape,
-                    physical_key: Some(egui::Key::Escape),
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| app.render_saved_group_open_modal(ctx),
-        );
+        let _ = escape_ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: Some(egui::Key::Escape),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.render_saved_group_open_modal(ctx),
+            )
+            .drop_without_applying_deltas();
         assert!(app.saved_group_open.is_none());
         assert!(!app.saved_group_open_modal_visible());
     }

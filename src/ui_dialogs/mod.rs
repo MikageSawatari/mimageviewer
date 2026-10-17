@@ -224,6 +224,10 @@ fn startup_dialog_scroll_body_with_axes<R>(
         |ui| {
             ui.spacing_mut().scroll = non_overlapping_dialog_scroll_style(ui.spacing().scroll);
             let scroll = egui::ScrollArea::new(axes)
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .id_salt(id)
                 .max_height(height)
                 .min_scrolled_height(0.0)

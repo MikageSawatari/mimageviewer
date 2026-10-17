@@ -6346,10 +6346,11 @@ mod similar_panel_tests {
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let requests_cb = std::sync::Arc::clone(&requests);
         ctx.set_request_repaint_callback(move |info| requests_cb.lock().unwrap().push(info));
-        // Consume egui's initial settling repaint so the delayed request becomes the earliest one.
-        let _ = ctx
-            .run_pass(Default::default(), |_| {})
-            .drop_without_applying_deltas();
+        // Finish the cold SetTheme pass and its outstanding repaint before measuring.
+        for _ in 0..2 {
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
+        }
         requests.lock().unwrap().clear();
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
@@ -6381,47 +6382,53 @@ mod similar_panel_tests {
             ),
         ] {
             let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let requests_cb = std::sync::Arc::clone(&requests);
             ctx.set_request_repaint_callback(move |info| requests_cb.lock().unwrap().push(info));
-            let _ = ctx
-                .run_pass(Default::default(), |_| {})
-                .drop_without_applying_deltas();
-            requests.lock().unwrap().clear();
-
             let mut state = SimilarPanelState::default();
+            let mut draw = |ctx: &egui::Context| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let move_frame = SimilarMoveFrameInput::capture(ctx, &state);
+                        let mut actions = super::SimilarPanelActions::default();
+                        super::draw_book_relations(
+                            ui,
+                            &book,
+                            &[],
+                            &mut state,
+                            72,
+                            85,
+                            crate::thumb_loader::CacheDecision::without_thumbnail(),
+                            None,
+                            ctx,
+                            &move_frame,
+                            &mut actions,
+                        );
+                    })
+                });
+            };
+            // The first separator initializes its widget style on the following pass.
+            // Establish this exact UI and its outstanding repaint before measuring
+            // whether the terminal itself schedules progress.
+            for _ in 0..2 {
+                ctx.run_pass(Default::default(), &mut draw)
+                    .drop_without_applying_deltas();
+            }
+            requests.lock().unwrap().clear();
             super::book_draw_probe_begin();
-            let _ = ctx
-                .run_pass(Default::default(), |ctx| {
-                    ctx.root_ui(|root_ui| {
-                        egui::CentralPanel::default().show(root_ui, |ui| {
-                            let move_frame = SimilarMoveFrameInput::capture(ctx, &state);
-                            let mut actions = super::SimilarPanelActions::default();
-                            super::draw_book_relations(
-                                ui,
-                                &book,
-                                &[],
-                                &mut state,
-                                72,
-                                85,
-                                crate::thumb_loader::CacheDecision::without_thumbnail(),
-                                None,
-                                ctx,
-                                &move_frame,
-                                &mut actions,
-                            );
-                        })
-                    });
-                })
+            ctx.run_pass(Default::default(), draw)
                 .drop_without_applying_deltas();
             let probe = super::book_draw_probe_finish();
 
             assert!(probe.heading_drawn);
             assert!(!probe.spinner_drawn);
             assert_eq!(probe.state_message, Some(expected_message));
+            let terminal_requests = requests.lock().unwrap().clone();
             assert!(
-                requests.lock().unwrap().is_empty(),
-                "terminal {book:?} unexpectedly requested a repaint"
+                terminal_requests.is_empty(),
+                "terminal {book:?} unexpectedly requested a repaint: {terminal_requests:?}, causes={:?}",
+                ctx.repaint_causes()
             );
         }
     }

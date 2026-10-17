@@ -10996,7 +10996,7 @@ mod tests {
                     lab_combo_box(
                         ui,
                         "repair_quality_theme_regression",
-                        "",
+                        "補修の品質",
                         repair_quality_label(quality),
                         |ui| {
                             for candidate in [

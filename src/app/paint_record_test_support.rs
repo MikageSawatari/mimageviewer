@@ -263,7 +263,7 @@ mod tests {
         drop(source);
         assert!(ctx.tex_manager().read().meta(source_texture_id).is_none());
         let output = with_capture(|| {
-            ctx.run_pass(egui::RawInput::default(), |ctx| {
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
                 let painter = ctx.layer_painter(egui::LayerId::background());
                 record_selected_paint_resource(&painter, &payload);
                 painter.image(
@@ -272,7 +272,7 @@ mod tests {
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
-            })
+            }))
         });
         let records = paint_records(egui::ViewportId::ROOT, &output);
         assert_eq!(records.len(), 1);
@@ -300,7 +300,7 @@ mod tests {
         let second =
             FullscreenPaintResource::direct(texture).with_test_paint_provenance(proof("second"));
         let output = with_capture(|| {
-            ctx.run_pass(egui::RawInput::default(), |ctx| {
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
                 let painter = ctx.layer_painter(egui::LayerId::background());
                 for (index, resource) in [&first, &second].into_iter().enumerate() {
                     record_selected_paint_resource(&painter, resource);
@@ -315,7 +315,7 @@ mod tests {
                         egui::Color32::WHITE,
                     );
                 }
-            })
+            }))
         });
         let records = paint_records(egui::ViewportId::ROOT, &output);
         assert_eq!(records.len(), 2);

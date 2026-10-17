@@ -619,6 +619,16 @@ fn reuse_proof_apply(
 }
 
 impl SidecarRestoreState {
+    #[cfg(test)]
+    pub(super) fn connection_request_ids_for_test(&self) -> (u64, Option<u64>) {
+        (
+            self.common.request_id,
+            self.common
+                .book_restore
+                .as_ref()
+                .map(|restore| restore.open_id_for_test()),
+        )
+    }
     pub(super) fn defer_main_list_action(
         &mut self,
         action: super::MainListAfterHydration,
@@ -5450,13 +5460,13 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run_pass(raw, |ctx| {
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(raw, |ctx| {
             let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
             app.consume_input_during_sidecar_restore(ctx);
             assert!(ctx.input(|input| input.viewport().close_requested()));
             app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
             app.show_sidecar_restore_dialog(ctx);
-        });
+        }));
         assert!(app.window_visible);
         assert!(
             output
@@ -5484,10 +5494,10 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run_pass(raw, |ctx| {
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(raw, |ctx| {
             app.consume_input_during_sidecar_restore(ctx);
             app.show_sidecar_restore_dialog(ctx);
-        });
+        }));
 
         assert!(
             output

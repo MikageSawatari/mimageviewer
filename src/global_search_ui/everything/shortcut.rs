@@ -70,6 +70,24 @@ mod tests {
         }
     }
 
+    fn assert_ctrl_r_pending(ctx: &egui::Context, repeated: bool) {
+        ctx.input(|input| {
+            assert_eq!(
+                input.events,
+                [
+                    egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                    egui::Event::Key {
+                        key: egui::Key::R,
+                        physical_key: Some(egui::Key::R),
+                        pressed: true,
+                        repeat: repeated,
+                        modifiers: egui::Modifiers::CTRL,
+                    }
+                ]
+            );
+        });
+    }
+
     #[test]
     fn everything_ctrl_r_reopen_selects_previous_query_and_typing_replaces_it() {
         #[cfg(windows)]
@@ -244,7 +262,11 @@ mod tests {
             app.global_search.pending.is_none(),
             "opening must not send IPC"
         );
-        assert!(ctx.input(|input| input.events.is_empty()));
+        assert_eq!(
+            ctx.input(|input| input.events.clone()),
+            [egui::Event::ModifiersChanged(egui::Modifiers::CTRL)],
+            "the shortcut consumes its key while preserving the ordered modifier notification"
+        );
         let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
 
         app.keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGlobalEverythingSearch = F24\n");
@@ -287,7 +309,7 @@ mod tests {
         app.address_has_focus = true;
         key_pass(&ctx, egui::Key::R, egui::Modifiers::CTRL, None);
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_ctrl_r_pending(&ctx, false);
         let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         app.address_has_focus = false;
         // IME composition and focus recovery are pass-owned claims; the
@@ -309,7 +331,7 @@ mod tests {
                 }),
             );
             assert!(!app.dispatch_everything_search_shortcut(&ctx), "{phase:?}");
-            assert_eq!(ctx.input(|input| input.events.len()), 1, "{phase:?}");
+            assert_ctrl_r_pending(&ctx, true);
             assert!(!app.global_search.active);
             let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         }
@@ -323,7 +345,7 @@ mod tests {
         let _clear = ClearKeyFrame;
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
-        for owner in [
+        for (index, owner) in [
             KeyboardOwner::Modal,
             KeyboardOwner::ApplicationShortcut {
                 scope: ShortcutScope::new(egui::ViewportId::ROOT, ShortcutSurface::Fullscreen),
@@ -334,10 +356,13 @@ mod tests {
                     ShortcutSurface::Main,
                 ),
             },
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             key_pass(&ctx, egui::Key::R, egui::Modifiers::CTRL, Some(owner));
             assert!(!app.dispatch_everything_search_shortcut(&ctx));
-            assert_eq!(ctx.input(|input| input.events.len()), 1);
+            assert_ctrl_r_pending(&ctx, index != 0);
             assert!(!app.global_search.active);
             let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         }
@@ -349,7 +374,7 @@ mod tests {
             Some(main_owner()),
         );
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_ctrl_r_pending(&ctx, true);
         let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
     }
 
@@ -370,7 +395,7 @@ mod tests {
             );
             assert!(!mounted.dispatch_everything_search_shortcut(&ctx));
             assert!(!mounted.global_search.active);
-            assert_eq!(ctx.input(|input| input.events.len()), 1);
+            assert_ctrl_r_pending(&ctx, false);
             let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         });
         app.items = vec![crate::grid_item::GridItem::Video(
@@ -386,7 +411,7 @@ mod tests {
         );
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
         assert!(!app.global_search.active);
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_ctrl_r_pending(&ctx, true);
         let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
     }
 }

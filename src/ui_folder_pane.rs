@@ -441,10 +441,12 @@ mod tests {
                     .exact_size(FOLDER_PANE_MIN_WIDTH)
                     .show(root_ui, |ui| {
                         ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
-                                .width(54.0)
-                                .selected_text("C:")
-                                .show_ui(ui, |_| {});
+                            let drive =
+                                egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
+                                    .width(54.0)
+                                    .selected_text("C:")
+                                    .show_ui(ui, |_| {});
+                            crate::ui_helpers::set_accessibility_label(&drive.response, "Drive");
                             let selected = folder_tree_sort_combo(
                                 ui,
                                 crate::settings::FolderTreeSortOrder::NameAsc,

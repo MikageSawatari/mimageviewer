@@ -173,3 +173,23 @@ The shared IME implementation lives in crates/egui-ime; egui-winit and
 eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
 were moved to vendor/upstream-provenance.json. Graph migration is not evidence
 that runtime checks or release gates have passed.
+
+
+## Stage 3: discard texture delivery (design revision 4.6, 2026-10-17)
+
+Implementation record and implementer internal inspection only. Independent
+acceptance and command results belong in the stage-3 verification ledger.
+
+- Context::enter_discard_texture_delivery installs a Context-identity-bound,
+  thread-local resource dispatcher with an RAII restore guard. Captures can be
+  non-Send; native backends capture Weak references to existing renderer owners.
+  The dispatcher owns no pending delta and invokes consumers outside its TLS
+  borrow and Context/texture-manager locks.
+- run_dyn moves only its accumulated textures_delta after a real retry is
+  confirmed, after output hooks and before the next begin_pass. Final/limited
+  passes and direct begin/end keep ordinary FullOutput delivery; no matching
+  scope preserves headless behavior. Nested immediate retries share the scope.
+- Four discard_texture_delivery regressions cover Context isolation, normal /
+  early-return / unwind restoration, limits/direct/empty output, actual plugin
+  mutation/IME output and receipt-model observation, and nested immediate retry.
+  Receipt-model tests are not evidence for the product page-turn plugin.

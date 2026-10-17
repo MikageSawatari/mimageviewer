@@ -2537,7 +2537,7 @@ mod small_screen_tests {
             let node = harness.get_by_label("設定を完全リセット…");
             let id = unsafe {
                 egui::Id::from_high_entropy_bits(
-                    ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                    (u128::from(node.accesskit_node().id()) >> 64) as u64,
                 )
             };
             let response = harness.ctx.read_response(id).unwrap();
