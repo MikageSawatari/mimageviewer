@@ -1,6 +1,6 @@
 # 音響調整の歌詞連携 試作計画 (EffeTune Mixwright Lyrics)
 
-状態: **第 2 版。第 1 回独立設計レビュー (REJECT、§10) の指摘を反映、再レビュー待ち。実装未着手**。2026-10-17。
+状態: **第 3 版。第 1・2 回独立設計レビュー (いずれも REJECT、§10) の指摘を反映、再レビュー待ち。実装未着手**。2026-10-17。
 目的は製品化ではなく、**作者 (Frieve-A) へ相談する前に、ホストから歌詞と再生位置を渡す方式が
 実際に噛み合うかを、動く試作で確かめること**。試作は配布しない。
 Coordinator は ClaudeCode。実装は Codex (mIV 側・Mixwright 側とも)。
@@ -224,7 +224,8 @@ Now Playing の受信からの処理量で位置を推定する。シーク・�
 Now Playing の所有者 (唯一の正本)
   Empty
   Media { identity, generation, revision, text, artwork, lyrics,
-          position_source: Local(Arc<AvClock>) | Unavailable (Remote) }
+          position_source: Local { clock: Arc<AvClock>, diagnostics: Arc<AudioDiagnostics> }
+                         | Unavailable (Remote) }
 位置の送り手 (effetune-host-control worker 内の小さな状態)
   ├ 所有者の状態から (generation, position_source) を写し取る
   ├ Local のとき 200 ms ごとに clock.now_secs() / is_playing() / playback_speed() と QPC を読む
@@ -234,7 +235,8 @@ Now Playing の所有者 (唯一の正本)
 ```
 
 - **時計は所有者の状態に持たせる**。送り手に別の登録を作らない。Local の player を採用するときに
-  その player の `Arc<AvClock>` を、Remote の採用では `Unavailable` を、同じ所有者の更新で入れる。
+  その player の `Arc<AvClock>` と、同じ player の `Arc<AudioDiagnostics>` (`src/video/mod.rs:451`) を、
+  Remote の採用では `Unavailable` を、同じ所有者の更新で入れる。
   旧 player の時計で新しい曲の位置を送ることは、世代と時計が同じ状態から一緒に読まれるので起こらない。
 - **時計を読む場所を 1 つにする**: 一時停止・シーク・速度変更・ループ・曲の切り替えを、
   それぞれの入口に呼び出しを足して拾うことはしない。時計の状態の変化として送り手が拾う
@@ -248,8 +250,13 @@ Now Playing の所有者 (唯一の正本)
 - RT スレッド (`fill_output`) には何も足さない。
 - 単一 player が鳴る利用者前提 (now-playing 計画 §0) を引き継ぐ。
 - detached viewer の述語や viewport の経路には触れない。所有者の更新は Now Playing と同じ境界で行う。
-- 確認用に、送るたびに「送った位置・その瞬間の可聴 PTS の診断値 (`audio_audible_pts_bits`)・lead の診断値」を
-  perf ログへ 1 行残す (§6.1 の D 記録)。試作だけの記録で、製品化の際に見直す。
+- 確認用に、送るたびに perf ログへ 1 行残す (§6.1 の D 記録)。試作だけの記録で、製品化の際に見直す。
+  載せるのは、送った位置と QPC、**出力コールバックの中で計算済みの lead** (`audio_lead_ms_bits`。
+  可聴 PTS と、それを反映した直後の時計の差。同じ瞬間の 2 値なので経過時間が混ざらない、`audio.rs:3996-4011`)、
+  その valid (`audio_audible_pts_valid`)、コールバックの seek serial と engine state と時刻
+  (`callback_seek_serial` / `callback_engine_state` / `callback_latest_wall_ns`、`src/video/audio_diagnostics.rs:55-64`)、
+  再生状態と速度。送った位置と `audio_audible_pts_bits` の単純な差は、コールバックから読み取りまでの経過時間が
+  混ざるので指標にしない (第 2 回レビュー P2-1)。
 
 ### 4.4 Remote・ポータブル版・歌詞のない曲
 
@@ -292,7 +299,11 @@ Now Playing の所有者 (唯一の正本)
    非表示中は `host/getInfo` しか読まれず (`ui-shim/vst-audio-manager.js:1022-1038`)、起動時も `host/getInfo` から始まる。
 4. `ui-shim/vst-audio-manager.js`:
    - 位置は、非表示時の早期 return より**前**で、受け取った時点の `performance.now()` と一緒に採用する。
-     再表示の直後に telemetry の破棄だけで終わる回でも、古い位置で描かないようにする。
+   - 非表示から表示に戻った最初の回は `telemetry/discard` だけで終わり、位置を取りに行かない
+     (`ui-shim/vst-audio-manager.js:1025-1031`)。最後の非表示の読み取りの後に一時停止・シークが起きると、
+     採用済みの位置は古い。そこで、表示に戻った時点で位置を「古い」と印を付け、その後に `telemetry/read` か
+     `host/getInfo` の応答で位置を採用するまでは `getHostLyrics()` が `null` を返す
+     (次の読み取りは 1/60 秒後なので、空になるのは数フレーム)。discard の分岐自体は変えない。
    - `getHostLyrics()` が `{ data, time, duration, isStopped }` を返す。曲情報と位置の世代が一致し `available=1` のときだけ
      `data` を返し、それ以外は `null`。`data` は Now Playing の revision ごとに、§4.1 の `parseLrc` と
      `selectLyrics` を 1 回だけ行って保持する。
@@ -325,7 +336,8 @@ Now Playing の所有者 (唯一の正本)
   (`choc_WebView.h:1853` `getUserDataFolder`。mIV では `%APPDATA%\mimageviewer-vst3-host.exe\`)。
   mIV の `--data-dir` ではこれを分けられない。試作ブランチでは host の exe 名を
   `mimageviewer-vst3-host-lyrics-trial.exe` に変え、実利用中の Visualizer のレイアウトを汚さない。
-  変更の範囲 (CMake の出力名・core が起動する名前・identity の検査) は T2 の最初にコードで確かめる。
+  実際に起動される名前は、埋め込んだ host を展開するときの名前で決まる (`src/video/dsp/extract.rs:115`)。
+  CMake の出力名・埋め込み元・identity の検査は標準の名前のまま変えず、**試作ブランチで展開する basename だけを変える**。
 - それでも分けられないもの: Mixwright の設定 `%APPDATA%\Frieve\EffeTunePlugin\config.json`
   (`src/bridge/config_store.cpp:26`) とプリセット (`%APPDATA%\effetune\` または同フォルダ) は DAW と共有される。
   確認中は Mixwright の設定画面を変えず、プリセットを保存しない (§6.3 の注意に書く)。
@@ -344,6 +356,8 @@ Now Playing の所有者 (唯一の正本)
     `telemetry/read` と `host/getInfo` の両方に同じ位置が載ること。
   - esm: `getHostLyrics()` が revision ごとに 1 回だけ解析すること、**世代が一致しない間は `null`**、
     外挿と一時停止、起動時 (`host/getInfo` から開始)、非表示中の一時停止・シーク → 再表示で古い位置を使わないこと、
+    **非表示中の最後の読み取りの後に位置が変わり、再表示の最初の描画 (discard の回) で `null` になること**、
+    E 記録の集計 (中央値・95 パーセンタイル) が 5 秒おきに native へ送られること、
     Offset とフェードが上流と同じ入力で動くこと。
   - 選択: `[ar:A][00:01.00]本文`、`[00:99]`、メタデータ行だけの `.lrc` (タグへ戻る)、時刻なし `.lrc` と時刻付きタグ。
 - mIV: `.\scripts\test-focused.ps1` に加えて、次を対象を絞って実行する。
@@ -359,11 +373,19 @@ Now Playing の所有者 (唯一の正本)
     同じ状態が続くときは 1 秒おきの再送だけになること、Local の位置が無いときは起床しないこと。
   - protocol v8 の handshake と、v7 host を拒否すること。
 - `cargo check -p mimageviewer --bin mimageviewer-core`、C++ host の CMake ビルド、`.\scripts\build-dev.ps1`。
-- **D 記録 (時計の誤差の測定)**: §4.3 の perf ログの行から、送った位置と可聴 PTS の診断値の差を場面ごとに集計する
+- **D 記録 (時計の誤差の測定)**: §4.3 の perf ログの行から、コールバック内の lead を場面ごとに集計する
   スクリプトを用意する (Python、リポジトリ内 `scripts/`)。場面は、通常再生・速度変更の直後・遅延の変化
   (EffeTune の読み込み直後の 0→128 サンプル)・シーク・DSP の引き継ぎ (曲の切り替え)・EOF とループ。
+  集計に入れるのは、valid で、再生中で、コールバックの seek serial が直前の行と同じ行だけ。
+  シーク直後の無効値と、停止中に残った古い値は除く (除いた件数も出す)。
   これで「時計と可聴 PTS の差」(§3 方式 A の (1)) を、利用者の見え方とは別に数字で確かめる。
-  デバイス側の遅延 (2) はこの記録には出ない。
+  デバイス側の遅延 (2) と、プラグイン内の配送・描画の遅れ (下の E 記録) はこの記録には出ない。
+- **E 記録 (プラグイン内の配送と描画の遅れ)**: native は応答を作る時点まで外挿するが、JS は受け取った時点を
+  補間の起点にするので、**応答を作ってから JS が受け取るまでの時間は補われず、その分だけ歌詞が遅れる**
+  (`ui-shim/vst-bootstrap.js:183-190` の往復)。描画の待ちも加わる。試作の JS は、telemetry の要求から応答までの時間と、
+  Visualizer の描画間隔を集計し、5 秒おきに中央値と 95 パーセンタイルを native へ送る。native は 1 行を stderr に書き、
+  mIV の既存の bridge stderr の受け口 (`src/video/dsp/bridge.rs:686-732`) でログに残る。残る場所は T2 の最初に確かめる。
+  要求から応答までの時間は、補われない遅れの上限として扱う。
 
 ### 6.2 試験素材と測定用レイアウト (エージェントが作る、リポジトリ外の `target\lyrics-trial\`)
 
@@ -375,14 +397,19 @@ Now Playing の所有者 (唯一の正本)
 - 素材は生成スクリプトで作り、市販曲の歌詞は使わない。
 - **測定用レイアウト**: Lyric Stage は行の移動に 0.4 秒の遷移を使う
   (`external/effetune/presets/visualizer/16x9.json:4595` `lyricsStepDuration`) ので、行の切り替わりのどこを
-  ビープに合わせるかで演出が測定値に混ざる。測定は次の設定の Lyrics 項目 1 つだけのレイアウトで行う。
-  View = Single line、Show next line = オフ、Step transition time = 0、Fade-in / Fade-out time = 0、Offset = 0、
-  Word highlight = オフ。比べる瞬間は「**表示の数字が次の数字に変わった瞬間**」とビープの鳴り始め。
+  ビープに合わせるかで演出が測定値に混ざる。Single line も固定の 0.18 秒で旧行から新行へ動き、
+  Step transition time の項目自体が出ない (`visualizer-editor.js:745-752`、`visualizer-lyrics.js:7`, `:33`)。
+  測定は次の設定の Lyrics 項目 1 つだけのレイアウトで行う。
+  View = List、Scroll = Step (vertical)、Step transition time = 0、Current line position = 50%、
+  Fade-in / Fade-out time = 0、Offset = 0、Word highlight = オフ。
+  比べる瞬間は「**中央の現在行の数字が次の数字に変わった瞬間**」とビープの鳴り始め。
   手順書には各設定項目の画面上の名前を書く。
 
 ### 6.3 利用者の実機確認 (試作の確認用ビルド)
 
-準備: 起動中の mIV を終了 → T3 の確認用ビルドを隔離した data-dir で起動 → 音響調整の窓を開いて Visualizer にする。
+準備: 起動中の mIV を終了 → T3 の確認用ビルドを隔離した data-dir と **`--perf-log`** を付けて起動
+(perf 記録は引数が無いと有効にならない、`src/lib.rs:1315`) → 隔離 data-dir の `logs` に `perf_*.jsonl` ができたことを確かめる
+→ 音響調整の窓を開いて Visualizer にする。起動コマンドは手順書に PowerShell で書く。
 
 隔離の範囲 (手順書の冒頭に書く):
 - mIV の設定・キャッシュ・ログは `--data-dir` で分かれる。
@@ -410,8 +437,10 @@ Now Playing の所有者 (唯一の正本)
 判断:
 - D 記録の差が小さく (数十 ms 以内)、#2 の値も小さい → 方式 A のまま相談する。
 - D 記録の差が場面によって大きい → 時計と可聴 PTS の差が原因。位置の出どころを可聴 PTS 側に寄せる案を mIV 側で検討する。
-- D 記録の差は小さいのに #2 の値が大きい → デバイス側の遅延が主な原因と考えられる。
-  cpal のタイムスタンプを使ってデバイスの遅延を含める案を mIV 側で検討する。
+- D 記録の差は小さいのに #2 の値が大きい → まず「配送・描画・デバイスのどれかで、未判定」とする。
+  E 記録 (要求から応答までと描画間隔) で説明できる分を差し引き、それでも残る分だけをデバイス側の遅延の候補とする。
+  ソフトウェア側の遅れで説明できるなら、JS の補間の起点を直す案 (往復の半分を足す等) を Mixwright 側で検討する。
+  説明できないときに限り、cpal のタイムスタンプを使ってデバイスの遅延を含める案を mIV 側で検討する。
 - 方式 B へは、これらでも不足するときだけ戻る。
 
 ## 7. 単純化の検討 (CLAUDE.md「設計の簡素化」)
@@ -468,3 +497,21 @@ ClaudeCode が各指摘の根拠のコードを読み、8 件すべてを正し�
 ProcessContext は処理フレーム数と常時 kPlaying であること、MSVC の `steady_clock` が QPC 由来で共通の時計に使えること、
 音楽の矢印キーのシーク・速度変更・ループが実装されていること、プラグイン版でも Lyrics の Offset を編集できること、
 最大の画像と歌詞を同時に載せても 32 MiB に収まること。FFmpeg の歌詞のキー名は未確認のまま (§6.1 で確かめる)。
+
+### 10.2 第 2 回独立設計レビュー (2026-10-17、同じ SID で継続)
+
+対象は第 2 版 (0af8c32d7)。判定 **REJECT**。前回の判定理由のうち、曲情報と位置の整合は解消
+(世代と時計を同じ状態から読み、両通知の世代を照合する構造で配送順の逆転に対応できる)。
+画像なし + 歌詞あり、候補 2 本の選択、Remote の確認方法も解消。`selectLyrics` は生成済みのプラグイン版の配布物にも残っており、
+許可リストの変更は不要と確認された。残りは測定方法と再表示時の位置で、ClaudeCode が根拠のコードを読み、5 件とも正しいと判断して第 3 版に反映した。
+
+| 指摘 | 内容 | 反映先 |
+| --- | --- | --- |
+| P2 | D 記録が、時刻の違う 2 つの位置を引き算している (経過時間 × 速度が混ざる)。診断値は `AvClock` からは読めない | §4.3 (コールバック内で計算済みの lead を使う、`AudioDiagnostics` も所有者の状態に持たせる)、§6.1 の D 記録 (valid・再生中・同じ seek serial の行だけ集計) |
+| P2 | Single line では Step transition time を設定できず、固定 0.18 秒の遷移が残る | §6.2 (List + Step (vertical) + Step transition time = 0、中央の現在行で比べる) |
+| P2 | D が小さく Offset が大きいとき、残りをすぐデバイスの遅延とみなすのは早い (プラグイン内の配送・描画の遅れが D に出ない) | §6.1 の E 記録、§6.3 の判断 |
+| P3 | 再表示の最初の回は discard だけで、最新の位置を取りに行かない | §4.6.4 (表示に戻ったら位置を古いと印を付け、新しい応答まで `null`)、§6.1 |
+| P3 | 実機手順に perf 記録の有効化が無い | §6.3 の準備 (`--perf-log` とログファイルの確認) |
+
+前回の P3 (保存領域の分離) について、実際に起動される名前は展開時の名前で決まる (`src/video/dsp/extract.rs:115`) との補足を受け、
+§5 を「展開する basename だけを変える」に改めた。
