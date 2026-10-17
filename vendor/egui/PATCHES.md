@@ -201,3 +201,22 @@ acceptance and command results belong in the stage-3 verification ledger.
   deprecated module constant. The numeric value and scene behavior are unchanged.
   No TextEdit compatibility patch is added; the upstream 0.37 same-batch pointer
   focus/Text behavior was explicitly accepted by the mIV user.
+
+## Stage 7: retain the unpublished font reservation (2026-10-17)
+
+`Context::take_viewport_retirement_texture_delta` now checks the existing
+Managed(0) TextureManager metadata under the same write lock before taking any
+pending delta. Until the first real atlas is published, every update remains
+with TextureManager. The first normal end_pass replaces the upstream 0x0 font
+reservation with the valid atlas and exports the complete batch. Nothing is
+filtered, discarded, replayed, or moved into an additional pending owner.
+
+The pass-outside retirement collector previously drained that reservation on
+the first ordinary WindowEvent, even without a close request. A ready wgpu
+renderer then attempted to create a zero-width texture. Upstream 0.37's ordinary
+Full path publishes the real font atlas before draining, and its renderer has
+no zero-size discard contract. Published-atlas metadata (rather than the
+existence of Fonts during begin_pass) defines this resource publication boundary.
+Subsequent no-paint updates/free-only delivery and font reload remain supported.
+The Context regression checks pre-Full whole/partial/free ownership, real font
+definition changes, and no duplicate delivery. See the stage-7 startup ledger.

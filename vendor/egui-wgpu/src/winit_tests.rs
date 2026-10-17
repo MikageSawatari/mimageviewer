@@ -538,6 +538,141 @@ fn receive_discard_delta(pending: &mut TexturesDelta, mut newer: TexturesDelta) 
 }
 
 #[test]
+fn retirement_texture_delivery_offscreen_startup_preserves_first_full_atlas_and_user_texture() {
+    use std::{cell::RefCell, rc::Rc};
+
+    for scenario in ["empty", "discard", "immediate"] {
+        let painter = headless_painter()
+            .expect("startup retirement regression requires a headless wgpu adapter");
+        let ctx = painter.context.clone();
+        let state = painter.render_state().unwrap();
+        let painter = Rc::new(RefCell::new(painter));
+        let pending = Rc::new(RefCell::new(TexturesDelta::default()));
+
+        // Exercise the actual ready Painter before any Full. In the broken
+        // implementation this submits the reserved 0x0 atlas to the real GPU;
+        // inspect validation only after the consumer has run.
+        let validation = state.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut initial = ctx.take_viewport_retirement_texture_delta();
+        painter.borrow_mut().apply_textures_delta(&mut initial);
+        let startup_error = pollster::block_on(validation.pop());
+        initial.clear();
+        assert!(startup_error.is_none(), "{scenario}: {startup_error:?}");
+        assert!(
+            state
+                .renderer
+                .read()
+                .texture(&TextureId::default())
+                .is_none()
+        );
+
+        let texture = ctx.load_texture(
+            "pre-Full user texture",
+            ColorImage::filled([2, 2], Color32::RED),
+            TextureOptions::NEAREST,
+        );
+        let id = texture.id();
+        let validation = state.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut before_full = ctx.take_viewport_retirement_texture_delta();
+        painter.borrow_mut().apply_textures_delta(&mut before_full);
+        assert!(pollster::block_on(validation.pop()).is_none());
+        assert!(before_full.is_empty());
+        assert!(state.renderer.read().texture(&id).is_none());
+
+        let validation = state.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let resource = Rc::downgrade(&painter);
+        let owner = Rc::downgrade(&pending);
+        let _scope = ctx.enter_discard_texture_delivery(move |delta| {
+            let owner = owner.upgrade().unwrap();
+            receive_discard_delta(&mut owner.borrow_mut(), delta);
+            resource
+                .upgrade()
+                .unwrap()
+                .borrow_mut()
+                .apply_textures_delta(&mut owner.borrow_mut());
+        });
+        let child = ViewportId::from_hash_of("startup first immediate");
+        if scenario == "immediate" {
+            ctx.set_embed_viewports(false);
+            let resource = Rc::downgrade(&painter);
+            let owner = Rc::downgrade(&pending);
+            Context::set_immediate_viewport_renderer(move |ctx, mut immediate| {
+                let mut input = egui::RawInput {
+                    viewport_id: immediate.ids.this,
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .entry(immediate.ids.this)
+                    .or_default()
+                    .parent = Some(immediate.ids.parent);
+                let mut output = ctx.run_ui(input, |ui| (immediate.viewport_ui_cb)(ui));
+                let owner = owner.upgrade().unwrap();
+                receive_discard_delta(
+                    &mut owner.borrow_mut(),
+                    core::mem::take(&mut output.textures_delta),
+                );
+                resource
+                    .upgrade()
+                    .unwrap()
+                    .borrow_mut()
+                    .apply_textures_delta(&mut owner.borrow_mut());
+                output.drop_without_applying_deltas();
+            });
+        }
+        let mut passes = 0;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            if scenario == "discard" && passes == 0 {
+                ui.ctx().request_discard("first Full atlas publication");
+            }
+            if scenario == "immediate" {
+                ui.ctx()
+                    .show_viewport_immediate(child, Default::default(), |_, _| {});
+            }
+            passes += 1;
+        });
+        assert_eq!(passes, if scenario == "discard" { 2 } else { 1 });
+        receive_discard_delta(
+            &mut pending.borrow_mut(),
+            core::mem::take(&mut output.textures_delta),
+        );
+        output.drop_without_applying_deltas();
+        painter
+            .borrow_mut()
+            .apply_textures_delta(&mut pending.borrow_mut());
+        assert!(pending.borrow().is_empty());
+        let atlas_size = state
+            .renderer
+            .read()
+            .texture_size(&TextureId::default())
+            .expect("first Full must publish the real font atlas even without text");
+        assert!(atlas_size[0] > 0 && atlas_size[1] > 0);
+        assert_pixels(&state, id, &[Color32::RED; 4]);
+        assert!(pollster::block_on(validation.pop()).is_none());
+
+        // Once the atlas is published, an ordinary handle drop must still
+        // reach the same no-paint consumer as a free-only batch.
+        drop(texture);
+        let validation = state.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut free_only = ctx.take_viewport_retirement_texture_delta();
+        assert!(free_only.set.is_empty());
+        assert!(free_only.free.contains(&id));
+        painter.borrow_mut().apply_textures_delta(&mut free_only);
+        assert!(free_only.is_empty());
+        assert!(state.renderer.read().texture(&id).is_none());
+        assert!(
+            state
+                .renderer
+                .read()
+                .texture(&TextureId::default())
+                .is_some()
+        );
+        assert!(painter.borrow().surfaces.is_empty());
+        assert!(pollster::block_on(validation.pop()).is_none());
+    }
+}
+
+#[test]
 fn discard_texture_delivery_offscreen_actual_retry_immediate_callback_drop_readback() {
     use std::{
         cell::{Cell, RefCell},

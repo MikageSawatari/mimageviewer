@@ -3675,6 +3675,10 @@ impl Context {
 
     /// Drain shared changes produced by callback/TextureHandle drops after cleanup.
     /// The shared renderer must apply these even when no surface is painted.
+    /// Before the first font atlas publication, keep all changes with their
+    /// TextureManager owner: Managed(0) is only a 0x0 reservation until end_pass
+    /// replaces it with the real atlas. A non-drawing boundary cannot publish
+    /// that reservation. No updates are discarded or moved to another queue.
     pub fn take_viewport_retirement_texture_delta(&self) -> crate::TexturesDelta {
         self.read(|ctx| {
             assert!(
@@ -3682,7 +3686,16 @@ impl Context {
                 "retirement delta collection requires a completed outer run"
             )
         });
-        self.tex_manager().write().take_delta()
+        let manager = self.tex_manager();
+        let mut manager = manager.write();
+        let atlas_published = manager
+            .meta(TextureId::default())
+            .is_some_and(|meta| meta.size[0] > 0 && meta.size[1] > 0);
+        if atlas_published {
+            manager.take_delta()
+        } else {
+            crate::TexturesDelta::default()
+        }
     }
 
     /// Retire a child viewport after its lifecycle owner has approved closing it.
@@ -5921,6 +5934,76 @@ mod child_close_consumption_tests {
 mod stage3_viewport_retirement_tests {
     use super::*;
     use crate::ApprovedViewportRetirement;
+
+    #[test]
+    fn viewport_retirement_before_first_full_preserves_unpublished_sets_partials_and_frees() {
+        let ctx = Context::default();
+        let mut texture = ctx.load_texture(
+            "created before Full",
+            crate::ColorImage::filled([2, 2], Color32::WHITE),
+            Default::default(),
+        );
+        texture.set_partial(
+            [1, 1],
+            crate::ColorImage::filled([1, 1], Color32::RED),
+            Default::default(),
+        );
+        let canceled = ctx.load_texture(
+            "dropped before Full",
+            crate::ColorImage::filled([1, 1], Color32::BLACK),
+            Default::default(),
+        );
+        let canceled_id = canceled.id();
+        drop(canceled);
+        for _ in 0..3 {
+            let _ = ctx.run_logic(&RawInput::default(), |_| {});
+            let mut delta = ctx.take_viewport_retirement_texture_delta();
+            let empty = delta.is_empty();
+            delta.clear(); // Preserve the primary assertion on a broken collector.
+            assert!(empty, "pre-Full changes must remain with TextureManager");
+        }
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        let delta = &mut output.textures_delta;
+        let atlas = &delta.set[&TextureId::default()];
+        assert_eq!(atlas.len(), 1);
+        assert!(atlas[0].image.width() > 0 && atlas[0].image.height() > 0);
+        let updates = &delta.set[&texture.id()];
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].pos, None);
+        assert_eq!(updates[1].pos, Some([1, 1]));
+        // TextureManager preserves its local set followed by free; only the
+        // generic TexturesDelta::append optimizes a superseded set away.
+        assert_eq!(delta.set[&canceled_id].len(), 1);
+        assert!(delta.free.contains(&canceled_id));
+        output.drop_without_applying_deltas();
+        assert!(ctx.take_viewport_retirement_texture_delta().is_empty());
+
+        // Reload requests do not revoke an already published atlas. A handle
+        // drop still belongs to the non-drawing consumer, without another Full.
+        let family = crate::FontFamily::Name("retirement-reload-regression".into());
+        let mut definitions = crate::FontDefinitions::default();
+        definitions.families.insert(family.clone(), Vec::new());
+        ctx.set_fonts(definitions);
+        assert!(ctx.read(|ctx| {
+            ctx.fonts
+                .as_ref()
+                .unwrap()
+                .definitions()
+                .families
+                .contains_key(&family)
+        }));
+        let id = texture.id();
+        drop(texture);
+        let mut delta = ctx.take_viewport_retirement_texture_delta();
+        assert!(delta.set.is_empty());
+        assert_eq!(delta.free.iter().copied().collect::<Vec<_>>(), [id]);
+        delta.clear();
+        assert!(ctx.take_viewport_retirement_texture_delta().is_empty());
+        let output = ctx.run_ui(Default::default(), |_| {});
+        assert!(!output.textures_delta.set.contains_key(&id));
+        assert!(!output.textures_delta.free.contains(&id));
+        output.drop_without_applying_deltas();
+    }
 
     fn declare(ctx: &Context, id: ViewportId) {
         ctx.show_viewport_deferred(id, ViewportBuilder::default(), |_, _| {});

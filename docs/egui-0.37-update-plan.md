@@ -2,6 +2,8 @@
 
 # 改訂履歴
 
+- **2026-10-17 段7・初回atlas公開の補修:** clean installの最初のFull前に退役collectorが本家の0×0 font予約を配送するP1を補修。未公開batchは既存TextureManagerに保持し、初回end_passで実atlasへ置換してから通常配送する。0×0の破棄・renderer側fallbackは行わない。§4.9と[段7起動補修台帳](egui-0.37-stage7-startup-atlas-verification.md)を参照。
+
 - **2026-10-17 HEX操作差の採択:** 別欄からのpointer click（press/release）と文字入力が同じRawInput batchに入ると、focusは新欄へ移るが最初のTextは新欄に入らない0.37の挙動を利用者が受け入れた。eguiは改修しない。通常の別pass入力保持と同batchでの採択結果を別回帰にし、段4aの保留を閉じる。詳細は§5と段4台帳。
 
 - **2026-10-17 段4採択:** §5の字面/baseline/hinting（保存済み補正値維持）、color emoji（固定印を含む）、margin/min sizeは0.37を採用。残る5回帰は到達性を保つ新寸法の根拠へ移し、PNG更新は段5に残す。HEXの同batch入力欠落は別のvendor TextEdit修正として扱う。
@@ -1816,6 +1818,14 @@ whole→partial、同一ID内の順序を維持する。freeは当該使用のsu
 Contextの登録・callback・TextureHandleをdropした結果、texture managerに追加deltaが生じる場合も同じownerへ引き継ぐ。通常GCが先に行われた場合の追加分も含め、回収に次のUI passや追加repaintを必要としない。生存する兄弟と共有するtexture managerをclearしない。
 
 wgpu／glowとも、surfaceなしの退役では既存の無描画submission契約を使う。root終了を伴う場合も、子の承認済みcommandと追加deltaを既存のrenderer終了ownerへ渡してから終了する。正常な退役をheadless用の明示破棄で代用しない。
+
+**段7での公開準備の補足 (2026-10-17):** renderer準備とfont atlasの初回公開は別の境界である。
+最初のFull前には本家0.37のManaged(0)予約が0×0でmanagerに保留されるため、pass外collectorは
+既存metadataが実atlasの正寸法になるまでmanagerをtakeしない。全pendingを元ownerへ残し、
+初回end_passが実atlasに置換した通常出力で配送する。0×0のsilent discardではない。
+公開後の無描画set/free配送・既存pending・cleanup順は維持する。初回FullなしでContextが終了する場合は、
+未GPU配送managerの既存Dropが終端する。初回empty/discard/immediate、実dispatcher、実Painter/deviceの
+回帰と修正前validation再現は[段7起動補修台帳](egui-0.37-stage7-startup-atlas-verification.md)に分ける。
 
 #### 第4.6版: discard再pass前のdelta配送
 

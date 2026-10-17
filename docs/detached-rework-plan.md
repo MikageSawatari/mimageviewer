@@ -5719,3 +5719,20 @@ Close帰還consumerのlive row keys採用は維持し、全行削除後の空rea
 live keysの再捕捉を省く変異で新回帰が失敗し、復元後に指定の限定確認を行った。
 HUDのWin32通知前提とmetadata testの既存同期競合候補は、製品退行の根拠と分けて設計担当のテスト判断待ちとする。
 詳細は段3台帳の分類第3版を正本とし、過去の「未分類0」や全件の分類記録は履歴として保持する。
+
+#### 2026-10-17 段7・clean install時の未公開atlas配送の補修
+
+段6 gate後、設計担当の承認付き実機起動で、最初のFull前のWindowEvent完結が本家0.37の
+Managed(0)の0×0予約をWGPUへ配送しpanicするP1が判明した。§2を再読した。
+退役callbackのfreeを拾うpass外collectorが、共有managerの通常の未公開deltaまで無条件takeしていた。
+
+第4.6版の既存owner間の受渡しの補修として、同じmanager lock内のfont metadataが初回公開を示すまで
+take自体を行わず、全pendingを元のTextureManagerへ残す。最初の通常end_passが実atlasへ置換して配送する。
+0×0を捨てるguard、第二pending、cleanup遅延、追加repaint、強制UIは作らない。
+Context/nativeの対象限定退役はcollectorより先に進め、公開済みのset/free-onlyは従来どおり即時回収する。
+
+実装前の限定独立設計確認と完成差分の独立source確認（GPT-6.1 Sol / xhigh）は、
+この公開準備の所有境界を直す補修を症状パッチではない構造修正としてACCEPT。
+初回FullなしのContext終了と旧native replacementのsource根拠、回帰の適用範囲、
+実deviceの修正前0×0 validation再現・修正後結果は[段7起動補修台帳](egui-0.37-stage7-startup-atlas-verification.md)へ記録する。
+実装担当は製品起動・liveを実行しない。設計担当の修正後実機確認・最終受入とは区別する。

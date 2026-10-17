@@ -111,3 +111,13 @@ renderer test retains whole/partial and merges a later free non-cancellatively,
 then completes through the existing consumer once the resource state is ready.
 A missing headless adapter fails these tests instead of being counted as PASS.
 No OS window, application/profile, present, or snapshot PNG is involved.
+
+## Stage 7: first-Full atlas publication regression (2026-10-17)
+
+No production renderer change. A new offscreen regression uses the real ready
+Painter/TextureDelivery/Renderer on a pristine Context before any Full, then
+checks first empty/discard/immediate Full delivery, actual atlas dimensions,
+user texture pixel readback, and later free-only completion. The headless adapter
+is mandatory. Before the egui collector repair it detects the same Managed(0)
+zero-width create_texture validation error as the clean-install startup report.
+The initial reservation is retained by egui, not silently discarded by wgpu.

@@ -298,3 +298,20 @@ The mIV window-witness serial counter uses `AtomicU64::try_update` instead of
 the deprecated `fetch_update` alias, with identical arguments, orderings and
 closure. Local Rust standard-library rustdoc metadata confirms stabilization
 in Rust 1.95.0, matching this crate's MSRV. See the stage-5 verification ledger.
+
+## Stage 7: startup retirement publication regression (2026-10-17)
+
+The WGPU idle-retirement regression now enters the actual child-close dispatcher
+32 times before any Full pass, with a real offscreen Renderer/device/queue. It
+checks validation, no premature resource entry, preservation of user textures
+until the first Full, and subsequent idle/free-only completion. The Glow fake
+no longer consumes and hides the 0x0 initial atlas: it checks no pre-Full context
+selection and requires positive dimensions for all received uploads, then uses
+a real empty Full to publish the font atlas. No native window is created.
+
+The production repair belongs to egui's pass-outside collector publication
+boundary; backend cleanup, pending ownership, and resource consumers are unchanged.
+The earlier Review A regression description applies only after atlas publication;
+its former fixture missed this startup state. Both baseline real-GPU startup
+regressions reproduced InvalidDimension(Zero(X)); details are in
+`docs/egui-0.37-stage7-startup-atlas-verification.md`.

@@ -3698,7 +3698,8 @@ mod viewport_retirement_tests {
         #[derive(Default)]
         struct Painter(Vec<(egui::TextureId, bool)>);
         impl GlowTexturePainter for Painter {
-            fn set_texture(&mut self, id: egui::TextureId, _: &egui::epaint::ImageDelta) {
+            fn set_texture(&mut self, id: egui::TextureId, delta: &egui::epaint::ImageDelta) {
+                assert!(delta.image.width() > 0 && delta.image.height() > 0);
                 self.0.push((id, false));
             }
             fn free_texture(&mut self, id: egui::TextureId) {
@@ -3716,7 +3717,17 @@ mod viewport_retirement_tests {
             });
         };
         deliver(&mut pending, &mut painter, &mut context_entries);
-        painter.0.clear(); // Initial font texture was consumed by the fake GL renderer.
+        assert_eq!(
+            context_entries, 0,
+            "pre-Full reservation must stay with Context"
+        );
+        assert!(painter.0.is_empty());
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        lifecycle::append_texture_delta(&mut pending, core::mem::take(&mut output.textures_delta));
+        output.drop_without_applying_deltas();
+        deliver(&mut pending, &mut painter, &mut context_entries);
+        assert_eq!(painter.0, [(egui::TextureId::default(), false)]);
+        painter.0.clear();
         context_entries = 0;
         for _ in 0..32 {
             deliver(&mut pending, &mut painter, &mut context_entries);

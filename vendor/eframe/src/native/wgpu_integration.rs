@@ -3186,9 +3186,9 @@ mod viewport_retirement_tests {
     type Headless = Rc<RefCell<SharedState>>;
 
     #[test]
-    fn retirement_texture_delivery_prepared_wgpu_skips_empty_and_delivers_free_only() {
+    fn retirement_texture_delivery_wgpu_startup_before_full_and_free_only() {
         use super::super::viewport_lifecycle::{
-            append_texture_delta, finish_retirement_texture_delta,
+            ChildCloseBackend, append_texture_delta, finish_retirement_texture_delta,
         };
         use egui_wgpu::{RenderState, RendererOptions, TextureUpdateSubmission, WgpuSetup};
 
@@ -3213,58 +3213,125 @@ mod viewport_retirement_tests {
             .device
             .push_error_scope(egui_wgpu::wgpu::ErrorFilter::Validation);
 
-        // This is the exact lazy dispatcher used by native finish_retirement.
-        // Its consumer uses a prepared real Renderer/queue, without inventing a
-        // windowless Painter setter. Painter's completion order has separate
-        // egui-wgpu coverage; this checks whether resource processing is entered.
+        // Exercise the WindowEvent close dispatcher before the first Full pass.
+        // Only the native window inventory is fake; delivery uses the real
+        // Renderer/queue. The Painter completion path has egui-wgpu coverage.
         // Counts are consumer entry, uploads, returned submits, and frees.
-        fn deliver(
-            ctx: &egui::Context,
-            pending: &mut TexturesDelta,
-            state: &RenderState,
-            counts: &mut [usize; 4],
-        ) {
-            finish_retirement_texture_delta(ctx, pending, |delta| {
-                counts[0] += 1;
-                let mut renderer = state.renderer.write();
-                for (id, updates) in delta.set.drain() {
-                    for update in updates {
-                        assert!(matches!(
-                            renderer.update_texture_with_submission(
-                                &state.device,
-                                &state.queue,
-                                id,
-                                &update,
-                            ),
-                            TextureUpdateSubmission::Pending
-                        ));
-                        counts[1] += 1;
+        struct Backend<'a> {
+            state: &'a RenderState,
+            pending: TexturesDelta,
+            counts: [usize; 4],
+        }
+        impl ChildCloseBackend for Backend<'_> {
+            fn close_requests(&self) -> Vec<ViewportId> {
+                Vec::new()
+            }
+            fn consume_close(&mut self, _: ViewportId) {
+                unreachable!()
+            }
+            fn retire(&mut self, _: &egui::Context, _: &egui::ApprovedViewportRetirement) {
+                unreachable!()
+            }
+            fn finish_retirement(&mut self, ctx: &egui::Context) {
+                let Self {
+                    state,
+                    pending,
+                    counts,
+                } = self;
+                finish_retirement_texture_delta(ctx, pending, |delta| {
+                    counts[0] += 1;
+                    let mut renderer = state.renderer.write();
+                    for (id, updates) in delta.set.drain() {
+                        for update in updates {
+                            assert!(matches!(
+                                renderer.update_texture_with_submission(
+                                    &state.device,
+                                    &state.queue,
+                                    id,
+                                    &update,
+                                ),
+                                TextureUpdateSubmission::Pending
+                            ));
+                            counts[1] += 1;
+                        }
                     }
-                }
-                state.queue.submit([]);
-                counts[2] += 1; // Count only after the actual submit returned.
-                for id in delta.free.drain() {
-                    renderer.free_texture(&id);
-                    counts[3] += 1;
-                }
-            });
+                    state.queue.submit([]);
+                    counts[2] += 1; // Count only after the actual submit returned.
+                    for id in delta.free.drain() {
+                        renderer.free_texture(&id);
+                        counts[3] += 1;
+                    }
+                });
+            }
+        }
+        struct App;
+        impl crate::App for App {
+            fn ui(&mut self, _: &mut egui::Ui, _: &mut crate::Frame) {
+                panic!("a WindowEvent before Full must not run UI");
+            }
+        }
+        fn deliver(ctx: &egui::Context, backend: &mut Backend<'_>) {
+            super::super::viewport_lifecycle::dispatch_child_close_requests(ctx, &mut App, backend);
         }
 
         let ctx = egui::Context::default();
-        let mut pending = TexturesDelta::default();
+        let mut backend = Backend {
+            state: &state,
+            pending: Default::default(),
+            counts: [0; 4],
+        };
+        let startup_texture = ctx.load_texture(
+            "created before first Full",
+            egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        for _ in 0..32 {
+            deliver(&ctx, &mut backend);
+        }
+        let startup_error = pollster::block_on(validation.pop());
+        assert!(
+            startup_error.is_none(),
+            "pre-Full dispatcher validation: {startup_error:?}"
+        );
+        assert_eq!(
+            backend.counts, [0; 4],
+            "the initial atlas belongs to the first Full pass"
+        );
+        let validation = state
+            .device
+            .push_error_scope(egui_wgpu::wgpu::ErrorFilter::Validation);
         let mut output = ctx.run_ui(Default::default(), |ui| {
             ui.label("Initialize the font atlas before idle resource checks");
         });
-        append_texture_delta(&mut pending, core::mem::take(&mut output.textures_delta));
+        assert!(
+            output
+                .textures_delta
+                .set
+                .contains_key(&startup_texture.id()),
+            "pre-Full user output must stay with the first Full pass"
+        );
+        append_texture_delta(
+            &mut backend.pending,
+            core::mem::take(&mut output.textures_delta),
+        );
         output.drop_without_applying_deltas();
-        let mut counts = [0; 4];
-        deliver(&ctx, &mut pending, &state, &mut counts); // Initialize the font texture.
-        assert!(pending.is_empty());
-        counts = [0; 4];
+        deliver(&ctx, &mut backend); // Initialize the font and user textures.
+        assert!(backend.pending.is_empty());
+        assert!(
+            state
+                .renderer
+                .read()
+                .texture(&startup_texture.id())
+                .is_some()
+        );
+        backend.counts = [0; 4];
         for _ in 0..32 {
-            deliver(&ctx, &mut pending, &state, &mut counts);
+            deliver(&ctx, &mut backend);
         }
-        assert_eq!(counts, [0; 4], "idle events must not enter a GPU consumer");
+        assert_eq!(
+            backend.counts, [0; 4],
+            "idle events must not enter a GPU consumer"
+        );
 
         let texture = ctx.load_texture(
             "retirement-delivery",
@@ -3272,21 +3339,33 @@ mod viewport_retirement_tests {
             egui::TextureOptions::NEAREST,
         );
         let id = texture.id();
-        deliver(&ctx, &mut pending, &state, &mut counts);
-        assert_eq!(counts, [1, 1, 1, 0], "collect before testing the batch");
+        deliver(&ctx, &mut backend);
+        assert_eq!(
+            backend.counts,
+            [1, 1, 1, 0],
+            "collect before testing the batch"
+        );
         assert!(state.renderer.read().texture(&id).is_some());
         drop(texture);
-        deliver(&ctx, &mut pending, &state, &mut counts);
-        let free_batch_consumed = pending.is_empty();
+        deliver(&ctx, &mut backend);
+        let free_batch_consumed = backend.pending.is_empty();
         // Headless negative-control cleanup avoids a second panic from dropping
         // an unapplied delta, while retaining the consumption assertion below.
-        pending.clear();
-        assert_eq!(counts, [2, 1, 2, 1], "free-only is a nonempty batch");
+        backend.pending.clear();
+        assert_eq!(
+            backend.counts,
+            [2, 1, 2, 1],
+            "free-only is a nonempty batch"
+        );
         assert!(free_batch_consumed, "free-only batch must be consumed");
         assert!(state.renderer.read().texture(&id).is_none());
-        deliver(&ctx, &mut pending, &state, &mut counts);
-        assert_eq!(counts, [2, 1, 2, 1], "consumed work must not be repeated");
-        assert!(pending.is_empty());
+        deliver(&ctx, &mut backend);
+        assert_eq!(
+            backend.counts,
+            [2, 1, 2, 1],
+            "consumed work must not be repeated"
+        );
+        assert!(backend.pending.is_empty());
         assert!(pollster::block_on(validation.pop()).is_none());
     }
 
