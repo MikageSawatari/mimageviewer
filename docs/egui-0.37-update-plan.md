@@ -1,6 +1,18 @@
-> 状態: 設計 第4.5版 (2026-10-17)。第4.4版までの Sol・Astra の独立レビューに加え、段3 で見つかった App 起点の子 viewport 退役の受け渡し不足を埋める第4.5版を Sol (gpt-6.1-sol / xhigh) が ACCEPT。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
+> 状態: 設計案 第4.6版 (2026-10-17、段3 の 2 件の P1 (閉じた後の表示継続の owner、discard と immediate の間の delta の年代順) を埋める追補。独立レビュー前)。第4.5版までは独立レビュー ACCEPT。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
 
 # 改訂履歴
+
+## 第4.6版 — 2026-10-17
+
+対象は第4.5版とWIPコミット`fe32f2e88`。段3台帳の「再開後の設計担当へ返す論点」全文・補修追記と、Close、bookmark／navigation、discard／immediateのdelta経路を読み取り専用で照合した。第4.5版の型付き退役と既存の独立設計ACCEPTは維持する。本追補の実装・独立レビュー・テスト・製品起動は未実施。
+
+- **P1 Close後の表示継続 — 反映:** teardown前に復帰先と必要な所有値を捕捉し、存続するmainの既存navigation帰還ownerへ型付きで移す。bookmark一覧更新・最後の実フォルダ復帰・auto-openの親一覧復帰を、次の正当なUI消費位置へ渡す。Remote取得、新navigation、新bookmark開始による失効も同じownerで扱う。
+- **P1 discard／immediate間のdelta順 — 反映:** 候補(a)を採用する。実際にdiscard再passへ進む直前、生成済みdeltaを既存backend共有renderer ownerへ一度だけ移譲し、可能な場合は既存の無描画resource consumerで完結する。後発freeが旧set／partialを追い越さないようにする。
+- **候補(b) TextureManagerへの再預託 — 不採用:** metadataを変えないprepend APIのためのepaint追加patch、年代順合流、output pluginによる再観測の契約が必要になる。今回はepaintと既存plugin観測を変えず、integrationの所有受渡しを限定追加する。
+
+dirty表示採用のP1は既存owner内で補修済みとして区別し、今回の2件と混同しない。全targetのコンパイル・既存filterの成功は段3台帳の条件付き証拠として再利用するが、段3全体のACCEPTや今回の2件の解消証拠にはしない。
+
+追加範囲は段3で完成させ、detached計画§11へ終了継続とdelta所有の変更を追記する。新しいpending bool、第二queue、遅延cleanup、追加retry、時間窓、強制UI、後付けguardは追加しない。
 
 ## 第4.5版 — 2026-10-17
 
@@ -227,6 +239,26 @@ Appのruntime、command、backend資源に同じ「終了待ち」を重複保�
 古い出力を識別するため、存続中のviewport登録には、その登録寿命を表す不透明な識別子を持たせる。Context登録、ViewportOutput、backend資源、必要な既存App bindingで同じ識別子を参照する。これは生存資源の同定であり、退役履歴の保存ではない。`ViewportId`、egui memoryの永続Id、surfaceのresize generationとは区別する。同じViewportIdを明示的に開き直した場合も、旧寿命への出力で新しい窓を変更しない。
 
 通常の操作での終了・Remote取得・兄弟窓の維持を構造で保証する。まれな失敗は既定のログ＋通知［＋作り直し］で割り切り、退役のretryや回復用状態は追加しない。
+
+### 第4.6版: 終端後の表示とdiscard中のdeltaの所有
+
+状態の組合せを増やす前に、既存ownerへ受渡しを集約する案を比較する。
+
+| 対象 | 採った案と理由 | 採らなかった案と理由 |
+|---|---|---|
+| Close後の表示継続 | 存続するmainの既存navigation帰還ownerへ、teardown前に型付きで移す。bookmark由来の所有値も同じ帰還要求へ移す | viewer runtimeやClosingの延命。表示復帰のためだけに終了済みcontextを残すと、backend退役・Remote・新navigationとの組合せが増える |
+| 帰還要求の表現 | 既存`pending_return_to_parent`のboolを型付き状態へ置き換える。既存のnavigation合流点で消費する | bookmark専用の終端slotを追加し、auto-open用帰還予約と並存させる。二つのownerの優先・取消・上書きが必要になる |
+| discard中のdelta | 実再passの直前にintegrationへ先行移譲し、既存renderer ownerで処理する候補(a) | TextureManagerへ戻す候補(b)。epaintの新API、非相殺合流、plugin再観測の契約が増える |
+| native callbackの破棄 | 既存の登録寿命置換・cleanupを維持し、先行deltaの受渡しを直す | callback破棄を最外側終了まで遅らせる。資源寿命と表示採用を再び結び付ける |
+| 新操作との競合 | 既存navigation／bookmarkのadmissionで古い帰還要求を失効・置換する | UI復帰時の現在path比較や追加generation guardで古い要求を見分ける。新操作を受け付けたownerで失効させる方が単純である |
+
+`BookmarkViewState`へ終端継続variantを追加する案も検討した。今回はbookmark以外のauto-open帰還も同時に修復するため、既存navigation帰還slotを型付き化する方を採る。`BookmarkViewState`が持つtarget／gridは、その帰還要求へ移し、同じCloseを二つのownerに保持しない。
+
+第4.5版の承認済み退役は資源寿命の終端を担う。今回の帰還要求は、終了したviewerに代わって一覧表示を継続する存続ownerの要求である。backendの退役ACK待ち状態として扱わず、表示が保留されても資源cleanupを遅らせない。
+
+deltaのintegration callbackは資源配送だけを担う。App、navigation、UI、platform output、viewport lifecycleを再実行する入口にはしない。既存discardの回数を増やさず、描画・present・repaintを追加しない。
+
+まれな失敗は既定のログ＋通知［＋作り直し］で割り切り、帰還やGPU処理の再試行機構は作らない。
 
 ## 2. 前提・更新履歴要約との相違
 
@@ -583,6 +615,12 @@ backendは、最外側のFull／LogicOnlyが戻った後、次のApp処理に入
 
 検査対象は`src/remote_ipc/ui.rs:1214`の全窓終了、`:1233`のclose readiness、`:1259`のFinishAcquireと、`src/app.rs:77836`の既存close-state判定である。
 
+第4.6版では、Remote取得時のlocal表示失効に、型付きnavigation帰還要求も含める。失効は全ローカルviewer終了より前に行い、Remote起点のCloseには「帰還表示を作らない」既存所有権変更causeを渡す。
+
+型付き帰還要求がUI待ちであることをRemote取得・ACK・drainの完了条件にしない。資源退役、保存・resume／shift・editor・AI readinessは従来どおりlogicで進める。Remote取得中の遅いUIや返却後のUIから、旧bookmark／親一覧帰還を再実行しない。
+
+返却後の既存`pending_local_display`による一覧再読込と、Closeの帰還要求は別の操作由来である。旧Close要求は取得時に終端させ、返却slotへコピーしない。表示要求を二重保持するqueueは作らない。
+
 ##### C2: play-testと起動worker
 
 代表: `src/app/update_phases.rs:335`、`src/app.rs:31164`。
@@ -865,6 +903,94 @@ WIPの影響箇所は`src/app.rs:3810`、`:60709`、`:61213`、`:61384`付近、
 `rg -n 'retire_terminal_detached_viewport_identity|finish_active_detached_session_close|close_all_detached_viewers_for_mode_change|close_detached_image_windows_by_ids|close_and_retire_context' src`
 
 通常GCは、参照されなくなった通常viewportの資源を従来どおり終了できる。ただし、Appの承認済み退役の代用品にはせず、GCをClose承認や完了通知の生成器にしない。承認済みcommandがある資源については、GCが先でも後でも、同じcleanupで残存資源を一度だけ終了する。
+
+###### 第4.6版: Close後の表示継続の移譲
+
+資源退役の承認だけでは、リリース済みの「閉じたら元の一覧へ戻る」動作は完結しない。終了するviewerが持つ復帰先をteardown前に存続ownerへ移す。通常Closeの表示継続を削除せず、Remote取得や独立した新navigationで失効する従来の意味も維持する。
+
+**所有者と型**
+
+既存`pending_return_to_parent`のboolを、仮称`FullscreenCloseContinuation`という型付き状態へ置き換える。新しいApp fieldや第二slotは作らない。
+
+状態は、帰還要求なし、既存の生存viewerから解決する帰還要求、終端viewerから移譲済みの帰還要求を区別する。終端要求には、次の排他的な効果を持たせる。
+
+| 効果 | 保持する内容 |
+|---|---|
+| bookmark一覧の更新・位置復元 | 元bookmark openのidentity、一覧を所有するmain context、target、gridのrow keys／opened keyと復元情報 |
+| bookmark mediaが対象を離れた後の実フォルダ復帰 | 元bookmark ownerのidentity、最後の利用者視点の実フォルダ、最後のmedia pathと選択intent |
+| standalone bookmarkから一覧へ戻る | 元bookmark owner、一覧復元情報、既存Bookmarks navigation |
+| auto-open等の親一覧へ戻る | 解決済みの既存`AddressBarNav`、選択・履歴intent、帰還先mainの所有情報 |
+
+上記は効果の設計上の分類であり、別々のqueueを意味しない。一つの帰還要求が必要な所有値を持つ。
+
+帰還先は「現在mountされているcontext」ではなく、一覧を所有していた存続mainとする。既存のmain navigation proof、quick-folderの切替identity、bookmark open request identityを用い、新しい採番ownerは作らない。bookmarkの同一pathを開き直した場合も区別できるよう、必要な既存request identityはOpening／Detachedの所有値と一緒に保持する。
+
+**移譲の時点**
+
+1. 既存modal等の終了可否判断を行う。拒否したCloseは帰還要求を作らない。
+2. 終了を確定した後、`close_fullscreen`、context retire、bookmark return state消去、window binding解除より前に、対象contextの帰還情報を捕捉する。
+3. bookmark由来なら、元mainの帰還ownerとの対応を確認し、必要なtarget／grid／終端summaryをそのownerへ移す。元mainが既に別navigationへ移っている場合は、新しい帰還要求を作らない。
+4. 既存navigation帰還slotへ型付き要求を移譲する。破棄されるviewerのslotに残さない。
+5. 第4.5版どおり承認済み退役を移譲し、viewer／worker／media／contextを終端させる。帰還表示のためにClosingやbindingを延命しない。
+
+`ClosedBookmarkSummary`は、終端後にboolへ変換して捨てる値にしない。必要なsummaryはteardown前に取得し、型付き帰還要求の材料として消費する。`close_and_retire_context`のfinish後に読むだけでは、既にbookmark ownerを消している場合がある。
+
+親navigationの解決も破棄前に行う。`effective_folder`／archive source override、Collection・bookmark・履歴・rating・subfolder・Smartの既存優先を再利用する。変換済みアーカイブのキャッシュZIPを利用者の帰還先にしない。resolverが現在行う選択予約の更新は、非描画で返せる型付き値へ抽出し、実際のload・一覧再構築はUI consumerに残す。
+
+**bookmarkの従来動作**
+
+- detached bookは、内部のページ／container移動だけでは元bookmark一覧への対応を失わない。
+- detached mediaが元targetに留まった場合は、mainのbookmark一覧を既存の非同期read-model更新へ渡す。
+- detached mediaが元targetを離れた場合は、最後の実フォルダへ戻り、最後のmediaを既存の選択規則で可視化する。
+- mainで利用者が選択・scrollを変えていた場合、従来どおり現在のmain状態を優先する。帰還要求に保存した古い選択で上書きしない。row keys／opened keyは増減検知と位置復元に利用する。
+- standalone bookmarkは、teardownでOpeningが消える前に一覧復帰情報を移す。
+
+`reconcile_closed_bookmark_detached_context`の判断を複製せず、「終端前に帰還効果を作る部分」と「UIで既存一覧更新・navigationへ適用する部分」へ分ける。現在のmainを読んで更新する処理を、そのままlogicから呼ぶ方法は採らない。
+
+**消費する位置**
+
+消費するのは帰還先mainの正当なUI passである。通常経路は、既存`take_pending_return_to_parent_nav`から`fullscreen_close_nav`へ渡す位置と、既存のnavigation合流点を使う。
+
+bookmark refreshも同じ帰還ownerから一度だけ取り出し、既存の`bookmark_view_begin_restore`／`refresh_bookmark_browser`／grid復元へ渡す。実フォルダ・親一覧は既存navigation dispatcherへ渡す。新しいload経路や同期I/Oを作らない。
+
+- Fullのlogicで受け取ったCloseは、その後のUIが既存消費位置へ到達すれば同じFull内で進められる。
+- LogicOnlyやpass外Close hookでは、資源終端と帰還要求の移譲まで進め、表示適用は次の帰還先UIまで保留する。
+- 子や兄弟のFullではmainの要求を消費しない。
+- 既存のUI早期return／native close即時適用位置も、同じ型付きownerを使う。従来同じdispatchで消費する経路を、無条件に次frameへ遅らせない。
+- 非描画hookから即時UI適用helperを呼ばない。新しいmode flagや強制UIで入口を共用しない。
+
+帰還要求は既存dispatcherへ渡した時点で一回消費する。読込拒否・通常の失敗は既存のログ・通知で終端し、古い帰還を再配送しない。
+
+**失効と上書き**
+
+失効はUI復帰時の後付け判定ではなく、新しい操作を受理する既存ownerの境界で行う。
+
+- Remote取得は、全ローカルviewerを閉じる前に、既存のlocal open失効と同じ境界で帰還要求を失効させる。Remote目的のCloseから新しい帰還要求を作らない。
+- mainの独立した新navigationを受理したら、`retire_replaced_main_list_requests`等の既存admissionで旧帰還要求を置換・失効させる。同じpathへの新navigationも含める。
+- 新しいbookmark openを受理したら、旧帰還要求と旧bookmark ownerを同じ受付で置き換える。遅れて届いた旧viewer Closeは新bookmarkの帰還要求を消去・上書きしない。
+- 帰還要求自身の消費は、自分を失効させる「別の新navigation」と区別し、既存request ownerの保持指定と同じ方式でhandoffする。
+- 単なるselection／scroll変更や同じ一覧のread-model更新は、新navigationとして帰還要求を消さない。
+- root終了では既存終了方針に従って帰還表示を終端させ、UIを開き直さない。
+
+終了理由は、通常Close、別navigationによる置換、Remote取得、App終了等の既存causeから型付きで渡す。reason文字列から意味を推定したり、新しいpending boolを足したりしない。
+
+**active／standalone／parked**
+
+| 対象 | 契約 |
+|---|---|
+| active at-rest | summaryを捨てず、破棄前に存続mainへ移譲する。旧reconciliationと同じ一覧更新・実フォルダ復帰へ戻す |
+| standalone fullscreen | bookmark／auto-open帰還を破棄前に解決し、mainの既存帰還ownerへ移す。直接teardownだけで終えない |
+| parked／passive | 保存されたcontextのoriginを非描画のowner付きアクセスで読む。元mainの帰還ownerが存続する場合だけ同じ移譲を行う。無関係なmainや新bookmarkへ移動を発行しない |
+| parking／resume途中 | Closeではないので帰還要求を作らない。存続viewerのoriginを保持する |
+| Remote／新main navigationによる全終了 | 先に既存帰還ownerを失効させ、通常Closeの一覧復帰を発行しない |
+
+主な影響箇所は`src/app/viewport_retirement.rs:34`以降、`src/app.rs:4146`、`:4177`、`:23030`、`:23436`、`:23468`、`:33511`、`:50707`、`:61182`、`:64873`、`:65144`、`:77607`、`:78142`、`:95230`、`src/app/viewer_context_registry.rs:5679`、`src/app/update_phases.rs:1088`以降。既存boolの型変更はcontext bundleの初期化・swap・fixtureも同時に揃える。
+
+棚卸し式:
+
+`rg -n 'pending_return_to_parent|BookmarkViewState|ClosedBookmarkSummary|reconcile_closed_bookmark_detached_context|take_pending_return_to_parent_nav|handle_fullscreen_close_request' src`
+
+dirty集合の消費は、補修済みの既存grid UI consumerへ残す。帰還修正のために非描画Closeへdirty consumerを戻さない。
 
 ##### Close以外の要求・通知の棚卸し
 
@@ -1468,6 +1594,19 @@ IME修正の本家境界は`egui-0.37.0/src/memory/mod.rs:124`、`:503`、`:799`
 
 通常GCで既にContext登録が消えている場合も、承認済み出力は残る。backend／IME cleanupの対象を「Contextが今回削除できたID」だけで決めない。退役後のcallback drop等で生じるdeltaの引継ぎも§4.9へ接続する。
 
+第4.6版の追加台帳:
+
+| 項目 | 分類・方針 |
+|---|---|
+| 実discard再pass前のtexture移譲 | (b・新規) `run_dyn`の再pass確定後、次begin_pass前に集約deltaをmoveする。最終pass・上限到達では通常出力を維持 |
+| Context束縛のintegration配送scope | (b・新規) 現在threadの限定した配送入口。RAIIで設置・復元し、別Contextへ配送しない。deltaの第二queueは持たない |
+| output plugin観測 | (b・追加回帰) 従来どおり各passで一度観測した後に移譲。再預託・再観測を導入しない |
+| 一度配送・direct consumer | (b・追加回帰) localを空にし、最終出力への再混入を防ぐ。direct begin／endは従来の出力所有を維持 |
+
+主な製品差分は`vendor/egui/src/context.rs`と必要な最小の公開re-exportに限定する。`FullOutput`に第二delta領域を加えず、platform／IME／viewport commandの集約契約を変えない。
+
+epaintは追加vendor化しない。TextureManagerのmetadata、retain count、`take_delta`、一般の`TexturesDelta::append`を変更しない。
+
 #### egui-winit
 
 | 項目 | 分類・方針 |
@@ -1557,6 +1696,20 @@ wgpuの`remove_viewports_not_in`／`handle_viewport_output`、glowの同等処�
 
 最小化中のUI継続、期限超過LogicOnly、viewport別RawInput、非描画action、screenshot、deltaの既存差分は撤去しない。今回の修正を、追加repaint・強制UI・次FullのGC待ちで成立させない。
 
+第4.6版の追加台帳:
+
+| 項目 | 分類・方針 |
+|---|---|
+| 両backendのdiscard delta sink | (b・新規) 最外側native FullへContext束縛scopeを設置し、既存共有renderer ownerへ移譲する |
+| 先行batchの無描画完結 | (b・追加接続) wgpuの既存upload submissionとglowの既存resource context処理を再利用。UI・surface描画・presentを追加しない |
+| pending deltaの非相殺受入 | (b・追加修正) Full／immediate／retirementの受入を既存非相殺helperへ揃え、後発freeで先行setを除去しない |
+| scope解除・Context隔離 | (b・追加回帰) 正常終了・早期return・unwind・複数Context・入れ子を検査する |
+| 実immediate置換との一体回帰 | (b・追加回帰) fake adapterでの保持だけを証拠にせず、旧callback dropと実resource consumerまで通す |
+
+主な対象は`vendor/eframe/src/native/wgpu_integration.rs`、`glow_integration.rs`、既存の共有出力／lifecycle helperと関連回帰。Appや`EpiIntegration`へrendererの第二ownerを設けず、native側が既存Full呼出しの外側でscopeを管理する。
+
+第4.5版の登録寿命、承認済み退役、Context／IME cleanupの契約は維持する。今回の順序修正のために旧callbackのcleanupを遅らせたり、旧native資源を新寿命へretagしたりしない。
+
 #### egui-wgpu
 
 | 項目 | 分類・方針 |
@@ -1574,6 +1727,10 @@ wgpuの`remove_viewports_not_in`／`handle_viewport_output`、glowの同等処�
 本家surface差: `egui-wgpu-0.37.0/src/winit.rs:203`、`:218`、`:229`、`:247`。
 
 既存atlas overflow skip-writeは根治策として拡張しない。診断を保ち、配送回帰でoverflowが生じないことを受け入れる。既存skip撤去は履歴を含め別判断とする。
+
+第4.6版では、discard先行移譲に新しいrendererやdelta queueを追加しない。既存`Painter::apply_textures_delta`とupload submission／freeの契約を再利用する。epaintのAPI変更も不要とする。
+
+必要な追加は、whole＋partialの実適用・submission・後発freeを証明するheadless／offscreen回帰と、必要最小限のtest用観測である。既存consumerで成立する場合、製品側のegui-wgpu差分は増やさない。CPU側のdelta保持・件数・texture sizeだけで、GPUへの配送順を証明したとは扱わない。
 
 #### 取り込み手順
 
@@ -1655,6 +1812,105 @@ whole→partial、同一ID内の順序を維持する。freeは当該使用のsu
 Contextの登録・callback・TextureHandleをdropした結果、texture managerに追加deltaが生じる場合も同じownerへ引き継ぐ。通常GCが先に行われた場合の追加分も含め、回収に次のUI passや追加repaintを必要としない。生存する兄弟と共有するtexture managerをclearしない。
 
 wgpu／glowとも、surfaceなしの退役では既存の無描画submission契約を使う。root終了を伴う場合も、子の承認済みcommandと追加deltaを既存のrenderer終了ownerへ渡してから終了する。正常な退役をheadless用の明示破棄で代用しない。
+
+#### 第4.6版: discard再pass前のdelta配送
+
+**確認した不足**
+
+`Context::run_dyn`は各passの出力をローカルFullOutputへ集約し、discard時もそのまま次passへ進む。旧passのdeltaがこのlocalにある間、次passのimmediate処理は別の実consumerからdeltaを配送できる。
+
+本家の境界は`egui-0.37.0/src/context.rs:1080`、`:1113`、`:1124`。output pluginは同`:2949`、texture managerからのtakeは同`:3169`。
+
+WIPでは、同じViewportIdの新寿命を準備する際に旧native callbackを破棄し、そのTextureHandle由来deltaをmanagerから共有rendererへ渡す。`vendor/eframe/src/native/wgpu_integration.rs:2035`付近とglowの`replace_stale_glow_viewport`が該当する。旧set／partialが外側localへ残ると、後発freeが先に処理され得る。
+
+これはコードから確認した所有順の不足であり、製品実行時の再現を確認したとは扱わない。
+
+**候補の比較と採用**
+
+| 候補 | 必要な変更・契約 | 判断 |
+|---|---|---|
+| (a) 実再pass直前のintegration配送 | eguiの限定した配送入口と、両backendから既存共有renderer ownerへの接続。旧batchを後発freeより先に処理でき、output pluginの観測を繰り返さない | 採用 |
+| (b) TextureManagerへの再預託 | epaintのmetadata非変更prepend API、旧local→新manager deltaの非相殺合流、pluginが同じ未配送分を再観測する契約 | 不採用。callbackを省けても変更する所有・観測境界が多い |
+| callback破棄を遅延 | old callbackを外側run終了まで存続させる別の寿命管理 | 不採用。cleanupを遅らせ、同ID新寿命との組合せを増やす |
+| setを失ったfreeを無視する等 | consumer側の後付けguard | 不採用。配送順の不成立を隠す |
+
+epaintの`TextureManager.delta`はprivateで、取り出しは`take_delta`である。`set`／`free`の再演はmetadata・retain count等も変更するため、再預託APIの代用品にならない。さらに`TexturesDelta::append`は新しいfreeに対応する旧setを除去する。
+
+根拠: `epaint-0.37.0/src/textures.rs:13`、`:44`、`:67`、`:102`、`:315`、`:319`。今回はこれらのAPI・最適化・metadata契約を変更せず、epaintの新vendorも追加しない。
+
+**発火する位置と移譲するもの**
+
+`run_dyn`で、次の条件を全て満たした直後、次の`begin_pass`より前に配送する。
+
+1. 現passの`end_pass`と全output pluginが完了している。
+2. 既存どおりdiscard要求がある。
+3. `max_passes`に達しておらず、実際に次passを実行する。
+4. 対応するintegration配送scopeが設定されている。
+
+配送するのは、集約local FullOutputが所有する未配送`textures_delta`だけとする。所有権をmoveし、local側は空にする。診断cloneやmut借用だけで配送したことにしない。
+
+platform output、shapes、IME出力、viewport commands、承認済み退役は移譲しない。それらは従来の集約と第4.5版の最外側配送を維持する。callback内でApp、UI、plugin、viewport cleanupを呼ばない。
+
+これは既存discardの受渡しを修正するもので、discard回数・再試行条件・repaintを追加する変更ではない。
+
+**年代順とconsumer**
+
+backend側のconsumerは、既存の共有renderer ownerを使い、次を満たす。
+
+1. 共有ownerに既にある、さらに古い未処理batchを先に処理する。
+2. 移譲された旧passのbatchを受け、set列を順に適用する。
+3. wgpuではupload／mipmap等のsubmissionを完結し、そのbatchのfreeを適用する。surfaceの取得・描画・presentは要求しない。
+4. その後に次passへ戻る。次passの旧callback破棄で生じたfreeは、既存manager→renderer経路から後で処理する。
+5. 最終FullOutputには移譲済みset／partialを残さず、外側で二重適用しない。
+
+これにより、対象の旧whole／partial→upload submit→後発freeの順序を保つ。既に生成済みのmanager内freeを、callbackが旧localより先にtakeすることもしない。
+
+glowでは対応する順序でtexture uploadとfreeを行う。既存resource context選択を使い、描画・swapを増やさない。wgpuと同じGPU submission APIがあるとは扱わない。
+
+rendererやGL resource contextが一時的に利用できない既存経路では、所有権を既存共有pending ownerへ移す。cleanupや次passを待たせる新しい状態は作らない。その後の合流でも旧set／partialと新freeを相殺せず、既存consumerが利用可能になった時にset適用→submission→freeを完結する。
+
+このため、backend共有pendingへのFull／immediate／retirement由来の受入は、WIPの`append_retirement_delta`と同じ非相殺の受入契約へ統一する。新しいfreeを受けたことだけで先行setを除去しない。現在のhelperを共通用途へ整理し、第二pending ownerを作らない。epaint一般の`TexturesDelta::append`は変更しない。
+
+無描画の既存consumerを再利用し、空batchのためだけのsubmission、GPU待機、新surface、強制UIは追加しない。実discardで非空deltaがある場合には、uploadのsubmissionが通常の最終Fullより早まる。
+
+**callbackの設置・解除・Context一致**
+
+配送入口はApp pluginではなくintegration専用の、UI実行thread上のscope付き入口とする。
+
+- eframeが最外側のnative Fullを実行する前に、対象Contextと既存renderer ownerに結び付けて設置する。
+- scopeはそのFullの実行・出力処理を包含し、終了時にRAIIで解除・元の登録を復元する。早期returnやunwindでも他のContextへ登録を残さない。
+- immediateの入れ子は同じContextのscopeを利用する。子ごとのpending領域・callback ownerを作らない。
+- Contextは内部Arcの同一性で照合する。root ViewportId、threadだけ、現在foregroundでは照合しない。
+- 既存native資源が`Rc<RefCell<_>>`であるため、`Send + Sync`を要求するContext内callbackへ無理に格納しない。現在threadのscope付きdispatcherを使い、backendへの参照はWeakとする。dispatcherはdeltaを保留するqueueではない。
+- dispatcherの登録borrowを解放してからconsumerを呼ぶ。Context／TextureManager／backendのlock・borrowを保持したまま入らない。
+- native Fullのscope中は配送先が存続することを成立条件とする。別Contextや失効したbackendへ誤配送しない。接続不成立をdeltaのclearや黙った成功にしない。
+- headless等でscopeがないContextは従来どおりFullOutputで所有権を返す。eframeのnative immediate経路では、対応するscopeがあることを入口の不変条件にする。
+
+新しいTLS登録は、既存の即時viewport rendererと同じthreadで動くが、その「最後に設定されたcallback」を無条件に流用しない。Contextを束縛したscopeと復元規則を設け、複数Contextのテスト間へ漏らさない。
+
+**最終pass・上限・direct begin／end**
+
+| 経路 | 契約 |
+|---|---|
+| discard後に実再passを行う | 次のbegin_pass前に未配送deltaを先行移譲する |
+| discardなしの最終pass | 新callbackを呼ばず、通常FullOutputで返す |
+| max_passes到達で再passしない | 新callbackを呼ばず、通常FullOutputで返す |
+| 再passのdeltaが空 | 配送・submissionを増やさない |
+| direct begin_pass／end_pass | 新callbackを自動実行しない。consumerは返されたoutputを受け入れてから、次の処理・native寿命置換へ進む |
+| LogicOnly | UI passもdiscardもないため発火しない。既存退役delta consumerを維持する |
+| immediate内のdiscard | 同じscopeへ先行移譲し、外側へ二重配送しない |
+
+direct consumerが出力を保持したまま次のnative処理を進める場合は、そのconsumer側の所有契約違反として直す。direct begin／endを暗黙のretry経路へ変えない。
+
+**output pluginとテスト隔離**
+
+output pluginの呼出回数・順序は変更しない。各passで従来どおりoutputを観測・変更した後、その結果のdeltaを移譲する。移譲のためにpluginを再呼出ししない。移譲済みの旧deltaをTextureManagerへ戻して次passで再観測させない。
+
+製品の`ImeInputPlugin`とpage-turnの`SubmissionPlugin`はそれぞれ`crates/egui-ime/src/lib.rs:111`、`src/ui_fullscreen/page_turn.rs:547`。IME・discard・page-turn receiptの既存観測を維持し、textureの先行移譲を実presentやpage-turn表示ACKとして扱わない。
+
+テストではscope guardを使い、Context AのsinkへContext Bのdeltaが入らないこと、入れ子scope終了後の復元、unwind後の解除、sinkなしContextへの非漏出を検査する。全testで共有するstatic受信queueは使わない。
+
+本家へ報告する価値がある。未改変本家で成立する最小discard／callback-drop再現を切り分ける対象とし、本家での再現確認済みとは扱わない。報告の送信は利用者判断とし、こちらからは送らない。
 
 #### 無描画submission
 
@@ -1783,6 +2039,15 @@ rect捕捉条件、geometry由来recreate、新detached pending bool、時間窓
 これは、空のUI呼出し、GC待ち、終了後のViewportId再検索という不成立な受渡しを、既存出力ownerへの移譲に置き換える構造修正である。guard・時間窓・retry・追加repaintによる症状パッチではないことについて、設計担当と独立レビュー担当の追加合意を得る。
 
 第4.4版と段0〜段2の既存ACCEPTを取り消す変更ではないが、そのACCEPTを今回追加分の承認として流用しない。限定レビューによる候補(B)推奨も、今回の具体的契約の独立ACCEPTとは区別する。
+
+第4.6版では、次の2件をdetached計画§11へ追記する前提とする。§11本文は設計担当が更新し、実装再開前に追加範囲の構造合意を得る。
+
+1. **終了経路:** 資源退役と一覧帰還を分け、破棄前にbookmark／navigationの所有値を存続mainへ移譲する。既存帰還boolの型付き化、active／standalone／parkedの対応、Remote・新navigation・新bookmarkによる失効、既存UI消費位置の維持を記録する。
+2. **delta所有:** 実discard再pass前のintegration配送scope、Context一致、既存共有rendererへの一度の移譲、旧set／partial→submission→後発free、plugin観測不変、両backendの非相殺受入とtest隔離を記録する。
+
+第4.5版の型付き退役・pass外cleanup・旧出力による非再作成を変更するものではない。表示継続のためにruntimeを延命せず、delta順のためにcleanupを遅らせないことを明記する。
+
+既存設計ACCEPTと、今回の追加設計・追加実装のACCEPTを区別する。新callbackの所有受渡しと帰還要求の失効は、重要な非同期・複数context境界として独立レビュー対象にする。
 
 ### 4.12 Rust 1.99警告とMSRV
 
@@ -2252,6 +2517,34 @@ C2・C4・C5とC3の表示用pollをuiへ残すため、全完成結果のlogic�
 
 作業は、vendorの受渡し契約とheadless回帰、App終了入口とRemote正式接続、残る段3全target移行・検証の順に分ける。各チェックポイントでcore checkを維持し、機能未接続の状態を段3完了として扱わない。正式な独立レビューは今回の所有・非同期・複数窓境界を対象に行う。
 
+#### 第4.6版: 段3再停止点からの追加範囲と見積り
+
+`fe32f2e88`の正式graphで得たコンパイル・回帰結果は、段3台帳のsource・feature・条件に従って再利用する。今回の追加2件を未解決のまま段3完了とせず、段4／snapshot更新へ送らない。
+
+追加作業:
+
+1. Close前の純粋な帰還効果生成と、存続mainの既存帰還ownerへの型付き移譲を実装する。
+2. `pending_return_to_parent`の型変更、context bundleの保存・swap・初期化、既存UI消費位置を揃える。
+3. active／standalone／parked、通常CloseとRemote／置換causeを接続し、navigation／bookmark admissionで失効・上書きを完結する。
+4. eguiの実再pass前配送入口とContext束縛scopeを追加する。
+5. eframe両backendを既存共有rendererへ接続し、pending deltaの非相殺受入を共通化する。
+6. plugin・scope隔離・実callback drop・実resource consumerを含む回帰を追加する。
+7. 第4.5版の退役、Remote、dirty保持と既存段3受入を再確認し、独立実装レビューの残るP1を閉じる。
+
+| 第4.6版の追加内訳 | 概算変更行 |
+|---|---:|
+| Close帰還ownerの型付き化・移譲・失効・UI接続 | 300～550 |
+| egui配送scope・両backend接続・受入共通化 | 250～450 |
+| App／plugin／scope／両backend／実resource回帰 | 500～900 |
+| **追加合計** | **1050～1900** |
+| **段3全体の改訂見積り** | **5400～10700** |
+
+今回の追加は概ね14～24ファイルを見込む。既存段3対象との重複が多いため、ファイル数は旧見積りへ単純加算せず実diffで更新する。原本・lockfile・PNGを除く設計見積りであり、WIPからの残り全行数を測定した値ではない。第4.5版で実装済みの行を残作業として再計上しない。
+
+Close帰還とdelta所有を別のレビュー単位に分け、それぞれcore checkと限定回帰を維持する。両方の接続後に段3の残る受入を完了する。epaint vendor追加、TextureManager再預託API、第二renderer ownerは見積りに含めない。
+
+台帳のdirty P1補修は維持し、再実装しない。launcherのrelease入力3ファイル不足、C2〜C5／D3の製品Full接続証拠、C4の新pointer、C5予算、D3 cutoff、fullscreen混在wheel、最終lib全件等の既存残件は別に残る。今回の限定回帰成功で代替しない。
+
 #### 第4.5版: 追加必須回帰と受入条件
 
 既存の段3受入1〜16と、IME・gamepad・入力・deltaの必須回帰は維持する。次を追加する。
@@ -2286,6 +2579,56 @@ Appの代表回帰は`viewport_retirement`で選択できる名前へ揃える�
 追加差分後に、既存段3のcore／test-script feature／workspace check、全test target compile、IME・continuation・root lifecycle・context state・両backend minimized_full、focused、fmtのgateを完了する。main lib全件は`.\scripts\test-lib-full.ps1`を使い、段3台帳の最後の1回を実施・分類する。最終`test-full.ps1`と確認用buildの段階は既存計画を維持する。
 
 `df0037eb7`で未実施のgateを、今回の追加回帰で代替しない。snapshot PNGはこの受渡し修正のために更新しない。
+
+#### 第4.6版: 追加必須回帰と受入条件
+
+**Close帰還**
+
+1. active at-restのbookmark book／mediaを非描画Closeする。viewerとnative資源は終端するが、帰還要求は存続mainに残る。次のmain UIで一覧更新・復元を一度だけ行う。
+2. detached mediaが元targetから別media／folderへ移動した後にCloseし、最後の実フォルダとmedia選択へ戻る。bookの内部移動では従来どおりbookmark一覧を維持する。
+3. standalone bookmarkとauto-open対象をCloseし、teardown後にも一覧／親navigationと選択intentが残る。ZIP／PDF、通常画像folder、変換アーカイブの代表を使い、キャッシュfolderへ帰還しない。
+4. mainのselection／scroll変更は維持し、row増減時の位置復元も既存期待値を保つ。
+5. parked／passiveのoriginが存続する場合と、新navigation・新bookmarkで置換済みの場合を検査する。無関係な兄弟・mainを変更しない。
+6. Close→UIなし→Remote取得→返却→遅いUIで旧帰還を再発火しない。取得・ACK・drainは帰還UIを待たない。
+7. Close→同pathへの新navigation、新bookmark開始→旧Close到着を検査し、新しいownerを旧要求が消去・上書きしない。
+8. 実EpiIntegrationのLogicOnlyからCloseを処理し、items・bookmark read-model・dirty集合を表示採用せず、終端と型付き移譲だけ進むことを検査する。
+9. 通常UI・早期return・既存native即時Closeのconsumerで一回だけ消費する。`native_immediate_close_consumes_bookmark_return_in_same_dispatch`等の既存期待値を弱めない。
+
+**delta配送**
+
+1. 実`Context::run_ui`の第1 passでwhole＋partialを生成し、discardする。次passで同IDの新寿命immediateを開き、旧native callbackが持つ最後のTextureHandleを実際にdropする。
+2. 第1 passのset／partialがintegration sinkへ移り、実immediate consumerの後発freeより先に処理されることを検査する。fake adapterがbatchを保持しただけの試験を主証拠にしない。
+3. wgpuの実resource consumerで旧textureの内容をoffscreen readbackし、whole／partial適用とsubmission後にfreeされることを検査する。glowは実adapterとresource consumerの順序を検査し、実GL環境の証拠とfake painterの証拠を区別する。
+4. 共有pendingが既にある場合、resource利用不能で既存pendingに残る場合、後発freeとの合流を検査する。先行set／partialを相殺せず、利用可能なconsumerでset→submission→freeを完結する。
+5. 入れ子immediateのdiscard、複数回の実discard、空deltaを検査し、最終outputへ移譲済みdeltaが戻らないことを確認する。
+6. discardなし、max_passes到達、direct begin／endでは新sinkが呼ばれず、通常outputが必要なdeltaを所有することを検査する。
+7. output pluginを実際に組み込み、各passの観測が従来どおり一度であること、pluginによる変更後のbatchが配送されること、IME／page-turn receipt／実表示ACKを変えないことを検査する。
+8. Context A／B、入れ子scope、正常終了・早期return・unwindで、誤配送・登録残留・二重配送がないことを検査する。
+9. 第4.5版のGC・承認済み退役・root終了と組み合わせ、drop後のdeltaを失わず、新寿命・兄弟資源を維持する。
+
+追加回帰には`close_return`と`discard_texture_delivery`の共通filterを付け、正式graphで実選択件数を記録する。代表コマンド:
+
+```powershell
+cargo test -p mimageviewer --lib close_return --offline
+cargo test -p mimageviewer --lib bookmark_return --offline
+cargo test -p mimageviewer --lib viewport_retirement --offline
+cargo test -p mimageviewer --lib native_immediate_close_consumes_bookmark_return_in_same_dispatch --offline
+
+cargo test --manifest-path vendor/egui/Cargo.toml --lib discard_texture_delivery --offline
+
+cargo test --manifest-path vendor/eframe/Cargo.toml --lib discard_texture_delivery --no-default-features --features default_fonts,wgpu --offline
+cargo test --manifest-path vendor/eframe/Cargo.toml --lib discard_texture_delivery --no-default-features --features default_fonts,glow --offline
+
+cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --lib discard_texture_delivery --features winit --offline
+```
+
+0件選択、GPU／GL前提不成立を成功として記録しない。OS windowを必要とする試験は自動gateへ混ぜず、既存の承認付き検証へ分離する。
+
+追加差分後にcore／test-script check、影響した全test target compile、既存IME・page-turn・退役・Remote・dirty保持の関連filter、fmtを確認する。成功済み証拠はsourceと条件が有効な範囲で再利用する。
+
+最終main lib全件は既存計画どおり`.\scripts\test-lib-full.ps1`の最後の1回で実施・分類する。`test-focused.ps1`がbroad/shared変更として未選択を返した場合は0件成功と扱わない。launcherを含むworkspace gateの前提不足も未達のまま記録する。
+
+今回の修正でsnapshot PNGを更新したり、既存Closeの帰還先・選択・scroll・同dispatch消費の期待値を弱めたりしない。
 
 #### 第4.3版追加範囲・受入条件
 
@@ -2539,6 +2882,14 @@ Full／LogicOnly、GC前後、discard再pass、古い出力、同じViewportId�
 
 エージェントによる実行は、既存の明示承認・使い捨てportable・実データ保護の規則に従う。今回の読み取り調査では製品を起動しておらず、上記を確認済みとは扱わない。
 
+第4.6版の実機代表確認:
+
+25. bookmark一覧から別窓の本・mediaを開き、mainのselection／scrollを変えてから閉じる。一覧の更新と現在位置の維持を確認する。mediaでは別ファイル／folderへ移動してから閉じ、最後の実フォルダと選択へ戻ることも確認する。
+26. auto-open対象のZIP／PDFまたは画像folderをstandaloneで開いて閉じ、従来の親一覧へ戻ることを確認する。変換アーカイブではキャッシュfolderへ移らないことを確認する。
+27. 別窓を閉じた後、mainで別navigationまたは新bookmarkを開始し、旧帰還で巻き戻されないことを確認する。Remote取得・返却後も閉じたviewerや旧bookmark帰還を復活させない。
+
+厳密なLogicOnly・discard・immediate置換・upload submission順は非対話回帰を主証拠とする。利用者へdiscard競合の手動再現を求めない。実機試験のためのタイマー・追加repaint・設定破損を作らない。エージェント実行は既存の明示承認・使い捨てportableの規則に従う。
+
 ### 7.5 動画HUD・GPU
 
 1. 再生、HUD文字、時間、速度、音量、track。
@@ -2647,3 +2998,23 @@ Full／LogicOnly、GC前後、discard再pass、古い出力、同じViewportId�
 - 第4.5版の追加回帰と、段3台帳の既存未達gateが正式graphで完了し、今回の追加差分について独立レビューを受けている。
 
 更新対象に、段3検証台帳、vendorのPATCHES／差分台帳、App終了入口とbackend退役の対応表を加える。段0〜段2のACCEPTと`df0037eb7`のcore check成功は履歴として保持し、今回の受渡し契約・実行時挙動の検証完了へ読み替えない。
+
+第4.6版の追加完了条件:
+
+- Close前に帰還先と所有値を存続mainの既存navigation帰還ownerへ型付きで移し、teardown後もbookmark一覧更新・最後の実フォルダ復帰・auto-open親一覧復帰が成立する。
+- 帰還boolの型付き化を既存slot・context bundle・消費位置へ一貫して接続し、第二の帰還slot／queueを作っていない。
+- active／standalone／parkedのoriginを保持し、無関係なmain・新bookmark・兄弟を古いCloseで変更しない。
+- Remote取得、新navigation、新bookmarkのadmissionで旧帰還を失効・置換し、帰還UIをRemoteの完了条件にしていない。
+- 既存UI・早期return・native即時Closeの帰還動作、選択・scroll・帰還先を保持している。
+- 実discard再passの直前だけ未配送deltaを移譲し、旧whole／partial→submission→後発freeを両backendの所有境界で保証する。
+- 最終pass・上限到達・direct begin／end・LogicOnlyの出力所有を変更せず、移譲済みdeltaを二重配送していない。
+- integration配送scopeのContext一致、設置・解除・復元・Weak参照・test隔離が回帰で確認されている。
+- output pluginの観測回数・順序を保ち、texture先行配送を実表示ACKへ変換していない。
+- epaintの新vendor、metadata再演、再預託API、第二renderer ownerを追加していない。
+- dirty採用の既存補修と第4.5版の型付き退役・pass外cleanupを維持している。
+- 新pending bool、第二queue、遅延cleanup、追加retry、時間窓、強制UI、後付けguardを追加していない。
+- 終了継続とdelta所有の追加範囲について構造合意・detached計画§11記録があり、独立実装レビューの残る2件のP1を解消している。
+
+更新対象に、段3検証台帳、navigation／bookmark帰還ownerの対応、vendor PATCHES、delta配送の所有図を含める。本家報告候補は未改変本家での再現状況と分けて記録し、利用者の判断前に送信しない。
+
+第4.5版の設計ACCEPT、`fe32f2e88`のコンパイル・既存filter成功、今回の追加契約の受入証拠を区別する。今回の読み取り調査を実行時確認やテスト成功として記録しない。
