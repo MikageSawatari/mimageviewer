@@ -1205,3 +1205,98 @@ fn egui037_wheel_frame_actual_immediate_child_music_gate_uses_child_focus() {
         });
     }
 }
+
+#[test]
+fn egui037_wheel_frame_actual_immediate_child_click_keeps_operation_identity() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    install(&ctx);
+    let mut app = ready_app(&ctx, SpreadMode::Single);
+    app.settings.page_turn_animation_enabled = true;
+    let child = egui::ViewportId::from_hash_of("wheel-click-child");
+    let pos = egui::pos2(400.0, 200.0);
+    // Establish the real child's canvas hit target before delivering a click.
+    install_immediate_child_input(&ctx, true, vec![egui::Event::PointerMoved(pos)]);
+    frame(&ctx, vec![], |_| {
+        ctx.show_viewport_immediate(child, egui::ViewportBuilder::default(), |ui, _| {
+            let (result, _) = actual_merge(&mut app, ui, false);
+            assert!(result.page_nav.is_none());
+        });
+    });
+    page_turn::take_test_events();
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    install_immediate_child_input(
+        &ctx,
+        true,
+        vec![
+            egui::Event::PointerMoved(pos),
+            wheel(-120.0, egui::Modifiers::NONE),
+            wheel(120.0, egui::Modifiers::ALT),
+            button(true),
+            button(false),
+        ],
+    );
+    frame(&ctx, vec![wheel(-41.0, egui::Modifiers::NONE)], |root_ui| {
+        let root_before = ctx.input(|input| input.events.clone());
+        let mut proposal = None;
+        let mut operation = None;
+        let mut click_operation = None;
+        ctx.show_viewport_immediate(child, egui::ViewportBuilder::default(), |ui, _| {
+            let (mut result, current_operation) = collect_actual_merge(&mut app, ui, false);
+            let mut owned = result
+                .deferred
+                .take()
+                .expect("mixed wheel plus child click");
+            assert!(matches!(
+                owned.canvas_click,
+                FsCanvasClickAction::PageSide(_)
+            ));
+            click_operation = app.page_turn_pointer_navigation_operation(&ctx, "pointer");
+            assert!(matches!(
+                click_operation,
+                Some(ViewerOperationId::Pointer { source, .. }) if source == child
+            ));
+            app.claim_fs_wheel_frame_after_ui(&mut owned);
+            proposal = Some(owned);
+            operation = current_operation;
+        });
+        assert_eq!(ctx.viewport_id(), egui::ViewportId::ROOT);
+        assert!(
+            app.page_turn_pointer_navigation_operation(&ctx, "pointer")
+                .is_none()
+        );
+        let result =
+            app.apply_fs_wheel_frame_proposal(proposal.take().unwrap(), false, &mut operation);
+        assert!(!result.page_nav.is_none());
+        assert_eq!(
+            operation, click_operation,
+            "PageSide retains the child's click identity"
+        );
+        finish(&mut app, root_ui, &result, operation);
+        let events = page_turn::take_test_events();
+        assert!(
+            events.iter().any(|(fact, _, _)| {
+                Some(fact.operation_id) == click_operation
+                    && fact.source == child
+                    && fact.cause == "pointer"
+            }),
+            "final navigation emits the child's click identity: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|(fact, _, _)| {
+                matches!(
+                    fact.operation_id,
+                    ViewerOperationId::UnattributedNavigation(_)
+                )
+            }),
+            "navigation diagnostics must retain the original child input fact"
+        );
+        assert_eq!(ctx.input(|input| input.events.clone()), root_before);
+    });
+}

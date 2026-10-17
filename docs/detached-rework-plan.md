@@ -5699,3 +5699,13 @@ core / test-script / testerのcheck、全23 test executableのno-run、fmtも成
 lib全件は利用者指定により再実行せず、旧290失敗の追跡分類を第2版（補修180 / PNG103 / 段4差7）へ更新した。
 PNG更新・新ignore・製品build/launch・live・test-fullは行わず、未コミット・未ステージで返す。
 詳細と各指摘の回帰対応表・実command / 件数 / exitは[段3台帳](egui-0.37-stage3-verification.md#独立レビュー指摘への対応1e55235f1後分類第2版)を参照する。
+
+#### 2026-10-17 段3・再確認の子クリック操作ID補修（7cb0494f9後）
+
+同じ独立レビュー担当Cの再確認で、遅延PageSideの操作ID検索だけがrootへ戻った後に残るP3を確認した。
+レビューCは、この補修を「所有境界を正す構造的修正」と明記している。
+子の既存claim内で、pointer操作IDも既存pass-local semantic inputへ捕捉し、最終navigationへ渡す。
+新しいApp状態・queue・待機・再入力・repaintやviewerの寿命延長は作らない。
+実immediate子の通常wheel→Alt+wheel＋単クリックをroot復帰後に適用し、子由来の操作IDと診断、親入力不変を確認する。
+今回2件の補修に対する限定独立source確認（Sol / xhigh、読み取り専用）もACCEPT・追加指摘なし。
+実行と変異検証は段3台帳の「再確認の残件への対応（7cb0494f9後）」を正本とし、設計担当の最終受入とは区別する。

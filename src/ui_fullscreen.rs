@@ -18174,6 +18174,7 @@ enum FsWheelFrameInput {
 /// the current viewport and cannot carry child input past an immediate callback.
 struct FsWheelFrameSemanticInput {
     pointer_pos: Option<egui::Pos2>,
+    pointer_navigation_operation: Option<ViewerOperationId>,
     modifiers: egui::Modifiers,
     primary_started: bool,
     primary_dragged: bool,
@@ -18188,6 +18189,8 @@ impl FsWheelFrameSemanticInput {
     fn capture(app: &App, ctx: &egui::Context, response: &egui::Response) -> Self {
         Self {
             pointer_pos: ctx.input(|input| input.pointer.hover_pos()),
+            pointer_navigation_operation: app
+                .page_turn_pointer_navigation_operation(ctx, "pointer"),
             modifiers: ctx.input(|input| input.modifiers),
             primary_started: response.drag_started_by(egui::PointerButton::Primary),
             primary_dragged: response.dragged_by(egui::PointerButton::Primary),
@@ -38941,8 +38944,7 @@ impl App {
                 }
                 FsCanvasClickAction::PageSide(base) => {
                     page_nav = self.spread_page_nav(base);
-                    *navigation_operation =
-                        self.page_turn_pointer_navigation_operation(ctx, "pointer");
+                    *navigation_operation = input.pointer_navigation_operation;
                 }
             }
         }

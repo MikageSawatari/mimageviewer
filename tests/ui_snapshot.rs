@@ -724,6 +724,7 @@ fn folder_toolbar_snapshot_status_label() {
                                         egui::TextEdit::singleline(&mut path)
                                             .desired_width(f32::INFINITY),
                                     )
+                                    .accessible_name("Folder address")
                                     .rect
                                 },
                             );
@@ -748,9 +749,7 @@ fn folder_toolbar_snapshot_status_label() {
                         label_rect.bottom() <= input.top() || label_rect.right() <= input.left()
                     );
                 }
-                for rect in [input, label_rect] {
-                    assert!(rect.left() >= 0.0 && rect.right() <= width * zoom);
-                }
+                assert_folder_toolbar_snapshot_nodes_inside(&harness.ctx, [input, label_rect]);
                 if changed && zoom == 1.0 && width >= 360.0 {
                     harness.snapshot(format!(
                         "folder_toolbar_snapshot_label_{}",
@@ -761,6 +760,37 @@ fn folder_toolbar_snapshot_status_label() {
             }
         }
     }
+}
+
+fn assert_folder_toolbar_snapshot_nodes_inside(ctx: &egui::Context, nodes: [egui::Rect; 2]) {
+    for rect in nodes {
+        logical_bounds::assert_node_inside(ctx, rect, "folder toolbar snapshot status label");
+    }
+}
+
+#[test]
+fn folder_toolbar_snapshot_status_label_rejects_high_dpi_overflow() {
+    use egui_kittest::kittest::Queryable;
+    let mut harness = test_ui::builder()
+        .with_size(egui::vec2(360.0, 180.0))
+        .build_ui(|ui| {
+            ui.ctx().set_zoom_factor(1.5);
+            ui.put(
+                egui::Rect::from_min_size(egui::pos2(260.0, 30.0), egui::vec2(70.0, 24.0)),
+                egui::Label::new("Outside toolbar"),
+            );
+        });
+    harness.run();
+    let rect = harness.get_by_label("Outside toolbar").rect();
+    assert_eq!(harness.ctx.content_rect().width(), 240.0);
+    assert!(rect.left() > 240.0 && rect.right() <= 360.0);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_folder_toolbar_snapshot_nodes_inside(&harness.ctx, [rect, rect]);
+        }))
+        .is_err(),
+        "the status-label consumer must reject nodes admitted by physical width * zoom"
+    );
 }
 
 /// Actual control styles, including the reported count and omitted-entry badge.

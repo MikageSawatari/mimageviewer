@@ -2,7 +2,9 @@
 
 ## 状態（2026-10-17）
 
-**最新状態:** 設計担当の段3コミット`1e55235f1`に対する独立レビューA〜Dの9指摘を補修し、変異による検出と指定の限定確認を完了した。末尾の「独立レビュー指摘への対応」を今回の正本とする。旧9件を再分類し、元の全件290失敗は補修成功180・PNG比較103・段4のlayout/挙動差7とした。lib全件は利用者指定により再実行していない。全test targetコンパイル（23 executable）・core/test-script check・fmtは成功。HEADとブランチを維持し、未コミット・未ステージで返す。これは実装担当の内部確認であり、設計担当の最終受入とは区別する。
+**最新状態（7cb0494f9後の再確認）:** 残るCのP3・DのP2はコードで成立を確認し、既存owner内で補修した。新規2回帰は旧処理へのsource変異で各1件の指定assert失敗を確認し、復元後は成功。限定lib42件成功、両integration9件中8件成功・1件は既存PNG2枚の不一致（geometry全12ケース成功）。core check、全test targetコンパイル（23 executable）、fmtは成功。末尾の「再確認の残件への対応（7cb0494f9後）」を今回の正本とする。lib全件は再実行せず、元290失敗の分類第2版（補修180／PNG103／段4差7）を維持する。HEAD `7cb0494f9`、ブランチ`egui-036`のまま未コミット・未ステージで返す。以下は実装担当の内部確認で、設計担当の最終受入とは区別する。
+
+**初回レビュー補修時の報告（履歴・分類第2版）:** 設計担当の段3コミット`1e55235f1`に対する独立レビューA〜Dの9指摘を補修し、変異による検出と指定の限定確認を完了した。末尾の「独立レビュー指摘への対応」を今回の正本とする。旧9件を再分類し、元の全件290失敗は補修成功180・PNG比較103・段4のlayout/挙動差7とした。lib全件は利用者指定により再実行していない。全test targetコンパイル（23 executable）・core/test-script check・fmtは成功。HEADとブランチを維持し、未コミット・未ステージで返す。これは実装担当の内部確認であり、設計担当の最終受入とは区別する。
 
 **独立レビュー前の報告（履歴・分類第1版）:** 第4.6版と双方の構造合意（97ab24ae1 / 5c1584d8a）に基づく段3の実装・指定自動確認を完了。**実装担当の内部確認では、未分類・残る段3契約違反は0件**。設計担当による最終受入とは区別する。最後に1回実行したlib全件は290失敗で、その後の限定検証により179件の移行不備を解消し、PNG比較102件と段4のlayout/挙動差9件へ分類した。全件を最終ソースで再実行したとは扱わない。後述の最終コマンド表と残課題を正本とし、過去の論点・未達記録は履歴として残す。HEAD `5c1584d8a`、ブランチ`egui-036`を維持し、未コミット・未ステージで返す。
 
@@ -964,3 +966,70 @@ vendor全libの実行には既存`minimized_full`（wgpu9 / glow11）、viewport
 | `review-final-glyphs` | `python scripts/check_ui_glyphs.py` | check | 0 / 3.56 |
 | `review-final-tree` | `cargo tree -d --offline` | check | 0 / 0.82 |
 | `review-final-diff` | `git diff --check` | check | 0 / 0.39 |
+
+### 再確認の残件への対応（7cb0494f9後）
+
+設計担当が補修を`7cb0494f9`へコミットした後、同じ独立レビュー担当による再確認で、
+A・BはACCEPT、CはP3を1件、DはP2を1件指摘した。以下はその2件への**実装担当の内部確認**。
+前節の初回レビュー対応と分類第2版は履歴・有効な検証証拠として保持する。
+
+| 指摘 | コードでの判断・根本原因 | 修正・主なファイル | 回帰 |
+| --- | --- | --- | --- |
+| C1残件 P3 | 成立。遅延PageSideだけが親へ戻ったContextで操作IDを再検索していた。barrierのsource一致により子クリックの事実を失う | `src/ui_fullscreen.rs`の既存pass-local `FsWheelFrameSemanticInput`にpointer操作IDを捕捉し、PageSide適用へ渡す。wheelと同じ子ownerの受付内で同定を完了 | `egui037_wheel_frame_actual_immediate_child_click_keeps_operation_identity`。実immediate子の通常wheel→Alt+wheel＋左単クリック、最終操作ID・診断のsource/cause、親入力不変を検査。**1選択・1成功**（最終wheel22件の内数） |
+| D1残件 P2 | 成立。`Node::rect()`の論理矩形をphysical幅相当の`width * zoom`と比較し、240pt画面で360ptまで許容していた | `tests/ui_snapshot.rs`のstatus labelとinputの境界を`logical_bounds::assert_node_inside`へ接続。両integration targetの同型比較も点検 | 既存`folder_toolbar_snapshot_status_label`の3幅×2zoom×2ラベルを維持。新規`folder_toolbar_snapshot_status_label_rejects_high_dpi_overflow`は同じconsumerで、240pt viewport外・360pt旧境界内の実Nodeを拒否。**追加回帰1選択・1成功**。既存testは1選択、全12 geometry成功後にPNG不一致 |
+
+新しいApp pending状態・非表示入力機構・guard・delay・retry・repaintは追加していない。
+既存assert・PNG baseline・ignoreは維持する。子入力の操作ID受渡しは、今回の独立レビューCが
+「所有境界を正す構造的修正」と認めた範囲であり、第4.6版の既存pass-local owner内の補修である。
+設計書との食い違い・新しい設計判断はない。
+
+限定実行では、従来のstatus-label fixtureが0.37のaccessibility検査で、名前のないTextInputとして停止することも確認した。
+そのfixtureのResponseに`accessible_name("Folder address")`を付け、検査の無効化をせずに到達を回復した。
+これはAccessKit labelだけの指定で、描画・矩形・disabled状態を変えない。追加1行も読み取り専用の限定独立source確認でACCEPT。
+その後は12ケースの配置・最小幅・論理境界検査を全て通過し、`SnapshotResults`集約の終端で
+`folder_toolbar_snapshot_label_stacked` / `folder_toolbar_snapshot_label_inline`のPNG不一致2枚に到達した。
+このintegration testのPNG差は既存の段4b比較・段5更新方針に従い、baselineは変更しない。
+元のlib全件290名の集合にはこのintegration testを含まないため、追跡分類第2版の180成功／103 PNG／7 layout・挙動差は変更しない。
+lib全件の再実行は利用者指定により行わない。
+
+#### 再確認2件の変異検証（実装担当の内部確認）
+
+両方とも実sourceを一か所ずつ旧処理へ戻し、既に正常系で到達を確認した新規回帰を単独選択した。
+変異後は指定assertでの失敗をJSONで検査し、`finally`で元のbyte列へ復元した。
+最終の限定確認は両変異を取り除いた後に実施した。
+
+| label / 変異 | 回帰名 | 選択・結果 | exit / 秒 |
+| --- | --- | --- | --- |
+| `review2-mut-c`：PageSideを`self.page_turn_pointer_navigation_operation(ctx, "pointer")`の遅延検索へ戻す | `egui037_wheel_frame_actual_immediate_child_click_keeps_operation_identity` | 1選択・1失敗。`PageSide retains the child's click identity`で`None`対`Some(Pointer { source: child, ordinal: 3, .. })` | 100 / 64.53 |
+| `review2-mut-d`：status-label consumerを`ctx.content_rect().width() * ctx.zoom_factor()`まで許容する旧物理幅比較へ戻す | `folder_toolbar_snapshot_status_label_rejects_high_dpi_overflow` | 1選択・1失敗。旧上限360pt内の画面外Nodeを誤って許容し、負例の拒否assertで失敗 | 100 / 29.43 |
+
+両変異はコンパイル・起動失敗ではなく、意図したRust assertの失敗まで到達している。
+完全なcommand / exit / 秒 / logは`target/egui037-stage3-<label>.json`、
+選択件数と失敗本文は同名`-tests.json` / `-junit.xml`に保存した。
+
+#### 再確認2件の最終限定実行（実装担当の内部確認）
+
+今回2件の限定独立source確認（`gpt-6.1-sol` / `xhigh`、読み取り専用）はACCEPT・追加指摘なし。
+レビュアーはCargo・製品起動・ファイル変更を行っておらず、下表は実装担当が直列・offlineで実行した結果である。
+環境・ログ命名は前節と同じ。`UPDATE_SNAPSHOTS`は未設定、lib全件・live・製品build/launch・`test-full.ps1`は実行しない。
+
+```powershell
+$libFilter = 'test(egui037_wheel_frame_) | test(page_turn::input_regression_tests)'
+$integrationFilter = 'test(high_dpi) | test(image_folder_zip_small_viewport_controls) | test(startup_dialogs_refit_after_viewport_resize) | test(composition_editor_all_phases_keep_cancel_reachable) | test(folder_toolbar_snapshot_status_label)'
+```
+
+nextest両コマンドの共通引数は`--no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --offline`。
+全commandは各labelのJSONにも保存した。
+
+| label | コマンド | 選択・結果 | exit / 秒 |
+| --- | --- | --- | --- |
+| `review2-final-lib` | `cargo nextest run -p mimageviewer --lib -E $libFilter`＋共通引数 | 42選択・42成功。wheel22、既存page-turn input20。新規子クリック1件を含む | 0 / 67.71 |
+| `review2-final-integration` | `cargo nextest run -p mimageviewer --test ui_snapshot --test book_composition_editor_snapshots -E $integrationFilter`＋共通引数 | 9選択・8成功・1 PNG失敗。新規status-label負例1件成功。既存status-labelは全12 geometry成功後、stacked / inlineのPNG2枚だけ不一致 | 100 / 15.26 |
+| `review2-final-core` | `cargo check -p mimageviewer --bin mimageviewer-core --offline` | check成功 | 0 / 14.07 |
+| `review2-final-tests-no-run` | `cargo test -p mimageviewer --tests --no-run --offline` | 23 executableをコンパイル、実行なし | 0 / 51.28 |
+| `review2-final-fmt` | `cargo fmt --check` | check成功 | 0 / 13.81 |
+| `review2-final-diff` | `git diff --check` | check成功 | 0 / 0.08 |
+
+新規ignore・期待値の弱化・PNG baseline更新はない。今回の2指摘は補修済みで、設計書との食い違いはない。
+段4への7 layout / 挙動差、PNGの段4b比較・段5更新、警告の段5整理は従来どおり残る。
+A・Bや今回変更しないvendor / GPU / Close / gamepadの証拠は、設計担当の再確認ACCEPTと前節の有効な結果を再利用する。
