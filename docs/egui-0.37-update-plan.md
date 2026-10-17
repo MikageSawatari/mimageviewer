@@ -1,6 +1,20 @@
-> 状態: 設計 第4.4版 (2026-10-16)。第4.2版までの Sol・Astra の独立レビューに加え、利用者決定の案B (最小化中も UI pass を続ける) と段1b-1 の C1〜C5・D3 を反映した第4.3〜4.4版を Sol (gpt-6.1-sol / xhigh) が ACCEPT。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
+> 状態: 設計案 第4.5版 (2026-10-17、段3 で見つかった App 起点の子 viewport 退役の受け渡し不足を、承認済み退役の型付き command で埋める追補。独立レビュー前)。第4.4版までは Sol・Astra の独立レビュー ACCEPT。目標は利用者決定により egui 0.37 系。正本の backlog は §1.382。
 
 # 改訂履歴
+
+## 第4.5版 — 2026-10-17
+
+対象は第4.4版と、段3途中のWIPコミット`df0037eb7`。`docs/egui-0.37-stage3-verification.md`の「設計担当へ返す論点」全文と、App・egui・eframeの退役経路を読み取り専用で照合した。段0〜段2のACCEPTは維持するが、今回判明した受渡し不足の解消までを既存のACCEPTに含めない。本追補の実装・独立レビュー・テスト・実機確認は未実施。
+
+- **論点1 mode changeのUI依存 — 反映:** 空の`show_viewport_immediate`と非描画によるGC待ちを、承認済み退役の型付きcommandへ置き換える。logic／uiで同じ終了入口を使う。
+- **論点2 App owner終了後のClose再要求 — 反映:** modal等の終了判断が確定し、window／context bindingを失う前に、exactなviewport寿命と子孫への退役権限を出力へ一度だけ移譲する。通常の`ViewportCommand::Close`で代用しない。
+- **論点3 ViewportIdだけのhook接続 — 反映:** OS Closeの要求受付と、承認済み退役の実行を分離する。後者はAppの終了済みbindingを再検索せず、型付きcommandの対象を使う。
+- **論点4 Full内logicからの直接退役 — 反映:** Appは承認済みcommandを発行するだけとし、Context・native資源の退役は最外側のUI／logic処理が戻ったpass外で行う。
+- **論点5 GCによるcommand消失・完了通知欠落 — 反映:** 子のGCに依存しない既存root command出力へ保持し、Full／LogicOnlyとpass外hookの全経路で配送する。通常GCと承認済み退役は共通cleanupを使い、AppへのClose完了通知を唯一の完了根拠にしない。
+
+候補(A)の「AppのClosingとbindingをbackend受理まで延命」は不採用とする。候補(B)の「既存viewport command出力への承認済み退役の追加」を採用し、Appの終了ownerを延命せず、出力への権限移譲後はbackendが資源寿命を完結させる。
+
+追加差分は段3の残作業として計上する。段2の完了記録を遡って書き換えず、正式vendor・App接続・回帰を追加レビューする。detached計画§11への追記と構造合意を実装再開の前提とする。
 
 ## 第4.4版 — 2026-10-16
 
@@ -194,6 +208,25 @@ C4の進捗だけをlogicへ移す分割は必須としない。完成採用か�
 | immediate子 | root／deferredと同じ出力・action契約へ揃え、描画資格は各子で判定する | 親の可視性を子の描画資格として流用する、immediateだけ常時描画する |
 
 既存modalの排他とoperation ownerを保ち、終了待ちのために新たな並行操作の組合せを作らない。まれなworker／資源処理失敗は既存のログ・通知・終端へ揃え、終了要求専用の回復機構は設けない。
+
+### 第4.5版: 承認済み退役の受渡しを一つにする
+
+本節の候補(A)／(B)は、最小化中のUI継続について利用者が選んだ「案B」とは別の比較である。最小化中のUI継続、期限超過時のLogicOnly、C1と保存・取消終端のlogic分離は変更しない。
+
+| 候補 | 必要になる寿命・状態 | 判断 |
+|---|---|---|
+| (A) Appの`Closing`とwindow／context bindingをbackend受理まで存続させる | App終了、native終了、通常GC、承認通知の前後をApp runtimeが扱う。worker／media終了後も同定用のownerを残す必要がある | 不採用。既存終了ownerの寿命を広く延ばし、Close hookと通常GCの双方からの完了を扱う組合せが増える |
+| (B) 承認済み退役を既存viewport command出力へ移譲する | Appは既存終了判断を一度行い、対象の資源退役権限を出力へ渡す。backendはpass外で資源寿命を完結させる | 採用。Appの登録解除後に再同定・再承認せず、Full／LogicOnly／OS Close後のcleanupを一つに揃えられる |
+
+単に子へ通常の`Close`を送る案、子を描かず次FullのGCを待つ案、Appから`Context::retire_viewport`を直接呼ぶ案では、今回の不足を解消できない。Fullの`App::logic`はUI pass内であり、子のcommandはeguiのGCで出力前に失われ得る。
+
+採用する(B)では、既存root command列を承認済み退役の搬送先にする。rootを閉じる命令ではなく、子のexactな寿命を対象とする終端出力である。子自身の登録がGCされても搬送先は失われない。
+
+Appのruntime、command、backend資源に同じ「終了待ち」を重複保持しない。権限移譲後のApp runtimeをbackend ACK待ちで残さず、第二の保留queue、pending bool、退役済みID集合による抑止ラッチを追加しない。
+
+古い出力を識別するため、存続中のviewport登録には、その登録寿命を表す不透明な識別子を持たせる。Context登録、ViewportOutput、backend資源、必要な既存App bindingで同じ識別子を参照する。これは生存資源の同定であり、退役履歴の保存ではない。`ViewportId`、egui memoryの永続Id、surfaceのresize generationとは区別する。同じViewportIdを明示的に開き直した場合も、旧寿命への出力で新しい窓を変更しない。
+
+通常の操作での終了・Remote取得・兄弟窓の維持を構造で保証する。まれな失敗は既定のログ＋通知［＋作り直し］で割り切り、退役のretryや回復用状態は追加しない。
 
 ## 2. 前提・更新履歴要約との相違
 
@@ -536,6 +569,20 @@ Local返却後のPC一覧再読込・既定起動先表示と、その先の本�
 
 `src/remote_ipc/ui.rs:4534`の返却処理は旧復元要求を消している。`:4587`以降に復元pollは残るが、今回照合した本番コードには新規`Some(PendingFullscreenRestore { ... })`生成元がなく、直接生成は`:6538`のテストfixtureである。slot置換では旧復元専用の`wait_frames`を継承せず、終了drainのfixtureを新しい一覧表示継続の所有・破棄へ合わせる。
 
+###### 第4.5版: ローカル窓の退役完了とFinishAcquire
+
+`service_remote_session`をlogicへ正式接続する条件として、全ローカル終了から空のimmediate UIを呼ぶ経路を除去し、§4.2「承認後の対象限定退役」の出力契約を成立させる。
+
+Appのruntimeやbindingが空になっただけで、同じlogic呼出し中にFinishAcquireしてはならない。承認済み退役をまだ出力へ保持している間は、既存のlocal close readinessを`InProgress`として扱う。
+
+この判断には、既存root command列にある未配送の承認済み退役という事実を使う。Remote側のpending bool、退役待ちqueue、退役済みIDラッチは追加しない。discard再passの間も承認済みcommandを同じ列へ保持するため、同じ外側runの次のlogicで誤って`Closed`と判定しない。
+
+backendは、最外側のFull／LogicOnlyが戻った後、次のApp処理に入る前に承認済み退役を完結する。この順序が成立して初めて、次の既存service機会で、従来のAI・保存・resume／shift・editorのreadinessと併せてFinishAcquireできる。既存のAcquiringRemoteのwakeを利用し、UI復帰待ち、追加repaint、退役のretryに置き換えない。
+
+これにより、RemoteActive／DrainingRemoteにローカル閲覧窓を残さない`docs/web-remote-plan.md` §2.2の契約を維持する。command発行をnative閉鎖完了と同一視せず、backendの退役にClose hookからの再承認やApp runtimeの延命を必要としない。
+
+検査対象は`src/remote_ipc/ui.rs:1214`の全窓終了、`:1233`のclose readiness、`:1259`のFinishAcquireと、`src/app.rs:77836`の既存close-state判定である。
+
 ##### C2: play-testと起動worker
 
 代表: `src/app/update_phases.rs:335`、`src/app.rs:31164`。
@@ -703,6 +750,18 @@ passive FrameのOS Close読取りは新受付へ集約し、同じ要求をFrame
 
 根拠: `src/app.rs:3247`、`:3524`、`src/app/detached_window_manager.rs:169`、`:265`。
 
+第4.5版では、上記の「終了を確定した」と「backend資源を退役する」の受渡しを次のように具体化する。
+
+- OS Closeのhookを呼ぶ前に、backendは要求対象の登録寿命を捕捉する。hook後に同じViewportIdだけを再検索して、別の寿命へ承認を適用しない。
+- mIVの共通終了ownerは、modal等による拒否なら退役commandを発行しない。承認なら、bindingを解除する前に「承認済み退役」を既存command出力へ渡し、その後にApp側の終端処理を完結させる。
+- hookの返値には、要求を消費し、承認済み退役を出力へ移譲したことを表す結果を用意する。仮称は`RetirementTransferred`とする。この結果を通常の`Close`要求へ戻したり、Appへ再照会したりしない。
+- 段2の`ViewportCloseResponse::Close`を使う互換経路も、hook前に捕捉した登録寿命への承認として、同じ型付き退役処理へ正規化する。ViewportIdだけを使う第二の直接cleanup経路は残さない。
+- `DelegateToUi`は非管理viewportの従来契約として維持する。mIVのApp ownerが既に終了したことを理由に、承認済み退役をこの結果へ落とさない。
+- App起点の承認済み退役を先に処理し、対象資源が終了した後で、同じ旧寿命のOS Closeを未知の子として再配送しない。対象が存続するmodal拒否では、一回の要求消費後も新規Closeを受け付ける。
+- pass外hookから発行された承認済みcommandも、その非描画境界で取り出して処理する。次のFull、子callback、追加repaintを待たない。
+
+現在の段2実装は`vendor/eframe/src/native/viewport_lifecycle.rs:24`以降で、hookの`Close`結果からViewportIdを使って直接退役する。第4.5版では、この受渡しを上記の寿命付き承認へ改める。hookのmodal判断や通常入力の所有契約は変更しない。
+
 ##### 承認後の対象限定退役
 
 Appが登録を外しても、親の次のFull passだけを待ってbackendを掃除する設計にはしない。rootもlogic-onlyの場合を含め、承認した子を復元せずに終了できることを契約とする。
@@ -715,7 +774,97 @@ Appが登録を外しても、親の次のFull passだけを待ってbackendを�
 - 対象viewportに未配送texture deltaがあれば、§4.9の共有renderer ownerへ引き継いでから退役する。window終了を理由に共有deltaを捨てない。
 - 既存終了処理が持つ保存・取消の意味を維持する。まれな失敗用のretryや新しい回復状態は追加しない。
 
-本家のbackend GCは`eframe-0.37.0/src/native/wgpu_integration.rs:1330`、`src/native/glow_integration.rs:1533`。Context登録の通常GCは`egui-0.37.0/src/context.rs:3317`以降。現本家にこの非描画退役入口があるとは扱わず、今回の限定追加としてvendor台帳と段2へ計上する。
+本家のbackend GCは`eframe-0.37.0/src/native/wgpu_integration.rs:1330`、`src/native/glow_integration.rs:1533`。Context登録の通常GCは`egui-0.37.0/src/context.rs:3317`以降。現本家にこの非描画退役入口があるとは扱わず、今回の限定追加としてvendor台帳と段2へ計上した。段2で実装した入口だけではAppからの受渡しが成立しないことが段3で判明したため、以下の型付き出力・寿命同定・配送の追加は段3へ計上する。
+
+###### 承認と権限移譲
+
+採用する方式は、既存viewport command出力への「承認済み退役」の追加である。以下では仮称を`ViewportCommand::RetireApproved`、対象を表す値を`ApprovedViewportRetirement`とする。
+
+このcommandは終了可否を問う要求ではなく、既存終了ownerが確定した資源寿命の終了をbackendへ移譲する終端出力とする。
+
+1. Appは既存modal・取消・保存方針を使って終了を判断する。
+2. 終了が確定した時点で、window／context bindingを解除する前に、exactな対象viewportの登録寿命を捕捉する。
+3. 対象寿命と、その寿命に所有される子孫への退役権限を、一つの型付きcommandとして既存root command列へ移す。
+4. その後はAppの既存終了処理を進め、runtimeとbindingを終えてよい。backend受理待ちのClosingや同定用runtimeを残さない。
+5. backendはcommandの対象を使う。終了済みのApp登録、現在のactive context、foreground、rectから対象を推定し直さない。
+
+対象はViewportIdだけでなく、その登録寿命の識別子を含む。Context登録とbackend資源は同じ識別子を持ち、必要な既存window／context bindingにもその対応を保持する。新しい登録寿命は実際の登録作成時に割り当て、明示的な再openでは新しい寿命にする。永続egui Idやsurface resize generationは流用しない。
+
+既にContextの通常GCが済んでいてnative資源だけが残る場合も、既存bindingが持つ旧寿命への承認を出力できる形にする。存在しないviewportを`viewport_for`等で新規登録してから退役する方法は採らない。初回登録前でContext・native資源のどちらも存在しない対象は、App側の既存要求を終端させればよく、架空の登録やwindowを作らない。
+
+子孫への権限は、対象の登録寿命を根とする所有関係に限定する。command作成時のContext上の子孫情報を保持し、pass外で残存native資源を照合する際も、同じ寿命の親子関係だけを辿る。ViewportIdだけが一致する別寿命や、独立した兄弟を巻き込まない。子孫ごとの再承認hookは呼ばない。
+
+同じ終了処理内で子と祖先の承認が重なった場合は、既存command列の正規化で重複をまとめ、各資源寿命に対する実効的な退役は一度にする。二重終了を防ぐ別ラッチや、退役済みID集合は作らない。
+
+rootはこのcommandの退役対象にできない。root command列は搬送先にすぎず、root自身のClose、CancelClose、tray置換、保存待ちの意味は変えない。
+
+###### GC前の保持とFull／LogicOnly配送
+
+子自身の`ViewportOutput.commands`だけに承認を置くと、未使用childのGCによって出力前に失われる。搬送先は既存root command列とし、子の登録が消えても承認を保持する。
+
+- Fullでは、最外側の`run_ui`／`run_pass`が完了した出力へ渡す。Appのlogic／uiから直接Context退役を呼ばない。
+- immediate子の入れ子passでは、親passが残る間に退役を実行しない。承認済みcommandを最外側まで保持する。
+- discardによる再passでも承認を失わない。承認済みcommandは途中passで搬送先から取り去らず、最外側のrun全体が戻る時に出力へ移す。通常commandの既存集約と区別して扱い、第二queueを作らない。
+- `begin_pass`／`end_pass`を直接使うconsumerには、最外側の出力を消費してから次の処理へ進む同じ契約を適用する。
+- LogicOnlyでは、`run_logic`の`LogicOutput.viewport_commands`へ渡し、その処理が戻ったpass外で消費する。
+- OS Close用のpass外App hookから発行した場合は、既存command列を同じ境界でdrainする。drainのためにUIや`App::logic`をもう一度呼ばない。
+- FullOutputのappend、EpiIntegrationの既存出力保留、子の出力集約を通っても承認を落とさない。
+- 両backendは、承認済みcommandを一般のwindow command処理より先に取り出す。対象native viewportが既に存在しないことを理由に、commandごと読み飛ばさない。
+
+backendは、最外側の処理から戻った後、次のApp処理へ入る前に、受け取った承認済み退役を完結させる。surface描画の有無、通常backend GC、rootの終了確定による早期returnより前に、この出力を処理する。
+
+現在の実装では`vendor/egui/src/context.rs:3338`のGC後に`:3347`以降でviewport outputを組み、`:3352`でcommandを取り出す。`run_logic`の取り出しは同`:1174`以降である。上記は、この既存搬送経路に追加する契約であり、現コードで成立済みとは扱わない。
+
+###### 古い出力と再作成
+
+承認済み退役は、その出力内の古いbuilder・callback・通常commandより優先する。
+
+- cleanup後、同じ旧寿命のViewportOutputからnative windowを作り直さない。
+- 現在のContext登録寿命と一致しない出力を、登録作成・更新の根拠にしない。
+- 同じViewportIdを明示的に再openして新しい登録寿命ができた場合、旧出力で新しい窓を更新・終了しない。
+- FullOutputを集約する際も、異なる登録寿命のbuilder・callback・commandを一つの寿命の出力として混ぜない。
+- 退役対象自身だけでなく、その旧寿命の子孫についても同じ条件を適用する。
+- EpiIntegration等が持つ既存出力内の対象情報も処理対象とする。退役済みIDを別に記録して後から抑止する設計にはしない。
+
+同じ承認出力が集約や診断cloneを経ても、資源ownerを実際に取り外せるのは一度だけとする。既に存在しない旧寿命への再適用は、新しい窓の作成やApp hookの再呼出しを起こさない。診断cloneを独立した実行ownerにしない。
+
+###### cleanupの順序
+
+両backendは、承認済み退役と通常GCで対象資源のcleanupを共通化する。次の順序を満たす。
+
+1. 現在までのFull／immediate出力が持つtexture deltaを共有renderer ownerへ移譲する。対象windowの資源と一緒に共有deltaをdropしない。
+2. 対象寿命と子孫の集合を、commandに保持した情報、現在のContext登録、native資源の所有関係から確定する。既に一部がGC済みでも、残っている所有者を取りこぼさない。
+3. 対象の新規callback配送・古い出力適用を止め、native側のwindow対応、入力配送、保留RawInput、focus／resize参照、surface／glutin資源等を対象限定で退役させる。native資源の親子依存は子から解消する。共有rendererは残す。
+4. backend borrow／lockを解放し、pass外でContextの同じ登録寿命を退役させる。callback等のuser-owned値のdropもContext lockの外で行う。
+5. IME policy等の対象別状態を同じ集合について終了する。ContextのGCで既に登録が消えていた場合も、`retire_viewport`が返した「今回削除したID」だけに依存してIME cleanupを省略しない。同じViewportIdの新寿命が存続する場合は、その状態を消さない。
+6. Context／callback／TextureHandleのdropで追加のtexture deltaが生成された場合も、共有renderer ownerへ移譲する。既存のset適用・submission・free順で完結または引き継ぐ。回収のための追加repaintは使わない。
+7. rootも終了する場合は、その後に共有renderer／Contextの既存終了契約を完結させる。root終了を理由に承認済みcommandや未処理deltaを捨てない。
+
+Contextの通常GCが先に一部を除いていても、保持済みの承認とnative資源の寿命から残りを終了できることを必要条件とする。AppへのClose完了callbackが来ることを唯一の完了根拠にしない。
+
+存続する兄弟の入力、IME、memory、cache、texture、surface、worker、世代には触れない。通常GCも承認済み退役も、共有texture managerや全viewportを一括resetしない。
+
+###### Appの終了入口と非管理viewport
+
+| 入口・状態 | 受渡し |
+|---|---|
+| mode change、Remote取得時の全ローカル終了 | 各対象の既存終了判断を行い、binding解除前に同じ承認済み退役入口へ渡す |
+| active detached sessionの終端 | `finish_active_detached_session_close`／`retire_terminal_detached_viewport_identity`の同定情報を失う前に移譲する |
+| parked／passiveの終了、contextのclose-and-retire | 各window／context ownerで終了を確定し、その対象寿命へ移譲する。activeの現在値を代用しない |
+| barの×、watcher | 既存modal判断・終了serviceへ合流し、承認後は同じ退役出力を使う |
+| OS Close、通常のprogrammatic Close | 未承認の要求としてhookへ渡し、拒否なら一回消費、承認なら同じ退役出力へ正規化する |
+| parking、hide、最小化、表示切替の途中 | 寿命終了ではない限り発行しない。parked-liveの存続を壊さない |
+| mIV非管理viewport | 従来のUI委譲を維持する。管理対象不明を一律承認する処理を足さない |
+| native presenter等の独自HWND | 既存native終了owner／control配送を維持する。このcommandでegui非所有HWNDを直接破棄しない |
+| root終了 | 既存root lifecycleを維持し、子の承認済み出力とdeltaを完結してから共有資源を終了する |
+
+`close_all_detached_viewers_for_mode_change`末尾の空の`show_viewport_immediate`、それに続く退役目的の`Visible(false)`と「描かないことでGCに消させる」経路は、この受渡しへ置き換える。実際の終了観測も、架空のVisible command発行を完了根拠にしない。
+
+WIPの影響箇所は`src/app.rs:3810`、`:60709`、`:61213`、`:61384`付近、`src/ui_fullscreen.rs:22175`、`src/remote_ipc/ui.rs:1214`。対象の終了helperへContextまたは承認済み出力のsinkを明示して渡し、同定できなくなった後に現在のfullscreen viewportを再計算しない。その他の呼出しは次で棚卸しする。
+
+`rg -n 'retire_terminal_detached_viewport_identity|finish_active_detached_session_close|close_all_detached_viewers_for_mode_change|close_detached_image_windows_by_ids|close_and_retire_context' src`
+
+通常GCは、参照されなくなった通常viewportの資源を従来どおり終了できる。ただし、Appの承認済み退役の代用品にはせず、GCをClose承認や完了通知の生成器にしない。承認済みcommandがある資源については、GCが先でも後でも、同じcleanupで残存資源を一度だけ終了する。
 
 ##### Close以外の要求・通知の棚卸し
 
@@ -1302,6 +1451,23 @@ IME修正の本家境界は`egui-0.37.0/src/memory/mod.rs:124`、`:503`、`:799`
 
 非描画退役は、Appの既存終了ownerが承認したviewportの寿命終了に限る。通常のGC境界は`egui-0.37.0/src/context.rs:3317`以降。最小化・hideだけでは呼ばず、UI pass強制、全memory reset、退役済みIDを抑止する別ラッチで代用しない。通常GCとの処理範囲共有、兄弟不変、後続出力での非再作成を回帰化する。
 
+第4.5版の追加台帳。段2の非描画退役入口を置き換える受渡し不足の解消であり、追加実装・回帰は段3へ計上する。
+
+| 項目 | 分類・方針 |
+|---|---|
+| 承認済み退役の型付きcommand | (b・新規) 通常Close要求と分離する。exactな登録寿命と子孫への権限を、既存root command列で搬送する |
+| 生存登録の寿命同定 | (b・新規) Context登録・ViewportOutput・backendが同じ不透明な登録寿命を参照する。同じViewportIdの再openを旧出力から区別する。永続Idやsurface resize generationを流用しない |
+| GC前保持と最外側への移譲 | (b・新規) 子のGCで承認を失わず、immediate入れ子・discard再passでは最外側runの完了まで既存列へ保持する。Full／LogicOnly双方へ配送する |
+| 出力appendの寿命境界 | (b・新規) 同じViewportIdでも異なる登録寿命のbuilder・callback・commandを混ぜない。承認済み退役を後続出力の上書きで失わない |
+| 寿命を限定したContext退役 | (b・追加修正) pass外制約は保持し、承認された旧寿命と子孫だけを除く。新寿命・root・兄弟を除去しない |
+| pass外command drain・未配送事実の照会 | (b・新規) Close hookからの出力も既存列から処理できる入口を用意する。Remote readinessは同じ未配送出力を照会し、補助状態を持たない |
+
+主な対象は`vendor/egui/src/viewport.rs`、`src/data/output.rs`、`src/context.rs`と、その既存回帰である。現在の境界は`context.rs:1080`のrun集約、`:1174`のLogicOutput、`:3170`のGC共通処理、`:3338`のGC、`:3347`の出力生成、`:3418`の非描画退役入口。
+
+既存`retire_viewport`のpass外制約を緩めない。Appのlogic／uiから即時破棄を可能にする変更にはせず、producerとpass外consumerを分ける。未知の対象を登録し直してから終了する方法、別の終端queue、退役履歴集合は追加しない。
+
+通常GCで既にContext登録が消えている場合も、承認済み出力は残る。backend／IME cleanupの対象を「Contextが今回削除できたID」だけで決めない。退役後のcallback drop等で生じるdeltaの引継ぎも§4.9へ接続する。
+
 #### egui-winit
 
 | 項目 | 分類・方針 |
@@ -1370,6 +1536,26 @@ RedrawRequested期限超過は`eframe-0.37.0/src/native/run.rs:29`、`:233`、`:
 root lifecycleの製品判断はApp側の既存ownerへ置き、vendor側でtray設定・保存状態を解釈しない。非描画context境界もApp側の責務であり、vendorに表示抑止flagを追加しない。
 
 immediate修正は既存のscreenshot callback移行、通常版計測、非描画・消滅viewport deltaと同じ入口へ付け直す。別rendererや別pending delta ownerを増やさない。
+
+第4.5版の追加台帳。以下は段3で判明した受渡し不足の修正として正式vendorへ追加し、段2の既存ACCEPTとは別に検証する。
+
+| 項目 | 分類・方針 |
+|---|---|
+| 承認済み退役の共通consumer | (b・新規) Full／LogicOnly／pass外hookから同じ型付きcommandを受け、次のApp処理より前に対象資源を退役する |
+| Close要求と承認済み退役の分離 | (b・追加修正) OS／通常Closeは既存hookへ、承認済みcommandは再承認せずcleanupへ渡す。hook前の対象寿命を保持する |
+| hook結果の受渡し | (b・追加修正) mIVの終了ownerが出力へ移譲した結果を表現する。既存Close結果も寿命付き承認へ正規化し、ViewportIdだけの直接破棄を残さない |
+| 古い出力の非再作成 | (b・新規) 対象寿命を退役してから通常outputを適用する。Contextの現登録寿命と一致しないbuilder・callbackからwindowを作成・更新しない |
+| 通常GCとのcleanup共通化 | (b・追加修正) 既にGC済みの部分を含め、残存native／Context／IME資源を終了する。Close完了hookの到着を前提にしない |
+| 終端時のdelta引継ぎ | (b・追加修正) 共有deltaを先に移譲し、Context／callback drop後の追加deltaも共通renderer ownerへ渡す |
+| root終了・早期return | (b・追加修正) 受領した承認済みcommandとdeltaの完結を、root終了・surfaceなし・通常GCによって飛ばさない |
+
+対象は`vendor/eframe/src/native/viewport_lifecycle.rs`、`epi_integration.rs`、`wgpu_integration.rs`、`glow_integration.rs`、App hookの型を持つ`src/epi.rs`と関連回帰である。
+
+wgpuの`remove_viewports_not_in`／`handle_viewport_output`、glowの同等処理、両backendの`render_immediate_viewport`からの集約、EpiIntegrationの既存FullOutput保留を含める。immediateの内側でContextを退役せず、最外側の出力consumerへ揃える。
+
+通常GCと承認済み退役は同じ対象資源cleanupを使うが、意味は混ぜない。GCはAppへの終了要求を作らず、承認済みcommandはOS Closeを作らない。非管理viewportの従来UI委譲、root lifecycle、兄弟資源を維持する。
+
+最小化中のUI継続、期限超過LogicOnly、viewport別RawInput、非描画action、screenshot、deltaの既存差分は撤去しない。今回の修正を、追加repaint・強制UI・次FullのGC待ちで成立させない。
 
 #### egui-wgpu
 
@@ -1463,6 +1649,12 @@ whole→partial、同一ID内の順序を維持する。freeは当該使用のsu
 製品の無条件clearは禁止する。headless APIで出力を捨てて同じ製品Contextを継続しない。
 
 例: `src/ime_focus.rs:795`。testもoutput検査後に明示破棄する。
+
+第4.5版の承認済み退役では、windowとContext登録の退役より先に、既に生成されたFull／immediate出力のdeltaを共有renderer ownerへ移譲する。古いViewportOutputを適用対象から除いても、そのFullOutputの共有deltaを一緒に破棄しない。
+
+Contextの登録・callback・TextureHandleをdropした結果、texture managerに追加deltaが生じる場合も同じownerへ引き継ぐ。通常GCが先に行われた場合の追加分も含め、回収に次のUI passや追加repaintを必要としない。生存する兄弟と共有するtexture managerをclearしない。
+
+wgpu／glowとも、surfaceなしの退役では既存の無描画submission契約を使う。root終了を伴う場合も、子の承認済みcommandと追加deltaを既存のrenderer終了ownerへ渡してから終了する。正常な退役をheadless用の明示破棄で代用しない。
 
 #### 無描画submission
 
@@ -1576,6 +1768,21 @@ rect捕捉条件、geometry由来recreate、新detached pending bool、時間窓
 §11へは、追加でroot lifecycleの非描画受付・既存延期ownerへの合流、owner付き状態更新と非描画mount／UI mountの境界、immediate子自身の描画資格を追記する。§11本文は設計担当が更新する。
 
 状態mountで兄弟の表示を再採用しないことと、次の正当なUI境界では従来どおり再採用することを、両方の不変条件として記録する。既存のrating publicationを後付けguardで抑える変更にはしない。追加3件の実装前レビューと、案B自体について成立した合意を区別する。
+
+第4.5版では、段3で判明したApp終了ownerとbackend資源ownerの受渡し不足について、次をdetached計画§11へ追記する前提とする。§11本文は設計担当が更新する。
+
+- 候補(A)のApp Closing／binding延命を採らず、候補(B)の承認済み退役出力への一度の権限移譲を採る理由。
+- exactな対象登録寿命と子孫の範囲、同じViewportIdの新寿命と兄弟を変更しない条件。
+- 既存root command列でのGC前保持、immediate入れ子・discard再pass・Full／LogicOnly・pass外hookの配送境界。
+- App runtime終了後に再同定・再承認せず、pass外consumerがnative／Context／IME資源を終了すること。
+- 古い出力による非再作成、通常GCとのcleanup共有、共有deltaとdrop後の追加deltaの引継ぎ。
+- mode change、active／parked／passive終了、Remote取得、watcher、barの×、通常OS Closeと非管理viewportの扱い。
+- RemoteのFinishAcquireが、App登録解除だけを根拠にnative退役より先行しないこと。
+- root lifecycle、最小化中のUI継続、期限超過LogicOnly、native presenterの既存終了ownerを維持すること。
+
+これは、空のUI呼出し、GC待ち、終了後のViewportId再検索という不成立な受渡しを、既存出力ownerへの移譲に置き換える構造修正である。guard・時間窓・retry・追加repaintによる症状パッチではないことについて、設計担当と独立レビュー担当の追加合意を得る。
+
+第4.4版と段0〜段2の既存ACCEPTを取り消す変更ではないが、そのACCEPTを今回追加分の承認として流用しない。限定レビューによる候補(B)推奨も、今回の具体的契約の独立ACCEPTとは区別する。
 
 ### 4.12 Rust 1.99警告とMSRV
 
@@ -2013,6 +2220,73 @@ C2・C4・C5とC3の表示用pollをuiへ残すため、全完成結果のlogic�
 
 段1b後に実差分で再評価する。gamepadやnative配送の抽出が不足する場合は、旧版上の挙動不変抽出を追加し、原子切替へ未整理の大改修を押し込まない。
 
+#### 第4.5版: 段3停止点からの追加範囲と再見積り
+
+`df0037eb7`は段3途中のWIPであり、通常core check成功をClose接続・全test target・正式vendor回帰の成立証拠にしない。段3台帳の未実施条件はそのまま残す。
+
+段0〜段2の完了済み差分を遡って未完了へ戻さず、今回の追加vendor修正と製品接続を段3内で完成させる。段4へ退役契約やC1の正式logic接続を先送りしない。
+
+追加範囲:
+
+1. eguiの承認済み退役command、登録寿命の同定、root command列での保持、Full／LogicOnly／pass外drain、入れ子・discard・appendの契約を実装する。
+2. eframeの両backendで、承認済み退役consumer、通常GCとのcleanup共有、旧出力の非再作成、root終了時の出力完結を接続する。
+3. Appの既存終了ownerで、binding解除前に権限を移譲する。`finish_active_detached_session_close`等のhelperへ必要なContextまたは出力sinkを明示して渡す。
+4. mode changeの空immediate UIと退役目的のVisible(false)を除き、logic／uiから同じ終了入口へ揃える。
+5. active／parked／passive、watcher、barの×、OS／programmatic Close、Remote起点を棚卸しし、未承認要求と承認済み退役を混ぜない。
+6. Remoteのclose readinessを未配送の承認済み出力と接続し、C1をlogicへ正式接続する。AcquiringRemoteの既存wake・保存・AI・取消・ACK契約を維持する。
+7. 以下の追加回帰を正式graphで実施し、段3台帳へ選択件数・結果・対象sourceを記録する。
+
+見積りは、上の第4.4版までの段3見積りに対する増分である。通常Closeの既存接続・回帰、段2の既存vendor移植、原本・lockfile・PNGを重複計上しない。
+
+| 第4.5版の追加内訳 | 概算変更行 |
+|---|---:|
+| egui／eframeの承認済み出力・寿命同定・配送・cleanup修正 | 450～850 |
+| App終了入口・mode change・Remote readinessの追加接続 | 150～300 |
+| 今回追加するvendor／App接続回帰 | 450～850 |
+| **追加合計** | **1050～2000** |
+| **段3全体の改訂見積り** | **4350～8800** |
+
+追加差分の対象は約14～24ファイルを見込む。多数は既存の段3対象と重なるため、旧見積りの112～200ファイルへ単純加算しない。段3全体は概ね115～215ファイルを目安に、再開後の実差分で更新する。
+
+この数字は段3全体の設計見積りと今回の追加量であり、WIPからの残り全変更行数を測定した値ではない。既存WIPの機械的test移行、ラボ、gamepad等の未完量は段3台帳から別途見積もる。既に実装した行数を新規残作業として数え直さない。
+
+作業は、vendorの受渡し契約とheadless回帰、App終了入口とRemote正式接続、残る段3全target移行・検証の順に分ける。各チェックポイントでcore checkを維持し、機能未接続の状態を段3完了として扱わない。正式な独立レビューは今回の所有・非同期・複数窓境界を対象に行う。
+
+#### 第4.5版: 追加必須回帰と受入条件
+
+既存の段3受入1〜16と、IME・gamepad・入力・deltaの必須回帰は維持する。次を追加する。
+
+1. **Full内logicからの退役:** 実`EpiIntegration::update`でApp::logicから承認済み退役を発行する。UI pass内の直接破棄を起こさず、最外側から戻ったpass外で対象native／Context／IME資源が終了する。
+2. **LogicOnlyだけの退役:** UIと子callbackを一度も呼ばず、実`update_logic_only`の出力から対象を終了する。次のFull、追加repaint、通常GCを完了条件にしない。
+3. **GC前の保持:** 承認後に対象childを使わず、実`Context::end_pass`のGCを通す。子のViewportOutputがなくなっても承認がroot出力に残り、native／IMEの残存資源が終了する。
+4. **immediate入れ子:** 子callbackから承認を発行しても、親passが残る間にContext退役を行わない。最外側が戻った後に対象と所有子孫だけを終了する。
+5. **実discard再pass:** 第1 passで承認し、discardでlogicを再実行する。承認が保持され、App終了ownerの再実行や二重退役がなく、Remoteが途中passでFinishAcquireしない。
+6. **exactな子孫と兄弟:** 対象・子孫・独立兄弟を置き、Contextとnativeで一部のGC状況を変える。承認した寿命の残存資源だけが終了し、兄弟の入力・IME・pending RawInput・surface・texture・workerを維持する。
+7. **旧出力と再open:** 退役前に取得したbuilder／callback／commandを含む出力を、退役後のroot／兄弟出力と集約・処理する。旧窓を再作成しない。同じViewportIdを明示的に新寿命で開いた場合も、旧出力が新窓を更新・終了しない。
+8. **通常Closeとの分離:** modal拒否は一回消費され、復元後に再発火しない。新規Closeは受理する。承認済みcommandをOS Closeへ変換せず、終了済みApp bindingを再検索しない。非管理viewportは従来の委譲へ進む。
+9. **終了入口:** mode change、active、parked、passive、watcher、barの×、OS／programmatic Closeの代表を同じApp終了ownerへ通す。mode change／Remoteから空immediate UIへ到達しない。parkingだけでは退役しない。
+10. **Remote取得:** Full、LogicOnly、discard再passそれぞれで取得を開始する。App runtime解除後でも未配送承認がある間はAcquiringRemoteを維持し、backend退役後の既存service機会で、保存・resume／shift・editor・AI readinessと併せてFinishAcquireする。UI復帰を必要としない。
+11. **deltaとdrop後の追加分:** whole／partial／freeを含む共有deltaと、Context／callback dropで生じる追加freeを使う。対象終了でdeltaを失わず、submit前freeを行わず、兄弟textureを維持する。surfaceなしとroot同時終了も検査する。
+12. **通常GC・重複・順序:** 承認済み退役と通常GCの順序を入れ替え、祖先と子の承認が重なる場合も各資源を一度だけ終了する。Close hookからの完了通知がなくても残存資源を終了する。
+13. **root終了:** 子の退役とroot Closeが同じ処理で起きても、rootのtray置換・保存待ち・CancelCloseを維持する。終了確定時はcommandとdeltaを消費してから共有ownerを終了する。
+
+vendor回帰は同じ共通シナリオをwgpu／glowの両adapterへ適用する。状態・配送はheadless／fake backendを主証拠とし、deltaのsubmission／freeは既存のoffscreen検証を使う。実ウィンドウ起動を通常の自動gateへ混ぜない。
+
+追加回帰の共通filterを`viewport_retirement`とし、正式manifest／featureに合わせて次を実行する。
+
+```powershell
+cargo test -p egui --lib viewport_retirement
+cargo test -p eframe --lib viewport_retirement --no-default-features --features default_fonts,wgpu
+cargo test -p eframe --lib viewport_retirement --no-default-features --features default_fonts,glow
+cargo test -p mimageviewer --lib viewport_retirement
+```
+
+Appの代表回帰は`viewport_retirement`で選択できる名前へ揃える。選択0件を成功と扱わない。GPU前提不成立は未実施として台帳へ残し、状態回帰の成功と区別する。
+
+追加差分後に、既存段3のcore／test-script feature／workspace check、全test target compile、IME・continuation・root lifecycle・context state・両backend minimized_full、focused、fmtのgateを完了する。main lib全件は`.\scripts\test-lib-full.ps1`を使い、段3台帳の最後の1回を実施・分類する。最終`test-full.ps1`と確認用buildの段階は既存計画を維持する。
+
+`df0037eb7`で未実施のgateを、今回の追加回帰で代替しない。snapshot PNGはこの受渡し修正のために更新しない。
+
 #### 第4.3版追加範囲・受入条件
 
 段1bの抽出を、案Bの正式backendへ接続する。「logic service」は§4.2の個別境界を意味し、全`service_*`の一括移動は行わない。
@@ -2255,6 +2529,16 @@ modal拒否・初回callback前・兄弟Fullとの順序網羅は非対話回帰
 
 厳密な期限超過中のClose、receiptとratingの競合順序、UI呼出し0回は非対話回帰で検査する。利用者へdeadline発生の手動再現を求めず、保存失敗や設定破損も作らない。エージェント実行は既存の明示承認・使い捨てportableの規則に従う。
 
+第4.5版の実機代表確認:
+
+22. active／passiveの別窓を用意し、一方を通常のbarの×またはタスクバーのCloseで終了する。もう一方の表示・入力を維持し、rootや兄弟を操作した後にも閉じた窓が再作成されないことを確認する。parkedの終了は既存操作で作れる代表一例に絞る。
+23. ローカル閲覧窓を残した状態でrootを最小化し、Remoteから操作権を取得する。PCを復元せずローカル閲覧窓が終了し、取得後の一覧表示・ページ送り・保存が応答することを確認する。返却後は既存の一覧へ戻り、閉じた窓を復元しない。
+24. 別窓を閉じた直後に同じ本を明示的に開き直し、新しい窓が維持されることを確認する。別窓を残したroot終了も代表一例で確認し、通常×のtray置換と明示終了の既存差を維持する。
+
+Full／LogicOnly、GC前後、discard再pass、古い出力、同じViewportIdの新寿命、deltaの厳密な順序は非対話回帰を主証拠とする。期限超過やGC競合の手動再現を利用者へ求めない。実機手順のために追加repaintや製品内の試験用タイマーを追加しない。
+
+エージェントによる実行は、既存の明示承認・使い捨てportable・実データ保護の規則に従う。今回の読み取り調査では製品を起動しておらず、上記を確認済みとは扱わない。
+
 ### 7.5 動画HUD・GPU
 
 1. 再生、HUD文字、時間、速度、音量、track。
@@ -2343,3 +2627,23 @@ modal拒否・初回callback前・兄弟Fullとの順序網羅は非対話回帰
 - 案Bについて成立した構造合意を維持し、追加のroot lifecycle・非描画mount・immediate子描画の範囲と理由を§11へ記録している。
 
 段1b台帳のO6・F6はroot lifecycleへの接続へ更新する。C1／C3／F13の留保には、callback本体だけでなくmount前後の表示副作用を含める。段1b-2のgamepadのみの並行実装へ追加3件を混ぜず、検証証拠とファイル所有を分ける。
+
+第4.5版の追加完了条件:
+
+- 候補(B)の具体的な権限移譲・配送・cleanup契約について、設計担当と独立レビュー担当の構造合意があり、detached計画§11へ範囲と理由を記録している。
+- Appの終了判断後、binding解除前に、exactな対象登録寿命と子孫への承認済み退役を一度だけ出力へ移譲する。
+- App runtimeやClosingをbackend ACK待ちで延命せず、終了後のViewportId再検索・再承認を必要としない。
+- 承認済み出力が子のGC前に既存root command列へ保持され、Full／LogicOnly／pass外hookの全経路からpass外consumerへ届く。
+- immediate入れ子とdiscard再passで承認が消失・二重適用されず、親passの途中にContext退役を行わない。
+- backendが次のApp処理へ入る前に承認済み退役を完結し、surface描画、次Full、追加repaint、Close完了hookを必要条件にしない。
+- 旧出力で退役済み寿命を再作成せず、同じViewportIdの新寿命を旧command・builder・callbackから区別する。
+- Contextの通常GCが先でも、native／IMEを含む残存資源が終了する。通常GCと承認済み退役のcleanupが共通化されている。
+- wg​​pu／glowで、共有deltaの先行移譲、対象限定のnative／Context／IME cleanup、drop後の追加delta引継ぎ、root終了時の完結が成立する。
+- root lifecycle、modal拒否後の新規Close、非管理viewportの委譲、兄弟資源、parked-liveの存続を維持する。
+- mode changeの空immediate UIと退役目的のVisible(false)が撤去され、logic／uiから同じ承認済み退役入口を使う。
+- mode change、active／parked／passive終了、Remote、watcher、barの×、OS／programmatic Closeの対応が台帳にある。native presenterの独自HWNDは既存終了ownerを維持する。
+- C1がlogicへ正式接続され、未配送の退役がある間にFinishAcquireしない。RemoteActive／DrainingRemoteにローカル閲覧窓を残さない。
+- 新しいpending bool、復帰待ちqueue、時間窓、強制UI、retry、退役済みIDの別ラッチを追加していない。
+- 第4.5版の追加回帰と、段3台帳の既存未達gateが正式graphで完了し、今回の追加差分について独立レビューを受けている。
+
+更新対象に、段3検証台帳、vendorのPATCHES／差分台帳、App終了入口とbackend退役の対応表を加える。段0〜段2のACCEPTと`df0037eb7`のcore check成功は履歴として保持し、今回の受渡し契約・実行時挙動の検証完了へ読み替えない。
