@@ -465,6 +465,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) state: DetachedWindowState,
     pub(crate) hwnd: u64,
     pub(crate) host_incarnation: u64,
+    viewport_binding: Option<super::viewport_retirement::ViewportCommandBinding>,
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
@@ -480,6 +481,7 @@ impl DetachedWindowRuntime {
             state: DetachedWindowState::Opening,
             hwnd: 0,
             host_incarnation: 0,
+            viewport_binding: None,
             placement: None,
             builder_placement_latch: None,
             trim_bboxes: std::collections::HashMap::new(),
@@ -532,6 +534,35 @@ impl DetachedWindowManager {
 
     pub(super) fn runtime(&self, window_id: u64) -> Option<&DetachedWindowRuntime> {
         self.runtimes.get(&window_id)
+    }
+
+    /// Bind the real Context registration, together with its command sink.
+    /// No registration is created for an owner that has not shown a viewport.
+    pub(super) fn capture_viewport_registration(
+        &mut self,
+        window_id: u64,
+        context: &egui::Context,
+    ) {
+        let viewport_id = super::App::detached_image_window_viewport_id(window_id);
+        let Some(binding) =
+            super::viewport_retirement::ViewportCommandBinding::capture(context, viewport_id)
+        else {
+            return;
+        };
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.viewport_binding = Some(binding);
+        }
+    }
+
+    /// Move approval before the existing owner removes its runtime or binding.
+    pub(super) fn transfer_viewport_retirement(&mut self, window_id: u64) {
+        if let Some(binding) = self
+            .runtimes
+            .get_mut(&window_id)
+            .and_then(|runtime| runtime.viewport_binding.take())
+        {
+            binding.transfer_retirement();
+        }
     }
 
     pub(super) fn placement(

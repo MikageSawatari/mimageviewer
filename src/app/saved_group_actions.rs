@@ -817,7 +817,10 @@ mod tests {
             egui::RawInput {
                 events: vec![
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("未確定".into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "未確定".into(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Key {
                         key: egui::Key::Escape,
                         physical_key: Some(egui::Key::Escape),
@@ -1179,7 +1182,7 @@ mod tests {
         });
         assert!(app.handle_keyboard(&ctx).is_none());
         assert!(app.saved_group_open_modal_visible());
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         app.cancel_saved_group_open_for_other_nav();
 
         ctx.begin_pass(egui::RawInput {
@@ -1188,7 +1191,7 @@ mod tests {
         });
         assert!(app.handle_keyboard(&ctx).is_none());
         assert!(app.show_favorites_editor);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         app.show_favorites_editor = false;
         ctx.begin_pass(egui::RawInput {
@@ -1206,7 +1209,7 @@ mod tests {
             !app.show_favorites_editor,
             "repeat must be claimed without reopening"
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]

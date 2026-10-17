@@ -205,7 +205,10 @@ mod ime_handler_tests {
         assert!(harness.ctx.memory(|memory| memory.focused().is_some()));
         harness.input_mut().events = vec![
             egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("preedit".into())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "preedit".into(),
+                active_range_chars: None,
+            }),
         ];
         harness.step();
         assert!(app.borrow().ime_input_active(&harness.ctx));

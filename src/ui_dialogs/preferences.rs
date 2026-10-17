@@ -4371,7 +4371,13 @@ mod tests {
         app.open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness.get_by_label("RAW").click();
         harness.run();
@@ -4427,7 +4433,13 @@ mod tests {
         app.open_preferences_page(PreferencesPage::General);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -4563,7 +4575,13 @@ mod tests {
             app.open_preferences_page(PreferencesPage::RawDevelop);
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1100.0, 850.0))
-                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
+                        app.show_preferences_dialog(ctx)
+                    },
+                    app,
+                );
             harness.run();
             harness.get_by_label("補正しない").click();
             harness.run();
@@ -5000,7 +5018,13 @@ mod tests {
         app.open_preferences_page(PreferencesPage::Folder);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -6503,7 +6527,13 @@ mod tests {
         app.open_preferences_page(PreferencesPage::Cache);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness.get_by_label("確認せず変換する").scroll_to_me();
         harness.run();
@@ -6525,7 +6555,13 @@ mod tests {
         app.open_preferences_page(page);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         // External-tool path checks repaint while their worker is pending.
         // These navigation tests need rendered transitions, not worker quiescence.
         harness.run_steps(3);
@@ -7240,7 +7276,13 @@ mod tests {
         app.open_preferences_page(PreferencesPage::Vst3);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness.get_by_label("Effect 39").scroll_to_me();
         harness.run();
@@ -7433,7 +7475,13 @@ mod tests {
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         assert_preferences_position(&harness, PreferencesPage::General, 0.0);
         harness
@@ -7536,7 +7584,13 @@ mod tests {
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         assert_preferences_position(&harness, PreferencesPage::General, 0.0);
     }
@@ -8229,7 +8283,10 @@ mod tests {
             );
             harness.input_mut().events.extend([
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("１２".into())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "１２".into(),
+                    active_range_chars: None,
+                }),
             ]);
             harness.run();
             harness.key_press(key);
@@ -8337,7 +8394,13 @@ mod tests {
         ));
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         // The search anchor intentionally animates a highlight; settle the scroll
         // then stop that animation before querying controls in this headless test.
         harness.run_steps(5);
@@ -8420,7 +8483,13 @@ mod tests {
         ));
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         for cancel in [true, false] {
             if !harness.state().show_preferences {
                 harness
@@ -8500,7 +8569,13 @@ mod tests {
         ));
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         for (cancel, enabled) in [(true, false), (false, false), (false, true)] {
             if !harness.state().show_preferences {
                 harness
@@ -8595,7 +8670,13 @@ mod tests {
         assert!(app.effetune.keep_visible_when_minimized());
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         for enabled in [false, true] {
             harness
                 .state_mut()
@@ -8661,7 +8742,13 @@ mod tests {
         app.open_preferences_page(PreferencesPage::Cache);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -8761,7 +8848,13 @@ mod tests {
 
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -8832,7 +8925,13 @@ mod tests {
             app.open_preferences_page(PreferencesPage::Cache);
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1100.0, 850.0))
-                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
+                        app.show_preferences_dialog(ctx)
+                    },
+                    app,
+                );
             harness.run();
             let settings = &mut harness.state_mut().pref_state.as_mut().unwrap().settings;
             if change_epub {
@@ -8948,7 +9047,13 @@ mod tests {
         app.open_preferences_page(PreferencesPage::ClipboardCapture);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         // Opening requests the page; the first dialog frame creates its draft.
         harness.run();
         let (tx, rx) = mpsc::channel();

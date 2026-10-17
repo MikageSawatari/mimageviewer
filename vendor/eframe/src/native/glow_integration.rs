@@ -139,6 +139,8 @@ struct GlutinWindowContext {
 
 struct Viewport {
     ids: ViewportIdPair,
+    registration: Option<egui::ViewportRegistration>,
+    parent_registration: Option<egui::ViewportRegistration>,
     class: ViewportClass,
     builder: ViewportBuilder,
     deferred_commands: Vec<egui::viewport::ViewportCommand>,
@@ -517,12 +519,29 @@ impl WinitApp for GlowWinitApp<'_> {
         if let Some(mut running) = self.running.take() {
             profiling::function_scope!();
 
-            running.integration.egui_ctx.on_exit();
+            let ctx = running.integration.egui_ctx.clone();
+            super::viewport_lifecycle::finish_pending_retirements(
+                &ctx,
+                &mut GlowChildCloseBackend {
+                    glutin: &running.glutin,
+                    painter: &running.painter,
+                    pending_deltas: &running.pending_deltas,
+                },
+            );
+            ctx.on_exit();
             running.integration.save(
                 running.app.as_mut(),
                 Some(&running.glutin.borrow().window(ViewportId::ROOT)),
             );
             running.app.on_exit(Some(running.painter.borrow().gl()));
+            super::viewport_lifecycle::finish_pending_retirements(
+                &ctx,
+                &mut GlowChildCloseBackend {
+                    glutin: &running.glutin,
+                    painter: &running.painter,
+                    pending_deltas: &running.pending_deltas,
+                },
+            );
             running.painter.borrow_mut().destroy();
         }
     }
@@ -639,6 +658,8 @@ impl GlowWinitRunning<'_> {
             self.app.as_mut(),
             &mut GlowChildCloseBackend {
                 glutin: &self.glutin,
+                painter: &self.painter,
+                pending_deltas: &self.pending_deltas,
             },
         );
     }
@@ -748,17 +769,27 @@ impl GlowWinitRunning<'_> {
             let is_root_viewport = viewport_ui_cb.is_none();
             if is_root_viewport {
                 // The app logic keeps ticking, so it can e.g. ask to be shown again:
-                let (
-                    egui::LogicOutput {
-                        platform_output,
-                        viewport_commands,
-                    },
-                    unused_input,
-                ) = self.integration.update_logic_only(
+                let (mut logic_output, unused_input) = self.integration.update_logic_only(
                     self.app.as_mut(),
                     raw_input.expect("root logic always acquires its own input"),
                 );
 
+                {
+                    let mut backend = GlowChildCloseBackend {
+                        glutin: &self.glutin,
+                        painter: &self.painter,
+                        pending_deltas: &self.pending_deltas,
+                    };
+                    super::viewport_lifecycle::finish_logic_output(
+                        &self.integration.egui_ctx,
+                        &mut backend,
+                        &mut logic_output,
+                    );
+                }
+                let egui::LogicOutput {
+                    platform_output,
+                    viewport_commands,
+                } = logic_output;
                 let mut glutin = self.glutin.borrow_mut();
                 if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
                     epi_integration::finish_root_logic_input(
@@ -859,9 +890,22 @@ impl GlowWinitRunning<'_> {
         // The update function, which could call immediate viewports,
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
-        let full_output =
+        let mut full_output =
             self.integration
                 .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+
+        self.pending_deltas
+            .borrow_mut()
+            .append(core::mem::take(&mut full_output.textures_delta));
+        super::viewport_lifecycle::finish_full_output(
+            &self.integration.egui_ctx,
+            &mut GlowChildCloseBackend {
+                glutin: &self.glutin,
+                painter: &self.painter,
+                pending_deltas: &self.pending_deltas,
+            },
+            &mut full_output,
+        );
 
         // ------------------------------------------------------------
 
@@ -869,14 +913,14 @@ impl GlowWinitRunning<'_> {
             integration,
             app,
             glutin: glutin_cell,
-            painter,
-            pending_deltas,
+            painter: painter_cell,
+            pending_deltas: pending_deltas_cell,
             ..
         } = self;
 
         let mut glutin = glutin_cell.borrow_mut();
-        let mut painter = painter.borrow_mut();
-        let mut pending_deltas = pending_deltas.borrow_mut();
+        let mut painter = painter_cell.borrow_mut();
+        let mut pending_deltas = pending_deltas_cell.borrow_mut();
 
         let egui::FullOutput {
             platform_output,
@@ -886,8 +930,6 @@ impl GlowWinitRunning<'_> {
             mut viewport_output,
         } = full_output;
         pending_deltas.append(textures_delta);
-
-        glutin.remove_viewports_not_in(&viewport_output);
 
         let window = glutin
             .viewports
@@ -1057,6 +1099,8 @@ impl GlowWinitRunning<'_> {
             app.as_mut(),
             &mut GlowChildCloseBackend {
                 glutin: glutin_cell,
+                painter: &*painter_cell,
+                pending_deltas: &*pending_deltas_cell,
             },
         );
 
@@ -1225,6 +1269,8 @@ impl GlowWinitRunning<'_> {
 /// hold the RefCell borrowed by the immediate viewport renderer.
 struct GlowChildCloseBackend<'a> {
     glutin: &'a RefCell<GlutinWindowContext>,
+    painter: &'a RefCell<egui_glow::Painter>,
+    pending_deltas: &'a RefCell<TexturesDelta>,
 }
 
 impl ChildCloseBackend for GlowChildCloseBackend<'_> {
@@ -1236,25 +1282,118 @@ impl ChildCloseBackend for GlowChildCloseBackend<'_> {
         consume_glow_child_close(&mut self.glutin.borrow_mut().viewports, id);
     }
 
-    fn retire(&mut self, ctx: &egui::Context, id: ViewportId) {
-        assert_ne!(id, ViewportId::ROOT);
-        {
-            let mut glutin = self.glutin.borrow_mut();
-            let retired = glow_viewport_subtree(
-                id,
-                glutin.viewports.iter().map(|(id, vp)| (*id, vp.ids.parent)),
-            );
-            glutin.retire_viewport_resources(&retired);
-        }
-        // Produced deltas already belong to GlowWinitRunning's shared painter
-        // owner, which this target-limited cleanup deliberately does not touch.
-        retire_glow_child_context(ctx, id);
+    fn registration(
+        &self,
+        ctx: &egui::Context,
+        id: ViewportId,
+    ) -> Option<egui::ViewportRegistration> {
+        self.glutin
+            .borrow()
+            .viewports
+            .get(&id)
+            .and_then(|vp| vp.registration)
+            .or_else(|| ctx.viewport_registration(id))
+    }
+
+    fn retire(&mut self, ctx: &egui::Context, approval: &egui::ApprovedViewportRetirement) {
+        let (approval, retired) = super::viewport_lifecycle::native_retirement_ids(
+            ctx,
+            approval,
+            self.glutin
+                .borrow()
+                .viewports
+                .iter()
+                .map(|(id, vp)| (*id, vp.registration, vp.parent_registration)),
+        );
+        retire_glow_native_resources(self.glutin, &retired);
+        super::viewport_lifecycle::finish_context_retirement(ctx, &approval);
+    }
+
+    fn gc(&mut self, ctx: &egui::Context) {
+        let retired = self
+            .glutin
+            .borrow()
+            .viewports
+            .iter()
+            .filter_map(|(id, vp)| {
+                (*id != ViewportId::ROOT
+                    && vp.registration.is_some_and(|registration| {
+                        ctx.viewport_registration(*id) != Some(registration)
+                    }))
+                .then_some(*id)
+            })
+            .collect();
+        retire_glow_native_resources(self.glutin, &retired);
+        let ime_ids: Vec<_> = retired
+            .into_iter()
+            .filter(|id| ctx.viewport_registration(*id).is_none())
+            .collect();
+        egui_ime::retire_viewport_ime_policy(ctx, &ime_ids);
+    }
+
+    fn collect_retirement_delta(&mut self, ctx: &egui::Context) {
+        super::viewport_lifecycle::append_retirement_delta(
+            &mut self.pending_deltas.borrow_mut(),
+            ctx.take_viewport_retirement_texture_delta(),
+        );
+    }
+
+    fn finish_retirement(&mut self, ctx: &egui::Context) {
+        self.collect_retirement_delta(ctx);
+        let current = self
+            .glutin
+            .borrow_mut()
+            .make_resource_context_current(ViewportId::ROOT);
+        finish_glow_texture_delta(
+            current,
+            &mut *self.painter.borrow_mut(),
+            &mut self.pending_deltas.borrow_mut(),
+        );
     }
 }
 
-fn retire_glow_child_context(ctx: &egui::Context, id: ViewportId) {
-    let retired = ctx.retire_viewport(id);
-    egui_ime::retire_viewport_ime_policy(ctx, &retired);
+fn replace_stale_glow_viewport(
+    glutin: &RefCell<GlutinWindowContext>,
+    pending: &RefCell<TexturesDelta>,
+    ctx: &egui::Context,
+    id: ViewportId,
+) {
+    let stale = super::viewport_lifecycle::stale_native_subtree(
+        ctx,
+        id,
+        glutin
+            .borrow()
+            .viewports
+            .iter()
+            .map(|(id, vp)| (*id, vp.registration, vp.parent_registration)),
+    );
+    if !stale.is_empty() {
+        retire_glow_native_resources(glutin, &stale);
+        super::viewport_lifecycle::append_retirement_delta(
+            &mut pending.borrow_mut(),
+            ctx.tex_manager().write().take_delta(),
+        );
+    }
+}
+
+fn retire_glow_native_resources(
+    glutin: &RefCell<GlutinWindowContext>,
+    retired: &egui::ViewportIdSet,
+) {
+    let removed = {
+        let mut glutin = glutin.borrow_mut();
+        let order = super::viewport_lifecycle::child_first_ids(
+            retired,
+            glutin.viewports.iter().map(|(id, vp)| (*id, vp.ids.parent)),
+        );
+        let removed: Vec<_> = order
+            .into_iter()
+            .filter_map(|id| glutin.viewports.remove(&id))
+            .collect();
+        glutin.retire_viewport_resources(retired);
+        removed
+    };
+    drop(removed);
 }
 
 fn glow_child_close_requests<Owner: std::borrow::Borrow<Viewport>>(
@@ -1294,6 +1433,7 @@ fn consume_glow_child_close<Owner: std::borrow::BorrowMut<Viewport>>(
     }
 }
 
+#[cfg(test)]
 fn glow_viewport_subtree(
     root: ViewportId,
     parents: impl Iterator<Item = (ViewportId, ViewportId)>,
@@ -1600,6 +1740,8 @@ impl GlutinWindowContext {
             ViewportId::ROOT,
             Viewport {
                 ids: ViewportIdPair::ROOT,
+                registration: egui_ctx.viewport_registration(ViewportId::ROOT),
+                parent_registration: None,
                 class: ViewportClass::Root,
                 builder: viewport_builder,
                 deferred_commands: vec![],
@@ -1818,23 +1960,6 @@ impl GlutinWindowContext {
         self.gl_config.display().get_proc_address(addr)
     }
 
-    pub(crate) fn remove_viewports_not_in(
-        &mut self,
-        viewport_output: &OrderedViewportIdMap<ViewportOutput>,
-    ) {
-        let retired = self
-            .viewports
-            .keys()
-            .chain(self.window_from_viewport.keys())
-            .chain(self.viewport_from_window.values())
-            .chain(self.current_viewport.iter())
-            .chain(self.focused_viewport.iter())
-            .copied()
-            .filter(|id| !viewport_output.contains_key(id))
-            .collect();
-        self.retire_viewport_resources(&retired);
-    }
-
     fn retire_viewport_resources(&mut self, retired: &egui::ViewportIdSet) {
         retire_glow_viewport_resources(
             &mut self.viewports,
@@ -1857,6 +1982,8 @@ impl GlutinWindowContext {
         for (
             viewport_id,
             ViewportOutput {
+                registration,
+                parent_registration,
                 parent,
                 class,
                 builder,
@@ -1866,6 +1993,14 @@ impl GlutinWindowContext {
             },
         ) in viewport_output.clone()
         {
+            if egui_ctx.viewport_registration(viewport_id) != Some(registration)
+                || self
+                    .viewports
+                    .get(&viewport_id)
+                    .is_some_and(|vp| vp.registration.is_some_and(|native| native != registration))
+            {
+                continue; // replacement belongs to outer cleanup or immediate prepare
+            }
             let ids = ViewportIdPair::from_self_and_parent(viewport_id, parent);
 
             let viewport = initialize_or_update_viewport(
@@ -1877,6 +2012,8 @@ impl GlutinWindowContext {
                 viewport_ui_cb,
             );
 
+            viewport.registration = Some(registration);
+            viewport.parent_registration = parent_registration;
             let old_inner_size = viewport.window.as_ref().map(|window| window.inner_size());
 
             viewport.process_commands(egui_ctx, commands);
@@ -1895,8 +2032,6 @@ impl GlutinWindowContext {
 
         // Create windows for any new viewports:
         self.initialize_all_windows(event_loop);
-
-        self.remove_viewports_not_in(viewport_output);
     }
 }
 
@@ -1933,6 +2068,8 @@ fn initialize_or_update_viewport<'a>(
             log::debug!("Creating new viewport {:?} ({:?})", ids.this, builder.title);
             entry.insert(Viewport {
                 ids,
+                registration: None,
+                parent_registration: None,
                 class,
                 builder,
                 deferred_commands: vec![],
@@ -2030,6 +2167,7 @@ impl ImmediateViewportBackend for NativeGlowImmediateBackend<'_> {
         ids: ViewportIdPair,
         builder: ViewportBuilder,
     ) -> Option<(egui::Context, egui::RawInput)> {
+        replace_stale_glow_viewport(self.glutin, self.pending_deltas, self.egui_ctx, ids.this);
         let mut glutin = self.glutin.borrow_mut();
         let glutin = &mut *glutin;
         initialize_or_update_viewport(
@@ -2040,6 +2178,9 @@ impl ImmediateViewportBackend for NativeGlowImmediateBackend<'_> {
             builder,
             None,
         );
+        let viewport = glutin.viewports.get_mut(&ids.this)?;
+        viewport.registration = self.egui_ctx.viewport_registration(ids.this);
+        viewport.parent_registration = self.egui_ctx.viewport_registration(ids.parent);
         let ret = event_loop_context::with_current_event_loop(|event_loop| {
             glutin.initialize_window(ids.this, event_loop)
         });
@@ -2806,16 +2947,20 @@ mod child_close_tests {
             consume_glow_child_close(&mut self.borrow_mut().owners, id);
         }
 
-        fn retire(&mut self, ctx: &egui::Context, id: ViewportId) {
+        fn retire(&mut self, ctx: &egui::Context, approval: &egui::ApprovedViewportRetirement) {
+            let (approval, retired) = super::super::viewport_lifecycle::native_retirement_ids(
+                ctx,
+                approval,
+                self.borrow().owners.iter().map(|(id, owner)| {
+                    (
+                        *id,
+                        owner.viewport.registration,
+                        owner.viewport.parent_registration,
+                    )
+                }),
+            );
             {
                 let mut resources = self.borrow_mut();
-                let retired = glow_viewport_subtree(
-                    id,
-                    resources
-                        .owners
-                        .iter()
-                        .map(|(id, owner)| (*id, owner.viewport.ids.parent)),
-                );
                 let HeadlessNativeResources {
                     owners,
                     from_window,
@@ -2833,7 +2978,7 @@ mod child_close_tests {
                     &retired,
                 );
             }
-            retire_glow_child_context(ctx, id);
+            super::super::viewport_lifecycle::finish_context_retirement(ctx, &approval);
         }
     }
 
@@ -3188,5 +3333,255 @@ mod immediate_screenshot_tests {
         complete_immediate_screenshots(&mut actions, || panic!("no capture remains"));
         callback.complete(Arc::clone(&image));
         assert_eq!(images.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod viewport_retirement_tests {
+    use super::super::viewport_lifecycle::{
+        self as lifecycle,
+        viewport_retirement_tests::{self as scenarios, Adapter},
+    };
+    use super::*;
+
+    struct Headless {
+        viewports: OrderedViewportIdMap<Viewport>,
+        from_window: HashMap<usize, ViewportId>,
+        from_viewport: OrderedViewportIdMap<usize>,
+        current: Option<ViewportId>,
+        focused: Option<ViewportId>,
+        delta: TexturesDelta,
+    }
+    impl Drop for Headless {
+        fn drop(&mut self) {
+            self.delta.clear();
+        }
+    }
+    impl Headless {
+        fn remove(&mut self, retired: &egui::ViewportIdSet) {
+            // Same child-first map/surface/input ownership removal as native
+            // GlutinWindowContext, with fake WindowKeys and no GL/desktop use.
+            let order = lifecycle::child_first_ids(
+                retired,
+                self.viewports.iter().map(|(id, vp)| (*id, vp.ids.parent)),
+            );
+            let removed: Vec<_> = order
+                .into_iter()
+                .filter_map(|id| self.viewports.remove(&id))
+                .collect();
+            retire_glow_viewport_resources(
+                &mut self.viewports,
+                &mut self.from_window,
+                &mut self.from_viewport,
+                &mut self.current,
+                &mut self.focused,
+                retired,
+            );
+            drop(removed);
+        }
+    }
+    impl ChildCloseBackend for Headless {
+        fn close_requests(&self) -> Vec<ViewportId> {
+            glow_child_close_requests(&self.viewports)
+        }
+        fn consume_close(&mut self, id: ViewportId) {
+            consume_glow_child_close(&mut self.viewports, id);
+        }
+        fn registration(
+            &self,
+            _: &egui::Context,
+            id: ViewportId,
+        ) -> Option<egui::ViewportRegistration> {
+            self.viewports.get(&id).and_then(|vp| vp.registration)
+        }
+        fn retire(&mut self, ctx: &egui::Context, approval: &egui::ApprovedViewportRetirement) {
+            let (approval, retired) = lifecycle::native_retirement_ids(
+                ctx,
+                approval,
+                self.viewports
+                    .iter()
+                    .map(|(id, vp)| (*id, vp.registration, vp.parent_registration)),
+            );
+            self.remove(&retired);
+            lifecycle::finish_context_retirement(ctx, &approval);
+        }
+        fn gc(&mut self, ctx: &egui::Context) {
+            let retired: egui::ViewportIdSet = self
+                .viewports
+                .iter()
+                .filter_map(|(id, vp)| {
+                    (*id != ViewportId::ROOT && ctx.viewport_registration(*id) != vp.registration)
+                        .then_some(*id)
+                })
+                .collect();
+            self.remove(&retired);
+            let ids: Vec<_> = retired
+                .into_iter()
+                .filter(|id| ctx.viewport_registration(*id).is_none())
+                .collect();
+            egui_ime::retire_viewport_ime_policy(ctx, &ids);
+        }
+        fn collect_retirement_delta(&mut self, ctx: &egui::Context) {
+            lifecycle::append_retirement_delta(
+                &mut self.delta,
+                ctx.take_viewport_retirement_texture_delta(),
+            );
+        }
+    }
+    impl Adapter for Headless {
+        fn new(_: &egui::Context) -> Self {
+            Self {
+                viewports: Default::default(),
+                from_window: Default::default(),
+                from_viewport: Default::default(),
+                current: None,
+                focused: None,
+                delta: Default::default(),
+            }
+        }
+        fn sync(&mut self, ctx: &egui::Context, outputs: &OrderedViewportIdMap<ViewportOutput>) {
+            for (&id, output) in outputs {
+                if ctx.viewport_registration(id) != Some(output.registration) {
+                    continue;
+                }
+                let viewport = initialize_or_update_viewport(
+                    &mut self.viewports,
+                    &mut self.current,
+                    ViewportIdPair::from_self_and_parent(id, output.parent),
+                    output.class,
+                    output.builder.clone(),
+                    output.viewport_ui_cb.clone(),
+                );
+                viewport.registration = Some(output.registration);
+                viewport.parent_registration = output.parent_registration;
+                viewport.deferred_commands.extend(output.commands.clone());
+                viewport.pending_raw_input.viewport_id = id;
+                if id != ViewportId::ROOT {
+                    viewport
+                        .pending_raw_input
+                        .viewports
+                        .entry(id)
+                        .or_default()
+                        .parent = Some(viewport.ids.parent);
+                }
+                if viewport.pending_raw_input.events.is_empty() {
+                    viewport
+                        .pending_raw_input
+                        .events
+                        .push(egui::Event::Text(format!("pending-{id:?}")));
+                }
+            }
+        }
+        fn registration_for(&self, id: ViewportId) -> Option<egui::ViewportRegistration> {
+            self.viewports.get(&id).and_then(|vp| vp.registration)
+        }
+        fn set_close(&mut self, id: ViewportId) {
+            self.viewports
+                .get_mut(&id)
+                .unwrap()
+                .info
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        fn pending(&self, id: ViewportId) -> Vec<egui::Event> {
+            self.viewports[&id].pending_raw_input.events.clone()
+        }
+        fn accept_delta(&mut self, delta: egui::TexturesDelta) {
+            self.delta.append(delta);
+        }
+        fn take_delta(&mut self) -> egui::TexturesDelta {
+            core::mem::take(&mut self.delta)
+        }
+        fn replace_stale_native(&mut self, ctx: &egui::Context, id: ViewportId) {
+            let stale = lifecycle::stale_native_subtree(
+                ctx,
+                id,
+                self.viewports
+                    .iter()
+                    .map(|(id, vp)| (*id, vp.registration, vp.parent_registration)),
+            );
+            if !stale.is_empty() {
+                self.remove(&stale);
+                lifecycle::append_retirement_delta(
+                    &mut self.delta,
+                    ctx.tex_manager().write().take_delta(),
+                );
+            }
+        }
+        fn seed_stale_native(&mut self, ctx: &egui::Context, id: ViewportId) -> egui::TextureId {
+            let texture = scenarios::stale_texture(ctx);
+            let texture_id = texture.id();
+            let viewport = self.viewports.get_mut(&id).unwrap();
+            viewport
+                .pending_raw_input
+                .events
+                .push(scenarios::stale_event());
+            viewport
+                .deferred_commands
+                .push(egui::ViewportCommand::Close);
+            let mut input = egui_winit::State::new(
+                ctx.clone(),
+                id,
+                &scenarios::HeadlessDisplay,
+                None,
+                None,
+                None,
+            );
+            *input.egui_input_mut() = scenarios::input(id, false);
+            input.egui_input_mut().events.push(scenarios::stale_event());
+            viewport.egui_winit = Some(input);
+            viewport.viewport_ui_cb = Some(Arc::new(move |_| {
+                let _ = &texture;
+            }));
+            texture_id
+        }
+        fn native_input(&self, id: ViewportId) -> Vec<egui::Event> {
+            let viewport = &self.viewports[&id];
+            let mut events = viewport.pending_raw_input.events.clone();
+            if let Some(input) = &viewport.egui_winit {
+                events.extend(input.egui_input().events.clone());
+            }
+            events
+        }
+    }
+    #[test]
+    fn viewport_retirement_glow_full_logic_gc_discard() {
+        scenarios::full_logic_gc_discard::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_logic_only() {
+        scenarios::logic_only_and_pass_outside_hook::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_close_request_separation() {
+        scenarios::close_request_separation::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_context_gc_native_descendants_ime() {
+        scenarios::context_gc_native_descendants_and_ime::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_old_output_reopen_duplicate() {
+        scenarios::old_output_reopen_and_duplicate::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_overlapping_gc_root_close() {
+        scenarios::overlapping_gc_and_root_close::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_delta_callback_drop() {
+        scenarios::delta_and_callback_drop::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_immediate_nested() {
+        scenarios::immediate_nested::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_hook_captures_lifetime_before_reopen() {
+        scenarios::legacy_hook_captures_lifetime_before_reopen::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_glow_discard_immediate_reopen_replaces_native() {
+        scenarios::discard_immediate_reopen_replaces_native::<Headless>();
     }
 }

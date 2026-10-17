@@ -10990,7 +10990,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     crate::os_theme::apply_dark_ui(ui);
                     ui.set_max_width(150.0);
                     lab_combo_box(

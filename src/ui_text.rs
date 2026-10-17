@@ -9766,7 +9766,7 @@ mod tests {
     ) {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -9777,7 +9777,7 @@ mod tests {
             |ctx| {
                 ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |ui| draw(ui)));
             },
-        );
+        ));
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         for &(name, role, value) in expected {
             let matches: Vec<_> = nodes

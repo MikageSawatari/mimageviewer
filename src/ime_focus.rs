@@ -700,19 +700,14 @@ mod tests {
         let mut request_focus = true;
 
         ctx.begin_pass(Default::default());
-        egui::CentralPanel::default().show(
-            &mut egui::Ui::new(
-                ctx.clone(),
-                egui::Id::unique("headless_manual_root"),
-                egui::UiBuilder::new(),
-            ),
-            |ui| {
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 let _ =
                     add_singleline_sensitive(ui, &mut password, Some(&mut request_focus), |edit| {
                         edit.id(field_id).password(true)
                     });
-            },
-        );
+            })
+        });
         ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
@@ -938,6 +933,7 @@ mod tests {
                                         },
                                     )
                                     .response
+                                    .response
                                 }
                                 1 => add_singleline(
                                     ui,
@@ -1112,7 +1108,16 @@ mod tests {
     #[test]
     fn facade_explicit_viewport_and_pending_reads_do_not_start_diagnostics() {
         let ctx = test_context();
+        ctx.set_embed_viewports(false);
         let child = egui::ViewportId::from_hash_of("facade-child");
+        // RawInput metadata alone does not keep a child registered after root
+        // end-pass GC. Declare the native child before its first input pass and
+        // on every parent pass, as the real viewport owner does.
+        ctx.run_ui(Default::default(), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(child, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
         ctx.begin_pass(viewport_raw_input(
             child,
             vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
@@ -1125,6 +1130,7 @@ mod tests {
         root_input.viewports.insert(child, Default::default());
         ctx.run_ui(root_input, |ui| {
             let ctx = &ui.ctx().clone();
+            ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
             egui::CentralPanel::default().show(ui, |ui| {
                 add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                     edit.id(field_id)
@@ -1138,6 +1144,7 @@ mod tests {
         );
         root_input.viewports.insert(child, Default::default());
         ctx.begin_pass(root_input);
+        ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
         let pass = ctx.cumulative_pass_nr();
         let events_before = ctx.input(|input| input.events.clone());
         let contract_before = egui_ime::text_focus_contract_snapshot(&ctx);
@@ -1170,6 +1177,14 @@ mod tests {
             Some(pass)
         );
         ctx.end_pass().drop_without_applying_deltas();
+
+        // Stale metadata must not preserve policy once the actual registration
+        // ends. This is a different owner lifetime, not a visibility change.
+        let mut retired_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
+        retired_input.viewports.insert(child, Default::default());
+        ctx.run_ui(retired_input, |_| {})
+            .drop_without_applying_deltas();
+        assert!(!ime_input_active_in_viewport(&ctx, child));
     }
 
     #[test]
@@ -1321,6 +1336,30 @@ mod tests {
             line_anchor: "multiline(&mut state.textarea)",
             expected_occurrences: 1,
             reason: "時刻付き行の paste と独自 focus lifecycle を持つ複数行 editor",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_presenter/render_core.rs",
+            line_anchor: "singleline(&mut text).id(id)",
+            expected_occurrences: 4,
+            reason: "native_ime_interrupt の2つの低レベル headless fixture。実eguiのcaret移動・focus要求から生成されるIME出力を測り、アプリのfocus復元policyを介在させない",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut text).id(id)",
+            expected_occurrences: 2,
+            reason: "native_ime_interrupt のheadless fixture。実eguiの旧focus ownerが生成する出力をcontrol配送へ渡す",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut String::new()).id(destination)",
+            expected_occurrences: 1,
+            reason: "同じnative_ime_interrupt fixtureのfocus移譲先。実eguiのfocus変更によるinterrupt pulseを直接生成する",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut text).id(destination)",
+            expected_occurrences: 1,
+            reason: "同じnative_ime_interrupt fixtureの配送後pass。実eguiがinterrupt pulseを再発行しないことを直接観測する",
         },
     ];
 

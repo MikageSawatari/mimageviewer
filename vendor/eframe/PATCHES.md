@@ -184,3 +184,72 @@ finish_root_logic_inputへ共通抽出し、回帰でも同じhelperと既存tak
 backend全入口／OS配送はsource接続の確認までであり、実window・GPU・製品終了ownerを動かした試験ではない。
 tray・保存・settings-family・ZIPの製品policy、新pending bool・queue・retry・repaint・強制UIは追加しない。
 3種類の部分復元で両回帰の失敗を確認し、復元後の全graph検証と段2全体の引継ぎ一覧は段2台帳へ記録する。
+
+
+## Stage 3: approved viewport retirement (design revision 4.5, 2026-10-17)
+
+Implementation record only; independent acceptance and execution evidence belong
+in the stage-3 verification ledger.
+
+- Both native adapters retain the exact Context/output registration and parent
+  registration. viewport_lifecycle consumes approved root commands for Full,
+  LogicOnly, pass-outside hooks, and shared-renderer shutdown before ordinary
+  command lookup or native-resource absence can discard them.
+- Close hooks capture native registration before entering App code. Legacy Close
+  is normalized to approval of that captured lifetime; RetirementTransferred
+  drains authority already emitted by App. Cancel consumes only this request;
+  DelegateToUi retains the traditional unmanaged-viewport path. App approvals
+  execute before an old OS Close can be redispatched to an ended binding.
+- Exact native parent registrations extend the owned subtree if Context GC ran
+  first. Native cleanup is shared with normal GC and removes children first.
+  Removed callback owners drop outside backend borrows; Context and then IME
+  finish outside those borrows. Same-ID new registrations and sibling resources
+  remain untouched, including IME when the old Context entry is already gone.
+- Full first transfers texture output to the shared pending owner, consumes
+  authority, removes stale output, runs normal GC, and collects callback-drop
+  deltas. The ordinary paint/no-paint consumer submits that batch once. LogicOnly,
+  hooks, and shutdown complete delivery at their own non-drawing boundary.
+  Retirement-generated frees merge without erasing already accepted set lists.
+- Immediate prepare checks native-vs-Context registration before update. Explicit
+  same-ID reopen removes the obsolete native subtree through the common cleanup,
+  transfers callback-drop deltas, and creates fresh State/input/commands/resources.
+  It never retags the old owner or retires the new Context/IME registration.
+  Nested ordinary output cannot retag a different native lifetime either.
+- HeadlessEpiIntegration is exposed only with miv-test-script-window-witness on a
+  native renderer build. It drives the real EpiIntegration Full/LogicOnly and root
+  Close decision without windows, renderer, user profile, or filesystem access.
+  Callers own output delivery. Existing vendor fixtures share its constructor.
+
+Ten common viewport_retirement scenarios run through each adapter: real Full
+logic and GC/discard; LogicOnly; Close cancel/delegate/transfer/legacy behavior;
+Context-first/native-only cleanup and IME; old output/reopen/duplicates; overlap
+and root Close/CancelClose; texture ordering within the shared batch and callback
+free; immediate nesting; hook-before-reopen identity; and actual discard plus
+immediate native replacement with stale State/pending/deferred Close seeded.
+Wgpu uses real SharedState/Painter with no initialized renderer. Glow uses real
+Viewport and production common cleanup with fake WindowKeys. GPU submission/free
+still requires the existing egui-wgpu offscreen evidence; fake adapters do not
+prove GPU completion.
+
+A confirmed design gap remains: pass-1 texture deltas can stay in run_dyn's local
+FullOutput while pass-2 immediate cleanup submits free, after which the outer
+old set can arrive late. The replacement regression currently proves native input
+isolation and shared-owner free retention only, not strict submission ordering.
+A discard-retry delivery callback was proposed but is NOT implemented pending
+an explicit design decision covering installation/removal, Context matching, and
+exactly-once transfer.
+
+## Stage 3: formal vendor graph
+
+Earlier descriptions of vendor-next/preparation-only graphs are historical.
+Stage 3 uses the formal vendor/ crates from the root Cargo.toml and Cargo.lock.
+Each normalized vendor manifest has its own [workspace] and [patch.crates-io]
+pointing at the same formal egui, egui-winit, egui-wgpu, and eframe crates.
+Cargo.toml.orig and the upstream README are retained. Original upstream lockfile
+hashes remain in the provenance inventory. Active standalone Cargo.lock files were
+initially copied from the root lock during WIP setup and are resolved/recorded by
+ordinary offline Cargo; they are not original upstream lockfiles.
+The shared IME implementation lives in crates/egui-ime; egui-winit and
+eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
+were moved to vendor/upstream-provenance.json. Graph migration is not evidence
+that runtime checks or release gates have passed.

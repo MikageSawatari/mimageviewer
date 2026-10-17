@@ -4709,7 +4709,7 @@ mod details_text_clip_tests {
         assert_eq!(details_item_content_opacity(false, false), 1.0);
 
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -4739,7 +4739,7 @@ mod details_text_clip_tests {
                         })
                 });
             },
-        );
+        ));
         let mut alpha = Vec::new();
         for clipped in &output.shapes {
             collect_text_alpha(&clipped.shape, &mut alpha);
@@ -4748,12 +4748,14 @@ mod details_text_clip_tests {
             alpha.iter().any(|alpha| (127..=128).contains(alpha)),
             "details content text must be painted at 0.5 opacity: {alpha:?}"
         );
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
     fn details_name_cut_paint_is_opaque_while_other_columns_remain_dimmed() {
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -4801,7 +4803,7 @@ mod details_text_clip_tests {
                         })
                 });
             },
-        );
+        ));
         let mut alpha = Vec::new();
         for clipped in &output.shapes {
             collect_text_alpha(&clipped.shape, &mut alpha);
@@ -4811,6 +4813,8 @@ mod details_text_clip_tests {
             alpha.iter().any(|a| (127..=128).contains(a)),
             "other columns retain cut opacity: {alpha:?}"
         );
+
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -6923,9 +6927,9 @@ mod fixed_sort_control_tests {
                         ctx.request_repaint();
                         return;
                     }
-                    render_app.borrow_mut().render_menubar(ctx);
-                    render_app.borrow_mut().render_toolbar(ctx);
-                    render_app.borrow_mut().render_facet_filter_bar(ctx);
+                    render_app.borrow_mut().render_menubar(root_ui);
+                    render_app.borrow_mut().render_toolbar(root_ui);
+                    render_app.borrow_mut().render_facet_filter_bar(root_ui);
                 });
             harness.run();
             harness.run();
@@ -7020,8 +7024,8 @@ mod fixed_sort_control_tests {
                     ctx.request_repaint();
                     return;
                 }
-                render_app.borrow_mut().render_menubar(ctx);
-                render_app.borrow_mut().render_toolbar(ctx);
+                render_app.borrow_mut().render_menubar(root_ui);
+                render_app.borrow_mut().render_toolbar(root_ui);
             });
         harness.run();
         harness.run();
@@ -7188,7 +7192,7 @@ mod fixed_sort_control_tests {
                     ctx.request_repaint();
                     return;
                 }
-                render_app.borrow_mut().render_toolbar(ctx);
+                render_app.borrow_mut().render_toolbar(root_ui);
             });
         harness.run();
         harness.run();
@@ -7232,8 +7236,8 @@ mod fixed_sort_control_tests {
                     ctx.request_repaint();
                     return;
                 }
-                render_app.borrow_mut().render_menubar(ctx);
-                render_app.borrow_mut().render_toolbar(ctx);
+                render_app.borrow_mut().render_menubar(root_ui);
+                render_app.borrow_mut().render_toolbar(root_ui);
             });
         harness.run();
         harness.run();
@@ -17070,6 +17074,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         previous.validate_background(context(GridClickSource::Mouse), frame);
         self.grid_click_pairing
             .validate_background(context(GridClickSource::Mouse), frame);
+        let wheel_options = ctx.options(|o| o.input_options);
         let (clicked, released, down, pos, press_pos, scroll) = ctx.input(|input| {
             (
                 input.pointer.primary_clicked(),
@@ -17080,7 +17085,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     .interact_pos()
                     .or_else(|| input.pointer.latest_pos()),
                 grid_primary_press_pos(input),
-                !crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options))
+                !crate::wheel_input::remaining_wheel_delta(input, wheel_options)
                     .eq(&egui::Vec2::ZERO),
             )
         });
@@ -19820,8 +19825,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // ただしスクロールバードラッグ時は egui 側のオフセットを読み戻す。
                 let egui_before = (self.items_are_rating_view && scroll_to).then(||
                     egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("scroll_area"))));
+                let wheel_options = ctx.options(|o| o.input_options);
                 let input_before = (self.items_are_rating_view && scroll_to).then(|| ctx.input(|input| (
-                    crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options)), input.smooth_scroll_delta,
+                    crate::wheel_input::remaining_wheel_delta(input, wheel_options), input.smooth_scroll_delta,
                     input.pointer.latest_pos(), input.pointer.primary_down(),
                     input.pointer.delta(), input.pointer.velocity())));
                 let scroll_output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
@@ -20206,12 +20212,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 let egui_offset = scroll_output.state.clamped_offset().y;
                 if self.items_are_rating_view && scroll_to
                 {
+                    let wheel_options = ctx.options(|o| o.input_options);
                     crate::logger::log(format!(
                         "[grid-scroll] source=egui-state gen={} injected={display_scroll_offset_y:.1} \
                          returned={egui_offset:.1} content={:?} inner={:?} wheel={:?} \
                          input_before={input_before:?} prior_state={egui_before:?} state={:?}",
                         self.items_generation, scroll_output.content_size, scroll_output.inner_rect,
-                        ctx.input(|input| (crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options)), input.smooth_scroll_delta)),
+                        ctx.input(|input| (crate::wheel_input::remaining_wheel_delta(input, wheel_options), input.smooth_scroll_delta)),
                         scroll_output.state));
                 }
                 if should_sync_grid_scrollbar(
@@ -21104,7 +21111,7 @@ mod facet_filter_bar_tests {
         app.items_are_bookmark_view = !reading_history;
 
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -21113,11 +21120,12 @@ mod facet_filter_bar_tests {
                 ..Default::default()
             },
             |ctx| ctx.root_ui(|root_ui| app.render_facet_filter_bar(root_ui)),
-        );
+        ));
         let mut text = String::new();
         for clipped in &output.shapes {
             collect_shape_text(&clipped.shape, &mut text);
         }
+        output.drop_without_applying_deltas();
         text
     }
 
@@ -21154,7 +21162,7 @@ mod facet_filter_bar_tests {
         app.visible_indices = vec![0];
 
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -21163,7 +21171,7 @@ mod facet_filter_bar_tests {
                 ..Default::default()
             },
             |ctx| ctx.root_ui(|root_ui| app.render_facet_filter_bar(root_ui)),
-        );
+        ));
         let mut text = String::new();
         for clipped in &output.shapes {
             collect_shape_text(&clipped.shape, &mut text);
@@ -21172,6 +21180,8 @@ mod facet_filter_bar_tests {
         assert!(!text.contains("ファイル名"), "{text}");
         assert!(app.facet_name_input.is_empty());
         assert!(app.settings.facet_filter.name_query.is_empty());
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -21188,7 +21198,7 @@ mod facet_filter_bar_tests {
         app.visible_indices = vec![0];
 
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -21197,7 +21207,7 @@ mod facet_filter_bar_tests {
                 ..Default::default()
             },
             |ctx| ctx.root_ui(|root_ui| app.render_facet_filter_bar(root_ui)),
-        );
+        ));
         let mut text = String::new();
         for clipped in &output.shapes {
             collect_shape_text(&clipped.shape, &mut text);
@@ -21205,6 +21215,8 @@ mod facet_filter_bar_tests {
 
         assert!(text.contains("needle"), "{text}");
         assert!(!text.contains("ファイル名:needle"), "{text}");
+
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -25781,9 +25793,9 @@ mod effetune_toolbar_flavor_tests {
                 })
                 .drop_without_applying_deltas();
         }
-        let output = ctx.run_pass(input(), |ctx| {
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(input(), |ctx| {
             ctx.root_ui(|root_ui| app.render_toolbar(root_ui));
-        });
+        }));
         let mut text = String::new();
         for shape in &output.shapes {
             collect_text(&shape.shape, &mut text);
@@ -25814,19 +25826,21 @@ mod effetune_toolbar_flavor_tests {
             assert_eq!(app.toolbar_section_anchors, with_hidden_row);
             assert_eq!(app.toolbar_content_rect, with_hidden_row_rect);
         }
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
     fn effetune_customization_candidate_follows_build_flavor() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(input(), |ctx| {
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(input(), |ctx| {
             ctx.root_ui(|root_ui| {
                 egui::CentralPanel::default().show(root_ui, |ui| {
                     app.draw_toolbar_visibility_menu(ui, false, false);
                 })
             });
-        });
+        }));
         let mut text = String::new();
         for shape in &output.shapes {
             collect_text(&shape.shape, &mut text);
@@ -25834,6 +25848,8 @@ mod effetune_toolbar_flavor_tests {
         assert_eq!(text.contains("音響調整"), !cfg!(feature = "portable"));
         assert!(text.contains("ツリー"));
         assert!(app.settings.show_toolbar_effetune);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -26465,7 +26481,7 @@ mod checked_selection_overlay_tests {
                     .exact_size(48.0)
                     .show(root_ui, |_| {});
                 *available_top_in_ui.lock().unwrap() =
-                    Some(ctx.root_ui(|ui| ui.available_rect_before_wrap()).top());
+                    Some(root_ui.available_rect_before_wrap().top());
                 let _ =
                     show_checked_selection_overlay(ctx, root_ui.available_rect_before_wrap(), 3);
             });
@@ -27108,7 +27124,7 @@ mod grid_reclick_open_tests {
         });
         app.keyboard_owner_for_pass(&ctx);
         app.handle_meta_undo_keys(&ctx);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -27932,7 +27948,7 @@ mod grid_reclick_open_tests {
                             ctx.request_repaint();
                             return;
                         }
-                        if let Some(nav) = state.0.render_grid(ctx) {
+                        if let Some(nav) = state.0.render_grid(root_ui) {
                             state.1.push(nav);
                         }
                     },
@@ -29580,7 +29596,7 @@ mod toolbar_wrap_tests {
         for _ in 0..2 {
             sink.lock().unwrap().clear();
             let out = sink.clone();
-            ctx.run_pass(input.clone(), |ctx| {
+            crate::test_ui::headless_paint_output(ctx.run_pass(input.clone(), |ctx| {
                 ctx.root_ui(|root_ui| {
                     egui::Panel::top("t").show(root_ui, |ui| {
                         let right = ui.max_rect().right();
@@ -29590,7 +29606,7 @@ mod toolbar_wrap_tests {
                         });
                     })
                 });
-            });
+            }));
         }
         let v = sink.lock().unwrap().clone();
         v
@@ -29889,7 +29905,7 @@ mod section207_tests {
                     ctx.request_repaint();
                     return;
                 }
-                if let Some(value) = render.borrow_mut().render_toolbar(ctx).1 {
+                if let Some(value) = render.borrow_mut().render_toolbar(root_ui).1 {
                     nav_render.borrow_mut().push(value);
                 }
             });
@@ -29971,12 +29987,12 @@ mod section207_tests {
                     ctx.request_repaint();
                     return;
                 }
-                if let Some(value) = render.borrow_mut().render_toolbar(ctx).1 {
+                if let Some(value) = render.borrow_mut().render_toolbar(root_ui).1 {
                     nav_render.borrow_mut().push(value);
                 }
+                let wheel_options = ctx.options(|o| o.input_options);
                 observed.set(ctx.input(|i| {
-                    crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options))
-                        != egui::Vec2::ZERO
+                    crate::wheel_input::remaining_wheel_delta(i, wheel_options) != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO
                         || i.events
                             .iter()
@@ -30091,7 +30107,7 @@ mod section207_tests {
                                     ctx.request_repaint();
                                     return;
                                 }
-                                render.borrow_mut().render_toolbar(ctx);
+                                render.borrow_mut().render_toolbar(root_ui);
                             });
                         harness.run();
                         let field = harness.get_by_role(egui::accesskit::Role::TextInput);
@@ -30211,7 +30227,7 @@ mod section207_tests {
                             ctx.request_repaint();
                             return;
                         }
-                        render.borrow_mut().render_toolbar(ctx);
+                        render.borrow_mut().render_toolbar(root_ui);
                     });
                 harness.run();
                 let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
@@ -30338,7 +30354,7 @@ mod section207_tests {
                                     ctx.request_repaint();
                                     return;
                                 }
-                                render.borrow_mut().render_toolbar(ctx);
+                                render.borrow_mut().render_toolbar(root_ui);
                             });
                         harness.run();
                         let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
@@ -30602,7 +30618,10 @@ mod section207_tests {
             .click();
         harness.run();
         harness.event(egui::Event::Ime(egui::ImeEvent::Enabled));
-        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit("にほんご".into())));
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "にほんご".into(),
+            active_range_chars: None,
+        }));
         harness.step();
         harness.key_press(egui::Key::Enter);
         harness.step();
@@ -30675,7 +30694,10 @@ mod section207_tests {
         // would run separate passes for each event and miss the same-pass regression.
         harness.input_mut().events = vec![
             egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("preedit".into())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "preedit".into(),
+                active_range_chars: None,
+            }),
         ];
         harness.step();
         assert!(app.borrow().ime_input_active(&harness.ctx));
@@ -30924,9 +30946,9 @@ mod section292_tests {
                 let mut app = render.borrow_mut();
                 app.render_toolbar(root_ui);
                 app.render_facet_filter_bar(root_ui);
+                let wheel_options = ctx.options(|o| o.input_options);
                 observed.set(ctx.input(|i| {
-                    crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options))
-                        != egui::Vec2::ZERO
+                    crate::wheel_input::remaining_wheel_delta(i, wheel_options) != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO
                         || i.events
                             .iter()

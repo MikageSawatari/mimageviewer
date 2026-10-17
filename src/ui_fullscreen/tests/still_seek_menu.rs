@@ -37,7 +37,7 @@ fn rating_membership_move_keeps_real_seek_strip_and_page_number_painted() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
         let mut strip = None;
         let mut track = None;
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(full),
                 ..Default::default()
@@ -54,7 +54,7 @@ fn rating_membership_move_keeps_real_seek_strip_and_page_number_painted() {
                     })
                 });
             },
-        );
+        ));
         assert!(
             strip.is_some(),
             "rating move must keep the real thumbnail strip"
@@ -70,6 +70,8 @@ fn rating_membership_move_keeps_real_seek_strip_and_page_number_painted() {
             )),
             "the seek bar or standalone page-number overlay must paint the updated count"
         );
+
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -87,7 +89,7 @@ fn menu_frame(
 ) -> MenuFrame {
     let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
     let mut toggle = None;
-    let output = ctx.run_pass(
+    let output = crate::test_ui::headless_paint_output(ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(full),
             events,
@@ -104,20 +106,24 @@ fn menu_frame(
                     })
             });
         },
-    );
-    MenuFrame {
+    ));
+    let frame = MenuFrame {
         toggle: toggle.expect("still seek strip menu button response"),
-        shapes: output.shapes,
-        wheel_remaining: ctx.input(|input| {
-            crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options))
-                != egui::Vec2::ZERO
-                || input.smooth_scroll_delta != egui::Vec2::ZERO
-                || input
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
-        }),
-    }
+        shapes: output.shapes.clone(),
+        wheel_remaining: {
+            let wheel_options = ctx.options(|o| o.input_options);
+            ctx.input(|input| {
+                crate::wheel_input::remaining_wheel_delta(input, wheel_options) != egui::Vec2::ZERO
+                    || input.smooth_scroll_delta != egui::Vec2::ZERO
+                    || input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+            })
+        },
+    };
+    output.drop_without_applying_deltas();
+    frame
 }
 
 fn touch_toggle_frame(
@@ -127,7 +133,7 @@ fn touch_toggle_frame(
 ) -> MenuFrame {
     let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
     let mut toggle = None;
-    let output = ctx.run_pass(
+    let output = crate::test_ui::headless_paint_output(ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(full),
             ..Default::default()
@@ -144,12 +150,14 @@ fn touch_toggle_frame(
                     })
             });
         },
-    );
-    MenuFrame {
+    ));
+    let frame = MenuFrame {
         toggle: toggle.expect("touch-only still seek menu button response"),
-        shapes: output.shapes,
+        shapes: output.shapes.clone(),
         wheel_remaining: false,
-    }
+    };
+    output.drop_without_applying_deltas();
+    frame
 }
 
 fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {

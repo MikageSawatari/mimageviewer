@@ -43,18 +43,19 @@ fn key(app: &mut App, ctx: &egui::Context, key: egui::Key, shift: bool) {
         ..Default::default()
     };
     ctx.begin_pass(egui::RawInput {
-        modifiers,
-        events: vec![egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        }],
+        events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+            .chain(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }])
+            .collect(),
         ..Default::default()
     });
     let _ = app.handle_keyboard(ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 fn anchor(app: &App) -> Option<usize> {

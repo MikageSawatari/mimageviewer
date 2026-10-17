@@ -422,8 +422,9 @@ fn run_root_app_update(
     frame: &mut eframe::Frame,
     input: egui::RawInput,
 ) -> egui::FullOutput {
-    ctx.run(input, |ctx| {
-        <App as eframe::App>::update(app, ctx, frame);
+    ctx.run_pass(input, |ctx| {
+        <App as eframe::App>::logic(app, ctx, frame);
+        ctx.root_ui(|ui| <App as eframe::App>::ui(app, ui, frame));
     })
 }
 

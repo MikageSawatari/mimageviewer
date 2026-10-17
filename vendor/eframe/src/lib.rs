@@ -627,3 +627,11 @@ impl core::fmt::Display for Error {
 
 /// Short for `Result<T, eframe::Error>`.
 pub type Result<T = (), E = Error> = core::result::Result<T, E>;
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "miv-test-script-window-witness",
+    any(feature = "glow", feature = "wgpu_no_default_features")
+))]
+#[doc(hidden)]
+pub use native::HeadlessEpiIntegration;

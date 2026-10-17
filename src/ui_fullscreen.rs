@@ -2557,6 +2557,8 @@ impl FsNavigatorFrameInput {
             .as_ref()
             .and_then(FsNavigatorFrameInput::pointer_position_after_events);
         let previous_focused = previous_input.as_ref().map(|input| input.focused);
+        // Context::input holds the context write lock; acquire options before entering it.
+        let wheel_options = ctx.options(|o| o.input_options);
         let (events, raw_focused, primary_down, secondary_down, wheel_y) = ctx.input(|input| {
             let mut adjudicated_releases = input.pointer.released_buttons_with_click_counts();
             let events = input
@@ -2605,8 +2607,7 @@ impl FsNavigatorFrameInput {
                 input.focused,
                 input.pointer.primary_down(),
                 input.pointer.secondary_down(),
-                crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options))
-                    .y,
+                crate::wheel_input::remaining_wheel_delta(input, wheel_options).y,
             )
         });
         let has_focus_event = events
@@ -22167,8 +22168,19 @@ impl App {
         if accepted.is_empty() {
             return false;
         }
-        self.close_detached_image_windows_by_ids(ctx, &accepted, reason, activate_ids);
-        true
+        let mut passive = Vec::new();
+        let mut any_accepted = false;
+        for id in accepted {
+            match self.accept_active_detached_window_close(ctx, id, reason) {
+                Some(accepted) => any_accepted |= accepted,
+                None => passive.push(id),
+            }
+        }
+        if !passive.is_empty() {
+            self.close_detached_image_windows_by_ids(ctx, &passive, reason, activate_ids);
+            any_accepted = true;
+        }
+        any_accepted
     }
 
     #[cfg(windows)]
@@ -22556,6 +22568,7 @@ impl App {
                     vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             });
+            self.capture_detached_viewport_registration(ctx, window.id);
             if apply_initial_placement {
                 render_batch.initial_placement_applied_ids.push(window.id);
             }
@@ -22658,6 +22671,8 @@ impl App {
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx_ui, _class| {
                 let vp_ctx = &vp_ctx_ui.ctx().clone();
+                #[cfg(windows)]
+                self.capture_detached_viewport_registration(vp_ctx, window.id);
                 #[cfg(feature = "test-script")]
                 crate::test_script::receive_screenshot_events(vp_ctx, "parked_live_immediate");
                 if sidecar_restore_presentation.is_some() {
@@ -22695,6 +22710,7 @@ impl App {
                         placement_update = Some(placement);
                     }
                 }
+                let wheel_options = ctx.options(|o| o.input_options);
                 (
                     primary_pressed,
                     primary_released,
@@ -22711,10 +22727,8 @@ impl App {
                     }
                     let primary_pressed = i.pointer.primary_pressed();
                     let primary_released = i.pointer.primary_released();
-                    let scroll = crate::wheel_input::remaining_wheel_delta(
-                        i,
-                        ctx.options(|o| o.input_options),
-                    ) != egui::Vec2::ZERO
+                    let scroll = crate::wheel_input::remaining_wheel_delta(i, wheel_options)
+                        != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO;
                     let key = i
                         .events
@@ -24588,6 +24602,8 @@ impl App {
             let mut cancel = false;
             ctx.show_viewport_immediate(fs_id, builder, |vp_ctx_ui, _class| {
                 let vp_ctx = &vp_ctx_ui.ctx().clone();
+                #[cfg(windows)]
+                self.capture_current_detached_viewport_registration(vp_ctx);
                 if self.sidecar_restore_blocks_projected_context() {
                     Self::consume_sidecar_restore_viewport_input(vp_ctx);
                 } else if vp_ctx.input(|input| {
@@ -24652,7 +24668,7 @@ impl App {
                 }
                 // This is deliberately after `show_viewport_immediate`: the loading callback is
                 // a real active viewport render, so it is the valid Opening -> Active boundary.
-                self.mark_active_detached_viewport_rendered_if_matches(fs_id);
+                self.mark_active_detached_viewport_rendered_if_matches(ctx, fs_id);
             }
             ctx.request_repaint();
             return;
@@ -24709,6 +24725,8 @@ impl App {
             });
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx_ui, _class| {
                 let ctx = &ctx_ui.ctx().clone();
+                #[cfg(windows)]
+                self.capture_current_detached_viewport_registration(ctx);
                 if self.sidecar_restore_blocks_projected_context() {
                     Self::consume_sidecar_restore_viewport_input(ctx);
                 }
@@ -24765,7 +24783,7 @@ impl App {
             // keep-alive marker: deferred holdover で描いた fs_id が現セッションの detached id と
             // 一致するときだけ marker を立てる (§3.6/§3.7)。
             #[cfg(windows)]
-            self.mark_active_detached_viewport_rendered_if_matches(fs_id);
+            self.mark_active_detached_viewport_rendered_if_matches(ctx, fs_id);
             if cancel {
                 #[cfg(windows)]
                 let preparing_lease = self.active_detached_session.and_then(|session| {
@@ -24843,6 +24861,8 @@ impl App {
         ));
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx_ui, _class| {
             let _ctx = &_ctx_ui.ctx().clone();
+            #[cfg(windows)]
+            self.capture_current_detached_viewport_registration(_ctx);
         });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         #[cfg(windows)]
@@ -25041,6 +25061,8 @@ impl App {
         let show_t0 = std::time::Instant::now();
         let inner_ms = ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx_ui, _class| {
             let vp_ctx = &vp_ctx_ui.ctx().clone();
+            #[cfg(windows)]
+            self.capture_current_detached_viewport_registration(vp_ctx);
             let inner_t0 = std::time::Instant::now();
             if self.sidecar_restore_blocks_projected_context() {
                 Self::consume_sidecar_restore_viewport_input(vp_ctx);
@@ -25138,7 +25160,7 @@ impl App {
                 },
             );
         }
-        self.mark_active_detached_viewport_rendered();
+        self.mark_active_detached_viewport_rendered(ctx);
     }
 
     /// in-window 静止画モード (`native_video_in_window_active`) で PDF/ZIP の
@@ -25666,6 +25688,10 @@ impl App {
         {
             let mut render_fs_body = |root_ui: &mut egui::Ui, embedded: bool| {
                 let ctx = &root_ui.ctx().clone();
+                #[cfg(windows)]
+                if !embedded {
+                    self.capture_current_detached_viewport_registration(ctx);
+                }
                 #[cfg(all(windows, feature = "test-script"))]
                 {
                     if !embedded {
@@ -26169,6 +26195,7 @@ impl App {
                         };
                         #[cfg(windows)]
                         if detached && Self::detached_image_window_debug_enabled() {
+                            let wheel_options = ctx.options(|o| o.input_options);
                             let (
                                 focused,
                                 raw_scroll,
@@ -26191,7 +26218,7 @@ impl App {
                                     .count();
                                 (
                                     i.viewport().focused.unwrap_or(false),
-                                    crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options)),
+                                    crate::wheel_input::remaining_wheel_delta(i, wheel_options),
                                     i.smooth_scroll_delta,
                                     i.events.len(),
                                     key_pressed_count,
@@ -28065,7 +28092,7 @@ impl App {
                 // keep-alive marker: 描いた fs_id が現セッションの detached id と一致するときだけ
                 // marker を立てる (§3.6/§3.7)。backstop の二重描画/描き漏れ防止。
                 #[cfg(windows)]
-                self.mark_active_detached_viewport_rendered_if_matches(fs_id);
+                self.mark_active_detached_viewport_rendered_if_matches(ctx, fs_id);
             }
             fs_body_ms = fs_body_t0.elapsed().as_secs_f64() * 1000.0;
             fs_body_cycles = Self::thread_cycles_now().saturating_sub(fs_body_cycles_t0);
@@ -30338,6 +30365,8 @@ impl App {
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx_ui, _class| {
             let _ctx = &_ctx_ui.ctx().clone();
+            #[cfg(windows)]
+            self.capture_current_detached_viewport_registration(_ctx);
         });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.log_main_flash_probe(
@@ -30374,6 +30403,8 @@ impl App {
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx_ui, _class| {
             let _ctx = &_ctx_ui.ctx().clone();
+            #[cfg(windows)]
+            self.capture_current_detached_viewport_registration(_ctx);
         });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.log_main_flash_probe(
@@ -30418,6 +30449,8 @@ impl App {
         .with_visible(false);
         ctx.show_viewport_immediate(fs_id, builder, |_ctx_ui, _class| {
             let _ctx = &_ctx_ui.ctx().clone();
+            #[cfg(windows)]
+            self.capture_current_detached_viewport_registration(_ctx);
         });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.log_main_flash_probe(
@@ -30454,6 +30487,8 @@ impl App {
         let mut close_fs = false;
         ctx.show_viewport_immediate(fs_id, fs_builder, |ctx_ui, _class| {
             let ctx = &ctx_ui.ctx().clone();
+            #[cfg(windows)]
+            self.capture_current_detached_viewport_registration(ctx);
             if self.sidecar_restore_blocks_projected_context() {
                 Self::consume_sidecar_restore_viewport_input(ctx);
             }
@@ -38023,14 +38058,12 @@ impl App {
             if self.viewer_session_is_detached_or_switching()
                 && Self::detached_image_window_debug_enabled()
             {
+                let wheel_options = ctx.options(|o| o.input_options);
                 let (focused, raw_scroll, smooth_scroll, wheel_event_count, event_count) = ctx
                     .input(|i| {
                         (
                             i.viewport().focused.unwrap_or(false),
-                            crate::wheel_input::remaining_wheel_delta(
-                                i,
-                                ctx.options(|o| o.input_options),
-                            ),
+                            crate::wheel_input::remaining_wheel_delta(i, wheel_options),
                             i.smooth_scroll_delta,
                             i.events
                                 .iter()
@@ -55957,7 +55990,7 @@ mod music_full_width_hud_tests {
         events: Vec<egui::Event>,
     ) -> Probe {
         let mut probe = None;
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                 events,
@@ -56045,7 +56078,7 @@ mod music_full_width_hud_tests {
                         })
                 });
             },
-        );
+        ));
         let mut probe = probe.unwrap();
         probe.time = output
             .shapes
@@ -56100,6 +56133,7 @@ mod music_full_width_hud_tests {
         // read_response can retain a hidden widget from an earlier frame: visibility
         // comes from this frame's actual paint, not the retained response.
         probe.panel = painted(egui::Color32::from_rgba_premultiplied(16, 16, 20, 235));
+        output.drop_without_applying_deltas();
         probe
     }
 
@@ -56591,7 +56625,7 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let mut delay = std::time::Duration::ZERO;
         for frame in 0..4 {
-            let output = ctx.run_pass(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     time: Some(frame as f64),
@@ -56612,8 +56646,10 @@ mod tests {
                         })
                     });
                 },
-            );
+            ));
             delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+
+            output.drop_without_applying_deltas();
         }
         assert_eq!(delay, std::time::Duration::from_millis(100));
     }
@@ -56704,7 +56740,7 @@ mod tests {
                 let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
                 let mut delay = std::time::Duration::ZERO;
                 for frame in 0..4 {
-                    let output = ctx.run_pass(
+                    let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                         egui::RawInput {
                             screen_rect: Some(rect),
                             time: Some(frame as f64),
@@ -56725,8 +56761,10 @@ mod tests {
                                 })
                             });
                         },
-                    );
+                    ));
                     delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+
+                    output.drop_without_applying_deltas();
                 }
                 assert_eq!(
                     delay,
@@ -57894,7 +57932,7 @@ mod tests {
                 transform.paint_texture(&painter, texture.id(), egui::Color32::WHITE);
             })
         });
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.end_pass());
         let painted = &output.shapes[output.shapes.len() - 3..];
         assert!(painted.iter().all(|shape| shape.clip_rect == clip));
 
@@ -57910,6 +57948,8 @@ mod tests {
             };
             assert_eq!(positions, expected);
         }
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -58021,7 +58061,7 @@ mod tests {
                 App::draw_detached_frozen_image_at_rect(ui, full_rect, image_rect, &window);
             })
         });
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.end_pass());
         let painted = &output.shapes[output.shapes.len() - 2..];
         assert!(painted.iter().all(|shape| shape.clip_rect == full_rect));
 
@@ -58054,6 +58094,8 @@ mod tests {
                 trim.left_bottom(),
             ]
         );
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -59902,7 +59944,7 @@ mod tests {
     ) -> egui::FullOutput {
         ctx.begin_pass(egui::RawInput::default());
         app.update_fullscreen_cursor_visibility(ctx, ctx.viewport_id(), true, cursor_active, false);
-        ctx.end_pass()
+        crate::test_ui::headless_paint_output(ctx.end_pass())
     }
 
     fn cursor_visible_commands(output: &egui::FullOutput) -> Vec<bool> {
@@ -59919,7 +59961,7 @@ mod tests {
 
     fn prime_zoom_aim_cursor_hidden(app: &mut crate::app::App, ctx: &egui::Context) {
         app.fs_zoom_aiming = true;
-        let _ = run_cursor_visibility_frame(app, ctx, false);
+        let _ = run_cursor_visibility_frame(app, ctx, false).drop_without_applying_deltas();
         assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
     }
 
@@ -59949,10 +59991,12 @@ mod tests {
         let permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
         app.update_fs_zoom_mode_keys(&ctx, 0, permit);
         app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, true, false);
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.end_pass());
         assert!(app.fs_zoom_aiming);
         assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
         assert_eq!(cursor_visible_commands(&output), vec![false]);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -59964,6 +60008,8 @@ mod tests {
             let output = run_cursor_visibility_frame(&mut app, &ctx, true);
             assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
             assert!(!cursor_visible_commands(&output).contains(&true));
+
+            output.drop_without_applying_deltas();
         }
     }
 
@@ -59985,11 +60031,13 @@ mod tests {
         let permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
         app.update_fs_zoom_mode_keys(&ctx, 0, permit);
         app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, false, false);
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.end_pass());
         assert!(app.fs_zoom_active);
         assert!(!app.fs_zoom_aiming);
         assert_eq!(app.cursor_hide_reason, None);
         assert_eq!(cursor_visible_commands(&output), vec![true]);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -60001,6 +60049,8 @@ mod tests {
         let output = run_cursor_visibility_frame(&mut app, &ctx, false);
         assert_eq!(app.cursor_hide_reason, None);
         assert_eq!(cursor_visible_commands(&output), vec![true]);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -60012,6 +60062,8 @@ mod tests {
         let output = run_cursor_visibility_frame(&mut app, &ctx, false);
         assert_eq!(app.cursor_hide_reason, None);
         assert_eq!(cursor_visible_commands(&output), vec![true]);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -60023,10 +60075,12 @@ mod tests {
         ctx.begin_pass(egui::RawInput::default());
         app.update_fs_zoom_mode_keys(&ctx, 0, None);
         app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, false, false);
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.end_pass());
         assert!(!app.fs_zoom_aiming);
         assert_eq!(app.cursor_hide_reason, None);
         assert_eq!(cursor_visible_commands(&output), vec![true]);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -60037,10 +60091,12 @@ mod tests {
         ctx.begin_pass(egui::RawInput::default());
         app.update_fs_zoom_mode_keys(&ctx, 0, None);
         app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, false, false);
-        let output = ctx.end_pass();
+        let output = crate::test_ui::headless_paint_output(ctx.end_pass());
         assert!(!app.fs_zoom_aiming);
         assert_eq!(app.cursor_hide_reason, None);
         assert_eq!(cursor_visible_commands(&output), vec![true]);
+
+        output.drop_without_applying_deltas();
     }
 
     /// Pointer activity clears the idle hide. This is the pre-existing contract for the
@@ -60056,6 +60112,8 @@ mod tests {
         let output = run_cursor_visibility_frame(&mut app, &ctx, true);
         assert_eq!(app.cursor_hide_reason, None);
         assert_eq!(cursor_visible_commands(&output), vec![true]);
+
+        output.drop_without_applying_deltas();
     }
 
     /// Aiming is nothing but pointer motion, so an idle hide that preceded it does not
@@ -60068,12 +60126,14 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
         app.cursor_hide_reason = Some(FsCursorHide::Idle);
         app.fs_zoom_aiming = true;
-        let _ = run_cursor_visibility_frame(&mut app, &ctx, true);
+        let _ = run_cursor_visibility_frame(&mut app, &ctx, true).drop_without_applying_deltas();
         assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
         app.fs_zoom_reset();
         let output = run_cursor_visibility_frame(&mut app, &ctx, true);
         assert_eq!(app.cursor_hide_reason, None);
         assert_eq!(cursor_visible_commands(&output), vec![true]);
+
+        output.drop_without_applying_deltas();
     }
 
     /// Holding the key without moving keeps the cursor hidden after aiming ends, because
@@ -60086,12 +60146,14 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
         app.cursor_hide_reason = Some(FsCursorHide::Idle);
         app.fs_zoom_aiming = true;
-        let _ = run_cursor_visibility_frame(&mut app, &ctx, false);
+        let _ = run_cursor_visibility_frame(&mut app, &ctx, false).drop_without_applying_deltas();
         assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
         app.fs_zoom_reset();
         let output = run_cursor_visibility_frame(&mut app, &ctx, false);
         assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::Idle));
         assert!(!cursor_visible_commands(&output).contains(&true));
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -60108,6 +60170,14 @@ mod tests {
         assert!(cursor_visible_commands(&second).is_empty());
         assert!(cursor_visible_commands(&third).is_empty());
         assert_eq!(cursor_visible_commands(&exit), vec![true]);
+
+        exit.drop_without_applying_deltas();
+
+        first.drop_without_applying_deltas();
+
+        second.drop_without_applying_deltas();
+
+        third.drop_without_applying_deltas();
     }
 
     #[test]
@@ -60144,7 +60214,7 @@ mod tests {
                 app.keymap
                     .consume_action_no_repeat(&ctx, KeyAction::VideoToggleAudioMode),
             ));
-            let _ = ctx.end_pass();
+            let _ = ctx.end_pass().drop_without_applying_deltas();
         }
 
         assert_eq!(
@@ -60203,7 +60273,7 @@ mod tests {
         cache_fullscreen_keyboard_owner_for_test(&ctx);
         let level_permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
         app.update_fs_zoom_mode_keys(&ctx, 0, level_permit);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert!(!app.fs_zoom_active);
         assert!(!app.fs_zoom_aiming);
@@ -60242,7 +60312,7 @@ mod tests {
         let leaked_to_video = app
             .keymap
             .consume_action_no_repeat(&ctx, KeyAction::VideoToggleAudioMode);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             !leaked_to_video,
@@ -66072,18 +66142,21 @@ mod tests {
         let mut accountant = crate::vram_budget::VramAccountant::default();
         pending.account(&mut accountant);
         assert_eq!(accountant.finish().total_texels, 4 * 6);
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            assert!(sources.paint_page(
-                &ctx.layer_painter(egui::LayerId::background()),
-                0,
-                &transform,
-                None,
-            ));
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                assert!(sources.paint_page(
+                    &ctx.layer_painter(egui::LayerId::background()),
+                    0,
+                    &transform,
+                    None,
+                ));
+            }));
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
         assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Mesh(mesh) if mesh.texture_id == source_id)));
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -66126,18 +66199,21 @@ mod tests {
         );
         drop(page);
         assert_eq!(sources.texture_for_page(0, None).unwrap().id(), source_id);
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            assert!(sources.paint_page(
-                &ctx.layer_painter(egui::LayerId::background()),
-                0,
-                &transform,
-                None,
-            ));
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                assert!(sources.paint_page(
+                    &ctx.layer_painter(egui::LayerId::background()),
+                    0,
+                    &transform,
+                    None,
+                ));
+            }));
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Mesh(mesh) if mesh.texture_id == source_id)));
         assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -66194,30 +66270,33 @@ mod tests {
                 })
             });
             let mut sources = None;
-            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-                let submitted = app.submit_fs_spread_prepared(ctx, pages.clone(), false, false);
-                assert!(submitted.pages.iter().all(|page| matches!(
-                    page.resource,
-                    FullscreenPaintPayload::NormalResource(_)
-                )));
-                // The SNS panel borrows this exact endpoint from the painted unit.
-                assert_eq!(
-                    submitted.texture_for_page(0, None).unwrap().id(),
-                    source_ids[0]
-                );
-                let geometry = navigator_test_transform(
-                    0,
-                    crate::rotation_db::Rotation::None,
-                    ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                );
-                assert!(submitted.paint_page(
-                    &ctx.layer_painter(egui::LayerId::background()),
-                    0,
-                    &geometry,
-                    None,
-                ));
-                sources = Some(submitted);
-            });
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput::default(),
+                |ctx| {
+                    let submitted = app.submit_fs_spread_prepared(ctx, pages.clone(), false, false);
+                    assert!(submitted.pages.iter().all(|page| matches!(
+                        page.resource,
+                        FullscreenPaintPayload::NormalResource(_)
+                    )));
+                    // The SNS panel borrows this exact endpoint from the painted unit.
+                    assert_eq!(
+                        submitted.texture_for_page(0, None).unwrap().id(),
+                        source_ids[0]
+                    );
+                    let geometry = navigator_test_transform(
+                        0,
+                        crate::rotation_db::Rotation::None,
+                        ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    );
+                    assert!(submitted.paint_page(
+                        &ctx.layer_painter(egui::LayerId::background()),
+                        0,
+                        &geometry,
+                        None,
+                    ));
+                    sources = Some(submitted);
+                },
+            ));
             assert_eq!(
                 output
                     .shapes
@@ -66235,6 +66314,8 @@ mod tests {
                     .source_texture()
                     .is_some()
             );
+
+            output.drop_without_applying_deltas();
         }
     }
 
@@ -66281,14 +66362,17 @@ mod tests {
         assert!(sources.pages[0].resource.source_texture().is_none());
         assert_eq!(sources.partial_presentation_source_id(0), Some(source_id));
         for fallback in [&source, &thumbnail] {
-            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-                assert!(sources.paint_page(
-                    &ctx.layer_painter(egui::LayerId::background()),
-                    0,
-                    &geometry,
-                    Some(fallback)
-                ));
-            });
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput::default(),
+                |ctx| {
+                    assert!(sources.paint_page(
+                        &ctx.layer_painter(egui::LayerId::background()),
+                        0,
+                        &geometry,
+                        Some(fallback)
+                    ));
+                },
+            ));
             assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
                 egui::Shape::Mesh(mesh) if mesh.texture_id == fallback.id())));
             assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
@@ -66309,6 +66393,8 @@ mod tests {
             assert_rect_close(egui::Rect::from_points(&positions), geometry.paint_rect);
             assert!(mesh.vertices.iter().any(|vertex| vertex.uv.y == 0.0));
             assert!(mesh.vertices.iter().any(|vertex| vertex.uv.y == 1.0));
+
+            output.drop_without_applying_deltas();
         }
     }
 
@@ -66357,7 +66443,7 @@ mod tests {
             )),
             None,
         ] {
-            let output = ctx.run_pass(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
@@ -66397,11 +66483,13 @@ mod tests {
                         })
                     });
                 },
-            );
+            ));
             assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
                 egui::Shape::Mesh(mesh) if mesh.texture_id == thumbnail.id())));
             assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
                 egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+
+            output.drop_without_applying_deltas();
         }
     }
 
@@ -66440,16 +66528,19 @@ mod tests {
             crate::rotation_db::Rotation::None,
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            assert!(sources.paint_page(
-                &ctx.layer_painter(egui::LayerId::background()),
-                0,
-                &geometry,
-                None
-            ));
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                assert!(sources.paint_page(
+                    &ctx.layer_painter(egui::LayerId::background()),
+                    0,
+                    &geometry,
+                    None
+                ));
+            }));
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -67829,7 +67920,7 @@ mod tests {
             complete_navigator_preview_for_test(&mut app, egui::Color32::LIGHT_BLUE);
 
             let mut paint_ids = None;
-            let output = ctx.run_pass(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 navigator_ordered_input(
                     vec![navigator_button_event(
                         image_rect.center(),
@@ -67864,9 +67955,9 @@ mod tests {
                             })
                     });
                 },
-            );
+            ));
             let (paint_id, source_id) = paint_ids.expect("preview paint ids");
-            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            let primitives = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
             let body_count = similar_preview_mesh_count(&primitives, paint_id);
             let navigator_count = similar_preview_mesh_count(&primitives, source_id);
             if paint_id == source_id {
@@ -67878,6 +67969,8 @@ mod tests {
                 assert!(body_count >= 1, "{case} candidate body paint");
                 assert!(navigator_count >= 1, "{case} candidate navigator paint");
             }
+
+            output.drop_without_applying_deltas();
         }
     }
 
@@ -67901,7 +67994,7 @@ mod tests {
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
         complete_navigator_preview_for_test(&mut app, egui::Color32::LIGHT_GREEN);
         let mut candidate_painted = false;
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             navigator_ordered_input(
                 vec![navigator_button_event(
                     image_rect.center(),
@@ -67933,7 +68026,7 @@ mod tests {
                         })
                 });
             },
-        );
+        ));
         assert!(candidate_painted);
         assert!(!output.shapes.is_empty());
 
@@ -67966,6 +68059,8 @@ mod tests {
         assert_eq!(slot.source_idx, 41);
         assert_eq!(slot.external_item_key.as_deref(), Some("pinned-a-key"));
         assert_eq!(slot.source_size, [700, 500]);
+
+        output.drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -68465,7 +68560,7 @@ mod tests {
                 29,
             )
             .expect("production strip press must own the queued deterministic receiver");
-        let preview_output = ctx.run_pass(
+        let preview_output = crate::test_ui::headless_paint_output(ctx.run_pass(
             navigator_ordered_input_for_screen(
                 Vec::new(),
                 0.3,
@@ -68473,7 +68568,7 @@ mod tests {
                 native_pixels_per_point,
             ),
             |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-        );
+        ));
         assert_eq!(
             !app.still_seek_thumbnail_pages.is_empty(),
             still_seek_strip_visible,
@@ -68491,8 +68586,10 @@ mod tests {
             .active_diagnostic_ids_for_test()
             .expect("the held completion must retain its diagnostic operation");
         let request_id = request_id.expect("the accepted completion authorizes one request");
-        let preview_primitives =
-            ctx.tessellate(preview_output.shapes, preview_output.pixels_per_point);
+        let preview_primitives = ctx.tessellate(
+            preview_output.shapes.clone(),
+            preview_output.pixels_per_point,
+        );
         assert!(
             similar_preview_mesh_count(&preview_primitives, candidate_id)
                 >= if navigator_visible { 2 } else { 1 },
@@ -68506,7 +68603,7 @@ mod tests {
             );
         }
 
-        let release_output = ctx.run_pass(
+        let release_output = crate::test_ui::headless_paint_output(ctx.run_pass(
             navigator_ordered_input_for_screen(
                 vec![navigator_button_event(
                     press_pos,
@@ -68518,9 +68615,11 @@ mod tests {
                 native_pixels_per_point,
             ),
             |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+        ));
+        let release_primitives = ctx.tessellate(
+            release_output.shapes.clone(),
+            release_output.pixels_per_point,
         );
-        let release_primitives =
-            ctx.tessellate(release_output.shapes, release_output.pixels_per_point);
         assert_eq!(
             similar_preview_mesh_count(&release_primitives, candidate_id),
             0,
@@ -68612,6 +68711,10 @@ mod tests {
             };
             cursor += offset + 1;
         }
+
+        preview_output.drop_without_applying_deltas();
+
+        release_output.drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -69061,17 +69164,22 @@ mod tests {
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
         complete_navigator_preview_for_test(&mut app, egui::Color32::LIGHT_BLUE);
 
-        let preview_output = ctx.run_pass(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
-            ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
-        });
+        let preview_output = crate::test_ui::headless_paint_output(ctx.run_pass(
+            navigator_ordered_input(Vec::new(), 0.1),
+            |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            },
+        ));
         let candidate_id = app
             .similar_panel
             .preview
             .cached_texture()
             .unwrap_or_else(|| panic!("{case} dispatcher must accept the candidate completion"))
             .id();
-        let preview_primitives =
-            ctx.tessellate(preview_output.shapes, preview_output.pixels_per_point);
+        let preview_primitives = ctx.tessellate(
+            preview_output.shapes.clone(),
+            preview_output.pixels_per_point,
+        );
         assert!(
             similar_preview_mesh_count(&preview_primitives, candidate_id) >= 2,
             "{case} must paint candidate B in both body and navigator through the dispatcher"
@@ -69090,7 +69198,7 @@ mod tests {
             mode
         );
 
-        let release_output = ctx.run_pass(
+        let release_output = crate::test_ui::headless_paint_output(ctx.run_pass(
             navigator_ordered_input(
                 vec![navigator_button_event(
                     image_rect.center(),
@@ -69100,9 +69208,11 @@ mod tests {
                 0.2,
             ),
             |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+        ));
+        let release_primitives = ctx.tessellate(
+            release_output.shapes.clone(),
+            release_output.pixels_per_point,
         );
-        let release_primitives =
-            ctx.tessellate(release_output.shapes, release_output.pixels_per_point);
         assert_eq!(
             similar_preview_mesh_count(&release_primitives, candidate_id),
             0,
@@ -69167,6 +69277,10 @@ mod tests {
                 );
             }
         }
+
+        preview_output.drop_without_applying_deltas();
+
+        release_output.drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -73541,7 +73655,7 @@ mod tests {
         ) -> bool {
             ctx.begin_pass(raw_input(viewport, events));
             let observed = observe_music_touch_for_panel_handles(ctx, gestures_disabled);
-            let _ = ctx.end_pass();
+            let _ = ctx.end_pass().drop_without_applying_deltas();
             observed
         }
 
@@ -76329,13 +76443,11 @@ mod tests {
                         })
                     });
                     assert!(ctx.egui_wants_keyboard_input());
+                    let wheel_options = ctx.options(|o| o.input_options);
                     assert!(ctx.input(|input| {
-                        crate::wheel_input::remaining_wheel_delta(
-                            input,
-                            ctx.options(|o| o.input_options),
-                        )
-                        .y
-                        .abs()
+                        crate::wheel_input::remaining_wheel_delta(input, wheel_options)
+                            .y
+                            .abs()
                             > 0.5
                     }));
                     app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
@@ -76357,7 +76469,10 @@ mod tests {
                     events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
                         .chain(vec![
                             egui::Event::Ime(egui::ImeEvent::Enabled),
-                            egui::Event::Ime(egui::ImeEvent::Preedit("あ".into())),
+                            egui::Event::Ime(egui::ImeEvent::Preedit {
+                                text: "あ".into(),
+                                active_range_chars: None,
+                            }),
                             egui::Event::MouseWheel {
                                 unit: egui::MouseWheelUnit::Line,
                                 delta: egui::vec2(0.0, -1.0),
@@ -76371,13 +76486,11 @@ mod tests {
                 },
                 |ctx| {
                     assert!(app.ime_input_active(ctx));
+                    let wheel_options = ctx.options(|o| o.input_options);
                     assert!(ctx.input(|input| {
-                        crate::wheel_input::remaining_wheel_delta(
-                            input,
-                            ctx.options(|o| o.input_options),
-                        )
-                        .y
-                        .abs()
+                        crate::wheel_input::remaining_wheel_delta(input, wheel_options)
+                            .y
+                            .abs()
                             > 0.5
                     }));
                     app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
@@ -76437,13 +76550,11 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
+                    let wheel_options = ctx.options(|o| o.input_options);
                     assert!(ctx.input(|input| {
-                        crate::wheel_input::remaining_wheel_delta(
-                            input,
-                            ctx.options(|o| o.input_options),
-                        )
-                        .y
-                        .abs()
+                        crate::wheel_input::remaining_wheel_delta(input, wheel_options)
+                            .y
+                            .abs()
                             > 0.5
                     }));
                     app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
@@ -78229,7 +78340,7 @@ mod tests {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0)),
         ] {
             let output = crate::app::paint_record_test_support::with_capture(|| {
-                ctx.run_pass(
+                crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(viewport),
                         ..Default::default()
@@ -78244,7 +78355,7 @@ mod tests {
                             )
                         });
                     },
-                )
+                ))
             });
             let records = crate::app::paint_record_test_support::white_companion_paint_records(
                 egui::ViewportId::ROOT,
@@ -78541,7 +78652,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(full),
                 ..Default::default()
@@ -78555,7 +78666,7 @@ mod tests {
                         })
                 });
             },
-        );
+        ));
         assert!(output.shapes.iter().any(|shape| {
             matches!(
                 &shape.shape,
@@ -78566,6 +78677,8 @@ mod tests {
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Retained(_)
         ));
+
+        output.drop_without_applying_deltas();
     }
 
     struct StillSeekOverlayTestFrame {
@@ -78587,7 +78700,7 @@ mod tests {
             strip: None,
             shapes: Vec::new(),
         };
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(full),
                 events,
@@ -78606,8 +78719,9 @@ mod tests {
                     })
                 });
             },
-        );
-        frame.shapes = output.shapes;
+        ));
+        frame.shapes = output.shapes.clone();
+        output.drop_without_applying_deltas();
         frame
     }
 
@@ -78906,17 +79020,16 @@ mod tests {
 
         // Use the same real CentralPanel with no overlay as the paint baseline.
         let baseline_ctx = egui::Context::default();
-        let baseline = baseline_ctx
-            .run(
-                egui::RawInput {
-                    screen_rect: Some(full),
-                    ..Default::default()
-                },
-                |ctx| {
-                    ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |_ui| {}));
-                },
-            )
-            .shapes;
+        let baseline = crate::test_ui::headless_paint_output(baseline_ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(full),
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |_ui| {}));
+            },
+        ))
+        .shapes;
         let frame = still_seek_edge_frame(&mut app, &egui::Context::default(), full, vec![]);
         assert!(frame.target.is_none());
         assert!(frame.track.is_none());
@@ -79247,7 +79360,7 @@ mod tests {
                 let ctx = egui::Context::default();
                 let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
                 still_seek_edge_frame(&mut app, &ctx, full, vec![]);
-                let output = ctx.run_pass(
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(full),
                         ..Default::default()
@@ -79259,7 +79372,7 @@ mod tests {
                             })
                         });
                     },
-                );
+                ));
                 let labels: Vec<_> = output
                     .shapes
                     .iter()
@@ -79273,6 +79386,8 @@ mod tests {
                     bar == StillSeekBarWithStrip::Hide,
                     "bar={bar:?}, lock={lock:?}, labels={labels:?}"
                 );
+
+                output.drop_without_applying_deltas();
             }
         }
     }
@@ -83207,7 +83322,7 @@ mod tests {
                 0.15,
             ));
             let _ = app.handle_fs_key_input(&ctx, fs_idx, false);
-            let _ = ctx.end_pass();
+            let _ = ctx.end_pass().drop_without_applying_deltas();
         }
         #[cfg(not(windows))]
         {
@@ -83848,7 +83963,7 @@ mod tests {
             affordance: CompareWipeAffordance,
         ) -> Vec<egui::epaint::ClippedShape> {
             let ctx = egui::Context::default();
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -83863,7 +83978,7 @@ mod tests {
                     ));
                     App::paint_compare_wipe_affordance(&painter, image, 0.25, affordance);
                 },
-            )
+            ))
             .shapes
         }
 
@@ -86734,7 +86849,7 @@ mod specified_scale_consumer_tests {
             events,
             ..Default::default()
         };
-        let output = ctx.run_pass(raw_input, |ctx| {
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(raw_input, |ctx| {
             ctx.root_ui(|root_ui| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
@@ -86855,7 +86970,7 @@ mod specified_scale_consumer_tests {
                         *open = fit_popup_open;
                     })
             });
-        });
+        }));
         output
     }
 
@@ -87543,14 +87658,14 @@ mod specified_scale_consumer_tests {
         assert!(app.fullscreen_embedded_still_active());
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
         let mut draw = |events| {
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
                     ..Default::default()
                 },
                 |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-            )
+            ))
         };
         let mut output = draw(vec![]);
         for _ in 0..4 {
@@ -87676,14 +87791,14 @@ mod specified_scale_consumer_tests {
             }
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
             let draw = |app: &mut App, events| {
-                ctx.run_pass(
+                crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(rect),
                         events,
                         ..Default::default()
                     },
                     |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-                )
+                ))
             };
             let mut output = draw(&mut app, vec![]);
             for _ in 0..4 {
@@ -87955,7 +88070,7 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
@@ -87963,7 +88078,7 @@ mod specified_scale_consumer_tests {
                     ..Default::default()
                 },
                 |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-            )
+            ))
         };
         let metadata = || {
             ctx.data(|data| {
@@ -88047,16 +88162,17 @@ mod specified_scale_consumer_tests {
             let _ = draw(&mut app, vec![egui::Event::PointerMoved(point)]);
             let before = metadata().2;
             let _ = draw(&mut app, wheel(point));
+            let wheel_options = ctx.options(|o| o.input_options);
             assert!(
-                ctx.input(|i| crate::wheel_input::remaining_wheel_delta(
-                    i,
-                    ctx.options(|o| o.input_options)
-                ) == egui::Vec2::ZERO
-                    && i.smooth_scroll_delta == egui::Vec2::ZERO
-                    && !i
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))),
+                ctx.input(
+                    |i| crate::wheel_input::remaining_wheel_delta(i, wheel_options)
+                        == egui::Vec2::ZERO
+                        && i.smooth_scroll_delta == egui::Vec2::ZERO
+                        && !i
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                ),
                 "the popup's wheel frame must leave nothing for a later grid/panel consumer"
             );
             for _ in 0..30 {
@@ -88067,9 +88183,9 @@ mod specified_scale_consumer_tests {
                 before,
                 "HUD popup {popup} owns wheel ahead of the right panel"
             );
+            let wheel_options = ctx.options(|o| o.input_options);
             assert!(ctx.input(|i| {
-                crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options))
-                    == egui::Vec2::ZERO
+                crate::wheel_input::remaining_wheel_delta(i, wheel_options) == egui::Vec2::ZERO
                     && i.smooth_scroll_delta == egui::Vec2::ZERO
                     && !i
                         .events
@@ -88114,9 +88230,9 @@ mod specified_scale_consumer_tests {
 
     #[cfg(windows)]
     fn assert_popup_wheel_consumed(ctx: &egui::Context) {
+        let wheel_options = ctx.options(|o| o.input_options);
         assert!(ctx.input(|i| {
-            crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options))
-                == egui::Vec2::ZERO
+            crate::wheel_input::remaining_wheel_delta(i, wheel_options) == egui::Vec2::ZERO
                 && i.smooth_scroll_delta == egui::Vec2::ZERO
                 && !i
                     .events
@@ -88133,7 +88249,7 @@ mod specified_scale_consumer_tests {
             let mut frame = 0;
             let mut draw = |app: &mut App, events| {
                 frame += 1;
-                ctx.run_pass(
+                crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(viewport),
                         time: Some(frame as f64 / 60.0),
@@ -88141,7 +88257,7 @@ mod specified_scale_consumer_tests {
                         ..Default::default()
                     },
                     |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-                )
+                ))
             };
             for _ in 0..5 {
                 let _ = draw(&mut app, vec![]);
@@ -88211,7 +88327,7 @@ mod specified_scale_consumer_tests {
             let mut frame = 0;
             let mut draw = |app: &mut App, events| {
                 frame += 1;
-                ctx.run_pass(
+                crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(viewport),
                         time: Some(frame as f64 / 60.0),
@@ -88219,7 +88335,7 @@ mod specified_scale_consumer_tests {
                         ..Default::default()
                     },
                     |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-                )
+                ))
             };
             for _ in 0..5 {
                 let _ = draw(&mut app, vec![]);
@@ -88288,7 +88404,7 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
@@ -88296,7 +88412,7 @@ mod specified_scale_consumer_tests {
                     ..Default::default()
                 },
                 |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-            )
+            ))
         };
         for _ in 0..5 {
             let _ = draw(&mut app, vec![]);
@@ -88392,7 +88508,7 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
@@ -88400,7 +88516,7 @@ mod specified_scale_consumer_tests {
                     ..Default::default()
                 },
                 |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-            )
+            ))
         };
         for _ in 0..5 {
             let _ = draw(&mut app, vec![]);
@@ -88505,7 +88621,7 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
@@ -88517,7 +88633,7 @@ mod specified_scale_consumer_tests {
                     let raw = FsNavigatorFrameInput::for_current_pass(ctx);
                     ctx.data_mut(|data| data.insert_temp(egui::Id::new("front_raw_wheel"), raw));
                 },
-            )
+            ))
         };
         for _ in 0..5 {
             let _ = draw(&mut app, vec![]);
@@ -88745,14 +88861,14 @@ mod specified_scale_consumer_tests {
         app.fit_popup_open = true;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 614.0));
         let draw = |app: &mut App, events| {
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
                     ..Default::default()
                 },
                 |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-            )
+            ))
         };
         let mut output = draw(&mut app, vec![]);
         for _ in 0..4 {
@@ -88849,7 +88965,10 @@ mod specified_scale_consumer_tests {
             &mut app,
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("にほん".into())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "にほん".into(),
+                    active_range_chars: None,
+                }),
             ],
             0.2,
             false,
@@ -88934,7 +89053,7 @@ mod specified_scale_consumer_tests {
         app.fit_popup_open = true;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         let draw = |app: &mut App, events| {
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
@@ -88952,7 +89071,7 @@ mod specified_scale_consumer_tests {
                     }
                     ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                 },
-            )
+            ))
         };
         let mut output = draw(&mut app, vec![]);
         for _ in 0..4 {
@@ -88997,7 +89116,10 @@ mod specified_scale_consumer_tests {
                 &mut app,
                 vec![
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("１２５".into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "１２５".into(),
+                        active_range_chars: None,
+                    }),
                 ],
             );
             assert!(app.ime_input_active(&ctx));
@@ -89630,7 +89752,7 @@ pub(crate) mod page_turn_submission_tests {
         run: impl FnMut(&mut egui::Ui, &egui::Context),
     ) -> egui::FullOutput {
         let mut run = run;
-        ctx.run_pass(
+        crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -89645,7 +89767,7 @@ pub(crate) mod page_turn_submission_tests {
                         .show(root_ui, |ui| run(ui, ctx))
                 });
             },
-        )
+        ))
     }
 
     pub(crate) fn seed_leaf(ctx: &egui::Context, app: &mut App) {
@@ -90488,7 +90610,7 @@ pub(crate) mod page_turn_submission_tests {
             drop(held);
             let native_id = native.paint_texture_id();
             let mut submitted_sources = None;
-            let output = ctx.run_pass(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -90565,7 +90687,7 @@ pub(crate) mod page_turn_submission_tests {
                             })
                     });
                 },
-            );
+            ));
             drop(native);
             let sources = submitted_sources.unwrap();
             assert!(sources.pages[0].resource.source_texture().is_none());
@@ -90579,6 +90701,8 @@ pub(crate) mod page_turn_submission_tests {
             assert_eq!(accountant.finish().total_texels, 40 * 60);
             assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Mesh(mesh) if mesh.texture_id == native_id)));
+
+            output.drop_without_applying_deltas();
         }
     }
 
@@ -90953,7 +91077,7 @@ mod music_overflow_tests {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
             for _ in 0..3 {
-                let output = ctx.run_pass(
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -90997,7 +91121,7 @@ mod music_overflow_tests {
                             )
                         });
                     },
-                );
+                ));
                 let title = output
                     .shapes
                     .iter()
@@ -91022,6 +91146,8 @@ mod music_overflow_tests {
                         "title/Row at {width}"
                     );
                 }
+
+                output.drop_without_applying_deltas();
             }
         }
     }
@@ -91193,17 +91319,20 @@ mod music_overflow_tests {
         events: Vec<egui::Event>,
         modifiers: egui::Modifiers,
     ) -> egui::FullOutput {
-        ctx.run_pass(
-            egui::RawInput {
-                events: vec![egui::Event::ModifiersChanged(modifiers)],
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(820.0, 600.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+        crate::test_ui::headless_paint_output(
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(820.0, 600.0),
+                    )),
+                    events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                        .chain(events)
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            ),
         )
     }
 

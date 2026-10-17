@@ -81,3 +81,15 @@ cfg(test) thread-local counterで別に検査する。productionの新field／fl
 command・最終件数・変異・制約は[段2検証台帳](../../docs/egui-0.37-stage2-verification.md)に記録する。
 AutoVsync／latency 1・環境変数の製品設定を新WgpuConfiguration.surfaceへ接続するのは段3で行い、
 この段ではrootの旧設定を変更しない。D3D11 presenter／Naga27の別経路も変更しない。
+
+## 段3: 正式vendorへの接続
+
+準備graphの内容を `vendor/egui-wgpu` へ正式配置し、rootのpatchと依存wgpu30へ接続した。
+原本記録は `vendor/upstream-provenance.json` / `vendor/import-upstream.py` に保持する。
+standalone検証用のmanifestは自身をworkspace rootとし、egui/egui-winit/eframeも正式vendorへpatchする。
+上記の `vendor-next/Cargo.lock` は段2時点の記録であり、段3以降はrootと正式standalone graphの通常cargo解決を使用する。
+
+native presenterが既存renderer ownerでtexture更新のGPU commandを提出するため、
+`renderer::TextureUpdateSubmission` をcrate rootから明示公開した。新しいrendererやdelta queueは追加しない。
+製品の各FullOutput consumerはmap型deltaを順序どおりdrainし、必要なsubmissionの後でfreeする。
+正式graphでの検証結果は [段3台帳](../../docs/egui-0.37-stage3-verification.md) に記録する。

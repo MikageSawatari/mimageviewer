@@ -294,3 +294,47 @@ fn egui037_continuation_context_state_window_service_preserves_sibling_publicati
     assert_eq!(env.rating_publication_count, publications);
     assert!(trace.take().is_empty());
 }
+
+#[test]
+fn egui037_continuation_context_state_real_logic_preserves_unadopted_owner_results() {
+    let Fixture {
+        mut env,
+        main,
+        other,
+        old_stamp,
+        ..
+    } = Fixture::new();
+    let ctx = egui::Context::default();
+    let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    let trace = BoundaryTrace::start();
+    let generation = env.items_generation;
+    let publications = env.rating_publication_count;
+    let original_events = vec![
+        egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+        egui::Event::WindowFocused(false),
+    ];
+    let mut pending = egui::RawInput {
+        events: original_events.clone(),
+        focused: false,
+        ..Default::default()
+    };
+    for _ in 0..3 {
+        let (_, returned) = integration.update_logic_only(&mut env.app, pending);
+        pending = returned;
+        assert_eq!(pending.viewport_id, egui::ViewportId::ROOT);
+        assert_eq!(pending.events, original_events);
+        assert_eq!(ctx.cumulative_frame_nr(), 0);
+        Fixture::assert_pending(&env, main, 4, old_stamp);
+        env.with_viewer_context_state(other, |app| {
+            Fixture::assert_pending(app, other, 7, old_stamp);
+        })
+        .unwrap();
+        assert_eq!(env.projected_viewer_context_id(), main);
+        assert_eq!(env.items_generation, generation);
+        assert_eq!(env.rating_publication_count, publications);
+        assert!(
+            trace.take().is_empty(),
+            "real logic cannot cross a UI adoption boundary"
+        );
+    }
+}

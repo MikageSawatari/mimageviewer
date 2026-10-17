@@ -273,6 +273,8 @@ fn apply_scrollbar_visibility_style(ctx: &egui::Context) {
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
         let mut style = (*ctx.style_of(theme)).clone();
         let scroll = &mut style.spacing.scroll;
+        // Keep the pre-0.37 ScrollArea edge appearance in both themes.
+        scroll.fade.strength = 0.0;
         scroll.bar_width = 10.0;
         scroll.floating_width = 8.0;
         scroll.floating_allocated_width = 0.0;

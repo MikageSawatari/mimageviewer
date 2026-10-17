@@ -4499,7 +4499,7 @@ mod tests {
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -5809,7 +5809,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run_pass(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -5818,9 +5818,10 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui| app.render_grid(ui)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
         draw(&mut app);
         draw(&mut app);
@@ -5894,7 +5895,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run_pass(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -5903,9 +5904,10 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui| app.render_grid(ui)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
         draw(&mut app);
         draw(&mut app);
@@ -7284,7 +7286,7 @@ mod tests {
                 let ctx = egui::Context::default();
                 ctx.begin_pass(egui::RawInput::default());
                 let nav = app.handle_keyboard(&ctx);
-                let _ = ctx.end_pass();
+                ctx.end_pass().drop_without_applying_deltas();
                 nav.expect("frame-start keyboard handling must consume the close request")
             } else {
                 app.take_pending_return_to_parent_nav()
@@ -8691,7 +8693,8 @@ mod tests {
         app.epub_convert = Some(saved);
         drop(original);
         let ctx = egui::Context::default();
-        let _ = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert_eq!(app.folder_nav_current_target(), root);
         assert_eq!(app.items, before_rows);
         let Some(mut transition) = app.top_level_grid_view.take_history_navigation_transition()

@@ -9824,6 +9824,8 @@ mod tests {
             ],
             ..Default::default()
         });
+        assert_eq!(ctx.input(|input| input.modifiers), modifiers);
+        assert!(ctx.input(|input| matches!(input.events.first(), Some(egui::Event::ModifiersChanged(value)) if *value == modifiers)));
         cache_test_keyboard_owner(ctx);
     }
 
@@ -9891,7 +9893,14 @@ mod tests {
                 !keymap.consume_action(&ctx, undo),
                 "Ctrl+Shift+Z must not fall through to {undo:?}"
             );
-            assert_eq!(ctx.input(|input| input.events.len()), 0);
+            assert_eq!(
+                ctx.input(|input| input
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, egui::Event::Key { .. }))
+                    .count()),
+                0
+            );
             ctx.end_pass().drop_without_applying_deltas();
         }
     }
@@ -9905,7 +9914,7 @@ mod tests {
                 modal: false,
                 text_input: None,
                 focused_ui: ctx
-                    .wants_keyboard_input()
+                    .egui_wants_keyboard_input()
                     .then_some(focused_widget.unwrap_or(egui::Id::NULL)),
                 shortcut_scope: Some(crate::keyboard_input::ShortcutScope::new(
                     ctx.viewport_id(),
@@ -9917,14 +9926,11 @@ mod tests {
     }
 
     fn draw_test_focusable(ctx: &egui::Context, id: &'static str) {
-        let mut ui = egui::Ui::new(
-            ctx.clone(),
-            egui::Id::unique(("test_focusable_root", id)),
-            egui::UiBuilder::new(),
-        );
-        egui::CentralPanel::default().show(&mut ui, |ui| {
-            let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
-            let _ = ui.interact(rect, egui::Id::new(id), egui::Sense::click_and_drag());
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+                let _ = ui.interact(rect, egui::Id::new(id), egui::Sense::click_and_drag());
+            })
         });
     }
 
@@ -13255,7 +13261,12 @@ mod tests {
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::S, egui::Modifiers::SHIFT);
         assert!(!keymap.consume_action(&ctx, KeyAction::FsSlideshow));
-        let remaining = ctx.input(|i| i.events.len());
+        let remaining = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()
+        });
         assert_eq!(remaining, 1);
         ctx.end_pass().drop_without_applying_deltas();
     }
@@ -13281,9 +13292,16 @@ mod tests {
         .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         ctx.end_pass().drop_without_applying_deltas();
     }
 
@@ -13307,10 +13325,17 @@ mod tests {
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x54, 0x14)]);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(keymap.diagnostic_peek_action_press(&ctx, KeyAction::FsPostFilterNext));
         assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         assert!(crate::key_input::pressed_key_down(
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x54
@@ -13358,9 +13383,14 @@ mod tests {
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
 
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
         assert!(keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
-        assert!(ctx.input(|input| input.events.is_empty()));
+        assert!(ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .all(|event| !matches!(event, egui::Event::Key { .. }))
+        }));
         ctx.end_pass().drop_without_applying_deltas();
     }
 
@@ -13385,9 +13415,16 @@ mod tests {
         .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(!keymap.pressed_action(&ctx, KeyAction::FsPostFilterNext));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         ctx.end_pass().drop_without_applying_deltas();
     }
 
@@ -13412,12 +13449,19 @@ mod tests {
         .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::NONE);
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert_eq!(
             keymap.take_key_hold_edges(&ctx, KeyAction::FsZoomMode),
             (false, false)
         );
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         ctx.end_pass().drop_without_applying_deltas();
     }
     #[cfg(windows)]
@@ -13444,11 +13488,15 @@ mod tests {
         crate::key_input::set_test_frame(vec![tab_edge(false), tab_edge(true)]);
 
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert!(ctx.input(|i| i.events.is_empty()));
+        assert!(ctx.input(|i| {
+            i.events
+                .iter()
+                .all(|event| !matches!(event, egui::Event::Key { .. }))
+        }));
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         draw_test_focusable(&ctx, "tab_claim_surface");
         ctx.end_pass().drop_without_applying_deltas();
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
 
         ctx.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {
@@ -13463,10 +13511,14 @@ mod tests {
         cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(true)]);
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert!(ctx.input(|i| i.events.is_empty()));
+        assert!(ctx.input(|i| {
+            i.events
+                .iter()
+                .all(|event| !matches!(event, egui::Event::Key { .. }))
+        }));
         draw_test_focusable(&ctx, "tab_repeat_claim_surface");
         ctx.end_pass().drop_without_applying_deltas();
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[cfg(windows)]
@@ -13483,7 +13535,7 @@ mod tests {
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         draw_test_focusable(&ctx, "tab_then_shortcuts_surface");
         ctx.end_pass().drop_without_applying_deltas();
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
 
         begin_key_pass(&ctx, egui::Key::I, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x49, 0x17)]);
@@ -13520,11 +13572,18 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::Tab, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         assert!(keymap.consume_action(&ctx, KeyAction::FsSlideshow));
         draw_test_focusable(&ctx, "reassigned_tab_surface");
         ctx.end_pass().drop_without_applying_deltas();
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[cfg(windows)]
@@ -13555,24 +13614,26 @@ mod tests {
         cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert_eq!(ctx.input(|i| i.events.len()), 1);
+        assert_eq!(
+            ctx.input(|i| i
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         assert!(crate::key_input::pressed_key_down(
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x09
         ));
-        egui::CentralPanel::default().show(
-            &mut egui::Ui::new(
-                ctx.clone(),
-                egui::Id::unique("headless_manual_root"),
-                egui::UiBuilder::new(),
-            ),
-            |ui| {
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
                 let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
-            },
-        );
+            })
+        });
         ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
@@ -13594,12 +13655,19 @@ mod tests {
         cache_test_keyboard_owner(&ctx);
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
 
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        assert_eq!(ctx.input(|input| input.events.len()), 1);
+        assert_eq!(
+            ctx.input(|input| input
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         draw_test_focusable(&ctx, "modal_focus_surface");
         ctx.end_pass().drop_without_applying_deltas();
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
     }
 
     #[test]
@@ -13649,7 +13717,14 @@ mod tests {
             keymap.consume_rating_action(&ctx, true),
             Some(RatingEdit::Assign(2))
         );
-        assert_eq!(ctx.input(|i| i.events.len()), 0);
+        assert_eq!(
+            ctx.input(|i| i
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            0
+        );
         ctx.end_pass().drop_without_applying_deltas();
 
         let keymap = Keymap::from_ini_str(
@@ -13661,7 +13736,14 @@ mod tests {
         assert!(keymap.warnings().is_empty());
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::NONE);
         assert_eq!(keymap.consume_rating_action(&ctx, false), None);
-        assert_eq!(ctx.input(|i| i.events.len()), 1);
+        assert_eq!(
+            ctx.input(|i| i
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            1
+        );
         ctx.end_pass().drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
@@ -13669,7 +13751,14 @@ mod tests {
             keymap.consume_rating_action(&ctx, false),
             Some(RatingEdit::Assign(1))
         );
-        assert_eq!(ctx.input(|i| i.events.len()), 0);
+        assert_eq!(
+            ctx.input(|i| i
+                .events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::Key { .. }))
+                .count()),
+            0
+        );
         ctx.end_pass().drop_without_applying_deltas();
 
         let keymap = Keymap::from_ini_str(

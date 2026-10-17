@@ -1100,9 +1100,10 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
         };
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.poll_book_composition_read(ctx)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             env.zip_nav.as_ref().unwrap().current(),
             &["c-show".to_owned()],
@@ -1151,9 +1152,10 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
             }
         }
         env.book_composition_permission.open = OpenPermission::Ready { intent, candidates };
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.poll_book_composition_read(ctx)
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             matches!(env.items.get(env.fullscreen_idx.unwrap()), Some(crate::grid_item::GridItem::ZipImage { entry_name, .. }) if entry_name == "c-show/c.jpg")
         );
@@ -1234,9 +1236,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
         env.book_composition_permission.bind(context_id, generation);
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.advance_slideshow(ctx, 0)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             (
                 env.fullscreen_idx,
@@ -1275,9 +1278,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
         env.book_composition_permission.open = OpenPermission::Checking { intent, candidates };
         if stop_while_checking {
             assert!(env.stop_slideshow_playback());
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(deliver.send(hidden_reply).is_err());
             assert!(matches!(
                 env.book_composition_permission.open,
@@ -1290,9 +1294,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
             assert!(!env.slideshow_playing);
         } else {
             deliver.send(hidden_reply).unwrap();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert_eq!(
                 (
                     env.fullscreen_idx,
@@ -1311,9 +1316,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
                 _ => panic!("C checking request"),
             };
             let sequence = env.book_composition_permission.sequence;
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.advance_slideshow(ctx, 0)
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(
                 matches!(&env.book_composition_permission.open, OpenPermission::Checking { intent, candidates } if intent.idx == 2 && candidates.iter().map(|candidate| candidate.correlation.clone()).collect::<Vec<_>>() == pending)
             );
@@ -1345,9 +1351,10 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
                 candidate.state = OpenCandidateState::Checking(receiver);
             }
             env.book_composition_permission.open = OpenPermission::Checking { intent, candidates };
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert_eq!(env.fullscreen_idx, Some(2));
             assert_eq!(env.selected, Some(2));
             assert!(env.slideshow_playing);
@@ -1440,9 +1447,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         );
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.advance_slideshow(ctx, 0)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             (
                 env.fullscreen_page_slice,
@@ -1487,9 +1495,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         candidates[0].state = OpenCandidateState::Checking(receiver);
         env.book_composition_permission.open = OpenPermission::Checking { intent, candidates };
         let sequence = env.book_composition_permission.sequence;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.advance_slideshow(ctx, 0)
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(env.book_composition_permission.sequence, sequence);
         assert!(
             matches!(&env.book_composition_permission.open, OpenPermission::Checking { candidates, .. } if candidates[0].correlation == correlation)
@@ -1500,9 +1509,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         );
         if stop_while_checking {
             assert!(env.stop_slideshow_playback());
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(deliver.send(reply).is_err());
             assert!(matches!(
                 env.book_composition_permission.open,
@@ -1522,9 +1532,10 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
             );
         } else {
             deliver.send(reply).unwrap();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 env.poll_book_presentation_permission(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             assert_eq!(env.fullscreen_idx, Some(0));
             assert_eq!(env.fullscreen_page_slice, PageSlice::Right);
             assert_eq!(

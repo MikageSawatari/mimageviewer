@@ -5630,6 +5630,10 @@ impl App {
         self.close_composition_editor_for_context(id);
         self.cancel_image_folder_zip_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
+        if let Some(window_id) = retiring_window {
+            self.detached_window_manager
+                .transfer_viewport_retirement(window_id);
+        }
         let commits = self
             .viewer_contexts
             .table
@@ -5679,7 +5683,7 @@ impl App {
         finish: impl FnOnce(&mut Self),
         digest: impl FnOnce(ContextMut<'_>) -> D,
     ) -> Result<D, RetireContextError> {
-        self.with_viewer_context(id, finish)
+        self.with_viewer_context_state(id, finish)
             .map_err(RetireContextError::Mount)?;
         self.retire_context(id, reason, digest)
             .map_err(RetireContextError::Retire)

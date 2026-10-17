@@ -83,6 +83,7 @@ const TRANSIENT_ACCENT_MIN: f32 = 0.42;
 fn main() -> eframe::Result {
     let startup_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
@@ -100,6 +101,8 @@ fn main() -> eframe::Result {
 }
 
 fn setup_fonts(ctx: &egui::Context) {
+    ctx.options_mut(|options| options.quit_shortcuts.clear());
+    ctx.global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
     let mut fonts = egui::FontDefinitions::default();
     let font_paths = [
         r"C:\Windows\Fonts\YuGothM.ttc",
@@ -1162,7 +1165,11 @@ impl MusicLabApp {
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
-        let Some(path) = dropped_files.into_iter().find_map(|file| file.path) else {
+        let Some(path) = dropped_files
+            .into_iter()
+            .map(|file| file.path().to_path_buf())
+            .next()
+        else {
             return;
         };
         if is_supported_media_path(&path) {
@@ -1897,9 +1904,8 @@ fn timeline_manual_scroll_requested(
     if !pointer_over_timeline {
         return false;
     }
-    ui.input(|input| {
-        input.raw_scroll_delta.y.abs() > 0.0 || input.smooth_scroll_delta.y.abs() > 0.5
-    })
+    remaining_wheel_delta(ui.ctx()).y.abs() > 0.0
+        || ui.input(|input| input.smooth_scroll_delta.y.abs() > 0.5)
 }
 
 fn timeline_focus_row(position_secs: f64, row_secs: f64, rows: usize) -> Option<usize> {
@@ -4707,4 +4713,44 @@ mod tests {
         let bin = timeline_bin_at_time(&bins, 0.75).expect("bin");
         assert_eq!(bin.rms, 0.7);
     }
+}
+
+// Project only unconsumed wheel events, using the same unit and modifier mapping as egui.
+fn remaining_wheel_delta(ctx: &egui::Context) -> egui::Vec2 {
+    let options = ctx.options(|o| o.input_options);
+    ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    phase,
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+                if *phase != egui::TouchPhase::Move {
+                    return None;
+                }
+                let delta = match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
+                    egui::MouseWheelUnit::Page => input.viewport_rect().height() * *delta,
+                };
+                let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
+                let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
+                Some(if horizontal && !vertical {
+                    egui::vec2(delta.x + delta.y, 0.0)
+                } else if vertical && !horizontal {
+                    egui::vec2(0.0, delta.x + delta.y)
+                } else {
+                    delta
+                })
+            })
+            .fold(egui::Vec2::ZERO, |sum, delta| sum + delta)
+    })
 }

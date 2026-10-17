@@ -4387,7 +4387,8 @@ mod tests {
                     assert_eq!(consumed.matched_count, 0);
                 }
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert_eq!(matches, 2);
         let mut repeat = raw_edge(0x27, true);
         repeat.repeat = true;
@@ -5164,6 +5165,62 @@ mod tests {
             consume_key_edges(viewport, |edge| edge.virtual_key == 0x27),
             (false, true)
         );
+    }
+
+    #[test]
+    fn synthetic_modifier_changes_precede_their_edges_without_rewriting_received_keys() {
+        let ctx = egui::Context::default();
+        let key = |modifiers, pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let received = key(egui::Modifiers::ALT, true);
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(super::PreparedSyntheticFrame {
+                frame_nr: 3,
+                time_key: super::RawInputTimeKey::from(Some(1.0)),
+                raw_input_time: Some(1.0),
+                batches: vec![super::SyntheticViewportBatch {
+                    viewport: egui::ViewportId::ROOT,
+                    events: vec![
+                        key(egui::Modifiers::CTRL, true),
+                        key(egui::Modifiers::NONE, false),
+                    ],
+                }],
+                hold_attributions: Vec::new(),
+                delivered_viewports: Vec::new(),
+                final_modifiers: egui::Modifiers::NONE,
+                armed: true,
+                #[cfg(windows)]
+                pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+            }),
+            ..Default::default()
+        };
+        let mut input = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                received.clone(),
+            ],
+            ..Default::default()
+        };
+        plugin.inject_prepared(&ctx, &mut input);
+        assert_eq!(
+            input.events,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                received,
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                key(egui::Modifiers::CTRL, true),
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+                key(egui::Modifiers::NONE, false),
+            ]
+        );
+        ctx.begin_pass(input);
+        assert_eq!(ctx.input(|input| input.modifiers), egui::Modifiers::NONE);
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]

@@ -157,6 +157,9 @@ pub enum ViewportCloseResponse {
     Cancel,
     /// The application owner has ended this child; retire its native and egui registrations.
     Close,
+    /// Consume the request; the App already transferred exact retirement authority
+    /// into Context's root command output before removing its binding.
+    RetirementTransferred,
 }
 
 /// Implement this trait to write apps that can be compiled for both web/wasm and desktop/native using [`eframe`](https://github.com/emilk/egui/tree/main/crates/eframe).
@@ -164,9 +167,12 @@ pub trait App {
     /// Handle one native child-viewport close request without running UI.
     ///
     /// Called outside UI passes and backend locks, for both OS and programmatic
-    /// close requests. `Close` and `Cancel` consume this request, including its
-    /// pending input snapshots. `Close` additionally retires the child and its
-    /// descendants immediately. End application-owned work before returning it.
+    /// close requests. `Close`, `Cancel` and `RetirementTransferred` consume this
+    /// request, including its pending input snapshots. `Close` is normalized to
+    /// approval of the registration captured before the hook. Prefer transferring
+    /// approval with `Context::approve_viewport_retirement` before ending an App
+    /// binding and returning `RetirementTransferred`. Native/Context cleanup then
+    /// completes at this same pass-outside boundary, without calling UI.
     /// Root close handling remains with `logic`/`ui` and `CancelClose`.
     /// The default preserves the existing UI callback contract.
     fn on_viewport_close_requested(

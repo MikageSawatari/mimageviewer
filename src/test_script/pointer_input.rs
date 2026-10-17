@@ -1896,12 +1896,14 @@ mod tests {
             time: Some(1.0),
             ..Default::default()
         });
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = ui.interact(
-                rect,
-                egui::Id::new("pointer-track"),
-                egui::Sense::click_and_drag(),
-            );
+        ctx.root_ui(|ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = ui.interact(
+                    rect,
+                    egui::Id::new("pointer-track"),
+                    egui::Sense::click_and_drag(),
+                );
+            })
         });
         ctx.end_pass().drop_without_applying_deltas();
         let child_input = egui::RawInput {
@@ -1931,18 +1933,20 @@ mod tests {
             callback_item.to_string(),
             callback_mode,
         );
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let response = ui.interact(
-                rect,
-                egui::Id::new("pointer-track"),
-                egui::Sense::click_and_drag(),
-            );
-            assert!(
-                response.is_pointer_button_down_on(),
-                "test precondition: egui must hit the actual response"
-            );
-            record_region(RegionId::StillSeekTrack, &response, rect, None);
-            observe_region_handler(&response, RegionId::StillSeekTrack, None);
+        ctx.root_ui(|ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new("pointer-track"),
+                    egui::Sense::click_and_drag(),
+                );
+                assert!(
+                    response.is_pointer_button_down_on(),
+                    "test precondition: egui must hit the actual response"
+                );
+                record_region(RegionId::StillSeekTrack, &response, rect, None);
+                observe_region_handler(&response, RegionId::StillSeekTrack, None);
+            })
         });
         finish_pass(&ctx);
         let output = show.finish();

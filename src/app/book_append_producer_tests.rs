@@ -512,14 +512,15 @@ fn section1373_keyaction_undo_busy_or_invalid_receipt_never_pops_older_metadata(
         app.book_append_undo_receipt = Some(append);
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers: egui::Modifiers::CTRL,
-            events: vec![egui::Event::Key {
-                key: egui::Key::Z,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::CTRL,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+                .chain(vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }])
+                .collect(),
             ..Default::default()
         });
         let owner = crate::keyboard_input::decide_keyboard_owner(
@@ -545,7 +546,7 @@ fn section1373_keyaction_undo_busy_or_invalid_receipt_never_pops_older_metadata(
         if case == "invalid" {
             assert!(app.book_append_undo_receipt.is_none());
         }
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 }
 

@@ -143,6 +143,17 @@ impl App {
 mod tests {
     use super::*;
 
+    fn run_headless(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        run: impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_pass(input, run);
+        // These lifecycle assertions inspect commands and have no renderer.
+        output.textures_delta.clear();
+        output
+    }
+
     fn close_input() -> egui::RawInput {
         let mut raw = egui::RawInput::default();
         raw.viewports
@@ -162,7 +173,7 @@ mod tests {
             app.shutdown_requested
                 .store(explicit, std::sync::atomic::Ordering::SeqCst);
             let ctx = egui::Context::default();
-            let output = ctx.run_pass(close_input(), |ctx| {
+            let output = run_headless(&ctx, close_input(), |ctx| {
                 let snapshot = app.accept_root_lifecycle_before_frame(ctx);
                 app.service_root_lifecycle_tray_checkpoint(ctx, snapshot);
                 assert!(ctx.input_for(egui::ViewportId::ROOT, |i| i.viewport().close_requested()));
@@ -173,7 +184,7 @@ mod tests {
                 .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose));
             assert_eq!(cancelled, !explicit);
             assert_eq!(app.window_visible, explicit);
-            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let output = run_headless(&ctx, egui::RawInput::default(), |ctx| {
                 app.service_root_lifecycle(ctx)
             });
             assert!(
@@ -192,13 +203,13 @@ mod tests {
         let folder = app.tmp.path().join("book");
         app.activate_sidecar_restore_modal_for_test(folder);
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
+        let output = run_headless(&ctx, close_input(), |ctx| app.service_root_lifecycle(ctx));
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
                 .contains(&egui::ViewportCommand::CancelClose)
         );
-        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+        let output = run_headless(&ctx, egui::RawInput::default(), |ctx| {
             app.service_root_lifecycle(ctx)
         });
         assert!(
@@ -215,7 +226,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.settings.minimize_to_tray_on_close = false;
         let ctx = egui::Context::default();
-        let output = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
+        let output = run_headless(&ctx, close_input(), |ctx| app.service_root_lifecycle(ctx));
         assert!(
             !output
                 .viewport_output
@@ -237,7 +248,7 @@ mod tests {
             let frame = app.frame_counter;
             let input_seq = app.input_seq;
             let ctx = egui::Context::default();
-            let blocked = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
+            let blocked = run_headless(&ctx, close_input(), |ctx| app.service_root_lifecycle(ctx));
             assert!(
                 blocked.viewport_output[&egui::ViewportId::ROOT]
                     .commands
@@ -247,7 +258,7 @@ mod tests {
             if late_quit {
                 app.shutdown_requested
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                let quit = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
+                let quit = run_headless(&ctx, close_input(), |ctx| app.service_root_lifecycle(ctx));
                 assert!(
                     quit.viewport_output[&egui::ViewportId::ROOT]
                         .commands
@@ -255,7 +266,7 @@ mod tests {
                 );
             }
             complete(status);
-            let resumed = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let resumed = run_headless(&ctx, egui::RawInput::default(), |ctx| {
                 app.service_root_lifecycle(ctx)
             });
             assert!(!app.composition_editor_writes_pending());
@@ -272,7 +283,7 @@ mod tests {
                     .count(),
                 1
             );
-            let again = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let again = run_headless(&ctx, egui::RawInput::default(), |ctx| {
                 app.service_root_lifecycle(ctx)
             });
             assert!(
@@ -284,5 +295,96 @@ mod tests {
             assert_eq!(app.frame_counter, frame);
             assert_eq!(app.input_seq, input_seq);
         }
+    }
+    #[test]
+    fn root_lifecycle_actual_app_logic_reaches_backend_close_decision_without_ui() {
+        for tray in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.minimize_to_tray_on_close = tray;
+            if tray {
+                app.tray_controller = Some(crate::tray::TrayController::controller_for_test());
+            }
+            let mut backend = eframe::HeadlessEpiIntegration::new(egui::Context::default());
+            let frame = app.frame_counter;
+            let sequence = app.input_seq;
+            let (output, unused) = backend.update_logic_only(&mut app.app, close_input());
+            assert_eq!(backend.should_close(), !tray);
+            assert_eq!(app.frame_counter, frame);
+            assert_eq!(app.input_seq, sequence);
+            assert_eq!(app.window_visible, !tray);
+            assert!(unused.events.is_empty());
+            let cancelled = output
+                .viewport_commands
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|commands| commands.contains(&egui::ViewportCommand::CancelClose));
+            assert_eq!(cancelled, tray);
+        }
+    }
+
+    #[test]
+    fn root_lifecycle_actual_app_save_ack_precedes_resumed_backend_close() {
+        for result in [Ok(()), Err("fake save failure".to_owned())] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.minimize_to_tray_on_close = false;
+            let complete = app.sent_composition_save_for_lifecycle_test();
+            let mut backend = eframe::HeadlessEpiIntegration::new(egui::Context::default());
+            let (output, _) = backend.update_logic_only(&mut app.app, close_input());
+            assert!(!backend.should_close());
+            assert!(
+                output.viewport_commands[&egui::ViewportId::ROOT]
+                    .contains(&egui::ViewportCommand::CancelClose)
+            );
+            complete(result);
+            let (output, _) = backend.update_logic_only(&mut app.app, Default::default());
+            assert!(
+                !backend.should_close(),
+                "Close command is the next delivery, not an incoming request"
+            );
+            assert!(!app.composition_editor_writes_pending());
+            assert_eq!(
+                output.viewport_commands[&egui::ViewportId::ROOT]
+                    .iter()
+                    .filter(|command| matches!(command, egui::ViewportCommand::Close))
+                    .count(),
+                1
+            );
+            let (output, _) = backend.update_logic_only(&mut app.app, close_input());
+            assert!(backend.should_close());
+            assert!(
+                !output
+                    .viewport_commands
+                    .get(&egui::ViewportId::ROOT)
+                    .is_some_and(|commands| commands.contains(&egui::ViewportCommand::CancelClose))
+            );
+        }
+    }
+
+    #[test]
+    fn root_lifecycle_actual_app_modal_rejection_consumes_only_one_delivery() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.minimize_to_tray_on_close = false;
+        let folder = app.tmp.path().join("book");
+        app.activate_sidecar_restore_modal_for_test(folder);
+        let mut backend = eframe::HeadlessEpiIntegration::new(egui::Context::default());
+        let (output, _) = backend.update_logic_only(&mut app.app, close_input());
+        assert!(!backend.should_close());
+        assert!(
+            output.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        let (output, _) = backend.update_logic_only(&mut app.app, Default::default());
+        assert!(!backend.should_close());
+        assert!(
+            !output
+                .viewport_commands
+                .values()
+                .flatten()
+                .any(|command| matches!(command, egui::ViewportCommand::Close))
+        );
+        let (_output, _) = backend.update_logic_only(&mut app.app, close_input());
+        assert!(
+            backend.should_close(),
+            "a new request is accepted after the discarded owner terminates"
+        );
     }
 }

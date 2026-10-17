@@ -109,7 +109,9 @@ fn view_harness(
             mimageviewer::os_theme::apply_resolved(ctx, theme);
             // Geometry and interaction tests do not need real-time scrolling
             // animation; the production ScrollArea still uses its normal style.
-            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            ctx.global_style_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none()
+            });
             if !fonts_ready {
                 mimageviewer::ui_fonts::configure_fonts(ctx);
                 mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
@@ -403,7 +405,7 @@ fn assert_control_inside(
     let node = nodes
         .iter()
         .find(|node| {
-            let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+            let id = egui_id_from_accesskit(node.accesskit_node().id());
             h.ctx
                 .read_response(id)
                 .is_some_and(|response| response.enabled())
@@ -420,7 +422,7 @@ fn assert_control_inside(
         node.rect()
     );
     // AccessKit stores the original egui widget id (same bridge as ui_snapshot).
-    let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+    let id = egui_id_from_accesskit(node.accesskit_node().id());
     let response = h
         .ctx
         .read_response(id)
@@ -540,4 +542,11 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
     })
     .drop_without_applying_deltas();
     assert!(actions.contains(&EditorUiAction::Cancel));
+}
+
+// accesskit_consumer 0.39's public FullNodeId conversion packs the local node ID
+// above the tree index. The local node ID is egui's original widget identity.
+fn egui_id_from_accesskit(node_id: impl Into<u128>) -> egui::Id {
+    let local_id = (node_id.into() >> 64) as u64;
+    unsafe { egui::Id::from_high_entropy_bits(local_id) }
 }

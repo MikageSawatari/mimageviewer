@@ -1274,7 +1274,8 @@ mod row_tests {
                     };
                     let mut output = egui::FullOutput::default();
                     for _ in 0..6 {
-                        output = ctx.run_pass(
+                        std::mem::take(&mut output).drop_without_applying_deltas();
+                        output = crate::test_ui::headless_paint_output(ctx.run_pass(
                             egui::RawInput {
                                 screen_rect: Some(screen),
                                 ..Default::default()
@@ -1288,7 +1289,7 @@ mod row_tests {
                                 );
                                 show_window(ctx, id, &view, &mut state, DialogKeys::default());
                             },
-                        );
+                        ));
                     }
                     let interior = ctx
                         .memory(|memory| memory.area_rect(id))
@@ -1323,6 +1324,7 @@ mod row_tests {
                         window_index < backdrop_index,
                         "darken the opaque editor from above"
                     );
+                    output.drop_without_applying_deltas();
                     for (theme, style) in [egui::Theme::Light, egui::Theme::Dark]
                         .into_iter()
                         .zip(&styles)
@@ -1377,8 +1379,11 @@ mod row_tests {
                     "キャンセル"
                 })
                 .find(|node| {
-                    let id =
-                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+                    let id = unsafe {
+                        egui::Id::from_high_entropy_bits(
+                            ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                        )
+                    };
                     h.ctx
                         .read_response(id)
                         .is_some_and(|response| response.enabled())

@@ -26,7 +26,7 @@ fn capture(
     viewport.focused = Some(true);
     viewport.native_pixels_per_point = Some(1.5);
     let mut before_render = Some(before_render);
-    let output = ctx.run_pass(input, |ctx| {
+    let output = crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
         // A real input is consumed once; a sizing/discard pass must not issue
         // the navigation handler again merely because egui re-runs painting.
         if let Some(before_render) = before_render.take() {
@@ -35,7 +35,7 @@ fn capture(
         // Deliberately do not use page_turn_submission_tests::draw_current:
         // a later normal-page draw or background can hide a valid curl receipt.
         ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
-    });
+    }));
     let meshes = ctx
         .tessellate(output.shapes.clone(), output.pixels_per_point)
         .into_iter()
@@ -44,10 +44,12 @@ fn capture(
             egui::epaint::Primitive::Callback(_) => None,
         })
         .collect();
-    CapturedFrame {
-        shapes: output.shapes,
+    let frame = CapturedFrame {
+        shapes: output.shapes.clone(),
         meshes,
-    }
+    };
+    output.drop_without_applying_deltas();
+    frame
 }
 
 fn bounds(mesh: &egui::Mesh) -> egui::Rect {

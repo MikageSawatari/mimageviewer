@@ -67,7 +67,7 @@ fn press_rating_key(app: &mut App, key: egui::Key) {
     });
     app.keyboard_owner_for_pass(&ctx);
     assert!(app.handle_fullscreen_root_key_input(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -213,19 +213,20 @@ fn last_reader_page_returns_to_current_grid_container_and_ctrl_z_reopens_page() 
     assert_eq!(app.meta_undo.undo_len(), 1);
     let ctx = egui::Context::default();
     ctx.begin_pass(egui::RawInput {
-        modifiers: egui::Modifiers::CTRL,
-        events: vec![egui::Event::Key {
-            key: egui::Key::Z,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::CTRL,
-        }],
+        events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+            .chain(vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }])
+            .collect(),
         ..Default::default()
     });
     app.keyboard_owner_for_pass(&ctx);
     app.handle_meta_undo_keys(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(app.fullscreen_idx, Some(0));
     assert_eq!(app.selected, Some(0));
     assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
@@ -530,7 +531,7 @@ fn combined_rating_and_next_key_rebases_navigation_to_the_new_reader_page() {
     });
     app.keyboard_owner_for_pass(&ctx);
     assert!(app.handle_fullscreen_root_key_input(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(app.rating_db.as_ref().unwrap().get(&original), 4);
     assert_eq!(
         app.fullscreen_idx,
@@ -1547,19 +1548,20 @@ fn rating_undo_grid_keys_cancel_held_restore_on_moves_edges_and_empty_sets() {
 pub(super) fn press_grid_key(app: &mut App, key: egui::Key, modifiers: egui::Modifiers) {
     let ctx = egui::Context::default();
     ctx.begin_pass(egui::RawInput {
-        modifiers,
-        events: vec![egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        }],
+        events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+            .chain(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }])
+            .collect(),
         ..Default::default()
     });
     app.keyboard_owner_for_pass(&ctx);
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -2532,8 +2534,8 @@ fn rating_grid_automatic_search_bar_close_without_events_keeps_return_authority(
                 let ctx = egui::Context::default();
                 ctx.begin_pass(egui::RawInput::default());
                 assert!(ctx.input(|input| input.events.is_empty()));
-                app.render_search_bar(&ctx);
-                let _ = ctx.end_pass();
+                ctx.root_ui(|ui_arg| app.render_search_bar(ui_arg));
+                ctx.end_pass().drop_without_applying_deltas();
 
                 assert!(!app.show_search_bar);
                 assert!(app.search_query.is_empty());

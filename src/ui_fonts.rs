@@ -878,7 +878,9 @@ mod tests {
                 fonts
                     .font_data
                     .get(*font_name)
-                    .and_then(|font| ttf_parser::Face::parse(font.font.as_ref(), font.index).ok())
+                    .and_then(|font| {
+                        ttf_parser::Face::parse(font.font.as_ref().as_ref(), font.index).ok()
+                    })
                     .and_then(|face| face.glyph_index(ch))
                     .is_some()
             });
@@ -912,7 +914,7 @@ mod tests {
                         .font_data
                         .get(*font_name)
                         .and_then(|font| {
-                            ttf_parser::Face::parse(font.font.as_ref(), font.index).ok()
+                            ttf_parser::Face::parse(font.font.as_ref().as_ref(), font.index).ok()
                         })
                         .and_then(|face| face.glyph_index(ch))
                         .is_some()
@@ -1034,7 +1036,7 @@ mod tests {
                 candidate.label
             );
             assert_eq!(
-                hud.font.as_ref(),
+                hud.font.as_ref().as_ref(),
                 default_data.as_slice(),
                 "{} must not change the fixed HUD font",
                 candidate.label,

@@ -19,7 +19,7 @@ impl ScrollLayout {
         Self {
             inner: output.inner_rect,
             content: output.content_size,
-            offset: output.state.offset,
+            offset: output.state.clamped_offset(),
         }
     }
 

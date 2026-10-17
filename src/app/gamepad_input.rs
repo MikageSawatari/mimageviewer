@@ -122,7 +122,7 @@ impl GamepadFrameBatch {
             .iter()
             .filter_map(|event| match event {
                 PadBatchEvent::Action(action) => Some(*action),
-                PadBatchEvent::SessionEnded => None,
+                PadBatchEvent::AxesChanged(_) | PadBatchEvent::SessionEnded => None,
             })
             .collect()
     }
@@ -381,6 +381,7 @@ enum PadActionKind {
 #[derive(Clone, Copy, Debug)]
 enum PadBatchEvent {
     Action(PadAction),
+    AxesChanged([f32; 6]),
     SessionEnded,
 }
 
@@ -2242,6 +2243,10 @@ impl App {
                 PadPhysicalEvent::SuppressedRelease(button) => {
                     (button, PadActionKind::SuppressedRelease)
                 }
+                PadPhysicalEvent::AxesChanged(values) => {
+                    events.push(PadBatchEvent::AxesChanged(values));
+                    continue;
+                }
                 PadPhysicalEvent::SessionEnded => {
                     events.push(PadBatchEvent::SessionEnded);
                     continue;
@@ -2377,17 +2382,29 @@ impl App {
                 match event {
                     PadBatchEvent::SessionEnded => {
                         self.clear_gamepad_input_overlays(ctx);
-                        self.commit_ring_picker(ctx);
+                        self.commit_ring_picker_in_owner(ctx);
+                        self.gamepad.state.end_delivered_session();
                     }
-                    PadBatchEvent::Action(action) if nav.is_none() => {
-                        if let Some(next_nav) =
-                            self.dispatch_gamepad_button_with_operation(ctx, action)
-                        {
-                            nav = Some(next_nav);
+                    PadBatchEvent::AxesChanged(values) => self.gamepad.state.deliver_axes(values),
+                    PadBatchEvent::Action(action) => {
+                        if action.kind == PadActionKind::Press {
+                            self.gamepad.state.deliver_button_edge(action.button, true);
                         }
-                        dispatched = true;
+                        if nav.is_none() {
+                            if let Some(next_nav) =
+                                self.dispatch_gamepad_button_with_operation(ctx, action)
+                            {
+                                nav = Some(next_nav);
+                            }
+                            dispatched = true;
+                        }
+                        if matches!(
+                            action.kind,
+                            PadActionKind::Release | PadActionKind::SuppressedRelease
+                        ) {
+                            self.gamepad.state.deliver_button_edge(action.button, false);
+                        }
                     }
-                    PadBatchEvent::Action(_) => {}
                 }
             }
             // A neutral poll is not input. Preserve the sampled analog fact;
@@ -2410,9 +2427,24 @@ impl App {
         } else {
             if delivery == PadBatchDelivery::Fresh {
                 for event in events {
-                    if matches!(event, PadBatchEvent::SessionEnded) {
-                        self.clear_gamepad_input_overlays(ctx);
-                        self.commit_ring_picker(ctx);
+                    match event {
+                        PadBatchEvent::SessionEnded => {
+                            self.clear_gamepad_input_overlays(ctx);
+                            self.commit_ring_picker_in_owner(ctx);
+                            self.gamepad.state.end_delivered_session();
+                        }
+                        PadBatchEvent::AxesChanged(values) => {
+                            self.gamepad.state.deliver_axes(values)
+                        }
+                        PadBatchEvent::Action(action) => match action.kind {
+                            PadActionKind::Press => {
+                                self.gamepad.state.deliver_button_edge(action.button, true)
+                            }
+                            PadActionKind::Release | PadActionKind::SuppressedRelease => {
+                                self.gamepad.state.deliver_button_edge(action.button, false)
+                            }
+                            PadActionKind::Repeat => {}
+                        },
                     }
                 }
             }
@@ -2616,7 +2648,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|picker| picker.x_close_armed)
             {
-                self.commit_ring_picker(ctx);
+                self.commit_ring_picker_in_owner(ctx);
             }
             return None;
         }
@@ -2781,7 +2813,10 @@ impl App {
 
     fn current_ring_gamepad_direction(&self) -> Option<RingDirection> {
         ring_direction_from_dpad_buttons(&self.gamepad.state).or_else(|| {
-            let stick = stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY);
+            let stick = egui::vec2(
+                deadzone(self.gamepad.state.delivered_axis(PadAxis::LeftX)),
+                deadzone(self.gamepad.state.delivered_axis(PadAxis::LeftY)),
+            );
             ring_direction_from_stick_with_hysteresis(
                 stick,
                 self.gamepad.state.west_ring_direction(),
@@ -4799,12 +4834,20 @@ impl App {
     }
 
     pub(crate) fn commit_ring_picker(&mut self, ctx: &egui::Context) {
+        if self.ring_picker.is_none() {
+            return;
+        }
+        self.gamepad.state.cancel_west_ring();
+        self.gamepad.state.require_directional_neutral();
+        self.commit_ring_picker_in_owner(ctx);
+    }
+
+    /// End a preview belonging to an earlier physical session without changing
+    /// the current physical owner: a new press or axis may follow its terminal.
+    fn commit_ring_picker_in_owner(&mut self, ctx: &egui::Context) {
         let Some(picker) = self.ring_picker.clone() else {
             return;
         };
-        // 物理側は App-global。パッドはもう無いかもしれないので mount に依存させない。
-        self.gamepad.state.cancel_west_ring();
-        self.gamepad.state.require_directional_neutral();
         let owner = picker.owner;
         let applied = self.with_owner_viewer_context(owner, |app| {
             let (item_rating_changes, container_rating_record) =
@@ -4828,8 +4871,10 @@ impl App {
             }
         });
         if applied.is_none() {
-            self.finish_rating_picker_without_commit(
-                crate::rating_membership::RatingAdoptionIntent::Manual,
+            self.terminate_rating_picker_in_owner(
+                RatingPickerTermination::Release(
+                    crate::rating_membership::RatingAdoptionIntent::Manual,
+                ),
                 Some(ctx),
             );
         }
@@ -4874,6 +4919,21 @@ impl App {
         terminal: RatingPickerTermination,
         ctx: Option<&egui::Context>,
     ) {
+        if self.ring_picker.is_none() {
+            return;
+        }
+        self.terminate_rating_picker_in_owner(terminal, ctx);
+        self.gamepad.state.cancel_west_ring();
+        self.gamepad.state.require_directional_neutral();
+    }
+
+    /// Complete only the recipe/Undo lifetime, including a retired owner. The
+    /// physical session may already contain a newer hold after this terminal.
+    fn terminate_rating_picker_in_owner(
+        &mut self,
+        terminal: RatingPickerTermination,
+        ctx: Option<&egui::Context>,
+    ) {
         let Some(picker) = self.ring_picker.take() else {
             return;
         };
@@ -4891,8 +4951,6 @@ impl App {
             }
             #[cfg(windows)]
             self.set_native_video_ring_picker_overlay(None);
-            self.gamepad.state.cancel_west_ring();
-            self.gamepad.state.require_directional_neutral();
             return;
         };
         let owner = picker.owner;
@@ -4927,8 +4985,6 @@ impl App {
                 picker.rating_origin.clone(),
             );
         }
-        self.gamepad.state.cancel_west_ring();
-        self.gamepad.state.require_directional_neutral();
     }
 
     fn picker_success_rating_toast(picker: &RingPickerState) -> Option<String> {
@@ -7037,7 +7093,7 @@ impl App {
     fn handle_gamepad_direction(&mut self, ctx: &egui::Context, dir: PadDir, repeat: bool) {
         let route = self.dpad_route();
         self.log_dpad_route_if_changed(route);
-        let y_modifier = self.gamepad.state.button_down(PadButton::North);
+        let y_modifier = self.gamepad.state.delivered_button_down(PadButton::North);
         if y_modifier {
             self.gamepad.state.mark_y_modifier_used();
         }
@@ -7870,10 +7926,10 @@ fn ring_direction_from_pad_dir(dir: PadDir) -> RingDirection {
 }
 
 fn ring_direction_from_dpad_buttons(state: &GamepadInputState) -> Option<RingDirection> {
-    let up = state.button_down(PadButton::DPadUp);
-    let down = state.button_down(PadButton::DPadDown);
-    let left = state.button_down(PadButton::DPadLeft);
-    let right = state.button_down(PadButton::DPadRight);
+    let up = state.delivered_button_down(PadButton::DPadUp);
+    let down = state.delivered_button_down(PadButton::DPadDown);
+    let left = state.delivered_button_down(PadButton::DPadLeft);
+    let right = state.delivered_button_down(PadButton::DPadRight);
     let vertical = match (up, down) {
         (true, false) => Some(PadDir::Up),
         (false, true) => Some(PadDir::Down),
@@ -9033,7 +9089,9 @@ mod tests {
                         let mut harness = crate::test_ui::builder()
                             .with_size(size)
                             .with_pixels_per_point(ppp)
-                            .build(move |ctx| {
+                            .build_ui(move |root_ui| {
+                                let ctx = &root_ui.ctx().clone();
+
                                 if !fonts_ready {
                                     crate::ui_fonts::configure_fonts(ctx);
                                     fonts_ready = true;
@@ -9165,7 +9223,9 @@ mod tests {
                     let mut harness = crate::test_ui::builder()
                         .with_size(size)
                         .with_pixels_per_point(ppp)
-                        .build(move |ctx| {
+                        .build_ui(move |root_ui| {
+                            let ctx = &root_ui.ctx().clone();
+
                             if !fonts_ready {
                                 crate::ui_fonts::configure_fonts(ctx);
                                 fonts_ready = true;
@@ -9708,7 +9768,7 @@ mod tests {
             ..Default::default()
         });
         let keyboard = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(keyboard.is_none());
         assert_eq!(app.folder_nav_back_stack, before);
         assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
@@ -9744,6 +9804,7 @@ mod tests {
 
     #[test]
     fn pad_operation_batch_preserves_multiple_press_release_edges_and_phase() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
@@ -9820,6 +9881,7 @@ mod tests {
 
     #[test]
     fn pad_operation_replay_preserves_ids_and_continuous_fact_after_neutral() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
@@ -9833,7 +9895,7 @@ mod tests {
             app.gamepad.push_for_test(event);
         }
         let mut observed = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_pass(Default::default(), |ctx| {
             let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
             assert_eq!(
                 batch.delivery,
@@ -9854,18 +9916,21 @@ mod tests {
             if ctx.current_pass_index() == 0 {
                 ctx.request_discard("pad operation replay");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(observed.len(), 2);
         assert_eq!(observed[0], observed[1]);
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_pass(Default::default(), |ctx| {
             let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
             assert_eq!(batch.delivery, super::PadBatchDelivery::Fresh);
             assert!(batch.presentation_operations().is_empty());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
     fn pad_operation_off_keeps_existing_polling_on_discarded_passes() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
@@ -9873,7 +9938,7 @@ mod tests {
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
         let mut kinds = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_pass(Default::default(), |ctx| {
             let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
             assert_eq!(batch.delivery, super::PadBatchDelivery::Fresh);
             assert_eq!(batch.operation_batch, 0);
@@ -9893,7 +9958,8 @@ mod tests {
                     .push_for_test(PadEvent::ButtonReleased(PadButton::DPadRight));
                 ctx.request_discard("pad off retains live polling");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             kinds,
             vec![super::PadActionKind::Press, super::PadActionKind::Release]
@@ -9985,7 +10051,12 @@ mod tests {
         });
 
         app.settings.gamepad_enabled = false;
-        let _ = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
+        assert!(
+            app.gamepad_favorite_picker.is_some(),
+            "sampling cannot end a mounted-context overlay"
+        );
+        app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| false);
 
         assert!(
             app.gamepad_favorite_picker.is_none(),
@@ -10046,7 +10117,7 @@ mod tests {
                 delivery: super::PadBatchDelivery::Fresh,
                 analog_operation: false,
                 now: Instant::now(),
-                events: vec![PadBatchEvent::SessionEnded],
+                events: vec![super::PadBatchEvent::SessionEnded],
                 saw_input_event: true,
             },
         );
@@ -10329,7 +10400,10 @@ mod tests {
             egui::ViewportId::ROOT,
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "あ".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
         ));
         assert!(gamepad_text_input_active(
@@ -10337,7 +10411,7 @@ mod tests {
             Some(viewer_viewport),
             no_presenter_input,
         ));
-        let _ = root_ctx.end_pass();
+        root_ctx.end_pass().drop_without_applying_deltas();
 
         let ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&ctx);
@@ -10346,11 +10420,14 @@ mod tests {
             fullscreen_viewport,
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "あ".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
         ));
         assert!(crate::ime_focus::ime_input_active(&ctx));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         // RawInput reports every live viewport, including a sibling whose
         // composition is read by this ROOT pass without consuming its queue.
@@ -10364,7 +10441,7 @@ mod tests {
             Some(fullscreen_viewport),
             no_presenter_input,
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         // Omitting the viewer now explicitly models its destruction. Its stale
         // composition must no longer block the gamepad on a surviving surface.
@@ -10374,7 +10451,7 @@ mod tests {
             Some(fullscreen_viewport),
             no_presenter_input,
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let presenter_ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&presenter_ctx);
@@ -10389,7 +10466,7 @@ mod tests {
             Some(viewer_viewport),
             no_presenter_input,
         ));
-        let _ = presenter_ctx.end_pass();
+        presenter_ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -11182,7 +11259,7 @@ mod next_input_tests {
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(ctx, 0, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             #[cfg(windows)]
             crate::key_input::set_test_frame(Vec::new());
         }
@@ -11454,7 +11531,471 @@ mod physical_boundary_tests {
     use super::*;
 
     #[test]
+    fn egui037_continuation_gamepad_real_logic_keeps_order_without_advancing_a_ui_frame() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        for event in [
+            PadEvent::ButtonPressed(PadButton::South),
+            PadEvent::ButtonReleased(PadButton::South),
+            PadEvent::Disconnected,
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+        ] {
+            app.gamepad.push_for_test(event);
+            integration.update_logic_only(&mut app.app, egui::RawInput::default());
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+        }
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(matches!(
+            batch.events.as_slice(),
+            [
+                PadBatchEvent::Action(PadAction {
+                    button: PadButton::South,
+                    kind: PadActionKind::Press,
+                    ..
+                }),
+                PadBatchEvent::Action(PadAction {
+                    button: PadButton::South,
+                    kind: PadActionKind::Release,
+                    ..
+                }),
+                PadBatchEvent::SessionEnded,
+                PadBatchEvent::Action(PadAction {
+                    button: PadButton::DPadRight,
+                    kind: PadActionKind::Press,
+                    ..
+                }),
+                PadBatchEvent::AxesChanged(_),
+            ]
+        ));
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    fn gamepad_y_press_release_press_across_logic_keeps_the_old_modifier_use() {
+        for tracking in [false, true] {
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.settings.page_turn_animation_enabled = tracking;
+            app.settings.folder_tree_pane_visible = false;
+            for event in [
+                PadEvent::ButtonPressed(PadButton::North),
+                PadEvent::ButtonPressed(PadButton::DPadRight),
+                PadEvent::ButtonReleased(PadButton::DPadRight),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(app.gamepad.state.y_modifier_used());
+            for event in [
+                PadEvent::ButtonReleased(PadButton::North),
+                PadEvent::ButtonPressed(PadButton::North),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            let batch = app.sample_gamepad_input(&ctx);
+            assert_eq!(batch.actions_for_test().len(), 2);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                !app.settings.folder_tree_pane_visible,
+                "old modifier release cannot become a tap"
+            );
+            assert!(app.gamepad.state.delivered_button_down(PadButton::North));
+            assert!(
+                !app.gamepad.state.y_modifier_used(),
+                "the new press starts its own semantic hold"
+            );
+            app.gamepad
+                .push_for_test(PadEvent::ButtonReleased(PadButton::North));
+            integration.update_logic_only(&mut app.app, Default::default());
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                app.settings.folder_tree_pane_visible,
+                "the new hold still has its own tap"
+            );
+        }
+    }
+
+    #[test]
+    fn gamepad_west_press_release_press_uses_axis_at_the_release_boundary() {
+        for tracking in [false, true] {
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.settings.page_turn_animation_enabled = tracking;
+            app.items = vec![GridItem::Image(app.tmp.path().join("west-boundary.jpg"))];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+            for event in [
+                PadEvent::ButtonPressed(PadButton::West),
+                PadEvent::ButtonReleased(PadButton::West),
+                PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+                PadEvent::ButtonPressed(PadButton::West),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            let batch = app.sample_gamepad_input(&ctx);
+            assert!(matches!(
+                batch.events.as_slice(),
+                [
+                    PadBatchEvent::Action(_),
+                    PadBatchEvent::Action(_),
+                    PadBatchEvent::AxesChanged(_),
+                    PadBatchEvent::Action(_)
+                ]
+            ));
+            // Isolate the ordered discrete edges from the next continuous
+            // picker step. That step intentionally edits a value and disarms
+            // X-close; its timer must not obscure the release-boundary check.
+            assert!(
+                app.gamepad
+                    .state
+                    .left_stick_step_due(true, batch.now, STICK_STEP_INTERVAL,)
+            );
+            let continuous_tick = batch.now + STICK_STEP_INTERVAL;
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                app.ring_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.x_close_armed),
+                "the first neutral tap opens the picker; the new press arms its close"
+            );
+            assert!(app.gamepad.state.button_down(PadButton::West));
+            assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+            assert_eq!(app.gamepad.state.delivered_axis(PadAxis::LeftX), 0.9);
+            let mut next = GamepadFrameBatch::empty_for_test();
+            next.now = continuous_tick;
+            next.analog_operation = true;
+            let continuous = app.dispatch_gamepad_batch_with_admission(&ctx, next, |_, _| true);
+            assert!(continuous.dispatched);
+            assert!(
+                app.ring_picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.x_close_armed),
+                "the same held axis edits the picker and disarms X-close at its next scheduled tick"
+            );
+            assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        }
+    }
+
+    #[test]
+    fn gamepad_west_delivered_direction_survives_release_and_new_physical_press() {
+        for tracking in [false, true] {
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.settings.page_turn_animation_enabled = tracking;
+            app.settings.ring_shortcuts.grid = crate::ring_shortcut::RingShortcutProfile::default();
+            app.items = vec![GridItem::Image(app.tmp.path().join("west-delivered.jpg"))];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+            for event in [
+                PadEvent::ButtonPressed(PadButton::West),
+                PadEvent::ButtonPressed(PadButton::DPadRight),
+                PadEvent::ButtonReleased(PadButton::DPadRight),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert_eq!(
+                app.gamepad.state.west_ring_direction(),
+                Some(RingDirection::Right)
+            );
+            for event in [
+                PadEvent::ButtonReleased(PadButton::West),
+                PadEvent::ButtonPressed(PadButton::West),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            assert_eq!(
+                app.gamepad.state.west_ring_direction(),
+                Some(RingDirection::Right),
+                "intake cannot reset the delivered old hold"
+            );
+            let batch = app.sample_gamepad_input(&ctx);
+            assert_eq!(batch.actions_for_test().len(), 2);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(
+                app.ring_picker.is_none(),
+                "the old ring release must not turn into a picker tap"
+            );
+            assert!(app.gamepad.state.west_ring_active());
+            assert_eq!(
+                app.gamepad.state.west_ring_direction(),
+                None,
+                "the new delivered hold has its own direction"
+            );
+        }
+    }
+
+    #[test]
+    fn gamepad_logic_ingress_during_replay_waits_for_the_next_fresh_ui_batch() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+        let mut first_id = None;
+        let mut passes = 0;
+        ctx.run_pass(Default::default(), |ctx| {
+            // EpiIntegration runs logic before UI on every discarded pass too.
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            passes += 1;
+            let actions = batch.actions_for_test();
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].kind, PadActionKind::Press);
+            if ctx.current_pass_index() == 0 {
+                first_id = Some(actions[0].operation_id);
+                app.gamepad
+                    .push_for_test(PadEvent::ButtonReleased(PadButton::DPadRight));
+                app.gamepad.push_for_test(PadEvent::Disconnected);
+                ctx.request_discard("new physical terminal during gamepad replay");
+            } else {
+                assert_eq!(batch.delivery, PadBatchDelivery::Replay);
+                assert_eq!(Some(actions[0].operation_id), first_id);
+                assert!(!app.gamepad.state.button_down(PadButton::DPadRight));
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            assert_eq!(batch.delivery, PadBatchDelivery::Fresh);
+            assert_eq!(batch.actions_for_test().len(), 1);
+            assert_eq!(batch.actions_for_test()[0].kind, PadActionKind::Release);
+            assert!(matches!(
+                batch.events.as_slice(),
+                [PadBatchEvent::Action(_), PadBatchEvent::SessionEnded]
+            ));
+            assert_ne!(Some(batch.actions_for_test()[0].operation_id), first_id);
+            app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| false);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.gamepad.take_pending().events.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn gamepad_retired_picker_terminal_keeps_new_physical_repeat_axis_and_one_undo() {
+        for suppressed_release in [false, true] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            let ctx = egui::Context::default();
+            let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.gamepad_enabled = true;
+            app.gamepad
+                .push_for_test(PadEvent::ButtonPressed(PadButton::West));
+            integration.update_logic_only(&mut app.app, Default::default());
+            let batch = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+
+            let path = app.tmp.path().join("retired-picker.jpg");
+            app.items = vec![GridItem::Image(path)];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+            let key = app.rating_path_key(0).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 1, None)
+                .unwrap();
+            app.rating_cache.insert(0, 1);
+            let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+            picker.dirty_rows.push(RingPickerRowId::ItemRating);
+            picker.item_rating = 4;
+            picker.x_close_armed = true;
+            app.ring_picker = Some(picker.clone());
+            app.preview_picker_item_rating(&picker, 4);
+            let generation = app.rating_session_write_generation;
+            let retired = app.stash_mounted_and_start_fresh("test_gamepad_picker_park");
+            assert_eq!(retired, picker.owner);
+            app.retire_context(retired, "test_gamepad_picker_retire", |_| ())
+                .unwrap();
+            assert!(
+                app.ring_picker.is_some(),
+                "passive retirement retains the terminal recipe"
+            );
+            assert_eq!(app.meta_undo.undo_len(), 0);
+
+            if suppressed_release {
+                app.gamepad
+                    .push_receipt_for_test(PadEvent::ButtonReleased(PadButton::West), None);
+            } else {
+                app.gamepad.push_for_test(PadEvent::Disconnected);
+            }
+            integration.update_logic_only(&mut app.app, Default::default());
+            for event in [
+                PadEvent::ButtonPressed(PadButton::DPadRight),
+                PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+            ] {
+                app.gamepad.push_for_test(event);
+                integration.update_logic_only(&mut app.app, Default::default());
+            }
+            assert_eq!(ctx.cumulative_frame_nr(), 0);
+            let batch = app.sample_gamepad_input(&ctx);
+            assert_eq!(batch.delivery, PadBatchDelivery::Fresh);
+            assert!(matches!(
+                batch.events.last(),
+                Some(PadBatchEvent::AxesChanged(_))
+            ));
+            if suppressed_release {
+                assert!(matches!(
+                    batch.events.first(),
+                    Some(PadBatchEvent::Action(PadAction {
+                        kind: PadActionKind::SuppressedRelease,
+                        ..
+                    }))
+                ));
+            } else {
+                assert!(matches!(
+                    batch.events.first(),
+                    Some(PadBatchEvent::SessionEnded)
+                ));
+            }
+            app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            assert!(app.ring_picker.is_none());
+            assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+            assert!(
+                app.gamepad
+                    .state
+                    .delivered_button_down(PadButton::DPadRight)
+            );
+            assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+            assert_eq!(app.gamepad.state.delivered_axis(PadAxis::LeftX), 0.9);
+            assert!(!app.gamepad.state.directional_neutral_required());
+            assert!(
+                app.gamepad.state.due_button_repeat(
+                    PadButton::DPadRight,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_millis(70),
+                ),
+                "the old owner's terminal cannot remove the new physical repeat schedule"
+            );
+            assert_eq!(app.meta_undo.undo_len(), 1);
+            assert_eq!(app.rating_session_write_generation, generation);
+            let empty = app.sample_gamepad_input(&ctx);
+            app.dispatch_gamepad_batch_with_admission(&ctx, empty, |_, _| false);
+            assert_eq!(app.meta_undo.undo_len(), 1);
+            assert_eq!(app.rating_session_write_generation, generation);
+        }
+    }
+
+    #[test]
+    fn gamepad_multiple_logic_terminals_commit_preview_once_without_cancelling_new_input() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        let path = app.tmp.path().join("logic-preview.jpg");
+        app.items = vec![GridItem::Image(path)];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = app.rating_path_key(0).unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, None)
+            .unwrap();
+        app.rating_cache.insert(0, 1);
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.dirty_rows.push(RingPickerRowId::ItemRating);
+        picker.item_rating = 4;
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 4);
+        let generation = app.rating_session_write_generation;
+        let now = Instant::now();
+        for event in [
+            PadEvent::Disconnected,
+            PadEvent::Connected,
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+        ] {
+            app.gamepad.push_for_test(event);
+            app.drain_gamepad_physical_input(&ctx, now);
+        }
+        assert_eq!(ctx.cumulative_frame_nr(), 0);
+        assert!(
+            app.ring_picker.is_some(),
+            "logic cannot commit a mounted owner"
+        );
+        app.settings.page_turn_animation_enabled = true;
+        let mut passes = 0;
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            assert!(matches!(
+                batch.events.first(),
+                Some(PadBatchEvent::SessionEnded)
+            ));
+            assert_eq!(
+                batch.delivery,
+                if passes == 0 {
+                    PadBatchDelivery::Fresh
+                } else {
+                    PadBatchDelivery::Replay
+                }
+            );
+            app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true);
+            assert_eq!(
+                app.meta_undo.undo_len(),
+                1,
+                "meaningful terminal is delivered once even when UI is discarded"
+            );
+            passes += 1;
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("terminal preview commit replay");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        assert!(app.ring_picker.is_none());
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert!(app.gamepad.state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+        assert!(!app.gamepad.state.directional_neutral_required());
+        let empty = app.sample_gamepad_input(&ctx);
+        app.dispatch_gamepad_batch_with_admission(&ctx, empty, |_, _| false);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+    }
+
+    #[test]
     fn gamepad_ui_take_preserves_split_drain_edges_without_another_poll() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.gamepad_enabled = true;
@@ -11531,6 +12072,8 @@ mod physical_boundary_tests {
         assert!(batch.session_ended_for_test());
         assert!(batch.saw_input_event);
         assert_eq!(batch.actions_for_test().len(), 2);
+        assert!(app.gamepad_favorite_picker.is_some());
+        app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| false);
         assert!(app.gamepad_favorite_picker.is_none());
         assert!(!app.gamepad.state.button_down(PadButton::West));
         assert!(app.gamepad.state.button_down(PadButton::DPadRight));

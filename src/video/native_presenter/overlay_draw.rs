@@ -3757,7 +3757,9 @@ mod ring_guide_tests {
                     let mut harness = crate::test_ui::builder()
                         .with_size(size)
                         .with_pixels_per_point(ppp)
-                        .build(move |ctx| {
+                        .build_ui(move |root_ui| {
+                            let ctx = &root_ui.ctx().clone();
+
                             if !fonts_ready {
                                 crate::ui_fonts::configure_fonts(ctx);
                                 fonts_ready = true;
@@ -7930,7 +7932,9 @@ pub(crate) mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1280.0, 720.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
@@ -8009,7 +8013,9 @@ pub(crate) mod tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1_200.0, 80.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -8290,7 +8296,9 @@ pub(crate) mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1_200.0, 80.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
@@ -8733,7 +8741,9 @@ pub(crate) mod tests {
         let mut projection_popup_rect = None;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 64.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -8784,7 +8794,9 @@ pub(crate) mod tests {
         let captured_for_ui = Arc::clone(&captured);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 egui::CentralPanel::default().show(root_ui, |ui| {
                     let painter = ui.painter().clone();
                     let mut commands = Vec::new();
@@ -8849,7 +8861,9 @@ pub(crate) mod tests {
         };
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(340.0, 650.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);

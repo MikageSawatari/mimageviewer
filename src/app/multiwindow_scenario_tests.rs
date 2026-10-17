@@ -354,7 +354,7 @@ impl ScenarioDriver {
             let id = viewport.ids.this;
             child_known.borrow_mut().insert(id);
             let input = Self::input(id, *child_focus.borrow(), CHILD_SIZE, &child_known.borrow());
-            let output = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            let output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
             capture.borrow_mut().push((id, output));
         });
         Self {
@@ -413,7 +413,9 @@ impl ScenarioDriver {
 
     fn root_with_events(&mut self, app: &mut App, events: Vec<egui::Event>) -> ScenarioFrame {
         self.number += 1;
-        self.child_outputs.borrow_mut().clear();
+        for (_, output) in self.child_outputs.borrow_mut().drain(..) {
+            output.drop_without_applying_deltas();
+        }
         let mut input = Self::input(
             egui::ViewportId::ROOT,
             *self.focused.borrow(),
@@ -422,8 +424,9 @@ impl ScenarioDriver {
         );
         input.events = events;
         let output = with_capture(|| {
-            self.ctx.run(input, |ctx| {
-                <App as eframe::App>::update(app, ctx, &mut self.frame);
+            self.ctx.run_ui(input, |ui| {
+                <App as eframe::App>::logic(app, ui.ctx(), &mut self.frame);
+                <App as eframe::App>::ui(app, ui, &mut self.frame);
             })
         });
         let mut records = HashMap::new();
@@ -442,6 +445,7 @@ impl ScenarioDriver {
             records.insert(id, paint_records(id, &output));
             white.insert(id, white_companion_paint_records(id, &output));
             errors.insert(id, error_messages(&output));
+            output.drop_without_applying_deltas();
         }
         let registered = output
             .viewport_output
@@ -452,11 +456,12 @@ impl ScenarioDriver {
         let mut known = registered;
         known.insert(egui::ViewportId::ROOT);
         *self.known.borrow_mut() = known;
-        for (id, viewport) in output.viewport_output {
-            if let Some(callback) = viewport.viewport_ui_cb {
-                self.callbacks.insert(id, callback);
+        for (&id, viewport) in &output.viewport_output {
+            if let Some(callback) = &viewport.viewport_ui_cb {
+                self.callbacks.insert(id, Arc::clone(callback));
             }
         }
+        output.drop_without_applying_deltas();
         ScenarioFrame {
             number: self.number,
             records,
@@ -471,13 +476,14 @@ impl ScenarioDriver {
         self.number += 1;
         let callback = Arc::clone(self.callbacks.get(&id).expect("ROOT registered child"));
         let input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
-        let output = with_capture(|| self.ctx.run(input, |ctx| callback(ctx)));
+        let output = with_capture(|| self.ctx.run_ui(input, |ui| callback(ui)));
         let mut records = HashMap::new();
         let mut white = HashMap::new();
         let mut errors = HashMap::new();
         records.insert(id, paint_records(id, &output));
         white.insert(id, white_companion_paint_records(id, &output));
         errors.insert(id, error_messages(&output));
+        output.drop_without_applying_deltas();
         ScenarioFrame {
             number: self.number,
             records,

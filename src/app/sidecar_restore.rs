@@ -3559,7 +3559,7 @@ mod tests {
 
         app.sidecar_restore.as_mut().unwrap().common.started_at =
             std::time::Instant::now() + SIDECAR_RESTORE_MODAL_GRACE;
-        let early = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+        let early = egui::Context::default().run_pass(egui::RawInput::default(), |ctx| {
             app.show_sidecar_restore_dialog(ctx);
         });
         assert!(
@@ -3569,7 +3569,7 @@ mod tests {
 
         app.sidecar_restore.as_mut().unwrap().common.started_at =
             std::time::Instant::now() - SIDECAR_RESTORE_MODAL_GRACE;
-        let visible = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+        let visible = egui::Context::default().run_pass(egui::RawInput::default(), |ctx| {
             app.show_sidecar_restore_dialog(ctx);
         });
         assert!(
@@ -3577,6 +3577,8 @@ mod tests {
             "an active restore must draw its progress modal after the grace"
         );
         assert!(app.sidecar_restore_blocks_projected_context());
+        early.drop_without_applying_deltas();
+        visible.drop_without_applying_deltas();
     }
 
     #[test]
@@ -4627,7 +4629,10 @@ mod tests {
             egui::ImeEvent::Enabled
         )));
         assert!(!sidecar_restore_retains_egui_event(&egui::Event::Ime(
-            egui::ImeEvent::Preedit("未確定".into())
+            egui::ImeEvent::Preedit {
+                text: "未確定".into(),
+                active_range_chars: None
+            }
         )));
         assert!(!sidecar_restore_retains_egui_event(&egui::Event::Ime(
             egui::ImeEvent::Commit("入力しない".into())
@@ -4735,6 +4740,8 @@ mod tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, 24.0),
                 modifiers: egui::Modifiers::CTRL,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             },
             egui::Event::Key {
                 key: egui::Key::A,
@@ -4752,15 +4759,22 @@ mod tests {
             },
         ];
 
-        let _ = ctx.run_pass(raw, |ctx| {
+        ctx.run_pass(raw, |ctx| {
             assert!(ctx.input(|input| input.pointer.primary_down()));
-            assert_ne!(ctx.input(|input| input.raw_scroll_delta), egui::Vec2::ZERO);
+            let input_options = ctx.options(|options| options.input_options);
+            assert_ne!(
+                ctx.input(|input| crate::wheel_input::remaining_wheel_delta(input, input_options)),
+                egui::Vec2::ZERO
+            );
             App::consume_sidecar_restore_viewport_input(ctx);
 
             ctx.input(|input| {
                 assert!(!input.pointer.any_down());
                 assert!(input.pointer.latest_pos().is_none());
-                assert_eq!(input.raw_scroll_delta, egui::Vec2::ZERO);
+                assert_eq!(
+                    crate::wheel_input::remaining_wheel_delta(input, input_options),
+                    egui::Vec2::ZERO
+                );
                 assert_eq!(input.smooth_scroll_delta, egui::Vec2::ZERO);
                 assert!(input.keys_down.is_empty());
                 assert_eq!(input.events.len(), 1);
@@ -4773,7 +4787,8 @@ mod tests {
                     }
                 ));
             });
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]

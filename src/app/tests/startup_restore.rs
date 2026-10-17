@@ -1151,7 +1151,7 @@ fn close_root_to_tray(app: &mut App) {
         .or_default()
         .events
         .push(egui::ViewportEvent::Close);
-    let output = ctx.run(raw, |ctx| assert!(app.maybe_intercept_close(ctx)));
+    let output = ctx.run_pass(raw, |ctx| assert!(app.maybe_intercept_close(ctx)));
     assert!(!app.window_visible);
     assert!(
         output.viewport_output[&egui::ViewportId::ROOT]
@@ -1159,6 +1159,7 @@ fn close_root_to_tray(app: &mut App) {
             .iter()
             .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
     );
+    output.drop_without_applying_deltas();
 }
 
 #[cfg(windows)]
@@ -1324,7 +1325,7 @@ fn section1335_tray_explicit_book_list_hide_restore_keeps_normally_opened_and_ba
                 ..Default::default()
             });
             assert!(env.handle_fullscreen_root_key_input(&ctx));
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
         assert!(env.fullscreen_idx.is_none());
         assert_physical(&env, &book, Some(""));
@@ -1525,7 +1526,7 @@ fn section1335_back_to_list_key_rejected_by_modal_then_accepted_updates_record_o
         env.handle_fullscreen_root_key_input(&ctx),
         "modal consumes leaked root input"
     );
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(env.fullscreen_idx, viewed);
     assert_eq!(env.settings.startup_list_restore, before);
     assert_physical(&env, &parent, None);
@@ -1542,7 +1543,7 @@ fn section1335_back_to_list_key_rejected_by_modal_then_accepted_updates_record_o
         ..Default::default()
     });
     assert!(env.handle_fullscreen_root_key_input(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert!(env.fullscreen_idx.is_none());
     assert_physical(&env, &book, Some(""));
 }
@@ -1794,7 +1795,7 @@ fn section1335_reading_empty_normal_folder_then_inner_zip_keeps_restore_at_each_
     assert_eq!(env.settings.startup_list_restore, before);
     let ctx = egui::Context::default();
     let mut reason = None;
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
         if reason.is_none() {
             reason = Some(env.reopen_fullscreen_after_folder_nav_load(
                 ctx,
@@ -1803,7 +1804,8 @@ fn section1335_reading_empty_normal_folder_then_inner_zip_keeps_restore_at_each_
                 HistoryTrigger::UserChosen,
             ));
         }
-    });
+    })
+    .drop_without_applying_deltas();
     assert_eq!(reason, Some("enumerate_defer"));
     assert!(
         matches!(
@@ -2377,11 +2379,12 @@ fn section1335_favorite_reading_sibling_fallbacks_preserve_last_accepted_physica
             queued_steps: 0,
         });
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             if let Some(result) = result.take() {
                 env.apply_folder_nav_result(ctx, result);
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(env.settings.startup_list_restore, departure);
         settle_book(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&next));
@@ -2902,18 +2905,19 @@ fn section1335_collection_ctrl_down_zip_adoption_restores_with_sidecars_on_and_o
 
         // Use the actual grid Ctrl+Down handler, including its Collection OuterGrid request.
         ctx.begin_pass(egui::RawInput {
-            modifiers: egui::Modifiers::CTRL,
-            events: vec![egui::Event::Key {
-                key: egui::Key::ArrowDown,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::CTRL,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+                .chain(vec![egui::Event::Key {
+                    key: egui::Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }])
+                .collect(),
             ..Default::default()
         });
         assert!(env.handle_keyboard(&ctx).is_none());
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(env.top_level_grid_view.collection_navigation_pending());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -3221,7 +3225,7 @@ fn section1335_extra_video_egui_close_key_restores_folder_list() {
     });
     let _ = env.keyboard_owner_for_pass(&ctx);
     env.handle_video_input(&ctx, index, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_extra_video_close_restarts_list(&mut env, &media_folder);
 }
 
@@ -3479,7 +3483,7 @@ fn backspace_image_folder_book_to_list(app: &mut App, book: &Path) {
         ..Default::default()
     });
     assert!(app.handle_fullscreen_root_key_input(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert!(app.fullscreen_idx.is_none());
     assert_eq!(app.current_folder.as_deref(), Some(book));
     assert_physical(app, book, None);

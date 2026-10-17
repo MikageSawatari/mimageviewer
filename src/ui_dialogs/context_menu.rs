@@ -4677,7 +4677,7 @@ mod delete_confirm_tests {
             !keymap.consume_action(&ctx, crate::keymap::KeyAction::GridPin),
             "削除確認で消費した Y は同 frame の背面 KeyAction に届かない"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -4689,7 +4689,7 @@ mod delete_confirm_tests {
             consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Delete, true, false, false);
         assert_eq!(response.action, DeleteConfirmAction::None);
         assert!(!keymap.consume_action(&ctx, crate::keymap::KeyAction::GridPin));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -4706,9 +4706,10 @@ mod delete_confirm_tests {
                 let _ = ctx
                     .run_pass(
                         egui::RawInput {
-                            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit(
-                                "preedit".into(),
-                            ))],
+                            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                                text: "preedit".into(),
+                                active_range_chars: None,
+                            })],
                             ..Default::default()
                         },
                         |ctx| app.update_ime_state(ctx),
@@ -4769,7 +4770,7 @@ mod delete_confirm_tests {
             consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Delete, false, true, false);
         assert_eq!(response.action, DeleteConfirmAction::Cancel);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -4780,7 +4781,7 @@ mod delete_confirm_tests {
             consume_delete_confirm_action(&ctx, DeleteConfirmSelection::Cancel, false, false, true);
         assert_eq!(response.action, DeleteConfirmAction::Cancel);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -4803,7 +4804,7 @@ mod delete_confirm_tests {
             assert_eq!(response.selection, expected, "{key:?}");
             assert_eq!(response.action, DeleteConfirmAction::None);
             assert!(ctx.input(|input| input.events.is_empty()));
-            let _ = ctx.end_pass();
+            let _ = ctx.end_pass().drop_without_applying_deltas();
         }
     }
 

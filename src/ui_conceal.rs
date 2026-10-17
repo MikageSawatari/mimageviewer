@@ -3289,7 +3289,7 @@ mod tests {
             ],
             ..Default::default()
         });
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(
             conceal_preview_pointer_state(&ctx, fullscreen_id),

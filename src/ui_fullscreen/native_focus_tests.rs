@@ -13,14 +13,14 @@ fn headless_fullscreen_focus_records_request_only_for_foreign_foreground() {
         app.settings.vst3_gui_visible = false;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
         let draw = |app: &mut App, events| {
-            ctx.run_pass(
+            crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
                     ..Default::default()
                 },
                 |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
-            )
+            ))
         };
         for _ in 0..5 {
             let _ = draw(&mut app, vec![]);

@@ -122,3 +122,54 @@ public input_mut_forで未知IDを列挙すると登録を作るため、既存�
 実Contextのrun_logic後snapshotと次の新Closeを検査する回帰を追加した。
 承認時の登録終了は既存retire_viewportのままで、IME policy整理は準備egui-imeの明示入口へ接続する。
 検証結果は段2台帳。正式な独立ACCEPT・実機確認ではない。
+
+
+## Stage 3: approved viewport retirement (design revision 4.5, 2026-10-17)
+
+Implementation record only; independent acceptance and execution evidence belong
+in the stage-3 verification ledger.
+
+- ViewportRegistration identifies one real Context registration. The read-only
+  Context::viewport_registration lookup never creates a target. Existing App
+  bindings may retain Context plus this identity after Context GC.
+- approve_viewport_retirement captures the exact target and owned descendants,
+  normalizes overlapping approvals in the existing root command column, and
+  emits RetireApproved. It does not request Close, repaint, UI, or native cleanup.
+- Full/LogicOnly/direct begin-end/pass-outside drains share the output contract.
+  Dynamic run_depth and the existing viewport stack keep authority in that same
+  root column through immediate nesting and discard retries. No second queue,
+  pending flag, retirement history, or retry was added.
+- ViewportOutput carries its own registration and exact parent registration.
+  append never mixes builders/callbacks/ordinary commands from different lives.
+  Old output cannot modify or recreate a reopened same-ID native viewport.
+- retire_approved_viewports uses the normal target-limited Context GC cleanup;
+  user callbacks drop outside the Context lock. Additional TextureHandle frees
+  can be transferred to the existing shared renderer owner.
+- consume_registered_viewport_close checks and consumes atomically, preserving
+  Close metadata belonging to a new same-ID registration created by a hook.
+
+The new stage3_viewport_retirement_tests module adds six real Context scenarios
+for logic, GC/discard, immediate nesting, append/reopen, overlap/direct end_pass,
+and unlocked callback drop/additional free. Existing stage-2 retirement tests
+remain intact. The first compile found a module-name collision and an associated
+setter called as a method; both source errors have been corrected.
+
+An additional discard/native-reopen texture ordering gap remains unresolved:
+run_dyn can retain pass-1 texture output while a pass-2 immediate renderer submits
+an old native callback's free first. No new delivery callback has been added;
+the design owner must decide that new ownership boundary before implementation.
+
+## Stage 3: formal vendor graph
+
+Earlier descriptions of vendor-next/preparation-only graphs are historical.
+Stage 3 uses the formal vendor/ crates from the root Cargo.toml and Cargo.lock.
+Each normalized vendor manifest has its own [workspace] and [patch.crates-io]
+pointing at the same formal egui, egui-winit, egui-wgpu, and eframe crates.
+Cargo.toml.orig and the upstream README are retained. Original upstream lockfile
+hashes remain in the provenance inventory. Active standalone Cargo.lock files were
+initially copied from the root lock during WIP setup and are resolved/recorded by
+ordinary offline Cargo; they are not original upstream lockfiles.
+The shared IME implementation lives in crates/egui-ime; egui-winit and
+eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
+were moved to vendor/upstream-provenance.json. Graph migration is not evidence
+that runtime checks or release gates have passed.

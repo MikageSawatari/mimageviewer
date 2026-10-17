@@ -5792,18 +5792,13 @@ mod tests {
             ));
             ctx.begin_pass(input);
             let mut clicked = false;
-            egui::CentralPanel::default().show(
-                &mut egui::Ui::new(
-                    ctx.clone(),
-                    egui::Id::unique("headless_manual_root"),
-                    egui::UiBuilder::new(),
-                ),
-                |ui| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let response = ui.button("Test button");
                     super::register_clickable_widget("Test button", &response);
                     clicked = response.clicked();
-                },
-            );
+                })
+            });
             ctx.end_pass().drop_without_applying_deltas();
             clicked
         };
@@ -5871,18 +5866,13 @@ mod tests {
                 }
                 ctx.begin_pass(input);
                 let mut result = (false, false);
-                egui::CentralPanel::default().show(
-                    &mut egui::Ui::new(
-                        ctx.clone(),
-                        egui::Id::unique("headless_manual_root"),
-                        egui::UiBuilder::new(),
-                    ),
-                    |ui| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         let response = ui.button("row");
                         super::register_clickable_widget("row", &response);
                         result = (response.clicked(), response.double_clicked());
-                    },
-                );
+                    })
+                });
                 ctx.end_pass().drop_without_applying_deltas();
                 result
             };
@@ -6643,18 +6633,13 @@ mod tests {
             ));
             ctx.begin_pass(input);
             let mut clicked = false;
-            egui::CentralPanel::default().show(
-                &mut egui::Ui::new(
-                    ctx.clone(),
-                    egui::Id::unique("headless_manual_root"),
-                    egui::UiBuilder::new(),
-                ),
-                |ui| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let response = ui.add_enabled(false, egui::Button::new("評価↑"));
                     super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
                     clicked = response.clicked();
-                },
-            );
+                })
+            });
             ctx.end_pass().drop_without_applying_deltas();
             clicked
         };
@@ -6696,19 +6681,14 @@ mod tests {
             ));
             ctx.begin_pass(input);
             let mut contains_pointer = false;
-            egui::CentralPanel::default().show(
-                &mut egui::Ui::new(
-                    ctx.clone(),
-                    egui::Id::unique("headless_manual_root"),
-                    egui::UiBuilder::new(),
-                ),
-                |ui| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let response = ui.add_enabled(false, egui::Button::new("評価↑"));
                     super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
                     contains_pointer = response.contains_pointer();
                     assert!(!response.clicked());
-                },
-            );
+                })
+            });
             ctx.end_pass().drop_without_applying_deltas();
             contains_pointer
         };
@@ -9008,20 +8988,19 @@ mod tests {
                 let field_id = egui::Id::new("semantic-action-text-owner");
                 let mut text = String::new();
                 let mut request_focus = true;
-                let draw_field = |ctx: &egui::Context,
-                                  text: &mut String,
-                                  request_focus: &mut bool| {
-                    let mut ui = egui::Ui::new(
-                        ctx.clone(),
-                        egui::Id::unique("semantic_action_root"),
-                        egui::UiBuilder::new(),
-                    );
-                    egui::CentralPanel::default().show(&mut ui, |ui| {
-                        crate::ime_focus::add_singleline(ui, text, Some(request_focus), |edit| {
-                            edit.id(field_id)
+                let draw_field =
+                    |ctx: &egui::Context, text: &mut String, request_focus: &mut bool| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                crate::ime_focus::add_singleline(
+                                    ui,
+                                    text,
+                                    Some(request_focus),
+                                    |edit| edit.id(field_id),
+                                );
+                            })
                         });
-                    });
-                };
+                    };
                 if guard == "text" {
                     ctx.begin_pass(Default::default());
                     draw_field(&ctx, &mut text, &mut request_focus);
@@ -10078,20 +10057,15 @@ mod tests {
             },
         );
         ctx.begin_pass(warmup_input);
-        egui::CentralPanel::default().show(
-            &mut egui::Ui::new(
-                ctx.clone(),
-                egui::Id::unique("headless_manual_root"),
-                egui::UiBuilder::new(),
-            ),
-            |ui| {
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 let _ = ui.interact(
                     rect,
                     egui::Id::new("poisoned-pointer-track"),
                     egui::Sense::click_and_drag(),
                 );
-            },
-        );
+            })
+        });
         ctx.end_pass().drop_without_applying_deltas();
 
         let mut child_input = egui::RawInput {
@@ -10123,13 +10097,8 @@ mod tests {
         ctx.begin_pass(child_input.clone());
         pointer_input::record_delivery_proof(&prepared, &child_input);
         pointer_input::begin_pass(&ctx, 29, 2, "page-2".to_string(), mode);
-        egui::CentralPanel::default().show(
-            &mut egui::Ui::new(
-                ctx.clone(),
-                egui::Id::unique("headless_manual_root"),
-                egui::UiBuilder::new(),
-            ),
-            |ui| {
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 let response = ui.interact(
                     rect,
                     egui::Id::new("poisoned-pointer-track"),
@@ -10150,8 +10119,8 @@ mod tests {
                     pointer_input::RegionId::StillSeekTrack,
                     None,
                 );
-            },
-        );
+            })
+        });
         pointer_input::finish_pass(&ctx);
         let output = show.finish();
         ctx.end_pass().drop_without_applying_deltas();

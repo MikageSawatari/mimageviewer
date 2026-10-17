@@ -123,7 +123,7 @@ fn plain_folder_final_exit_flushes_dirty_tags_with_generic_rename_owners_pending
         .unwrap()
         .events
         .push(egui::ViewportEvent::Close);
-    let output = ctx.run(close, |ctx| {
+    let output = ctx.run_pass(close, |ctx| {
         fixture.app.defer_composition_editor_root_close(ctx)
     });
     assert!(
@@ -142,6 +142,7 @@ fn plain_folder_final_exit_flushes_dirty_tags_with_generic_rename_owners_pending
     // bytes, rather than accepting the writer's read-through pending snapshot.
     assert_plain_folder_tags_on_disk(&fixture);
     assert_migrations_unconsumed(&fixture);
+    output.drop_without_applying_deltas();
 }
 
 #[test]

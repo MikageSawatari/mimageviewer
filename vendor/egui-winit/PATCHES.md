@@ -51,3 +51,25 @@ byte変更なしで同梱する。
 | --- | --- |
 | `../../vendor/egui-winit/LICENSE-MIT` | `3fceb7b317f3c70451942b0e123723a2e250c7eaf970ce4b490a57a94c5588ff` |
 | `../../vendor/egui-winit/LICENSE-APACHE` | `1ac50a5abd5cff5331d59928d83369b66b0099a88f0111dc2175526b3c666dec` |
+
+
+## Stage 3: terminal command ownership (design revision 4.5, 2026-10-17)
+
+RetireApproved belongs to the eframe pass-outside consumer. Reaching ordinary
+window-command processing is a contract violation, rather than a Close event or
+a silently dropped command. Existing Close/CancelClose behavior is preserved.
+
+## Stage 3: formal vendor graph
+
+Earlier descriptions of vendor-next/preparation-only graphs are historical.
+Stage 3 uses the formal vendor/ crates from the root Cargo.toml and Cargo.lock.
+Each normalized vendor manifest has its own [workspace] and [patch.crates-io]
+pointing at the same formal egui, egui-winit, egui-wgpu, and eframe crates.
+Cargo.toml.orig and the upstream README are retained. Original upstream lockfile
+hashes remain in the provenance inventory. Active standalone Cargo.lock files were
+initially copied from the root lock during WIP setup and are resolved/recorded by
+ordinary offline Cargo; they are not original upstream lockfiles.
+The shared IME implementation lives in crates/egui-ime; egui-winit and
+eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
+were moved to vendor/upstream-provenance.json. Graph migration is not evidence
+that runtime checks or release gates have passed.

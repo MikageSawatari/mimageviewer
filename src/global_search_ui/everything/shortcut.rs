@@ -81,12 +81,14 @@ mod tests {
         crate::ime_focus::install_ime_input_policy(&ctx);
 
         fn draw(ctx: &egui::Context, app: &mut App) -> egui::Id {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                super::super::ui::draw_everything_controls(
-                    ui,
-                    &mut app.global_search.query,
-                    &mut app.global_search.focus_request,
-                );
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    super::super::ui::draw_everything_controls(
+                        ui,
+                        &mut app.global_search.query,
+                        &mut app.global_search.focus_request,
+                    );
+                })
             });
             ctx.memory(|memory| memory.focused()).unwrap()
         }
@@ -105,7 +107,7 @@ mod tests {
                 )));
             state.store(&ctx, id);
             ctx.memory_mut(|memory| memory.surrender_focus(id));
-            let _ = ctx.end_pass();
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
 
             key_pass(
                 &ctx,
@@ -124,18 +126,24 @@ mod tests {
                 .char_range()
                 .unwrap()
                 .as_sorted_char_range();
-            assert_eq!(selection, 0..previous.chars().count());
+            assert_eq!(
+                selection,
+                egui::text::CharIndex(0)..egui::text::CharIndex(previous.chars().count())
+            );
             assert!(!app.global_search.focus_request);
             assert!(
                 app.global_search.pending.is_none(),
                 "reopen must not send IPC"
             );
-            let _ = ctx.end_pass();
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
 
             let mut events = if ime {
                 vec![
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit(replacement.into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: replacement.into(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Ime(egui::ImeEvent::Commit(replacement.into())),
                     egui::Event::Ime(egui::ImeEvent::Disabled),
                 ]
@@ -158,7 +166,7 @@ mod tests {
             });
             draw(&ctx, &mut app);
             assert_eq!(app.global_search.query, replacement);
-            let _ = ctx.end_pass();
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
             ctx.begin_pass(egui::RawInput {
                 events: vec![egui::Event::Text("x".into())],
                 ..Default::default()
@@ -169,7 +177,7 @@ mod tests {
                 format!("{replacement}x"),
                 "ordinary typing must not repeatedly select the query"
             );
-            let _ = ctx.end_pass();
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
             if ime {
                 // Even an explicit caller focus request during composition must
                 // preserve the preedit selection. Recovery retries are helper-owned.
@@ -177,7 +185,10 @@ mod tests {
                 ctx.begin_pass(egui::RawInput {
                     events: vec![
                         egui::Event::Ime(egui::ImeEvent::Enabled),
-                        egui::Event::Ime(egui::ImeEvent::Preedit("未".into())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "未".into(),
+                            active_range_chars: None,
+                        }),
                     ],
                     ..Default::default()
                 });
@@ -189,8 +200,11 @@ mod tests {
                     .unwrap()
                     .as_sorted_char_range();
                 let start = replacement.chars().count() + 1;
-                assert_eq!(selection, start..start + 1);
-                let _ = ctx.end_pass();
+                assert_eq!(
+                    selection,
+                    egui::text::CharIndex(start)..egui::text::CharIndex(start + 1)
+                );
+                let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
                 ctx.begin_pass(egui::RawInput {
                     events: vec![
                         egui::Event::Ime(egui::ImeEvent::Commit("確".into())),
@@ -200,7 +214,7 @@ mod tests {
                 });
                 draw(&ctx, &mut app);
                 assert_eq!(app.global_search.query, format!("{replacement}x確"));
-                let _ = ctx.end_pass();
+                let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
             }
         }
     }
@@ -231,7 +245,7 @@ mod tests {
             "opening must not send IPC"
         );
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
 
         app.keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGlobalEverythingSearch = F24\n");
         key_pass(
@@ -241,7 +255,7 @@ mod tests {
             Some(main_owner()),
         );
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
-        let _ = ctx.end_pass();
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         key_pass(
             &ctx,
             egui::Key::F24,
@@ -249,7 +263,7 @@ mod tests {
             Some(main_owner()),
         );
         assert!(app.dispatch_everything_search_shortcut(&ctx));
-        let _ = ctx.end_pass();
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         app.keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGlobalEverythingSearch = none\n");
         key_pass(
             &ctx,
@@ -258,7 +272,7 @@ mod tests {
             Some(main_owner()),
         );
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
-        let _ = ctx.end_pass();
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
     }
 
     #[test]
@@ -274,7 +288,7 @@ mod tests {
         key_pass(&ctx, egui::Key::R, egui::Modifiers::CTRL, None);
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
         assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         app.address_has_focus = false;
         // IME composition and focus recovery are pass-owned claims; the
         // real dispatcher must retain their edge for the field, not just skip open.
@@ -297,7 +311,7 @@ mod tests {
             assert!(!app.dispatch_everything_search_shortcut(&ctx), "{phase:?}");
             assert_eq!(ctx.input(|input| input.events.len()), 1, "{phase:?}");
             assert!(!app.global_search.active);
-            let _ = ctx.end_pass();
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         }
     }
 
@@ -325,7 +339,7 @@ mod tests {
             assert!(!app.dispatch_everything_search_shortcut(&ctx));
             assert_eq!(ctx.input(|input| input.events.len()), 1);
             assert!(!app.global_search.active);
-            let _ = ctx.end_pass();
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         }
         app.fullscreen_idx = Some(0);
         key_pass(
@@ -336,7 +350,7 @@ mod tests {
         );
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
         assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
     }
 
     #[cfg(windows)]
@@ -357,7 +371,7 @@ mod tests {
             assert!(!mounted.dispatch_everything_search_shortcut(&ctx));
             assert!(!mounted.global_search.active);
             assert_eq!(ctx.input(|input| input.events.len()), 1);
-            let _ = ctx.end_pass();
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         });
         app.items = vec![crate::grid_item::GridItem::Video(
             app.tmp.path().join("fake.mp4"),
@@ -373,6 +387,6 @@ mod tests {
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
         assert!(!app.global_search.active);
         assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
     }
 }

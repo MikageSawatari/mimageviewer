@@ -5602,3 +5602,34 @@ Fullのlogicはrun_ui内で呼ばれ、pass外専用のContext退役APIも直接
 設計判断と独立レビューを要する。合意済み範囲の実装完了とは扱わず、構造を追加する前に停止した。
 Remoteはlogicへ結線せず旧UI checkpointに残す。強制UI・pending bool等の代用品は追加しない。
 詳細と分野別差分・未実施gateは[段3台帳](egui-0.37-stage3-verification.md)へ記録した。
+
+#### 2026-10-17 段3再開・第4.5版の実装途中記録
+
+第4.5版と独立設計レビュー・双方の構造合意（`8944ef6a5` / `f5d632d17`）を受け、
+承認済み退役を既存root viewport command出力へ型付きで移譲する方式を実装中。
+初回の上記設計論点はこの改訂で解決済みであり、履歴は削除しない。
+
+Contextの実登録寿命とcommand sinkを既存detached runtimeおよびstandalone fullscreen ownerのbindingへ保持し、
+終了ownerがtakeして承認を渡してからApp ownerを終える。Closing延命、第二queue、新pending flagは作らない。
+mode-changeの退役用空immediate UIを撤去し、C1・watcher Closeをlogicへ接続した。
+backendはFull/LogicOnly/hookの外で同じcleanupを使い、旧output・同ID新寿命・兄弟IMEを分離する。
+
+別contextの独立実装レビューでは、Closeのbookmark/親一覧表示継続の受渡し、C1終了内pin dirtyの表示採用、
+discard第1passの未配送deltaと第2pass immediateの旧callback freeのsubmission順に未解決P1を確認した。
+この記録は新しいdelta先行移譲callbackの構造合意ではない。新callbackは未実装で設計判断待ち。
+既存ownerでの終端/表示継続分離と、追加受渡し契約を定義してから未完部分を実装する。
+**実装担当の内部確認**やcompile成功を段3完了・独立ACCEPTには読み替えない。
+分野別差分・回帰候補・コマンド結果と未達gateは[段3台帳](egui-0.37-stage3-verification.md)へ追記する。
+
+上記dirty採用P1は、既存App-global dirty集合とgate付き一覧UI consumerの存続を双方で確認した後、
+非描画Close内の表示consumer 2呼出しを外す形で補修した。新owner・状態・待機を追加しない。
+実App::logicからRemote取得・fullscreen終了を進めつつdirtyと表示itemsを保つ回帰を追加し、結果を段3台帳へ記録する。
+Closeのbookmark/親一覧継続とdelta配送の構造契約は引き続き未解決であり、今回の局所補修をその合意へ拡大しない。
+
+正式graphではApp退役10、continuation36、root lifecycle11、context-state8、gamepad94が成功した。
+vendor退役はegui14・eframe両backend各10、最小化Fullはwgpu9・glow11、viewport入力は両backend各5が成功。
+本体default全23 test executableはno-runでコンパイル成功。IME/native control等の結果も段3台帳へ記録した。
+これらは2件の未解決P1や製品Full接続回帰の不足を代替しない。stage3完了・独立ACCEPTではない。
+deltaは既存shared TextureManagerへ戻す案も検討したが、現epaint APIにはmetadata非変更の返却がなく、
+限定API追加・年代順合流・出力hook観測の契約が必要であることを双方がsourceで確認した。
+新callback案だけを必須の結論とせず、いずれの新経路も設計判断前には実装していない。

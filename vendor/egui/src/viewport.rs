@@ -1083,6 +1083,9 @@ pub enum ResizeDirection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum ViewportCommand {
+    /// Finish already approved child lifetimes, outside all UI passes.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    RetireApproved(ApprovedViewportRetirement),
     /// Request this viewport to be closed.
     ///
     /// For the root viewport, this usually results in the application shutting down.
@@ -1264,12 +1267,78 @@ impl ViewportCommand {
 
 // ----------------------------------------------------------------------------
 
+/// Opaque identity of one live viewport registration. Reopening an ID gets a
+/// different identity. This is not a persistent widget ID or a surface generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ViewportRegistration {
+    pub(crate) id: ViewportId,
+    pub(crate) lifetime: ViewportLifetime,
+}
+
+impl ViewportRegistration {
+    /// The viewport ID for this particular registration lifetime.
+    pub fn viewport_id(self) -> ViewportId {
+        self.id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ViewportLifetime(u64);
+
+impl Default for ViewportLifetime {
+    fn default() -> Self {
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Authority transferred by an application owner after its close decision.
+/// Contains only exact registration lifetimes, never a request to ask again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovedViewportRetirement {
+    pub(crate) registrations: Vec<ViewportRegistration>,
+}
+
+impl ApprovedViewportRetirement {
+    /// Registrations captured at approval. Native adapters extend this through
+    /// their retained exact parent registrations if Context GC ran first.
+    pub fn registrations(&self) -> &[ViewportRegistration] {
+        &self.registrations
+    }
+
+    /// Add live descendants whose exact parent lifetime is already approved.
+    pub fn include_descendants(
+        &mut self,
+        owners: &[(ViewportRegistration, Option<ViewportRegistration>)],
+    ) {
+        loop {
+            let count = self.registrations.len();
+            for &(registration, parent) in owners {
+                if registration.id != ViewportId::ROOT
+                    && parent.is_some_and(|parent| self.registrations.contains(&parent))
+                    && !self.registrations.contains(&registration)
+                {
+                    self.registrations.push(registration);
+                }
+            }
+            if count == self.registrations.len() {
+                break;
+            }
+        }
+    }
+}
+
 /// Describes a viewport, i.e. a native window.
 ///
 /// This is returned by [`crate::Context::run_ui`] on each frame, and should be applied
 /// by the integration.
 #[derive(Clone)]
 pub struct ViewportOutput {
+    /// Exact Context registration that produced this output.
+    pub registration: ViewportRegistration,
+
+    /// Exact registration of the owning parent, if registered.
+    pub parent_registration: Option<ViewportRegistration>,
     /// Id of our parent viewport.
     pub parent: ViewportId,
 
@@ -1306,7 +1375,30 @@ pub struct ViewportOutput {
 impl ViewportOutput {
     /// Add on new output.
     pub fn append(&mut self, newer: Self) {
+        if self.registration != newer.registration {
+            if newer.registration.lifetime.0 < self.registration.lifetime.0 {
+                self.commands.extend(
+                    newer
+                        .commands
+                        .into_iter()
+                        .filter(|command| matches!(command, ViewportCommand::RetireApproved(_))),
+                );
+                return;
+            }
+            // Never mix builders, callbacks or ordinary commands across lifetimes.
+            // RetireApproved normally travels on the never-replaced root owner.
+            let approvals: Vec<_> = self
+                .commands
+                .drain(..)
+                .filter(|command| matches!(command, ViewportCommand::RetireApproved(_)))
+                .collect();
+            *self = newer;
+            self.commands.extend(approvals);
+            return;
+        }
         let Self {
+            registration: _,
+            parent_registration,
             parent,
             class,
             builder,
@@ -1316,6 +1408,7 @@ impl ViewportOutput {
         } = newer;
 
         self.parent = parent;
+        self.parent_registration = parent_registration;
         self.class = class;
         let _ = self.builder.patch(builder); // we ignore the returned command, because `self.builder` will be the basis of a new patch
         self.viewport_ui_cb = viewport_ui_cb;

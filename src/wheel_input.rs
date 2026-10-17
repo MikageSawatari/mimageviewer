@@ -14,6 +14,45 @@ pub(crate) struct WheelInput {
     pub(crate) source: egui::MouseWheelSource,
 }
 
+fn project_wheel_event(
+    event: &egui::Event,
+    options: egui::InputOptions,
+    viewport_height: f32,
+) -> Option<WheelInput> {
+    let egui::Event::MouseWheel {
+        unit,
+        delta,
+        modifiers,
+        phase,
+        source,
+    } = event
+    else {
+        return None;
+    };
+    let mut delta = if *phase == egui::TouchPhase::Move {
+        match unit {
+            egui::MouseWheelUnit::Point => *delta,
+            egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
+            egui::MouseWheelUnit::Page => viewport_height * *delta,
+        }
+    } else {
+        egui::Vec2::ZERO
+    };
+    let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
+    let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
+    if horizontal && !vertical {
+        delta = egui::vec2(delta.x + delta.y, 0.0);
+    } else if vertical && !horizontal {
+        delta = egui::vec2(0.0, delta.x + delta.y);
+    }
+    Some(WheelInput {
+        delta,
+        modifiers: *modifiers,
+        phase: *phase,
+        source: *source,
+    })
+}
+
 /// Project only unconsumed events at the existing consumer boundary.
 /// Adjacent events share one legacy aggregation unit only while their modifier,
 /// source and phase agree. Gesture boundaries carry no movement.
@@ -23,45 +62,29 @@ pub(crate) fn remaining_wheel_inputs(
 ) -> Vec<WheelInput> {
     let mut segments: Vec<WheelInput> = Vec::new();
     for event in &input.events {
-        let egui::Event::MouseWheel {
-            unit,
+        let Some(projected) = project_wheel_event(event, options, input.viewport_rect().height())
+        else {
+            continue;
+        };
+        let WheelInput {
             delta,
             modifiers,
             phase,
             source,
-        } = event
-        else {
-            continue;
-        };
-        let mut delta = if *phase == egui::TouchPhase::Move {
-            match unit {
-                egui::MouseWheelUnit::Point => *delta,
-                egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
-                egui::MouseWheelUnit::Page => input.viewport_rect().height() * *delta,
-            }
-        } else {
-            egui::Vec2::ZERO
-        };
-        let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
-        let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
-        if horizontal && !vertical {
-            delta = egui::vec2(delta.x + delta.y, 0.0);
-        } else if vertical && !horizontal {
-            delta = egui::vec2(0.0, delta.x + delta.y);
-        }
+        } = projected;
         if let Some(previous) = segments.last_mut()
-            && previous.modifiers == *modifiers
-            && previous.phase == *phase
-            && previous.source == *source
-            && *phase == egui::TouchPhase::Move
+            && previous.modifiers == modifiers
+            && previous.phase == phase
+            && previous.source == source
+            && phase == egui::TouchPhase::Move
         {
             previous.delta += delta;
         } else {
             segments.push(WheelInput {
                 delta,
-                modifiers: *modifiers,
-                phase: *phase,
-                source: *source,
+                modifiers,
+                phase,
+                source,
             });
         }
     }
@@ -90,38 +113,10 @@ pub(crate) fn consume_remaining_wheel_inputs(
         let height = input.viewport_rect().height();
         let mut consumed = false;
         input.events.retain(|event| {
-            let egui::Event::MouseWheel {
-                unit,
-                delta,
-                modifiers,
-                phase,
-                source,
-            } = event
-            else {
+            let Some(projected) = project_wheel_event(event, options, height) else {
                 return true;
             };
-            let mut delta = if *phase == egui::TouchPhase::Move {
-                match unit {
-                    egui::MouseWheelUnit::Point => *delta,
-                    egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
-                    egui::MouseWheelUnit::Page => height * *delta,
-                }
-            } else {
-                egui::Vec2::ZERO
-            };
-            let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
-            let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
-            if horizontal && !vertical {
-                delta = egui::vec2(delta.x + delta.y, 0.0);
-            } else if vertical && !horizontal {
-                delta = egui::vec2(0.0, delta.x + delta.y);
-            }
-            let accepted = accepts(&WheelInput {
-                delta,
-                modifiers: *modifiers,
-                phase: *phase,
-                source: *source,
-            });
+            let accepted = accepts(&projected);
             consumed |= accepted;
             !accepted
         });
@@ -341,5 +336,49 @@ mod tests {
             assert_eq!(input.modifiers, egui::Modifiers::NONE);
         });
         crate::egui_output::discard_headless_output(ctx.end_pass());
+    }
+
+    #[test]
+    fn egui037_wheel_selective_consumer_preserves_ctrl_route_and_source_boundaries() {
+        let ctx = egui::Context::default();
+        let event = |modifiers, source| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            modifiers,
+            phase: egui::TouchPhase::Move,
+            source,
+        };
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                event(egui::Modifiers::NONE, egui::MouseWheelSource::Wheel),
+                event(egui::Modifiers::CTRL, egui::MouseWheelSource::Wheel),
+                event(egui::Modifiers::CTRL, egui::MouseWheelSource::Momentum),
+                egui::Event::Copy,
+            ],
+            ..Default::default()
+        });
+        let options = ctx.options(|options| options.input_options);
+        consume_remaining_wheel_inputs(&ctx, |input| !input.modifiers.ctrl);
+        let remaining = ctx.input(|input| remaining_wheel_inputs(input, options));
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|input| input.modifiers.ctrl));
+        assert_eq!(remaining[0].source, egui::MouseWheelSource::Wheel);
+        assert_eq!(remaining[1].source, egui::MouseWheelSource::Momentum);
+        assert!(
+            remaining
+                .iter()
+                .all(|input| input.delta.y == options.line_scroll_speed)
+        );
+        assert_eq!(
+            ctx.input(|input| input.smooth_scroll_delta),
+            egui::Vec2::ZERO
+        );
+        consume_remaining_wheel_inputs(&ctx, |input| input.modifiers.ctrl);
+        assert!(
+            ctx.input(|input| remaining_wheel_inputs(input, options))
+                .is_empty()
+        );
+        assert!(ctx.input(|input| matches!(input.events.as_slice(), [egui::Event::Copy])));
+        ctx.end_pass().drop_without_applying_deltas();
     }
 }

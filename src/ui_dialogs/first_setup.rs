@@ -207,7 +207,11 @@ mod tests {
                 harness.state_mut().watched = ["初回設定", "開始"]
                     .map(|label| {
                         let node = harness.get_by_label(label);
-                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) }
+                        unsafe {
+                            egui::Id::from_high_entropy_bits(
+                                ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                            )
+                        }
                     })
                     .to_vec();
                 for size in [
@@ -332,7 +336,10 @@ mod tests {
             let mut events = Vec::new();
             if composing {
                 events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
-                events.push(egui::Event::Ime(egui::ImeEvent::Preedit("設定".into())));
+                events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "設定".into(),
+                    active_range_chars: None,
+                }));
             }
             events.push(egui::Event::Key {
                 key,

@@ -187,6 +187,8 @@ pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
 
 pub struct Viewport {
     ids: ViewportIdPair,
+    registration: Option<egui::ViewportRegistration>,
+    parent_registration: Option<egui::ViewportRegistration>,
     class: ViewportClass,
     builder: ViewportBuilder,
     deferred_commands: Vec<egui::viewport::ViewportCommand>,
@@ -444,6 +446,8 @@ impl<'app> WgpuWinitApp<'app> {
             ViewportId::ROOT,
             Viewport {
                 ids: ViewportIdPair::ROOT,
+                registration: egui_ctx.viewport_registration(ViewportId::ROOT),
+                parent_registration: None,
                 class: ViewportClass::Root,
                 builder,
                 deferred_commands: vec![],
@@ -705,7 +709,9 @@ impl WgpuWinitRunning<'_> {
     fn save_and_destroy(&mut self) {
         profiling::function_scope!();
 
-        self.integration.egui_ctx.on_exit();
+        let ctx = self.integration.egui_ctx.clone();
+        super::viewport_lifecycle::finish_pending_retirements(&ctx, &mut self.shared);
+        ctx.on_exit();
         self.save();
 
         #[cfg(feature = "glow")]
@@ -714,6 +720,7 @@ impl WgpuWinitRunning<'_> {
         #[cfg(not(feature = "glow"))]
         self.app.on_exit();
 
+        super::viewport_lifecycle::finish_pending_retirements(&ctx, &mut self.shared);
         let mut shared = self.shared.borrow_mut();
         shared.painter.destroy();
     }
@@ -867,17 +874,20 @@ impl WgpuWinitRunning<'_> {
             let is_root_viewport = viewport_ui_cb.is_none();
             if is_root_viewport {
                 // The app logic keeps ticking, so it can e.g. ask to be shown again:
-                let (
-                    egui::LogicOutput {
-                        platform_output,
-                        viewport_commands,
-                    },
-                    unused_input,
-                ) = integration.update_logic_only(
+                let (mut logic_output, unused_input) = integration.update_logic_only(
                     app.as_mut(),
                     raw_input.expect("root input is taken even without a UI pass"),
                 );
 
+                super::viewport_lifecycle::finish_logic_output(
+                    &integration.egui_ctx,
+                    shared,
+                    &mut logic_output,
+                );
+                let egui::LogicOutput {
+                    platform_output,
+                    viewport_commands,
+                } = logic_output;
                 let mut shared_mut = shared.borrow_mut();
                 let SharedState { viewports, .. } = &mut *shared_mut;
 
@@ -939,7 +949,7 @@ impl WgpuWinitRunning<'_> {
             .viewports
             .get(&viewport_id)
             .and_then(|viewport| viewport.window.clone());
-        let full_output = {
+        let mut full_output = {
             #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
             let _window_witness_scope = crate::miv_test_script_window_witness::enter_native_window(
                 &integration.egui_ctx,
@@ -954,6 +964,21 @@ impl WgpuWinitRunning<'_> {
                 raw_input.expect("a Full UI pass takes its viewport's input"),
             )
         };
+        egui_wgpu::atlas_diag::record_produced(
+            egui_wgpu::atlas_diag::Site::ProducedMain,
+            &full_output.textures_delta,
+            Some(viewport_id.0.value()),
+            egui_installed_atlas_size(&integration.egui_ctx),
+        );
+        shared
+            .borrow_mut()
+            .pending_deltas
+            .append(core::mem::take(&mut full_output.textures_delta));
+        super::viewport_lifecycle::finish_full_output(
+            &integration.egui_ctx,
+            shared,
+            &mut full_output,
+        );
         let startup_tag = (viewport_id == ViewportId::ROOT)
             .then(|| egui_wgpu::take_root_startup_frame_tag(&integration.egui_ctx));
 
@@ -978,15 +1003,7 @@ impl WgpuWinitRunning<'_> {
             mut viewport_output,
         } = full_output;
 
-        egui_wgpu::atlas_diag::record_produced(
-            egui_wgpu::atlas_diag::Site::ProducedMain,
-            &textures_delta,
-            Some(viewport_id.0.value()),
-            egui_installed_atlas_size(egui_ctx),
-        );
         pending_deltas.append(textures_delta);
-
-        remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
 
         // Synchronization between the integration layer and the painter layer
         if let Some(surface_config) = integration.frame.wgpu_surface_config {
@@ -1555,6 +1572,8 @@ impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBacken
         builder: ViewportBuilder,
     ) -> Option<(egui::Context, egui::RawInput)> {
         profiling::function_scope!();
+        let ctx = self.shared.borrow().egui_ctx.clone();
+        replace_stale_wgpu_viewport(self.shared, &ctx, ids.this);
         let SharedState {
             egui_ctx,
             viewports,
@@ -1571,6 +1590,8 @@ impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBacken
             None,
             painter,
         );
+        viewport.registration = egui_ctx.viewport_registration(ids.this);
+        viewport.parent_registration = egui_ctx.viewport_registration(ids.parent);
         if viewport.window.is_none() {
             event_loop_context::with_current_event_loop(|event_loop| {
                 viewport.initialize_window(
@@ -1881,6 +1902,7 @@ fn egui_installed_atlas_size(egui_ctx: &egui::Context) -> Option<[usize; 2]> {
     guard.meta(egui::TextureId::default()).map(|meta| meta.size)
 }
 
+#[cfg(test)]
 pub(crate) fn remove_viewports_not_in(
     viewports: &mut Viewports,
     painter: &mut egui_wgpu::winit::Painter,
@@ -1915,7 +1937,13 @@ impl super::viewport_lifecycle::ChildCloseBackend for Rc<RefCell<SharedState>> {
         self.borrow()
             .viewports
             .iter()
-            .filter_map(|(id, viewport)| viewport.info.close_requested().then_some(*id))
+            .filter_map(|(id, viewport)| {
+                (viewport.info.close_requested()
+                    || viewport
+                        .deferred_commands
+                        .contains(&egui::ViewportCommand::Close))
+                .then_some(*id)
+            })
             .collect()
     }
 
@@ -1926,6 +1954,9 @@ impl super::viewport_lifecycle::ChildCloseBackend for Rc<RefCell<SharedState>> {
                 .info
                 .events
                 .retain(|event| !matches!(event, egui::ViewportEvent::Close));
+            viewport
+                .deferred_commands
+                .retain(|command| !matches!(command, egui::ViewportCommand::Close));
         }
         for viewport in shared.viewports.values_mut() {
             super::viewport_lifecycle::consume_close_in_input(&mut viewport.pending_raw_input, id);
@@ -1935,41 +1966,130 @@ impl super::viewport_lifecycle::ChildCloseBackend for Rc<RefCell<SharedState>> {
         }
     }
 
-    fn retire(&mut self, ctx: &egui::Context, id: ViewportId) {
-        {
-            let mut shared = self.borrow_mut();
-            let retired = native_viewport_subtree(&shared.viewports, id);
-            let active = shared
+    fn registration(
+        &self,
+        ctx: &egui::Context,
+        id: ViewportId,
+    ) -> Option<egui::ViewportRegistration> {
+        self.borrow()
+            .viewports
+            .get(&id)
+            .and_then(|vp| vp.registration)
+            .or_else(|| ctx.viewport_registration(id))
+    }
+
+    fn retire(&mut self, ctx: &egui::Context, approval: &egui::ApprovedViewportRetirement) {
+        let (approval, retired) = super::viewport_lifecycle::native_retirement_ids(
+            ctx,
+            approval,
+            self.borrow()
                 .viewports
-                .keys()
-                .copied()
-                .filter(|id| !retired.contains(id))
-                .collect();
-            let SharedState {
-                viewports,
-                painter,
-                viewport_from_window,
-                focused_viewport,
-                resized_viewport,
-                ..
-            } = &mut *shared;
-            retain_viewport_resources(viewports, viewport_from_window, &active, |active| {
-                painter.gc_viewports(active);
-            });
-            if focused_viewport.is_some_and(|id| retired.contains(&id)) {
-                *focused_viewport = None;
-            }
-            if resized_viewport.is_some_and(|id| retired.contains(&id)) {
-                *resized_viewport = None;
-            }
-        }
-        // Native publication stops first. Context callbacks and IME policy are
-        // retired outside the backend borrow and outside the completed UI pass.
-        let retired = ctx.retire_viewport(id);
-        egui_ime::retire_viewport_ime_policy(ctx, &retired);
+                .iter()
+                .map(|(id, vp)| (*id, vp.registration, vp.parent_registration)),
+        );
+        retire_wgpu_native_resources(self, &retired);
+        super::viewport_lifecycle::finish_context_retirement(ctx, &approval);
+    }
+
+    fn gc(&mut self, ctx: &egui::Context) {
+        let retired: ViewportIdSet = self
+            .borrow()
+            .viewports
+            .iter()
+            .filter_map(|(id, vp)| {
+                (*id != ViewportId::ROOT
+                    && vp.registration.is_some_and(|registration| {
+                        ctx.viewport_registration(*id) != Some(registration)
+                    }))
+                .then_some(*id)
+            })
+            .collect();
+        retire_wgpu_native_resources(self, &retired);
+        let ime_ids: Vec<_> = retired
+            .into_iter()
+            .filter(|id| ctx.viewport_registration(*id).is_none())
+            .collect();
+        egui_ime::retire_viewport_ime_policy(ctx, &ime_ids);
+    }
+
+    fn collect_retirement_delta(&mut self, ctx: &egui::Context) {
+        super::viewport_lifecycle::append_retirement_delta(
+            &mut self.borrow_mut().pending_deltas,
+            ctx.take_viewport_retirement_texture_delta(),
+        );
+    }
+
+    fn finish_retirement(&mut self, ctx: &egui::Context) {
+        super::viewport_lifecycle::ChildCloseBackend::collect_retirement_delta(self, ctx);
+        let mut shared = self.borrow_mut();
+        let SharedState {
+            painter,
+            pending_deltas,
+            ..
+        } = &mut *shared;
+        painter.apply_textures_delta(pending_deltas);
     }
 }
 
+fn replace_stale_wgpu_viewport(shared: &RefCell<SharedState>, ctx: &egui::Context, id: ViewportId) {
+    let stale = super::viewport_lifecycle::stale_native_subtree(
+        ctx,
+        id,
+        shared
+            .borrow()
+            .viewports
+            .iter()
+            .map(|(id, vp)| (*id, vp.registration, vp.parent_registration)),
+    );
+    if !stale.is_empty() {
+        retire_wgpu_native_resources(shared, &stale);
+        // Native callback Drop may free textures while the parent UI pass is
+        // paused. Transfer those deltas now; the existing renderer submission
+        // still owns when sets/frees actually run.
+        let delta = ctx.tex_manager().write().take_delta();
+        super::viewport_lifecycle::append_retirement_delta(
+            &mut shared.borrow_mut().pending_deltas,
+            delta,
+        );
+    }
+}
+
+fn retire_wgpu_native_resources(shared: &RefCell<SharedState>, retired: &ViewportIdSet) {
+    let removed = {
+        let mut shared = shared.borrow_mut();
+        let SharedState {
+            viewports,
+            painter,
+            viewport_from_window,
+            focused_viewport,
+            resized_viewport,
+            ..
+        } = &mut *shared;
+        let order = super::viewport_lifecycle::child_first_ids(
+            retired,
+            viewports.iter().map(|(id, vp)| (*id, vp.ids.parent)),
+        );
+        let removed: Vec<_> = order
+            .into_iter()
+            .filter_map(|id| viewports.remove(&id))
+            .collect();
+        let active = viewports.keys().copied().collect();
+        retain_viewport_resources(viewports, viewport_from_window, &active, |active| {
+            painter.gc_viewports(active)
+        });
+        if focused_viewport.is_some_and(|id| retired.contains(&id)) {
+            *focused_viewport = None;
+        }
+        if resized_viewport.is_some_and(|id| retired.contains(&id)) {
+            *resized_viewport = None;
+        }
+        removed
+    };
+    // Deferred callbacks may call Context, or inspect native ownership in Drop.
+    drop(removed);
+}
+
+#[cfg(test)]
 fn native_viewport_subtree(viewports: &Viewports, root: ViewportId) -> ViewportIdSet {
     let mut retired = ViewportIdSet::from_iter([root]);
     loop {
@@ -1991,11 +2111,13 @@ fn handle_viewport_output(
     viewport_output: &OrderedViewportIdMap<ViewportOutput>,
     viewports: &mut Viewports,
     painter: &mut egui_wgpu::winit::Painter,
-    viewport_from_window: &mut HashMap<WindowId, ViewportId>,
+    _viewport_from_window: &mut HashMap<WindowId, ViewportId>,
 ) {
     for (
         viewport_id,
         ViewportOutput {
+            registration,
+            parent_registration,
             parent,
             class,
             builder,
@@ -2005,6 +2127,15 @@ fn handle_viewport_output(
         },
     ) in viewport_output.clone()
     {
+        if egui_ctx.viewport_registration(viewport_id) != Some(registration)
+            || viewports
+                .get(&viewport_id)
+                .is_some_and(|vp| vp.registration.is_some_and(|native| native != registration))
+        {
+            // A nested immediate output cannot retag another native lifetime.
+            // The outer completed-output cleanup removes it before replacement.
+            continue;
+        }
         let ids = ViewportIdPair::from_self_and_parent(viewport_id, parent);
 
         let viewport =
@@ -2028,6 +2159,8 @@ fn handle_viewport_output(
                 viewport.deferred_commands.len()
             ));
         }
+        viewport.registration = Some(registration);
+        viewport.parent_registration = parent_registration;
         let old_inner_size = viewport.window.as_ref().map(|window| window.inner_size());
 
         viewport.process_commands(egui_ctx, commands);
@@ -2058,8 +2191,6 @@ fn handle_viewport_output(
             }
         }
     }
-
-    remove_viewports_not_in(viewports, painter, viewport_from_window, viewport_output);
 }
 
 fn initialize_or_update_viewport<'a>(
@@ -2087,6 +2218,8 @@ fn initialize_or_update_viewport<'a>(
             log::debug!("Creating new viewport {:?} ({:?})", ids.this, builder.title);
             entry.insert(Viewport {
                 ids,
+                registration: None,
+                parent_registration: None,
                 class,
                 builder,
                 deferred_commands: vec![],
@@ -3012,5 +3145,167 @@ mod stage2c4a_tests {
             resources.retain(|id, _| active.contains(id));
         });
         assert_eq!(drops.get(), 6);
+    }
+}
+
+#[cfg(test)]
+mod viewport_retirement_tests {
+    use super::super::viewport_lifecycle::viewport_retirement_tests::{self as scenarios, Adapter};
+    use super::*;
+    type Headless = Rc<RefCell<SharedState>>;
+
+    impl Adapter for Headless {
+        fn new(ctx: &egui::Context) -> Self {
+            Rc::new(RefCell::new(SharedState {
+                egui_ctx: ctx.clone(),
+                viewports: Default::default(),
+                painter: pollster::block_on(egui_wgpu::winit::Painter::new(
+                    ctx.clone(),
+                    Default::default(),
+                    false,
+                    Default::default(),
+                )),
+                pending_deltas: Default::default(),
+                viewport_from_window: Default::default(),
+                focused_viewport: None,
+                resized_viewport: None,
+                clipboard_shortcuts: true,
+            }))
+        }
+        fn sync(&mut self, ctx: &egui::Context, outputs: &OrderedViewportIdMap<ViewportOutput>) {
+            let mut state = self.borrow_mut();
+            let SharedState {
+                viewports,
+                painter,
+                viewport_from_window,
+                ..
+            } = &mut *state;
+            handle_viewport_output(ctx, outputs, viewports, painter, viewport_from_window);
+            for (id, viewport) in viewports {
+                viewport.pending_raw_input.viewport_id = *id;
+                if *id != ViewportId::ROOT {
+                    viewport
+                        .pending_raw_input
+                        .viewports
+                        .entry(*id)
+                        .or_default()
+                        .parent = Some(viewport.ids.parent);
+                }
+                if viewport.pending_raw_input.events.is_empty() {
+                    viewport
+                        .pending_raw_input
+                        .events
+                        .push(egui::Event::Text(format!("pending-{id:?}")));
+                }
+            }
+        }
+        fn registration_for(&self, id: ViewportId) -> Option<egui::ViewportRegistration> {
+            self.borrow()
+                .viewports
+                .get(&id)
+                .and_then(|vp| vp.registration)
+        }
+        fn set_close(&mut self, id: ViewportId) {
+            self.borrow_mut()
+                .viewports
+                .get_mut(&id)
+                .unwrap()
+                .info
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        fn pending(&self, id: ViewportId) -> Vec<egui::Event> {
+            self.borrow().viewports[&id]
+                .pending_raw_input
+                .events
+                .clone()
+        }
+        fn accept_delta(&mut self, delta: egui::TexturesDelta) {
+            self.borrow_mut().pending_deltas.append(delta);
+        }
+        fn take_delta(&mut self) -> egui::TexturesDelta {
+            core::mem::take(&mut self.borrow_mut().pending_deltas)
+        }
+        fn replace_stale_native(&mut self, ctx: &egui::Context, id: ViewportId) {
+            replace_stale_wgpu_viewport(self, ctx, id);
+        }
+        fn seed_stale_native(&mut self, ctx: &egui::Context, id: ViewportId) -> egui::TextureId {
+            let texture = scenarios::stale_texture(ctx);
+            let texture_id = texture.id();
+            let mut state = self.borrow_mut();
+            let viewport = state.viewports.get_mut(&id).unwrap();
+            viewport
+                .pending_raw_input
+                .events
+                .push(scenarios::stale_event());
+            viewport
+                .deferred_commands
+                .push(egui::ViewportCommand::Close);
+            let mut input = egui_winit::State::new(
+                ctx.clone(),
+                id,
+                &scenarios::HeadlessDisplay,
+                None,
+                None,
+                None,
+            );
+            *input.egui_input_mut() = scenarios::input(id, false);
+            input.egui_input_mut().events.push(scenarios::stale_event());
+            viewport.egui_winit = Some(input);
+            viewport.viewport_ui_cb = Some(Arc::new(move |_| {
+                let _ = &texture;
+            }));
+            texture_id
+        }
+        fn native_input(&self, id: ViewportId) -> Vec<egui::Event> {
+            let state = self.borrow();
+            let viewport = &state.viewports[&id];
+            let mut events = viewport.pending_raw_input.events.clone();
+            if let Some(input) = &viewport.egui_winit {
+                events.extend(input.egui_input().events.clone());
+            }
+            events
+        }
+    }
+
+    #[test]
+    fn viewport_retirement_wgpu_full_logic_gc_discard() {
+        scenarios::full_logic_gc_discard::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_logic_only() {
+        scenarios::logic_only_and_pass_outside_hook::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_close_request_separation() {
+        scenarios::close_request_separation::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_context_gc_native_descendants_ime() {
+        scenarios::context_gc_native_descendants_and_ime::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_old_output_reopen_duplicate() {
+        scenarios::old_output_reopen_and_duplicate::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_overlapping_gc_root_close() {
+        scenarios::overlapping_gc_and_root_close::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_delta_callback_drop() {
+        scenarios::delta_and_callback_drop::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_immediate_nested() {
+        scenarios::immediate_nested::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_hook_captures_lifetime_before_reopen() {
+        scenarios::legacy_hook_captures_lifetime_before_reopen::<Headless>();
+    }
+    #[test]
+    fn viewport_retirement_wgpu_discard_immediate_reopen_replaces_native() {
+        scenarios::discard_immediate_reopen_replaces_native::<Headless>();
     }
 }

@@ -215,6 +215,7 @@ enum RootUi {
 /// Things here may move and change without warning.
 #[derive(Default)]
 pub struct ViewportState {
+    lifetime: crate::viewport::ViewportLifetime,
     /// The type of viewport.
     ///
     /// This will never be [`ViewportClass::EmbeddedWindow`],
@@ -434,6 +435,9 @@ struct ContextImpl {
 
     /// How deeply nested are we?
     viewport_stack: Vec<ViewportIdPair>,
+
+    /// Dynamic run nesting, including discard gaps between passes.
+    run_depth: usize,
 
     /// What is the last viewport rendered?
     last_viewport: ViewportId,
@@ -1080,6 +1084,7 @@ impl Context {
     fn run_dyn(&self, mut new_input: RawInput, run_ui: &mut dyn FnMut(&Self)) -> FullOutput {
         profiling::function_scope!();
         let viewport_id = new_input.viewport_id;
+        self.write(|ctx| ctx.run_depth += 1);
         let max_passes = self.write(|ctx| ctx.memory.options.max_passes.get());
 
         let mut output = FullOutput::default();
@@ -1142,6 +1147,14 @@ impl Context {
             viewport.repaint.cumulative_frame_nr += 1;
         });
 
+        self.write(|ctx| {
+            ctx.run_depth -= 1;
+            if ctx.run_depth == 0 && ctx.viewport_stack.is_empty() {
+                if let Some(root) = output.viewport_output.get_mut(&ViewportId::ROOT) {
+                    root.commands.extend(ctx.take_approved_retirements());
+                }
+            }
+        });
         output
     }
 
@@ -1177,6 +1190,7 @@ impl Context {
         let viewport_id = new_input.viewport_id;
 
         self.write(|ctx| {
+            ctx.run_depth += 1;
             // Consume any outstanding repaint request, so that a new request from `logic`
             // reaches the integration instead of being considered already served:
             ctx.begin_pass_repaint_logic(viewport_id);
@@ -1190,14 +1204,24 @@ impl Context {
 
         logic(self);
 
-        self.write(|ctx| LogicOutput {
-            platform_output: core::mem::take(&mut ctx.viewport_for(viewport_id).output),
-            viewport_commands: ctx
-                .viewports
-                .iter_mut()
-                .filter(|(_, viewport)| !viewport.commands.is_empty())
-                .map(|(&id, viewport)| (id, core::mem::take(&mut viewport.commands)))
-                .collect(),
+        self.write(|ctx| {
+            ctx.run_depth -= 1;
+            let keep_approvals = ctx.run_depth > 0 || !ctx.viewport_stack.is_empty();
+            LogicOutput {
+                platform_output: core::mem::take(&mut ctx.viewport_for(viewport_id).output),
+                viewport_commands: ctx
+                    .viewports
+                    .iter_mut()
+                    .filter(|(_, viewport)| !viewport.commands.is_empty())
+                    .map(|(&id, viewport)| {
+                        (
+                            id,
+                            ContextImpl::take_commands(&mut viewport.commands, keep_approvals),
+                        )
+                    })
+                    .filter(|(_, commands)| !commands.is_empty())
+                    .collect(),
+            }
         })
     }
 
@@ -3165,6 +3189,47 @@ impl Context {
 }
 
 impl ContextImpl {
+    fn consume_close_metadata(&mut self, id: ViewportId) {
+        for viewport in self.viewports.values_mut() {
+            if let Some(info) = viewport.input.raw.viewports.get_mut(&id) {
+                info.events
+                    .retain(|event| *event != crate::ViewportEvent::Close);
+            }
+        }
+    }
+
+    fn take_commands(
+        commands: &mut Vec<ViewportCommand>,
+        keep_approvals: bool,
+    ) -> Vec<ViewportCommand> {
+        if !keep_approvals {
+            return core::mem::take(commands);
+        }
+        let mut output = Vec::new();
+        for command in core::mem::take(commands) {
+            if matches!(command, ViewportCommand::RetireApproved(_)) {
+                commands.push(command);
+            } else {
+                output.push(command);
+            }
+        }
+        output
+    }
+
+    fn take_approved_retirements(&mut self) -> Vec<ViewportCommand> {
+        let mut approved = Vec::new();
+        if let Some(root) = self.viewports.get_mut(&ViewportId::ROOT) {
+            for command in core::mem::take(&mut root.commands) {
+                if matches!(command, ViewportCommand::RetireApproved(_)) {
+                    approved.push(command);
+                } else {
+                    root.commands.push(command);
+                }
+            }
+        }
+        approved
+    }
+
     /// Common finalization for normal GC and backend-approved retirement.
     /// Return removed states so their user-owned values can be dropped unlocked.
     fn retire_viewports(
@@ -3344,6 +3409,20 @@ impl ContextImpl {
         // just the top _immediate_ viewport.
         let is_last = self.viewport_stack.is_empty();
 
+        let registrations: ViewportIdMap<_> = self
+            .viewports
+            .iter()
+            .map(|(&id, state)| {
+                (
+                    id,
+                    crate::ViewportRegistration {
+                        id,
+                        lifetime: state.lifetime,
+                    },
+                )
+            })
+            .collect();
+        let keep_approvals = self.run_depth > 0;
         let viewport_output = self
             .viewports
             .iter_mut()
@@ -3353,7 +3432,7 @@ impl ContextImpl {
                     // Let the primary immediate viewport handle the commands of its children too.
                     // This can make things easier for the backend, as otherwise we may get commands
                     // that affect a viewport while its egui logic is running.
-                    core::mem::take(&mut viewport.commands)
+                    Self::take_commands(&mut viewport.commands, keep_approvals)
                 } else {
                     vec![]
                 };
@@ -3361,6 +3440,8 @@ impl ContextImpl {
                 (
                     id,
                     ViewportOutput {
+                        registration: registrations[&id],
+                        parent_registration: registrations.get(&parent).copied(),
                         parent,
                         class: viewport.class,
                         builder: viewport.builder.clone(),
@@ -3397,6 +3478,138 @@ impl ContextImpl {
 }
 
 impl Context {
+    /// Look up an existing registration without creating a viewport.
+    pub fn viewport_registration(&self, id: ViewportId) -> Option<crate::ViewportRegistration> {
+        self.read(|ctx| {
+            ctx.viewports
+                .get(&id)
+                .map(|state| crate::ViewportRegistration {
+                    id,
+                    lifetime: state.lifetime,
+                })
+        })
+    }
+
+    /// Transfer an approved lifetime to the existing root command output.
+    /// Valid during logic/UI or an out-of-pass close hook. Does not run cleanup,
+    /// create the target, request a repaint, or call the application's close hook.
+    /// A retained App binding may supply a registration already removed by GC.
+    pub fn approve_viewport_retirement(&self, registration: crate::ViewportRegistration) {
+        assert_ne!(
+            registration.id,
+            ViewportId::ROOT,
+            "cannot approve root retirement"
+        );
+        self.write(|ctx| {
+            let owners: Vec<_> = ctx
+                .viewports
+                .iter()
+                .map(|(&id, state)| {
+                    let parent = ctx.viewport_parents.get(&id).and_then(|parent| {
+                        ctx.viewports
+                            .get(parent)
+                            .map(|state| crate::ViewportRegistration {
+                                id: *parent,
+                                lifetime: state.lifetime,
+                            })
+                    });
+                    (
+                        crate::ViewportRegistration {
+                            id,
+                            lifetime: state.lifetime,
+                        },
+                        parent,
+                    )
+                })
+                .collect();
+            let mut approval = crate::ApprovedViewportRetirement {
+                registrations: vec![registration],
+            };
+            approval.include_descendants(&owners);
+            let commands = &mut ctx
+                .viewports
+                .get_mut(&ViewportId::ROOT)
+                .expect("root registered")
+                .commands;
+            // Normalize overlap in the existing command column, without history.
+            commands.retain(|command| {
+                if let ViewportCommand::RetireApproved(existing) = command {
+                    for &registration in &existing.registrations {
+                        if !approval.registrations.contains(&registration) {
+                            approval.registrations.push(registration);
+                        }
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            commands.push(ViewportCommand::RetireApproved(approval));
+        });
+    }
+
+    /// Whether authority still waits in the existing root output column.
+    pub fn has_pending_viewport_retirements(&self) -> bool {
+        self.read(|ctx| {
+            ctx.viewports.get(&ViewportId::ROOT).is_some_and(|root| {
+                root.commands
+                    .iter()
+                    .any(|command| matches!(command, ViewportCommand::RetireApproved(_)))
+            })
+        })
+    }
+
+    /// Drain close-hook output at a completed non-drawing boundary.
+    pub fn take_approved_viewport_retirements(&self) -> Vec<ViewportCommand> {
+        self.write(|ctx| {
+            assert!(
+                ctx.viewport_stack.is_empty() && ctx.run_depth == 0,
+                "retirement transfer requires a completed outer run"
+            );
+            ctx.take_approved_retirements()
+        })
+    }
+
+    /// Complete exact approved lifetimes after native publication has stopped.
+    /// User callback owners drop after releasing the Context lock.
+    pub fn retire_approved_viewports(
+        &self,
+        approval: &crate::ApprovedViewportRetirement,
+    ) -> Vec<ViewportId> {
+        let retired = self.write(|ctx| {
+            assert!(
+                ctx.viewport_stack.is_empty() && ctx.run_depth == 0,
+                "retirement requires a completed outer run"
+            );
+            let ids = approval
+                .registrations
+                .iter()
+                .filter_map(|registration| {
+                    ctx.viewports
+                        .get(&registration.id)
+                        .filter(|state| state.lifetime == registration.lifetime)
+                        .map(|_| registration.id)
+                })
+                .collect();
+            ctx.retire_viewports(ids)
+        });
+        let ids = retired.iter().map(|(id, _)| *id).collect();
+        drop(retired);
+        ids
+    }
+
+    /// Drain shared changes produced by callback/TextureHandle drops after cleanup.
+    /// The shared renderer must apply these even when no surface is painted.
+    pub fn take_viewport_retirement_texture_delta(&self) -> crate::TexturesDelta {
+        self.read(|ctx| {
+            assert!(
+                ctx.viewport_stack.is_empty() && ctx.run_depth == 0,
+                "retirement delta collection requires a completed outer run"
+            )
+        });
+        self.tex_manager().write().take_delta()
+    }
+
     /// Retire a child viewport after its lifecycle owner has approved closing it.
     ///
     /// This backend entry point removes the viewport and its descendants using
@@ -3422,7 +3635,7 @@ impl Context {
         );
         let retired = self.write(|ctx| {
             assert!(
-                ctx.viewport_stack.is_empty(),
+                ctx.viewport_stack.is_empty() && ctx.run_depth == 0,
                 "viewport retirement requires no active UI pass"
             );
             if !ctx.viewports.contains_key(&viewport_id) {
@@ -3433,6 +3646,29 @@ impl Context {
         let ids = retired.iter().map(|(id, _)| *id).collect();
         drop(retired);
         ids
+    }
+
+    /// Consume cached Close metadata only while it still belongs to the captured
+    /// registration. A close hook may explicitly reopen the same viewport ID.
+    pub fn consume_registered_viewport_close(&self, registration: crate::ViewportRegistration) {
+        assert_ne!(
+            registration.id,
+            ViewportId::ROOT,
+            "root close uses CancelClose"
+        );
+        self.write(|ctx| {
+            assert!(
+                ctx.viewport_stack.is_empty() && ctx.run_depth == 0,
+                "close consumption requires a completed outer run"
+            );
+            if ctx
+                .viewports
+                .get(&registration.id)
+                .is_some_and(|state| state.lifetime == registration.lifetime)
+            {
+                ctx.consume_close_metadata(registration.id);
+            }
+        });
     }
 
     /// Consume a child close request from existing cached viewport metadata.
@@ -3447,15 +3683,10 @@ impl Context {
         );
         self.write(|ctx| {
             assert!(
-                ctx.viewport_stack.is_empty(),
+                ctx.viewport_stack.is_empty() && ctx.run_depth == 0,
                 "close consumption requires no active UI pass"
             );
-            for viewport in ctx.viewports.values_mut() {
-                if let Some(info) = viewport.input.raw.viewports.get_mut(&viewport_id) {
-                    info.events
-                        .retain(|event| *event != crate::ViewportEvent::Close);
-                }
-            }
+            ctx.consume_close_metadata(viewport_id);
         });
     }
 
@@ -5608,5 +5839,269 @@ mod child_close_consumption_tests {
             ctx.input(|input| input.raw.viewports[&child].close_requested()),
             "a newly received request must remain eligible"
         );
+    }
+}
+
+#[cfg(test)]
+mod stage3_viewport_retirement_tests {
+    use super::*;
+    use crate::ApprovedViewportRetirement;
+
+    fn declare(ctx: &Context, id: ViewportId) {
+        ctx.show_viewport_deferred(id, ViewportBuilder::default(), |_, _| {});
+    }
+
+    fn input(ctx: &Context, viewport_id: ViewportId, parent: ViewportId) -> RawInput {
+        let mut input = RawInput {
+            viewport_id,
+            ..Default::default()
+        };
+        let parents: Vec<_> = ctx.read(|ctx| {
+            ctx.viewports
+                .keys()
+                .map(|&id| (id, ctx.viewport_parents.get(&id).copied()))
+                .collect()
+        });
+        for (id, parent) in parents {
+            input.viewports.entry(id).or_insert(crate::ViewportInfo {
+                parent,
+                ..Default::default()
+            });
+        }
+        input.viewports.entry(parent).or_default();
+        if viewport_id != ViewportId::ROOT {
+            input.viewports.entry(viewport_id).or_default().parent = Some(parent);
+        }
+        input
+    }
+
+    fn fixture() -> (Context, ViewportId, ViewportId, ViewportId) {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let child = ViewportId::from_hash_of("retirement-child");
+        let grandchild = ViewportId::from_hash_of("retirement-grandchild");
+        let sibling = ViewportId::from_hash_of("retirement-sibling");
+        ctx.run_ui(input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ui| {
+            declare(ui.ctx(), child);
+            declare(ui.ctx(), sibling);
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(input(&ctx, child, ViewportId::ROOT), |ui| {
+            declare(ui.ctx(), grandchild)
+        })
+        .drop_without_applying_deltas();
+        (ctx, child, grandchild, sibling)
+    }
+
+    fn approval(commands: &[ViewportCommand]) -> &ApprovedViewportRetirement {
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ViewportCommand::RetireApproved(_)))
+                .count(),
+            1
+        );
+        commands
+            .iter()
+            .find_map(|command| match command {
+                ViewportCommand::RetireApproved(approval) => Some(approval),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn viewport_retirement_logic_transfer_exact_descendants_and_no_phantom_registration() {
+        let (ctx, child, grandchild, sibling) = fixture();
+        let registration = ctx.viewport_registration(child).unwrap();
+        let unknown = ViewportId::from_hash_of("not-registered");
+        assert!(ctx.viewport_registration(unknown).is_none());
+        let sibling_before = ctx.viewport_registration(sibling);
+        let output = ctx.run_logic(&input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ctx| {
+            ctx.approve_viewport_retirement(registration);
+            assert!(ctx.has_pending_viewport_retirements());
+            assert_eq!(ctx.viewport_registration(child), Some(registration));
+        });
+        assert!(!ctx.has_pending_viewport_retirements());
+        let approval = approval(&output.viewport_commands[&ViewportId::ROOT]);
+        assert!(
+            approval
+                .registrations()
+                .contains(&ctx.viewport_registration(grandchild).unwrap())
+        );
+        assert_eq!(ctx.retire_approved_viewports(approval).len(), 2);
+        assert!(ctx.retire_approved_viewports(approval).is_empty());
+        assert!(ctx.viewport_registration(child).is_none());
+        assert!(ctx.viewport_registration(grandchild).is_none());
+        assert_eq!(ctx.viewport_registration(sibling), sibling_before);
+        assert!(ctx.viewport_registration(unknown).is_none());
+    }
+
+    #[test]
+    fn viewport_retirement_gc_discard_keeps_authority_in_root_until_outer_return() {
+        let (ctx, child, _, sibling) = fixture();
+        let registration = ctx.viewport_registration(child).unwrap();
+        let mut passes = 0;
+        let output = ctx.run_ui(input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ui| {
+            let ctx = ui.ctx();
+            if passes == 0 {
+                ctx.approve_viewport_retirement(registration);
+                ctx.request_discard("retirement regression");
+            }
+            // The second App::logic opportunity must still observe the transfer.
+            assert!(ctx.has_pending_viewport_retirements());
+            declare(ctx, sibling);
+            passes += 1;
+        });
+        assert_eq!(passes, 2);
+        assert!(
+            ctx.viewport_registration(child).is_none(),
+            "real end_pass GC ran"
+        );
+        assert!(!ctx.has_pending_viewport_retirements());
+        assert!(
+            approval(&output.viewport_output[&ViewportId::ROOT].commands)
+                .registrations()
+                .contains(&registration)
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn viewport_retirement_immediate_nested_pass_defers_transfer_and_cleanup() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let child = ViewportId::from_hash_of("retirement-immediate");
+        Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
+            let output = ctx.run_ui(input(ctx, viewport.ids.this, viewport.ids.parent), |ui| {
+                (viewport.viewport_ui_cb)(ui)
+            });
+            assert!(output.viewport_output.values().all(|output| {
+                !output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, ViewportCommand::RetireApproved(_)))
+            }));
+            assert!(ctx.has_pending_viewport_retirements());
+            output.drop_without_applying_deltas();
+        });
+        let output = ctx.run_ui(input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ui| {
+            ui.ctx()
+                .show_viewport_immediate(child, ViewportBuilder::default(), |ui, _| {
+                    let registration = ui.ctx().viewport_registration(child).unwrap();
+                    ui.ctx().approve_viewport_retirement(registration);
+                });
+            assert!(ui.ctx().viewport_registration(child).is_some());
+            assert!(ui.ctx().has_pending_viewport_retirements());
+        });
+        let approval = approval(&output.viewport_output[&ViewportId::ROOT].commands);
+        assert_eq!(ctx.retire_approved_viewports(approval), vec![child]);
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn viewport_retirement_old_output_append_and_reopen_never_mix_lifetimes() {
+        let (ctx, child, _, _) = fixture();
+        let mut old = ctx.run_ui(input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ui| {
+            declare(ui.ctx(), child);
+            ui.ctx()
+                .send_viewport_cmd_to(child, ViewportCommand::Title("old".into()));
+        });
+        let old_registration = old.viewport_output[&child].registration;
+        ctx.approve_viewport_retirement(old_registration);
+        let commands = ctx.take_approved_viewport_retirements();
+        let approval = approval(&commands);
+        let _ = ctx.retire_approved_viewports(approval);
+        let newer = ctx.run_ui(input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ui| {
+            declare(ui.ctx(), child);
+            ui.ctx()
+                .send_viewport_cmd_to(child, ViewportCommand::Title("new".into()));
+        });
+        let registration = newer.viewport_output[&child].registration;
+        assert_ne!(old_registration, registration);
+        old.append(newer);
+        assert_eq!(old.viewport_output[&child].registration, registration);
+        assert!(
+            !old.viewport_output[&child]
+                .commands
+                .contains(&ViewportCommand::Title("old".into()))
+        );
+        let stale = ctx.run_logic(&input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ctx| {
+            ctx.approve_viewport_retirement(old_registration)
+        });
+        assert!(
+            ctx.retire_approved_viewports(approval_from_logic(&stale))
+                .is_empty()
+        );
+        assert_eq!(ctx.viewport_registration(child), Some(registration));
+        old.drop_without_applying_deltas();
+    }
+
+    fn approval_from_logic(output: &LogicOutput) -> &ApprovedViewportRetirement {
+        approval(&output.viewport_commands[&ViewportId::ROOT])
+    }
+
+    #[test]
+    fn viewport_retirement_overlapping_approvals_normalize_and_direct_end_pass_transfers() {
+        let (ctx, child, grandchild, sibling) = fixture();
+        let child_registration = ctx.viewport_registration(child).unwrap();
+        let grandchild_registration = ctx.viewport_registration(grandchild).unwrap();
+        ctx.begin_pass(input(&ctx, ViewportId::ROOT, ViewportId::ROOT));
+        declare(&ctx, child);
+        declare(&ctx, sibling);
+        ctx.approve_viewport_retirement(grandchild_registration);
+        ctx.approve_viewport_retirement(child_registration);
+        let output = ctx.end_pass();
+        let approval = approval(&output.viewport_output[&ViewportId::ROOT].commands);
+        assert_eq!(approval.registrations().len(), 2);
+        assert!(approval.registrations().contains(&child_registration));
+        assert!(approval.registrations().contains(&grandchild_registration));
+        assert!(!ctx.has_pending_viewport_retirements());
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn viewport_retirement_callback_drop_is_unlocked_and_free_is_available_without_repaint() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let child = ViewportId::from_hash_of("retirement-drop");
+        struct DropOwner {
+            ctx: Context,
+            texture: Option<crate::TextureHandle>,
+        }
+        impl Drop for DropOwner {
+            fn drop(&mut self) {
+                // Deadlocks if either GC or explicit cleanup drops under Context lock.
+                assert!(self.ctx.viewport_registration(child_id()).is_none());
+                self.texture.take();
+            }
+        }
+        fn child_id() -> ViewportId {
+            ViewportId::from_hash_of("retirement-drop")
+        }
+        let mut texture_id = None;
+        ctx.run_ui(input(&ctx, ViewportId::ROOT, ViewportId::ROOT), |ui| {
+            let texture = ctx.load_texture(
+                "retire-drop",
+                crate::ColorImage::filled([2, 2], crate::Color32::WHITE),
+                Default::default(),
+            );
+            texture_id = Some(texture.id());
+            let owner = DropOwner {
+                ctx: ctx.clone(),
+                texture: Some(texture),
+            };
+            ui.ctx()
+                .show_viewport_deferred(child, ViewportBuilder::default(), move |_, _| {
+                    let _ = &owner;
+                });
+        })
+        .drop_without_applying_deltas();
+        ctx.approve_viewport_retirement(ctx.viewport_registration(child).unwrap());
+        let commands = ctx.take_approved_viewport_retirements();
+        let _ = ctx.retire_approved_viewports(approval(&commands));
+        let mut delta = ctx.take_viewport_retirement_texture_delta();
+        assert!(delta.free.contains(&texture_id.unwrap()));
+        delta.clear(); // inspected headless output, no renderer destination
     }
 }

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
-eframe = { version = "0.37.0", features = ["wgpu"] }
+eframe = { version = "0.37.0", features = ["wgpu", "glow"] }
 egui = "0.37.0"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "gif", "bmp"] }
 comic-core = { path = "../../crates/comic-core" }

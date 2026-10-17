@@ -3896,7 +3896,7 @@ mod tests {
             egui::Pos2::ZERO,
             egui::vec2(64.0, 64.0),
         ));
-        let output = ctx.run(raw, |ctx| {
+        let mut output = ctx.run_pass(raw, |ctx| {
             let painter = ctx.debug_painter();
             painter.image(
                 payload.id(),
@@ -3908,7 +3908,9 @@ mod tests {
         });
         drop(payload);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
         assert!(
             primitives.iter().any(|primitive| matches!(
                 &primitive.primitive,
@@ -4090,6 +4092,7 @@ mod tests {
         let target_format = wgpu::TextureFormat::Rgba8Unorm;
         let renderer = egui_wgpu::Renderer::new(&device, target_format, Default::default());
         let render_state = egui_wgpu::RenderState {
+            instance,
             adapter,
             available_adapters: Vec::new(),
             device,
@@ -4230,7 +4233,7 @@ mod tests {
             egui::Pos2::ZERO,
             egui::vec2(64.0, 64.0),
         ));
-        let output = ctx.run(raw, |ctx| {
+        let mut output = ctx.run_pass(raw, |ctx| {
             let painter = ctx.debug_painter().with_clip_rect(clip_rect);
             painter.image(
                 texture_id,
@@ -4249,8 +4252,10 @@ mod tests {
         owner: Arc<NativeTextureIdLease>,
     ) -> Vec<egui::ClippedPrimitive> {
         let clip_rect = egui::Rect::from_min_max(egui::pos2(3.0, 5.0), egui::pos2(41.0, 43.0));
-        let (ctx, output) = native_texture_batch_output(texture_id, owner, clip_rect);
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let (ctx, mut output) = native_texture_batch_output(texture_id, owner, clip_rect);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
         assert!(primitives.iter().any(|primitive| {
             matches!(
                 &primitive.primitive,
@@ -4277,11 +4282,13 @@ mod tests {
             releaser: releaser.clone(),
         });
         let clip_rect = egui::Rect::from_min_max(egui::pos2(3.0, 5.0), egui::pos2(41.0, 43.0));
-        let (ctx, output) =
+        let (ctx, mut output) =
             native_texture_batch_output(lease.texture_id, Arc::clone(&lease), clip_rect);
         drop(lease);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
         drop(primitives);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
@@ -4301,7 +4308,7 @@ mod tests {
         );
         drop(lease);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
-        drop(output);
+        output.drop_without_applying_deltas();
         assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
     }
 
@@ -4313,11 +4320,13 @@ mod tests {
             releaser: releaser.clone(),
         });
         let empty_clip = egui::Rect::from_min_max(egui::pos2(7.0, 7.0), egui::pos2(7.0, 7.0));
-        let (ctx, output) =
+        let (ctx, mut output) =
             native_texture_batch_output(lease.texture_id, Arc::clone(&lease), empty_clip);
         drop(lease);
         assert_eq!(releaser.0.load(Ordering::Relaxed), 0);
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let primitives =
+            ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        output.drop_without_applying_deltas();
         assert!(primitives.is_empty());
         assert_eq!(releaser.0.load(Ordering::Relaxed), 1);
     }

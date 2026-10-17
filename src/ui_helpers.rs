@@ -484,7 +484,9 @@ pub(crate) fn apply_brush_radius_wheel(
 
     *radius = crate::manual_mask_tools::brush_radius_after_wheel(*radius, notches, min, max);
     let applied = *radius;
-    crate::wheel_input::consume_wheel_input(ctx);
+    crate::wheel_input::consume_remaining_wheel_inputs(ctx, |wheel| {
+        wheel.modifiers == egui::Modifiers::SHIFT && wheel.phase == egui::TouchPhase::Move
+    });
     Some(applied)
 }
 
@@ -1252,20 +1254,21 @@ mod accessibility_names_tests {
                 ctx.enable_accesskit();
             }
             let mut id = egui::Id::NULL;
-            let output = ctx.run_pass(Default::default(), |ctx| {
-                ctx.root_ui(|root_ui| {
-                    egui::CentralPanel::default().show(root_ui, |ui| {
-                        let response = ui.button("");
-                        id = response.id;
-                        let builds = Cell::new(0);
-                        set_accessibility_label_with(&response, || {
-                            builds.set(builds.get() + 1);
-                            format!("対象 / {}", 1)
-                        });
-                        assert_eq!(builds.get(), usize::from(accesskit));
-                    })
-                });
-            });
+            let output =
+                crate::test_ui::headless_paint_output(ctx.run_pass(Default::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response = ui.button("");
+                            id = response.id;
+                            let builds = Cell::new(0);
+                            set_accessibility_label_with(&response, || {
+                                builds.set(builds.get() + 1);
+                                format!("対象 / {}", 1)
+                            });
+                            assert_eq!(builds.get(), usize::from(accesskit));
+                        })
+                    });
+                }));
             if accesskit {
                 let nodes = output.platform_output.accesskit_update.unwrap().nodes;
                 let node = &nodes
@@ -1284,38 +1287,39 @@ mod accessibility_names_tests {
         ctx.enable_accesskit();
         let mut slider_value = 0.25;
         let mut ids = Vec::new();
-        let output = ctx.run_pass(Default::default(), |ctx| {
-            ctx.root_ui(|root_ui| {
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ids.clear();
-                    ids.push(ui.button("").hover_tip("通常の操作").id);
-                    ids.push(ui.button("").hover_tip_dark("暗色の操作").id);
-                    ids.push(
-                        ui.add_enabled(false, egui::Button::new(""))
-                            .hover_tip_disabled("無効な操作")
-                            .id,
-                    );
-                    ids.push(
-                        ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0))
-                            .hover_tip("適用量")
-                            .id,
-                    );
-                    ids.push(ui.button("既存の名前").hover_tip("補足説明").id);
-                    let label = ui.label("既存ラベル");
-                    let response = ui.button("").labelled_by(label.id).hover_tip("別の説明");
-                    ids.push(response.id);
-                    ids.push(label.id);
-                    let mut days = 7;
-                    let drag = ui.add(egui::DragValue::new(&mut days).range(1..=30));
-                    set_accessibility_label(&drag, "日数");
-                    ids.push(drag.id);
-                    let mut checked = true;
-                    let checkbox = ui.checkbox(&mut checked, "");
-                    set_accessibility_label(&checkbox, "対象");
-                    ids.push(checkbox.id);
-                })
-            });
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ids.clear();
+                        ids.push(ui.button("").hover_tip("通常の操作").id);
+                        ids.push(ui.button("").hover_tip_dark("暗色の操作").id);
+                        ids.push(
+                            ui.add_enabled(false, egui::Button::new(""))
+                                .hover_tip_disabled("無効な操作")
+                                .id,
+                        );
+                        ids.push(
+                            ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0))
+                                .hover_tip("適用量")
+                                .id,
+                        );
+                        ids.push(ui.button("既存の名前").hover_tip("補足説明").id);
+                        let label = ui.label("既存ラベル");
+                        let response = ui.button("").labelled_by(label.id).hover_tip("別の説明");
+                        ids.push(response.id);
+                        ids.push(label.id);
+                        let mut days = 7;
+                        let drag = ui.add(egui::DragValue::new(&mut days).range(1..=30));
+                        set_accessibility_label(&drag, "日数");
+                        ids.push(drag.id);
+                        let mut checked = true;
+                        let checkbox = ui.checkbox(&mut checked, "");
+                        set_accessibility_label(&checkbox, "対象");
+                        ids.push(checkbox.id);
+                    })
+                });
+            }));
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let node = |index: usize| {
             &nodes
@@ -2702,6 +2706,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn egui037_wheel_brush_radius_consumes_only_its_modifier_route() {
+        let ctx = egui::Context::default();
+        let wheel = |modifiers, phase| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            modifiers,
+            phase,
+            source: egui::MouseWheelSource::Unknown,
+        };
+        let mut radius = 20.0;
+        let mut applied = None;
+        let mut remaining = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                events: vec![
+                    wheel(egui::Modifiers::NONE, egui::TouchPhase::Move),
+                    wheel(egui::Modifiers::SHIFT, egui::TouchPhase::Move),
+                    wheel(egui::Modifiers::CTRL, egui::TouchPhase::Move),
+                    wheel(egui::Modifiers::SHIFT, egui::TouchPhase::End),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                applied = apply_brush_radius_wheel(ctx, Some(&mut radius), 1.0, 100.0, true);
+                remaining = ctx.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .filter_map(|event| {
+                            if let egui::Event::MouseWheel {
+                                modifiers, phase, ..
+                            } = event
+                            {
+                                Some((*modifiers, *phase))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            applied,
+            Some(crate::manual_mask_tools::brush_radius_after_wheel(
+                20.0, 1.0, 1.0, 100.0
+            ))
+        );
+        assert_eq!(
+            remaining,
+            vec![
+                (egui::Modifiers::NONE, egui::TouchPhase::Move),
+                (egui::Modifiers::CTRL, egui::TouchPhase::Move),
+                (egui::Modifiers::SHIFT, egui::TouchPhase::End),
+            ]
+        );
+    }
+
     fn begin_wheel_pass(ctx: &egui::Context, modifiers: egui::Modifiers) {
         ctx.begin_pass(egui::RawInput {
             events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
@@ -2718,9 +2782,9 @@ mod tests {
     }
 
     fn wheel_input_remaining(ctx: &egui::Context) -> bool {
+        let wheel_options = ctx.options(|o| o.input_options);
         ctx.input(|input| {
-            crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options))
-                != egui::Vec2::ZERO
+            crate::wheel_input::remaining_wheel_delta(input, wheel_options) != egui::Vec2::ZERO
                 || input.smooth_scroll_delta != egui::Vec2::ZERO
                 || input
                     .events
@@ -2738,7 +2802,7 @@ mod tests {
         assert_eq!(applied, Some(4.0));
         assert_eq!(radius, 4.0);
         assert!(!wheel_input_remaining(&ctx));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -2747,7 +2811,7 @@ mod tests {
         begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
         assert_eq!(apply_brush_radius_wheel(&ctx, None, 1.0, 100.0, true), None);
         assert!(wheel_input_remaining(&ctx));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -2761,7 +2825,7 @@ mod tests {
         );
         assert_eq!(radius, 3.0);
         assert!(wheel_input_remaining(&ctx));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -2779,7 +2843,7 @@ mod tests {
             );
             assert_eq!(radius, 3.0);
             assert!(wheel_input_remaining(&ctx));
-            let _ = ctx.end_pass();
+            let _ = ctx.end_pass().drop_without_applying_deltas();
         }
     }
 

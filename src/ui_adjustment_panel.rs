@@ -10938,19 +10938,20 @@ mod bookmark_title_edit_tests {
     }
 
     fn draw_editor(
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
         title: &mut String,
         request_focus: &mut bool,
         enter_pressed: bool,
     ) -> (egui::Id, bool) {
+        let ctx = &root_ui.ctx().clone();
         let mut output = None;
-        ctx.root_ui(|root_ui| {
+        {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 let (response, submit) =
                     draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
                 output = Some((response.id, submit));
             })
-        });
+        };
         output.expect("bookmark title editor response")
     }
 
@@ -10958,7 +10959,10 @@ mod bookmark_title_edit_tests {
         egui::RawInput {
             events: vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("\u{3042}".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "\u{3042}".to_owned(),
+                    active_range_chars: None,
+                }),
                 egui::Event::Ime(egui::ImeEvent::Commit("\u{3042}".to_owned())),
                 key_event(egui::Key::Enter),
             ],
@@ -10973,14 +10977,20 @@ mod bookmark_title_edit_tests {
         let mut request_focus = true;
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
             })
             .drop_without_applying_deltas();
 
         let mut editor_id = None;
         let _ = ctx
             .run_pass(ime_commit_and_enter_input(), |ctx| {
-                editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                editor_id = Some(
+                    ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    })
+                    .0,
+                );
             })
             .drop_without_applying_deltas();
 
@@ -10995,12 +11005,14 @@ mod bookmark_title_edit_tests {
         let mut request_focus = true;
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
             })
             .drop_without_applying_deltas();
         let _ = ctx
             .run_pass(ime_commit_and_enter_input(), |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
             })
             .drop_without_applying_deltas();
         let _ = ctx
@@ -11010,7 +11022,9 @@ mod bookmark_title_edit_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+                    let _ = ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    });
                 },
             )
             .drop_without_applying_deltas();
@@ -11026,7 +11040,8 @@ mod bookmark_title_edit_tests {
         let mut submit_count = 0;
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
-                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+                let _ = ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false));
             })
             .drop_without_applying_deltas();
         let _ = ctx
@@ -11036,7 +11051,12 @@ mod bookmark_title_edit_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    if draw_editor(ctx, &mut title, &mut request_focus, true).1 {
+                    if ctx
+                        .root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, true)
+                        })
+                        .1
+                    {
                         submit_count += 1;
                     }
                 },
@@ -11044,7 +11064,10 @@ mod bookmark_title_edit_tests {
             .drop_without_applying_deltas();
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
-                if draw_editor(ctx, &mut title, &mut request_focus, false).1 {
+                if ctx
+                    .root_ui(|root_ui| draw_editor(root_ui, &mut title, &mut request_focus, false))
+                    .1
+                {
                     submit_count += 1;
                 }
             })
@@ -11061,7 +11084,12 @@ mod bookmark_title_edit_tests {
         let mut ids = Vec::new();
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                ids.push(
+                    ctx.root_ui(|root_ui| {
+                        draw_editor(root_ui, &mut title, &mut request_focus, false)
+                    })
+                    .0,
+                );
             })
             .drop_without_applying_deltas();
 
@@ -11079,7 +11107,12 @@ mod bookmark_title_edit_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
                 },
             )
             .drop_without_applying_deltas();
@@ -11090,7 +11123,12 @@ mod bookmark_title_edit_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
                 },
             )
             .drop_without_applying_deltas();
@@ -11105,7 +11143,12 @@ mod bookmark_title_edit_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                    ids.push(
+                        ctx.root_ui(|root_ui| {
+                            draw_editor(root_ui, &mut title, &mut request_focus, false)
+                        })
+                        .0,
+                    );
                 },
             )
             .drop_without_applying_deltas();

@@ -2904,7 +2904,7 @@ mod tests {
                     for scan in [false, true] {
                         let mut navigation = None;
                         let mut slots = None;
-                        let output = ctx.run_pass(
+                        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                             egui::RawInput {
                                 screen_rect: Some(egui::Rect::from_min_size(
                                     egui::Pos2::ZERO,
@@ -2976,7 +2976,7 @@ mod tests {
                                     )
                                 });
                             },
-                        );
+                        ));
                         let nav = navigation.unwrap();
                         // Ignore arrow emphasis; inspect every other primitive actually
                         // emitted by the CPU HUD, including text and slider geometry.
@@ -2999,6 +2999,8 @@ mod tests {
                             .collect();
                         bounds.sort_unstable();
                         frames.push((slots.unwrap(), nav, bounds));
+
+                        output.drop_without_applying_deltas();
                     }
                     assert_eq!(
                         frames[0],
@@ -3202,7 +3204,7 @@ mod tests {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
             let mut navigation = None;
-            let output = ctx.run_pass(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -3227,7 +3229,7 @@ mod tests {
                             })
                     });
                 },
-            );
+            ));
             let navigation = navigation.unwrap();
             let mut visible_icons = Vec::new();
             for (index, rect) in navigation.into_iter().enumerate() {
@@ -3273,6 +3275,8 @@ mod tests {
                     );
                 }
             }
+
+            output.drop_without_applying_deltas();
         }
     }
 

@@ -61,6 +61,7 @@ fn setup_fonts(ctx: &egui::Context) {
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 520.0])
             .with_title("VST3 Host Tester"),
@@ -123,6 +124,10 @@ struct TesterApp {
 
 impl TesterApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.quit_shortcuts.clear());
+        cc.egui_ctx
+            .global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
         setup_fonts(&cc.egui_ctx);
         // 永続ログファイル: %TEMP%\vst3-host-tester.log
         // 起動ごとに上書き (truncate) して 1 セッション分だけ残す。

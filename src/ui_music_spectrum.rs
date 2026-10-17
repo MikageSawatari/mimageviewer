@@ -1884,10 +1884,11 @@ mod tests {
                 .run_pass(egui::RawInput::default(), |_| {})
                 .drop_without_applying_deltas();
         }
-        let output = ctx.run_pass(egui::RawInput::default(), |_| {
-            state.last_request = Some(Instant::now());
-            state.update(&ctx, Some(&pcm), 0.0, false);
-        });
+        let output =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |_| {
+                state.last_request = Some(Instant::now());
+                state.update(&ctx, Some(&pcm), 0.0, false);
+            }));
         assert!(
             request_rx.try_recv().is_err(),
             "throttle should skip sending"
@@ -1896,6 +1897,8 @@ mod tests {
             output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
                 <= SPECTRUM_REFRESH_INTERVAL
         );
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]

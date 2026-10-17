@@ -9,6 +9,7 @@ use image::{ImageBuffer, Rgba, RgbaImage};
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default()
             .with_title("mIV Mask Lab")
             .with_inner_size([1280.0, 840.0])
@@ -81,6 +82,10 @@ struct MaskLabApp {
 
 impl MaskLabApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.quit_shortcuts.clear());
+        cc.egui_ctx
+            .global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
         let mut app = Self {
             image: None,
             texture: None,
@@ -276,7 +281,8 @@ impl eframe::App for MaskLabApp {
         let ctx = &root_ui.ctx().clone();
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
-            if let Some(path) = file.path {
+            {
+                let path = file.path().to_path_buf();
                 self.load_path(ctx, &path);
                 break;
             }

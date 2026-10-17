@@ -1063,7 +1063,7 @@ mod tests {
             ..Default::default()
         };
         let mut frames = None;
-        let _ = ctx.run(raw, |ctx| {
+        ctx.run_pass(raw, |ctx| {
             frames = Some((
                 drive_egui_touch_input_inner(
                     ctx,
@@ -1080,7 +1080,8 @@ mod tests {
                     true,
                 ),
             ));
-        });
+        })
+        .drop_without_applying_deltas();
         frames.unwrap()
     }
 
@@ -1234,6 +1235,8 @@ mod tests {
             unit: egui::MouseWheelUnit::Line,
             delta: egui::vec2(0.0, 1.0),
             modifiers: Modifiers::CTRL,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         });
 
         let frame = process(&mut state, &events, 100);
@@ -1573,45 +1576,48 @@ mod tests {
             events: tap_events(1, pos2(500.0, 400.0)),
             ..Default::default()
         };
-        let _ = ctx.run(raw, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let frame = drive_egui_touch_input_inner(
-                    ctx,
-                    TouchSurface::MainGrid,
-                    geometry.clone(),
-                    9,
-                    true,
-                );
-                let mut response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
-                response.interact_pointer_pos = Some(pos2(500.0, 400.0));
-                assert!(frame.should_suppress_response(&response));
-                assert_eq!(frame.clone().into_commands().len(), 1);
+        ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let frame = drive_egui_touch_input_inner(
+                        ctx,
+                        TouchSurface::MainGrid,
+                        geometry.clone(),
+                        9,
+                        true,
+                    );
+                    let mut response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
+                    response.interact_pointer_pos_or_nan = pos2(500.0, 400.0);
+                    assert!(frame.should_suppress_response(&response));
+                    assert_eq!(frame.clone().into_commands().len(), 1);
 
-                let repeated = drive_egui_touch_input_inner(
-                    ctx,
-                    TouchSurface::MainGrid,
-                    geometry.clone(),
-                    9,
-                    true,
-                );
-                assert!(repeated.commands().is_empty());
-                assert!(repeated.should_suppress_response(&response));
-                assert_eq!(
-                    repeated
-                        .correlated_primary_release_positions()
-                        .collect::<Vec<_>>(),
-                    vec![pos2(500.0, 400.0)]
-                );
-                let conflicting = drive_egui_touch_input_inner(
-                    ctx,
-                    TouchSurface::StillFullscreen,
-                    geometry.clone(),
-                    9,
-                    true,
-                );
-                assert!(conflicting.commands().is_empty());
+                    let repeated = drive_egui_touch_input_inner(
+                        ctx,
+                        TouchSurface::MainGrid,
+                        geometry.clone(),
+                        9,
+                        true,
+                    );
+                    assert!(repeated.commands().is_empty());
+                    assert!(repeated.should_suppress_response(&response));
+                    assert_eq!(
+                        repeated
+                            .correlated_primary_release_positions()
+                            .collect::<Vec<_>>(),
+                        vec![pos2(500.0, 400.0)]
+                    );
+                    let conflicting = drive_egui_touch_input_inner(
+                        ctx,
+                        TouchSurface::StillFullscreen,
+                        geometry.clone(),
+                        9,
+                        true,
+                    );
+                    assert!(conflicting.commands().is_empty());
+                })
             });
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -1620,7 +1626,7 @@ mod tests {
         let geometry = geometry();
         let pos = pos2(500.0, 400.0);
         let mut disabled_frame = None;
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(geometry.surface),
                 time: Some(0.1),
@@ -1640,7 +1646,8 @@ mod tests {
                     false,
                 ));
             },
-        );
+        )
+        .drop_without_applying_deltas();
         let disabled_frame = disabled_frame.unwrap();
         assert!(disabled_frame.commands().is_empty());
         assert!(disabled_frame.has_touch_derived_pointer_activity());
@@ -1656,7 +1663,7 @@ mod tests {
         assert_eq!(disabled_state.recognizer.contact_count(), 1);
 
         let mut enabled_frame = None;
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(geometry.surface),
                 time: Some(0.2),
@@ -1676,7 +1683,8 @@ mod tests {
                     true,
                 ));
             },
-        );
+        )
+        .drop_without_applying_deltas();
         let enabled_frame = enabled_frame.unwrap();
         assert_eq!(enabled_frame.commands(), &[TouchCommand::ToggleChrome]);
         assert!(enabled_frame.should_suppress_primary(pos, false));

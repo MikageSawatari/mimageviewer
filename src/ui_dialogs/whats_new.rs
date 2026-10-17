@@ -221,7 +221,9 @@ mod tests {
                     for label in ["Close window", "すべての変更を見る", "閉じる"] {
                         let node = harness.get_by_label(label);
                         let id = unsafe {
-                            egui::Id::from_high_entropy_bits(node.accesskit_node().id().0)
+                            egui::Id::from_high_entropy_bits(
+                                ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                            )
                         };
                         let initial = harness.ctx.read_response(id).unwrap().rect;
                         harness.hover_at(initial.center());

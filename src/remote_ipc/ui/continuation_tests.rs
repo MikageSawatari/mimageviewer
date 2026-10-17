@@ -263,16 +263,95 @@ fn egui037_continuation_remote_normal_driver_retains_both_display_checkpoints() 
         let position = remaining.find(call).expect(call);
         remaining = &remaining[position + call.len()..];
     }
-    let phases = include_str!("../../app/update_phases.rs");
-    assert!(
-        phases
-            .find("self.acknowledge_tray_resident_media_wake()")
-            .unwrap()
-            < phases.find("self.poll_remote_session(ctx)").unwrap()
+    // The legacy coordinator above retains both reload positions. The product
+    // driver now completes its service phase in logic and adopts display only
+    // at the original root UI checkpoint, before ordinary input/modal sampling.
+    let assert_order = |source: &str, calls: &[&str]| {
+        let mut remaining = source;
+        for call in calls {
+            let position = remaining.find(call).expect(call);
+            remaining = &remaining[position + call.len()..];
+        }
+    };
+    let service = source
+        .split("pub(crate) fn service_remote_session(")
+        .nth(1)
+        .expect("non-drawing remote service")
+        .split("fn service_remote_session_begin(")
+        .next()
+        .unwrap();
+    assert_order(
+        service,
+        &[
+            "service_remote_session_begin(ctx)",
+            "service_remote_session_requests(ctx, &poll)",
+            "service_remote_session_finish(ctx, &poll)",
+        ],
     );
-    assert!(
-        phases.find("self.poll_remote_session(ctx)").unwrap()
-            < phases.find("self.note_modal_block_transition()").unwrap()
+    assert!(!service.contains("continue_remote_local_display()"));
+
+    let logic = include_str!("../../app/logic_service.rs");
+    assert!(logic.contains("self.service_remote_session(ctx)"));
+    assert!(!logic.contains("self.poll_remote_session(ctx)"));
+    assert!(!logic.contains("continue_remote_local_display()"));
+    let phases = include_str!("../../app/update_phases.rs");
+    let begin = phases
+        .split("fn render_update_begin(")
+        .nth(1)
+        .expect("root display checkpoint")
+        .split("fn input_update_begin(")
+        .next()
+        .unwrap();
+    assert_order(
+        begin,
+        &[
+            "self.acknowledge_tray_resident_media_wake()",
+            "self.continue_remote_local_display()",
+            "self.note_modal_block_transition()",
+        ],
+    );
+    assert!(!phases.contains("self.poll_remote_session(ctx)"));
+    assert!(!phases.contains("self.service_remote_session(ctx)"));
+
+    let app = include_str!("../../app.rs");
+    let trait_impl = app.split("impl eframe::App for App {").nth(1).unwrap();
+    let logic_entry = trait_impl
+        .split("fn logic(")
+        .nth(1)
+        .unwrap()
+        .split("fn ui(")
+        .next()
+        .unwrap();
+    assert!(logic_entry.contains("self.service_app_logic(ctx, frame)"));
+    let ui_entry = trait_impl
+        .split("fn ui(")
+        .nth(1)
+        .unwrap()
+        .split("fn on_exit(")
+        .next()
+        .unwrap();
+    assert_order(
+        ui_entry,
+        &[
+            "self.render_update_before_frame(ctx)",
+            "self.update_frame(ui, frame)",
+            "self.render_update_after_frame(ctx)",
+        ],
+    );
+    assert!(!ui_entry.contains("self.service_remote_session(ctx)"));
+    let frame = app
+        .split("fn update_frame(")
+        .nth(1)
+        .unwrap()
+        .split("impl eframe::App for App {")
+        .next()
+        .unwrap();
+    assert_order(
+        frame,
+        &[
+            "self.render_update_begin(ctx)",
+            "self.input_update_begin(ctx)",
+        ],
     );
 }
 

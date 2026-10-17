@@ -87,14 +87,15 @@ fn sticker_key(
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
     let mut options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default()
             .with_title("comic_lab")
             .with_inner_size([1360.0, 880.0])
             .with_drag_and_drop(true),
-        vsync: false,
         ..Default::default()
     };
-    options.wgpu_options.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
+    options.glow_options.vsync = false;
+    options.wgpu_options.surface.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
     eframe::run_native(
         "comic_lab",
         options,
@@ -533,6 +534,10 @@ struct ComicLab {
 
 impl ComicLab {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.quit_shortcuts.clear());
+        cc.egui_ctx
+            .global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
         // Build the merged font catalog: enumerated system fonts (registry) +
         // the built-in FONT_CATALOG (so common JP fonts are always present even
         // if the registry read fails). Paths are recorded but NOT parsed here —
@@ -748,7 +753,7 @@ impl ComicLab {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
         if let Some(path) = dropped.first() {
@@ -5134,7 +5139,7 @@ impl ComicLab {
             }
 
             // Scroll-to-zoom around the pointer.
-            let scroll = ctx.input(|i| i.raw_scroll_delta.y);
+            let scroll = remaining_wheel_delta(ctx).y;
             if scroll.abs() > 0.0 && resp.hovered() {
                 if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
                     let before = self.view.screen_to_img(ptr);
@@ -8084,19 +8089,22 @@ fn recent_files_path() -> PathBuf {
 mod sample_tests {
     use super::*;
 
-    fn text_body_pass(root_ui: &mut egui::Ui, tb: &mut TextBlock, events: Vec<egui::Event>) {
-        let ctx = &root_ui.ctx().clone();
-        let _ = ctx.run_pass(
-            egui::RawInput {
-                events,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    let _ = draw_text_body(ui, tb, 1);
-                });
-            },
-        );
+    fn text_body_pass(ctx: &egui::Context, tb: &mut TextBlock, events: Vec<egui::Event>) {
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let _ = draw_text_body(ui, tb, 1);
+                        });
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
     }
 
     fn enter_event(pressed: bool) -> egui::Event {
@@ -8126,7 +8134,10 @@ mod sample_tests {
                 &mut tb,
                 vec![
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "あ".to_owned(),
+                        active_range_chars: None,
+                    }),
                 ],
             );
             assert_eq!(tb.text, "あ");
@@ -8236,4 +8247,44 @@ mod sample_tests {
         ));
         assert!(!font_name_matches_candidate("Yu Gothic", "Dela Gothic One"));
     }
+}
+
+// Project only unconsumed wheel events, using the same unit and modifier mapping as egui.
+fn remaining_wheel_delta(ctx: &egui::Context) -> egui::Vec2 {
+    let options = ctx.options(|o| o.input_options);
+    ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    phase,
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+                if *phase != egui::TouchPhase::Move {
+                    return None;
+                }
+                let delta = match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
+                    egui::MouseWheelUnit::Page => input.viewport_rect().height() * *delta,
+                };
+                let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
+                let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
+                Some(if horizontal && !vertical {
+                    egui::vec2(delta.x + delta.y, 0.0)
+                } else if vertical && !horizontal {
+                    egui::vec2(0.0, delta.x + delta.y)
+                } else {
+                    delta
+                })
+            })
+            .fold(egui::Vec2::ZERO, |sum, delta| sum + delta)
+    })
 }

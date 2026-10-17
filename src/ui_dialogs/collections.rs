@@ -5414,7 +5414,7 @@ mod tests {
         });
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -6314,7 +6314,10 @@ mod tests {
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| render_app.borrow_mut().show_collection_manager(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                render_app.borrow_mut().show_collection_manager(ctx)
+            });
         harness.step();
         harness.get_by_label("コレクションから外す");
         harness.get_by_label("キャンセル").click();
@@ -7488,7 +7491,10 @@ mod tests {
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                render_app.borrow_mut().draw_collection_reorder(ctx)
+            });
         harness.step();
         harness.get_by_label("変更を破棄して閉じる").click();
         harness.step();
@@ -7543,7 +7549,10 @@ mod tests {
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                render_app.borrow_mut().draw_collection_reorder(ctx)
+            });
         harness.step();
         harness.get_by_label("閉じる").click();
         harness.step();
@@ -8285,7 +8294,7 @@ mod tests {
             app.fs_feedback_toast.is_none(),
             "same key press must not be reused"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         app.fullscreen_idx = Some(0);
         ctx.begin_pass(egui::RawInput {
@@ -8298,7 +8307,7 @@ mod tests {
             app.fs_feedback_toast.is_none(),
             "Grid action must not run in FS"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -8954,7 +8963,10 @@ mod tests {
         let ui_app = std::rc::Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                ui_app.borrow_mut().show_collection_manager(ctx)
+            });
         harness.step();
         harness.get_by_label("取り消す").click();
         harness.step();
@@ -9005,7 +9017,10 @@ mod tests {
         let ui_app = std::rc::Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                ui_app.borrow_mut().show_collection_manager(ctx)
+            });
         harness.step();
         harness.get_by_label("取り消す").click();
         harness.step();

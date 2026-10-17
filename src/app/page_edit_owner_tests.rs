@@ -1078,10 +1078,11 @@ fn single_bundle_waits_for_parked_lut_producer_and_its_write_before_replacing_pa
     );
     let ctx = egui::Context::default();
     let pump = |app: &mut App| {
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_bulk_page_edit_dialog(ctx);
             app.show_edit_bundle_paste_confirm_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
     };
     pump(&mut app);
     assert!(app.has_page_edit_producers());
@@ -1467,10 +1468,11 @@ fn real_bundle_adjustment_commit_publishes_to_inactive_same_key_context() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while owner.edit_bundle_apply_pending.is_some() || owner.edit_bundle_bulk_pending.is_some()
         {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 owner.show_bulk_page_edit_dialog(ctx);
                 owner.show_edit_bundle_paste_confirm_dialog(ctx);
-            });
+            })
+            .drop_without_applying_deltas();
             assert!(
                 std::time::Instant::now() < deadline,
                 "real bundle worker must deliver its publication"

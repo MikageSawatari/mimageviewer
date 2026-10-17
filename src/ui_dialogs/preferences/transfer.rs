@@ -1213,7 +1213,10 @@ mod tests {
                     egui::RawInput {
                         events: vec![
                             egui::Event::Ime(egui::ImeEvent::Enabled),
-                            egui::Event::Ime(egui::ImeEvent::Preedit("移行".into())),
+                            egui::Event::Ime(egui::ImeEvent::Preedit {
+                                text: "移行".into(),
+                                active_range_chars: None,
+                            }),
                             egui::Event::Key {
                                 key,
                                 physical_key: None,

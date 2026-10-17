@@ -882,9 +882,12 @@ mod tests {
         app.epub_convert = Some(state);
         assert!(app.epub_convert_dialog_visible());
         assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
-        let output = egui::Context::default().run(Default::default(), |ctx| {
-            app.show_epub_convert_dialog(ctx);
-        });
+        let output = crate::test_ui::headless_paint_output(egui::Context::default().run_pass(
+            Default::default(),
+            |ctx| {
+                app.show_epub_convert_dialog(ctx);
+            },
+        ));
         assert!(!output.shapes.is_empty());
         assert_eq!(
             std::ptr::from_ref(app.epub_convert.as_deref().unwrap()),
@@ -922,9 +925,11 @@ mod tests {
                 app.epub_convert = Some(state);
                 assert!(app.epub_convert_dialog_visible());
                 assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
-                let output = egui::Context::default().run(Default::default(), |ctx| {
-                    app.show_epub_convert_dialog(ctx);
-                });
+                let output = crate::test_ui::headless_paint_output(
+                    egui::Context::default().run_pass(Default::default(), |ctx| {
+                        app.show_epub_convert_dialog(ctx);
+                    }),
+                );
                 assert!(!output.shapes.is_empty());
                 assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
             }
@@ -992,7 +997,9 @@ mod tests {
         let _ = ctx
             .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
             .drop_without_applying_deltas();
-        let output = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let output = crate::test_ui::headless_paint_output(
+            ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx)),
+        );
         let mut text = String::new();
         let mut stack: Vec<&egui::epaint::Shape> =
             output.shapes.iter().map(|shape| &shape.shape).collect();
@@ -1005,6 +1012,8 @@ mod tests {
         }
         assert!(text.contains("指定なし"), "{text}");
         assert!(!text.contains("左開き"), "{text}");
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -1033,7 +1042,9 @@ mod tests {
             (2, 4, Some(17))
         );
         assert_eq!(progress_fraction(progress), 0.5);
-        let output = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let output = crate::test_ui::headless_paint_output(
+            ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx)),
+        );
         let mut text = String::new();
         let mut stack: Vec<&egui::epaint::Shape> =
             output.shapes.iter().map(|shape| &shape.shape).collect();
@@ -1045,6 +1056,8 @@ mod tests {
             }
         }
         assert!(text.contains("ページを変換中 (17 ページ)"), "{text}");
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -1149,7 +1162,9 @@ mod tests {
         let _ = ctx
             .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
             .drop_without_applying_deltas();
-        let output = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let output = crate::test_ui::headless_paint_output(
+            ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx)),
+        );
         assert!(
             matches!(app.epub_convert.as_ref().map(|state| &state.phase), Some(EpubConvertPhase::Confirm(summary)) if summary.sibling_pdf_exists)
         );
@@ -1190,6 +1205,8 @@ mod tests {
             })
             .drop_without_applying_deltas();
         assert!(enabled);
+
+        output.drop_without_applying_deltas();
     }
 
     #[test]

@@ -133,7 +133,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(260.0, 120.0))
-            .build_state(
+            .build_ui_state(
                 |ctx, policy| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         crate::ui_dialogs::preferences::draw_same_name_folder_book_settings(

@@ -197,7 +197,7 @@ fn section1375_actual_delete_no_notify_equal_preserves_rows_and_rating_zeros() {
     app.rebuild_visible_indices();
     for offset in [0.0, 100.0, 400.0] {
         app.scroll_offset_y = offset;
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -206,9 +206,10 @@ fn section1375_actual_delete_no_notify_equal_preserves_rows_and_rating_zeros() {
                 ..Default::default()
             },
             |ctx| {
-                let _ = app.render_grid(ctx);
+                let _ = ctx.root_ui(|ui_arg| app.render_grid(ui_arg));
             },
-        );
+        )
+        .drop_without_applying_deltas();
     }
     assert_eq!(crate::rating_db::read_operations_for_test(), all_reads);
     assert_eq!(crate::tags_db::read_operations_for_test(), tag_reads);
@@ -415,18 +416,19 @@ fn section1375_automatic_origin_survives_match_diff_restart_resume_and_defer() {
                 ..Default::default()
             };
             ctx.begin_pass(egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key: egui::Key::F5,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
+                events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                    .chain(vec![egui::Event::Key {
+                        key: egui::Key::F5,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }])
+                    .collect(),
                 ..Default::default()
             });
             let _ = app.handle_keyboard(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             settle(&mut app, &ctx);
             assert!(
                 sidecar_restore::import_starts_for_test() > imports,

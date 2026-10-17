@@ -23,6 +23,17 @@ pub(crate) fn wgpu_setup() -> egui_wgpu::WgpuSetup {
     setup
 }
 
+/// Retain paint/platform observations from a fixture with no renderer.
+/// Texture upload/submission tests must consume their deltas instead of using this helper.
+pub(crate) fn headless_paint_output(mut output: egui::FullOutput) -> egui::FullOutput {
+    egui::FullOutput {
+        textures_delta: std::mem::take(&mut output.textures_delta),
+        ..Default::default()
+    }
+    .drop_without_applying_deltas();
+    output
+}
+
 pub(crate) fn builder<State>() -> egui_kittest::HarnessBuilder<State> {
     egui_kittest::HarnessBuilder::default().renderer(egui_kittest::LazyRenderer::new(|| {
         egui_kittest::wgpu::WgpuTestRenderer::from_setup(wgpu_setup())

@@ -918,7 +918,7 @@ fn source_absent_changed_view_or_prepare_key_uses_existing_fallback() {
                     1.0
                 };
                 ctx.set_pixels_per_point(input_ppp);
-                let output = ctx.run_pass(
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size)),
                         ..Default::default()
@@ -956,7 +956,7 @@ fn source_absent_changed_view_or_prepare_key_uses_existing_fallback() {
                             )
                         });
                     },
-                );
+                ));
                 let painted = texture_ids_in_output(&output);
                 assert!(
                     held.iter()
@@ -980,6 +980,8 @@ fn source_absent_changed_view_or_prepare_key_uses_existing_fallback() {
                     resolved.iter().all(|id| thumbnails.contains(id)),
                     "no absent source or Native paint ID may become an input"
                 );
+
+                output.drop_without_applying_deltas();
             }
         }
     }

@@ -173,10 +173,12 @@ fn idle_repaint_context() -> egui::Context {
     let ctx = egui::Context::default();
     // Fixed empty passes consume egui's initial immediate repaint, independently
     // of worker timing. These are neither worker polls nor completion retries.
-    let _ = ctx.run(egui::RawInput::default(), |_| {});
-    let _ = ctx.run(egui::RawInput::default(), |_| {});
+    ctx.run_pass(egui::RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
+    ctx.run_pass(egui::RawInput::default(), |_| {})
+        .drop_without_applying_deltas();
     assert_eq!(
-        root_repaint_delay(&ctx.run(egui::RawInput::default(), |_| {})),
+        root_repaint_delay(&ctx.run_pass(egui::RawInput::default(), |_| {})),
         Duration::MAX
     );
     ctx
@@ -557,7 +559,7 @@ fn g2_at_rest_stale_prepare_after_drained_change_reprepares_without_accepting_ol
     let after_save = database_bytes(&data);
 
     let ctx = idle_repaint_context();
-    let pending_output = ctx.run(egui::RawInput::default(), |ctx| {
+    let pending_output = ctx.run_pass(egui::RawInput::default(), |ctx| {
         env.poll_book_composition_service(ctx);
     });
     env.with_window_context_for_test(parked, |app| {
@@ -593,6 +595,7 @@ fn g2_at_rest_stale_prepare_after_drained_change_reprepares_without_accepting_ol
     env.retire_context(parked, "composition_stale_parked_test", |_| ())
         .unwrap();
     owner.shutdown_and_join();
+    pending_output.drop_without_applying_deltas();
 }
 
 #[cfg(windows)]
@@ -697,11 +700,11 @@ fn g2_input_free_pending_read_wakes_root_until_fifo_reply_is_adopted() {
         requests_callback.lock().unwrap().push(info);
     });
 
-    let first = ctx.run(egui::RawInput::default(), |ctx| {
+    let first = ctx.run_pass(egui::RawInput::default(), |ctx| {
         env.poll_mounted_document_open_owners(ctx);
     });
     assert_pending_root_wake(&first);
-    let second = ctx.run(egui::RawInput::default(), |ctx| {
+    let second = ctx.run_pass(egui::RawInput::default(), |ctx| {
         env.poll_mounted_document_open_owners(ctx);
     });
     assert_pending_root_wake(&second);
@@ -716,23 +719,24 @@ fn g2_input_free_pending_read_wakes_root_until_fifo_reply_is_adopted() {
     }));
 
     deliver.send(reply).unwrap();
-    let projecting = ctx.run(egui::RawInput::default(), |ctx| {
+    let projecting = ctx.run_pass(egui::RawInput::default(), |ctx| {
         env.poll_mounted_document_open_owners(ctx);
     });
     assert_eq!(root_repaint_delay(&projecting), Duration::ZERO);
     settle_projection_with_context(&mut env, &ctx);
-    let accepted = ctx.run(egui::RawInput::default(), |ctx| {
+    let accepted = ctx.run_pass(egui::RawInput::default(), |ctx| {
         env.poll_mounted_document_open_owners(ctx);
     });
     assert_accepted_token(&env, &service, &scope);
     assert_eq!(root_repaint_delay(&accepted), Duration::ZERO);
     let accepted_record = record(&env);
     // egui deliberately carries an immediate request over one more pass.
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
         env.poll_mounted_document_open_owners(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
     requests.lock().unwrap().clear();
-    let idle = ctx.run(egui::RawInput::default(), |ctx| {
+    let idle = ctx.run_pass(egui::RawInput::default(), |ctx| {
         env.poll_mounted_document_open_owners(ctx);
     });
     assert_eq!(root_repaint_delay(&idle), Duration::MAX);
@@ -744,6 +748,15 @@ fn g2_input_free_pending_read_wakes_root_until_fifo_reply_is_adopted() {
     );
     assert_eq!(database_bytes(&data), before_database);
     owner.shutdown_and_join();
+    accepted.drop_without_applying_deltas();
+
+    first.drop_without_applying_deltas();
+
+    idle.drop_without_applying_deltas();
+
+    projecting.drop_without_applying_deltas();
+
+    second.drop_without_applying_deltas();
 }
 
 #[test]

@@ -485,7 +485,7 @@ mod tests {
                 captured
                     .lock()
                     .unwrap()
-                    .push(draw_loading_width_test_panel(ctx));
+                    .push(draw_loading_width_test_panel(root_ui));
             });
         harness.run_steps(8);
         assert_loading_width_stable(&widths.lock().unwrap());
@@ -497,8 +497,9 @@ mod tests {
         assert!(widths.iter().all(|width| (*width - first).abs() <= 0.1));
     }
 
-    fn draw_loading_width_test_panel(ctx: &egui::Context) -> f32 {
-        ctx.root_ui(|root_ui| {
+    fn draw_loading_width_test_panel(root_ui: &mut egui::Ui) -> f32 {
+        let ctx = &root_ui.ctx().clone();
+        {
             egui::Panel::left("folder_tree_pane_loading_width_test")
                 .resizable(true)
                 .default_size(240.0)
@@ -531,7 +532,7 @@ mod tests {
                             });
                     });
                 })
-        })
+        }
         .response
         .rect
         .width()

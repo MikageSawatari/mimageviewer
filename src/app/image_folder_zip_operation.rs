@@ -1660,6 +1660,7 @@ mod tests {
                         .commands
                         .contains(&egui::ViewportCommand::CancelClose)
                 );
+                requested.drop_without_applying_deltas();
                 ctx.begin_pass(egui::RawInput::default());
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 while app.image_folder_zip_operation.is_some() {
@@ -1677,6 +1678,7 @@ mod tests {
                 assert_eq!(app.window_visible, !tray);
                 assert!(app.folder_pane_open_pending.is_none());
                 assert_eq!(source.with_extension("zip").exists(), committed);
+                terminal.drop_without_applying_deltas();
             }
         }
     }
@@ -1738,6 +1740,7 @@ mod tests {
             hydration_messages.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+        blocked.drop_without_applying_deltas();
         let terminal = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.service_discarded_sidecar_restore(ctx);
             assert!(!app.image_zip_discarded_hydration_exit_pending(owner));
@@ -1753,6 +1756,7 @@ mod tests {
             app.selected, selected,
             "cancelled hydration cannot select the ZIP destination"
         );
+        terminal.drop_without_applying_deltas();
         let again = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.service_root_lifecycle(ctx)
         });
@@ -1762,6 +1766,7 @@ mod tests {
                 .get(&egui::ViewportId::ROOT)
                 .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::Close))
         );
+        again.drop_without_applying_deltas();
     }
 
     #[test]
@@ -1932,7 +1937,8 @@ mod tests {
             let mut first = true;
             let mut h = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if first {
                         crate::ui_fonts::configure_fonts(ctx);
                         crate::ime_focus::install_ime_input_policy(ctx);
@@ -1949,11 +1955,16 @@ mod tests {
             if composing {
                 h.input_mut().events.extend([
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("input".into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "input".into(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, 120.0),
                         modifiers: egui::Modifiers::CTRL,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                 ]);
                 h.key_press(egui::Key::Escape);

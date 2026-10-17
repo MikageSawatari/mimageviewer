@@ -617,6 +617,9 @@ pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
 mod update_phases;
+mod viewport_retirement;
+#[cfg(all(test, windows))]
+mod viewport_retirement_tests;
 pub(crate) use subfolder_expansion::listing_sort_metas_for_items;
 pub(crate) use subfolder_expansion::{SubfolderExpansionEntry, listing_sort_metas_for_entries};
 #[cfg(all(windows, feature = "test-script"))]
@@ -3503,6 +3506,24 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn service_detached_watcher_close_requests(&mut self, ctx: &egui::Context) {
+        let close_ids = self
+            .detached_window_manager
+            .drain_close_requests()
+            .into_iter()
+            .map(|request| request.window_id)
+            .collect::<Vec<_>>();
+        if !close_ids.is_empty() {
+            self.request_detached_image_window_close_by_ids(
+                ctx,
+                &close_ids,
+                "watcher_passive_close",
+                None,
+            );
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn drain_deferred_detached_activation_watcher(&mut self, ctx: &egui::Context) {
         for diagnostic in self.detached_window_manager.drain_watch_diagnostics() {
             let cursor = diagnostic
@@ -3528,20 +3549,6 @@ impl App {
                 target_hwnd,
                 self.frame_counter
             ));
-        }
-        let close_ids = self
-            .detached_window_manager
-            .drain_close_requests()
-            .into_iter()
-            .map(|request| request.window_id)
-            .collect::<Vec<_>>();
-        if !close_ids.is_empty() {
-            self.close_detached_image_windows_by_ids(
-                ctx,
-                &close_ids,
-                "watcher_passive_close",
-                None,
-            );
         }
         for request in self.detached_window_manager.drain_activation_requests() {
             let id = request.window_id;
@@ -3762,6 +3769,8 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
+        self.detached_window_manager
+            .transfer_viewport_retirement(window_id);
         self.discard_parked_native_video_pending_for_window(window_id, reason);
         self.cancel_media_navigation_pending_for_owner(Some(window_id), reason);
         self.cancel_detached_right_drag_owner(window_id, reason);
@@ -3800,18 +3809,55 @@ impl App {
         runtime
     }
 
-    /// Retire one terminal detached viewport identity without publishing a synthetic close.
-    ///
-    /// Egui does not distinguish an internally queued `ViewportCommand::Close` from an OS close
-    /// request delivered for the same `ViewportId`. Terminal teardown therefore removes the
-    /// lease from App's desired output and runtime registry. A later open must allocate a fresh
-    /// identity; stale work for `window_id` can then only address the retired lease.
+    #[cfg(windows)]
+    pub(crate) fn capture_detached_viewport_registration(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+    ) {
+        self.detached_window_manager
+            .capture_viewport_registration(window_id, ctx);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn capture_current_detached_viewport_registration(&mut self, ctx: &egui::Context) {
+        let viewport_id = ctx.viewport_id();
+        if let Some(window_id) = self
+            .detached_window_manager
+            .ids()
+            .into_iter()
+            .find(|id| Self::detached_image_window_viewport_id(*id) == viewport_id)
+        {
+            self.capture_detached_viewport_registration(ctx, window_id);
+        } else if viewport_id
+            == egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
+        {
+            if let Some(binding) =
+                viewport_retirement::ViewportCommandBinding::capture(ctx, viewport_id)
+            {
+                self.fullscreen_viewport_binding = Some(binding);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn transfer_fullscreen_viewport_retirement(&mut self) {
+        if let Some(binding) = self.fullscreen_viewport_binding.take() {
+            binding.transfer_retirement();
+        }
+    }
+
+    /// Retire the exact registered lifetime through the root command output.
+    /// The registration and sink were captured by the real viewport producer,
+    /// so Context GC cannot turn this into a new registration or target a sibling.
     #[cfg(windows)]
     pub(crate) fn retire_terminal_detached_viewport_identity(
         &mut self,
         window_id: u64,
         reason: &'static str,
     ) {
+        self.detached_window_manager
+            .transfer_viewport_retirement(window_id);
         if self.detached_window_state(window_id).is_some()
             && self.detached_window_state(window_id) != Some(DetachedWindowState::Closing)
         {
@@ -17139,6 +17185,9 @@ pub struct App {
     // ── フルスクリーンビューポート ─────────────────────────────
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
+    /// Exact authority for the standalone fullscreen surface (separate from detached runtimes).
+    #[cfg(windows)]
+    fullscreen_viewport_binding: Option<viewport_retirement::ViewportCommandBinding>,
     /// `fs_viewport_shown` が true のとき、その viewport を作った表示形態。
     ///
     /// `Fullscreen` と `DetachedWindow` は装飾・サイズ・taskbar 表示が異なるため、
@@ -20599,6 +20648,8 @@ impl App {
             continuous_reading_scroll_transition: None,
             slideshow_scroll_range_cache: None,
             fs_viewport_shown: false,
+            #[cfg(windows)]
+            fullscreen_viewport_binding: None,
             #[cfg(windows)]
             fs_viewport_presentation: None,
             #[cfg(windows)]
@@ -43888,10 +43939,8 @@ impl App {
     }
 
     /// 親コンテナの代表サムネピンが書き換わっていたら現フォルダを再ロードして
-    /// グリッドに反映する。`close_fullscreen` と `App::update` (= 毎フレーム) の
-    /// 両方から呼ばれる。dirty が `close_fullscreen` でしか consume されないと、
-    /// グリッドモードで 📌 を押しても次の fullscreen 開閉までグリッドが古いまま
-    /// になる (Codex Phase D P2 指摘)。
+    /// グリッドに反映する。正当な一覧UIの既存checkpointで消費する。
+    /// fullscreenの非描画終了ではdirtyを保持し、表示用の再ロードを開始しない。
     pub(crate) fn consume_folder_thumb_pin_dirty(&mut self) {
         if self.sidecar_restore_active() {
             return;
@@ -43907,11 +43956,9 @@ impl App {
     }
 
     /// 動画ピンの書き換え (P ピン / 解除 / 後追い WebP 補完) があったら現フォルダを
-    /// 再ロードしてグリッドサムネに反映する (Phase 8.B')。`close_fullscreen` と
-    /// `App::update` (= 毎フレーム、メインビューア非表示時) の両方から呼ばれる。
-    /// close_fullscreen だけで consume していると、フル機能モード + メディア別
-    /// ウィンドウの P ピンではメイン窓のグリッドが開きっぱなしで反映契機が来ない
-    /// (実機 FB 2026-07-10。`consume_folder_thumb_pin_dirty` と同じ構造の修正)。
+    /// 再ロードしてグリッドサムネに反映する (Phase 8.B')。メインビューアが
+    /// 塞がれていない一覧UIの既存checkpointで消費する。別窓のPピンも同じ入口を
+    /// 使用し、非描画Closeからは表示結果を採用しない。
     ///
     /// 再ロードは「ピンした動画が現在の items に見えているとき」だけ行う。別窓が
     /// メイン表示と無関係なフォルダの動画をピンしたケースで、メイン側のスクロール /
@@ -60855,9 +60902,10 @@ impl App {
     /// アクティブ detached の `show_viewport_immediate(detached_id, …)` を実際に呼んだ直後に
     /// 立てる marker (§3.6)。これ以外 (passive / cleanup / Close / backdrop) では呼ばない。
     #[cfg(windows)]
-    pub(crate) fn mark_active_detached_viewport_rendered(&mut self) {
+    pub(crate) fn mark_active_detached_viewport_rendered(&mut self, ctx: &egui::Context) {
         self.detached_active_viewport_rendered_frame = self.frame_counter;
         if let Some(mut session) = self.active_detached_session {
+            self.capture_detached_viewport_registration(ctx, session.window_id);
             if matches!(
                 self.detached_window_state(session.window_id),
                 Some(DetachedWindowState::Opening | DetachedWindowState::Resuming)
@@ -60894,11 +60942,12 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn mark_active_detached_viewport_rendered_if_matches(
         &mut self,
+        ctx: &egui::Context,
         rendered_id: egui::ViewportId,
     ) {
         if let Some(session) = self.active_detached_session {
             if rendered_id == Self::detached_image_window_viewport_id(session.window_id) {
-                self.mark_active_detached_viewport_rendered();
+                self.mark_active_detached_viewport_rendered(ctx);
             }
         }
     }
@@ -61215,7 +61264,8 @@ impl App {
         ctx: &egui::Context,
     ) -> Result<bool, LocalViewerCloseFailure> {
         self.close_local_composition_editor(CompositionEditorCloseReason::OwnerClosed);
-        let had_detached = self.active_detached_context_is_at_rest()
+        let had_detached = self.fullscreen_viewport_binding.is_some()
+            || self.active_detached_context_is_at_rest()
             || !self.other_viewer_context_ids().is_empty()
             || self.active_detached_session.is_some()
             || self.viewer_session_is_detached_or_switching()
@@ -61230,10 +61280,8 @@ impl App {
         if !had_detached {
             return Ok(false);
         }
+        self.transfer_fullscreen_viewport_retirement();
         let mut close_failure = None;
-        let visible_viewport_id = self
-            .fs_viewport_shown
-            .then(|| self.fullscreen_viewport_id());
 
         if self.video_presentation_transition.is_transitioning() {
             self.video_presentation_transition
@@ -61367,22 +61415,6 @@ impl App {
         self.detached_viewer_focus_requested = false;
         self.detached_viewer_no_activate_once = false;
         self.fs_open_intent_from_grid = false;
-        if let Some(viewport_id) = visible_viewport_id {
-            // Match the inactive fullscreen cleanup protocol: keep the viewport alive for
-            // this frame before sending Visible(false). Clearing the marker alone is not
-            // evidence that the existing native viewport was hidden.
-            let builder = self
-                .build_inactive_fullscreen_viewport_builder_with_source(0, "mode_change_close_all")
-                .with_visible(false);
-            ctx.show_viewport_immediate(viewport_id, builder, |_ctx, _class| {});
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(false));
-            self.observe_viewport_presentation_command(
-                viewport_id,
-                crate::presentation_observer::WindowAction::Visible,
-                "app::mode_change_close_all",
-                "value=false",
-            );
-        }
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
@@ -61704,6 +61736,7 @@ impl App {
         viewport_id: egui::ViewportId,
         before: Option<&[crate::dwm_transitions::ThreadWindowSnapshotEntry]>,
     ) {
+        self.capture_detached_viewport_registration(ctx, window_id);
         let Some(before) = before else {
             self.recover_detached_window_hwnd_after_skipped_snapshot(
                 ctx,
@@ -77603,6 +77636,8 @@ impl App {
             return;
         }
         self.accept_current_page_list_request();
+        #[cfg(windows)]
+        self.transfer_fullscreen_viewport_retirement();
         // グリッドへ戻る = detached セッションの明示終了 (§3.7 closing)。folder-nav の
         // 内部 close とは別経路なので、ここでは確実に session を畳んでよい。
         #[cfg(windows)]
@@ -77835,12 +77870,14 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn local_viewer_close_state(
         &self,
+        ctx: &egui::Context,
         failure: Option<LocalViewerCloseFailure>,
     ) -> LocalViewerCloseState {
         if let Some(failure) = failure {
             return LocalViewerCloseState::Failed(failure);
         }
-        if !self.composition_editor_acquire_ready()
+        if ctx.has_pending_viewport_retirements()
+            || !self.composition_editor_acquire_ready()
             || self.viewer_context_ids().len() > 1
             || self.fullscreen_idx.is_some()
             || self
@@ -77848,6 +77885,7 @@ impl App {
                 .values()
                 .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
             || self.fs_viewport_shown
+            || self.fullscreen_viewport_binding.is_some()
             || self.active_detached_session.is_some()
             || !self.detached_image_windows.is_empty()
             || !self.detached_window_manager.is_empty()
@@ -77865,12 +77903,14 @@ impl App {
     #[cfg(not(windows))]
     pub(crate) fn local_viewer_close_state(
         &self,
+        ctx: &egui::Context,
         failure: Option<LocalViewerCloseFailure>,
     ) -> LocalViewerCloseState {
         if let Some(failure) = failure {
             return LocalViewerCloseState::Failed(failure);
         }
-        if !self.composition_editor_acquire_ready()
+        if ctx.has_pending_viewport_retirements()
+            || !self.composition_editor_acquire_ready()
             || self.fullscreen_idx.is_some()
             || self
                 .fs_cache
@@ -78081,18 +78121,10 @@ impl App {
                 self.settings.save();
             }
         }
-        // Phase 8.B': 動画ピン留めが変更されていたら現在フォルダを再ロードして
-        // グリッドサムネに反映 (= ピンの WebP がグリッド表示に出る)。
-        // close_fullscreen + メインの update 両方から拾うため共通ヘルパー経由
-        // (folder_thumb_pin_dirty と同じ構造。フル機能モード + メディア別ウィンドウ
-        // では close_fullscreen を通らずメイン窓のグリッドが開きっぱなしになるため)。
-        self.consume_video_thumb_overrides_dirty();
-        // 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネピンが書き換わっていたら
-        // 同じく現フォルダを再ロードしてグリッドに反映する。
-        // close_fullscreen + メインの update 両方から拾うため共通ヘルパー経由
-        // (Codex Phase D P2 指摘: dirty が close_fullscreen でしか consume されず、
-        // グリッドモードで 📌 を押しても次の fullscreen 開閉まで反映されなかった)。
-        self.consume_folder_thumb_pin_dirty();
+        // Pin publications remain in their existing App-global dirty sets.
+        // The grid UI already consumes both sets when its viewer/modal gates
+        // permit adoption. Terminal close also runs from logic, so reloading
+        // the displayed folder here would cross that UI ownership boundary.
         // perf: close_fullscreen は fs_cache / ai_upscale_cache / pending スレッドの
         // キャンセル通知を行うため、Ctrl+↑↓ (Fullscreen モード) の sync パスで
         // 実行される。ms を計測してブロックの所在を特定する。
@@ -96045,6 +96077,14 @@ impl eframe::App for App {
         // eframe 既定の alpha=180 は transparent() 有効時用なので踏襲せず、不透明の
         // パネル背景色を返す (純ロジックは free fn 化して unit test で回帰ガード)。
         main_window_clear_color(visuals)
+    }
+
+    fn on_viewport_close_requested(
+        &mut self,
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+    ) -> eframe::ViewportCloseResponse {
+        self.accept_viewport_close_request(ctx, viewport_id)
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

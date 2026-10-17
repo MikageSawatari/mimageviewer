@@ -473,7 +473,10 @@ mod tests {
             &mut rgb,
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("#A87E00".into())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "#A87E00".into(),
+                    active_range_chars: None,
+                }),
             ],
         );
         assert_eq!(rgb, [55, 55, 55]);

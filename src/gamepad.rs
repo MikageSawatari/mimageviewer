@@ -333,9 +333,35 @@ enum PadPressAdmission {
     Suppressed,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PhysicalButtonLevel {
+    #[default]
+    Up,
+    Down(PadPressAdmission),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DeliveredButtonLevel {
+    #[default]
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ButtonLevel {
+    physical: PhysicalButtonLevel,
+    delivered: DeliveredButtonLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AxisLevel {
+    physical: f32,
+    delivered: f32,
+}
+
 pub struct GamepadInputState {
-    buttons: HashMap<PadButton, PadPressAdmission>,
-    axes: [f32; 6],
+    buttons: HashMap<PadButton, ButtonLevel>,
+    axes: [AxisLevel; 6],
     trigger_ranges: [TriggerRange; 2],
     repeat_next: HashMap<PadButton, Instant>,
     y_modifier_used: bool,
@@ -351,7 +377,7 @@ impl Default for GamepadInputState {
     fn default() -> Self {
         Self {
             buttons: HashMap::new(),
-            axes: [0.0; 6],
+            axes: [AxisLevel::default(); 6],
             trigger_ranges: [TriggerRange::Unknown; 2],
             repeat_next: HashMap::new(),
             y_modifier_used: false,
@@ -366,39 +392,95 @@ impl Default for GamepadInputState {
 }
 
 impl GamepadInputState {
+    /// Direct state setup used by input-state callers; runtime intake and UI
+    /// delivery use the two explicit stage methods below.
     pub fn set_button_down(&mut self, button: PadButton, down: bool, now: Instant) -> bool {
-        let changed = if down {
-            if let std::collections::hash_map::Entry::Vacant(entry) = self.buttons.entry(button) {
-                entry.insert(PadPressAdmission::Accepted);
-                true
-            } else {
-                false
-            }
+        let changed = self.set_physical_button_down(button, down, now);
+        if changed {
+            self.deliver_button_edge(button, down);
+        }
+        changed
+    }
+
+    pub(crate) fn set_physical_button_down(
+        &mut self,
+        button: PadButton,
+        down: bool,
+        now: Instant,
+    ) -> bool {
+        let level = self.buttons.entry(button).or_default();
+        let was_down = matches!(level.physical, PhysicalButtonLevel::Down(_));
+        if down && !was_down {
+            level.physical = PhysicalButtonLevel::Down(PadPressAdmission::Accepted);
+        } else if !down {
+            level.physical = PhysicalButtonLevel::Up;
+            self.repeat_next.remove(&button);
+        }
+        if down && !was_down && is_repeatable_button(button) {
+            self.repeat_next
+                .insert(button, now + Duration::from_millis(300));
+        }
+        was_down != down
+    }
+
+    pub(crate) fn deliver_button_edge(&mut self, button: PadButton, down: bool) {
+        let level = self.buttons.entry(button).or_default();
+        let was_down = level.delivered == DeliveredButtonLevel::Down;
+        level.delivered = if down {
+            DeliveredButtonLevel::Down
         } else {
-            self.buttons.remove(&button).is_some()
+            DeliveredButtonLevel::Up
         };
-        if down && changed {
+        if down && !was_down {
             if button == PadButton::North {
                 self.y_modifier_used = false;
             }
             if button == PadButton::West {
                 self.reset_west_ring_state();
             }
-        } else if !down {
-            self.repeat_next.remove(&button);
         }
-        if down && changed && is_repeatable_button(button) {
-            self.repeat_next
-                .insert(button, now + Duration::from_millis(300));
+    }
+
+    pub(crate) fn delivered_button_down(&self, button: PadButton) -> bool {
+        self.buttons
+            .get(&button)
+            .is_some_and(|level| level.delivered == DeliveredButtonLevel::Down)
+    }
+
+    pub(crate) fn clear_physical(&mut self) {
+        for level in self.buttons.values_mut() {
+            level.physical = PhysicalButtonLevel::Up;
         }
-        changed
+        for level in &mut self.axes {
+            level.physical = 0.0;
+        }
+        self.repeat_next.clear();
+        self.analog_last_tick = None;
+        self.left_stick_next_step = None;
+        self.trigger_next_step = None;
+    }
+
+    pub(crate) fn end_delivered_session(&mut self) {
+        for level in self.buttons.values_mut() {
+            level.delivered = DeliveredButtonLevel::Up;
+        }
+        for level in &mut self.axes {
+            level.delivered = 0.0;
+        }
+        self.y_modifier_used = false;
+        self.reset_west_ring_state();
+        self.directional_neutral_required = false;
     }
 
     /// 保持している入力が何も無いか。終端処理を毎フレーム空振りさせないための述語で、
     /// [`Self::clear`] が落とす項目とここが見る項目は**同じ**でなければならない。
     pub fn is_idle(&self) -> bool {
-        self.buttons.is_empty()
-            && self.axes.iter().all(|value| *value == 0.0)
+        self.buttons.values().all(|level| {
+            level.physical == PhysicalButtonLevel::Up && level.delivered == DeliveredButtonLevel::Up
+        }) && self
+            .axes
+            .iter()
+            .all(|level| level.physical == 0.0 && level.delivered == 0.0)
             && self.repeat_next.is_empty()
             && !self.y_modifier_used
             && self.west_ring_direction.is_none()
@@ -414,7 +496,7 @@ impl GamepadInputState {
     /// 不具合を防ぐ。トリガーのレンジ較正 (`trigger_ranges`) は次接続でも有効なので残す。
     pub fn clear(&mut self) {
         self.buttons.clear();
-        self.axes = [0.0; 6];
+        self.axes = [AxisLevel::default(); 6];
         self.repeat_next.clear();
         self.y_modifier_used = false;
         self.reset_west_ring_state();
@@ -429,15 +511,21 @@ impl GamepadInputState {
     /// (= 解除後に保持中ボタンが勝手に連続発火しない)、保持中の Y は modifier 使用済み
     /// 扱いにして「離し = タップ」を抑止する。軸 / ボタン保持状態自体は残すので、
     /// 一瞬のポップアップ後もアナログ操作はそのまま継続できる。
-    pub fn suppress_pending_actions(&mut self) {
+    pub(crate) fn suppress_physical_actions(&mut self) {
         self.repeat_next.clear();
-        for admission in self.buttons.values_mut() {
-            *admission = PadPressAdmission::Suppressed;
+        for level in self.buttons.values_mut() {
+            if matches!(level.physical, PhysicalButtonLevel::Down(_)) {
+                level.physical = PhysicalButtonLevel::Down(PadPressAdmission::Suppressed);
+            }
         }
-        if self.buttons.contains_key(&PadButton::North) {
+    }
+
+    pub fn suppress_pending_actions(&mut self) {
+        self.suppress_physical_actions();
+        if self.delivered_button_down(PadButton::North) {
             self.y_modifier_used = true;
         }
-        if self.buttons.contains_key(&PadButton::West) {
+        if self.delivered_button_down(PadButton::West) {
             self.west_tap_suppressed = true;
             self.west_ring_direction = None;
             // X リング操作中にブロックされた場合、リング用に倒していたスティックが
@@ -449,26 +537,42 @@ impl GamepadInputState {
     }
 
     pub fn set_axis(&mut self, axis: PadAxis, value: f32) {
+        self.set_physical_axis(axis, value);
+        self.axes[axis.index()].delivered = self.axes[axis.index()].physical;
+    }
+
+    pub(crate) fn set_physical_axis(&mut self, axis: PadAxis, value: f32) {
         let value = value.clamp(-1.0, 1.0);
-        if axis == PadAxis::LeftTrigger || axis == PadAxis::RightTrigger {
-            let idx = if axis == PadAxis::LeftTrigger { 0 } else { 1 };
-            if value < -0.25 {
-                self.trigger_ranges[idx] = TriggerRange::MinusOneToOne;
-            }
+        if matches!(axis, PadAxis::LeftTrigger | PadAxis::RightTrigger) && value < -0.25 {
+            self.trigger_ranges[if axis == PadAxis::LeftTrigger { 0 } else { 1 }] =
+                TriggerRange::MinusOneToOne;
         }
-        self.axes[axis.index()] = value;
+        self.axes[axis.index()].physical = value;
     }
 
+    pub(crate) fn physical_axes(&self) -> [f32; 6] {
+        self.axes.map(|level| level.physical)
+    }
+    pub(crate) fn deliver_axes(&mut self, values: [f32; 6]) {
+        for (level, value) in self.axes.iter_mut().zip(values) {
+            level.delivered = value;
+        }
+    }
+    pub(crate) fn delivered_axis(&self, axis: PadAxis) -> f32 {
+        self.axes[axis.index()].delivered
+    }
     pub(crate) fn button_release_admitted(&self, button: PadButton) -> bool {
-        self.buttons.get(&button) == Some(&PadPressAdmission::Accepted)
+        self.buttons.get(&button).is_some_and(|level| {
+            level.physical == PhysicalButtonLevel::Down(PadPressAdmission::Accepted)
+        })
     }
-
     pub fn button_down(&self, button: PadButton) -> bool {
-        self.buttons.contains_key(&button)
+        self.buttons
+            .get(&button)
+            .is_some_and(|level| matches!(level.physical, PhysicalButtonLevel::Down(_)))
     }
-
     pub fn axis(&self, axis: PadAxis) -> f32 {
-        self.axes[axis.index()]
+        self.axes[axis.index()].physical
     }
 
     pub fn trigger_value(&self, left: bool) -> f32 {
@@ -518,7 +622,7 @@ impl GamepadInputState {
     }
 
     pub fn mark_y_modifier_used(&mut self) {
-        if self.button_down(PadButton::North) {
+        if self.delivered_button_down(PadButton::North) {
             self.y_modifier_used = true;
         }
     }
@@ -528,7 +632,7 @@ impl GamepadInputState {
     }
 
     pub fn west_ring_active(&self) -> bool {
-        self.button_down(PadButton::West) && !self.west_tap_suppressed
+        self.delivered_button_down(PadButton::West) && !self.west_tap_suppressed
     }
 
     pub fn west_ring_direction(&self) -> Option<RingDirection> {
@@ -546,7 +650,7 @@ impl GamepadInputState {
     }
 
     pub fn cancel_west_ring(&mut self) {
-        if self.button_down(PadButton::West) {
+        if self.delivered_button_down(PadButton::West) {
             self.west_ring_direction = None;
             self.west_tap_suppressed = true;
             self.require_directional_neutral();
@@ -571,9 +675,7 @@ impl GamepadInputState {
     }
 
     pub fn dpad_direction_down(&self) -> bool {
-        DPAD_BUTTONS
-            .iter()
-            .any(|button| self.buttons.contains_key(button))
+        DPAD_BUTTONS.iter().any(|&button| self.button_down(button))
     }
 
     pub fn finish_west_release(&mut self) -> WestReleaseOutcome {
@@ -611,9 +713,9 @@ impl GamepadInputState {
     }
 
     pub fn repeat_active(&self) -> bool {
-        self.buttons
-            .keys()
-            .any(|&button| is_repeatable_button(button))
+        self.buttons.iter().any(|(&button, level)| {
+            matches!(level.physical, PhysicalButtonLevel::Down(_)) && is_repeatable_button(button)
+        })
     }
 
     fn reset_west_ring_state(&mut self) {

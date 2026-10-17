@@ -102,7 +102,7 @@ mod tests {
         )
         .drop_without_applying_deltas();
 
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
         )
         .drop_without_applying_deltas();
 
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
             ),
             |ui| {
                 let ctx = &ui.ctx().clone();
-                assert!(ctx.wants_keyboard_input());
+                assert!(ctx.egui_wants_keyboard_input());
                 assert!(ctx.input(|input| input.events.iter().any(|event| matches!(
                     event,
                     egui::Event::Key {
@@ -169,7 +169,10 @@ mod tests {
                 vec![
                     egui::Event::Text("x".to_owned()),
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "あ".to_owned(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
                 ],
             ),
@@ -243,7 +246,7 @@ mod tests {
             |ui| draw_focusable_surface(ui, egui::Id::new("fullscreen_child_surface")),
         )
         .drop_without_applying_deltas();
-        assert!(!ctx.wants_keyboard_input());
+        assert!(!ctx.egui_wants_keyboard_input());
 
         ctx.run_ui(
             raw_input(

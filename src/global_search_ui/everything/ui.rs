@@ -178,7 +178,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
                     let mut focus = false;
                     super::draw_everything_controls(ui, &mut query, &mut focus);

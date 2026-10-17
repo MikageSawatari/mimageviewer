@@ -101,15 +101,16 @@ const LAB_CURSOR_FALLBACK_EXTENT: f32 = 34.0;
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
     let mut options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport: egui::ViewportBuilder::default()
             .with_title("mIV Local Adjust Lab")
             .with_inner_size([1360.0, 880.0])
             .with_drag_and_drop(true),
-        vsync: false,
         ..Default::default()
     };
-    options.wgpu_options.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
-    options.wgpu_options.desired_maximum_frame_latency = Some(1);
+    options.glow_options.vsync = false;
+    options.wgpu_options.surface.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
+    options.wgpu_options.surface.desired_maximum_frame_latency = Some(1);
     eframe::run_native(
         "mIV Local Adjust Lab",
         options,
@@ -1981,6 +1982,10 @@ struct LocalAdjustLabApp {
 
 impl LocalAdjustLabApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.quit_shortcuts.clear());
+        cc.egui_ctx
+            .global_style_mut(|style| style.spacing.scroll.fade.strength = 0.0);
         configure_lab_fonts(&cc.egui_ctx);
         let now = Instant::now();
         let recent_files = load_recent_files();
@@ -6613,12 +6618,13 @@ impl LocalAdjustLabApp {
             return false;
         }
 
+        let wheel_delta = remaining_wheel_delta(ui.ctx());
         let (hover_pos, interact_pos, scroll_delta, space_held, middle_down, primary_down) = ui
             .input(|i| {
                 (
                     i.pointer.hover_pos(),
                     i.pointer.interact_pos(),
-                    i.raw_scroll_delta,
+                    wheel_delta,
                     i.key_down(Key::Space),
                     i.pointer.button_down(egui::PointerButton::Middle),
                     i.pointer.primary_down(),
@@ -8647,7 +8653,7 @@ impl eframe::App for LocalAdjustLabApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|file| file.path.clone())
+                .map(|file| file.path().to_path_buf())
                 .collect()
         });
         if let Some(path) = dropped.first() {
@@ -25704,4 +25710,44 @@ mod tests {
         assert_eq!(mask.alpha.len(), width * height);
         assert!(mask.alpha.iter().all(|v| v.is_finite()));
     }
+}
+
+// Project only unconsumed wheel events, using the same unit and modifier mapping as egui.
+fn remaining_wheel_delta(ctx: &egui::Context) -> egui::Vec2 {
+    let options = ctx.options(|o| o.input_options);
+    ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    phase,
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+                if *phase != egui::TouchPhase::Move {
+                    return None;
+                }
+                let delta = match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
+                    egui::MouseWheelUnit::Page => input.viewport_rect().height() * *delta,
+                };
+                let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
+                let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
+                Some(if horizontal && !vertical {
+                    egui::vec2(delta.x + delta.y, 0.0)
+                } else if vertical && !horizontal {
+                    egui::vec2(0.0, delta.x + delta.y)
+                } else {
+                    delta
+                })
+            })
+            .fold(egui::Vec2::ZERO, |sum, delta| sum + delta)
+    })
 }

@@ -964,13 +964,16 @@ fn alternating_hidden_window_over_forty_units_keeps_bounded_ranges_and_reentry_i
 }
 
 fn painted_texture_ids(ctx: &egui::Context, output: egui::FullOutput) -> Vec<egui::TextureId> {
-    ctx.tessellate(output.shapes, output.pixels_per_point)
+    let ids = ctx
+        .tessellate(output.shapes.clone(), output.pixels_per_point)
         .into_iter()
         .filter_map(|primitive| match primitive.primitive {
             egui::epaint::Primitive::Mesh(mesh) => Some(mesh.texture_id),
             egui::epaint::Primitive::Callback(_) => None,
         })
-        .collect()
+        .collect();
+    output.drop_without_applying_deltas();
+    ids
 }
 
 fn paint_composition_surface(
@@ -982,7 +985,7 @@ fn paint_composition_surface(
     Vec<crate::app::paint_record_test_support::PaintRecord>,
 ) {
     let output = crate::app::paint_record_test_support::with_capture(|| {
-        ctx.run_pass(
+        crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 ..Default::default()
@@ -1008,7 +1011,7 @@ fn paint_composition_surface(
                     });
                 }
             },
-        )
+        ))
     });
     let records =
         crate::app::paint_record_test_support::paint_records(egui::ViewportId::ROOT, &output);
@@ -1616,7 +1619,7 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             if hidden {
                 app.install_hidden_presentation_for_test(&b);
             }
-            let output = ctx.run_pass(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
@@ -1637,7 +1640,7 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
                             })
                     });
                 },
-            );
+            ));
             let painted = painted_texture_ids(&ctx, output);
             let allowed_ids = if cache == "processed" {
                 &source_ids[4..6]
@@ -1688,7 +1691,7 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             if hidden {
                 app.install_hidden_presentation_for_test(&b);
             }
-            let output = ctx.run_pass(
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
@@ -1696,7 +1699,7 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
                 |ctx| {
                     ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                 },
-            );
+            ));
             let painted = painted_texture_ids(&ctx, output);
             assert!(
                 !painted.contains(&source_ids[2]) && !painted.contains(&source_ids[3]),
@@ -1774,7 +1777,7 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
     let held_b = app.install_checking_presentation_for_test(&b);
     let b_correlation = app.checking_presentation_correlations_for_test(&b);
     let draw = |app: &mut crate::app::App, rect: egui::Rect| {
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 ..Default::default()
@@ -1795,7 +1798,7 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
                         })
                 });
             },
-        );
+        ));
         painted_texture_ids(&ctx, output)
     };
     app.fs_vertical_scroll = 1.0;
@@ -2101,7 +2104,7 @@ fn g3_similar_preview_continuous_routing_requires_admitted_anchor_occurrence() {
         if expected == "hidden" {
             app.install_hidden_presentation_for_test(&demand);
         }
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 focused: true,
@@ -2127,7 +2130,7 @@ fn g3_similar_preview_continuous_routing_requires_admitted_anchor_occurrence() {
                         })
                 });
             },
-        );
+        ));
         assert_eq!(
             painted_texture_ids(&ctx, output).contains(&candidate_texture),
             expected == "allowed",

@@ -750,12 +750,13 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run(raw, |ctx| {
+        let mut output = ctx.run_pass(raw, |ctx| {
             let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
             // Terminal completion cannot change the modal ownership sampled at acceptance.
             assert!(app.cancel_saved_group_open_request(request_id));
             app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
         });
+        output.textures_delta.clear();
 
         assert!(app.window_visible);
         assert!(

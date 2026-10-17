@@ -1086,9 +1086,8 @@ impl crate::app::App {
     }
 
     /// Remote progress without consuming the PC display continuation.
-    /// Legacy close/mount and shared completion dependencies are inventoried in
-    /// the stage 1b ledger; they are resolved in 1b-3b / stages 2-3 before logic hookup.
-    #[allow(dead_code)] // stage 3 entry; exercised without UI in boundary regressions.
+    /// App logic owns shared receipts, cancellation and approved retirement;
+    /// the existing UI checkpoint alone consumes display continuation.
     pub(crate) fn service_remote_session(&mut self, ctx: &egui::Context) {
         let poll = self.service_remote_session_begin(ctx);
         self.service_remote_session_requests(ctx, &poll);
@@ -1230,7 +1229,7 @@ impl crate::app::App {
                 }
                 None
             };
-            let close_state = self.local_viewer_close_state(close_failure);
+            let close_state = self.local_viewer_close_state(ctx, close_failure);
             let barrier = self.local_ai_remote_barrier_snapshot();
             let elapsed = snapshot
                 .active

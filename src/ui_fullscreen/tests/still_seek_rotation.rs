@@ -254,7 +254,7 @@ fn overlay_output(
     hover: Option<egui::Pos2>,
 ) -> egui::FullOutput {
     let before = crate::rotation_db::read_operations_for_test();
-    let output = ctx.run_pass(
+    let output = crate::test_ui::headless_paint_output(ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -270,7 +270,7 @@ fn overlay_output(
                 })
             });
         },
-    );
+    ));
     assert_eq!(
         crate::rotation_db::read_operations_for_test(),
         before,

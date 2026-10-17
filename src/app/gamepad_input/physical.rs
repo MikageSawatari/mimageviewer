@@ -10,11 +10,12 @@ use crate::gamepad::{
 
 /// Physical facts, in receipt order. Terminals must not overwrite undelivered
 /// edges: a press and release can arrive in different logic calls before UI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum PadPhysicalEvent {
     ButtonPressed(PadButton),
     ButtonReleased(PadButton),
     SuppressedRelease(PadButton),
+    AxesChanged([f32; 6]),
     SessionEnded,
 }
 
@@ -40,7 +41,7 @@ impl GamepadPhysicalInput {
         let events = self.runtime.drain(ctx, enabled);
         self.ingest(enabled, events, now);
         if foreground_app_hwnd().is_none() {
-            self.state.suppress_pending_actions();
+            self.state.suppress_physical_actions();
             let _ = self.state.analog_dt(false, now);
             let _ = self
                 .state
@@ -53,7 +54,7 @@ impl GamepadPhysicalInput {
 
     fn ingest(&mut self, enabled: bool, events: Vec<PadEventReceipt>, now: Instant) {
         if !enabled {
-            self.state.clear();
+            self.state.clear_physical();
             self.pending.events.push(PadPhysicalEvent::SessionEnded);
             return;
         }
@@ -62,9 +63,9 @@ impl GamepadPhysicalInput {
             self.pending.saw_input_event = true;
             match receipt.event {
                 PadEvent::ButtonPressed(button) => {
-                    let changed = self.state.set_button_down(button, true, now);
+                    let changed = self.state.set_physical_button_down(button, true, now);
                     if !receipt.accepted {
-                        self.state.suppress_pending_actions();
+                        self.state.suppress_physical_actions();
                     } else if changed {
                         self.pending
                             .events
@@ -72,8 +73,8 @@ impl GamepadPhysicalInput {
                     }
                 }
                 PadEvent::ButtonReleased(button) => {
-                    let admitted = self.state.button_release_admitted(button);
-                    if self.state.set_button_down(button, false, now) {
+                    let admitted = self.state.button_release_admitted(button) && receipt.accepted;
+                    if self.state.set_physical_button_down(button, false, now) {
                         self.pending.events.push(if admitted {
                             PadPhysicalEvent::ButtonReleased(button)
                         } else {
@@ -82,14 +83,24 @@ impl GamepadPhysicalInput {
                     }
                 }
                 PadEvent::AxisChanged(axis, value) => {
-                    self.state.set_axis(axis, value);
+                    self.state.set_physical_axis(axis, value);
+                    let values = self.state.physical_axes();
+                    if let Some(PadPhysicalEvent::AxesChanged(previous)) =
+                        self.pending.events.last_mut()
+                    {
+                        *previous = values;
+                    } else {
+                        self.pending
+                            .events
+                            .push(PadPhysicalEvent::AxesChanged(values));
+                    }
                     self.pending.analog_operation |= self.analog_active();
                 }
                 PadEvent::Connected => {}
                 PadEvent::Disconnected => {
                     // Clear here, before any subsequent press in this drain.
                     // UI overlay cleanup and context-owned ring commit are separate.
-                    self.state.clear();
+                    self.state.clear_physical();
                     self.pending.events.push(PadPhysicalEvent::SessionEnded);
                 }
             }
@@ -123,6 +134,88 @@ impl GamepadPhysicalInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gamepad_receipt_keeps_short_background_press_rejected_after_focus_returns() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut input = GamepadPhysicalInput::default();
+        let now = Instant::now();
+        // The producer saw another app. No logic poll happened before mIV returned.
+        for event in [
+            PadEvent::ButtonPressed(PadButton::DPadRight),
+            PadEvent::AxisChanged(PadAxis::LeftX, 0.9),
+            PadEvent::ButtonReleased(PadButton::DPadRight),
+            PadEvent::ButtonPressed(PadButton::North),
+            PadEvent::ButtonReleased(PadButton::North),
+            PadEvent::ButtonPressed(PadButton::West),
+            PadEvent::ButtonReleased(PadButton::West),
+        ] {
+            input.push_receipt_for_test(event, None);
+        }
+        input.push_receipt_for_test(PadEvent::ButtonPressed(PadButton::South), Some(1));
+        input.drain(&ctx, true, now);
+        assert_eq!(input.state.axis(PadAxis::LeftX), 0.9);
+        assert!(!input.state.button_down(PadButton::DPadRight));
+        assert!(input.state.button_down(PadButton::South));
+        assert!(!input.state.due_button_repeat(
+            PadButton::DPadRight,
+            now + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(70),
+        ));
+        assert_eq!(
+            input.take_pending().events,
+            [
+                PadPhysicalEvent::AxesChanged([0.9, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                PadPhysicalEvent::SuppressedRelease(PadButton::DPadRight),
+                PadPhysicalEvent::SuppressedRelease(PadButton::North),
+                PadPhysicalEvent::SuppressedRelease(PadButton::West),
+                PadPhysicalEvent::ButtonPressed(PadButton::South),
+            ]
+        );
+        assert!(input.take_pending().events.is_empty());
+    }
+
+    #[test]
+    fn gamepad_background_logic_stops_discrete_repeat_but_keeps_the_axis() {
+        let ctx = egui::Context::default();
+        let mut input = GamepadPhysicalInput::default();
+        let now = Instant::now();
+        {
+            let _foreground = crate::test_native_focus::scoped(1, 1, true);
+            input.push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+            input.push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
+            input.drain(&ctx, true, now);
+        }
+        {
+            let _background = crate::test_native_focus::scoped(2, 2, false);
+            input.drain(&ctx, true, now + std::time::Duration::from_secs(1));
+            input.drain(&ctx, true, now + std::time::Duration::from_secs(2));
+        }
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        input.drain(&ctx, true, now + std::time::Duration::from_secs(3));
+        assert!(input.state.button_down(PadButton::DPadRight));
+        assert_eq!(input.state.axis(PadAxis::LeftX), 0.9);
+        assert!(!input.state.directional_neutral_required());
+        assert!(!input.state.due_button_repeat(
+            PadButton::DPadRight,
+            now + std::time::Duration::from_secs(3),
+            std::time::Duration::from_millis(70)
+        ));
+        assert!(input.state.left_stick_step_due(
+            true,
+            now + std::time::Duration::from_secs(3),
+            std::time::Duration::from_millis(70)
+        ));
+        // The earlier admitted edge was never overwritten by the neutral polls.
+        assert_eq!(
+            input.take_pending().events,
+            [
+                PadPhysicalEvent::ButtonPressed(PadButton::DPadRight),
+                PadPhysicalEvent::AxesChanged([0.9, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ]
+        );
+    }
 
     #[test]
     fn gamepad_physical_handoff_keeps_press_release_across_two_drains() {
@@ -202,6 +295,7 @@ mod tests {
             handoff.events,
             [
                 PadPhysicalEvent::ButtonPressed(PadButton::DPadRight),
+                PadPhysicalEvent::AxesChanged([0.9, 0.0, 0.0, 0.0, 0.0, 0.0]),
                 PadPhysicalEvent::SessionEnded,
             ]
         );
@@ -222,7 +316,7 @@ mod tests {
 
         assert!(!input.analog_active());
         let handoff = input.take_pending();
-        assert!(handoff.events.is_empty());
+        assert_eq!(handoff.events, [PadPhysicalEvent::AxesChanged([0.0; 6])]);
         assert!(handoff.analog_operation);
         assert!(!input.take_pending().analog_operation);
     }

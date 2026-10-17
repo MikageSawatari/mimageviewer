@@ -2103,7 +2103,7 @@ mod tests {
             !app.keymap.consume_action(&ctx, KeyAction::FsExport),
             "通常の Ctrl+E は SNS handler が export guard へ渡す"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(app.sns_split, Some(layout));
         assert!(app.export_dialog.is_none());
@@ -2236,7 +2236,7 @@ mod tests {
             !app.keymap.consume_action(&ctx, KeyAction::SnsSplitExecute),
             "利用者が割り当てた SNS 分割実行キーは handler が消費する"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.sns_split.is_none());
         assert!(app.sns_split_spread_ctx.is_none());

@@ -1981,7 +1981,9 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let blocked = ctx.run_pass(raw, |ctx| app.service_root_lifecycle(ctx));
+        let blocked = crate::test_ui::headless_paint_output(
+            ctx.run_pass(raw, |ctx| app.service_root_lifecycle(ctx)),
+        );
         assert!(
             blocked
                 .viewport_output
@@ -1999,24 +2001,56 @@ mod tests {
         ));
         assert!(app.tray_resident_media_updates_needed());
         let app_source = include_str!("../app.rs");
-        let update = app_source
-            .find("fn update(&mut self, ctx: &egui::Context")
-            .expect("eframe update wrapper");
-        let update_source = &app_source[update..];
+        let app_trait = app_source
+            .split_once("impl eframe::App for App {")
+            .expect("eframe application callbacks")
+            .1;
+        let (logic_source, ui_source) = app_trait
+            .split_once("fn logic(&mut self, ctx: &egui::Context")
+            .expect("eframe logic callback")
+            .1
+            .split_once("fn ui(&mut self, ui: &mut egui::Ui")
+            .expect("eframe UI callback");
+        let ui_source = ui_source.split_once("fn on_exit(").unwrap().0;
+        assert!(logic_source.contains("self.service_app_logic(ctx, frame)"));
+        assert!(ui_source.contains("self.update_frame(ui, frame)"));
+        assert!(!ui_source.contains("accept_root_lifecycle_before_frame("));
+        let logic_service = include_str!("../app/logic_service.rs");
+        let close_latch = logic_service
+            .find("self.accept_root_lifecycle_before_frame(ctx)")
+            .expect("logic close latch");
+        let tray_checkpoint = logic_service
+            .find("self.service_root_lifecycle_tray_checkpoint(ctx, lifecycle)")
+            .expect("logic tray checkpoint");
+        let tray_wake = logic_service
+            .find("self.sync_tray_resident_media_wake()")
+            .expect("logic tray wake publication");
         assert!(
-            update_source
-                .find("accept_root_lifecycle_before_frame(ctx)")
-                .expect("close latch")
-                < update_source
-                    .find("self.update_frame(ctx, frame")
-                    .expect("tray wake publication pass"),
-            "the hidden-root close latch must precede update_frame's tray wake publication"
+            close_latch < tray_checkpoint && tray_checkpoint < tray_wake,
+            "the hidden-root close latch and tray checkpoint must precede logic's wake publication"
+        );
+        let integration =
+            include_str!("../../vendor/eframe/src/native/epi_integration.rs").replace("\r\n", "\n");
+        let full_update = integration
+            .split_once("pub fn update(\n")
+            .expect("native full update")
+            .1
+            .split_once("pub fn update_logic_only(")
+            .unwrap()
+            .0;
+        assert!(
+            full_update
+                .find("app.logic(ui.ctx(), &mut self.frame)")
+                .unwrap()
+                < full_update.find("app.ui(ui, &mut self.frame)").unwrap(),
+            "the full pass must service the close latch before the display callback"
         );
 
         finish_save(Ok(()));
-        let still_blocked = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.service_root_lifecycle(ctx)
-        });
+        let still_blocked =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.service_root_lifecycle(ctx)
+            }));
         assert!(!app.composition_editor_writes_pending());
         assert!(
             still_blocked.viewport_output[&egui::ViewportId::ROOT]
@@ -2033,9 +2067,11 @@ mod tests {
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-                app.service_root_lifecycle(ctx)
-            });
+            let output = crate::test_ui::headless_paint_output(
+                ctx.run_pass(egui::RawInput::default(), |ctx| {
+                    app.service_root_lifecycle(ctx)
+                }),
+            );
             if output
                 .viewport_output
                 .get(&egui::ViewportId::ROOT)
@@ -2045,6 +2081,8 @@ mod tests {
             }
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
+
+            output.drop_without_applying_deltas();
         }
         assert!(matches!(
             app.settings_restore_state.family_operation,
@@ -2052,15 +2090,22 @@ mod tests {
         ));
         assert!(worker_finished.load(std::sync::atomic::Ordering::Acquire));
         assert!(!app.tray_resident_media_updates_needed());
-        let again = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.service_root_lifecycle(ctx)
-        });
+        let again =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.service_root_lifecycle(ctx)
+            }));
         assert!(
             !again
                 .viewport_output
                 .get(&egui::ViewportId::ROOT)
                 .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::Close))
         );
+
+        again.drop_without_applying_deltas();
+
+        blocked.drop_without_applying_deltas();
+
+        still_blocked.drop_without_applying_deltas();
     }
 
     #[test]
@@ -2490,7 +2535,11 @@ mod small_screen_tests {
                 });
             harness.run_steps(12);
             let node = harness.get_by_label("設定を完全リセット…");
-            let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+            let id = unsafe {
+                egui::Id::from_high_entropy_bits(
+                    ((u128::from(node.accesskit_node().id()) >> 64) as u64),
+                )
+            };
             let response = harness.ctx.read_response(id).unwrap();
             assert!(harness.ctx.content_rect().contains_rect(response.rect));
             assert!(

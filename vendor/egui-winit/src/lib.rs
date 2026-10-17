@@ -1943,6 +1943,9 @@ fn process_viewport_command(
     let pixels_per_point = pixels_per_point(egui_ctx, window);
 
     match command {
+        ViewportCommand::RetireApproved(_) => {
+            panic!("approved retirement must be consumed by the integration outside UI passes");
+        }
         ViewportCommand::Close => {
             info.events.push(egui::ViewportEvent::Close);
         }

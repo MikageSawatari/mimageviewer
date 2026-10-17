@@ -3955,7 +3955,7 @@ mod tests {
         inventory.account(&mut accountant);
         assert_eq!(accountant.finish().total_bytes(), bytes);
         let weak = Arc::downgrade(&old);
-        let output = ctx.run_pass(
+        let output = crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -3968,7 +3968,7 @@ mod tests {
                 paint_flat_page(&old.pages[0]);
                 crate::gpu_lanczos::retain_owner_for_fullscreen_paint_batch(&painter, old.clone());
             },
-        );
+        ));
         drop(old);
         assert!(weak.upgrade().is_some());
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
@@ -4143,13 +4143,16 @@ mod tests {
                 rect,
             )
             .unwrap();
-            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
-                transform.paint_texture(
-                    &ctx.debug_painter(),
-                    egui::TextureId::User(19),
-                    egui::Color32::WHITE,
-                )
-            });
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput::default(),
+                |ctx| {
+                    transform.paint_texture(
+                        &ctx.debug_painter(),
+                        egui::TextureId::User(19),
+                        egui::Color32::WHITE,
+                    )
+                },
+            ));
             let mesh = output
                 .shapes
                 .iter()
@@ -4171,6 +4174,8 @@ mod tests {
             assert!(canonical_source_uv(&transform).iter().all(|uv| {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)).contains(*uv)
             }));
+
+            output.drop_without_applying_deltas();
         }
     }
     #[test]

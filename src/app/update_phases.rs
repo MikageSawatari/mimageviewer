@@ -27,9 +27,9 @@ impl App {
     pub(super) fn render_update_begin(&mut self, ctx: &egui::Context) {
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
-        // The Remote coordinator interleaves service and PC-display checkpoints
-        // at the two old reload positions. Logic hookup is deferred to stage 3.
-        self.poll_remote_session(ctx);
+        // Remote service runs in logic. Display continuation stays at the old
+        // root UI checkpoint before ordinary input and worker adoption.
+        self.continue_remote_local_display();
         // Before any shortcut path, so a state that swallows every key says so once, in the
         // ordinary log, whether or not the reader happened to be running with --perf-log.
         self.note_modal_block_transition();

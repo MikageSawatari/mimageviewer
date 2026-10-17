@@ -583,11 +583,10 @@ let ctx = &root_ui.ctx().clone();
                             ui.label("Long message\n".repeat(80));
                         });
                         if had_wheel {
+                            let wheel_options = ctx.options(|o| o.input_options);
                             state.1 = ctx.input(|input| {
-                                crate::wheel_input::remaining_wheel_delta(
-                                    input,
-                                    ctx.options(|o| o.input_options),
-                                ) == egui::Vec2::ZERO
+                                crate::wheel_input::remaining_wheel_delta(input, wheel_options)
+                                    == egui::Vec2::ZERO
                                     && input.smooth_scroll_delta == egui::Vec2::ZERO
                                     && !input.events.iter().any(|event| {
                                         matches!(event, egui::Event::MouseWheel { .. })

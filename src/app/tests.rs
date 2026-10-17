@@ -337,7 +337,7 @@ mod file_organize_tests {
                 FileOrganizeRequest::Hidden
             ));
             assert!(env.fs_feedback_toast.as_ref().unwrap().0.contains("終了"));
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
         env.shutdown_requested.store(false, Ordering::SeqCst);
     }
@@ -378,7 +378,7 @@ mod file_organize_tests {
                 ..Default::default()
             });
             env.show_file_organize_dialog(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             match step {
                 0 | 1 => assert!(matches!(
                     env.file_organize_request,
@@ -1583,7 +1583,8 @@ fn mutation_refresh_synthetic_pin_keeps_rows_location_selection_and_history() {
         let wake_callback = Arc::clone(&wake);
         ctx.set_request_repaint_callback(move |_| wake_callback.store(true, Ordering::Relaxed));
         for _ in 0..4 {
-            let _ = ctx.run(Default::default(), |_| {});
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
         }
         wake.store(false, Ordering::Relaxed);
         app.thumbnails = vec![mutation_refresh_loaded_thumb(&ctx)];
@@ -2923,7 +2924,8 @@ fn epub_modal_rejects_second_direct_open_and_cancel_preserves_history() {
         }],
         ..Default::default()
     };
-    let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(input, |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert_eq!(
         app.folder_nav_history_snapshot().back_stack,
@@ -2976,7 +2978,8 @@ fn epub_published_stale_smart_owner_does_not_reopen_current_view() {
         ),
     );
     let ctx = egui::Context::default();
-    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert_eq!(app.pdf_enumerate_pending.as_ref().unwrap().0, other);
 }
@@ -3007,7 +3010,8 @@ fn epub_navigation_published_after_collection_root_open_cannot_replace_root() {
     app.open_collection_grid(collection_id, None);
     publish();
     let ctx = egui::Context::default();
-    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert!(matches!(
         app.top_level_grid_view.surface(),
@@ -3410,7 +3414,8 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
     });
     app.epub_convert = Some(state);
     let ctx = egui::Context::default();
-    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     let pending = app.pdf_enumerate_pending.as_ref().unwrap();
     assert_eq!(pending.0, other);
     assert_eq!(pending.4.as_ref().unwrap().logical, other);
@@ -4246,7 +4251,8 @@ fn epub_enumeration_failure_preserves_history_and_transfers_owner_to_conversion(
         }],
         ..Default::default()
     };
-    let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
+    ctx.run_pass(input, |ctx| app.show_epub_convert_dialog(ctx))
+        .drop_without_applying_deltas();
     assert!(app.epub_convert.is_none());
     assert_eq!(app.address, previous.to_string_lossy());
 }
@@ -5173,6 +5179,7 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
         ],
         "the preserved maximized intent must be applied by the transition owner's Visible commit"
     );
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -5219,7 +5226,7 @@ fn synthetic_f12_reaches_the_fullscreen_detached_handler() {
         }
     ))));
     let _ = app.handle_fs_key_input(&ctx, 0, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(app.settings.detached_viewer_enabled);
     assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
@@ -5350,7 +5357,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
     );
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.fs_viewport_shown = true;
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
 
     // A late terminal effect for retired H must be exact-by-lease and leave J untouched.
     app.retire_terminal_detached_viewport_identity(OLD_WINDOW_H, "test_stale_h_cleanup");
@@ -5478,7 +5485,7 @@ fn hwnd_registration_preserves_previewport_lifecycle_until_render_marker() {
         Some(DetachedWindowState::Opening),
         "post-show HWND adoption is not the viewport-rendered marker"
     );
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
     assert_eq!(
         app.detached_window_state(WINDOW_ID),
         Some(DetachedWindowState::Active)
@@ -5497,7 +5504,7 @@ fn hwnd_registration_preserves_previewport_lifecycle_until_render_marker() {
         Some(DetachedWindowState::Resuming),
         "registration must preserve the typed resume lifecycle"
     );
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
     assert_eq!(
         app.detached_window_state(WINDOW_ID),
         Some(DetachedWindowState::Active),
@@ -6905,7 +6912,7 @@ fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(app.rating_db.as_ref().unwrap().get(&rating_key), 0);
 }
 
@@ -6938,7 +6945,7 @@ fn epub_single_save_modal_blocks_grid_keyboard() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(app.rating_db.as_ref().unwrap().get(&rating_key), 0);
 }
 
@@ -7609,7 +7616,7 @@ fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     });
     app.update_ime_state(&ctx);
     assert!(app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     app.native_video_last_move_client = None;
     app.handle_native_video_window_event(
         &ctx,
@@ -9784,19 +9791,20 @@ fn press_ctrl_z_for_metadata_test(app: &mut App) {
     let ctx = egui::Context::default();
     let modifiers = egui::Modifiers::CTRL;
     ctx.begin_pass(egui::RawInput {
-        modifiers,
-        events: vec![egui::Event::Key {
-            key: egui::Key::Z,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        }],
+        events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+            .chain(vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }])
+            .collect(),
         ..Default::default()
     });
     app.keyboard_owner_for_pass(&ctx);
     app.handle_meta_undo_keys(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -10057,7 +10065,7 @@ fn rating_step_grid_key_handler_single_records_rating_and_undo() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
     assert_eq!(app.meta_undo.undo_len(), 1);
@@ -10105,7 +10113,7 @@ fn rating_step_grid_key_handler_checked_multi_records_one_undo() {
         vec![fullscreen_fixed_key_event(egui::Key::F13)],
     ));
     let _ = app.handle_keyboard(&ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
         assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
@@ -10162,7 +10170,7 @@ fn rating_step_grid_key_handler_partial_bound_clears_checks_but_all_bound_keeps_
             vec![fullscreen_fixed_key_event(egui::Key::F13)],
         ));
         let _ = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     };
     press_step_up(&mut app);
     assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[0]), 5);
@@ -10218,7 +10226,7 @@ fn rating_step_still_fullscreen_key_handler_item_and_container_record_undo() {
             vec![fullscreen_fixed_key_event(key)],
         ));
         let _ = app.handle_fs_key_input(&ctx, 0, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 2);
@@ -13573,11 +13581,14 @@ mod paused_similar_feature_tests {
                 screen_rect: Some(full_rect),
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+            ctx.run_pass(input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+                    })
                 });
-            });
+            })
+            .drop_without_applying_deltas();
             crate::ui_metadata_panel::take_book_section_heading_rect_for_test()
                 .expect("ready book result must draw the book section heading")
         };
@@ -14191,9 +14202,13 @@ mod startup_open_path_resolve_tests {
             detached.pdf_password_request = Some(super::PdfPasswordRequest::legacy(pdf.clone()));
         });
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| {
-            assert!(app.update_active_viewer_context(ctx, None).updated);
-        });
+        ctx.run_pass(Default::default(), |ctx| {
+            assert!(
+                ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                    .updated
+            );
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.with_active_viewer_context(|detached| detached.fs_viewport_shown)
                 .unwrap_or(false)
@@ -14210,9 +14225,10 @@ mod startup_open_path_resolve_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(input, |ctx| {
-            app.update_active_viewer_context(ctx, None);
-        });
+        ctx.run_pass(input, |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+        })
+        .drop_without_applying_deltas();
         assert!(app.pdf_password_dialog_path().is_none());
     }
 
@@ -14251,7 +14267,7 @@ mod startup_open_path_resolve_tests {
         assert_eq!(app.modal_dialog_block_reason(), Some("pdf_password"));
         assert!(!app.active_detached_owns_pdf_password_prompt());
         assert!(!app.detached_window_can_activate(8107));
-        let output = ctx.run(Default::default(), |ctx| {
+        let output = ctx.run_pass(Default::default(), |ctx| {
             app.show_pdf_password_dialog_window(ctx);
         });
         assert!(!output.shapes.is_empty());
@@ -14260,6 +14276,7 @@ mod startup_open_path_resolve_tests {
         assert!(app.pdf_password_dialog_path().is_none());
         assert!(!app.document_open_modal_admission_blocked());
         assert!(app.detached_window_can_activate(8107));
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -14305,8 +14322,11 @@ mod startup_open_path_resolve_tests {
                 super::PdfOpenFailureRoute::ConversionDialogOpened
             );
         });
-        let output = ctx.run(Default::default(), |ctx| {
-            assert!(app.update_active_viewer_context(ctx, None).updated);
+        let output = ctx.run_pass(Default::default(), |ctx| {
+            assert!(
+                ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                    .updated
+            );
         });
         assert!(!app.detached_window_can_activate(8105));
         app.queue_deferred_detached_window_activation(8105, "modal_gate_test");
@@ -14343,14 +14363,16 @@ mod startup_open_path_resolve_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(input, |ctx| {
-            app.update_active_viewer_context(ctx, None);
-        });
+        ctx.run_pass(input, |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+        })
+        .drop_without_applying_deltas();
         assert!(app.active_viewer_context_id().is_none_or(|active| {
             app.with_viewer_context_ref(active, |owner| owner.epub_convert().is_none())
                 .unwrap_or(true)
         }));
         assert!(app.activate_detached_image_window_snapshot(&ctx, 8105));
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -14387,9 +14409,10 @@ mod startup_open_path_resolve_tests {
                 .is_empty())
                 .unwrap()
         );
-        let output = ctx.run(Default::default(), |_| {});
+        let output = ctx.run_pass(Default::default(), |_| {});
         assert!(output.shapes.is_empty());
         assert_eq!(app.modal_dialog_block_reason(), None);
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -14421,9 +14444,10 @@ mod startup_open_path_resolve_tests {
             })
             .unwrap();
         send_done();
-        let _ = ctx.run(Default::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None);
-        });
+        ctx.run_pass(Default::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.with_active_viewer_context(|active| active.epub_convert.is_none())
                 .unwrap_or(true)
@@ -14464,9 +14488,10 @@ mod startup_open_path_resolve_tests {
                 break;
             }
             assert!(std::time::Instant::now() < deadline);
-            let _ = ctx.run(Default::default(), |ctx| {
-                app.update_active_viewer_context(ctx, None);
-            });
+            ctx.run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|ui| app.update_active_viewer_context(ui, None));
+            })
+            .drop_without_applying_deltas();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         app.with_window_viewer_context(8101, |detached| {
@@ -15100,7 +15125,8 @@ mod startup_open_path_resolve_tests {
             .unwrap()
             .fake_published_sender_for_test()();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.top_level_grid_view.history_navigation_transition(),
             Some(super::HistoryNavigationTransition::Physical(request))
@@ -15778,9 +15804,10 @@ mod startup_open_path_resolve_tests {
     }
 
     fn show_archive_convert_dialog_frame(app: &mut App, ctx: &egui::Context) {
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -16389,7 +16416,7 @@ mod startup_open_path_resolve_tests {
         let source = app.tmp.path().join("escape-normal-scan.7z");
         let (tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
         let ctx = egui::Context::default();
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,
@@ -16401,7 +16428,8 @@ mod startup_open_path_resolve_tests {
                 ..Default::default()
             },
             |ctx| app.show_archive_convert_dialog(ctx),
-        );
+        )
+        .drop_without_applying_deltas();
 
         assert!(cancel.load(Ordering::Relaxed));
         assert!(app.archive_convert.is_none());
@@ -16435,7 +16463,9 @@ mod startup_open_path_resolve_tests {
         let app_for_ui = Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 app_for_ui.borrow_mut().show_archive_convert_dialog(ctx);
             });
 
@@ -16546,9 +16576,10 @@ mod startup_open_path_resolve_tests {
         app.archive_convert.as_mut().unwrap().pending_direct_nav = Some(source.clone());
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(crate::folder_tree::path_eq(
@@ -16583,9 +16614,10 @@ mod startup_open_path_resolve_tests {
         app.archive_convert.as_mut().unwrap().pending_nav = Some(cached.clone());
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         finish_bookmark_cache_adoption(&mut app);
@@ -17411,18 +17443,19 @@ mod phase_c_key_tests {
     ) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -17578,7 +17611,7 @@ mod phase_c_key_tests {
             });
             let _owner = app.keyboard_owner_for_pass(&ctx);
             app.handle_delete_key(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             assert_eq!(app.show_delete_confirm, !blocked);
             if blocked {
                 app.stack_return_state = None; // accepted aggregate replacement
@@ -17626,7 +17659,7 @@ mod phase_c_key_tests {
         );
 
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.selected, Some(1));
@@ -19844,18 +19877,19 @@ mod phase_c_folder_nav_history_tests {
     fn history_key_nav(app: &mut App, key: egui::Key) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers: egui::Modifiers::ALT,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::ALT,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::ALT))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                }])
+                .collect(),
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -20809,7 +20843,8 @@ mod phase_c_folder_nav_history_tests {
             .fake_stale_sender_for_test();
         send_stale();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.epub_convert.as_ref().map(|state| &state.phase),
             Some(crate::ui_dialogs::epub_convert::EpubConvertPhase::Stale)
@@ -20843,7 +20878,8 @@ mod phase_c_folder_nav_history_tests {
             .unwrap()
             .fake_error_sender_for_test();
         send_error();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.epub_convert.as_ref().map(|state| &state.phase),
             Some(crate::ui_dialogs::epub_convert::EpubConvertPhase::Error(_))
@@ -20885,7 +20921,8 @@ mod phase_c_folder_nav_history_tests {
             .fake_published_sender_for_test();
         send();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert!(
             matches!(app.top_level_grid_view.history_navigation_transition(),
@@ -21067,7 +21104,8 @@ mod phase_c_folder_nav_history_tests {
         app.epub_convert = Some(saved);
         drop(old_state);
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(
             matches!(app.top_level_grid_view.history_navigation_transition(),
             Some(super::HistoryNavigationTransition::Physical(request))
@@ -21945,7 +21983,7 @@ mod phase_c_folder_nav_history_tests {
                 "old page survives hydration"
             );
             let old_texture = app.fs_holdover_tex.as_ref().unwrap().primary_texture_id();
-            let output = ctx.run(Default::default(), |ctx| {
+            let mut output = ctx.run_pass(Default::default(), |ctx| {
                 app.keep_fullscreen_viewport_alive(ctx)
             });
             assert!(app.fs_viewport_shown);
@@ -21955,12 +21993,13 @@ mod phase_c_folder_nav_history_tests {
                     .iter()
                     .any(|command| matches!(command, egui::ViewportCommand::Visible(false)))
             }));
-            assert!(ctx.tessellate(output.shapes, output.pixels_per_point).iter().any(|clipped| {
+            assert!(ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point).iter().any(|clipped| {
                 matches!(&clipped.primitive, egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == old_texture)
             }), "the keep-alive frame draws the old page texture");
             finish_staged_physical_history_for_test(&mut app);
             assert_eq!(app.fullscreen_idx, Some(0));
             assert!(!app.fs_nav_deferred_reopen_wait_active());
+            output.drop_without_applying_deltas();
         }
     }
 
@@ -23938,18 +23977,19 @@ mod phase_c_folder_nav_history_tests {
                 ..Default::default()
             };
             ctx.begin_pass(egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key: egui::Key::F5,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
+                events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                    .chain(vec![egui::Event::Key {
+                        key: egui::Key::F5,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }])
+                    .collect(),
                 ..Default::default()
             });
             let _ = app.handle_keyboard(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             assert!(
                 app.top_level_grid_view
                     .history_navigation_transition()
@@ -24693,7 +24733,7 @@ mod phase_c_folder_nav_history_tests {
             })
         });
         assert!(app.handle_fullscreen_root_key_input(&ctx));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(app.fullscreen_idx.is_none());
         assert!(!app.pending_return_to_parent);
         assert_eq!(app.visible_indices.len(), 4);
@@ -25039,7 +25079,7 @@ mod phase_c_folder_nav_history_tests {
         let mut frame = 0;
         fn draw(app: &mut App, ctx: &egui::Context, frame: &mut u64) {
             *frame += 1;
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -25049,16 +25089,17 @@ mod phase_c_folder_nav_history_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    app.render_menubar(ctx);
-                    app.render_toolbar(ctx);
-                    app.render_facet_filter_bar(ctx);
-                    app.render_selection_info_bar(ctx);
-                    app.render_folder_pane(ctx);
-                    app.render_checked_selection_overlay(ctx);
-                    assert!(app.render_grid(ctx).is_none());
+                    ctx.root_ui(|ui_arg| app.render_menubar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_facet_filter_bar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_selection_info_bar(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_folder_pane(ui_arg));
+                    ctx.root_ui(|ui_arg| app.render_checked_selection_overlay(ui_arg));
+                    assert!(ctx.root_ui(|ui_arg| app.render_grid(ui_arg)).is_none());
                     app.render_selection_info(ctx);
                 },
-            );
+            )
+            .drop_without_applying_deltas();
             app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
         }
         fn visible(app: &App) -> bool {
@@ -25367,7 +25408,7 @@ mod phase_c_folder_nav_history_tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         fn draw(app: &mut App, ctx: &egui::Context) {
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -25376,9 +25417,10 @@ mod phase_c_folder_nav_history_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui_arg| app.render_grid(ui_arg)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         }
         fn visible(app: &App) -> bool {
             let row = app
@@ -27399,7 +27441,7 @@ mod phase_c_folder_nav_history_tests {
         app.folder_pane.set_cursor(directory.clone());
         app.folder_pane.set_focus_tree();
         // Real pane keyboard gate consumes Enter and starts the real directory scan.
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Enter,
@@ -27413,7 +27455,8 @@ mod phase_c_folder_nav_history_tests {
             |ctx| {
                 assert!(app.handle_folder_pane_keyboard(ctx).is_none());
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert!(app.folder_pane_open_pending.is_some());
         refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -27722,7 +27765,9 @@ mod phase_c_folder_nav_history_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 crate::ime_focus::install_ime_input_policy(ctx);
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -27731,7 +27776,7 @@ mod phase_c_folder_nav_history_tests {
                 }
                 let mut app = render.borrow_mut();
                 app.update_ime_state(ctx);
-                if let Some(nav) = app.render_toolbar(ctx).1 {
+                if let Some(nav) = app.render_toolbar(root_ui).1 {
                     let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
                         panic!("address Enter must produce Direct navigation");
                     };
@@ -28214,9 +28259,10 @@ mod phase_c_folder_nav_history_tests {
             )
             .unwrap();
             let ctx = egui::Context::default();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.show_archive_convert_dialog(ctx)
-            });
+            })
+            .drop_without_applying_deltas();
             finish_staged_physical_history_for_test(&mut app);
             finish_context_jump_hydration(&mut app);
             assert!(app.archive_convert.is_none());
@@ -28368,18 +28414,19 @@ mod phase_c_drill_nav_tests {
     ) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -28881,7 +28928,10 @@ mod phase_c_drill_nav_tests {
         ctx.begin_pass(egui::RawInput {
             events: vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("未確定".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "未確定".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
             ..Default::default()
         });
@@ -28895,7 +28945,7 @@ mod phase_c_drill_nav_tests {
                 .is_some_and(|deadline| deadline > std::time::Instant::now()),
             "IME 中は debounce の残り時間を消費しない"
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -29944,18 +29994,19 @@ mod phase_c_drill_nav_tests {
     fn run_grid_key(app: &mut super::App, modifiers: egui::Modifiers, key: egui::Key) {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let _ = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     /// 2026-05 ユーザー報告: ★フィルタでサムネイルが 0 件になった状態でも、
@@ -33634,9 +33685,11 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
         if materialized {
             break;
         }
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(
             std::time::Instant::now() < deadline,
             "detached image-folder bookmark scan did not complete"
@@ -33966,8 +34019,16 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
         })
         .expect("active detached context");
         assert!(
-            app.update_active_viewer_context(&egui::Context::default(), None)
-                .updated
+            {
+                let ctx = egui::Context::default();
+                let mut result = None;
+                ctx.run_ui(Default::default(), |ui| {
+                    result = Some(app.update_active_viewer_context(ui, None))
+                })
+                .drop_without_applying_deltas();
+                result.unwrap()
+            }
+            .updated
         );
 
         assert!(app.active_viewer_context_id().is_none());
@@ -34006,8 +34067,16 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
     })
     .expect("active detached context");
     assert!(
-        app.update_active_viewer_context(&egui::Context::default(), None)
-            .updated
+        {
+            let ctx = egui::Context::default();
+            let mut result = None;
+            ctx.run_ui(Default::default(), |ui| {
+                result = Some(app.update_active_viewer_context(ui, None))
+            })
+            .drop_without_applying_deltas();
+            result.unwrap()
+        }
+        .updated
     );
 
     assert!(app.active_viewer_context_id().is_none());
@@ -34141,8 +34210,9 @@ mod phase_c_drill_address_tests {
 
     fn settle_repaint_state(ctx: &egui::Context) {
         for _ in 0..4 {
-            let output = ctx.run(egui::RawInput::default(), |_| {});
+            let output = ctx.run_pass(egui::RawInput::default(), |_| {});
             if root_repaint_delay(&output) == std::time::Duration::MAX {
+                output.drop_without_applying_deltas();
                 return;
             }
         }
@@ -34321,9 +34391,10 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_events(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.address.contains("3 件 / 検索中 · 412,000 件を確認"),
             "streaming progress must be visible in the address: {}",
@@ -34348,7 +34419,7 @@ mod phase_c_drill_address_tests {
         })
         .unwrap();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_events(ctx);
         });
         assert!(app.global_search.done);
@@ -34359,6 +34430,7 @@ mod phase_c_drill_address_tests {
             std::time::Duration::ZERO,
             "terminal event 後に即時 repaint を継続しない"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -34389,9 +34461,10 @@ mod phase_c_drill_address_tests {
         .unwrap();
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_events(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.address.contains("ヒット 3 件 · 412,000 件を確認"),
             "{}",
@@ -34409,7 +34482,7 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_debounce(ctx);
         });
         let delay = root_repaint_delay(&output);
@@ -34418,6 +34491,7 @@ mod phase_c_drill_address_tests {
             delay <= std::time::Duration::from_millis(300),
             "delay={delay:?}"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -34432,7 +34506,7 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_events(ctx);
         });
         let delay = root_repaint_delay(&output);
@@ -34444,6 +34518,7 @@ mod phase_c_drill_address_tests {
             delay <= std::time::Duration::from_secs(1),
             "backstop は最大1秒: {delay:?}"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -34467,7 +34542,7 @@ mod phase_c_drill_address_tests {
 
         let ctx = egui::Context::default();
         settle_repaint_state(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.poll_global_search_events(ctx);
         });
         assert_eq!(
@@ -34479,6 +34554,7 @@ mod phase_c_drill_address_tests {
             app.global_search.total_scanned,
             8 * crate::global_search::PAGE_SIZE
         );
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -36855,7 +36931,7 @@ mod favorite_adjustment_defaults_tests {
     fn always_on_top_toggle_has_one_root_command_and_origin_feedback() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.toggle_always_on_top(ctx, crate::app::ActionSurface::MainWindow);
         });
         assert!(app.settings.always_on_top);
@@ -36870,7 +36946,8 @@ mod favorite_adjustment_defaults_tests {
             Some(crate::app::ActionSurface::MainWindow)
         );
 
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        output.drop_without_applying_deltas();
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.set_always_on_top(ctx, true, crate::app::ActionSurface::Viewer);
         });
         assert!(
@@ -36878,7 +36955,9 @@ mod favorite_adjustment_defaults_tests {
                 .commands
                 .is_empty()
         );
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+
+        output.drop_without_applying_deltas();
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
         });
         assert!(!app.settings.always_on_top);
@@ -36894,6 +36973,7 @@ mod favorite_adjustment_defaults_tests {
             app.fs_feedback_toast_surface,
             Some(crate::app::ActionSurface::Viewer)
         );
+        output.drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -41522,7 +41602,7 @@ mod favorite_adjustment_defaults_tests {
         events: Vec<egui::Event>,
         background_clicks: &std::cell::Cell<u32>,
     ) {
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -41544,7 +41624,8 @@ mod favorite_adjustment_defaults_tests {
                     });
                 app.show_rename_migration_recovery_dialog(ctx);
             },
-        );
+        )
+        .drop_without_applying_deltas();
     }
 
     fn recovery_pointer_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
@@ -47931,7 +48012,8 @@ mod favorite_adjustment_defaults_tests {
             if !ctx.has_requested_repaint() {
                 break;
             }
-            let _ = ctx.run(Default::default(), |_| {});
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
         }
         assert!(!ctx.has_requested_repaint(), "ここでは静止している");
 
@@ -49987,9 +50069,10 @@ mod favorite_adjustment_defaults_tests {
         let direct_path = PathBuf::from(r"C:\books\04.rar");
         app.archive_convert.as_mut().unwrap().pending_direct_nav = Some(direct_path.clone());
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(app.archive_convert.is_none());
         assert_eq!(app.current_folder, Some(direct_path));
         assert!(app.zip_enumerate_pending.is_some());
@@ -50044,9 +50127,10 @@ mod favorite_adjustment_defaults_tests {
             crate::app::HistoryTrigger::UserChosen,
         ));
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(!app.archive_convert_deferred_fullscreen_active());
         assert!(!app.fs_nav_is_locked());
@@ -50111,9 +50195,10 @@ mod favorite_adjustment_defaults_tests {
             crate::app::HistoryTrigger::UserChosen,
         ));
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(!app.archive_convert_deferred_fullscreen_active());
         assert!(!app.fs_nav_is_locked());
@@ -50521,7 +50606,7 @@ mod favorite_adjustment_defaults_tests {
         let press_count = app
             .keymap
             .consume_action_press_count(&ctx, crate::keymap::KeyAction::FsCtrlNavNext);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(press_count, 2);
 
         app.handle_fs_navigation(
@@ -51284,9 +51369,10 @@ mod favorite_adjustment_defaults_tests {
         let ctx = egui::Context::default();
         let blocked = |app: &App| {
             let result = std::cell::Cell::new(false);
-            let _ = ctx.run(Default::default(), |ctx| {
+            ctx.run_pass(Default::default(), |ctx| {
                 result.set(app.shortcuts_blocked_by_text_input(ctx));
-            });
+            })
+            .drop_without_applying_deltas();
             result.get()
         };
         // 全フォーカスフラグが false の初期状態ではブロックされない。
@@ -51337,9 +51423,10 @@ mod favorite_adjustment_defaults_tests {
         let ctx = egui::Context::default();
         let owner = std::cell::Cell::new(crate::keyboard_input::KeyboardOwner::Unclaimed);
 
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_pass(Default::default(), |ctx| {
             owner.set(app.keyboard_owner_for_pass(ctx));
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(matches!(
             owner.get(),
@@ -51359,7 +51446,7 @@ mod favorite_adjustment_defaults_tests {
             crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
         ));
         app.claim_pending_text_input_focus(ctx.viewport_id(), widget_id, ctx.cumulative_pass_nr());
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         ctx.begin_pass(Default::default());
         assert_eq!(
@@ -51370,14 +51457,14 @@ mod favorite_adjustment_defaults_tests {
                 phase: crate::keyboard_input::TextInputPhase::PendingFocus,
             }
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         ctx.begin_pass(Default::default());
         assert!(matches!(
             app.keyboard_owner_for_pass(&ctx),
             crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     /// 削除確認ダイアログの文言は対象パスのドライブ種別・ゴミ箱設定で変わるため、
@@ -54919,18 +55006,19 @@ mod pipeline_cache_refactor_tests {
                 ..Default::default()
             };
             ctx.begin_pass(egui::RawInput {
-                modifiers: ctrl,
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: ctrl,
-                }],
+                events: std::iter::once(egui::Event::ModifiersChanged(ctrl))
+                    .chain(vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: ctrl,
+                    }])
+                    .collect(),
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(&ctx, idx, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
 
             assert!(!app.erase_mode, "E must remain blocked");
             assert!(!app.local_adjust_mode, "Ctrl+G must remain blocked");
@@ -58957,7 +59045,8 @@ mod pipeline_cache_refactor_tests {
             if !ctx.has_requested_repaint() {
                 break;
             }
-            let _ = ctx.run(Default::default(), |_| {});
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
         }
         assert!(!ctx.has_requested_repaint(), "ここでは静止している");
 
@@ -61000,7 +61089,7 @@ mod native_video_display_mode_input_tests {
         begin_generic_v_pass(&mut app, &ctx);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(
             app.video_zoom_state.map(|state| state.scale()),
             Some(crate::video::zoom_view::VIDEO_ZOOM_FIT_SCALE),
@@ -61085,7 +61174,7 @@ mod native_video_display_mode_input_tests {
 
         begin_generic_v_pass(&mut app, &ctx);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.is_panorama_mode_active(idx));
         assert!(app.video_zoom_state.is_none());
@@ -64452,9 +64541,12 @@ mod still_window_mode_key_tests {
 
     fn run_active_detached_frame_for_test(app: &mut App, ctx: &egui::Context) {
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated, "the active detached context must be updated");
     }
 
@@ -64762,9 +64854,10 @@ mod still_window_mode_key_tests {
             ],
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
+        ctx.run_pass(input, |ctx| {
             captured = shared.capture_right_drag_event(ctx, true);
-        });
+        })
+        .drop_without_applying_deltas();
         captured
     }
 
@@ -66183,14 +66276,15 @@ mod still_window_mode_key_tests {
             });
         }
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
     }
@@ -66210,7 +66304,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F11, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             handled,
@@ -66243,7 +66337,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F11, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(
             handled,
             "fullscreen root key path should absorb non-action keys"
@@ -66252,7 +66346,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F13, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert!(app.settings.video_in_window_mode);
@@ -66307,12 +66401,14 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let draw_probe_text = |ctx: &egui::Context| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.label("font update probe 日本語");
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    ui.label("font update probe 日本語");
+                })
             });
         };
 
-        let baseline = ctx.run(egui::RawInput::default(), draw_probe_text);
+        let baseline = ctx.run_pass(egui::RawInput::default(), draw_probe_text);
         assert!(
             !baseline.textures_delta.set.is_empty(),
             "the baseline pass must materialize its initial atlas"
@@ -66325,7 +66421,7 @@ mod still_window_mode_key_tests {
             "multiple setting edits before the next root pass coalesce into one application"
         );
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.apply_pending_main_font_update(ctx);
             draw_probe_text(ctx);
             assert!(
@@ -66336,14 +66432,15 @@ mod still_window_mode_key_tests {
                 !ctx.will_discard(),
                 "the old definitions and old atlas remain valid for this pass; no repass is needed"
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
-        let applied = ctx.run(egui::RawInput::default(), draw_probe_text);
+        let applied = ctx.run_pass(egui::RawInput::default(), draw_probe_text);
         assert!(
             !applied.textures_delta.set.is_empty(),
             "the next begin_pass must apply the requested definitions and emit their atlas delta"
         );
-        let stable = ctx.run(egui::RawInput::default(), |ctx| {
+        let stable = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.apply_pending_main_font_update(ctx);
             draw_probe_text(ctx);
         });
@@ -66355,6 +66452,11 @@ mod still_window_mode_key_tests {
             !app.main_font_update_pending,
             "font settings must not re-arm themselves for later frames"
         );
+        applied.drop_without_applying_deltas();
+
+        baseline.drop_without_applying_deltas();
+
+        stable.drop_without_applying_deltas();
     }
     #[test]
     fn still_image_root_f11_repeat_is_ignored() {
@@ -66367,7 +66469,7 @@ mod still_window_mode_key_tests {
 
         begin_root_key_pass(&ctx, egui::Key::F11, true);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled, "repeat F11 is still a fullscreen root key");
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -66943,7 +67045,7 @@ mod still_window_mode_key_tests {
             app.detached_window_state(session.window_id),
             Some(DetachedWindowState::Opening)
         );
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         app.bind_mounted_context_for_test(session.window_id);
 
         let request_id = begin_test_video_presentation_transition(
@@ -67055,7 +67157,7 @@ mod still_window_mode_key_tests {
         app.set_detached_window_binding_for_test(Some(window_id));
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
         app.detached_window_hwnd_set(window_id, 0x1000 + window_id);
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
 
         assert_eq!(
             app.detached_window_state(window_id),
@@ -68701,9 +68803,12 @@ mod still_window_mode_key_tests {
         .expect("active detached context must mount");
 
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
         assert!(
             app.with_active_viewer_context(|active| active.folder_pane_open_pending.is_some())
@@ -68726,9 +68831,12 @@ mod still_window_mode_key_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             app.poll_sidecar_restore(&ctx);
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                updated = app.update_active_viewer_context(ctx, None).updated;
-            });
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                updated = ctx
+                    .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                    .updated;
+            })
+            .drop_without_applying_deltas();
             let opened = app
                 .with_active_viewer_context(|active| active.fullscreen_idx.is_some())
                 .unwrap_or(false);
@@ -68889,9 +68997,12 @@ mod still_window_mode_key_tests {
         .expect("active detached context must mount");
 
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
         assert!(
             app.active_viewer_context_id().is_none(),
@@ -68949,9 +69060,11 @@ mod still_window_mode_key_tests {
             context.detached_viewer_open_next_still_detached_once = false;
         });
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(
             app.with_active_viewer_context(|active| active.pdf_password_request.is_some())
                 .unwrap_or(false),
@@ -69020,10 +69133,11 @@ mod still_window_mode_key_tests {
             app.pdf_password_save = true;
 
             let mut summary = None;
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 summary = app
                     .take_and_close_current_active_viewer_context(ctx, "test_pdf_terminal_close");
-            });
+            })
+            .drop_without_applying_deltas();
             let summary = summary.expect("the detached context must be closed");
 
             assert!(summary.had_pdf_password_request);
@@ -69067,9 +69181,11 @@ mod still_window_mode_key_tests {
         })
         .expect("the terminal producer must be mounted in its owning context");
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
 
         assert!(
             app.active_viewer_context_id().is_none(),
@@ -69891,9 +70007,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         let expected_pages = ["page-001.jpg", "page-002.png"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -69928,9 +70045,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         let expected_pages = ["cover.jpg", "page-002.webp"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -69966,9 +70084,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.detached_viewer_open_images_in_window = false;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
@@ -70006,9 +70125,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_grid_archive_open_request_seq += 1;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
@@ -70207,9 +70327,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .unwrap();
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         let expected_pages = ["cached-rar-cover.jpg", "cached-rar-page-002.png"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -70276,9 +70397,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         .unwrap();
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
@@ -71209,9 +71331,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         })
         .unwrap();
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.active_detached_session.is_none());
@@ -71264,9 +71388,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         })
         .expect("active detached context must mount");
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         app.finish_page_identity_preparation_for_test();
         app.with_active_viewer_context(|active| {
             let fullscreen_item = active.fullscreen_idx.and_then(|idx| active.items.get(idx));
@@ -71450,14 +71576,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.visible_indices = vec![0, 1];
 
         let mut reason = "";
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             reason = app.reopen_fullscreen_after_folder_nav_load(
                 ctx,
                 false,
                 false,
                 crate::app::HistoryTrigger::UserChosen,
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(reason, "done");
         assert_eq!(
@@ -71776,9 +71903,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         });
 
         let mut updated = false;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
 
         assert!(
@@ -72468,9 +72598,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             modifiers: egui::Modifiers::NONE,
         });
         let mut updated = false;
-        let _ = ctx.run(input, |ctx| {
-            updated = app.update_active_viewer_context(ctx, None).updated;
-        });
+        ctx.run_pass(input, |ctx| {
+            updated = ctx
+                .root_ui(|ui| app.update_active_viewer_context(ui, None))
+                .updated;
+        })
+        .drop_without_applying_deltas();
         assert!(updated);
 
         assert!(!app.fs_viewport_shown);
@@ -73220,7 +73353,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         drop(local_ai_activity);
         assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
         app.poll_remote_session(&ctx);
@@ -73283,7 +73416,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.fullscreen_idx, None);
         assert!(!app.pending_auto_fs_open);
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
         assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
@@ -73714,20 +73847,21 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let mut app = setup_app();
         app.fs_viewport_shown = true;
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::InProgress
         );
         assert_eq!(
-            app.local_viewer_close_state(Some(
-                crate::app::LocalViewerCloseFailure::ActiveContextRetire
-            )),
+            app.local_viewer_close_state(
+                &egui::Context::default(),
+                Some(crate::app::LocalViewerCloseFailure::ActiveContextRetire)
+            ),
             crate::app::LocalViewerCloseState::Failed(
                 crate::app::LocalViewerCloseFailure::ActiveContextRetire
             )
         );
         app.fs_viewport_shown = false;
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::Closed
         );
     }
@@ -73737,7 +73871,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let mut app = setup_app();
         app.native_video_parked_live_activation_requests.push(77);
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::InProgress
         );
         assert_eq!(
@@ -73746,7 +73880,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert!(app.native_video_parked_live_activation_requests.is_empty());
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&egui::Context::default(), None),
             crate::app::LocalViewerCloseState::Closed
         );
     }
@@ -73772,7 +73906,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let output = ctx.end_pass();
         assert!(!app.fs_viewport_shown);
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
         assert!(
@@ -73789,6 +73923,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 .map(|(id, viewport)| (id, &viewport.commands))
                 .collect::<Vec<_>>()
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -74067,7 +74202,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.detached_image_windows.is_empty());
         assert!(app.detached_window_manager.is_empty());
         assert_eq!(
-            app.local_viewer_close_state(None),
+            app.local_viewer_close_state(&ctx, None),
             crate::app::LocalViewerCloseState::Closed
         );
     }
@@ -74319,7 +74454,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(121, DetachedSource::Video);
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&ctx);
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
@@ -74365,7 +74500,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(122, DetachedSource::Video);
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&ctx);
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
@@ -77486,6 +77621,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].id, 7);
         assert!(app.detached_window_can_activate(app.detached_image_windows[0].id));
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -77512,6 +77648,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             !output.viewport_output.contains_key(&viewport_id),
             "a closed viewport must not receive a stale CursorVisible command"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -78817,7 +78954,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
             bundle.detached_viewer_independent_active = true;
         });
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
 
         app.open_fullscreen(second_main, crate::app::HistoryTrigger::UserChosen);
 
@@ -81057,7 +81194,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             !handled,
@@ -81215,13 +81352,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.hide_native_video_black_backdrop_if_shown(ctx);
             assert!(
                 !ctx.will_discard(),
                 "backdrop visibility is unrelated to the main renderer's valid atlas"
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(!app.fs_viewport_shown);
         assert_eq!(app.fs_viewport_presentation, None);
@@ -81243,13 +81381,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.main_font_update_pending,
             "a detached session does not own or relocate the main Context's settings update"
         );
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.apply_pending_main_font_update(ctx);
             assert!(
                 !ctx.will_discard(),
                 "applying real font settings does not require a same-frame repass"
             );
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(!app.main_font_update_pending);
     }
     #[test]
@@ -81263,13 +81402,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
         app.fs_viewport_generation = 4;
 
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.hide_current_fullscreen_viewport_for_recreate(ctx, idx);
             assert!(
                 !ctx.will_discard(),
                 "recreating a viewport does not invalidate the shared renderer atlas"
             );
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(app.fs_viewport_generation, 5);
         assert!(
@@ -81784,7 +81924,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "publishing materialized content is not a viewport render"
         );
 
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         assert_eq!(
             app.active_detached_session.unwrap().content_phase,
             DetachedSessionContentPhase::Ready
@@ -81820,7 +81960,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             Some(DetachedWindowState::Opening),
             "publishing the session must not erase the lifecycle before its first viewport render"
         );
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Active)
@@ -81848,7 +81988,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             Some(DetachedWindowState::Resuming),
             "resumption remains nonterminal until its viewport is rendered"
         );
-        app.mark_active_detached_viewport_rendered();
+        app.mark_active_detached_viewport_rendered(&egui::Context::default());
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Active)
@@ -86164,6 +86304,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         // セッション id 一致 → marker が立つ。
         app.mark_active_detached_viewport_rendered_if_matches(
+            &egui::Context::default(),
             App::detached_image_window_viewport_id(3),
         );
         assert!(app.active_detached_viewport_rendered_this_frame());
@@ -86174,6 +86315,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         // 別 id (= 既存経路が別 viewport を描いた gap) では marker を立てない。
         app.mark_active_detached_viewport_rendered_if_matches(
+            &egui::Context::default(),
             App::detached_image_window_viewport_id(999),
         );
         assert!(!app.active_detached_viewport_rendered_this_frame());
@@ -86262,11 +86404,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             input
                 .viewports
                 .insert(viewport.ids.this, egui::ViewportInfo::default());
-            let output = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            let output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
             *renderer_capture.borrow_mut() = Some((builder, output));
         });
         ctx.set_embed_viewports(false);
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -86275,7 +86417,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 ..Default::default()
             },
             |ctx| app.render_active_detached_viewport_backstop(ctx),
-        );
+        )
+        .drop_without_applying_deltas();
         let output = captured.borrow_mut().take();
         output
     }
@@ -86329,6 +86472,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
             })
             .unwrap();
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -86371,6 +86515,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             );
             assert!(output_uses_texture(&rendered.1, texture));
             assert!(app.active_detached_viewport_rendered_this_frame());
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -86429,6 +86574,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 "the first active backstop render completes Opening"
             );
             assert!(app.active_detached_viewport_rendered_this_frame());
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -86481,6 +86627,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 "the first active backstop render completes Opening"
             );
             assert!(app.active_detached_viewport_rendered_this_frame());
+            rendered.1.drop_without_applying_deltas();
         })
         .join()
         .unwrap();
@@ -86497,7 +86644,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.stash_mounted_as_active_for_test(207);
             set_detached_host_for_test(&mut app, 207, 0x2070, true);
             app.frame_counter = 202;
-            app.mark_active_detached_viewport_rendered();
+            app.mark_active_detached_viewport_rendered(&ctx);
 
             assert!(render_backstop_with_captured_viewport(&mut app, &ctx).is_none());
             assert!(app.active_viewer_context_id().is_some());
@@ -86844,7 +86991,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_suppress_enter_close_until_release = false;
         begin_root_key_pass(&ctx, egui::Key::Enter, false);
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -86872,7 +87019,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.items_generation = app.items_generation.wrapping_add(1);
         begin_root_key_pass(&ctx, egui::Key::Enter, false);
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -86902,7 +87049,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::Enter, false);
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(nav.is_none());
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -88171,7 +88318,6 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
             id: 7,
-            viewport_close_requested: false,
             bar_close_requested: false,
             focused: true,
             placement_update: None,
@@ -88269,7 +88415,6 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
             id: 7,
-            viewport_close_requested: false,
             bar_close_requested: false,
             focused: false,
             placement_update: Some(default_candidate),
@@ -88331,7 +88476,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             handled,
@@ -88350,7 +88495,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, true);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled, "repeat F12 is still a fullscreen root key");
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -88367,7 +88512,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::F12, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled, "F12 remains a fullscreen root key while editing");
         assert_eq!(app.fullscreen_idx, Some(idx));
@@ -88401,7 +88546,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::Modifiers::SHIFT,
         );
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -88441,7 +88586,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
             begin_root_key_pass(&ctx, egui::Key::ArrowRight, false);
             let handled = app.handle_fullscreen_root_key_input(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
 
             assert!(handled);
             assert_eq!(app.fullscreen_idx, Some(expected), "{cursor_direction:?}");
@@ -88467,7 +88612,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::Modifiers::SHIFT,
         );
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -88533,7 +88678,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::Modifiers::SHIFT,
         );
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -88553,7 +88698,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass_with_modifiers(&ctx, egui::Key::ArrowUp, false, egui::Modifiers::SHIFT);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(
@@ -88574,7 +88719,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::Backspace, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             handled,
@@ -88606,7 +88751,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass(&ctx, egui::Key::Backspace, false);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         assert_eq!(app.fullscreen_idx, None);
@@ -88643,7 +88788,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass_with_modifiers(&ctx, egui::Key::F2, false, egui::Modifiers::SHIFT);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         let source_key = crate::adjustment_db::normalize_path(&src);
@@ -88680,7 +88825,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         begin_root_key_pass_with_modifiers(&ctx, egui::Key::F4, false, egui::Modifiers::SHIFT);
         let handled = app.handle_fullscreen_root_key_input(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(handled);
         let literal_key = crate::adjustment_db::normalize_path(&src.join("bookB"));
@@ -88790,7 +88935,7 @@ mod file_operation_selection_tests {
         });
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.show_delete_confirm);
         assert_eq!(app.delete_targets, vec![(folder, folder_path)]);
@@ -88823,7 +88968,7 @@ mod file_operation_selection_tests {
         });
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(!app.show_delete_confirm);
         assert!(app.delete_targets.is_empty());
@@ -88899,7 +89044,7 @@ mod file_operation_selection_tests {
             ..Default::default()
         });
         app.handle_clipboard_shortcuts(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(
             app.fs_feedback_toast.is_none(),
             "割り当て解除後の egui Copy event は既定 Ctrl+C を復活させない"
@@ -88912,7 +89057,7 @@ mod file_operation_selection_tests {
             ..Default::default()
         });
         app.handle_clipboard_shortcuts(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
             toast
                 .0
@@ -90577,9 +90722,11 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
         unit: egui::MouseWheelUnit::Line,
         delta: egui::vec2(0.0, -1.0),
         modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
     });
 
-    let _ = ctx.run(input, |ctx| {
+    ctx.run_pass(input, |ctx| {
         egui::Window::new("future_dialog_not_in_registry")
             .fixed_pos(egui::pos2(40.0, 40.0))
             .fixed_size(egui::vec2(240.0, 160.0))
@@ -90588,7 +90735,8 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
             });
         assert!(App::floating_ui_blocks_background_scroll(ctx));
         app.process_scroll(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
 
     assert_eq!(app.scroll_offset_y, 56.0);
 }
@@ -90804,9 +90952,10 @@ mod smart_folder_transition_tests {
             app.shortcuts_blocked_by_text_input(&ctx),
             "main keyboard and gamepad dispatch must share the modal gate"
         );
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.render_smart_folder_overlay(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(ctx.memory(|memory| memory.top_modal_layer().is_some()));
     }
 
@@ -93278,7 +93427,7 @@ mod smart_folder_transition_tests {
         assert_eq!(convertible_archive_main_state(&app), before);
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,
@@ -93290,7 +93439,8 @@ mod smart_folder_transition_tests {
                 ..Default::default()
             },
             |ctx| app.show_archive_convert_dialog(ctx),
-        );
+        )
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert_eq!(convertible_archive_main_state(&app), before);
@@ -93324,9 +93474,10 @@ mod smart_folder_transition_tests {
         )
         .unwrap();
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -94549,9 +94700,10 @@ mod smart_folder_transition_tests {
         app.fs_feedback_toast = None;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -94586,9 +94738,10 @@ mod smart_folder_transition_tests {
         app.fs_feedback_toast = None;
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -94659,9 +94812,10 @@ mod smart_folder_transition_tests {
         assert_eq!(app.snapshot_owner_entry(&current_source), Some(0));
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(
@@ -94728,9 +94882,10 @@ mod smart_folder_transition_tests {
         );
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert!(app.archive_convert.is_none());
         assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
@@ -97628,7 +97783,7 @@ fn tooltip_layer_does_not_disable_normal_grid_wheel() {
         .events
         .push(egui::Event::PointerMoved(egui::pos2(80.0, 80.0)));
 
-    let _ = ctx.run(input, |ctx| {
+    ctx.run_pass(input, |ctx| {
         egui::Area::new(egui::Id::new("grid_hover_tooltip"))
             .order(egui::Order::Tooltip)
             .fixed_pos(egui::pos2(40.0, 40.0))
@@ -97637,7 +97792,8 @@ fn tooltip_layer_does_not_disable_normal_grid_wheel() {
                 ui.label("tooltip body");
             });
         assert!(!App::floating_ui_blocks_background_scroll(ctx));
-    });
+    })
+    .drop_without_applying_deltas();
 }
 
 #[test]
@@ -97706,9 +97862,12 @@ fn settings_restore_blocks_background_wheel_scroll() {
         unit: egui::MouseWheelUnit::Line,
         delta: egui::vec2(0.0, -1.0),
         modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
     });
 
-    let _ = ctx.run(input, |ctx| app.process_scroll(ctx));
+    ctx.run_pass(input, |ctx| app.process_scroll(ctx))
+        .drop_without_applying_deltas();
 
     assert_eq!(app.scroll_offset_y, 56.0);
 }
@@ -98094,6 +98253,7 @@ fn main_window_close_ring_action_remains_grid_scoped() {
             .load(std::sync::atomic::Ordering::SeqCst),
         "close-main must remain eligible for tray interception"
     );
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -98126,6 +98286,7 @@ fn quit_ring_action_uses_root_close_in_every_context() {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "explicit quit must bypass tray interception from {context:?}"
         );
+        output.drop_without_applying_deltas();
     }
 }
 
@@ -98283,21 +98444,23 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         crate::settings::FsSidePanelMode::Hover
     );
     assert!(ctx.input(|i| i.events.is_empty()));
-    egui::CentralPanel::default().show(&ctx, |ui| {
-        let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
-        let _ = ui.interact(
-            rect,
-            egui::Id::new("fullscreen_tab_round_trip_surface"),
-            egui::Sense::click_and_drag(),
-        );
+    ctx.root_ui(|root_ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
+            let _ = ui.interact(
+                rect,
+                egui::Id::new("fullscreen_tab_round_trip_surface"),
+                egui::Sense::click_and_drag(),
+            );
+        })
     });
-    assert!(!ctx.wants_keyboard_input());
+    assert!(!ctx.egui_wants_keyboard_input());
     let _ = app.handle_fs_key_input(&ctx, idx, false);
     assert_eq!(
         app.settings.fullscreen_side_panel_mode,
         crate::settings::FsSidePanelMode::Hover
     );
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     begin_fullscreen_tab_pass(&ctx, true);
     let _ = app.handle_fs_key_input(&ctx, idx, false);
@@ -98306,7 +98469,7 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         crate::settings::FsSidePanelMode::Hover
     );
     assert!(ctx.input(|i| i.events.is_empty()));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     ctx.begin_pass(egui::RawInput {
         events: vec![egui::Event::Key {
@@ -98318,7 +98481,7 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         }],
         ..Default::default()
     });
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     begin_fullscreen_tab_pass(&ctx, false);
     let _ = app.handle_fs_key_input(&ctx, idx, false);
@@ -98327,7 +98490,7 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
         crate::settings::FsSidePanelMode::ClickToShow
     );
     assert!(ctx.input(|i| i.events.is_empty()));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -98350,7 +98513,7 @@ fn fullscreen_i_key_toggles_side_panel_mode() {
     });
 
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(
         app.settings.fullscreen_side_panel_mode,
@@ -98380,7 +98543,7 @@ fn plain_a_has_no_bookmark_panel_fullscreen_action() {
     });
 
     let action = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(action.page_nav.is_none());
     assert!(!action.close);
@@ -98479,7 +98642,7 @@ fn configured_fs_collection_key_reaches_current_image_handler_once() {
         app.fs_feedback_toast.is_none(),
         "same FS press must not be reused"
     );
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -98505,7 +98668,7 @@ fn configured_media_collection_key_reaches_egui_video_and_music_handlers() {
                 .as_ref()
                 .is_some_and(|(text, _, _)| text.contains("追加先"))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 }
 
@@ -98536,21 +98699,23 @@ fn start_bookmark_title_edit_after_handler(app: &mut App, ctx: &egui::Context, f
         title: String::from("editing"),
         request_focus: true,
     });
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 fn draw_bookmark_title_editor(app: &mut App, ctx: &egui::Context) {
-    egui::CentralPanel::default().show(ctx, |ui| {
-        let edit = app
-            .book_bookmark_title_edit
-            .as_mut()
-            .expect("bookmark title editor must be active");
-        let _ = crate::ui_adjustment_panel::draw_bookmark_title_edit_for_test(
-            ui,
-            edit.id,
-            &mut edit.title,
-            &mut edit.request_focus,
-        );
+    ctx.root_ui(|root_ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            let edit = app
+                .book_bookmark_title_edit
+                .as_mut()
+                .expect("bookmark title editor must be active");
+            let _ = crate::ui_adjustment_panel::draw_bookmark_title_edit_for_test(
+                ui,
+                edit.id,
+                &mut edit.title,
+                &mut edit.request_focus,
+            );
+        })
     });
 }
 
@@ -98570,7 +98735,7 @@ fn focus_bookmark_title_editor(app: &mut App, ctx: &egui::Context, fs_idx: usize
     let action = app.handle_fs_key_input(ctx, fs_idx, false);
     assert_no_fullscreen_fixed_key_action(action);
     draw_bookmark_title_editor(app, ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert!(
         app.pending_text_input_focus.get().is_some(),
         "pending focus claim must survive until the handler observes focused TextEdit"
@@ -98607,7 +98772,7 @@ fn run_bookmark_title_key_pass(
     );
     let action = app.handle_fs_key_input(ctx, fs_idx, false);
     draw_bookmark_title_editor(app, ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     action
 }
 
@@ -98667,12 +98832,14 @@ fn focused_slider_still_allows_fullscreen_arrow_navigation() {
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     let mut value = 0.5_f32;
     ctx.begin_pass(Default::default());
-    egui::CentralPanel::default().show(&ctx, |ui| {
-        ui.add(egui::Slider::new(&mut value, 0.0..=1.0))
-            .request_focus();
+    ctx.root_ui(|root_ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            ui.add(egui::Slider::new(&mut value, 0.0..=1.0))
+                .request_focus();
+        })
     });
-    let _ = ctx.end_pass();
-    assert!(ctx.wants_keyboard_input());
+    ctx.end_pass().drop_without_applying_deltas();
+    assert!(ctx.egui_wants_keyboard_input());
 
     ctx.begin_pass(egui::RawInput {
         events: vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
@@ -98684,7 +98851,7 @@ fn focused_slider_still_allows_fullscreen_arrow_navigation() {
         crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
     ));
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(!action.page_nav.is_none());
 }
@@ -98705,7 +98872,7 @@ fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
     });
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(!action.page_nav.is_none());
 }
@@ -98759,7 +98926,7 @@ fn fullscreen_routed_tap_is_consumed_once_after_focus_loss() {
 
     let first = app.handle_fs_key_input(&ctx, fs_idx, false);
     let second = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(first.page_nav, crate::ui_fullscreen::FsPageNav::Delta(1));
     assert_no_fullscreen_fixed_key_action(second);
@@ -98784,7 +98951,7 @@ fn fullscreen_sibling_edge_does_not_authorize_unfocused_egui_event() {
     crate::key_input::add_test_frame_active_viewport(viewport);
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -98799,7 +98966,7 @@ fn fullscreen_unfocused_pass_without_edge_or_event_does_nothing() {
     crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -98822,7 +98989,7 @@ fn fullscreen_modal_owner_blocks_routed_edge_after_focus_loss() {
     );
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -98853,7 +99020,7 @@ fn fullscreen_text_input_owner_blocks_routed_edge_after_focus_loss() {
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
     draw_bookmark_title_editor(&mut app, &ctx);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -98881,7 +99048,7 @@ fn fullscreen_released_auto_repeat_is_dropped_after_focus_loss() {
     );
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
 }
@@ -98903,7 +99070,7 @@ fn fullscreen_focus_loss_clears_zoom_transient_without_rearming_from_z_edge() {
     crate::key_input::set_test_frame_for_viewport(viewport, vec![fullscreen_z_edge(true, false)]);
 
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_no_fullscreen_fixed_key_action(action);
     assert!(!app.fs_zoom_aiming);
@@ -98924,14 +99091,14 @@ fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
     ));
     app.update_ime_state(&ctx);
     assert!(app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     ctx.begin_pass(viewport_raw_input(
         viewport_b,
         vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
     ));
     let action = app.handle_fs_key_input(&ctx, fs_idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(!action.page_nav.is_none());
 }
@@ -98949,12 +99116,12 @@ fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event
     ));
     app.update_ime_state(&ctx);
     assert!(app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     ctx.begin_pass(viewport_raw_input(viewport_b, Vec::new()));
     app.update_ime_state(&ctx);
     assert!(!app.ime_input_active(&ctx));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 }
 
 #[test]
@@ -98974,44 +99141,50 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
     let mut title = String::new();
     let mut request_focus = true;
     let draw_field = |ctx: &egui::Context, title: &mut String, request_focus: &mut bool| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let _ = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
-                edit.id(field_id)
-            });
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let _ = crate::ime_focus::add_singleline(ui, title, Some(request_focus), |edit| {
+                    edit.id(field_id)
+                });
+            })
         });
     };
 
     ctx.begin_pass(Default::default());
     draw_field(&ctx, &mut title, &mut request_focus);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
     ctx.begin_pass(egui::RawInput {
         events: vec![
             egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "あ".to_owned(),
+                active_range_chars: None,
+            }),
         ],
         ..Default::default()
     });
     draw_field(&ctx, &mut title, &mut request_focus);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     let alt = egui::Modifiers {
         alt: true,
         ..Default::default()
     };
     ctx.begin_pass(egui::RawInput {
-        modifiers: alt,
-        events: vec![
-            egui::Event::Ime(egui::ImeEvent::Disabled),
-            egui::Event::Key {
-                key: egui::Key::J,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: alt,
-            },
-        ],
+        events: std::iter::once(egui::Event::ModifiersChanged(alt))
+            .chain(vec![
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::Key {
+                    key: egui::Key::J,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: alt,
+                },
+            ])
+            .collect(),
         ..Default::default()
     });
     // Windows Alt/IME processing can remove egui's focused widget before the
@@ -99026,7 +99199,7 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
         }
     );
     draw_field(&ctx, &mut title, &mut request_focus);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
     ctx.begin_pass(egui::RawInput {
@@ -99040,7 +99213,7 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
         ..Default::default()
     });
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert!(
         app.adjustment_mode.is_open(),
@@ -99064,18 +99237,19 @@ fn still_seek_strip_toggle_key_uses_shared_setting_and_obeys_keymap() {
 
     let press = |app: &mut App, key: egui::Key, modifiers: egui::Modifiers| {
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }])
+                .collect(),
             ..Default::default()
         });
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     };
     let shift = egui::Modifiers {
         shift: true,
@@ -99120,7 +99294,7 @@ fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(&ctx, idx, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
 
         assert_eq!(
@@ -99150,7 +99324,7 @@ fn music_fullscreen_i_key_toggles_side_panel_mode() {
     });
 
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(
         app.settings.fullscreen_side_panel_mode,
@@ -99180,7 +99354,7 @@ fn music_fullscreen_i_and_tab_return_to_hover_without_repeat_retoggle() {
                 ..Default::default()
             });
             let _ = app.handle_fs_key_input(&ctx, idx, false);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
 
         assert_eq!(
@@ -99209,7 +99383,7 @@ fn video_audio_toggle_normal_video_egui_requests_enter() {
     let _ = app.keyboard_owner_for_pass(&ctx);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(
         crate::app::native_video::take_video_audio_enter_requests_for_test(),
@@ -99251,7 +99425,7 @@ fn video_adjust_slot_egui_loads_saved_slot_when_video_is_visible() {
     let _ = app.keyboard_owner_for_pass(&ctx);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, saved);
 }
@@ -99313,7 +99487,7 @@ fn video_adjust_slot_egui_does_not_load_when_presenter_is_hidden() {
     begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num1);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, before);
 }
@@ -99333,7 +99507,7 @@ fn video_adjust_slot_egui_loads_when_audio_mode_vst_makes_video_visible() {
     begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num1);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, saved);
 }
@@ -99348,7 +99522,7 @@ fn video_adjust_slot_egui_empty_slot_keeps_current_adjustments() {
     begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num2);
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, before);
 }
@@ -99378,7 +99552,7 @@ fn video_adjust_slot_egui_modal_guard_leaves_key_unconsumed() {
             )
         })
     }));
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.settings.video_adjustments, before);
 }
@@ -99440,7 +99614,7 @@ fn video_audio_toggle_audio_mode_egui_requests_exit() {
     });
 
     let _ = app.handle_fs_key_input(&ctx, idx, false);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.video_audio_mode, None);
     assert!(
@@ -99495,7 +99669,7 @@ fn video_audio_toggle_repeat_egui_does_not_request_transition() {
         events: vec![fullscreen_fixed_key_event(egui::Key::Z)],
         ..Default::default()
     });
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     ctx.begin_pass(egui::RawInput {
         events: vec![fullscreen_fixed_key_event_with_state(
             egui::Key::Z,
@@ -99520,7 +99694,7 @@ fn video_audio_toggle_repeat_egui_does_not_request_transition() {
     }));
 
     app.handle_video_input(&ctx, idx, None);
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
 
     assert_eq!(app.video_audio_mode, None);
     assert_eq!(
@@ -100803,11 +100977,11 @@ mod rating_write_failure_tests {
                 crate::gamepad::PadAxis::LeftX,
                 0.9,
             ));
-        let _ = app.sample_gamepad_input(&ctx);
+        let _ = app.sample_gamepad_input_with_logic_for_test(&ctx);
         assert!(!app.gamepad.state.is_idle());
 
         app.settings.gamepad_enabled = false;
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
 
         assert!(batch.session_ended_for_test(), "区切りを batch で伝える");
         assert!(app.gamepad.state.is_idle(), "物理側は sample が終わらせる");
@@ -100855,7 +101029,7 @@ mod rating_write_failure_tests {
         // パッドが切れる (= 設定 OFF と同じ終端)。sample は物理側だけを終わらせ、
         // リングの確定は通常の配送が所有 context で行う (N01)。
         app.settings.gamepad_enabled = false;
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
         assert!(
             app.ring_picker.is_some(),
             "sample はリングを確定しない (root 投影のため)"
@@ -102006,7 +102180,7 @@ mod ring_picker_owner_tests {
         // メイン一覧が前面のままパッドが切れる。
         app.gamepad
             .push_for_test(crate::gamepad::PadEvent::Disconnected);
-        let batch = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input_with_logic_for_test(&ctx);
         assert!(batch.session_ended_for_test(), "区切りを batch で伝える");
         let _ = app.dispatch_gamepad_batch(&ctx, batch);
 
@@ -102305,7 +102479,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
     crate::ui_fonts::configure_fonts(&ctx);
     // TopBottomPanel learns the integrated toolbar height on its first frame.
     // Inspect the settled frame, as the real event loop and Harness do.
-    let _ = ctx.run(
+    ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -102314,10 +102488,11 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_toolbar(ctx);
+            ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
         },
-    );
-    let output = ctx.run(
+    )
+    .drop_without_applying_deltas();
+    let output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -102326,7 +102501,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_toolbar(ctx);
+            ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
         },
     );
     let mut drawn = String::new();
@@ -102345,7 +102520,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
 
     // フォルダバー右クリックの設定で消せること。
     app.settings.show_address_bar_omitted_entries = false;
-    let hidden = ctx.run(
+    let hidden = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -102354,7 +102529,7 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
             ..Default::default()
         },
         |ctx| {
-            app.render_toolbar(ctx);
+            ctx.root_ui(|ui_arg| app.render_toolbar(ui_arg));
         },
     );
     let mut drawn_off = String::new();
@@ -102367,6 +102542,9 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
         }
     }
     assert!(!drawn_off.contains("非表示"), "OFF にしたら出さない");
+    hidden.drop_without_applying_deltas();
+
+    output.drop_without_applying_deltas();
 }
 
 /// 空になった理由は、次の読み込みへ持ち越さない (§1.68)。
@@ -102534,9 +102712,10 @@ fn the_current_window_rect_is_recorded_even_while_maximized() {
     viewport.minimized = Some(false);
     viewport.maximized = Some(true);
 
-    let _ = ctx.run(input, |ctx| {
+    ctx.run_pass(input, |ctx| {
         app.track_window_rect(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
 
     assert_eq!(
         app.last_window_rect,
@@ -102556,9 +102735,10 @@ fn the_current_window_rect_is_recorded_even_while_maximized() {
     viewport.inner_rect = Some(restored);
     viewport.minimized = Some(false);
     viewport.maximized = Some(false);
-    let _ = ctx.run(input, |ctx| {
+    ctx.run_pass(input, |ctx| {
         app.track_window_rect(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
     assert_eq!(app.last_window_rect, Some(restored));
     assert_eq!(app.last_outer_rect, Some(restored));
 }
@@ -102755,10 +102935,12 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
 
     // active context が無い = root が前面。batch は配られずに返る。
     assert!(!app.active_detached_context_is_at_rest());
-    let update = app.update_active_viewer_context(
-        &ctx,
-        Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
-    );
+    let update = ctx.root_ui(|ui| {
+        app.update_active_viewer_context(
+            ui,
+            Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
+        )
+    });
     assert!(!update.updated);
     assert!(
         update.gamepad_batch.is_some(),
@@ -102792,10 +102974,12 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
         app.viewer_context_residence(context_id)
     );
 
-    let update = app.update_active_viewer_context(
-        &ctx,
-        Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
-    );
+    let update = ctx.root_ui(|ui| {
+        app.update_active_viewer_context(
+            ui,
+            Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
+        )
+    });
     assert!(
         update.gamepad_batch.is_none(),
         "前面の別ウィンドウへ配らず、root へ返している"
@@ -103219,7 +103403,7 @@ fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport(
     app.detached_window_hwnd_set(SIBLING_WINDOW, SIBLING_HOST);
     app.set_detached_window_live_hwnds_for_test([OLD_HOST, SIBLING_HOST]);
     app.begin_mounted_detached_session_for_test(SIBLING_WINDOW, DetachedSource::Video);
-    app.mark_active_detached_viewport_rendered();
+    app.mark_active_detached_viewport_rendered(&egui::Context::default());
     let sibling_context = app
         .locate_window_context(SIBLING_WINDOW)
         .expect("sibling binding before stale cleanup")
@@ -103326,6 +103510,7 @@ fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport(
             .is_some_and(|viewport| !viewport.commands.contains(&egui::ViewportCommand::Close)),
         "DestroyHost(old) must address only the effect-owned viewport identity"
     );
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -103723,7 +103908,7 @@ mod sns_split_p2_transition_tests {
         });
         app.keyboard_owner_for_pass(&ctx);
         let _ = app.handle_fs_key_input(&ctx, idx, false);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_sns_split_transient_state_cleared(&app);
         assert_eq!(
@@ -105272,8 +105457,10 @@ mod background_click_scroll_regression_tests {
         crate::test_ui::builder()
             .with_size(egui::vec2(2000.0, 480.0))
             .with_step_dt(0.01)
-            .build_state(
-                move |ctx, state| {
+            .build_ui_state(
+                move |root_ui, state| {
+                    let ctx = &root_ui.ctx().clone();
+
                     if !fonts_set {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_set = true;
@@ -105282,10 +105469,22 @@ mod background_click_scroll_regression_tests {
                     }
                     state.app.begin_grid_click_input_frame(ctx);
                     // Match App::update: the wheel owner runs before render_grid.
-                    let had_wheel = ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5);
+                    let input_options = ctx.options(|options| options.input_options);
+                    let had_wheel = ctx.input(|input| {
+                        crate::wheel_input::remaining_wheel_delta(input, input_options)
+                            .y
+                            .abs()
+                            > 0.5
+                    });
                     state.app.process_scroll(ctx);
                     if had_wheel {
-                        assert_eq!(ctx.input(|input| input.raw_scroll_delta), egui::Vec2::ZERO);
+                        assert_eq!(
+                            ctx.input(|input| crate::wheel_input::remaining_wheel_delta(
+                                input,
+                                input_options
+                            )),
+                            egui::Vec2::ZERO
+                        );
                         assert!(!ctx.input(|input| {
                             input
                                 .events
@@ -105297,7 +105496,7 @@ mod background_click_scroll_regression_tests {
                             .push(ctx.input(|input| input.modifiers.ctrl));
                     }
                     let old_folder = state.app.current_folder.clone();
-                    if let Some(nav) = state.app.render_grid(ctx) {
+                    if let Some(nav) = state.app.render_grid(root_ui) {
                         state.navs.push(nav);
                     }
                     if state.app.current_folder != old_folder {
@@ -105352,6 +105551,8 @@ mod background_click_scroll_regression_tests {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, -1.0),
                     modifiers,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
                 modifiers,
             );

@@ -16070,8 +16070,9 @@ mod chrome_suppression_interaction_tests {
             overlay.pending_events.push(egui::Event::PointerGone);
             let final_hidden = frame(&mut overlay);
             assert!(!final_hidden.overlay_visible);
-            batch.append(final_hidden);
+            batch.append(final_hidden.into_inner());
             record_native_overlay_drawn_rects(&diagnostics, &overlay, batch.draw_facts);
+            crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
             let hidden = latest(&diagnostics, "drawn_rects").unwrap();
             for name in [
                 "top_bar",
@@ -20859,7 +20860,9 @@ mod tests {
         let captured_for_ui = Arc::clone(&captured);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+
                 egui::CentralPanel::default().show(root_ui, |ui| {
                     let painter = ui.painter().clone();
                     let mut commands = Vec::new();
@@ -20914,58 +20917,61 @@ mod tests {
             let captured_for_ui = Arc::clone(&captured);
             let drag_origin = Arc::new(Mutex::new(None));
             let mut fonts_ready = false;
-            let mut harness = crate::test_ui::builder()
-                .with_size(overlay_size)
-                .build(move |ctx| {
-                    if !fonts_ready {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        fonts_ready = true;
-                        ctx.request_repaint();
-                        return;
-                    }
-                    let strip = NativeOverlaySeekStrip {
-                        stamp: test_seek_strip_stamp(),
-                        span: crate::video::seek_strip_layout::SeekStripSpan::Window,
-                        cell_aspect: None,
-                        center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
-                            center_index: 4.0,
-                        },
-                        axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
-                            crate::video::seek_strip::StripAxis::TimeGrid {
-                                interval_secs: 15.0,
-                                fallback_interval_secs: 15.0,
-                                duration_secs: 480.0,
+            let mut harness =
+                crate::test_ui::builder()
+                    .with_size(overlay_size)
+                    .build_ui(move |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
+
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        let strip = NativeOverlaySeekStrip {
+                            stamp: test_seek_strip_stamp(),
+                            span: crate::video::seek_strip_layout::SeekStripSpan::Window,
+                            cell_aspect: None,
+                            center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                                center_index: 4.0,
                             },
-                        )),
-                        range_value_secs:
-                            crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
-                        cell_count: 32,
-                        cells: Vec::new(),
-                        thumbnail_notice: None,
-                        wave_image: None,
-                        wave_notice: None,
-                        waveform_span_secs:
-                            crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
-                        duration_secs: 600.0,
-                    };
-                    let mut commands = Vec::new();
-                    draw_native_seek_strip(
-                        ctx,
-                        test_strip_layout(overlay_size),
-                        crate::video::seek_strip_layout::SeekStripMarker::Center,
-                        Some(pointer),
-                        true,
-                        &strip,
-                        false,
-                        false,
-                        &std::collections::HashMap::new(),
-                        None,
-                        &mut drag_origin.lock().unwrap(),
-                        &mut commands,
-                        None,
-                    );
-                    captured_for_ui.lock().unwrap().extend(commands);
-                });
+                            axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
+                                crate::video::seek_strip::StripAxis::TimeGrid {
+                                    interval_secs: 15.0,
+                                    fallback_interval_secs: 15.0,
+                                    duration_secs: 480.0,
+                                },
+                            )),
+                            range_value_secs:
+                                crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
+                            cell_count: 32,
+                            cells: Vec::new(),
+                            thumbnail_notice: None,
+                            wave_image: None,
+                            wave_notice: None,
+                            waveform_span_secs:
+                                crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                            duration_secs: 600.0,
+                        };
+                        let mut commands = Vec::new();
+                        draw_native_seek_strip(
+                            ctx,
+                            test_strip_layout(overlay_size),
+                            crate::video::seek_strip_layout::SeekStripMarker::Center,
+                            Some(pointer),
+                            true,
+                            &strip,
+                            false,
+                            false,
+                            &std::collections::HashMap::new(),
+                            None,
+                            &mut drag_origin.lock().unwrap(),
+                            &mut commands,
+                            None,
+                        );
+                        captured_for_ui.lock().unwrap().extend(commands);
+                    });
             harness.run();
             harness.hover_at(pointer);
             for pressed in [true, false] {
@@ -21030,7 +21036,9 @@ mod tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(overlay_size)
                 .with_pixels_per_point(1.5)
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -21188,7 +21196,9 @@ mod tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(overlay_size)
                 .with_pixels_per_point(1.5)
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
+
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -21539,7 +21549,7 @@ mod tests {
                             ui.allocate_space(egui::vec2(190.0, 1200.0));
                         });
                     panel_inner_rect = output.inner_rect;
-                    panel_offset = output.state.offset.y;
+                    panel_offset = output.state.offset().y;
                 });
             (strip.inner, panel_inner_rect, strip_steps, panel_offset)
         }
@@ -22262,9 +22272,10 @@ mod tests {
     #[test]
     fn native_ime_interrupt_multiple_logical_passes_keep_one_generated_request() {
         let mut target = HeadlessNativeBatchTarget::default();
+        target.batch_prepare().unwrap();
         let context = egui::Context::default();
         let id = egui::Id::new("native-multiple-pass-ime");
-        let mut text = "??? sample".to_owned();
+        let mut text = "日本語 sample".to_owned();
         let raw = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,

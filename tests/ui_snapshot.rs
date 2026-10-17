@@ -63,7 +63,7 @@ fn effetune_show_only_tooltip_snapshot(
         egui::vec2(640.0, 260.0),
         move |ui| {
             ui.ctx()
-                .style_mut(|style| style.interaction.tooltip_delay = 0.0);
+                .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
             mimageviewer::draw_effetune_show_only_snapshot_fixture(ui, active);
         },
         |harness| {
@@ -441,8 +441,7 @@ fn startup_dialogs_small_viewport() {
                         "{kind} {size:?} scale {scale} {button}: {rect:?}"
                     );
                     // AccessKit stores egui's original high-entropy widget id.
-                    let id =
-                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+                    let id = egui_id_from_accesskit(node.accesskit_node().id());
                     let disabled = kind == "archive_empty" && button == "変換して開く";
                     let response = harness.ctx.read_response(id).unwrap();
                     assert!(
@@ -561,7 +560,7 @@ fn startup_dialogs_refit_after_viewport_resize() {
                 .iter()
                 .map(|label| {
                     let node = harness.get_by_label(*label);
-                    unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) }
+                    egui_id_from_accesskit(node.accesskit_node().id())
                 })
                 .collect();
             harness.state_mut().0 = ids;
@@ -709,7 +708,7 @@ fn folder_toolbar_snapshot_status_label() {
                             ctx.request_repaint();
                             return;
                         }
-                        let panel = egui::TopBottomPanel::top("folder").show(ui, |ui| {
+                        let panel = egui::Panel::top("folder").show(ui, |ui| {
                             let input = layout::address_input(
                                 ui,
                                 Some(
@@ -793,7 +792,7 @@ fn folder_toolbar_flexible_snapshots() {
                                 ctx.request_repaint();
                                 return;
                             }
-                            egui::TopBottomPanel::top("toolbar").show(ui, |ui| {
+                            egui::Panel::top("toolbar").show(ui, |ui| {
                                 draw_folder_toolbar_fixture(
                                     ui, before, new_row, buttons, &mut path,
                                 );
@@ -2194,9 +2193,7 @@ fn spread_shift_hud_snapshots() {
                             ("見開きの調整を本ごとに記憶する", true),
                         ] {
                             let node = harness.get_by_label(label);
-                            let id = unsafe {
-                                egui::Id::from_high_entropy_bits(node.accesskit_node().id().0)
-                            };
+                            let id = egui_id_from_accesskit(node.accesskit_node().id());
                             let response = harness.ctx.read_response(id).unwrap();
                             assert!(
                                 viewport.contains_rect(response.rect),
@@ -4078,4 +4075,11 @@ fn assert_image_folder_zip_controls(
             "{name}: {phase}/{label} outside viewport at {size:?}"
         );
     }
+}
+
+// accesskit_consumer 0.39's public FullNodeId conversion packs the local node ID
+// above the tree index. The local node ID is egui's original widget identity.
+fn egui_id_from_accesskit(node_id: impl Into<u128>) -> egui::Id {
+    let local_id = (node_id.into() >> 64) as u64;
+    unsafe { egui::Id::from_high_entropy_bits(local_id) }
 }

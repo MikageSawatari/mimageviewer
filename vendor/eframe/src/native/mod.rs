@@ -19,3 +19,6 @@ mod glow_integration;
 
 #[cfg(feature = "wgpu_no_default_features")]
 mod wgpu_integration;
+
+#[cfg(feature = "miv-test-script-window-witness")]
+pub use epi_integration::HeadlessEpiIntegration;

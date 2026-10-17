@@ -241,7 +241,79 @@ pub struct EpiIntegration {
     app_icon_setter: super::app_icon::AppTitleIconSetter,
 }
 
+/// Feature-limited noninteractive driver for application integration regressions.
+/// Runs the real EpiIntegration logic/UI and root Close decision. The caller owns
+/// output delivery; this driver creates no windows, renderer, profile or files.
+#[cfg(feature = "miv-test-script-window-witness")]
+#[doc(hidden)]
+pub struct HeadlessEpiIntegration(EpiIntegration);
+
+#[cfg(feature = "miv-test-script-window-witness")]
+impl HeadlessEpiIntegration {
+    /// Create a windowless driver using the supplied Context.
+    pub fn new(ctx: egui::Context) -> Self {
+        Self(EpiIntegration::headless(ctx))
+    }
+    /// The same Context used by real logic and UI processing.
+    pub fn context(&self) -> &egui::Context {
+        &self.0.egui_ctx
+    }
+    /// Run one real root Full operation; the caller owns returned output.
+    pub fn update(&mut self, app: &mut dyn epi::App, input: egui::RawInput) -> egui::FullOutput {
+        self.0.update(app, None, input)
+    }
+    /// Run real root logic without UI, preserving the unconsumed input.
+    pub fn update_logic_only(
+        &mut self,
+        app: &mut dyn epi::App,
+        input: egui::RawInput,
+    ) -> (egui::LogicOutput, egui::RawInput) {
+        self.0.update_logic_only(app, input)
+    }
+    /// The backend root-close decision after the last completed operation.
+    pub fn should_close(&self) -> bool {
+        self.0.should_close()
+    }
+}
+
 impl EpiIntegration {
+    #[cfg(any(test, feature = "miv-test-script-window-witness"))]
+    fn headless(egui_ctx: egui::Context) -> Self {
+        egui_ctx.set_embed_viewports(false);
+        egui_ime::install_ime_input_policy(&egui_ctx);
+        Self {
+            frame: epi::Frame {
+                info: epi::IntegrationInfo { cpu_usage: None },
+                storage: None,
+                #[cfg(feature = "glow")]
+                gl: None,
+                #[cfg(feature = "glow")]
+                glow_register_native_texture: None,
+                #[cfg(feature = "wgpu_no_default_features")]
+                wgpu_render_state: None,
+                #[cfg(feature = "wgpu_no_default_features")]
+                wgpu_surface_config: None,
+                window: None,
+                raw_display_handle: Err(raw_window_handle::HandleError::Unavailable),
+                raw_window_handle: Err(raw_window_handle::HandleError::Unavailable),
+                native_window_visible_commit_completed: false,
+                activation_token: None,
+            },
+            last_auto_save: Instant::now(),
+            beginning: Instant::now(),
+            egui_ctx,
+            pending_full_output: Default::default(),
+            close: false,
+            can_drag_window: false,
+            #[cfg(feature = "persistence")]
+            persist_window: false,
+            restored_window_settings: None,
+            #[cfg(feature = "persistence")]
+            normal_geometry: None,
+            app_icon_setter: super::app_icon::AppTitleIconSetter::new(String::new(), None),
+        }
+    }
+
     #[allow(clippy::allow_attributes, clippy::too_many_arguments)]
     pub fn new(
         egui_ctx: egui::Context,
@@ -608,7 +680,7 @@ pub(super) fn finish_root_logic_input(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use egui::{Event, Key, Modifiers, RawInput};
     use std::sync::Mutex;
@@ -678,41 +750,8 @@ mod tests {
         }
     }
 
-    fn headless_integration() -> EpiIntegration {
-        let egui_ctx = egui::Context::default();
-        egui_ctx.set_embed_viewports(false);
-        egui_ime::install_ime_input_policy(&egui_ctx);
-        EpiIntegration {
-            frame: epi::Frame {
-                info: epi::IntegrationInfo { cpu_usage: None },
-                storage: None,
-                #[cfg(feature = "glow")]
-                gl: None,
-                #[cfg(feature = "glow")]
-                glow_register_native_texture: None,
-                #[cfg(feature = "wgpu_no_default_features")]
-                wgpu_render_state: None,
-                #[cfg(feature = "wgpu_no_default_features")]
-                wgpu_surface_config: None,
-                window: None,
-                raw_display_handle: Err(raw_window_handle::HandleError::Unavailable),
-                raw_window_handle: Err(raw_window_handle::HandleError::Unavailable),
-                native_window_visible_commit_completed: false,
-                activation_token: None,
-            },
-            last_auto_save: Instant::now(),
-            beginning: Instant::now(),
-            egui_ctx,
-            pending_full_output: Default::default(),
-            close: false,
-            can_drag_window: false,
-            #[cfg(feature = "persistence")]
-            persist_window: false,
-            restored_window_settings: None,
-            #[cfg(feature = "persistence")]
-            normal_geometry: None,
-            app_icon_setter: super::super::app_icon::AppTitleIconSetter::new(String::new(), None),
-        }
+    pub(in crate::native) fn headless_integration() -> EpiIntegration {
+        EpiIntegration::headless(egui::Context::default())
     }
 
     #[derive(Default)]
