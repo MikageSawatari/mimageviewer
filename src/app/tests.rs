@@ -52308,7 +52308,7 @@ mod pipeline_cache_refactor_tests {
                     seed_shared_source(&mut app, &ctx, idx)
                 })
                 .collect();
-            ctx.tex_manager().write().take_delta();
+            ctx.tex_manager().write().take_delta().clear();
             let budget = app.last_edit_materialize_upload_frame;
             for idx in 0..2 {
                 if cpu_prefetched {
@@ -52348,7 +52348,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/shared/cpu.jpg");
         let id = seed_shared_source(&mut app, &ctx, idx);
         let (key, _) = app.ensure_edit_result_pixels_cpu(&ctx, idx).unwrap();
-        ctx.tex_manager().write().take_delta();
+        ctx.tex_manager().write().take_delta().clear();
         app.last_edit_materialize_upload_frame = app.frame_counter;
         app.ensure_edit_result_pixels(&ctx, idx).unwrap();
         assert_eq!(

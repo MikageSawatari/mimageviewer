@@ -473,7 +473,7 @@ mod tests {
             id
         );
         assert_eq!(app.current_final_composite_texture(0).unwrap().id(), id);
-        ctx.tex_manager().write().take_delta();
+        ctx.tex_manager().write().take_delta().clear();
         assert_eq!(app.vram_accounting_snapshot().total_texels, expected);
         app.fs_cache.clear();
         assert_eq!(app.vram_accounting_snapshot().total_texels, expected);
@@ -484,7 +484,9 @@ mod tests {
         app.final_composite_cache.clear();
         assert_eq!(app.vram_accounting_snapshot().total_texels, 0);
         assert!(ctx.tex_manager().read().meta(id).is_none());
-        assert_eq!(ctx.tex_manager().write().take_delta().free, vec![id]);
+        let mut delta = ctx.tex_manager().write().take_delta();
+        assert_eq!(delta.free.iter().copied().collect::<Vec<_>>(), vec![id]);
+        delta.clear();
     }
 
     fn texture(

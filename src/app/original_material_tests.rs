@@ -16,7 +16,7 @@ fn source_texture_sharing_survives_source_eviction_and_normal_reload_invalidates
     drop(app.ensure_final_composite_texture(&ctx, 0).unwrap());
     let old_key = app.current_edit_result_key(0);
     let old_final = app.final_composite_key_for_pixels(old_key, [4, 6], app.effective_params(0));
-    ctx.tex_manager().write().take_delta();
+    ctx.tex_manager().write().take_delta().clear();
     app.fs_cache.remove(&0);
     assert!(app.current_raw_source_pixels(0).is_none());
     assert!(ctx.tex_manager().read().meta(id).is_some());
