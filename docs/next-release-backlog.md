@@ -171,6 +171,79 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 
+### 1.393 master の lib テスト2件の環境依存・完了待ちの修正（2026-10-17）
+
+- 対象: `499782b7c` から作成した `flaky-lib-tests`。egui 更新とは別件。
+  出典は利用者が指定した `mimageviewer-egui036/docs/egui-0.37-stage3-verification.md` の
+  「HUDのexternal raise」「Metadata transferとresume writerの待機」と、以下のソース・
+  非対話libテスト。過去の失敗時には通知fields・busy内訳の記録がなく、過去の各失敗の
+  実通知・瞬間のthread interleavingを事後に断定するものではない。
+- **HUDの原因**: 旧テストは隠れたTOPMOST HUDだけを作り、相対順を確立せずに
+  `SetWindowPos(HWND_TOP / HWND_TOPMOST)` を呼び、要求時のinsertAfterと
+  `!SWP_NOZORDER`が実通知にも残ることを期待していた。製品handlerは実際の
+  `WINDOWPOS`を判定するため、この未確立のOS通知前提がテストの問題となる。
+  合成した通知を製品`hud_wnd_proc`と専用event routeへ通し、TOP / TOPMOSTの正例と、
+  NOZORDER / BOTTOM / NOTOPMOST / 実HWNDの負例を検査する。
+  実Win32での復旧は既存のhidden siblingテストで相対順を確立・assertしてから検査する。
+  自前raiseの通知counter不変も検査し、OSの通知正規化に依存せずNOSENDCHANGINGを守る。
+  今回の診断付き旧テストは1件成功（exit 0）。実通知には要求したTOPMOST（-1）ではなく
+  TOP（0）、flags `0x213`が届いた（`target/hud-baseline-serial.log`）。要求値と通知値を
+  同一視できないことの実測であり、過去のraise 0件時のfieldsの再現と混同しない。
+- **Metadataの原因**: `assert_resume_once`の位置返信はcutoffまでの位置読出しの証拠であり、
+  actor全体のidleの証拠ではない。queued readは返信sendの後にpendingを減算し、warm
+  snapshotもRecordの完了watermark公開後・pending減算前に返信できる。
+  テスト専用channelでこの減算前を固定し、位置返信・watermark完了と`is_busy()`が同時に
+  成立する両経路を検査する。構成保存の成功ケースもRecord公開直後を固定し、保存一回と
+  Import / Export保留を検査した後、既存DropのFIFO drain / joinを経て転送開始を検査する。
+  ZIP / PDF / EPUB、Preview / Import / Export、保存成功 / 失敗を維持する。
+- **製品側の順序を変えない判断**: 利用者がresume直後にImport / Exportを開いた場合、
+  既存の`WaitingForWriters`がUIをブロックせず待機・キャンセル可能な状態を提示し、
+  次のpollでidle後に開始する。これは既存writerと転送の競合を防ぐ正しい契約である。
+  Previewは構成保存票の回収だけを待つため、resume busyによる保留を追加しない。
+  返信をidle証明へ変更しても後続commandまで含むidleは保証できない。
+  テストの待ち方を修正し、製品の返信順序・pending・受付条件は変更しない。
+  modalの新設・待機機構の追加は不要。まれな失敗は割り切り（ログ＋通知）の既定方針を維持。
+- **決定的再現・変異検査**（`target/flaky-mutations.log`）:
+  channelでRecord公開後・pending減算前を固定し、releaseとdrainを転送開始assertの後へ
+  戻すとZIP Importの旧受付期待が失敗し、`rename_writers_busy=true`を採取した。
+  HUDの製品raise配送を一時的に無効化すると、合成TOP通知（flags `0x213`）に対する
+  raise 0 / 期待1で失敗した。3件実行、resume両返信経路のテスト1件成功・対象2件失敗、
+  nextest exit 100。全変異はレビュー済み保存版とバイト比較して復元済み。
+  テストのrecv timeoutはhang検出上限だけであり、完了の根拠はchannel通知とFIFO join。
+- 独立レビュー（GPT-6.1 Sol / xhigh）は設計・実装ACCEPT。自動検証は以下に追記する。
+  製品バイナリ・liveテスト・probe・test-fullは実行しない。
+
+検証（featureなし・test/dev profile、上記HEADに対する未コミット差分）:
+
+| コマンド（filterは `cargo test -p mimageviewer --lib <filter> -- --nocapture`） | 件数・exit | ログ（`target/`配下） |
+| --- | --- | --- |
+| `video::native_window_host::hud_window::tests` | 2成功、0失敗、exit 0 | `flaky-related-hud.log` |
+| `app::book_composition_editor::metadata_transfer_tests` | 5成功、0失敗、exit 0 | `flaky-related-metadata.log` |
+| `book_resume_db::tests` | 19成功、0失敗、exit 0 | `flaky-related-resume.log` |
+| `hud_raise_` | 5成功、0失敗、exit 0 | `flaky-related-hud-route.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 | `flaky-core-check.log` |
+| `cargo fmt --check` | exit 0 | `flaky-fmt.log` |
+| `git diff --check` | exit 0 | ツール出力 |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-lib-full.ps1`（1回、台帳MISS） | 13,298実行、13,261成功、37失敗、59既存skip、exit 100 | `test-lib-full/runs/20261017T084041016Z-b3cc830d/` |
+
+全件は359.191秒で完走。対象2件を含む関連31件すべてが全件JUnitでも成功した。
+37失敗はすべて**環境準備不足**: このworktreeには `vendor/raw-samples/` 自体がなく、
+36件は `setup-raw-samples.ps1` を案内するfixture存在assert / readで失敗した。
+残る `remote_ipc::container::tests::cached_zip_raw_representative_can_prefetch_without_extracting_nested_archives`
+も `src/remote_ipc/container.rs` の `fs::read("vendor/raw-samples/885.dng")` でNotFoundとなった。
+RAWの製品decodeや今回の変更の失敗とは分類しない。全37名・診断・件数の照合結果は
+`target/flaky-full-classification.json`、source SHA-256・コマンド・結果の集約は
+`target/flaky-lib-verification.json`。全件の再実行・fixture取得・無関係な製品修正は行っていない。
+full実行後の変更は本節への検証結果の追記だけで、Rustソースはレビュー・検証済み保存版と一致する。
+
+初回ビルドはlibjpeg-turboのMSBuildで失敗（cargo exit 101、テスト実行0件、
+`target/hud-baseline.log`）。`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`で
+ビルドを完了し、以後のCargo検証も同じ条件で実行した。初回lib実行前に
+`vendor/ffmpeg/bin/*.dll` 6本を `target/debug/deps/` へ実体コピーした。
+
+製品挙動の変更がないテスト専用の修正であり、依頼に従い製品バイナリのbuild・起動、
+liveテスト、`test-full.ps1`、`probe-*.ps1`、git add・コミット・ブランチ変更・pushは行っていない。
+
 ### 1.392 `--features test-script` のときだけ走るテストが 2 件、master で落ちている — 通常の全件実行に入っていない (2026-10-17)
 
 - 観測 (ClaudeCode が master `0af8c32d7` で `cargo nextest run -p mimageviewer --lib --features test-script -E 'test(/…/)'`、2026-10-17):
