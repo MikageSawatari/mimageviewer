@@ -32486,6 +32486,13 @@ impl App {
 
         if !self.ime_input_active(ctx)
             && !self.is_overlay_edit_mode_active()
+            && self.consume_saved_position_clear_shortcuts(ctx, crate::app::ActionSurface::Viewer)
+        {
+            return action;
+        }
+
+        if !self.ime_input_active(ctx)
+            && !self.is_overlay_edit_mode_active()
             && self
                 .keymap
                 .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
@@ -53944,6 +53951,10 @@ impl App {
     ) {
         // IME 変換中はショートカットを発火させない
         if self.ime_input_active(ctx) {
+            return;
+        }
+
+        if self.consume_saved_position_clear_shortcuts(ctx, crate::app::ActionSurface::Viewer) {
             return;
         }
 

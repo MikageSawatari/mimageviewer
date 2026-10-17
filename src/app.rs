@@ -96413,6 +96413,17 @@ impl App {
             && !self.tag_view.has_focus
             && !main_viewer_blocked
             && !self.any_dialog_open()
+        {
+            self.consume_saved_position_clear_shortcuts(ctx, ActionSurface::MainWindow);
+        }
+
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+            && !main_viewer_blocked
+            && !self.any_dialog_open()
             && self
                 .keymap
                 .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)

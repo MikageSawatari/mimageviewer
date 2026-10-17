@@ -1,5 +1,36 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+## 保存済み位置の全件クリア（§1.394）
+
+`ClearVideoMediaMemory` / `ClearBookResumePositions` は独立した Global / Press 操作で、
+どちらも既定キーなし。操作カスタマイズの「全体共通」に表示する。確認ダイアログは付けない。
+一覧、画像フルスクリーン、egui 動画・音声、native 動画の既存 `ToggleAlwaysOnTop` と同じ
+受付条件・keymap helper を使う。文字入力・IME・モーダル・編集モードの入力所有を優先し、
+native 転送対象にも登録する。detached の述語・viewport 配送は変更しない。
+
+動画側は `Settings::clear_video_media_memory` に対象を集約し、環境設定の編集値とコマンドの
+live 値を同じ関数で消す。対象は再生位置、視聴済み記録、音声トラック選択だけ。
+コマンドは件数（各記録別）または空を発火面へ通知し、その場では同期保存しない。
+記録時と同じく終了時等の既存保存機会に永続化する。環境設定は従来どおり OK で反映、
+キャンセルでは破棄する。古い draft の OK も最新 live を merge し、消した記録を復活させない。
+
+本側は既存 `clear_book_resume_async` の writer FIFO、追加後続変更の受付、`Delta::Clear`、
+`last_book_resume` の解除、失敗時のメーター再読込を共有する。完了の件数・空・失敗は
+環境設定の結果欄、コマンドは発火コンテキストと面を完了票に保持し、既存
+`with_viewer_context` 内から発火元の既存トーストへ通知する。root poll時のmainや兄弟の
+native overlayへ送らない。発火コンテキスト退役後の通知はログに残して破棄する。
+閲覧履歴・しおり・構成・見開き調整・タグ・評価・編集・最近のフォルダ・A/B の場所は消さない。
+消去後も通常の閲覧・再生による新規記録を続ける。
+
+設計の簡素化: 新しい保存 worker・待機状態・モーダルは追加せず既存の所有境界を再利用する。
+動画は live の変更だけ、本は既存 FIFO の clear だけなので閲覧を追加で止める必要はない。
+まれな失敗は割り切り（ログ + 通知 + 既存の本メーター再読込）。保存前の強制終了は
+通常の再生位置記録と同じ扱いにする。
+
+Remote は本体の同じ live media 記録と BookResumeWriter を読み書きする。
+本の再開読取は writer の受付済み操作後を読む。操作権によるローカル入力の既存遮断と
+旧 session の write 拒否を維持し、Remote 専用クリア・IPC・キャッシュ無効化は追加しない。
+
 `FsPageTurnAnimationToggle` は `FsImage` / `Press`、既定キーなしの操作。
 静止画フルスクリーンの「その他の機能」の他のON/OFF行と同様にKeyActionを持ち、
 操作カスタマイズでキーを割り当てられる。HUD行には割り当てた先頭chordを表示する。

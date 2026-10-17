@@ -8801,6 +8801,8 @@ impl App {
     fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
         match row.spec.action {
             KeyAction::ToggleAlwaysOnTop
+            | KeyAction::ClearVideoMediaMemory
+            | KeyAction::ClearBookResumePositions
             | KeyAction::ToggleDetachedViewerMode
             | KeyAction::FsToggleWindowMode
             | KeyAction::FsBackToList
@@ -12437,6 +12439,8 @@ impl App {
             KeyAction::FsBackToList,
             KeyAction::VideoSeekStart,
             KeyAction::ToggleAlwaysOnTop,
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
             KeyAction::ToggleDetachedViewerMode,
             KeyAction::FsToggleWindowMode,
             KeyAction::FsPanoramaProjection,
@@ -12706,6 +12710,17 @@ impl App {
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
+            }
+            _ if !key.repeat
+                && matches!(
+                    resolved_action,
+                    Some(KeyAction::ClearVideoMediaMemory | KeyAction::ClearBookResumePositions)
+                ) =>
+            {
+                let action = resolved_action.expect("resolved clear action");
+                self.execute_saved_position_clear(action, crate::app::ActionSurface::Viewer);
+                hud_activity = false;
+                NativeVideoKeyOutcome::Action(action)
             }
             _ if !key.repeat && resolved_action == Some(KeyAction::ToggleAlwaysOnTop) => {
                 self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
@@ -16418,6 +16433,73 @@ mod configurable_video_seek_dispatch_tests {
             NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
         ));
         assert!(!app.settings.always_on_top);
+    }
+
+    #[test]
+    fn saved_position_clear_native_keys_dispatch_independently_without_repeats() {
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Global]\nClearVideoMediaMemory = F16\nClearBookResumePositions = F17\n",
+        );
+        let book = app.tmp.path().join("native-clear.zip");
+        app.persist_book_resume(
+            book.clone(),
+            1,
+            crate::book_resume_db::ReadingMeterValue::new(2, 4),
+        );
+        app.book_resume_writer
+            .as_ref()
+            .unwrap()
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        app.settings
+            .video_resume_positions
+            .insert("keep-media".into(), 42.0);
+        let mut repeat = native_key(0x7f, false, false);
+        repeat.repeat = true;
+        assert!(!matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, repeat),
+            NativeVideoKeyOutcome::Action(KeyAction::ClearVideoMediaMemory)
+        ));
+        assert_eq!(
+            app.settings.video_resume_positions.get("keep-media"),
+            Some(&42.0)
+        );
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x80, false, false)),
+            NativeVideoKeyOutcome::Action(KeyAction::ClearBookResumePositions)
+        ));
+        app.book_resume_writer
+            .as_ref()
+            .unwrap()
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        app.poll_book_resume_meters(&ctx);
+        assert_eq!(app.book_resume_db.as_ref().unwrap().count(), 0);
+        assert_eq!(
+            app.settings.video_resume_positions.get("keep-media"),
+            Some(&42.0)
+        );
+        // Reading again after clearing remains enabled; media clear must leave it alone.
+        app.persist_book_resume(book.clone(), 2, None);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
+            NativeVideoKeyOutcome::Action(KeyAction::ClearVideoMediaMemory)
+        ));
+        app.book_resume_writer
+            .as_ref()
+            .unwrap()
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(app.settings.video_resume_positions.is_empty());
+        assert_eq!(app.book_resume_db.as_ref().unwrap().count(), 1);
     }
 
     fn native_key(

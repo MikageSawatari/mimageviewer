@@ -1,5 +1,11 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+2026-10-17 §1.394: `ClearVideoMediaMemory` / `ClearBookResumePositions` を Global / Press、
+既定キーなしで追加。既存の常に最前面と同じ各入力受付から、保存済み位置の管理処理へ渡す。
+環境設定と消去対象を共通化し、動画は live のみ変更、本は既存 writer の非同期 clear を使う。
+完了・空・失敗は既存トーストへ出す。保存・Remote・入力所有の契約は
+[keymap-spec.md](keymap-spec.md#保存済み位置の全件クリア1394) を参照。
+
 2026-10-11 §1.242 G3: `FsViewSpread` / `FsViewLandscapeSplit`を通常のfullscreen Action登録へ追加。
 既定キーなし、保存済みbindingの移行なし。構成本/A2では閲覧mode-only、通常本では既存表示ownerへ渡す。
 

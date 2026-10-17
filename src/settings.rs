@@ -9015,6 +9015,20 @@ impl Settings {
 
     /// 位置復元マトリクス「動画 × 一覧から開く」セル。保存先は互換維持のため既存 bool
     /// `video_grid_open_starts_from_beginning`。FromStart = 先頭から開く。
+    /// Clear only saved media memory. Runtime playback continues to record normally.
+    /// Persistence follows the caller's existing settings-save boundary.
+    pub(crate) fn clear_video_media_memory(&mut self) -> (usize, usize, usize) {
+        let counts = (
+            self.video_resume_positions.len(),
+            self.video_watched_to_end.len(),
+            self.video_audio_track_choices.len(),
+        );
+        self.video_resume_positions.clear();
+        self.video_watched_to_end.clear();
+        self.video_audio_track_choices.clear();
+        counts
+    }
+
     pub fn video_open_resume(&self) -> ResumeMode {
         if self.video_grid_open_starts_from_beginning {
             ResumeMode::FromStart

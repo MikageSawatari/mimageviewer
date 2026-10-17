@@ -61,6 +61,326 @@ fn stored_row(data_dir: &Path, path: &Path) -> Option<(i64, Option<i64>, Option<
         .unwrap()
 }
 
+fn seed_saved_media(app: &mut AppTestEnv) {
+    for name in ["one.mp4", "two.mp3"] {
+        let key = crate::adjustment_db::normalize_path(&app.tmp.path().join(name));
+        app.settings
+            .video_resume_positions
+            .insert(key.clone(), 18.0);
+        app.settings.video_watched_to_end.insert(key.clone());
+        app.settings.video_audio_track_choices.insert(
+            key,
+            crate::video::SavedAudioTrackChoice {
+                stream_index: 2,
+                codec: "aac".into(),
+                language: None,
+                channels: Some(2),
+                title: None,
+            },
+        );
+    }
+}
+
+fn seed_reading_history(app: &mut AppTestEnv) {
+    let entry = crate::reading_history_db::ReadingHistoryEntry::new(
+        app.tmp.path().join("history.zip"),
+        crate::reading_history_db::ReadingHistoryKind::Zip,
+        None,
+        "keep history".into(),
+        None,
+        None,
+    );
+    app.reading_history_db
+        .as_ref()
+        .unwrap()
+        .upsert(entry, 100)
+        .unwrap();
+}
+
+#[test]
+fn saved_position_media_clear_preserves_books_and_other_settings_then_saves_and_records_again() {
+    use super::{ActionSurface, MediaResumeUpdate};
+    use crate::keymap::KeyAction;
+    let mut app = setup_app();
+    settle(&mut app);
+    seed_saved_media(&mut app);
+    seed_reading_history(&mut app);
+    let book = app.tmp.path().join("keep.zip");
+    app.persist_book_resume(book.clone(), 1, meter(2, 5));
+    settle(&mut app);
+    // Retain a non-default unrelated preference and the full settings inventory.
+    app.settings.last_folder = Some(app.tmp.path().join("keep-folder"));
+    app.settings.video_volume = 0.42;
+    app.settings.save();
+    let generation = crate::settings::save_generation();
+    let mut expected = serde_json::to_value(&app.settings).unwrap();
+    expected["video_resume_positions"] = serde_json::json!({});
+    expected["video_watched_to_end"] = serde_json::json!([]);
+    expected["video_audio_track_choices"] = serde_json::json!({});
+    app.execute_saved_position_clear(KeyAction::ClearVideoMediaMemory, ActionSurface::MainWindow);
+    assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+    assert_eq!(
+        crate::settings::save_generation(),
+        generation,
+        "command does not save synchronously"
+    );
+    assert_eq!(
+        stored_row(app.tmp.path(), &book),
+        Some((1, Some(2), Some(5)))
+    );
+    assert_eq!(app.reading_history_db.as_ref().unwrap().count(), 1);
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("再生位置 2 件")
+    );
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("視聴済み記録 2 件")
+    );
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("音声トラックの選択 2 件")
+    );
+    // The same Settings::save path used at normal exit persists the cleared live state.
+    app.settings.save();
+    let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+    let restored = db.load_into_settings().unwrap();
+    assert!(restored.video_resume_positions.is_empty());
+    assert!(restored.video_watched_to_end.is_empty());
+    assert!(restored.video_audio_track_choices.is_empty());
+    assert_eq!(restored.last_folder, app.settings.last_folder);
+    app.execute_saved_position_clear(KeyAction::ClearVideoMediaMemory, ActionSurface::MainWindow);
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("はありません")
+    );
+    let path = app.tmp.path().join("one.mp4");
+    let key = crate::adjustment_db::normalize_path(&path);
+    app.apply_media_resume_updates(vec![MediaResumeUpdate {
+        path,
+        key: key.clone(),
+        position: 23.0,
+        duration: 120.0,
+        at_eof: false,
+        audio_track_choice: None,
+    }]);
+    assert_eq!(app.settings.video_resume_positions.get(&key), Some(&23.0));
+}
+
+#[test]
+fn saved_position_book_clear_uses_writer_preserves_media_and_history_and_reports_empty() {
+    use super::ActionSurface;
+    use crate::keymap::KeyAction;
+    let mut app = setup_app();
+    settle(&mut app);
+    seed_saved_media(&mut app);
+    seed_reading_history(&mut app);
+    let books: Vec<_> = ["folder", "book.zip", "book.pdf", "cache.7z.zip"]
+        .map(|name| app.tmp.path().join(name))
+        .into();
+    for book in &books {
+        app.persist_book_resume(book.clone(), 1, meter(2, 5));
+    }
+    settle(&mut app);
+    let settings = serde_json::to_value(&app.settings).unwrap();
+    app.execute_saved_position_clear(
+        KeyAction::ClearBookResumePositions,
+        ActionSurface::MainWindow,
+    );
+    assert_eq!(app.book_resume_entry_count(), 0);
+    assert!(app.last_book_resume.is_none());
+    settle(&mut app);
+    assert!(
+        books
+            .iter()
+            .all(|book| stored_row(app.tmp.path(), book).is_none())
+    );
+    assert_eq!(app.book_resume_db.as_ref().unwrap().count(), 0);
+    assert_eq!(serde_json::to_value(&app.settings).unwrap(), settings);
+    assert_eq!(app.reading_history_db.as_ref().unwrap().count(), 1);
+    assert_eq!(
+        app.fs_feedback_toast.as_ref().unwrap().0,
+        "4 件の読書位置をクリアしました"
+    );
+    assert_eq!(
+        app.fs_feedback_toast_surface,
+        Some(ActionSurface::MainWindow)
+    );
+    app.execute_saved_position_clear(KeyAction::ClearBookResumePositions, ActionSurface::Viewer);
+    settle(&mut app);
+    assert_eq!(
+        app.fs_feedback_toast.as_ref().unwrap().0,
+        "保存済みの本の読書位置はありません"
+    );
+    assert_eq!(app.fs_feedback_toast_surface, Some(ActionSurface::Viewer));
+    app.persist_book_resume(books[0].clone(), 2, meter(3, 5));
+    settle(&mut app);
+    assert_eq!(
+        stored_row(app.tmp.path(), &books[0]),
+        Some((2, Some(3), Some(5)))
+    );
+}
+
+#[test]
+fn saved_position_book_clear_failure_notifies_and_reloads_existing_rows() {
+    let mut app = setup_app();
+    settle(&mut app);
+    let book = app.tmp.path().join("keep-on-failure.pdf");
+    app.persist_book_resume(book.clone(), 1, meter(2, 5));
+    settle(&mut app);
+    let conn = rusqlite::Connection::open(app.tmp.path().join("book_resume.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_clear BEFORE DELETE ON book_resume BEGIN SELECT RAISE(FAIL, 'clear test failure'); END;").unwrap();
+    app.execute_saved_position_clear(
+        crate::keymap::KeyAction::ClearBookResumePositions,
+        super::ActionSurface::MainWindow,
+    );
+    assert_eq!(app.book_resume_entry_count(), 0);
+    settle(&mut app); // Clear failure schedules the existing reload path.
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("クリアに失敗しました")
+    );
+    settle(&mut app); // Drain the reload after its writer ACK.
+    assert_eq!(app.book_resume_entry_count(), 1);
+    assert_eq!(app.book_resume_meters.get(&book), meter(2, 5));
+    assert_eq!(
+        stored_row(app.tmp.path(), &book),
+        Some((1, Some(2), Some(5)))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn saved_position_book_clear_completion_returns_to_native_origin_after_main_restore() {
+    use super::ActionSurface;
+    let mut app = setup_app();
+    settle(&mut app);
+    let main = app.projected_viewer_context_id();
+    let mut probes = Vec::new();
+    let mut contexts = Vec::new();
+    for window in [801, 802] {
+        let id = app.build_window_context_for_test(window, |mounted| {
+            let path = PathBuf::from(format!("media/{window}.mp4"));
+            let mut player =
+                crate::video::VideoPlayer::local_ready_disconnected_for_test(path.clone());
+            probes.push(player.install_native_ui_probe_for_test());
+            mounted.items = vec![GridItem::Video(path)];
+            mounted.fullscreen_idx = Some(0);
+            mounted.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+        });
+        contexts.push(id);
+    }
+    app.with_viewer_context(contexts[0], |mounted| {
+        mounted.execute_saved_position_clear(
+            crate::keymap::KeyAction::ClearBookResumePositions,
+            ActionSurface::Viewer,
+        );
+    })
+    .unwrap();
+    assert_eq!(app.projected_viewer_context_id(), main);
+    settle(&mut app);
+    assert_eq!(app.projected_viewer_context_id(), main);
+    let toasts = probes[0].drain_toasts();
+    assert_eq!(toasts.len(), 1);
+    assert_eq!(toasts[0].0, "保存済みの本の読書位置はありません");
+    assert!(
+        probes[1].drain_toasts().is_empty(),
+        "sibling must not receive completion"
+    );
+    assert!(
+        app.fs_feedback_toast.is_none(),
+        "native completion must not become an invisible egui toast"
+    );
+}
+
+#[test]
+fn saved_position_clear_egui_image_and_audio_handlers_respect_keyboard_ownership() {
+    use crate::keyboard_input::{KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase};
+    for audio in [false, true] {
+        for blocked in [
+            None,
+            Some(TextInputPhase::Focused),
+            Some(TextInputPhase::ImeComposing),
+        ] {
+            for modal in [false, true] {
+                let mut app = setup_app();
+                // Modal ownership keeps the existing outer App gate in this input stage.
+                app.show_preferences = modal;
+                let path = app
+                    .tmp
+                    .path()
+                    .join(if audio { "item.mp3" } else { "item.png" });
+                app.items = vec![if audio {
+                    GridItem::Audio(path.clone())
+                } else {
+                    GridItem::Image(path.clone())
+                }];
+                app.fullscreen_idx = Some(0);
+                app.settings
+                    .video_resume_positions
+                    .insert("keep".into(), 18.0);
+                app.keymap =
+                    crate::keymap::Keymap::from_ini_str("[Global]\nClearVideoMediaMemory = F16\n");
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput {
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::F16,
+                        physical_key: Some(egui::Key::F16),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                });
+                let owner = if modal {
+                    KeyboardOwner::Modal
+                } else if let Some(phase) = blocked {
+                    KeyboardOwner::TextInput {
+                        viewport: ctx.viewport_id(),
+                        widget_id: egui::Id::new("text"),
+                        phase,
+                    }
+                } else {
+                    KeyboardOwner::ApplicationShortcut {
+                        scope: ShortcutScope::new(ctx.viewport_id(), ShortcutSurface::Fullscreen),
+                    }
+                };
+                crate::keyboard_input::cache_keyboard_owner(&ctx, owner);
+                // Music uses this same fullscreen entry; it does not call handle_video_input.
+                app.handle_fs_key_input(&ctx, 0, false);
+                assert_eq!(
+                    app.settings.video_resume_positions.is_empty(),
+                    !modal && blocked.is_none(),
+                    "audio={audio} modal={modal} blocked={blocked:?}"
+                );
+                let _ = ctx.end_pass();
+            }
+        }
+    }
+}
+
 #[test]
 fn book_resume_meter_records_hud_ordinal_in_mixed_items() {
     let mut app = setup_app();
