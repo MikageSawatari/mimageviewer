@@ -380,6 +380,23 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 
 再現手段が無い、利用者の確認を待っている、実機計測を待っている、原因が未確定のもの。
 
+### 1.391 ui-smoke `NativeTopPanoramaClick` が 1 回だけ、押下の受領を確認できずに止まった — 原因不明、再現待ち (2026-10-17)
+
+- 経緯: 押下の前に止まっていた原因 (パノラマボタンの中心へカーソルを動かす手順が無かった) は、ボタン中心への 2 回目の MouseMove と
+  移動後の観測で押下先を決め直す修正で解消した (`47b65285e`、master 取り込み `d34978975`)。
+- 残り (原因不明): 修正後の実入力 1 回目 (2026-10-17 14:09、利用者了承、ClaudeCode の隔離 portable 実行) で、Down は挿入されたが App が
+  LeftButtonDown の受領を確認できず、31 秒で `button_receipt_wait` の timeout (EnvironmentFailure)。当時の WndProc の記録は MouseMove
+  専用で、Down がどこに届き、どこで外れたかは決められない。実行後、左ボタンは離れていた (ClaudeCode が `GetAsyncKeyState` で確認)。
+  証跡は作業ツリー `G:/home/mimageviewer-panclick` の `target/ui-smoke-runs/20261017T050904742Z-84168-NativeTopPanoramaClick-c019ac0e`
+  にあったが、作業ツリーの撤去で消えるので、要点はこの節に残す。
+- その後、Down/Up の入口・照合・処分 (activate-and-eat、touch 破棄、capture 変更など) と、補助プログラム側の tag・挿入・受け手を
+  記録する計装を足した (`f62103b45`、test-script 限定、製品の挙動は不変)。2 回目 (16:42) は PASS (zoom=1.0)。2 回は表示位置が違う
+  (presenter の画面原点が 1 回目 (159,193)、2 回目 (463,497)。ボタン中心は同じ client (1239,41))。独立レビューの見立てでは、
+  計装でタイミングが変わって競合が隠れた可能性は排除できない。残る候補は、入力先の違い・activation による破棄・照合 / 配送の経路。
+- 再開の条件: 次に NativeTopPanoramaClick が受領の timeout で落ちたら、計装の記録 (runner-events.log の `button helper input trace` と
+  App ログの button edge の処分) から原因を決め、本体のバックログへ戻す。実入力の試験なので、実行は毎回利用者の了承を得る。
+- 規模 / 優先度: Small / P3。
+
 ### 1.388 別ウィンドウの promote で `plan_promote` のアサーションが落ちる — panic.log の記録、操作不明 (2026-10-16 起票)
 
 - 出どころ: v4.7.1 のリリース前の `check-panic-log.ps1` で見つかった未分類の 1 件。

@@ -185,22 +185,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   定期的に回す入口 (test-lib-full のオプションか、リリース前の手順) を検討する。
 - 規模 / 優先度: Small / P3。
 
-### 1.391 ui-smoke `NativeTopPanoramaClick` が押下の前に必ず止まる — クリック先へカーソルを動かす手順が無い (2026-10-17)
-
-- 観測 (ClaudeCode の隔離 portable 実行。2026-10-17 未明に 2 回、同日昼に利用者の了承を得て 1 回): 3 回とも、ボタン操作の補助プログラムが
-  `FailedBeforeDown` で止まり、押下は送られていない。昼の実行で失敗理由をログに出すようにした (2b4500282) ところ、
-  理由は `current cursor does not match the immutable physical screen point` だった。証跡 `target/ui-smoke-runs/20261017T041401651Z-84364-NativeTopPanoramaClick-96e24003`。
-- 原因 (コード): `click_native_top_panorama` (`src/test_script.rs`) は、上端の帯の中央 (`prepare_real_mouse_in_top_hover_activation`
-  の normalized `[0.5, 0.5]`) へ MouseMove を 1 回送ってパノラマボタンを出し、その後ボタンの中心を押下先として補助プログラムへ渡す
-  (`ButtonPipeClient::connect`、`src/video/native_ui_smoke.rs`)。補助プログラムは自分ではカーソルを動かさず、押下前に
-  「カーソルが押下先の座標にあること」を確かめる (`scripts/ui-smoke/button-helper/ButtonInputBackend.cs` の送信前検査)。
-  ボタンの中心へカーソルを動かす手順がどこにも無いので、ボタンが帯の中央に無い限り必ず止まる。2026-09-10 に接続したあと、
-  本物の入力での実行は 10/17 が初めてで、これまで一度も通っていない。製品の不具合ではない。
-- 直し方: パノラマボタンが出たあと、その中心へ 2 回目の MouseMove を送り、その移動で hover 応答が更新された後の観測で押下先を
-  決め直してから補助プログラムへ渡す。補助プログラムの検査は緩めない。ほかの名前付きボタンの試験 (音声ボタンは移動・押下・
-  離すを 1 回の SendInput で送る) と手順が違うので、揃えるかも合わせて検討する。
-- 規模 / 優先度: Small〜Medium / P3 (試験の入口。リリース前の対話試験の一つが使えない)。
-
 ### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
 
 - 観測 (このセッションの全件実行の記録。単独で再実行するとどれも成功):
