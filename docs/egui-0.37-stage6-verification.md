@@ -18,3 +18,17 @@ release の 3 本は `test-full.ps1` の前提 (launcher の build.rs が内包�
 test-full には vendor の非対話区分・MSRV 検査・core / Remote / EPUB が含まれる。live の eframe テストは段0a のとおり既定対象外 (`scripts/test-live-windows.ps1` で承認付き実行)。
 
 自動 gate は成功。段7 の利用者実機確認と承認付き live 試験は未実施で、この台帳は PASS として扱わない。
+
+## master 取り込み後の再確認 (2026-10-17 夜)
+
+master `720565e35` を merge (`6540b982d`、コンフリクトなし)。master 由来のテクスチャ共有テストを 0.37 の API へ移行 (`147519d5e`)。
+source `147519d5e` で、fmt・core check・全 test target のコンパイル・release core のビルド・`test-full.ps1` (PASS) は exit 0。
+
+`test-lib-full.ps1` は 13,461 件中 2 件が失敗した。どちらも単独で再実行すると成功し、egui の変更が触れない経路のテスト:
+
+- `video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch` (実 decoder の音声 callback で末尾 burst が 2 回に分かれた)
+- `app::section375_tests::section1375_search_root_delete_does_not_dispatch_physical_folder_reload` (実ファイル監視の最初の通知が来なかった)
+
+実行時、利用者が確認用ビルドを起動して操作中で、別の作業ツリーでも native のビルドが走っていた。負荷によって実時計・実 OS 通知に依存するテストが
+落ちる既知の傾向 (backlog §1.389) と同じ形と判断した。`build-dev.ps1 -PreserveRuntime` は、利用者が起動中の dev core を止めないため
+作り直しを断った (スクリプトの意図どおり)。
