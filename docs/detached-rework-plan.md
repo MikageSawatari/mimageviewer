@@ -5406,6 +5406,7 @@ active / parked / passive の終了、Remote 起点、watcher、bar の ×) を 
 対象の登録寿命と子孫への退役権限を、子の GC に依存しない root の viewport command 出力へ型付きで一度だけ移譲し、backend が pass 外で
 native → Context → IME の順に対象限定で退役させる契約とした (権限移譲・寿命同定・配送境界・cleanup・終了入口・Remote の readiness)。
 設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.5版 ACCEPT) の双方が「症状パッチではなく構造的修正である」ことに同意した。
+**追加合意 (2026-10-17、設計書第4.6版)**: 段3 の実装で見つかった 2 件について、(1) 退役する別窓の Close 後の表示継続 (bookmark 一覧の更新・最後の実フォルダ復帰・auto-open の親一覧復帰) を、teardown の前に捕捉して存続する main の既存 navigation 帰還 owner へ型付きで移す (Remote 取得・新 navigation・新 bookmark 開始で同じ owner が失効させる)、(2) discard 再 pass に進む直前に生成済みの texture delta を既存の backend 共有 renderer owner へ一度だけ移譲し、旧 pass の set / partial が後発の free に追い越されないようにする、の 2 点を、設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.6版 ACCEPT) の双方が「症状パッチではなく構造的修正である」と合意した。
 旧版の静的調査・非対話検査は[段0b基準台帳](egui-0.37-baseline.md)へ分ける。
 以下のBA番号は§2が参照する[提案書§2](detached-viewer-lifecycle-redesign-proposal.md#2-初期診断の壊れた前提と現在の解消状況)への対応であり、各BA全体の解消を主張しない。
 
