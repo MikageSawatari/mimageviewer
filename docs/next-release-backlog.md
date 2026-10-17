@@ -171,7 +171,7 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 
-### 1.390 `scripts/page-turn-smoke.ps1` が `--test-evidence-dir` を渡さず、操作スクリプトが起動直後に終了する — 夜間計測で判明 (2026-10-17)
+### 1.390 `scripts/page-turn-smoke.ps1` が `--test-evidence-dir` を渡さず、操作スクリプトが起動直後に終了する — 夜間計測で判明、修正済み (2026-10-17)
 
 - 観測 (ClaudeCode の隔離 portable 計測、2026-10-17 未明): `-Script` 付きで実行すると core が exit 2。app log は
   `runner start failed` で、`--test-script` には `--test-evidence-dir` が必須 (`src/test_script.rs` の `cli_capture_dir_from`)。
@@ -181,6 +181,13 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 直し方: ui-smoke と同じ証跡先の作り方 (run id ディレクトリの作成) を page-turn-smoke.ps1 にも入れる。`-SelfTest` を
   定期的に回す回帰か、ui-smoke 側の共通関数への寄せを検討する。`.ps1` は ASCII のみ。
 - 規模 / 優先度: Small / P2 (ページめくりの実アプリ計測の入口が壊れている)。
+- 修正 (2026-10-17): 実行ごとに `target/ui-smoke-runs/page-turn-<UTC時刻>-<PID>-<乱数>` を作って `--test-evidence-dir` に渡す
+  (ui-smoke.ps1 と同じ 1 階層の置き場。アプリは `target/ui-smoke-runs/` の 1 階層下も受け付ける)。
+  起動が通ると `-SelfTest` の解析が次の別問題で FAIL した: 押しっぱなし入力の判定 (`Keymap::key_held_chord`) の観測が
+  全フレーム `held=false`。観測は ROOT の描画回で取っていて、フォーカス許可を ROOT の focus から作っていたため、
+  全画面ウィンドウが前面の間は常に許可なしになっていた (f3261a9eb でフォーカス許可が入ったとき観測側が追従していなかった)。
+  製品の判定経路は各 viewport 自身の回で許可を作るので影響しない。観測の許可を合成入力の送り先 viewport の focus から
+  作るよう直し、ClaudeCode の隔離実行で `-SelfTest` が PASS した (押しっぱなし判定 825 フレームすべて `held=true`)。
 
 ### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
 

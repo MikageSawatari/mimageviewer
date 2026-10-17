@@ -31609,6 +31609,20 @@ impl App {
         &self,
         ctx: &egui::Context,
     ) -> crate::test_script::TestScriptSnapshot {
+        let target = crate::key_input::resolve_synthetic_routing_target().ok();
+        // The snapshot runs in ROOT's pass, but a fullscreen hold is owned by the
+        // fullscreen viewport. Issue the level permit from the routing target's
+        // focus, as that viewport's own handler would; ROOT's focus is false there.
+        let focused = target
+            .map(|target| {
+                ctx.input_for(target.viewport, |input| {
+                    input.viewport().focused.unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let level_permit = target.and_then(|target| {
+            crate::keyboard_input::focused_key_state_permit_for_viewport(target.viewport, focused)
+        });
         let keymap_level_observations = crate::key_input::synthetic_hold_observations(ctx)
             .into_iter()
             .map(|observation| {
@@ -31632,13 +31646,13 @@ impl App {
                     frame_nr: observation.frame_nr,
                     key: key_name.settings_name().to_string(),
                     hold_ids: observation.hold_ids,
-                    held: self
-                        .keymap
-                        .test_script_key_held_chord(ctx, Chord::key(key_name)),
+                    held: level_permit.is_some_and(|permit| {
+                        self.keymap
+                            .test_script_key_held_chord(ctx, permit, Chord::key(key_name))
+                    }),
                 }
             })
             .collect();
-        let target = crate::key_input::resolve_synthetic_routing_target().ok();
         let target_viewport = target
             .map(|target| {
                 if target.viewport == egui::ViewportId::ROOT {
@@ -31648,13 +31662,6 @@ impl App {
                 }
             })
             .unwrap_or_else(|| "unregistered".to_string());
-        let focused = target
-            .map(|target| {
-                ctx.input_for(target.viewport, |input| {
-                    input.viewport().focused.unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
         let fs_idx = self.fullscreen_idx;
         let current_is_still_image = fs_idx.is_some_and(|idx| {
             matches!(
