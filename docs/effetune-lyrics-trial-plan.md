@@ -750,8 +750,8 @@ protocol v8 の試作なので通常版のbackupを上書きせず、試作用�
 ## 12. T3 の準備 (2026-10-17、ClaudeCode)
 
 - T1 (Mixwright `miv-lyrics-trial` 3843b96) のビルド済みバンドル
-  `G:\home\effetune-mixwright-trialuild\windows-release\VST3\Release\EffeTune Mixwright.vst3` を
-  `.\scriptsuild-dev.ps1 -EffetuneBundle <そのパス>` で dev-runtime に置いた。dev-runtime のバンドルが元と完全に同じこと、
+  `G:\home\effetune-mixwright-trial\build\windows-release\VST3\Release\EffeTune Mixwright.vst3` を
+  `.\scripts\build-dev.ps1 -EffetuneBundle <そのパス>` で dev-runtime に置いた。dev-runtime のバンドルが元と完全に同じこと、
   JS に P2 の修正 (歌詞用 listener が `telemetryWasHidden` に触れない) が入っていることを確かめた。
 - 試験素材は `python scripts/generate-lyrics-trial-assets.py` で `target/lyrics-trial/assets` に生成した (FFmpeg)。
   ビープが 2 秒ごとに 50 ms 鳴ること (silencedetect)、埋め込みの歌詞のキー (MP3 / M4A は `lyrics`、FLAC は `LYRICS`) を ffprobe で確かめた。
