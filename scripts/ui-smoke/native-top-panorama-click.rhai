@@ -1,5 +1,6 @@
-// Reveals native_top_panorama with one real MouseMove, then performs one real
-// left-button Down/Up through the external helper. The App must report the
+// Reveals native_top_panorama, then moves to its observed center (two real
+// MouseMoves) before one real left-button Down/Up through the external helper.
+// The post-move observation is the click target. The App must report the
 // exact normal TogglePanorama handler transition before this script succeeds.
 
 fn root_host_ready(s) {
@@ -68,12 +69,15 @@ if selected.target_mode != "targeted" || !selected.current {
 
 let observed = click_native_top_panorama(30000);
 let moved = observed.mouse;
+let target_moved = observed.target_mouse;
 let target = observed.target;
 let click = observed.click;
 let down = click.down;
 let up = click.up;
 
 log("native-top-panorama-click: gesture=" + click.gesture_id
+    + " hover_move=" + moved.token
+    + " target_move=" + target_moved.token
     + " target=" + target.token
     + " down=" + down.token
     + " up=" + up.token
@@ -97,6 +101,21 @@ if target.owner_hwnd != moved.owner_hwnd
 if moved.requested_client_x != moved.actual_client_x
         || moved.requested_client_y != moved.actual_client_y {
     fail("the hover WndProc receipt did not preserve the requested point");
+}
+if moved.token == 0 || target_moved.token == 0 || moved.token == target_moved.token {
+    fail("the reveal and control-center moves did not have distinct nonzero tokens");
+}
+if target_moved.owner_hwnd != target.owner_hwnd
+        || target_moved.presenter_hwnd != target.presenter_hwnd
+        || target_moved.source_epoch != target.source_epoch
+        || target_moved.generation != target.generation {
+    fail("the control-center move did not preserve the exact target owner/source/host");
+}
+if target_moved.requested_client_x != target.client_x
+        || target_moved.requested_client_y != target.client_y
+        || target_moved.actual_client_x != target.client_x
+        || target_moved.actual_client_y != target.client_y {
+    fail("the second MouseMove did not reach the post-move control center");
 }
 if down.token == 0 || up.token == 0 || down.token == up.token {
     fail("Down and Up did not have distinct nonzero delivery tokens");

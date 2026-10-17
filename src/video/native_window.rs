@@ -2256,13 +2256,29 @@ unsafe extern "system" fn wnd_proc(
     // Capture before touch-source/debug helpers, then compare with the value read at the
     // established metadata match point. This trace is observational and covers only the
     // explicitly prepared move or ordinary left-button edge.
-    let ui_smoke_message_entry = if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
-        super::native_ui_smoke::capture_message_entry()
+    let ui_smoke_message_entry = if matches!(
+        msg,
+        WM_MOUSEMOVE
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_MOUSEACTIVATE
+            | WM_CAPTURECHANGED
+            | WM_CANCELMODE
+    ) {
+        super::native_ui_smoke::capture_message_entry(hwnd, msg, lparam.0)
     } else {
         None
     };
     log_win32_message(TouchDebugWindow::Presenter, hwnd, msg, wparam, lparam);
     if let Some(result) = handle_presenter_pointer_message(hwnd, msg, wparam) {
+        #[cfg(feature = "test-script")]
+        super::native_ui_smoke::record_message_disposition(
+            hwnd,
+            ui_smoke_message_entry,
+            lparam.0,
+            "pointer_handled",
+        );
         return result;
     }
     match msg {
@@ -2321,6 +2337,13 @@ unsafe extern "system" fn wnd_proc(
             } else {
                 want_eat
             };
+            #[cfg(feature = "test-script")]
+            super::native_ui_smoke::record_message_disposition(
+                hwnd,
+                ui_smoke_message_entry,
+                lparam.0,
+                if eat { "activate_and_eat" } else { "activate" },
+            );
             if eat {
                 LRESULT(MA_ACTIVATEANDEAT as isize)
             } else {
@@ -2529,6 +2552,13 @@ unsafe extern "system" fn wnd_proc(
         | WM_MBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK
         | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
             if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Presenter) {
+                #[cfg(feature = "test-script")]
+                super::native_ui_smoke::record_message_disposition(
+                    hwnd,
+                    ui_smoke_message_entry,
+                    lparam.0,
+                    "touch_discard",
+                );
                 return LRESULT(0);
             }
             if let Some(state) = window_state_mut(hwnd) {

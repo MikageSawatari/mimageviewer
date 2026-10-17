@@ -42,8 +42,10 @@ click、wheel、key、panは送らない。この具体scenarioの実行了承�
 `-InteractiveApproved`を付けず、portable artifactの準備と非対話検証までに留める。
 
 `NativeTopPanoramaClick`は単独で約2分を見込み、同じ使い捨て動画と別窓を使う。上端36ptへの
-MouseMove 1件で実`native_top_panorama` Responseを表示し、そのcontrol centerへLeft Down/Upを
-各1件送る。外部helperがUpの送信と解放確認を所有し、runnerはhelperをjoinしてからだけexact
+MouseMove 1件で実`native_top_panorama` Responseを表示し、観測したcontrol centerへ2件目の
+MouseMoveを送る。その入力のApp配送と描画確定を待ち、新しい観測で対象を取り直してから
+同じcontrol centerへLeft Down/Upを各1件送る。移動中のボタン消失・位置変更は環境不成立として
+停止し、再試行しない。外部helperがUpの送信と解放確認を所有し、runnerはhelperをjoinしてからだけexact
 portable Appを終了できる。通常handlerの非360動画zoom `None -> Some(1.0)`までを確認するが、
 wheel/panやGPU scanoutの確認には読み替えない。このscenario名、所要時間、前面windowとmouseの
 使用、使い捨てdataを示した実行了承が届くまでは、buildと非対話検証だけに留める。
