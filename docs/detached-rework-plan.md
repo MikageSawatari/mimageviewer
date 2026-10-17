@@ -5400,6 +5400,12 @@ surface 描画の要否は別に判断する。RedrawRequested 期限超過の L
 (4) immediate 子窓の描画判定 (両 backend の `render_immediate_viewport` で子自身の metadata と明示描画要求を使う) について、
 設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.4版 ACCEPT) の双方が「症状パッチではなく構造的修正である」ことに同意した。
 下の 11 項目のうち「App の logic/ui 分離」「scheduler 付け直し」「非表示子 Close」の範囲を、この追加合意で補う。
+**追加合意 (2026-10-17、設計書第4.5版)**: 段3 の途中で、App 起点の子 viewport 退役 (mode change の「描かないことで GC に消させる」退役、
+active / parked / passive の終了、Remote 起点、watcher、bar の ×) を App::logic から行えず、App が先に owner を終えると段2c の Close hook が対象を同定できない
+受け渡しの不足が見つかった。App の Closing と binding を backend の受理まで延命する案は採らず、App の既存終了判断が確定した時点で、
+対象の登録寿命と子孫への退役権限を、子の GC に依存しない root の viewport command 出力へ型付きで一度だけ移譲し、backend が pass 外で
+native → Context → IME の順に対象限定で退役させる契約とした (権限移譲・寿命同定・配送境界・cleanup・終了入口・Remote の readiness)。
+設計担当と独立レビュー担当 (GPT-6.1 Sol / xhigh、第4.5版 ACCEPT) の双方が「症状パッチではなく構造的修正である」ことに同意した。
 旧版の静的調査・非対話検査は[段0b基準台帳](egui-0.37-baseline.md)へ分ける。
 以下のBA番号は§2が参照する[提案書§2](detached-viewer-lifecycle-redesign-proposal.md#2-初期診断の壊れた前提と現在の解消状況)への対応であり、各BA全体の解消を主張しない。
 
