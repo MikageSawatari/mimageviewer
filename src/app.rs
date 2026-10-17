@@ -14513,6 +14513,7 @@ fn viewer_bundle_references_removed(
 
 #[derive(Clone, Debug)]
 struct MediaResumeUpdate {
+    clear_generation: u64,
     path: PathBuf,
     key: String,
     position: f64,
@@ -14601,6 +14602,7 @@ fn merge_repaint_deadline(
 fn viewer_context_media_teardown_plan(
     owner_context_id: ViewerContextId,
     context: ContextRef<'_>,
+    clear_generation: u64,
 ) -> ViewerContextMediaTeardownPlan {
     let mut plan = ViewerContextMediaTeardownPlan {
         owner_context_id,
@@ -14635,6 +14637,7 @@ fn viewer_context_media_teardown_plan(
                     .video_audio_vst()
                     .is_some_and(|state| state.fs_idx == *idx);
             plan.resume_updates.push(MediaResumeUpdate {
+                clear_generation,
                 key: crate::adjustment_db::normalize_path(&path),
                 path,
                 position: video_resume_position_for_save(player, audio_mode_without_vst),
@@ -14729,9 +14732,13 @@ fn apply_viewer_context_media_resume_updates(
     watched: &mut HashSet<String>,
     choices: &mut std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
     updates: &[MediaResumeUpdate],
+    clear_generation: u64,
 ) -> Vec<String> {
     let mut removed = Vec::new();
     for update in updates {
+        if update.clear_generation != clear_generation {
+            continue;
+        }
         if let Some(choice) = &update.audio_track_choice {
             choices.insert(update.key.clone(), choice.clone());
         }
@@ -18738,6 +18745,8 @@ pub struct App {
 
     /// 動画再生位置の自動保存タイマ (5 秒間隔)。
     pub(crate) video_resume_last_save: Option<std::time::Instant>,
+    /// App-global clear boundary, including updates captured by another viewer context.
+    pub(crate) media_memory_clear_generation: u64,
     /// Resume 位置サムネの生成要求を同じ PTS で重複投入しないための session-local 記録。
     #[cfg(windows)]
     pub(crate) video_resume_thumb_last_request: std::collections::HashMap<String, i64>,
@@ -21133,6 +21142,7 @@ impl App {
             archive_auto_fs_paint_trace: None,
             final_effect_prefetch_block_log: FinalEffectPrefetchBlockLog::default(),
             video_resume_last_save: None,
+            media_memory_clear_generation: 0,
             #[cfg(windows)]
             video_resume_thumb_last_request: std::collections::HashMap::new(),
             #[cfg(windows)]
@@ -62067,12 +62077,14 @@ impl App {
         let _ = clears_mode_switch;
         let mut plans = Vec::new();
         let mut retire_failed = false;
+        let clear_generation = self.media_memory_clear_generation;
         for &window_id in window_ids {
             let Some((id, _)) = self.locate_window_context(window_id) else {
                 continue;
             };
             match self.retire_context(id, reason, |mut context| {
-                let plan = viewer_context_media_teardown_plan(id, context.as_ref());
+                let plan =
+                    viewer_context_media_teardown_plan(id, context.as_ref(), clear_generation);
                 context.clear_normalize_state();
                 plan
             }) {
@@ -62118,15 +62130,17 @@ impl App {
             &mut self.settings.video_watched_to_end,
             &mut self.settings.video_audio_track_choices,
             &updates,
+            self.media_memory_clear_generation,
         );
         for key in removed {
             self.video_resume_thumb_last_request.remove(&key);
         }
         for update in &updates {
-            if self
-                .settings
-                .video_resume_positions
-                .contains_key(&update.key)
+            if update.clear_generation == self.media_memory_clear_generation
+                && self
+                    .settings
+                    .video_resume_positions
+                    .contains_key(&update.key)
             {
                 self.maybe_schedule_video_resume_thumbnail(
                     &update.path,
@@ -62399,7 +62413,11 @@ impl App {
             .into_iter()
             .filter_map(|id| {
                 self.with_viewer_context_ref(id, |context| {
-                    viewer_context_media_teardown_plan(id, context)
+                    viewer_context_media_teardown_plan(
+                        id,
+                        context,
+                        self.media_memory_clear_generation,
+                    )
                 })
             })
             .collect::<Vec<_>>();
@@ -92738,19 +92756,32 @@ impl App {
         }
     }
 
+    pub(crate) fn advance_media_memory_clear_generation(&mut self) {
+        self.media_memory_clear_generation = self.media_memory_clear_generation.wrapping_add(1);
+    }
+
+    fn clear_live_video_media_memory(&mut self) -> (usize, usize, usize) {
+        self.advance_media_memory_clear_generation();
+        self.settings.clear_video_media_memory()
+    }
+
     /// 手動 flush と定期保存が共有する、再生位置更新の唯一の適用入口。
     fn apply_media_resume_updates(&mut self, updates: Vec<MediaResumeUpdate>) {
         for update in updates {
-            if let Some(choice) = update.audio_track_choice {
-                self.settings
-                    .video_audio_track_choices
-                    .insert(update.key.clone(), choice);
-            }
             self.update_reading_history_media_progress(
                 &update.path,
                 update.position,
                 update.duration,
             );
+            // Reading history is outside the clear operation. Only media memory is fenced.
+            if update.clear_generation != self.media_memory_clear_generation {
+                continue;
+            }
+            if let Some(choice) = update.audio_track_choice {
+                self.settings
+                    .video_audio_track_choices
+                    .insert(update.key.clone(), choice);
+            }
             let kept = save_video_resume_position(
                 &mut self.settings.video_resume_positions,
                 &mut self.settings.video_watched_to_end,
@@ -92775,6 +92806,7 @@ impl App {
     ) {
         let key = crate::adjustment_db::normalize_path(&path);
         self.apply_media_resume_updates(vec![MediaResumeUpdate {
+            clear_generation: self.media_memory_clear_generation,
             path: path.clone(),
             key: key.clone(),
             position,
@@ -92807,6 +92839,7 @@ impl App {
                 #[cfg(windows)]
                 thumb_requests.push((player.path().clone(), key.clone(), pos));
                 updates.push(MediaResumeUpdate {
+                    clear_generation: self.media_memory_clear_generation,
                     path: player.path().clone(),
                     key,
                     position: pos,
@@ -94333,6 +94366,7 @@ impl App {
                         video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx),
                     );
                     updates.push(MediaResumeUpdate {
+                        clear_generation: self.media_memory_clear_generation,
                         path: player.path().clone(),
                         key: path_key,
                         position: pos,

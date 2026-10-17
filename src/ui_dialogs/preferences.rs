@@ -2808,6 +2808,11 @@ impl App {
             // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
             // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
             // Settings に追加した場合はここにも追記が必要。
+            // Only accepted OK clears invalidate captured media updates. Draft edits,
+            // unsaved-change comparisons and Cancel leave the live generation alone.
+            if state.video_media_memory_clear_requested {
+                self.advance_media_memory_clear_generation();
+            }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
             self.install_preferences_settings(state.settings);
             if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
@@ -5123,6 +5128,28 @@ mod tests {
         assert!(reopened.settings.video_watched_to_end.is_empty());
         assert!(reopened.settings.video_resume_positions.is_empty());
         assert!(reopened.settings.video_audio_track_choices.is_empty());
+    }
+
+    #[test]
+    fn saved_position_preferences_only_accepted_ok_advances_media_clear_generation() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let generation = app.media_memory_clear_generation;
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.pref_state = Some(Box::new(state));
+        let _ = app.preferences_dialog_has_unsaved_changes(); // Preview must not advance it.
+        assert_eq!(app.media_memory_clear_generation, generation);
+        app.discard_preferences_dialog();
+        assert_eq!(app.media_memory_clear_generation, generation);
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.pref_state = Some(Box::new(state));
+        app.apply_preferences_dialog(&ctx);
+        assert_eq!(app.media_memory_clear_generation, generation + 1);
+        app.pref_state = Some(Box::new(preferences_state_for_test(&app.settings)));
+        app.apply_preferences_dialog(&ctx);
+        assert_eq!(app.media_memory_clear_generation, generation + 1);
     }
 
     #[test]

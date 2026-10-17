@@ -76653,6 +76653,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::adjustment_db::normalize_path(std::path::Path::new(r"C:\clips\finished.mp4"));
         let updates = vec![
             MediaResumeUpdate {
+                clear_generation: 0,
                 path: PathBuf::from(r"C:\clips\keep.mp4"),
                 key: kept.clone(),
                 position: 37.5,
@@ -76661,6 +76662,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 audio_track_choice: None,
             },
             MediaResumeUpdate {
+                clear_generation: 0,
                 path: PathBuf::from(r"C:\clips\finished.mp4"),
                 key: finished.clone(),
                 position: 118.0,
@@ -76677,6 +76679,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             &mut watched,
             &mut Default::default(),
             &updates,
+            0,
         );
 
         assert_eq!(resume.get(&kept), Some(&37.5));
@@ -76922,6 +76925,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 viewer_context_media_teardown_plan(
                     context.projected_viewer_context_id(),
                     ContextRef::mounted(context),
+                    context.media_memory_clear_generation,
                 )
             })
             .unwrap();
@@ -77017,6 +77021,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 viewer_context_media_teardown_plan(
                     context.projected_viewer_context_id(),
                     ContextRef::mounted(context),
+                    context.media_memory_clear_generation,
                 )
             })
             .unwrap();
@@ -77031,6 +77036,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             &mut watched,
             &mut Default::default(),
             &plan.resume_updates,
+            0,
         );
 
         assert!(!resume.contains_key(&key));
@@ -77069,6 +77075,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 viewer_context_media_teardown_plan(
                     context.projected_viewer_context_id(),
                     ContextRef::mounted(context),
+                    context.media_memory_clear_generation,
                 )
             })
             .unwrap();
@@ -77080,6 +77087,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             &mut watched,
             &mut choices,
             &plan.resume_updates,
+            0,
         );
         assert_eq!(choices[&key].stream_index, 1);
     }

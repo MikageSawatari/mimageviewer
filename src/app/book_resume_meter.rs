@@ -163,6 +163,14 @@ impl App {
         ctx: &egui::Context,
         surface: ActionSurface,
     ) -> bool {
+        // Share the current-player normalize predicate with native input. Text/IME
+        // ownership stays with each caller (native receives a root egui Context).
+        if self.fullscreen_idx.is_some_and(|idx| {
+            self.music_normalize_modal_active(idx)
+                || (self.fs_music_view_active(idx) && self.music_bookmark_modal_open())
+        }) {
+            return false;
+        }
         for action in [
             KeyAction::ClearVideoMediaMemory,
             KeyAction::ClearBookResumePositions,
@@ -182,7 +190,7 @@ impl App {
     ) {
         match action {
             KeyAction::ClearVideoMediaMemory => {
-                let (positions, watched, tracks) = self.settings.clear_video_media_memory();
+                let (positions, watched, tracks) = self.clear_live_video_media_memory();
                 let message = if positions == 0 && watched == 0 && tracks == 0 {
                     "保存済みの再生位置・視聴済み記録・音声トラックの選択はありません".into()
                 } else {
@@ -262,6 +270,20 @@ impl App {
     }
 
     fn clear_book_resume_async_on(&mut self, surface: Option<ActionSurface>) {
+        // Keep the first completion ticket, even if the worker already replied but
+        // the UI has not polled it yet. Do not admit another mutation or enqueue it.
+        if self.book_resume_meters.clear.is_some() {
+            let message = "本の読書位置をクリア中です".to_string();
+            if let Some(state) = &mut self.pref_state {
+                state.book_resume_clear_result = Some(message.clone());
+            }
+            if let Some(surface) = surface {
+                self.show_feedback_toast_on(message, surface);
+            } else {
+                self.show_feedback_toast(message);
+            }
+            return;
+        }
         if self.book_resume_writer.is_some() && !self.admit_book_append_followup_mutation() {
             return;
         }

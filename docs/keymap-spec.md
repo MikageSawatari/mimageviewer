@@ -5,7 +5,7 @@
 `ClearVideoMediaMemory` / `ClearBookResumePositions` は独立した Global / Press 操作で、
 どちらも既定キーなし。操作カスタマイズの「全体共通」に表示する。確認ダイアログは付けない。
 一覧、画像フルスクリーン、egui 動画・音声、native 動画の既存 `ToggleAlwaysOnTop` と同じ
-受付条件・keymap helper を使う。文字入力・IME・モーダル・編集モードの入力所有を優先し、
+Global の keymap helper を使う。文字入力・IME・モーダル・編集モードの入力所有を優先し、
 native 転送対象にも登録する。detached の述語・viewport 配送は変更しない。
 
 動画側は `Settings::clear_video_media_memory` に対象を集約し、環境設定の編集値とコマンドの
@@ -14,11 +14,33 @@ live 値を同じ関数で消す。対象は再生位置、視聴済み記録、
 記録時と同じく終了時等の既存保存機会に永続化する。環境設定は従来どおり OK で反映、
 キャンセルでは破棄する。古い draft の OK も最新 live を merge し、消した記録を復活させない。
 
+App 共通の `media_memory_clear_generation` をキー消去と環境設定 OK の消去で進める。
+空の消去も世代境界とし、draft のボタン・変更比較・キャンセルでは進めない。
+`MediaResumeUpdate` は採取時の世代を保持し、通常適用と teardown 適用の双方で照合する。
+旧世代から再生位置・視聴済み・音声選択や resume thumbnail の要求を復活させない。
+対象外の閲覧履歴 progress 更新は世代によらず従来どおり行う。
+
+| 採取元 | 世代と適用時点 |
+| --- | --- |
+| `poll_video` 定期採取 | native キー処理より前の世代を保持し、処理後の適用で検査 |
+| `save_all_video_resume_positions`（表示中・終了時の保存） | プレイヤー採取時の現在世代、同じ UI 呼出し内で適用 |
+| `viewer_context_media_teardown_plan`（別窓の破棄・終了時保存） | App の現在世代を採取関数へ渡し、保持した plan の適用時にも検査 |
+| `apply_remote_media_resume_update` | session 検証後の受信処理で現在世代を付け、直ちに適用 |
+| 音声トラック確定 | poll の tick 直後、明示選択の Unchanged、Remote の選択記憶はいずれも採取した UI 呼出し内で即適用。旧更新を保持しない |
+
+音楽ビューの早期受付も既存 `music_normalize_modal_active` を使い、その内側の
+`normalize_scan_is_modal_for_current_player` を native と共有する。音楽のしおりモーダルも
+受付を止める。文字入力・IME は各入力所有者に任せ、native に root の文字入力状態を混ぜない。
+
 本側は既存 `clear_book_resume_async` の writer FIFO、追加後続変更の受付、`Delta::Clear`、
 `last_book_resume` の解除、失敗時のメーター再読込を共有する。完了の件数・空・失敗は
 環境設定の結果欄、コマンドは発火コンテキストと面を完了票に保持し、既存
 `with_viewer_context` 内から発火元の既存トーストへ通知する。root poll時のmainや兄弟の
 native overlayへ送らない。発火コンテキスト退役後の通知はログに残して破棄する。
+egui の完了通知は既存の App 共通トーストを使い、同じ面の別窓へ切り替えた場合は
+表示中の窓に出す。egui の窓を追跡する状態は追加しない。
+先行 clear の完了票が未処理なら、キーと環境設定ボタンのどちらも「クリア中です」と通知して
+再要求を拒否する。先行の件数・通知先・変更受付状態を保ち、待ち行列は作らない。
 閲覧履歴・しおり・構成・見開き調整・タグ・評価・編集・最近のフォルダ・A/B の場所は消さない。
 消去後も通常の閲覧・再生による新規記録を続ける。
 
