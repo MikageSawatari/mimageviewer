@@ -36,7 +36,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, GetClientRect, GetForegroundWindow, GetMessageExtraInfo,
     GetSystemMetrics, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
 };
 
 use super::NativeVideoPlacement;
@@ -48,7 +49,8 @@ const DISPOSABLE_DATA_MARKER: &str = "mimageviewer-disposable-smoke-v1;test-scri
 const TARGET_WAIT_POLL: Duration = Duration::from_millis(20);
 const TARGET_DIAGNOSTIC_RECORD_LIMIT: usize = 4;
 const TARGET_DIAGNOSTIC_PAIR_LIMIT: usize = 8;
-const WNDPROC_TRACE_RECORD_LIMIT: usize = 8;
+const WNDPROC_TRACE_RECORD_LIMIT: usize = 32;
+const WNDPROC_TRACE_MOVE_LIMIT: usize = 8;
 const STEP_TOKEN_PREFIX: usize = 0x4d49_0000;
 const STEP_TOKEN_SERIAL_MIN: u32 = 1;
 const STEP_TOKEN_SERIAL_MAX: u32 = u16::MAX as u32;
@@ -69,10 +71,15 @@ static WNDPROC_TRACE_UNAVAILABLE_TOTAL: AtomicUsize = AtomicUsize::new(0);
 pub(crate) struct NativeUiSmokeMessageEntry {
     active_token: usize,
     extra_info: usize,
+    message: u32,
+    stage: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WndProcTraceRecord {
+    message: u32,
+    stage: &'static str,
+    tick_ms: u64,
     entry_active_token: usize,
     match_active_token: usize,
     receiver_hwnd: u64,
@@ -1175,12 +1182,39 @@ fn receipt_kind_matches(step: &PendingStep, actual: NativeUiSmokeInputKind) -> b
     )
 }
 
-pub(crate) fn capture_message_entry() -> Option<NativeUiSmokeMessageEntry> {
+pub(crate) fn capture_message_entry(
+    hwnd: HWND,
+    message: u32,
+    lparam: isize,
+) -> Option<NativeUiSmokeMessageEntry> {
     let active_token = ACTIVE_STEP_TOKEN.load(Ordering::Acquire);
-    (active_token != 0).then(|| NativeUiSmokeMessageEntry {
+    let entry = (active_token != 0).then(|| NativeUiSmokeMessageEntry {
         active_token,
         extra_info: unsafe { GetMessageExtraInfo().0 as usize },
-    })
+        message,
+        stage: "entry",
+    })?;
+    record_message_disposition(hwnd, Some(entry), lparam, "entry");
+    Some(entry)
+}
+
+pub(crate) fn record_message_disposition(
+    hwnd: HWND,
+    entry: Option<NativeUiSmokeMessageEntry>,
+    lparam: isize,
+    stage: &'static str,
+) {
+    if let Some(mut entry) = entry {
+        entry.stage = stage;
+        record_wndproc_trace(
+            entry,
+            ACTIVE_STEP_TOKEN.load(Ordering::Acquire),
+            unsafe { GetMessageExtraInfo().0 as usize },
+            hwnd_value(hwnd),
+            lparam as i16 as i32,
+            (lparam >> 16) as i16 as i32,
+        );
+    }
 }
 
 pub(crate) fn message_metadata(
@@ -1195,17 +1229,20 @@ pub(crate) fn message_metadata(
         return None;
     }
     let observed = unsafe { GetMessageExtraInfo().0 as usize };
-    if let (Some(entry), super::native_window::NativeVideoWindowEvent::MouseMove(mouse)) =
-        (entry, event)
-    {
-        record_wndproc_trace(
-            entry,
-            active,
-            observed,
-            hwnd_value(receiver_hwnd),
-            mouse.x,
-            mouse.y,
-        );
+    if let Some(mut entry) = entry {
+        entry.stage = "match";
+        let point = match event {
+            super::native_window::NativeVideoWindowEvent::MouseMove(mouse) => {
+                Some([mouse.x, mouse.y])
+            }
+            super::native_window::NativeVideoWindowEvent::MouseButton(button) => {
+                Some([button.x, button.y])
+            }
+            _ => None,
+        };
+        if let Some([x, y]) = point {
+            record_wndproc_trace(entry, active, observed, hwnd_value(receiver_hwnd), x, y);
+        }
     }
     message_metadata_from_values(active, observed, hwnd_value(receiver_hwnd))
 }
@@ -1385,12 +1422,25 @@ fn record_wndproc_trace_in(
     if state.owner_token != entry.active_token {
         return;
     }
-    if state.len == WNDPROC_TRACE_RECORD_LIMIT {
+    // Reserve space for button/activation/capture evidence even after a flood of
+    // ordinary untagged moves. Overflow never silently turns into "no Down".
+    if state.len == WNDPROC_TRACE_RECORD_LIMIT
+        || (entry.message == WM_MOUSEMOVE
+            && state.records[..state.len]
+                .iter()
+                .flatten()
+                .filter(|record| record.message == WM_MOUSEMOVE)
+                .count()
+                >= WNDPROC_TRACE_MOVE_LIMIT)
+    {
         state.overflow = state.overflow.saturating_add(1);
         return;
     }
     let index = state.len;
     state.records[index] = Some(WndProcTraceRecord {
+        message: entry.message,
+        stage: entry.stage,
+        tick_ms: unsafe { GetTickCount64() },
         entry_active_token: entry.active_token,
         match_active_token,
         receiver_hwnd,
@@ -1749,7 +1799,21 @@ fn send_prepared_real_mouse_move_with_completion<T>(
         completed_actual_point(&state, token, &prepared)?.ok_or_else(|| {
             "native mouse receipt completion was revoked before observation".to_string()
         })?;
-        complete(&state, mouse)
+        let result = complete(&state, mouse);
+        drop(state);
+        if result.is_ok() {
+            crate::logger::log(format!(
+                "[native-smoke] move_complete tick_ms={} token=0x{:x} hwnd=0x{:x} requested=({},{}) actual=({},{})",
+                unsafe { GetTickCount64() },
+                mouse.token,
+                mouse.presenter_hwnd,
+                mouse.requested_client_x,
+                mouse.requested_client_y,
+                mouse.actual_client_x,
+                mouse.actual_client_y,
+            ));
+        }
+        result
     })
 }
 
@@ -2282,9 +2346,30 @@ impl ButtonPipeClient {
         terminal: bool,
     ) -> Result<(), String> {
         let payload = encode_button_request(&self.gesture, kind, step, flags, delivery);
+        crate::logger::log(format!(
+            "[native-smoke] helper_request tick_ms={} kind={kind} step={step} gesture={} down=0x{:x} up=0x{:x} input=0x{:x} parent=0x{:x} screen=({},{}) deadline_tick={}",
+            unsafe { GetTickCount64() },
+            self.gesture.gesture_id,
+            self.gesture.down_tag,
+            self.gesture.up_tag,
+            self.gesture.input_hwnd,
+            self.gesture.parent_hwnd,
+            self.gesture.screen_x,
+            self.gesture.screen_y,
+            self.gesture.deadline_tick,
+        ));
         write_button_frame(&mut self.file, &payload)?;
         loop {
             let reply = read_button_reply(&mut self.file)?;
+            crate::logger::log(format!(
+                "[native-smoke] helper_reply tick_ms={} kind={} step={} gesture={} phase={} detail={}",
+                unsafe { GetTickCount64() },
+                reply.kind,
+                reply.step,
+                reply.gesture_id,
+                reply.phase,
+                reply.detail,
+            ));
             if reply.session != self.gesture.session
                 || reply.gesture_id != self.gesture.gesture_id
                 || reply.step != step
@@ -2443,6 +2528,7 @@ fn run_external_button_step(
             deadline,
             validate_owner_and_interrupt,
         )
+        .map_err(|error| receipt_wait_failure(broker(), token, error))
     })
 }
 
@@ -3390,14 +3476,18 @@ fn receipt_wait_failure(broker: &Broker, expected_token: usize, error: String) -
     match lock_broker_state(broker) {
         Ok(state) => match state.pending.as_ref() {
             Some(step) => format!(
-                "{error}; receipt_snapshot={{expected_token=0x{expected_token:x},pending_token=0x{:x},requested=({},{}),tolerance=({},{}),pump_actual={},render_actual={},failure={}}}",
+                "{error}; receipt_snapshot={{expected_token=0x{expected_token:x},pending_token=0x{:x},kind={:?},presenter=0x{:x},requested=({},{}),tolerance=({},{}),pump_actual={},render_actual={},wndproc_identity={:?},capture_confirmed={},failure={}}}",
                 step.token,
+                step.kind,
+                step.target.render.presenter_hwnd,
                 step.target.client_point.x,
                 step.target.client_point.y,
                 step.coordinate_tolerance[0],
                 step.coordinate_tolerance[1],
                 format_receipt_point(step.pump_actual_point),
                 format_receipt_point(step.render_actual_point),
+                step.metadata,
+                step.wndproc_state_confirmed,
                 step.failure
                     .as_deref()
                     .map(bounded_diagnostic_text)
@@ -3489,7 +3579,10 @@ fn format_wndproc_trace(
                     && record.match_extra_info == record.match_active_token;
                 let _ = write!(
                     text,
-                    "kind=mouse_move,entry_active=0x{:x},match_active=0x{:x},hwnd=0x{:x},client=({},{}),entry_extra=0x{:x},match_extra=0x{:x},matched={matched}",
+                    "kind={},stage={},tick_ms={},entry_active=0x{:x},match_active=0x{:x},hwnd=0x{:x},point_or_lparam=({},{}),entry_extra=0x{:x},match_extra=0x{:x},matched={matched}",
+                    wndproc_message_name(record.message),
+                    record.stage,
+                    record.tick_ms,
                     record.entry_active_token,
                     record.match_active_token,
                     record.receiver_hwnd,
@@ -3516,6 +3609,19 @@ fn format_wndproc_trace(
         WndProcTraceSnapshot::Poisoned => format!(
             "unavailable(reason=poisoned,process_unavailable_total={process_unavailable_total})"
         ),
+    }
+}
+
+fn wndproc_message_name(message: u32) -> &'static str {
+    match message {
+        WM_MOUSEMOVE => "mouse_move",
+        WM_LBUTTONDOWN => "left_down",
+        WM_LBUTTONUP => "left_up",
+        WM_LBUTTONDBLCLK => "left_double_click",
+        WM_MOUSEACTIVATE => "mouse_activate",
+        WM_CAPTURECHANGED => "capture_changed",
+        WM_CANCELMODE => "cancel_mode",
+        _ => "other",
     }
 }
 
@@ -6583,6 +6689,8 @@ mod tests {
             &active,
             &unavailable,
             NativeUiSmokeMessageEntry {
+                message: WM_MOUSEMOVE,
+                stage: "match",
                 active_token: token,
                 extra_info: token,
             },
@@ -6607,6 +6715,9 @@ mod tests {
         assert_eq!(
             records[0],
             Some(WndProcTraceRecord {
+                message: WM_MOUSEMOVE,
+                stage: "match",
+                tick_ms: records[0].unwrap().tick_ms,
                 entry_active_token: token,
                 match_active_token: token,
                 receiver_hwnd: 0x200,
@@ -6629,12 +6740,14 @@ mod tests {
         let active = AtomicUsize::new(token);
         let unavailable = AtomicUsize::new(0);
         begin_wndproc_trace_in(&trace, &unavailable, token);
-        for x in 0..(WNDPROC_TRACE_RECORD_LIMIT + 2) {
+        for x in 0..(WNDPROC_TRACE_MOVE_LIMIT + 2) {
             record_wndproc_trace_in(
                 &trace,
                 &active,
                 &unavailable,
                 NativeUiSmokeMessageEntry {
+                    message: WM_MOUSEMOVE,
+                    stage: "match",
                     active_token: token,
                     extra_info: token,
                 },
@@ -6649,7 +6762,7 @@ mod tests {
         assert!(matches!(
             snapshot,
             WndProcTraceSnapshot::Available {
-                len: WNDPROC_TRACE_RECORD_LIMIT,
+                len: WNDPROC_TRACE_MOVE_LIMIT,
                 overflow: 2,
                 ..
             }
@@ -6669,6 +6782,8 @@ mod tests {
             &active,
             &unavailable,
             NativeUiSmokeMessageEntry {
+                message: WM_MOUSEMOVE,
+                stage: "match",
                 active_token: token,
                 extra_info: token,
             },
@@ -6686,6 +6801,91 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn wndproc_trace_keeps_button_entry_and_match_after_untagged_move_overflow() {
+        let token = STEP_TOKEN_PREFIX | 3;
+        let trace = Mutex::new(WndProcTraceState::default());
+        let active = AtomicUsize::new(token);
+        let unavailable = AtomicUsize::new(0);
+        begin_wndproc_trace_in(&trace, &unavailable, token);
+        for _ in 0..20 {
+            record_wndproc_trace_in(
+                &trace,
+                &active,
+                &unavailable,
+                NativeUiSmokeMessageEntry {
+                    active_token: token,
+                    extra_info: 0,
+                    message: WM_MOUSEMOVE,
+                    stage: "entry",
+                },
+                token,
+                0,
+                0x200,
+                1239,
+                41,
+            );
+        }
+        for (message, stage, observed) in [
+            (WM_LBUTTONDOWN, "entry", token),
+            (WM_LBUTTONDOWN, "match", 0),
+            (WM_LBUTTONUP, "entry", token + 1),
+            (WM_MOUSEACTIVATE, "activate_and_eat", 0),
+        ] {
+            record_wndproc_trace_in(
+                &trace,
+                &active,
+                &unavailable,
+                NativeUiSmokeMessageEntry {
+                    active_token: token,
+                    extra_info: token,
+                    message,
+                    stage,
+                },
+                token,
+                observed,
+                0x200,
+                1239,
+                41,
+            );
+        }
+        let text = format_wndproc_trace(snapshot_wndproc_trace_in(&trace, token, || token), 0);
+        assert!(text.contains("overflow=12"), "{text}");
+        assert!(
+            text.contains("kind=left_down,stage=entry,tick_ms="),
+            "{text}"
+        );
+        assert!(
+            text.contains("kind=left_down,stage=match,tick_ms="),
+            "{text}"
+        );
+        assert!(text.contains("kind=left_up,stage=entry"), "{text}");
+        assert!(
+            text.contains("kind=mouse_activate,stage=activate_and_eat"),
+            "{text}"
+        );
+        assert!(message_metadata_from_values(token, 0, 0x200).is_none());
+        assert!(message_metadata_from_values(token, token, 0x200).is_some());
+    }
+
+    #[test]
+    fn button_receipt_failure_snapshot_preserves_the_missing_stage_and_primary_error() {
+        let fixture = ButtonReceiptFixture::new();
+        fixture.begin_up_before_wndproc(17);
+        let text = receipt_wait_failure(
+            &fixture.broker,
+            fixture.metadata.token,
+            "owner validation timed out".into(),
+        );
+        assert!(text.starts_with("owner validation timed out; receipt_snapshot="));
+        assert!(text.contains("kind=ButtonUp { gesture_id: 17 }"), "{text}");
+        assert!(
+            text.contains("wndproc_identity=None,capture_confirmed=false"),
+            "{text}"
+        );
+        assert!(text.contains("presenter=0x2200"), "{text}");
     }
 
     #[test]
@@ -6708,6 +6908,8 @@ mod tests {
             &active,
             &unavailable,
             NativeUiSmokeMessageEntry {
+                message: WM_MOUSEMOVE,
+                stage: "match",
                 active_token: token,
                 extra_info: token,
             },

@@ -1143,6 +1143,39 @@ Rhaiの`mouse`は帯表示の移動、`target_mouse`はボタン中心への移�
 input backend 12件は成功。helper全体はsandbox内の同一process named pipe接続のアクセス拒否で未完了。
 証跡は当該worktreeの`target/panorama-click-checks/`。実入力・アプリ起動は実施していない。
 
+2026-10-17 14:09のClaudeCodeによる了承済み実行（`47b65285e`、証跡
+`target/ui-smoke-runs/20261017T050904742Z-84168-NativeTopPanoramaClick-c019ac0e`）では、
+helperのDown挿入応答後、Appが30秒の共通期限で`button_receipt_wait`中のowner検証待ちに失敗した。
+既存traceは`message_metadata`でMouseMoveだけを記録し、出力のkindも固定文字列だったため、
+Downの記録がないことは未配送の証明にならない。helper記録にも挿入時刻・tag・hit HWNDがなく、
+この証跡だけでは配送先や照合失敗の段階を確定できない。MPO coverとegui overlayはこの構成では
+同じpresenter上のDComp visualであり、別の入力HWNDではない。2件目の移動完了を経ないと
+当該helper呼出しへ進めないが、旧証跡には各移動の完了時刻を示す独立した行はない。
+
+次の1回に向け、判定を変えず以下だけを追加する。
+
+- WndProc入口（touch/debug helperより前）とmetadata照合時のDown/Up/DBLCLK、
+  MouseActivateのeat判定、capture変更、touch discardを記録する。各記録は実message種・HWND・
+  entry/match tag・active token・`GetTickCount64`を持つ。32件の上限内でMouseMoveは8件までとし、
+  moveの洪水でbutton用の枠を消費しない。try_lock失敗・overflowは引き続き欠落として明示する。
+  `point_or_lparam`は通常mouse messageではclient座標、MouseActivate等ではLPARAMのlow/high wordである。
+- button待機失敗時にはpending token/kind・期待presenter/座標・WndProc identity/capture確認・
+  pump/renderの到達・最初の失敗理由を出す。最終owner待機の期限超過だけから、30秒間UIが停止したとは推定しない。
+- App側は2件のmove完了とhelper要求/応答を記録する。helperは実SendInput前後の共有tick、
+  実tag、挿入件数、カーソル、WindowFromPointのHWND/class/PID/TID/root、foreground、
+  hit threadのcapture、物理左ボタン状態を8件までメモリに保持し、runnerのfinallyで証跡へ出す。
+  これは送信直前/直後のサンプルであり、OSの最終配送先そのものの証明には読み替えない。
+これらの記録でtag不一致、入口後の破棄、capture不成立、pump/render未到達、入力先変化を区別する。
+新しい待機・再試行・入力補正は加えず、receipt/送信前検査/cleanup解放の証明条件は維持する。
+helperがAppからvalidated Downを得ていない場合、cleanup Upの挿入や事後のphysical Upだけでは
+`ConfirmedOutstanding`を解除できない既存契約も変更しない。追加計装後の実入力は未実施。
+
+本追補の非対話検証は`cargo fmt`/`--check`、通常/`test-script` core check、
+`cargo nextest run -p mimageviewer --lib --features test-script -E 'test(/video::native_ui_smoke::|test_script::tests::native_top_panorama/)' --no-tests fail`
+が成功（58件、追加Rust回帰2件を含む）。button runner pure検査とinput backend 13件
+（追加1件を含む）も成功。PS1のASCIIと`git diff --check`を確認し、証跡は
+`target/panorama-click-receipt-checks/`へ保存した。アプリ/portable/ui-smokeの起動とcommitは行っていない。
+
 通常操作の現在target検証と、既に挿入したDownのcleanup解放証明は型で分ける。
 cleanupの権限は保存済みのtagged/validated Downとown Up挿入から取り、元HWND消失後も
 別windowへtargetを付け替えない。現在のhelper-thread input desktop/accessとphysical Upを

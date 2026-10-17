@@ -514,6 +514,9 @@ function Finalize-UiSmokeButtonHelper {
     elseif ($script:buttonHelperStarted) {
         Write-UiSmokeEvent 'button helper terminal unavailable; exact App termination remains blocked'
     }
+    if ($Scenario -eq 'NativeTopPanoramaClick' -and $null -ne $script:buttonHelperHandle) {
+        Write-UiSmokeEvent ('button helper input trace: ' + $script:buttonHelperHandle.InputTrace())
+    }
 }
 
 function Open-UiSmokeRunnerLock {
