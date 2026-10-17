@@ -52069,6 +52069,7 @@ mod thumbnail_progress_tests {
 /// be invalidated on different axes.
 #[cfg(test)]
 mod pipeline_cache_refactor_tests {
+    use super::source_texture_test_support::seed as seed_shared_source;
     use crate::adjustment::PostFilter;
     use crate::colorize::ColorizeMode;
     use crate::ui_fullscreen::SpreadPair;
@@ -52082,6 +52083,236 @@ mod pipeline_cache_refactor_tests {
         app.items.push(GridItem::Image(PathBuf::from(path)));
         app.thumbnails.push(ThumbnailState::Pending);
         app.items.len() - 1
+    }
+
+    #[test]
+    fn source_texture_sharing_two_pages_same_frame_has_no_extra_delta() {
+        for cpu_prefetched in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let ids: Vec<_> = (0..2)
+                .map(|idx| {
+                    push_image(&mut app, &format!("C:/shared/{idx}.jpg"));
+                    seed_shared_source(&mut app, &ctx, idx)
+                })
+                .collect();
+            ctx.tex_manager().write().take_delta();
+            let budget = app.last_edit_materialize_upload_frame;
+            for idx in 0..2 {
+                if cpu_prefetched {
+                    let (key, _) = app.ensure_edit_result_pixels_cpu(&ctx, idx).unwrap();
+                    assert!(app.edit_result_cache[&key].texture.is_none());
+                }
+                let final_tex = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+                let edit_key = app.current_edit_result_key(idx);
+                let edit = &app.edit_result_cache[&edit_key];
+                let params = app.effective_params(idx);
+                let final_key =
+                    app.final_composite_key_for_pixels(edit_key, edit.pixels.size, params);
+                let final_entry = &app.final_composite_cache[&final_key];
+                assert_eq!(edit.texture.as_ref().unwrap().id(), ids[idx]);
+                assert_eq!(final_tex.id(), ids[idx]);
+                assert!(Arc::ptr_eq(
+                    &app.current_raw_source_pixels(idx).unwrap(),
+                    &edit.pixels
+                ));
+                assert!(Arc::ptr_eq(&edit.pixels, &final_entry.pixels));
+                assert!(final_entry.complete);
+                assert_eq!(final_entry.source_size, [4, 6]);
+                assert_eq!(
+                    final_entry.canonical_dims,
+                    Some(crate::page_dims::CanonicalPageDimensions::new(400, 600))
+                );
+            }
+            assert_eq!(app.last_edit_materialize_upload_frame, budget);
+            assert!(ctx.tex_manager().write().take_delta().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_texture_sharing_cpu_entry_ignores_already_spent_upload_budget() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/cpu.jpg");
+        let id = seed_shared_source(&mut app, &ctx, idx);
+        let (key, _) = app.ensure_edit_result_pixels_cpu(&ctx, idx).unwrap();
+        ctx.tex_manager().write().take_delta();
+        app.last_edit_materialize_upload_frame = app.frame_counter;
+        app.ensure_edit_result_pixels(&ctx, idx).unwrap();
+        assert_eq!(
+            app.edit_result_cache[&key].texture.as_ref().unwrap().id(),
+            id
+        );
+        assert!(ctx.tex_manager().write().take_delta().is_empty());
+    }
+
+    #[test]
+    fn source_texture_sharing_excludes_raw_preview_and_animation_frames() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/preview.png");
+        seed_shared_source(&mut app, &ctx, idx);
+        let key = app.current_edit_result_key(idx);
+        let pixels = app.current_raw_source_pixels(idx).unwrap();
+        let FsCacheEntry::Static { animation, .. } = app.fs_cache.get_mut(&idx).unwrap() else {
+            panic!()
+        };
+        *animation = StaticAnimationState::FirstFrameOnly(
+            crate::canonical_image_loader::CanonicalAnimatedFormat::Gif,
+        );
+        assert!(
+            app.shared_source_texture_for_edit(&ctx, &key, &pixels)
+                .is_none()
+        );
+        assert!(app.ensure_edit_result_pixels(&ctx, idx).is_none());
+        assert!(app.ensure_final_composite_texture(&ctx, idx).is_none());
+        let FsCacheEntry::Static { tex, .. } = app.fs_cache.get(&idx).unwrap() else {
+            panic!()
+        };
+        let tex = tex.clone();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::RawPreview {
+                preview: Some(crate::fs_animation::RawPreviewTexture {
+                    tex,
+                    pixels: Arc::clone(&pixels),
+                }),
+                developed_dims: [400, 600],
+                load_seq: 1,
+            },
+        );
+        assert!(
+            app.shared_source_texture_for_edit(&ctx, &key, &pixels)
+                .is_none()
+        );
+        assert!(app.edit_result_cache.is_empty());
+        assert!(app.final_composite_cache.is_empty());
+    }
+
+    #[test]
+    fn source_texture_sharing_rejects_changed_arc_size_options_key_and_identity() {
+        for case in ["arc", "size", "options", "key", "identity"] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = push_image(&mut app, "C:/shared/reject.jpg");
+            seed_shared_source(&mut app, &ctx, idx);
+            let pixels = app.current_raw_source_pixels(idx).unwrap();
+            let mut key = app.current_edit_result_key(idx);
+            let mut candidate = Arc::clone(&pixels);
+            match case {
+                "arc" => candidate = Arc::new((*pixels).clone()),
+                "key" => key.source_gen += 1,
+                "identity" => {
+                    push_image(&mut app, "C:/shared/other.jpg");
+                    let other = app.item_id(1);
+                    let FsCacheEntry::Static { tex, .. } = app.fs_cache.get(&idx).unwrap() else {
+                        panic!()
+                    };
+                    *app.texture_identity.borrow_mut() = Default::default();
+                    app.bind_display_texture_identity(tex, other);
+                }
+                _ => {
+                    let texture = ctx.load_texture(
+                        "incompatible",
+                        egui::ColorImage::filled(
+                            if case == "size" { [2, 3] } else { pixels.size },
+                            egui::Color32::WHITE,
+                        ),
+                        if case == "options" {
+                            egui::TextureOptions::LINEAR
+                        } else {
+                            DISPLAY_IMAGE_TEXTURE_OPTIONS
+                        },
+                    );
+                    let FsCacheEntry::Static { tex, .. } = app.fs_cache.get_mut(&idx).unwrap()
+                    else {
+                        panic!()
+                    };
+                    *tex = texture;
+                }
+            }
+            let _expected = crate::item_identity::expect_mismatch();
+            assert!(
+                app.shared_source_texture_for_edit(&ctx, &key, &candidate)
+                    .is_none(),
+                "{case}"
+            );
+            if case == "identity" {
+                assert!(app.display_identity_error.borrow().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn source_texture_sharing_final_effects_keep_separate_allocations() {
+        for case in ["adjustment", "sharpen", "post", "nearest", "ai"] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = push_image(&mut app, "C:/shared/effects.jpg");
+            let id = seed_shared_source(&mut app, &ctx, idx);
+            match case {
+                "adjustment" => app.settings.global_preset.brightness = 12.0,
+                "sharpen" => app.settings.global_preset.smart_sharpen = 50,
+                "post" => app.settings.global_preset.post_filter = PostFilter::Sepia,
+                "nearest" => app.settings.global_preset.post_filter = PostFilter::Nearest,
+                "ai" => {
+                    enable_pdf_final_ai_params(&mut app);
+                    let key = pdf_final_ai_key(&app, idx, [4, 6]);
+                    app.final_ai_cache.insert(
+                        key,
+                        FinalAiEntry {
+                            canonical_dims: None,
+                            source_size: [4, 6],
+                            pixels: Arc::new(egui::ColorImage::filled(
+                                [8, 12],
+                                egui::Color32::WHITE,
+                            )),
+                            used_upscale: true,
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let final_tex = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+            assert_ne!(final_tex.id(), id, "{case}");
+            assert_eq!(app.current_edit_result_texture(idx).unwrap().id(), id);
+            assert_eq!(
+                app.current_raw_source_pixels(idx).unwrap().pixels[0],
+                egui::Color32::from_rgb(60, 120, 180)
+            );
+            let expected_options = if case == "nearest" {
+                egui::TextureOptions::NEAREST
+            } else {
+                DISPLAY_IMAGE_TEXTURE_OPTIONS
+            };
+            assert_eq!(
+                ctx.tex_manager()
+                    .read()
+                    .meta(final_tex.id())
+                    .unwrap()
+                    .options,
+                expected_options
+            );
+        }
+    }
+
+    #[test]
+    fn source_texture_sharing_pending_ai_does_not_promote_complete() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/pending-ai.jpg");
+        let id = seed_shared_source(&mut app, &ctx, idx);
+        enable_pdf_final_ai_params(&mut app);
+        let key = pdf_final_ai_key(&app, idx, [4, 6]);
+        let (pending, _) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(key, pending);
+        let texture = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+        assert_eq!(texture.id(), id);
+        assert!(!app.current_final_composite_is_complete(idx));
+        assert!(
+            app.ensure_final_composite_pixels_with_key(&ctx, idx)
+                .is_none()
+        );
     }
 
     fn push_pdf_page(app: &mut App, path: &str, page_num: u32) -> usize {
@@ -60313,6 +60544,69 @@ mod pipeline_display_edit_split_tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn source_texture_sharing_waits_for_edits_and_preserves_transparent_raw() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/shared/transparent.png");
+        super::source_texture_test_support::seed(&mut app, &ctx, idx);
+        // An alpha source can share when unchanged; erase flatten must allocate
+        // separate pixels and must never mutate the shared raw/edit/final owners.
+        let raw = Arc::new(egui::ColorImage::filled(
+            [4, 6],
+            egui::Color32::from_rgba_unmultiplied(100, 150, 200, 100),
+        ));
+        let texture = ctx.load_texture(
+            "transparent-source",
+            (*raw).clone(),
+            DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        );
+        let id = texture.id();
+        let FsCacheEntry::Static { tex, pixels, .. } = app.fs_cache.get_mut(&idx).unwrap() else {
+            panic!()
+        };
+        *tex = texture;
+        *pixels = Arc::clone(&raw);
+        assert_eq!(
+            app.ensure_final_composite_texture(&ctx, idx).unwrap().id(),
+            id
+        );
+        let flattened = app.black_flatten_erase_source_if_needed(idx, Arc::clone(&raw));
+        assert!(!Arc::ptr_eq(&flattened, &raw));
+        assert_eq!(flattened.pixels[0].a(), 255);
+        assert_eq!(raw.pixels[0].a(), 100);
+        assert!(
+            app.shared_source_texture_for_edit(&ctx, &app.current_edit_result_key(idx), &flattened)
+                .is_none()
+        );
+
+        app.local_adjust_page_layers
+            .insert(idx, Arc::new(vec![active_tone_layer()]));
+        app.bump_local_adjust_generation(idx);
+        assert!(app.ensure_edit_result_pixels(&ctx, idx).is_none());
+        assert!(app.ensure_final_composite_texture(&ctx, idx).is_none());
+        assert!(!app.current_final_composite_is_complete(idx));
+        assert_eq!(
+            app.current_raw_source_pixels(idx).unwrap().pixels,
+            raw.pixels
+        );
+
+        let edited =
+            insert_current_local_adjust_result(&mut app, &ctx, idx, "edited", egui::Color32::GREEN);
+        app.frame_counter += 1;
+        let (key, pixels) = app.ensure_edit_result_pixels(&ctx, idx).unwrap();
+        assert!(Arc::ptr_eq(&pixels, &edited));
+        assert_ne!(
+            app.edit_result_cache[&key].texture.as_ref().unwrap().id(),
+            id
+        );
+        assert_eq!(raw.pixels[0].a(), 100);
+        assert_eq!(
+            app.current_raw_source_pixels(idx).unwrap().pixels,
+            raw.pixels
+        );
+    }
 
     fn push_image(app: &mut App, path: &str) -> usize {
         app.items.push(GridItem::Image(PathBuf::from(path)));

@@ -88963,6 +88963,64 @@ mod specified_scale_consumer_tests {
 pub(crate) mod page_turn_submission_tests {
     use super::*;
 
+    #[test]
+    fn source_texture_sharing_actual_draw_preserves_single_spread_on_off_and_resize() {
+        for enabled in [false, true] {
+            for mode in [SpreadMode::Single, SpreadMode::Rtl, SpreadMode::Ltr] {
+                let ctx = egui::Context::default();
+                page_turn::install(&ctx);
+                let mut app = ready_app(&ctx, mode);
+                app.settings.page_turn_animation_enabled = enabled;
+                let ids: Vec<_> = (0..4)
+                    .map(|idx| crate::app::source_texture_test_support::seed(&mut app, &ctx, idx))
+                    .collect();
+                for size in [egui::vec2(600.0, 400.0), egui::vec2(900.0, 500.0)] {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                ctx,
+                                |ui| {
+                                    let (composition, sources) = draw_current(&mut app, ui, ctx);
+                                    assert_eq!(
+                                        sources.pages.len(),
+                                        if mode.is_spread() { 2 } else { 1 }
+                                    );
+                                    for page in &sources.pages {
+                                        let idx = page.occurrence.idx;
+                                        assert_eq!(page.resource.paint_texture_id(), ids[idx]);
+                                        assert_eq!(
+                                            app.current_edit_result_texture(idx).unwrap().id(),
+                                            ids[idx]
+                                        );
+                                        assert_eq!(
+                                            app.current_final_composite_texture(idx).unwrap().id(),
+                                            ids[idx]
+                                        );
+                                        assert!(app.current_final_composite_is_complete(idx));
+                                    }
+                                    app.emit_fs_page_turn_ready_for_display_unit(
+                                        ctx,
+                                        &composition,
+                                        FsPageTurnDecision::normal(),
+                                        &sources,
+                                    );
+                                },
+                            );
+                        },
+                    );
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Mesh(mesh) if ids.contains(&mesh.texture_id))));
+                    frame(&ctx, |_, ctx| app.flush_submitted_page_turn_ready(ctx));
+                    assert!(app.pending_fs_page_turn_ready.is_none());
+                }
+            }
+        }
+    }
+
     pub(crate) fn ready_app(
         ctx: &egui::Context,
         mode: SpreadMode,

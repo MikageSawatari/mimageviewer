@@ -3077,6 +3077,31 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   - フォルダ切替 → edit / final / thumb 系 cache をグローバルクリア
   - 回転変更 → **キャッシュはクリアしない** (GPU 行列で回すため)
 
+#### 無変換の静止画テクスチャ共有（2026-10-17）
+
+`ensure_edit_result_pixels` は新規組立て時と CPU-only entry の表示昇格時の両方で、
+upload の枚数制限より先に現在 context の `fs_cache` の静止画 source を調べる。
+現在の `EditResultKey`（item identity と各世代を含む）が一致し、source/edit pixels が
+`Arc::ptr_eq`、texture 寸法が pixels 寸法と一致、options が
+`DISPLAY_IMAGE_TEXTURE_OPTIONS`（LINEAR＋完全 mip）と一致し、既存 display identity gate を
+通る場合だけ `source.tex.clone()` を edit entry に保存する。画素比較・I/O・新しい待機状態はない。
+handle 共有は upload ではないので `last_edit_materialize_upload_frame` を消費せず、見開きの
+両頁も同 frame に共有できる。不一致時は従来の paced upload を行う。CPU-only の先読み入口は
+texture を確保せず、表示時まで `None` を維持する。
+
+final の key・pixels・source_size・canonical_dims・complete と resolver の優先順位は維持する。
+既存の `Arc::ptr_eq(post_filtered, edit_pixels)` による edit→final の共有につなぐため、
+無補正では source/edit/final が同じ TextureId になる。共有自体は完成の証拠ではなく、
+AI 待ち等の `complete=false` を昇格させない。raw preview、animated frame、別 Arc の編集結果、
+消しゴム用の透過 black flatten、寸法/options 不一致は共有しない。Nearest 等の final sampler は
+従来の final 処理が解決する。注釈や Native Lanczos 出力の生成・所有境界も変更しない。
+
+共有 allocation は immutable とし、各 stage の entry と失効規則は省略しない。source 退去後も
+edit/final の clone は生存するが、raw cache がある証明には使わない。通常再読込は既存の input 世代更新で
+派生 cache を失効させ、兄弟 context には作用しない。VRAM は既存の TextureId dedup で一回だけ数え、
+最後の handle owner の drop で解放する。演出 ON/OFF・初回表示とも共通の全画面表示経路へ適用する。
+
+
 ---
 
 ## 4. 分岐チェックリスト

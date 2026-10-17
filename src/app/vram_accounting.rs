@@ -459,6 +459,34 @@ impl App {
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_texture_sharing_counts_once_and_frees_only_after_last_cache_owner() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(PathBuf::from("C:/shared/account.jpg"))];
+        let id = crate::app::source_texture_test_support::seed(&mut app, &ctx, 0);
+        drop(app.ensure_final_composite_texture(&ctx, 0).unwrap());
+        let expected = crate::vram_budget::texture_size_texels([4, 6], true);
+        let key = app.current_edit_result_key(0);
+        assert_eq!(
+            app.edit_result_cache[&key].texture.as_ref().unwrap().id(),
+            id
+        );
+        assert_eq!(app.current_final_composite_texture(0).unwrap().id(), id);
+        ctx.tex_manager().write().take_delta();
+        assert_eq!(app.vram_accounting_snapshot().total_texels, expected);
+        app.fs_cache.clear();
+        assert_eq!(app.vram_accounting_snapshot().total_texels, expected);
+        assert!(ctx.tex_manager().write().take_delta().is_empty());
+        app.edit_result_cache.clear();
+        assert_eq!(app.vram_accounting_snapshot().total_texels, expected);
+        assert!(ctx.tex_manager().write().take_delta().is_empty());
+        app.final_composite_cache.clear();
+        assert_eq!(app.vram_accounting_snapshot().total_texels, 0);
+        assert!(ctx.tex_manager().read().meta(id).is_none());
+        assert_eq!(ctx.tex_manager().write().take_delta().free, vec![id]);
+    }
+
     fn texture(
         ctx: &egui::Context,
         name: &str,
