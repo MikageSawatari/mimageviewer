@@ -10122,7 +10122,7 @@ pub(crate) struct EditResultKey {
 pub(crate) struct EditResultEntry {
     pub(crate) pixels: Arc<egui::ColorImage>,
     /// 表示用テクスチャ。先読み (CPU 専用) では `None` で積み、実際に表示パイプラインへ
-    /// 入る時に lazy アップロードする (F2: AI/編集先読みで非表示ページの GPU upload を
+    /// 入る時に source 共有または lazy upload で確保する (F2: AI/編集先読みで非表示ページの GPU upload を
     /// UI スレッドで前倒ししない)。holdover 表示 (`current_edit_result_texture`) は
     /// `None` のとき単にこのソースを使わない (best-effort)。
     pub(crate) texture: Option<egui::TextureHandle>,
@@ -82984,8 +82984,39 @@ impl App {
         })
     }
 
+    /// Borrow only the current context's immutable, canonical still raster. Sharing
+    /// a handle does not materialize an upload and says nothing about final completeness.
+    fn shared_source_texture_for_edit(
+        &self,
+        ctx: &egui::Context,
+        key: &EditResultKey,
+        edit_pixels: &Arc<egui::ColorImage>,
+    ) -> Option<egui::TextureHandle> {
+        if *key != self.current_edit_result_key(key.idx) {
+            return None;
+        }
+        let FsCacheEntry::Static {
+            tex,
+            pixels,
+            animation: StaticAnimationState::Still,
+            ..
+        } = self.fs_cache.get(&key.idx)?
+        else {
+            return None;
+        };
+        if !Arc::ptr_eq(pixels, edit_pixels) {
+            return None;
+        }
+        // Display allocations never change sampler options in place. Release the
+        // manager read lock before cloning the handle (retain takes a write lock).
+        let matches = ctx.tex_manager().read().meta(tex.id()).is_some_and(|meta| {
+            meta.size == edit_pixels.size && meta.options == DISPLAY_IMAGE_TEXTURE_OPTIONS
+        });
+        (matches && self.display_texture_matches_page(tex, key.idx)).then(|| tex.clone())
+    }
+
     /// 表示パイプライン用: 編集結果ピクセル + 表示テクスチャを確保する。先読みで
-    /// CPU 専用キャッシュ済み (`texture == None`) なら、ここで lazy に GPU アップロードする。
+    /// CPU 専用キャッシュ済みなら、source 共有または paced upload で texture を確保する。
     pub(crate) fn ensure_edit_result_pixels(
         &mut self,
         ctx: &egui::Context,
@@ -83002,7 +83033,9 @@ impl App {
                 return Some((key, Arc::clone(&entry.pixels)));
             }
             let pixels = Arc::clone(&entry.pixels);
-            if self.last_edit_materialize_upload_frame != self.frame_counter {
+            if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels) {
+                self.edit_result_cache.get_mut(&key)?.texture = Some(texture);
+            } else if self.last_edit_materialize_upload_frame != self.frame_counter {
                 self.last_edit_materialize_upload_frame = self.frame_counter;
                 let upload_t0 = std::time::Instant::now();
                 let texture = upload_edit_result_texture(ctx, &key, &pixels);
@@ -83022,7 +83055,10 @@ impl App {
         }
 
         let pixels = self.assemble_edit_result_pixels(ctx, idx)?;
-        let texture = if self.last_edit_materialize_upload_frame != self.frame_counter {
+        let texture = if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels)
+        {
+            Some(texture)
+        } else if self.last_edit_materialize_upload_frame != self.frame_counter {
             self.last_edit_materialize_upload_frame = self.frame_counter;
             let upload_t0 = std::time::Instant::now();
             let texture = upload_edit_result_texture(ctx, &key, &pixels);
@@ -83052,7 +83088,7 @@ impl App {
     /// 入力は CPU ピクセルで足り、表示テクスチャは実際に表示する時まで不要なので、
     /// 非表示の近隣ページのテクスチャ upload を UI スレッドで前倒ししない (F2)。
     /// キャッシュには `texture == None` で積み、毎フレームの再計算も防ぐ。表示パイプラインに
-    /// 入った時に `ensure_edit_result_pixels` が lazy アップロードする。
+    /// 入った時に `ensure_edit_result_pixels` が source 共有または lazy upload で確保する。
     pub(crate) fn ensure_edit_result_pixels_cpu(
         &mut self,
         ctx: &egui::Context,
@@ -99970,6 +100006,8 @@ mod section375_tests;
 mod similar_navigation_tests;
 #[cfg(all(test, windows))]
 mod similar_preview_context_tests;
+#[cfg(test)]
+pub(crate) mod source_texture_test_support;
 #[cfg(test)]
 mod spread_shift_lifecycle_tests;
 #[cfg(test)]

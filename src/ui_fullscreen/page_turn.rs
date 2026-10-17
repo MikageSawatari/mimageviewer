@@ -4194,6 +4194,35 @@ mod tests {
         assert!(app.edit_result_cache.is_empty());
         assert!(app.comic_docs.is_empty());
     }
+
+    #[test]
+    fn source_texture_sharing_native_roi_keeps_only_output_after_all_source_owners_drop() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "C:/shared/native.png",
+        ))];
+        let id = crate::app::source_texture_test_support::seed(&mut app, &ctx, 0);
+        let final_texture = app.ensure_final_composite_texture(&ctx, 0).unwrap();
+        assert_eq!(final_texture.id(), id);
+        let input = app.fullscreen_paint_resource_for_texture(0, final_texture);
+        let native = crate::gpu_lanczos::test_native_resource_with_region(
+            input,
+            [2, 3],
+            egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75)),
+        );
+        let output_id = native.paint_texture_id();
+        let material = native.capture_presentation(&ctx);
+        drop(native);
+        app.fs_cache.clear();
+        app.edit_result_cache.clear();
+        app.final_composite_cache.clear();
+        assert!(ctx.tex_manager().read().meta(id).is_none());
+        assert_eq!(material.paint_texture_id(), output_id);
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        material.account_material(&mut accountant);
+        assert_eq!(accountant.finish().total_texels, 6);
+    }
     #[test]
     fn accepted_exclusion_claims_single_repeat_once_and_does_not_attribute_multi_edges() {
         let ctx = egui::Context::default();
