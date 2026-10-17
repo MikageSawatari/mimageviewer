@@ -171,23 +171,21 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 
-### 1.390 `scripts/page-turn-smoke.ps1` が `--test-evidence-dir` を渡さず、操作スクリプトが起動直後に終了する — 夜間計測で判明、修正済み (2026-10-17)
+### 1.391 ui-smoke `NativeTopPanoramaClick` が押下の前に必ず止まる — クリック先へカーソルを動かす手順が無い (2026-10-17)
 
-- 観測 (ClaudeCode の隔離 portable 計測、2026-10-17 未明): `-Script` 付きで実行すると core が exit 2。app log は
-  `runner start failed` で、`--test-script` には `--test-evidence-dir` が必須 (`src/test_script.rs` の `cli_capture_dir_from`)。
-  さらに証跡先は `target/ui-smoke/runs/` の **ちょうど 2 階層下** で、**事前に存在する** 必要がある。page-turn-smoke.ps1 は
-  どれも満たさないので、`-SelfTest` / `-Script` / 既定の計測のすべてが現在は動かない (いつから壊れていたかは未確認)。
-- 回避 (今回): 写しに証跡先 `target/ui-smoke/runs/pageturn-d4/<run>` を足し、フォルダを先に作って実行した。§27.13 の計測はこの方法。
-- 直し方: ui-smoke と同じ証跡先の作り方 (run id ディレクトリの作成) を page-turn-smoke.ps1 にも入れる。`-SelfTest` を
-  定期的に回す回帰か、ui-smoke 側の共通関数への寄せを検討する。`.ps1` は ASCII のみ。
-- 規模 / 優先度: Small / P2 (ページめくりの実アプリ計測の入口が壊れている)。
-- 修正 (2026-10-17): 実行ごとに `target/ui-smoke-runs/page-turn-<UTC時刻>-<PID>-<乱数>` を作って `--test-evidence-dir` に渡す
-  (ui-smoke.ps1 と同じ 1 階層の置き場。アプリは `target/ui-smoke-runs/` の 1 階層下も受け付ける)。
-  起動が通ると `-SelfTest` の解析が次の別問題で FAIL した: 押しっぱなし入力の判定 (`Keymap::key_held_chord`) の観測が
-  全フレーム `held=false`。観測は ROOT の描画回で取っていて、フォーカス許可を ROOT の focus から作っていたため、
-  全画面ウィンドウが前面の間は常に許可なしになっていた (f3261a9eb でフォーカス許可が入ったとき観測側が追従していなかった)。
-  製品の判定経路は各 viewport 自身の回で許可を作るので影響しない。観測の許可を合成入力の送り先 viewport の focus から
-  作るよう直し、ClaudeCode の隔離実行で `-SelfTest` が PASS した (押しっぱなし判定 825 フレームすべて `held=true`)。
+- 観測 (ClaudeCode の隔離 portable 実行。2026-10-17 未明に 2 回、同日昼に利用者の了承を得て 1 回): 3 回とも、ボタン操作の補助プログラムが
+  `FailedBeforeDown` で止まり、押下は送られていない。昼の実行で失敗理由をログに出すようにした (2b4500282) ところ、
+  理由は `current cursor does not match the immutable physical screen point` だった。証跡 `target/ui-smoke-runs/20261017T041401651Z-84364-NativeTopPanoramaClick-96e24003`。
+- 原因 (コード): `click_native_top_panorama` (`src/test_script.rs`) は、上端の帯の中央 (`prepare_real_mouse_in_top_hover_activation`
+  の normalized `[0.5, 0.5]`) へ MouseMove を 1 回送ってパノラマボタンを出し、その後ボタンの中心を押下先として補助プログラムへ渡す
+  (`ButtonPipeClient::connect`、`src/video/native_ui_smoke.rs`)。補助プログラムは自分ではカーソルを動かさず、押下前に
+  「カーソルが押下先の座標にあること」を確かめる (`scripts/ui-smoke/button-helper/ButtonInputBackend.cs` の送信前検査)。
+  ボタンの中心へカーソルを動かす手順がどこにも無いので、ボタンが帯の中央に無い限り必ず止まる。2026-09-10 に接続したあと、
+  本物の入力での実行は 10/17 が初めてで、これまで一度も通っていない。製品の不具合ではない。
+- 直し方: パノラマボタンが出たあと、その中心へ 2 回目の MouseMove を送り、その移動で hover 応答が更新された後の観測で押下先を
+  決め直してから補助プログラムへ渡す。補助プログラムの検査は緩めない。ほかの名前付きボタンの試験 (音声ボタンは移動・押下・
+  離すを 1 回の SendInput で送る) と手順が違うので、揃えるかも合わせて検討する。
+- 規模 / 優先度: Small〜Medium / P3 (試験の入口。リリース前の対話試験の一つが使えない)。
 
 ### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
 
