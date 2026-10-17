@@ -613,6 +613,7 @@ struct RenderSnapshot {
 enum PreparedTargetKind {
     Canvas,
     TopHoverActivation,
+    NamedTopPanoramaMove,
     NamedTopPanorama,
 }
 
@@ -690,7 +691,7 @@ impl PreparedTarget {
                         }
                     }
             }
-            PreparedTargetKind::NamedTopPanorama => {
+            PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => {
                 let Some(expected_token) = self.named_token else {
                     return false;
                 };
@@ -704,7 +705,22 @@ impl PreparedTarget {
                     && named.classification == NativeUiSmokePanoramaClassification::NonPanorama
                     && !named.panorama_pose_present
                     && !named.video_zoom_present
-                    && render.inventory.target_version == self.render.inventory.target_version
+                    && match (self.kind, phase) {
+                        (
+                            PreparedTargetKind::NamedTopPanoramaMove,
+                            PreparedTargetValidationPhase::ReceiptCompletion,
+                        ) => {
+                            // Hover may change other entries in the inventory. The actual
+                            // button token, Response and area must survive the move unchanged,
+                            // and a new presented inventory must precede its render receipt.
+                            render.inventory.target_version >= self.render.inventory.target_version
+                                && render.inventory.commit_serial
+                                    > self.render.inventory.commit_serial
+                        }
+                        _ => {
+                            render.inventory.target_version == self.render.inventory.target_version
+                        }
+                    }
             }
         }
     }
@@ -715,7 +731,7 @@ impl PreparedTarget {
             PreparedTargetKind::TopHoverActivation => {
                 self.render.inventory.native_top_panorama.is_none()
             }
-            PreparedTargetKind::NamedTopPanorama => true,
+            PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => true,
         }
     }
 }
@@ -1448,6 +1464,12 @@ fn record_render_receipt_in(
         broker.changed.notify_all();
         return;
     };
+    let named_move_inventory_matches = state.pending.as_ref().is_none_or(|step| {
+        step.target.kind != PreparedTargetKind::NamedTopPanoramaMove
+            || step
+                .target
+                .still_matches(&state, PreparedTargetValidationPhase::ReceiptCompletion)
+    });
     let Some(step) = state.pending.as_mut() else {
         return;
     };
@@ -1468,7 +1490,9 @@ fn record_render_receipt_in(
             receipt.geometry == target.render.geometry
                 && receipt.geometry_version == target.render.geometry_version
         }
-        PreparedTargetKind::TopHoverActivation | PreparedTargetKind::NamedTopPanorama => true,
+        PreparedTargetKind::TopHoverActivation
+        | PreparedTargetKind::NamedTopPanoramaMove
+        | PreparedTargetKind::NamedTopPanorama => true,
     };
     let mismatch = metadata.receiver_hwnd != target.render.presenter_hwnd
         || !receipt_kind_matches(step, receipt.input_kind)
@@ -1500,7 +1524,7 @@ fn record_render_receipt_in(
                 || !receipt.drag_latches_released
         }
     };
-    if mismatch || semantic_mismatch {
+    if mismatch || semantic_mismatch || !named_move_inventory_matches {
         if step.failure.is_none() {
             step.failure = Some(
                 "native mouse render receipt did not match the prepared target or point".into(),
@@ -1609,8 +1633,22 @@ pub(crate) fn prepare_real_mouse_in_top_hover_activation(
 pub(crate) fn send_prepared_real_mouse_move(
     prepared: NativeUiSmokePreparedMove,
     deadline: Instant,
-    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+    validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
 ) -> Result<NativeUiSmokeMoveReceipt, String> {
+    send_prepared_real_mouse_move_with_completion(
+        prepared,
+        deadline,
+        validate_owner_and_interrupt,
+        |_, mouse| Ok(mouse),
+    )
+}
+
+fn send_prepared_real_mouse_move_with_completion<T>(
+    prepared: NativeUiSmokePreparedMove,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+    complete: impl FnOnce(&BrokerState, NativeUiSmokeMoveReceipt) -> Result<T, String>,
+) -> Result<T, String> {
     validate_disposable_runtime()?;
     require_unexpired_deadline(deadline, "sending native mouse input")?;
     validate_owner_for_phase(
@@ -1691,7 +1729,7 @@ pub(crate) fn send_prepared_real_mouse_move(
             deadline,
             &mut validate_owner_and_interrupt,
         )?;
-        Ok(NativeUiSmokeMoveReceipt {
+        let mouse = NativeUiSmokeMoveReceipt {
             token: token as u64,
             owner_hwnd: prepared.target.host.owner_hwnd,
             presenter_hwnd: prepared.target.render.presenter_hwnd,
@@ -1704,8 +1742,50 @@ pub(crate) fn send_prepared_real_mouse_move(
             host_publisher: prepared.target.host.publisher,
             render_publisher: prepared.target.render.publisher,
             overlay_owner_nonce: prepared.target.render.inventory.owner_nonce,
-        })
+        };
+        // Take any named observation under the same lock as the final receipt
+        // validation, before retiring the move. Do not reuse the pre-hover version.
+        let state = lock_broker_state(broker)?;
+        completed_actual_point(&state, token, &prepared)?.ok_or_else(|| {
+            "native mouse receipt completion was revoked before observation".to_string()
+        })?;
+        complete(&state, mouse)
     })
+}
+
+pub(crate) fn move_to_native_top_panorama(
+    observed: &NativeUiSmokeNamedControlReceipt,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<(NativeUiSmokeMoveReceipt, NativeUiSmokeNamedControlReceipt), String> {
+    validate_disposable_runtime()?;
+    require_unexpired_deadline(deadline, "preparing native_top_panorama mouse move")?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_named_move_before_snapshot",
+    )?;
+    let target = {
+        let state = lock_broker_state(broker())?;
+        let mut target = named_top_panorama_target_from_observation(&state, observed)?;
+        target.kind = PreparedTargetKind::NamedTopPanoramaMove;
+        target
+    };
+    let prepared = NativeUiSmokePreparedMove {
+        target,
+        normalized: [0.5, 0.5],
+        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
+    };
+    send_prepared_real_mouse_move_with_completion(
+        prepared,
+        deadline,
+        validate_owner_and_interrupt,
+        |state, mouse| {
+            let named = named_control_after_move(state, &mouse)?.ok_or_else(|| {
+                "native_top_panorama disappeared after its control-center move".to_string()
+            })?;
+            Ok((mouse, named))
+        },
+    )
 }
 
 pub(crate) fn wait_for_native_top_panorama_after_move(
@@ -2010,8 +2090,29 @@ pub(crate) fn prepare_native_top_panorama_click(
     )?;
     let broker = broker();
     let state = lock_broker_state(broker)?;
+    let target = named_top_panorama_target_from_observation(&state, observed)?;
+    let prepared = NativeUiSmokePreparedButtonClick {
+        target,
+        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
+        host_incarnation,
+        backend_token,
+    };
+    drop(state);
+    validate_os_target(&prepared.target)?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_button_after_os_target_validation",
+    )?;
+    validate_prepared_button_target(broker, &prepared)?;
+    Ok(prepared)
+}
+
+fn named_top_panorama_target_from_observation(
+    state: &BrokerState,
+    observed: &NativeUiSmokeNamedControlReceipt,
+) -> Result<PreparedTarget, String> {
     let candidates =
-        coherent_named_top_panorama_targets(&state, observed.owner_hwnd, observed.token)?;
+        coherent_named_top_panorama_targets(state, observed.owner_hwnd, observed.token)?;
     let [target] = candidates.as_slice() else {
         return Err(format!(
             "native_top_panorama target was not unique while preparing click (candidates={})",
@@ -2044,20 +2145,7 @@ pub(crate) fn prepare_native_top_panorama_click(
     if !receipt_matches {
         return Err("native_top_panorama observation changed before click preparation".into());
     }
-    let prepared = NativeUiSmokePreparedButtonClick {
-        target: target.clone(),
-        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
-        host_incarnation,
-        backend_token,
-    };
-    drop(state);
-    validate_os_target(&prepared.target)?;
-    validate_owner_for_phase(
-        &mut validate_owner_and_interrupt,
-        "prepare_button_after_os_target_validation",
-    )?;
-    validate_prepared_button_target(broker, &prepared)?;
-    Ok(prepared)
+    Ok(target.clone())
 }
 
 const BUTTON_WIRE_REQUEST_MAGIC: u32 = 0x4256_494d;
@@ -2655,7 +2743,7 @@ fn wait_for_target(
                 PreparedTargetKind::TopHoverActivation => {
                     coherent_top_hover_targets(&state, owner_hwnd)
                 }
-                PreparedTargetKind::NamedTopPanorama => {
+                PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => {
                     return Err("named native controls are prepared from an observed token".into());
                 }
             };
@@ -3185,14 +3273,16 @@ fn prepared_target_is_unique(
         PreparedTargetKind::TopHoverActivation => {
             coherent_top_hover_targets(state, prepared.target.host.owner_hwnd)?
         }
-        PreparedTargetKind::NamedTopPanorama => coherent_named_top_panorama_targets(
-            state,
-            prepared.target.host.owner_hwnd,
-            prepared
-                .target
-                .named_token
-                .ok_or_else(|| "named native target has no token".to_string())?,
-        )?,
+        PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => {
+            coherent_named_top_panorama_targets(
+                state,
+                prepared.target.host.owner_hwnd,
+                prepared
+                    .target
+                    .named_token
+                    .ok_or_else(|| "named native target has no token".to_string())?,
+            )?
+        }
     };
     Ok(matches!(candidates.as_slice(), [candidate]
         if candidate.host.publisher == prepared.target.host.publisher
@@ -4558,6 +4648,172 @@ mod tests {
     }
 
     #[test]
+    fn panorama_center_move_uses_response_center_and_reobserves_before_click() {
+        let mut fixture = ReceiptFixture::new();
+        let before = fixture.prepare_panorama_move();
+        let point = fixture.prepared.target.client_point;
+        assert_eq!([point.x, point.y], [before.client_x, before.client_y]);
+        let activation = fixture
+            .prepared
+            .target
+            .render
+            .inventory
+            .top_hover_activation
+            .unwrap();
+        let activation_center = activation.client_point([0.5, 0.5]).unwrap();
+        assert_ne!(
+            [point.x, point.y],
+            [activation_center.x, activation_center.y]
+        );
+        fixture.begin();
+        fixture.commit_panorama_move_inventory(|logical| {
+            // A hover-induced change outside the button advances the inventory
+            // version without replacing the actual button Response/token.
+            logical
+                .top_hover_activation
+                .as_mut()
+                .unwrap()
+                .rect_points
+                .max
+                .y += 1.0;
+        });
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        assert_eq!(fixture.completion().unwrap(), Some([point.x, point.y]));
+
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        let after = named_control_after_move(&state, &fixture.mouse_receipt())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.token, before.token);
+        assert_eq!(after.area, before.area);
+        assert!(after.inventory_target_version > before.inventory_target_version);
+        assert!(named_top_panorama_target_from_observation(&state, &before).is_err());
+        let click = named_top_panorama_target_from_observation(&state, &after).unwrap();
+        assert_eq!(click.kind, PreparedTargetKind::NamedTopPanorama);
+        assert_eq!(
+            click.render.inventory.target_version,
+            after.inventory_target_version
+        );
+        assert!(click.still_matches(&state, PreparedTargetValidationPhase::BeforeInput));
+        assert!(
+            !fixture
+                .prepared
+                .target
+                .still_matches(&state, PreparedTargetValidationPhase::BeforeInput,)
+        );
+    }
+
+    #[test]
+    fn panorama_center_move_requires_a_new_present_even_when_targets_are_unchanged() {
+        let mut fixture = ReceiptFixture::new();
+        let before = fixture.prepare_panorama_move();
+        fixture.begin();
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        assert_eq!(fixture.completion().unwrap(), None);
+        fixture.commit_panorama_move_inventory(|_| {});
+        assert_eq!(fixture.completion().unwrap(), None);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        assert!(fixture.completion().unwrap().is_some());
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        assert_eq!(
+            named_control_after_move(&state, &fixture.mouse_receipt())
+                .unwrap()
+                .unwrap()
+                .inventory_target_version,
+            before.inventory_target_version,
+        );
+    }
+
+    #[test]
+    fn panorama_center_move_rejects_a_render_without_a_new_inventory() {
+        let mut fixture = ReceiptFixture::new();
+        fixture.prepare_panorama_move();
+        fixture.begin();
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        assert!(fixture.completion().is_err());
+        // A later unrelated present cannot repair the failed tagged render.
+        fixture.commit_panorama_move_inventory(|_| {});
+        assert!(fixture.completion().is_err());
+    }
+
+    #[test]
+    fn panorama_center_move_rejects_changed_or_missing_controls_without_retry() {
+        for change in [
+            "hidden",
+            "disabled",
+            "moved",
+            "layer",
+            "clip",
+            "sense",
+            "zoom",
+            "pose",
+            "classification",
+            "scale",
+        ] {
+            let mut fixture = ReceiptFixture::new();
+            fixture.prepare_panorama_move();
+            fixture.begin();
+            fixture.commit_panorama_move_inventory(|logical| {
+                let control = logical.native_top_panorama.as_mut().unwrap();
+                match change {
+                    "hidden" => logical.native_top_panorama = None,
+                    "disabled" => control.enabled = false,
+                    "moved" => {
+                        control.rect = control.rect.translate(egui::vec2(1.0, 0.0));
+                        control.interact_rect = control.rect;
+                    }
+                    "layer" => {
+                        control.layer_id = egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("replacement"),
+                        )
+                    }
+                    "clip" => control.clip_rect.max.x -= 1.0,
+                    "sense" => control.sense = egui::Sense::hover(),
+                    "zoom" => logical.video_zoom_present = true,
+                    "pose" => logical.panorama_pose_present = true,
+                    "classification" => {
+                        logical.panorama_classification =
+                            NativeUiSmokePanoramaClassification::Panorama
+                    }
+                    "scale" => logical.pixels_per_point += 0.25,
+                    _ => unreachable!(),
+                }
+            });
+            record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+            record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+            assert!(fixture.completion().is_err(), "{change}");
+            fixture.commit_panorama_move_inventory(|_| {});
+            assert!(fixture.completion().is_err(), "{change} must not recover");
+        }
+    }
+
+    #[test]
+    fn panorama_center_move_rejects_target_changes_after_delivery_before_click() {
+        let mut fixture = ReceiptFixture::new();
+        fixture.prepare_panorama_move();
+        fixture.begin();
+        fixture.commit_panorama_move_inventory(|_| {});
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        assert!(fixture.completion().unwrap().is_some());
+        let after = {
+            let state = lock_broker_state(&fixture.broker).unwrap();
+            named_control_after_move(&state, &fixture.mouse_receipt())
+                .unwrap()
+                .unwrap()
+        };
+        fixture.commit_panorama_move_inventory(|logical| {
+            logical.native_top_panorama.as_mut().unwrap().rect.min.x += 1.0;
+        });
+        assert!(fixture.completion().is_err());
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        assert!(named_top_panorama_target_from_observation(&state, &after).is_err());
+    }
+
+    #[test]
     fn named_target_waits_for_enabled_click_response_and_rotates_after_hide() {
         let owner = allocate_overlay_owner();
         let disabled = NativeUiSmokeCommittedInventory::commit(
@@ -4891,6 +5147,65 @@ mod tests {
         fn completion(&self) -> Result<Option<[i32; 2]>, String> {
             let state = lock_broker_state(&self.broker).unwrap();
             completed_actual_point(&state, self.metadata.token, &self.prepared)
+        }
+
+        fn mouse_receipt(&self) -> NativeUiSmokeMoveReceipt {
+            let target = &self.prepared.target;
+            NativeUiSmokeMoveReceipt {
+                token: self.metadata.token as u64,
+                owner_hwnd: target.host.owner_hwnd,
+                presenter_hwnd: target.render.presenter_hwnd,
+                source_epoch: target.render.actual_source_epoch,
+                generation: target.render.generation,
+                requested_client_x: target.client_point.x,
+                requested_client_y: target.client_point.y,
+                actual_client_x: self.pump.event_x,
+                actual_client_y: self.pump.event_y,
+                host_publisher: target.host.publisher,
+                render_publisher: target.render.publisher,
+                overlay_owner_nonce: target.render.inventory.owner_nonce,
+            }
+        }
+
+        fn commit_panorama_move_inventory(
+            &self,
+            mutate: impl FnOnce(&mut NativeUiSmokeLogicalInventory),
+        ) {
+            let mut state = lock_broker_state(&self.broker).unwrap();
+            let render = state
+                .renders
+                .get_mut(&self.prepared.target.render.publisher)
+                .unwrap();
+            let mut logical = test_fixture_panorama_logical(
+                &self._ui_smoke_owner,
+                self.prepared
+                    .target
+                    .render
+                    .inventory
+                    .top_hover_activation
+                    .unwrap(),
+                Some(test_fixture_panorama_observation(true)),
+            );
+            mutate(&mut logical);
+            render.inventory =
+                NativeUiSmokeCommittedInventory::commit(Some(&render.inventory), logical);
+        }
+
+        fn prepare_panorama_move(&mut self) -> NativeUiSmokeNamedControlReceipt {
+            self.commit_panorama_move_inventory(|_| {});
+            let state = lock_broker_state(&self.broker).unwrap();
+            let observed = named_control_after_move(&state, &self.mouse_receipt())
+                .unwrap()
+                .unwrap();
+            let mut target = named_top_panorama_target_from_observation(&state, &observed).unwrap();
+            target.kind = PreparedTargetKind::NamedTopPanoramaMove;
+            let point = target.client_point;
+            self.prepared.target = target;
+            self.pump.event_x = point.x;
+            self.pump.event_y = point.y;
+            self.render.event_x = point.x;
+            self.render.event_y = point.y;
+            observed
         }
     }
 

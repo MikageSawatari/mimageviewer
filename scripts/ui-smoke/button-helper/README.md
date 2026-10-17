@@ -12,6 +12,14 @@ App authenticates that endpoint and carries the gesture and step identity
 through its prepared target, WndProc, pump/render, actual Response command, and
 normal App handler receipt.
 
+For `NativeTopPanoramaClick`, the App first moves to the top activation band,
+then sends a second tagged MouseMove to the committed Response center. It waits
+for App delivery and a fresh presented inventory before preparing the click from
+the post-move observation. A missing, disabled, replaced, or moved button fails
+the run without retry. The helper never moves the cursor; its cursor, foreground,
+receiver, and button-state preflight checks remain required. Native audio controls
+keep their separate single-batch move/Down/Up route.
+
 `ClipboardCapture` uses `ClipboardKeyHelperHandle` from this package as a
 separate keyboard owner. It reuses the pinned process lease, current-SID local
 pipe authentication and runner cleanup/join interlock. Its bounded 56-byte
