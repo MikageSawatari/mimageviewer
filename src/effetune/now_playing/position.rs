@@ -67,7 +67,7 @@ impl Sender {
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
     pub(in crate::effetune) fn update(&mut self, core: &Core, destination: &Weak<DspBridge>) {
-        self.update_at(core, destination, Instant::now(), |clock| {
+        self.update_at(core, destination, Instant::now(), |clock, _diagnostics| {
             let position = clock.now_secs();
             let time = host_time_ns();
             Sample {
@@ -83,7 +83,10 @@ impl Sender {
         core: &Core,
         destination: &Weak<DspBridge>,
         now: Instant,
-        read_clock: impl FnOnce(&crate::video::clock::AvClock) -> Sample,
+        read_source: impl FnOnce(
+            &crate::video::clock::AvClock,
+            &crate::video::audio_diagnostics::AudioDiagnostics,
+        ) -> Sample,
     ) {
         let Some(bridge) = destination.upgrade().filter(|_| core.active()) else {
             self.reset();
@@ -114,7 +117,7 @@ impl Sender {
             return;
         }
         self.next_poll = Some(now + POLL);
-        let sample = read_clock(&clock);
+        let sample = read_source(&clock, &diagnostics);
         let Sample { position, time, .. } = sample;
         if !self.sent.is_none_or(|old| sample.needs_send(old)) {
             return;
@@ -203,6 +206,7 @@ impl Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::{audio_diagnostics::AudioDiagnostics, clock::AvClock};
     use std::sync::{Arc, Mutex, atomic::AtomicU64, mpsc};
 
     #[test]
@@ -211,25 +215,29 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let now = NowPlaying::new(true, tx, Arc::new(Mutex::new(None)));
         now.set_active(true);
-        let clock = Arc::new(crate::video::clock::AvClock::new(
-            1.0,
-            Arc::new(AtomicU64::new(0)),
-        ));
-        let diagnostics = Arc::new(crate::video::audio_diagnostics::AudioDiagnostics::new(
-            Instant::now(),
-        ));
-        let input = |path: &str| NowPlayingInput {
-            path: path.into(),
-            title: None,
-            album: None,
-            artist: None,
-            artwork: NowPlayingArtworkSource::None,
-            lyrics_embedded: Some("lyrics".into()),
-            duration_seconds: Some(60.0),
-            position_source: PositionSource::Local {
-                clock: clock.clone(),
-                diagnostics: diagnostics.clone(),
-            },
+        let clock_a = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let clock_b = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        clock_a.set_paused_position(2.0);
+        clock_b.set_paused_position(42.0);
+        clock_b.set_playback_speed(0.75);
+        let diagnostics_a = Arc::new(AudioDiagnostics::new(Instant::now()));
+        let diagnostics_b = Arc::new(AudioDiagnostics::new(Instant::now()));
+        assert!(!Arc::ptr_eq(&clock_a, &clock_b));
+        assert!(!Arc::ptr_eq(&diagnostics_a, &diagnostics_b));
+        let input = |path: &str, clock: &Arc<AvClock>, diagnostics: &Arc<AudioDiagnostics>| {
+            NowPlayingInput {
+                path: path.into(),
+                title: None,
+                album: None,
+                artist: None,
+                artwork: NowPlayingArtworkSource::None,
+                lyrics_embedded: Some("lyrics".into()),
+                duration_seconds: Some(60.0),
+                position_source: PositionSource::Local {
+                    clock: clock.clone(),
+                    diagnostics: diagnostics.clone(),
+                },
+            }
         };
         let bridge = crate::effetune::new_bridge();
         let (host, commands, _) = crate::video::dsp::bridge::Bridge::fake_host_for_test();
@@ -239,7 +247,7 @@ mod tests {
         let mut sender = Sender::default();
         let a = NowPlayingOwner::Local(1);
         let b = NowPlayingOwner::Local(2);
-        now.publish(a, input("a.flac"));
+        now.publish(a, input("a.flac", &clock_a, &diagnostics_a));
         let generation_a = now.core.snapshot().media_generation;
         let sample = Sample {
             position: 2.0,
@@ -247,37 +255,49 @@ mod tests {
             rate: 1.0,
             time: 1_000_000_000,
         };
-        sender.update_at(&now.core, &destination, base, |_| {
+        sender.update_at(&now.core, &destination, base, |_, _| {
             panic!("generation invalidation must precede clock read")
         });
         assert_eq!(commands.recv().unwrap()["available"], 0);
         assert!(sender.wait().is_some());
-        sender.update_at(&now.core, &destination, base + POLL, |_| sample);
+        sender.update_at(
+            &now.core,
+            &destination,
+            base + POLL,
+            |clock, diagnostics| {
+                assert!(std::ptr::eq(clock, clock_a.as_ref()));
+                assert!(std::ptr::eq(diagnostics, diagnostics_a.as_ref()));
+                Sample {
+                    position: clock.now_secs(),
+                    ..sample
+                }
+            },
+        );
         let command = commands.recv().unwrap();
         assert_eq!(command["mediaGeneration"], generation_a);
         assert_eq!(command["positionSeconds"], 2.0);
         for step in 2..=5 {
-            sender.update_at(&now.core, &destination, base + POLL * step, |_| Sample {
+            sender.update_at(&now.core, &destination, base + POLL * step, |_, _| Sample {
                 position: 2.0 + (step - 1) as f64 * 0.2,
                 time: 1_000_000_000 + (step - 1) as u64 * 200_000_000,
                 ..sample
             });
             assert!(commands.try_recv().is_err());
         }
-        sender.update_at(&now.core, &destination, base + POLL * 6, |_| Sample {
+        sender.update_at(&now.core, &destination, base + POLL * 6, |_, _| Sample {
             position: 3.0,
             time: 2_000_000_000,
             ..sample
         });
         commands.recv().unwrap(); // One-second resend.
-        sender.update_at(&now.core, &destination, base + POLL * 7, |_| Sample {
+        sender.update_at(&now.core, &destination, base + POLL * 7, |_, _| Sample {
             playing: false,
             position: 3.0,
             time: 2_200_000_000,
             ..sample
         });
         assert_eq!(commands.recv().unwrap()["playing"], 0);
-        sender.update_at(&now.core, &destination, base + POLL * 8, |_| Sample {
+        sender.update_at(&now.core, &destination, base + POLL * 8, |_, _| Sample {
             playing: false,
             position: 40.0,
             rate: 2.0,
@@ -285,24 +305,93 @@ mod tests {
             ..sample
         });
         assert_eq!(commands.recv().unwrap()["positionSeconds"], 40.0);
-        now.publish(b, input("b.flac"));
-        sender.update_at(&now.core, &destination, base + POLL * 8, |_| {
+        now.publish(b, input("b.flac", &clock_b, &diagnostics_b));
+        sender.update_at(&now.core, &destination, base + POLL * 8, |_, _| {
             panic!("new generation first invalidates")
         });
-        let generation_b = commands.recv().unwrap()["mediaGeneration"]
-            .as_u64()
-            .unwrap();
+        let command = commands.recv().unwrap();
+        assert_eq!(command["available"], 0);
+        let generation_b = command["mediaGeneration"].as_u64().unwrap();
         assert!(generation_b > generation_a);
+        sender.update_at(
+            &now.core,
+            &destination,
+            base + POLL * 9,
+            |clock, diagnostics| {
+                assert!(std::ptr::eq(clock, clock_b.as_ref()));
+                assert!(std::ptr::eq(diagnostics, diagnostics_b.as_ref()));
+                Sample {
+                    position: clock.now_secs(),
+                    playing: clock.is_playing(),
+                    rate: clock.playback_speed(),
+                    time: 3_200_000_000,
+                }
+            },
+        );
+        let command = commands.recv().unwrap();
+        assert_eq!(command["available"], 1);
+        assert_eq!(command["mediaGeneration"], generation_b);
+        assert_eq!(command["positionSeconds"], 42.0);
+        assert_eq!(command["playing"], 0);
+        assert_eq!(command["rate"], 0.75);
+        assert!(sender.wait().is_some());
         now.clear(a); // Old owner cannot invalidate B.
         assert_eq!(now.core.snapshot().media_generation, generation_b);
-        now.publish(a, input("a.flac"));
-        assert!(now.core.snapshot().media_generation > generation_b);
+        now.publish(a, input("a.flac", &clock_a, &diagnostics_a));
+        let generation_a_again = now.core.snapshot().media_generation;
+        assert!(generation_a_again > generation_b);
+        sender.update_at(&now.core, &destination, base + POLL * 9, |_, _| {
+            panic!("returning to A first invalidates")
+        });
+        let command = commands.recv().unwrap();
+        assert_eq!(command["available"], 0);
+        assert_eq!(command["mediaGeneration"], generation_a_again);
+        sender.update_at(
+            &now.core,
+            &destination,
+            base + POLL * 10,
+            |clock, diagnostics| {
+                assert!(std::ptr::eq(clock, clock_a.as_ref()));
+                assert!(std::ptr::eq(diagnostics, diagnostics_a.as_ref()));
+                Sample {
+                    position: clock.now_secs(),
+                    time: 3_400_000_000,
+                    ..sample
+                }
+            },
+        );
+        let command = commands.recv().unwrap();
+        assert_eq!(command["available"], 1);
+        assert_eq!(command["mediaGeneration"], generation_a_again);
+        assert_eq!(command["positionSeconds"], 2.0);
+        now.clear(a);
+        let generation_empty = now.core.snapshot().media_generation;
+        assert!(generation_empty > generation_a_again);
+        sender.update_at(&now.core, &destination, base + POLL * 10, |_, _| {
+            panic!("Local clear cannot read a player")
+        });
+        let command = commands.recv().unwrap();
+        assert_eq!(command["available"], 0);
+        assert_eq!(command["mediaGeneration"], generation_empty);
+        assert!(sender.wait().is_none());
+        sender.update_at(&now.core, &destination, base + POLL * 11, |_, _| {
+            panic!("Empty must remain idle")
+        });
+        assert!(commands.try_recv().is_err());
+        assert!(sender.wait().is_none());
+        // Keep Local -> Remote coverage separate from the Local -> Empty case.
+        now.publish(a, input("a.flac", &clock_a, &diagnostics_a));
+        sender.update_at(&now.core, &destination, base + POLL * 11, |_, _| {
+            panic!("reopened Local first invalidates")
+        });
+        assert_eq!(commands.recv().unwrap()["available"], 0);
+        assert!(sender.wait().is_some());
         let remote = NowPlayingOwner::Remote {
             session: 3,
             registration: 1,
         };
-        now.publish(remote, input("remote.flac"));
-        sender.update_at(&now.core, &destination, base + POLL * 9, |_| {
+        now.publish(remote, input("remote.flac", &clock_a, &diagnostics_a));
+        sender.update_at(&now.core, &destination, base + POLL * 12, |_, _| {
             panic!("Remote never reads local clock")
         });
         assert_eq!(commands.recv().unwrap()["available"], 0);
@@ -310,12 +399,12 @@ mod tests {
         assert!(now.core.snapshot().lyrics_embedded.is_none());
         assert!(now.core.snapshot().lyrics_sidecar.is_none());
         sender.reset(); // RegisterBridge replays even the same generation.
-        sender.update_at(&now.core, &destination, base + POLL * 10, |_| {
+        sender.update_at(&now.core, &destination, base + POLL * 13, |_, _| {
             panic!("Remote")
         });
         assert_eq!(commands.recv().unwrap()["available"], 0);
         now.clear(remote);
-        sender.update_at(&now.core, &destination, base + POLL * 11, |_| {
+        sender.update_at(&now.core, &destination, base + POLL * 14, |_, _| {
             panic!("Empty")
         });
         assert_eq!(commands.recv().unwrap()["available"], 0);

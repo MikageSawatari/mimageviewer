@@ -682,10 +682,19 @@ Rust の cold native build は並列実行で TurboJPEG が失敗したため、
 | vendor egui-wgpu | `cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib` + 共通引数、11/11成功、exit 0。`vendor-egui-wgpu.log` |
 | vendor eframe | `cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib` + 共通引数、18/18成功、exit 0。`vendor-eframe.log` |
 | 最終整形/差分検査 | `cargo fmt` (引数なし) / `cargo fmt --check` / `git diff --check` すべて exit 0。Rust整形後の追加差分なし。HEADは開始時の `2d75d0c41`、コミットなし |
+| 独立コードレビューP3: 所有交代回帰 | `cargo nextest run -p mimageviewer --lib -E 'test(/lyrics_sender_owner_lifecycle_and_fake_clock/)'` 1/1成功、exit 0。基点 `e2a54a47a` 後の未コミット差分。`p3-owner-test-r2.log` |
+| 独立コードレビューP3: focused | `.\scripts\test-focused.ps1 -Path @('src/effetune/now_playing/position.rs','src/effetune/now_playing.rs')` 3/3 + 34/34成功、exit 0 (3件は重複)。`p3-focused-r2.log` / `p3-verification-r2.json` |
+| 独立コードレビューP3: 整形/差分検査 | `cargo fmt` (引数なし) / `cargo fmt --check` / `git diff --check` すべてexit 0。変更2ファイル、HEAD `e2a54a47a` のまま、コミット/製品起動なし |
 
 追加nextest検証の共通引数は `--config-file .config/nextest.toml --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`。
 完全なargv・exit・所要時間は `target/lyrics-trial/verification.json` / `verification-r2.json` / `available-gate-result.json`。
-表の短いlog名も同じ `target/lyrics-trial/` 内。検証後の最終変更は本実装記録だけで、製品/テストの内容は固定している。
+表の短いlog名も同じ `target/lyrics-trial/` 内。初回T2検証後の最終変更は本実装記録だけで、製品/テストの内容は固定していた。
+その後の独立コードレビューP3修正は上表のP3行として別に検証した。環境変数3本は本節冒頭と同じ。
+A/Bに別々のclockとdiagnosticsを与え、A→B→Aの各読取り対象の参照同一性、clock由来の位置、送信世代を照合する。
+Local clear直後の `available=0` と `wait() == None`、その後の読取り/送信なしも検査する。
+Localを再採用して既存のLocal→Remote抑制の検査も維持する。
+diagnosticsの読取り対象もテストから観測するため、既存の読取り注入関数の引数をclockだけからclockとdiagnosticsへ拡張した。
+両者は従来と同じ `PositionSource::Local` から取り出す。所有構造、送信条件/周期、D記録の処理に変更はない。
 
 通常全体gateの不足物は `target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`。
 `crates/launcher/build.rs:31-75` がこれらの実在を必須とする。代替/偽のexeを置かず、検査を無効化せずに、
