@@ -918,40 +918,43 @@ fn source_absent_changed_view_or_prepare_key_uses_existing_fallback() {
                     1.0
                 };
                 ctx.set_pixels_per_point(input_ppp);
-                let output = ctx.run(
+                let output = ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size)),
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
-                                assert_eq!(ctx.pixels_per_point(), input_ppp);
-                                let sources =
-                                    draw_with_absent_source(&mut app, ui, ctx, &held, false);
-                                if thumbnails.is_empty() {
-                                    assert!(sources.pages.is_empty());
-                                } else {
-                                    assert_eq!(sources.pages.len(), held.len());
-                                    assert!(
-                                        sources
-                                            .pages
-                                            .iter()
-                                            .zip(&thumbnails)
-                                            .all(|(page, id)| page.resource.paint_texture_id()
-                                                == *id),
-                                        "{mode:?} {stage:?} {change:?}"
-                                    );
-                                    paint_fallback_navigator_and_emit_ready(
-                                        &mut app,
-                                        ui,
-                                        ctx,
-                                        &sources,
-                                        &thumbnails,
-                                    );
-                                }
-                            });
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    assert_eq!(ctx.pixels_per_point(), input_ppp);
+                                    let sources =
+                                        draw_with_absent_source(&mut app, ui, ctx, &held, false);
+                                    if thumbnails.is_empty() {
+                                        assert!(sources.pages.is_empty());
+                                    } else {
+                                        assert_eq!(sources.pages.len(), held.len());
+                                        assert!(
+                                            sources
+                                                .pages
+                                                .iter()
+                                                .zip(&thumbnails)
+                                                .all(|(page, id)| page.resource.paint_texture_id()
+                                                    == *id),
+                                            "{mode:?} {stage:?} {change:?}"
+                                        );
+                                        paint_fallback_navigator_and_emit_ready(
+                                            &mut app,
+                                            ui,
+                                            ctx,
+                                            &sources,
+                                            &thumbnails,
+                                        );
+                                    }
+                                },
+                            )
+                        });
                     },
                 );
                 let painted = texture_ids_in_output(&output);

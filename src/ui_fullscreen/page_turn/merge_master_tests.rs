@@ -1077,7 +1077,7 @@ fn paint_saved_pdf_viewport(
     ctx: &egui::Context,
 ) -> Vec<crate::app::paint_record_test_support::PaintRecord> {
     let output = crate::app::paint_record_test_support::with_capture(|| {
-        ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -1085,7 +1085,7 @@ fn paint_saved_pdf_viewport(
                 )),
                 ..Default::default()
             },
-            |ctx| app.render_fullscreen_viewport(ctx),
+            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
         )
     });
     crate::app::paint_record_test_support::paint_records(egui::ViewportId::ROOT, &output)

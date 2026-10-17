@@ -28,9 +28,9 @@ pub(super) struct OverlayGpuService {
 impl OverlayGpuService {
     fn new() -> Self {
         Self {
-            instance: wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            instance: wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::DX12,
-                ..Default::default()
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
             }),
             epochs: Mutex::new(Vec::new()),
             next_generation: AtomicU64::new(1),
@@ -78,6 +78,7 @@ impl OverlayGpuService {
             pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
                 compatible_surface: Some(surface),
             }))
             .map_err(|e| format!("wgpu request_adapter for DComp overlay: {e:?}"))?;

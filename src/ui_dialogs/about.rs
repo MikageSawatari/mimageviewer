@@ -24,6 +24,10 @@ fn draw_license_text(ui: &mut egui::Ui, title: &str, id: &str, text: &str) {
         .id_salt(id)
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .id_salt(format!("{id}_scroll"))
                 .max_height(180.0)
                 .show(ui, |ui| {
@@ -102,6 +106,7 @@ impl App {
         let pack_about = self.ensure_editing_pack_about();
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         egui::Window::new("バージョン情報")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -273,6 +278,10 @@ impl App {
                         .id_salt(("about_effetune_notice", relative_path))
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
                                 .id_salt(("about_effetune_notice_scroll", relative_path))
                                 .max_height(180.0)
                                 .show(ui, |ui| {
@@ -396,8 +405,9 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(eframe::egui::vec2(900.0, 2000.0))
-            .build_state(
-                move |ctx, app: &mut crate::app::AppTestEnvForTest| {
+            .build_ui_state(
+                move |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;

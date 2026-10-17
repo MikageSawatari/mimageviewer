@@ -91,7 +91,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut measured = None;
         for _ in 0..3 {
-            let _ = ctx.run(
+            ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -99,10 +99,11 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
+                        .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = spacing;
                             let output = egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
@@ -117,7 +118,8 @@ mod tests {
                             measured = Some(ScrollLayout::from_output(&output));
                         });
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         }
         measured.unwrap()
     }

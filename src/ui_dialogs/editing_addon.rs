@@ -276,6 +276,7 @@ impl App {
         let default_pos = content.min + egui::vec2(80.0, 60.0);
 
         egui::Window::new("編集用追加ファイルのダウンロード")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("editing_addon_dialog"))
             .order(egui::Order::Foreground)
             .default_pos(default_pos)

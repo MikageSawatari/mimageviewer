@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -66,12 +66,45 @@ pub enum PadEvent {
     Disconnected,
 }
 
+#[cfg(all(windows, not(test)))]
+pub(crate) fn foreground_app_hwnd() -> Option<u64> {
+    crate::video::native_window::foreground_process_hwnd()
+}
+
+#[cfg(all(not(windows), not(test)))]
+pub(crate) fn foreground_app_hwnd() -> Option<u64> {
+    Some(1)
+}
+
+#[cfg(test)]
+pub(crate) fn foreground_app_hwnd() -> Option<u64> {
+    crate::test_native_focus::foreground_belongs_to_current_process_strict()
+        .then(crate::test_native_focus::foreground_hwnd)
+}
+
+/// The producer's foreground observation travels with this event through stalls.
+/// It only grants discrete presses; physical releases, axes and terminals always pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PadEventReceipt {
+    pub(crate) event: PadEvent,
+    pub(crate) accepted: bool,
+}
+
+impl PadEventReceipt {
+    pub(crate) fn new(event: PadEvent, foreground: Option<u64>) -> Self {
+        Self {
+            event,
+            accepted: foreground.is_some(),
+        }
+    }
+}
+
 pub struct GamepadRuntime {
     /// producer (gilrs スレッド) → consumer (UI スレッド) の共有キュー。mpsc を使わず
     /// `VecDeque` にしているのは、満杯時に **最古** を捨てて最新を残す (drop-oldest) ため。
     /// mpsc の sync_channel は満杯時に送ろうとした最新を捨ててしまい、release / disconnect /
     /// 中立軸を取りこぼして状態が固着しうる。
-    queue: Arc<Mutex<VecDeque<PadEvent>>>,
+    queue: Arc<Mutex<VecDeque<PadEventReceipt>>>,
     shutdown: Arc<AtomicBool>,
     #[cfg(not(test))]
     handle: Option<std::thread::JoinHandle<()>>,
@@ -102,7 +135,7 @@ impl GamepadRuntime {
     /// `ctx.request_repaint()` を呼ぶので、スティックが少しずれているパッドが
     /// 挿さっているだけで UI が起き続ける。無効にした人が求めているのは
     /// 「反応しないこと」であって「反応しないまま起き続けること」ではない。
-    pub fn drain(&mut self, ctx: &egui::Context, enabled: bool) -> Vec<PadEvent> {
+    pub(crate) fn drain(&mut self, ctx: &egui::Context, enabled: bool) -> Vec<PadEventReceipt> {
         if !enabled {
             self.stop();
             return Vec::new();
@@ -118,7 +151,7 @@ impl GamepadRuntime {
         self.queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(event);
+            .push_back(PadEventReceipt::new(event, Some(1)));
     }
 
     /// 読み取りスレッドを止め、溜まっていたイベントを捨てる。再度 `enabled` に
@@ -127,6 +160,14 @@ impl GamepadRuntime {
     /// `shutdown` は次に生きるスレッドと共有しないよう、停止のたびに新しい
     /// フラグへ差し替える。使い回すと、再開したスレッドが前回の停止要求を
     /// 読んで即座に終了する。
+    #[cfg(test)]
+    pub(crate) fn push_receipt_for_test(&mut self, event: PadEvent, foreground: Option<u64>) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(PadEventReceipt::new(event, foreground));
+    }
+
     fn stop(&mut self) {
         if !self.started {
             return;
@@ -176,7 +217,7 @@ impl GamepadRuntime {
                             if q.len() >= GAMEPAD_EVENT_CAP {
                                 q.pop_front();
                             }
-                            q.push_back(mapped);
+                            q.push_back(PadEventReceipt::new(mapped, foreground_app_hwnd()));
                             drop(q);
                             sent_any = true;
                         }
@@ -286,8 +327,14 @@ pub enum WestReleaseOutcome {
     Suppressed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PadPressAdmission {
+    Accepted,
+    Suppressed,
+}
+
 pub struct GamepadInputState {
-    buttons: HashSet<PadButton>,
+    buttons: HashMap<PadButton, PadPressAdmission>,
     axes: [f32; 6],
     trigger_ranges: [TriggerRange; 2],
     repeat_next: HashMap<PadButton, Instant>,
@@ -303,7 +350,7 @@ pub struct GamepadInputState {
 impl Default for GamepadInputState {
     fn default() -> Self {
         Self {
-            buttons: HashSet::new(),
+            buttons: HashMap::new(),
             axes: [0.0; 6],
             trigger_ranges: [TriggerRange::Unknown; 2],
             repeat_next: HashMap::new(),
@@ -321,9 +368,14 @@ impl Default for GamepadInputState {
 impl GamepadInputState {
     pub fn set_button_down(&mut self, button: PadButton, down: bool, now: Instant) -> bool {
         let changed = if down {
-            self.buttons.insert(button)
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.buttons.entry(button) {
+                entry.insert(PadPressAdmission::Accepted);
+                true
+            } else {
+                false
+            }
         } else {
-            self.buttons.remove(&button)
+            self.buttons.remove(&button).is_some()
         };
         if down && changed {
             if button == PadButton::North {
@@ -379,10 +431,13 @@ impl GamepadInputState {
     /// 一瞬のポップアップ後もアナログ操作はそのまま継続できる。
     pub fn suppress_pending_actions(&mut self) {
         self.repeat_next.clear();
-        if self.buttons.contains(&PadButton::North) {
+        for admission in self.buttons.values_mut() {
+            *admission = PadPressAdmission::Suppressed;
+        }
+        if self.buttons.contains_key(&PadButton::North) {
             self.y_modifier_used = true;
         }
-        if self.buttons.contains(&PadButton::West) {
+        if self.buttons.contains_key(&PadButton::West) {
             self.west_tap_suppressed = true;
             self.west_ring_direction = None;
             // X リング操作中にブロックされた場合、リング用に倒していたスティックが
@@ -404,8 +459,12 @@ impl GamepadInputState {
         self.axes[axis.index()] = value;
     }
 
+    pub(crate) fn button_release_admitted(&self, button: PadButton) -> bool {
+        self.buttons.get(&button) == Some(&PadPressAdmission::Accepted)
+    }
+
     pub fn button_down(&self, button: PadButton) -> bool {
-        self.buttons.contains(&button)
+        self.buttons.contains_key(&button)
     }
 
     pub fn axis(&self, axis: PadAxis) -> f32 {
@@ -514,7 +573,7 @@ impl GamepadInputState {
     pub fn dpad_direction_down(&self) -> bool {
         DPAD_BUTTONS
             .iter()
-            .any(|button| self.buttons.contains(button))
+            .any(|button| self.buttons.contains_key(button))
     }
 
     pub fn finish_west_release(&mut self) -> WestReleaseOutcome {
@@ -553,7 +612,7 @@ impl GamepadInputState {
 
     pub fn repeat_active(&self) -> bool {
         self.buttons
-            .iter()
+            .keys()
             .any(|&button| is_repeatable_button(button))
     }
 
@@ -630,7 +689,10 @@ mod tests {
             .queue
             .lock()
             .unwrap()
-            .push_back(PadEvent::ButtonPressed(PadButton::South));
+            .push_back(super::PadEventReceipt::new(
+                PadEvent::ButtonPressed(PadButton::South),
+                Some(1),
+            ));
         assert!(runtime.drain(&ctx, false).is_empty());
         assert!(!runtime.started, "無効なら読み取りを止める");
         assert!(

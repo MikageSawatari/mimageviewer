@@ -7937,7 +7937,7 @@ pub(crate) mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |_| {});
+                egui::CentralPanel::default().show(root_ui, |_| {});
                 let mut commands = Vec::new();
                 draw_native_metadata_panel(
                     ctx,
@@ -8099,7 +8099,8 @@ pub(crate) mod tests {
         let mut projection_popup_open = false;
         let mut projection_popup_rect = None;
         let mut commands = Vec::new();
-        let _ = ctx.run(input, |ctx| {
+        let output = ctx.run_ui(input, |root_ui| {
+            let ctx = root_ui.ctx();
             layout = Some(draw_native_top_bar(
                 ctx,
                 width_points,
@@ -8129,6 +8130,7 @@ pub(crate) mod tests {
                 &mut None,
             ));
         });
+        crate::egui_output::discard_headless_output(output);
         layout.expect("the native top bar must publish its drawn layout")
     }
 
@@ -8203,7 +8205,8 @@ pub(crate) mod tests {
             let mut popup_rect = None;
             let mut commands = Vec::new();
             for frame in 0..2 {
-                let _ = ctx.run(input.clone(), |ctx| {
+                let output = ctx.run_ui(input.clone(), |root_ui| {
+                    let ctx = root_ui.ctx();
                     let _ = draw_native_top_bar(
                         ctx,
                         1_200.0,
@@ -8230,6 +8233,7 @@ pub(crate) mod tests {
                         &mut None,
                     );
                 });
+                crate::egui_output::discard_headless_output(output);
                 if frame == 0 {
                     assert!(
                         !observation.as_ref().unwrap().enabled,
@@ -8413,7 +8417,7 @@ pub(crate) mod tests {
         let mut projection_popup_open = false;
         let mut projection_popup_rect = None;
         let mut commands = Vec::new();
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -8421,7 +8425,8 @@ pub(crate) mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 layout = Some(draw_native_top_bar(
                     ctx,
                     1_200.0,
@@ -8452,6 +8457,7 @@ pub(crate) mod tests {
                 ));
             },
         );
+        crate::egui_output::discard_headless_output(output);
         layout.expect("conditional native top bar must publish its drawn layout")
     }
 
@@ -8651,7 +8657,7 @@ pub(crate) mod tests {
         let mut tile_layout = None;
         let mut tile_commands = Vec::new();
         let tile_state = NativeOverlayTileOverlay::preparing_with_filename(long_title.clone());
-        let _ = tile_ctx.run(
+        let tile_output = tile_ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -8659,7 +8665,8 @@ pub(crate) mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 tile_layout = Some(draw_native_top_bar_tile(
                     ctx,
                     900.0,
@@ -8670,6 +8677,7 @@ pub(crate) mod tests {
                 ));
             },
         );
+        crate::egui_output::discard_headless_output(tile_output);
         let tile = tile_layout.unwrap();
 
         let preview_ctx = egui::Context::default();
@@ -8681,7 +8689,7 @@ pub(crate) mod tests {
             subtitle: "次の動画を準備中".to_owned(),
             thumbnail: None,
         };
-        let _ = preview_ctx.run(
+        let output = preview_ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -8689,7 +8697,8 @@ pub(crate) mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 preview_layout = Some(draw_native_navigation_preview(
                     ctx,
                     900.0,
@@ -8704,6 +8713,7 @@ pub(crate) mod tests {
                 ));
             },
         );
+        crate::egui_output::discard_headless_output(output);
         let preview = preview_layout.unwrap();
 
         for layout in [&audio, &tile, &preview] {
@@ -8731,7 +8741,7 @@ pub(crate) mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |_| {});
+                egui::CentralPanel::default().show(root_ui, |_| {});
                 let mut commands = Vec::new();
                 let _ = draw_native_top_bar(
                     ctx,
@@ -8775,7 +8785,7 @@ pub(crate) mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
             .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let painter = ui.painter().clone();
                     let mut commands = Vec::new();
                     draw_native_bar_lock_button(
@@ -8847,7 +8857,7 @@ pub(crate) mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |_| {});
+                egui::CentralPanel::default().show(root_ui, |_| {});
                 let mut commands = Vec::new();
                 draw_native_video_left_panel(
                     ctx,
@@ -9048,7 +9058,8 @@ pub(crate) mod tests {
     fn test_painter() -> (egui::Context, egui::Painter) {
         let ctx = egui::Context::default();
         // Run one no-op pass so fonts are initialized.
-        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        crate::egui_output::discard_headless_output(output);
         let painter = ctx.layer_painter(egui::LayerId::background());
         (ctx, painter)
     }

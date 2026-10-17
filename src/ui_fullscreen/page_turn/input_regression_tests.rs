@@ -83,11 +83,15 @@ fn viewer_frame_with_focus(
             ..Default::default()
         },
     );
-    let _ = ctx.run(raw, |ctx| {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| run(ui, ctx));
-    });
+    let _ = ctx
+        .run_pass(raw, |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| run(ui, ctx))
+            });
+        })
+        .drop_without_applying_deltas();
 }
 
 fn neutral_gamepad_poll(app: &mut App, ctx: &egui::Context) {
@@ -823,6 +827,8 @@ fn child_key_and_wheel_navigation_start_and_complete_after_outer_root_acceptance
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -120.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
             ]
         } else {
@@ -912,6 +918,8 @@ fn mixed_key_and_wheel_batch_skips_once_for_the_actual_accepted_key_navigation()
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -1.0),
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         },
     ];
     let mut accepted_operation = None;
@@ -1026,6 +1034,8 @@ fn raw_wheel(delta: egui::Vec2) -> Vec<egui::Event> {
             unit: egui::MouseWheelUnit::Point,
             delta,
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         },
     ]
 }

@@ -263,7 +263,7 @@ mod tests {
         drop(source);
         assert!(ctx.tex_manager().read().meta(source_texture_id).is_none());
         let output = with_capture(|| {
-            ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 let painter = ctx.layer_painter(egui::LayerId::background());
                 record_selected_paint_resource(&painter, &payload);
                 painter.image(
@@ -300,7 +300,7 @@ mod tests {
         let second =
             FullscreenPaintResource::direct(texture).with_test_paint_provenance(proof("second"));
         let output = with_capture(|| {
-            ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
                 let painter = ctx.layer_painter(egui::LayerId::background());
                 for (index, resource) in [&first, &second].into_iter().enumerate() {
                     record_selected_paint_resource(&painter, resource);

@@ -18,8 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 # 軽量 GUI (mIV 本体と同じ系統)
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
-egui = "0.33"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.37.0"
 
 # 音声出力 (mIV 本体と同じ)
 cpal = "0.16"

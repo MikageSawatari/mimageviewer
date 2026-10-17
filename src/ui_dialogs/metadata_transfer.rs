@@ -1097,8 +1097,9 @@ fn progress_widget_height(progress: TransferProgress) -> f32 {
     let captured_height = Arc::clone(&height);
     let mut harness = crate::test_ui::builder()
         .with_size(egui::vec2(430.0, 240.0))
-        .build(move |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 let top = ui.cursor().top();
                 draw_progress(ui, Some(&progress));
                 *captured_height.lock().unwrap() = Some(ui.cursor().top() - top);
@@ -1721,7 +1722,8 @@ mod tests {
         let render_state = std::rc::Rc::clone(&state);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 let _ = draw_dialog(ctx, &mut render_state.borrow_mut(), false);
             });
         harness.run();

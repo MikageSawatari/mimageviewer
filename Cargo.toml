@@ -48,8 +48,8 @@ ort = { path = "crates/ort-patched" }
 [workspace.package]
 version = "4.7.1"
 edition = "2024"
-# let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
-rust-version = "1.88"
+# egui / eframe 0.37 の MSRV。開発 toolchain は 1.99 固定。
+rust-version = "1.95"
 
 [package]
 name = "mimageviewer"
@@ -308,6 +308,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_Debug",
@@ -350,13 +351,13 @@ winreg = "0.52"
 
 [dependencies]
 miv-startup = { path = "crates/startup-diagnostics" }
-eframe = { version = "0.33", features = ["wgpu"] }
-egui = "0.33"
+eframe = { version = "0.37.0", features = ["wgpu", "glow"] }
+egui = "0.37.0"
 egui-ime = { path = "crates/egui-ime" }
-egui-wgpu = "0.33"
+egui-wgpu = "0.37.0"
 # 静止画縮小・比較・パノラマと native presenter の HUD overlay に使う。
 # eframe[wgpu] / egui-wgpu が使う版に揃える。動画本体は D3D11 native presenter。
-wgpu = "27"
+wgpu = "30"
 pollster = "0.4"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 qrcode = { version = "0.14", default-features = false }
@@ -472,13 +473,13 @@ mimalloc = { version = "0.1.52", default-features = false }
 [dev-dependencies]
 tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
 tempfile = "3"
-eframe = { version = "0.33", features = ["miv-test-script-window-witness"] }
+eframe = { version = "0.37.0", features = ["miv-test-script-window-witness"] }
 # `examples/bench_pdf_count.rs` (PDFium vs lopdf 比較ベンチマーク) でのみ使用。
 # 本体には組み込まれない (= 配布バイナリサイズに影響なし)。MIT.
 lopdf = "0.36"
 # egui UI の回帰テスト用 (WCAG 検証 + 見た目のスナップショット)。
 # egui 0.33 系統に合わせて 0.33.x を指定。
-egui_kittest = { version = "0.33", features = ["snapshot", "wgpu"] }
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
 
 [build-dependencies]
 winresource = "0.1"

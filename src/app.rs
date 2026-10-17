@@ -75,10 +75,10 @@ mod clipboard_capture_admission_tests {
         ctx.set_request_repaint_callback(move |info| received.lock().unwrap().push(info));
         // Model a quiet notification stream without reading the real clipboard.
         // Consume egui's initial settling repaint before checking the UI drains.
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run_pass(Default::default(), |_| {});
         requests.lock().unwrap().clear();
         for _ in 0..40 {
-            let _ = ctx.run(Default::default(), |ctx| {
+            let _ = ctx.run_pass(Default::default(), |ctx| {
                 app.poll_clipboard_capture_with_activation(ctx, |_, _| {
                     panic!("idle monitoring activated main")
                 });
@@ -612,6 +612,7 @@ use raw_page_store::*;
 mod ai_terminal_service;
 #[cfg(all(test, windows))]
 mod context_state_tests;
+mod logic_service;
 pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
@@ -1914,7 +1915,6 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
     },
     Frame {
         id: u64,
-        viewport_close_requested: bool,
         bar_close_requested: bool,
         focused: bool,
         placement_update: Option<crate::settings::DetachedViewerWindowPlacement>,
@@ -19178,7 +19178,7 @@ impl App {
         };
         self.clipboard_capture_service.synchronize(
             &self.settings,
-            ctx.style().visuals.dark_mode,
+            ctx.global_style().visuals.dark_mode,
             ctx,
             hwnd,
         );
@@ -22437,7 +22437,7 @@ impl App {
                 tracked_text_input_focused.then_some(focused_widget.unwrap_or(egui::Id::NULL))
             })
             .or(claimed_focused_text_input);
-        let wants_keyboard_input = ctx.wants_keyboard_input();
+        let wants_keyboard_input = ctx.egui_wants_keyboard_input();
         let focused_ui = wants_keyboard_input.then_some(focused_widget.unwrap_or(egui::Id::NULL));
         let text_input = focused_text_input
             .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::Focused))
@@ -31770,7 +31770,8 @@ impl App {
         }
     }
 
-    pub(crate) fn render_startup_overlay(&self, ctx: &egui::Context) {
+    pub(crate) fn render_startup_overlay(&self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         let snapshot = miv_startup::lane_snapshot(miv_startup::Lane::Indexer);
         let progress_text = snapshot
             .stage
@@ -31778,13 +31779,13 @@ impl App {
             .unwrap_or("検索の準備中");
         // 背景全面に半透明の幕を引いてから中央に文字を出す。
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(ctx.style().visuals.panel_fill))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(ctx.global_style().visuals.panel_fill))
+            .show(ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 ui.painter().rect_filled(
                     rect,
                     egui::CornerRadius::ZERO,
-                    ctx.style().visuals.panel_fill,
+                    ctx.global_style().visuals.panel_fill,
                 );
                 ui.scope_builder(
                     egui::UiBuilder::new().max_rect(rect).layout(
@@ -58903,7 +58904,7 @@ impl App {
         if self.viewer_session_blocks_main_window()
             || self.fs_nav_deferred_reopen_wait_active()
             || self.any_dialog_open()
-            || ctx.is_popup_open()
+            || ctx.any_popup_open()
             // 新しい egui::Window / Modal を共通状態述語へ追加し忘れても、ポインタ直下が
             // floating layer なら背面グリッドへ wheel を渡さない最終安全網。Tooltip は
             // hover 中の通常グリッドスクロールを妨げるため対象外にする。
@@ -58915,52 +58916,55 @@ impl App {
         let cell_h = self.last_cell_h.max(1.0);
 
         // マウスホイールイベントだけを取り出し、egui には渡さない
-        let wheel = ctx.input(crate::wheel_input::remaining_wheel_input);
-        let (scroll_delta_y, ctrl) = (wheel.delta.y, wheel.modifiers.ctrl);
-        if scroll_delta_y.abs() > 0.5 {
-            // This owner consumes the wheel before render_grid can observe it.
-            // An accepted scroll (including Ctrl+wheel at a column limit) ends
-            // the grid click run even when the resulting offset is unchanged.
-            self.grid_click_pairing.end_activation();
-            crate::wheel_input::consume_wheel_input(ctx);
+        let options = ctx.options(|options| options.input_options);
+        let wheels = ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, options));
+        for wheel in wheels {
+            let (scroll_delta_y, ctrl) = (wheel.delta.y, wheel.modifiers.ctrl);
+            if scroll_delta_y.abs() > 0.5 {
+                // This owner consumes the wheel before render_grid can observe it.
+                // An accepted scroll (including Ctrl+wheel at a column limit) ends
+                // the grid click run even when the resulting offset is unchanged.
+                self.grid_click_pairing.end_activation();
+                crate::wheel_input::consume_wheel_input(ctx);
 
-            if ctrl {
-                // Ctrl+ホイール: 列数を増減（1〜20 の範囲）
-                let delta = -scroll_delta_y.signum() as i32;
-                if self.change_grid_cols_by(delta) {
-                    self.settings.save();
-                }
-            } else {
-                // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
-                let prev_offset = self.scroll_offset_y;
-                self.scroll_offset_y = crate::ui_main::grid_wheel_scroll_offset(
-                    self.scroll_offset_y,
-                    scroll_delta_y,
-                    cell_h,
-                );
-                if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
-                    self.log_rating_grid_scroll(
-                        &format!("wheel delta={scroll_delta_y:.1}"),
-                        prev_offset,
+                if ctrl {
+                    // Ctrl+ホイール: 列数を増減（1〜20 の範囲）
+                    let delta = -scroll_delta_y.signum() as i32;
+                    if self.change_grid_cols_by(delta) {
+                        self.settings.save();
+                    }
+                } else {
+                    // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
+                    let prev_offset = self.scroll_offset_y;
+                    self.scroll_offset_y = crate::ui_main::grid_wheel_scroll_offset(
                         self.scroll_offset_y,
-                        (
-                            self.last_grid_cols,
-                            self.last_cell_size,
-                            cell_h,
-                            self.last_viewport_h,
-                        ),
+                        scroll_delta_y,
+                        cell_h,
                     );
-                    self.bump_input_seq(
-                        "grid_wheel",
-                        Some(&format!("offset={:.0}", self.scroll_offset_y)),
-                    );
+                    if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+                        self.log_rating_grid_scroll(
+                            &format!("wheel delta={scroll_delta_y:.1}"),
+                            prev_offset,
+                            self.scroll_offset_y,
+                            (
+                                self.last_grid_cols,
+                                self.last_cell_size,
+                                cell_h,
+                                self.last_viewport_h,
+                            ),
+                        );
+                        self.bump_input_seq(
+                            "grid_wheel",
+                            Some(&format!("offset={:.0}", self.scroll_offset_y)),
+                        );
+                    }
                 }
             }
         }
     }
 
     fn suppress_popup_wheel_before_grid(&self, ctx: &egui::Context) {
-        if !ctx.is_popup_open() {
+        if !ctx.any_popup_open() {
             return;
         }
         crate::wheel_input::consume_wheel_input(ctx);
@@ -59455,7 +59459,7 @@ impl App {
             let stale = ctx.input_mut(|input| {
                 let before = input.modifiers;
                 input.modifiers = modifiers;
-                input.raw.modifiers = modifiers;
+                input.events.push(egui::Event::ModifiersChanged(modifiers));
                 // egui 側が「押されている」と思っていたのに OS では離れていた分。
                 // Shell のモーダルが KeyUp を持っていった後に残る。
                 egui::Modifiers {
@@ -64912,9 +64916,10 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn update_active_viewer_context(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         gamepad_batch: Option<crate::app::gamepad_input::GamepadFrameBatch>,
     ) -> crate::app::gamepad_input::ActiveContextUpdate {
+        let ctx = &ui.ctx().clone();
         if !self.active_detached_context_is_at_rest() {
             return crate::app::gamepad_input::ActiveContextUpdate {
                 updated: false,
@@ -65053,7 +65058,7 @@ impl App {
                 }
 
                 app.keep_fullscreen_viewport_alive(ctx);
-                app.render_fullscreen_viewport(ctx);
+                app.render_fullscreen_viewport(ui);
 
                 if std::mem::take(&mut app.pending_return_to_parent) {
                     app.close_fullscreen();
@@ -94825,12 +94830,8 @@ impl App {
     ///
     /// **早期 return を複数持つ。** frame の最後に必ず走らせたい処理は、ここではなく
     /// 呼び出し側 (`update`) へ置く。
-    fn update_frame(
-        &mut self,
-        ctx: &egui::Context,
-        frame: &mut eframe::Frame,
-        root_lifecycle: root_lifecycle::RootLifecycleSnapshot,
-    ) {
+    fn update_frame(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         let update_perf_on = crate::perf::is_enabled();
         let mut update_perf = update_perf_start_with(
             update_perf_on,
@@ -94909,24 +94910,8 @@ impl App {
         // タスクトレイ関連の毎フレーム処理は、設定 ON のときのみ走らせる。
         // 既定 OFF のユーザーには IsWindowVisible の syscall やイベント polling を
         // 走らせないで済むようここで一括 gate する。
-        let tray_active = self.settings.minimize_to_tray_on_close || self.tray_controller.is_some();
-        if tray_active {
-            self.service_tray_requests(ctx);
-            // A tray-intercepted CloseRequested must finish this frame. Immediate/deferred
-            // viewports are registered below; returning here omits them from egui's frame and
-            // destroys their host HWNDs (and any WS_CHILD native presenter). hide_to_tray has
-            // already made each retained viewport explicit Hidden, so normal registration is safe.
-        }
-        self.service_root_lifecycle_tray_checkpoint(ctx, root_lifecycle);
-        // request_repaint cannot wake a hidden Win32 root window. Publish the current media
-        // ownership projection near the top of every pass so the tray thread can continue (or
-        // stop) its 50ms WM_PAINT bridge even when later update paths return early.
-        self.sync_tray_resident_media_wake();
-
         self.input_main_focus_resume(ctx);
-        self.service_folder_watch(ctx);
         self.poll_external_rescan(ctx);
-        self.service_periodic_folder_work(ctx);
         self.input_frame_diagnostics(ctx);
         mark_update_perf(&mut update_perf, UpdatePerfStage::FrameStart);
 
@@ -94936,7 +94921,7 @@ impl App {
         // 入力イベントを破棄する。完了したら通常 update に進む。
         self.service_startup_notifications(ctx);
         if self.indexer_init.overlay_active() {
-            self.render_startup_overlay(ctx);
+            self.render_startup_overlay(ui);
             self.consume_input_during_startup(ctx);
             #[cfg(all(feature = "test-script", windows))]
             self.release_check_record_early_tail(ctx);
@@ -94944,7 +94929,7 @@ impl App {
             return;
         }
         if self.indexer_init.pending().is_some() {
-            egui::TopBottomPanel::top("startup-search-preparing").show(ctx, |ui| {
+            egui::Panel::top("startup-search-preparing").show(ui, |ui| {
                 crate::ui_startup::draw_preparing(ui);
             });
         }
@@ -95084,7 +95069,7 @@ impl App {
         #[cfg(windows)]
         let active_detached_context_updated = {
             let update =
-                self.update_active_viewer_context(ctx, gamepad_batch_for_active_context.take());
+                self.update_active_viewer_context(ui, gamepad_batch_for_active_context.take());
             // mount が起きなければ batch は返ってくる。活性化がこの frame で変わった等。
             gamepad_batch_for_active_context = update.gamepad_batch;
             if let Some(mut outcome) = update.gamepad_outcome {
@@ -95182,7 +95167,7 @@ impl App {
             ),
         );
         if should_render_main_fullscreen_viewport {
-            self.render_fullscreen_viewport_with_root_input(ctx, fullscreen_root_input);
+            self.render_fullscreen_viewport_with_root_input(ui, fullscreen_root_input);
         }
         // This span is the whole of `pre_grid` while a video plays in a detached
         // window (backlog 1.122). Name the call that owns it.
@@ -95351,7 +95336,7 @@ impl App {
             self.process_native_video_main_chrome_restore(ctx);
 
             if still_viewport_enter_suppressed {
-                self.render_still_fullscreen_viewport_enter_holdover(ctx);
+                self.render_still_fullscreen_viewport_enter_holdover(ui);
                 self.log_main_flash_probe(
                     "early_return",
                     "reason=still_viewport_enter_suppressed main_ui=holdover",
@@ -95445,7 +95430,7 @@ impl App {
         self.update_thumb_adjust_drag_state();
 
         // ── メニューバー ─────────────────────────────────────────────
-        let (fav_nav, _) = self.render_menubar(ctx);
+        let (fav_nav, _) = self.render_menubar(ui);
 
         self.render_main_overlays(ctx);
         self.render_menu_worker_results(ctx);
@@ -95494,7 +95479,7 @@ impl App {
         self.stack_reconcile_after_fullscreen_close(ctx);
 
         // ── ツールバー ───────────────────────────────────────────────
-        let (toolbar_fav_nav, address_nav) = self.render_toolbar(ctx);
+        let (toolbar_fav_nav, address_nav) = self.render_toolbar(ui);
         // ツールバーお気に入りクリックは「指定フォルダへ飛ぶ」操作なので、検索系
         // (Ctrl+F フォルダ内ファイル名フィルタ / Ctrl+S お気に入り横断検索 /
         //  Ctrl+G 全文検索) が立っていれば全部抜けてからナビゲートする。
@@ -95553,7 +95538,7 @@ impl App {
         let perf_on = crate::perf::is_enabled();
         let mut pre_grid_perf = pre_grid_perf_start_with(perf_on, std::time::Instant::now);
 
-        let (folder_pane_nav, folder_pane_rect) = self.render_main_bars(ctx, &mut pre_grid_perf);
+        let (folder_pane_nav, folder_pane_rect) = self.render_main_bars(ui, &mut pre_grid_perf);
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
         // wheel が背面のサムネイル一覧にも通り抜ける。
@@ -95594,7 +95579,7 @@ impl App {
         let t_pre_grid = frame_t0.elapsed();
         self.sync_startup_present_watch(ctx, true);
         egui_wgpu::set_root_startup_frame_tag(ctx, true);
-        let grid_nav = self.render_grid(ctx);
+        let grid_nav = self.render_grid(ui);
         let t_grid = frame_t0.elapsed();
         mark_update_perf(&mut update_perf, UpdatePerfStage::Grid);
         self.reconcile_details_lazy_session_after_grid(ctx);
@@ -96062,8 +96047,12 @@ impl eframe::App for App {
         main_window_clear_color(visuals)
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.diagnostics_export.poll();
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.service_app_logic(ctx, frame);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.begin_grid_click_input_frame(ctx);
         static FIRST_UPDATE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
@@ -96098,10 +96087,6 @@ impl eframe::App for App {
         self.poll_clipboard_capture(ctx);
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);
-        // A settings-family mutation may already hold the exclusive DB permit. Defer only a
-        // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
-        // remains under the established close policy.
-        let root_lifecycle = self.accept_root_lifecycle_before_frame(ctx);
         #[cfg(not(windows))]
         {
             // Non-Windows builds have one mounted viewer context and therefore no
@@ -96113,7 +96098,7 @@ impl eframe::App for App {
             }
         }
         self.poll_image_folder_zip(ctx);
-        self.update_frame(ctx, frame, root_lifecycle);
+        self.update_frame(ui, frame);
         self.render_update_after_frame(ctx);
         self.render_update_owner_dialogs(ctx);
         // `update_frame` has several native/fullscreen early returns. Recovery polling belongs
@@ -98868,7 +98853,7 @@ mod index_full_check_tests {
                 disposal_witness: None,
             });
             let ctx = egui::Context::default();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| app.poll_startup_owner(ctx));
+            let _ = ctx.run_pass(egui::RawInput::default(), |ctx| app.poll_startup_owner(ctx));
             if terminal {
                 tx.send(crate::indexer_manager::StartupInitOutcome::Unavailable)
                     .unwrap_or_else(|_| panic!("live receiver"));
@@ -98880,11 +98865,11 @@ mod index_full_check_tests {
                 events: vec![egui::Event::Text("queued input".into())],
                 ..Default::default()
             };
-            let _ = ctx.run(input(), |ctx| {
+            let _ = ctx.run_pass(input(), |ctx| {
                 app.poll_startup_owner(ctx);
                 assert!(ctx.input(|i| i.events.is_empty()));
             });
-            let _ = ctx.run(input(), |ctx| {
+            let _ = ctx.run_pass(input(), |ctx| {
                 app.poll_startup_owner(ctx);
                 assert!(ctx.input(|i| !i.events.is_empty()));
             });

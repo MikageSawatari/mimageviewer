@@ -158,7 +158,8 @@ fn everything_search_progress_snapshot(
 ) {
     let size = egui::vec2(1093.0, 614.0);
     let mut fonts_ready = false;
-    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(size).build_ui(move |ui| {
+        let ctx = &ui.ctx().clone();
         mimageviewer::os_theme::apply_resolved(ctx, theme);
         if !fonts_ready {
             install_app_fonts(ctx);
@@ -167,7 +168,7 @@ fn everything_search_progress_snapshot(
             ctx.request_repaint();
             return;
         }
-        egui::CentralPanel::default().show(ctx, |_| {});
+        egui::CentralPanel::default().show(ui, |_| {});
         mimageviewer::draw_everything_progress_snapshot_fixture(ctx);
     });
     // The shared production body has an intentionally animated progress spinner.
@@ -390,8 +391,9 @@ fn startup_dialogs_small_viewport() {
             for &(kind, buttons) in STARTUP_DIALOG_CASES {
                 let size = egui::vec2(width as f32, height as f32);
                 let mut fonts_ready = false;
-                let mut harness = test_ui::builder().with_size(size).build_state(
-                    move |ctx, actions: &mut Actions| {
+                let mut harness = test_ui::builder().with_size(size).build_ui_state(
+                    move |ui, actions: &mut Actions| {
+                        let ctx = &ui.ctx().clone();
                         mimageviewer::os_theme::apply_resolved(
                             ctx,
                             mimageviewer::os_theme::ResolvedTheme::Light,
@@ -405,7 +407,7 @@ fn startup_dialogs_small_viewport() {
                         }
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
+                            .show(ui, |ui| {
                                 mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
                                     ui, kind,
                                 );
@@ -520,8 +522,9 @@ fn startup_dialogs_refit_after_viewport_resize() {
             let mut fonts_ready = false;
             let mut harness = test_ui::builder()
                 .with_size(egui::vec2(1920.0, 1440.0))
-                .build_state(
-                    move |ctx, state: &mut (Vec<egui::Id>, Vec<egui::Response>)| {
+                .build_ui_state(
+                    move |ui, state: &mut (Vec<egui::Id>, Vec<egui::Response>)| {
+                        let ctx = &ui.ctx().clone();
                         if !fonts_ready {
                             install_app_fonts(ctx);
                             mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
@@ -531,7 +534,7 @@ fn startup_dialogs_refit_after_viewport_resize() {
                         }
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
+                            .show(ui, |ui| {
                                 mimageviewer::ui_dialogs::draw_startup_dialog_snapshot_fixture(
                                     ui, kind,
                                 );
@@ -693,7 +696,8 @@ fn folder_toolbar_snapshot_status_label() {
                 let mut path = String::from(r"C:\Pictures\日本語フォルダ");
                 let mut harness = test_ui::builder()
                     .with_size(egui::vec2(width * zoom, 120.0 * zoom))
-                    .build(move |ctx| {
+                    .build_ui(move |ui| {
+                        let ctx = &ui.ctx().clone();
                         ctx.set_zoom_factor(zoom);
                         mimageviewer::os_theme::apply_resolved(
                             ctx,
@@ -705,7 +709,7 @@ fn folder_toolbar_snapshot_status_label() {
                             ctx.request_repaint();
                             return;
                         }
-                        let panel = egui::TopBottomPanel::top("folder").show(ctx, |ui| {
+                        let panel = egui::TopBottomPanel::top("folder").show(ui, |ui| {
                             let input = layout::address_input(
                                 ui,
                                 Some(
@@ -776,7 +780,8 @@ fn folder_toolbar_flexible_snapshots() {
                     let mut path = String::from(r"C:\Pictures\日本語フォルダ");
                     let mut harness = test_ui::builder()
                         .with_size(egui::vec2(width, 240.0 * zoom))
-                        .build(move |ctx| {
+                        .build_ui(move |ui| {
+                            let ctx = &ui.ctx().clone();
                             ctx.set_zoom_factor(zoom);
                             mimageviewer::os_theme::apply_resolved(
                                 ctx,
@@ -788,7 +793,7 @@ fn folder_toolbar_flexible_snapshots() {
                                 ctx.request_repaint();
                                 return;
                             }
-                            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                            egui::TopBottomPanel::top("toolbar").show(ui, |ui| {
                                 draw_folder_toolbar_fixture(
                                     ui, before, new_row, buttons, &mut path,
                                 );
@@ -998,7 +1003,8 @@ fn snapshot_color_presets(name: &str, width: f32) {
     let mut fonts_ready = false;
     let mut harness = test_ui::builder()
         .with_size(egui::vec2(width, 160.0))
-        .build(move |ctx| {
+        .build_ui(move |ui| {
+            let ctx = &ui.ctx().clone();
             mimageviewer::os_theme::apply_resolved(
                 ctx,
                 mimageviewer::os_theme::ResolvedTheme::Dark,
@@ -1009,7 +1015,7 @@ fn snapshot_color_presets(name: &str, width: f32) {
                 ctx.request_repaint();
                 return;
             }
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let available = ui.available_width();
                 let response = mimageviewer::draw_color_presets_snapshot_fixture(ui);
                 assert!(response.rect.width() <= available + 0.1);
@@ -1249,7 +1255,8 @@ fn snapshot_file_organize_modal(
     )>,
 ) {
     let mut fonts_ready = false;
-    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(size).build_ui(move |ui| {
+        let ctx = &ui.ctx().clone();
         mimageviewer::os_theme::apply_resolved_with_contrast(
             ctx,
             theme,
@@ -1481,7 +1488,8 @@ fn snapshot_with_theme_options_collect(
     interact: impl FnOnce(&mut Harness<'_>),
 ) -> egui_kittest::SnapshotResults {
     let mut fonts_ready = false;
-    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(size).build_ui(move |ui| {
+        let ctx = &ui.ctx().clone();
         mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
         if !fonts_ready {
             install_app_fonts(ctx);
@@ -1491,7 +1499,7 @@ fn snapshot_with_theme_options_collect(
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 egui::Frame::central_panel(ui.style())
                     .outer_margin(8.0)
                     .inner_margin(0.0)
@@ -1517,7 +1525,8 @@ fn snapshot_with_ui_font(
     let mut fonts_ready = false;
     let mut harness = test_ui::builder()
         .with_size(egui::vec2(480.0, 260.0))
-        .build(move |ctx| {
+        .build_ui(move |ui| {
+            let ctx = &ui.ctx().clone();
             mimageviewer::os_theme::apply_resolved(
                 ctx,
                 mimageviewer::os_theme::ResolvedTheme::Dark,
@@ -1528,7 +1537,7 @@ fn snapshot_with_ui_font(
                 ctx.request_repaint();
                 return;
             }
-            egui::CentralPanel::default().show(ctx, |ui| build_ui(ui));
+            egui::CentralPanel::default().show(ui, |ui| build_ui(ui));
         });
     harness.run();
     harness.snapshot(name);
@@ -3464,19 +3473,25 @@ fn content_restore_prompt_long_paths() {
     let mut dont_ask_again = false;
     let mut fonts_ready = false;
     const WINDOW_SIZE: egui::Vec2 = egui::vec2(980.0, 600.0);
-    let mut harness = test_ui::builder().with_size(WINDOW_SIZE).build(move |ctx| {
-        mimageviewer::os_theme::apply_resolved(ctx, mimageviewer::os_theme::ResolvedTheme::Light);
-        if !fonts_ready {
-            install_app_fonts(ctx);
-            fonts_ready = true;
-            ctx.request_repaint();
-            return;
-        }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("画像一覧");
+    let mut harness = test_ui::builder()
+        .with_size(WINDOW_SIZE)
+        .build_ui(move |ui| {
+            let ctx = &ui.ctx().clone();
+            mimageviewer::os_theme::apply_resolved(
+                ctx,
+                mimageviewer::os_theme::ResolvedTheme::Light,
+            );
+            if !fonts_ready {
+                install_app_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.heading("画像一覧");
+            });
+            let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
         });
-        let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
-    });
     harness.run();
     let modal = harness
         .ctx
@@ -3536,7 +3551,8 @@ fn content_restore_prompt_light() {
     let mut fonts_ready = false;
     let mut harness = test_ui::builder()
         .with_size(egui::vec2(980.0, 600.0))
-        .build(move |ctx| {
+        .build_ui(move |ui| {
+            let ctx = &ui.ctx().clone();
             mimageviewer::os_theme::apply_resolved(
                 ctx,
                 mimageviewer::os_theme::ResolvedTheme::Light,
@@ -3547,7 +3563,7 @@ fn content_restore_prompt_light() {
                 ctx.request_repaint();
                 return;
             }
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.heading("画像一覧");
                 ui.label("モーダル表示中は背景の一覧を操作できません。");
                 ui.add_space(12.0);
@@ -4029,7 +4045,8 @@ fn image_folder_zip_harness(
         mimageviewer::os_theme::ResolvedTheme::Dark
     };
     let mut fonts_ready = false;
-    test_ui::builder().with_size(size).build(move |ctx| {
+    test_ui::builder().with_size(size).build_ui(move |ui| {
+        let ctx = &ui.ctx().clone();
         mimageviewer::os_theme::apply_resolved(ctx, theme);
         if !fonts_ready {
             install_app_fonts(ctx);
@@ -4038,7 +4055,7 @@ fn image_folder_zip_harness(
             ctx.request_repaint();
             return;
         }
-        egui::CentralPanel::default().show(ctx, |_| {});
+        egui::CentralPanel::default().show(ui, |_| {});
         mimageviewer::draw_image_folder_zip_snapshot(ctx, phase);
     })
 }

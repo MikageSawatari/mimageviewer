@@ -1561,7 +1561,7 @@ mod book_resume_meter_tests {
                     for fraction in [None, Some(0.4), Some(1.0)] {
                         let mut output = None;
                         for _ in 0..2 {
-                            output=Some(ctx.run(egui::RawInput::default(),|ctx| {egui::CentralPanel::default().show(ctx,|ui| {
+                            output=Some(ctx.run_pass(egui::RawInput::default(),|ctx| {egui::CentralPanel::default().show(ctx,|ui| {
                             let cell=egui::Rect::from_min_size(egui::pos2(20.3,20.7),egui::vec2(width,width));
                             let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None,false,
                                 VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true);
@@ -1579,7 +1579,7 @@ mod book_resume_meter_tests {
                         });}));
                         }
                         let palette = crate::os_theme::book_resume_meter_palette(
-                            ctx.style().visuals.dark_mode,
+                            ctx.global_style().visuals.dark_mode,
                         );
                         let tracks=output.unwrap().shapes.iter().filter(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.fill==palette.track)).count();
                         assert_eq!(tracks, usize::from(fraction.is_some()));
@@ -1619,7 +1619,7 @@ mod book_resume_meter_tests {
                 for enabled in [false, true] {
                     let mut output = None;
                     for _ in 0..2 {
-                        output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                        output = Some(ctx.run_pass(egui::RawInput::default(), |ctx| {
                             egui::CentralPanel::default().show(ctx, |ui| {
                                 let cell = egui::Rect::from_min_size(
                                     egui::pos2(20.0, 20.0),
@@ -1714,7 +1714,7 @@ mod book_resume_meter_tests {
         for clipped in [false, true] {
             let mut output = None;
             for _ in 0..2 {
-                output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                output = Some(ctx.run_pass(egui::RawInput::default(), |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         if clipped {
                             ui.set_clip_rect(egui::Rect::from_min_max(
@@ -1809,7 +1809,7 @@ mod book_resume_meter_tests {
             ] {
                 let mut output = None;
                 for _ in 0..2 {
-                    output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                    output = Some(ctx.run_pass(egui::RawInput::default(), |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             let cell = egui::Rect::from_min_size(
                                 egui::pos2(20.0, 20.0),
@@ -2018,7 +2018,7 @@ mod book_resume_meter_tests {
                             let mut band = None;
                             let mut output = None;
                             for _ in 0..2 {
-                                output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                                output = Some(ctx.run_pass(egui::RawInput::default(), |ctx| {
                                     egui::CentralPanel::default().show(ctx, |ui| {
                                         let thumb = if loaded {
                                             solid_thumbnail(ctx, [3, 5], egui::Color32::WHITE)
@@ -2133,7 +2133,7 @@ mod book_resume_meter_tests {
         ] {
             let mut output = None;
             for _ in 0..2 {
-                output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                output = Some(ctx.run_pass(egui::RawInput::default(), |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let cell = egui::Rect::from_min_size(
                             egui::pos2(20.0, 20.0),
@@ -2178,13 +2178,14 @@ mod book_resume_meter_tests {
                 }));
             }
             let shapes = output.unwrap().shapes;
-            let track = crate::os_theme::book_resume_meter_palette(ctx.style().visuals.dark_mode)
-                .track
-                .gamma_multiply(if cut {
-                    crate::cut_clipboard::CUT_CONTENT_OPACITY
-                } else {
-                    1.0
-                });
+            let track =
+                crate::os_theme::book_resume_meter_palette(ctx.global_style().visuals.dark_mode)
+                    .track
+                    .gamma_multiply(if cut {
+                        crate::cut_clipboard::CUT_CONTENT_OPACITY
+                    } else {
+                        1.0
+                    });
             let meter = shapes
                 .iter()
                 .position(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == track))
@@ -2211,7 +2212,7 @@ mod book_resume_meter_tests {
         let cell = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(140.0, 94.0));
         let mut output = None;
         for _ in 0..2 {
-            output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+            output = Some(ctx.run_pass(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let item = GridItem::Video(std::path::PathBuf::from("v.mp4"));
                     let layout = layout_cell_overlays(
@@ -2254,7 +2255,7 @@ mod book_resume_meter_tests {
         }
         let shapes = output.unwrap().shapes;
         let fill_color =
-            crate::os_theme::book_resume_meter_palette(ctx.style().visuals.dark_mode).fill;
+            crate::os_theme::book_resume_meter_palette(ctx.global_style().visuals.dark_mode).fill;
         let meter = shapes
             .iter()
             .position(|s| {
@@ -2306,7 +2307,7 @@ mod book_resume_meter_tests {
                     egui::pos2(24.0, 80.0),
                     egui::vec2(92.0, pixels / dpi),
                 );
-                let output = ctx.run(egui::RawInput::default(), |ctx| {
+                let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         paint_thumbnail_resume_meter(
                             ui,
@@ -2317,8 +2318,9 @@ mod book_resume_meter_tests {
                         );
                     });
                 });
-                let palette =
-                    crate::os_theme::book_resume_meter_palette(ctx.style().visuals.dark_mode);
+                let palette = crate::os_theme::book_resume_meter_palette(
+                    ctx.global_style().visuals.dark_mode,
+                );
                 assert!(output.shapes.iter().any(|s| matches!(&s.shape,
                     egui::Shape::Rect(r) if r.fill == palette.fill && r.rect == meter)));
                 assert!(!output.shapes.iter().any(|s| matches!(&s.shape,
@@ -2337,7 +2339,7 @@ mod book_resume_meter_tests {
                     egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(100.0, 80.0));
                 let meter =
                     egui::Rect::from_min_max(egui::pos2(24.0, 93.0), egui::pos2(116.0, 96.0));
-                let output = ctx.run(
+                let output = ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -2384,7 +2386,7 @@ mod book_resume_meter_tests {
     fn thumbnail_resume_meter_paint_has_no_track_without_value_or_layout() {
         for has_value in [false, true] {
             let ctx = egui::Context::default();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let rect =
@@ -2980,7 +2982,7 @@ mod cut_content_paint_tests {
     fn cut_opacity_fades_cell_content_but_keeps_selection_and_check_opaque() {
         let ctx = egui::Context::default();
         let cell = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 90.0));
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -3065,7 +3067,7 @@ mod cut_content_paint_tests {
     fn cut_badge_is_vector_at_small_size_and_replaces_video_play_indicator() {
         fn paint_video(is_cut: bool) -> Vec<egui::epaint::Shape> {
             let ctx = egui::Context::default();
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,

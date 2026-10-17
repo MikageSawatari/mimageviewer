@@ -1,4 +1,5 @@
-use std::time::{Duration, Instant};
+use core::time::Duration;
+use std::time::Instant;
 
 use winit::{
     application::ApplicationHandler,
@@ -14,7 +15,7 @@ use crate::{
     native::{
         event_loop_context,
         winit_integration::{
-            EventResult, RenderTarget, RepaintNowReason, is_invisible_or_minimized,
+            EventResult, PassMode, RenderTarget, RepaintNowReason, is_invisible_or_minimized,
         },
     },
 };
@@ -26,6 +27,15 @@ use crate::{
 /// processing viewport commands like `Visible(true)`.
 /// See <https://github.com/emilk/egui/issues/7776>.
 const INVISIBLE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long to wait for a requested `RedrawRequested` before running the app logic anyway.
+///
+/// On Wayland, `RedrawRequested` waits for the compositor's frame callback, and compositors
+/// may withhold those from a window that isn't shown (e.g. one covered by a fullscreen window),
+/// without telling us that it is occluded. Nothing we paint would be shown, and presenting could
+/// block, so until the compositor asks for a frame again we only run [`crate::App::logic`].
+/// See <https://github.com/emilk/egui/issues/5136>.
+const MISSED_REDRAW_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn throttle_invisible_repaint_time(when: Instant, now: Instant) -> Instant {
     when.max(now + INVISIBLE_WINDOW_REPAINT_INTERVAL)
@@ -64,11 +74,26 @@ impl From<RenderTarget> for SchedulerTarget<WindowId, egui::ViewportId> {
 enum DamageReason {
     RedrawRequested,
     ScheduledRepaint,
+    MissedRedrawDeadline,
     Bootstrap,
     AccessKit,
     InteractiveResize,
     #[cfg(test)]
     ReadinessWake,
+}
+
+impl DamageReason {
+    fn pass_mode(self) -> PassMode {
+        match self {
+            Self::MissedRedrawDeadline => PassMode::LogicOnly,
+            _ => PassMode::Full,
+        }
+    }
+
+    fn supersedes(self, previous: Self) -> bool {
+        self == Self::Bootstrap
+            || (previous == Self::MissedRedrawDeadline && self != Self::MissedRedrawDeadline)
+    }
 }
 
 impl From<RepaintNowReason> for DamageReason {
@@ -117,6 +142,9 @@ struct PaintClaim<W, V> {
 /// a second scheduler claim.
 struct RenderScheduler<W, V> {
     windows_next_repaint_times: HashMap<W, Instant>,
+    /// Upstream 0.37 fallback for a compositor withholding RedrawRequested.
+    /// These deadlines wake logic only; they never grant a Full pass.
+    windows_redraw_deadlines: HashMap<W, Instant>,
     window_states: HashMap<W, WindowRenderState<W, V>>,
     outer_epoch: u64,
 }
@@ -125,6 +153,7 @@ impl<W, V> Default for RenderScheduler<W, V> {
     fn default() -> Self {
         Self {
             windows_next_repaint_times: HashMap::default(),
+            windows_redraw_deadlines: HashMap::default(),
             window_states: HashMap::default(),
             outer_epoch: 0,
         }
@@ -169,7 +198,34 @@ where
     }
 
     fn next_repaint_time(&self) -> Option<Instant> {
-        self.windows_next_repaint_times.values().min().copied()
+        self.windows_next_repaint_times
+            .values()
+            .chain(self.windows_redraw_deadlines.values())
+            .min()
+            .copied()
+    }
+
+    fn requested_redraw(&mut self, window_id: W, now: Instant) {
+        self.windows_redraw_deadlines
+            .entry(window_id)
+            .or_insert(now + MISSED_REDRAW_TIMEOUT);
+    }
+
+    fn received_redraw(&mut self, window_id: W) {
+        self.windows_redraw_deadlines.remove(&window_id);
+    }
+
+    fn take_overdue_redraws(&mut self, now: Instant) -> Vec<W> {
+        let mut overdue = Vec::new();
+        self.windows_redraw_deadlines.retain(|window_id, deadline| {
+            if *deadline <= now {
+                overdue.push(*window_id);
+                false
+            } else {
+                true
+            }
+        });
+        overdue
     }
 
     fn record_damage(&mut self, target: SchedulerTarget<W, V>, reason: DamageReason) {
@@ -187,7 +243,7 @@ where
             Entry::Occupied(mut entry) => match entry.get_mut() {
                 WindowRenderState::Dirty(dirty) => {
                     dirty.target = target;
-                    if reason == DamageReason::Bootstrap {
+                    if reason.supersedes(dirty.reason) {
                         dirty.reason = reason;
                     }
                 }
@@ -195,7 +251,7 @@ where
                     let next_epoch = self.outer_epoch.wrapping_add(1);
                     if let Some(dirty) = pending {
                         dirty.target = target;
-                        if reason == DamageReason::Bootstrap {
+                        if reason.supersedes(dirty.reason) {
                             dirty.reason = reason;
                         }
                         dirty.eligible_epoch = dirty.eligible_epoch.min(next_epoch);
@@ -324,11 +380,13 @@ where
 
     fn close_window(&mut self, window_id: W) {
         self.windows_next_repaint_times.remove(&window_id);
+        self.windows_redraw_deadlines.remove(&window_id);
         self.window_states.remove(&window_id);
     }
 
     fn clear(&mut self) {
         self.windows_next_repaint_times.clear();
+        self.windows_redraw_deadlines.clear();
         self.window_states.clear();
     }
 
@@ -355,7 +413,7 @@ fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoo
             ))
         })?);
 
-    if let Some(hook) = std::mem::take(&mut native_options.event_loop_builder) {
+    if let Some(hook) = core::mem::take(&mut native_options.event_loop_builder) {
         hook(&mut builder);
     }
 
@@ -372,7 +430,7 @@ fn with_event_loop<R>(
     mut native_options: epi::NativeOptions,
     f: impl FnOnce(&mut EventLoop<UserEvent>, epi::NativeOptions) -> R,
 ) -> Result<R> {
-    thread_local!(static EVENT_LOOP: std::cell::RefCell<Option<EventLoop<UserEvent>>> = const { std::cell::RefCell::new(None) });
+    thread_local!(static EVENT_LOOP: core::cell::RefCell<Option<EventLoop<UserEvent>>> = const { core::cell::RefCell::new(None) });
 
     EVENT_LOOP.with(|event_loop| {
         // Since we want to reference NativeOptions when creating the EventLoop we can't
@@ -506,9 +564,11 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                     claim.target.surface_generation,
                     claim.target.size
                 );
-                event_result = self
-                    .winit_app
-                    .run_ui_and_paint(event_loop, claim.target.window_id);
+                event_result = self.winit_app.run_ui_and_paint(
+                    event_loop,
+                    claim.target.window_id,
+                    claim.reason.pass_mode(),
+                );
                 self.render_scheduler.finish_paint(claim);
                 log::trace!(
                     "inline resize paint end: window={:?} viewport={:?} generation={}",
@@ -542,13 +602,12 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             break;
         }
 
-        let requested_redraw = self.schedule_redraw_requests(event_loop);
-        self.apply_control_flow(event_loop, requested_redraw);
+        self.schedule_redraw_requests();
+        self.apply_control_flow(event_loop);
     }
 
-    fn schedule_redraw_requests(&mut self, _event_loop: &ActiveEventLoop) -> bool {
+    fn schedule_redraw_requests(&mut self) {
         let now = Instant::now();
-        let mut requested_redraw = false;
         for window_id in self.render_scheduler.take_due_repaints(now) {
             let Some(window) = self.winit_app.window(window_id) else {
                 log::trace!("No window found for {window_id:?}");
@@ -565,11 +624,22 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                 }
             } else {
                 log::trace!("request_redraw for {window_id:?}");
+                // Retain upstream 0.37's sleeping wait for compositor callbacks (#8326).
+                // A withheld callback wakes logic at the original 250 ms deadline.
                 window.request_redraw();
-                requested_redraw = true;
+                self.render_scheduler.requested_redraw(window_id, now);
             }
         }
-        requested_redraw
+
+        for window_id in self.render_scheduler.take_overdue_redraws(now) {
+            if let Some(target) = self.winit_app.render_target(window_id) {
+                log::trace!("RedrawRequested is overdue for {window_id:?}: scheduling logic only");
+                self.render_scheduler
+                    .record_damage(target.into(), DamageReason::MissedRedrawDeadline);
+            } else {
+                self.render_scheduler.close_window(window_id);
+            }
+        }
     }
 
     fn drain_outer_paints(&mut self, event_loop: &ActiveEventLoop) {
@@ -596,9 +666,11 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                 claim.target.size,
                 claim.reason
             );
-            let event_result = self
-                .winit_app
-                .run_ui_and_paint(event_loop, claim.target.window_id);
+            let event_result = self.winit_app.run_ui_and_paint(
+                event_loop,
+                claim.target.window_id,
+                claim.reason.pass_mode(),
+            );
             self.render_scheduler.finish_paint(claim);
             log::trace!(
                 "outer paint end: window={:?} viewport={:?} generation={}",
@@ -615,8 +687,8 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         }
     }
 
-    fn apply_control_flow(&self, event_loop: &ActiveEventLoop, requested_redraw: bool) {
-        if requested_redraw || self.render_scheduler.has_dirty_work() {
+    fn apply_control_flow(&self, event_loop: &ActiveEventLoop) {
+        if self.render_scheduler.has_dirty_work() {
             event_loop.set_control_flow(ControlFlow::Poll);
         } else if let Some(next_repaint_time) = self.render_scheduler.next_repaint_time() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(next_repaint_time));
@@ -776,7 +848,7 @@ mod tests {
 
             struct TestApp;
             impl crate::App for TestApp {
-                fn update(&mut self, _ctx: &egui::Context, _frame: &mut crate::Frame) {}
+                fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut crate::Frame) {}
             }
 
             crate::run_native(
@@ -1034,16 +1106,101 @@ mod tests {
     }
 
     #[test]
+    fn withheld_redraw_keeps_original_250_ms_deadline() {
+        let now = Instant::now();
+        let mut scheduler = TestScheduler::default();
+        scheduler.requested_redraw(1, now);
+        scheduler.requested_redraw(1, now + Duration::from_millis(100));
+
+        assert_eq!(MISSED_REDRAW_TIMEOUT, Duration::from_millis(250));
+        assert_eq!(
+            scheduler.next_repaint_time(),
+            Some(now + MISSED_REDRAW_TIMEOUT)
+        );
+        assert!(
+            scheduler
+                .take_overdue_redraws(now + Duration::from_millis(249))
+                .is_empty()
+        );
+        assert_eq!(
+            scheduler.take_overdue_redraws(now + MISSED_REDRAW_TIMEOUT),
+            vec![1]
+        );
+        assert!(scheduler.next_repaint_time().is_none());
+        assert!(
+            scheduler
+                .take_overdue_redraws(now + Duration::from_secs(1))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn received_redraw_cancels_only_its_window_deadline() {
+        let now = Instant::now();
+        let mut scheduler = TestScheduler::default();
+        scheduler.requested_redraw(1, now);
+        scheduler.requested_redraw(2, now);
+        scheduler.received_redraw(1);
+
+        assert_eq!(
+            scheduler.take_overdue_redraws(now + MISSED_REDRAW_TIMEOUT),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn deadline_claim_is_logic_only_and_waits_for_outer_phase() {
+        let mut scheduler = TestScheduler::default();
+        scheduler.record_damage(target(1, 11, 1), DamageReason::MissedRedrawDeadline);
+
+        assert!(matches!(
+            scheduler.window_states.get(&1),
+            Some(WindowRenderState::Dirty(_))
+        ));
+        let epoch = scheduler.begin_outer_phase();
+        let claim = scheduler
+            .claim_next_outer(epoch)
+            .expect("overdue logic claim");
+        assert_eq!(claim.reason.pass_mode(), PassMode::LogicOnly);
+    }
+
+    #[test]
+    fn full_damage_is_not_downgraded_by_deadline_in_either_order() {
+        for reasons in [
+            [
+                DamageReason::RedrawRequested,
+                DamageReason::MissedRedrawDeadline,
+            ],
+            [
+                DamageReason::MissedRedrawDeadline,
+                DamageReason::RedrawRequested,
+            ],
+        ] {
+            let mut scheduler = TestScheduler::default();
+            for reason in reasons {
+                scheduler.record_damage(target(1, 11, 1), reason);
+            }
+            let epoch = scheduler.begin_outer_phase();
+            let claim = scheduler
+                .claim_next_outer(epoch)
+                .expect("coalesced full claim");
+            assert_eq!(claim.reason.pass_mode(), PassMode::Full);
+        }
+    }
+
+    #[test]
     fn closing_window_discards_dirty_schedule_and_readiness_wake() {
         let now = Instant::now();
         let mut scheduler = TestScheduler::default();
         scheduler.record_damage(target(1, 11, 3), DamageReason::ReadinessWake);
         scheduler.schedule_repaint(1, now, false, now);
+        scheduler.requested_redraw(1, now);
 
         scheduler.close_window(1);
 
         assert!(scheduler.window_states.is_empty());
         assert!(scheduler.windows_next_repaint_times.is_empty());
+        assert!(scheduler.windows_redraw_deadlines.is_empty());
     }
 
     #[test]
@@ -1256,8 +1413,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
             log::trace!("Woke up to check next_repaint_time");
         }
 
-        let requested_redraw = self.schedule_redraw_requests(event_loop);
-        self.apply_control_flow(event_loop, requested_redraw);
+        self.schedule_redraw_requests();
+        self.apply_control_flow(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1265,10 +1422,10 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
             // This is the first callback whose ownership is outside all message-dispatch
             // callbacks. Scheduling OS redraw is safe in either phase; only this phase may
             // drain ordinary dirty work into the renderer.
-            let requested_before = self.schedule_redraw_requests(event_loop);
+            self.schedule_redraw_requests();
             self.drain_outer_paints(event_loop);
-            let requested_after = self.schedule_redraw_requests(event_loop);
-            self.apply_control_flow(event_loop, requested_before || requested_after);
+            self.schedule_redraw_requests();
+            self.apply_control_flow(event_loop);
         });
     }
 
@@ -1288,6 +1445,7 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
             );
             let event_result = match event {
                 winit::event::WindowEvent::RedrawRequested => {
+                    self.render_scheduler.received_redraw(window_id);
                     if let Some(target) = self.winit_app.render_target(window_id) {
                         log::trace!(
                             "damage recorded: window={:?} viewport={:?} generation={} size={:?}",
@@ -1349,22 +1507,23 @@ fn run_and_exit(event_loop: EventLoop<UserEvent>, winit_app: impl WinitApp) -> R
 pub fn run_glow(
     app_name: &str,
     mut native_options: epi::NativeOptions,
+    egui_ctx: Option<egui::Context>,
     app_creator: epi::AppCreator<'_>,
 ) -> Result {
-    #![allow(clippy::needless_return_with_question_mark)] // False positive
-
     use super::glow_integration::GlowWinitApp;
 
     #[cfg(not(target_os = "ios"))]
     if native_options.run_and_return {
         return with_event_loop(native_options, |event_loop, native_options| {
-            let glow_eframe = GlowWinitApp::new(event_loop, app_name, native_options, app_creator);
+            let glow_eframe =
+                GlowWinitApp::new(event_loop, app_name, native_options, egui_ctx, app_creator);
             run_and_return(event_loop, glow_eframe)
         })?;
     }
 
     let event_loop = create_event_loop(&mut native_options)?;
-    let glow_eframe = GlowWinitApp::new(&event_loop, app_name, native_options, app_creator);
+    let glow_eframe =
+        GlowWinitApp::new(&event_loop, app_name, native_options, egui_ctx, app_creator);
     run_and_exit(event_loop, glow_eframe)
 }
 
@@ -1377,36 +1536,37 @@ pub fn create_glow<'a>(
 ) -> impl ApplicationHandler<UserEvent> + 'a {
     use super::glow_integration::GlowWinitApp;
 
-    let glow_eframe = GlowWinitApp::new(event_loop, app_name, native_options, app_creator);
+    let glow_eframe = GlowWinitApp::new(event_loop, app_name, native_options, None, app_creator);
     WinitAppWrapper::new(glow_eframe, true)
 }
 
 // ----------------------------------------------------------------------------
 
-#[cfg(feature = "wgpu")]
+#[cfg(feature = "wgpu_no_default_features")]
 pub fn run_wgpu(
     app_name: &str,
     mut native_options: epi::NativeOptions,
+    egui_ctx: Option<egui::Context>,
     app_creator: epi::AppCreator<'_>,
 ) -> Result {
-    #![allow(clippy::needless_return_with_question_mark)] // False positive
-
     use super::wgpu_integration::WgpuWinitApp;
 
     #[cfg(not(target_os = "ios"))]
     if native_options.run_and_return {
         return with_event_loop(native_options, |event_loop, native_options| {
-            let wgpu_eframe = WgpuWinitApp::new(event_loop, app_name, native_options, app_creator);
+            let wgpu_eframe =
+                WgpuWinitApp::new(event_loop, app_name, native_options, egui_ctx, app_creator);
             run_and_return(event_loop, wgpu_eframe)
         })?;
     }
 
     let event_loop = create_event_loop(&mut native_options)?;
-    let wgpu_eframe = WgpuWinitApp::new(&event_loop, app_name, native_options, app_creator);
+    let wgpu_eframe =
+        WgpuWinitApp::new(&event_loop, app_name, native_options, egui_ctx, app_creator);
     run_and_exit(event_loop, wgpu_eframe)
 }
 
-#[cfg(feature = "wgpu")]
+#[cfg(feature = "wgpu_no_default_features")]
 pub fn create_wgpu<'a>(
     app_name: &str,
     native_options: epi::NativeOptions,
@@ -1415,7 +1575,7 @@ pub fn create_wgpu<'a>(
 ) -> impl ApplicationHandler<UserEvent> + 'a {
     use super::wgpu_integration::WgpuWinitApp;
 
-    let wgpu_eframe = WgpuWinitApp::new(event_loop, app_name, native_options, app_creator);
+    let wgpu_eframe = WgpuWinitApp::new(event_loop, app_name, native_options, None, app_creator);
     WinitAppWrapper::new(wgpu_eframe, true)
 }
 
@@ -1498,7 +1658,7 @@ impl<'a> EframeWinitApplication<'a> {
     pub fn pump_eframe_app(
         &mut self,
         event_loop: &mut EventLoop<UserEvent>,
-        timeout: Option<std::time::Duration>,
+        timeout: Option<core::time::Duration>,
     ) -> EframePumpStatus {
         use winit::platform::pump_events::{EventLoopExtPumpEvents as _, PumpStatus};
 

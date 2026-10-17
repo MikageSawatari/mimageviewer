@@ -64,6 +64,12 @@ struct Batch {
     deadline: Instant,
 }
 
+struct CaptureResult {
+    viewport_id: egui::ViewportId,
+    token: CaptureToken,
+    image: Arc<egui::ColorImage>,
+}
+
 struct WriteResult {
     batch_id: u64,
     result: Result<(), String>,
@@ -83,6 +89,8 @@ pub(super) struct Coordinator {
     batches: HashMap<u64, Batch>,
     probe_epoch: u64,
     pass_epoch: HashMap<egui::ViewportId, (u64, &'static str)>,
+    capture_tx: mpsc::Sender<CaptureResult>,
+    capture_rx: mpsc::Receiver<CaptureResult>,
     write_tx: mpsc::Sender<WriteResult>,
     write_rx: mpsc::Receiver<WriteResult>,
 }
@@ -144,6 +152,7 @@ impl Coordinator {
             .open(&manifest_path)
             .map_err(|error| format!("cannot create {}: {error}", manifest_path.display()))?;
         let (write_tx, write_rx) = mpsc::channel();
+        let (capture_tx, capture_rx) = mpsc::channel();
         let run_nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -161,6 +170,8 @@ impl Coordinator {
             batches: HashMap::new(),
             probe_epoch: 0,
             pass_epoch: HashMap::new(),
+            capture_tx,
+            capture_rx,
             write_tx,
             write_rx,
         })
@@ -277,11 +288,24 @@ impl Coordinator {
                     file_name,
                 },
             );
+            let token = CaptureToken {
+                run_nonce: self.run_nonce,
+                shot_id,
+            };
+            let viewport_id = target.viewport_id;
+            let tx = self.capture_tx.clone();
+            let wake_ctx = ctx.clone();
             ctx.send_viewport_cmd_to(
-                target.viewport_id,
-                egui::ViewportCommand::Screenshot(egui::UserData::new(CaptureToken {
-                    run_nonce: self.run_nonce,
-                    shot_id,
+                viewport_id,
+                egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |image| {
+                    // The renderer callback only transfers ownership and wakes the
+                    // existing coordinator. Encoding and file I/O remain workers.
+                    let _ = tx.send(CaptureResult {
+                        viewport_id,
+                        token,
+                        image,
+                    });
+                    wake_ctx.request_repaint_of(egui::ViewportId::ROOT);
                 })),
             );
             if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
@@ -368,43 +392,18 @@ impl Coordinator {
     }
 
     pub(super) fn receive_events(&mut self, ctx: &egui::Context) {
-        if !self.batches.is_empty() {
-            let arrival_viewport = ctx.viewport_id();
-            ctx.input(|input| {
-                for event in &input.events {
-                    if let egui::Event::Screenshot { viewport_id, user_data, image } = event {
-                        let token = user_data.data.as_ref().and_then(|data| data.downcast_ref::<CaptureToken>());
-                        let batch = token.and_then(|token| self.shots.get(&token.shot_id)).map(|shot| shot.batch_id);
-                        if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
-                            crate::logger::log(format!(
-                                "[capture-probe] event frame={} arrival={:?} viewport={viewport_id:?} token={token:?} batch={batch:?} image_size={:?}",
-                                self.probe_epoch, arrival_viewport, image.size
-                            ));
-                        }
-                    }
-                }
-            });
-        }
-        let events = ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::Screenshot {
-                        viewport_id,
-                        user_data,
-                        image,
-                    } => user_data
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.downcast_ref::<CaptureToken>())
-                        .copied()
-                        .map(|token| (*viewport_id, token, Arc::clone(image))),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        });
-        for (viewport_id, token, image) in events {
+        while let Ok(CaptureResult {
+            viewport_id,
+            token,
+            image,
+        }) = self.capture_rx.try_recv()
+        {
+            if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                crate::logger::log(format!(
+                    "[capture-probe] callback frame={} viewport={viewport_id:?} token={token:?} image_size={:?}",
+                    self.probe_epoch, image.size
+                ));
+            }
             if token.run_nonce != self.run_nonce {
                 continue;
             }
@@ -615,6 +614,7 @@ mod tests {
             .open(dir.join("manifest.jsonl"))
             .unwrap();
         let (write_tx, write_rx) = mpsc::channel();
+        let (capture_tx, capture_rx) = mpsc::channel();
         Coordinator {
             output: Arc::new(Output {
                 dir,
@@ -627,9 +627,27 @@ mod tests {
             batches: HashMap::new(),
             probe_epoch: 0,
             pass_epoch: HashMap::new(),
+            capture_tx,
+            capture_rx,
             write_tx,
             write_rx,
         }
+    }
+
+    fn complete_capture(
+        output: &egui::FullOutput,
+        viewport: egui::ViewportId,
+        image: Arc<egui::ColorImage>,
+    ) {
+        let commands = &output.viewport_output.get(&viewport).unwrap().commands;
+        let callback = commands
+            .iter()
+            .find_map(|command| match command {
+                egui::ViewportCommand::Screenshot(callback) => Some(callback.clone()),
+                _ => None,
+            })
+            .expect("target viewport must own its screenshot callback");
+        callback.complete(image);
     }
 
     #[test]
@@ -689,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_event_completes_the_capture_request() {
+    fn screenshot_callback_completes_the_capture_request_once() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("screenshots");
         let mut capture = test_coordinator(dir.clone());
@@ -702,7 +720,8 @@ mod tests {
             ..Default::default()
         };
         let (reply, received) = mpsc::sync_channel(1);
-        let _ = ctx.run(raw.clone(), |ctx| {
+        let output = ctx.run_ui(raw.clone(), |ui| {
+            let ctx = &ui.ctx().clone();
             capture
                 .request(
                     ctx,
@@ -720,18 +739,11 @@ mod tests {
                 .unwrap();
         });
         assert!(capture.is_pending(1));
-        let token = CaptureToken {
-            run_nonce: capture.run_nonce,
-            shot_id: 1,
-        };
-        let image = egui::ColorImage::new([2, 2], vec![egui::Color32::BLUE; 4]);
-        let mut response = raw;
-        response.events.push(egui::Event::Screenshot {
-            viewport_id: egui::ViewportId::ROOT,
-            user_data: egui::UserData::new(token),
-            image: Arc::new(image),
-        });
-        let _ = ctx.run(response, |ctx| capture.receive_events(ctx));
+        let image = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::BLUE; 4]));
+        complete_capture(&output, egui::ViewportId::ROOT, image.clone());
+        complete_capture(&output, egui::ViewportId::ROOT, image);
+        output.drop_without_applying_deltas();
+        capture.receive_events(&ctx);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             capture.poll();
@@ -755,7 +767,16 @@ mod tests {
         let detached = egui::ViewportId::from_hash_of("detached-pdf-test");
         ctx.set_embed_viewports(false);
         egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
-            (viewport.viewport_ui_cb)(ctx);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    viewport_id: viewport.ids.this,
+                    ..Default::default()
+                },
+                |ui| {
+                    (viewport.viewport_ui_cb)(ui);
+                },
+            );
+            output.drop_without_applying_deltas();
         });
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -766,7 +787,8 @@ mod tests {
         };
         let (reply, received) = mpsc::sync_channel(1);
         let repainted = Arc::new(Mutex::new(Vec::new()));
-        let output = ctx.run(raw.clone(), |ctx| {
+        let output = ctx.run_ui(raw.clone(), |ui| {
+            let ctx = &ui.ctx().clone();
             ctx.show_viewport_immediate(detached, egui::ViewportBuilder::default(), |_, class| {
                 assert!(class == egui::ViewportClass::Immediate);
             });
@@ -826,20 +848,15 @@ mod tests {
                 .any(|command| matches!(command, egui::ViewportCommand::Screenshot(_)))
         );
 
-        // wgpu returns completed screenshots to the root input queue, each
-        // carrying the viewport id of the surface that was painted.
-        let mut response = raw;
-        for (viewport_id, shot_id) in [(egui::ViewportId::ROOT, 1), (detached, 2)] {
-            response.events.push(egui::Event::Screenshot {
+        for viewport_id in [egui::ViewportId::ROOT, detached] {
+            complete_capture(
+                &output,
                 viewport_id,
-                user_data: egui::UserData::new(CaptureToken {
-                    run_nonce: capture.run_nonce,
-                    shot_id,
-                }),
-                image: Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::GREEN; 4])),
-            });
+                Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::GREEN; 4])),
+            );
         }
-        let _ = ctx.run(response, |ctx| capture.receive_events(ctx));
+        output.drop_without_applying_deltas();
+        capture.receive_events(&ctx);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             capture.poll();
@@ -874,14 +891,24 @@ mod tests {
         let second = egui::ViewportId::from_hash_of("active-second");
         ctx.set_embed_viewports(false);
         egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
-            (viewport.viewport_ui_cb)(ctx);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    viewport_id: viewport.ids.this,
+                    ..Default::default()
+                },
+                |ui| {
+                    (viewport.viewport_ui_cb)(ui);
+                },
+            );
+            output.drop_without_applying_deltas();
         });
         let mut raw = egui::RawInput::default();
         raw.viewports.insert(first, Default::default());
         raw.viewports.insert(second, Default::default());
         let (reply, received) = mpsc::sync_channel(1);
         let repainted = Arc::new(Mutex::new(Vec::new()));
-        let output = ctx.run(raw.clone(), |ctx| {
+        let output = ctx.run_ui(raw.clone(), |ui| {
+            let ctx = &ui.ctx().clone();
             ctx.show_viewport_deferred(first, egui::ViewportBuilder::default(), |_, class| {
                 assert!(class == egui::ViewportClass::Deferred);
             });
@@ -942,27 +969,16 @@ mod tests {
                 .is_none()
         );
 
-        // eframe drains the screenshot channel into the next native viewport
-        // input. The passive deferred child can be that next viewport.
-        let run_nonce = capture.run_nonce;
-        let token = |shot_id| egui::UserData::new(CaptureToken { run_nonce, shot_id });
         let image = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::GREEN; 4]));
+        complete_capture(&output, first, image.clone());
         let mut child_input = raw.clone();
         child_input.viewport_id = first;
-        child_input.events.push(egui::Event::Screenshot {
-            viewport_id: first,
-            user_data: token(1),
-            image: image.clone(),
-        });
-        let _ = ctx.run(child_input, |ctx| capture.receive_events(ctx));
-        let mut root_input = raw;
-        root_input.events.push(egui::Event::Screenshot {
-            viewport_id: second,
-            user_data: token(2),
-            image,
-        });
-        let _ = ctx.run(root_input, |ctx| capture.receive_events(ctx));
-
+        ctx.run_ui(child_input, |ui| capture.receive_events(ui.ctx()))
+            .drop_without_applying_deltas();
+        complete_capture(&output, second, image);
+        output.drop_without_applying_deltas();
+        ctx.run_ui(raw, |ui| capture.receive_events(ui.ctx()))
+            .drop_without_applying_deltas();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             capture.poll();
@@ -985,7 +1001,8 @@ mod tests {
         let ctx = egui::Context::default();
         let frozen = egui::ViewportId::from_hash_of("frozen-parked-view");
         let (reply, received) = mpsc::sync_channel(1);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             capture
                 .request(
                     ctx,
@@ -1027,6 +1044,7 @@ mod tests {
         assert_eq!(record["status"], "skipped");
         assert_eq!(record["reason"], PARKED_FROZEN_SKIP_REASON);
         assert_eq!(record["viewport"], "detached-1-1");
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -1037,7 +1055,8 @@ mod tests {
         let ctx = egui::Context::default();
         let detached = egui::ViewportId::from_hash_of("hidden-detached");
         let (reply, received) = mpsc::sync_channel(1);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             capture
                 .request_with_repaint(
                     ctx,
@@ -1078,6 +1097,7 @@ mod tests {
         assert_eq!(record["reason"], "native viewport is hidden");
         assert_eq!(record["viewport"], "detached-1-7");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -1087,7 +1107,8 @@ mod tests {
         let mut capture = test_coordinator(dir.clone());
         let ctx = egui::Context::default();
         let (reply, received) = mpsc::sync_channel(1);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             capture
                 .request(
                     ctx,
@@ -1103,7 +1124,8 @@ mod tests {
                     Some(reply.clone()),
                 )
                 .unwrap();
-        });
+        })
+        .drop_without_applying_deltas();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             capture.poll();
@@ -1129,7 +1151,8 @@ mod tests {
         let mut capture = test_coordinator(temp.path().join("screenshots"));
         let ctx = egui::Context::default();
         let (reply, received) = mpsc::sync_channel(1);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             capture
                 .request(
                     ctx,
@@ -1145,7 +1168,8 @@ mod tests {
                     Some(reply.clone()),
                 )
                 .unwrap();
-        });
+        })
+        .drop_without_applying_deltas();
         capture.poll();
         assert!(
             received

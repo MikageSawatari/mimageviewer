@@ -107,6 +107,7 @@ impl App {
         let dialog_pos = ctx.content_rect().min + egui::vec2(70.0, 60.0);
 
         egui::Window::new("タグを付ける/外す")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -231,6 +232,10 @@ impl App {
                 };
                 if normalized_input.is_empty() {
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("tag_apply_suggestions")
                         .max_height(suggestion_height)
                         .auto_shrink([false, false])
@@ -262,6 +267,10 @@ impl App {
                     ui.label(egui::RichText::new("（候補なし）").weak());
                 } else {
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("tag_apply_suggestions")
                         .max_height(suggestion_height)
                         .auto_shrink([false, false])

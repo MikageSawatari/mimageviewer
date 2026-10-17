@@ -1488,6 +1488,10 @@ impl App {
         let append_undo_pending = self.book_append_undo_in_progress();
 
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .max_height(body_height.max(160.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {

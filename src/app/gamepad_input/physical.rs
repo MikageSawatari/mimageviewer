@@ -3,7 +3,10 @@ use std::time::Instant;
 use eframe::egui;
 
 use super::{TRIGGER_THRESHOLD, stick_pair};
-use crate::gamepad::{GamepadInputState, GamepadRuntime, PadAxis, PadButton, PadEvent};
+use crate::gamepad::{
+    GamepadInputState, GamepadRuntime, PadAxis, PadButton, PadEvent, PadEventReceipt,
+    foreground_app_hwnd,
+};
 
 /// Physical facts, in receipt order. Terminals must not overwrite undelivered
 /// edges: a press and release can arrive in different logic calls before UI.
@@ -11,6 +14,7 @@ use crate::gamepad::{GamepadInputState, GamepadRuntime, PadAxis, PadButton, PadE
 pub(super) enum PadPhysicalEvent {
     ButtonPressed(PadButton),
     ButtonReleased(PadButton),
+    SuppressedRelease(PadButton),
     SessionEnded,
 }
 
@@ -35,30 +39,46 @@ impl GamepadPhysicalInput {
     pub(super) fn drain(&mut self, ctx: &egui::Context, enabled: bool, now: Instant) {
         let events = self.runtime.drain(ctx, enabled);
         self.ingest(enabled, events, now);
+        if foreground_app_hwnd().is_none() {
+            self.state.suppress_pending_actions();
+            let _ = self.state.analog_dt(false, now);
+            let _ = self
+                .state
+                .left_stick_step_due(false, now, super::STICK_STEP_INTERVAL);
+            let _ = self
+                .state
+                .trigger_step_due(false, now, super::STICK_STEP_INTERVAL);
+        }
     }
 
-    fn ingest(&mut self, enabled: bool, events: Vec<PadEvent>, now: Instant) {
+    fn ingest(&mut self, enabled: bool, events: Vec<PadEventReceipt>, now: Instant) {
         if !enabled {
             self.state.clear();
             self.pending.events.push(PadPhysicalEvent::SessionEnded);
             return;
         }
         self.pending.analog_operation |= self.analog_active();
-        for event in events {
+        for receipt in events {
             self.pending.saw_input_event = true;
-            match event {
+            match receipt.event {
                 PadEvent::ButtonPressed(button) => {
-                    if self.state.set_button_down(button, true, now) {
+                    let changed = self.state.set_button_down(button, true, now);
+                    if !receipt.accepted {
+                        self.state.suppress_pending_actions();
+                    } else if changed {
                         self.pending
                             .events
                             .push(PadPhysicalEvent::ButtonPressed(button));
                     }
                 }
                 PadEvent::ButtonReleased(button) => {
+                    let admitted = self.state.button_release_admitted(button);
                     if self.state.set_button_down(button, false, now) {
-                        self.pending
-                            .events
-                            .push(PadPhysicalEvent::ButtonReleased(button));
+                        self.pending.events.push(if admitted {
+                            PadPhysicalEvent::ButtonReleased(button)
+                        } else {
+                            PadPhysicalEvent::SuppressedRelease(button)
+                        });
                     }
                 }
                 PadEvent::AxisChanged(axis, value) => {
@@ -90,6 +110,11 @@ impl GamepadPhysicalInput {
     }
 
     #[cfg(test)]
+    pub(crate) fn push_receipt_for_test(&mut self, event: PadEvent, foreground: Option<u64>) {
+        self.runtime.push_receipt_for_test(event, foreground);
+    }
+
+    #[cfg(test)]
     pub(crate) fn push_for_test(&mut self, event: PadEvent) {
         self.runtime.push_for_test(event);
     }
@@ -101,6 +126,7 @@ mod tests {
 
     #[test]
     fn gamepad_physical_handoff_keeps_press_release_across_two_drains() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut input = GamepadPhysicalInput::default();
         let now = Instant::now();
@@ -127,6 +153,7 @@ mod tests {
 
     #[test]
     fn gamepad_physical_handoff_keeps_terminals_and_post_disconnect_press() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut input = GamepadPhysicalInput::default();
         let now = Instant::now();
@@ -160,6 +187,7 @@ mod tests {
 
     #[test]
     fn gamepad_physical_disable_clears_holds_without_overwriting_pending_edge() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut input = GamepadPhysicalInput::default();
         let now = Instant::now();
@@ -183,6 +211,7 @@ mod tests {
 
     #[test]
     fn gamepad_physical_handoff_retains_analog_fact_after_later_neutral() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
         let ctx = egui::Context::default();
         let mut input = GamepadPhysicalInput::default();
         let now = Instant::now();

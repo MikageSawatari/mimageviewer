@@ -106,6 +106,7 @@ pub(super) fn draw_everything_progress(ctx: &egui::Context) -> bool {
     let mut cancel = false;
     let viewport = ctx.content_rect();
     egui::Window::new("Everything ファイル名検索")
+        .drag_area(egui::WindowDrag::Anywhere)
         .id(egui::Id::new("everything_search_progress"))
         .default_pos(viewport.min + egui::vec2(60.0, 40.0))
         .default_width(340.0_f32.min((viewport.width() - 80.0).max(160.0)))
@@ -116,6 +117,10 @@ pub(super) fn draw_everything_progress(ctx: &egui::Context) -> bool {
         .show(ctx, |ui| {
             let action_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .auto_shrink([false, true])
                 .max_height((ui.available_height() - action_height).max(20.0))
                 .show(ui, |ui| {
@@ -162,25 +167,28 @@ mod tests {
     fn everything_search_bar_not_responding_narrow_dark() {
         let mut fonts_ready = false;
         let size = egui::vec2(320.0, 400.0);
-        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
-                let mut focus = false;
-                super::draw_everything_controls(ui, &mut query, &mut focus);
-                // Production renders a failed search via the same error label.
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    crate::everything_ipc::EverythingError::NotResponding.user_message(),
-                );
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
+                    let mut focus = false;
+                    super::draw_everything_controls(ui, &mut query, &mut focus);
+                    // Production renders a failed search via the same error label.
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        crate::everything_ipc::EverythingError::NotResponding.user_message(),
+                    );
+                });
             });
-        });
         harness.run();
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         for label in [

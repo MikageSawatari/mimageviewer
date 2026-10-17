@@ -162,7 +162,7 @@ mod tests {
             app.shutdown_requested
                 .store(explicit, std::sync::atomic::Ordering::SeqCst);
             let ctx = egui::Context::default();
-            let output = ctx.run(close_input(), |ctx| {
+            let output = ctx.run_pass(close_input(), |ctx| {
                 let snapshot = app.accept_root_lifecycle_before_frame(ctx);
                 app.service_root_lifecycle_tray_checkpoint(ctx, snapshot);
                 assert!(ctx.input_for(egui::ViewportId::ROOT, |i| i.viewport().close_requested()));
@@ -173,7 +173,7 @@ mod tests {
                 .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose));
             assert_eq!(cancelled, !explicit);
             assert_eq!(app.window_visible, explicit);
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.service_root_lifecycle(ctx)
             });
             assert!(
@@ -192,13 +192,13 @@ mod tests {
         let folder = app.tmp.path().join("book");
         app.activate_sidecar_restore_modal_for_test(folder);
         let ctx = egui::Context::default();
-        let output = ctx.run(close_input(), |ctx| app.service_root_lifecycle(ctx));
+        let output = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
                 .contains(&egui::ViewportCommand::CancelClose)
         );
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.service_root_lifecycle(ctx)
         });
         assert!(
@@ -215,7 +215,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.settings.minimize_to_tray_on_close = false;
         let ctx = egui::Context::default();
-        let output = ctx.run(close_input(), |ctx| app.service_root_lifecycle(ctx));
+        let output = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
         assert!(
             !output
                 .viewport_output
@@ -237,7 +237,7 @@ mod tests {
             let frame = app.frame_counter;
             let input_seq = app.input_seq;
             let ctx = egui::Context::default();
-            let blocked = ctx.run(close_input(), |ctx| app.service_root_lifecycle(ctx));
+            let blocked = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
             assert!(
                 blocked.viewport_output[&egui::ViewportId::ROOT]
                     .commands
@@ -247,7 +247,7 @@ mod tests {
             if late_quit {
                 app.shutdown_requested
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                let quit = ctx.run(close_input(), |ctx| app.service_root_lifecycle(ctx));
+                let quit = ctx.run_pass(close_input(), |ctx| app.service_root_lifecycle(ctx));
                 assert!(
                     quit.viewport_output[&egui::ViewportId::ROOT]
                         .commands
@@ -255,7 +255,7 @@ mod tests {
                 );
             }
             complete(status);
-            let resumed = ctx.run(egui::RawInput::default(), |ctx| {
+            let resumed = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.service_root_lifecycle(ctx)
             });
             assert!(!app.composition_editor_writes_pending());
@@ -272,7 +272,7 @@ mod tests {
                     .count(),
                 1
             );
-            let again = ctx.run(egui::RawInput::default(), |ctx| {
+            let again = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.service_root_lifecycle(ctx)
             });
             assert!(

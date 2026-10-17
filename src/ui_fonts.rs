@@ -500,7 +500,12 @@ fn install_primary_fonts(
             hud_names.push("ui_hud_default".to_owned());
             let relative = selected_target
                 .map(|target| {
-                    row_alignment_factor(default_font.font.as_ref(), index, &['今', 'あ'], target)
+                    row_alignment_factor(
+                        default_font.font.as_ref().as_ref(),
+                        index,
+                        &['今', 'あ'],
+                        target,
+                    )
                 })
                 .unwrap_or(0.0);
             let mut japanese = (*default_font).clone();

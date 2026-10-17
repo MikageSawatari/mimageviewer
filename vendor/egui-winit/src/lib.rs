@@ -7,7 +7,7 @@
 #![cfg_attr(feature = "document-features", doc = document_features::document_features!())]
 //!
 
-#![allow(clippy::manual_range_contains)]
+#![expect(clippy::manual_range_contains)]
 
 #[cfg(target_os = "windows")]
 use std::collections::HashMap;
@@ -20,20 +20,34 @@ use egui::accesskit;
 use egui::{Pos2, Rect, Theme, Vec2, ViewportBuilder, ViewportCommand, ViewportId, ViewportInfo};
 pub use winit;
 
+// TODO(emilk): remove once we are on a winit with https://github.com/rust-windowing/winit/pull/4732
+#[cfg(target_os = "macos")]
+mod macos_scroll_momentum;
+
 pub mod clipboard;
-mod ime_key_trace;
+#[cfg(not(target_arch = "wasm32"))]
+mod dropped_file;
 mod safe_area;
 mod window_settings;
 
-pub use window_settings::WindowSettings;
+#[cfg(test)]
+mod disabled_ime_tests;
+mod ime_key_trace;
+#[cfg(test)]
+mod keyboard_input_tests;
+
+pub use window_settings::{WindowGeometry, WindowSettings};
 
 use raw_window_handle::HasDisplayHandle;
+
+#[cfg(not(target_arch = "wasm32"))]
+use dropped_file::NativeFile;
 
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::ElementState,
     event_loop::ActiveEventLoop,
-    window::{CursorGrabMode, Window, WindowButtons, WindowLevel},
+    window::{CursorGrabMode, CustomCursor, Window, WindowButtons, WindowLevel},
 };
 
 pub fn screen_size_in_pixels(window: &Window) -> egui::Vec2 {
@@ -92,12 +106,26 @@ pub struct State {
     egui_ctx: egui::Context,
 
     viewport_id: ViewportId,
-    ime_key_trace: Option<&'static ime_key_trace::Trace>,
     start_time: web_time::Instant,
     egui_input: egui::RawInput,
+
+    /// The current modifier state.
+    ///
+    /// We keep a copy so we can stamp
+    /// it onto per-event `modifiers` fields and emit [`egui::Event::ModifiersChanged`].
+    modifiers: egui::Modifiers,
+
     pointer_pos_in_points: Option<egui::Pos2>,
     any_pointer_button_down: bool,
     current_cursor_icon: Option<egui::CursorIcon>,
+
+    /// Cached `CustomCursor` for the last RGBA bitmap pushed through
+    /// `PlatformOutput::cursor_image`. We dedupe by `Arc::as_ptr` so the
+    /// integration only re-uploads the bitmap to the OS when the app
+    /// switches sprite, not every frame the cursor moves. `usize` is the
+    /// raw pointer of the source `Arc<[u8]>` — opaque, only used as a
+    /// cache key.
+    current_custom_cursor: Option<(usize, CustomCursor)>,
 
     clipboard: clipboard::Clipboard,
 
@@ -112,19 +140,26 @@ pub struct State {
     /// Only one touch will be interpreted as pointer at any time.
     pointer_touch_id: Option<u64>,
 
-    /// track ime state
-    has_sent_ime_enabled: bool,
-
     #[cfg(feature = "accesskit")]
-    accesskit: Option<accesskit_winit::Adapter>,
+    pub accesskit: Option<accesskit_winit::Adapter>,
 
     allow_ime: bool,
-    ime_rect_px: Option<egui::Rect>,
+
+    /// See [`Self::set_clipboard_shortcuts`].
+    clipboard_shortcuts: bool,
+
+    ime_cursor_rect_px: Option<egui::Rect>,
+    old_ime_purpose: egui::IMEPurpose,
+
+    // TODO(emilk): remove once we are on a winit with https://github.com/rust-windowing/winit/pull/4732
+    #[cfg(target_os = "macos")]
+    scroll_momentum_monitor: Option<macos_scroll_momentum::ScrollMomentumMonitor>,
 
     /// Whether egui has seen a press during each current physical hold.
     /// Forwarded survives later Process repeats until release or focus loss.
     #[cfg(target_os = "windows")]
     key_holds: HashMap<winit::keyboard::PhysicalKey, KeyHold>,
+    ime_key_trace: Option<&'static ime_key_trace::Trace>,
 }
 
 impl State {
@@ -144,32 +179,44 @@ impl State {
             ..Default::default()
         };
 
+        // SAFETY: The display handle is obtained from `display_target` which the caller
+        // is responsible for keeping alive. Winit display handles remain valid for the
+        // duration of the event loop, which outlives any `State` instance.
+        #[expect(unsafe_code)]
+        let clipboard = unsafe {
+            clipboard::Clipboard::new(display_target.display_handle().ok().map(|h| h.as_raw()))
+        };
+
         let mut slf = Self {
-            egui_ctx,
             viewport_id,
-            ime_key_trace: ime_key_trace::init(),
-            start_time: web_time::Instant::now(),
+            start_time: web_time::Instant::now()
+                .checked_sub(web_time::Duration::from_secs_f64(egui_ctx.time()))
+                .unwrap_or_else(web_time::Instant::now),
+            egui_ctx,
             egui_input,
+            modifiers: egui::Modifiers::default(),
             pointer_pos_in_points: None,
             any_pointer_button_down: false,
             current_cursor_icon: None,
+            current_custom_cursor: None,
 
-            clipboard: clipboard::Clipboard::new(
-                display_target.display_handle().ok().map(|h| h.as_raw()),
-            ),
+            clipboard,
 
             simulate_touch_screen: false,
             pointer_touch_id: None,
-
-            has_sent_ime_enabled: false,
 
             #[cfg(feature = "accesskit")]
             accesskit: None,
 
             allow_ime: false,
-            ime_rect_px: None,
+            clipboard_shortcuts: true,
+            ime_cursor_rect_px: None,
+            old_ime_purpose: egui::IMEPurpose::Normal,
+            #[cfg(target_os = "macos")]
+            scroll_momentum_monitor: macos_scroll_momentum::ScrollMomentumMonitor::install(),
             #[cfg(target_os = "windows")]
             key_holds: HashMap::new(),
+            ime_key_trace: ime_key_trace::init(),
         };
 
         slf.egui_input
@@ -212,6 +259,12 @@ impl State {
         self.clipboard.get()
     }
 
+    /// Fetches an image from the clipboard and returns it, if there is one and the platform
+    /// backend supports it. Mirrors [`Self::clipboard_text`] for images.
+    pub fn clipboard_image(&mut self) -> Option<egui::ColorImage> {
+        self.clipboard.get_image()
+    }
+
     /// Places the text onto the clipboard.
     pub fn set_clipboard_text(&mut self, text: String) {
         self.clipboard.set_text(text);
@@ -225,6 +278,33 @@ impl State {
     /// Set the last value that [`Window::set_ime_allowed()`] was called with.
     pub fn set_allow_ime(&mut self, allow: bool) {
         self.allow_ime = allow;
+    }
+
+    /// Are clipboard keyboard shortcuts translated into clipboard events?
+    ///
+    /// See [`Self::set_clipboard_shortcuts`].
+    #[inline]
+    pub fn clipboard_shortcuts(&self) -> bool {
+        self.clipboard_shortcuts
+    }
+
+    /// Should the platform clipboard keyboard shortcuts be translated into
+    /// [`egui::Event::Cut`], [`egui::Event::Copy`] and [`egui::Event::Paste`]?
+    ///
+    /// The shortcuts are <kbd>Cmd/Ctrl</kbd>+<kbd>X</kbd>/<kbd>C</kbd>/<kbd>V</kbd>,
+    /// the dedicated Cut/Copy/Paste keys, and on Windows also
+    /// <kbd>Shift</kbd>+<kbd>Delete</kbd>, <kbd>Ctrl</kbd>+<kbd>Insert</kbd> and <kbd>Shift</kbd>+<kbd>Insert</kbd>.
+    ///
+    /// If `false`, these key presses are instead passed on as ordinary [`egui::Event::Key`] events,
+    /// so your app can bind them to whatever it wants.
+    /// Note that this means built-in widgets such as [`egui::TextEdit`] will no longer
+    /// respond to these shortcuts, since they listen for the clipboard events.
+    /// You can still push [`egui::Event::Cut`] etc. yourself.
+    ///
+    /// Default: `true`.
+    #[inline]
+    pub fn set_clipboard_shortcuts(&mut self, enabled: bool) {
+        self.clipboard_shortcuts = enabled;
     }
 
     #[inline]
@@ -335,21 +415,21 @@ impl State {
                 self.on_mouse_button_input(*state, *button);
                 EventResponse {
                     repaint: true,
-                    consumed: self.egui_ctx.wants_pointer_input(),
+                    consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                self.on_mouse_wheel(window, *delta);
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                self.on_mouse_wheel(window, *delta, *phase);
                 EventResponse {
                     repaint: true,
-                    consumed: self.egui_ctx.wants_pointer_input(),
+                    consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.on_cursor_moved(window, *position);
                 EventResponse {
                     repaint: true,
-                    consumed: self.egui_ctx.is_using_pointer(),
+                    consumed: self.egui_ctx.egui_is_using_pointer(),
                 }
             }
             WindowEvent::CursorLeft { .. } => {
@@ -366,8 +446,10 @@ impl State {
                 let consumed = match touch.phase {
                     winit::event::TouchPhase::Started
                     | winit::event::TouchPhase::Ended
-                    | winit::event::TouchPhase::Cancelled => self.egui_ctx.wants_pointer_input(),
-                    winit::event::TouchPhase::Moved => self.egui_ctx.is_using_pointer(),
+                    | winit::event::TouchPhase::Cancelled => {
+                        self.egui_ctx.egui_wants_pointer_input()
+                    }
+                    winit::event::TouchPhase::Moved => self.egui_ctx.egui_is_using_pointer(),
                 };
                 EventResponse {
                     repaint: true,
@@ -376,49 +458,11 @@ impl State {
             }
 
             WindowEvent::Ime(ime) => {
-                // on Mac even Cmd-C is pressed during ime, a `c` is pushed to Preedit.
-                // So no need to check is_mac_cmd.
-                //
-                // How winit produce `Ime::Enabled` and `Ime::Disabled` differs in MacOS
-                // and Windows.
-                //
-                // - On Windows, before and after each Commit will produce an Enable/Disabled
-                // event.
-                // - On MacOS, only when user explicit enable/disable ime. No Disabled
-                // after Commit.
-                //
-                // We use input_method_editor_started to manually insert CompositionStart
-                // between Commits.
-                match ime {
-                    winit::event::Ime::Enabled => {
-                        if cfg!(target_os = "linux") {
-                            // This event means different things in X11 and Wayland, but we can just
-                            // ignore it and enable IME on the preedit event.
-                            // See <https://github.com/rust-windowing/winit/issues/2498>
-                        } else {
-                            self.ime_event_enable();
-                        }
-                    }
-                    winit::event::Ime::Preedit(text, Some(_cursor)) => {
-                        self.ime_event_enable();
-                        self.egui_input
-                            .events
-                            .push(egui::Event::Ime(egui::ImeEvent::Preedit(text.clone())));
-                    }
-                    winit::event::Ime::Commit(text) => {
-                        self.egui_input
-                            .events
-                            .push(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
-                        self.ime_event_disable();
-                    }
-                    winit::event::Ime::Disabled | winit::event::Ime::Preedit(_, None) => {
-                        self.ime_event_disable();
-                    }
-                }
+                self.on_ime(ime);
 
                 EventResponse {
                     repaint: true,
-                    consumed: self.egui_ctx.wants_keyboard_input(),
+                    consumed: self.egui_ctx.egui_wants_keyboard_input(),
                 }
             }
             WindowEvent::KeyboardInput {
@@ -426,19 +470,18 @@ impl State {
                 is_synthetic,
                 ..
             } => {
-                // Winit generates fake "synthetic" KeyboardInput events when the focus
-                // is changed to the window, or away from it. Synthetic key presses
-                // represent no real key presses and should be ignored.
-                // See https://github.com/rust-windowing/winit/issues/3543
                 if *is_synthetic && event.state == ElementState::Pressed {
+                    // Winit generates fake "synthetic" KeyboardInput events when the focus
+                    // is changed to the window, or away from it. Synthetic key presses
+                    // represent no real key presses and should be ignored.
+                    // See https://github.com/rust-windowing/winit/issues/3543
                     EventResponse {
                         repaint: true,
                         consumed: false,
                     }
                 } else {
                     if self.on_keyboard_input(event) {
-                        // When pressing the Tab key, egui focuses the first focusable element, hence Tab always consumes.
-                        let consumed = self.egui_ctx.wants_keyboard_input()
+                        let consumed = self.egui_ctx.egui_wants_keyboard_input()
                             || event.logical_key
                                 == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab);
                         EventResponse {
@@ -448,7 +491,7 @@ impl State {
                     } else {
                         EventResponse {
                             repaint: false,
-                            consumed: self.egui_ctx.wants_keyboard_input(),
+                            consumed: self.egui_ctx.egui_wants_keyboard_input(),
                         }
                     }
                 }
@@ -493,35 +536,26 @@ impl State {
                     consumed: false,
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             WindowEvent::DroppedFile(path) => {
                 self.egui_input.hovered_files.clear();
-                self.egui_input.dropped_files.push(egui::DroppedFile {
-                    path: Some(path.clone()),
-                    ..Default::default()
-                });
+                self.egui_input
+                    .dropped_files
+                    .push(std::sync::Arc::new(NativeFile::from(path.clone())));
                 EventResponse {
                     repaint: true,
                     consumed: false,
                 }
             }
+            // Winit's web backend does not emit file-drop events. Browser file reads
+            // require a browser file handle, which this path-only event cannot provide.
+            #[cfg(target_arch = "wasm32")]
+            WindowEvent::DroppedFile(_) => EventResponse {
+                repaint: false,
+                consumed: false,
+            },
             WindowEvent::ModifiersChanged(state) => {
-                let state = state.state();
-
-                let alt = state.alt_key();
-                let ctrl = state.control_key();
-                let shift = state.shift_key();
-                let super_ = state.super_key();
-
-                self.egui_input.modifiers.alt = alt;
-                self.egui_input.modifiers.ctrl = ctrl;
-                self.egui_input.modifiers.shift = shift;
-                self.egui_input.modifiers.mac_cmd = cfg!(target_os = "macos") && super_;
-                self.egui_input.modifiers.command = if cfg!(target_os = "macos") {
-                    super_
-                } else {
-                    ctrl
-                };
-
+                self.on_modifiers_changed(state.state());
                 EventResponse {
                     repaint: true,
                     consumed: false,
@@ -556,7 +590,7 @@ impl State {
                 self.egui_input.events.push(egui::Event::Zoom(zoom_factor));
                 EventResponse {
                     repaint: true,
-                    consumed: self.egui_ctx.wants_pointer_input(),
+                    consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
 
@@ -569,21 +603,23 @@ impl State {
                     .push(egui::Event::Rotate(-delta.to_radians()));
                 EventResponse {
                     repaint: true,
-                    consumed: self.egui_ctx.wants_pointer_input(),
+                    consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
 
-            WindowEvent::PanGesture { delta, .. } => {
+            WindowEvent::PanGesture { delta, phase, .. } => {
                 let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
 
                 self.egui_input.events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: Vec2::new(delta.x, delta.y) / pixels_per_point,
-                    modifiers: self.egui_input.modifiers,
+                    phase: to_egui_touch_phase(*phase),
+                    source: egui::MouseWheelSource::Trackpad,
+                    modifiers: self.modifiers,
                 });
                 EventResponse {
                     repaint: true,
-                    consumed: self.egui_ctx.wants_pointer_input(),
+                    consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
         };
@@ -593,27 +629,161 @@ impl State {
         response
     }
 
-    pub fn ime_event_enable(&mut self) {
-        if !self.has_sent_ime_enabled {
-            self.egui_input
+    /// ## NOTE
+    ///
+    /// on Mac even Cmd-C is pressed during ime, a `c` is pushed to Preedit.
+    /// So no need to check `is_mac_cmd`.
+    ///
+    /// ### How events are emitted by [`winit`] across different setups in various situations
+    ///
+    /// This is done by uncommenting the code block at the top of this method
+    /// and checking console outputs.
+    ///
+    /// winit version: 0.30.12.
+    ///
+    /// #### Setups
+    ///
+    /// - `a-macos15-apple_shuangpin`: macOS 15.7.3 `aarch64`, IME: builtin Chinese Shuangpin - Simplified. (Demo app shows: renderer: `wgpu`, backend: `Metal`.)
+    /// - `b-debian13_gnome48_wayland-fcitx5_shuangpin`: Debian 13 `aarch64`, Gnome 48, Wayland, IME: Fcitx5 with fcitx5-chinese-addons's Shuangpin. (Demo app shows: renderer: `wgpu`, backend: `Gl`.)
+    /// - `c-windows11-ms_pinyin`: Windows11 23H2 `x86_64`, IME: builtin Microsoft Pinyin. (Demo app shows: renderer: `wgpu`, backend: `Vulkan` & `Dx12`, others: `Dx12` & `Gl`.)
+    ///
+    /// #### Situation: pressed space to select the first candidate "测试"
+    ///
+    /// | Setup                                       | Events in Order                                                                                                                  |
+    /// | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+    /// | a-macos15-apple_shuangpin                   | `Preedit("", None)` -> `Commit("测试")`                                                                                          |
+    /// | b-debian13_gnome48_wayland-fcitx5_shuangpin | `Preedit("", None)` -> `Commit("测试")` -> `Preedit("", Some(0, 0))` -> `Preedit("", None)` (duplicate until `TextEdit` blurred) |
+    /// | c-windows11-ms_pinyin                       | `Preedit("测试", Some(…))` -> `Preedit("", None)` -> `Commit("测试")` -> `Disabled`                                              |
+    ///
+    /// #### Situation: pressed backspace to delete the last character in the composition
+    ///
+    /// | Setup                                       | Events in Order                                                                       |
+    /// | a-macos15-apple_shuangpin                   | `Preedit("", None)`                                                                   |
+    /// | b-debian13_gnome48_wayland-fcitx5_shuangpin | `Preedit("", Some(0, 0))` -> `Preedit("", None)` (duplicate until `TextEdit` blurred) |
+    /// | c-windows11-ms_pinyin                       | `Preedit("", Some(0, 0))` -> `Preedit("", None)` -> `Commit("")` -> `Disabled`        |
+    ///
+    /// #### Situation: clicked somewhere else while there is an active composition with the pre-edit text "ce"
+    ///
+    /// | Setup                                       | Events in Order                                                                                   |
+    /// | ------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+    /// | a-macos15-apple_shuangpin                   | nothing emitted                                                                                   |
+    /// | b-debian13_gnome48_wayland-fcitx5_shuangpin | `Preedit("", Some(0, 0))` (duplicate) -> `Preedit("", None)` (duplicate until `TextEdit` blurred) |
+    /// | c-windows11-ms_pinyin                       | nothing emitted                                                                                   |
+    fn on_ime(&mut self, ime: &winit::event::Ime) {
+        // // code for inspecting ime events emitted by winit:
+        // {
+        //     static LAST_IME: std::sync::Mutex<Option<winit::event::Ime>> =
+        //         std::sync::Mutex::new(None);
+        //     static IS_LAST_DUPLICATE: std::sync::atomic::AtomicBool =
+        //         std::sync::atomic::AtomicBool::new(false);
+        //     let mut last_ime_guard = LAST_IME.lock().unwrap();
+        //     if { last_ime_guard.as_ref().cloned() }.as_ref() != Some(ime) {
+        //         println!("IME={ime:?}");
+        //         *last_ime_guard = Some(ime.clone());
+        //         IS_LAST_DUPLICATE.store(false, std::sync::atomic::Ordering::Relaxed);
+        //     } else if !IS_LAST_DUPLICATE.load(std::sync::atomic::Ordering::Relaxed) {
+        //         println!("IME=(duplicate)");
+        //         IS_LAST_DUPLICATE.store(true, std::sync::atomic::Ordering::Relaxed);
+        //     }
+        // }
+
+        match ime {
+            // [`winit::event::Ime::Enabled`] means different things in X11 and
+            // Wayland, but it doesn't matter to us.
+            // See <https://github.com/rust-windowing/winit/issues/2498>
+            // mIV's shared normalizer still needs terminal notifications when
+            // Windows emits Disabled without an empty Preedit/Commit. Keep the
+            // legacy Enabled notification too; TextEdit itself ignores both.
+            #[expect(deprecated, reason = "mIV IME normalization compatibility boundary")]
+            winit::event::Ime::Enabled => {
+                // Preserve the old X11/Wayland exception; non-empty Preedit
+                // itself starts composition in the shared policy.
+                if !cfg!(target_os = "linux") {
+                    self.egui_input
+                        .events
+                        .push(egui::Event::Ime(egui::ImeEvent::Enabled));
+                }
+            }
+            #[expect(
+                deprecated,
+                reason = "mIV Disabled-only cancellation must reach normalization"
+            )]
+            winit::event::Ime::Disabled => self
+                .egui_input
                 .events
-                .push(egui::Event::Ime(egui::ImeEvent::Enabled));
-            self.has_sent_ime_enabled = true;
+                .push(egui::Event::Ime(egui::ImeEvent::Disabled)),
+            winit::event::Ime::Preedit(text, active_range_bytes) => {
+                let active_range_chars = match *active_range_bytes {
+                    Some((start_bytes, end_bytes)) => {
+                        if let (Some(start_chars), Some(middle_chars)) = (
+                            text.get(..start_bytes).map(|s| s.chars().count()),
+                            text.get(start_bytes..end_bytes).map(|s| s.chars().count()),
+                        ) {
+                            if cfg!(target_os = "windows") && start_chars == 0 && middle_chars == 0
+                            {
+                                // Workaround for a bug on Windows where `winit`
+                                // incorrectly reports the cursor position at
+                                // the start of the preedit text during
+                                // composition with the builtin Korean IME.
+                                // See: https://github.com/emilk/egui/pull/8083#issuecomment-4206742668
+                                // TODO(umajho): Remove this workaround once the
+                                // `winit` bug is fixed and we've updated to a
+                                // version that includes the fix.
+                                None
+                            } else {
+                                Some(start_chars..start_chars + middle_chars)
+                            }
+                        } else {
+                            // Do not expose the preedit text through ordinary logs.
+                            log::warn!("ignoring invalid IME preedit byte range");
+                            None
+                        }
+                    }
+                    None => None,
+                };
+
+                self.egui_input
+                    .events
+                    .push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: text.clone(),
+                        active_range_chars,
+                    }));
+            }
+            winit::event::Ime::Commit(text) => {
+                self.egui_input
+                    .events
+                    .push(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
+            }
         }
     }
 
-    pub fn ime_event_disable(&mut self) {
-        self.egui_input
-            .events
-            .push(egui::Event::Ime(egui::ImeEvent::Disabled));
-        self.has_sent_ime_enabled = false;
-    }
+    /// Forward raw mouse motion (e.g. `winit::event::DeviceEvent::MouseMotion`) to egui
+    /// as [`egui::Event::MouseMoved`].
+    ///
+    /// The motion is ignored unless the pointer is inside the window or a pointer button is held down,
+    /// so that mouse motion elsewhere on the screen doesn't cause repaints.
+    ///
+    /// Returns `true` if the event was sent to egui.
+    pub fn on_mouse_motion(&mut self, delta: (f64, f64)) -> bool {
+        if !self.is_pointer_in_window() && !self.any_pointer_button_down {
+            return false;
+        }
 
-    pub fn on_mouse_motion(&mut self, delta: (f64, f64)) {
         self.egui_input.events.push(egui::Event::MouseMoved(Vec2 {
             x: delta.0 as f32,
             y: delta.1 as f32,
         }));
+        true
+    }
+
+    /// Returns `true` when the pointer is currently inside the window.
+    pub fn is_pointer_in_window(&self) -> bool {
+        self.pointer_pos_in_points.is_some()
+    }
+
+    /// Returns `true` if any pointer button is currently held down.
+    pub fn is_any_pointer_button_down(&self) -> bool {
+        self.any_pointer_button_down
     }
 
     /// Call this when there is a new [`accesskit::ActionRequest`].
@@ -640,8 +810,19 @@ impl State {
                 pos,
                 button,
                 pressed,
-                modifiers: self.egui_input.modifiers,
+                modifiers: self.modifiers,
             });
+
+            // Middle-click pastes the PRIMARY selection on X11 and Wayland:
+            if pressed
+                && button == egui::PointerButton::Middle
+                && let Some(text) = self.clipboard.get_primary_text()
+                && !text.is_empty()
+            {
+                self.egui_input
+                    .events
+                    .push(egui::Event::MiddleClickPaste { pos, text });
+            }
 
             if self.simulate_touch_screen {
                 if pressed {
@@ -712,12 +893,7 @@ impl State {
         self.egui_input.events.push(egui::Event::Touch {
             device_id: egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id)),
             id: egui::TouchId::from(touch.id),
-            phase: match touch.phase {
-                winit::event::TouchPhase::Started => egui::TouchPhase::Start,
-                winit::event::TouchPhase::Moved => egui::TouchPhase::Move,
-                winit::event::TouchPhase::Ended => egui::TouchPhase::End,
-                winit::event::TouchPhase::Cancelled => egui::TouchPhase::Cancel,
-            },
+            phase: to_egui_touch_phase(touch.phase),
             pos: egui::pos2(
                 touch.location.x as f32 / pixels_per_point,
                 touch.location.y as f32 / pixels_per_point,
@@ -770,7 +946,12 @@ impl State {
         }
     }
 
-    fn on_mouse_wheel(&mut self, window: &Window, delta: winit::event::MouseScrollDelta) {
+    fn on_mouse_wheel(
+        &mut self,
+        window: &Window,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+    ) {
         let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
 
         {
@@ -786,13 +967,59 @@ impl State {
                     egui::vec2(x as f32, y as f32) / pixels_per_point,
                 ),
             };
-            let modifiers = self.egui_input.modifiers;
+            let phase = to_egui_touch_phase(phase);
+            let modifiers = self.modifiers;
+
+            // winit doesn't tell us what is driving the scroll, and collapses the macOS
+            // momentum phase into the regular `TouchPhase`, so we detect that ourselves.
+            // TODO(emilk): use `WindowEvent::MouseWheel::source` once we are on a winit
+            // with https://github.com/rust-windowing/winit/pull/4732
+            let source = cfg_select! {
+                target_os = "macos" => {
+                    if self
+                        .scroll_momentum_monitor
+                        .as_ref()
+                        .is_some_and(|monitor| monitor.latest_scroll_event_is_momentum())
+                    {
+                        egui::MouseWheelSource::Momentum
+                    } else {
+                        // On macOS, only trackpads (and the Magic Mouse) report precise deltas:
+                        match unit {
+                            egui::MouseWheelUnit::Point => egui::MouseWheelSource::Trackpad,
+                            egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
+                                egui::MouseWheelSource::Wheel
+                            }
+                        }
+                    }
+                }
+                _ => egui::MouseWheelSource::Unknown,
+            };
+
             self.egui_input.events.push(egui::Event::MouseWheel {
                 unit,
                 delta,
+                phase,
+                source,
                 modifiers,
             });
         }
+    }
+
+    fn on_modifiers_changed(&mut self, state: winit::keyboard::ModifiersState) {
+        self.modifiers.alt = state.alt_key();
+        self.modifiers.ctrl = state.control_key();
+        self.modifiers.shift = state.shift_key();
+        // Preserve upstream's runtime OS selection, including web integrations.
+        let is_mac = self.egui_ctx.os().is_mac();
+        self.modifiers.mac_cmd = is_mac && state.super_key();
+        self.modifiers.command = if is_mac {
+            state.super_key()
+        } else {
+            state.control_key()
+        };
+        self.egui_input
+            .events
+            .push(egui::Event::ModifiersChanged(self.modifiers));
     }
 
     fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) -> bool {
@@ -816,6 +1043,7 @@ impl State {
     ) -> bool {
         append_keyboard_input(
             &mut self.egui_input,
+            self.modifiers,
             logical_key,
             physical_key,
             text,
@@ -825,7 +1053,14 @@ impl State {
             self.allow_ime,
             #[cfg(target_os = "windows")]
             &mut self.key_holds,
-            || self.clipboard.get(),
+            self.clipboard_shortcuts,
+            || {
+                if let Some(text) = self.clipboard.get() {
+                    Some(PasteContent::Text(text))
+                } else {
+                    self.clipboard.get_image().map(PasteContent::Image)
+                }
+            },
         )
     }
 
@@ -834,6 +1069,10 @@ impl State {
         if !focused {
             // Releases may go to another window while unfocused.
             self.key_holds.clear();
+        }
+        if !focused {
+            // As upstream 0.37: avoid sticky modifiers (InputState clears too).
+            self.modifiers = egui::Modifiers::default();
         }
         self.egui_input.focused = focused;
         self.egui_input
@@ -854,15 +1093,40 @@ impl State {
         window: &Window,
         platform_output: egui::PlatformOutput,
     ) {
+        self.handle_platform_output_inner(window, None, platform_output);
+    }
+
+    /// Same as [`Self::handle_platform_output`] but threads the
+    /// `ActiveEventLoop` so we can register a `winit::CustomCursor` from
+    /// `PlatformOutput::cursor_image`. Integration paths that don't have
+    /// access to the event loop (e.g. immediate viewports) should call
+    /// [`Self::handle_platform_output`] instead — any custom cursor
+    /// request is silently dropped there and the standard `cursor_icon`
+    /// path still runs.
+    pub fn handle_platform_output_with_event_loop(
+        &mut self,
+        window: &Window,
+        event_loop: &ActiveEventLoop,
+        platform_output: egui::PlatformOutput,
+    ) {
+        self.handle_platform_output_inner(window, Some(event_loop), platform_output);
+    }
+
+    fn handle_platform_output_inner(
+        &mut self,
+        window: &Window,
+        event_loop: Option<&ActiveEventLoop>,
+        platform_output: egui::PlatformOutput,
+    ) {
         profiling::function_scope!();
 
         let egui::PlatformOutput {
             commands,
             cursor_icon,
+            cursor_image,
             events: _,                    // handled elsewhere
             mutable_text_under_cursor: _, // only used in eframe web
             ime,
-            #[cfg(feature = "accesskit")]
             accesskit_update,
             num_completed_passes: _,    // `egui::Context::run` handles this
             request_discard_reasons: _, // `egui::Context::run` handles this
@@ -873,6 +1137,9 @@ impl State {
                 egui::OutputCommand::CopyText(text) => {
                     self.clipboard.set_text(text);
                 }
+                egui::OutputCommand::TextSelectionSettled(text) => {
+                    self.clipboard.set_primary_text(text);
+                }
                 egui::OutputCommand::CopyImage(image) => {
                     self.clipboard.set_image(&image);
                 }
@@ -882,36 +1149,50 @@ impl State {
             }
         }
 
-        self.set_cursor_icon(window, cursor_icon);
+        self.apply_cursor(window, event_loop, cursor_icon, cursor_image.as_ref());
 
         let allow_ime = ime.is_some();
-        if self.allow_ime != allow_ime {
+        let is_toggling_ime = self.allow_ime != allow_ime;
+        if is_toggling_ime {
             self.allow_ime = allow_ime;
             profiling::scope!("set_ime_allowed");
             window.set_ime_allowed(allow_ime);
         }
 
         if let Some(ime) = ime {
+            if !is_toggling_ime && ime.should_interrupt_composition {
+                // TODO(umajho): use a more proper way to interrupt composition
+                // if `winit` provides one in the future.
+
+                window.set_ime_allowed(false);
+                window.set_ime_allowed(true);
+            }
+
+            if ime.purpose != self.old_ime_purpose {
+                self.old_ime_purpose = ime.purpose;
+                window.set_ime_purpose(to_winit_ime_purpose(ime.purpose));
+            }
+
             let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
-            let ime_rect_px = pixels_per_point * ime.rect;
-            if self.ime_rect_px != Some(ime_rect_px)
+            let ime_cursor_rect_px = pixels_per_point * ime.cursor_rect;
+            if self.ime_cursor_rect_px != Some(ime_cursor_rect_px)
                 || self.egui_ctx.input(|i| !i.events.is_empty())
             {
-                self.ime_rect_px = Some(ime_rect_px);
+                self.ime_cursor_rect_px = Some(ime_cursor_rect_px);
                 profiling::scope!("set_ime_cursor_area");
                 window.set_ime_cursor_area(
                     winit::dpi::PhysicalPosition {
-                        x: ime_rect_px.min.x,
-                        y: ime_rect_px.min.y,
+                        x: ime_cursor_rect_px.min.x,
+                        y: ime_cursor_rect_px.min.y,
                     },
                     winit::dpi::PhysicalSize {
-                        width: ime_rect_px.width(),
-                        height: ime_rect_px.height(),
+                        width: ime_cursor_rect_px.width(),
+                        height: ime_cursor_rect_px.height(),
                     },
                 );
             }
         } else {
-            self.ime_rect_px = None;
+            self.ime_cursor_rect_px = None;
         }
 
         #[cfg(feature = "accesskit")]
@@ -921,29 +1202,107 @@ impl State {
             profiling::scope!("accesskit");
             accesskit.update_if_active(|| update);
         }
+
+        #[cfg(not(feature = "accesskit"))]
+        let _ = accesskit_update;
     }
 
-    fn set_cursor_icon(&mut self, window: &Window, cursor_icon: egui::CursorIcon) {
+    /// Apply either a bitmap cursor (preferred when both `cursor_image`
+    /// and `event_loop` are `Some`) or the standard `cursor_icon` to the
+    /// window. Mirrors the no-flicker dedupe the old `set_cursor_icon`
+    /// did, on the appropriate cache key for whichever path is active.
+    fn apply_cursor(
+        &mut self,
+        window: &Window,
+        event_loop: Option<&ActiveEventLoop>,
+        cursor_icon: egui::CursorIcon,
+        cursor_image: Option<&egui::CustomCursorImage>,
+    ) {
+        let is_pointer_in_window = self.pointer_pos_in_points.is_some();
+        if !is_pointer_in_window {
+            // Drop both caches so the cursor gets re-applied (and the
+            // bitmap re-checked for staleness) once the pointer comes
+            // back. Same contract the old `set_cursor_icon` followed.
+            self.current_cursor_icon = None;
+            self.current_custom_cursor = None;
+            return;
+        }
+
+        // Bitmap cursor wins over CursorIcon when both are present and we
+        // have an event loop to register it with. Otherwise the bitmap is
+        // dropped and we fall through to the icon path — this is the
+        // documented fallback for integrations that didn't opt in.
+        if let (Some(image), Some(event_loop)) = (cursor_image, event_loop) {
+            let key = std::sync::Arc::as_ptr(&image.rgba).cast::<u8>() as usize;
+            let cached = self
+                .current_custom_cursor
+                .as_ref()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, c)| c.clone());
+
+            let custom = match cached {
+                Some(c) => c,
+                None => match winit::window::CustomCursor::from_rgba(
+                    image.rgba.to_vec(),
+                    image.size[0],
+                    image.size[1],
+                    image.hotspot[0],
+                    image.hotspot[1],
+                ) {
+                    Ok(source) => {
+                        let c = event_loop.create_custom_cursor(source);
+                        self.current_custom_cursor = Some((key, c.clone()));
+                        c
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "egui-winit: invalid cursor bitmap, falling back to cursor_icon: {err:?}"
+                        );
+                        self.current_custom_cursor = None;
+                        self.set_cursor_icon_inner(window, cursor_icon);
+                        return;
+                    }
+                },
+            };
+
+            window.set_cursor_visible(true);
+            window.set_cursor(custom);
+            // Resync `current_cursor_icon` so the next icon-only path
+            // notices a real change rather than dedupe-skipping it.
+            self.current_cursor_icon = None;
+            return;
+        }
+
+        self.current_custom_cursor = None;
+        self.set_cursor_icon_inner(window, cursor_icon);
+    }
+
+    /// Icon-only path, factored out so `apply_cursor` can fall back to it
+    /// when the bitmap path bails. Preserves the original dedupe.
+    fn set_cursor_icon_inner(&mut self, window: &Window, cursor_icon: egui::CursorIcon) {
         if self.current_cursor_icon == Some(cursor_icon) {
             // Prevent flickering near frame boundary when Windows OS tries to control cursor icon for window resizing.
             // On other platforms: just early-out to save CPU.
             return;
         }
 
-        let is_pointer_in_window = self.pointer_pos_in_points.is_some();
-        if is_pointer_in_window {
-            self.current_cursor_icon = Some(cursor_icon);
+        self.current_cursor_icon = Some(cursor_icon);
 
-            if let Some(winit_cursor_icon) = translate_cursor(cursor_icon) {
-                window.set_cursor_visible(true);
-                window.set_cursor(winit_cursor_icon);
-            } else {
-                window.set_cursor_visible(false);
-            }
+        if let Some(winit_cursor_icon) = translate_cursor(cursor_icon) {
+            window.set_cursor_visible(true);
+            window.set_cursor(winit_cursor_icon);
         } else {
-            // Remember to set the cursor again once the cursor returns to the screen:
-            self.current_cursor_icon = None;
+            window.set_cursor_visible(false);
         }
+    }
+}
+
+fn to_egui_touch_phase(phase: winit::event::TouchPhase) -> egui::TouchPhase {
+    match phase {
+        winit::event::TouchPhase::Started => egui::TouchPhase::Start,
+        winit::event::TouchPhase::Moved => egui::TouchPhase::Move,
+        winit::event::TouchPhase::Ended => egui::TouchPhase::End,
+        winit::event::TouchPhase::Cancelled => egui::TouchPhase::Cancel,
     }
 }
 
@@ -1062,11 +1421,17 @@ fn is_printable_char(chr: char) -> bool {
     !is_in_private_use_area && !chr.is_ascii_control()
 }
 
+enum PasteContent {
+    Text(String),
+    Image(egui::ColorImage),
+}
+
 // The complete keyboard delivery path, separated from KeyEvent's private
 // platform fields so tests exercise the same gate and event producers as State.
 // Clipboard access stays lazy: only an ordinary paste press reads it.
 fn append_keyboard_input(
     input: &mut egui::RawInput,
+    modifiers: egui::Modifiers,
     winit_logical_key: &winit::keyboard::Key,
     winit_physical_key: winit::keyboard::PhysicalKey,
     text: Option<&str>,
@@ -1074,7 +1439,8 @@ fn append_keyboard_input(
     _repeat: bool, // egui derives repeat itself, as before
     #[cfg(target_os = "windows")] allow_ime: bool,
     #[cfg(target_os = "windows")] key_holds: &mut HashMap<winit::keyboard::PhysicalKey, KeyHold>,
-    clipboard_text: impl FnOnce() -> Option<String>,
+    clipboard_shortcuts: bool,
+    clipboard_content: impl FnOnce() -> Option<PasteContent>,
 ) -> bool {
     #[cfg(target_os = "windows")]
     if try_on_ime_processed_keyboard_input(
@@ -1097,33 +1463,30 @@ fn append_keyboard_input(
 
     let logical_key = key_from_winit_key(winit_logical_key);
 
-    // Helpful logging to enable when adding new key support
-    log::trace!(
-        "logical {:?} -> {:?},  physical {:?} -> {:?}",
-        winit_logical_key,
-        logical_key,
-        winit_physical_key,
-        physical_key
-    );
+    // Keyboard diagnostics use the opt-in, redacted ime_key_trace path.
 
     // "Logical OR physical key" is a fallback mechanism for keyboard layouts without Latin characters: it lets them
     // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
     // are mapped to the physical keys that normally contain C, X, V, etc.
     // See also: https://github.com/emilk/egui/issues/3653
     if let Some(active_key) = logical_key.or(physical_key) {
-        if pressed {
-            if let Some(command) = egui_ime::winit_clipboard_command(input.modifiers, active_key) {
+        if pressed && clipboard_shortcuts {
+            if let Some(command) = egui_ime::winit_clipboard_command(modifiers, active_key) {
                 match command {
                     egui_ime::ClipboardCommand::Cut => input.events.push(egui::Event::Cut),
                     egui_ime::ClipboardCommand::Copy => input.events.push(egui::Event::Copy),
-                    egui_ime::ClipboardCommand::Paste => {
-                        if let Some(contents) = clipboard_text() {
+                    egui_ime::ClipboardCommand::Paste => match clipboard_content() {
+                        Some(PasteContent::Text(contents)) => {
                             let contents = contents.replace("\r\n", "\n");
                             if !contents.is_empty() {
                                 input.events.push(egui::Event::Paste(contents));
                             }
                         }
-                    }
+                        Some(PasteContent::Image(image)) => input
+                            .events
+                            .push(egui::Event::PasteImage(std::sync::Arc::new(image))),
+                        None => {}
+                    },
                 }
                 return true;
             }
@@ -1134,7 +1497,7 @@ fn append_keyboard_input(
             physical_key,
             pressed,
             repeat: false, // egui will fill this in for us!
-            modifiers: input.modifiers,
+            modifiers: modifiers,
         });
     }
 
@@ -1146,7 +1509,7 @@ fn append_keyboard_input(
             // We need to ignore these characters that are side-effects of commands.
             // Also make sure the key is pressed (not released). On Linux, text might
             // contain some data even when the key is released.
-            let is_cmd = input.modifiers.ctrl || input.modifiers.command || input.modifiers.mac_cmd;
+            let is_cmd = modifiers.ctrl || modifiers.command || modifiers.mac_cmd;
             if pressed && !is_cmd {
                 input.events.push(egui::Event::Text(text.to_owned()));
             }
@@ -1177,1152 +1540,6 @@ fn try_on_ime_processed_keyboard_input(
                 key_holds.insert(physical_key, KeyHold::Forwarded);
                 false
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod keyboard_input_tests {
-    use super::*;
-    use winit::{
-        event::ElementState,
-        keyboard::{Key, KeyCode, NamedKey, PhysicalKey},
-    };
-
-    fn key_event(
-        key: egui::Key,
-        physical_key: egui::Key,
-        pressed: bool,
-        modifiers: egui::Modifiers,
-    ) -> egui::Event {
-        egui::Event::Key {
-            key,
-            physical_key: Some(physical_key),
-            pressed,
-            repeat: false,
-            modifiers,
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn delivery_process_presses_and_repeats_append_no_events_or_read_clipboard() {
-        for physical in [
-            KeyCode::Enter,
-            KeyCode::Escape,
-            KeyCode::Tab,
-            KeyCode::Space,
-            KeyCode::KeyA,
-            KeyCode::KeyX,
-            KeyCode::KeyC,
-            KeyCode::KeyV,
-            KeyCode::Insert,
-            KeyCode::Delete,
-        ] {
-            for modifiers in [
-                egui::Modifiers::NONE,
-                egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                egui::Modifiers::SHIFT,
-            ] {
-                for repeat in [false, true] {
-                    let existing = vec![egui::Event::Text("already queued".into())];
-                    let mut input = egui::RawInput {
-                        events: existing.clone(),
-                        modifiers,
-                        ..Default::default()
-                    };
-                    append_keyboard_input(
-                        &mut input,
-                        &Key::Named(NamedKey::Process),
-                        PhysicalKey::Code(physical),
-                        Some("IME-handled text"),
-                        ElementState::Pressed,
-                        repeat,
-                        #[cfg(target_os = "windows")]
-                        true,
-                        #[cfg(target_os = "windows")]
-                        &mut HashMap::new(),
-                        || panic!("Process must not read clipboard"),
-                    );
-                    assert_eq!(
-                        input.events, existing,
-                        "physical={physical:?}, modifiers={modifiers:?}, repeat={repeat}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn delivery_processed_press_and_corresponding_release_append_no_events() {
-        for (physical, expected) in [
-            (KeyCode::Enter, egui::Key::Enter),
-            (KeyCode::Escape, egui::Key::Escape),
-            (KeyCode::Tab, egui::Key::Tab),
-            (KeyCode::Space, egui::Key::Space),
-            (KeyCode::KeyA, egui::Key::A),
-            (KeyCode::KeyV, egui::Key::V),
-        ] {
-            let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
-            let mut input = egui::RawInput {
-                modifiers,
-                ..Default::default()
-            };
-            let mut processed = HashMap::new();
-            let physical_key = PhysicalKey::Code(physical);
-            assert!(!append_keyboard_input(
-                &mut input,
-                &Key::Named(NamedKey::Process),
-                physical_key,
-                Some("processed text"),
-                ElementState::Pressed,
-                false,
-                true,
-                &mut processed,
-                || panic!("Process must not read clipboard"),
-            ));
-            assert_eq!(processed, HashMap::from([(physical_key, KeyHold::Hidden)]));
-            append_keyboard_input(
-                &mut input,
-                &Key::Character("original logical key".into()),
-                physical_key,
-                Some("release text"),
-                ElementState::Released,
-                false,
-                #[cfg(target_os = "windows")]
-                true,
-                #[cfg(target_os = "windows")]
-                &mut processed,
-                || panic!("Release must not read clipboard"),
-            );
-            assert!(input.events.is_empty());
-            assert!(processed.is_empty());
-            // The release of a physical key with no processed press still flows.
-            append_keyboard_input(
-                &mut input,
-                &Key::Character("original logical key".into()),
-                physical_key,
-                Some("release text"),
-                ElementState::Released,
-                false,
-                true,
-                &mut processed,
-                || panic!("Release must not read clipboard"),
-            );
-            assert_eq!(
-                input.events,
-                vec![key_event(expected, expected, false, modifiers)]
-            );
-        }
-    }
-
-    #[test]
-    fn delivery_ordinary_keys_keep_press_release_text_and_egui_repeat_inference() {
-        for (logical, physical, expected, text) in [
-            (
-                Key::Named(NamedKey::Enter),
-                KeyCode::Enter,
-                egui::Key::Enter,
-                "\r",
-            ),
-            (
-                Key::Named(NamedKey::Escape),
-                KeyCode::Escape,
-                egui::Key::Escape,
-                "",
-            ),
-            (
-                Key::Named(NamedKey::Tab),
-                KeyCode::Tab,
-                egui::Key::Tab,
-                "\t",
-            ),
-            (
-                Key::Named(NamedKey::Space),
-                KeyCode::Space,
-                egui::Key::Space,
-                " ",
-            ),
-            (Key::Character("a".into()), KeyCode::KeyQ, egui::Key::A, "a"),
-            (Key::Character("ж".into()), KeyCode::KeyA, egui::Key::A, "ж"),
-        ] {
-            for state in [ElementState::Pressed, ElementState::Released] {
-                for repeat in [false, true] {
-                    let mut input = egui::RawInput::default();
-                    append_keyboard_input(
-                        &mut input,
-                        &logical,
-                        PhysicalKey::Code(physical),
-                        Some(text),
-                        state,
-                        repeat,
-                        #[cfg(target_os = "windows")]
-                        true,
-                        #[cfg(target_os = "windows")]
-                        &mut HashMap::new(),
-                        || panic!("Ordinary key must not read clipboard"),
-                    );
-                    let mut expected_events = vec![key_event(
-                        expected,
-                        key_from_key_code(physical).unwrap(),
-                        state == ElementState::Pressed,
-                        egui::Modifiers::NONE,
-                    )];
-                    if state == ElementState::Pressed
-                        && !text.is_empty()
-                        && text.chars().all(is_printable_char)
-                    {
-                        expected_events.push(egui::Event::Text(text.into()));
-                    }
-                    assert_eq!(
-                        input.events, expected_events,
-                        "logical={logical:?}, state={state:?}, repeat={repeat}"
-                    );
-                }
-            }
-        }
-        let mut input = egui::RawInput::default();
-        append_keyboard_input(
-            &mut input,
-            &Key::Character("a".into()),
-            PhysicalKey::Code(KeyCode::KeyA),
-            None,
-            ElementState::Pressed,
-            false,
-            #[cfg(target_os = "windows")]
-            true,
-            #[cfg(target_os = "windows")]
-            &mut HashMap::new(),
-            || None,
-        );
-        assert_eq!(
-            input.events,
-            vec![
-                key_event(egui::Key::A, egui::Key::A, true, egui::Modifiers::NONE),
-                egui::Event::Text("a".into())
-            ]
-        );
-    }
-
-    #[test]
-    fn delivery_ordinary_clipboard_commands_keep_fallback_normalization_and_releases() {
-        for modifiers in [
-            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-            egui::Modifiers::CTRL | egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-            egui::Modifiers::CTRL | egui::Modifiers::COMMAND | egui::Modifiers::ALT,
-            egui::Modifiers::CTRL
-                | egui::Modifiers::COMMAND
-                | egui::Modifiers::SHIFT
-                | egui::Modifiers::ALT,
-        ] {
-            for (physical, character, expected) in [
-                (KeyCode::KeyX, "x", egui::Event::Cut),
-                (KeyCode::KeyC, "c", egui::Event::Copy),
-                (
-                    KeyCode::KeyV,
-                    "v",
-                    egui::Event::Paste("first\nsecond".into()),
-                ),
-            ] {
-                for logical in [Key::Character(character.into()), Key::Character("ж".into())] {
-                    for repeat in [false, true] {
-                        let mut input = egui::RawInput {
-                            modifiers,
-                            ..Default::default()
-                        };
-                        let mut reads = 0;
-                        append_keyboard_input(
-                            &mut input,
-                            &logical,
-                            PhysicalKey::Code(physical),
-                            Some(character),
-                            ElementState::Pressed,
-                            repeat,
-                            #[cfg(target_os = "windows")]
-                            true,
-                            #[cfg(target_os = "windows")]
-                            &mut HashMap::new(),
-                            || {
-                                reads += 1;
-                                Some("first\r\nsecond".into())
-                            },
-                        );
-                        assert_eq!(input.events, vec![expected.clone()]);
-                        assert_eq!(reads, usize::from(physical == KeyCode::KeyV));
-                        input.events.clear();
-                        append_keyboard_input(
-                            &mut input,
-                            &logical,
-                            PhysicalKey::Code(physical),
-                            Some(character),
-                            ElementState::Released,
-                            false,
-                            #[cfg(target_os = "windows")]
-                            true,
-                            #[cfg(target_os = "windows")]
-                            &mut HashMap::new(),
-                            || panic!("Release must not read clipboard"),
-                        );
-                        let key = key_from_key_code(physical).unwrap();
-                        assert_eq!(input.events, vec![key_event(key, key, false, modifiers)]);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn delivery_paste_without_clipboard_contents_appends_no_events() {
-        for contents in [None, Some(String::new())] {
-            let mut input = egui::RawInput {
-                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                ..Default::default()
-            };
-            let mut reads = 0;
-            append_keyboard_input(
-                &mut input,
-                &Key::Character("v".into()),
-                PhysicalKey::Code(KeyCode::KeyV),
-                Some("v"),
-                ElementState::Pressed,
-                false,
-                #[cfg(target_os = "windows")]
-                true,
-                #[cfg(target_os = "windows")]
-                &mut HashMap::new(),
-                || {
-                    reads += 1;
-                    contents
-                },
-            );
-            assert_eq!(reads, 1);
-            assert!(input.events.is_empty());
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn ime_process_press_is_not_forwarded() {
-        // The decision does not depend on physical key, text, modifiers, or
-        // repeat: it precedes every Key/Text/Cut/Copy/Paste producer.
-        let mut processed = HashMap::new();
-        let physical = PhysicalKey::Code(KeyCode::Enter);
-        assert!(try_on_ime_processed_keyboard_input(
-            true,
-            &mut processed,
-            &Key::Named(NamedKey::Process),
-            physical,
-            ElementState::Pressed,
-        ));
-        assert_eq!(processed, HashMap::from([(physical, KeyHold::Hidden)]));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn only_corresponding_processed_physical_releases_are_filtered() {
-        let enter = PhysicalKey::Code(KeyCode::Enter);
-        let tab = PhysicalKey::Code(KeyCode::Tab);
-        let mut processed = HashMap::from([(enter, KeyHold::Hidden)]);
-        assert!(!try_on_ime_processed_keyboard_input(
-            true,
-            &mut processed,
-            &Key::Named(NamedKey::Tab),
-            tab,
-            ElementState::Released,
-        ));
-        assert_eq!(processed, HashMap::from([(enter, KeyHold::Hidden)]));
-        assert!(try_on_ime_processed_keyboard_input(
-            true,
-            &mut processed,
-            &Key::Named(NamedKey::Enter),
-            enter,
-            ElementState::Released,
-        ));
-        assert!(processed.is_empty());
-        assert!(!try_on_ime_processed_keyboard_input(
-            true,
-            &mut processed,
-            &Key::Named(NamedKey::Enter),
-            enter,
-            ElementState::Released,
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn disabled_ime_forwards_unrecorded_input_but_removes_recorded_releases() {
-        let physical = PhysicalKey::Code(KeyCode::KeyV);
-        let mut processed = HashMap::from([(physical, KeyHold::Hidden)]);
-        let mut input = egui::RawInput {
-            modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-            ..Default::default()
-        };
-        assert!(!append_keyboard_input(
-            &mut input,
-            &Key::Character("v".into()),
-            physical,
-            None,
-            ElementState::Released,
-            false,
-            false,
-            &mut processed,
-            || panic!("Suppressed release must not read clipboard"),
-        ));
-        assert!(processed.is_empty());
-        assert!(input.events.is_empty());
-        let mut reads = 0;
-        assert!(append_keyboard_input(
-            &mut input,
-            &Key::Named(NamedKey::Process),
-            physical,
-            Some("v"),
-            ElementState::Pressed,
-            true,
-            false,
-            &mut processed,
-            || {
-                reads += 1;
-                Some("clipboard".into())
-            },
-        ));
-        assert_eq!(reads, 1);
-        assert_eq!(input.events, vec![egui::Event::Paste("clipboard".into())]);
-        assert!(append_keyboard_input(
-            &mut input,
-            &Key::Character("v".into()),
-            physical,
-            None,
-            ElementState::Released,
-            false,
-            false,
-            &mut processed,
-            || panic!("Release must not read clipboard"),
-        ));
-        assert_eq!(
-            input.events[1],
-            key_event(egui::Key::V, egui::Key::V, false, input.modifiers)
-        );
-        assert!(processed.is_empty());
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn delivery_ime_permission_changes_do_not_leave_enter_down() {
-        for release_allowed in [false, true] {
-            let ctx = egui::Context::default();
-            let mut input = egui::RawInput::default();
-            let mut processed = HashMap::new();
-            let physical = PhysicalKey::Code(KeyCode::Enter);
-            for (logical, state, allowed, forwarded) in [
-                (NamedKey::Process, ElementState::Pressed, true, false),
-                (
-                    NamedKey::Enter,
-                    ElementState::Released,
-                    release_allowed,
-                    false,
-                ),
-                (NamedKey::Enter, ElementState::Pressed, true, true),
-                (NamedKey::Enter, ElementState::Released, true, true),
-                (NamedKey::Enter, ElementState::Pressed, true, true),
-                (NamedKey::Enter, ElementState::Released, false, true),
-            ] {
-                assert_eq!(
-                    append_keyboard_input(
-                        &mut input,
-                        &Key::Named(logical),
-                        physical,
-                        None,
-                        state,
-                        false,
-                        allowed,
-                        &mut processed,
-                        || panic!("Enter does not use clipboard"),
-                    ),
-                    forwarded
-                );
-                let _ =
-                    ctx.run(input.take(), |ctx| {
-                        ctx.input(|input| {
-                            assert_eq!(
-                                input.key_down(egui::Key::Enter),
-                                forwarded && state == ElementState::Pressed
-                            );
-                            assert!(!input.events.iter().any(|event| matches!(
-                                event,
-                                egui::Event::Key { repeat: true, .. }
-                            )));
-                        });
-                    });
-                if state == ElementState::Released {
-                    assert!(processed.is_empty());
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn headless_state(ctx: egui::Context, viewport_id: ViewportId) -> State {
-        struct NoDisplay;
-        impl HasDisplayHandle for NoDisplay {
-            fn display_handle(
-                &self,
-            ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
-            {
-                Err(raw_window_handle::HandleError::Unavailable)
-            }
-        }
-        State::new(ctx, viewport_id, &NoDisplay, None, None, None)
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn forwarded_hold_survives_process_repeats_until_release_or_focus_loss() {
-        for initially_hidden in [false, true] {
-            for focus_loss in [false, true] {
-                let ctx = egui::Context::default();
-                let mut state = headless_state(ctx.clone(), ViewportId::ROOT);
-                state.on_focused(true);
-                let physical = PhysicalKey::Code(KeyCode::Enter);
-                if initially_hidden {
-                    state.allow_ime = true;
-                    assert!(!state.on_keyboard_input_parts(
-                        &Key::Named(NamedKey::Process),
-                        physical,
-                        None,
-                        ElementState::Pressed,
-                        false,
-                    ));
-                }
-                for (logical, allowed, repeat, forwarded) in [
-                    (NamedKey::Enter, true, initially_hidden, true),
-                    (NamedKey::Process, true, true, false),
-                    (NamedKey::Enter, false, true, true),
-                    (NamedKey::Process, true, true, false),
-                ] {
-                    state.allow_ime = allowed;
-                    assert_eq!(
-                        state.on_keyboard_input_parts(
-                            &Key::Named(logical),
-                            physical,
-                            None,
-                            ElementState::Pressed,
-                            repeat,
-                        ),
-                        forwarded
-                    );
-                    assert_eq!(state.key_holds.get(&physical), Some(&KeyHold::Forwarded));
-                    let _ = ctx.run(state.egui_input.take(), |ctx| {
-                        assert!(ctx.input(|input| input.key_down(egui::Key::Enter)));
-                    });
-                }
-                state.allow_ime = false;
-                if focus_loss {
-                    state.on_focused(false);
-                } else {
-                    assert!(state.on_keyboard_input_parts(
-                        &Key::Named(NamedKey::Enter),
-                        physical,
-                        None,
-                        ElementState::Released,
-                        false,
-                    ));
-                }
-                assert!(state.key_holds.is_empty());
-                let _ = ctx.run(state.egui_input.take(), |ctx| {
-                    assert!(!ctx.input(|input| input.key_down(egui::Key::Enter)));
-                });
-                state.on_focused(true);
-                assert!(state.on_keyboard_input_parts(
-                    &Key::Named(NamedKey::Enter),
-                    physical,
-                    None,
-                    ElementState::Pressed,
-                    false,
-                ));
-                let _ = ctx.run(state.egui_input.take(), |ctx| {
-                    ctx.input(|input| {
-                        assert!(input.key_down(egui::Key::Enter));
-                        assert!(input.events.iter().any(|event| matches!(
-                            event,
-                            egui::Event::Key {
-                                pressed: true,
-                                repeat: false,
-                                ..
-                            }
-                        )));
-                    });
-                });
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn all_key_hold_sequences_through_length_six_preserve_egui_key_state() {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum Input {
-            ProcessPress,
-            ProcessRepeat,
-            Press,
-            Repeat,
-            Release,
-            FocusLost,
-        }
-        const INPUTS: [Input; 6] = [
-            Input::ProcessPress,
-            Input::ProcessRepeat,
-            Input::Press,
-            Input::Repeat,
-            Input::Release,
-            Input::FocusLost,
-        ];
-
-        // InputState::begin_pass inserts/removes keys on press/release and clears
-        // them on WindowFocused(false). Its repeat bit is the pre-insert down state.
-        // The real InputState is also exercised by the individual State tests.
-        fn apply_egui_events(input: &egui::RawInput, down: &mut bool) -> Option<bool> {
-            let mut inferred_repeat = None;
-            for event in &input.events {
-                match event {
-                    egui::Event::Key {
-                        key: egui::Key::Enter,
-                        pressed,
-                        ..
-                    } => {
-                        if *pressed {
-                            inferred_repeat = Some(std::mem::replace(down, true));
-                        } else {
-                            *down = false;
-                        }
-                    }
-                    egui::Event::WindowFocused(false) => *down = false,
-                    _ => panic!("unexpected event: {event:?}"),
-                }
-            }
-            inferred_repeat
-        }
-
-        fn visit(
-            state: &mut State,
-            down: bool,
-            path: &mut [(Input, bool); 6],
-            depth: usize,
-            count: &mut usize,
-        ) {
-            let physical = PhysicalKey::Code(KeyCode::Enter);
-            for input in INPUTS {
-                for allow_ime in [false, true] {
-                    path[depth] = (input, allow_ime);
-                    let sequence = &path[..=depth];
-                    let previous_hold = state.key_holds.get(&physical).copied();
-                    let previous_focus = state.egui_input.focused;
-                    let previous_allow = state.allow_ime;
-                    state.allow_ime = allow_ime;
-                    state.egui_input.events.clear();
-                    if input == Input::FocusLost {
-                        state.on_focused(false);
-                    } else {
-                        let logical = if matches!(input, Input::ProcessPress | Input::ProcessRepeat)
-                        {
-                            NamedKey::Process
-                        } else {
-                            NamedKey::Enter
-                        };
-                        let element = if input == Input::Release {
-                            ElementState::Released
-                        } else {
-                            ElementState::Pressed
-                        };
-                        let repeat = matches!(input, Input::ProcessRepeat | Input::Repeat);
-                        let forwarded = state.on_keyboard_input_parts(
-                            &Key::Named(logical),
-                            physical,
-                            None,
-                            element,
-                            repeat,
-                        );
-                        if input == Input::Release {
-                            if previous_hold.is_some() {
-                                // A known hold's release is delivered iff egui saw a press.
-                                assert_eq!(forwarded, down, "{sequence:?}");
-                            } else {
-                                // Arbitrary sequences include orphan/duplicate releases.
-                                // Preserve the specified legacy forwarding for these too.
-                                assert!(forwarded, "{sequence:?}");
-                            }
-                        } else {
-                            assert_eq!(
-                                forwarded,
-                                !(allow_ime && logical == NamedKey::Process),
-                                "{sequence:?}"
-                            );
-                        }
-                        assert_eq!(
-                            state.egui_input.events.len(),
-                            usize::from(forwarded),
-                            "{sequence:?}"
-                        );
-                        if forwarded {
-                            assert!(
-                                matches!(state.egui_input.events[0], egui::Event::Key {
-                                key: egui::Key::Enter, pressed, ..
-                            } if pressed == (element == ElementState::Pressed)),
-                                "{sequence:?}"
-                            );
-                        }
-                    }
-                    let mut next_down = down;
-                    apply_egui_events(&state.egui_input, &mut next_down);
-                    if matches!(input, Input::Release | Input::FocusLost) {
-                        assert!(!next_down, "{sequence:?}");
-                        assert!(state.key_holds.is_empty(), "{sequence:?}");
-                    } else {
-                        let expected = if next_down {
-                            KeyHold::Forwarded
-                        } else {
-                            KeyHold::Hidden
-                        };
-                        assert_eq!(
-                            state.key_holds.get(&physical),
-                            Some(&expected),
-                            "{sequence:?}"
-                        );
-                    }
-                    if input == Input::Release {
-                        // Probe the next fresh press through the same State delivery path.
-                        state.egui_input.events.clear();
-                        assert!(
-                            state.on_keyboard_input_parts(
-                                &Key::Named(NamedKey::Enter),
-                                physical,
-                                None,
-                                ElementState::Pressed,
-                                false,
-                            ),
-                            "{sequence:?}"
-                        );
-                        assert_eq!(
-                            apply_egui_events(&state.egui_input, &mut next_down),
-                            Some(false),
-                            "{sequence:?}"
-                        );
-                        state.egui_input.events.clear();
-                        assert!(
-                            state.on_keyboard_input_parts(
-                                &Key::Named(NamedKey::Enter),
-                                physical,
-                                None,
-                                ElementState::Released,
-                                false,
-                            ),
-                            "{sequence:?}"
-                        );
-                        apply_egui_events(&state.egui_input, &mut next_down);
-                        assert!(!next_down, "{sequence:?}");
-                        assert!(state.key_holds.is_empty(), "{sequence:?}");
-                    }
-                    *count += 1;
-                    if depth + 1 < path.len() {
-                        visit(state, next_down, path, depth + 1, count);
-                    }
-                    // Restore the parent prefix; no columns are skipped or merged.
-                    if let Some(hold) = previous_hold {
-                        state.key_holds.insert(physical, hold);
-                    } else {
-                        state.key_holds.remove(&physical);
-                    }
-                    state.egui_input.focused = previous_focus;
-                    state.allow_ime = previous_allow;
-                    state.egui_input.events.clear();
-                }
-            }
-        }
-
-        let mut state = headless_state(egui::Context::default(), ViewportId::ROOT);
-        let mut count = 0;
-        visit(
-            &mut state,
-            false,
-            &mut [(Input::Press, false); 6],
-            0,
-            &mut count,
-        );
-        assert_eq!(
-            count,
-            (1..=6).map(|length| 12_usize.pow(length)).sum::<usize>()
-        );
-        assert_eq!(count, 3_257_436);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn forwarded_repeat_after_process_press_keeps_release_and_next_press() {
-        for use_state in [false, true] {
-            for (ordinary_allowed, ordinary_key) in [
-                (false, NamedKey::Enter),
-                (true, NamedKey::Enter),
-                // allow_ime=false keeps upstream's physical fallback for Process.
-                (false, NamedKey::Process),
-            ] {
-                let ctx = egui::Context::default();
-                let mut state = headless_state(ctx.clone(), ViewportId::ROOT);
-                state.on_focused(true);
-                let mut raw_input = egui::RawInput::default();
-                let mut processed = HashMap::new();
-                let physical = PhysicalKey::Code(KeyCode::Enter);
-                for (logical, element, allowed, repeat, forwarded, egui_repeat) in [
-                    (
-                        NamedKey::Process,
-                        ElementState::Pressed,
-                        true,
-                        false,
-                        false,
-                        false,
-                    ),
-                    (
-                        ordinary_key,
-                        ElementState::Pressed,
-                        ordinary_allowed,
-                        true,
-                        true,
-                        false,
-                    ),
-                    (
-                        ordinary_key,
-                        ElementState::Pressed,
-                        ordinary_allowed,
-                        true,
-                        true,
-                        true,
-                    ),
-                    (
-                        NamedKey::Enter,
-                        ElementState::Released,
-                        ordinary_allowed,
-                        false,
-                        true,
-                        false,
-                    ),
-                    (
-                        NamedKey::Enter,
-                        ElementState::Pressed,
-                        true,
-                        false,
-                        true,
-                        false,
-                    ),
-                    (
-                        NamedKey::Enter,
-                        ElementState::Released,
-                        true,
-                        false,
-                        true,
-                        false,
-                    ),
-                ] {
-                    let delivered = if use_state {
-                        state.allow_ime = allowed;
-                        state.on_keyboard_input_parts(
-                            &Key::Named(logical),
-                            physical,
-                            None,
-                            element,
-                            repeat,
-                        )
-                    } else {
-                        append_keyboard_input(
-                            &mut raw_input,
-                            &Key::Named(logical),
-                            physical,
-                            None,
-                            element,
-                            repeat,
-                            allowed,
-                            &mut processed,
-                            || panic!("Enter must not read clipboard"),
-                        )
-                    };
-                    assert_eq!(delivered, forwarded);
-                    let tracked = if use_state {
-                        &state.key_holds
-                    } else {
-                        &processed
-                    };
-                    let expected = if element == ElementState::Released {
-                        None
-                    } else if forwarded {
-                        Some(&KeyHold::Forwarded)
-                    } else {
-                        Some(&KeyHold::Hidden)
-                    };
-                    assert_eq!(tracked.get(&physical), expected);
-                    let input = if use_state {
-                        state.egui_input.take()
-                    } else {
-                        raw_input.take()
-                    };
-                    let _ = ctx.run(input, |ctx| {
-                        ctx.input(|input| {
-                            assert_eq!(
-                                input.key_down(egui::Key::Enter),
-                                forwarded && element == ElementState::Pressed
-                            );
-                            let keys: Vec<_> = input
-                                .events
-                                .iter()
-                                .filter_map(|event| {
-                                    if let egui::Event::Key {
-                                        key,
-                                        pressed,
-                                        repeat,
-                                        ..
-                                    } = event
-                                    {
-                                        Some((*key, *pressed, *repeat))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            assert_eq!(
-                                keys,
-                                if forwarded {
-                                    vec![(
-                                        egui::Key::Enter,
-                                        element == ElementState::Pressed,
-                                        egui_repeat,
-                                    )]
-                                } else {
-                                    vec![]
-                                }
-                            );
-                        });
-                    });
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn state_delivery_tracks_releases_across_ime_permission_changes() {
-        for release_allowed in [false, true] {
-            let ctx = egui::Context::default();
-            let mut state = headless_state(ctx.clone(), ViewportId::ROOT);
-            state.on_focused(true);
-            for (logical, element, allowed, forwarded) in [
-                (NamedKey::Process, ElementState::Pressed, true, false),
-                (
-                    NamedKey::Enter,
-                    ElementState::Released,
-                    release_allowed,
-                    false,
-                ),
-                (NamedKey::Enter, ElementState::Pressed, true, true),
-                (NamedKey::Enter, ElementState::Released, true, true),
-                (NamedKey::Enter, ElementState::Pressed, true, true),
-                (NamedKey::Enter, ElementState::Released, false, true),
-            ] {
-                state.allow_ime = allowed;
-                assert_eq!(
-                    state.on_keyboard_input_parts(
-                        &Key::Named(logical),
-                        PhysicalKey::Code(KeyCode::Enter),
-                        None,
-                        element,
-                        false
-                    ),
-                    forwarded
-                );
-                let _ =
-                    ctx.run(state.egui_input.take(), |ctx| {
-                        ctx.input(|input| {
-                            assert_eq!(
-                                input.key_down(egui::Key::Enter),
-                                forwarded && element == ElementState::Pressed
-                            );
-                            assert!(!input.events.iter().any(|event| matches!(
-                                event,
-                                egui::Event::Key { repeat: true, .. }
-                            )));
-                        });
-                    });
-                if element == ElementState::Released {
-                    assert!(state.key_holds.is_empty());
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn state_focus_loss_clears_only_its_own_processed_keys() {
-        for allowed in [false, true] {
-            let ctx = egui::Context::default();
-            let mut owner = headless_state(ctx.clone(), ViewportId::ROOT);
-            let mut sibling = headless_state(ctx.clone(), ViewportId::from_hash_of("sibling"));
-            let physical = PhysicalKey::Code(KeyCode::Enter);
-            for state in [&mut owner, &mut sibling] {
-                state.on_focused(true);
-                state.allow_ime = true;
-                assert!(!state.on_keyboard_input_parts(
-                    &Key::Named(NamedKey::Process),
-                    physical,
-                    None,
-                    ElementState::Pressed,
-                    false
-                ));
-            }
-            owner.allow_ime = allowed;
-            owner.on_focused(false);
-            assert!(!owner.egui_input.focused);
-            assert!(
-                owner
-                    .egui_input
-                    .events
-                    .contains(&egui::Event::WindowFocused(false))
-            );
-            assert!(owner.key_holds.is_empty());
-            assert_eq!(
-                sibling.key_holds,
-                HashMap::from([(physical, KeyHold::Hidden)])
-            );
-            // The old release goes to another window. After refocusing, the next ordinary
-            // press/release must both reach egui, including when allow_ime changes.
-            let _ = ctx.run(owner.egui_input.take(), |_| {});
-            owner.on_focused(true);
-            owner.allow_ime = true;
-            for element in [
-                ElementState::Pressed,
-                ElementState::Released,
-                ElementState::Pressed,
-                ElementState::Released,
-            ] {
-                assert!(owner.on_keyboard_input_parts(
-                    &Key::Named(NamedKey::Enter),
-                    physical,
-                    None,
-                    element,
-                    false
-                ));
-                let _ =
-                    ctx.run(owner.egui_input.take(), |ctx| {
-                        ctx.input(|input| {
-                            assert_eq!(
-                                input.key_down(egui::Key::Enter),
-                                element == ElementState::Pressed
-                            );
-                            assert!(!input.events.iter().any(|event| matches!(
-                                event,
-                                egui::Event::Key { repeat: true, .. }
-                            )));
-                        });
-                    });
-            }
-            sibling.allow_ime = false;
-            assert!(!sibling.on_keyboard_input_parts(
-                &Key::Named(NamedKey::Enter),
-                physical,
-                None,
-                ElementState::Released,
-                false
-            ));
-            assert!(sibling.key_holds.is_empty());
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn processed_keys_track_repeats_and_multiple_physical_keys_per_state() {
-        let enter = PhysicalKey::Code(KeyCode::Enter);
-        let tab = PhysicalKey::Code(KeyCode::Tab);
-        let mut owner = HashMap::new();
-        let mut sibling = HashMap::new();
-        for physical in [enter, enter, tab] {
-            assert!(try_on_ime_processed_keyboard_input(
-                true,
-                &mut owner,
-                &Key::Named(NamedKey::Process),
-                physical,
-                ElementState::Pressed,
-            ));
-        }
-        assert_eq!(
-            owner,
-            HashMap::from([(enter, KeyHold::Hidden), (tab, KeyHold::Hidden)])
-        );
-        assert!(!try_on_ime_processed_keyboard_input(
-            true,
-            &mut sibling,
-            &Key::Named(NamedKey::Enter),
-            enter,
-            ElementState::Released,
-        ));
-        assert_eq!(
-            owner,
-            HashMap::from([(enter, KeyHold::Hidden), (tab, KeyHold::Hidden)])
-        );
-        assert!(sibling.is_empty());
-        assert!(try_on_ime_processed_keyboard_input(
-            true,
-            &mut owner,
-            &Key::Named(NamedKey::Enter),
-            enter,
-            ElementState::Released,
-        ));
-        assert_eq!(owner, HashMap::from([(tab, KeyHold::Hidden)]));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn ordinary_named_keys_are_forwarded() {
-        let mut processed = HashMap::new();
-        for key in [
-            NamedKey::Enter,
-            NamedKey::Escape,
-            NamedKey::Tab,
-            NamedKey::Space,
-        ] {
-            assert!(!try_on_ime_processed_keyboard_input(
-                true,
-                &mut processed,
-                &Key::Named(key),
-                PhysicalKey::Code(KeyCode::Enter),
-                ElementState::Pressed
-            ));
-            assert!(key_from_winit_key(&Key::Named(key)).is_some());
-        }
-        assert_eq!(
-            processed,
-            HashMap::from([(PhysicalKey::Code(KeyCode::Enter), KeyHold::Forwarded)])
-        );
-    }
-
-    #[test]
-    fn non_latin_physical_fallback_keeps_clipboard_commands() {
-        let logical = Key::Character("ж".into());
-        assert_eq!(key_from_winit_key(&logical), None);
-        for (physical, expected) in [
-            (KeyCode::KeyX, egui::Key::X),
-            (KeyCode::KeyC, egui::Key::C),
-            (KeyCode::KeyV, egui::Key::V),
-        ] {
-            assert_eq!(
-                key_from_winit_key(&logical).or(key_from_key_code(physical)),
-                Some(expected)
-            );
-        }
-        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
-        for (key, expected) in [
-            (egui::Key::X, egui_ime::ClipboardCommand::Cut),
-            (egui::Key::C, egui_ime::ClipboardCommand::Copy),
-            (egui::Key::V, egui_ime::ClipboardCommand::Paste),
-        ] {
-            assert_eq!(
-                egui_ime::winit_clipboard_command(modifiers, key),
-                Some(expected)
-            );
         }
     }
 }
@@ -2408,6 +1625,39 @@ fn key_from_named_key(named_key: winit::keyboard::NamedKey) -> Option<egui::Key>
         NamedKey::F35 => Key::F35,
 
         NamedKey::BrowserBack => Key::BrowserBack,
+        NamedKey::BrowserForward => Key::BrowserForward,
+        NamedKey::BrowserRefresh => Key::BrowserRefresh,
+        NamedKey::BrowserSearch => Key::BrowserSearch,
+        NamedKey::BrowserHome => Key::BrowserHome,
+        NamedKey::BrowserFavorites => Key::BrowserFavorites,
+        NamedKey::BrowserStop => Key::BrowserStop,
+
+        NamedKey::MediaPlayPause => Key::MediaPlayPause,
+        NamedKey::MediaTrackNext => Key::MediaTrackNext,
+        NamedKey::MediaTrackPrevious => Key::MediaTrackPrevious,
+        NamedKey::MediaStop => Key::MediaStop,
+        NamedKey::AudioVolumeMute => Key::AudioVolumeMute,
+        NamedKey::AudioVolumeDown => Key::AudioVolumeDown,
+        NamedKey::AudioVolumeUp => Key::AudioVolumeUp,
+
+        NamedKey::LaunchMail => Key::LaunchMail,
+        NamedKey::LaunchApplication1 => Key::LaunchApp1,
+        NamedKey::LaunchApplication2 => Key::LaunchApp2,
+
+        NamedKey::CapsLock => Key::CapsLock,
+        NamedKey::NumLock => Key::NumLock,
+        NamedKey::ScrollLock => Key::ScrollLock,
+        NamedKey::PrintScreen => Key::PrintScreen,
+        NamedKey::Pause => Key::Pause,
+        NamedKey::ContextMenu => Key::Menu,
+
+        NamedKey::Fn => Key::Fn,
+        NamedKey::Eject => Key::Eject,
+        NamedKey::Help => Key::Help,
+        NamedKey::Power => Key::Power,
+        NamedKey::Standby => Key::Sleep,
+        NamedKey::Clear => Key::Clear,
+
         _ => {
             log::trace!("Unknown key: {named_key:?}");
             return None;
@@ -2531,6 +1781,60 @@ fn key_from_key_code(key: winit::keyboard::KeyCode) -> Option<egui::Key> {
         KeyCode::F34 => Key::F34,
         KeyCode::F35 => Key::F35,
 
+        // Modifier keys — egui now surfaces them as distinct physical
+        // variants so games / capture UIs can bind them independently.
+        // The collapsed `Modifiers.shift/ctrl/alt/command` booleans still
+        // track just the "any side is pressed" state for shortcut matching.
+        KeyCode::ShiftLeft => Key::ShiftLeft,
+        KeyCode::ShiftRight => Key::ShiftRight,
+        KeyCode::ControlLeft => Key::ControlLeft,
+        KeyCode::ControlRight => Key::ControlRight,
+        KeyCode::AltLeft => Key::AltLeft,
+        KeyCode::AltRight => Key::AltRight,
+        KeyCode::SuperLeft => Key::SuperLeft,
+        KeyCode::SuperRight => Key::SuperRight,
+
+        // ISO 102nd key — `<>|` on French AZERTY, `\|` on UK QWERTY.
+        KeyCode::IntlBackslash => Key::IntlBackslash,
+
+        // Lock / System keys:
+        KeyCode::CapsLock => Key::CapsLock,
+        KeyCode::NumLock => Key::NumLock,
+        KeyCode::ScrollLock => Key::ScrollLock,
+        KeyCode::PrintScreen => Key::PrintScreen,
+        KeyCode::Pause => Key::Pause,
+        KeyCode::ContextMenu => Key::Menu,
+
+        // Browser keys:
+        KeyCode::BrowserBack => Key::BrowserBack,
+        KeyCode::BrowserForward => Key::BrowserForward,
+        KeyCode::BrowserRefresh => Key::BrowserRefresh,
+        KeyCode::BrowserSearch => Key::BrowserSearch,
+        KeyCode::BrowserHome => Key::BrowserHome,
+        KeyCode::BrowserFavorites => Key::BrowserFavorites,
+        KeyCode::BrowserStop => Key::BrowserStop,
+
+        // Media keys:
+        KeyCode::MediaPlayPause => Key::MediaPlayPause,
+        KeyCode::MediaTrackNext => Key::MediaTrackNext,
+        KeyCode::MediaTrackPrevious => Key::MediaTrackPrevious,
+        KeyCode::MediaStop => Key::MediaStop,
+        KeyCode::AudioVolumeMute => Key::AudioVolumeMute,
+        KeyCode::AudioVolumeDown => Key::AudioVolumeDown,
+        KeyCode::AudioVolumeUp => Key::AudioVolumeUp,
+
+        // Launch keys:
+        KeyCode::LaunchMail => Key::LaunchMail,
+        KeyCode::LaunchApp1 => Key::LaunchApp1,
+        KeyCode::LaunchApp2 => Key::LaunchApp2,
+
+        // Mac / other system keys:
+        KeyCode::Fn => Key::Fn,
+        KeyCode::Eject => Key::Eject,
+        KeyCode::Help => Key::Help,
+        KeyCode::Power => Key::Power,
+        KeyCode::Sleep => Key::Sleep,
+
         _ => {
             return None;
         }
@@ -2583,12 +1887,32 @@ fn translate_cursor(cursor_icon: egui::CursorIcon) -> Option<winit::window::Curs
 
 // Helpers for egui Viewports
 // ---------------------------------------------------------------------------
-#[derive(PartialEq, Eq, Hash, Debug)]
+#[derive(Debug)]
 pub enum ActionRequested {
-    Screenshot(egui::UserData),
+    Screenshot(egui::ScreenshotCallback),
     Cut,
     Copy,
     Paste,
+
+    /// Run `App::ui` and paint a frame even while the window is hidden (minimized or occluded).
+    ///
+    /// This is useful when the UI needs to keep running without anything currently visible on
+    /// screen. For example, a tool can use this to drive an app in the background:
+    /// `egui_inspection` includes it with every request so that a hidden app still runs its UI,
+    /// paints the screenshot, rebuilds the widget tree, and applies injected input.
+    ///
+    /// See [`egui::ViewportCommand::RequestPaintWhileHidden`].
+    PaintWhileHidden,
+}
+
+impl ActionRequested {
+    /// Does this need a painted frame, even from a window that is hidden?
+    ///
+    /// A screenshot of a hidden window is still a screenshot of something, and painting is
+    /// the only way to produce it.
+    pub fn wants_paint(&self) -> bool {
+        matches!(self, Self::Screenshot(_) | Self::PaintWhileHidden)
+    }
 }
 
 pub fn process_viewport_commands(
@@ -2730,7 +2054,26 @@ fn process_viewport_command(
         ViewportCommand::Fullscreen(v) => {
             window.set_fullscreen(v.then_some(winit::window::Fullscreen::Borderless(None)));
         }
-        ViewportCommand::Decorations(v) => window.set_decorations(v),
+        ViewportCommand::SetMonitor(idx) => {
+            if let Some(monitor) = window.available_monitors().nth(idx) {
+                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
+            } else {
+                log::warn!(
+                    "ViewportCommand::SetMonitor({idx}): index out of range ({} monitors available)",
+                    window.available_monitors().count()
+                );
+            }
+        }
+        ViewportCommand::Decorations(v) => {
+            window.set_decorations(v);
+            #[cfg(target_os = "windows")]
+            {
+                use winit::platform::windows::WindowExtWindows as _;
+
+                // don't request the undecorated-window drop shadow in fullscreen (#8399)
+                window.set_undecorated_shadow(!v && window.fullscreen().is_none());
+            }
+        }
         ViewportCommand::WindowLevel(l) => window.set_window_level(match l {
             egui::viewport::WindowLevel::AlwaysOnBottom => WindowLevel::AlwaysOnBottom,
             egui::viewport::WindowLevel::AlwaysOnTop => WindowLevel::AlwaysOnTop,
@@ -2750,11 +2093,7 @@ fn process_viewport_command(
             );
         }
         ViewportCommand::IMEAllowed(v) => window.set_ime_allowed(v),
-        ViewportCommand::IMEPurpose(p) => window.set_ime_purpose(match p {
-            egui::viewport::IMEPurpose::Password => winit::window::ImePurpose::Password,
-            egui::viewport::IMEPurpose::Terminal => winit::window::ImePurpose::Terminal,
-            egui::viewport::IMEPurpose::Normal => winit::window::ImePurpose::Normal,
-        }),
+        ViewportCommand::IMEPurpose(p) => window.set_ime_purpose(to_winit_ime_purpose(p)),
         ViewportCommand::Focus => {
             if !window.has_focus() {
                 window.focus_window();
@@ -2771,11 +2110,18 @@ fn process_viewport_command(
                 }
             });
         }
-        ViewportCommand::SetTheme(t) => window.set_theme(match t {
-            egui::SystemTheme::Light => Some(winit::window::Theme::Light),
-            egui::SystemTheme::Dark => Some(winit::window::Theme::Dark),
-            egui::SystemTheme::SystemDefault => None,
-        }),
+        ViewportCommand::SetTheme(t) => {
+            window.set_theme(match t {
+                egui::SystemTheme::Light => Some(winit::window::Theme::Light),
+                egui::SystemTheme::Dark => Some(winit::window::Theme::Dark),
+                egui::SystemTheme::SystemDefault => None,
+            });
+
+            #[cfg(target_os = "windows")]
+            {
+                refresh_windows_non_client_activation(window);
+            }
+        }
         ViewportCommand::ContentProtected(v) => window.set_content_protected(v),
         ViewportCommand::CursorPosition(pos) => {
             if let Err(err) = window.set_cursor_position(PhysicalPosition::new(
@@ -2800,8 +2146,11 @@ fn process_viewport_command(
                 log::warn!("{command:?}: {err}");
             }
         }
-        ViewportCommand::Screenshot(user_data) => {
-            actions_requested.push(ActionRequested::Screenshot(user_data));
+        ViewportCommand::Screenshot(callback) => {
+            actions_requested.push(ActionRequested::Screenshot(callback));
+        }
+        ViewportCommand::RequestPaintWhileHidden => {
+            actions_requested.push(ActionRequested::PaintWhileHidden);
         }
         ViewportCommand::RequestCut => {
             actions_requested.push(ActionRequested::Cut);
@@ -2812,6 +2161,14 @@ fn process_viewport_command(
         ViewportCommand::RequestPaste => {
             actions_requested.push(ActionRequested::Paste);
         }
+    }
+}
+
+fn to_winit_ime_purpose(purpose: egui::IMEPurpose) -> winit::window::ImePurpose {
+    match purpose {
+        egui::IMEPurpose::Password => winit::window::ImePurpose::Password,
+        egui::IMEPurpose::Terminal => winit::window::ImePurpose::Terminal,
+        egui::IMEPurpose::Normal => winit::window::ImePurpose::Normal,
     }
 }
 
@@ -2828,10 +2185,45 @@ pub fn create_window(
 ) -> Result<Window, winit::error::OsError> {
     profiling::function_scope!();
 
-    let window_attributes = create_winit_window_attributes(egui_ctx, viewport_builder.clone());
+    let window_attributes = apply_monitor_to_window_attributes(
+        create_winit_window_attributes(egui_ctx, viewport_builder.clone()),
+        viewport_builder,
+        event_loop,
+    );
+
     let window = event_loop.create_window(window_attributes)?;
     apply_viewport_builder_to_window(egui_ctx, &window, viewport_builder);
     Ok(window)
+}
+
+/// Apply [`ViewportBuilder::with_monitor`] to freshly-built [`winit::window::WindowAttributes`].
+///
+/// Resolve the target monitor index → `MonitorHandle` and request borderless
+/// fullscreen on that output, so the window is created directly on the right
+/// monitor. This is the only reliable way to target a specific monitor under
+/// Wayland, and also avoids the Mutter race where `OuterPosition` is ignored
+/// pre-mapping.
+///
+/// Must be called by every backend that builds its own window from
+/// [`create_winit_window_attributes`] (the glow backend and per-viewport window
+/// creation do this) — otherwise `with_monitor` silently does nothing there.
+pub fn apply_monitor_to_window_attributes(
+    mut window_attributes: winit::window::WindowAttributes,
+    viewport_builder: &ViewportBuilder,
+    event_loop: &ActiveEventLoop,
+) -> winit::window::WindowAttributes {
+    if let Some(idx) = viewport_builder.monitor {
+        if let Some(monitor) = event_loop.available_monitors().nth(idx) {
+            window_attributes = window_attributes
+                .with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
+        } else {
+            log::warn!(
+                "ViewportBuilder::with_monitor({idx}): index out of range ({} monitors available)",
+                event_loop.available_monitors().count()
+            );
+        }
+    }
+    window_attributes
 }
 
 pub fn create_winit_window_attributes(
@@ -2876,9 +2268,11 @@ pub fn create_winit_window_attributes(
 
         // x11
         window_type: _window_type,
+        override_redirect: _override_redirect,
 
         mouse_passthrough: _, // handled in `apply_viewport_builder_to_window`
         clamp_size_to_monitor_size: _, // Handled in `viewport_builder` in `epi_integration.rs`
+        monitor: _, // Handled in `create_window` (needs ActiveEventLoop for monitor handle)
     } = viewport_builder;
 
     let mut window_attributes = winit::window::WindowAttributes::default()
@@ -2889,6 +2283,10 @@ pub fn create_winit_window_attributes(
         .with_visible(visible.unwrap_or(true))
         .with_maximized(if cfg!(target_os = "ios") {
             true
+        } else if cfg!(target_os = "windows") && visible == Some(false) {
+            // Maximizing a hidden window on Windows briefly shows it.
+            // Deferred to `apply_viewport_builder_to_window`, which hides that flash.
+            false
         } else {
             maximized.unwrap_or(false)
         })
@@ -2973,10 +2371,41 @@ pub fn create_winit_window_attributes(
         window_attributes = window_attributes.with_name(app_id, "");
     }
 
+    // Consume the activation token our launcher handed us, so the first
+    // window actually gets the focus.
+    //
+    // A desktop entry with `StartupNotify=true` passes a token through
+    // `XDG_ACTIVATION_TOKEN` (Wayland) or `DESKTOP_STARTUP_ID` (X11), and
+    // winit can only apply it at window creation. eframe never read it, so
+    // under a compositor that enforces focus-stealing prevention the window
+    // opened unfocused and stayed that way: `ViewportCommand::Focus` is
+    // exactly the request such a compositor refuses, so nothing could
+    // recover it and the user had to click the window themselves.
+    //
+    // The variables are cleared once read, per the startup-notification
+    // spec: a token is single-use, and leaving it in the environment would
+    // have every later window — and every child process — replay it.
+    #[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
+    {
+        use winit::platform::startup_notify::{
+            WindowAttributesExtStartupNotify as _, reset_activation_token_env,
+        };
+        let token = std::env::var("XDG_ACTIVATION_TOKEN")
+            .or_else(|_| std::env::var("DESKTOP_STARTUP_ID"))
+            .ok()
+            .filter(|t| !t.is_empty());
+        if let Some(token) = token {
+            log::debug!("using the activation token from the environment to focus the window");
+            reset_activation_token_env();
+            window_attributes = window_attributes
+                .with_activation_token(winit::window::ActivationToken::from_raw(token));
+        }
+    }
+
     #[cfg(all(feature = "x11", target_os = "linux"))]
     {
+        use winit::platform::x11::WindowAttributesExtX11 as _;
         if let Some(window_type) = _window_type {
-            use winit::platform::x11::WindowAttributesExtX11 as _;
             use winit::platform::x11::WindowType;
             window_attributes = window_attributes.with_x11_window_type(vec![match window_type {
                 egui::X11WindowType::Normal => WindowType::Normal,
@@ -2995,6 +2424,9 @@ pub fn create_winit_window_attributes(
                 egui::X11WindowType::Dnd => WindowType::Dnd,
             }]);
         }
+        if let Some(override_redirect) = _override_redirect {
+            window_attributes = window_attributes.with_override_redirect(override_redirect);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -3006,6 +2438,10 @@ pub fn create_winit_window_attributes(
         if let Some(show) = _taskbar {
             window_attributes = window_attributes.with_skip_taskbar(!show);
         }
+
+        // don't request the undecorated-window drop shadow in fullscreen (#8399)
+        let want_undecorated_shadow = !decorations.unwrap_or(true) && !fullscreen.unwrap_or(false);
+        window_attributes = window_attributes.with_undecorated_shadow(want_undecorated_shadow);
     }
 
     #[cfg(target_os = "macos")]
@@ -3085,7 +2521,94 @@ pub fn apply_viewport_builder_to_window(
             window.set_outer_position(pos);
         }
         if let Some(maximized) = builder.maximized {
-            window.set_maximized(maximized);
+            set_maximized(window, maximized);
+        }
+    }
+}
+
+/// Like [`winit::window::Window::set_maximized`], but doesn't flash a hidden window on Windows.
+pub fn set_maximized(window: &winit::window::Window, maximized: bool) {
+    #[cfg(target_os = "windows")]
+    if maximized && window.is_visible() == Some(false) {
+        set_maximized_while_hidden(window);
+        return;
+    }
+
+    window.set_maximized(maximized);
+}
+
+/// Maximize a hidden window without it flashing on screen.
+///
+/// winit implements maximize with `ShowWindow(SW_MAXIMIZE)`, which also shows the window,
+/// and then hides it again with `SW_HIDE` if it is supposed to be invisible.
+/// We cloak the window during that so the brief show is never composited.
+/// The window stays hidden but maximized, so the first frame is rendered at the right size.
+// TODO(rust-windowing/winit#4575): remove this (and the `with_maximized` special case in
+// `create_winit_window_attributes`) once we are on a winit with that fix (or rust-windowing/winit#4587).
+#[cfg(target_os = "windows")]
+fn set_maximized_while_hidden(window: &winit::window::Window) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+
+    let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|h| h.as_raw()) else {
+        window.set_maximized(true);
+        return;
+    };
+    let hwnd = handle.hwnd.get() as _;
+
+    let set_cloaked = |cloaked: bool| {
+        let value = i32::from(cloaked);
+        // SAFETY: `hwnd` is a valid window handle and `value` is a BOOL, as DWMWA_CLOAK expects.
+        #[expect(unsafe_code)]
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAK as u32,
+                (&raw const value).cast(),
+                size_of::<i32>() as u32,
+            )
+        }
+    };
+
+    let cloaked = set_cloaked(true) >= 0;
+    // winit runs this synchronously, since we're on the event loop thread:
+    window.set_maximized(true);
+    if cloaked {
+        set_cloaked(false);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_windows_non_client_activation(window: &winit::window::Window) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_NCACTIVATE};
+
+    let Ok(window_handle) = window.window_handle() else {
+        return;
+    };
+
+    let RawWindowHandle::Win32(handle) = window_handle.as_raw() else {
+        return;
+    };
+
+    let hwnd = handle.hwnd.get() as _;
+
+    // SAFETY:
+    // On Windows, changing the window theme updates egui immediately, but the
+    // native title bar may keep its previous colors until the activation state
+    // changes. Send WM_NCACTIVATE to refresh the non-client title bar state
+    // without actually changing the real focus.
+    #[expect(unsafe_code)]
+    unsafe {
+        #[expect(clippy::branches_sharing_code)]
+        if window.has_focus() {
+            // The window is active already, so send inactive -> active to force
+            // Windows to recalculate/repaint the title bar state.
+            SendMessageW(hwnd, WM_NCACTIVATE, 0, 0);
+            SendMessageW(hwnd, WM_NCACTIVATE, 1, 0);
+        } else {
+            // Keep the visual state inactive if the window does not have focus.
+            SendMessageW(hwnd, WM_NCACTIVATE, 0, 0);
         }
     }
 }

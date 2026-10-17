@@ -5809,7 +5809,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run(
+            let _ = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -5894,7 +5894,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run(
+            let _ = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -8691,7 +8691,7 @@ mod tests {
         app.epub_convert = Some(saved);
         drop(original);
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
         assert_eq!(app.folder_nav_current_target(), root);
         assert_eq!(app.items, before_rows);
         let Some(mut transition) = app.top_level_grid_view.take_history_navigation_transition()

@@ -52,7 +52,7 @@ fn gpu_frame(
     gpu: &egui_wgpu::RenderState,
     mut run: impl FnMut(&mut egui::Ui, &egui::Context),
 ) {
-    let output = ctx.run(
+    let output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -61,9 +61,11 @@ fn gpu_frame(
             ..Default::default()
         },
         |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| run(ui, ctx));
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| run(ui, ctx))
+            });
         },
     );
     // Ordinary native preparation reads registered egui source textures.

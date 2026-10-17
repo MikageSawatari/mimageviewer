@@ -1528,6 +1528,7 @@ impl App {
         let password_required =
             matches!(&state.phase, ArchiveConvertPhase::PasswordRequired { .. });
         let window = egui::Window::new(title)
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("archive_convert_dialog"))
             .open(&mut open)
             .resizable(false)
@@ -2565,7 +2566,7 @@ pub(super) fn draw_archive_startup_snapshot_fixture(ctx: &egui::Context, kind: &
         | "archive_no_images_error" => "変換エラー",
         _ => "7z を ZIP に変換",
     };
-    egui::Window::new(title)
+    egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
         .id(egui::Id::new("archive_convert_dialog"))
         .open(&mut true)
         .resizable(false)

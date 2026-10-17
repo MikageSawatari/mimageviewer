@@ -257,6 +257,7 @@ impl App {
         let default_pos = content.min + egui::vec2(80.0, 60.0);
 
         egui::Window::new("TensorRT 高速化パックのインストール")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("trt_install_dialog"))
             .default_pos(default_pos)
             .default_width(560.0)

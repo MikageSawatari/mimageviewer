@@ -982,28 +982,30 @@ fn paint_composition_surface(
     Vec<crate::app::paint_record_test_support::PaintRecord>,
 ) {
     let output = crate::app::paint_record_test_support::with_capture(|| {
-        ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 ..Default::default()
             },
             |ctx| {
                 if app.reading_flow.is_paged() {
-                    app.render_fullscreen_viewport(ctx);
+                    ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                 } else {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let idx = app.fullscreen_idx.unwrap();
-                            app.draw_fs_continuous_reading(
-                                ui,
-                                ctx,
-                                rect,
-                                idx,
-                                true,
-                                FsPageTurnDecision::normal(),
-                            );
-                        });
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let idx = app.fullscreen_idx.unwrap();
+                                app.draw_fs_continuous_reading(
+                                    ui,
+                                    ctx,
+                                    rect,
+                                    idx,
+                                    true,
+                                    FsPageTurnDecision::normal(),
+                                );
+                            })
+                    });
                 }
             },
         )
@@ -1614,24 +1616,26 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             if hidden {
                 app.install_hidden_presentation_for_test(&b);
             }
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            app.draw_fs_continuous_reading(
-                                ui,
-                                ctx,
-                                rect,
-                                0,
-                                cache != "processed",
-                                FsPageTurnDecision::normal(),
-                            );
-                        });
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                app.draw_fs_continuous_reading(
+                                    ui,
+                                    ctx,
+                                    rect,
+                                    0,
+                                    cache != "processed",
+                                    FsPageTurnDecision::normal(),
+                                );
+                            })
+                    });
                 },
             );
             let painted = painted_texture_ids(&ctx, output);
@@ -1684,13 +1688,13 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             if hidden {
                 app.install_hidden_presentation_for_test(&b);
             }
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
                 |ctx| {
-                    app.render_fullscreen_viewport(ctx);
+                    ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                 },
             );
             let painted = painted_texture_ids(&ctx, output);
@@ -1770,24 +1774,26 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
     let held_b = app.install_checking_presentation_for_test(&b);
     let b_correlation = app.checking_presentation_correlations_for_test(&b);
     let draw = |app: &mut crate::app::App, rect: egui::Rect| {
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        app.draw_fs_continuous_reading(
-                            ui,
-                            ctx,
-                            rect,
-                            app.fullscreen_idx.unwrap(),
-                            true,
-                            FsPageTurnDecision::normal(),
-                        );
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fs_continuous_reading(
+                                ui,
+                                ctx,
+                                rect,
+                                app.fullscreen_idx.unwrap(),
+                                true,
+                                FsPageTurnDecision::normal(),
+                            );
+                        })
+                });
             },
         );
         painted_texture_ids(&ctx, output)
@@ -1937,28 +1943,32 @@ fn composed_continuous_geometry_and_pdf_demand_match_the_real_e_consumer() {
                         app.fs_zoom = zoom;
                         app.fs_vertical_scroll = scroll;
                         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-                        let _ = ctx.run(
-                            egui::RawInput {
-                                screen_rect: Some(rect),
-                                ..Default::default()
-                            },
-                            |ctx| {
-                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
-                                    ctx,
-                                    |ui| {
-                                        app.draw_fs_continuous_reading(
-                                            ui,
-                                            ctx,
-                                            rect,
-                                            0,
-                                            true,
-                                            FsPageTurnDecision::normal(),
-                                        );
-                                        app.reconcile_specified_pdf_demand(ctx);
-                                    },
-                                );
-                            },
-                        );
+                        let _ = ctx
+                            .run_pass(
+                                egui::RawInput {
+                                    screen_rect: Some(rect),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    ctx.root_ui(|root_ui| {
+                                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                            root_ui,
+                                            |ui| {
+                                                app.draw_fs_continuous_reading(
+                                                    ui,
+                                                    ctx,
+                                                    rect,
+                                                    0,
+                                                    true,
+                                                    FsPageTurnDecision::normal(),
+                                                );
+                                                app.reconcile_specified_pdf_demand(ctx);
+                                            },
+                                        )
+                                    });
+                                },
+                            )
+                            .drop_without_applying_deltas();
                         records.push(
                             app.fullscreen_page_layout
                                 .displayed_pages()
@@ -2017,20 +2027,22 @@ fn g3_similar_preview_continuous_routing_requires_admitted_anchor_occurrence() {
         }
         let demand = units[0].presentation_demand();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(rect),
-                focused: true,
-                events: vec![egui::Event::PointerButton {
-                    pos: rect.center(),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    focused: true,
+                    events: vec![egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         let hit = crate::similar_index::QueryHit {
             item_id: 901,
             item_key: "c:/preview/candidate.png".into(),
@@ -2089,28 +2101,31 @@ fn g3_similar_preview_continuous_routing_requires_admitted_anchor_occurrence() {
         if expected == "hidden" {
             app.install_hidden_presentation_for_test(&demand);
         }
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(rect),
                 focused: true,
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let asset = app
-                            .similar_preview_asset_for_permitted_surface(ctx, rect, 0, false, true);
-                        assert_eq!(
-                            asset.is_some(),
-                            expected == "allowed",
-                            "{expected} anchor admission"
-                        );
-                        if let Some(asset) = asset {
-                            let style = app.fs_bg_style(ctx);
-                            app.draw_similar_preview_asset(ui, rect, &asset, &style);
-                        }
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let asset = app.similar_preview_asset_for_permitted_surface(
+                                ctx, rect, 0, false, true,
+                            );
+                            assert_eq!(
+                                asset.is_some(),
+                                expected == "allowed",
+                                "{expected} anchor admission"
+                            );
+                            if let Some(asset) = asset {
+                                let style = app.fs_bg_style(ctx);
+                                app.draw_similar_preview_asset(ui, rect, &asset, &style);
+                            }
+                        })
+                });
             },
         );
         assert_eq!(
@@ -2527,22 +2542,24 @@ fn book_composition_legacy_spread_keys_match_binding_and_preserve_record() {
                 app.apply_fullscreen_view_mode(&ctx, 0, FullscreenViewMode::Single);
                 app.spread_shift.state = crate::app::spread_shift_owner::ViewerShift::Ordinary(2);
                 let revision_before = app.book_append_undo_revision;
-                let _ = ctx.run(
-                    egui::RawInput {
-                        focused: true,
-                        events: vec![egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::NONE,
-                        }],
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        app.handle_fs_key_input(ctx, 0, false);
-                    },
-                );
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            focused: true,
+                            events: vec![egui::Event::Key {
+                                key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            }],
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.handle_fs_key_input(ctx, 0, false);
+                        },
+                    )
+                    .drop_without_applying_deltas();
                 assert_eq!(
                     app.spread_mode,
                     if requested == expected {

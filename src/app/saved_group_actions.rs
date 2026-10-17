@@ -813,7 +813,7 @@ mod tests {
         app.open_active_book_from_action(&ime_ctx);
         let first_id = app.saved_group_open_request_id_for_test().unwrap();
 
-        let _ = ime_ctx.run(
+        let _ = ime_ctx.run_pass(
             egui::RawInput {
                 events: vec![
                     egui::Event::Ime(egui::ImeEvent::Enabled),
@@ -843,7 +843,7 @@ mod tests {
         let second_id = app.saved_group_open_request_id_for_test().unwrap();
         assert_ne!(first_id, second_id);
         assert!(!app.cancel_saved_group_open_request(first_id));
-        let _ = escape_ctx.run(
+        let _ = escape_ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,

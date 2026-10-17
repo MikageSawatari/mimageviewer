@@ -1028,7 +1028,6 @@ impl App {
         }
         ctx.input_mut(|input| {
             input.events.retain(sidecar_restore_retains_egui_event);
-            input.raw_scroll_delta = egui::Vec2::ZERO;
             input.smooth_scroll_delta = egui::Vec2::ZERO;
             input.pointer = egui::PointerState::default();
             input.keys_down.clear();
@@ -3000,7 +2999,6 @@ fn sidecar_restore_retains_egui_event(event: &egui::Event) -> bool {
                 ..
             }
             | egui::Event::Ime(egui::ImeEvent::Disabled)
-            | egui::Event::Screenshot { .. }
     )
 }
 
@@ -4754,7 +4752,7 @@ mod tests {
             },
         ];
 
-        let _ = ctx.run(raw, |ctx| {
+        let _ = ctx.run_pass(raw, |ctx| {
             assert!(ctx.input(|input| input.pointer.primary_down()));
             assert_ne!(ctx.input(|input| input.raw_scroll_delta), egui::Vec2::ZERO);
             App::consume_sidecar_restore_viewport_input(ctx);
@@ -5437,7 +5435,7 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run(raw, |ctx| {
+        let output = ctx.run_pass(raw, |ctx| {
             let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
             app.consume_input_during_sidecar_restore(ctx);
             assert!(ctx.input(|input| input.viewport().close_requested()));
@@ -5471,7 +5469,7 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let output = ctx.run(raw, |ctx| {
+        let output = ctx.run_pass(raw, |ctx| {
             app.consume_input_during_sidecar_restore(ctx);
             app.show_sidecar_restore_dialog(ctx);
         });

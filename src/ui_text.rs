@@ -2166,7 +2166,7 @@ impl App {
             self.reset_comic_history(&key);
             return;
         }
-        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input();
         if busy {
             return;
         }
@@ -2271,7 +2271,7 @@ impl App {
         let action = FsKeyAction::default();
 
         if !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && self.consume_context_shortcuts_help_key(ctx)
         {
             self.show_context_shortcuts_help = true;
@@ -2300,7 +2300,7 @@ impl App {
         // consume 順は `handle_meta_undo_keys` と同じ: Ctrl+Shift+Z (redo) → Ctrl+Y (redo)
         // → Ctrl+Z (undo)。`Modifiers::CTRL` 指定の consume は Shift 併用 Z も拾うため
         // redo を先に握り、Ctrl+Shift+Z が undo 側へ流れないようにする。
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             let redo = self.keymap.consume_action(ctx, KeyAction::TextRedo);
             let undo = self.keymap.consume_action(ctx, KeyAction::TextUndo);
             if undo {
@@ -3251,6 +3251,10 @@ impl App {
                         let list_max =
                             (sink_rect.bottom() - list_top - ACTIONS_RESERVE).clamp(80.0, 2000.0);
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .id_salt("text_panel_scroll")
                             .max_height(list_max)
                             .auto_shrink([false, true])
@@ -3348,7 +3352,7 @@ impl App {
                             egui::vec2(PANEL_W, body_height),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
-                                egui::ScrollArea::vertical()
+                                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                     .id_salt("text_detail_scroll")
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
@@ -3556,13 +3560,14 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 600.0);
         let default_h = (avail.height() - 120.0).clamp(240.0, 560.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("吹き出しを追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("text_add_bubble_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -3580,6 +3585,10 @@ impl App {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let cols = ((ui.available_width() / (PRESET_CELL_W + 8.0)).floor()
@@ -3661,13 +3670,14 @@ impl App {
         let mut cancel_requested = false;
         let avail = ctx.content_rect();
         let default_size = egui::vec2((avail.width() - 32.0).clamp(420.0, 600.0), 430.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("注釈を追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("text_add_annotation_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -3761,13 +3771,14 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(320.0, 540.0);
         let default_h = (avail.height() - 120.0).clamp(220.0, 460.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("メッセージウィンドウを追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("text_add_window_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -3785,6 +3796,10 @@ impl App {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let cols =
@@ -3951,13 +3966,13 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 860.0);
         let default_h = (avail.height() - 120.0).clamp(300.0, 660.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("オノマトペを追加")
+        egui::Window::new("オノマトペを追加").drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("text_add_onomatopoeia_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -3996,7 +4011,7 @@ impl App {
                     .color(egui::Color32::from_gray(180)),
                 );
                 ui.separator();
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         // パック未導入時はカードを無効化して追加をブロックする (見本は見える
@@ -4267,13 +4282,14 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 760.0);
         let default_h = (avail.height() - 120.0).clamp(320.0, 600.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("フォントを見本から選択")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("text_font_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -4855,13 +4871,13 @@ impl App {
         let avail = ctx.content_rect();
         let default_w = (avail.width() - 24.0).clamp(360.0, 600.0);
         let default_h = (avail.height() - 120.0).clamp(280.0, 560.0);
-        let frame = egui::Frame::window(ctx.style().as_ref())
+        let frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new(title)
+        egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("text_add_stamp_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -4957,7 +4973,7 @@ impl App {
                 }
 
                 // 絵文字グリッド。
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -6301,6 +6317,10 @@ fn show_font_card_rows<R>(
     // Each horizontal row allocates exactly FONT_CARD_H; show_rows adds
     // the parent's vertical item spacing once.
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .auto_shrink([false, false])
         .show_rows(ui, FONT_CARD_H, rows, draw)
 }
@@ -7397,7 +7417,7 @@ fn text_body_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, sel: u
     }
     let text_sel: Option<(usize, usize)> = te_out
         .cursor_range
-        .map(|r| (r.primary.index, r.secondary.index));
+        .map(|r| (r.primary.index.0, r.secondary.index.0));
     // 記法 ON のとき、本文欄の直下に記号挿入ボタンを出す。選択範囲があればそれを囲み、
     // 無ければキャレット位置 (末尾) に空ペアを挿入する (ラボ `draw_text_body` 相当)。
     if t.markup_enabled {
@@ -9746,7 +9766,7 @@ mod tests {
     ) {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -9755,7 +9775,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| draw(ui));
+                ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |ui| draw(ui)));
             },
         );
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
@@ -9904,29 +9924,34 @@ mod tests {
             let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, height));
             let draw = |events| {
                 let mut measured = None;
-                let _ = ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(viewport),
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
-                                let output = show_font_card_rows(ui, 3, |ui, rows| {
-                                    for _ in rows {
-                                        ui.horizontal(|ui| {
-                                            for _ in 0..2 {
-                                                allocate_font_card(ui);
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|root_ui| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    root_ui,
+                                    |ui| {
+                                        let output = show_font_card_rows(ui, 3, |ui, rows| {
+                                            for _ in rows {
+                                                ui.horizontal(|ui| {
+                                                    for _ in 0..2 {
+                                                        allocate_font_card(ui);
+                                                    }
+                                                });
                                             }
                                         });
-                                    }
-                                });
-                                measured = Some(ScrollLayout::from_output(&output));
+                                        measured = Some(ScrollLayout::from_output(&output));
+                                    },
+                                )
                             });
-                    },
-                );
+                        },
+                    )
+                    .drop_without_applying_deltas();
                 measured.unwrap()
             };
             let mut before = draw(vec![]);
@@ -9935,7 +9960,7 @@ mod tests {
             }
             assert_eq!(
                 before.content.y,
-                3.0 * FONT_CARD_H + 2.0 * ctx.style().spacing.item_spacing.y
+                3.0 * FONT_CARD_H + 2.0 * ctx.global_style().spacing.item_spacing.y
             );
             before.assert_height(
                 if height > 200.0 {
@@ -9956,6 +9981,8 @@ mod tests {
                                 unit: egui::MouseWheelUnit::Point,
                                 delta: egui::vec2(0.0, -4000.0),
                                 modifiers: egui::Modifiers::NONE,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
                             },
                         ]
                     } else {
@@ -10018,34 +10045,40 @@ mod tests {
         for _ in 0..2 {
             let mut priming_input = primary_press_input(pos);
             priming_input.events.truncate(1);
-            let _ = ctx.run(priming_input, |ctx| {
+            let _ = ctx
+                .run_pass(priming_input, |ctx| {
+                    egui::Area::new(egui::Id::new(0xC010_57u64))
+                        .fixed_pos(egui::pos2(400.0, 100.0))
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
+                })
+                .drop_without_applying_deltas();
+        }
+        let _ = ctx
+            .run_pass(primary_press_input(pos), |ctx| {
+                assert!(ctx.input(|input| input.pointer.primary_pressed()));
+                blocked.set(text_floating_ui_blocks_canvas_input(
+                    ctx,
+                    ctx.input(|input| input.pointer.interact_pos()),
+                ));
                 egui::Area::new(egui::Id::new(0xC010_57u64))
                     .fixed_pos(egui::pos2(400.0, 100.0))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
-            });
-        }
-        let _ = ctx.run(primary_press_input(pos), |ctx| {
-            assert!(ctx.input(|input| input.pointer.primary_pressed()));
-            blocked.set(text_floating_ui_blocks_canvas_input(
-                ctx,
-                ctx.input(|input| input.pointer.interact_pos()),
-            ));
-            egui::Area::new(egui::Id::new(0xC010_57u64))
-                .fixed_pos(egui::pos2(400.0, 100.0))
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
-        });
+            })
+            .drop_without_applying_deltas();
         assert!(blocked.get());
 
         let unblocked = Cell::new(true);
         let ctx = egui::Context::default();
-        let _ = ctx.run(primary_press_input(pos), |ctx| {
-            unblocked.set(text_floating_ui_blocks_canvas_input(
-                ctx,
-                ctx.input(|input| input.pointer.interact_pos()),
-            ));
-        });
+        let _ = ctx
+            .run_pass(primary_press_input(pos), |ctx| {
+                unblocked.set(text_floating_ui_blocks_canvas_input(
+                    ctx,
+                    ctx.input(|input| input.pointer.interact_pos()),
+                ));
+            })
+            .drop_without_applying_deltas();
         assert!(!unblocked.get());
     }
 
@@ -10804,14 +10837,15 @@ mod tests {
         };
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W + 32.0, 720.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.allocate_ui_with_layout(
                         egui::vec2(PANEL_W, 680.0),
                         egui::Layout::top_down(egui::Align::Min),
@@ -10957,7 +10991,8 @@ mod tests {
         let mut cursor_thumbs = HashMap::new();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 460.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -10984,7 +11019,7 @@ mod tests {
                         cursor_thumbs.insert(cache_key, texture);
                     }
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let _ = annotation_dialog_contents_ui(
                         ui,
                         &mut preset,

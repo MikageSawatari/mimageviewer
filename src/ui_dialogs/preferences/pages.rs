@@ -284,6 +284,10 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         ui.label(egui::RichText::new("システムフォントを読み込み中…").weak());
                     }
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("ui_font_face_list")
                         .max_height(260.0)
                         .show(ui, |ui| {
@@ -711,7 +715,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     None,
                     |edit| edit.desired_width(360.0),
                 );
-                output.response = output.response.labelled_by(field_label.id);
+                output.response.response = output.response.response.labelled_by(field_label.id);
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -744,7 +748,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     None,
                     |edit| edit.desired_width(360.0),
                 );
-                output.response = output.response.labelled_by(field_label.id);
+                output.response.response = output.response.response.labelled_by(field_label.id);
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -2948,6 +2952,7 @@ pub(super) fn draw_operation_assignment_editor_dialog(
     let default_size = egui::vec2(680.0, 620.0).min(safe_size);
     let min_size = egui::vec2(520.0, 360.0).min(safe_size);
     egui::Window::new(title)
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(&mut open)
         .resizable(true)
         .collapsible(false)
@@ -2974,6 +2979,10 @@ pub(super) fn draw_operation_assignment_editor_dialog(
             } else {
                 let available_h = ui.available_height().max(120.0);
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("operation_assignment_editor_body")
                     .max_height(available_h)
                     .auto_shrink([false, false])
@@ -3011,7 +3020,7 @@ pub(super) fn draw_mouse_gesture_recorder_dialog(
     } else {
         format!("マウスジェスチャ追加: {}", recorder.context.label())
     };
-    egui::Window::new(title)
+    egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
         .open(&mut open)
         .resizable(true)
         .movable(false)
@@ -3529,7 +3538,7 @@ fn command_editor_source_chord_section(
         let filter = state.command_filter.trim().to_string();
         let key_filter = state.command_key_filter.trim().to_string();
         let candidate_height = ui.available_height().max(180.0);
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
             .id_salt(("command_editor_chord_assign_list", chord_label))
             .max_height(candidate_height)
             .auto_shrink([false, false])
@@ -7271,6 +7280,7 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 let mut window_open = state.trt_cache_delete_confirm_open;
                 let pack_total_mib = state.trt_pack_size_mib + state.trt_engine_cache_size_mib;
                 egui::Window::new("TensorRT パック削除の確認")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut window_open)
@@ -7395,6 +7405,7 @@ pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState
                     let mut do_cancel = false;
                     let mut window_open = state.editing_addon_delete_confirm_open;
                     egui::Window::new("編集用追加ファイル削除の確認")
+                        .drag_area(egui::WindowDrag::Anywhere)
                         .collapsible(false)
                         .resizable(false)
                         .open(&mut window_open)
@@ -8489,6 +8500,7 @@ fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut Preference
         let mut open = true;
         let entry_count = state.audio_normalize_entry_count;
         egui::Window::new("音量ノーマライズ測定値のクリア")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -8909,7 +8921,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .collect();
     let available_height = ui.available_height().max(120.0);
     let mut clicked_add: Option<String> = None;
-    let output = egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
         .id_salt("vst3-pref-page-picker-scroll")
         .vertical_scroll_offset(state.vst3_picker_scroll_y)
         .max_height(available_height)
@@ -8957,7 +8969,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 }
             }
         });
-    state.vst3_picker_scroll_y = output.state.offset.y;
+    state.vst3_picker_scroll_y = output.state.clamped_offset().y;
     if let Some(path) = clicked_add {
         if state.settings.vst3_plugins.len() < MAX_CHAIN_LEN
             && !state.settings.vst3_plugins.iter().any(|e| e.path == path)
@@ -9395,6 +9407,10 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                 let len = state.settings.image_ext_priority.len();
 
                 let output = egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .max_height(200.0)
                     .id_salt("dup_ext_scroll")
                     .vertical_scroll_offset(state.duplicate_priority_scroll_y)
@@ -9437,7 +9453,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                         }
                     });
 
-                state.duplicate_priority_scroll_y = output.state.offset.y;
+                state.duplicate_priority_scroll_y = output.state.clamped_offset().y;
                 if let Some((a, b)) = swap {
                     state.settings.image_ext_priority.swap(a, b);
                 }
@@ -10649,7 +10665,8 @@ mod page_turn_animation_settings_tests {
         let mut duration_ms = 200;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 320.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, theme);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -10657,7 +10674,7 @@ mod page_turn_animation_settings_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
                 });
             });
@@ -10693,15 +10710,16 @@ mod page_turn_animation_settings_tests {
         };
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 320.0))
-            .build_state(
-                |ctx, (settings, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (settings, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         draw_page_turn_animation_setting(
                             ui,
                             &mut settings.page_turn_animation_enabled,
@@ -10856,16 +10874,18 @@ mod context_menu_layout_settings_tests {
         ];
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
-            .build_state(
-                |ctx, (settings, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (settings, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default()
-                        .show(ctx, |ui| draw_fullscreen_fit_cycle_settings(ui, settings));
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_fullscreen_fit_cycle_settings(ui, settings)
+                    });
                 },
                 (settings, false),
             );
@@ -10909,19 +10929,27 @@ mod context_menu_layout_settings_tests {
         );
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 420.0))
-            .build_state(
-                |ctx, (layout, scenario, fonts_ready, expanded)| {
+            .build_ui_state(
+                |root_ui, (layout, scenario, fonts_ready, expanded)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            draw_context_menu_layout_settings(ui, layout, scenario, expanded, 0);
-                        });
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_context_menu_layout_settings(
+                                    ui, layout, scenario, expanded, 0,
+                                );
+                            });
                     });
                 },
                 state,
@@ -11466,15 +11494,16 @@ mod tests {
 
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(300.0, 540.0))
-            .build_state(
-                |ctx, (value, changed, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (value, changed, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         let mut max_tenths = 50;
                         *changed = super::draw_fullscreen_specified_scale_settings(
                             ui,
@@ -11545,15 +11574,16 @@ mod tests {
 
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 540.0))
-            .build_state(
-                |ctx, (value, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (value, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         let mut max_tenths = 50;
                         super::draw_fullscreen_specified_scale_settings(ui, value, &mut max_tenths);
                     });
@@ -11634,15 +11664,16 @@ mod tests {
             let pixels = matches!(axis, SpecifiedScaleAxis::LogicalPixels(_));
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(400.0, 520.0))
-                .build_state(
-                    |ctx, (value, fonts_ready)| {
+                .build_ui_state(
+                    |root_ui, (value, fonts_ready)| {
+                        let ctx = &root_ui.ctx().clone();
                         if !*fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             *fonts_ready = true;
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
                             let mut max_tenths = 50;
                             super::draw_fullscreen_specified_scale_settings(
                                 ui,
@@ -11705,8 +11736,9 @@ mod tests {
         for (text, expected) in [("2.5", 25), ("0", 10), ("20.1", 200), ("1.14", 11)] {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(500.0, 560.0))
-                .build_state(
-                    |ctx, (value, max_tenths, changed, fonts_ready)| {
+                .build_ui_state(
+                    |root_ui, (value, max_tenths, changed, fonts_ready)| {
+                        let ctx = &root_ui.ctx().clone();
                         crate::ime_focus::install_ime_input_policy(ctx);
                         if !*fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
@@ -11714,7 +11746,7 @@ mod tests {
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
                             *changed |= super::draw_fullscreen_specified_scale_settings(
                                 ui, value, max_tenths,
                             );
@@ -11756,17 +11788,22 @@ mod tests {
 
         for width in [220.0, 280.0] {
             let size = egui::vec2(width, 640.0);
-            let mut harness = crate::test_ui::builder().with_size(size).build_state(
-                |ctx, (value, fonts_ready)| {
+            let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+                |root_ui, (value, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 let mut max_tenths = 50;

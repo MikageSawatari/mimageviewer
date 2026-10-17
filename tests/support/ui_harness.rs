@@ -51,7 +51,10 @@ mod tests {
 
     #[test]
     fn render_state_enumerates_only_product_backends() {
-        let state = egui_kittest::wgpu::create_render_state(super::wgpu_setup());
+        let state = egui_kittest::wgpu::create_render_state(
+            super::wgpu_setup(),
+            egui_wgpu::RendererOptions::PREDICTABLE,
+        );
         eprintln!("UI test adapter: {:?}", state.adapter.get_info());
         assert!(!state.available_adapters.is_empty());
         for adapter in &state.available_adapters {

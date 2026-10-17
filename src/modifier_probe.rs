@@ -165,8 +165,15 @@ struct ModifierSnapshot {
 }
 
 impl ModifierSnapshot {
-    fn from_raw_input(input: &egui::RawInput) -> Self {
-        Self::new(input.viewport_id, input.focused, input.modifiers)
+    fn from_raw_input(ctx: &egui::Context, input: &egui::RawInput) -> Self {
+        let modifiers = input.events.iter().fold(
+            ctx.input_for(input.viewport_id, |i| i.modifiers),
+            |current, event| match event {
+                egui::Event::ModifiersChanged(modifiers) => *modifiers,
+                _ => current,
+            },
+        );
+        Self::new(input.viewport_id, input.focused, modifiers)
     }
 
     fn from_context(ctx: &egui::Context) -> Self {
@@ -307,7 +314,7 @@ impl egui::Plugin for ModifierProbePlugin {
         "miv_modifier_probe"
     }
 
-    fn input_hook(&mut self, input: &mut egui::RawInput) {
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         if !crate::perf::is_enabled() {
             return;
         }
@@ -317,7 +324,7 @@ impl egui::Plugin for ModifierProbePlugin {
             self.state
                 .next(input.viewport_id, frame_token, Instant::now(), &frame)
         {
-            let snapshot = ModifierSnapshot::from_raw_input(input);
+            let snapshot = ModifierSnapshot::from_raw_input(ctx, input);
             let emission = ModifierProbeEmission {
                 trigger,
                 frame,

@@ -347,43 +347,47 @@ mod bar_button_touch_tests {
         let mut fitted_rect = None;
         let mut fitted_icon = None;
 
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    legacy_rect = Some(
-                        draw_bar_button(
-                            ui,
-                            4.0,
-                            4.0,
-                            "legacy_rect_button",
-                            |_| egui::Color32::BLACK,
-                            false,
-                            |_, _, _| {},
-                        )
-                        .response
-                        .rect,
-                    );
-                    fitted_rect = Some(
-                        draw_bar_button_in_rect(
-                            ui,
-                            fitted,
-                            "fitted_rect_button",
-                            |_| egui::Color32::BLACK,
-                            false,
-                            |painter, _, r| {
-                                fitted_icon = Some((painter.clip_rect(), r));
-                            },
-                        )
-                        .response
-                        .rect,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            legacy_rect = Some(
+                                draw_bar_button(
+                                    ui,
+                                    4.0,
+                                    4.0,
+                                    "legacy_rect_button",
+                                    |_| egui::Color32::BLACK,
+                                    false,
+                                    |_, _, _| {},
+                                )
+                                .response
+                                .rect,
+                            );
+                            fitted_rect = Some(
+                                draw_bar_button_in_rect(
+                                    ui,
+                                    fitted,
+                                    "fitted_rect_button",
+                                    |_| egui::Color32::BLACK,
+                                    false,
+                                    |painter, _, r| {
+                                        fitted_icon = Some((painter.clip_rect(), r));
+                                    },
+                                )
+                                .response
+                                .rect,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(
             legacy_rect,
@@ -492,34 +496,38 @@ mod bar_button_touch_tests {
             ],
             ..Default::default()
         };
-        let _ = ctx.run(raw, |ctx| {
-            let state_id = bar_button_touch_state_id(ctx);
-            ctx.data_mut(|data| {
-                data.insert_temp(
-                    state_id,
-                    BarButtonTouchState {
-                        frame: Some(0),
-                        bar_rect: Some(bar),
-                        current: vec![close],
-                        ..Default::default()
-                    },
-                );
-            });
+        let _ = ctx
+            .run_pass(raw, |ctx| {
+                let state_id = bar_button_touch_state_id(ctx);
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        state_id,
+                        BarButtonTouchState {
+                            frame: Some(0),
+                            bar_rect: Some(bar),
+                            current: vec![close],
+                            ..Default::default()
+                        },
+                    );
+                });
 
-            assert!(
-                ctx.input(|input| { input.pointer.button_clicked(egui::PointerButton::Primary) })
-            );
-            assert!(!prepare_bar_button_touch_targets(
-                ctx,
-                1,
-                bar,
-                &crate::touch_correlation::TouchFrame::default(),
-            ));
-            let state = ctx
-                .data(|data| data.get_temp::<BarButtonTouchState>(state_id))
-                .unwrap();
-            assert!(state.resolved_ids.is_empty());
-        });
+                assert!(
+                    ctx.input(|input| {
+                        input.pointer.button_clicked(egui::PointerButton::Primary)
+                    })
+                );
+                assert!(!prepare_bar_button_touch_targets(
+                    ctx,
+                    1,
+                    bar,
+                    &crate::touch_correlation::TouchFrame::default(),
+                ));
+                let state = ctx
+                    .data(|data| data.get_temp::<BarButtonTouchState>(state_id))
+                    .unwrap();
+                assert!(state.resolved_ids.is_empty());
+            })
+            .drop_without_applying_deltas();
     }
 }
 

@@ -92,7 +92,7 @@ pub fn set_capture_probe(active: bool) {
         CAPTURE_PROBE_DETAIL_ATTEMPTS.store(0, Ordering::Relaxed);
     }
     CAPTURE_PROBE.store(active, Ordering::Relaxed);
-    #[cfg(feature = "wgpu")]
+    #[cfg(feature = "wgpu_no_default_features")]
     egui_wgpu::atlas_diag::set_capture_probe(active);
 }
 

@@ -144,11 +144,12 @@ pub fn show_window(
     // backdrop do the dimming. Disabled Ui opacity would also fade the window
     // fill and expose the viewer page underneath. Limit this style to the
     // editor draw; the confirmation and other UI retain their normal style.
-    let editor_style = ctx.style();
+    let editor_style = ctx.global_style();
     if confirmation_at_start != EditorConfirmation::None {
-        ctx.style_mut(|style| style.visuals.disabled_alpha = 1.0);
+        ctx.global_style_mut(|style| style.visuals.disabled_alpha = 1.0);
     }
     egui::Window::new("本の構成を編集")
+        .drag_area(egui::WindowDrag::Anywhere)
         .id(id)
         .order(egui::Order::Foreground)
         .enabled(confirmation_at_start == EditorConfirmation::None)
@@ -165,7 +166,7 @@ pub fn show_window(
             actions = render(ui, view, state);
         });
     if confirmation_at_start != EditorConfirmation::None {
-        ctx.set_style(editor_style);
+        ctx.set_global_style(editor_style);
     }
     if state.confirmation != EditorConfirmation::None {
         // A click opening a confirmation must not also accept it with a key
@@ -255,7 +256,7 @@ fn show_confirmation(
         });
     }
     let screen = ctx.content_rect();
-    let frame = egui::Frame::popup(&ctx.style());
+    let frame = egui::Frame::popup(&ctx.global_style());
     let margin = frame.total_margin();
     let size = (screen.size() - margin.sum() - egui::vec2(24.0, 24.0)).max(egui::vec2(1.0, 1.0));
     let mut choice = None;
@@ -295,6 +296,10 @@ fn show_confirmation(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .max_height(body_height)
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, true])
@@ -537,6 +542,10 @@ pub fn render(
             let scroll = &mut ui.spacing_mut().scroll;
             scroll.floating_allocated_width = scroll.bar_inner_margin + scroll.bar_width;
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .auto_shrink([false, true])
                 .max_height(ui.available_height().max(0.0))
                 .show(ui, |ui| {
@@ -703,6 +712,10 @@ fn source_list(
         );
     let height = ui.available_height().min(height).max(0.0);
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("composition_sources")
         .max_height(height)
         .auto_shrink([false, false])
@@ -898,6 +911,10 @@ fn unit_list(
     let row_height = result_row_height(ui);
     let height = ui.available_height().min(height).max(0.0);
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("composition_units")
         .max_height(height)
         .auto_shrink([false, false])
@@ -1235,7 +1252,7 @@ mod row_tests {
                 for confirmation in [EditorConfirmation::Remove, EditorConfirmation::Reload] {
                     let ctx = egui::Context::default();
                     crate::os_theme::apply_resolved(&ctx, theme);
-                    ctx.style_mut(|style| {
+                    ctx.global_style_mut(|style| {
                         style.animation_time = 0.0;
                         // A non-default alpha catches accidental resets to the default.
                         style.visuals.disabled_alpha = 0.23;
@@ -1257,7 +1274,7 @@ mod row_tests {
                     };
                     let mut output = egui::FullOutput::default();
                     for _ in 0..6 {
-                        output = ctx.run(
+                        output = ctx.run_pass(
                             egui::RawInput {
                                 screen_rect: Some(screen),
                                 ..Default::default()
@@ -1333,8 +1350,9 @@ mod row_tests {
             let mut fonts_ready = false;
             let mut h = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build_state(
-                    move |ctx, actions: &mut Vec<EditorUiAction>| {
+                .build_ui_state(
+                    move |root_ui, actions: &mut Vec<EditorUiAction>| {
+                        let ctx = &root_ui.ctx().clone();
                         if !fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             fonts_ready = true;
@@ -1399,15 +1417,17 @@ mod row_tests {
                     let id = egui::Id::new("confirmation_bounds");
                     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, physical / scale);
                     for _ in 0..6 {
-                        let _ = ctx.run(
-                            egui::RawInput {
-                                screen_rect: Some(screen),
-                                ..Default::default()
-                            },
-                            |ctx| {
-                                show_window(ctx, id, &view, &mut state, DialogKeys::default());
-                            },
-                        );
+                        let _ = ctx
+                            .run_pass(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    show_window(ctx, id, &view, &mut state, DialogKeys::default());
+                                },
+                            )
+                            .drop_without_applying_deltas();
                     }
                     let (heading, accept, accept_hit, cancel, cancel_hit, actual) = ctx
                         .data(|data| {
@@ -1467,21 +1487,23 @@ mod row_tests {
                             egui::vec2(width / scale, height / scale),
                         );
                         for _ in 0..5 {
-                            let _ = ctx.run(
-                                egui::RawInput {
-                                    screen_rect: Some(screen),
-                                    ..Default::default()
-                                },
-                                |ctx| {
-                                    show_window(
-                                        ctx,
-                                        egui::Id::new("footer_geometry_window"),
-                                        &view,
-                                        &mut state,
-                                        DialogKeys::default(),
-                                    );
-                                },
-                            );
+                            let _ = ctx
+                                .run_pass(
+                                    egui::RawInput {
+                                        screen_rect: Some(screen),
+                                        ..Default::default()
+                                    },
+                                    |ctx| {
+                                        show_window(
+                                            ctx,
+                                            egui::Id::new("footer_geometry_window"),
+                                            &view,
+                                            &mut state,
+                                            DialogKeys::default(),
+                                        );
+                                    },
+                                )
+                                .drop_without_applying_deltas();
                         }
                         let geometry = ctx
                             .data(|data| {
@@ -1520,28 +1542,39 @@ mod row_tests {
         let view = fixture(2);
         let mut state = EditorUiState::default();
         for _ in 0..3 {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(620.0, 640.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let output =
-                            unit_list(ui, &view, &mut state, 540.0, true, &mut vec![], &mut vec![]);
-                        ScrollLayout::from_output(&output).assert_height(
-                            HeightExpectation::Fits,
-                            ctx.content_rect(),
-                            ctx.pixels_per_point(),
-                        );
-                        assert_eq!(output.inner.len(), 2);
-                        assert!(output.inner[0].1.bottom() <= output.inner[1].1.top());
-                    });
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(620.0, 640.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                let output = unit_list(
+                                    ui,
+                                    &view,
+                                    &mut state,
+                                    540.0,
+                                    true,
+                                    &mut vec![],
+                                    &mut vec![],
+                                );
+                                ScrollLayout::from_output(&output).assert_height(
+                                    HeightExpectation::Fits,
+                                    ctx.content_rect(),
+                                    ctx.pixels_per_point(),
+                                );
+                                assert_eq!(output.inner.len(), 2);
+                                assert!(output.inner[0].1.bottom() <= output.inner[1].1.top());
+                            })
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
         }
     }
 
@@ -1550,14 +1583,16 @@ mod row_tests {
         for scale in [1.0, 2.0] {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(scale);
-            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            ctx.global_style_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none()
+            });
             let view = fixture(100);
             let mut state = EditorUiState::default();
             let mut previous_layout = None;
             let mut origin: Option<f32> = None;
             let mut first_indices = Vec::new();
             for frame in 0..12 {
-                let _ = ctx.run(
+                let _ = ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1570,7 +1605,7 @@ mod row_tests {
                                     unit: egui::MouseWheelUnit::Point,
                                     delta: egui::vec2(0.0, -800.0),
                                     modifiers: egui::Modifiers::NONE,
-                                },
+                                 phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown,},
                             ]
                         } else {
                             vec![]
@@ -1578,14 +1613,14 @@ mod row_tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 13.0;
                             let pitch = result_row_height(ui) + ui.spacing().item_spacing.y;
                             // egui draws from begin()'s loaded offset, and only
                             // applies this frame's wheel in end(). Output.state
                             // therefore describes the next render's offset.
                             let rendered_offset = egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("composition_units")))
-                                .unwrap_or_default().offset.y;
+                                .unwrap_or_default().clamped_offset().y;
                             let output =
                                 unit_list(ui, &view, &mut state, 360.0, true, &mut vec![], &mut vec![]);
                             let layout = ScrollLayout::from_output(&output);
@@ -1627,9 +1662,9 @@ mod row_tests {
                             if frame == 11 {
                                 assert!(layout.offset.y > previous_layout.unwrap().offset.y);
                             }
-                        });
+                        }));
                     },
-                );
+                ).drop_without_applying_deltas();
             }
             assert!(
                 first_indices.iter().any(|&index| index > 0),

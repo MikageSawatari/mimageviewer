@@ -269,11 +269,15 @@ fn page_turn_permission_service_vacant_composed_handler_starts_and_completes_bot
             .entry(egui::ViewportId::ROOT)
             .or_default()
             .native_pixels_per_point = Some(ppp);
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| run(ui, ctx));
-        });
+        let _ = ctx
+            .run_pass(input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| run(ui, ctx))
+                });
+            })
+            .drop_without_applying_deltas();
     }
     for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
         for (size, ppp, actual_composition) in [

@@ -700,24 +700,34 @@ mod tests {
         let mut request_focus = true;
 
         ctx.begin_pass(Default::default());
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = add_singleline_sensitive(ui, &mut password, Some(&mut request_focus), |edit| {
-                edit.id(field_id).password(true)
-            });
-        });
-        let _ = ctx.end_pass();
+        egui::CentralPanel::default().show(
+            &mut egui::Ui::new(
+                ctx.clone(),
+                egui::Id::unique("headless_manual_root"),
+                egui::UiBuilder::new(),
+            ),
+            |ui| {
+                let _ =
+                    add_singleline_sensitive(ui, &mut password, Some(&mut request_focus), |edit| {
+                        edit.id(field_id).password(true)
+                    });
+            },
+        );
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
         let modifiers = egui::Modifiers::SHIFT;
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::A),
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: Some(egui::Key::A),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
             ..Default::default()
         });
         begin_pass_diagnostics(&ctx);
@@ -736,7 +746,7 @@ mod tests {
             ctx.data(|data| data.get_temp(diagnostic_id).unwrap_or_default());
         assert!(diagnostic_is_anomalous(&diagnostic, None));
         let lines = format_key_diagnostic(&diagnostic, None);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
@@ -768,14 +778,14 @@ mod tests {
     }
 
     fn draw_text_fields(
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         first_id: egui::Id,
         second_id: egui::Id,
         first: &mut String,
         second: &mut String,
         first_focus_request: &mut bool,
     ) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let _ = show_singleline(ui, first, Some(first_focus_request), |edit| {
                 edit.id(first_id)
             });
@@ -792,9 +802,10 @@ mod tests {
         let mut first = String::new();
         let mut second = String::new();
         let mut focus_request = true;
-        crate::egui_output::discard_headless_output(ctx.run(Default::default(), |ctx| {
+        crate::egui_output::discard_headless_output(ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             draw_text_fields(
-                ctx,
+                ui,
                 first_id,
                 second_id,
                 &mut first,
@@ -802,9 +813,10 @@ mod tests {
                 &mut focus_request,
             );
         }));
-        crate::egui_output::discard_headless_output(ctx.run(Default::default(), |ctx| {
+        crate::egui_output::discard_headless_output(ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             draw_text_fields(
-                ctx,
+                ui,
                 first_id,
                 second_id,
                 &mut first,
@@ -812,14 +824,15 @@ mod tests {
                 &mut focus_request,
             );
         }));
-        crate::egui_output::discard_headless_output(ctx.run(
+        crate::egui_output::discard_headless_output(ctx.run_ui(
             egui::RawInput {
                 events: vec![key_event(egui::Key::Tab)],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 draw_text_fields(
-                    ctx,
+                    ui,
                     first_id,
                     second_id,
                     &mut first,
@@ -831,19 +844,23 @@ mod tests {
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
-        crate::egui_output::discard_headless_output(ctx.run(
+        crate::egui_output::discard_headless_output(ctx.run_ui(
             egui::RawInput {
                 events: vec![
                     egui::Event::Text("x".to_owned()),
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "あ".to_owned(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
                 ],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 draw_text_fields(
-                    ctx,
+                    ui,
                     first_id,
                     second_id,
                     &mut first,
@@ -887,7 +904,7 @@ mod tests {
                 TextInputDiagnosticKeyPolicy::Standard
             };
             for keyed_pass in [false, true] {
-                let _ = ctx.run(
+                ctx.run_ui(
                     viewport_raw_input(
                         egui::ViewportId::ROOT,
                         if keyed_pass {
@@ -896,8 +913,9 @@ mod tests {
                             Vec::new()
                         },
                     ),
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        egui::CentralPanel::default().show(ui, |ui| {
                             let assert_before_drawing = || {
                                 if keyed_pass {
                                     let diagnostic = diagnostic_for_pass(ctx).unwrap();
@@ -977,14 +995,15 @@ mod tests {
                             }
                         }
                     },
-                );
+                )
+                .drop_without_applying_deltas();
             }
             // Finalize the previous record once, after egui's end-pass validation.
             ctx.begin_pass(Default::default());
             assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
             assert!(!ime_input_active(&ctx));
             assert!(diagnostic_for_pass(&ctx).is_none());
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
@@ -994,18 +1013,21 @@ mod tests {
         let field_id = egui::Id::new("facade-forget-contract");
         let mut text = "abc".to_owned();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                     edit.id(field_id)
                 });
             });
-        });
-        let _ = ctx.run(
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
             viewport_raw_input(egui::ViewportId::ROOT, vec![key_event(egui::Key::Escape)]),
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 assert_eq!(ctx.memory(|memory| memory.focused()), None);
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     add_singleline(ui, &mut text, None, |edit| edit.id(field_id));
                 });
                 assert!(egui_ime::text_focus_contract_snapshot(ctx).is_none());
@@ -1014,11 +1036,14 @@ mod tests {
                 assert_eq!(diagnostic.field_id_after, Some(field_id));
                 assert!(diagnostic_is_anomalous(&diagnostic, None));
             },
-        );
-        let _ = ctx.run(Default::default(), |ctx| {
+        )
+        .drop_without_applying_deltas();
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             begin_pass_diagnostics(ctx);
             assert!(diagnostic_for_pass(ctx).is_none());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -1028,26 +1053,32 @@ mod tests {
             let field_id = egui::Id::new(("facade-restored-contract", external_latch));
             let mut text = String::new();
             let mut request_focus = true;
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(Default::default(), |ui| {
+                let ctx = &ui.ctx().clone();
+                egui::CentralPanel::default().show(ui, |ui| {
                     show_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                         edit.id(field_id)
                     });
                 });
-            });
-            let _ = ctx.run(
+            })
+            .drop_without_applying_deltas();
+            ctx.run_ui(
                 viewport_raw_input(
                     egui::ViewportId::ROOT,
                     vec![
                         egui::Event::Ime(egui::ImeEvent::Enabled),
-                        egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "あ".to_owned(),
+                            active_range_chars: None,
+                        }),
                         // An ordinary Enter while still composing exercises restoration.
                         // IME-handled Process presses never reach this event queue.
                         key_event(egui::Key::Enter),
                     ],
                 ),
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let focus_request = external_latch.then_some(&mut request_focus);
                         let output =
                             show_singleline(ui, &mut text, focus_request, |edit| edit.id(field_id));
@@ -1073,7 +1104,8 @@ mod tests {
                     assert_eq!(diagnostic.field_id_after, Some(field_id));
                     assert!(!diagnostic_is_anomalous(&diagnostic, Some(field_id)));
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         }
     }
 
@@ -1085,19 +1117,21 @@ mod tests {
             child,
             vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         let field_id = egui::Id::new("facade-root-field");
         let mut text = "abc".to_owned();
         let mut request_focus = true;
         let mut root_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
         root_input.viewports.insert(child, Default::default());
-        let _ = ctx.run(root_input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(root_input, |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                     edit.id(field_id)
                 });
             });
-        });
+        })
+        .drop_without_applying_deltas();
         let mut root_input = viewport_raw_input(
             egui::ViewportId::ROOT,
             vec![key_event(egui::Key::ArrowLeft)],
@@ -1135,7 +1169,7 @@ mod tests {
             ctx.data(|data| data.get_temp::<u64>(text_input_key_diagnostic_started_id(child))),
             Some(pass)
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -1148,16 +1182,21 @@ mod tests {
             Vec::new(),
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "あ".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
         ] {
-            let _ = ctx.run(viewport_raw_input(egui::ViewportId::ROOT, events), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(viewport_raw_input(egui::ViewportId::ROOT, events), |ui| {
+                let ctx = &ui.ctx().clone();
+                egui::CentralPanel::default().show(ui, |ui| {
                     add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                         edit.id(field_id)
                     });
                 });
-            });
+            })
+            .drop_without_applying_deltas();
         }
         assert_eq!(text, "あ");
         install_ime_input_policy(&ctx);
@@ -1166,7 +1205,7 @@ mod tests {
             egui::ViewportId::ROOT,
             &[]
         ));
-        let _ = ctx.run(
+        ctx.run_ui(
             viewport_raw_input(
                 egui::ViewportId::ROOT,
                 vec![
@@ -1180,12 +1219,14 @@ mod tests {
                     },
                 ],
             ),
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
+                egui::CentralPanel::default().show(ui, |ui| {
                     add_singleline(ui, &mut text, None, |edit| edit.id(field_id));
                 });
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert!(text.is_empty());
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
         assert!(!ime_composing_with_pending_events(

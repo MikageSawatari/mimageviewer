@@ -231,6 +231,10 @@ impl App {
                 ui.label(&pending.current_name);
             }
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(240.0)
                 .show(ui, |ui| {
                     for (source, result) in &pending.results {

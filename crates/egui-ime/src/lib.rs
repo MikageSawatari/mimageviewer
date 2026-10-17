@@ -35,16 +35,22 @@ impl ImeFocusState {
         }
     }
 
+    #[allow(
+        deprecated,
+        reason = "Enabled/Disabled remain compatibility notifications until producer cancellation has an equivalent contract"
+    )]
     fn apply_event(&mut self, event: &egui::Event) {
         match event {
             egui::Event::WindowFocused(false) => self.lose_focus(),
             egui::Event::Ime(ime) => {
                 *self = match ime {
                     egui::ImeEvent::Enabled => Self::Composing,
-                    egui::ImeEvent::Preedit(text) if !text.is_empty() => Self::Composing,
-                    egui::ImeEvent::Preedit(_)
+                    egui::ImeEvent::Preedit { text, .. } if !text.is_empty() => Self::Composing,
+                    egui::ImeEvent::Preedit { .. }
                     | egui::ImeEvent::Commit(_)
                     | egui::ImeEvent::Disabled => Self::Inactive,
+                    // Surrounding-text edits do not terminate the current composition.
+                    egui::ImeEvent::DeleteSurrounding { .. } => *self,
                 };
             }
             _ => {}
@@ -65,6 +71,20 @@ struct ImeInputPlugin {
 }
 
 impl ImeInputPlugin {
+    fn retain_viewports(
+        &mut self,
+        ctx: &egui::Context,
+        mut is_live: impl FnMut(egui::ViewportId) -> bool,
+    ) {
+        self.viewports.retain(|&id, _| {
+            if is_live(id) {
+                return true;
+            }
+            forget_viewport_text_focus(ctx, id);
+            false
+        });
+    }
+
     fn composing_in_viewport(&self, viewport_id: egui::ViewportId) -> bool {
         self.viewports
             .get(&viewport_id)
@@ -77,16 +97,24 @@ impl egui::Plugin for ImeInputPlugin {
         "miv_ime_input_policy"
     }
 
-    fn input_hook(&mut self, input: &mut egui::RawInput) {
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         // RawInput lists all live viewports. A destroyed viewport must not leave
         // composition behind when its id is reused without a terminal event.
-        self.viewports
-            .retain(|id, _| input.viewports.contains_key(id));
+        self.retain_viewports(ctx, |id| input.viewports.contains_key(&id));
         let state = self.viewports.entry(input.viewport_id).or_default();
         normalize_ime_input(&mut input.events, state);
         if !input.focused {
             state.lose_focus();
         }
+    }
+
+    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
+        // Normal viewport GC happens after the input hook. End that owner's
+        // input/focus policy now: the same ID can reopen before another UI pass
+        // observes its absence, and run_logic does not invoke input hooks.
+        // This is the complete post-GC registration set, including hidden and
+        // minimized viewports; visibility alone never ends their policy.
+        self.retain_viewports(ctx, |id| output.viewport_output.contains_key(&id));
     }
 }
 
@@ -98,6 +126,33 @@ pub fn install_ime_input_policy(ctx: &egui::Context) {
     ctx.add_plugin(ImeInputPlugin::default());
 }
 
+/// End IME policy ownership for registrations explicitly retired by the backend.
+///
+/// Pass exactly the IDs returned by [`egui::Context::retire_viewport`], including
+/// retired descendants. Call immediately after that operation, outside plugin
+/// callbacks and Context/backend locks, before another logic/UI operation or
+/// same-ID registration. Unlike normal end-pass GC, explicit retirement runs
+/// without input/output hooks, so those hooks cannot end the old owner's policy.
+///
+/// This removes only those owners' composition, text-focus contracts and focus
+/// retries. It does not consume input, reset shared widget data, install a plugin,
+/// or infer retirement from hidden/minimized metadata. Empty/already-cleaned
+/// lists are harmless; merely hiding/minimizing a live viewport must not call it.
+pub fn retire_viewport_ime_policy(ctx: &egui::Context, retired: &[egui::ViewportId]) {
+    let _ = ctx.with_plugin(|plugin: &mut ImeInputPlugin| {
+        for id in retired {
+            plugin.viewports.remove(id);
+        }
+    });
+    for &id in retired {
+        forget_viewport_text_focus(ctx, id);
+    }
+}
+
+#[allow(
+    deprecated,
+    reason = "Disabled is the Windows cancellation terminal; preserve notification compatibility during the 0.37 migration"
+)]
 fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState) {
     // Only a *non-empty* commit confirms text. Windows ends a cancelled composition
     // with an empty `Commit("")` (observed sequence on Esc:
@@ -122,7 +177,10 @@ fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState)
                 && *state != ImeFocusState::Inactive
                 && !commit_in_input
             {
-                normalized.push(egui::Event::Ime(egui::ImeEvent::Preedit(String::new())));
+                normalized.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: String::new(),
+                    active_range_chars: None,
+                }));
             }
         }
         state.apply_event(&event);
@@ -158,11 +216,21 @@ impl Default for ImeTextFocusContract {
 }
 
 fn focus_retry_id(viewport_id: egui::ViewportId, widget_id: egui::Id) -> egui::Id {
-    egui::Id::new((IME_FOCUS_RETRY_ID, viewport_id, widget_id))
+    egui::Id::unique((IME_FOCUS_RETRY_ID, viewport_id, widget_id))
 }
 
 fn text_focus_contract_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new((IME_TEXT_FOCUS_CONTRACT_ID, viewport_id))
+    egui::Id::unique((IME_TEXT_FOCUS_CONTRACT_ID, viewport_id))
+}
+
+fn forget_viewport_text_focus(ctx: &egui::Context, viewport_id: egui::ViewportId) {
+    ctx.data_mut(|data| {
+        if let Some(contract) =
+            data.remove_temp::<ImeTextFocusContract>(text_focus_contract_id(viewport_id))
+        {
+            data.remove_temp::<u64>(focus_retry_id(viewport_id, contract.widget_id));
+        }
+    });
 }
 
 /// A read-only copy of the helper-managed focus contract for host diagnostics.
@@ -280,18 +348,31 @@ fn remember_text_focus(
         focused_pass: ctx.cumulative_pass_nr(),
         diagnostic_key_policy,
     };
-    let id = text_focus_contract_id(ctx.viewport_id());
-    ctx.data_mut(|data| data.insert_temp(id, contract));
+    let viewport_id = ctx.viewport_id();
+    let id = text_focus_contract_id(viewport_id);
+    ctx.data_mut(|data| {
+        if let Some(previous) = data.get_temp::<ImeTextFocusContract>(id)
+            && previous.widget_id != widget_id
+        {
+            // A new field supersedes the previous field's recovery claim.
+            // Keep every pending retry owned by the known viewport contract,
+            // so viewport GC can remove it without clearing shared widget data.
+            data.remove_temp::<u64>(focus_retry_id(viewport_id, previous.widget_id));
+        }
+        data.insert_temp(id, contract);
+    });
 }
 
 fn forget_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
-    let id = text_focus_contract_id(ctx.viewport_id());
+    let viewport_id = ctx.viewport_id();
+    let id = text_focus_contract_id(viewport_id);
     ctx.data_mut(|data| {
         if data
             .get_temp::<ImeTextFocusContract>(id)
             .is_some_and(|contract| contract.widget_id == widget_id)
         {
             data.remove_temp::<ImeTextFocusContract>(id);
+            data.remove_temp::<u64>(focus_retry_id(viewport_id, widget_id));
         }
     });
 }
@@ -484,3 +565,250 @@ pub fn add_sized_singleline<'text>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod explicit_retirement_tests {
+    use super::*;
+
+    fn key_event() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::J,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn draw_field(
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        text: &mut String,
+        request: Option<&mut bool>,
+        lose_focus: bool,
+    ) -> egui::Response {
+        egui::CentralPanel::default()
+            .show(ui, |ui| {
+                let ctx = ui.ctx().clone();
+                show_singleline(ui, text, request, |edit| {
+                    if lose_focus {
+                        ctx.memory_mut(|memory| memory.surrender_focus(id));
+                    }
+                    edit.id(id)
+                })
+                .response
+                .response
+            })
+            .inner
+    }
+
+    #[test]
+    fn explicit_retirement_ends_only_retired_owners_before_logic_and_same_id_reopen() {
+        let ctx = egui::Context::default();
+        install_ime_input_policy(&ctx);
+        ctx.set_embed_viewports(false);
+        let target = egui::ViewportId::from_hash_of("retired-ime-target");
+        let descendant = egui::ViewportId::from_hash_of("retired-ime-descendant");
+        let sibling = egui::ViewportId::from_hash_of("retired-ime-sibling");
+        let owners = [target, descendant, sibling];
+        // Reuse one widget ID across owners to exercise viewport-scoped retries.
+        let field = egui::Id::unique("retired-ime-field");
+        let input = |viewport_id, events| {
+            let mut input = egui::RawInput {
+                viewport_id,
+                events,
+                ..Default::default()
+            };
+            for id in owners {
+                input.viewports.insert(
+                    id,
+                    egui::ViewportInfo {
+                        parent: Some(if id == descendant {
+                            target
+                        } else {
+                            egui::ViewportId::ROOT
+                        }),
+                        minimized: Some(true),
+                        occluded: Some(true),
+                        ..Default::default()
+                    },
+                );
+            }
+            input
+        };
+        let declare = |ctx: &egui::Context, id| {
+            ctx.show_viewport_deferred(
+                id,
+                egui::ViewportBuilder::default().with_visible(false),
+                |_, _| {},
+            );
+        };
+        ctx.run_ui(input(egui::ViewportId::ROOT, vec![]), |ui| {
+            declare(ui.ctx(), target);
+            declare(ui.ctx(), sibling);
+        })
+        .drop_without_applying_deltas();
+
+        let mut texts = [
+            "target".to_owned(),
+            "descendant".to_owned(),
+            "sibling".to_owned(),
+        ];
+        for (id, text) in owners.into_iter().zip(&mut texts) {
+            let mut request = true;
+            ctx.run_ui(input(id, vec![]), |ui| {
+                if id == target {
+                    declare(ui.ctx(), descendant);
+                }
+                draw_field(ui, field, text, Some(&mut request), false);
+            })
+            .drop_without_applying_deltas();
+            ctx.run_ui(
+                input(
+                    id,
+                    vec![
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "変換".into(),
+                            active_range_chars: None,
+                        }),
+                        key_event(),
+                    ],
+                ),
+                |ui| {
+                    if id == target {
+                        declare(ui.ctx(), descendant);
+                    }
+                    assert!(draw_field(ui, field, text, None, true).has_focus());
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        let snapshot = |id| {
+            ctx.data(|data| {
+                let contract = data
+                    .get_temp::<ImeTextFocusContract>(text_focus_contract_id(id))
+                    .unwrap();
+                (
+                    contract.widget_id,
+                    contract.focused_pass,
+                    data.get_temp::<u64>(focus_retry_id(id, field)).unwrap(),
+                )
+            })
+        };
+        let sibling_before = snapshot(sibling);
+        let sibling_input_before = ctx.input_for(sibling, |input| input.events.clone());
+        let target_retry = snapshot(target).2;
+        // All owners are hidden/minimized yet still live. Neither an empty
+        // retirement notification nor logic-only metadata updates may prune them.
+        retire_viewport_ime_policy(&ctx, &[]);
+        let _ = ctx.run_logic(&input(egui::ViewportId::ROOT, vec![]), |ctx| {
+            for id in owners {
+                assert!(ime_input_active_in_viewport(ctx, id));
+            }
+        });
+
+        let retired = ctx.retire_viewport(target);
+        assert_eq!(retired.len(), 2);
+        assert!(retired.contains(&target));
+        assert!(retired.contains(&descendant));
+        retire_viewport_ime_policy(&ctx, &retired);
+        for id in [target, descendant] {
+            assert!(!ime_input_active_in_viewport(&ctx, id));
+            ctx.data(|data| {
+                assert!(
+                    data.get_temp::<ImeTextFocusContract>(text_focus_contract_id(id))
+                        .is_none()
+                );
+                assert!(data.get_temp::<u64>(focus_retry_id(id, field)).is_none());
+            });
+        }
+        assert!(ime_input_active_in_viewport(&ctx, sibling));
+        assert_eq!(snapshot(sibling), sibling_before);
+        assert_eq!(
+            ctx.input_for(sibling, |input| input.events.clone()),
+            sibling_input_before
+        );
+        // An unknown/already retired Context ID yields no cleanup targets.
+        let retired_again = ctx.retire_viewport(target);
+        assert!(retired_again.is_empty());
+        retire_viewport_ime_policy(&ctx, &retired_again);
+        assert_eq!(snapshot(sibling), sibling_before);
+
+        // Reopen from logic with no intervening UI pass. Stale native metadata
+        // intentionally still contains both retired IDs, so hooks cannot detect
+        // the previous owner's absence and repair this later.
+        let _ = ctx.run_logic(&input(egui::ViewportId::ROOT, vec![]), |ctx| {
+            assert!(!ime_input_active_in_viewport(ctx, target));
+            assert!(ime_input_active_in_viewport(ctx, sibling));
+            declare(ctx, target);
+        });
+        for _ in 0..=target_retry {
+            ctx.run_ui(input(target, vec![]), |_| {})
+                .drop_without_applying_deltas();
+        }
+        let mut reopened = "reopened".to_owned();
+        ctx.run_ui(input(target, vec![key_event()]), |ui| {
+            assert!(!ime_input_active(ui.ctx()));
+            assert!(text_focus_contract_snapshot(ui.ctx()).is_none());
+            assert!(recovering_text_input(ui.ctx()).is_none());
+            assert!(!draw_field(ui, field, &mut reopened, None, false).has_focus());
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(reopened, "reopened");
+        assert_eq!(snapshot(sibling), sibling_before);
+        assert!(ime_input_active_in_viewport(&ctx, sibling));
+
+        let sibling_events = vec![
+            egui::Event::Ime(egui::ImeEvent::Commit("確定".into())),
+            egui::Event::Text("!".into()),
+        ];
+        ctx.run_ui(input(sibling, sibling_events.clone()), |ui| {
+            assert_eq!(ui.ctx().input(|input| input.events.clone()), sibling_events);
+            assert!(!ime_input_active(ui.ctx()));
+            assert!(draw_field(ui, field, &mut texts[2], None, false).has_focus());
+        })
+        .drop_without_applying_deltas();
+        assert!(texts[2].contains("確定"));
+        assert!(texts[2].ends_with('!'));
+    }
+
+    #[test]
+    fn explicit_retirement_cleans_focus_contract_without_installing_input_plugin() {
+        let ctx = egui::Context::default();
+        let target = egui::ViewportId::from_hash_of("uninstalled-retired-ime-target");
+        let sibling = egui::ViewportId::from_hash_of("uninstalled-retired-ime-sibling");
+        let field = egui::Id::unique("uninstalled-retired-ime-field");
+        ctx.data_mut(|data| {
+            for id in [target, sibling] {
+                data.insert_temp(
+                    text_focus_contract_id(id),
+                    ImeTextFocusContract {
+                        widget_id: field,
+                        ..Default::default()
+                    },
+                );
+                data.insert_temp(focus_retry_id(id, field), 1_u64);
+            }
+        });
+        retire_viewport_ime_policy(&ctx, &[target]);
+        assert!(ctx.with_plugin(|_: &mut ImeInputPlugin| ()).is_none());
+        ctx.data(|data| {
+            assert!(
+                data.get_temp::<ImeTextFocusContract>(text_focus_contract_id(target))
+                    .is_none()
+            );
+            assert!(
+                data.get_temp::<u64>(focus_retry_id(target, field))
+                    .is_none()
+            );
+            assert!(
+                data.get_temp::<ImeTextFocusContract>(text_focus_contract_id(sibling))
+                    .is_some()
+            );
+            assert_eq!(
+                data.get_temp::<u64>(focus_retry_id(sibling, field)),
+                Some(1)
+            );
+        });
+    }
+}

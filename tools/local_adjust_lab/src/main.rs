@@ -188,7 +188,7 @@ fn apply_lab_dark_theme(ctx: &egui::Context) {
     // egui 0.33 can resolve popups against the OS light style unless the theme
     // preference itself is pinned. Keep the lab dark even inside ComboBox popups.
     ctx.set_theme(egui::ThemePreference::Dark);
-    ctx.style_mut(|style| {
+    ctx.global_style_mut(|style| {
         style.visuals = lab_dark_visuals();
         apply_lab_text_style(style);
     });
@@ -268,7 +268,7 @@ impl LabHoverTipExt for egui::Response {
 
 fn lab_combo_box<R>(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
     selected_text: impl Into<egui::WidgetText>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
@@ -2146,12 +2146,13 @@ impl LocalAdjustLabApp {
         save_recent_files(&self.recent_files)
     }
 
-    fn draw_menu_bar(&mut self, ctx: &egui::Context) {
+    fn draw_menu_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         let recent_files = self.recent_files.clone();
         let current_path = self.image.as_ref().map(|image| image.path.clone());
         let mut path_to_load = None;
 
-        egui::TopBottomPanel::top("local_adjust_lab_menubar").show(ctx, |ui| {
+        egui::Panel::top("local_adjust_lab_menubar").show(root_ui, |ui| {
             apply_lab_dark_ui(ui);
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("読み込み", |ui| {
@@ -5355,6 +5356,10 @@ impl LocalAdjustLabApp {
                                 ui.set_max_width(PANEL_W);
                                 ui.set_min_height(body_height);
                                 egui::ScrollArea::vertical()
+                                    .scroll_source(egui::scroll_area::ScrollSource {
+                                        drag: egui::scroll_area::DragScroll::Always,
+                                        ..Default::default()
+                                    })
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
@@ -5410,6 +5415,10 @@ impl LocalAdjustLabApp {
                         ui.set_max_height(body_height);
                         apply_lab_dark_ui(ui);
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .max_height(body_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
@@ -6337,13 +6346,14 @@ impl LocalAdjustLabApp {
         let current_kind = self.add_layer_mask_kind;
         let mut add_requested = None;
         let subject_model_available = subject_model_available();
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("補正レイヤーを追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .order(egui::Order::Debug)
             .frame(dialog_frame)
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
@@ -6363,6 +6373,10 @@ impl LocalAdjustLabApp {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .max_height(320.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -6391,13 +6405,13 @@ impl LocalAdjustLabApp {
         let mut keep_manual_override = self.change_mask_keep_manual_override;
         let mut selected_kind = None;
         let subject_model_available = subject_model_available();
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("マスク種類変更")
+        egui::Window::new("マスク種類変更").drag_area(egui::WindowDrag::Anywhere)
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
             .default_pos(ctx.content_rect().min + egui::vec2(90.0, 60.0))
@@ -6416,7 +6430,7 @@ impl LocalAdjustLabApp {
                     .color(Color32::from_gray(180)),
                 );
                 ui.separator();
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .max_height(300.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -6456,13 +6470,14 @@ impl LocalAdjustLabApp {
             .unwrap_or(EffectKind::None);
         let mut open = self.effect_picker_dialog_open;
         let mut selected_kind = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("効果選択")
+            .drag_area(egui::WindowDrag::Anywhere)
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
             .default_pos(ctx.content_rect().min + egui::vec2(80.0, 50.0))
@@ -6502,6 +6517,10 @@ impl LocalAdjustLabApp {
                 let query = self.effect_picker_query.trim().to_string();
                 let picker_body_height = ui.available_height().clamp(240.0, 680.0);
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .max_height(picker_body_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -8605,7 +8624,8 @@ impl LocalAdjustLabApp {
 }
 
 impl eframe::App for LocalAdjustLabApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = &root_ui.ctx().clone();
         let update_start = Instant::now();
         self.perf_stats.ui_frames += 1;
         if let Some(prev) = self.perf_last_update_start.replace(update_start) {
@@ -8767,7 +8787,7 @@ impl eframe::App for LocalAdjustLabApp {
             self.switch_tool(MaskTool::Select);
         }
 
-        self.draw_menu_bar(ctx);
+        self.draw_menu_bar(root_ui);
         self.poll_segmentation(ctx);
         self.poll_lut_load(ctx);
         self.poll_render(ctx);
@@ -8789,7 +8809,7 @@ impl eframe::App for LocalAdjustLabApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(Color32::from_rgb(28, 28, 30)))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 let full_rect = ui.max_rect();
                 self.draw_canvas(ui);
                 self.draw_overlay_panel(ctx, full_rect);

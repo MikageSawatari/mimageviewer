@@ -532,7 +532,8 @@ impl TesterApp {
 }
 
 impl eframe::App for TesterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root_ui.ctx().clone();
         // ── graceful shutdown ──
         // ウィンドウ × クリック等で close 要求が出たら、bridge とプラグイン GUI を
         // 順番に破棄してから終了する。Rust の Drop だと宣言順の逆で gui_host が
@@ -546,7 +547,7 @@ impl eframe::App for TesterApp {
             // close_requested はそのまま伝播してウィンドウが閉じる
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        egui::Panel::top("top").show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("VST3 Host Tester");
                 ui.separator();
@@ -557,10 +558,10 @@ impl eframe::App for TesterApp {
             });
         });
 
-        egui::SidePanel::left("plugins")
+        egui::Panel::left("plugins")
             .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show(root_ui, |ui| {
                 ui.heading("Plugins");
                 ui.horizontal(|ui| {
                     if ui.button("Rescan").clicked() {
@@ -604,25 +605,30 @@ impl eframe::App for TesterApp {
                 ui.separator();
 
                 let mut clicked: Option<usize> = None;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for &i in &matches {
-                        let p = &self.plugins[i];
-                        let selected = self.selected == Some(i);
-                        if ui
-                            .selectable_label(selected, &p.display_name)
-                            .on_hover_text(p.path.display().to_string())
-                            .clicked()
-                        {
-                            clicked = Some(i);
+                egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        for &i in &matches {
+                            let p = &self.plugins[i];
+                            let selected = self.selected == Some(i);
+                            if ui
+                                .selectable_label(selected, &p.display_name)
+                                .on_hover_text(p.path.display().to_string())
+                                .clicked()
+                            {
+                                clicked = Some(i);
+                            }
                         }
-                    }
-                });
+                    });
                 if let Some(i) = clicked {
                     self.selected = Some(i);
                 }
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 let load_enabled = self.selected.is_some() && self.bridge.is_none();
                 if ui
@@ -747,6 +753,10 @@ impl eframe::App for TesterApp {
             ui.separator();
             ui.heading("Log");
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .auto_shrink([false; 2])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {

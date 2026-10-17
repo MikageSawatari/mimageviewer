@@ -203,9 +203,11 @@ mod tests {
         size: egui::Vec2,
         events: Vec<egui::Event>,
     ) -> egui::Rect {
-        let _ = ctx.run(raw_input(size, events), |ctx| {
-            app.show_thumb_quality_dialog_window(ctx);
-        });
+        let _ = ctx
+            .run_pass(raw_input(size, events), |ctx| {
+                app.show_thumb_quality_dialog_window(ctx);
+            })
+            .drop_without_applying_deltas();
         ctx.memory(|memory| {
             memory
                 .area_rect(egui::Id::new(THUMB_QUALITY_DIALOG_ID))
@@ -219,21 +221,25 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> ThumbQualityPanelAction {
         let mut action = ThumbQualityPanelAction::default();
-        let _ = ctx.run(raw_input(size, events), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut px = 512;
-                let mut quality = 80;
-                action = draw_thumb_quality_panel(
-                    ui,
-                    "A",
-                    &None,
-                    &mut px,
-                    &mut quality,
-                    0,
-                    egui::vec2(240.0, 180.0),
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(raw_input(size, events), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut px = 512;
+                        let mut quality = 80;
+                        action = draw_thumb_quality_panel(
+                            ui,
+                            "A",
+                            &None,
+                            &mut px,
+                            &mut quality,
+                            0,
+                            egui::vec2(240.0, 180.0),
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         action
     }
 
@@ -473,6 +479,8 @@ mod tests {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -480.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
             ]
         };
@@ -571,7 +579,7 @@ mod tests {
         }
         // Match egui's title-bar layout: the close glyph is centered in the right-most square
         // whose side is the full title height (window.rs `TitleBar::close_button_ui`).
-        let style = ctx.style();
+        let style = ctx.global_style();
         let frame = egui::Frame::window(&style);
         let heading = egui::TextStyle::Heading.resolve(&style);
         let title_inner_height = ctx.fonts_mut(|fonts| fonts.row_height(&heading));
@@ -590,12 +598,14 @@ mod tests {
                 pointer_button(close_pos, true),
             ],
         );
-        let _ = ctx.run(
-            raw_input(size, vec![pointer_button(close_pos, false)]),
-            |ctx| {
-                app.show_thumb_quality_dialog_window(ctx);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                raw_input(size, vec![pointer_button(close_pos, false)]),
+                |ctx| {
+                    app.show_thumb_quality_dialog_window(ctx);
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(!app.tq.show);
         assert!(app.tq.sample.is_none());
@@ -629,7 +639,7 @@ impl App {
             let dialog_rect =
                 egui::Rect::from_center_size(layout.safe_rect.center(), layout.default_size);
 
-            egui::Window::new(THUMB_QUALITY_DIALOG_ID)
+            egui::Window::new(THUMB_QUALITY_DIALOG_ID).drag_area(egui::WindowDrag::Anywhere)
                 .id(egui::Id::new(THUMB_QUALITY_DIALOG_ID))
                 .open(&mut open)
                 .resizable(true)
@@ -687,7 +697,7 @@ impl App {
                                         super::non_overlapping_dialog_scroll_style(
                                             ui.spacing().scroll,
                                         );
-                                    egui::ScrollArea::vertical()
+                                    egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                         .id_salt("thumb_quality_dialog_body")
                                         .auto_shrink([false, false])
                                         .max_height(body_size.y)

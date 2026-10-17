@@ -37,18 +37,21 @@ fn rating_membership_move_keeps_real_seek_strip_and_page_number_painted() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
         let mut strip = None;
         let mut track = None;
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(full),
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.draw_fullscreen_seek_overlay(ui, ctx, full, 4, false, false);
-                    strip =
-                        ctx.read_response(ui.make_persistent_id("fullscreen_still_seek_strip_row"));
-                    track = ctx.read_response(ui.make_persistent_id("fullscreen_seek_track"));
-                    app.draw_fullscreen_page_number_overlay(ui, full, 4, false);
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        app.draw_fullscreen_seek_overlay(ui, ctx, full, 4, false, false);
+                        strip = ctx.read_response(
+                            ui.make_persistent_id("fullscreen_still_seek_strip_row"),
+                        );
+                        track = ctx.read_response(ui.make_persistent_id("fullscreen_seek_track"));
+                        app.draw_fullscreen_page_number_overlay(ui, full, 4, false);
+                    })
                 });
             },
         );
@@ -84,27 +87,30 @@ fn menu_frame(
 ) -> MenuFrame {
     let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
     let mut toggle = None;
-    let output = ctx.run(
+    let output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(full),
             events,
             ..Default::default()
         },
         |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                    toggle =
-                        ctx.read_response(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
-                });
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| {
+                        app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                        toggle =
+                            ctx.read_response(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
+                    })
+            });
         },
     );
     MenuFrame {
         toggle: toggle.expect("still seek strip menu button response"),
         shapes: output.shapes,
         wheel_remaining: ctx.input(|input| {
-            input.raw_scroll_delta != egui::Vec2::ZERO
+            crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options))
+                != egui::Vec2::ZERO
                 || input.smooth_scroll_delta != egui::Vec2::ZERO
                 || input
                     .events
@@ -121,20 +127,22 @@ fn touch_toggle_frame(
 ) -> MenuFrame {
     let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
     let mut toggle = None;
-    let output = ctx.run(
+    let output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(full),
             ..Default::default()
         },
         |ctx| {
             test_arm_bar_button_touch_click(ctx, FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID, full);
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                    toggle =
-                        ctx.read_response(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
-                });
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| {
+                        app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                        toggle =
+                            ctx.read_response(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
+                    })
+            });
         },
     );
     MenuFrame {
@@ -203,29 +211,33 @@ fn menu_key_frame(key: egui::Key) -> (FsKeyAction, bool) {
         jump_to: None,
         music_ctrl_wheel_gate_reached: false,
     };
-    let _ = ctx.run(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            events: vec![plain_key_press(key)],
-            ..Default::default()
-        },
-        |ctx| {
-            cache_fullscreen_keyboard_owner_for_test(ctx);
-            action = app.handle_fs_key_input(ctx, 3, false);
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fullscreen_seek_overlay(
-                        ui,
-                        ctx,
-                        egui::Rect::from_min_size(egui::Pos2::ZERO, size),
-                        3,
-                        false,
-                        false,
-                    );
+    let _ = ctx
+        .run_pass(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![plain_key_press(key)],
+                ..Default::default()
+            },
+            |ctx| {
+                cache_fullscreen_keyboard_owner_for_test(ctx);
+                action = app.handle_fs_key_input(ctx, 3, false);
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fullscreen_seek_overlay(
+                                ui,
+                                ctx,
+                                egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+                                3,
+                                false,
+                                false,
+                            );
+                        })
                 });
-        },
-    );
+            },
+        )
+        .drop_without_applying_deltas();
     (action, fs_still_seek_strip_popup_open(&ctx))
 }
 
@@ -547,6 +559,8 @@ fn still_seek_popup_short_window_scrolls_both_columns_and_consumes_wheel() {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, -5.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
             ],
         );
@@ -609,24 +623,27 @@ fn still_seek_popup_regular_and_narrow_snapshots() {
         app.settings.still_seek_strip_height_values.smallest = 36;
         app.settings.still_seek_strip_height = crate::settings::StillSeekStripHeight::Medium;
         let mut initialized = false;
-        let mut harness = crate::test_ui::builder().with_size(size).build(|ctx| {
-            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !initialized {
-                crate::ui_fonts::configure_fonts(ctx);
-                egui::Popup::open_id(
-                    ctx,
-                    egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
-                );
-                initialized = true;
-                ctx.request_repaint();
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    let full = ctx.content_rect();
-                    app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                });
-        });
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(|root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !initialized {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    egui::Popup::open_id(
+                        ctx,
+                        egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
+                    );
+                    initialized = true;
+                    ctx.request_repaint();
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| {
+                        let full = ctx.content_rect();
+                        app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                    });
+            });
         harness.run();
         harness.snapshot(name);
         snapshots.extend_harness(&mut harness);

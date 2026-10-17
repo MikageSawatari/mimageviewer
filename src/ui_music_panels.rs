@@ -71,7 +71,6 @@ pub(crate) fn test_script_music_audio_track_popup_open(ctx: &egui::Context) -> b
 #[cfg(windows)]
 fn consume_music_popup_wheel(ctx: &egui::Context) {
     ctx.input_mut(|input| {
-        input.raw_scroll_delta = egui::Vec2::ZERO;
         input.smooth_scroll_delta = egui::Vec2::ZERO;
         input
             .events
@@ -1152,6 +1151,10 @@ impl App {
         let mut open_external_url: Option<String> = None;
 
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt(("music_right_scroll", fs_idx))
             .auto_shrink([false, false])
             .show(&mut child, |ui| {
@@ -2777,50 +2780,54 @@ mod tests {
                 let mut frame = |events| {
                     clock += 1.0 / 60.0;
                     let mut result = None;
-                    let _ = ctx.run(
-                        egui::RawInput {
-                            screen_rect: Some(egui::Rect::from_min_size(
-                                egui::Pos2::ZERO,
-                                egui::vec2(width, 360.0),
-                            )),
-                            events,
-                            time: Some(clock),
-                            ..Default::default()
-                        },
-                        |ctx| {
-                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
-                                ctx,
-                                |ui| {
-                                    let hud = egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 360.0 - MUSIC_HUD_HEIGHT),
-                                        egui::pos2(width, 360.0),
-                                    );
-                                    let layout = music_hud_row_layout(
-                                        hud,
-                                        measure_music_hud_row(ui, &chrome, &rows),
-                                    );
-                                    let actions = draw_music_playback_row(
-                                        ui,
-                                        hud,
-                                        0,
-                                        &chrome,
-                                        &layout,
-                                        &rows,
-                                        selector_id,
-                                        false,
-                                        MusicHudPresentation::Interactive,
-                                        &crate::keymap::Keymap::empty(),
-                                        &mut last_volume,
-                                        &mut speed_open,
-                                    );
-                                    result = Some((
-                                        layout.rects[MusicHudItem::Track as usize].unwrap(),
-                                        actions.selected_audio_track,
-                                    ));
-                                },
-                            );
-                        },
-                    );
+                    let _ = ctx
+                        .run_pass(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 360.0),
+                                )),
+                                events,
+                                time: Some(clock),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                ctx.root_ui(|root_ui| {
+                                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                        root_ui,
+                                        |ui| {
+                                            let hud = egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 360.0 - MUSIC_HUD_HEIGHT),
+                                                egui::pos2(width, 360.0),
+                                            );
+                                            let layout = music_hud_row_layout(
+                                                hud,
+                                                measure_music_hud_row(ui, &chrome, &rows),
+                                            );
+                                            let actions = draw_music_playback_row(
+                                                ui,
+                                                hud,
+                                                0,
+                                                &chrome,
+                                                &layout,
+                                                &rows,
+                                                selector_id,
+                                                false,
+                                                MusicHudPresentation::Interactive,
+                                                &crate::keymap::Keymap::empty(),
+                                                &mut last_volume,
+                                                &mut speed_open,
+                                            );
+                                            result = Some((
+                                                layout.rects[MusicHudItem::Track as usize].unwrap(),
+                                                actions.selected_audio_track,
+                                            ));
+                                        },
+                                    )
+                                });
+                            },
+                        )
+                        .drop_without_applying_deltas();
                     result.unwrap()
                 };
                 for _ in 0..4 {
@@ -2897,7 +2904,7 @@ mod tests {
                     for scan in [false, true] {
                         let mut navigation = None;
                         let mut slots = None;
-                        let output = ctx.run(
+                        let output = ctx.run_pass(
                             egui::RawInput {
                                 screen_rect: Some(egui::Rect::from_min_size(
                                     egui::Pos2::ZERO,
@@ -2908,64 +2915,66 @@ mod tests {
                                 ..Default::default()
                             },
                             |ctx| {
-                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
-                                    ctx,
-                                    |ui| {
-                                        let hud = egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 140.0 - MUSIC_HUD_HEIGHT),
-                                            ui.max_rect().max,
-                                        );
-                                        let id = ui.id().with("track");
-                                        let layout = music_hud_row_layout(
-                                            hud,
-                                            measure_music_hud_row(ui, &chrome, tracks),
-                                        );
-                                        let nav = if scan {
-                                            let nav = draw_music_scan_row(
-                                                ui, hud, 0, &chrome, &layout, tracks, id, true,
+                                ctx.root_ui(|root_ui| {
+                                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                        root_ui,
+                                        |ui| {
+                                            let hud = egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 140.0 - MUSIC_HUD_HEIGHT),
+                                                ui.max_rect().max,
                                             );
-                                            let _ = draw_music_file_navigation(
-                                                ui,
-                                                nav,
-                                                0,
-                                                egui::Sense::click(),
-                                                [None; 2],
-                                                true,
-                                            );
-                                            nav
-                                        } else {
-                                            let _ = draw_music_playback_row(
-                                                ui,
+                                            let id = ui.id().with("track");
+                                            let layout = music_hud_row_layout(
                                                 hud,
-                                                0,
-                                                &chrome,
-                                                &layout,
-                                                tracks,
-                                                id,
-                                                true,
-                                                MusicHudPresentation::Interactive,
-                                                &crate::keymap::Keymap::empty(),
-                                                &mut None,
-                                                &mut false,
+                                                measure_music_hud_row(ui, &chrome, tracks),
                                             );
-                                            layout.navigation()
-                                        };
-                                        for (index, name) in
-                                            ["music_hud_prevfile", "music_hud_nextfile"]
-                                                .into_iter()
-                                                .enumerate()
-                                        {
-                                            assert_eq!(
-                                                ctx.read_response(ui.id().with((name, 0usize)))
-                                                    .unwrap()
-                                                    .rect,
-                                                nav[index]
-                                            );
-                                        }
-                                        navigation = Some(nav);
-                                        slots = Some(layout.rects);
-                                    },
-                                );
+                                            let nav = if scan {
+                                                let nav = draw_music_scan_row(
+                                                    ui, hud, 0, &chrome, &layout, tracks, id, true,
+                                                );
+                                                let _ = draw_music_file_navigation(
+                                                    ui,
+                                                    nav,
+                                                    0,
+                                                    egui::Sense::click(),
+                                                    [None; 2],
+                                                    true,
+                                                );
+                                                nav
+                                            } else {
+                                                let _ = draw_music_playback_row(
+                                                    ui,
+                                                    hud,
+                                                    0,
+                                                    &chrome,
+                                                    &layout,
+                                                    tracks,
+                                                    id,
+                                                    true,
+                                                    MusicHudPresentation::Interactive,
+                                                    &crate::keymap::Keymap::empty(),
+                                                    &mut None,
+                                                    &mut false,
+                                                );
+                                                layout.navigation()
+                                            };
+                                            for (index, name) in
+                                                ["music_hud_prevfile", "music_hud_nextfile"]
+                                                    .into_iter()
+                                                    .enumerate()
+                                            {
+                                                assert_eq!(
+                                                    ctx.read_response(ui.id().with((name, 0usize)))
+                                                        .unwrap()
+                                                        .rect,
+                                                    nav[index]
+                                                );
+                                            }
+                                            navigation = Some(nav);
+                                            slots = Some(layout.rects);
+                                        },
+                                    )
+                                });
                             },
                         );
                         let nav = navigation.unwrap();
@@ -3015,22 +3024,26 @@ mod tests {
             state: crate::video::AudioTrackSelectionDisplayState::Applied,
         });
         let mut samples = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for long in [false, true] {
-                    let mut chrome = music_hud_snapshot_chrome();
-                    if long {
-                        chrome.position_secs = 445556.0;
-                        chrome.duration_secs = 845556.0;
-                        chrome.volume = 8.0;
-                        chrome.playback_speed = 0.25;
-                    }
-                    for tracks in [&[][..], &rows[..]] {
-                        samples.push(measure_music_hud_row(ui, &chrome, tracks));
-                    }
-                }
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        for long in [false, true] {
+                            let mut chrome = music_hud_snapshot_chrome();
+                            if long {
+                                chrome.position_secs = 445556.0;
+                                chrome.duration_secs = 845556.0;
+                                chrome.volume = 8.0;
+                                chrome.playback_speed = 0.25;
+                            }
+                            for tracks in [&[][..], &rows[..]] {
+                                samples.push(measure_music_hud_row(ui, &chrome, tracks));
+                            }
+                        }
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         for metrics in samples {
             for width in 1..=2000 {
                 let hud = egui::Rect::from_min_size(
@@ -3112,69 +3125,74 @@ mod tests {
         crate::ui_fonts::configure_fonts(&ctx);
         let mut last_volume = Some(0.5);
         let mut speed_open = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let hud = egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(300.0, MUSIC_HUD_HEIGHT),
-                );
-                let chrome = music_hud_snapshot_chrome();
-                let layout = music_hud_row_layout(hud, measure_music_hud_row(ui, &chrome, &[]));
-                let passive = draw_music_playback_row(
-                    ui,
-                    hud,
-                    0,
-                    &chrome,
-                    &layout,
-                    &[],
-                    ui.id().with("track"),
-                    false,
-                    MusicHudPresentation::Disabled,
-                    &crate::keymap::Keymap::empty(),
-                    &mut last_volume,
-                    &mut speed_open,
-                );
-                assert!(passive.set_vol.is_none());
-                assert_eq!(last_volume, Some(0.5));
-                assert!(
-                    speed_open,
-                    "passive chrome cannot close the active context's popup"
-                );
-                let active = draw_music_playback_row(
-                    ui,
-                    hud,
-                    0,
-                    &chrome,
-                    &layout,
-                    &[],
-                    ui.id().with("track"),
-                    false,
-                    MusicHudPresentation::Interactive,
-                    &crate::keymap::Keymap::empty(),
-                    &mut last_volume,
-                    &mut speed_open,
-                );
-                assert_eq!(active.set_vol, Some(0.5));
-                assert!(active.vol_persist);
-                assert_eq!(last_volume, None);
-                assert!(!speed_open);
-                let settled = draw_music_playback_row(
-                    ui,
-                    hud,
-                    0,
-                    &chrome,
-                    &layout,
-                    &[],
-                    ui.id().with("track"),
-                    false,
-                    MusicHudPresentation::Interactive,
-                    &crate::keymap::Keymap::empty(),
-                    &mut last_volume,
-                    &mut speed_open,
-                );
-                assert!(!settled.vol_persist, "an omitted gesture commits only once");
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let hud = egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(300.0, MUSIC_HUD_HEIGHT),
+                        );
+                        let chrome = music_hud_snapshot_chrome();
+                        let layout =
+                            music_hud_row_layout(hud, measure_music_hud_row(ui, &chrome, &[]));
+                        let passive = draw_music_playback_row(
+                            ui,
+                            hud,
+                            0,
+                            &chrome,
+                            &layout,
+                            &[],
+                            ui.id().with("track"),
+                            false,
+                            MusicHudPresentation::Disabled,
+                            &crate::keymap::Keymap::empty(),
+                            &mut last_volume,
+                            &mut speed_open,
+                        );
+                        assert!(passive.set_vol.is_none());
+                        assert_eq!(last_volume, Some(0.5));
+                        assert!(
+                            speed_open,
+                            "passive chrome cannot close the active context's popup"
+                        );
+                        let active = draw_music_playback_row(
+                            ui,
+                            hud,
+                            0,
+                            &chrome,
+                            &layout,
+                            &[],
+                            ui.id().with("track"),
+                            false,
+                            MusicHudPresentation::Interactive,
+                            &crate::keymap::Keymap::empty(),
+                            &mut last_volume,
+                            &mut speed_open,
+                        );
+                        assert_eq!(active.set_vol, Some(0.5));
+                        assert!(active.vol_persist);
+                        assert_eq!(last_volume, None);
+                        assert!(!speed_open);
+                        let settled = draw_music_playback_row(
+                            ui,
+                            hud,
+                            0,
+                            &chrome,
+                            &layout,
+                            &[],
+                            ui.id().with("track"),
+                            false,
+                            MusicHudPresentation::Interactive,
+                            &crate::keymap::Keymap::empty(),
+                            &mut last_volume,
+                            &mut speed_open,
+                        );
+                        assert!(!settled.vol_persist, "an omitted gesture commits only once");
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
     }
 
     #[test]
@@ -3184,7 +3202,7 @@ mod tests {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
             let mut navigation = None;
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -3193,19 +3211,21 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            draw_music_normalize_snapshot_fixture(ui);
-                            navigation = Some([
-                                ctx.read_response(ui.id().with(("music_hud_prevfile", 0usize)))
-                                    .unwrap()
-                                    .rect,
-                                ctx.read_response(ui.id().with(("music_hud_nextfile", 0usize)))
-                                    .unwrap()
-                                    .rect,
-                            ]);
-                        });
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                draw_music_normalize_snapshot_fixture(ui);
+                                navigation = Some([
+                                    ctx.read_response(ui.id().with(("music_hud_prevfile", 0usize)))
+                                        .unwrap()
+                                        .rect,
+                                    ctx.read_response(ui.id().with(("music_hud_nextfile", 0usize)))
+                                        .unwrap()
+                                        .rect,
+                                ]);
+                            })
+                    });
                 },
             );
             let navigation = navigation.unwrap();
@@ -3366,14 +3386,15 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(430.0, 120.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let mut frame_clicked = None;
                     info_row(
                         ui,
@@ -3551,7 +3572,8 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 280.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -3559,7 +3581,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let id = ui.id().with("fixture_audio_track_popup");
                     ui.ctx().data_mut(|data| data.insert_temp(id, true));
                     let rect =
@@ -3587,15 +3609,19 @@ mod tests {
             state: crate::video::AudioTrackSelectionDisplayState::Applied,
         });
         let mut metrics = None;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                metrics = Some(measure_music_hud_row(
-                    ui,
-                    &music_hud_snapshot_chrome(),
-                    &rows,
-                ));
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        metrics = Some(measure_music_hud_row(
+                            ui,
+                            &music_hud_snapshot_chrome(),
+                            &rows,
+                        ));
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         let metrics = metrics.unwrap();
         // Track selection is retained; every optional control follows this order.
         let order = [
@@ -3664,57 +3690,65 @@ mod tests {
         let mut frame = |width, events| {
             time += 1.0 / 60.0;
             let mut result = None;
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, 360.0),
-                    )),
-                    time: Some(time),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let hud = egui::Rect::from_min_max(
-                                egui::pos2(0.0, 360.0 - MUSIC_HUD_HEIGHT),
-                                egui::pos2(width, 360.0),
-                            );
-                            let layout = music_hud_row_layout(
-                                hud,
-                                measure_music_hud_row(ui, &chrome, &rows),
-                            );
-                            let id =
-                                music_audio_track_selector_id(ui.id(), 0, Path::new("tracks.mka"));
-                            let actions = draw_music_playback_row(
-                                ui,
-                                hud,
-                                0,
-                                &chrome,
-                                &layout,
-                                &rows,
-                                id,
-                                false,
-                                MusicHudPresentation::Interactive,
-                                &crate::keymap::Keymap::empty(),
-                                &mut last_volume,
-                                &mut speed_open,
-                            );
-                            assert!(actions.selected_audio_track.is_none());
-                            result = Some((
-                                layout.rects[MusicHudItem::Track as usize],
-                                music_audio_track_popup_open(
-                                    ctx,
-                                    ui.id(),
-                                    0,
-                                    Path::new("tracks.mka"),
-                                ),
-                            ));
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 360.0),
+                        )),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    let hud = egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 360.0 - MUSIC_HUD_HEIGHT),
+                                        egui::pos2(width, 360.0),
+                                    );
+                                    let layout = music_hud_row_layout(
+                                        hud,
+                                        measure_music_hud_row(ui, &chrome, &rows),
+                                    );
+                                    let id = music_audio_track_selector_id(
+                                        ui.id(),
+                                        0,
+                                        Path::new("tracks.mka"),
+                                    );
+                                    let actions = draw_music_playback_row(
+                                        ui,
+                                        hud,
+                                        0,
+                                        &chrome,
+                                        &layout,
+                                        &rows,
+                                        id,
+                                        false,
+                                        MusicHudPresentation::Interactive,
+                                        &crate::keymap::Keymap::empty(),
+                                        &mut last_volume,
+                                        &mut speed_open,
+                                    );
+                                    assert!(actions.selected_audio_track.is_none());
+                                    result = Some((
+                                        layout.rects[MusicHudItem::Track as usize],
+                                        music_audio_track_popup_open(
+                                            ctx,
+                                            ui.id(),
+                                            0,
+                                            Path::new("tracks.mka"),
+                                        ),
+                                    ));
+                                },
+                            )
                         });
-                },
-            );
+                    },
+                )
+                .drop_without_applying_deltas();
             result.unwrap()
         };
         let _ = frame(950.0, vec![]);

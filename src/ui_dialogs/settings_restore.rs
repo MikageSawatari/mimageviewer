@@ -451,6 +451,7 @@ impl App {
             || self.settings_restore_state.preferences_transfer.is_some();
 
         egui::Window::new("設定の復元")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -1168,6 +1169,7 @@ impl App {
                 let mut window_open = true;
                 let mut save = false;
                 egui::Window::new("操作カスタマイズを書き出す")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1215,8 +1217,9 @@ impl App {
                 previous,
             } => {
                 let mut window_open = true;
-                let modal_size = operation_modal_size(ctx.available_rect().size());
+                let modal_size = operation_modal_size(ctx.content_rect().size());
                 egui::Window::new("操作カスタマイズの差分")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1296,8 +1299,9 @@ impl App {
                 let preview = crate::operation_customize_share::diff(&current, bundle);
                 let mut window_open = true;
                 let mut apply = false;
-                let modal_size = operation_modal_size(ctx.available_rect().size());
+                let modal_size = operation_modal_size(ctx.content_rect().size());
                 egui::Window::new("操作カスタマイズを取り込む")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1358,7 +1362,7 @@ impl App {
             OperationModal::ResetConfirm => {
                 let mut window_open = true;
                 let mut reset = false;
-                egui::Window::new("操作カスタマイズを初期値に戻す")
+                egui::Window::new("操作カスタマイズを初期値に戻す").drag_area(egui::WindowDrag::Anywhere)
                     .open(&mut window_open)
                     .collapsible(false)
                     .resizable(false)
@@ -1417,6 +1421,10 @@ fn draw_operation_customize_body(app: &mut App, ui: &mut egui::Ui) {
     let backups = app.settings_restore_state.backups.clone();
     let now = SystemTime::now();
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .max_height(340.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
@@ -1777,7 +1785,7 @@ fn load_previous_operation_bundle(
 
 fn draw_operation_modal_scroll_body(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
     modal_height: f32,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
@@ -1785,6 +1793,10 @@ fn draw_operation_modal_scroll_body(
     let body_size = egui::vec2(ui.available_width(), body_height);
     ui.allocate_ui_with_layout(body_size, egui::Layout::top_down(egui::Align::Min), |ui| {
         egui::ScrollArea::both()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt(id_salt)
             .auto_shrink([false, false])
             .max_height(body_height)
@@ -1969,7 +1981,7 @@ mod tests {
             .events
             .push(egui::ViewportEvent::Close);
 
-        let blocked = ctx.run(raw, |ctx| app.service_root_lifecycle(ctx));
+        let blocked = ctx.run_pass(raw, |ctx| app.service_root_lifecycle(ctx));
         assert!(
             blocked
                 .viewport_output
@@ -2002,7 +2014,7 @@ mod tests {
         );
 
         finish_save(Ok(()));
-        let still_blocked = ctx.run(egui::RawInput::default(), |ctx| {
+        let still_blocked = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.service_root_lifecycle(ctx)
         });
         assert!(!app.composition_editor_writes_pending());
@@ -2021,7 +2033,7 @@ mod tests {
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.service_root_lifecycle(ctx)
             });
             if output
@@ -2040,7 +2052,7 @@ mod tests {
         ));
         assert!(worker_finished.load(std::sync::atomic::Ordering::Acquire));
         assert!(!app.tray_resident_media_updates_needed());
-        let again = ctx.run(egui::RawInput::default(), |ctx| {
+        let again = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.service_root_lifecycle(ctx)
         });
         assert!(
@@ -2139,14 +2151,15 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 420.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::ui_fonts::configure_fonts(ctx);
                 if !fonts_ready {
                     fonts_ready = true;
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.heading("操作カスタマイズの差分");
                     ui.horizontal(|ui| {
                         let _ = ui.selectable_label(false, "標準");
@@ -2199,6 +2212,7 @@ pub(super) fn draw_restore_result_snapshot_fixture(ctx: &egui::Context, fixture:
 pub(super) fn draw_restore_list_snapshot_fixture(ctx: &egui::Context) {
     let backups = restore_backup_snapshot_fixture();
     egui::Window::new("設定の復元")
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(&mut true)
         .resizable(true)
         .collapsible(false)
@@ -2457,7 +2471,8 @@ mod small_screen_tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -2466,6 +2481,7 @@ mod small_screen_tests {
                     }
                     crate::settings::apply_ui_scale_factor(ctx, scale);
                     egui::Window::new("設定の復元")
+                        .drag_area(egui::WindowDrag::Anywhere)
                         .fixed_size(egui::vec2(200.0, ctx.content_rect().height() - 80.0))
                         .default_pos(egui::pos2(60.0, 40.0))
                         .show(ctx, |ui| {
@@ -2494,7 +2510,8 @@ mod small_screen_tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -2502,6 +2519,7 @@ mod small_screen_tests {
                         return;
                     }
                     egui::Window::new("設定の復元")
+                        .drag_area(egui::WindowDrag::Anywhere)
                         .fixed_size(egui::vec2(500.0, 420.0))
                         .default_pos(egui::pos2(60.0, 40.0))
                         .show(ctx, |ui| {
@@ -2557,6 +2575,7 @@ fn draw_restore_confirm_dialog(
     };
 
     egui::Window::new(title)
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(confirm_open)
         .collapsible(false)
         .resizable(false)

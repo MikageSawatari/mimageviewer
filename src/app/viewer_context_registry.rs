@@ -8039,7 +8039,7 @@ mod tests {
         let retained = app
             .with_viewer_context(stashed, |app| {
                 let ctx = egui::Context::default();
-                let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+                let _ = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
                 assert_eq!(
                     std::ptr::from_ref(ContextRef::mounted(app).epub_convert().unwrap()),
                     allocation

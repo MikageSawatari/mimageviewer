@@ -408,6 +408,7 @@ impl App {
             .iter()
             .any(|definition| definition.name.eq_ignore_ascii_case(&trimmed));
         egui::Window::new("新しいスマートフォルダ")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -472,6 +473,7 @@ impl App {
         let mut confirm = false;
         let mut cancel = false;
         egui::Window::new("現在のアイテム表示条件を追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -617,7 +619,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(48.0, 32.0);
 
-        egui::Window::new("スマートフォルダ")
+        egui::Window::new("スマートフォルダ").drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -671,7 +673,7 @@ impl App {
                         });
                         ui.separator();
                         let list_height = ui.available_height().max(0.0);
-                        egui::ScrollArea::vertical()
+                        egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                             .id_salt("smart_folder_definition_list")
                             .auto_shrink([false, false])
                             .max_height(list_height)
@@ -767,7 +769,7 @@ impl App {
                                 .weak(),
                             );
                             let rule_list_height = ui.available_height().max(0.0);
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                 .id_salt("smart_folder_rule_list")
                                 .auto_shrink([false, false])
                                 .max_height(rule_list_height)

@@ -367,8 +367,9 @@ fn atlas_entries(textures_delta: &epaint::textures::TexturesDelta) -> usize {
     textures_delta
         .set
         .iter()
-        .filter(|(id, _)| tracked(*id))
-        .count()
+        .filter(|(id, _)| tracked(**id))
+        .map(|(_, deltas)| deltas.len())
+        .sum()
 }
 
 fn push(event: Event) {
@@ -438,15 +439,17 @@ pub fn record_produced(
             egui_installed,
         },
     );
-    for (id, delta) in &textures_delta.set {
+    for (id, deltas) in &textures_delta.set {
         if tracked(*id) {
-            push_locked(
-                &mut ledger,
-                Event::Produced {
-                    pos: delta.pos,
-                    size: [delta.image.width(), delta.image.height()],
-                },
-            );
+            for delta in deltas {
+                push_locked(
+                    &mut ledger,
+                    Event::Produced {
+                        pos: delta.pos,
+                        size: [delta.image.width(), delta.image.height()],
+                    },
+                );
+            }
         }
     }
 }
@@ -619,5 +622,67 @@ fn emit(line: String) {
     let sink = SINK.lock().ok().and_then(|guard| *guard);
     if let Some(sink) = sink {
         sink(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atlas_entries_count_each_rgba_delta_in_an_id_sequence() {
+        let mut deltas = epaint::textures::TexturesDelta::default();
+        let atlas = epaint::TextureId::default();
+        deltas.push(
+            atlas,
+            epaint::ImageDelta::full(
+                epaint::ColorImage::filled([2, 2], epaint::Color32::WHITE),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        deltas.push(
+            atlas,
+            epaint::ImageDelta::partial(
+                [0, 0],
+                epaint::ColorImage::filled([1, 1], epaint::Color32::BLACK),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        deltas.push(
+            epaint::TextureId::Managed(1),
+            epaint::ImageDelta::full(
+                epaint::ColorImage::filled([1, 1], epaint::Color32::WHITE),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        let entries = atlas_entries(&deltas);
+        let viewport = u64::MAX - next_renderer_id();
+        record_produced(Site::ProducedMain, &deltas, Some(viewport), Some([2, 2]));
+        let produced = {
+            let ledger = LEDGER.lock().expect("diagnostic test ledger");
+            let start = ledger.events.iter().position(|(_, event)| {
+                matches!(event, Event::ProducedBatch { viewport: Some(id), .. } if *id == viewport)
+            });
+            start.map(|start| {
+                ledger
+                    .events
+                    .iter()
+                    .skip(start + 1)
+                    .take(2)
+                    .map(|(_, event)| match event {
+                        Event::Produced { pos, size } => Some((*pos, *size)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        // This diagnostic-only fixture intentionally has no GPU consumer.
+        deltas.clear();
+        assert_eq!(entries, 2, "count deltas, not texture IDs");
+        assert_eq!(
+            produced,
+            Some(vec![Some((None, [2, 2])), Some((Some([0, 0]), [1, 1]))]),
+            "the diagnostic ledger must preserve full-to-partial order within an ID"
+        );
     }
 }

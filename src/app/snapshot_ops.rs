@@ -3786,7 +3786,7 @@ mod tests {
             content_type: None,
         }];
         let ctx = egui::Context::default();
-        let _ = ctx.run(
+        let _ = ctx.run_pass(
             egui::RawInput {
                 focused: true,
                 events: vec![egui::Event::Key {

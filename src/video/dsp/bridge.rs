@@ -1775,7 +1775,8 @@ mod concurrent_state_tests {
         });
         // Drain egui's initial two-pass repaint before simulating an idle app.
         for _ in 0..3 {
-            let _ = ctx.run(Default::default(), |_| {});
+            let output = ctx.run_ui(Default::default(), |_| {});
+            crate::egui_output::discard_headless_output(output);
         }
         repaint_count.store(0, Ordering::SeqCst);
 

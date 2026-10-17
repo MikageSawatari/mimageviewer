@@ -76,7 +76,7 @@ fn input_frame(
             ..Default::default()
         },
     );
-    let _ = ctx.run(raw, run);
+    let _ = ctx.run_pass(raw, run).drop_without_applying_deltas();
 }
 
 #[test]
@@ -102,19 +102,21 @@ fn page_turn_merge_rating_key_rebases_root_forwarded_root_and_viewer_before_navi
                     egui::ViewportId::from_hash_of("merge-forwarded"),
                     vec![],
                     |ctx| {
-                        app.render_fullscreen_viewport_with_root_input(
-                            ctx,
-                            Some(FullscreenRootFrameInput {
-                                context: root.clone(),
-                                destination,
-                            }),
-                        );
+                        ctx.root_ui(|root_ui| {
+                            app.render_fullscreen_viewport_with_root_input(
+                                root_ui,
+                                Some(FullscreenRootFrameInput {
+                                    context: root.clone(),
+                                    destination,
+                                }),
+                            )
+                        });
                     },
                 );
             });
         } else {
             input_frame(&ctx, egui::ViewportId::ROOT, events, |ctx| {
-                app.render_fullscreen_viewport(ctx);
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
             });
         }
         assert_eq!(app.rating_cache.get(&0), Some(&0), "route={route}");
@@ -169,19 +171,21 @@ fn page_turn_merge_rating_empty_exits_all_key_routes_and_preserves_rating_histor
                     egui::ViewportId::from_hash_of("merge-empty"),
                     vec![],
                     |ctx| {
-                        app.render_fullscreen_viewport_with_root_input(
-                            ctx,
-                            Some(FullscreenRootFrameInput {
-                                context: root.clone(),
-                                destination,
-                            }),
-                        );
+                        ctx.root_ui(|root_ui| {
+                            app.render_fullscreen_viewport_with_root_input(
+                                root_ui,
+                                Some(FullscreenRootFrameInput {
+                                    context: root.clone(),
+                                    destination,
+                                }),
+                            )
+                        });
                     },
                 );
             });
         } else {
             input_frame(&ctx, egui::ViewportId::ROOT, events, |ctx| {
-                app.render_fullscreen_viewport(ctx);
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
             });
         }
         assert_eq!(app.fullscreen_idx, None, "route={route}");

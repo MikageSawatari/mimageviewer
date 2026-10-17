@@ -1,53 +1,16 @@
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::undocumented_unsafe_blocks)]
+#![expect(clippy::missing_errors_doc)]
+#![expect(clippy::undocumented_unsafe_blocks)]
+#![expect(clippy::unwrap_used)] // TODO(emilk): avoid unwraps
+#![expect(unsafe_code)]
 
 use crate::{
-    RenderState, RootStartupFrameTag, StartupGpuStage, SurfaceErrorAction, WgpuConfiguration,
-    renderer,
+    RenderState, RootStartupFrameTag, StartupGpuStage, SurfaceConfig, SurfaceErrorAction,
+    WgpuConfiguration, renderer,
 };
-use crate::{
-    RendererOptions,
-    capture::{CaptureReceiver, CaptureSender, CaptureState, capture_channel},
-};
-use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
-use std::{num::NonZeroU32, sync::Arc};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaintOutcome {
-    RenderStateAbsent,
-    AppliedWithoutPaint,
-    SurfaceAbsent,
-    SurfaceRecreated,
-    Skipped,
-    Submitted,
-}
-
-/// mIV: hand a frame's `set` deltas to the renderer, recording each one against the size the
-/// renderer held beforehand. Both the painting and the non-painting path go through here so the
-/// ledger sees every application, in order. See [`crate::atlas_diag`].
-fn apply_delta_set(
-    renderer: &mut renderer::Renderer,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    textures_delta: &epaint::textures::TexturesDelta,
-    site: crate::atlas_diag::Site,
-) {
-    let diag_id = renderer.diag_id();
-    let batch = crate::atlas_diag::begin_applied_batch(site, diag_id, textures_delta);
-    for (id, image_delta) in &textures_delta.set {
-        // Bracket the call: a delta that was skipped as out of bounds must not read back as a
-        // successful application, so `after` is taken once `update_texture` has returned.
-        let before = renderer.texture_size(id);
-        renderer.update_texture(device, queue, *id, image_delta);
-        let after = renderer.texture_size(id);
-        crate::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
-    }
-    if batch.tracked() {
-        // Flush at the end of the batch rather than at the offending delta: a batch can be
-        // `[stale partial, repairing full]`, and dumping early would hide the repair.
-        crate::atlas_diag::flush("applying a texture delta batch");
-    }
-}
+use crate::{RendererOptions, capture::CaptureState};
+use core::num::NonZeroU32;
+use egui::{Context, ViewportId, ViewportIdMap, ViewportIdSet};
+use std::sync::Arc;
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
@@ -55,6 +18,8 @@ struct SurfaceState {
     width: u32,
     height: u32,
     resizing: bool,
+    needs_reconfigure: bool,
+    needs_recreate: bool,
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -65,7 +30,7 @@ struct SurfaceState {
 pub struct Painter {
     startup_present: crate::startup_diagnostics::RootPresentObserver,
     context: Context,
-    configuration: WgpuConfiguration,
+    config: WgpuConfiguration,
     options: RendererOptions,
     support_transparent_backbuffer: bool,
     screen_capture_state: Option<CaptureState>,
@@ -77,8 +42,6 @@ pub struct Painter {
     depth_texture_view: ViewportIdMap<wgpu::TextureView>,
     msaa_texture_view: ViewportIdMap<wgpu::TextureView>,
     surfaces: ViewportIdMap<SurfaceState>,
-    capture_tx: CaptureSender,
-    capture_rx: CaptureReceiver,
 }
 
 impl Painter {
@@ -96,19 +59,18 @@ impl Painter {
     /// associated.
     pub async fn new(
         context: Context,
-        configuration: WgpuConfiguration,
+        config: WgpuConfiguration,
         support_transparent_backbuffer: bool,
         options: RendererOptions,
     ) -> Self {
-        let (capture_tx, capture_rx) = capture_channel();
-        configuration.startup_begin(StartupGpuStage::Instance);
-        let instance = configuration.wgpu_setup.new_instance().await;
-        configuration.startup_end(StartupGpuStage::Instance, true);
+        config.startup_begin(StartupGpuStage::Instance);
+        let instance = config.wgpu_setup.new_instance().await;
+        config.startup_end(StartupGpuStage::Instance, true);
 
         Self {
             startup_present: Default::default(),
             context,
-            configuration,
+            config,
             options,
             support_transparent_backbuffer,
             screen_capture_state: None,
@@ -119,9 +81,6 @@ impl Painter {
             depth_texture_view: Default::default(),
             surfaces: Default::default(),
             msaa_texture_view: Default::default(),
-
-            capture_tx,
-            capture_rx,
         }
     }
 
@@ -132,6 +91,29 @@ impl Painter {
         self.render_state.clone()
     }
 
+    /// The surface configuration (present mode, frame latency) the surfaces are configured with.
+    pub fn surface_config(&self) -> SurfaceConfig {
+        self.config.surface
+    }
+
+    /// Change the surface configuration (present mode, frame latency) at runtime.
+    ///
+    /// All surfaces are reconfigured before the next paint.
+    ///
+    /// This is cheap to call every frame.
+    pub fn set_surface_config(&mut self, surface_config: SurfaceConfig) {
+        if self.config.surface == surface_config {
+            return;
+        }
+
+        self.config.surface = surface_config;
+
+        #[expect(clippy::iter_over_hash_type)]
+        for surface in self.surfaces.values_mut() {
+            surface.needs_reconfigure = true;
+        }
+    }
+
     fn configure_surface(
         surface_state: &SurfaceState,
         render_state: &RenderState,
@@ -140,6 +122,20 @@ impl Painter {
         observe_startup: bool,
     ) {
         profiling::function_scope!();
+
+        let SurfaceConfig {
+            present_mode,
+            desired_maximum_frame_latency,
+        } = config.surface;
+
+        // Transaction presentation can hold a drawable during AppKit live resize. Keep the
+        // configured low-latency path normally, but use three Metal drawables while resizing.
+        #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+        let desired_maximum_frame_latency = if surface_state.resizing {
+            Some(desired_maximum_frame_latency.unwrap_or(2).max(2))
+        } else {
+            desired_maximum_frame_latency
+        };
 
         let width = surface_state.width;
         let height = surface_state.height;
@@ -158,17 +154,16 @@ impl Painter {
                 default_config.is_some(),
             );
         }
-
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: render_state.target_format,
-            present_mode: config.present_mode,
+            present_mode,
             alpha_mode: surface_state.alpha_mode,
             view_formats: vec![render_state.target_format],
             ..default_config.expect("The surface isn't supported by this adapter")
         };
 
-        if let Some(desired_maximum_frame_latency) = config.desired_maximum_frame_latency {
+        if let Some(desired_maximum_frame_latency) = desired_maximum_frame_latency {
             surf_config.desired_maximum_frame_latency = desired_maximum_frame_latency;
         }
 
@@ -181,6 +176,33 @@ impl Painter {
         if observe {
             config.startup_end(StartupGpuStage::SurfaceConfigure, true);
         }
+    }
+
+    /// Drop the existing [`wgpu::Surface`] for `viewport_id` and create a fresh one for the
+    /// given window via [`wgpu::Instance::create_surface`], then configure it.
+    ///
+    /// Used to recover from [`wgpu::CurrentSurfaceTexture::Lost`], where reconfiguring the
+    /// existing surface object cannot recover.
+    fn recreate_surface(
+        &mut self,
+        viewport_id: ViewportId,
+        window: &Arc<winit::window::Window>,
+    ) -> Result<(), crate::WgpuError> {
+        profiling::function_scope!();
+
+        let Some(old_state) = self.surfaces.remove(&viewport_id) else {
+            return Ok(());
+        };
+
+        let surface = self.instance.create_surface(Arc::clone(window))?;
+        self.install_surface(
+            surface,
+            viewport_id,
+            old_state.width,
+            old_state.height,
+            old_state.resizing,
+        );
+        Ok(())
     }
 
     /// Updates (or clears) the [`winit::window::Window`] associated with the [`Painter`]
@@ -214,22 +236,20 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
-                    self.configuration
-                        .startup_begin(StartupGpuStage::SurfaceCreate);
+                let observe = viewport_id == ViewportId::ROOT && self.startup_present.pending();
+                if observe {
+                    self.config.startup_begin(StartupGpuStage::SurfaceCreate);
                 }
-                let result = self.instance.create_surface(window);
-                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
-                    self.configuration
-                        .startup_end(StartupGpuStage::SurfaceCreate, result.is_ok());
+                let surface = self.instance.create_surface(window);
+                if observe {
+                    self.config
+                        .startup_end(StartupGpuStage::SurfaceCreate, surface.is_ok());
                 }
-                let surface = result?;
+                let surface = surface?;
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            // Viewport recreation retires only that viewport's window. Other
-            // viewports share this painter and must retain their surfaces.
-            self.surfaces.remove(&viewport_id);
+            self.remove_viewport(viewport_id);
         }
         Ok(())
     }
@@ -250,27 +270,36 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
-                    self.configuration
-                        .startup_begin(StartupGpuStage::SurfaceCreate);
+                let observe = viewport_id == ViewportId::ROOT && self.startup_present.pending();
+                if observe {
+                    self.config.startup_begin(StartupGpuStage::SurfaceCreate);
                 }
-                let result =
+                let surface =
                     (|| unsafe {
                         Ok::<_, crate::WgpuError>(self.instance.create_surface_unsafe(
                             wgpu::SurfaceTargetUnsafe::from_window(&window)?,
                         )?)
                     })();
-                if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
-                    self.configuration
-                        .startup_end(StartupGpuStage::SurfaceCreate, result.is_ok());
+                if observe {
+                    self.config
+                        .startup_end(StartupGpuStage::SurfaceCreate, surface.is_ok());
                 }
-                let surface = result?;
+                let surface = surface?;
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            self.surfaces.remove(&viewport_id);
+            self.remove_viewport(viewport_id);
         }
         Ok(())
+    }
+
+    fn remove_viewport(&mut self, viewport_id: ViewportId) {
+        remove_viewport_resources(
+            viewport_id,
+            &mut self.surfaces,
+            &mut self.depth_texture_view,
+            &mut self.msaa_texture_view,
+        );
     }
 
     async fn add_surface(
@@ -279,63 +308,83 @@ impl Painter {
         viewport_id: ViewportId,
         size: winit::dpi::PhysicalSize<u32>,
     ) -> Result<(), crate::WgpuError> {
-        let render_state = if let Some(render_state) = &self.render_state {
-            render_state
-        } else {
-            let render_state = RenderState::create(
-                &self.configuration,
-                &self.instance,
-                Some(&surface),
-                self.options,
-            )
-            .await?;
-            self.render_state.get_or_insert(render_state)
-        };
-        let alpha_mode = if self.support_transparent_backbuffer {
-            if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
-                self.configuration
-                    .startup_begin(StartupGpuStage::SurfaceCapabilities);
-            }
-            let supported_alpha_modes = surface.get_capabilities(&render_state.adapter).alpha_modes;
-            if viewport_id == ViewportId::ROOT && self.startup_present.pending() {
-                self.configuration
-                    .startup_end(StartupGpuStage::SurfaceCapabilities, true);
-            }
+        if self.render_state.is_none() {
+            let render_state =
+                RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
+                    .await?;
+            self.render_state = Some(render_state);
+        }
+        self.install_surface(surface, viewport_id, size.width, size.height, false);
+        Ok(())
+    }
 
-            // Prefer pre multiplied over post multiplied!
-            if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-                wgpu::CompositeAlphaMode::PreMultiplied
-            } else if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-                wgpu::CompositeAlphaMode::PostMultiplied
+    /// Inserts a freshly created surface into [`Self::surfaces`] and configures it.
+    ///
+    /// Render state must already be initialised before calling this.
+    // NOTE: The same assumption is already required by `resize_and_generate_depth_texture_view_and_msaa_view`.
+    fn install_surface(
+        &mut self,
+        surface: wgpu::Surface<'static>,
+        viewport_id: ViewportId,
+        width: u32,
+        height: u32,
+        resizing: bool,
+    ) {
+        let alpha_mode = {
+            // Panic: We use the same failure mode as `resize_and_generate_depth_texture_view_and_msaa_view`
+            let render_state = self
+                .render_state
+                .as_ref()
+                .expect("install_surface called before render_state initialization");
+            if self.support_transparent_backbuffer {
+                let observe = viewport_id == ViewportId::ROOT && self.startup_present.pending();
+                if observe {
+                    self.config
+                        .startup_begin(StartupGpuStage::SurfaceCapabilities);
+                }
+                let supported_alpha_modes =
+                    surface.get_capabilities(&render_state.adapter).alpha_modes;
+                if observe {
+                    self.config
+                        .startup_end(StartupGpuStage::SurfaceCapabilities, true);
+                }
+                // Prefer pre multiplied over post multiplied!
+                if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                } else if supported_alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+                {
+                    wgpu::CompositeAlphaMode::PostMultiplied
+                } else {
+                    log::warn!(
+                        "Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency."
+                    );
+                    wgpu::CompositeAlphaMode::Auto
+                }
             } else {
-                log::warn!(
-                    "Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency."
-                );
                 wgpu::CompositeAlphaMode::Auto
             }
-        } else {
-            wgpu::CompositeAlphaMode::Auto
         };
         self.surfaces.insert(
             viewport_id,
             SurfaceState {
                 surface,
-                width: size.width,
-                height: size.height,
+                width,
+                height,
                 alpha_mode,
-                resizing: false,
+                resizing,
+                needs_reconfigure: false,
+                needs_recreate: false,
             },
         );
-        let Some(width) = NonZeroU32::new(size.width) else {
+        let Some(width) = NonZeroU32::new(width) else {
             log::debug!("The window width was zero; skipping generate textures");
-            return Ok(());
+            return;
         };
-        let Some(height) = NonZeroU32::new(size.height) else {
+        let Some(height) = NonZeroU32::new(height) else {
             log::debug!("The window height was zero; skipping generate textures");
-            return Ok(());
+            return;
         };
         self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
-        Ok(())
     }
 
     /// Returns the maximum texture dimension supported if known
@@ -369,7 +418,7 @@ impl Painter {
         Self::configure_surface(
             surface_state,
             render_state,
-            &self.configuration,
+            &self.config,
             viewport_id,
             self.startup_present.pending(),
         );
@@ -449,6 +498,9 @@ impl Painter {
             return;
         }
 
+        // Set before reconfiguring so macOS live resize uses the temporary latency bump above.
+        state.resizing = resizing;
+
         // Resizing is a bit tricky on macOS.
         // It requires enabling ["present_with_transaction"](https://developer.apple.com/documentation/quartzcore/cametallayer/presentswithtransaction)
         // flag to avoid jittering during the resize. Even though resize jittering on macOS
@@ -457,28 +509,28 @@ impl Painter {
         // See https://github.com/emilk/egui/issues/903
         #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
         {
-            // SAFETY: The cast is checked with if condition. If the used backend is not metal
-            // it gracefully fails. The pointer casts are valid as it's 1-to-1 type mapping.
-            // This is how wgpu currently exposes this backend-specific flag.
+            // SAFETY: `as_hal::<Metal>()` returns `None` unless this surface is backed by wgpu's
+            // Metal backend.
             unsafe {
-                if let Some(hal_surface) = state.surface.as_hal::<wgpu::hal::api::Metal>() {
-                    let raw =
-                        std::ptr::from_ref::<wgpu::hal::metal::Surface>(&*hal_surface).cast_mut();
-
-                    (*raw).present_with_transaction = resizing;
+                if let (Some(render_state), Some(hal_surface)) = (
+                    self.render_state.as_ref(),
+                    state.surface.as_hal::<wgpu::hal::api::Metal>(),
+                ) {
+                    hal_surface
+                        .render_layer()
+                        .lock()
+                        .setPresentsWithTransaction(resizing);
 
                     Self::configure_surface(
                         state,
-                        self.render_state.as_ref().unwrap(),
-                        &self.configuration,
+                        render_state,
+                        &self.config,
                         viewport_id,
                         self.startup_present.pending(),
                     );
                 }
             }
         }
-
-        state.resizing = resizing;
     }
 
     pub fn on_window_resized(
@@ -502,35 +554,29 @@ impl Painter {
         }
     }
 
-    /// mIV: apply a frame's texture deltas without painting it.
+    /// Deliver texture updates even when there is no frame to paint.
     ///
-    /// egui hands each delta over exactly once - `Context::end_pass` moves it out of the
-    /// `TextureManager` and nothing re-sends it. Any frame that is produced but never painted
-    /// therefore has to deliver its textures anyway, or the renderer's shared namespace falls
-    /// behind what egui believes is on the GPU. The frames around fullscreen viewport
-    /// recreation and native-video handover are exactly that case: `egui_ctx.run` has already
-    /// returned a delta when the viewport or its window turns out to be gone.
-    ///
-    /// Losing a full font-atlas replacement this way leaves egui laying out against a grown
-    /// atlas while the GPU copy keeps its original 32px height, and the next partial glyph
-    /// upload is rejected:
-    ///   "Copy of Y 45..126 would end up overrunning the bounds of ... Y size 32".
-    /// The same dropped-upload boundary has also shown up as permanently black thumbnails.
-    /// See docs/display-pipeline.md.
-    ///
-    /// Frees are applied here too: this frame will never paint, so nothing can still be
-    /// referencing them, and leaving them behind leaks for the life of the process.
-    pub fn apply_textures_delta(&mut self, textures_delta: &epaint::textures::TexturesDelta) {
-        let outcome = match begin_delivery(
+    /// If the renderer is not initialized the delta is unchanged: the caller's existing
+    /// pending owner must retain it. Otherwise sets are drained, uploads submitted, then frees
+    /// drained. This shares the same completion owner as every paint exit.
+    pub fn apply_textures_delta(&mut self, textures_delta: &mut epaint::textures::TexturesDelta) {
+        let _probe = DeliveryProbe::new(
+            "no_paint",
+            ViewportId::ROOT,
+            false,
+            textures_delta,
+            if self.render_state.is_some() {
+                PaintOutcome::AppliedWithoutPaint
+            } else {
+                PaintOutcome::RenderStateAbsent
+            },
+        );
+        let _delivery = TextureDelivery::begin(
             self.render_state.as_ref(),
             textures_delta,
             crate::atlas_diag::Site::AppliedNoPaint,
-        ) {
-            Ok(()) => PaintOutcome::AppliedWithoutPaint,
-            Err(outcome) => outcome,
-        };
-        probe_atlas_delivery("no_paint", textures_delta, outcome);
-        finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
+            None,
+        );
     }
 
     /// Returns two things:
@@ -539,14 +585,16 @@ impl Painter {
     /// and the captures captured screenshot if it was requested.
     ///
     /// If `capture_data` isn't empty, a screenshot will be captured.
+    #[expect(clippy::too_many_arguments)]
     pub fn paint_and_update_textures(
         &mut self,
         viewport_id: ViewportId,
         pixels_per_point: f32,
         clear_color: [f32; 4],
         clipped_primitives: &[epaint::ClippedPrimitive],
-        textures_delta: &epaint::textures::TexturesDelta,
-        capture_data: Vec<UserData>,
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<egui::ScreenshotCallback>,
+        window: &Arc<winit::window::Window>,
     ) -> f32 {
         self.paint_and_update_textures_with_startup_tag(
             viewport_id,
@@ -555,25 +603,51 @@ impl Painter {
             clipped_primitives,
             textures_delta,
             capture_data,
+            window,
             None,
         )
     }
 
     /// Like [`Self::paint_and_update_textures`], with the accepted root pass tag.
+    #[expect(clippy::too_many_arguments)]
     pub fn paint_and_update_textures_with_startup_tag(
         &mut self,
         viewport_id: ViewportId,
         pixels_per_point: f32,
         clear_color: [f32; 4],
         clipped_primitives: &[epaint::ClippedPrimitive],
-        textures_delta: &epaint::textures::TexturesDelta,
-        capture_data: Vec<UserData>,
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<egui::ScreenshotCallback>,
+        window: &Arc<winit::window::Window>,
+        startup_tag: Option<RootStartupFrameTag>,
+    ) -> f32 {
+        self.paint_and_update_textures_impl(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            Some(window),
+            startup_tag,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn paint_and_update_textures_impl(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<egui::ScreenshotCallback>,
+        window: Option<&Arc<winit::window::Window>>,
         startup_tag: Option<RootStartupFrameTag>,
     ) -> f32 {
         profiling::function_scope!();
-        let observe = self.configuration.startup_diagnostics.is_some()
+        let observe = self.config.startup_diagnostics.is_some()
             && self.startup_present.observes(viewport_id, startup_tag);
-
         let capture = !capture_data.is_empty();
         if capture && crate::atlas_diag::capture_probe_active() {
             crate::atlas_diag::log_line(format!(
@@ -581,297 +655,346 @@ impl Painter {
                 capture_data.len()
             ));
         }
+        let mut probe = DeliveryProbe::new(
+            "paint",
+            viewport_id,
+            capture,
+            textures_delta,
+            PaintOutcome::RenderStateAbsent,
+        );
         let mut vsync_sec = 0.0;
 
-        // mIV: apply texture deltas before the surface lookup.
-        //
-        // egui hands each delta over exactly once - `Context::end_pass` takes it out of the
-        // `TextureManager` and never re-sends it. Textures live in the renderer's shared
-        // namespace and need no presentation surface, so returning early below used to throw
-        // the whole `set` list away whenever a viewport was momentarily surface-less (the
-        // frames around fullscreen viewport recreation). Losing a full font-atlas replacement
-        // that way leaves egui drawing against a grown atlas while the GPU copy stays at its
-        // original 32px height, and the next partial glyph upload is then rejected:
-        //   "Copy of Y 45..126 would end up overrunning the bounds of ... Y size 32".
-        // The same dropped-upload boundary previously showed up as permanently black
-        // thumbnails. See docs/display-pipeline.md.
-        if observe {
-            self.configuration
-                .startup_begin(StartupGpuStage::TextureDelivery);
+        // If the previous frame produced `CurrentSurfaceTexture::Lost`, the action match
+        // below set `needs_recreate`. Recreate the surface now, before re-borrowing
+        // `self.render_state` / `self.surfaces` for the rest of the paint.
+        if self
+            .surfaces
+            .get(&viewport_id)
+            .is_some_and(|s| s.needs_recreate)
+            && let Some(window) = window
+            && let Err(err) = self.recreate_surface(viewport_id, window)
+        {
+            log::error!("Failed to recreate surface for {viewport_id:?}: {err}");
+            probe.outcome = PaintOutcome::SurfaceRecreationFailed;
+            // Keep this paint batch's diagnostic site while sharing the non-paint completion owner.
+            let _delivery = TextureDelivery::begin(
+                self.render_state.as_ref(),
+                textures_delta,
+                crate::atlas_diag::Site::AppliedPaint,
+                observe.then_some(&self.config),
+            );
+            return vsync_sec;
         }
-        let begin = begin_delivery(
+
+        let delivery = TextureDelivery::begin(
             self.render_state.as_ref(),
             textures_delta,
             crate::atlas_diag::Site::AppliedPaint,
+            observe.then_some(&self.config),
         );
+        let Some(mut delivery) = delivery else {
+            return vsync_sec;
+        };
+        let render_state = delivery.render_state;
+        probe.outcome = PaintOutcome::SurfaceAbsent;
+
+        let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
+            return vsync_sec;
+        };
+
+        probe.outcome = PaintOutcome::Skipped;
         if observe {
-            self.configuration
-                .startup_end(StartupGpuStage::TextureDelivery, begin.is_ok());
+            self.config.startup_begin(StartupGpuStage::Buffers);
+        }
+        let mut encoder =
+            render_state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("encoder"),
+                });
+
+        // Upload all resources for the GPU.
+        let screen_descriptor = renderer::ScreenDescriptor {
+            size_in_pixels: [surface_state.width, surface_state.height],
+            pixels_per_point,
+        };
+
+        let user_cmd_bufs = {
+            let mut renderer = render_state.renderer.write();
+            renderer.update_buffers(
+                &render_state.device,
+                &render_state.queue,
+                &mut encoder,
+                clipped_primitives,
+                &screen_descriptor,
+            )
+        };
+
+        // update_buffers may have queued new writes after the last mipmap submission.
+        delivery.queue_needs_submit = true;
+        if observe {
+            self.config.startup_end(StartupGpuStage::Buffers, true);
+        }
+        if surface_state.needs_reconfigure {
+            Self::configure_surface(
+                surface_state,
+                render_state,
+                &self.config,
+                viewport_id,
+                self.startup_present.pending(),
+            );
+            surface_state.needs_reconfigure = false;
         }
 
-        let outcome = match begin {
-            Err(outcome) => outcome,
-            Ok(()) => 'paint: {
-                let render_state = self
-                    .render_state
-                    .as_mut()
-                    .expect("begin_delivery verified the render state");
-                let Some(surface_state) = self.surfaces.get(&viewport_id) else {
-                    break 'paint PaintOutcome::SurfaceAbsent;
-                };
-                // A zero-sized surface cannot establish startup presentation.
-                // This only narrows observation; texture/render delivery is unchanged.
-                let observe = observe && surface_state.width > 0 && surface_state.height > 0;
+        let output_frame = {
+            profiling::scope!("get_current_texture");
+            // This is what vsync-waiting happens on my Mac.
+            let start = web_time::Instant::now();
+            if observe {
+                self.config.startup_begin(StartupGpuStage::SurfaceAcquire);
+            }
+            let output_frame = surface_state.surface.get_current_texture();
+            if observe {
+                self.config.startup_end(
+                    StartupGpuStage::SurfaceAcquire,
+                    matches!(
+                        output_frame,
+                        wgpu::CurrentSurfaceTexture::Success(_)
+                            | wgpu::CurrentSurfaceTexture::Suboptimal(_)
+                    ),
+                );
+            }
+            vsync_sec += start.elapsed().as_secs_f32();
+            output_frame
+        };
 
-                if observe {
-                    self.configuration.startup_begin(StartupGpuStage::Buffers);
+        // `None` when there is no frame to present to. A capture is rendered to its own
+        // texture and copied back to the cpu, so it is served even then — that is how a hidden
+        // window, which the compositor gives no surface texture, is screenshotted at all.
+        let output_frame = match output_frame {
+            wgpu::CurrentSurfaceTexture::Success(frame) => Some(frame),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                surface_state.needs_reconfigure = true;
+                Some(frame)
+            }
+            other => {
+                match (*self.config.on_surface_status)(&other) {
+                    SurfaceErrorAction::Reconfigure => {
+                        probe.outcome = PaintOutcome::SurfaceReconfigured;
+                        Self::configure_surface(
+                            surface_state,
+                            render_state,
+                            &self.config,
+                            viewport_id,
+                            self.startup_present.pending(),
+                        );
+                        self.context.request_repaint_of(viewport_id);
+                    }
+                    SurfaceErrorAction::RecreateSurface => {
+                        probe.outcome = PaintOutcome::SurfaceRecreated;
+                        // Because of ownership, I could not find an easy way to do a full recovery here,
+                        // as that would involve dropping the old surface and creating a new one.
+                        // For now, we defer the recreation to the beginning of the next frame (which
+                        // we ensure to arrive via `request_repaint_of`). A cleaner solution would be
+                        // to untangle the ownership of `RenderState`.
+                        surface_state.needs_recreate = true;
+                        self.context.request_repaint_of(viewport_id);
+                    }
+                    SurfaceErrorAction::SkipFrame => {}
                 }
-                let mut encoder =
-                    render_state
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("encoder"),
-                        });
-
-                // Upload all resources for the GPU.
-                let screen_descriptor = renderer::ScreenDescriptor {
-                    size_in_pixels: [surface_state.width, surface_state.height],
-                    pixels_per_point,
-                };
-
-                let user_cmd_bufs = {
-                    let mut renderer = render_state.renderer.write();
-                    // `textures_delta.set` was already applied above, before the surface lookup.
-
-                    renderer.update_buffers(
-                        &render_state.device,
-                        &render_state.queue,
-                        &mut encoder,
-                        clipped_primitives,
-                        &screen_descriptor,
-                    )
-                };
-                if observe {
-                    self.configuration
-                        .startup_end(StartupGpuStage::Buffers, true);
+                if !capture {
+                    return vsync_sec;
                 }
-
-                let output_frame = {
-                    profiling::scope!("get_current_texture");
-                    // This is what vsync-waiting happens on my Mac.
-                    let start = web_time::Instant::now();
-                    if observe {
-                        self.configuration
-                            .startup_begin(StartupGpuStage::SurfaceAcquire);
-                    }
-                    let output_frame = surface_state.surface.get_current_texture();
-                    if observe {
-                        self.configuration
-                            .startup_end(StartupGpuStage::SurfaceAcquire, output_frame.is_ok());
-                    }
-                    vsync_sec += start.elapsed().as_secs_f32();
-                    output_frame
-                };
-
-                let output_frame = match classify_surface_acquire(
-                    output_frame,
-                    &*self.configuration.on_surface_error,
-                ) {
-                    Ok(frame) => frame,
-                    Err(outcome) => {
-                        if outcome == PaintOutcome::SurfaceRecreated {
-                            Self::configure_surface(
-                                surface_state,
-                                render_state,
-                                &self.configuration,
-                                viewport_id,
-                                self.startup_present.pending(),
-                            );
-                        }
-                        break 'paint outcome;
-                    }
-                };
-
-                if observe {
-                    self.configuration.startup_begin(StartupGpuStage::Encode);
-                }
-                let mut capture_buffer = None;
-                {
-                    let renderer = render_state.renderer.read();
-
-                    let target_texture = if capture {
-                        let capture_state = self.screen_capture_state.get_or_insert_with(|| {
-                            CaptureState::new(&render_state.device, &output_frame.texture)
-                        });
-                        capture_state.update(&render_state.device, &output_frame.texture);
-
-                        &capture_state.texture
-                    } else {
-                        &output_frame.texture
-                    };
-                    let target_view =
-                        target_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-                    let (view, resolve_target) = (self.options.msaa_samples > 1)
-                        .then_some(self.msaa_texture_view.get(&viewport_id))
-                        .flatten()
-                        .map_or((&target_view, None), |texture_view| {
-                            (texture_view, Some(&target_view))
-                        });
-
-                    let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("egui_render"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view,
-                            resolve_target,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: clear_color[0] as f64,
-                                    g: clear_color[1] as f64,
-                                    b: clear_color[2] as f64,
-                                    a: clear_color[3] as f64,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: self.depth_texture_view.get(&viewport_id).map(
-                            |view| {
-                                wgpu::RenderPassDepthStencilAttachment {
-                                    view,
-                                    depth_ops: Some(wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(1.0),
-                                        // It is very unlikely that the depth buffer is needed after egui finished rendering
-                                        // so no need to store it. (this can improve performance on tiling GPUs like mobile chips or Apple Silicon)
-                                        store: wgpu::StoreOp::Discard,
-                                    }),
-                                    stencil_ops: None,
-                                }
-                            },
-                        ),
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-
-                    // Forgetting the pass' lifetime means that we are no longer compile-time protected from
-                    // runtime errors caused by accessing the parent encoder before the render pass is dropped.
-                    // Since we don't pass it on to the renderer, we should be perfectly safe against this mistake here!
-                    renderer.render(
-                        &mut render_pass.forget_lifetime(),
-                        clipped_primitives,
-                        &screen_descriptor,
-                    );
-
-                    if capture && let Some(capture_state) = &mut self.screen_capture_state {
-                        capture_buffer = Some(capture_state.copy_textures(
-                            &render_state.device,
-                            &output_frame,
-                            &mut encoder,
-                        ));
-                    }
-                }
-
-                let encoded = {
-                    profiling::scope!("CommandEncoder::finish");
-                    encoder.finish()
-                };
-                if observe {
-                    self.configuration
-                        .startup_end(StartupGpuStage::Encode, true);
-                }
-
-                // Submit the commands: both the main buffer and user-defined ones.
-                {
-                    profiling::scope!("Queue::submit");
-                    // wgpu doesn't document where vsync can happen. Maybe here?
-                    let start = web_time::Instant::now();
-                    if observe {
-                        self.configuration
-                            .startup_begin(StartupGpuStage::QueueSubmit);
-                    }
-                    render_state
-                        .queue
-                        .submit(user_cmd_bufs.into_iter().chain([encoded]));
-                    if observe {
-                        self.configuration
-                            .startup_end(StartupGpuStage::QueueSubmit, true);
-                    }
-                    vsync_sec += start.elapsed().as_secs_f32();
-                };
-
-                if let Some(capture_buffer) = capture_buffer
-                    && let Some(screen_capture_state) = &mut self.screen_capture_state
-                {
-                    if crate::atlas_diag::capture_probe_active() {
-                        crate::atlas_diag::log_line(format!(
-                            "[capture-probe] wgpu_capture_readback_queued viewport={viewport_id:?}"
-                        ));
-                    }
-                    screen_capture_state.read_screen_rgba(
-                        self.context.clone(),
-                        capture_buffer,
-                        capture_data,
-                        self.capture_tx.clone(),
-                        viewport_id,
-                    );
-                }
-
-                {
-                    profiling::scope!("present");
-                    // wgpu doesn't document where vsync can happen. Maybe here?
-                    let start = web_time::Instant::now();
-                    if observe {
-                        self.configuration.startup_begin(StartupGpuStage::Present);
-                    }
-                    output_frame.present();
-                    if observe {
-                        self.configuration
-                            .startup_end(StartupGpuStage::Present, true);
-                        if let Some(event) = self.startup_present.returned(viewport_id, startup_tag)
-                        {
-                            self.configuration.startup_event(event);
-                        }
-                    }
-                    vsync_sec += start.elapsed().as_secs_f32();
-                }
-
-                PaintOutcome::Submitted
+                None
             }
         };
 
-        if capture && crate::atlas_diag::capture_probe_active() {
-            crate::atlas_diag::log_line(format!(
-                "[capture-probe] wgpu_capture_outcome viewport={viewport_id:?} outcome={outcome:?}"
-            ));
-        }
-
-        probe_atlas_delivery("paint", textures_delta, outcome);
         if observe {
-            self.configuration
-                .startup_begin(StartupGpuStage::TextureDelivery);
+            self.config.startup_begin(StartupGpuStage::Encode);
         }
-        finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
-        if observe {
-            self.configuration.startup_end(
-                StartupGpuStage::TextureDelivery,
-                self.render_state.is_some(),
-            );
-        }
-        vsync_sec
-    }
+        let mut capture_buffer = None;
+        {
+            let renderer = render_state.renderer.read();
 
-    /// Call this at the beginning of each frame to receive the requested screenshots.
-    pub fn handle_screenshots(&self, events: &mut Vec<Event>) {
-        for (viewport_id, user_data, screenshot) in self.capture_rx.try_iter() {
-            let screenshot = Arc::new(screenshot);
-            for data in user_data {
-                events.push(Event::Screenshot {
-                    viewport_id,
-                    user_data: data,
-                    image: screenshot.clone(),
+            let target_texture = if capture {
+                // The frame we would have presented decides the capture, when there is one.
+                // Without it we have only the surface we configured, which is the same thing
+                // as long as no resize is in flight.
+                let (size, format) = match &output_frame {
+                    Some(output_frame) => {
+                        (output_frame.texture.size(), output_frame.texture.format())
+                    }
+                    None => (
+                        wgpu::Extent3d {
+                            width: surface_state.width,
+                            height: surface_state.height,
+                            depth_or_array_layers: 1,
+                        },
+                        render_state.target_format,
+                    ),
+                };
+                if size.width == 0 || size.height == 0 {
+                    log::warn!("Cannot capture a screenshot of a zero-sized surface");
+                    probe.outcome = PaintOutcome::CaptureZeroSized;
+                    return vsync_sec;
+                }
+
+                let capture_state = self
+                    .screen_capture_state
+                    .get_or_insert_with(|| CaptureState::new(&render_state.device, size, format));
+                capture_state.update(&render_state.device, size);
+
+                &capture_state.texture
+            } else if let Some(output_frame) = &output_frame {
+                &output_frame.texture
+            } else {
+                // Unreachable: without a frame to present to, and with nothing to capture,
+                // we returned above.
+                return vsync_sec;
+            };
+            let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let (view, resolve_target) = (self.options.msaa_samples > 1)
+                .then_some(self.msaa_texture_view.get(&viewport_id))
+                .flatten()
+                .map_or((&target_view, None), |texture_view| {
+                    (texture_view, Some(&target_view))
                 });
+
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui_render"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear_color[0] as f64,
+                            g: clear_color[1] as f64,
+                            b: clear_color[2] as f64,
+                            a: clear_color[3] as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: self.depth_texture_view.get(&viewport_id).map(|view| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view,
+                        depth_ops: self
+                            .options
+                            .depth_stencil_format
+                            .is_some_and(|depth_stencil_format| {
+                                depth_stencil_format.has_depth_aspect()
+                            })
+                            .then_some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                // It is very unlikely that the depth buffer is needed after egui finished rendering
+                                // so no need to store it. (this can improve performance on tiling GPUs like mobile chips or Apple Silicon)
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                        stencil_ops: self
+                            .options
+                            .depth_stencil_format
+                            .is_some_and(|depth_stencil_format| {
+                                depth_stencil_format.has_stencil_aspect()
+                            })
+                            .then_some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                    }
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            // Forgetting the pass' lifetime means that we are no longer compile-time protected from
+            // runtime errors caused by accessing the parent encoder before the render pass is dropped.
+            // Since we don't pass it on to the renderer, we should be perfectly safe against this mistake here!
+            renderer.render(
+                &mut render_pass.forget_lifetime(),
+                clipped_primitives,
+                &screen_descriptor,
+            );
+
+            if capture && let Some(capture_state) = &mut self.screen_capture_state {
+                capture_buffer = Some(capture_state.copy_textures(
+                    &render_state.device,
+                    output_frame.as_ref(),
+                    &mut encoder,
+                ));
             }
         }
+
+        let encoded = {
+            profiling::scope!("CommandEncoder::finish");
+            encoder.finish()
+        };
+
+        if observe {
+            self.config.startup_end(StartupGpuStage::Encode, true);
+        }
+        // Submit the commands: both the main buffer and user-defined ones.
+        {
+            profiling::scope!("Queue::submit");
+            // wgpu doesn't document where vsync can happen. Maybe here?
+            let start = web_time::Instant::now();
+            if observe {
+                self.config.startup_begin(StartupGpuStage::QueueSubmit);
+            }
+            delivery.submit(core::iter::chain(user_cmd_bufs, [encoded]));
+            if observe {
+                self.config.startup_end(StartupGpuStage::QueueSubmit, true);
+            }
+            vsync_sec += start.elapsed().as_secs_f32();
+        };
+
+        probe.outcome = if output_frame.is_some() {
+            PaintOutcome::Submitted
+        } else {
+            PaintOutcome::CaptureOnly
+        };
+        // Complete frees after the real submission; early exits use the same owner.
+        drop(delivery);
+
+        if let Some(capture_buffer) = capture_buffer
+            && let Some(screen_capture_state) = &mut self.screen_capture_state
+        {
+            if crate::atlas_diag::capture_probe_active() {
+                crate::atlas_diag::log_line(format!(
+                    "[capture-probe] wgpu_capture_readback_queued viewport={viewport_id:?}"
+                ));
+            }
+            screen_capture_state.read_screen_rgba_in_viewport(
+                capture_buffer,
+                capture_data,
+                viewport_id,
+            );
+        }
+
+        if let Some(output_frame) = output_frame {
+            if let Some(window) = window {
+                window.pre_present_notify();
+            }
+
+            profiling::scope!("present");
+            // wgpu doesn't document where vsync can happen. Maybe here?
+            let start = web_time::Instant::now();
+            if observe {
+                self.config.startup_begin(StartupGpuStage::Present);
+            }
+            render_state.queue.present(output_frame);
+            if observe {
+                self.config.startup_end(StartupGpuStage::Present, true);
+                if let Some(event) = self.startup_present.returned(viewport_id, startup_tag) {
+                    self.config.startup_event(event);
+                }
+            }
+            vsync_sec += start.elapsed().as_secs_f32();
+        }
+
+        vsync_sec
     }
 
     pub fn gc_viewports(&mut self, active_viewports: &ViewportIdSet) {
@@ -888,353 +1011,221 @@ impl Painter {
     }
 }
 
-/// mIV probe: report every font-atlas delta and the outcome it was delivered under, so the
-/// A/B measurement for the detached-close flicker can show whether an upload really does
-/// survive a surface-less frame. The caller repeat that once stood in for this ownership
-/// guarantee has been removed; keep the probe through the follow-up measurement.
-fn probe_atlas_delivery(
-    site: &str,
-    textures_delta: &epaint::textures::TexturesDelta,
-    outcome: PaintOutcome,
-) {
-    let atlas: Vec<String> = textures_delta
-        .set
-        .iter()
-        .filter(|(id, _)| *id == epaint::TextureId::default())
-        .map(|(_, delta)| {
-            format!(
-                "{}x{}{}",
-                delta.image.width(),
-                delta.image.height(),
-                if delta.pos.is_none() {
-                    "full"
-                } else {
-                    "partial"
+/// Shared completion owner extending upstream's queue guard: early returns submit queued
+/// writes, then release resources. A normal submit suppresses the fallback empty submit.
+struct TextureDelivery<'a> {
+    render_state: &'a RenderState,
+    textures_delta: &'a mut epaint::textures::TexturesDelta,
+    queue_needs_submit: bool,
+    startup_observer: Option<&'a WgpuConfiguration>,
+}
+
+impl<'a> TextureDelivery<'a> {
+    fn begin(
+        render_state: Option<&'a RenderState>,
+        textures_delta: &'a mut epaint::textures::TexturesDelta,
+        site: crate::atlas_diag::Site,
+        startup_observer: Option<&'a WgpuConfiguration>,
+    ) -> Option<Self> {
+        if let Some(observer) = startup_observer {
+            observer.startup_begin(StartupGpuStage::TextureDelivery);
+        }
+        let Some(render_state) = render_state else {
+            if let Some(observer) = startup_observer {
+                observer.startup_end(StartupGpuStage::TextureDelivery, false);
+                // Preserve the finalization observation even when the pending owner retains
+                // the entire batch because no renderer exists.
+                observer.startup_begin(StartupGpuStage::TextureDelivery);
+                observer.startup_end(StartupGpuStage::TextureDelivery, false);
+            }
+            return None;
+        };
+        // Preserve upstream's fallback submission unless an upload actually submits the queue.
+        let mut queue_needs_submit = true;
+        {
+            let mut renderer = render_state.renderer.write();
+            let diag_id = renderer.diag_id();
+            let batch = crate::atlas_diag::begin_applied_batch(site, diag_id, textures_delta);
+            #[expect(clippy::iter_over_hash_type)] // Each ID's delta order is preserved.
+            for (id, image_deltas) in textures_delta.set.drain() {
+                for image_delta in image_deltas {
+                    let before = renderer.texture_size(&id);
+                    match renderer.update_texture_with_submission(
+                        &render_state.device,
+                        &render_state.queue,
+                        id,
+                        &image_delta,
+                    ) {
+                        renderer::TextureUpdateSubmission::Unchanged => {}
+                        renderer::TextureUpdateSubmission::Pending => queue_needs_submit = true,
+                        renderer::TextureUpdateSubmission::Submitted => queue_needs_submit = false,
+                    }
+                    let after = renderer.texture_size(&id);
+                    crate::atlas_diag::record_applied(id, diag_id, &image_delta, before, after);
                 }
-            )
-        })
-        .collect();
-    if atlas.is_empty() {
-        return;
-    }
-    crate::atlas_diag::log_line(format!(
-        "[atlas-probe] site={site} outcome={outcome:?} deltas=[{}]",
-        atlas.join(",")
-    ));
-}
-
-fn begin_delivery(
-    render_state: Option<&RenderState>,
-    textures_delta: &epaint::textures::TexturesDelta,
-    site: crate::atlas_diag::Site,
-) -> Result<(), PaintOutcome> {
-    let Some(render_state) = render_state else {
-        crate::atlas_diag::record_dropped_batch(
-            site,
-            crate::atlas_diag::DropReason::RenderStateAbsent,
+            }
+            if batch.tracked() {
+                crate::atlas_diag::flush("applying a texture delta batch");
+            }
+        }
+        if let Some(observer) = startup_observer {
+            observer.startup_end(StartupGpuStage::TextureDelivery, true);
+        }
+        Some(Self {
+            render_state,
             textures_delta,
-        );
-        return Err(PaintOutcome::RenderStateAbsent);
-    };
-
-    let mut renderer = render_state.renderer.write();
-    apply_delta_set(
-        &mut renderer,
-        &render_state.device,
-        &render_state.queue,
-        textures_delta,
-        site,
-    );
-    Ok(())
-}
-
-fn classify_surface_acquire<T>(
-    result: Result<T, wgpu::SurfaceError>,
-    on_surface_error: &dyn Fn(wgpu::SurfaceError) -> SurfaceErrorAction,
-) -> Result<T, PaintOutcome> {
-    result.map_err(|error| match on_surface_error(error) {
-        SurfaceErrorAction::RecreateSurface => PaintOutcome::SurfaceRecreated,
-        SurfaceErrorAction::SkipFrame => PaintOutcome::Skipped,
-    })
-}
-
-fn finish_delivery(
-    render_state: Option<&RenderState>,
-    textures_delta: &epaint::textures::TexturesDelta,
-    outcome: PaintOutcome,
-) {
-    // The inner paint block has dropped every unsubmitted encoder/command buffer before this
-    // finalizer runs. `Submitted` is only produced after `queue.submit`, so freeing here cannot
-    // invalidate commands that still need submission.
-    //
-    // The contract is deliberately "a renderer means the frees are delivered", with no outcome
-    // able to opt out - that is the whole point of routing every exit through here. The
-    // agreement between the outcome and the render state is an invariant worth catching while
-    // developing, but not worth killing a session over: this function sits on the paint path,
-    // and `Renderer::update_texture` next door already chose to skip a bad write rather than
-    // panic ("a frame of wrong glyphs beats losing the session"). A future outcome added by
-    // 1.31 must not be able to turn a bookkeeping mismatch into a process kill.
-    debug_assert_eq!(
-        render_state.is_none(),
-        outcome == PaintOutcome::RenderStateAbsent,
-        "paint outcome and render-state availability must agree, got {outcome:?}"
-    );
-    let Some(render_state) = render_state else {
-        return;
-    };
-    let mut renderer = render_state.renderer.write();
-    for id in &textures_delta.free {
-        renderer.free_texture(id);
+            queue_needs_submit,
+            startup_observer,
+        })
     }
+
+    fn submit(&mut self, commands: impl IntoIterator<Item = wgpu::CommandBuffer>) {
+        self.render_state.queue.submit(commands);
+        #[cfg(test)]
+        SUBMISSION_COUNTS.with(|counts| {
+            let mut next = counts.get();
+            next.normal += 1;
+            counts.set(next);
+        });
+        self.queue_needs_submit = false;
+    }
+}
+
+impl Drop for TextureDelivery<'_> {
+    fn drop(&mut self) {
+        if let Some(observer) = self.startup_observer {
+            observer.startup_begin(StartupGpuStage::TextureDelivery);
+        }
+        if self.queue_needs_submit {
+            self.render_state.queue.submit([]);
+            #[cfg(test)]
+            SUBMISSION_COUNTS.with(|counts| {
+                let mut next = counts.get();
+                next.empty += 1;
+                counts.set(next);
+            });
+        }
+        {
+            let mut renderer = self.render_state.renderer.write();
+            #[expect(clippy::iter_over_hash_type)]
+            for id in self.textures_delta.free.drain() {
+                renderer.free_texture(&id);
+            }
+        }
+        if let Some(observer) = self.startup_observer {
+            observer.startup_end(StartupGpuStage::TextureDelivery, true);
+        }
+    }
+}
+
+// Observe only actual returned submit calls, with no production state or queue added.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SubmissionCounts {
+    normal: usize,
+    empty: usize,
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{WgpuError, WgpuSetup};
-    use egui::{Color32, ColorImage, TextureId, TextureOptions};
-    use epaint::{ImageDelta, textures::TexturesDelta};
+std::thread_local! {
+    static SUBMISSION_COUNTS: std::cell::Cell<SubmissionCounts> = const { std::cell::Cell::new(SubmissionCounts { normal: 0, empty: 0 }) };
+}
 
-    fn full_delta(id: TextureId, height: usize) -> TexturesDelta {
-        TexturesDelta {
-            set: vec![(
-                id,
-                ImageDelta::full(
-                    ColorImage::filled([1, height], Color32::WHITE),
-                    TextureOptions::LINEAR,
-                ),
-            )],
-            free: Vec::new(),
-        }
-    }
+#[cfg(test)]
+fn submission_counts() -> SubmissionCounts {
+    SUBMISSION_COUNTS.with(std::cell::Cell::get)
+}
 
-    fn paint_without_surface(painter: &mut Painter, textures_delta: &TexturesDelta) {
-        assert!(painter.surfaces.is_empty(), "test requires no surfaces");
-        painter.paint_and_update_textures(
-            ViewportId::ROOT,
-            1.0,
-            [0.0; 4],
-            &[],
-            textures_delta,
-            Vec::new(),
-        );
-    }
+fn remove_viewport_resources<S, D, M>(
+    viewport_id: ViewportId,
+    surfaces: &mut ViewportIdMap<S>,
+    depth_views: &mut ViewportIdMap<D>,
+    msaa_views: &mut ViewportIdMap<M>,
+) {
+    surfaces.remove(&viewport_id);
+    depth_views.remove(&viewport_id);
+    msaa_views.remove(&viewport_id);
+}
 
-    #[test]
-    fn paint_and_update_textures_delivers_set_and_free_without_surface() {
-        let mut configuration = WgpuConfiguration::default();
-        let present_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let callback_count = present_count.clone();
-        let delivery_begin = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let delivery_end = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let callback_begin = delivery_begin.clone();
-        let callback_end = delivery_end.clone();
-        configuration.startup_diagnostics = Some(Arc::new(move |event| {
-            match event {
-                crate::StartupDiagnosticEvent::Begin(StartupGpuStage::TextureDelivery) => {
-                    callback_begin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                crate::StartupDiagnosticEvent::End {
-                    stage: StartupGpuStage::TextureDelivery,
-                    ..
-                } => {
-                    callback_end.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                _ => {}
-            }
-            if matches!(event, crate::StartupDiagnosticEvent::RootPresented { .. }) {
-                callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }));
-        let WgpuSetup::CreateNew(setup) = &mut configuration.wgpu_setup else {
-            unreachable!("default configuration must create a new wgpu setup");
-        };
-        setup.instance_descriptor.backends = wgpu::Backends::DX12;
+#[cfg(test)]
+#[path = "winit_tests.rs"]
+mod tests;
 
-        let options = RendererOptions::default();
-        let mut painter = pollster::block_on(Painter::new(
-            Context::default(),
-            configuration.clone(),
-            false,
-            options,
-        ));
-        paint_without_surface(&mut painter, &TexturesDelta::default());
-        assert_eq!(delivery_begin.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(delivery_end.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(
-            present_count.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "render-state absence cannot prove root presentation"
-        );
-        let render_state = match pollster::block_on(RenderState::create(
-            &configuration,
-            &painter.instance,
-            None,
-            options,
-        )) {
-            Ok(render_state) => render_state,
-            Err(WgpuError::RequestAdapterError(error)) => {
-                eprintln!("skipping headless DX12 texture delivery test: {error}");
-                return;
-            }
-            Err(error) => panic!("create headless DX12 render state: {error}"),
-        };
-        painter.render_state = Some(render_state.clone());
+/// Diagnostic classification only; resource completion belongs exclusively to TextureDelivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintOutcome {
+    RenderStateAbsent,
+    AppliedWithoutPaint,
+    SurfaceAbsent,
+    SurfaceRecreated,
+    SurfaceRecreationFailed,
+    SurfaceReconfigured,
+    Skipped,
+    CaptureZeroSized,
+    CaptureOnly,
+    Submitted,
+}
 
-        let texture_id = TextureId::Managed(0);
-        paint_without_surface(&mut painter, &full_delta(texture_id, 32));
-        assert_eq!(
-            render_state.renderer.read().texture_size(&texture_id),
-            Some([1, 32]),
-            "seed texture must be observable before exercising replacement delivery"
-        );
+/// Keep only a printable summary across draining. It carries no texture application rights.
+/// Constructed before TextureDelivery so its drop observes that owner's completed submission/free.
+struct DeliveryProbe {
+    site: &'static str,
+    viewport_id: ViewportId,
+    capture: bool,
+    atlas: String,
+    outcome: PaintOutcome,
+}
 
-        paint_without_surface(&mut painter, &full_delta(texture_id, 128));
-        assert_eq!(
-            render_state.renderer.read().texture_size(&texture_id),
-            Some([1, 128]),
-            "a full replacement must reach the shared renderer without a surface"
-        );
-
-        render_state
-            .device
-            .push_error_scope(wgpu::ErrorFilter::Validation);
-        let partial_delta = TexturesDelta {
-            set: vec![(
-                texture_id,
-                ImageDelta::partial(
-                    [0, 45],
-                    ColorImage::filled([1, 81], Color32::WHITE),
-                    TextureOptions::LINEAR,
-                ),
-            )],
-            free: Vec::new(),
-        };
-        paint_without_surface(&mut painter, &partial_delta);
-        let validation_error = pollster::block_on(render_state.device.pop_error_scope());
-        assert!(
-            validation_error.is_none(),
-            "partial update after the full replacement must validate: {validation_error:?}"
-        );
-        assert_eq!(
-            render_state.renderer.read().texture_size(&texture_id),
-            Some([1, 128]),
-            "a partial update must preserve the replacement texture size"
-        );
-
-        let freed_id = TextureId::Managed(1);
-        paint_without_surface(&mut painter, &full_delta(freed_id, 32));
-        assert!(
-            render_state.renderer.read().texture(&freed_id).is_some(),
-            "free-path texture must be seeded"
-        );
-        paint_without_surface(
-            &mut painter,
-            &TexturesDelta {
-                set: Vec::new(),
-                free: vec![freed_id],
-            },
-        );
-        assert!(
-            render_state.renderer.read().texture(&freed_id).is_none(),
-            "free must reach the shared renderer without a surface"
-        );
-        assert_eq!(
-            present_count.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "texture-only delivery cannot prove root presentation"
-        );
-        let begins = delivery_begin.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            begins > 2,
-            "real texture-only delivery must emit startup phase observations"
-        );
-        assert_eq!(
-            begins,
-            delivery_end.load(std::sync::atomic::Ordering::Relaxed)
-        );
-    }
-
-    fn headless_render_state() -> Option<RenderState> {
-        let mut configuration = WgpuConfiguration::default();
-        let WgpuSetup::CreateNew(setup) = &mut configuration.wgpu_setup else {
-            unreachable!("default configuration must create a new wgpu setup");
-        };
-        setup.instance_descriptor.backends = wgpu::Backends::DX12;
-
-        let instance = pollster::block_on(configuration.wgpu_setup.new_instance());
-        match pollster::block_on(RenderState::create(
-            &configuration,
-            &instance,
-            None,
-            RendererOptions::default(),
-        )) {
-            Ok(render_state) => Some(render_state),
-            Err(WgpuError::RequestAdapterError(error)) => {
-                eprintln!("skipping headless DX12 texture delivery test: {error}");
-                None
-            }
-            Err(error) => panic!("create headless DX12 render state: {error}"),
-        }
-    }
-
-    fn recreate_surface(_: wgpu::SurfaceError) -> SurfaceErrorAction {
-        SurfaceErrorAction::RecreateSurface
-    }
-
-    fn skip_frame(_: wgpu::SurfaceError) -> SurfaceErrorAction {
-        SurfaceErrorAction::SkipFrame
-    }
-
-    fn assert_surface_error_outcome_frees_texture(
-        on_surface_error: fn(wgpu::SurfaceError) -> SurfaceErrorAction,
-        expected_outcome: PaintOutcome,
-    ) {
-        let Some(render_state) = headless_render_state() else {
-            return;
-        };
-        let texture_id = TextureId::Managed(0);
-        begin_delivery(
-            Some(&render_state),
-            &full_delta(texture_id, 32),
-            crate::atlas_diag::Site::AppliedPaint,
-        )
-        .expect("seed texture delivery requires a render state");
-        assert_eq!(
-            render_state.renderer.read().texture_size(&texture_id),
-            Some([1, 32]),
-            "outcome test texture must be seeded before finalization"
-        );
-
-        let outcome =
-            classify_surface_acquire::<()>(Err(wgpu::SurfaceError::Lost), &on_surface_error)
-                .expect_err("injected surface error must classify as a non-submit outcome");
-        assert_eq!(outcome, expected_outcome);
-
-        finish_delivery(
-            Some(&render_state),
-            &TexturesDelta {
-                set: Vec::new(),
-                free: vec![texture_id],
-            },
+impl DeliveryProbe {
+    fn new(
+        site: &'static str,
+        viewport_id: ViewportId,
+        capture: bool,
+        textures_delta: &epaint::textures::TexturesDelta,
+        outcome: PaintOutcome,
+    ) -> Self {
+        let atlas = textures_delta
+            .set
+            .get(&epaint::TextureId::default())
+            .into_iter()
+            .flatten()
+            .map(|delta| {
+                format!(
+                    "{}x{}{}",
+                    delta.image.width(),
+                    delta.image.height(),
+                    if delta.pos.is_none() {
+                        "full"
+                    } else {
+                        "partial"
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Self {
+            site,
+            viewport_id,
+            capture,
+            atlas,
             outcome,
-        );
-        assert!(
-            render_state.renderer.read().texture(&texture_id).is_none(),
-            "the transaction finalizer must free the seeded texture for {outcome:?}"
-        );
+        }
     }
+}
 
-    #[test]
-    fn surface_recreated_outcome_finalizes_texture_free() {
-        assert_surface_error_outcome_frees_texture(
-            recreate_surface,
-            PaintOutcome::SurfaceRecreated,
-        );
-    }
-
-    #[test]
-    fn skipped_outcome_finalizes_texture_free() {
-        assert_surface_error_outcome_frees_texture(skip_frame, PaintOutcome::Skipped);
+impl Drop for DeliveryProbe {
+    fn drop(&mut self) {
+        if !self.atlas.is_empty() {
+            crate::atlas_diag::log_line(format!(
+                "[atlas-probe] site={} outcome={:?} deltas=[{}]",
+                self.site, self.outcome, self.atlas
+            ));
+        }
+        if self.capture && crate::atlas_diag::capture_probe_active() {
+            crate::atlas_diag::log_line(format!(
+                "[capture-probe] wgpu_capture_outcome viewport={:?} outcome={:?}",
+                self.viewport_id, self.outcome
+            ));
+        }
     }
 }

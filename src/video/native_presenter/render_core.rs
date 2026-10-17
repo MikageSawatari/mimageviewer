@@ -1033,7 +1033,6 @@ fn consume_seek_strip_wheel(
         return steps;
     }
     ctx.input_mut(|input| {
-        input.raw_scroll_delta = egui::Vec2::ZERO;
         input.smooth_scroll_delta = egui::Vec2::ZERO;
         input
             .events
@@ -1793,11 +1792,14 @@ fn draw_native_seek_strip_menu(
     if max_scroll > 0.0
         && anchor.contains(ctx.input(|input| input.pointer.hover_pos().unwrap_or_default()))
     {
-        let delta = ctx.input(|input| input.raw_scroll_delta.y);
-        if delta < -0.1 {
-            scroll = (scroll + row_height).min(max_scroll);
-        } else if delta > 0.1 {
-            scroll = (scroll - row_height).max(0.0);
+        let options = ctx.options(|options| options.input_options);
+        let wheel = ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, options));
+        for delta in wheel.into_iter().map(|wheel| wheel.delta.y) {
+            if delta < -0.1 {
+                scroll = (scroll + row_height).min(max_scroll);
+            } else if delta > 0.1 {
+                scroll = (scroll - row_height).max(0.0);
+            }
         }
     }
     ctx.data_mut(|data| data.insert_temp(scroll_id, scroll));
@@ -2045,12 +2047,15 @@ pub(crate) fn draw_native_audio_track_menu(
         })
         .min(max_first);
     if anchor.contains(ctx.input(|input| input.pointer.hover_pos().unwrap_or_default())) {
-        let delta = ctx.input(|input| input.raw_scroll_delta.y);
-        if delta < -0.1 {
-            first = (first + 1).min(max_first);
-        }
-        if delta > 0.1 {
-            first = first.saturating_sub(1);
+        let options = ctx.options(|options| options.input_options);
+        let wheel = ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, options));
+        for delta in wheel.into_iter().map(|wheel| wheel.delta.y) {
+            if delta < -0.1 {
+                first = (first + 1).min(max_first);
+            }
+            if delta > 0.1 {
+                first = first.saturating_sub(1);
+            }
         }
     }
     ctx.data_mut(|data| data.insert_temp(scroll_id, first));
@@ -3803,6 +3808,24 @@ struct NativeOverlayLogicalBatch {
 }
 
 impl NativeOverlayLogicalBatch {
+    fn append_result(
+        &mut self,
+        output: Result<NativeOverlayLogicalOutput, String>,
+    ) -> Result<(), String> {
+        match output {
+            Ok(output) => {
+                self.append(output);
+                Ok(())
+            }
+            Err(error) => {
+                // The caller faults and retires this renderer; no future pass can use it.
+                if let Some(mut output) = self.full_output.take() {
+                    crate::egui_output::terminate_renderer_output(&mut output.textures_delta);
+                }
+                Err(error)
+            }
+        }
+    }
     fn append(&mut self, output: NativeOverlayLogicalOutput) {
         self.draw_facts = output.draw_facts;
         if let Some(full_output) = self.full_output.as_mut() {
@@ -4129,7 +4152,8 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
     for (event_index, event) in events.iter().enumerate() {
         if let NativeEvent::MouseWheel(wheel) = event {
             if ownership_commit_pending && target.batch_needs_render() {
-                logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+                logical_batch
+                    .append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
                 logical_pass_count += 1;
                 let routing = native_routing_after_segment(target, segment_routing);
                 assign_native_routing_segment(
@@ -4142,7 +4166,8 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
             }
             ownership_commit_pending = false;
             event_dispositions[event_index] = target.batch_push_wheel(*wheel);
-            logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+            logical_batch
+                .append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
             logical_pass_count += 1;
             let routing = native_routing_after_segment(target, segment_routing);
             assign_native_routing_segment(
@@ -4169,7 +4194,7 @@ fn run_native_event_batch<T: NativeLogicalBatchTarget>(
     }
 
     if logical_input_pending {
-        logical_batch.append(target.batch_render_logical_once(logical_pass_count > 0)?);
+        logical_batch.append_result(target.batch_render_logical_once(logical_pass_count > 0))?;
         logical_pass_count += 1;
     }
     let routing = native_routing_after_segment(target, segment_routing);
@@ -4964,7 +4989,7 @@ fn configure_overlay_style(ctx: &egui::Context, text_contrast: crate::settings::
         crate::os_theme::ResolvedTheme::Dark,
         text_contrast,
     );
-    ctx.style_mut(|style| {
+    ctx.global_style_mut(|style| {
         // native HUD は HUD_BOTTOM_HEIGHT (= 64pt、2 段) の小さな操作面なので、ヘルプ
         // text は hover 直後に出す。egui default の 0.5s delay だと「初回だけ待つ /
         // 隣ボタンは即時」という grace-time 由来の不揃いな挙動に見える。
@@ -9605,7 +9630,10 @@ impl NativeEguiOverlay {
         crate::ime_focus::install_ime_input_policy(&egui_ctx);
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         crate::double_click_time::configure_context(&egui_ctx);
-        egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
+        egui_ctx.options_mut(|options| {
+            options.zoom_with_keyboard = false;
+            options.quit_shortcuts.clear();
+        });
         let fonts_t0 = Instant::now();
         configure_overlay_fonts(&egui_ctx, &ui_font);
         let fonts_ms = fonts_t0.elapsed().as_secs_f64() * 1000.0;
@@ -10055,6 +10083,8 @@ impl NativeEguiOverlayState {
         let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, wheel.alt);
         self.pointer_pos = Some(pos);
         self.modifiers = modifiers;
+        self.pending_events
+            .push(egui::Event::ModifiersChanged(self.modifiers));
         if matches!(
             self.normalize_state.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
@@ -10125,6 +10155,8 @@ impl NativeEguiOverlayState {
                 unit: egui::MouseWheelUnit::Line,
                 delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
                 modifiers,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             });
         }
         self.dirty = true;
@@ -10150,6 +10182,8 @@ impl NativeEguiOverlayState {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
                 let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
                 self.modifiers = modifiers;
+                self.pending_events
+                    .push(egui::Event::ModifiersChanged(self.modifiers));
                 if self.shortcut_help_open {
                     if matches!(event, NativeEvent::KeyDown(_))
                         && !key.repeat
@@ -10295,9 +10329,14 @@ impl NativeEguiOverlayState {
                 self.dirty = true;
             }
             NativeEvent::Ime(ime) => {
+                // Native WM_IME termination still feeds the shared cancellation normalizer.
+                #[allow(deprecated)]
                 let ime = match ime {
                     NativeVideoImeEvent::Enabled => egui::ImeEvent::Enabled,
-                    NativeVideoImeEvent::Preedit(text) => egui::ImeEvent::Preedit(text),
+                    NativeVideoImeEvent::Preedit(text) => egui::ImeEvent::Preedit {
+                        text,
+                        active_range_chars: None,
+                    },
                     NativeVideoImeEvent::Commit(text) => egui::ImeEvent::Commit(text),
                     NativeVideoImeEvent::Disabled => egui::ImeEvent::Disabled,
                 };
@@ -10308,6 +10347,8 @@ impl NativeEguiOverlayState {
                 let pos = self.native_pos(mouse.x, mouse.y);
                 self.pointer_pos = Some(pos);
                 self.modifiers = egui_modifiers(mouse.shift, mouse.ctrl, false);
+                self.pending_events
+                    .push(egui::Event::ModifiersChanged(self.modifiers));
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 self.dirty = true;
             }
@@ -10397,6 +10438,8 @@ impl NativeEguiOverlayState {
                 let modifiers = egui_modifiers(button.shift, button.ctrl, false);
                 self.pointer_pos = Some(pos);
                 self.modifiers = modifiers;
+                self.pending_events
+                    .push(egui::Event::ModifiersChanged(self.modifiers));
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 let egui_button = match button.button {
                     NativeVideoMouseButton::Left => egui::PointerButton::Primary,
@@ -12461,6 +12504,7 @@ impl NativeEguiOverlay {
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: self.gpu.format,
+                color_space: wgpu::SurfaceColorSpace::Auto,
                 width: self.width,
                 height: self.height,
                 present_mode: self.gpu.present_mode,
@@ -12934,7 +12978,6 @@ impl NativeEguiOverlayState {
             )),
             time: Some(self.started_at.elapsed().as_secs_f64()),
             predicted_dt: 1.0 / 60.0,
-            modifiers: self.modifiers,
             events: std::mem::take(&mut self.pending_events),
             ..Default::default()
         };
@@ -12945,7 +12988,8 @@ impl NativeEguiOverlayState {
         let mut seek_strip_area_ran = false;
         let mut seek_strip_preview_hover = NativeSeekStripPreviewHover::Outside;
         let egui_run_t0 = Instant::now();
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+        let full_output = self.egui_ctx.run_ui(raw_input, |root_ui| {
+            let ctx = root_ui.ctx();
             draw_facts = NativeOverlayDrawFacts::default();
             if !overlay_visible {
                 return;
@@ -14065,8 +14109,8 @@ impl NativeEguiOverlayState {
         // Query after `run`: egui updates these flags from the just-processed
         // frame, which lets this presenter decide whether to forward the same
         // native input batch to the legacy fullscreen shortcut path.
-        self.wants_pointer_input = self.egui_ctx.wants_pointer_input();
-        self.wants_keyboard_input = self.egui_ctx.wants_keyboard_input();
+        self.wants_pointer_input = self.egui_ctx.egui_wants_pointer_input();
+        self.wants_keyboard_input = self.egui_ctx.egui_wants_keyboard_input();
         self.last_seek_target_secs = last_seek_target_secs;
         // T35: hover_preview_target_secs が Some → None に遷移したら clear イベントを
         // 送って player 側の pump_native_hover_thumbnail 永久リトライを止める
@@ -14240,7 +14284,7 @@ impl NativeEguiOverlay {
             #[cfg(feature = "test-script")]
             ui_smoke_command_attributions,
         } = batch;
-        let full_output = full_output
+        let mut full_output = full_output
             .ok_or_else(|| "native overlay logical batch produced no output".to_string())?;
         self.gpu.diagnostics.snapshot("final_draw", || {
             let resolved = state.resolved_chrome();
@@ -14318,7 +14362,7 @@ impl NativeEguiOverlay {
             overlay_visible,
             |gpu| {
                 let timings = gpu.present_batch(
-                    &full_output.textures_delta,
+                    &mut full_output.textures_delta,
                     &paint_jobs,
                     &screen_descriptor,
                     window_epoch,
@@ -14401,12 +14445,19 @@ impl NativeEguiOverlay {
 
 // Keep platform conversion separate from both GPU presentation and HWND mutation. The
 // logical batch still accumulates these intents in the same order before its one present.
-fn append_native_platform_window_intents(
+pub(crate) fn append_native_platform_window_intents(
     output: &egui::PlatformOutput,
     pixels_per_point: f32,
     auto_hide_allowed: bool,
     intents: &mut Vec<NativeWindowIntent>,
 ) {
+    if output
+        .ime
+        .as_ref()
+        .is_some_and(|ime| ime.should_interrupt_composition)
+    {
+        intents.push(NativeWindowIntent::InterruptImeComposition);
+    }
     if let Some(intent) = native_ime_cursor_area_intent(output.ime, pixels_per_point) {
         intents.push(intent);
     }
@@ -14444,6 +14495,8 @@ mod native_output_tests {
         let output = egui::PlatformOutput {
             ime: Some(egui::output::IMEOutput {
                 rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 30.0)),
+                purpose: egui::IMEPurpose::Normal,
+                should_interrupt_composition: false,
                 cursor_rect: egui::Rect::from_min_size(
                     egui::pos2(-1.5, 3.0),
                     egui::vec2(0.25, 10.0),
@@ -14470,6 +14523,64 @@ mod native_output_tests {
                 },
             ]
         ));
+    }
+
+    #[test]
+    fn native_ime_interrupt_real_text_edit_cursor_move_becomes_one_intent() {
+        let context = egui::Context::default();
+        let id = egui::Id::new("native-ime-cursor-move");
+        let mut text = "sample text".to_owned();
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(300.0, 30.0));
+        let raw = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 360.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let output = context.run_ui(raw(Vec::new()), |ui| {
+                ui.put(rect, egui::TextEdit::singleline(&mut text).id(id))
+                    .request_focus();
+            });
+            crate::egui_output::discard_headless_output(output);
+        }
+        let pointer = rect.left_center() + egui::vec2(8.0, 0.0);
+        let output = context.run_ui(
+            raw(vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ui| {
+                ui.put(rect, egui::TextEdit::singleline(&mut text).id(id));
+            },
+        );
+        let ime = output.platform_output.ime;
+        let mut intents = Vec::new();
+        append_native_platform_window_intents(&output.platform_output, 2.0, false, &mut intents);
+        crate::egui_output::discard_headless_output(output);
+        assert!(
+            ime.expect("focused real TextEdit")
+                .should_interrupt_composition
+        );
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| matches!(intent, NativeWindowIntent::InterruptImeComposition))
+                .count(),
+            1
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|intent| matches!(intent, NativeWindowIntent::UpdateImeCursorArea { .. }))
+        );
     }
 
     #[test]
@@ -14649,7 +14760,7 @@ fn apply_native_overlay_visibility(
 impl NativeEguiOverlayGpu {
     fn present_batch(
         &mut self,
-        textures_delta: &egui::TexturesDelta,
+        textures_delta: &mut egui::TexturesDelta,
         paint_jobs: &[egui::ClippedPrimitive],
         screen_descriptor: &egui_wgpu::ScreenDescriptor,
         window_epoch: u64,
@@ -14658,7 +14769,10 @@ impl NativeEguiOverlayGpu {
         let gate_wait_t0 = Instant::now();
         let _submission_guard = self.gpu_epoch.submission_guard();
         let gate_wait_ms = gate_wait_t0.elapsed().as_secs_f64() * 1000.0;
-        self.gpu_epoch.ensure_alive("overlay GPU submission")?;
+        if let Err(error) = self.gpu_epoch.ensure_alive("overlay GPU submission") {
+            crate::egui_output::terminate_renderer_output(textures_delta);
+            return Err(error);
+        }
 
         // presenter は本体とは別の egui Context / Renderer を持つ。font atlas の追跡台帳は
         // renderer 番号で区別するので、こちらの適用も同じ経路に載せる
@@ -14670,14 +14784,19 @@ impl NativeEguiOverlayGpu {
             textures_delta,
         );
         let texture_update_t0 = Instant::now();
+        let mut queue_needs_submit = false;
         crate::egui_output::apply_texture_sets(textures_delta, |id, image_delta| {
             let before = self.renderer.texture_size(&id);
-            self.renderer.update_texture(
+            match self.renderer.update_texture_with_submission(
                 self.gpu_epoch.device(),
                 self.gpu_epoch.queue(),
                 id,
                 image_delta,
-            );
+            ) {
+                egui_wgpu::TextureUpdateSubmission::Unchanged => {}
+                egui_wgpu::TextureUpdateSubmission::Pending => queue_needs_submit = true,
+                egui_wgpu::TextureUpdateSubmission::Submitted => queue_needs_submit = false,
+            }
             let after = self.renderer.texture_size(&id);
             egui_wgpu::atlas_diag::record_applied(id, diag_id, image_delta, before, after);
         });
@@ -14686,91 +14805,95 @@ impl NativeEguiOverlayGpu {
             egui_wgpu::atlas_diag::flush("applying the presenter's texture delta batch");
         }
 
-        let surface_acquire_t0 = Instant::now();
-        let surface_texture = match self.surface.get_current_texture() {
-            Ok(texture) => texture,
-            Err(error) => {
-                self.diagnostics.count("surface_acquire_error", 1);
-                self.diagnostics.event("surface_error", || {
-                    DiagnosticSample::new().bool("device_lost", self.gpu_epoch.is_lost())
-                });
-                if error == wgpu::SurfaceError::Other && self.gpu_epoch.is_lost() {
-                    return Err(format!(
-                        "wgpu overlay device epoch {} was lost during surface acquire: {error:?}",
-                        self.gpu_epoch.generation()
-                    ));
+        // Completion runs on acquire errors as well: writes/mipmaps precede frees.
+        let result = (|| {
+            let surface_acquire_t0 = Instant::now();
+            let surface_texture = match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(texture)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+                error => {
+                    self.diagnostics.count("surface_acquire_error", 1);
+                    self.diagnostics.event("surface_error", || {
+                        DiagnosticSample::new().bool("device_lost", self.gpu_epoch.is_lost())
+                    });
+                    return Err(format!("egui overlay get_current_texture: {error:?}"));
                 }
-                // Lost / Outdated / Timeout are surface conditions. They preserve the
-                // epoch cache; only the device-lost callback can latch an epoch.
-                return Err(format!("egui overlay get_current_texture: {error:?}"));
-            }
-        };
-        let surface_acquire_ms = surface_acquire_t0.elapsed().as_secs_f64() * 1000.0;
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let buffer_update_encode_t0 = Instant::now();
-        let mut encoder =
-            self.gpu_epoch
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("mIV native egui overlay encoder"),
-                });
-        let user_cmds = self.renderer.update_buffers(
-            self.gpu_epoch.device(),
-            self.gpu_epoch.queue(),
-            &mut encoder,
-            &paint_jobs,
-            &screen_descriptor,
-        );
-        {
-            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("mIV native egui overlay render"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            self.renderer.render(
-                &mut render_pass.forget_lifetime(),
+            };
+            let surface_acquire_ms = surface_acquire_t0.elapsed().as_secs_f64() * 1000.0;
+            let view = surface_texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let buffer_update_encode_t0 = Instant::now();
+            let mut encoder =
+                self.gpu_epoch
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("mIV native egui overlay encoder"),
+                    });
+            let user_cmds = self.renderer.update_buffers(
+                self.gpu_epoch.device(),
+                self.gpu_epoch.queue(),
+                &mut encoder,
                 &paint_jobs,
                 &screen_descriptor,
             );
+            {
+                let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("mIV native egui overlay render"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.renderer.render(
+                    &mut render_pass.forget_lifetime(),
+                    &paint_jobs,
+                    &screen_descriptor,
+                );
+            }
+            let mut submissions = user_cmds;
+            submissions.push(encoder.finish());
+            let buffer_update_encode_ms = buffer_update_encode_t0.elapsed().as_secs_f64() * 1000.0;
+            let submit_present_t0 = Instant::now();
+            self.gpu_epoch.queue().submit(submissions);
+            queue_needs_submit = false;
+            {
+                let _operation = self
+                    .health
+                    .begin_render_operation(NativeRenderOperation::Present, window_epoch);
+                self.diagnostics.count("Present", 1);
+                self.gpu_epoch.queue().present(surface_texture);
+                self.diagnostics.event("Present", || {
+                    DiagnosticSample::new().text("completion", "wgpu_call_returned")
+                });
+            }
+            let submit_present_ms = submit_present_t0.elapsed().as_secs_f64() * 1000.0;
+            let gpu_span_ms = gpu_span_t0.elapsed().as_secs_f64() * 1000.0;
+            Ok(NativeOverlayGpuTimings {
+                gate_wait_ms,
+                texture_update_ms,
+                surface_acquire_ms,
+                buffer_update_encode_ms,
+                submit_present_ms,
+                gpu_span_ms,
+            })
+        })();
+        if queue_needs_submit {
+            self.gpu_epoch.queue().submit([]);
         }
-        let mut submissions = user_cmds;
-        submissions.push(encoder.finish());
-        let buffer_update_encode_ms = buffer_update_encode_t0.elapsed().as_secs_f64() * 1000.0;
-        let submit_present_t0 = Instant::now();
-        self.gpu_epoch.queue().submit(submissions);
-        {
-            let _operation = self
-                .health
-                .begin_render_operation(NativeRenderOperation::Present, window_epoch);
-            self.diagnostics.count("Present", 1);
-            surface_texture.present();
-            self.diagnostics.event("Present", || {
-                DiagnosticSample::new().text("completion", "wgpu_call_returned")
-            });
-        }
-        let submit_present_ms = submit_present_t0.elapsed().as_secs_f64() * 1000.0;
-        let gpu_span_ms = gpu_span_t0.elapsed().as_secs_f64() * 1000.0;
-        drop(_submission_guard);
-        Ok(NativeOverlayGpuTimings {
-            gate_wait_ms,
-            texture_update_ms,
-            surface_acquire_ms,
-            buffer_update_encode_ms,
-            submit_present_ms,
-            gpu_span_ms,
-        })
+        crate::egui_output::finish_texture_output(std::mem::take(textures_delta), |id| {
+            self.renderer.free_texture(id)
+        });
+        result
     }
 
     fn set_visual_attached(&mut self, attached: bool, window_epoch: u64) -> Result<(), String> {
@@ -15845,7 +15968,7 @@ mod chrome_suppression_interaction_tests {
             let output = frame(&mut overlay);
             let facts = output.draw_facts;
             let mut batch = NativeOverlayLogicalBatch::default();
-            batch.append(output);
+            batch.append(output.into_inner());
             record_native_overlay_drawn_rects(&diagnostics, &overlay, batch.draw_facts);
             let snapshot = latest(&diagnostics, "drawn_rects").unwrap();
             for (name, rect) in [
@@ -15882,8 +16005,10 @@ mod chrome_suppression_interaction_tests {
                 serde_json::json!([0, if show_bar { 984 } else { 1020 }, 1920, 1080])
             );
             assert!(snapshot.get("omitted_fields").is_none());
+            crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
 
-            let off = overlay.render_logical_once(false, false).unwrap();
+            let off =
+                HeadlessLogicalOutput(Some(overlay.render_logical_once(false, false).unwrap()));
             assert!(off.overlay_visible);
             assert!(
                 [
@@ -15973,7 +16098,10 @@ mod chrome_suppression_interaction_tests {
         }
         overlay.pending_events.extend([
             egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("かな".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "かな".to_owned(),
+                active_range_chars: None,
+            }),
         ]);
         let output = frame(&mut overlay);
         assert!(overlay.ime_composing());
@@ -16241,7 +16369,7 @@ mod chrome_suppression_interaction_tests {
 
     fn frame_hold_scan_end_before_release(cancel: bool) {
         use crate::video::normalize_types::{NormalizeOverlayState, NormalizeUiState};
-        fn draw(overlay: &mut NativeEguiOverlayState) -> NativeOverlayLogicalOutput {
+        fn draw(overlay: &mut NativeEguiOverlayState) -> HeadlessLogicalOutput {
             // Keep the real egui click-duration contract deterministic under full-suite load.
             let time = overlay.egui_ctx.input(|i| i.time) + 1.0 / 60.0;
             overlay.started_at = Instant::now() - Duration::from_secs_f64(time);
@@ -16761,10 +16889,33 @@ mod chrome_suppression_interaction_tests {
         (overlay, chrome)
     }
 
-    fn frame(overlay: &mut NativeEguiOverlayState) -> NativeOverlayLogicalOutput {
-        overlay
-            .render_logical_once(false, true)
-            .expect("real CPU draw and hidden cleanup")
+    struct HeadlessLogicalOutput(Option<NativeOverlayLogicalOutput>);
+
+    impl HeadlessLogicalOutput {
+        fn into_inner(mut self) -> NativeOverlayLogicalOutput {
+            self.0.take().unwrap()
+        }
+    }
+    impl std::ops::Deref for HeadlessLogicalOutput {
+        type Target = NativeOverlayLogicalOutput;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+    impl Drop for HeadlessLogicalOutput {
+        fn drop(&mut self) {
+            if let Some(output) = self.0.take() {
+                crate::egui_output::discard_headless_output(output.full_output);
+            }
+        }
+    }
+
+    fn frame(overlay: &mut NativeEguiOverlayState) -> HeadlessLogicalOutput {
+        HeadlessLogicalOutput(Some(
+            overlay
+                .render_logical_once(false, true)
+                .expect("real CPU draw and hidden cleanup"),
+        ))
     }
 
     #[derive(Default)]
@@ -16875,11 +17026,12 @@ mod chrome_suppression_interaction_tests {
             batch: NativeOverlayLogicalBatch,
             _: Instant,
         ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
-            let output = batch
+            let mut output = batch
                 .full_output
                 .expect("production logical passes produced output");
             let texture_sets = output.textures_delta.set.len();
             let texture_frees = output.textures_delta.free.len();
+            crate::egui_output::apply_texture_sets(&mut output.textures_delta, |_, _| {});
             let state = &mut self.state;
             let result = finalize_native_overlay_gpu_batch(
                 &mut self.gpu,
@@ -16891,7 +17043,7 @@ mod chrome_suppression_interaction_tests {
                         state,
                         batch.seek_strip_inventory,
                         batch.seek_strip_window_request,
-                        output.textures_delta,
+                        std::mem::take(&mut output.textures_delta),
                         |id| {
                             gpu.operations.push("FreeTexture");
                             gpu.freed.push(*id);
@@ -16900,7 +17052,9 @@ mod chrome_suppression_interaction_tests {
                         batch.window_intents,
                     )
                 },
-            )?;
+            );
+            crate::egui_output::discard_headless_output(output);
+            let result = result?;
             self.texture_sets += texture_sets;
             self.texture_frees += texture_frees;
             Ok(result)
@@ -18507,7 +18661,7 @@ mod tests {
         for frame in 0..3 {
             let mut controls = Vec::new();
             let mut menu_rect = None;
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(full_rect),
                     ..Default::default()
@@ -18526,6 +18680,7 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
             assert!(menu_open);
             assert_eq!(controls.len(), 3);
             assert!(
@@ -18635,12 +18790,13 @@ mod tests {
         let button = egui::Rect::from_min_size(egui::pos2(150.0, 170.0), egui::vec2(62.0, 28.0));
         let mut commands = Vec::new();
         open = true;
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(viewport),
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 super::draw_native_audio_track_menu(
                     ctx,
                     viewport,
@@ -18655,6 +18811,7 @@ mod tests {
                 );
             },
         );
+        crate::egui_output::discard_headless_output(output);
         let first = ctx
             .data(|data| data.get_temp::<usize>(scroll_id))
             .expect("reopened menu should store its first visible row");
@@ -18751,13 +18908,14 @@ mod tests {
         let mut run = || {
             let time = time_secs;
             time_secs += 1.0;
-            ctx.run(
+            ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     time: Some(time),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         layout,
@@ -18776,7 +18934,7 @@ mod tests {
                 },
             )
         };
-        let _ = run();
+        crate::egui_output::discard_headless_output(run());
         run()
     }
 
@@ -18881,6 +19039,7 @@ mod tests {
             egui::Shape::LineSegment { stroke, .. } if stroke.width == 5.0
         )));
         assert_fixed_range_text_colors(&shapes, "画像間隔");
+        crate::egui_output::discard_headless_output(output);
 
         strip.thumbnail_notice = Some(super::NativeOverlaySeekStripThumbnailNotice::Unavailable);
         let notice_output =
@@ -18895,6 +19054,7 @@ mod tests {
                 if text.galley.text().contains(strip.thumbnail_notice.unwrap().label())
                     && text.fallback_color == egui::Color32::from_gray(210)
         )));
+        crate::egui_output::discard_headless_output(notice_output);
     }
 
     #[test]
@@ -18990,6 +19150,7 @@ mod tests {
             egui::Shape::LineSegment { stroke, .. } if stroke.width == 5.0
         )));
         assert_fixed_range_text_colors(&shapes, "表示範囲");
+        crate::egui_output::discard_headless_output(output);
     }
 
     /// テストが使う帯の寸法。overlay の `seek_strip_layout` と同じ引数で解決する。
@@ -19108,7 +19269,7 @@ mod tests {
         let mut cursor_icons = Vec::new();
         for frame in 0..4 {
             let mut commands = Vec::new();
-            let output = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     time: Some(frame as f64 / 60.0),
@@ -19119,7 +19280,8 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         test_strip_layout(overlay_size),
@@ -19146,6 +19308,7 @@ mod tests {
             let egui_hover = ctx.pointer_hover_pos();
             egui_hover_positions.push(egui_hover);
             cursor_icons.push(output.platform_output.cursor_icon);
+            crate::egui_output::discard_headless_output(output);
         }
 
         assert_eq!(
@@ -19203,12 +19366,13 @@ mod tests {
 
             // `Area` intentionally makes its first frame an invisible sizing pass. Prime the
             // two test-only areas so the assertions below inspect their painted second frame.
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     for id in [
                         egui::Id::new(("seek_preview_clip", case)),
                         egui::Id::new(("seek_preview_legacy_clip", case)),
@@ -19222,13 +19386,15 @@ mod tests {
                     }
                 },
             );
+            crate::egui_output::discard_headless_output(output);
 
-            let output = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     egui::Area::new(egui::Id::new(("seek_preview_clip", case)))
                         .fade_in(false)
                         .fixed_pos(egui::Pos2::ZERO)
@@ -19356,12 +19522,13 @@ mod tests {
                 "{case}: bookmark action icon"
             );
 
-            let legacy_output = ctx.run(
+            let legacy_output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     egui::Area::new(egui::Id::new(("seek_preview_legacy_clip", case)))
                         .fade_in(false)
                         .fixed_pos(egui::Pos2::ZERO)
@@ -19399,6 +19566,8 @@ mod tests {
                 !hud_rect.intersects(layout.preview_rect.expand(2.0)),
                 "{case}: that HUD-only clip excludes the complete popup"
             );
+            crate::egui_output::discard_headless_output(output);
+            crate::egui_output::discard_headless_output(legacy_output);
         }
     }
 
@@ -19943,17 +20112,20 @@ mod tests {
                 immediate_native_wheel_command(120, false, false, false, false, true).is_none(),
                 "wheel over the strip must not enqueue navigation before egui handles it"
             );
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     events: vec![egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Line,
                         delta: egui::vec2(0.0, 1.0),
                         modifiers: egui::Modifiers::default(),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         test_strip_layout(overlay_size),
@@ -19969,8 +20141,9 @@ mod tests {
                         &mut commands,
                         None,
                     );
+                    let options = ctx.options(|options| options.input_options);
                     wheel_remaining = ctx.input(|input| {
-                        input.raw_scroll_delta != egui::Vec2::ZERO
+                        !crate::wheel_input::remaining_wheel_inputs(input, options).is_empty()
                             || input.smooth_scroll_delta != egui::Vec2::ZERO
                             || input
                                 .events
@@ -19979,6 +20152,7 @@ mod tests {
                     });
                 },
             );
+            crate::egui_output::discard_headless_output(output);
 
             assert!(!wheel_remaining);
             assert!(commands.iter().any(|command| matches!(
@@ -20055,13 +20229,14 @@ mod tests {
         let mut drag_origin = None;
         let mut commands = Vec::new();
         for chunk in std::iter::once(Vec::new()).chain(frames) {
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
                     events: chunk,
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     draw_native_seek_strip(
                         ctx,
                         layout,
@@ -20083,6 +20258,7 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
         }
         (commands, layout)
     }
@@ -20129,7 +20305,7 @@ mod tests {
             320.0,
         );
         let release = egui::pos2(480.0, 0.0);
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -20146,7 +20322,8 @@ mod tests {
                 ],
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 let _ = draw_native_seek_strip(
                     ctx,
                     layout,
@@ -20166,8 +20343,9 @@ mod tests {
         );
         assert!(drag_origin.is_some());
         assert!(commands.is_empty());
+        crate::egui_output::discard_headless_output(output);
 
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -20184,7 +20362,8 @@ mod tests {
                 ],
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 let _ = draw_native_seek_strip(
                     ctx,
                     layout,
@@ -20202,6 +20381,7 @@ mod tests {
                 );
             },
         );
+        crate::egui_output::discard_headless_output(output);
         assert!(drag_origin.is_none());
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -20331,6 +20511,8 @@ mod tests {
                 unit: egui::MouseWheelUnit::Line,
                 delta: egui::vec2(0.0, 1.0),
                 modifiers: egui::Modifiers::default(),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             }]],
             Some(layout_center(overlay_size)),
         );
@@ -20493,13 +20675,14 @@ mod tests {
                         }],
                         _ => Vec::new(),
                     };
-                    let _ = ctx.run(
+                    let output = ctx.run_ui(
                         egui::RawInput {
                             screen_rect: Some(full),
                             events,
                             ..Default::default()
                         },
-                        |ctx| {
+                        |root_ui| {
+                            let ctx = root_ui.ctx();
                             if pass == 1 && overlay_size.y < 140.0 && *row_index >= 5 {
                                 ctx.data_mut(|data| {
                                     data.insert_temp(
@@ -20524,6 +20707,7 @@ mod tests {
                             );
                         },
                     );
+                    crate::egui_output::discard_headless_output(output);
                     // Area は 1 フレーム目にまだ `fixed_pos` へ落ち着いていない。押す位置は
                     // 落ち着いた後 (pass 1) の実 rect から取る。
                     if pass <= 1 {
@@ -20611,16 +20795,19 @@ mod tests {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, -1.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 }],
                 _ => Vec::new(),
             };
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(full),
                     events,
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     super::draw_native_seek_strip_menu(
                         ctx,
                         full,
@@ -20637,6 +20824,7 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
         }
         let scroll = ctx
             .data(|data| data.get_temp::<f32>(egui::Id::new("native_video_seek_strip_menu_scroll")))
@@ -20672,7 +20860,7 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
             .build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let painter = ui.painter().clone();
                     let mut commands = Vec::new();
                     super::draw_native_seek_strip_lock_button(
@@ -21368,7 +21556,7 @@ mod tests {
 
         fn batch_prepare(&mut self) -> Result<(), String> {
             let mut rects = None;
-            let full_output = self.ctx.run(
+            let full_output = self.ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -21377,7 +21565,8 @@ mod tests {
                     time: Some(0.0),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     let (strip, panel, _, _) = Self::draw_regions(ctx, false);
                     rects = Some((strip, panel));
                 },
@@ -21467,6 +21656,8 @@ mod tests {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
                     modifiers: super::egui_modifiers(wheel.shift, wheel.ctrl, wheel.alt),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 });
             }
             disposition
@@ -21485,7 +21676,7 @@ mod tests {
             let mut panel_raw_delta = None;
             let strip_rect = self.strip_rect.expect("prepared strip rect");
             let panel_rect = self.panel_rect.expect("prepared panel rect");
-            let mut full_output = ctx.run(
+            let mut full_output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -21495,7 +21686,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     assert!(
                         ctx.input(|input| input.stable_dt) > 0.0,
                         "headless logical pass clock must advance monotonically"
@@ -21504,7 +21696,13 @@ mod tests {
                     let over_strip = pointer.is_some_and(|pos| strip_rect.contains(pos));
                     let over_panel = pointer.is_some_and(|pos| panel_rect.contains(pos));
                     if over_panel {
-                        panel_raw_delta = Some(ctx.input(|input| input.raw_scroll_delta.y));
+                        let options = ctx.options(|options| options.input_options);
+                        panel_raw_delta = Some(ctx.input(|input| {
+                            crate::wheel_input::remaining_wheel_inputs(input, options)
+                                .iter()
+                                .map(|wheel| wheel.delta.y)
+                                .sum()
+                        }));
                     }
                     let (actual_strip, actual_panel, steps, offset) =
                         Self::draw_regions(ctx, over_strip);
@@ -21534,13 +21732,13 @@ mod tests {
                 .platform_output
                 .commands
                 .push(egui::OutputCommand::CopyText(format!("pass-{pass}")));
-            full_output.textures_delta.set.push((
+            full_output.textures_delta.push(
                 egui::TextureId::Managed(10_000 + pass as u64),
                 egui::epaint::ImageDelta::full(
                     egui::ColorImage::new([1, 1], vec![egui::Color32::from_gray(pass as u8)]),
                     egui::TextureOptions::NEAREST,
                 ),
-            ));
+            );
             self.last_logical_shape_count = full_output.shapes.len();
             self.dirty = false;
             Ok(NativeOverlayLogicalOutput {
@@ -21628,14 +21826,14 @@ mod tests {
         let ctx = egui::Context::default();
         configure_overlay_style(&ctx, crate::settings::TextContrast::Strong);
 
-        assert!(ctx.style().visuals.dark_mode);
+        assert!(ctx.global_style().visuals.dark_mode);
         assert_eq!(
             crate::os_theme::current_text_contrast(&ctx),
             crate::settings::TextContrast::Strong
         );
-        assert_eq!(ctx.style().interaction.tooltip_delay, 0.0);
+        assert_eq!(ctx.global_style().interaction.tooltip_delay, 0.0);
         assert_eq!(
-            ctx.style().visuals.text_color(),
+            ctx.global_style().visuals.text_color(),
             crate::os_theme::dark_visuals(crate::settings::TextContrast::Strong).text_color()
         );
 
@@ -21645,7 +21843,7 @@ mod tests {
             crate::settings::TextContrast::Standard
         );
         assert_eq!(
-            ctx.style().visuals.text_color(),
+            ctx.global_style().visuals.text_color(),
             crate::os_theme::dark_visuals(crate::settings::TextContrast::Standard).text_color()
         );
     }
@@ -22058,6 +22256,73 @@ mod tests {
             Some(1.0),
             "the final pass inventory remains the presented inventory"
         );
+        crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
+    }
+
+    #[test]
+    fn native_ime_interrupt_multiple_logical_passes_keep_one_generated_request() {
+        let mut target = HeadlessNativeBatchTarget::default();
+        let context = egui::Context::default();
+        let id = egui::Id::new("native-multiple-pass-ime");
+        let mut text = "??? sample".to_owned();
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let output = context.run_ui(raw(), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(id))
+                    .request_focus();
+            });
+            crate::egui_output::discard_headless_output(output);
+        }
+        let mut batch = NativeOverlayLogicalBatch::default();
+        for interrupt in [true, false] {
+            let mut logical = target.batch_render_logical_once(false).unwrap();
+            let output = context.run_ui(raw(), |ui| {
+                let response = ui.add(egui::TextEdit::singleline(&mut text).id(id));
+                if interrupt {
+                    response.request_focus();
+                }
+            });
+            assert_eq!(
+                output
+                    .platform_output
+                    .ime
+                    .expect("actual field")
+                    .should_interrupt_composition,
+                interrupt
+            );
+            super::append_native_platform_window_intents(
+                &output.platform_output,
+                1.0,
+                false,
+                &mut logical.window_intents,
+            );
+            crate::egui_output::discard_headless_output(std::mem::replace(
+                &mut logical.full_output,
+                output,
+            ));
+            batch.append(logical);
+        }
+        let ime = batch.full_output.as_ref().unwrap().platform_output.ime;
+        let interrupts = batch
+            .window_intents
+            .iter()
+            .filter(|intent| matches!(intent, super::NativeWindowIntent::InterruptImeComposition))
+            .count();
+        crate::egui_output::discard_headless_output(batch.full_output.take().unwrap());
+        assert!(
+            ime.expect("aggregated field metadata")
+                .should_interrupt_composition
+        );
+        assert_eq!(
+            interrupts, 1,
+            "the second logical pass does not recreate the delivered pulse"
+        );
     }
 
     #[test]
@@ -22099,6 +22364,7 @@ mod tests {
             .is_none()
         );
 
+        crate::egui_output::discard_headless_output(hidden_final.full_output.take().unwrap());
         let mut intermediate = target.batch_render_logical_once(false).unwrap();
         intermediate.seek_strip_inventory =
             crate::video::seek_strip::SeekStripPresentedInventory::Hidden(stamp);
@@ -22120,6 +22386,7 @@ mod tests {
                 ..
             })
         ));
+        crate::egui_output::discard_headless_output(visible_final.full_output.take().unwrap());
     }
 
     #[test]
@@ -22138,7 +22405,7 @@ mod tests {
         let mut observations = Vec::new();
         for frame in 0..4 {
             let mut commands = Vec::new();
-            let _ = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -22147,7 +22414,8 @@ mod tests {
                     time: Some(frame as f64),
                     ..Default::default()
                 },
-                |ctx| {
+                |root_ui| {
+                    let ctx = root_ui.ctx();
                     let _ = draw_native_seek_strip(
                         ctx,
                         layout,
@@ -22165,6 +22433,7 @@ mod tests {
                     );
                 },
             );
+            crate::egui_output::discard_headless_output(output);
             observations.push(
                 commands
                     .into_iter()
@@ -22197,6 +22466,7 @@ mod tests {
             "only the final actual logical-pass observation may survive"
         );
 
+        crate::egui_output::discard_headless_output(two_pass_batch.full_output.take().unwrap());
         let mut committed = None;
         // A failed present never calls the commit helper. Even though both logical passes
         // observed the same layout, their speculative observations cannot mutate the dedup
@@ -24431,12 +24701,13 @@ mod tests {
         let mut time_shape = None;
         let mut notice_shape = None;
         let mut range_shape = None;
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(hud_rect),
                 ..Default::default()
             },
-            |ctx| {
+            |root_ui| {
+                let ctx = root_ui.ctx();
                 egui::Area::new(egui::Id::new("tiny_bottom_hud_geometry_test"))
                     .fixed_pos(hud_rect.min)
                     .show(ctx, |ui| {
@@ -24494,6 +24765,7 @@ mod tests {
                     });
             },
         );
+        crate::egui_output::discard_headless_output(output);
 
         assert_eq!(actual_lock, Some(expected_lock));
         assert_eq!(actual_selector, Some(expected_selector));
@@ -24509,7 +24781,8 @@ mod tests {
     fn fitted_strip_text_preserves_short_normal_text_and_only_skips_empty_rects() {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        crate::egui_output::discard_headless_output(output);
         let painter = ctx.layer_painter(egui::LayerId::background());
         let text = "画像間隔 15秒";
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 104.0));

@@ -2252,6 +2252,10 @@ impl App {
         apply_metadata_panel_dark_widget_style(&mut child_ui);
         child_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt("metadata_navigation_shell_scroll")
             .auto_shrink([false, false])
             .show(&mut child_ui, |ui| {
@@ -2398,6 +2402,10 @@ impl App {
         child_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
         let scroll_output = egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt("metadata_scroll")
             .auto_shrink([false, false])
             .show(&mut child_ui, |ui| {
@@ -2700,7 +2708,7 @@ impl App {
                 (
                     scroll_output.inner_rect,
                     scroll_output.content_size,
-                    scroll_output.state.offset,
+                    scroll_output.state.clamped_offset(),
                 ),
             );
         });
@@ -4090,25 +4098,29 @@ pub(crate) fn draw_book_move_action_for_test(
     state: &mut SimilarPanelState,
 ) -> Option<(String, crate::similar_index::SimilarItemTarget)> {
     let mut actions = SimilarPanelActions::default();
-    let _ = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let move_frame = SimilarMoveFrameInput::capture(ctx, state);
-            draw_book_relations(
-                ui,
-                book,
-                &[],
-                state,
-                72,
-                85,
-                crate::thumb_loader::CacheDecision::without_thumbnail(),
-                None,
-                ctx,
-                &move_frame,
-                &mut actions,
-            );
-            finish_similar_move_frame(state, &move_frame);
-        });
-    });
+    let _ = ctx
+        .run_pass(input, |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let move_frame = SimilarMoveFrameInput::capture(ctx, state);
+                    draw_book_relations(
+                        ui,
+                        book,
+                        &[],
+                        state,
+                        72,
+                        85,
+                        crate::thumb_loader::CacheDecision::without_thumbnail(),
+                        None,
+                        ctx,
+                        &move_frame,
+                        &mut actions,
+                    );
+                    finish_similar_move_frame(state, &move_frame);
+                })
+            });
+        })
+        .drop_without_applying_deltas();
     actions.open_page.map(|action| action.value)
 }
 
@@ -5150,6 +5162,10 @@ fn draw_metadata_panel_snapshot_fixture_with_capability(
         .show(ui, |ui| {
             let outer_width = ui.available_width();
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .id_salt("metadata_snapshot_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -5863,6 +5879,10 @@ fn draw_collapsible_json_section(
     }
     if *open {
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt(label)
             .max_height(300.0)
             .show(ui, |ui| {
@@ -6327,11 +6347,15 @@ mod similar_panel_tests {
         let requests_cb = std::sync::Arc::clone(&requests);
         ctx.set_request_repaint_callback(move |info| requests_cb.lock().unwrap().push(info));
         // Consume egui's initial settling repaint so the delayed request becomes the earliest one.
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx
+            .run_pass(Default::default(), |_| {})
+            .drop_without_applying_deltas();
         requests.lock().unwrap().clear();
-        let _ = ctx.run(Default::default(), |ctx| {
-            maintain_similar_item_query_progress(ctx, &projected);
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                maintain_similar_item_query_progress(ctx, &projected);
+            })
+            .drop_without_applying_deltas();
 
         let requests = requests.lock().unwrap();
         assert!(
@@ -6360,30 +6384,36 @@ mod similar_panel_tests {
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let requests_cb = std::sync::Arc::clone(&requests);
             ctx.set_request_repaint_callback(move |info| requests_cb.lock().unwrap().push(info));
-            let _ = ctx.run(Default::default(), |_| {});
+            let _ = ctx
+                .run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
             requests.lock().unwrap().clear();
 
             let mut state = SimilarPanelState::default();
             super::book_draw_probe_begin();
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let move_frame = SimilarMoveFrameInput::capture(ctx, &state);
-                    let mut actions = super::SimilarPanelActions::default();
-                    super::draw_book_relations(
-                        ui,
-                        &book,
-                        &[],
-                        &mut state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        ctx,
-                        &move_frame,
-                        &mut actions,
-                    );
-                });
-            });
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let move_frame = SimilarMoveFrameInput::capture(ctx, &state);
+                            let mut actions = super::SimilarPanelActions::default();
+                            super::draw_book_relations(
+                                ui,
+                                &book,
+                                &[],
+                                &mut state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                ctx,
+                                &move_frame,
+                                &mut actions,
+                            );
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
             let probe = super::book_draw_probe_finish();
 
             assert!(probe.heading_drawn);
@@ -6490,93 +6520,105 @@ mod similar_panel_tests {
         let state = SimilarPanelState::default();
         let target = crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\other\book\001.jpg"));
         let mut rect = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    rect = Some(
-                        ui.push_id("similar-move", |ui| ui.small_button("移動"))
-                            .inner
-                            .rect,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            rect = Some(
+                                ui.push_id("similar-move", |ui| ui.small_button("移動"))
+                                    .inner
+                                    .rect,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let pos = rect.expect("neutral move button").center();
 
         let mut press_trace = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = ui
-                        .push_id("similar-move", |ui| ui.small_button("移動"))
-                        .inner;
-                    press_trace = observe_similar_move_response(
-                        &state,
-                        &SimilarMoveFrameInput {
-                            enabled: true,
-                            focused: true,
-                            primary_down: true,
-                            events: vec![SimilarMovePointerEvent { pos, pressed: true }],
-                        },
-                        &response,
-                        crate::app::SimilarMoveSource::BookButton,
-                        || Some(target.clone()),
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response = ui
+                                .push_id("similar-move", |ui| ui.small_button("移動"))
+                                .inner;
+                            press_trace = observe_similar_move_response(
+                                &state,
+                                &SimilarMoveFrameInput {
+                                    enabled: true,
+                                    focused: true,
+                                    primary_down: true,
+                                    events: vec![SimilarMovePointerEvent { pos, pressed: true }],
+                                },
+                                &response,
+                                crate::app::SimilarMoveSource::BookButton,
+                                || Some(target.clone()),
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(press_trace.is_none());
         assert!(state.move_trace_pressed.borrow().is_some());
 
         let mut click_trace = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = ui
-                        .push_id("similar-move", |ui| ui.small_button("移動"))
-                        .inner;
-                    click_trace = observe_similar_move_response(
-                        &state,
-                        &SimilarMoveFrameInput {
-                            enabled: true,
-                            focused: true,
-                            primary_down: false,
-                            events: vec![SimilarMovePointerEvent {
-                                pos,
-                                pressed: false,
-                            }],
-                        },
-                        &response,
-                        crate::app::SimilarMoveSource::BookButton,
-                        || Some(target.clone()),
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response = ui
+                                .push_id("similar-move", |ui| ui.small_button("移動"))
+                                .inner;
+                            click_trace = observe_similar_move_response(
+                                &state,
+                                &SimilarMoveFrameInput {
+                                    enabled: true,
+                                    focused: true,
+                                    primary_down: false,
+                                    events: vec![SimilarMovePointerEvent {
+                                        pos,
+                                        pressed: false,
+                                    }],
+                                },
+                                &response,
+                                crate::app::SimilarMoveSource::BookButton,
+                                || Some(target.clone()),
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(
             click_trace.is_some(),
             "the trace moves only with egui's click"
@@ -6591,65 +6633,76 @@ mod similar_panel_tests {
         let state = SimilarPanelState::default();
         let target = crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\same\book\001.jpg"));
         let mut second_rect = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = ui.push_id("first", |ui| ui.small_button("移動"));
-                    second_rect = Some(
-                        ui.push_id("second", |ui| ui.small_button("移動"))
-                            .inner
-                            .rect,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let _ = ui.push_id("first", |ui| ui.small_button("移動"));
+                            second_rect = Some(
+                                ui.push_id("second", |ui| ui.small_button("移動"))
+                                    .inner
+                                    .rect,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let pos = second_rect.expect("second move button").center();
 
         let mut second_response_id = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    for id in ["first", "second"] {
-                        let response = ui.push_id(id, |ui| ui.small_button("移動")).inner;
-                        if id == "second" {
-                            second_response_id = Some(response.id);
-                        }
-                        assert!(
-                            observe_similar_move_response(
-                                &state,
-                                &SimilarMoveFrameInput {
-                                    enabled: true,
-                                    focused: true,
-                                    primary_down: true,
-                                    events: vec![SimilarMovePointerEvent { pos, pressed: true }],
-                                },
-                                &response,
-                                crate::app::SimilarMoveSource::BookButton,
-                                || Some(target.clone()),
-                            )
-                            .is_none()
-                        );
-                    }
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            for id in ["first", "second"] {
+                                let response = ui.push_id(id, |ui| ui.small_button("移動")).inner;
+                                if id == "second" {
+                                    second_response_id = Some(response.id);
+                                }
+                                assert!(
+                                    observe_similar_move_response(
+                                        &state,
+                                        &SimilarMoveFrameInput {
+                                            enabled: true,
+                                            focused: true,
+                                            primary_down: true,
+                                            events: vec![SimilarMovePointerEvent {
+                                                pos,
+                                                pressed: true
+                                            }],
+                                        },
+                                        &response,
+                                        crate::app::SimilarMoveSource::BookButton,
+                                        || Some(target.clone()),
+                                    )
+                                    .is_none()
+                                );
+                            }
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let pressed_id = state
             .move_trace_pressed
             .borrow()
@@ -6667,43 +6720,47 @@ mod similar_panel_tests {
         );
 
         let mut release_results = Vec::new();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    for id in ["first", "second"] {
-                        let response = ui.push_id(id, |ui| ui.small_button("移動")).inner;
-                        release_results.push(observe_similar_move_response(
-                            &state,
-                            &SimilarMoveFrameInput {
-                                enabled: true,
-                                focused: true,
-                                primary_down: false,
-                                events: vec![SimilarMovePointerEvent {
-                                    pos,
-                                    pressed: false,
-                                }],
-                            },
-                            &response,
-                            crate::app::SimilarMoveSource::BookButton,
-                            || Some(target.clone()),
-                        ));
-                    }
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            for id in ["first", "second"] {
+                                let response = ui.push_id(id, |ui| ui.small_button("移動")).inner;
+                                release_results.push(observe_similar_move_response(
+                                    &state,
+                                    &SimilarMoveFrameInput {
+                                        enabled: true,
+                                        focused: true,
+                                        primary_down: false,
+                                        events: vec![SimilarMovePointerEvent {
+                                            pos,
+                                            pressed: false,
+                                        }],
+                                    },
+                                    &response,
+                                    crate::app::SimilarMoveSource::BookButton,
+                                    || Some(target.clone()),
+                                ));
+                            }
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(release_results[0].is_none());
         let trace = release_results[1]
             .take()
@@ -6723,21 +6780,25 @@ mod similar_panel_tests {
         let replacement =
             crate::snapshot::SnapshotTarget::Fs(PathBuf::from(r"C:\new\book\001.jpg"));
         let mut button_rect = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    button_rect = Some(
-                        ui.push_id("stable-row", |ui| ui.small_button("移動"))
-                            .inner
-                            .rect,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            button_rect = Some(
+                                ui.push_id("stable-row", |ui| ui.small_button("移動"))
+                                    .inner
+                                    .rect,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let pos = button_rect.expect("move button").center();
         let mut pressed_response_id = None;
         let press_frame = SimilarMoveFrameInput {
@@ -6746,37 +6807,42 @@ mod similar_panel_tests {
             primary_down: true,
             events: vec![SimilarMovePointerEvent { pos, pressed: true }],
         };
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = ui.push_id("stable-row", |ui| ui.small_button("移動")).inner;
-                    pressed_response_id = Some(response.id);
-                    assert!(
-                        observe_similar_move_response(
-                            &state,
-                            &press_frame,
-                            &response,
-                            crate::app::SimilarMoveSource::BookButton,
-                            || Some(original.clone()),
-                        )
-                        .is_none()
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response =
+                                ui.push_id("stable-row", |ui| ui.small_button("移動")).inner;
+                            pressed_response_id = Some(response.id);
+                            assert!(
+                                observe_similar_move_response(
+                                    &state,
+                                    &press_frame,
+                                    &response,
+                                    crate::app::SimilarMoveSource::BookButton,
+                                    || Some(original.clone()),
+                                )
+                                .is_none()
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let trace_id = state
             .move_trace_pressed
             .borrow()
@@ -6796,34 +6862,39 @@ mod similar_panel_tests {
         };
         let mut release_response_id = None;
         let mut release_trace = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = ui.push_id("stable-row", |ui| ui.small_button("移動")).inner;
-                    release_response_id = Some(response.id);
-                    release_trace = observe_similar_move_response(
-                        &state,
-                        &release_frame,
-                        &response,
-                        crate::app::SimilarMoveSource::BookButton,
-                        || Some(replacement.clone()),
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response =
+                                ui.push_id("stable-row", |ui| ui.small_button("移動")).inner;
+                            release_response_id = Some(response.id);
+                            release_trace = observe_similar_move_response(
+                                &state,
+                                &release_frame,
+                                &response,
+                                crate::app::SimilarMoveSource::BookButton,
+                                || Some(replacement.clone()),
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(pressed_response_id, release_response_id);
         assert!(
             release_trace.is_none(),
@@ -7320,30 +7391,34 @@ mod similar_panel_tests {
         let mut origin_columns = None;
         let mut allocated_height = 0.0;
 
-        let _ = ctx.run(input.clone(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_clip_rect(egui::Rect::from_min_max(
-                    screen.min,
-                    egui::pos2(screen.right(), 36.0),
-                ));
-                ui.add_space(80.0);
-                let before = ui.cursor().top();
-                super::draw_page_strip(
-                    ui,
-                    strip,
-                    &[3],
-                    &mut origin_columns,
-                    &mut state,
-                    72,
-                    85,
-                    crate::thumb_loader::CacheDecision::without_thumbnail(),
-                    None,
-                    ctx,
-                    &mut actions,
-                );
-                allocated_height = ui.cursor().top() - before;
-            });
-        });
+        let _ = ctx
+            .run_pass(input.clone(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_clip_rect(egui::Rect::from_min_max(
+                            screen.min,
+                            egui::pos2(screen.right(), 36.0),
+                        ));
+                        ui.add_space(80.0);
+                        let before = ui.cursor().top();
+                        super::draw_page_strip(
+                            ui,
+                            strip,
+                            &[3],
+                            &mut origin_columns,
+                            &mut state,
+                            72,
+                            85,
+                            crate::thumb_loader::CacheDecision::without_thumbnail(),
+                            None,
+                            ctx,
+                            &mut actions,
+                        );
+                        allocated_height = ui.cursor().top() - before;
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(
             allocated_height >= super::STRIP_HEIGHT + super::STRIP_MARKER_HEIGHT,
             "the clipped row must keep its scroll layout height: {allocated_height}"
@@ -7355,24 +7430,28 @@ mod similar_panel_tests {
         assert!(state.thumbnails.is_empty());
         assert!(actions.thumbnail_demand.is_empty());
 
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_clip_rect(screen);
-                super::draw_page_strip(
-                    ui,
-                    strip,
-                    &[3],
-                    &mut origin_columns,
-                    &mut state,
-                    72,
-                    85,
-                    crate::thumb_loader::CacheDecision::without_thumbnail(),
-                    None,
-                    ctx,
-                    &mut actions,
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_clip_rect(screen);
+                        super::draw_page_strip(
+                            ui,
+                            strip,
+                            &[3],
+                            &mut origin_columns,
+                            &mut state,
+                            72,
+                            85,
+                            crate::thumb_loader::CacheDecision::without_thumbnail(),
+                            None,
+                            ctx,
+                            &mut actions,
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(
             origin_columns.is_some(),
             "a visible row builds the shared origin projection"
@@ -7392,67 +7471,75 @@ mod similar_panel_tests {
         let mut state = SimilarPanelState::default();
         let mut origin_columns = None;
 
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                let mut actions = super::SimilarPanelActions::default();
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    super::draw_page_strip(
-                        ui,
-                        strip,
-                        &[0],
-                        &mut origin_columns,
-                        &mut state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        ctx,
-                        &mut actions,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let mut actions = super::SimilarPanelActions::default();
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            super::draw_page_strip(
+                                ui,
+                                strip,
+                                &[0],
+                                &mut origin_columns,
+                                &mut state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                ctx,
+                                &mut actions,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let strip_center = super::take_book_strip_rect_for_test()
             .expect("the production strip must expose its actual response rect")
             .center();
 
         let mut press_actions = super::SimilarPanelActions::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    egui::Event::PointerMoved(strip_center),
-                    egui::Event::PointerButton {
-                        pos: strip_center,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    super::draw_page_strip(
-                        ui,
-                        strip,
-                        &[0],
-                        &mut origin_columns,
-                        &mut state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        ctx,
-                        &mut press_actions,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(strip_center),
+                        egui::Event::PointerButton {
+                            pos: strip_center,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            super::draw_page_strip(
+                                ui,
+                                strip,
+                                &[0],
+                                &mut origin_columns,
+                                &mut state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                ctx,
+                                &mut press_actions,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let candidate = press_actions
             .peek_press
             .as_ref()
@@ -7461,35 +7548,39 @@ mod similar_panel_tests {
         assert!(press_actions.open_page.is_none());
 
         let mut release_actions = super::SimilarPanelActions::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerButton {
-                    pos: strip_center,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    super::draw_page_strip(
-                        ui,
-                        strip,
-                        &[0],
-                        &mut origin_columns,
-                        &mut state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        ctx,
-                        &mut release_actions,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerButton {
+                        pos: strip_center,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            super::draw_page_strip(
+                                ui,
+                                strip,
+                                &[0],
+                                &mut origin_columns,
+                                &mut state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                ctx,
+                                &mut release_actions,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(release_actions.peek_press.is_none());
         assert!(
             release_actions.open_page.is_none(),
@@ -7510,100 +7601,114 @@ mod similar_panel_tests {
         let drag_owner_id = egui::Id::new("book-strip-overlapping-drag-owner");
         let mut strip_rect = None;
 
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                let mut actions = super::SimilarPanelActions::default();
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    super::draw_page_strip(
-                        ui,
-                        strip,
-                        &[0],
-                        &mut origin_columns,
-                        &mut state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        ctx,
-                        &mut actions,
-                    );
-                    let rect = super::take_book_strip_rect_for_test()
-                        .expect("the production strip must expose its actual response rect");
-                    strip_rect = Some(rect);
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let mut actions = super::SimilarPanelActions::default();
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            super::draw_page_strip(
+                                ui,
+                                strip,
+                                &[0],
+                                &mut origin_columns,
+                                &mut state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                ctx,
+                                &mut actions,
+                            );
+                            let rect = super::take_book_strip_rect_for_test().expect(
+                                "the production strip must expose its actual response rect",
+                            );
+                            strip_rect = Some(rect);
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let registered_rect =
             strip_rect.expect("the bootstrap frame must register the production strip");
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                let mut actions = super::SimilarPanelActions::default();
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = ui.interact(registered_rect, drag_owner_id, egui::Sense::drag());
-                    super::draw_page_strip(
-                        ui,
-                        strip,
-                        &[0],
-                        &mut origin_columns,
-                        &mut state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        ctx,
-                        &mut actions,
-                    );
-                    assert_eq!(
-                        super::take_book_strip_rect_for_test(),
-                        Some(registered_rect),
-                        "the overlapping drag owner must cover the production strip"
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let mut actions = super::SimilarPanelActions::default();
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let _ =
+                                ui.interact(registered_rect, drag_owner_id, egui::Sense::drag());
+                            super::draw_page_strip(
+                                ui,
+                                strip,
+                                &[0],
+                                &mut origin_columns,
+                                &mut state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                ctx,
+                                &mut actions,
+                            );
+                            assert_eq!(
+                                super::take_book_strip_rect_for_test(),
+                                Some(registered_rect),
+                                "the overlapping drag owner must cover the production strip"
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let strip_center = registered_rect.center();
 
         let mut press_actions = super::SimilarPanelActions::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerButton {
-                    pos: strip_center,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let drag_owner =
-                        ui.interact(registered_rect, drag_owner_id, egui::Sense::drag());
-                    super::draw_page_strip(
-                        ui,
-                        strip,
-                        &[0],
-                        &mut origin_columns,
-                        &mut state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        ctx,
-                        &mut press_actions,
-                    );
-                    assert!(drag_owner.dragged());
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerButton {
+                        pos: strip_center,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let drag_owner =
+                                ui.interact(registered_rect, drag_owner_id, egui::Sense::drag());
+                            super::draw_page_strip(
+                                ui,
+                                strip,
+                                &[0],
+                                &mut origin_columns,
+                                &mut state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                ctx,
+                                &mut press_actions,
+                            );
+                            assert!(drag_owner.dragged());
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         let observation = press_actions
             .relation_press_observation
             .as_ref()
@@ -7634,8 +7739,8 @@ mod similar_panel_tests {
                     origin_columns: &mut Option<super::OriginStripColumns>,
                     actions: &mut super::SimilarPanelActions,
                     known_rect: Option<egui::Rect>| {
-            egui::CentralPanel::default()
-                .show(ctx, |ui| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     super::draw_page_strip(
                         ui,
                         strip,
@@ -7657,43 +7762,49 @@ mod similar_panel_tests {
                     let drag_owner = ui.interact(rect, drag_owner_id, egui::Sense::drag());
                     (rect, drag_owner.is_pointer_button_down_on())
                 })
-                .inner
+            })
+            .inner
         };
 
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                let mut actions = super::SimilarPanelActions::default();
-                strip_rect = Some(draw(ctx, &mut state, &mut origin_columns, &mut actions, None).0);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let mut actions = super::SimilarPanelActions::default();
+                    strip_rect =
+                        Some(draw(ctx, &mut state, &mut origin_columns, &mut actions, None).0);
+                },
+            )
+            .drop_without_applying_deltas();
         let strip_rect = strip_rect.expect("the bootstrap frame must register the strip");
         let mut actions = super::SimilarPanelActions::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![egui::Event::PointerButton {
-                    pos: strip_rect.center(),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                let (_, other_response_down) = draw(
-                    ctx,
-                    &mut state,
-                    &mut origin_columns,
-                    &mut actions,
-                    Some(strip_rect),
-                );
-                assert!(other_response_down);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerButton {
+                        pos: strip_rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let (_, other_response_down) = draw(
+                        ctx,
+                        &mut state,
+                        &mut origin_columns,
+                        &mut actions,
+                        Some(strip_rect),
+                    );
+                    assert!(other_response_down);
+                },
+            )
+            .drop_without_applying_deltas();
         let observation = actions
             .relation_press_observation
             .as_ref()
@@ -7860,34 +7971,42 @@ mod similar_panel_tests {
         super::book_draw_probe_begin();
         let cpu_before = current_thread_cpu_100ns();
         let started = std::time::Instant::now();
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-                let output = egui::ScrollArea::vertical()
-                    .id_salt("large-book-relations-measurement")
-                    .vertical_scroll_offset(scroll_offset)
-                    .show(ui, |ui| {
-                        let mut actions = super::SimilarPanelActions::default();
-                        super::draw_similar_panel(
-                            ui,
-                            &[],
-                            Some(book),
-                            state,
-                            72,
-                            85,
-                            crate::thumb_loader::CacheDecision::without_thumbnail(),
-                            None,
-                            None,
-                            false,
-                            ctx,
-                            &mut actions,
-                        );
-                        assert!(actions.thumbnail_demand.is_empty());
-                    });
-                max_scroll = (output.content_size.y - output.inner_rect.height()).max(0.0);
-                actual_scroll = output.state.offset.y;
-            });
-        });
+        let _ = ctx
+            .run_pass(input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                        let output = egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .id_salt("large-book-relations-measurement")
+                            .vertical_scroll_offset(scroll_offset)
+                            .show(ui, |ui| {
+                                let mut actions = super::SimilarPanelActions::default();
+                                super::draw_similar_panel(
+                                    ui,
+                                    &[],
+                                    Some(book),
+                                    state,
+                                    72,
+                                    85,
+                                    crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                    None,
+                                    None,
+                                    false,
+                                    ctx,
+                                    &mut actions,
+                                );
+                                assert!(actions.thumbnail_demand.is_empty());
+                            });
+                        max_scroll = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                        actual_scroll = output.state.clamped_offset().y;
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         let wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap();
         let cpu_100ns = current_thread_cpu_100ns().saturating_sub(cpu_before);
         (
@@ -8365,7 +8484,9 @@ mod similar_panel_tests {
             Some(SimilarThumbState::Loading)
         ));
 
-        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
         assert_eq!(state.apply_thumbnail_completions(&ctx, &demand).0, 1);
         assert!(matches!(
             state.thumbnail_state("b"),
@@ -8587,35 +8708,39 @@ mod similar_panel_tests {
         let mut state = SimilarPanelState::default();
 
         let draw_frame = |state: &mut SimilarPanelState| {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_clip_rect(egui::Rect::from_min_max(
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2(420.0, 420.0),
-                    ));
-                    let view = super::SimilarPageView {
-                        heading: None,
-                        item_key: Some(matches.origin.item_key.as_str()),
-                        model: SimilarPanelModel::Results(&matches),
-                    };
-                    let mut actions = super::SimilarPanelActions::default();
-                    let move_frame = super::SimilarMoveFrameInput::capture(ctx, state);
-                    super::draw_similar_page_results(
-                        ui,
-                        &view,
-                        state,
-                        72,
-                        85,
-                        crate::thumb_loader::CacheDecision::without_thumbnail(),
-                        None,
-                        None,
-                        false,
-                        ctx,
-                        &move_frame,
-                        &mut actions,
-                    );
-                });
-            });
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            ui.set_clip_rect(egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(420.0, 420.0),
+                            ));
+                            let view = super::SimilarPageView {
+                                heading: None,
+                                item_key: Some(matches.origin.item_key.as_str()),
+                                model: SimilarPanelModel::Results(&matches),
+                            };
+                            let mut actions = super::SimilarPanelActions::default();
+                            let move_frame = super::SimilarMoveFrameInput::capture(ctx, state);
+                            super::draw_similar_page_results(
+                                ui,
+                                &view,
+                                state,
+                                72,
+                                85,
+                                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                                None,
+                                None,
+                                false,
+                                ctx,
+                                &move_frame,
+                                &mut actions,
+                            );
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
         };
         draw_frame(&mut state);
         let first_frame = state

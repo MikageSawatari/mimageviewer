@@ -1714,7 +1714,7 @@ mod tests {
             .or_default()
             .events
             .push(egui::ViewportEvent::Close);
-        let blocked = ctx.run(raw, |ctx| {
+        let blocked = ctx.run_pass(raw, |ctx| {
             let lifecycle = app.accept_root_lifecycle_before_frame(ctx);
             app.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
             assert!(app.image_zip_discarded_hydration_exit_pending(owner));
@@ -1738,7 +1738,7 @@ mod tests {
             hydration_messages.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
-        let terminal = ctx.run(egui::RawInput::default(), |ctx| {
+        let terminal = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.service_discarded_sidecar_restore(ctx);
             assert!(!app.image_zip_discarded_hydration_exit_pending(owner));
             app.service_root_lifecycle(ctx);
@@ -1753,7 +1753,7 @@ mod tests {
             app.selected, selected,
             "cancelled hydration cannot select the ZIP destination"
         );
-        let again = ctx.run(egui::RawInput::default(), |ctx| {
+        let again = ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.service_root_lifecycle(ctx)
         });
         assert!(

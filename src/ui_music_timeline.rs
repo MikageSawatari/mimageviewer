@@ -814,7 +814,11 @@ fn timeline_manual_scroll_requested(
         return false;
     }
     ui.input(|input| {
-        input.raw_scroll_delta.y.abs() > 0.0 || input.smooth_scroll_delta.y.abs() > 0.5
+        crate::wheel_input::remaining_wheel_delta(input, ui.ctx().options(|o| o.input_options))
+            .y
+            .abs()
+            > 0.0
+            || input.smooth_scroll_delta.y.abs() > 0.5
     })
 }
 
@@ -2784,7 +2788,8 @@ mod tests {
         let mut texture = None;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(240.0, 80.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 let texture = texture.get_or_insert_with(|| {
                     ctx.load_texture(
                         "timeline_bass_partial",
@@ -2792,7 +2797,7 @@ mod tests {
                         egui::TextureOptions::NEAREST,
                     )
                 });
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.image((texture.id(), egui::vec2(200.0, 32.0)));
                 });
             });
@@ -2817,7 +2822,8 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(660.0, 80.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
@@ -2837,7 +2843,7 @@ mod tests {
                         })
                         .collect::<Vec<_>>()
                 });
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.horizontal(|ui| {
                         for (texture, label) in
                             textures
@@ -3047,15 +3053,19 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let outcome = draw_music_timeline(
-                        ui, &analysis, &bass, version, 30.0, 20.0, false, false, cache, 30.0, true,
-                        0.0, scheme,
-                    );
-                    drawn = outcome.displayed_texture_rows;
-                });
-            });
+            let _ = ctx
+                .run_pass(input, |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let outcome = draw_music_timeline(
+                                ui, &analysis, &bass, version, 30.0, 20.0, false, false, cache,
+                                30.0, true, 0.0, scheme,
+                            );
+                            drawn = outcome.displayed_texture_rows;
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
             drawn
         };
         frame(&mut cache, 1, MusicNoteColorScheme::Fifths);

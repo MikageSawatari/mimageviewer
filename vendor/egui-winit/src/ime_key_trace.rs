@@ -218,8 +218,9 @@ fn keyboard_description(
 
 fn is_text_key(key: egui::Key) -> bool {
     use egui::Key::*;
-    // Space is text too, but is outside the contiguous punctuation/digit/letter groups.
-    key == Space || (Colon..=Z).contains(&key)
+    // Space and the ISO 102nd printable key are outside the contiguous
+    // punctuation/digit/letter groups (IntlBackslash was added in egui 0.37).
+    matches!(key, Space | IntlBackslash) || (Colon..=Z).contains(&key)
 }
 
 fn ime_description(line: &mut String, ime: &Ime) {
@@ -279,10 +280,19 @@ fn appended_events(line: &mut String, events: &[egui::Event]) {
             egui::Event::Ime(ime) => {
                 line.push_str("Ime.");
                 match ime {
+                    #[expect(
+                        deprecated,
+                        reason = "describe compatibility notifications without text"
+                    )]
                     egui::ImeEvent::Enabled => line.push_str("Enabled"),
+                    #[expect(
+                        deprecated,
+                        reason = "describe compatibility cancellation without text"
+                    )]
                     egui::ImeEvent::Disabled => line.push_str("Disabled"),
-                    egui::ImeEvent::Preedit(text) | egui::ImeEvent::Commit(text) => {
-                        line.push_str(if matches!(ime, egui::ImeEvent::Preedit(_)) {
+                    egui::ImeEvent::DeleteSurrounding { .. } => line.push_str("DeleteSurrounding"),
+                    egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text) => {
+                        line.push_str(if matches!(ime, egui::ImeEvent::Preedit { .. }) {
                             "Preedit("
                         } else {
                             "Commit("
@@ -429,6 +439,78 @@ mod tests {
     }
 
     #[test]
+    fn intl_backslash_matches_other_character_keys_in_all_trace_fields() {
+        for pressed in [false, true] {
+            for process in [false, true] {
+                let describe = |code, character: &str| {
+                    let mut line = String::new();
+                    keyboard_description(
+                        &mut line,
+                        if pressed {
+                            ElementState::Pressed
+                        } else {
+                            ElementState::Released
+                        },
+                        false,
+                        false,
+                        &if process {
+                            Key::Named(NamedKey::Process)
+                        } else {
+                            Key::Character(character.into())
+                        },
+                        PhysicalKey::Code(code),
+                        Some(character),
+                    );
+                    line
+                };
+                let iso = describe(KeyCode::IntlBackslash, "\\");
+                assert_eq!(iso, describe(KeyCode::KeyX, "x"));
+                assert!(!iso.contains("IntlBackslash"));
+                assert_eq!(iso.contains("Named(Process)"), process);
+            }
+            for (key, physical, ordinary, ordinary_physical) in [
+                (egui::Key::IntlBackslash, None, egui::Key::X, None),
+                (
+                    egui::Key::IntlBackslash,
+                    Some(egui::Key::Enter),
+                    egui::Key::X,
+                    Some(egui::Key::Enter),
+                ),
+                (
+                    egui::Key::Enter,
+                    Some(egui::Key::IntlBackslash),
+                    egui::Key::Enter,
+                    Some(egui::Key::X),
+                ),
+                (
+                    egui::Key::IntlBackslash,
+                    Some(egui::Key::IntlBackslash),
+                    egui::Key::X,
+                    Some(egui::Key::X),
+                ),
+            ] {
+                let describe = |key, physical_key| {
+                    let mut line = String::new();
+                    appended_events(
+                        &mut line,
+                        &[egui::Event::Key {
+                            key,
+                            physical_key,
+                            pressed,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                    line
+                };
+                let iso = describe(key, physical);
+                assert_eq!(iso, describe(ordinary, ordinary_physical));
+                assert!(!iso.contains("IntlBackslash"));
+            }
+        }
+    }
+
+    #[test]
     fn masks_character_dead_physical_and_egui_text_keys() {
         let mut line = String::new();
         keyboard_description(
@@ -470,14 +552,23 @@ mod tests {
                 },
                 egui::Event::Text("秘密\n".into()),
                 egui::Event::Paste("秘密\n".into()),
-                egui::Event::Ime(egui::ImeEvent::Preedit("秘密\n".into())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "秘密\n".into(),
+                    active_range_chars: Some(0..1),
+                }),
                 egui::Event::Ime(egui::ImeEvent::Commit("秘密\n".into())),
+                egui::Event::Ime(egui::ImeEvent::DeleteSurrounding {
+                    before_chars: 12345,
+                    after_chars: 67890,
+                }),
             ],
         );
         assert!(!line.contains('秘') && !line.contains('密') && !line.contains('\n'));
         assert!(!line.contains("KeyP") && !line.contains("IntlYen"));
         assert!(line.contains("Key(Char,physical=Char"));
         assert!(line.contains("bytes=7,empty=false,newline=true"));
+        assert!(line.contains("Ime.DeleteSurrounding"));
+        assert!(!line.contains("12345") && !line.contains("67890"));
     }
 
     #[test]
@@ -512,6 +603,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated, reason = "legacy IME compatibility fixture")]
     fn observes_only_appended_events_and_does_not_modify_them() {
         let (trace, receiver) = trace_fixture();
         let event = WindowEvent::Ime(Ime::Commit("秘密".into()));

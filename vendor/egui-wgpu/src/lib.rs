@@ -16,27 +16,30 @@
 #![doc = document_features::document_features!()]
 //!
 
-#![allow(unsafe_code)]
-
 pub use wgpu;
 
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 pub mod atlas_diag;
 mod mipmap;
 mod renderer;
+mod startup_diagnostics;
 
 mod setup;
-mod startup_diagnostics;
-pub use startup_diagnostics::{
-    RootStartupFrameTag, StartupDiagnosticEvent, StartupDiagnosticsCallback, StartupGpuStage,
-    set_root_startup_frame_tag, take_root_startup_frame_tag,
-};
 
 pub use mipmap::{MipmapGenerator, mip_chain_texel_count, mip_level_count};
 pub use renderer::*;
-pub use setup::{NativeAdapterSelectorMethod, WgpuSetup, WgpuSetupCreateNew, WgpuSetupExisting};
+pub use setup::{
+    EguiDisplayHandle, NativeAdapterSelectorMethod, WgpuSetup, WgpuSetupCreateNew,
+    WgpuSetupExisting,
+};
+pub use startup_diagnostics::{
+    RootStartupFrameTag, StartupDiagnosticEvent, StartupDiagnosticsCallback, StartupGpuStage,
+};
+#[cfg(feature = "capture")]
+pub use startup_diagnostics::{set_root_startup_frame_tag, take_root_startup_frame_tag};
 
 /// Helpers for capturing screenshots of the UI.
+#[cfg(feature = "capture")]
 pub mod capture;
 
 /// Module for painting [`egui`](https://github.com/emilk/egui) with [`wgpu`] on [`winit`].
@@ -70,6 +73,42 @@ pub enum WgpuError {
     HandleError(#[from] ::winit::raw_window_handle::HandleError),
 }
 
+/// Runtime-mutable subset of [`WgpuConfiguration`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SurfaceConfig {
+    /// Present mode used for the primary surface.
+    pub present_mode: wgpu::PresentMode,
+
+    /// Desired maximum number of frames that the presentation engine should queue in advance.
+    ///
+    /// Use `1` for low-latency, and `2` for high-throughput.
+    ///
+    /// See [`wgpu::SurfaceConfiguration::desired_maximum_frame_latency`] for details.
+    ///
+    /// `None` => Let `wgpu` pick a default (currently `2`).
+    pub desired_maximum_frame_latency: Option<u32>,
+}
+
+impl SurfaceConfig {
+    /// Good default for GUIs with very little (or no) extra GPU work.
+    pub const LOW_LATENCY: Self = Self {
+        present_mode: wgpu::PresentMode::AutoVsync,
+
+        desired_maximum_frame_latency: if cfg!(target_os = "ios") {
+            None // The default is good on iOS, while `Some(1)` cuts FPS in half
+        } else {
+            Some(1)
+        },
+    };
+
+    /// Good default for GUIs with a lot of extra GPU work,
+    /// or that want to prioritize smoothness over latency.
+    pub const HIGH_THROUGHPUT: Self = Self {
+        present_mode: wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: Some(2), // High-throughput.
+    };
+}
+
 /// Access to the render state for egui.
 #[derive(Clone)]
 pub struct RenderState {
@@ -82,6 +121,9 @@ pub struct RenderState {
     /// On web, we always select WebGPU is available, then fall back to WebGL if not.
     #[cfg(not(target_arch = "wasm32"))]
     pub available_adapters: Vec<wgpu::Adapter>,
+
+    /// Wgpu instance used for creating surfaces and adapters.
+    pub instance: wgpu::Instance,
 
     /// Wgpu device used for rendering, created from the adapter.
     pub device: wgpu::Device,
@@ -113,6 +155,7 @@ async fn request_adapter(
             // * fails if there's no software rasterizer available
             // * can achieve the same with `native_adapter_selector`
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
         .inspect_err(|_err| {
@@ -144,29 +187,12 @@ async fn request_adapter(
             }
         })?;
 
-    if cfg!(target_arch = "wasm32") {
-        log::debug!(
-            "Picked wgpu adapter: {}",
-            adapter_info_summary(&adapter.get_info())
+    if 1 < available_adapters.len() {
+        log::info!(
+            "There are {} available wgpu adapters: {}",
+            available_adapters.len(),
+            describe_adapters(available_adapters)
         );
-    } else {
-        // native:
-        if available_adapters.len() == 1 {
-            log::debug!(
-                "Picked the only available wgpu adapter: {}",
-                adapter_info_summary(&adapter.get_info())
-            );
-        } else {
-            log::info!(
-                "There were {} available wgpu adapters: {}",
-                available_adapters.len(),
-                describe_adapters(available_adapters)
-            );
-            log::debug!(
-                "Picked wgpu adapter: {}",
-                adapter_info_summary(&adapter.get_info())
-            );
-        }
     }
 
     Ok(adapter)
@@ -195,14 +221,15 @@ impl RenderState {
                 wgpu::Backends::all()
             };
 
-            let adapters = instance.enumerate_adapters(backends);
+            let adapters = instance.enumerate_adapters(backends).await;
             config.startup_end(StartupGpuStage::AdapterEnumeration, true);
             adapters
         };
 
-        let (adapter, device, queue) = match config.wgpu_setup.clone() {
+        let (instance, adapter, device, queue) = match config.wgpu_setup.clone() {
             WgpuSetup::CreateNew(WgpuSetupCreateNew {
                 instance_descriptor: _,
+                display_handle: _,
                 power_preference,
                 native_adapter_selector: _native_adapter_selector,
                 device_descriptor,
@@ -244,19 +271,21 @@ impl RenderState {
                     result?
                 };
 
-                (adapter, device, queue)
+                (instance.clone(), adapter, device, queue)
             }
             WgpuSetup::Existing(WgpuSetupExisting {
-                instance: _,
+                instance,
                 adapter,
                 device,
                 queue,
-            }) => (adapter, device, queue),
+            }) => (instance, adapter, device, queue),
         };
+
+        log_adapter_info(&adapter.get_info());
 
         let surface_formats = {
             profiling::scope!("get_capabilities");
-            let formats = compatible_surface.map_or_else(
+            compatible_surface.map_or_else(
                 || vec![wgpu::TextureFormat::Rgba8Unorm],
                 |s| {
                     config.startup_begin(StartupGpuStage::SurfaceCapabilities);
@@ -264,10 +293,8 @@ impl RenderState {
                     config.startup_end(StartupGpuStage::SurfaceCapabilities, true);
                     formats
                 },
-            );
-            formats
+            )
         };
-
         config.startup_begin(StartupGpuStage::PipelineCreate);
         let target_format = match crate::preferred_framebuffer_format(&surface_formats) {
             Ok(format) => format,
@@ -281,8 +308,9 @@ impl RenderState {
 
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
         // It doesn't make sense to switch to Rc for that special usecase, so simply disable the lint.
-        #[allow(clippy::arc_with_non_send_sync, clippy::allow_attributes)] // For wasm
+        #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
         Ok(Self {
+            instance,
             adapter,
             #[cfg(not(target_arch = "wasm32"))]
             available_adapters,
@@ -308,12 +336,22 @@ fn describe_adapters(adapters: &[wgpu::Adapter]) -> String {
     }
 }
 
-/// Specifies which action should be taken as consequence of a [`wgpu::SurfaceError`]
+/// Specifies which action should be taken as consequence of a surface error.
 pub enum SurfaceErrorAction {
     /// Do nothing and skip the current frame.
     SkipFrame,
 
-    /// Instructs egui to recreate the surface, then skip the current frame.
+    /// Reconfigure the existing surface, then skip the current frame.
+    ///
+    /// Calls [`wgpu::Surface::configure`] on the current surface object.
+    /// Use for [`wgpu::CurrentSurfaceTexture::Outdated`].
+    Reconfigure,
+
+    /// Drop the surface, create a new one via [`wgpu::Instance::create_surface`], configure it,
+    /// then skip the current frame.
+    ///
+    /// Use for [`wgpu::CurrentSurfaceTexture::Lost`], where reconfiguring the same surface
+    /// object cannot recover.
     RecreateSurface,
 }
 
@@ -322,69 +360,51 @@ pub enum SurfaceErrorAction {
 pub struct WgpuConfiguration {
     /// Optional nonblocking startup observation. It must not do I/O or render.
     pub startup_diagnostics: Option<StartupDiagnosticsCallback>,
-    /// Present mode used for the primary surface.
-    pub present_mode: wgpu::PresentMode,
-
-    /// Desired maximum number of frames that the presentation engine should queue in advance.
-    ///
-    /// Use `1` for low-latency, and `2` for high-throughput.
-    ///
-    /// See [`wgpu::SurfaceConfiguration::desired_maximum_frame_latency`] for details.
-    ///
-    /// `None` = `wgpu` default.
-    pub desired_maximum_frame_latency: Option<u32>,
+    /// Runtime-mutable configuration for the surface (present mode, frame latency).
+    pub surface: SurfaceConfig,
 
     /// How to create the wgpu adapter & device
     pub wgpu_setup: WgpuSetup,
 
-    /// Callback for surface errors.
-    pub on_surface_error: Arc<dyn Fn(wgpu::SurfaceError) -> SurfaceErrorAction + Send + Sync>,
+    /// Callback for surface status changes.
+    ///
+    /// Called with the [`wgpu::CurrentSurfaceTexture`] result whenever acquiring a frame
+    /// does not return [`wgpu::CurrentSurfaceTexture::Success`]. For
+    /// [`wgpu::CurrentSurfaceTexture::Suboptimal`], egui uses the frame as-is and
+    /// defers surface reconfiguration to the next frame — the callback is not invoked
+    /// in that case either.
+    pub on_surface_status:
+        Arc<dyn Fn(&wgpu::CurrentSurfaceTexture) -> SurfaceErrorAction + Send + Sync>,
 }
 
-#[test]
-fn wgpu_config_impl_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
+// Compile-time check that `WgpuConfiguration` is `Send + Sync`.
+// Deliberately not a `#[test]`: tests never run on wasm, but `cargo check` does.
+// On wasm this only holds with `fragile-send-sync-non-atomic-wasm` and without threads;
+// look at the feature flag for an explanation.
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(
+        feature = "fragile-send-sync-non-atomic-wasm",
+        not(target_feature = "atomics")
+    ),
+))]
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<WgpuConfiguration>();
-}
+};
 
-impl std::fmt::Debug for WgpuConfiguration {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for WgpuConfiguration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Self {
-            present_mode,
-            desired_maximum_frame_latency,
+            surface,
             wgpu_setup,
-            on_surface_error: _,
+            on_surface_status: _,
             startup_diagnostics: _,
         } = self;
         f.debug_struct("WgpuConfiguration")
-            .field("present_mode", &present_mode)
-            .field(
-                "desired_maximum_frame_latency",
-                &desired_maximum_frame_latency,
-            )
+            .field("surface", &surface)
             .field("wgpu_setup", &wgpu_setup)
             .finish_non_exhaustive()
-    }
-}
-
-impl Default for WgpuConfiguration {
-    fn default() -> Self {
-        Self {
-            startup_diagnostics: None,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: None,
-            wgpu_setup: Default::default(),
-            on_surface_error: Arc::new(|err| {
-                if err == wgpu::SurfaceError::Outdated {
-                    // This error occurs when the app is minimized on Windows.
-                    // Silently return here to prevent spamming the console with:
-                    // "The underlying surface has changed, and therefore the swap chain must be updated"
-                } else {
-                    log::warn!("Dropped frame with error: {err}");
-                }
-                SurfaceErrorAction::SkipFrame
-            }),
-        }
     }
 }
 
@@ -401,6 +421,48 @@ impl WgpuConfiguration {
 
     pub(crate) fn startup_end(&self, stage: StartupGpuStage, success: bool) {
         self.startup_event(StartupDiagnosticEvent::End { stage, success });
+    }
+
+    #[inline]
+    pub fn with_surface_config(mut self, surface_config: SurfaceConfig) -> Self {
+        self.surface = surface_config;
+        self
+    }
+}
+
+impl Default for WgpuConfiguration {
+    fn default() -> Self {
+        Self {
+            startup_diagnostics: None,
+            surface: SurfaceConfig::HIGH_THROUGHPUT,
+
+            // No display handle available at this point — callers should replace this with
+            // `WgpuSetup::from_display_handle(...)` before creating the instance if one is available.
+            wgpu_setup: WgpuSetup::without_display_handle(),
+            on_surface_status: Arc::new(|status| match status {
+                wgpu::CurrentSurfaceTexture::Outdated => {
+                    // The compositor changed the surface (resize, scale, output, …). wgpu
+                    // requires us to reconfigure before the next acquire. Skipping would mean
+                    // we are stuck in `Outdated` forever.
+                    log::trace!("Dropped frame with error: {status:?}");
+                    SurfaceErrorAction::Reconfigure
+                }
+                wgpu::CurrentSurfaceTexture::Lost => {
+                    // The underlying surface is gone and we need a fresh one from the `wgpu::Instance`.
+                    log::debug!("Dropped frame with error: {status:?}");
+                    SurfaceErrorAction::RecreateSurface
+                }
+                wgpu::CurrentSurfaceTexture::Occluded => {
+                    // App is hidden (minimized / behind another window). Skip silently.
+                    log::trace!("Skipping frame due to occlusion.");
+                    SurfaceErrorAction::SkipFrame
+                }
+                _ => {
+                    log::warn!("Dropped frame with error: {status:?}");
+                    SurfaceErrorAction::SkipFrame
+                }
+            }),
+        }
     }
 }
 
@@ -441,6 +503,18 @@ pub fn depth_format_from_bits(depth_buffer: u8, stencil_buffer: u8) -> Option<wg
 
 // ---------------------------------------------------------------------------
 
+fn log_adapter_info(info: &wgpu::AdapterInfo) {
+    let summary = adapter_info_summary(info);
+
+    let is_test = cfg!(test); // Software rasterizers are expected (and preferred) during testing!
+
+    if info.device_type == wgpu::DeviceType::Cpu && !is_test {
+        log::warn!("Software rasterizer detected - loss of performance expected. {summary}");
+    } else {
+        log::debug!("wgpu adapter: {summary}");
+    }
+}
+
 /// A human-readable summary about an adapter
 pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
     let wgpu::AdapterInfo {
@@ -451,6 +525,11 @@ pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
         driver,
         driver_info,
         backend,
+        device_pci_bus_id,
+        subgroup_min_size,
+        subgroup_max_size,
+        transient_saves_memory,
+        limit_bucket,
     } = &info;
 
     // Example values:
@@ -458,30 +537,53 @@ pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
     // > name: "Apple M1 Pro", device_type: IntegratedGpu, backend: Metal, driver: "", driver_info: ""
     // > name: "ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)", device_type: IntegratedGpu, backend: Gl, driver: "", driver_info: ""
 
+    use core::fmt::Write as _;
+
     let mut summary = format!("backend: {backend:?}, device_type: {device_type:?}");
 
     if !name.is_empty() {
-        summary += &format!(", name: {name:?}");
+        write!(summary, ", name: {name:?}").ok();
     }
     if !driver.is_empty() {
-        summary += &format!(", driver: {driver:?}");
+        write!(summary, ", driver: {driver:?}").ok();
     }
     if !driver_info.is_empty() {
-        summary += &format!(", driver_info: {driver_info:?}");
+        write!(summary, ", driver_info: {driver_info:?}").ok();
     }
     if *vendor != 0 {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            summary += &format!(", vendor: {} (0x{vendor:04X})", parse_vendor_id(*vendor));
+            write!(
+                summary,
+                ", vendor: {} (0x{vendor:04X})",
+                parse_vendor_id(*vendor)
+            )
+            .ok();
         }
         #[cfg(target_arch = "wasm32")]
         {
-            summary += &format!(", vendor: 0x{vendor:04X}");
+            write!(summary, ", vendor: 0x{vendor:04X}").ok();
         }
     }
     if *device != 0 {
-        summary += &format!(", device: 0x{device:02X}");
+        write!(summary, ", device: 0x{device:02X}").ok();
     }
+    if !device_pci_bus_id.is_empty() {
+        write!(summary, ", pci_bus_id: {device_pci_bus_id:?}").ok();
+    }
+    if *subgroup_min_size != 0 || *subgroup_max_size != 0 {
+        write!(
+            summary,
+            ", subgroup_size: {subgroup_min_size}..={subgroup_max_size}"
+        )
+        .ok();
+    }
+    write!(
+        summary,
+        ", transient_saves_memory: {transient_saves_memory:?}"
+    )
+    .ok();
+    write!(summary, ", limit_bucket: {limit_bucket:?}").ok();
 
     summary
 }

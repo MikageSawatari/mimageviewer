@@ -32,6 +32,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("フォルダを開く")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -173,7 +174,8 @@ mod ime_handler_tests {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1000.0, 600.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::ime_focus::install_ime_input_policy(ctx);
                 if !fonts.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);

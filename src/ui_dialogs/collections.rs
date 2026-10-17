@@ -3810,7 +3810,7 @@ impl App {
         let mut open = true;
         let mut action = None;
         let mut cancel_worker = false;
-        egui::Window::new("コレクションの管理")
+        egui::Window::new("コレクションの管理").drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("collection_manager"))
             .open(&mut open)
             .default_size(egui::vec2(720.0, 440.0))
@@ -3879,7 +3879,7 @@ impl App {
                         ui.label(egui::RichText::new("処理中…").weak());
                     }
                 });
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .id_salt("collection_definitions")
                     .max_height(300.0)
                     .auto_shrink([false, false])
@@ -4083,6 +4083,7 @@ impl App {
         }
         let mut cancel = false;
         egui::Window::new("コレクション処理")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("collection_detached_operation_status"))
             .collapsible(false)
             .resizable(false)
@@ -4497,7 +4498,7 @@ impl App {
                         ));
                     }
                     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-                    egui::ScrollArea::vertical().max_height(320.0).show_rows(ui, row_height, preview.lines().len(), |ui, row_range| {
+                    egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() }).max_height(320.0).show_rows(ui, row_height, preview.lines().len(), |ui, row_range| {
                         for line in &preview.lines()[row_range] {
                             let is_network = line.source_key.as_ref().is_some_and(|key| {
                                 key.normalized_path().starts_with("//")
@@ -4655,6 +4656,7 @@ impl App {
         let mut refresh = false;
         let mut discard = false;
         egui::Window::new(title)
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("collection_reorder_window"))
             .open(&mut window_open)
             .collapsible(false)
@@ -4839,6 +4841,10 @@ impl App {
                         let scroll_output = crate::ui_helpers::show_fixed_slot_rows(
                             ui,
                             egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
                                 .id_salt("collection_reorder_thumb_scroll")
                                 .vertical_scroll_offset(state.scroll_offset_y)
                                 .max_height(scroll_height)
@@ -5034,7 +5040,7 @@ impl App {
                                     });
                             },
                         );
-                        state.scroll_offset_y = scroll_output.state.offset.y;
+                        state.scroll_offset_y = scroll_output.state.clamped_offset().y;
                         if !busy
                             && !pointer_released
                             && state.dragging.is_some()
@@ -6606,7 +6612,8 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, theme);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -6614,7 +6621,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.heading("画像一覧");
                     ui.label("コレクション管理は独立したウィンドウで表示されます。");
                 });
@@ -6666,7 +6673,8 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -6674,7 +6682,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.heading("画像一覧");
                     ui.label("コレクションの項目を選択しています。");
                 });
@@ -6699,7 +6707,8 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -6707,7 +6716,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.heading("画像一覧");
                     ui.label("コレクションの参照順を編集中です。");
                 });

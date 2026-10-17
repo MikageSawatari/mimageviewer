@@ -31,7 +31,7 @@ pub fn cancel_tab_focus_traversal(ctx: &egui::Context) {
 /// event. The focused UI or the later keymap ownership boundary still receives
 /// the same press.
 pub fn install_tab_shortcut_focus_policy(ctx: &egui::Context) {
-    let installation_id = egui::Id::new(INSTALLATION_ID);
+    let installation_id = egui::Id::unique(INSTALLATION_ID);
     let already_installed = ctx.data_mut(|data| {
         if data.get_temp::<bool>(installation_id).unwrap_or(false) {
             true
@@ -46,7 +46,8 @@ pub fn install_tab_shortcut_focus_policy(ctx: &egui::Context) {
 
     ctx.on_begin_pass(
         "miv_tab_shortcut_focus_policy",
-        Arc::new(|ctx| {
+        Arc::new(|ui| {
+            let ctx = ui.ctx();
             if !tab_pressed(ctx) {
                 return;
             }

@@ -41,47 +41,56 @@ mod calculated_grid_height_tests {
             let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, height));
             let draw = |events| {
                 let mut measured = None;
-                let _ = ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(viewport),
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
-                                // Both reorder dialogs use 78pt tiles, 8pt explicit Grid gaps,
-                                // and calculate a complete 86pt slot for scrolling and End.
-                                ui.spacing_mut().item_spacing.y = 13.0; // unrelated ambient style
-                                let output = show_fixed_slot_rows(
-                                    ui,
-                                    egui::ScrollArea::vertical()
-                                        .max_height(430.0)
-                                        .auto_shrink([false, false]),
-                                    86.0,
-                                    5,
-                                    |ui, rows| {
-                                        egui::Grid::new("reorder")
-                                            .num_columns(2)
-                                            .spacing(egui::vec2(8.0, 8.0))
-                                            .show(ui, |ui| {
-                                                for _ in rows {
-                                                    for _ in 0..2 {
-                                                        ui.allocate_exact_size(
-                                                            egui::vec2(58.0, 78.0),
-                                                            egui::Sense::click(),
-                                                        );
-                                                    }
-                                                    ui.end_row();
-                                                }
-                                            });
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|root_ui| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    root_ui,
+                                    |ui| {
+                                        // Both reorder dialogs use 78pt tiles, 8pt explicit Grid gaps,
+                                        // and calculate a complete 86pt slot for scrolling and End.
+                                        ui.spacing_mut().item_spacing.y = 13.0; // unrelated ambient style
+                                        let output = show_fixed_slot_rows(
+                                            ui,
+                                            egui::ScrollArea::vertical()
+                                                .scroll_source(egui::scroll_area::ScrollSource {
+                                                    drag: egui::scroll_area::DragScroll::Always,
+                                                    ..Default::default()
+                                                })
+                                                .max_height(430.0)
+                                                .auto_shrink([false, false]),
+                                            86.0,
+                                            5,
+                                            |ui, rows| {
+                                                egui::Grid::new("reorder")
+                                                    .num_columns(2)
+                                                    .spacing(egui::vec2(8.0, 8.0))
+                                                    .show(ui, |ui| {
+                                                        for _ in rows {
+                                                            for _ in 0..2 {
+                                                                ui.allocate_exact_size(
+                                                                    egui::vec2(58.0, 78.0),
+                                                                    egui::Sense::click(),
+                                                                );
+                                                            }
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            },
+                                        );
+                                        measured = Some(ScrollLayout::from_output(&output));
                                     },
-                                );
-                                measured = Some(ScrollLayout::from_output(&output));
+                                )
                             });
-                    },
-                );
+                        },
+                    )
+                    .drop_without_applying_deltas();
                 measured.unwrap()
             };
             let mut before = draw(vec![]);
@@ -111,6 +120,8 @@ mod calculated_grid_height_tests {
                                 unit: egui::MouseWheelUnit::Point,
                                 delta: egui::vec2(0.0, -4000.0),
                                 modifiers: egui::Modifiers::NONE,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
                             },
                         ]
                     } else {
@@ -120,7 +131,7 @@ mod calculated_grid_height_tests {
                 after.assert_scrolled_to_end(before, ctx.pixels_per_point());
             }
             assert_eq!(
-                ctx.style().spacing.item_spacing.y,
+                ctx.global_style().spacing.item_spacing.y,
                 3.0,
                 "local row-slot style must not leak"
             );
@@ -395,7 +406,7 @@ const BRUSH_WHEEL_POINT_PER_NOTCH: f32 = 40.0;
 pub(crate) fn draw_panel_tab_button(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     selected: bool,
 ) -> egui::Response {
@@ -426,11 +437,13 @@ fn shift_wheel_notches(events: &[egui::Event]) -> f32 {
                 unit,
                 delta,
                 modifiers,
+                phase,
+                ..
             } = event
             else {
                 return None;
             };
-            if *modifiers != egui::Modifiers::SHIFT {
+            if *modifiers != egui::Modifiers::SHIFT || *phase != egui::TouchPhase::Move {
                 return None;
             }
             // Shift による egui の水平スクロール化は raw_scroll_delta へ反映される。
@@ -1146,14 +1159,18 @@ mod accessibility_names_tests {
     fn non_hovered_tooltips_skip_conversion_without_accesskit() {
         let ctx = egui::Context::default();
         let conversions = Cell::new(0);
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.button("").hover_tip(CountedTooltip(&conversions));
-                ui.button("").hover_tip_dark(CountedTooltip(&conversions));
-                ui.add_enabled(false, egui::Button::new(""))
-                    .hover_tip_disabled(CountedTooltip(&conversions));
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.button("").hover_tip(CountedTooltip(&conversions));
+                        ui.button("").hover_tip_dark(CountedTooltip(&conversions));
+                        ui.add_enabled(false, egui::Button::new(""))
+                            .hover_tip_disabled(CountedTooltip(&conversions));
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert_eq!(conversions.get(), 0);
     }
 
@@ -1161,27 +1178,31 @@ mod accessibility_names_tests {
     fn accesskit_only_converts_tooltips_for_unnamed_input_nodes() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let conversions = Cell::new(0);
-                ui.button("").hover_tip(CountedTooltip(&conversions));
-                ui.button("").hover_tip_dark(CountedTooltip(&conversions));
-                ui.add_enabled(false, egui::Button::new(""))
-                    .hover_tip_disabled(CountedTooltip(&conversions));
-                assert_eq!(conversions.get(), 3);
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let conversions = Cell::new(0);
+                        ui.button("").hover_tip(CountedTooltip(&conversions));
+                        ui.button("").hover_tip_dark(CountedTooltip(&conversions));
+                        ui.add_enabled(false, egui::Button::new(""))
+                            .hover_tip_disabled(CountedTooltip(&conversions));
+                        assert_eq!(conversions.get(), 3);
 
-                let named_conversions = Cell::new(0);
-                ui.button("既存名")
-                    .hover_tip(CountedTooltip(&named_conversions));
-                let label = ui.label("既存ラベル");
-                ui.button("")
-                    .labelled_by(label.id)
-                    .hover_tip(CountedTooltip(&named_conversions));
-                ui.label("説明")
-                    .hover_tip(CountedTooltip(&named_conversions));
-                assert_eq!(named_conversions.get(), 0);
-            });
-        });
+                        let named_conversions = Cell::new(0);
+                        ui.button("既存名")
+                            .hover_tip(CountedTooltip(&named_conversions));
+                        let label = ui.label("既存ラベル");
+                        ui.button("")
+                            .labelled_by(label.id)
+                            .hover_tip(CountedTooltip(&named_conversions));
+                        ui.label("説明")
+                            .hover_tip(CountedTooltip(&named_conversions));
+                        assert_eq!(named_conversions.get(), 0);
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
     }
 
     #[test]
@@ -1191,29 +1212,35 @@ mod accessibility_names_tests {
             if accesskit {
                 ctx.enable_accesskit();
             }
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = ui.button("");
-                    let conversions = Cell::new(0);
-                    let text =
-                        tooltip_text_with_accessibility(&response, CountedTooltip(&conversions));
-                    assert_eq!(conversions.get(), usize::from(accesskit));
-                    let renders = Cell::new(0);
-                    show_offset_tooltip_with_observer(
-                        ctx,
-                        egui::Tooltip::for_widget(&response),
-                        false,
-                        Some(response.rect),
-                        text,
-                        |_, _| {
-                            renders.set(renders.get() + 1);
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let response = ui.button("");
+                            let conversions = Cell::new(0);
+                            let text = tooltip_text_with_accessibility(
+                                &response,
+                                CountedTooltip(&conversions),
+                            );
+                            assert_eq!(conversions.get(), usize::from(accesskit));
+                            let renders = Cell::new(0);
+                            show_offset_tooltip_with_observer(
+                                ctx,
+                                egui::Tooltip::for_widget(&response),
+                                false,
+                                Some(response.rect),
+                                text,
+                                |_, _| {
+                                    renders.set(renders.get() + 1);
+                                    assert_eq!(conversions.get(), 1);
+                                },
+                            );
+                            assert_eq!(renders.get(), 1);
                             assert_eq!(conversions.get(), 1);
-                        },
-                    );
-                    assert_eq!(renders.get(), 1);
-                    assert_eq!(conversions.get(), 1);
-                });
-            });
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
         }
     }
 
@@ -1225,16 +1252,18 @@ mod accessibility_names_tests {
                 ctx.enable_accesskit();
             }
             let mut id = egui::Id::NULL;
-            let output = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = ui.button("");
-                    id = response.id;
-                    let builds = Cell::new(0);
-                    set_accessibility_label_with(&response, || {
-                        builds.set(builds.get() + 1);
-                        format!("対象 / {}", 1)
-                    });
-                    assert_eq!(builds.get(), usize::from(accesskit));
+            let output = ctx.run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let response = ui.button("");
+                        id = response.id;
+                        let builds = Cell::new(0);
+                        set_accessibility_label_with(&response, || {
+                            builds.set(builds.get() + 1);
+                            format!("対象 / {}", 1)
+                        });
+                        assert_eq!(builds.get(), usize::from(accesskit));
+                    })
                 });
             });
             if accesskit {
@@ -1255,34 +1284,36 @@ mod accessibility_names_tests {
         ctx.enable_accesskit();
         let mut slider_value = 0.25;
         let mut ids = Vec::new();
-        let output = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ids.clear();
-                ids.push(ui.button("").hover_tip("通常の操作").id);
-                ids.push(ui.button("").hover_tip_dark("暗色の操作").id);
-                ids.push(
-                    ui.add_enabled(false, egui::Button::new(""))
-                        .hover_tip_disabled("無効な操作")
-                        .id,
-                );
-                ids.push(
-                    ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0))
-                        .hover_tip("適用量")
-                        .id,
-                );
-                ids.push(ui.button("既存の名前").hover_tip("補足説明").id);
-                let label = ui.label("既存ラベル");
-                let response = ui.button("").labelled_by(label.id).hover_tip("別の説明");
-                ids.push(response.id);
-                ids.push(label.id);
-                let mut days = 7;
-                let drag = ui.add(egui::DragValue::new(&mut days).range(1..=30));
-                set_accessibility_label(&drag, "日数");
-                ids.push(drag.id);
-                let mut checked = true;
-                let checkbox = ui.checkbox(&mut checked, "");
-                set_accessibility_label(&checkbox, "対象");
-                ids.push(checkbox.id);
+        let output = ctx.run_pass(Default::default(), |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    ids.clear();
+                    ids.push(ui.button("").hover_tip("通常の操作").id);
+                    ids.push(ui.button("").hover_tip_dark("暗色の操作").id);
+                    ids.push(
+                        ui.add_enabled(false, egui::Button::new(""))
+                            .hover_tip_disabled("無効な操作")
+                            .id,
+                    );
+                    ids.push(
+                        ui.add(egui::Slider::new(&mut slider_value, 0.0..=1.0))
+                            .hover_tip("適用量")
+                            .id,
+                    );
+                    ids.push(ui.button("既存の名前").hover_tip("補足説明").id);
+                    let label = ui.label("既存ラベル");
+                    let response = ui.button("").labelled_by(label.id).hover_tip("別の説明");
+                    ids.push(response.id);
+                    ids.push(label.id);
+                    let mut days = 7;
+                    let drag = ui.add(egui::DragValue::new(&mut days).range(1..=30));
+                    set_accessibility_label(&drag, "日数");
+                    ids.push(drag.id);
+                    let mut checked = true;
+                    let checkbox = ui.checkbox(&mut checked, "");
+                    set_accessibility_label(&checkbox, "対象");
+                    ids.push(checkbox.id);
+                })
             });
         });
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
@@ -1429,8 +1460,8 @@ fn clamp_cursor_range(
     let Some(mut range) = range else {
         return CCursorRange::one(CCursor::new(char_count));
     };
-    range.primary.index = range.primary.index.min(char_count);
-    range.secondary.index = range.secondary.index.min(char_count);
+    range.primary.index = range.primary.index.min(egui::text::CharIndex(char_count));
+    range.secondary.index = range.secondary.index.min(egui::text::CharIndex(char_count));
     range
 }
 
@@ -2673,19 +2704,23 @@ mod tests {
 
     fn begin_wheel_pass(ctx: &egui::Context, modifiers: egui::Modifiers) {
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, 1.0),
-                modifiers,
-            }],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 1.0),
+                    modifiers,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                }])
+                .collect(),
             ..Default::default()
         });
     }
 
     fn wheel_input_remaining(ctx: &egui::Context) -> bool {
         ctx.input(|input| {
-            input.raw_scroll_delta != egui::Vec2::ZERO
+            crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options))
+                != egui::Vec2::ZERO
                 || input.smooth_scroll_delta != egui::Vec2::ZERO
                 || input
                     .events
@@ -2752,41 +2787,46 @@ mod tests {
     fn bucket_region_controls_stay_inside_a_200px_visible_ui() {
         let ctx = egui::Context::default();
         let mut controls_rect = egui::Rect::NOTHING;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(900.0, 500.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let visible_rect = egui::Rect::from_min_size(
-                            ui.cursor().left_top(),
-                            egui::vec2(200.0, 400.0),
-                        );
-                        // ScrollArea の content Ui は、先行 widget が幅を広げると表示範囲より
-                        // 大きい max_rect を持ちうる。clip はパネル幅のままという実機条件を再現する。
-                        let wide_rect = egui::Rect::from_min_size(
-                            visible_rect.min,
-                            egui::vec2(800.0, visible_rect.height()),
-                        );
-                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
-                        child.set_clip_rect(visible_rect);
-                        let mut region = crate::mask_db::BucketRegion::Connected;
-                        controls_rect = draw_bucket_region_controls(
-                            &mut child,
-                            &mut region,
-                            &mut 0.0,
-                            &mut 1.0,
-                            &mut 10.0,
-                        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let visible_rect = egui::Rect::from_min_size(
+                                    ui.cursor().left_top(),
+                                    egui::vec2(200.0, 400.0),
+                                );
+                                // ScrollArea の content Ui は、先行 widget が幅を広げると表示範囲より
+                                // 大きい max_rect を持ちうる。clip はパネル幅のままという実機条件を再現する。
+                                let wide_rect = egui::Rect::from_min_size(
+                                    visible_rect.min,
+                                    egui::vec2(800.0, visible_rect.height()),
+                                );
+                                let mut child =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                                child.set_clip_rect(visible_rect);
+                                let mut region = crate::mask_db::BucketRegion::Connected;
+                                controls_rect = draw_bucket_region_controls(
+                                    &mut child,
+                                    &mut region,
+                                    &mut 0.0,
+                                    &mut 1.0,
+                                    &mut 10.0,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(
             controls_rect.width() <= 200.0 + 0.5,
@@ -2799,47 +2839,52 @@ mod tests {
     fn tool_settings_heading_stays_inside_a_200px_visible_ui_and_skips_none() {
         let ctx = egui::Context::default();
         let mut heading_rect = egui::Rect::NOTHING;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(900.0, 500.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let visible_rect = egui::Rect::from_min_size(
-                            ui.cursor().left_top(),
-                            egui::vec2(200.0, 200.0),
-                        );
-                        let wide_rect = egui::Rect::from_min_size(
-                            visible_rect.min,
-                            egui::vec2(800.0, visible_rect.height()),
-                        );
-                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
-                        child.set_clip_rect(visible_rect);
-                        let before_none = child.cursor().top();
-                        assert!(
-                            draw_tool_settings_heading(
-                                &mut child,
-                                None,
-                                egui::Color32::from_gray(200),
-                            )
-                            .is_none()
-                        );
-                        assert_eq!(child.cursor().top(), before_none);
-                        heading_rect = draw_tool_settings_heading(
-                            &mut child,
-                            Some("隙間補完"),
-                            egui::Color32::from_gray(200),
-                        )
-                        .expect("a configured tool must draw its heading");
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let visible_rect = egui::Rect::from_min_size(
+                                    ui.cursor().left_top(),
+                                    egui::vec2(200.0, 200.0),
+                                );
+                                let wide_rect = egui::Rect::from_min_size(
+                                    visible_rect.min,
+                                    egui::vec2(800.0, visible_rect.height()),
+                                );
+                                let mut child =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                                child.set_clip_rect(visible_rect);
+                                let before_none = child.cursor().top();
+                                assert!(
+                                    draw_tool_settings_heading(
+                                        &mut child,
+                                        None,
+                                        egui::Color32::from_gray(200),
+                                    )
+                                    .is_none()
+                                );
+                                assert_eq!(child.cursor().top(), before_none);
+                                heading_rect = draw_tool_settings_heading(
+                                    &mut child,
+                                    Some("隙間補完"),
+                                    egui::Color32::from_gray(200),
+                                )
+                                .expect("a configured tool must draw its heading");
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(
             heading_rect.width() <= 200.0 + 0.5,

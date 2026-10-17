@@ -272,7 +272,8 @@ impl MaskLabApp {
 }
 
 impl eframe::App for MaskLabApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root_ui.ctx().clone();
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
             if let Some(path) = file.path {
@@ -291,10 +292,10 @@ impl eframe::App for MaskLabApp {
             self.polygon.clear();
         }
 
-        egui::SidePanel::left("tools")
+        egui::Panel::left("tools")
             .resizable(false)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show(root_ui, |ui| {
                 ui.heading("Mask Lab");
                 ui.label(&self.status);
                 ui.separator();
@@ -391,7 +392,7 @@ impl eframe::App for MaskLabApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             self.ensure_mask_texture(ctx);
             let (img_w, img_h, tex_id) = match (&self.image, &self.texture) {
                 (Some(img), Some(tex)) => (img.w, img.h, tex.id()),

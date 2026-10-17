@@ -9818,8 +9818,10 @@ mod tests {
 
     fn begin_key_pass(ctx: &egui::Context, key: egui::Key, modifiers: egui::Modifiers) {
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![key_event(key, modifiers)],
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                key_event(key, modifiers),
+            ],
             ..Default::default()
         });
         cache_test_keyboard_owner(ctx);
@@ -9844,7 +9846,7 @@ mod tests {
         );
         assert!(keymap.consume_fixed_chord(&ctx, Chord::ctrl_shift(KeyName::Z)));
         assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         for editor in [
             KeyAction::EraseUndo,
@@ -9855,14 +9857,14 @@ mod tests {
             begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::CTRL);
             assert!(keymap.consume_action(&ctx, editor));
             assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
         let rebound = Keymap::from_ini_str("[Global]\nUndoLastAction = F16\n");
         let ctx = egui::Context::default();
         begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
         assert!(rebound.consume_action(&ctx, KeyAction::UndoLastAction));
         assert!(!rebound.consume_action(&ctx, KeyAction::UndoLastAction));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -9890,7 +9892,7 @@ mod tests {
                 "Ctrl+Shift+Z must not fall through to {undo:?}"
             );
             assert_eq!(ctx.input(|input| input.events.len()), 0);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
@@ -9915,7 +9917,12 @@ mod tests {
     }
 
     fn draw_test_focusable(ctx: &egui::Context, id: &'static str) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::unique(("test_focusable_root", id)),
+            egui::UiBuilder::new(),
+        );
+        egui::CentralPanel::default().show(&mut ui, |ui| {
             let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
             let _ = ui.interact(rect, egui::Id::new(id), egui::Sense::click_and_drag());
         });
@@ -10107,7 +10114,7 @@ mod tests {
         crate::key_input::add_test_frame_active_viewport(main_viewport);
 
         let close = keymap.consume_action(&ctx, KeyAction::FsClose);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert!(
             !close,
@@ -10158,7 +10165,7 @@ mod tests {
 
         let hold = keymap.take_key_hold_edges(&ctx, KeyAction::FsZoomMode);
         let close = keymap.consume_action(&ctx, KeyAction::FsClose);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(hold, (true, false), "テンキー Enter で hold の押下が立つ");
         assert!(!close, "同じ押下で Enter 割り当ての FsClose を発火させない");
@@ -11244,7 +11251,7 @@ mod tests {
         let default = Keymap::empty();
         begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
         assert!(!default.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let rebound = Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
         assert!(rebound.warnings().is_empty());
@@ -11256,7 +11263,7 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
         assert!(rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
         assert!(!rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let key = crate::video::native_window::NativeVideoKeyEvent {
             receipt: crate::mouse_seek_debug::test_receipt(1),
@@ -12700,7 +12707,7 @@ mod tests {
             !keymap.consume_action(&ctx, action),
             "one press cannot toggle twice"
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -12836,7 +12843,7 @@ mod tests {
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x28
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -12858,7 +12865,7 @@ mod tests {
             keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
             3
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -12880,7 +12887,7 @@ mod tests {
             keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
             1
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -12900,7 +12907,7 @@ mod tests {
             fn debug_name(&self) -> &'static str {
                 "replayed_page_press"
             }
-            fn input_hook(&mut self, input: &mut egui::RawInput) {
+            fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
                 input.events.push(egui::Event::Key {
                     key: egui::Key::ArrowRight,
                     physical_key: Some(egui::Key::ArrowRight),
@@ -12916,7 +12923,8 @@ mod tests {
         ctx.add_plugin(ReplayedPress);
         crate::key_input::install_operation_input_plugin(&ctx);
         let mut identities = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             cache_test_keyboard_owner(ctx);
             let result = keymap.consume_page_turn_action(ctx, None, KeyAction::FsPageNext);
             let input = match result {
@@ -12936,7 +12944,8 @@ mod tests {
             if ctx.current_pass_index() == 0 {
                 ctx.request_discard("page turn id replay");
             }
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(identities.len(), 2);
         assert_eq!(identities[0], identities[1]);
     }
@@ -13005,7 +13014,7 @@ mod tests {
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13032,7 +13041,7 @@ mod tests {
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13054,7 +13063,7 @@ mod tests {
             keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
             PageTurnConsumeResult::NoMatch
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13086,7 +13095,7 @@ mod tests {
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13118,7 +13127,7 @@ mod tests {
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13151,7 +13160,7 @@ mod tests {
             })
         );
         assert!(!crate::key_input::pressed_key_down(viewport, |_| true));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13183,7 +13192,7 @@ mod tests {
                 viewport,
             })
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13199,7 +13208,7 @@ mod tests {
 
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13220,7 +13229,7 @@ mod tests {
             keymap.consume_action_press_count(&ctx, KeyAction::FsSlideshow),
             1
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13248,7 +13257,7 @@ mod tests {
         assert!(!keymap.consume_action(&ctx, KeyAction::FsSlideshow));
         let remaining = ctx.input(|i| i.events.len());
         assert_eq!(remaining, 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13262,18 +13271,20 @@ mod tests {
         let ctx = egui::Context::default();
         let text_id = egui::Id::new("keymap_owned_fallback_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
         assert!(ctx.wants_keyboard_input());
         assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
         assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13285,12 +13296,14 @@ mod tests {
         let ctx = egui::Context::default();
         let text_id = egui::Id::new("keymap_owned_win32_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x54, 0x14)]);
@@ -13302,7 +13315,7 @@ mod tests {
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x54
         ));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13331,7 +13344,7 @@ mod tests {
         assert!(crate::key_input::consume_key_down(sibling, true, |edge| {
             edge.virtual_key == 0x5A
         }));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13348,7 +13361,7 @@ mod tests {
         assert!(!ctx.wants_keyboard_input());
         assert!(keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13362,18 +13375,20 @@ mod tests {
         let ctx = egui::Context::default();
         let text_id = egui::Id::new("keymap_owned_pressed_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
         assert!(ctx.wants_keyboard_input());
         assert!(!keymap.pressed_action(&ctx, KeyAction::FsPostFilterNext));
         assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -13387,12 +13402,14 @@ mod tests {
         let ctx = egui::Context::default();
         let text_id = egui::Id::new("keymap_owned_hold_text");
         let mut text = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::NONE);
         assert!(ctx.wants_keyboard_input());
@@ -13401,7 +13418,7 @@ mod tests {
             (false, false)
         );
         assert_eq!(ctx.input(|input| input.events.len()), 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
     #[cfg(windows)]
     #[test]
@@ -13430,7 +13447,7 @@ mod tests {
         assert!(ctx.input(|i| i.events.is_empty()));
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         draw_test_focusable(&ctx, "tab_claim_surface");
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(!ctx.wants_keyboard_input());
 
         ctx.begin_pass(egui::RawInput {
@@ -13448,7 +13465,7 @@ mod tests {
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         assert!(ctx.input(|i| i.events.is_empty()));
         draw_test_focusable(&ctx, "tab_repeat_claim_surface");
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(!ctx.wants_keyboard_input());
     }
 
@@ -13465,13 +13482,13 @@ mod tests {
         crate::key_input::set_test_frame(vec![tab_edge(false)]);
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         draw_test_focusable(&ctx, "tab_then_shortcuts_surface");
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(!ctx.wants_keyboard_input());
 
         begin_key_pass(&ctx, egui::Key::I, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x49, 0x17)]);
         assert!(keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x71, 0x3c)]);
@@ -13479,12 +13496,12 @@ mod tests {
             keymap.consume_rating_action(&ctx, false),
             Some(RatingEdit::Assign(2))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::Home, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x24, 0x47)]);
         assert!(keymap.consume_action(&ctx, KeyAction::FsJumpFirst));
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[cfg(windows)]
@@ -13506,7 +13523,7 @@ mod tests {
         assert_eq!(ctx.input(|input| input.events.len()), 1);
         assert!(keymap.consume_action(&ctx, KeyAction::FsSlideshow));
         draw_test_focusable(&ctx, "reassigned_tab_surface");
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(!ctx.wants_keyboard_input());
     }
 
@@ -13522,13 +13539,15 @@ mod tests {
         let second_id = egui::Id::new("keymap_tab_second_text");
         let mut first = String::new();
         let mut second = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 let first_response = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
                 let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
                 first_response.request_focus();
             });
-        });
+        })
+        .drop_without_applying_deltas();
         ctx.begin_pass(egui::RawInput {
             events: vec![key_event(egui::Key::Tab, egui::Modifiers::NONE)],
             ..Default::default()
@@ -13543,11 +13562,18 @@ mod tests {
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x09
         ));
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
-            let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
-        });
-        let _ = ctx.end_pass();
+        egui::CentralPanel::default().show(
+            &mut egui::Ui::new(
+                ctx.clone(),
+                egui::Id::unique("headless_manual_root"),
+                egui::UiBuilder::new(),
+            ),
+            |ui| {
+                let _ = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
+                let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
+            },
+        );
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     }
 
@@ -13572,7 +13598,7 @@ mod tests {
         assert!(!keymap.consume_action_no_repeat(&ctx, KeyAction::FsToggleMetadata));
         assert_eq!(ctx.input(|input| input.events.len()), 1);
         draw_test_focusable(&ctx, "modal_focus_surface");
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(ctx.wants_keyboard_input());
     }
 
@@ -13624,7 +13650,7 @@ mod tests {
             Some(RatingEdit::Assign(2))
         );
         assert_eq!(ctx.input(|i| i.events.len()), 0);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let keymap = Keymap::from_ini_str(
             r#"
@@ -13636,7 +13662,7 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::NONE);
         assert_eq!(keymap.consume_rating_action(&ctx, false), None);
         assert_eq!(ctx.input(|i| i.events.len()), 1);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
         assert_eq!(
@@ -13644,7 +13670,7 @@ mod tests {
             Some(RatingEdit::Assign(1))
         );
         assert_eq!(ctx.input(|i| i.events.len()), 0);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         let keymap = Keymap::from_ini_str(
             "[Rating]\nRatingItemStepUp = Ctrl+F1\nRatingContainerStepDown = Alt+F2\n",
@@ -13654,13 +13680,13 @@ mod tests {
             keymap.consume_rating_action(&ctx, false),
             Some(RatingEdit::Step(RatingStepDirection::Up))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::ALT);
         assert_eq!(
             keymap.consume_rating_action(&ctx, true),
             Some(RatingEdit::Step(RatingStepDirection::Down))
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -14680,7 +14706,7 @@ mod tests {
             begin_key_pass(&ctx, egui::Key::F13, egui::Modifiers::NONE);
             assert!(keymap.consume_action_no_repeat(&ctx, action));
             assert!(!keymap.consume_action_no_repeat(&ctx, action));
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 

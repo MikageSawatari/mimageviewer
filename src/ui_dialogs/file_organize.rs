@@ -225,6 +225,10 @@ pub fn render_file_organize_contents(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("organize_sources")
                     .max_height(height)
                     .min_scrolled_height(0.0)
@@ -308,6 +312,10 @@ pub fn render_file_organize_contents(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 let mut scroll = egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("organize_destinations")
                     .max_height(height)
                     .min_scrolled_height(0.0)
@@ -318,7 +326,7 @@ pub fn render_file_organize_contents(
                         ui.make_persistent_id(egui::Id::new("organize_destinations")),
                     )
                     .unwrap_or_default()
-                    .offset
+                    .clamped_offset()
                     .y;
                     let top = row as f32 * (row_height + spacing.y);
                     // Set the nearest visible offset before show_rows chooses
@@ -578,8 +586,9 @@ mod tests {
 
     fn navigation_harness(size: egui::Vec2) -> NavigationHarness {
         let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder().with_size(size).build_state(
-            move |ctx, state: &mut (Vec<FileOrganizeDestination>, Option<_>)| {
+        let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+            move |root_ui, state: &mut (Vec<FileOrganizeDestination>, Option<_>)| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
@@ -685,6 +694,8 @@ mod tests {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -600.0),
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         });
         // Hover tooltips can keep requesting repaint; allow the wheel to
         // settle without waiting for the entire Modal to become idle.
@@ -722,14 +733,15 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1000.0, 720.0))
-                .build_state(
-                    |ctx,
+                .build_ui_state(
+                    |root_ui,
                      state: &mut (
                         Vec<FileOrganizeDestination>,
                         Option<(usize, Option<ShellTransferOperation>)>,
                         egui::Rect,
                         bool,
                     )| {
+                        let ctx = &root_ui.ctx().clone();
                         if !state.3 {
                             crate::ui_fonts::configure_fonts(ctx);
                             state.3 = true;
@@ -788,12 +800,13 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1000.0, 720.0))
-            .build_state(
-                |ctx,
+            .build_ui_state(
+                |root_ui,
                  state: &mut (
                     Option<(usize, Option<ShellTransferOperation>)>,
                     Option<FileOrganizeUiAction>,
                 )| {
+                    let ctx = &root_ui.ctx().clone();
                     state.1 = show_file_organize_modal(
                         ctx,
                         &[r"C:\source\image.jpg".into()],

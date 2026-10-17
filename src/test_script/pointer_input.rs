@@ -1699,7 +1699,7 @@ mod tests {
         // `begin_pass` must keep the run-local handler receipt from the actual delivery pass.
         begin_pass(&ctx, 7, 2, "page-2".to_string(), mode_proof());
         let output = show.finish();
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(matches!(output.receipt, ReceiptAccumulator::Valid(_)));
     }
 
@@ -1738,7 +1738,7 @@ mod tests {
         finish_pass(&ctx);
         let mut output = show.finish();
         let joined = output.take_joined_region_frame(&identity, 7);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(joined.is_ok());
     }
 
@@ -1867,7 +1867,7 @@ mod tests {
         finish_pass(&ctx);
         let mut output = show.finish();
         let error = output.take_joined_region_frame(&identity, 7).unwrap_err();
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(error.contains("delivery did not join"), "{error}");
     }
 
@@ -1903,7 +1903,7 @@ mod tests {
                 egui::Sense::click_and_drag(),
             );
         });
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         let child_input = egui::RawInput {
             viewport_id: viewport,
             time: Some(1.005),
@@ -1946,7 +1946,7 @@ mod tests {
         });
         finish_pass(&ctx);
         let output = show.finish();
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(matches!(output.delivery, DeliveryAccumulator::Exact(_)));
         assert_eq!(
             matches!(output.receipt, ReceiptAccumulator::Valid(_)),

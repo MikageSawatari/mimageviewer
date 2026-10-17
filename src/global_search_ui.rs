@@ -4234,12 +4234,13 @@ impl App {
     }
 
     /// Ctrl+G トップパネルの描画 (既存 render_favsearch_bar と同パターン)。
-    pub(crate) fn render_global_search_bar(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_global_search_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         if !self.global_search.active {
             return;
         }
         if self.global_search.source == SearchSource::Everything {
-            self.render_everything_search_bar(ctx);
+            self.render_everything_search_bar(root_ui);
             self.show_everything_search_progress(ctx);
             return;
         }
@@ -4257,7 +4258,7 @@ impl App {
 
         let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
         let mut drill_back = false;
-        egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
+        egui::Panel::top("global_search_bar").show(root_ui, |ui| {
             if running {
                 ui.disable();
             }

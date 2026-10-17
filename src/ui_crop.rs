@@ -838,27 +838,31 @@ mod tests {
         force_create_held: bool,
     ) -> bool {
         let mut used = false;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(transform.viewport_rect),
-                events,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    used = app.handle_export_crop_pointer_with_holds(
-                        ui,
-                        transform,
-                        0,
-                        image_size,
-                        settings,
-                        handles,
-                        space_pan_held,
-                        force_create_held,
-                    );
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(transform.viewport_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            used = app.handle_export_crop_pointer_with_holds(
+                                ui,
+                                transform,
+                                0,
+                                image_size,
+                                settings,
+                                handles,
+                                space_pan_held,
+                                force_create_held,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         used
     }
 

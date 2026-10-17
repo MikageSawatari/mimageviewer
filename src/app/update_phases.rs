@@ -398,7 +398,7 @@ impl App {
                     i.raw
                         .dropped_files
                         .iter()
-                        .filter_map(|f| f.path.clone())
+                        .map(|f| f.path().to_path_buf())
                         .collect()
                 });
                 self.handle_external_file_drop(dropped_paths);
@@ -2019,41 +2019,42 @@ impl App {
 
     pub(super) fn render_main_bars(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         pre_grid_perf: &mut Option<PreGridPerfRecorder>,
     ) -> (Option<PathBuf>, Option<egui::Rect>) {
+        let ctx = &ui.ctx().clone();
         // ── 検索バー ─────────────────────────────────────────────────
-        self.render_search_bar(ctx);
+        self.render_search_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::SearchBar);
 
         // ── お気に入り検索バー (ツールバー直下の 2 行目相当) ─────────
-        self.render_favsearch_bar(ctx);
+        self.render_favsearch_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::FavSearchBar);
 
         // ── Ctrl+G グローバルメタ検索バー (docs §10.3) ────────────────
-        self.render_global_search_bar(ctx);
+        self.render_global_search_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::GlobalSearchBar);
 
         // ── Ctrl+T タグビュー ───────────────────────────────────────
-        self.render_tag_view_bar(ctx);
+        self.render_tag_view_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::TagViewBar);
 
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
-        self.render_facet_filter_bar(ctx);
+        self.render_facet_filter_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::FacetFilterBar);
-        self.render_details_lazy_status_bar(ctx);
+        self.render_details_lazy_status_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::DetailsLazyStatusBar);
 
         // 下部情報バーは CentralPanel のグリッドより先に確保する。egui が残り領域を
         // render_grid へ渡すため、last_viewport_h と仮想スクロール範囲にも反映される。
-        self.render_selection_info_bar(ctx);
+        self.render_selection_info_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::SelectionInfoBar);
-        let (folder_pane_nav, folder_pane_rect) = self.render_folder_pane(ctx);
+        let (folder_pane_nav, folder_pane_rect) = self.render_folder_pane(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::FolderPane);
 
         // チェック件数は一覧の右上へ常時表示する。Foreground Area をグリッドより先に
         // 登録し、解除クリックが背面セルの選択操作へ漏れないようにする。
-        self.render_checked_selection_overlay(ctx);
+        self.render_checked_selection_overlay(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::CheckedSelectionOverlay);
 
         (folder_pane_nav, folder_pane_rect)

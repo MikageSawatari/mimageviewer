@@ -5,8 +5,8 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
-eframe = { version = "0.33", features = ["wgpu"] }
-egui = "0.33"
+eframe = { version = "0.37.0", features = ["wgpu"] }
+egui = "0.37.0"
 image = { version = "0.25", features = ["jpeg", "png"] }
 local-adjust-core = { path = "../../crates/local-adjust-core" }
 ndarray = "0.17"

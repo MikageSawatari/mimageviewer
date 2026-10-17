@@ -48,11 +48,15 @@ pub(super) fn draw_whats_new_dialog(
     // Round the viewport-limited width inward: a half-point logical viewport at
     // 200% must not gain an outward rounded frame edge.
     let default_width = (650.0_f32.min(ctx.content_rect().width()).floor()
-        - egui::Frame::window(&ctx.style()).total_margin().sum().x)
+        - egui::Frame::window(&ctx.global_style())
+            .total_margin()
+            .sum()
+            .x)
         .max(1.0);
     let mut close = false;
     let mut open_changelog = false;
     egui::Window::new("重要な変更点")
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(open)
         .collapsible(false)
         .resizable(true)
@@ -92,16 +96,21 @@ mod tests {
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
             for scale in [1.0, 2.0] {
                 let mut fonts_ready = false;
-                let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-                    if !fonts_ready {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        crate::settings::apply_ui_scale_factor(ctx, scale);
-                        fonts_ready = true;
-                        return;
-                    }
-                    let entries: Vec<_> = crate::version_highlights::table().iter().rev().collect();
-                    draw_whats_new_dialog(ctx, &mut true, &entries);
-                });
+                let mut harness =
+                    crate::test_ui::builder()
+                        .with_size(size)
+                        .build_ui(move |root_ui| {
+                            let ctx = &root_ui.ctx().clone();
+                            if !fonts_ready {
+                                crate::ui_fonts::configure_fonts(ctx);
+                                crate::settings::apply_ui_scale_factor(ctx, scale);
+                                fonts_ready = true;
+                                return;
+                            }
+                            let entries: Vec<_> =
+                                crate::version_highlights::table().iter().rev().collect();
+                            draw_whats_new_dialog(ctx, &mut true, &entries);
+                        });
                 harness.run_steps(12);
                 let viewport = harness.ctx.content_rect();
                 let intended_width = 650.0_f32.min(viewport.width()).floor();
@@ -126,14 +135,15 @@ mod tests {
         for width in [440.0, 507.0, 640.0, 860.0] {
             for scale in [1.0, 2.0] {
                 let mut fonts_ready = false;
-                let mut harness = crate::test_ui::builder().build(move |ctx| {
+                let mut harness = crate::test_ui::builder().build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         crate::settings::apply_ui_scale_factor(ctx, scale);
                         fonts_ready = true;
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(width, 500.0),
                             egui::Layout::top_down(egui::Align::Min),
@@ -186,7 +196,8 @@ mod tests {
                 let mut fonts_ready = false;
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(1093.0, 614.0))
-                    .build(move |ctx| {
+                    .build_ui(move |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
                         if !fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             crate::settings::apply_ui_scale_factor(ctx, scale);

@@ -314,9 +314,10 @@ mod tests {
             draft.text_contrast = contrast;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(760.0, 1200.0))
-                .build_state(
-                    |ctx, draft| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                .build_ui_state(
+                    |root_ui, draft| {
+                        let ctx = &root_ui.ctx().clone();
+                        egui::CentralPanel::default().show(root_ui, |ui| {
                             draw_settings(ui, draft);
                         });
                     },
@@ -345,9 +346,10 @@ mod tests {
         let before = live.details_name_colors.clone();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(680.0, 1200.0))
-            .build_state(
-                |ctx, draft| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+            .build_ui_state(
+                |root_ui, draft| {
+                    let ctx = &root_ui.ctx().clone();
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         draw_settings(ui, draft);
                     });
                 },
@@ -405,21 +407,25 @@ mod tests {
     }
     fn editor_pass(ctx: &egui::Context, rgb: &mut [u8; 3], events: Vec<egui::Event>) -> egui::Id {
         let mut id = egui::Id::NULL;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(400.0, 100.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    id = draw_rgb_editor(ui, rgb).id;
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 100.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            id = draw_rgb_editor(ui, rgb).id;
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         id
     }
 
@@ -491,27 +497,31 @@ mod tests {
         ) -> ([egui::Id; 2], [egui::Rect; 2]) {
             let mut ids = [egui::Id::NULL; 2];
             let mut rects = [egui::Rect::NOTHING; 2];
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(400.0, 160.0),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        for index in 0..2 {
-                            ui.push_id(index, |ui| {
-                                let response = draw_rgb_editor(ui, &mut colors[index]);
-                                ids[index] = response.id;
-                                rects[index] = response.rect;
-                            });
-                        }
-                    });
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 160.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                for index in 0..2 {
+                                    ui.push_id(index, |ui| {
+                                        let response = draw_rgb_editor(ui, &mut colors[index]);
+                                        ids[index] = response.id;
+                                        rects[index] = response.rect;
+                                    });
+                                }
+                            })
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
             (ids, rects)
         }
         let ctx = egui::Context::default();

@@ -707,7 +707,7 @@ impl App {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("EPUB");
-            egui::Window::new("EPUB を PDF に変換")
+            egui::Window::new("EPUB を PDF に変換").drag_area(egui::WindowDrag::Anywhere)
                 .id(egui::Id::new("epub_convert_dialog"))
                 .open(&mut open)
                 .resizable(false)
@@ -944,14 +944,18 @@ mod tests {
             pages: Some(12),
         }))
         .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.epub_convert.as_ref().map(|state| &state.phase),
             Some(EpubConvertPhase::Converting(Some(progress))) if progress.done == 2
         ));
         tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Stale)))
             .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.epub_convert.as_ref().map(|state| &state.phase),
             Some(EpubConvertPhase::Stale)
@@ -963,7 +967,9 @@ mod tests {
         app.epub_convert = Some(state);
         tx.send(EpubConvertMsg::InspectDone(Err(EpubConvertError::Drm)))
             .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.epub_convert.as_ref().map(|state| &state.phase),
             Some(EpubConvertPhase::Error(message)) if message.contains("保護")
@@ -983,8 +989,10 @@ mod tests {
             sibling_pdf_exists: false,
         })))
         .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
-        let output = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
+        let output = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
         let mut text = String::new();
         let mut stack: Vec<&egui::epaint::Shape> =
             output.shapes.iter().map(|shape| &shape.shape).collect();
@@ -1012,7 +1020,9 @@ mod tests {
             pages: Some(17),
         }))
         .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         let Some(EpubConvertPhase::Converting(Some(progress))) =
             app.epub_convert.as_ref().map(|state| &state.phase)
         else {
@@ -1023,7 +1033,7 @@ mod tests {
             (2, 4, Some(17))
         );
         assert_eq!(progress_fraction(progress), 0.5);
-        let output = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let output = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
         let mut text = String::new();
         let mut stack: Vec<&egui::epaint::Shape> =
             output.shapes.iter().map(|shape| &shape.shape).collect();
@@ -1058,7 +1068,9 @@ mod tests {
         app.epub_convert = Some(state);
         tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Published)))
             .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert!(
             app.pdf_enumerate_pending
@@ -1101,7 +1113,9 @@ mod tests {
             user_data_errors: Vec::new(),
         })))
         .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert!(
             app.pdf_enumerate_pending
@@ -1132,8 +1146,10 @@ mod tests {
         };
         tx.send(EpubConvertMsg::InspectDone(Ok(summary.clone())))
             .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
-        let output = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
+        let output = ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
         assert!(
             matches!(app.epub_convert.as_ref().map(|state| &state.phase), Some(EpubConvertPhase::Confirm(summary)) if summary.sibling_pdf_exists)
         );
@@ -1152,19 +1168,27 @@ mod tests {
             "{text}"
         );
         let mut enabled = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                enabled = save_pdf_button(ui, &summary).enabled();
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        enabled = save_pdf_button(ui, &summary).enabled();
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(!enabled);
         let mut available = summary;
         available.sibling_pdf_exists = false;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                enabled = save_pdf_button(ui, &available).enabled();
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        enabled = save_pdf_button(ui, &available).enabled();
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(enabled);
     }
 
@@ -1178,7 +1202,9 @@ mod tests {
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only"),
         ))))
         .unwrap();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(
             matches!(app.epub_convert.as_ref().map(|state| &state.phase), Some(EpubConvertPhase::SaveError(message)) if message.contains("変換して開く"))
         );

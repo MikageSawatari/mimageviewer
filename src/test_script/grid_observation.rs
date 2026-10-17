@@ -112,7 +112,7 @@ mod tests {
     fn grid_observation_uses_actual_scrollarea_clip_and_content_translation() {
         let ctx = egui::Context::default();
         for (offset, visible) in [(0.0, false), (300.0, true)] {
-            let _ = ctx.run(
+            ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -120,8 +120,9 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .vertical_scroll_offset(offset)
                             .show_viewport(ui, |ui, viewport| {
@@ -146,7 +147,8 @@ mod tests {
                             });
                     });
                 },
-            );
+            )
+            .drop_without_applying_deltas();
             let observed = snapshot(&ctx);
             assert_eq!(
                 observed.to_rhai_map()["visible"].clone().cast::<bool>(),

@@ -16363,7 +16363,7 @@ mod configurable_video_seek_dispatch_tests {
             .get_mut(&egui::ViewportId::ROOT)
             .unwrap()
             .focused = Some(false);
-        let _ = ctx.run(input, |_| {});
+        let _ = ctx.run_pass(input, |_| {});
         assert_eq!(ctx.input(|input| input.viewport().focused), Some(false));
 
         for (bindings, virtual_key) in [

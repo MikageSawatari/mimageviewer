@@ -208,6 +208,10 @@ fn show_delete_confirm_modal(
                 ui.spacing_mut().scroll =
                     super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("delete_confirm_targets")
                     .max_height(target_list_height)
                     .auto_shrink([false, true])
@@ -830,6 +834,7 @@ impl crate::app::App {
         let checked_count = self.checked.len();
         let pos = self.context_menu_pos;
         egui::Window::new("bookmark-grid-context")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("bookmark_grid_context_menu"))
             .title_bar(false)
             .resizable(false)
@@ -996,6 +1001,7 @@ impl crate::app::App {
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("context_menu")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("grid_ctx_menu"))
             .title_bar(false)
             .collapsible(false)
@@ -2100,6 +2106,7 @@ impl crate::app::App {
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("fs_context_menu")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("fs_ctx_menu"))
             .title_bar(false)
             .collapsible(false)
@@ -4588,7 +4595,8 @@ mod delete_confirm_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -4596,7 +4604,7 @@ mod delete_confirm_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     if ui.button("Background action").clicked() {
                         clicked_in_ui.store(true, Ordering::Relaxed);
                     }
@@ -4695,13 +4703,17 @@ mod delete_confirm_tests {
                 let ctx = egui::Context::default();
                 crate::ime_focus::install_ime_input_policy(&ctx);
                 let mut app = crate::app::setup_app_for_test();
-                let _ = ctx.run(
-                    egui::RawInput {
-                        events: vec![egui::Event::Ime(egui::ImeEvent::Preedit("preedit".into()))],
-                        ..Default::default()
-                    },
-                    |ctx| app.update_ime_state(ctx),
-                );
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit(
+                                "preedit".into(),
+                            ))],
+                            ..Default::default()
+                        },
+                        |ctx| app.update_ime_state(ctx),
+                    )
+                    .drop_without_applying_deltas();
                 let press = egui::Event::Key {
                     key,
                     physical_key: Some(key),
@@ -4714,33 +4726,37 @@ mod delete_confirm_tests {
                     egui::Event::Ime(egui::ImeEvent::Disabled),
                 ];
                 if !same_pass {
-                    let _ = ctx.run(
-                        egui::RawInput {
-                            events: std::mem::take(&mut events),
-                            ..Default::default()
-                        },
-                        |ctx| app.update_ime_state(ctx),
-                    );
+                    let _ = ctx
+                        .run_pass(
+                            egui::RawInput {
+                                events: std::mem::take(&mut events),
+                                ..Default::default()
+                            },
+                            |ctx| app.update_ime_state(ctx),
+                        )
+                        .drop_without_applying_deltas();
                 }
                 events.push(press);
-                let _ = ctx.run(
-                    egui::RawInput {
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        app.update_ime_state(ctx);
-                        let response = consume_delete_confirm_action(
-                            ctx,
-                            DeleteConfirmSelection::Delete,
-                            app.ime_input_active(ctx),
-                            app.dialog_escape_pressed(ctx),
-                            app.dialog_enter_pressed(ctx),
-                        );
-                        assert_eq!(response.action, expected, "{key:?}, same_pass={same_pass}");
-                        assert!(!ctx.input(|input| input.key_pressed(key)));
-                    },
-                );
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.update_ime_state(ctx);
+                            let response = consume_delete_confirm_action(
+                                ctx,
+                                DeleteConfirmSelection::Delete,
+                                app.ime_input_active(ctx),
+                                app.dialog_escape_pressed(ctx),
+                                app.dialog_enter_pressed(ctx),
+                            );
+                            assert_eq!(response.action, expected, "{key:?}, same_pass={same_pass}");
+                            assert!(!ctx.input(|input| input.key_pressed(key)));
+                        },
+                    )
+                    .drop_without_applying_deltas();
             }
         }
     }

@@ -546,7 +546,7 @@ impl App {
             ..FavoritesEditorActivity::default()
         };
 
-        egui::Window::new("お気に入り")
+        egui::Window::new("お気に入り").drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -565,7 +565,7 @@ impl App {
                 // 一覧の表示面積を優先して予約幅 0 なので、このダイアログで局所適用する。
                 ui.spacing_mut().scroll = super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
                 let body_height = ui.available_height().max(1.0);
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .id_salt("favorites_editor_body_scroll")
                     .auto_shrink([false, false])
                     .max_height(body_height)
@@ -1777,7 +1777,8 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 360.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -1785,7 +1786,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.heading("お気に入りの Full 結果");
                     for (label, state) in [
                         ("Full 完了 / 起動時確認省略", IndexScanState::Monitoring),
@@ -2110,7 +2111,8 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 270.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -2118,7 +2120,7 @@ mod tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(egui::RichText::new("別バージョン索引の進行状態").strong());
                     ui.separator();

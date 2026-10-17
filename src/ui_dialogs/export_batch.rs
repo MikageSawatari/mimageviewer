@@ -194,6 +194,7 @@ impl App {
         // 必ず default_pos() を使う。
         let default_pos = ctx.content_rect().center() - egui::vec2(230.0, 190.0);
         egui::Window::new("一括エクスポート")
+            .drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(false)
             .default_pos(default_pos)

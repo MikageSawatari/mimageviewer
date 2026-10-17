@@ -14,8 +14,8 @@ use windows::Win32::Graphics::DirectComposition::{IDCompositionDevice, IDComposi
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::Ime::{
-    CANDIDATEFORM, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow,
-    ImmSetCompositionWindow,
+    CANDIDATEFORM, COMPOSITIONFORM, CPS_CANCEL, ImmGetContext, ImmNotifyIME, ImmReleaseContext,
+    ImmSetCandidateWindow, ImmSetCompositionWindow, NI_COMPOSITIONSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetCapture, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -157,6 +157,7 @@ pub(crate) enum NativeCursorIcon {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NativeWindowIntent {
     ClaimTextInputFocus,
+    InterruptImeComposition,
     UpdateImeCursorArea {
         x: i32,
         y: i32,
@@ -892,6 +893,7 @@ impl NativeWindowHost {
                         ],
                     );
                 }
+                NativeWindowIntent::InterruptImeComposition => self.interrupt_ime_composition(),
                 NativeWindowIntent::UpdateImeCursorArea {
                     x,
                     y,
@@ -901,6 +903,22 @@ impl NativeWindowHost {
                     self.update_ime_cursor_area(x, y, width, height);
                 }
                 NativeWindowIntent::SetCursorPolicy { .. } => {}
+            }
+        }
+    }
+
+    fn interrupt_ime_composition(&self) {
+        self.assert_owner_thread();
+        // The same presenter HWND owns keyboard/IME input and cursor updates.
+        // Cancelling the current HIMC does not disable subsequent composition.
+        unsafe {
+            let hwnd = self.hwnd();
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                if !ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0).as_bool() {
+                    crate::logger::log("native IME composition interrupt failed");
+                }
+                let _ = ImmReleaseContext(hwnd, himc);
             }
         }
     }

@@ -531,10 +531,12 @@ impl egui::Plugin for SubmissionPlugin {
     fn debug_name(&self) -> &'static str {
         "page_turn_submitted_output"
     }
-    fn on_begin_pass(&mut self, ctx: &egui::Context) {
+    fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx();
         self.pending.remove(&ctx.viewport_id());
     }
-    fn on_end_pass(&mut self, ctx: &egui::Context) {
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx();
         let viewport = ctx.viewport_id();
         self.output = Some((
             viewport,
@@ -542,7 +544,7 @@ impl egui::Plugin for SubmissionPlugin {
             ctx.options(|o| o.max_passes.get()),
         ));
     }
-    fn output_hook(&mut self, output: &mut egui::FullOutput) {
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
         let Some((viewport, pending, max_passes)) = self.output.take() else {
             return;
         };
@@ -3751,13 +3753,15 @@ mod tests {
             pos: egui::pos2(30.0, 40.0),
             force: None,
         };
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![touch(egui::TouchPhase::Start)],
-                ..Default::default()
-            },
-            |ctx| app.page_turn_pre_draw(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![touch(egui::TouchPhase::Start)],
+                    ..Default::default()
+                },
+                |ctx| app.page_turn_pre_draw(ctx),
+            )
+            .drop_without_applying_deltas();
         let start = app
             .page_turn_presentation
             .transaction
@@ -3766,13 +3770,15 @@ mod tests {
             .find(|f| f.cause == "touch")
             .copied()
             .unwrap();
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![touch(egui::TouchPhase::End)],
-                ..Default::default()
-            },
-            |ctx| app.page_turn_pre_draw(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![touch(egui::TouchPhase::End)],
+                    ..Default::default()
+                },
+                |ctx| app.page_turn_pre_draw(ctx),
+            )
+            .drop_without_applying_deltas();
         let end = app
             .page_turn_presentation
             .transaction
@@ -3783,13 +3789,15 @@ mod tests {
             .unwrap();
         assert!(same_operation(&start, &end));
         assert_eq!(start.destination, end.destination);
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![touch(egui::TouchPhase::End)],
-                ..Default::default()
-            },
-            |ctx| app.page_turn_pre_draw(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![touch(egui::TouchPhase::End)],
+                    ..Default::default()
+                },
+                |ctx| app.page_turn_pre_draw(ctx),
+            )
+            .drop_without_applying_deltas();
         assert!(
             !app.page_turn_presentation
                 .transaction
@@ -3817,37 +3825,43 @@ mod tests {
         install(&ctx);
         let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         let mut receipts = Vec::new();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let proof = receipt(ctx, 1);
-            queue_submission(
-                ctx,
-                proof.clone(),
-                Some(event(&tracker, SubmissionKind::Curl)),
-            );
-            receipts.push(proof);
-            if ctx.current_pass_index() == 0 {
-                ctx.request_discard("test replay");
-            }
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                let proof = receipt(ctx, 1);
+                queue_submission(
+                    ctx,
+                    proof.clone(),
+                    Some(event(&tracker, SubmissionKind::Curl)),
+                );
+                receipts.push(proof);
+                if ctx.current_pass_index() == 0 {
+                    ctx.request_discard("test replay");
+                }
+            })
+            .drop_without_applying_deltas();
         assert_eq!(receipts.len(), 2);
         assert!(!receipts[0].was_accepted());
         assert!(receipts[1].was_accepted());
         assert_eq!(tracker.status(), SubmissionStatus::Started);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(
-                ctx,
-                receipt(ctx, 1),
-                Some(event(&tracker, SubmissionKind::Canonical)),
-            )
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(
+                    ctx,
+                    receipt(ctx, 1),
+                    Some(event(&tracker, SubmissionKind::Canonical)),
+                )
+            })
+            .drop_without_applying_deltas();
         assert_eq!(tracker.status(), SubmissionStatus::Finished);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(
-                ctx,
-                receipt(ctx, 1),
-                Some(event(&tracker, SubmissionKind::Curl)),
-            )
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(
+                    ctx,
+                    receipt(ctx, 1),
+                    Some(event(&tracker, SubmissionKind::Curl)),
+                )
+            })
+            .drop_without_applying_deltas();
         assert_eq!(tracker.status(), SubmissionStatus::Finished);
     }
     #[test]
@@ -3857,18 +3871,20 @@ mod tests {
             install(&ctx);
             let tracker = Arc::new(SubmissionTracker::new(fact(1)));
             tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                if ctx.current_pass_index() == 0 {
-                    queue_submission(
-                        ctx,
-                        receipt(ctx, 1),
-                        Some(event(&tracker, SubmissionKind::Canonical)),
-                    );
-                    ctx.request_discard("canonical replay");
-                } else {
-                    queue_submission(ctx, receipt(ctx, if matching { 1 } else { 2 }), None);
-                }
-            });
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    if ctx.current_pass_index() == 0 {
+                        queue_submission(
+                            ctx,
+                            receipt(ctx, 1),
+                            Some(event(&tracker, SubmissionKind::Canonical)),
+                        );
+                        ctx.request_discard("canonical replay");
+                    } else {
+                        queue_submission(ctx, receipt(ctx, if matching { 1 } else { 2 }), None);
+                    }
+                })
+                .drop_without_applying_deltas();
             assert_eq!(
                 tracker.status(),
                 if matching {
@@ -3886,22 +3902,24 @@ mod tests {
         let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
         tracker.end();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            if ctx.current_pass_index() == 0 {
-                queue_submission(
-                    ctx,
-                    receipt(ctx, 1),
-                    Some(event(&tracker, SubmissionKind::Canonical)),
-                );
-                ctx.request_discard("cancel flat replay");
-            } else {
-                let ledger = tracker.ledger.lock().unwrap();
-                assert!(!ledger.canonical_visible);
-                assert_eq!(ledger.visible_pages, 0);
-                drop(ledger);
-                queue_submission(ctx, receipt(ctx, 1), None);
-            }
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                if ctx.current_pass_index() == 0 {
+                    queue_submission(
+                        ctx,
+                        receipt(ctx, 1),
+                        Some(event(&tracker, SubmissionKind::Canonical)),
+                    );
+                    ctx.request_discard("cancel flat replay");
+                } else {
+                    let ledger = tracker.ledger.lock().unwrap();
+                    assert!(!ledger.canonical_visible);
+                    assert_eq!(ledger.visible_pages, 0);
+                    drop(ledger);
+                    queue_submission(ctx, receipt(ctx, 1), None);
+                }
+            })
+            .drop_without_applying_deltas();
         let ledger = tracker.ledger.lock().unwrap();
         assert!(ledger.canonical_visible);
         assert_eq!(ledger.visible_pages, 1);
@@ -3937,7 +3955,7 @@ mod tests {
         inventory.account(&mut accountant);
         assert_eq!(accountant.finish().total_bytes(), bytes);
         let weak = Arc::downgrade(&old);
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -3974,17 +3992,21 @@ mod tests {
         let mut outgoing = unit(&ctx, texture, 1);
         let proof = receipt(&ctx, 0);
         Arc::make_mut(&mut outgoing).evidence = proof.accepted.clone();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            if ctx.current_pass_index() == 0 {
-                queue_submission(ctx, proof.clone(), None);
-                ctx.request_discard("never shown outgoing");
-            }
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                if ctx.current_pass_index() == 0 {
+                    queue_submission(ctx, proof.clone(), None);
+                    ctx.request_discard("never shown outgoing");
+                }
+            })
+            .drop_without_applying_deltas();
         assert!(!outgoing.evidence.was_accepted());
         // The runtime Offered -> Turning guard reads this exact shared proof.
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(ctx, proof.clone(), None)
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(ctx, proof.clone(), None)
+            })
+            .drop_without_applying_deltas();
         assert!(outgoing.evidence.was_accepted());
     }
 
@@ -4006,9 +4028,11 @@ mod tests {
         assert!(previous.same_material_and_geometry(&next));
         let selected = PaintedUnit::select_flat(previous, &next);
         assert!(Arc::ptr_eq(&selected, &next));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            queue_submission(ctx, adopted.clone(), None)
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                queue_submission(ctx, adopted.clone(), None)
+            })
+            .drop_without_applying_deltas();
         assert!(selected.evidence.was_accepted());
         assert!(!discarded.was_accepted());
         assert!(Arc::ptr_eq(
@@ -4119,7 +4143,7 @@ mod tests {
                 rect,
             )
             .unwrap();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 transform.paint_texture(
                     &ctx.debug_painter(),
                     egui::TextureId::User(19),
@@ -4174,18 +4198,20 @@ mod tests {
         );
         assert!(app.resolve_fs_display_tex(0, false).is_some());
         assert!(app.page_turn_normal_ready_texture(0).is_some());
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 73,
-                    ordinal: 0,
-                },
-                OperationPhase::Press,
-                "test",
-            );
-            app.offer_page_turn(ctx, 0, true);
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 73,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Press,
+                    "test",
+                );
+                app.offer_page_turn(ctx, 0, true);
+            })
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.page_turn_presentation.state,
             PresentationState::Inactive
@@ -4199,64 +4225,68 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.settings.page_turn_animation_enabled = true;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 91,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "test",
-            );
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 91,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "replay_metadata",
-            );
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-        });
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operations(
-                ctx,
-                &[
-                    (
-                        ViewerOperationId::Pad {
-                            batch: 92,
-                            ordinal: 0,
-                        },
-                        OperationPhase::Press,
-                        "test",
-                    ),
-                    (
-                        ViewerOperationId::Pad {
-                            batch: 92,
-                            ordinal: 1,
-                        },
-                        OperationPhase::Press,
-                        "test",
-                    ),
-                ],
-            );
-            app.page_turn_excluded_navigation(ctx, "ambiguous");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 91,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "test",
+                );
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 91,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "replay_metadata",
+                );
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operations(
+                    ctx,
+                    &[
+                        (
+                            ViewerOperationId::Pad {
+                                batch: 92,
+                                ordinal: 0,
+                            },
+                            OperationPhase::Press,
+                            "test",
+                        ),
+                        (
+                            ViewerOperationId::Pad {
+                                batch: 92,
+                                ordinal: 1,
+                            },
+                            OperationPhase::Press,
+                            "test",
+                        ),
+                    ],
+                );
+                app.page_turn_excluded_navigation(ctx, "ambiguous");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+            })
+            .drop_without_applying_deltas();
     }
 
     #[test]
@@ -4273,77 +4303,81 @@ mod tests {
         let incoming = unit(&ctx, texture, 1);
         let tracker = Arc::new(SubmissionTracker::new(fact(1)));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 110,
-                    ordinal: 0,
-                },
-                OperationPhase::Press,
-                "test",
-            );
-            let old_fact = app.page_turn_presentation.take_candidate().unwrap();
-            app.page_turn_presentation.state = PresentationState::Turning {
-                projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
-                clock: MotionClock::AwaitingAcceptedOutput,
-                outgoing: outgoing.clone(),
-                incoming: incoming.clone(),
-                offer: AcceptedOffer {
-                    fact: old_fact,
-                    ready_sources: Arc::new(AcceptedSources(Vec::new())),
-                    resident_bytes: 0,
-                    pin_bytes: 0,
-                    accepted_at: presentation_now(),
-                    duration: Duration::from_millis(200),
-                    forward: true,
-                    submission: tracker.clone(),
-                },
-            };
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 110,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Press,
+                    "test",
+                );
+                let old_fact = app.page_turn_presentation.take_candidate().unwrap();
+                app.page_turn_presentation.state = PresentationState::Turning {
+                    projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
+                    clock: MotionClock::AwaitingAcceptedOutput,
+                    outgoing: outgoing.clone(),
+                    incoming: incoming.clone(),
+                    offer: AcceptedOffer {
+                        fact: old_fact,
+                        ready_sources: Arc::new(AcceptedSources(Vec::new())),
+                        resident_bytes: 0,
+                        pin_bytes: 0,
+                        accepted_at: presentation_now(),
+                        duration: Duration::from_millis(200),
+                        forward: true,
+                        submission: tracker.clone(),
+                    },
+                };
+            })
+            .drop_without_applying_deltas();
         // The active turn originated in a previous frame. Distinct operations
         // in one physical frame are intentionally an ambiguous transaction.
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 111,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "test",
-            );
-            assert!(matches!(
-                app.page_turn_presentation.state,
-                PresentationState::Completing { .. }
-            ));
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Cancelled
-            );
-            assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-            assert!(app.page_turn_presentation.take_candidate().is_none());
-            app.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: 111,
-                    ordinal: 0,
-                },
-                OperationPhase::Repeat,
-                "replay_metadata",
-            );
-            app.page_turn_excluded_navigation(ctx, "repeat_operation");
-            assert!(
-                app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Excluded
-            );
-            assert!(app.page_turn_presentation.take_candidate().is_none());
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 111,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "test",
+                );
+                assert!(matches!(
+                    app.page_turn_presentation.state,
+                    PresentationState::Completing { .. }
+                ));
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Cancelled
+                );
+                assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+                assert!(app.page_turn_presentation.take_candidate().is_none());
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: 111,
+                        ordinal: 0,
+                    },
+                    OperationPhase::Repeat,
+                    "replay_metadata",
+                );
+                app.page_turn_excluded_navigation(ctx, "repeat_operation");
+                assert!(
+                    app.page_turn_presentation.transaction.disposition
+                        == OperationDisposition::Excluded
+                );
+                assert!(app.page_turn_presentation.take_candidate().is_none());
+            })
+            .drop_without_applying_deltas();
         assert!(app.fullscreen_idx.is_none()); // Observer never navigates or queues a target.
     }
 

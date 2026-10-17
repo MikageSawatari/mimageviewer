@@ -43,7 +43,7 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut add_empty_row = false;
 
-        egui::Window::new("ピン留めタグの管理")
+        egui::Window::new("ピン留めタグの管理").drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -61,7 +61,7 @@ impl App {
                 ui.add_space(6.0);
 
                 let n = self.tag_editor_draft.len();
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .id_salt("tag_edit_scroll")
                     .max_height(360.0)
                     .auto_shrink([false, true])

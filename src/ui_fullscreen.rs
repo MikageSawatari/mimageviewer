@@ -2605,7 +2605,8 @@ impl FsNavigatorFrameInput {
                 input.focused,
                 input.pointer.primary_down(),
                 input.pointer.secondary_down(),
-                input.raw_scroll_delta.y,
+                crate::wheel_input::remaining_wheel_delta(input, ctx.options(|o| o.input_options))
+                    .y,
             )
         });
         let has_focus_event = events
@@ -2903,7 +2904,7 @@ pub(crate) fn install_fs_navigator_input_tracking(ctx: &egui::Context) {
     }
     ctx.on_begin_pass(
         "miv_fs_navigator_input_tracking",
-        Arc::new(FsNavigatorFrameInput::record_current_pass),
+        Arc::new(|ui| FsNavigatorFrameInput::record_current_pass(ui.ctx())),
     );
 }
 
@@ -5846,7 +5847,7 @@ fn append_fs_overflow_touch_exclusion(
 
 fn draw_fs_overflow_panel_row(
     ui: &mut egui::Ui,
-    _id: impl std::hash::Hash,
+    _id: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     status: &str,
     selected: bool,
@@ -6026,7 +6027,7 @@ fn draw_fs_overflow_panel_surface(
         // without gaps. The default item spacing made the content taller than the body,
         // so a scrollbar appeared even when the whole menu fitted on screen.
         body.spacing_mut().item_spacing.y = 0.0;
-        let output = egui::ScrollArea::vertical()
+        let output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
             .id_salt("fs_overflow_panel_body")
             .min_scrolled_height(0.0)
             .max_height(body_rect.height())
@@ -6137,7 +6138,11 @@ fn draw_fs_overflow_panel_surface(
         ui.ctx().data_mut(|data| {
             data.insert_temp(
                 egui::Id::new("fs_overflow_scroll_test_layout"),
-                (output.inner_rect, output.content_size, output.state.offset),
+                (
+                    output.inner_rect,
+                    output.content_size,
+                    output.state.clamped_offset(),
+                ),
             );
         });
         #[cfg(not(test))]
@@ -6831,7 +6836,6 @@ fn draw_still_seek_strip_popup(
     if popup.is_some() {
         // Let the popup scroll first, then consume even unused wheel input at an edge.
         response.ctx.input_mut(|input| {
-            input.raw_scroll_delta = egui::Vec2::ZERO;
             input.smooth_scroll_delta = egui::Vec2::ZERO;
             input
                 .events
@@ -6925,6 +6929,10 @@ fn draw_still_seek_strip_menu(
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
             egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .max_height(menu_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -6948,7 +6956,7 @@ fn draw_still_seek_strip_menu(
                             ui.interact(item_rect, ui.id().with(id), egui::Sense::click());
                         response.widget_info(|| {
                             egui::WidgetInfo::selected(
-                                egui::WidgetType::SelectableLabel,
+                                egui::Role::Button,
                                 ui.is_enabled(),
                                 current,
                                 label,
@@ -8123,21 +8131,25 @@ mod singleton_spread_endpoint_popup_tests {
         events: Vec<egui::Event>,
     ) -> bool {
         let mut selected = false;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(400.0, 500.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    selected = draw_singleton_spread_endpoint_popup(ui, saved, animation);
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            selected = draw_singleton_spread_endpoint_popup(ui, saved, animation);
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         selected
     }
 
@@ -11963,7 +11975,7 @@ impl App {
             return None;
         }
         let pixels_per_point = ctx.pixels_per_point();
-        let viewport = self.fullscreen_media_rect(ctx.screen_rect(), page.idx(), false);
+        let viewport = self.fullscreen_media_rect(ctx.viewport_rect(), page.idx(), false);
         let texture_size = page.texture.size_vec2();
         let placement = ResolvedDisplayPlacement::SingletonSpread {
             side: unit.singleton_placement,
@@ -21768,7 +21780,6 @@ impl App {
             }
             crate::app::DeferredDetachedImageWindowEvent::Frame {
                 id,
-                viewport_close_requested,
                 bar_close_requested,
                 focused,
                 placement_update,
@@ -21776,6 +21787,7 @@ impl App {
                 apply_initial_placement,
                 right_drag,
             } => {
+                let viewport_close_requested = false;
                 let Some(window_pos) = self
                     .detached_image_windows
                     .iter()
@@ -21802,12 +21814,11 @@ impl App {
                     && Self::detached_image_window_debug_enabled()
                 {
                     crate::logger::log(format!(
-                        "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
+                        "[detached-window-debug] passive_event id={} close_viewport=false close_bar={} \
                          focused={} focused_prev={} focus_edge={} \
                          focus_activation_candidate={} can_activate={} armed={} ready_frame={} \
                          frame={} has_bundle={} has_descriptor={} has_stamp={} source=deferred",
                         id,
-                        viewport_close_requested,
                         bar_close_requested,
                         focused,
                         window.focused_last_frame,
@@ -22073,7 +22084,7 @@ impl App {
         batch.close_ids.sort_unstable();
         batch.close_ids.dedup();
         if !batch.close_ids.is_empty() {
-            self.close_detached_image_windows_by_ids(
+            self.request_detached_image_window_close_by_ids(
                 ctx,
                 &batch.close_ids,
                 "passive_close",
@@ -22134,6 +22145,30 @@ impl App {
             }
         }
         self.prune_deferred_detached_image_window_views();
+    }
+
+    /// Consume one application Close request at the existing detached owner boundary.
+    /// Sidecar restoration blocks only its target, exactly as passive input batching does.
+    /// Refused requests are not retained for restoration or a later UI pass.
+    #[cfg(windows)]
+    pub(crate) fn request_detached_image_window_close_by_ids(
+        &mut self,
+        ctx: &egui::Context,
+        close_ids: &[u64],
+        reason: &'static str,
+        activate_ids: Option<&[u64]>,
+    ) -> bool {
+        let target = self.sidecar_restore_target_window_id();
+        let accepted = close_ids
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != target)
+            .collect::<Vec<_>>();
+        if accepted.is_empty() {
+            return false;
+        }
+        self.close_detached_image_windows_by_ids(ctx, &accepted, reason, activate_ids);
+        true
     }
 
     #[cfg(windows)]
@@ -22397,7 +22432,8 @@ impl App {
             );
             let shared = self.deferred_detached_image_window_shared(view);
             let ui_scale = self.settings.ui_scale_factor;
-            ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx, _class| {
+            ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx_ui, _class| {
+                let vp_ctx = &vp_ctx_ui.ctx().clone();
                 #[cfg(feature = "test-script")]
                 crate::test_script::receive_screenshot_events(vp_ctx, "deferred");
                 if sidecar_restore_presentation.is_some() {
@@ -22441,8 +22477,7 @@ impl App {
                         placement_update = Some(placement);
                     }
                 }
-                let viewport_close_requested = sidecar_restore_presentation.is_none()
-                    && vp_ctx.input(|i| i.viewport().close_requested());
+                let viewport_close_requested = false;
                 let right_drag = sidecar_restore_presentation
                     .is_none()
                     .then(|| shared.capture_right_drag_event(vp_ctx, focused))
@@ -22450,7 +22485,7 @@ impl App {
                 let mut bar_close_requested = false;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(view.margin_color))
-                    .show(vp_ctx, |ui| {
+                    .show(vp_ctx_ui, |ui| {
                         let full_rect = ui.max_rect();
                         if first_callback {
                             Self::log_detached_frozen_page_restore_debug(
@@ -22506,7 +22541,6 @@ impl App {
                 // they contain no text input, so IME state remains owned by the root App pass.
                 shared.push_event(crate::app::DeferredDetachedImageWindowEvent::Frame {
                     id: view.id,
-                    viewport_close_requested,
                     bar_close_requested,
                     focused,
                     placement_update,
@@ -22622,7 +22656,8 @@ impl App {
                 })
                 .flatten();
             let ui_scale = self.settings.ui_scale_factor;
-            ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+            ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx_ui, _class| {
+                let vp_ctx = &vp_ctx_ui.ctx().clone();
                 #[cfg(feature = "test-script")]
                 crate::test_script::receive_screenshot_events(vp_ctx, "parked_live_immediate");
                 if sidecar_restore_presentation.is_some() {
@@ -22660,11 +22695,6 @@ impl App {
                         placement_update = Some(placement);
                     }
                 }
-                if sidecar_restore_presentation.is_none()
-                    && vp_ctx.input(|i| i.viewport().close_requested())
-                {
-                    viewport_close_requested = true;
-                }
                 (
                     primary_pressed,
                     primary_released,
@@ -22681,7 +22711,10 @@ impl App {
                     }
                     let primary_pressed = i.pointer.primary_pressed();
                     let primary_released = i.pointer.primary_released();
-                    let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
+                    let scroll = crate::wheel_input::remaining_wheel_delta(
+                        i,
+                        ctx.options(|o| o.input_options),
+                    ) != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO;
                     let key = i
                         .events
@@ -22706,7 +22739,7 @@ impl App {
 
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                    .show(vp_ctx, |ui| {
+                    .show(vp_ctx_ui, |ui| {
                         let full_rect = ui.max_rect();
                         if let Some(info) = parked_live_music_info.as_ref() {
                             self.draw_parked_live_music_window(
@@ -22823,14 +22856,13 @@ impl App {
                 && Self::detached_image_window_debug_enabled()
             {
                 crate::logger::log(format!(
-                    "[detached-window-debug] passive_event id={} close_viewport={} close_bar={} \
+                    "[detached-window-debug] passive_event id={} close_viewport=false close_bar={} \
                      focused={} focused_prev={} focus_edge={} \
                      focus_activation_candidate={} pointer_pressed={} pointer_released={} \
                      scroll_candidate={} key_candidate={} wheel_candidate={} user_activation={} \
                      can_activate={} armed={} ready_frame={} frame={} \
                      has_bundle={} has_descriptor={} has_stamp={}",
                     window.id,
-                    viewport_close_requested,
                     bar_close_requested,
                     focused_now,
                     window.focused_last_frame,
@@ -24554,7 +24586,8 @@ impl App {
             );
             let loading_location = self.address.clone();
             let mut cancel = false;
-            ctx.show_viewport_immediate(fs_id, builder, |vp_ctx, _class| {
+            ctx.show_viewport_immediate(fs_id, builder, |vp_ctx_ui, _class| {
+                let vp_ctx = &vp_ctx_ui.ctx().clone();
                 if self.sidecar_restore_blocks_projected_context() {
                     Self::consume_sidecar_restore_viewport_input(vp_ctx);
                 } else if vp_ctx.input(|input| {
@@ -24564,7 +24597,7 @@ impl App {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                    .show(vp_ctx, |ui| {
+                    .show(vp_ctx_ui, |ui| {
                         paint_fullscreen_loading_placeholder(
                             ui,
                             ui.max_rect(),
@@ -24674,7 +24707,8 @@ impl App {
                     fs_id,
                 )
             });
-            ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
+            ctx.show_viewport_immediate(fs_id, fs_builder, |ctx_ui, _class| {
+                let ctx = &ctx_ui.ctx().clone();
                 if self.sidecar_restore_blocks_projected_context() {
                     Self::consume_sidecar_restore_viewport_input(ctx);
                 }
@@ -24689,7 +24723,7 @@ impl App {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(canvas_color))
-                    .show(ctx, |ui| {
+                    .show(ctx_ui, |ui| {
                         self.draw_fs_navigation_gap_surface(
                             ui,
                             ctx,
@@ -24807,7 +24841,9 @@ impl App {
             self.fs_viewport_generation,
             self.detached_viewer_host_debug_state()
         ));
-        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx_ui, _class| {
+            let _ctx = &_ctx_ui.ctx().clone();
+        });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         #[cfg(windows)]
         self.log_main_flash_probe(
@@ -25003,14 +25039,15 @@ impl App {
         // Separate our drawing from what eframe does around it (render + present of
         // the child viewport), because only one of the two can be made cheaper.
         let show_t0 = std::time::Instant::now();
-        let inner_ms = ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+        let inner_ms = ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx_ui, _class| {
+            let vp_ctx = &vp_ctx_ui.ctx().clone();
             let inner_t0 = std::time::Instant::now();
             if self.sidecar_restore_blocks_projected_context() {
                 Self::consume_sidecar_restore_viewport_input(vp_ctx);
             }
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(canvas_color))
-                .show(vp_ctx, |ui| {
+                .show(vp_ctx_ui, |ui| {
                     let full_rect = ui.max_rect();
                     let layout = self.fs_navigation_gap_layout(full_rect, navigation_chrome);
                     match &backstop_draw {
@@ -25119,7 +25156,8 @@ impl App {
     /// Esc / ウィンドウクローズ要求で deferred reopen を破棄して fullscreen を抜ける
     /// (viewport モードの defer 分岐と同じ挙動)。
     #[cfg(windows)]
-    fn render_embedded_fs_nav_holdover(&mut self, ctx: &egui::Context) {
+    fn render_embedded_fs_nav_holdover(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         let holdover = self.fs_nav_holdover_for_draw();
         let navigation_chrome = self.fs_navigation_chrome_for_draw();
         let canvas_color = fullscreen_holdover_canvas_color(
@@ -25145,7 +25183,7 @@ impl App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(canvas_color))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 self.draw_fs_navigation_gap_surface(ui, ctx, holdover.as_ref(), navigation_chrome);
             });
         self.show_sidecar_restore_dialog(ctx);
@@ -25198,7 +25236,11 @@ impl App {
     /// 可能なら直前画像を中央 contain で残し、専用 viewport が前面に出るまで
     /// 背面のグリッドが見えないようにする。
     #[cfg(windows)]
-    pub(crate) fn render_still_fullscreen_viewport_enter_holdover(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_still_fullscreen_viewport_enter_holdover(
+        &mut self,
+        root_ui: &mut egui::Ui,
+    ) {
+        let ctx = &root_ui.ctx().clone();
         let holdover = self
             .presentation_switch_holdover()
             .or_else(|| self.fs_nav_holdover_without_latching());
@@ -25216,7 +25258,7 @@ impl App {
             .frame(egui::Frame::new().fill(fullscreen_image_margin_color(
                 self.settings.fullscreen_image_margin_color,
             )))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 if let Some(unit) = holdover.as_ref() {
                     let image_rect = ui.max_rect();
                     self.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
@@ -25258,15 +25300,17 @@ impl App {
         0
     }
 
-    pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
-        self.render_fullscreen_viewport_with_root_input(ctx, None);
+    pub(crate) fn render_fullscreen_viewport(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        self.render_fullscreen_viewport_with_root_input(root_ui, None);
     }
 
     pub(crate) fn render_fullscreen_viewport_with_root_input(
         &mut self,
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
         root_input: Option<FullscreenRootFrameInput>,
     ) {
+        let ctx = &root_ui.ctx().clone();
         let mut fs_render_perf = fs_render_perf_start_with(
             crate::perf::is_enabled(),
             std::time::Instant::now,
@@ -25281,7 +25325,7 @@ impl App {
             // `native_video_in_window_active` で gate する。
             #[cfg(windows)]
             if self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active() {
-                self.render_embedded_fs_nav_holdover(ctx);
+                self.render_embedded_fs_nav_holdover(root_ui);
             }
             finish_fs_render_perf(
                 &mut fs_render_perf,
@@ -25620,7 +25664,8 @@ impl App {
             .and_then(|window_id| self.test_script_pointer_show_owner(window_id, fs_id));
 
         {
-            let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
+            let mut render_fs_body = |root_ui: &mut egui::Ui, embedded: bool| {
+                let ctx = &root_ui.ctx().clone();
                 #[cfg(all(windows, feature = "test-script"))]
                 {
                     if !embedded {
@@ -25987,7 +26032,7 @@ impl App {
                 };
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(canvas_color))
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         if self.viewer_mutation_modal_active() { ui.disable(); }
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
@@ -26146,14 +26191,14 @@ impl App {
                                     .count();
                                 (
                                     i.viewport().focused.unwrap_or(false),
-                                    i.raw_scroll_delta,
+                                    crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options)),
                                     i.smooth_scroll_delta,
                                     i.events.len(),
                                     key_pressed_count,
                                     wheel_event_count,
                                 )
                             });
-                            let wants_keyboard = ctx.wants_keyboard_input();
+                            let wants_keyboard = ctx.egui_wants_keyboard_input();
                             let input_interesting = key_pressed_count > 0
                                 || wheel_event_count > 0
                                 || raw_scroll != egui::Vec2::ZERO
@@ -27997,7 +28042,7 @@ impl App {
             let fs_body_cycles_t0 = Self::thread_cycles_now();
             if embedded {
                 // in-window 静止画: メインウィンドウの egui ctx に直接描画する。
-                render_fs_body(main_ctx, true);
+                render_fs_body(root_ui, true);
                 #[cfg(windows)]
                 if hide_viewport_after_embedded_paint && !frame_path_changed && !frame_exited {
                     // 先に main 側へ画像を描いてから古い専用 viewport を隠す。
@@ -28009,8 +28054,9 @@ impl App {
                 #[cfg(all(windows, feature = "test-script"))]
                 let test_script_pointer_show =
                     crate::test_script::pointer_input::enter_show(test_script_pointer_show_owner);
-                main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx, _class| {
-                    render_fs_body(vp_ctx, false);
+                main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx_ui, _class| {
+                    let vp_ctx = &vp_ctx_ui.ctx().clone();
+                    render_fs_body(vp_ctx_ui, false);
                 });
                 #[cfg(all(windows, feature = "test-script"))]
                 {
@@ -30290,7 +30336,9 @@ impl App {
         }
         let fs_id = self.fullscreen_viewport_id();
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
-        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx_ui, _class| {
+            let _ctx = &_ctx_ui.ctx().clone();
+        });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.log_main_flash_probe(
             "fs_visible_false",
@@ -30324,7 +30372,9 @@ impl App {
         }
         let fs_id = self.fullscreen_viewport_id();
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
-        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx_ui, _class| {
+            let _ctx = &_ctx_ui.ctx().clone();
+        });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.log_main_flash_probe(
             "fs_visible_false",
@@ -30366,7 +30416,9 @@ impl App {
             _ => self.build_fullscreen_viewport_builder(),
         }
         .with_visible(false);
-        ctx.show_viewport_immediate(fs_id, builder, |_ctx, _class| {});
+        ctx.show_viewport_immediate(fs_id, builder, |_ctx_ui, _class| {
+            let _ctx = &_ctx_ui.ctx().clone();
+        });
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.log_main_flash_probe(
             "fs_visible_false",
@@ -30400,7 +30452,8 @@ impl App {
         };
         let expected_physical_rect = self.fullscreen_backdrop_physical_rect();
         let mut close_fs = false;
-        ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
+        ctx.show_viewport_immediate(fs_id, fs_builder, |ctx_ui, _class| {
+            let ctx = &ctx_ui.ctx().clone();
             if self.sidecar_restore_blocks_projected_context() {
                 Self::consume_sidecar_restore_viewport_input(ctx);
             }
@@ -30463,7 +30516,7 @@ impl App {
             }
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                .show(ctx, |_ui| {});
+                .show(ctx_ui, |_ui| {});
             self.show_sidecar_restore_dialog(ctx);
         });
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_none()
@@ -32113,7 +32166,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> Option<BarButtonResponse> {
-        let full_rect = ctx.available_rect();
+        let full_rect = ctx.content_rect();
         if !self.fullscreen_top_bar_chrome_allowed(fs_idx) {
             return None;
         }
@@ -32546,7 +32599,7 @@ impl App {
 
         if self.local_adjust_mode {
             if !self.ime_input_active(ctx)
-                && !ctx.wants_keyboard_input()
+                && !ctx.egui_wants_keyboard_input()
                 && self.consume_context_shortcuts_help_key(ctx)
             {
                 self.show_context_shortcuts_help = true;
@@ -32825,7 +32878,7 @@ impl App {
             Some(VideoAudioExitKeyOutcome::ContextMenuOpen)
         } else if self.ime_input_active(ctx) {
             Some(VideoAudioExitKeyOutcome::ImeInputActive)
-        } else if ctx.wants_keyboard_input() {
+        } else if ctx.egui_wants_keyboard_input() {
             Some(VideoAudioExitKeyOutcome::KeyboardInputWanted)
         } else if self.music_bookmark_modal_open() {
             Some(VideoAudioExitKeyOutcome::BookmarkModalOpen)
@@ -32843,7 +32896,7 @@ impl App {
         #[cfg(windows)]
         if fs_music_view_active
             && self.music_normalize_modal_active(fs_idx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.ime_input_active(ctx)
             && !self.music_bookmark_modal_open()
             && let Some(nav) = self.keymap.consume_first_action(
@@ -32932,7 +32985,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self
                 .keymap
@@ -32959,7 +33012,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             // no_repeat: native enter 側も !key.repeat。Z を押しっぱなしで enter した直後、
             // focus が egui 音楽ビューへ移ってからの repeat Z で即 exit するのを防ぐ (Codex P2)。
@@ -33002,7 +33055,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self
                 .keymap
@@ -33022,7 +33075,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
             && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
@@ -33036,7 +33089,7 @@ impl App {
         if animated_playback_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
             && let Some(entry) = self.fs_cache.get_mut(&fs_idx)
         {
@@ -33050,7 +33103,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::VideoBookmark)
         {
             self.add_music_bookmark_at_current(fs_idx);
@@ -33062,7 +33115,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoLoop)
         {
@@ -33075,7 +33128,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoSeekStart)
         {
@@ -33088,7 +33141,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
             let prev_marker = self.keymap.consume_action(ctx, KeyAction::VideoMarkerPrev);
@@ -33107,7 +33160,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
             let vol_up = self.keymap.consume_action(ctx, KeyAction::VideoVolumeUp);
@@ -33137,7 +33190,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoMute)
         {
@@ -33159,7 +33212,7 @@ impl App {
         if fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
         {
             let shift_left = self
@@ -35753,7 +35806,6 @@ impl App {
 
         if wheel_y.abs() > 0.5 {
             ctx.input_mut(|input| {
-                input.raw_scroll_delta = egui::Vec2::ZERO;
                 input.smooth_scroll_delta = egui::Vec2::ZERO;
                 input
                     .events
@@ -36097,7 +36149,6 @@ impl App {
 
         if wheel_y.abs() > 0.5 {
             ctx.input_mut(|input| {
-                input.raw_scroll_delta = egui::Vec2::ZERO;
                 input.smooth_scroll_delta = egui::Vec2::ZERO;
                 input
                     .events
@@ -37600,7 +37651,7 @@ impl App {
             is_music_view: music_view_active,
             has_fullscreen_item: panel_fs_idx.is_some(),
             dialog_open: self.any_dialog_open(),
-            wants_keyboard_input: ctx.wants_keyboard_input(),
+            wants_keyboard_input: ctx.egui_wants_keyboard_input(),
             ime_input_active: self.ime_input_active(ctx),
             context_menu_open: self.fs_context_menu_idx.is_some(),
             spread_popup_open: self.spread_popup_open,
@@ -37911,85 +37962,92 @@ impl App {
         let in_video_tile = self.video_tile_mode_active;
         #[cfg(not(windows))]
         let in_video_tile = false;
-        let wheel = ctx.input(crate::wheel_input::remaining_wheel_input);
-        let (wheel_y, modifiers) = (wheel.delta.y, wheel.modifiers);
-        let ctrl_held = modifiers.ctrl;
-        #[cfg(windows)]
-        let suppress_egui_wheel = should_suppress_egui_wheel_for_native_detached_video(
-            state.is_video,
-            self.viewer_session_is_detached(),
-            self.native_video_presenter_hwnd().is_some(),
-            self.fullscreen_idx
-                .is_some_and(|idx| self.fs_music_view_active(idx)),
-        );
-        #[cfg(not(windows))]
-        let suppress_egui_wheel = false;
-        // modal ダイアログ (Ctrl+E など) が開いている間は wheel 由来のページ送りを
-        // 抑止する。state.source 等が snapshot 時点で固定されているので、idx だけ
-        // 移動すると間違った画像が export される (Codex review CONFIRMED)。
-        let modal_for_keys = self.any_modal_dialog_open_for_fullscreen_keys();
-        // 下部ページシークバーはスクロール可能パネルではないので、hover 中の wheel は通常の
-        // 前後ページ移動 / 連結スクロールへ流す。ドラッグ中だけはシーク操作を優先して抑制する。
-        let cursor_in_panel_for_wheel = fullscreen_cursor_in_panel_for_wheel(
-            cursor_in_panel,
-            cursor_in_seek_panel,
-            self.fs_seek_drag_active,
-        );
-        // The music HUD owns Ctrl+wheel after drawing its popups. An already open
-        // audio or speed popup also owns plain wheel before this early viewer pass.
-        let music_audio_popup_open = music_view_active
-            && panel_fs_idx
-                .and_then(|idx| {
-                    let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&idx)? else {
-                        return None;
-                    };
-                    Some(crate::ui_music_panels::music_audio_track_popup_open(
-                        ctx,
-                        music_view_backing_ui_id(ui.id()),
-                        idx,
-                        player.path(),
-                    ))
-                })
-                .unwrap_or(false);
-        let handle_wheel_here = should_handle_fullscreen_wheel(
-            cursor_in_panel_for_wheel,
-            in_video_tile,
-            ctrl_held,
-            modal_for_keys,
-            self.spread_popup_open
-                || self.fit_popup_open
-                || self.slideshow_popup_open
-                || self.panorama_projection_popup_open
-                || fs_rotation_popup_open(ctx)
-                || fs_still_seek_strip_popup_open(ctx)
-                || (music_view_active && (music_audio_popup_open || self.music_speed_popup_open)),
-        ) && !(music_view_active && ctrl_held);
-        #[cfg(windows)]
-        if self.viewer_session_is_detached_or_switching()
-            && Self::detached_image_window_debug_enabled()
-        {
-            let (focused, raw_scroll, smooth_scroll, wheel_event_count, event_count) =
-                ctx.input(|i| {
-                    (
-                        i.viewport().focused.unwrap_or(false),
-                        i.raw_scroll_delta,
-                        i.smooth_scroll_delta,
-                        i.events
-                            .iter()
-                            .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
-                            .count(),
-                        i.events.len(),
-                    )
-                });
-            let input_interesting = wheel_y.abs() > 0.5
-                || wheel_event_count > 0
-                || raw_scroll != egui::Vec2::ZERO
-                || smooth_scroll != egui::Vec2::ZERO;
-            if input_interesting || self.frame_counter % 60 == 0 {
-                let foreground = current_foreground_hwnd();
-                let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
-                self.log_detached_image_window_debug(format!(
-                    "active_input_probe stage=wheel_gate fs_idx={:?} focused={} \
+        let wheel_options = ctx.options(|o| o.input_options);
+        let wheel_segments =
+            ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, wheel_options));
+        for wheel in wheel_segments {
+            let (wheel_y, modifiers) = (wheel.delta.y, wheel.modifiers);
+            let ctrl_held = modifiers.ctrl;
+            #[cfg(windows)]
+            let suppress_egui_wheel = should_suppress_egui_wheel_for_native_detached_video(
+                state.is_video,
+                self.viewer_session_is_detached(),
+                self.native_video_presenter_hwnd().is_some(),
+                self.fullscreen_idx
+                    .is_some_and(|idx| self.fs_music_view_active(idx)),
+            );
+            #[cfg(not(windows))]
+            let suppress_egui_wheel = false;
+            // modal ダイアログ (Ctrl+E など) が開いている間は wheel 由来のページ送りを
+            // 抑止する。state.source 等が snapshot 時点で固定されているので、idx だけ
+            // 移動すると間違った画像が export される (Codex review CONFIRMED)。
+            let modal_for_keys = self.any_modal_dialog_open_for_fullscreen_keys();
+            // 下部ページシークバーはスクロール可能パネルではないので、hover 中の wheel は通常の
+            // 前後ページ移動 / 連結スクロールへ流す。ドラッグ中だけはシーク操作を優先して抑制する。
+            let cursor_in_panel_for_wheel = fullscreen_cursor_in_panel_for_wheel(
+                cursor_in_panel,
+                cursor_in_seek_panel,
+                self.fs_seek_drag_active,
+            );
+            // The music HUD owns Ctrl+wheel after drawing its popups. An already open
+            // audio or speed popup also owns plain wheel before this early viewer pass.
+            let music_audio_popup_open = music_view_active
+                && panel_fs_idx
+                    .and_then(|idx| {
+                        let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&idx)? else {
+                            return None;
+                        };
+                        Some(crate::ui_music_panels::music_audio_track_popup_open(
+                            ctx,
+                            music_view_backing_ui_id(ui.id()),
+                            idx,
+                            player.path(),
+                        ))
+                    })
+                    .unwrap_or(false);
+            let handle_wheel_here = should_handle_fullscreen_wheel(
+                cursor_in_panel_for_wheel,
+                in_video_tile,
+                ctrl_held,
+                modal_for_keys,
+                self.spread_popup_open
+                    || self.fit_popup_open
+                    || self.slideshow_popup_open
+                    || self.panorama_projection_popup_open
+                    || fs_rotation_popup_open(ctx)
+                    || fs_still_seek_strip_popup_open(ctx)
+                    || (music_view_active
+                        && (music_audio_popup_open || self.music_speed_popup_open)),
+            ) && !(music_view_active && ctrl_held);
+            #[cfg(windows)]
+            if self.viewer_session_is_detached_or_switching()
+                && Self::detached_image_window_debug_enabled()
+            {
+                let (focused, raw_scroll, smooth_scroll, wheel_event_count, event_count) = ctx
+                    .input(|i| {
+                        (
+                            i.viewport().focused.unwrap_or(false),
+                            crate::wheel_input::remaining_wheel_delta(
+                                i,
+                                ctx.options(|o| o.input_options),
+                            ),
+                            i.smooth_scroll_delta,
+                            i.events
+                                .iter()
+                                .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                                .count(),
+                            i.events.len(),
+                        )
+                    });
+                let input_interesting = wheel_y.abs() > 0.5
+                    || wheel_event_count > 0
+                    || raw_scroll != egui::Vec2::ZERO
+                    || smooth_scroll != egui::Vec2::ZERO;
+                if input_interesting || self.frame_counter % 60 == 0 {
+                    let foreground = current_foreground_hwnd();
+                    let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
+                    self.log_detached_image_window_debug(format!(
+                        "active_input_probe stage=wheel_gate fs_idx={:?} focused={} \
                      foreground=0x{foreground:x} active_hwnd=0x{active_hwnd:x} \
                      foreground_matches={} prev_foreground=0x{:x} events={} \
                      wheel_events={} raw_scroll=({:.1},{:.1}) smooth_scroll=({:.1},{:.1}) \
@@ -37998,150 +38056,177 @@ impl App {
                      popup_open={} suppress_egui_wheel={} handle_wheel_here={} \
                      zoom_aiming={} zoom_active={} overlay_edit={} continuous_active={} \
                      frame={}",
-                    self.fullscreen_idx,
-                    focused,
-                    foreground != 0 && foreground == active_hwnd,
-                    prev_foreground_hwnd,
-                    event_count,
-                    wheel_event_count,
-                    raw_scroll.x,
-                    raw_scroll.y,
-                    smooth_scroll.x,
-                    smooth_scroll.y,
-                    wheel_y,
-                    ctrl_held,
-                    cursor_in_panel,
-                    cursor_in_seek_panel,
-                    cursor_in_panel_for_wheel,
-                    in_video_tile,
-                    modal_for_keys,
-                    self.spread_popup_open
-                        || self.fit_popup_open
-                        || self.slideshow_popup_open
-                        || self.panorama_projection_popup_open,
-                    suppress_egui_wheel,
-                    handle_wheel_here,
-                    self.fs_zoom_aiming,
-                    self.fs_zoom_active,
-                    self.is_overlay_edit_mode_active(),
-                    continuous_active,
-                    self.frame_counter
-                ));
-            }
-        }
-        if wheel_y.abs() > 0.5 && suppress_egui_wheel {
-            // F12 detached 動画では native presenter child HWND がホイールを
-            // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
-            // 同じ wheel が届く環境があるため、ここでは消費だけして二重ナビを防ぐ。
-            crate::wheel_input::consume_wheel_input(ctx);
-        } else if wheel_y.abs() > 0.5 && handle_wheel_here {
-            crate::wheel_input::consume_wheel_input(ctx);
-            if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
-                // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
-                // Ctrl+ホイールのときだけ倍率変更。
-                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
-                self.adjust_fs_zoom_factor(wheel_y);
-            } else if self.fs_zoom_active {
-                // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
-                let base = if wheel_y < 0.0 { 1 } else { -1 };
-                page_nav = self.spread_page_nav(base);
-                *navigation_operation = self.page_turn_pointer_navigation_operation(ctx, "wheel");
-            } else if self.analysis_mode {
-                // 分析モード: ホイールでズーム
-                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "analysis");
-                let mouse = ctx.input(|i| i.pointer.hover_pos());
-                let image_rect = analysis_image_rect(full_rect);
-                let changed = Self::apply_wheel_zoom(
-                    &mut self.analysis_zoom,
-                    &mut self.analysis_pan,
-                    wheel_y,
-                    mouse,
-                    image_rect.center(),
-                );
-                if changed {
-                    self.maybe_rerender_pdf(self.analysis_zoom);
+                        self.fullscreen_idx,
+                        focused,
+                        foreground != 0 && foreground == active_hwnd,
+                        prev_foreground_hwnd,
+                        event_count,
+                        wheel_event_count,
+                        raw_scroll.x,
+                        raw_scroll.y,
+                        smooth_scroll.x,
+                        smooth_scroll.y,
+                        wheel_y,
+                        ctrl_held,
+                        cursor_in_panel,
+                        cursor_in_seek_panel,
+                        cursor_in_panel_for_wheel,
+                        in_video_tile,
+                        modal_for_keys,
+                        self.spread_popup_open
+                            || self.fit_popup_open
+                            || self.slideshow_popup_open
+                            || self.panorama_projection_popup_open,
+                        suppress_egui_wheel,
+                        handle_wheel_here,
+                        self.fs_zoom_aiming,
+                        self.fs_zoom_active,
+                        self.is_overlay_edit_mode_active(),
+                        continuous_active,
+                        self.frame_counter
+                    ));
                 }
-            } else if self.handle_panorama_wheel_if_active(ctx, wheel_y, ctrl_held) {
-                // 360 度パノラマビュー: ホイールを FOV 調整に転用 (Ctrl 有無に関わらず)。
-                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "panorama_fov");
-                // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
-                // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
-                // FOV 操作に振る。前後ナビは矢印キーで行う。
-            } else if !ctrl_held && continuous_active {
-                let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
-                self.scroll_vertical_reading_by(ctx, delta, crate::app::HistoryTrigger::UserChosen);
-            } else {
-                if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
-                    // 通常モード: Ctrl+ホイールでズーム。
-                    // 消しゴム / 隠蔽加工モード中は画像上の修飾なしホイールも
-                    // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
-                    // パネルスクロールを維持できる。
-                    crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "edit_mode");
+            }
+            if wheel_y.abs() > 0.5 && suppress_egui_wheel {
+                // F12 detached 動画では native presenter child HWND がホイールを
+                // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
+                // 同じ wheel が届く環境があるため、ここでは消費だけして二重ナビを防ぐ。
+                crate::wheel_input::consume_remaining_wheel_inputs(ctx, |input| {
+                    input.modifiers == wheel.modifiers
+                        && input.source == wheel.source
+                        && input.phase == wheel.phase
+                });
+            } else if wheel_y.abs() > 0.5 && handle_wheel_here {
+                crate::wheel_input::consume_remaining_wheel_inputs(ctx, |input| {
+                    input.modifiers == wheel.modifiers
+                        && input.source == wheel.source
+                        && input.phase == wheel.phase
+                });
+                if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
+                    // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
+                    // Ctrl+ホイールのときだけ倍率変更。
+                    crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
+                    self.adjust_fs_zoom_factor(wheel_y);
+                } else if self.fs_zoom_active {
+                    // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
+                    let base = if wheel_y < 0.0 { 1 } else { -1 };
+                    page_nav = self.spread_page_nav(base);
+                    *navigation_operation =
+                        self.page_turn_pointer_navigation_operation(ctx, "wheel");
+                } else if self.analysis_mode {
+                    // 分析モード: ホイールでズーム
+                    crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "analysis");
                     let mouse = ctx.input(|i| i.pointer.hover_pos());
-                    let mut proposed_zoom = self.fs_zoom;
-                    let mut proposed_pan = self.fs_pan;
+                    let image_rect = analysis_image_rect(full_rect);
                     let changed = Self::apply_wheel_zoom(
-                        &mut proposed_zoom,
-                        &mut proposed_pan,
+                        &mut self.analysis_zoom,
+                        &mut self.analysis_pan,
                         wheel_y,
                         mouse,
-                        default_image_rect.center(),
+                        image_rect.center(),
                     );
                     if changed {
-                        self.fs_zoom = proposed_zoom;
-                        self.set_fs_pan_from_input(proposed_zoom, proposed_pan);
-                        self.maybe_rerender_pdf(self.fs_zoom);
+                        self.maybe_rerender_pdf(self.analysis_zoom);
                     }
+                } else if self.handle_panorama_wheel_if_active(ctx, wheel_y, ctrl_held) {
+                    // 360 度パノラマビュー: ホイールを FOV 調整に転用 (Ctrl 有無に関わらず)。
+                    crate::modifier_probe::record_modified_action(
+                        ctx,
+                        "FsWheelZoom",
+                        "panorama_fov",
+                    );
+                    // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
+                    // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
+                    // FOV 操作に振る。前後ナビは矢印キーで行う。
+                } else if !ctrl_held && continuous_active {
+                    let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
+                    self.scroll_vertical_reading_by(
+                        ctx,
+                        delta,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
                 } else {
-                    let unmodified = !modifiers.shift && !modifiers.ctrl && !modifiers.alt;
-                    let normal_media_action = self
-                        .fullscreen_idx
-                        .filter(|idx| state.is_video || self.fs_music_view_active(*idx))
-                        .filter(|_| unmodified)
-                        .and_then(|_| {
-                            self.settings
-                                .ring_shortcuts
-                                .video_normal_wheel_action
-                                .resolve(wheel_y)
-                        });
-                    match normal_media_action {
-                        Some(
-                            crate::ring_shortcut::VideoNormalWheelResolvedAction::NavigateDelta(
-                                delta,
-                            ),
-                        ) => page_nav = self.spread_page_nav(delta),
-                        Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(
-                            step,
-                        )) => {
-                            let new_volume = self.fullscreen_idx.and_then(|idx| {
-                                let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&idx)?
-                                else {
-                                    return None;
-                                };
-                                let value = crate::settings::step_video_volume_by_fader_key_step(
-                                    player.volume(),
-                                    step,
-                                );
-                                player.set_volume(value);
-                                Some(value)
-                            });
-                            if let Some(value) = new_volume {
-                                self.settings.video_volume = value;
-                                self.settings.save();
-                            }
+                    if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
+                        // 通常モード: Ctrl+ホイールでズーム。
+                        // 消しゴム / 隠蔽加工モード中は画像上の修飾なしホイールも
+                        // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
+                        // パネルスクロールを維持できる。
+                        crate::modifier_probe::record_modified_action(
+                            ctx,
+                            "FsWheelZoom",
+                            "edit_mode",
+                        );
+                        let mouse = ctx.input(|i| i.pointer.hover_pos());
+                        let mut proposed_zoom = self.fs_zoom;
+                        let mut proposed_pan = self.fs_pan;
+                        let changed = Self::apply_wheel_zoom(
+                            &mut proposed_zoom,
+                            &mut proposed_pan,
+                            wheel_y,
+                            mouse,
+                            default_image_rect.center(),
+                        );
+                        if changed {
+                            self.fs_zoom = proposed_zoom;
+                            self.set_fs_pan_from_input(proposed_zoom, proposed_pan);
+                            self.maybe_rerender_pdf(self.fs_zoom);
                         }
-                        None => {
-                            let base = if wheel_y < 0.0 { 1 } else { -1 };
-                            page_nav = self.spread_page_nav(base);
-                            *navigation_operation =
-                                self.page_turn_pointer_navigation_operation(ctx, "wheel");
+                    } else {
+                        let unmodified = !modifiers.shift && !modifiers.ctrl && !modifiers.alt;
+                        let normal_media_action = self
+                            .fullscreen_idx
+                            .filter(|idx| state.is_video || self.fs_music_view_active(*idx))
+                            .filter(|_| unmodified)
+                            .and_then(|_| {
+                                self.settings
+                                    .ring_shortcuts
+                                    .video_normal_wheel_action
+                                    .resolve(wheel_y)
+                            });
+                        match normal_media_action {
+                            Some(
+                                crate::ring_shortcut::VideoNormalWheelResolvedAction::NavigateDelta(
+                                    delta,
+                                ),
+                            ) => page_nav = self.spread_page_nav(delta),
+                            Some(
+                                crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(
+                                    step,
+                                ),
+                            ) => {
+                                let new_volume = self.fullscreen_idx.and_then(|idx| {
+                                    let FsCacheEntry::Video { player, .. } =
+                                        self.fs_cache.get(&idx)?
+                                    else {
+                                        return None;
+                                    };
+                                    let value =
+                                        crate::settings::step_video_volume_by_fader_key_step(
+                                            player.volume(),
+                                            step,
+                                        );
+                                    player.set_volume(value);
+                                    Some(value)
+                                });
+                                if let Some(value) = new_volume {
+                                    self.settings.video_volume = value;
+                                    self.settings.save();
+                                }
+                            }
+                            None => {
+                                let base = if wheel_y < 0.0 { 1 } else { -1 };
+                                page_nav = self.spread_page_nav(base);
+                                *navigation_operation =
+                                    self.page_turn_pointer_navigation_operation(ctx, "wheel");
+                            }
                         }
                     }
                 }
             }
+
+            // ── クリック & ドラッグ ──
         }
 
-        // ── クリック & ドラッグ ──
         let fs_response = ui.interact(
             full_rect,
             egui::Id::new("fs_click"),
@@ -49023,7 +49108,7 @@ impl App {
                     0.0
                 };
             let popup_h = popup_content_h
-                .min((ctx.available_rect().bottom() - popup_y - BAR_POPUP_SCREEN_MARGIN).max(1.0));
+                .min((ctx.content_rect().bottom() - popup_y - BAR_POPUP_SCREEN_MARGIN).max(1.0));
             let popup_rect = egui::Rect::from_min_size(
                 egui::pos2(popup_x, popup_y),
                 egui::vec2(popup_w, popup_h),
@@ -49055,6 +49140,10 @@ impl App {
                     popup_ui.set_height(popup_inner.height());
                     popup_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     let scroll_output = egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("fs_spread_popup_scroll")
                         .auto_shrink([false, false])
                         .show_viewport(popup_ui, |scroll_ui, _viewport| {
@@ -49300,7 +49389,7 @@ impl App {
                             egui::Id::new("fs_spread_popup_scroll_test_output"),
                             (
                                 scroll_output.id,
-                                scroll_output.state.offset,
+                                scroll_output.state.clamped_offset(),
                                 scroll_output.inner_rect,
                                 scroll_output.content_size,
                             ),
@@ -49744,7 +49833,6 @@ enum FsHudPopupWheelTarget {
 /// Reserve wheel input while backing panels render, then hand it to its front drawing boundary.
 struct FsHudPopupWheelInput {
     target: FsHudPopupWheelTarget,
-    raw: egui::Vec2,
     smooth: egui::Vec2,
     events: Vec<egui::Event>,
 }
@@ -49763,7 +49851,6 @@ impl FsHudPopupWheelInput {
             });
             Self {
                 target,
-                raw: std::mem::take(&mut input.raw_scroll_delta),
                 smooth: std::mem::take(&mut input.smooth_scroll_delta),
                 events,
             }
@@ -49775,7 +49862,6 @@ impl FsHudPopupWheelInput {
             return;
         }
         ctx.input_mut(|input| {
-            input.raw_scroll_delta = std::mem::take(&mut self.raw);
             input.smooth_scroll_delta = std::mem::take(&mut self.smooth);
             input.events.append(&mut self.events);
         });
@@ -50019,6 +50105,10 @@ fn draw_fs_fit_popup(
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("fs_fit_popup_scroll")
                         .min_scrolled_height(1.0)
                         .max_height(body_height)
@@ -50087,7 +50177,7 @@ fn draw_fs_fit_popup(
             );
             data.insert_temp(
                 egui::Id::new("fs_fit_popup_scroll_offset"),
-                scroll_output.state.offset,
+                scroll_output.state.clamped_offset(),
             );
         });
         scroll_output.inner
@@ -50308,7 +50398,7 @@ impl App {
             self.fs_loading_label_top,
             ctx.content_rect().bottom(),
         );
-        egui::Area::new("fs_ai_status_overlay".into())
+        egui::Area::new(egui::Id::unique("fs_ai_status_overlay"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, bottom_offset))
             .show(&ctx, |ui| {
@@ -53251,6 +53341,7 @@ impl App {
         // 必ず default_pos() を使う。
         let default_pos = ctx.content_rect().center() - egui::vec2(230.0, 200.0);
         egui::Window::new("エクスポート")
+            .drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(false)
             .default_pos(default_pos)
@@ -53522,6 +53613,7 @@ impl App {
         // 必ず default_pos() を使う。
         let progress_default_pos = ctx.content_rect().center() - egui::vec2(190.0, 100.0);
         egui::Window::new("エクスポート進行状況")
+            .drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(false)
             .default_pos(progress_default_pos)
@@ -53540,6 +53632,10 @@ impl App {
                         format!("{} 件のエラー", pending.errors.len()),
                     );
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(120.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
@@ -53975,7 +54071,7 @@ impl App {
 
         #[cfg(windows)]
         if self.fs_context_menu_idx.is_none()
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.any_modal_dialog_open_for_fullscreen_keys()
             && !self.normalize_scan_is_modal_for_current_player(fs_idx)
             && self
@@ -53988,7 +54084,7 @@ impl App {
 
         #[cfg(windows)]
         if self.fs_context_menu_idx.is_none()
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.any_modal_dialog_open_for_fullscreen_keys()
             && !self.normalize_scan_is_modal_for_current_player(fs_idx)
             && self
@@ -54009,7 +54105,7 @@ impl App {
         // even while audio mode remains active. All ownership guards must run before the action
         // is consumed.
         if self.fs_context_menu_idx.is_none()
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.any_modal_dialog_open_for_fullscreen_keys()
             && !self.normalize_scan_is_modal_for_current_player(fs_idx)
             && !self.video_audio_mode_hides_native_presenter_for(fs_idx)
@@ -54056,7 +54152,7 @@ impl App {
         // して return するため、同じ pass の静止画用 360 ハンドラへ二重配送されない。
         #[cfg(windows)]
         if self.fs_context_menu_idx.is_none()
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.any_modal_dialog_open_for_fullscreen_keys()
             && !self.normalize_scan_is_modal_for_current_player(fs_idx)
             && self
@@ -54697,7 +54793,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> bool {
-        ctx.wants_keyboard_input()
+        ctx.egui_wants_keyboard_input()
             || self.ime_input_active(ctx)
             || self.music_bookmark_modal_open()
             || self.music_normalize_modal_active(fs_idx)
@@ -54722,23 +54818,25 @@ impl App {
         }
         // The HUD popups have consumed their wheel events by this point. Wheel up
         // raises timeline resolution, like the Row stepper in the top chrome.
-        let (wheel_y, ctrl_held) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
-        if !ctrl_held || wheel_y.abs() <= 0.5 {
-            return;
+        let options = ctx.options(|o| o.input_options);
+        let segments =
+            ctx.input(|input| crate::wheel_input::remaining_wheel_inputs(input, options));
+        for wheel in segments {
+            if !wheel.modifiers.ctrl || wheel.delta.y.abs() <= 0.5 {
+                continue;
+            }
+            let delta = if wheel.delta.y > 0.0 { -1 } else { 1 };
+            let new_secs =
+                crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
+            if self.set_music_timeline_row_secs_from_input(new_secs) {
+                self.show_feedback_toast(format!(
+                    "Row {}",
+                    crate::ui_music_timeline::format_row_secs(new_secs)
+                ));
+            }
         }
-        let delta = if wheel_y > 0.0 { -1 } else { 1 };
-        let new_secs = crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
-        if self.set_music_timeline_row_secs_from_input(new_secs) {
-            self.show_feedback_toast(format!(
-                "Row {}",
-                crate::ui_music_timeline::format_row_secs(new_secs)
-            ));
-        }
-        ctx.input_mut(|i| {
-            i.raw_scroll_delta = egui::Vec2::ZERO;
-            i.smooth_scroll_delta = egui::Vec2::ZERO;
-            i.events
-                .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+        crate::wheel_input::consume_remaining_wheel_inputs(ctx, |wheel| {
+            wheel.modifiers.ctrl && wheel.delta.y.abs() > 0.5
         });
     }
 
@@ -55096,14 +55194,8 @@ impl App {
         );
         // 左右パネルと HUD popup は中央タイムラインに重なる。ホイールを一度退避し、
         // 後段のパネル・popup 描画前に戻して背面の ScrollArea に渡さない。
-        let panel_scroll_deltas = pointer_over_panel.then(|| {
-            ctx.input_mut(|i| {
-                let deltas = (i.raw_scroll_delta, i.smooth_scroll_delta);
-                i.raw_scroll_delta = egui::Vec2::ZERO;
-                i.smooth_scroll_delta = egui::Vec2::ZERO;
-                deltas
-            })
-        });
+        let mut panel_scroll_input = pointer_over_panel
+            .then(|| FsHudPopupWheelInput::take(ctx, FsHudPopupWheelTarget::TopBar));
         if show_timeline {
             // タイムラインは複数行 (row) になり中央領域より高くなるので ScrollArea で縦スクロール。
             // 子 UI は常に DARK visuals (フルスクリーン内は黒背景ベース統一)。
@@ -55180,6 +55272,10 @@ impl App {
             #[cfg(test)]
             let mut pan_probe = None;
             let sa_output = egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
                 .auto_shrink([false, false])
                 .id_salt(("music_timeline", fs_idx))
                 .show(&mut child, |ui| {
@@ -55230,7 +55326,7 @@ impl App {
             if let Some(mut probe) = pan_probe {
                 probe.manual_scroll = outcome.manual_scroll;
                 probe.auto_scrolled = outcome.auto_scrolled;
-                probe.offset = sa_output.state.offset;
+                probe.offset = sa_output.state.clamped_offset();
                 probe.content = sa_output.content_size;
                 let probe_id = egui::Id::new(("music_pan_probe", ctx.viewport_id()));
                 ctx.data_mut(|data| data.insert_temp(probe_id, probe));
@@ -55240,7 +55336,7 @@ impl App {
             // その変化がプログラム起因 (▲▼ の scroll_with_delta / 追従の scroll_to_rect) でない
             // なら、ユーザーの scrollbar ドラッグ (またはホイール) とみなしてクールダウンを張る
             // (ドラッグ中に playhead へ引き戻されるのを防ぐ、実機 FB)。
-            let new_offset = sa_output.state.offset.y;
+            let new_offset = sa_output.state.clamped_offset().y;
             let offset_changed = (new_offset - self.music_timeline_last_scroll_offset).abs() > 0.5;
             self.music_timeline_last_scroll_offset = new_offset;
             // プログラム起因スクロール (追従 / ▲▼) を発行したら 150ms の猶予を張る。egui は
@@ -55316,11 +55412,8 @@ impl App {
             }
         }
 
-        if let Some((raw_scroll_delta, smooth_scroll_delta)) = panel_scroll_deltas {
-            ctx.input_mut(|i| {
-                i.raw_scroll_delta = raw_scroll_delta;
-                i.smooth_scroll_delta = smooth_scroll_delta;
-            });
+        if let Some(input) = panel_scroll_input.as_mut() {
+            input.restore_at(ctx, FsHudPopupWheelTarget::TopBar);
         }
 
         // ── 下段 MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4)。──
@@ -55598,11 +55691,11 @@ mod music_full_width_hud_tests {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
             let mut nav = Vec::new();
-            let _ = ctx.run(egui::RawInput {
+            let _ = ctx.run_pass(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
                 ..Default::default()
             }, |ctx| {
-                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                ctx.root_ui(|root_ui| egui::CentralPanel::default().frame(egui::Frame::NONE).show(root_ui, |ui| {
                     app.draw_parked_live_music_window(ui, ctx, ui.max_rect(), &info, &mut false);
                     for name in ["music_hud_prevfile", "music_hud_nextfile"] {
                         let response = ctx.read_response(ui.id().with((name, info.fs_idx)))
@@ -55610,8 +55703,8 @@ mod music_full_width_hud_tests {
                         assert!(!response.sense.senses_click());
                         nav.push(response.rect);
                     }
-                });
-            });
+                }));
+            }).drop_without_applying_deltas();
             nav
         };
         let before = draw(&mut app);
@@ -55864,88 +55957,93 @@ mod music_full_width_hud_tests {
         events: Vec<egui::Event>,
     ) -> Probe {
         let mut probe = None;
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                 events,
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let full = ui.max_rect();
-                        let reserved = if app.resolved_still_chrome().info_locked {
-                            crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full.width() * 0.5)
-                        } else {
-                            0.0
-                        };
-                        let content = egui::Rect::from_min_max(
-                            full.min,
-                            full.max - egui::vec2(reserved, 0.0),
-                        );
-                        app.draw_fs_music_view(
-                            ui,
-                            ctx,
-                            full,
-                            content,
-                            reserved,
-                            0,
-                            false,
-                            MusicOverflowFrameInput::default(),
-                        );
-                        let response = |name| {
-                            ctx.read_response(
-                                music_view_backing_ui_id(ui.id()).with((name, 0usize)),
-                            )
-                        };
-                        let panel = response("music_right_bg");
-                        probe = Some(Probe {
-                            time: egui::Rect::NOTHING,
-                            row: [
-                                "music_hud_start",
-                                "music_hud_play",
-                                "music_hud_loop",
-                                "music_hud_continuous",
-                                "music_hud_prevfile",
-                                "music_hud_nextfile",
-                                "music_hud_prevbm",
-                                "music_hud_nextbm",
-                                "music_hud_time",
-                                "music_hud_speed",
-                                "music_hud_mute",
-                                "music_hud_normalize",
-                                "music_hud_vol",
-                                "music_hud_db",
-                                "music_hud_limiter",
-                            ]
-                            .into_iter()
-                            .filter_map(|name| response(name).map(|r| r.rect))
-                            .collect(),
-                            nav: [
-                                response("music_hud_prevfile").unwrap().rect,
-                                response("music_hud_nextfile").unwrap().rect,
-                            ],
-                            play: response("music_hud_play").unwrap().rect,
-                            close: response("music_top_close")
-                                .expect("actual close button")
-                                .rect,
-                            seek: response("music_hud_seek").expect("actual seek widget").rect,
-                            volume: response("music_hud_vol")
-                                .map_or(egui::Rect::NOTHING, |r| r.rect),
-                            speed: response("music_hud_speed")
-                                .map_or(egui::Rect::NOTHING, |r| r.rect),
-                            volume_enabled: response("music_hud_vol").is_some_and(|r| r.enabled()),
-                            speed_enabled: response("music_hud_speed").is_some_and(|r| r.enabled()),
-                            nav_above_modal: [false; 2],
-                            panel: panel.as_ref().map(|r| r.rect),
-                            panel_clicked: panel.is_some_and(|r| r.clicked()),
-                            content_clip: egui::Rect::NOTHING,
-                            painted_background: egui::Rect::NOTHING,
-                            painted_top: egui::Rect::NOTHING,
-                            painted_hud: egui::Rect::NOTHING,
-                        });
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let full = ui.max_rect();
+                            let reserved = if app.resolved_still_chrome().info_locked {
+                                crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
+                                    .min(full.width() * 0.5)
+                            } else {
+                                0.0
+                            };
+                            let content = egui::Rect::from_min_max(
+                                full.min,
+                                full.max - egui::vec2(reserved, 0.0),
+                            );
+                            app.draw_fs_music_view(
+                                ui,
+                                ctx,
+                                full,
+                                content,
+                                reserved,
+                                0,
+                                false,
+                                MusicOverflowFrameInput::default(),
+                            );
+                            let response = |name| {
+                                ctx.read_response(
+                                    music_view_backing_ui_id(ui.id()).with((name, 0usize)),
+                                )
+                            };
+                            let panel = response("music_right_bg");
+                            probe = Some(Probe {
+                                time: egui::Rect::NOTHING,
+                                row: [
+                                    "music_hud_start",
+                                    "music_hud_play",
+                                    "music_hud_loop",
+                                    "music_hud_continuous",
+                                    "music_hud_prevfile",
+                                    "music_hud_nextfile",
+                                    "music_hud_prevbm",
+                                    "music_hud_nextbm",
+                                    "music_hud_time",
+                                    "music_hud_speed",
+                                    "music_hud_mute",
+                                    "music_hud_normalize",
+                                    "music_hud_vol",
+                                    "music_hud_db",
+                                    "music_hud_limiter",
+                                ]
+                                .into_iter()
+                                .filter_map(|name| response(name).map(|r| r.rect))
+                                .collect(),
+                                nav: [
+                                    response("music_hud_prevfile").unwrap().rect,
+                                    response("music_hud_nextfile").unwrap().rect,
+                                ],
+                                play: response("music_hud_play").unwrap().rect,
+                                close: response("music_top_close")
+                                    .expect("actual close button")
+                                    .rect,
+                                seek: response("music_hud_seek").expect("actual seek widget").rect,
+                                volume: response("music_hud_vol")
+                                    .map_or(egui::Rect::NOTHING, |r| r.rect),
+                                speed: response("music_hud_speed")
+                                    .map_or(egui::Rect::NOTHING, |r| r.rect),
+                                volume_enabled: response("music_hud_vol")
+                                    .is_some_and(|r| r.enabled()),
+                                speed_enabled: response("music_hud_speed")
+                                    .is_some_and(|r| r.enabled()),
+                                nav_above_modal: [false; 2],
+                                panel: panel.as_ref().map(|r| r.rect),
+                                panel_clicked: panel.is_some_and(|r| r.clicked()),
+                                content_clip: egui::Rect::NOTHING,
+                                painted_background: egui::Rect::NOTHING,
+                                painted_top: egui::Rect::NOTHING,
+                                painted_hud: egui::Rect::NOTHING,
+                            });
+                        })
+                });
             },
         );
         let mut probe = probe.unwrap();
@@ -56179,24 +56277,28 @@ mod tests {
                         navigator_button_event(close, egui::PointerButton::Primary, down),
                     ]
                 });
-                let _ = ctx.run(
-                    navigator_ordered_input_for_screen(
-                        events,
-                        frame as f64 * 0.1,
-                        rect.size(),
-                        1.0,
-                    ),
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            if music {
-                                app.draw_fs_music_right_panel(ui, ctx, panel, 0);
-                            } else {
-                                let lock = app.resolved_still_chrome().info_locked;
-                                app.draw_metadata_panel(ui, ctx, rect, lock, 0.0);
-                            }
-                        });
-                    },
-                );
+                let _ = ctx
+                    .run_pass(
+                        navigator_ordered_input_for_screen(
+                            events,
+                            frame as f64 * 0.1,
+                            rect.size(),
+                            1.0,
+                        ),
+                        |ctx| {
+                            ctx.root_ui(|root_ui| {
+                                egui::CentralPanel::default().show(root_ui, |ui| {
+                                    if music {
+                                        app.draw_fs_music_right_panel(ui, ctx, panel, 0);
+                                    } else {
+                                        let lock = app.resolved_still_chrome().info_locked;
+                                        app.draw_metadata_panel(ui, ctx, rect, lock, 0.0);
+                                    }
+                                })
+                            });
+                        },
+                    )
+                    .drop_without_applying_deltas();
                 if frame == 1 {
                     close = if music {
                         ctx.read_response(
@@ -56489,7 +56591,7 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let mut delay = std::time::Duration::ZERO;
         for frame in 0..4 {
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     time: Some(frame as f64),
@@ -56497,15 +56599,17 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        app.draw_fs_continuous_reading(
-                            ui,
-                            ctx,
-                            rect,
-                            0,
-                            false,
-                            FsPageTurnDecision::normal(),
-                        );
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            app.draw_fs_continuous_reading(
+                                ui,
+                                ctx,
+                                rect,
+                                0,
+                                false,
+                                FsPageTurnDecision::normal(),
+                            );
+                        })
                     });
                 },
             );
@@ -56600,7 +56704,7 @@ mod tests {
                 let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
                 let mut delay = std::time::Duration::ZERO;
                 for frame in 0..4 {
-                    let output = ctx.run(
+                    let output = ctx.run_pass(
                         egui::RawInput {
                             screen_rect: Some(rect),
                             time: Some(frame as f64),
@@ -56608,15 +56712,17 @@ mod tests {
                             ..Default::default()
                         },
                         |ctx| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                app.draw_fs_continuous_reading(
-                                    ui,
-                                    ctx,
-                                    rect,
-                                    0,
-                                    false,
-                                    FsPageTurnDecision::normal(),
-                                );
+                            ctx.root_ui(|root_ui| {
+                                egui::CentralPanel::default().show(root_ui, |ui| {
+                                    app.draw_fs_continuous_reading(
+                                        ui,
+                                        ctx,
+                                        rect,
+                                        0,
+                                        false,
+                                        FsPageTurnDecision::normal(),
+                                    );
+                                })
                             });
                         },
                     );
@@ -56649,13 +56755,15 @@ mod tests {
         app.visible_indices = vec![0];
         app.fullscreen_idx = Some(0);
         let ctx = egui::Context::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                max_texture_side: Some(8192),
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    max_texture_side: Some(8192),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         let images = [[1200, 800], [8192, 5461], [300, 200]]
             .map(|size| Arc::new(egui::ColorImage::filled(size, egui::Color32::GRAY)));
         let textures = std::array::from_fn::<_, 3, _>(|idx| {
@@ -56732,119 +56840,124 @@ mod tests {
                             }
                         }
                         let mut drawn = None;
-                        let _ = ctx.run(
-                            egui::RawInput {
-                                screen_rect: Some(rect),
-                                ..Default::default()
-                            },
-                            |ctx| {
-                                egui::CentralPanel::default().show(ctx, |ui| {
-                                    let state = app.prepare_fullscreen_state(
-                                        ctx,
-                                        0,
-                                        FsPageTurnDecision::normal(),
-                                    );
-                                    if stage == 1 {
-                                        assert_eq!(
-                                            state.tex.as_ref().unwrap().size(),
-                                            [8192, 5461]
-                                        );
-                                    } else {
-                                        assert_eq!(
-                                            state.tex.as_ref().unwrap().id(),
-                                            textures[stage].id(),
-                                            "stage={stage}"
-                                        );
-                                    }
-                                    let resource = app.fullscreen_paint_resource_for_texture(
-                                        0,
-                                        state.tex.clone().unwrap(),
-                                    );
-                                    let source_size = app.fs_page_coordinate_source_size(0);
-                                    let bg = FsBgStyle::Solid(egui::Color32::BLACK);
-                                    drawn = if mode == 1 {
-                                        let seek = StillSeekGeometry::resolve(
-                                            rect,
-                                            false,
-                                            false,
-                                            0.0,
-                                            app.settings.still_seek_bar_with_strip,
-                                            app.settings.still_bottom_lock(),
-                                            0,
-                                        );
-                                        // Rotation is obtained by the real Z entry from the page owner.
-                                        app.draw_fs_zoom_mode(
-                                            ui,
-                                            ctx,
-                                            rect,
-                                            0,
-                                            SingletonSpreadPlacement::Center,
-                                            &state,
-                                            seek,
-                                        )
-                                    } else if mode == 2 {
-                                        app.draw_fs_spread_page(
-                                            ui.painter(),
-                                            rect,
-                                            rect,
-                                            0,
-                                            source_size,
-                                            FsPageLayoutSource::CurrentItem,
-                                            rotation,
-                                            &bg,
-                                            "",
-                                            Some(&resource),
-                                            false,
-                                            None,
-                                            1.0,
-                                            ResolvedDisplayPlacement::SingletonSpread {
-                                                side: SingletonSpreadPlacement::Left,
-                                                gap: 8.0,
-                                                zoom_pan: None,
-                                            },
-                                            egui::Vec2::ZERO,
-                                        )
-                                    } else if mode == 3 {
-                                        app.draw_fs_continuous_reading(
-                                            ui,
-                                            ctx,
-                                            rect,
-                                            0,
-                                            false,
-                                            FsPageTurnDecision::normal(),
-                                        );
-                                        app.fullscreen_page_layout
-                                            .page_by_idx(0)
-                                            .map(|page| page.transform)
-                                    } else {
-                                        app.draw_fs_image(
-                                            ui,
-                                            rect,
-                                            0,
-                                            source_size,
-                                            FsPageLayoutSource::CurrentItem,
-                                            None,
-                                            None,
-                                            SingletonSpreadPlacement::Center,
-                                            Some(&resource),
-                                            None,
-                                            false,
-                                            false,
-                                            false,
-                                            rotation,
-                                            Some((1.3, egui::vec2(35.0, -20.0))),
-                                            0.15,
-                                            &bg,
-                                            "",
-                                            false,
-                                            fit,
-                                            FullscreenFitScaleLimits::default(),
-                                            None,
-                                        )
-                                    };
-                                });
-                            },
-                        );
+                        let _ = ctx
+                            .run_pass(
+                                egui::RawInput {
+                                    screen_rect: Some(rect),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    ctx.root_ui(|root_ui| {
+                                        egui::CentralPanel::default().show(root_ui, |ui| {
+                                            let state = app.prepare_fullscreen_state(
+                                                ctx,
+                                                0,
+                                                FsPageTurnDecision::normal(),
+                                            );
+                                            if stage == 1 {
+                                                assert_eq!(
+                                                    state.tex.as_ref().unwrap().size(),
+                                                    [8192, 5461]
+                                                );
+                                            } else {
+                                                assert_eq!(
+                                                    state.tex.as_ref().unwrap().id(),
+                                                    textures[stage].id(),
+                                                    "stage={stage}"
+                                                );
+                                            }
+                                            let resource = app
+                                                .fullscreen_paint_resource_for_texture(
+                                                    0,
+                                                    state.tex.clone().unwrap(),
+                                                );
+                                            let source_size = app.fs_page_coordinate_source_size(0);
+                                            let bg = FsBgStyle::Solid(egui::Color32::BLACK);
+                                            drawn = if mode == 1 {
+                                                let seek = StillSeekGeometry::resolve(
+                                                    rect,
+                                                    false,
+                                                    false,
+                                                    0.0,
+                                                    app.settings.still_seek_bar_with_strip,
+                                                    app.settings.still_bottom_lock(),
+                                                    0,
+                                                );
+                                                // Rotation is obtained by the real Z entry from the page owner.
+                                                app.draw_fs_zoom_mode(
+                                                    ui,
+                                                    ctx,
+                                                    rect,
+                                                    0,
+                                                    SingletonSpreadPlacement::Center,
+                                                    &state,
+                                                    seek,
+                                                )
+                                            } else if mode == 2 {
+                                                app.draw_fs_spread_page(
+                                                    ui.painter(),
+                                                    rect,
+                                                    rect,
+                                                    0,
+                                                    source_size,
+                                                    FsPageLayoutSource::CurrentItem,
+                                                    rotation,
+                                                    &bg,
+                                                    "",
+                                                    Some(&resource),
+                                                    false,
+                                                    None,
+                                                    1.0,
+                                                    ResolvedDisplayPlacement::SingletonSpread {
+                                                        side: SingletonSpreadPlacement::Left,
+                                                        gap: 8.0,
+                                                        zoom_pan: None,
+                                                    },
+                                                    egui::Vec2::ZERO,
+                                                )
+                                            } else if mode == 3 {
+                                                app.draw_fs_continuous_reading(
+                                                    ui,
+                                                    ctx,
+                                                    rect,
+                                                    0,
+                                                    false,
+                                                    FsPageTurnDecision::normal(),
+                                                );
+                                                app.fullscreen_page_layout
+                                                    .page_by_idx(0)
+                                                    .map(|page| page.transform)
+                                            } else {
+                                                app.draw_fs_image(
+                                                    ui,
+                                                    rect,
+                                                    0,
+                                                    source_size,
+                                                    FsPageLayoutSource::CurrentItem,
+                                                    None,
+                                                    None,
+                                                    SingletonSpreadPlacement::Center,
+                                                    Some(&resource),
+                                                    None,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    rotation,
+                                                    Some((1.3, egui::vec2(35.0, -20.0))),
+                                                    0.15,
+                                                    &bg,
+                                                    "",
+                                                    false,
+                                                    fit,
+                                                    FullscreenFitScaleLimits::default(),
+                                                    None,
+                                                )
+                                            };
+                                        })
+                                    });
+                                },
+                            )
+                            .drop_without_applying_deltas();
                         let transform = drawn.unwrap();
                         assert_eq!(transform.source_size, egui::vec2(12000.0, 8000.0));
                         if let Some(preview) = first.as_ref() {
@@ -57765,19 +57878,21 @@ mod tests {
             screen_rect: Some(viewport),
             ..Default::default()
         });
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let painter = ui.painter().with_clip_rect(clip);
-            paint_image_underlay(
-                &painter,
-                transform.paint_quad(),
-                &FsBgStyle::Solid(egui::Color32::BLACK),
-            );
-            paint_image_underlay(
-                &painter,
-                transform.paint_quad(),
-                &FsBgStyle::Checker(texture.clone()),
-            );
-            transform.paint_texture(&painter, texture.id(), egui::Color32::WHITE);
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let painter = ui.painter().with_clip_rect(clip);
+                paint_image_underlay(
+                    &painter,
+                    transform.paint_quad(),
+                    &FsBgStyle::Solid(egui::Color32::BLACK),
+                );
+                paint_image_underlay(
+                    &painter,
+                    transform.paint_quad(),
+                    &FsBgStyle::Checker(texture.clone()),
+                );
+                transform.paint_texture(&painter, texture.id(), egui::Color32::WHITE);
+            })
         });
         let output = ctx.end_pass();
         let painted = &output.shapes[output.shapes.len() - 3..];
@@ -57901,8 +58016,10 @@ mod tests {
             screen_rect: Some(full_rect),
             ..Default::default()
         });
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            App::draw_detached_frozen_image_at_rect(ui, full_rect, image_rect, &window);
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                App::draw_detached_frozen_image_at_rect(ui, full_rect, image_rect, &window);
+            })
         });
         let output = ctx.end_pass();
         let painted = &output.shapes[output.shapes.len() - 2..];
@@ -58853,20 +58970,24 @@ mod tests {
 
             let image_rect =
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.draw_fs_spread(
-                        ui,
-                        ctx,
-                        image_rect,
-                        0,
-                        1,
-                        false,
-                        FsPageTurnDecision::normal(),
-                        None,
-                    );
-                });
-            });
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            app.draw_fs_spread(
+                                ui,
+                                ctx,
+                                image_rect,
+                                0,
+                                1,
+                                false,
+                                FsPageTurnDecision::normal(),
+                                None,
+                            );
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
 
             let pixels_per_point = ctx.pixels_per_point();
             let left = app
@@ -58933,18 +59054,22 @@ mod tests {
 
             let image_rect =
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.draw_fs_continuous_reading(
-                        ui,
-                        ctx,
-                        image_rect,
-                        0,
-                        false,
-                        FsPageTurnDecision::normal(),
-                    );
-                });
-            });
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            app.draw_fs_continuous_reading(
+                                ui,
+                                ctx,
+                                image_rect,
+                                0,
+                                false,
+                                FsPageTurnDecision::normal(),
+                            );
+                        })
+                    });
+                })
+                .drop_without_applying_deltas();
 
             let pixels_per_point = ctx.pixels_per_point();
             let (Some(left), Some(right)) = (
@@ -59024,18 +59149,22 @@ mod tests {
 
                 let image_rect =
                     egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
-                let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        app.draw_fs_continuous_reading(
-                            ui,
-                            ctx,
-                            image_rect,
-                            0,
-                            false,
-                            FsPageTurnDecision::normal(),
-                        );
-                    });
-                });
+                let _ = ctx
+                    .run_pass(egui::RawInput::default(), |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                app.draw_fs_continuous_reading(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    0,
+                                    false,
+                                    FsPageTurnDecision::normal(),
+                                );
+                            })
+                        });
+                    })
+                    .drop_without_applying_deltas();
 
                 let mut drawn = app
                     .fullscreen_page_layout
@@ -61210,19 +61339,23 @@ mod tests {
         image_rect: egui::Rect,
         unit: &FsDisplayUnitHoldover,
     ) {
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(image_rect),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        app.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(image_rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                app.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
     }
 
     fn assert_aspect_ratio(rect: egui::Rect, expected: f32) {
@@ -61254,145 +61387,151 @@ mod tests {
             screen_rect: Some(full_rect),
             ..Default::default()
         };
-        let _ = ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    let keymap = Keymap::default();
-                    let mut close = false;
-                    let mut page_nav = FsPageNav::None;
-                    let mut side_panel_mode_pressed = false;
-                    let mut overflow_request = None;
-                    let mut slideshow_playing = false;
-                    let mut slideshow_interval = 5.0;
-                    let mut slideshow_end_action = SlideshowEndAction::default();
-                    let mut rotation_choice = None;
-                    let mut panorama_pressed = false;
-                    let mut panorama_projection_popup_open = panorama_projection_list_open;
-                    let mut panorama_projection_choice = None;
-                    let mut spread_mode = SpreadMode::Ltr;
-                    let mut reading_flow = initial_reading_flow;
-                    let mut reading_direction = ReadingDirection::Ltr;
-                    let mut final_cover_spread_preference =
-                        crate::settings::FinalCoverSpreadPreference::FollowGlobal;
-                    let mut page_alone_preferences =
-                        crate::settings::PageAlonePreferences::default();
-                    let mut singleton_spread_endpoint_preferences =
-                        crate::settings::SingletonSpreadEndpointPreferences::default();
-                    let mut spread_popup_open = false;
-                    let mut local_adjust_mode = false;
-                    let mut fit_popup_open = false;
-                    let mut slideshow_popup_open = false;
-                    let mut slideshow_wait = 1.0;
-                    let mut slideshow_scroll = 1.0;
-                    let mut slideshow_percent = 100;
-                    let mut fit_mode_choice = None;
-                    let mut fit_no_upscale_choice = None;
-                    let mut fit_no_downscale_choice = None;
-                    let mut view_trim_mode = false;
-                    let mut tile_pressed = false;
-                    let mut vst_pressed = false;
-                    let mut copy_pressed = false;
-                    let mut copy_region_pressed = false;
-                    let mut window_mode_pressed = false;
-                    let mut top_bar_lock_pressed = false;
-                    App::draw_fs_hover_bar(
-                        ui,
-                        ctx,
-                        &keymap,
-                        full_rect,
-                        &[],
-                        &mut close,
-                        &mut page_nav,
-                        crate::settings::FsSidePanelMode::Hover,
-                        &mut side_panel_mode_pressed,
-                        false,
-                        false,
-                        &mut overflow_request,
-                        &mut slideshow_playing,
-                        &mut slideshow_interval,
-                        &mut slideshow_end_action,
-                        crate::rotation_db::Rotation::None,
-                        &mut rotation_choice,
-                        // 投影一覧を出すシナリオでは 360 表示中として描く
-                        // (投影ボタンはそのときだけ現れる)。
-                        panorama_projection_list_open
-                            .then_some(crate::panorama::PanoramaTrigger::Auto),
-                        panorama_projection_list_open,
-                        panorama_projection_list_open,
-                        &mut panorama_pressed,
-                        crate::panorama::PanoProjection::Perspective,
-                        &mut panorama_projection_popup_open,
-                        &mut panorama_projection_choice,
-                        false,
-                        crate::spread_shift::PairingEditAvailability::Automatic,
-                        None,
-                        &mut spread_mode,
-                        &mut reading_flow,
-                        &mut reading_direction,
-                        &mut final_cover_spread_preference,
-                        &mut singleton_spread_endpoint_preferences,
-                        false,
-                        &mut page_alone_preferences,
-                        &mut spread_popup_open,
-                        is_spread_double,
-                        &mut local_adjust_mode,
-                        false,
-                        FullscreenFitMode::Page,
-                        false,
-                        false,
-                        &mut fit_popup_open,
-                        &mut slideshow_popup_open,
-                        &mut slideshow_wait,
-                        &mut slideshow_scroll,
-                        &mut slideshow_percent,
-                        &mut crate::settings::FullscreenSpecifiedScale::default(),
-                        &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
-                        false,
-                        &mut false,
-                        &mut fit_mode_choice,
-                        &mut fit_no_upscale_choice,
-                        &mut fit_no_downscale_choice,
-                        &mut view_trim_mode,
-                        false,
-                        false,
-                        None,
-                        false,
-                        &mut tile_pressed,
-                        false,
-                        false,
-                        &mut vst_pressed,
-                        &mut copy_pressed,
-                        &mut copy_region_pressed,
-                        false,
-                        false,
-                        &mut window_mode_pressed,
-                        true,
-                        true,
-                        &mut top_bar_lock_pressed,
-                        false,
-                        None,
-                        false,
-                        1,
-                        None,
-                        None,
-                    );
-                    positions = test_current_bar_button_targets(ctx)
-                        .into_iter()
-                        .map(|(id, rect)| (id, rect.min.x))
-                        .collect();
-                    projection_items = crate::panorama::PanoProjection::all()
-                        .iter()
-                        .filter_map(|mode| {
-                            ctx.read_response(egui::Id::new((
-                                "fs_panorama_projection_item",
-                                mode.shader_code(),
-                            )))
-                            .map(|response| response.rect)
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let keymap = Keymap::default();
+                            let mut close = false;
+                            let mut page_nav = FsPageNav::None;
+                            let mut side_panel_mode_pressed = false;
+                            let mut overflow_request = None;
+                            let mut slideshow_playing = false;
+                            let mut slideshow_interval = 5.0;
+                            let mut slideshow_end_action = SlideshowEndAction::default();
+                            let mut rotation_choice = None;
+                            let mut panorama_pressed = false;
+                            let mut panorama_projection_popup_open = panorama_projection_list_open;
+                            let mut panorama_projection_choice = None;
+                            let mut spread_mode = SpreadMode::Ltr;
+                            let mut reading_flow = initial_reading_flow;
+                            let mut reading_direction = ReadingDirection::Ltr;
+                            let mut final_cover_spread_preference =
+                                crate::settings::FinalCoverSpreadPreference::FollowGlobal;
+                            let mut page_alone_preferences =
+                                crate::settings::PageAlonePreferences::default();
+                            let mut singleton_spread_endpoint_preferences =
+                                crate::settings::SingletonSpreadEndpointPreferences::default();
+                            let mut spread_popup_open = false;
+                            let mut local_adjust_mode = false;
+                            let mut fit_popup_open = false;
+                            let mut slideshow_popup_open = false;
+                            let mut slideshow_wait = 1.0;
+                            let mut slideshow_scroll = 1.0;
+                            let mut slideshow_percent = 100;
+                            let mut fit_mode_choice = None;
+                            let mut fit_no_upscale_choice = None;
+                            let mut fit_no_downscale_choice = None;
+                            let mut view_trim_mode = false;
+                            let mut tile_pressed = false;
+                            let mut vst_pressed = false;
+                            let mut copy_pressed = false;
+                            let mut copy_region_pressed = false;
+                            let mut window_mode_pressed = false;
+                            let mut top_bar_lock_pressed = false;
+                            App::draw_fs_hover_bar(
+                                ui,
+                                ctx,
+                                &keymap,
+                                full_rect,
+                                &[],
+                                &mut close,
+                                &mut page_nav,
+                                crate::settings::FsSidePanelMode::Hover,
+                                &mut side_panel_mode_pressed,
+                                false,
+                                false,
+                                &mut overflow_request,
+                                &mut slideshow_playing,
+                                &mut slideshow_interval,
+                                &mut slideshow_end_action,
+                                crate::rotation_db::Rotation::None,
+                                &mut rotation_choice,
+                                // 投影一覧を出すシナリオでは 360 表示中として描く
+                                // (投影ボタンはそのときだけ現れる)。
+                                panorama_projection_list_open
+                                    .then_some(crate::panorama::PanoramaTrigger::Auto),
+                                panorama_projection_list_open,
+                                panorama_projection_list_open,
+                                &mut panorama_pressed,
+                                crate::panorama::PanoProjection::Perspective,
+                                &mut panorama_projection_popup_open,
+                                &mut panorama_projection_choice,
+                                false,
+                                crate::spread_shift::PairingEditAvailability::Automatic,
+                                None,
+                                &mut spread_mode,
+                                &mut reading_flow,
+                                &mut reading_direction,
+                                &mut final_cover_spread_preference,
+                                &mut singleton_spread_endpoint_preferences,
+                                false,
+                                &mut page_alone_preferences,
+                                &mut spread_popup_open,
+                                is_spread_double,
+                                &mut local_adjust_mode,
+                                false,
+                                FullscreenFitMode::Page,
+                                false,
+                                false,
+                                &mut fit_popup_open,
+                                &mut slideshow_popup_open,
+                                &mut slideshow_wait,
+                                &mut slideshow_scroll,
+                                &mut slideshow_percent,
+                                &mut crate::settings::FullscreenSpecifiedScale::default(),
+                                &mut {
+                                    crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
+                                },
+                                false,
+                                &mut false,
+                                &mut fit_mode_choice,
+                                &mut fit_no_upscale_choice,
+                                &mut fit_no_downscale_choice,
+                                &mut view_trim_mode,
+                                false,
+                                false,
+                                None,
+                                false,
+                                &mut tile_pressed,
+                                false,
+                                false,
+                                &mut vst_pressed,
+                                &mut copy_pressed,
+                                &mut copy_region_pressed,
+                                false,
+                                false,
+                                &mut window_mode_pressed,
+                                true,
+                                true,
+                                &mut top_bar_lock_pressed,
+                                false,
+                                None,
+                                false,
+                                1,
+                                None,
+                                None,
+                            );
+                            positions = test_current_bar_button_targets(ctx)
+                                .into_iter()
+                                .map(|(id, rect)| (id, rect.min.x))
+                                .collect();
+                            projection_items = crate::panorama::PanoProjection::all()
+                                .iter()
+                                .filter_map(|mode| {
+                                    ctx.read_response(egui::Id::new((
+                                        "fs_panorama_projection_item",
+                                        mode.shader_code(),
+                                    )))
+                                    .map(|response| response.rect)
+                                })
+                                .collect();
                         })
-                        .collect();
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         (positions, projection_items)
     }
 
@@ -61480,6 +61619,8 @@ mod tests {
                                     unit: egui::MouseWheelUnit::Point,
                                     delta: egui::vec2(0.0, -4000.0),
                                     modifiers: egui::Modifiers::NONE,
+                                    phase: egui::TouchPhase::Move,
+                                    source: egui::MouseWheelSource::Unknown,
                                 },
                             ]
                         } else {
@@ -61505,122 +61646,128 @@ mod tests {
             events,
             ..Default::default()
         };
-        let _ = ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    let keymap = Keymap::default();
-                    let mut close = false;
-                    let mut page_nav = FsPageNav::None;
-                    let mut side_panel_mode_pressed = false;
-                    let mut overflow_request = None;
-                    let mut slideshow_playing = false;
-                    let mut slideshow_interval = 5.0;
-                    let mut slideshow_end_action = SlideshowEndAction::default();
-                    let mut rotation_choice = None;
-                    let mut panorama_pressed = false;
-                    let mut panorama_projection_popup_open = false;
-                    let mut panorama_projection_choice = None;
-                    let mut local_adjust_mode = false;
-                    let mut fit_popup_open = false;
-                    let mut slideshow_popup_open = false;
-                    let mut slideshow_wait = 1.0;
-                    let mut slideshow_scroll = 1.0;
-                    let mut slideshow_percent = 100;
-                    let mut fit_mode_choice = None;
-                    let mut fit_no_upscale_choice = None;
-                    let mut fit_no_downscale_choice = None;
-                    let mut view_trim_mode = false;
-                    let mut tile_pressed = false;
-                    let mut vst_pressed = false;
-                    let mut copy_pressed = false;
-                    let mut copy_region_pressed = false;
-                    let mut window_mode_pressed = false;
-                    let mut top_bar_lock_pressed = false;
-                    App::draw_fs_hover_bar(
-                        ui,
-                        ctx,
-                        &keymap,
-                        full_rect,
-                        &[],
-                        &mut close,
-                        &mut page_nav,
-                        crate::settings::FsSidePanelMode::Hover,
-                        &mut side_panel_mode_pressed,
-                        false,
-                        false,
-                        &mut overflow_request,
-                        &mut slideshow_playing,
-                        &mut slideshow_interval,
-                        &mut slideshow_end_action,
-                        crate::rotation_db::Rotation::None,
-                        &mut rotation_choice,
-                        None,
-                        false,
-                        false,
-                        &mut panorama_pressed,
-                        crate::panorama::PanoProjection::Perspective,
-                        &mut panorama_projection_popup_open,
-                        &mut panorama_projection_choice,
-                        state.extracted_result,
-                        if state.composition_owned {
-                            crate::spread_shift::PairingEditAvailability::Composed
-                        } else {
-                            crate::spread_shift::PairingEditAvailability::Automatic
-                        },
-                        state.composition_owned.then_some(SpreadMode::Ltr),
-                        &mut state.spread_mode,
-                        &mut state.reading_flow,
-                        &mut state.reading_direction,
-                        &mut state.final_cover_preference,
-                        &mut state.singleton_preference,
-                        false,
-                        &mut state.page_alone_preferences,
-                        &mut state.open,
-                        false,
-                        &mut local_adjust_mode,
-                        false,
-                        FullscreenFitMode::Page,
-                        false,
-                        false,
-                        &mut fit_popup_open,
-                        &mut slideshow_popup_open,
-                        &mut slideshow_wait,
-                        &mut slideshow_scroll,
-                        &mut slideshow_percent,
-                        &mut crate::settings::FullscreenSpecifiedScale::default(),
-                        &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
-                        false,
-                        &mut false,
-                        &mut fit_mode_choice,
-                        &mut fit_no_upscale_choice,
-                        &mut fit_no_downscale_choice,
-                        &mut view_trim_mode,
-                        false,
-                        false,
-                        None,
-                        false,
-                        &mut tile_pressed,
-                        false,
-                        false,
-                        &mut vst_pressed,
-                        &mut copy_pressed,
-                        &mut copy_region_pressed,
-                        false,
-                        false,
-                        &mut window_mode_pressed,
-                        true,
-                        true,
-                        &mut top_bar_lock_pressed,
-                        false,
-                        None,
-                        false,
-                        1,
-                        None,
-                        None,
-                    );
+        let _ = ctx
+            .run_pass(raw_input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let keymap = Keymap::default();
+                            let mut close = false;
+                            let mut page_nav = FsPageNav::None;
+                            let mut side_panel_mode_pressed = false;
+                            let mut overflow_request = None;
+                            let mut slideshow_playing = false;
+                            let mut slideshow_interval = 5.0;
+                            let mut slideshow_end_action = SlideshowEndAction::default();
+                            let mut rotation_choice = None;
+                            let mut panorama_pressed = false;
+                            let mut panorama_projection_popup_open = false;
+                            let mut panorama_projection_choice = None;
+                            let mut local_adjust_mode = false;
+                            let mut fit_popup_open = false;
+                            let mut slideshow_popup_open = false;
+                            let mut slideshow_wait = 1.0;
+                            let mut slideshow_scroll = 1.0;
+                            let mut slideshow_percent = 100;
+                            let mut fit_mode_choice = None;
+                            let mut fit_no_upscale_choice = None;
+                            let mut fit_no_downscale_choice = None;
+                            let mut view_trim_mode = false;
+                            let mut tile_pressed = false;
+                            let mut vst_pressed = false;
+                            let mut copy_pressed = false;
+                            let mut copy_region_pressed = false;
+                            let mut window_mode_pressed = false;
+                            let mut top_bar_lock_pressed = false;
+                            App::draw_fs_hover_bar(
+                                ui,
+                                ctx,
+                                &keymap,
+                                full_rect,
+                                &[],
+                                &mut close,
+                                &mut page_nav,
+                                crate::settings::FsSidePanelMode::Hover,
+                                &mut side_panel_mode_pressed,
+                                false,
+                                false,
+                                &mut overflow_request,
+                                &mut slideshow_playing,
+                                &mut slideshow_interval,
+                                &mut slideshow_end_action,
+                                crate::rotation_db::Rotation::None,
+                                &mut rotation_choice,
+                                None,
+                                false,
+                                false,
+                                &mut panorama_pressed,
+                                crate::panorama::PanoProjection::Perspective,
+                                &mut panorama_projection_popup_open,
+                                &mut panorama_projection_choice,
+                                state.extracted_result,
+                                if state.composition_owned {
+                                    crate::spread_shift::PairingEditAvailability::Composed
+                                } else {
+                                    crate::spread_shift::PairingEditAvailability::Automatic
+                                },
+                                state.composition_owned.then_some(SpreadMode::Ltr),
+                                &mut state.spread_mode,
+                                &mut state.reading_flow,
+                                &mut state.reading_direction,
+                                &mut state.final_cover_preference,
+                                &mut state.singleton_preference,
+                                false,
+                                &mut state.page_alone_preferences,
+                                &mut state.open,
+                                false,
+                                &mut local_adjust_mode,
+                                false,
+                                FullscreenFitMode::Page,
+                                false,
+                                false,
+                                &mut fit_popup_open,
+                                &mut slideshow_popup_open,
+                                &mut slideshow_wait,
+                                &mut slideshow_scroll,
+                                &mut slideshow_percent,
+                                &mut crate::settings::FullscreenSpecifiedScale::default(),
+                                &mut {
+                                    crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
+                                },
+                                false,
+                                &mut false,
+                                &mut fit_mode_choice,
+                                &mut fit_no_upscale_choice,
+                                &mut fit_no_downscale_choice,
+                                &mut view_trim_mode,
+                                false,
+                                false,
+                                None,
+                                false,
+                                &mut tile_pressed,
+                                false,
+                                false,
+                                &mut vst_pressed,
+                                &mut copy_pressed,
+                                &mut copy_region_pressed,
+                                false,
+                                false,
+                                &mut window_mode_pressed,
+                                true,
+                                true,
+                                &mut top_bar_lock_pressed,
+                                false,
+                                None,
+                                false,
+                                1,
+                                None,
+                                None,
+                            );
+                        })
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         ctx.read_response(egui::Id::new(format!(
             "singleton_spread_placement_popup_1_{}",
             target.to_int()
@@ -61860,6 +62007,8 @@ mod tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, -2_000.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     }],
                     &mut state,
                     target,
@@ -62129,7 +62278,7 @@ mod tests {
             ] {
                 for ambient_spacing in [0.0, 13.0] {
                     let ctx = egui::Context::default();
-                    ctx.style_mut(|style| style.spacing.item_spacing.y = ambient_spacing);
+                    ctx.global_style_mut(|style| style.spacing.item_spacing.y = ambient_spacing);
                     crate::ui_fonts::configure_fonts(&ctx);
                     let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
                     let panel = fs_overflow_panel_rect(viewport, state).unwrap();
@@ -62159,21 +62308,27 @@ mod tests {
                         music_note_color_scheme: Default::default(),
                     };
                     let draw = |events| {
-                        let _ = ctx.run(
-                            egui::RawInput {
-                                screen_rect: Some(viewport),
-                                events,
-                                ..Default::default()
-                            },
-                            |ctx| {
-                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
-                                    ctx,
-                                    |ui| {
-                                        let _ = draw_fs_overflow_panel_surface(ui, panel, &view);
-                                    },
-                                );
-                            },
-                        );
+                        let _ = ctx
+                            .run_pass(
+                                egui::RawInput {
+                                    screen_rect: Some(viewport),
+                                    events,
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    ctx.root_ui(|root_ui| {
+                                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                            root_ui,
+                                            |ui| {
+                                                let _ = draw_fs_overflow_panel_surface(
+                                                    ui, panel, &view,
+                                                );
+                                            },
+                                        )
+                                    });
+                                },
+                            )
+                            .drop_without_applying_deltas();
                         let (inner, content, offset) = ctx.data(|data| {
                             data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
                                 .unwrap()
@@ -62232,6 +62387,8 @@ mod tests {
                                         unit: egui::MouseWheelUnit::Point,
                                         delta: egui::vec2(0.0, -4000.0),
                                         modifiers: egui::Modifiers::NONE,
+                                        phase: egui::TouchPhase::Move,
+                                        source: egui::MouseWheelSource::Unknown,
                                     },
                                 ]
                             } else {
@@ -62271,76 +62428,81 @@ mod tests {
             .unwrap();
         drop(app);
         let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
-                .show(ctx, |ui| {
-                    let root_rows = vec![
-                        FsOverflowPanelRow {
-                            item: FullscreenOverflowItemId::SpreadAdjustment,
-                            label: "見開きの調整".into(),
-                            status: "調整なし  >".into(),
-                            enabled: true,
-                            disabled_reason: None,
-                        },
-                        FsOverflowPanelRow {
-                            item: FullscreenOverflowItemId::NavigatorToggle,
-                            label: "ナビゲータ [Alt+N]".to_string(),
-                            status: "ON".to_string(),
-                            enabled: true,
-                            disabled_reason: None,
-                        },
-                        FsOverflowPanelRow {
-                            item: FullscreenOverflowItemId::NavigatorPosition,
-                            label: "ナビゲータ位置".to_string(),
-                            status: "右下  >".to_string(),
-                            enabled: true,
-                            disabled_reason: None,
-                        },
-                        FsOverflowPanelRow {
-                            item: FullscreenOverflowItemId::ImageAnalysis,
-                            label: "分析ツール [Shift+Z]".to_string(),
-                            status: "OFF".to_string(),
-                            enabled: false,
-                            disabled_reason: Some("分析ツールは見開きの2ページ表示中は使えません"),
-                        },
-                        FsOverflowPanelRow {
-                            item: FullscreenOverflowItemId::PixelGrid,
-                            label: "ピクセルグリッド [G]".to_string(),
-                            status: "ON".to_string(),
-                            enabled: true,
-                            disabled_reason: None,
-                        },
-                        FsOverflowPanelRow {
-                            item: FullscreenOverflowItemId::LoupeLock,
-                            label: "ルーペ固定 [M]".to_string(),
-                            status: "OFF".to_string(),
-                            enabled: true,
-                            disabled_reason: None,
-                        },
-                    ];
-                    let mut root_rows = root_rows;
-                    root_rows.insert(3, animation_row.clone());
-                    let view = FsOverflowPanelView {
-                        state,
-                        root_rows,
-                        navigator_corner: FullscreenNavigatorCorner::BottomRight,
-                        shift: Default::default(),
-                        composition_available: true,
-                        composition_managed: false,
-                        music_note_color_scheme: Default::default(),
-                    };
-                    let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
-                    let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
-                });
-        });
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+                    .show(root_ui, |ui| {
+                        let root_rows = vec![
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::SpreadAdjustment,
+                                label: "見開きの調整".into(),
+                                status: "調整なし  >".into(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::NavigatorToggle,
+                                label: "ナビゲータ [Alt+N]".to_string(),
+                                status: "ON".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::NavigatorPosition,
+                                label: "ナビゲータ位置".to_string(),
+                                status: "右下  >".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::ImageAnalysis,
+                                label: "分析ツール [Shift+Z]".to_string(),
+                                status: "OFF".to_string(),
+                                enabled: false,
+                                disabled_reason: Some(
+                                    "分析ツールは見開きの2ページ表示中は使えません",
+                                ),
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::PixelGrid,
+                                label: "ピクセルグリッド [G]".to_string(),
+                                status: "ON".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::LoupeLock,
+                                label: "ルーペ固定 [M]".to_string(),
+                                status: "OFF".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                        ];
+                        let mut root_rows = root_rows;
+                        root_rows.insert(3, animation_row.clone());
+                        let view = FsOverflowPanelView {
+                            state,
+                            root_rows,
+                            navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                            shift: Default::default(),
+                            composition_available: true,
+                            composition_managed: false,
+                            music_note_color_scheme: Default::default(),
+                        };
+                        let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
+                        let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
+                    });
+            });
         harness.run();
         if size.y >= 520.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
@@ -62444,8 +62606,9 @@ mod tests {
             {
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(800.0, 600.0))
-                    .build(|ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    .build_ui(|root_ui| {
+                        let ctx = &root_ui.ctx().clone();
+                        egui::CentralPanel::default().show(root_ui, |ui| {
                             app.draw_fs_overflow_panel(ui, ctx, ui.max_rect(), false);
                         });
                     });
@@ -62994,7 +63157,9 @@ mod tests {
         assert!(app.fs_holdover_tex.is_none());
         assert!(app.fs_nav_locked_gen.is_none());
 
-        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
         app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
         assert!(app.fs_upload_backlog.is_empty());
         assert!(app.fs_cache.contains_key(&2));
@@ -63080,7 +63245,9 @@ mod tests {
         // Each page turn is its own pass. The mark is scoped to the pass that wrote it, so
         // running them together would let the first hold answer for the release at the end.
         let advance = |app: &mut crate::app::App, from: usize, to: usize, still_held: bool| {
-            let _ = ctx.run(egui::RawInput::default(), |_| {});
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |_| {})
+                .drop_without_applying_deltas();
             crate::keymap::record_page_turn_edge_hold(&ctx, viewport, still_held);
             app.update_fs_page_turn_burst_after_navigation(&ctx, from, Some(to))
         };
@@ -64896,20 +65063,25 @@ mod tests {
         assert!(app.fs_navigation_sequence_blocks_new_target());
         let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let mut continuous_sources = FsNavigatorTextureSources::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(image_rect),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        continuous_sources =
-                            app.draw_fs_continuous_reading(ui, ctx, image_rect, 0, false, decision);
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(image_rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                continuous_sources = app.draw_fs_continuous_reading(
+                                    ui, ctx, image_rect, 0, false, decision,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         app.emit_fs_page_turn_ready_for_display_unit(
             &ctx,
             &composition,
@@ -65900,7 +66072,7 @@ mod tests {
         let mut accountant = crate::vram_budget::VramAccountant::default();
         pending.account(&mut accountant);
         assert_eq!(accountant.finish().total_texels, 4 * 6);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             assert!(sources.paint_page(
                 &ctx.layer_painter(egui::LayerId::background()),
                 0,
@@ -65954,7 +66126,7 @@ mod tests {
         );
         drop(page);
         assert_eq!(sources.texture_for_page(0, None).unwrap().id(), source_id);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             assert!(sources.paint_page(
                 &ctx.layer_painter(egui::LayerId::background()),
                 0,
@@ -66022,7 +66194,7 @@ mod tests {
                 })
             });
             let mut sources = None;
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 let submitted = app.submit_fs_spread_prepared(ctx, pages.clone(), false, false);
                 assert!(submitted.pages.iter().all(|page| matches!(
                     page.resource,
@@ -66109,7 +66281,7 @@ mod tests {
         assert!(sources.pages[0].resource.source_texture().is_none());
         assert_eq!(sources.partial_presentation_source_id(0), Some(source_id));
         for fallback in [&source, &thumbnail] {
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 assert!(sources.paint_page(
                     &ctx.layer_painter(egui::LayerId::background()),
                     0,
@@ -66185,42 +66357,44 @@ mod tests {
             )),
             None,
         ] {
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        assert!(
-                            app.draw_fs_image_with_receipt(
-                                ui,
-                                rect,
-                                0,
-                                None,
-                                FsPageLayoutSource::CurrentItem,
-                                None,
-                                None,
-                                SingletonSpreadPlacement::Center,
-                                Some(&payload),
-                                Some(&thumbnail),
-                                false,
-                                false,
-                                false,
-                                crate::rotation_db::Rotation::None,
-                                None,
-                                0.0,
-                                &FsBgStyle::Solid(egui::Color32::BLACK),
-                                "",
-                                false,
-                                FullscreenFitMode::Page,
-                                FullscreenFitScaleLimits::default(),
-                                content_bbox,
-                                None,
-                                true,
-                            )
-                            .is_some()
-                        );
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            assert!(
+                                app.draw_fs_image_with_receipt(
+                                    ui,
+                                    rect,
+                                    0,
+                                    None,
+                                    FsPageLayoutSource::CurrentItem,
+                                    None,
+                                    None,
+                                    SingletonSpreadPlacement::Center,
+                                    Some(&payload),
+                                    Some(&thumbnail),
+                                    false,
+                                    false,
+                                    false,
+                                    crate::rotation_db::Rotation::None,
+                                    None,
+                                    0.0,
+                                    &FsBgStyle::Solid(egui::Color32::BLACK),
+                                    "",
+                                    false,
+                                    FullscreenFitMode::Page,
+                                    FullscreenFitScaleLimits::default(),
+                                    content_bbox,
+                                    None,
+                                    true,
+                                )
+                                .is_some()
+                            );
+                        })
                     });
                 },
             );
@@ -66266,7 +66440,7 @@ mod tests {
             crate::rotation_db::Rotation::None,
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
             assert!(sources.paint_page(
                 &ctx.layer_painter(egui::LayerId::background()),
                 0,
@@ -67054,8 +67228,9 @@ mod tests {
                 egui::vec2(1200.0, 800.0),
             )),
             time: Some(time),
-            modifiers,
-            events: vec![egui::Event::PointerMoved(pos)],
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(vec![egui::Event::PointerMoved(pos)])
+                .collect(),
             ..Default::default()
         };
         input
@@ -67082,19 +67257,23 @@ mod tests {
     ) -> bool {
         install_fs_navigator_input_tracking(ctx);
         let mut consumed = false;
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    consumed = app.handle_fs_navigator_input(
-                        ui,
-                        ctx,
-                        image_rect,
-                        app.fullscreen_idx.unwrap(),
-                        None,
-                    );
+        let _ = ctx
+            .run_pass(input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            consumed = app.handle_fs_navigator_input(
+                                ui,
+                                ctx,
+                                image_rect,
+                                app.fullscreen_idx.unwrap(),
+                                None,
+                            );
+                        })
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         consumed
     }
 
@@ -67534,7 +67713,8 @@ mod tests {
         let mut texture: Option<egui::TextureHandle> = None;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if texture.is_none() {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -67566,7 +67746,7 @@ mod tests {
 
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(10, 12, 16)))
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let host_rect = ui.max_rect();
                         let body_rect = host_rect.shrink2(egui::vec2(30.0, 22.0));
                         let texture = texture.as_ref().expect("snapshot texture");
@@ -67649,7 +67829,7 @@ mod tests {
             complete_navigator_preview_for_test(&mut app, egui::Color32::LIGHT_BLUE);
 
             let mut paint_ids = None;
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 navigator_ordered_input(
                     vec![navigator_button_event(
                         image_rect.center(),
@@ -67659,28 +67839,30 @@ mod tests {
                     0.0,
                 ),
                 |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let asset = app
-                                .similar_preview_asset_for_frame(ctx)
-                                .expect("completed preview must be selected for this frame");
-                            let bg_style = app.fs_bg_style(ctx);
-                            let presentation = app
-                                .draw_similar_preview_asset(ui, image_rect, &asset, &bg_style)
-                                .expect("candidate geometry");
-                            paint_ids = Some((
-                                presentation.resource.paint_texture_id(),
-                                presentation.resource.source_texture_id(),
-                            ));
-                            app.draw_similar_preview_navigator(
-                                ui,
-                                ctx,
-                                image_rect,
-                                fs_idx,
-                                &presentation,
-                            );
-                        });
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let asset = app
+                                    .similar_preview_asset_for_frame(ctx)
+                                    .expect("completed preview must be selected for this frame");
+                                let bg_style = app.fs_bg_style(ctx);
+                                let presentation = app
+                                    .draw_similar_preview_asset(ui, image_rect, &asset, &bg_style)
+                                    .expect("candidate geometry");
+                                paint_ids = Some((
+                                    presentation.resource.paint_texture_id(),
+                                    presentation.resource.source_texture_id(),
+                                ));
+                                app.draw_similar_preview_navigator(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    fs_idx,
+                                    &presentation,
+                                );
+                            })
+                    });
                 },
             );
             let (paint_id, source_id) = paint_ids.expect("preview paint ids");
@@ -67719,7 +67901,7 @@ mod tests {
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
         complete_navigator_preview_for_test(&mut app, egui::Color32::LIGHT_GREEN);
         let mut candidate_painted = false;
-        let output = ctx.run(
+        let output = ctx.run_pass(
             navigator_ordered_input(
                 vec![navigator_button_event(
                     image_rect.center(),
@@ -67729,43 +67911,47 @@ mod tests {
                 0.0,
             ),
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let asset = app
-                            .similar_preview_asset_for_frame(ctx)
-                            .expect("ready candidate B");
-                        let bg_style = app.fs_bg_style(ctx);
-                        let presentation = app
-                            .draw_similar_preview_asset(ui, image_rect, &asset, &bg_style)
-                            .expect("candidate B geometry");
-                        candidate_painted = true;
-                        app.draw_similar_preview_navigator(
-                            ui,
-                            ctx,
-                            image_rect,
-                            fs_idx,
-                            &presentation,
-                        );
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let asset = app
+                                .similar_preview_asset_for_frame(ctx)
+                                .expect("ready candidate B");
+                            let bg_style = app.fs_bg_style(ctx);
+                            let presentation = app
+                                .draw_similar_preview_asset(ui, image_rect, &asset, &bg_style)
+                                .expect("candidate B geometry");
+                            candidate_painted = true;
+                            app.draw_similar_preview_navigator(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                &presentation,
+                            );
+                        })
+                });
             },
         );
         assert!(candidate_painted);
         assert!(!output.shapes.is_empty());
 
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![navigator_button_event(
-                    image_rect.center(),
-                    egui::PointerButton::Primary,
-                    false,
-                )],
-                0.1,
-            ),
-            |ctx| {
-                assert!(app.similar_preview_asset_for_frame(ctx).is_none());
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        image_rect.center(),
+                        egui::PointerButton::Primary,
+                        false,
+                    )],
+                    0.1,
+                ),
+                |ctx| {
+                    assert!(app.similar_preview_asset_for_frame(ctx).is_none());
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(
             app.compare_view_mode,
@@ -68073,15 +68259,17 @@ mod tests {
         let initial_events = (!info_panel_locked)
             .then(|| vec![egui::Event::PointerMoved(panel_hover_pos)])
             .unwrap_or_default();
-        let _ = ctx.run(
-            navigator_ordered_input_for_screen(
-                initial_events,
-                0.0,
-                screen_size,
-                native_pixels_per_point,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input_for_screen(
+                    initial_events,
+                    0.0,
+                    screen_size,
+                    native_pixels_per_point,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         let actual_screen = ctx.content_rect();
         assert_eq!(actual_screen.min, egui::Pos2::ZERO);
         assert!(
@@ -68121,21 +68309,29 @@ mod tests {
                 screen_size,
                 native_pixels_per_point,
             );
-            toggle_input.modifiers = shift;
-            let _ = ctx.run(toggle_input, |ctx| app.render_fullscreen_viewport(ctx));
+            toggle_input
+                .events
+                .insert(0, egui::Event::ModifiersChanged(shift));
+            let _ = ctx
+                .run_pass(toggle_input, |ctx| {
+                    ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui))
+                })
+                .drop_without_applying_deltas();
             assert!(
                 app.settings.still_seek_strip_visible,
                 "{case}: the production Shift+S action must enable the strip"
             );
-            let _ = ctx.run(
-                navigator_ordered_input_for_screen(
-                    Vec::new(),
-                    0.02,
-                    screen_size,
-                    native_pixels_per_point,
-                ),
-                |ctx| app.render_fullscreen_viewport(ctx),
-            );
+            let _ = ctx
+                .run_pass(
+                    navigator_ordered_input_for_screen(
+                        Vec::new(),
+                        0.02,
+                        screen_size,
+                        native_pixels_per_point,
+                    ),
+                    |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+                )
+                .drop_without_applying_deltas();
         }
         assert_eq!(
             !app.still_seek_thumbnail_pages.is_empty(),
@@ -68155,15 +68351,17 @@ mod tests {
             .get(target_rects.len() / 2)
             .unwrap_or_else(|| panic!("{case}: target must own an actually painted strip column"))
             .center();
-        let _ = ctx.run(
-            navigator_ordered_input_for_screen(
-                vec![egui::Event::PointerMoved(press_pos)],
-                0.05,
-                screen_size,
-                native_pixels_per_point,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input_for_screen(
+                    vec![egui::Event::PointerMoved(press_pos)],
+                    0.05,
+                    screen_size,
+                    native_pixels_per_point,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         let hover_rect = crate::ui_metadata_panel::take_book_strip_rect_for_test()
             .unwrap_or_else(|| panic!("{case}: hovered locked panel must retain the book strip"));
         let _ = crate::ui_metadata_panel::take_book_strip_target_rects_for_test();
@@ -68171,18 +68369,20 @@ mod tests {
             .similar_panel
             .preview
             .queue_test_completion_for_next_press();
-        let _ = ctx.run(
-            navigator_ordered_input_for_screen(
-                vec![
-                    egui::Event::PointerMoved(press_pos),
-                    navigator_button_event(press_pos, egui::PointerButton::Primary, true),
-                ],
-                0.1,
-                screen_size,
-                native_pixels_per_point,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input_for_screen(
+                    vec![
+                        egui::Event::PointerMoved(press_pos),
+                        navigator_button_event(press_pos, egui::PointerButton::Primary, true),
+                    ],
+                    0.1,
+                    screen_size,
+                    native_pixels_per_point,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         let pressed_rect = crate::ui_metadata_panel::take_book_strip_rect_for_test();
         let _ = crate::ui_metadata_panel::take_book_strip_target_rects_for_test();
         let (candidate, session) = app
@@ -68224,15 +68424,17 @@ mod tests {
         // across ordinary fullscreen frames so a later strip/navigator layer cannot silently
         // retire the panel-owned gesture while the candidate is still loading.
         for time in [0.15, 0.2, 0.25] {
-            let _ = ctx.run(
-                navigator_ordered_input_for_screen(
-                    Vec::new(),
-                    time,
-                    screen_size,
-                    native_pixels_per_point,
-                ),
-                |ctx| app.render_fullscreen_viewport(ctx),
-            );
+            let _ = ctx
+                .run_pass(
+                    navigator_ordered_input_for_screen(
+                        Vec::new(),
+                        time,
+                        screen_size,
+                        native_pixels_per_point,
+                    ),
+                    |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+                )
+                .drop_without_applying_deltas();
             assert!(
                 app.similar_panel
                     .preview
@@ -68263,14 +68465,14 @@ mod tests {
                 29,
             )
             .expect("production strip press must own the queued deterministic receiver");
-        let preview_output = ctx.run(
+        let preview_output = ctx.run_pass(
             navigator_ordered_input_for_screen(
                 Vec::new(),
                 0.3,
                 screen_size,
                 native_pixels_per_point,
             ),
-            |ctx| app.render_fullscreen_viewport(ctx),
+            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
         );
         assert_eq!(
             !app.still_seek_thumbnail_pages.is_empty(),
@@ -68304,7 +68506,7 @@ mod tests {
             );
         }
 
-        let release_output = ctx.run(
+        let release_output = ctx.run_pass(
             navigator_ordered_input_for_screen(
                 vec![navigator_button_event(
                     press_pos,
@@ -68315,7 +68517,7 @@ mod tests {
                 screen_size,
                 native_pixels_per_point,
             ),
-            |ctx| app.render_fullscreen_viewport(ctx),
+            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
         );
         let release_primitives =
             ctx.tessellate(release_output.shapes, release_output.pixels_per_point);
@@ -68520,37 +68722,43 @@ mod tests {
                 },
             ));
 
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.0), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.0), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
         let button = crate::ui_metadata_panel::take_book_move_button_rect_for_test()
             .expect("locked production metadata panel must draw the book move button")
             .center();
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(button),
-                    navigator_button_event(button, egui::PointerButton::Primary, true),
-                ],
-                0.1,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(button),
+                        navigator_button_event(button, egui::PointerButton::Primary, true),
+                    ],
+                    0.1,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         assert!(
             !app.cancel_required_fullscreen_folder_open(),
             "press alone must not admit a scan"
         );
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![navigator_button_event(
-                    button,
-                    egui::PointerButton::Primary,
-                    false,
-                )],
-                0.2,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        button,
+                        egui::PointerButton::Primary,
+                        false,
+                    )],
+                    0.2,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         assert!(
             app.cancel_required_fullscreen_folder_open(),
             "the full Scene must leave the release to the button and admit its physical scan"
@@ -68592,9 +68800,11 @@ mod tests {
         // accepting a fresh query in this same render pass.
         activate(&app);
         app.fs_zoom_active = true;
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.0), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.0), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Retained(_)
@@ -68606,9 +68816,11 @@ mod tests {
         activate(&app);
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
         app.fs_info_panel = crate::ui_helpers::FullscreenInfoPanelState::default();
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Retained(_)
@@ -68617,9 +68829,11 @@ mod tests {
         activate(&app);
         app.fs_info_panel.locked = true;
         app.similar_panel.select_similar_tab_for_test();
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Active(_)
@@ -68628,31 +68842,35 @@ mod tests {
             full_rect.right() - 285.0,
             full_rect.top() + TOP_BAR_HEIGHT + 52.0,
         );
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(info_tab),
-                    navigator_button_event(info_tab, egui::PointerButton::Primary, true),
-                ],
-                0.25,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(info_tab),
+                        navigator_button_event(info_tab, egui::PointerButton::Primary, true),
+                    ],
+                    0.25,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Active(_)
         ));
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![navigator_button_event(
-                    info_tab,
-                    egui::PointerButton::Primary,
-                    false,
-                )],
-                0.3,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        info_tab,
+                        egui::PointerButton::Primary,
+                        false,
+                    )],
+                    0.3,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         assert!(
             !app.similar_panel.context_marker_for_test().0,
             "the fixture must exercise the real Similar-to-Info tab click"
@@ -68668,22 +68886,26 @@ mod tests {
         app.similar_panel.select_similar_tab_for_test();
         app.fs_info_panel.locked = false;
         app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.35), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.35), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
         let close = crate::ui_metadata_panel::take_metadata_close_button_rect_for_test()
             .expect("visible explicit panel must expose its actual close rect to the fixture")
             .center();
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(close),
-                    navigator_button_event(close, egui::PointerButton::Primary, true),
-                ],
-                0.4,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(close),
+                        navigator_button_event(close, egui::PointerButton::Primary, true),
+                    ],
+                    0.4,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         assert_eq!(
             app.fs_info_panel.open,
             crate::ui_helpers::MetadataPanelOpenState::ByPointer
@@ -68692,17 +68914,19 @@ mod tests {
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Active(_)
         ));
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![navigator_button_event(
-                    close,
-                    egui::PointerButton::Primary,
-                    false,
-                )],
-                0.5,
-            ),
-            |ctx| app.render_fullscreen_viewport(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        close,
+                        egui::PointerButton::Primary,
+                        false,
+                    )],
+                    0.5,
+                ),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+            )
+            .drop_without_applying_deltas();
         assert_eq!(
             app.fs_info_panel.open,
             crate::ui_helpers::MetadataPanelOpenState::Closed,
@@ -68718,11 +68942,15 @@ mod tests {
         app.fs_info_panel.locked = true;
         app.similar_panel.select_similar_tab_for_test();
         app.fullscreen_idx = None;
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.6), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
-            });
-        });
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.6), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert_eq!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Withdrawn
@@ -68734,9 +68962,11 @@ mod tests {
         app.fullscreen_idx = Some(fs_idx);
         app.items[fs_idx] = GridItem::Video(PathBuf::from(r"C:\videos\native.mp4"));
         app.native_video_in_window_active = false;
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.7), |ctx| {
-            app.render_fullscreen_viewport(ctx);
-        });
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.7), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Retained(_)
@@ -68812,21 +69042,27 @@ mod tests {
         });
 
         install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(image_rect.center()),
-                    navigator_button_event(image_rect.center(), egui::PointerButton::Primary, true),
-                ],
-                0.0,
-            ),
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(image_rect.center()),
+                        navigator_button_event(
+                            image_rect.center(),
+                            egui::PointerButton::Primary,
+                            true,
+                        ),
+                    ],
+                    0.0,
+                ),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
         complete_navigator_preview_for_test(&mut app, egui::Color32::LIGHT_BLUE);
 
-        let preview_output = ctx.run(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
-            app.render_fullscreen_viewport(ctx);
+        let preview_output = ctx.run_pass(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
+            ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
         });
         let candidate_id = app
             .similar_panel
@@ -68854,7 +69090,7 @@ mod tests {
             mode
         );
 
-        let release_output = ctx.run(
+        let release_output = ctx.run_pass(
             navigator_ordered_input(
                 vec![navigator_button_event(
                     image_rect.center(),
@@ -68863,7 +69099,7 @@ mod tests {
                 )],
                 0.2,
             ),
-            |ctx| app.render_fullscreen_viewport(ctx),
+            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
         );
         let release_primitives =
             ctx.tessellate(release_output.shapes, release_output.pixels_per_point);
@@ -69037,19 +69273,23 @@ mod tests {
                 gesture: FsNavigatorPointerGesture::Idle,
             })
         ));
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fs_navigator(
-                        ui,
-                        ctx,
-                        image_rect,
-                        fs_idx,
-                        &FsNavigatorTextureSources::default(),
-                    );
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fs_navigator(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                &FsNavigatorTextureSources::default(),
+                            );
+                        })
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         assert!(!app.fullscreen_navigator_interaction.is_active());
     }
 
@@ -69131,40 +69371,44 @@ mod tests {
         let state = navigator_test_frame_state();
         let mut reserved = None;
 
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(start),
-                    navigator_button_event(start, egui::PointerButton::Secondary, true),
-                    egui::Event::PointerMoved(finish),
-                    navigator_button_event(finish, egui::PointerButton::Secondary, false),
-                ],
-                0.0,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let _ = app.handle_fs_wheel_and_click(
-                            ui,
-                            ctx,
-                            image_rect,
-                            &state,
-                            false,
-                            0,
-                            &mut reserved,
-                        );
-                        app.draw_fs_navigator_and_apply_reserved_input(
-                            ui,
-                            ctx,
-                            image_rect,
-                            fs_idx,
-                            &FsNavigatorTextureSources::default(),
-                            &mut reserved,
-                        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(start),
+                        navigator_button_event(start, egui::PointerButton::Secondary, true),
+                        egui::Event::PointerMoved(finish),
+                        navigator_button_event(finish, egui::PointerButton::Secondary, false),
+                    ],
+                    0.0,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let _ = app.handle_fs_wheel_and_click(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    &state,
+                                    false,
+                                    0,
+                                    &mut reserved,
+                                );
+                                app.draw_fs_navigator_and_apply_reserved_input(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    fs_idx,
+                                    &FsNavigatorTextureSources::default(),
+                                    &mut reserved,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.fullscreen_navigator_interaction.flat(),
             Some(FsNavigatorInteraction {
@@ -69184,20 +69428,24 @@ mod tests {
             .begin(FullscreenPageLayoutKind::Single);
         app.fullscreen_page_layout.push(next_transform);
         let mut none = None;
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fs_navigator_and_apply_reserved_input(
-                        ui,
-                        ctx,
-                        image_rect,
-                        fs_idx,
-                        &FsNavigatorTextureSources::default(),
-                        &mut none,
-                    );
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fs_navigator_and_apply_reserved_input(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                &FsNavigatorTextureSources::default(),
+                                &mut none,
+                            );
+                        })
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         assert!(!app.fullscreen_navigator_interaction.is_active());
     }
 
@@ -69226,6 +69474,8 @@ mod tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, 1.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                     egui::Event::PointerMoved(outside),
                 ],
@@ -69245,6 +69495,8 @@ mod tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, 1.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                     egui::Event::PointerMoved(inside),
                 ],
@@ -69266,14 +69518,18 @@ mod tests {
         let inside = layout.canvas_rect.center();
         let outside = layout.panel_rect.right_bottom() + egui::vec2(180.0, 140.0);
 
-        let _ = ctx.run(
-            navigator_ordered_input(vec![egui::Event::PointerMoved(inside)], 0.0),
-            |_| {},
-        );
-        let _ = ctx.run(
-            navigator_ordered_input(vec![egui::Event::PointerMoved(outside)], 0.1),
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(vec![egui::Event::PointerMoved(inside)], 0.0),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(vec![egui::Event::PointerMoved(outside)], 0.1),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         let old_size = app.settings.fullscreen_navigator_size;
         assert!(run_flat_navigator_input_frame(
             &mut app,
@@ -69285,6 +69541,8 @@ mod tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, 1.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                     egui::Event::PointerMoved(inside),
                 ],
@@ -69293,10 +69551,12 @@ mod tests {
         ));
         assert_eq!(app.settings.fullscreen_navigator_size, old_size);
 
-        let _ = ctx.run(
-            navigator_ordered_input(vec![egui::Event::PointerGone], 0.3),
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(vec![egui::Event::PointerGone], 0.3),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         assert!(run_flat_navigator_input_frame(
             &mut app,
             &ctx,
@@ -69307,6 +69567,8 @@ mod tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, 1.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                     egui::Event::PointerMoved(inside),
                 ],
@@ -69323,28 +69585,32 @@ mod tests {
     fn navigator_begin_pass_focus_without_events_uses_current_raw_fact() {
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::WindowFocused(false),
-                    egui::Event::WindowFocused(false),
-                ],
-                0.0,
-            ),
-            |ctx| {
-                let input = FsNavigatorFrameInput::for_current_pass(ctx);
-                assert!(!input.initial_focused);
-                assert!(!input.focused);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::WindowFocused(false),
+                        egui::Event::WindowFocused(false),
+                    ],
+                    0.0,
+                ),
+                |ctx| {
+                    let input = FsNavigatorFrameInput::for_current_pass(ctx);
+                    assert!(!input.initial_focused);
+                    assert!(!input.focused);
+                },
+            )
+            .drop_without_applying_deltas();
 
         let mut focused_input = navigator_ordered_input(Vec::new(), 0.1);
         focused_input.focused = true;
-        let _ = ctx.run(focused_input, |ctx| {
-            let input = FsNavigatorFrameInput::for_current_pass(ctx);
-            assert!(input.initial_focused);
-            assert!(input.focused);
-        });
+        let _ = ctx
+            .run_pass(focused_input, |ctx| {
+                let input = FsNavigatorFrameInput::for_current_pass(ctx);
+                assert!(input.initial_focused);
+                assert!(input.focused);
+            })
+            .drop_without_applying_deltas();
     }
 
     #[test]
@@ -69371,53 +69637,65 @@ mod tests {
             input
         };
 
-        let _ = ctx.run(
-            viewport_input(
-                egui::ViewportId::ROOT,
-                vec![egui::Event::PointerMoved(inside)],
-                0.0,
-            ),
-            |_| {},
-        );
-        let _ = ctx.run(
-            viewport_input(child, vec![egui::Event::PointerMoved(outside)], 0.1),
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                viewport_input(
+                    egui::ViewportId::ROOT,
+                    vec![egui::Event::PointerMoved(inside)],
+                    0.0,
+                ),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                viewport_input(child, vec![egui::Event::PointerMoved(outside)], 0.1),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
 
         let mut root_wheel = 0.0;
-        let _ = ctx.run(
-            viewport_input(
-                egui::ViewportId::ROOT,
-                vec![
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, 1.0),
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                    egui::Event::PointerMoved(outside),
-                ],
-                0.2,
-            ),
-            |ctx| root_wheel = FsNavigatorFrameInput::for_current_pass(ctx).wheel_y_in(panel),
-        );
+        let _ = ctx
+            .run_pass(
+                viewport_input(
+                    egui::ViewportId::ROOT,
+                    vec![
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, 1.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        },
+                        egui::Event::PointerMoved(outside),
+                    ],
+                    0.2,
+                ),
+                |ctx| root_wheel = FsNavigatorFrameInput::for_current_pass(ctx).wheel_y_in(panel),
+            )
+            .drop_without_applying_deltas();
         assert!(root_wheel > 0.5);
 
         let mut child_wheel = 0.0;
-        let _ = ctx.run(
-            viewport_input(
-                child,
-                vec![
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, 1.0),
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                    egui::Event::PointerMoved(inside),
-                ],
-                0.3,
-            ),
-            |ctx| child_wheel = FsNavigatorFrameInput::for_current_pass(ctx).wheel_y_in(panel),
-        );
+        let _ = ctx
+            .run_pass(
+                viewport_input(
+                    child,
+                    vec![
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, 1.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        },
+                        egui::Event::PointerMoved(inside),
+                    ],
+                    0.3,
+                ),
+                |ctx| child_wheel = FsNavigatorFrameInput::for_current_pass(ctx).wheel_y_in(panel),
+            )
+            .drop_without_applying_deltas();
         assert_eq!(child_wheel, 0.0);
     }
 
@@ -69444,38 +69722,47 @@ mod tests {
             input
         };
 
-        let _ = ctx.run(
-            viewport_input(child, true, vec![egui::Event::PointerMoved(inside)], 0.0),
-            |_| {},
-        );
-        let _ = ctx.run(
-            viewport_input(
-                egui::ViewportId::ROOT,
-                true,
-                vec![egui::Event::PointerMoved(inside)],
-                0.1,
-            ),
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                viewport_input(child, true, vec![egui::Event::PointerMoved(inside)], 0.0),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                viewport_input(
+                    egui::ViewportId::ROOT,
+                    true,
+                    vec![egui::Event::PointerMoved(inside)],
+                    0.1,
+                ),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         let mut wheel_by_pass = Vec::new();
-        let _ = ctx.run(
-            viewport_input(
-                egui::ViewportId::ROOT,
-                true,
-                vec![egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, 1.0),
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                0.2,
-            ),
-            |ctx| {
-                wheel_by_pass.push(FsNavigatorFrameInput::for_current_pass(ctx).wheel_y_in(panel));
-                if ctx.current_pass_index() == 0 {
-                    ctx.request_discard("navigator input multipass regression");
-                }
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                viewport_input(
+                    egui::ViewportId::ROOT,
+                    true,
+                    vec![egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, 1.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                    }],
+                    0.2,
+                ),
+                |ctx| {
+                    wheel_by_pass
+                        .push(FsNavigatorFrameInput::for_current_pass(ctx).wheel_y_in(panel));
+                    if ctx.current_pass_index() == 0 {
+                        ctx.request_discard("navigator input multipass regression");
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(wheel_by_pass.len(), 2);
         assert!(wheel_by_pass[0] > 0.5);
         assert_eq!(
@@ -69488,10 +69775,12 @@ mod tests {
                 .is_some_and(|snapshots| snapshots.by_viewport.contains_key(&child))
         }));
 
-        let _ = ctx.run(
-            viewport_input(egui::ViewportId::ROOT, false, Vec::new(), 0.3),
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                viewport_input(egui::ViewportId::ROOT, false, Vec::new(), 0.3),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         assert!(ctx.data(|data| {
             data.get_temp::<FsNavigatorFrameInputSnapshots>(cache_id)
                 .is_some_and(|snapshots| !snapshots.by_viewport.contains_key(&child))
@@ -69509,47 +69798,52 @@ mod tests {
         let state = navigator_test_frame_state();
         let mut reserved = None;
 
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    navigator_button_event(peek_release, egui::PointerButton::Primary, false),
-                    egui::Event::PointerMoved(nav_press),
-                    navigator_button_event(nav_press, egui::PointerButton::Primary, true),
-                ],
-                0.0,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        assert_eq!(
-                            app.handle_fs_wheel_and_click(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &state,
-                                false,
-                                0,
-                                &mut reserved,
-                            ),
-                            (FsPageNav::None, false)
-                        );
-                        let reservation = reserved.as_ref().expect("navigator press is reserved");
-                        assert!(matches!(
-                            reservation,
-                            FsNavigatorInputReservation::Canvas(_)
-                        ));
-                        assert!(!app.similar_panel.preview.has_active_gesture());
-                        assert!(app.handle_fs_navigator_input(
-                            ui,
-                            ctx,
-                            image_rect,
-                            fs_idx,
-                            Some(reservation.frame_input()),
-                        ));
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        navigator_button_event(peek_release, egui::PointerButton::Primary, false),
+                        egui::Event::PointerMoved(nav_press),
+                        navigator_button_event(nav_press, egui::PointerButton::Primary, true),
+                    ],
+                    0.0,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                assert_eq!(
+                                    app.handle_fs_wheel_and_click(
+                                        ui,
+                                        ctx,
+                                        image_rect,
+                                        &state,
+                                        false,
+                                        0,
+                                        &mut reserved,
+                                    ),
+                                    (FsPageNav::None, false)
+                                );
+                                let reservation =
+                                    reserved.as_ref().expect("navigator press is reserved");
+                                assert!(matches!(
+                                    reservation,
+                                    FsNavigatorInputReservation::Canvas(_)
+                                ));
+                                assert!(!app.similar_panel.preview.has_active_gesture());
+                                assert!(app.handle_fs_navigator_input(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    fs_idx,
+                                    Some(reservation.frame_input()),
+                                ));
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(matches!(
             app.fullscreen_navigator_interaction.flat(),
             Some(FsNavigatorInteraction {
@@ -69572,45 +69866,49 @@ mod tests {
         let state = navigator_test_frame_state();
         let mut reserved = None;
 
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(nav_press),
-                    navigator_button_event(nav_press, egui::PointerButton::Primary, true),
-                ],
-                0.0,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        assert_eq!(
-                            app.handle_fs_wheel_and_click(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &state,
-                                false,
-                                0,
-                                &mut reserved,
-                            ),
-                            (FsPageNav::None, false)
-                        );
-                        app.fullscreen_page_layout.clear();
-                        assert!(
-                            !app.handle_fs_navigator_input(
-                                ui,
-                                ctx,
-                                image_rect,
-                                fs_idx,
-                                reserved
-                                    .as_ref()
-                                    .map(FsNavigatorInputReservation::frame_input),
-                            )
-                        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(nav_press),
+                        navigator_button_event(nav_press, egui::PointerButton::Primary, true),
+                    ],
+                    0.0,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                assert_eq!(
+                                    app.handle_fs_wheel_and_click(
+                                        ui,
+                                        ctx,
+                                        image_rect,
+                                        &state,
+                                        false,
+                                        0,
+                                        &mut reserved,
+                                    ),
+                                    (FsPageNav::None, false)
+                                );
+                                app.fullscreen_page_layout.clear();
+                                assert!(
+                                    !app.handle_fs_navigator_input(
+                                        ui,
+                                        ctx,
+                                        image_rect,
+                                        fs_idx,
+                                        reserved
+                                            .as_ref()
+                                            .map(FsNavigatorInputReservation::frame_input),
+                                    )
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(reserved.is_some());
         assert!(!app.fullscreen_navigator_interaction.is_active());
     }
@@ -69624,43 +69922,47 @@ mod tests {
         let corner = fs_navigator_corner_button_rect(layout.header_rect, 0).center();
         let state = navigator_test_frame_state();
         let mut reserved = None;
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(corner),
-                    navigator_button_event(corner, egui::PointerButton::Primary, true),
-                    navigator_button_event(corner, egui::PointerButton::Primary, false),
-                ],
-                0.0,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let _ = app.handle_fs_wheel_and_click(
-                            ui,
-                            ctx,
-                            image_rect,
-                            &state,
-                            false,
-                            0,
-                            &mut reserved,
-                        );
-                        assert!(matches!(
-                            reserved,
-                            Some(FsNavigatorInputReservation::Header(_))
-                        ));
-                        let reservation = reserved.as_ref().unwrap();
-                        assert!(app.handle_fs_navigator_input(
-                            ui,
-                            ctx,
-                            image_rect,
-                            fs_idx,
-                            Some(reservation.frame_input()),
-                        ));
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(corner),
+                        navigator_button_event(corner, egui::PointerButton::Primary, true),
+                        navigator_button_event(corner, egui::PointerButton::Primary, false),
+                    ],
+                    0.0,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let _ = app.handle_fs_wheel_and_click(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    &state,
+                                    false,
+                                    0,
+                                    &mut reserved,
+                                );
+                                assert!(matches!(
+                                    reserved,
+                                    Some(FsNavigatorInputReservation::Header(_))
+                                ));
+                                let reservation = reserved.as_ref().unwrap();
+                                assert!(app.handle_fs_navigator_input(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    fs_idx,
+                                    Some(reservation.frame_input()),
+                                ));
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(
             app.settings.fullscreen_navigator_corner.normalized(),
             FullscreenNavigatorCorner::TopLeft
@@ -69671,46 +69973,52 @@ mod tests {
         let wheel_pos = layout.canvas_rect.center();
         let old_size = app.settings.fullscreen_navigator_size;
         reserved = None;
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::PointerMoved(wheel_pos),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, 1.0),
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                0.1,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let _ = app.handle_fs_wheel_and_click(
-                            ui,
-                            ctx,
-                            image_rect,
-                            &state,
-                            false,
-                            0,
-                            &mut reserved,
-                        );
-                        assert!(matches!(
-                            reserved,
-                            Some(FsNavigatorInputReservation::Wheel(_))
-                        ));
-                        let reservation = reserved.as_ref().unwrap();
-                        assert!(app.handle_fs_navigator_input(
-                            ui,
-                            ctx,
-                            image_rect,
-                            fs_idx,
-                            Some(reservation.frame_input()),
-                        ));
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerMoved(wheel_pos),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, 1.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        },
+                    ],
+                    0.1,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let _ = app.handle_fs_wheel_and_click(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    &state,
+                                    false,
+                                    0,
+                                    &mut reserved,
+                                );
+                                assert!(matches!(
+                                    reserved,
+                                    Some(FsNavigatorInputReservation::Wheel(_))
+                                ));
+                                let reservation = reserved.as_ref().unwrap();
+                                assert!(app.handle_fs_navigator_input(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    fs_idx,
+                                    Some(reservation.frame_input()),
+                                ));
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(
             app.settings.fullscreen_navigator_size,
             (old_size + FS_NAVIGATOR_WHEEL_STEP)
@@ -69796,19 +70104,23 @@ mod tests {
             })
         ));
 
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fs_navigator(
-                        ui,
-                        ctx,
-                        image_rect,
-                        fs_idx,
-                        &FsNavigatorTextureSources::default(),
-                    );
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.2), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fs_navigator(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                &FsNavigatorTextureSources::default(),
+                            );
+                        })
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         let resolved = navigator_test_transform(
             fs_idx,
             crate::rotation_db::Rotation::None,
@@ -69874,19 +70186,23 @@ mod tests {
         ));
 
         let old_pan = app.fs_pan;
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fs_navigator(
-                        ui,
-                        ctx,
-                        image_rect,
-                        fs_idx,
-                        &FsNavigatorTextureSources::default(),
-                    );
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fs_navigator(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                &FsNavigatorTextureSources::default(),
+                            );
+                        })
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         assert_ne!(app.fs_pan, old_pan);
         assert!(!app.fullscreen_navigator_interaction.is_active());
     }
@@ -69910,37 +70226,45 @@ mod tests {
         let screen_scale = layout.screen_scale;
         install_fs_navigator_input_tracking(&ctx);
 
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![navigator_button_event(
-                    press,
-                    egui::PointerButton::Primary,
-                    true,
-                )],
-                0.0,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        assert!(app.handle_fs_navigator_input(ui, ctx, image_rect, fs_idx, None,));
-                        assert!(matches!(
-                            app.fullscreen_navigator_interaction.flat(),
-                            Some(FsNavigatorInteraction {
-                                geometry: FsNavigatorGeometryIntent::Center { .. },
-                                gesture: FsNavigatorPointerGesture::AwaitingPan { .. },
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        press,
+                        egui::PointerButton::Primary,
+                        true,
+                    )],
+                    0.0,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                assert!(
+                                    app.handle_fs_navigator_input(
+                                        ui, ctx, image_rect, fs_idx, None,
+                                    )
+                                );
+                                assert!(matches!(
+                                    app.fullscreen_navigator_interaction.flat(),
+                                    Some(FsNavigatorInteraction {
+                                        geometry: FsNavigatorGeometryIntent::Center { .. },
+                                        gesture: FsNavigatorPointerGesture::AwaitingPan { .. },
+                                    })
+                                ));
+                                app.draw_fs_navigator(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    fs_idx,
+                                    &FsNavigatorTextureSources::default(),
+                                );
                             })
-                        ));
-                        app.draw_fs_navigator(
-                            ui,
-                            ctx,
-                            image_rect,
-                            fs_idx,
-                            &FsNavigatorTextureSources::default(),
-                        );
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         let centered_pan = app.fs_pan;
         assert_ne!(centered_pan, old_pan);
         let centered_transform = navigator_test_transform(
@@ -70065,23 +70389,31 @@ mod tests {
             let layout = viewer.fs_navigator_layout(viewport).unwrap();
             let start = layout.canvas_rect.center();
             let finish = start + egui::vec2(32.0, 18.0);
-            let _ = ctx.run(
-                navigator_ordered_input(
-                    vec![
-                        navigator_button_event(start, egui::PointerButton::Primary, true),
-                        egui::Event::PointerMoved(finish),
-                        navigator_button_event(finish, egui::PointerButton::Primary, false),
-                    ],
-                    0.0,
-                ),
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            assert!(viewer.handle_fs_navigator_input(ui, ctx, viewport, 0, None,));
+            let _ = ctx
+                .run_pass(
+                    navigator_ordered_input(
+                        vec![
+                            navigator_button_event(start, egui::PointerButton::Primary, true),
+                            egui::Event::PointerMoved(finish),
+                            navigator_button_event(finish, egui::PointerButton::Primary, false),
+                        ],
+                        0.0,
+                    ),
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    assert!(
+                                        viewer
+                                            .handle_fs_navigator_input(ui, ctx, viewport, 0, None,)
+                                    );
+                                },
+                            )
                         });
-                },
-            );
+                    },
+                )
+                .drop_without_applying_deltas();
             assert_ne!(viewer.fs_pan, egui::Vec2::ZERO);
         })
         .unwrap();
@@ -70288,19 +70620,23 @@ mod tests {
         app.fullscreen_page_layout
             .begin(FullscreenPageLayoutKind::Single);
         app.fullscreen_page_layout.push(normal_transform);
-        let _ = ctx.run(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    app.draw_fs_navigator(
-                        ui,
-                        ctx,
-                        image_rect,
-                        fs_idx,
-                        &FsNavigatorTextureSources::default(),
-                    );
+        let _ = ctx
+            .run_pass(navigator_ordered_input(Vec::new(), 0.1), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            app.draw_fs_navigator(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                &FsNavigatorTextureSources::default(),
+                            );
+                        })
                 });
-        });
+            })
+            .drop_without_applying_deltas();
         let resolved = navigator_test_transform(
             fs_idx,
             crate::rotation_db::Rotation::None,
@@ -70423,23 +70759,27 @@ mod tests {
         };
         let mut result = (FsPageNav::Delta(1), true);
 
-        let _ = ctx.run(
-            navigator_pointer_input(
-                layout.canvas_rect.center(),
-                None,
-                egui::Modifiers::default(),
-                0.0,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        result = app.handle_fs_wheel_and_click(
-                            ui, ctx, image_rect, &state, false, 0, &mut None,
-                        );
+        let _ = ctx
+            .run_pass(
+                navigator_pointer_input(
+                    layout.canvas_rect.center(),
+                    None,
+                    egui::Modifiers::default(),
+                    0.0,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                result = app.handle_fs_wheel_and_click(
+                                    ui, ctx, image_rect, &state, false, 0, &mut None,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(result, (FsPageNav::None, false));
         assert!(!app.fs_info_panel.hover_active);
@@ -70473,54 +70813,61 @@ mod tests {
             pdf_content_type: None,
         };
         let mut result = (FsPageNav::None, false);
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                modifiers,
-                events: vec![
-                    egui::Event::PointerMoved(pointer_pos),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Line,
-                        delta: egui::vec2(0.0, delta_y),
-                        modifiers,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                let mut music_ctrl_wheel_key_gate_reached = false;
-                if route_music_keyboard_first {
-                    let fs_idx = app
-                        .fullscreen_idx
-                        .expect("music fixture has a current item");
-                    let action = app.handle_fs_key_input(ctx, fs_idx, false);
-                    assert!(action.page_nav.is_none());
-                    music_ctrl_wheel_key_gate_reached = action.music_ctrl_wheel_gate_reached;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let mut navigator_reservation = None;
-                        result = app.handle_fs_wheel_and_click(
-                            ui,
-                            ctx,
-                            screen,
-                            &state,
-                            false,
-                            0,
-                            &mut navigator_reservation,
-                        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                        .chain(vec![
+                            egui::Event::PointerMoved(pointer_pos),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Line,
+                                delta: egui::vec2(0.0, delta_y),
+                                modifiers,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                            },
+                        ])
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let mut music_ctrl_wheel_key_gate_reached = false;
+                    if route_music_keyboard_first {
+                        let fs_idx = app
+                            .fullscreen_idx
+                            .expect("music fixture has a current item");
+                        let action = app.handle_fs_key_input(ctx, fs_idx, false);
+                        assert!(action.page_nav.is_none());
+                        music_ctrl_wheel_key_gate_reached = action.music_ctrl_wheel_gate_reached;
+                    }
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let mut navigator_reservation = None;
+                                result = app.handle_fs_wheel_and_click(
+                                    ui,
+                                    ctx,
+                                    screen,
+                                    &state,
+                                    false,
+                                    0,
+                                    &mut navigator_reservation,
+                                );
+                            })
                     });
-                if route_music_keyboard_first {
-                    let fs_idx = app.fullscreen_idx.unwrap();
-                    app.handle_music_timeline_ctrl_wheel_after_hud(
-                        ctx,
-                        fs_idx,
-                        music_ctrl_wheel_key_gate_reached,
-                    );
-                }
-            },
-        );
+                    if route_music_keyboard_first {
+                        let fs_idx = app.fullscreen_idx.unwrap();
+                        app.handle_music_timeline_ctrl_wheel_after_hud(
+                            ctx,
+                            fs_idx,
+                            music_ctrl_wheel_key_gate_reached,
+                        );
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
         result
     }
 
@@ -71360,29 +71707,33 @@ mod tests {
             },
         );
         let mut waiting_composite_drawn = true;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(640.0, 480.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        waiting_composite_drawn = app.draw_compare_prepared_mode(
-                            ui,
-                            ctx,
-                            image_rect,
-                            7,
-                            crate::app::CompareViewMode::wipe(0.5),
-                            None,
-                        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                waiting_composite_drawn = app.draw_compare_prepared_mode(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    7,
+                                    crate::app::CompareViewMode::wipe(0.5),
+                                    None,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(
             !waiting_composite_drawn,
             "a pair waiting for its source must not reach compare drawing"
@@ -71403,29 +71754,33 @@ mod tests {
                 diff_texture: None,
             });
         let mut composite_drawn = true;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(640.0, 480.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        composite_drawn = app.draw_compare_prepared_mode(
-                            ui,
-                            ctx,
-                            image_rect,
-                            8,
-                            crate::app::CompareViewMode::PinnedNormal,
-                            None,
-                        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                composite_drawn = app.draw_compare_prepared_mode(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    8,
+                                    crate::app::CompareViewMode::PinnedNormal,
+                                    None,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(app.compare_prepared_pair_matches(7));
         assert!(!app.compare_prepared_pair_matches(8));
@@ -71915,22 +72270,27 @@ mod tests {
                 app.frame_counter += 1;
             }
             let mut result = (FsPageNav::None, false);
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            result = app.handle_fs_wheel_and_click(
-                                ui, ctx, screen, state, false, 0, &mut None,
-                            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    result = app.handle_fs_wheel_and_click(
+                                        ui, ctx, screen, state, false, 0, &mut None,
+                                    );
+                                },
+                            )
                         });
-                },
-            );
+                    },
+                )
+                .drop_without_applying_deltas();
             result
         }
 
@@ -73369,22 +73729,27 @@ mod tests {
             if advance_app_frame {
                 app.frame_counter += 1;
             }
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let _ = app.handle_fs_wheel_and_click(
-                                ui, ctx, screen, state, false, 0, &mut None,
-                            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    let _ = app.handle_fs_wheel_and_click(
+                                        ui, ctx, screen, state, false, 0, &mut None,
+                                    );
+                                },
+                            )
                         });
-                },
-            );
+                    },
+                )
+                .drop_without_applying_deltas();
         }
 
         let mut app = crate::app::setup_app_for_test();
@@ -73607,22 +73972,27 @@ mod tests {
         ) -> (FsPageNav, bool) {
             app.frame_counter += 1;
             let mut result = (FsPageNav::None, false);
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            result = app.handle_fs_wheel_and_click(
-                                ui, ctx, screen, state, false, 0, &mut None,
-                            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    result = app.handle_fs_wheel_and_click(
+                                        ui, ctx, screen, state, false, 0, &mut None,
+                                    );
+                                },
+                            )
                         });
-                },
-            );
+                    },
+                )
+                .drop_without_applying_deltas();
             result
         }
 
@@ -73906,72 +74276,87 @@ mod tests {
         let control_id = egui::Id::new("foreground_reclaim_control_probe");
 
         // Prime egui's previous-pass hit test for the synthetic primary click.
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let _ = ui.interact(control, control_id, egui::Sense::click());
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let _ = ui.interact(control, control_id, egui::Sense::click());
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         let mut suppression = FullscreenPrimarySuppression::PointerStream;
         let mut probe = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                events: vec![
-                    touch(egui::TouchPhase::Start, pos),
-                    egui::Event::PointerMoved(pos),
-                    primary(pos, true),
-                    touch(egui::TouchPhase::End, pos),
-                    primary(pos, false),
-                    egui::Event::PointerGone,
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let touch_frame = crate::touch_correlation::drive_egui_touch_input(
-                            ctx,
-                            crate::touch_correlation::TouchSurface::StillFullscreen,
-                            crate::touch_input::TapZoneGeometry {
-                                surface: screen,
-                                excluded: Vec::new(),
-                                behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
-                                    accepts_pinch: true,
-                                    tap_zones: true,
-                                },
-                            },
-                            1,
-                            true,
-                        );
-                        let response = ui.interact(control, control_id, egui::Sense::click());
-                        let correlated = touch_frame.should_suppress_response(&response);
-                        let pointer =
-                            suppression.apply(FullscreenPrimarySuppressionEvent::PointerFrame {
-                                released: true,
-                            });
-                        let touch =
-                            suppression.apply(FullscreenPrimarySuppressionEvent::TouchFrame {
-                                suppresses_current_frame: correlated,
-                                active: touch_frame.is_active(),
-                                completed: !touch_frame.is_active()
-                                    && touch_frame.has_touch_derived_pointer_activity(),
-                                cancelled: touch_frame.touch_cancelled(),
-                            });
-                        probe =
-                            Some((response.clicked(), correlated, pointer.overridden_by(touch)));
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        touch(egui::TouchPhase::Start, pos),
+                        egui::Event::PointerMoved(pos),
+                        primary(pos, true),
+                        touch(egui::TouchPhase::End, pos),
+                        primary(pos, false),
+                        egui::Event::PointerGone,
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let touch_frame = crate::touch_correlation::drive_egui_touch_input(
+                                    ctx,
+                                    crate::touch_correlation::TouchSurface::StillFullscreen,
+                                    crate::touch_input::TapZoneGeometry {
+                                        surface: screen,
+                                        excluded: Vec::new(),
+                                        behavior:
+                                            crate::touch_input::TouchSurfaceBehavior::Viewer {
+                                                accepts_pinch: true,
+                                                tap_zones: true,
+                                            },
+                                    },
+                                    1,
+                                    true,
+                                );
+                                let response =
+                                    ui.interact(control, control_id, egui::Sense::click());
+                                let correlated = touch_frame.should_suppress_response(&response);
+                                let pointer = suppression.apply(
+                                    FullscreenPrimarySuppressionEvent::PointerFrame {
+                                        released: true,
+                                    },
+                                );
+                                let touch = suppression.apply(
+                                    FullscreenPrimarySuppressionEvent::TouchFrame {
+                                        suppresses_current_frame: correlated,
+                                        active: touch_frame.is_active(),
+                                        completed: !touch_frame.is_active()
+                                            && touch_frame.has_touch_derived_pointer_activity(),
+                                        cancelled: touch_frame.touch_cancelled(),
+                                    },
+                                );
+                                probe = Some((
+                                    response.clicked(),
+                                    correlated,
+                                    pointer.overridden_by(touch),
+                                ));
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
 
         let (synthetic_clicked, correlated, decision) = probe.unwrap();
         assert!(
@@ -73992,35 +74377,40 @@ mod tests {
             events: Vec<egui::Event>,
         ) -> bool {
             let mut clicked = false;
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let response = interact_touch_panel_handle(
-                                ui,
-                                handle,
-                                egui::Id::new((
-                                    "fs_touch_panel_handle",
-                                    crate::ui_helpers::PanelEdge::Left,
-                                )),
-                            );
-                            paint_panel_callout_chrome(
-                                ui,
-                                handle,
-                                crate::ui_helpers::PanelEdge::Left,
-                                false,
-                                response.hovered(),
-                            );
-                            clicked = response.clicked();
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    let response = interact_touch_panel_handle(
+                                        ui,
+                                        handle,
+                                        egui::Id::new((
+                                            "fs_touch_panel_handle",
+                                            crate::ui_helpers::PanelEdge::Left,
+                                        )),
+                                    );
+                                    paint_panel_callout_chrome(
+                                        ui,
+                                        handle,
+                                        crate::ui_helpers::PanelEdge::Left,
+                                        false,
+                                        response.hovered(),
+                                    );
+                                    clicked = response.clicked();
+                                },
+                            )
                         });
-                },
-            );
+                    },
+                )
+                .drop_without_applying_deltas();
             clicked
         }
 
@@ -74097,16 +74487,18 @@ mod tests {
             events: Vec<egui::Event>,
         ) -> DragProbe {
             let mut probe = DragProbe::default();
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
+                        .show(root_ui, |ui| {
                             let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                                 ctx,
                                 crate::touch_correlation::TouchSurface::StillFullscreen,
@@ -74137,9 +74529,11 @@ mod tests {
                                     egui::vec2(11.0, 7.0),
                                 ),
                             };
+                        })
                         });
-                },
-            );
+                    },
+                )
+                .drop_without_applying_deltas();
             probe
         }
 
@@ -75850,37 +76244,46 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let modifiers = egui::Modifiers::CTRL;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(420.0, 300.0),
-                )),
-                modifiers,
-                events: vec![
-                    egui::Event::PointerMoved(egui::pos2(220.0, 220.0)),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Line,
-                        delta: egui::vec2(0.0, -1.0),
-                        modifiers,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let id = ui.id().with("music_audio_popup_wheel_regression");
-                    ctx.data_mut(|data| data.insert_temp(id, true));
-                    let button =
-                        egui::Rect::from_min_size(egui::pos2(200.0, 270.0), egui::vec2(62.0, 28.0));
-                    crate::ui_music_panels::draw_music_audio_track_selector(
-                        ui, button, &rows, true, id,
-                    );
-                    assert!(ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false)));
-                    app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(420.0, 300.0),
+                    )),
+                    events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                        .chain(vec![
+                            egui::Event::PointerMoved(egui::pos2(220.0, 220.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Line,
+                                delta: egui::vec2(0.0, -1.0),
+                                modifiers,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                            },
+                        ])
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let id = ui.id().with("music_audio_popup_wheel_regression");
+                            ctx.data_mut(|data| data.insert_temp(id, true));
+                            let button = egui::Rect::from_min_size(
+                                egui::pos2(200.0, 270.0),
+                                egui::vec2(62.0, 28.0),
+                            );
+                            crate::ui_music_panels::draw_music_audio_track_selector(
+                                ui, button, &rows, true, id,
+                            );
+                            assert!(ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false)));
+                            app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(app.music_timeline_row_secs, before);
     }
 
@@ -75890,32 +76293,55 @@ mod tests {
         let ctx = egui::Context::default();
         let mut text = String::new();
         let edit_id = egui::Id::new("music_ctrl_wheel_text_edit");
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                crate::ime_focus::add_singleline(ui, &mut text, None, |edit| edit.id(edit_id))
-                    .request_focus();
-            });
-        });
-        let before = app.music_timeline_row_secs;
-        let _ = ctx.run(
-            egui::RawInput {
-                modifiers: egui::Modifiers::CTRL,
-                events: vec![egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, -1.0),
-                    modifiers: egui::Modifiers::CTRL,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    crate::ime_focus::add_singleline(ui, &mut text, None, |edit| edit.id(edit_id));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        crate::ime_focus::add_singleline(ui, &mut text, None, |edit| {
+                            edit.id(edit_id)
+                        })
+                        .request_focus();
+                    })
                 });
-                assert!(ctx.wants_keyboard_input());
-                assert!(ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5));
-                app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
-            },
-        );
+            })
+            .drop_without_applying_deltas();
+        let before = app.music_timeline_row_secs;
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+                        .chain(vec![egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: egui::vec2(0.0, -1.0),
+                            modifiers: egui::Modifiers::CTRL,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        }])
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            crate::ime_focus::add_singleline(ui, &mut text, None, |edit| {
+                                edit.id(edit_id)
+                            });
+                        })
+                    });
+                    assert!(ctx.egui_wants_keyboard_input());
+                    assert!(ctx.input(|input| {
+                        crate::wheel_input::remaining_wheel_delta(
+                            input,
+                            ctx.options(|o| o.input_options),
+                        )
+                        .y
+                        .abs()
+                            > 0.5
+                    }));
+                    app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(app.music_timeline_row_secs, before);
     }
 
@@ -75925,26 +76351,39 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&ctx);
         let before = app.music_timeline_row_secs;
-        let _ = ctx.run(
-            egui::RawInput {
-                modifiers: egui::Modifiers::CTRL,
-                events: vec![
-                    egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".into())),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Line,
-                        delta: egui::vec2(0.0, -1.0),
-                        modifiers: egui::Modifiers::CTRL,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                assert!(app.ime_input_active(ctx));
-                assert!(ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5));
-                app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+                        .chain(vec![
+                            egui::Event::Ime(egui::ImeEvent::Enabled),
+                            egui::Event::Ime(egui::ImeEvent::Preedit("あ".into())),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Line,
+                                delta: egui::vec2(0.0, -1.0),
+                                modifiers: egui::Modifiers::CTRL,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                            },
+                        ])
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.ime_input_active(ctx));
+                    assert!(ctx.input(|input| {
+                        crate::wheel_input::remaining_wheel_delta(
+                            input,
+                            ctx.options(|o| o.input_options),
+                        )
+                        .y
+                        .abs()
+                            > 0.5
+                    }));
+                    app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(app.music_timeline_row_secs, before);
     }
 
@@ -75983,21 +76422,34 @@ mod tests {
         assert!(app.music_normalize_modal_active(0));
         let ctx = egui::Context::default();
         let before = app.music_timeline_row_secs;
-        let _ = ctx.run(
-            egui::RawInput {
-                modifiers: egui::Modifiers::CTRL,
-                events: vec![egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, -1.0),
-                    modifiers: egui::Modifiers::CTRL,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                assert!(ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5));
-                app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::CTRL))
+                        .chain(vec![egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: egui::vec2(0.0, -1.0),
+                            modifiers: egui::Modifiers::CTRL,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        }])
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(ctx.input(|input| {
+                        crate::wheel_input::remaining_wheel_delta(
+                            input,
+                            ctx.options(|o| o.input_options),
+                        )
+                        .y
+                        .abs()
+                            > 0.5
+                    }));
+                    app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(app.music_timeline_row_secs, before);
     }
 
@@ -77187,14 +77639,18 @@ mod tests {
         // transiently between the first landing frame and the next held-pointer frame.
         let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         app.analysis_mode = true;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                assert_eq!(
-                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
-                    None
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        assert_eq!(
+                            app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                            None
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(app.fs_seek_gesture.is_active());
 
         app.analysis_mode = false;
@@ -77202,14 +77658,18 @@ mod tests {
             .set_still_bottom_lock(crate::settings::BottomBarLock::BarOnly);
         app.visible_indices = vec![0, 2];
         app.viewer_navigation_caches.invalidate();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                assert_eq!(
-                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
-                    None
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        assert_eq!(
+                            app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                            None
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         let StillSeekGesture::Track(gesture) = &mut app.fs_seek_gesture else {
             panic!("the first scrub frame's page switch must preserve the track gesture");
@@ -77275,28 +77735,33 @@ mod tests {
     ) -> Option<usize> {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let mut target = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(rect),
-                events,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let current = app.fullscreen_idx.unwrap();
-                    target = app.draw_fullscreen_seek_overlay(ui, ctx, rect, current, false, false);
-                    if land && let Some(target) = target {
-                        app.land_still_page_navigation_target(
-                            ctx,
-                            current,
-                            target,
-                            crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
-                            &mut None,
-                        );
-                    }
-                });
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let current = app.fullscreen_idx.unwrap();
+                            target = app
+                                .draw_fullscreen_seek_overlay(ui, ctx, rect, current, false, false);
+                            if land && let Some(target) = target {
+                                app.land_still_page_navigation_target(
+                                    ctx,
+                                    current,
+                                    target,
+                                    crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                                    &mut None,
+                                );
+                            }
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
         target
     }
 
@@ -77701,13 +78166,15 @@ mod tests {
             },
         );
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(viewport),
-                ..Default::default()
-            },
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         let unpainted = app
             .capture_fs_navigation_display_unit(&ctx, 1)
             .expect("ready page before its first paint");
@@ -77762,17 +78229,20 @@ mod tests {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0)),
         ] {
             let output = crate::app::paint_record_test_support::with_capture(|| {
-                ctx.run(
+                ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(viewport),
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
-                                app.draw_fs_display_unit_holdover(ui, ctx, viewport, &held);
-                            });
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    app.draw_fs_display_unit_holdover(ui, ctx, viewport, &held);
+                                },
+                            )
+                        });
                     },
                 )
             });
@@ -78071,17 +78541,19 @@ mod tests {
 
         let ctx = egui::Context::default();
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(full),
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                    .show(ctx, |ui| {
-                        app.draw_fs_navigation_gap_surface(ui, ctx, None, chrome);
-                    });
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                        .show(root_ui, |ui| {
+                            app.draw_fs_navigation_gap_surface(ui, ctx, None, chrome);
+                        })
+                });
             },
         );
         assert!(output.shapes.iter().any(|shape| {
@@ -78115,18 +78587,23 @@ mod tests {
             strip: None,
             shapes: Vec::new(),
         };
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(full),
                 events,
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    frame.target = app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                    frame.track = ctx.read_response(ui.make_persistent_id("fullscreen_seek_track"));
-                    frame.strip =
-                        ctx.read_response(ui.make_persistent_id("fullscreen_still_seek_strip_row"));
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        frame.target =
+                            app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                        frame.track =
+                            ctx.read_response(ui.make_persistent_id("fullscreen_seek_track"));
+                        frame.strip = ctx.read_response(
+                            ui.make_persistent_id("fullscreen_still_seek_strip_row"),
+                        );
+                    })
                 });
             },
         );
@@ -78231,6 +78708,8 @@ mod tests {
                         unit: egui::MouseWheelUnit::Line,
                         delta: egui::vec2(0.0, -5.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                 ],
             );
@@ -78434,7 +78913,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default().show(ctx, |_ui| {});
+                    ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |_ui| {}));
                 },
             )
             .shapes;
@@ -78768,14 +79247,16 @@ mod tests {
                 let ctx = egui::Context::default();
                 let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
                 still_seek_edge_frame(&mut app, &ctx, full, vec![]);
-                let output = ctx.run(
+                let output = ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(full),
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                            })
                         });
                     },
                 );
@@ -78825,7 +79306,8 @@ mod tests {
             let mut texture: Option<egui::TextureHandle> = None;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(640.0, 360.0))
-                .build(|ctx| {
+                .build_ui(|root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                     if texture.is_none() {
                         crate::ui_fonts::configure_fonts(ctx);
@@ -78860,7 +79342,7 @@ mod tests {
                     }
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
+                        .show(root_ui, |ui| {
                             let full = ctx.content_rect();
                             let media = app.fullscreen_media_rect(full, 3, false);
                             let tex = texture.as_ref().unwrap();
@@ -80332,22 +80814,24 @@ mod tests {
             (egui::Key::Num7, SpreadMode::Rtl),
             (egui::Key::Num1, SpreadMode::Single),
         ] {
-            let _ = ctx.run(
-                egui::RawInput {
-                    focused: true,
-                    events: vec![egui::Event::Key {
-                        key,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: egui::Modifiers::NONE,
-                    }],
-                    ..Default::default()
-                },
-                |ctx| {
-                    app.handle_fs_key_input(ctx, 0, false);
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        focused: true,
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.handle_fs_key_input(ctx, 0, false);
+                    },
+                )
+                .drop_without_applying_deltas();
             assert_eq!(app.spread_mode, expected);
             assert_eq!(app.reading_direction, ReadingDirection::Rtl);
         }
@@ -80398,22 +80882,24 @@ mod tests {
             alt: false,
         }]);
         let press_spread = |app: &mut crate::app::AppTestEnvForTest| {
-            let _ = ctx.run(
-                egui::RawInput {
-                    focused: true,
-                    events: vec![egui::Event::Key {
-                        key: egui::Key::Num3,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: egui::Modifiers::NONE,
-                    }],
-                    ..Default::default()
-                },
-                |ctx| {
-                    app.handle_fs_key_input(ctx, 0, false);
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        focused: true,
+                        events: vec![egui::Event::Key {
+                            key: egui::Key::Num3,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.handle_fs_key_input(ctx, 0, false);
+                    },
+                )
+                .drop_without_applying_deltas();
         };
         press_spread(&mut app);
         assert_eq!(app.spread_mode, SpreadMode::Single);
@@ -80684,7 +81170,8 @@ mod tests {
             let mut textures_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(720.0, 420.0))
-                .build(|ctx| {
+                .build_ui(|root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                     if !textures_ready {
                         crate::ui_fonts::configure_fonts(ctx);
@@ -80735,7 +81222,7 @@ mod tests {
                     }
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
-                        .show(ctx, |ui| {
+                        .show(root_ui, |ui| {
                             let full = ctx.content_rect();
                             let image_rect = full.shrink(18.0);
                             let composition = app.spread_display_composition_for_anchor(3);
@@ -82387,9 +82874,11 @@ mod tests {
         fs_idx: usize,
         input: egui::RawInput,
     ) {
-        let _ = ctx.run(input, |ctx| {
-            app.begin_capture_region_selection(ctx, fs_idx);
-        });
+        let _ = ctx
+            .run_pass(input, |ctx| {
+                app.begin_capture_region_selection(ctx, fs_idx);
+            })
+            .drop_without_applying_deltas();
         assert!(app.capture_region_selection.is_some());
     }
 
@@ -82402,14 +82891,19 @@ mod tests {
     ) -> (Option<CaptureRegionTerminalEffect>, Vec<egui::Event>) {
         let mut effect = None;
         let mut remaining_events = Vec::new();
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    effect = app.draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
+        let _ = ctx
+            .run_pass(input, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            effect = app
+                                .draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
+                        })
                 });
-            remaining_events = ctx.input(|input| input.events.clone());
-        });
+                remaining_events = ctx.input(|input| input.events.clone());
+            })
+            .drop_without_applying_deltas();
         (effect, remaining_events)
     }
 
@@ -82748,10 +83242,12 @@ mod tests {
         let (mut app, full_rect, image_rect, fs_idx) = setup_capture_region_input_test(&ctx);
         let finish =
             begin_capture_region_drag_for_test(&mut app, &ctx, full_rect, image_rect, fs_idx);
-        let _ = ctx.run(
-            navigator_ordered_input(vec![egui::Event::WindowFocused(false)], 0.2),
-            |_| {},
-        );
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(vec![egui::Event::WindowFocused(false)], 0.2),
+                |_| {},
+            )
+            .drop_without_applying_deltas();
         let (effect, _) = run_capture_region_input_frame(
             &mut app,
             &ctx,
@@ -82774,24 +83270,29 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut app, full_rect, image_rect, fs_idx) = setup_capture_region_input_test(&ctx);
         let mut effect = Some(CaptureRegionTerminalEffect::Cancel);
-        let _ = ctx.run(
-            navigator_ordered_input(
-                vec![
-                    egui::Event::WindowFocused(false),
-                    egui::Event::WindowFocused(true),
-                ],
-                0.0,
-            ),
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        effect =
-                            app.draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::WindowFocused(false),
+                        egui::Event::WindowFocused(true),
+                    ],
+                    0.0,
+                ),
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                effect = app.draw_capture_region_selection_overlay(
+                                    ui, ctx, full_rect, fs_idx,
+                                );
+                            })
                     });
-                app.begin_capture_region_selection(ctx, fs_idx);
-            },
-        );
+                    app.begin_capture_region_selection(ctx, fs_idx);
+                },
+            )
+            .drop_without_applying_deltas();
         assert!(effect.is_none());
         assert!(app.capture_region_selection.is_some());
 
@@ -83347,7 +83848,7 @@ mod tests {
             affordance: CompareWipeAffordance,
         ) -> Vec<egui::epaint::ClippedShape> {
             let ctx = egui::Context::default();
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -84547,7 +85048,7 @@ mod tests {
             "ctx.input(",
             "ctx.input_mut(",
             "ctx.options(",
-            "ctx.style(",
+            "ctx.global_style(",
             "ctx.fonts(",
             "ctx.output(",
             "ctx.output_mut(",
@@ -85321,19 +85822,23 @@ mod specified_scale_consumer_tests {
         draw: impl FnOnce(&mut egui::Ui, &egui::Context),
     ) {
         let mut draw = Some(draw);
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(rect),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        draw.take().unwrap()(ui, ctx);
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                draw.take().unwrap()(ui, ctx);
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
     }
 
     /// Calls the actual single/Z consumer and records its returned paint transform,
@@ -86229,125 +86734,127 @@ mod specified_scale_consumer_tests {
             events,
             ..Default::default()
         };
-        let output = ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
-                    let keymap = Keymap::default();
-                    let mut close = false;
-                    let mut page_nav = FsPageNav::None;
-                    let mut side_panel_mode_pressed = false;
-                    let mut overflow_request = None;
-                    let mut slideshow_playing = false;
-                    let mut slideshow_interval = 5.0;
-                    let mut slideshow_end_action = SlideshowEndAction::default();
-                    let mut rotation_choice = None;
-                    let mut panorama_pressed = false;
-                    let mut panorama_projection_popup_open = false;
-                    let mut panorama_projection_choice = None;
-                    let mut spread_mode = SpreadMode::Ltr;
-                    let mut reading_flow = ReadingFlow::Paged;
-                    let mut reading_direction = ReadingDirection::Ltr;
-                    let mut final_cover_spread_preference =
-                        crate::settings::FinalCoverSpreadPreference::FollowGlobal;
-                    let mut page_alone_preferences =
-                        crate::settings::PageAlonePreferences::default();
-                    let mut local_adjust_mode = false;
-                    let mut fit_popup_open = *open;
-                    let mut slideshow_popup_open = false;
-                    let mut slideshow_wait = 1.0;
-                    let mut slideshow_scroll = 1.0;
-                    let mut slideshow_percent = 100;
-                    let mut fit_mode_choice = None;
-                    let mut fit_no_upscale_choice = None;
-                    let mut fit_no_downscale_choice = None;
-                    let mut view_trim_mode = false;
-                    let mut tile_pressed = false;
-                    let mut vst_pressed = false;
-                    let mut copy_pressed = false;
-                    let mut copy_region_pressed = false;
-                    let mut window_mode_pressed = false;
-                    let mut top_bar_lock_pressed = false;
-                    App::draw_fs_hover_bar(
-                        ui,
-                        ctx,
-                        &keymap,
-                        full_rect,
-                        &[],
-                        &mut close,
-                        &mut page_nav,
-                        crate::settings::FsSidePanelMode::Hover,
-                        &mut side_panel_mode_pressed,
-                        false,
-                        false,
-                        &mut overflow_request,
-                        &mut slideshow_playing,
-                        &mut slideshow_interval,
-                        &mut slideshow_end_action,
-                        crate::rotation_db::Rotation::None,
-                        &mut rotation_choice,
-                        None,
-                        false,
-                        false,
-                        &mut panorama_pressed,
-                        crate::panorama::PanoProjection::Perspective,
-                        &mut panorama_projection_popup_open,
-                        &mut panorama_projection_choice,
-                        false,
-                        crate::spread_shift::PairingEditAvailability::Automatic,
-                        None,
-                        &mut spread_mode,
-                        &mut reading_flow,
-                        &mut reading_direction,
-                        &mut final_cover_spread_preference,
-                        &mut crate::settings::SingletonSpreadEndpointPreferences::default(),
-                        false,
-                        &mut page_alone_preferences,
-                        &mut false,
-                        false,
-                        &mut local_adjust_mode,
-                        false,
-                        FullscreenFitMode::Page,
-                        false,
-                        false,
-                        &mut fit_popup_open,
-                        &mut slideshow_popup_open,
-                        &mut slideshow_wait,
-                        &mut slideshow_scroll,
-                        &mut slideshow_percent,
-                        value,
-                        &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
-                        false,
-                        &mut false,
-                        &mut fit_mode_choice,
-                        &mut fit_no_upscale_choice,
-                        &mut fit_no_downscale_choice,
-                        &mut view_trim_mode,
-                        false,
-                        false,
-                        None,
-                        false,
-                        &mut tile_pressed,
-                        false,
-                        false,
-                        &mut vst_pressed,
-                        &mut copy_pressed,
-                        &mut copy_region_pressed,
-                        false,
-                        false,
-                        &mut window_mode_pressed,
-                        true,
-                        true,
-                        &mut top_bar_lock_pressed,
-                        false,
-                        None,
-                        false,
-                        1,
-                        None,
-                        None,
-                    );
-                    *open = fit_popup_open;
-                });
+        let output = ctx.run_pass(raw_input, |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| {
+                        let keymap = Keymap::default();
+                        let mut close = false;
+                        let mut page_nav = FsPageNav::None;
+                        let mut side_panel_mode_pressed = false;
+                        let mut overflow_request = None;
+                        let mut slideshow_playing = false;
+                        let mut slideshow_interval = 5.0;
+                        let mut slideshow_end_action = SlideshowEndAction::default();
+                        let mut rotation_choice = None;
+                        let mut panorama_pressed = false;
+                        let mut panorama_projection_popup_open = false;
+                        let mut panorama_projection_choice = None;
+                        let mut spread_mode = SpreadMode::Ltr;
+                        let mut reading_flow = ReadingFlow::Paged;
+                        let mut reading_direction = ReadingDirection::Ltr;
+                        let mut final_cover_spread_preference =
+                            crate::settings::FinalCoverSpreadPreference::FollowGlobal;
+                        let mut page_alone_preferences =
+                            crate::settings::PageAlonePreferences::default();
+                        let mut local_adjust_mode = false;
+                        let mut fit_popup_open = *open;
+                        let mut slideshow_popup_open = false;
+                        let mut slideshow_wait = 1.0;
+                        let mut slideshow_scroll = 1.0;
+                        let mut slideshow_percent = 100;
+                        let mut fit_mode_choice = None;
+                        let mut fit_no_upscale_choice = None;
+                        let mut fit_no_downscale_choice = None;
+                        let mut view_trim_mode = false;
+                        let mut tile_pressed = false;
+                        let mut vst_pressed = false;
+                        let mut copy_pressed = false;
+                        let mut copy_region_pressed = false;
+                        let mut window_mode_pressed = false;
+                        let mut top_bar_lock_pressed = false;
+                        App::draw_fs_hover_bar(
+                            ui,
+                            ctx,
+                            &keymap,
+                            full_rect,
+                            &[],
+                            &mut close,
+                            &mut page_nav,
+                            crate::settings::FsSidePanelMode::Hover,
+                            &mut side_panel_mode_pressed,
+                            false,
+                            false,
+                            &mut overflow_request,
+                            &mut slideshow_playing,
+                            &mut slideshow_interval,
+                            &mut slideshow_end_action,
+                            crate::rotation_db::Rotation::None,
+                            &mut rotation_choice,
+                            None,
+                            false,
+                            false,
+                            &mut panorama_pressed,
+                            crate::panorama::PanoProjection::Perspective,
+                            &mut panorama_projection_popup_open,
+                            &mut panorama_projection_choice,
+                            false,
+                            crate::spread_shift::PairingEditAvailability::Automatic,
+                            None,
+                            &mut spread_mode,
+                            &mut reading_flow,
+                            &mut reading_direction,
+                            &mut final_cover_spread_preference,
+                            &mut crate::settings::SingletonSpreadEndpointPreferences::default(),
+                            false,
+                            &mut page_alone_preferences,
+                            &mut false,
+                            false,
+                            &mut local_adjust_mode,
+                            false,
+                            FullscreenFitMode::Page,
+                            false,
+                            false,
+                            &mut fit_popup_open,
+                            &mut slideshow_popup_open,
+                            &mut slideshow_wait,
+                            &mut slideshow_scroll,
+                            &mut slideshow_percent,
+                            value,
+                            &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
+                            false,
+                            &mut false,
+                            &mut fit_mode_choice,
+                            &mut fit_no_upscale_choice,
+                            &mut fit_no_downscale_choice,
+                            &mut view_trim_mode,
+                            false,
+                            false,
+                            None,
+                            false,
+                            &mut tile_pressed,
+                            false,
+                            false,
+                            &mut vst_pressed,
+                            &mut copy_pressed,
+                            &mut copy_region_pressed,
+                            false,
+                            false,
+                            &mut window_mode_pressed,
+                            true,
+                            true,
+                            &mut top_bar_lock_pressed,
+                            false,
+                            None,
+                            false,
+                            1,
+                            None,
+                            None,
+                        );
+                        *open = fit_popup_open;
+                    })
+            });
         });
         output
     }
@@ -87036,13 +87543,13 @@ mod specified_scale_consumer_tests {
         assert!(app.fullscreen_embedded_still_active());
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
         let mut draw = |events| {
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
                     ..Default::default()
                 },
-                |ctx| app.render_fullscreen_viewport(ctx),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
             )
         };
         let mut output = draw(vec![]);
@@ -87169,13 +87676,13 @@ mod specified_scale_consumer_tests {
             }
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
             let draw = |app: &mut App, events| {
-                ctx.run(
+                ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(rect),
                         events,
                         ..Default::default()
                     },
-                    |ctx| app.render_fullscreen_viewport(ctx),
+                    |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
                 )
             };
             let mut output = draw(&mut app, vec![]);
@@ -87192,6 +87699,8 @@ mod specified_scale_consumer_tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, -2000.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                 ],
             );
@@ -87372,6 +87881,8 @@ mod specified_scale_consumer_tests {
                                 unit: egui::MouseWheelUnit::Point,
                                 delta: egui::vec2(0.0, -2000.0),
                                 modifiers: egui::Modifiers::NONE,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
                             },
                         ]
                     } else {
@@ -87444,14 +87955,14 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
                     events,
                     ..Default::default()
                 },
-                |ctx| app.render_fullscreen_viewport(ctx),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
             )
         };
         let metadata = || {
@@ -87477,6 +87988,8 @@ mod specified_scale_consumer_tests {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -100.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
             ]
         };
@@ -87535,7 +88048,10 @@ mod specified_scale_consumer_tests {
             let before = metadata().2;
             let _ = draw(&mut app, wheel(point));
             assert!(
-                ctx.input(|i| i.raw_scroll_delta == egui::Vec2::ZERO
+                ctx.input(|i| crate::wheel_input::remaining_wheel_delta(
+                    i,
+                    ctx.options(|o| o.input_options)
+                ) == egui::Vec2::ZERO
                     && i.smooth_scroll_delta == egui::Vec2::ZERO
                     && !i
                         .events
@@ -87552,7 +88068,8 @@ mod specified_scale_consumer_tests {
                 "HUD popup {popup} owns wheel ahead of the right panel"
             );
             assert!(ctx.input(|i| {
-                i.raw_scroll_delta == egui::Vec2::ZERO
+                crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options))
+                    == egui::Vec2::ZERO
                     && i.smooth_scroll_delta == egui::Vec2::ZERO
                     && !i
                         .events
@@ -87589,6 +88106,8 @@ mod specified_scale_consumer_tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, -100.0),
                 modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             },
         ]
     }
@@ -87596,7 +88115,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     fn assert_popup_wheel_consumed(ctx: &egui::Context) {
         assert!(ctx.input(|i| {
-            i.raw_scroll_delta == egui::Vec2::ZERO
+            crate::wheel_input::remaining_wheel_delta(i, ctx.options(|o| o.input_options))
+                == egui::Vec2::ZERO
                 && i.smooth_scroll_delta == egui::Vec2::ZERO
                 && !i
                     .events
@@ -87613,14 +88133,14 @@ mod specified_scale_consumer_tests {
             let mut frame = 0;
             let mut draw = |app: &mut App, events| {
                 frame += 1;
-                ctx.run(
+                ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(viewport),
                         time: Some(frame as f64 / 60.0),
                         events,
                         ..Default::default()
                     },
-                    |ctx| app.render_fullscreen_viewport(ctx),
+                    |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
                 )
             };
             for _ in 0..5 {
@@ -87691,14 +88211,14 @@ mod specified_scale_consumer_tests {
             let mut frame = 0;
             let mut draw = |app: &mut App, events| {
                 frame += 1;
-                ctx.run(
+                ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(viewport),
                         time: Some(frame as f64 / 60.0),
                         events,
                         ..Default::default()
                     },
-                    |ctx| app.render_fullscreen_viewport(ctx),
+                    |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
                 )
             };
             for _ in 0..5 {
@@ -87768,14 +88288,14 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
                     events,
                     ..Default::default()
                 },
-                |ctx| app.render_fullscreen_viewport(ctx),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
             )
         };
         for _ in 0..5 {
@@ -87872,14 +88392,14 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
                     events,
                     ..Default::default()
                 },
-                |ctx| app.render_fullscreen_viewport(ctx),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
             )
         };
         for _ in 0..5 {
@@ -87985,7 +88505,7 @@ mod specified_scale_consumer_tests {
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(viewport),
                     time: Some(frame as f64 / 60.0),
@@ -87993,7 +88513,7 @@ mod specified_scale_consumer_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    app.render_fullscreen_viewport(ctx);
+                    ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                     let raw = FsNavigatorFrameInput::for_current_pass(ctx);
                     ctx.data_mut(|data| data.insert_temp(egui::Id::new("front_raw_wheel"), raw));
                 },
@@ -88125,7 +88645,9 @@ mod specified_scale_consumer_tests {
         ] {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
-            ctx.style_mut(|style| style.spacing.scroll = egui::style::ScrollStyle::floating());
+            ctx.global_style_mut(|style| {
+                style.spacing.scroll = egui::style::ScrollStyle::floating()
+            });
             let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
             let mut open = true;
             let mut value = FullscreenSpecifiedScale::default();
@@ -88144,6 +88666,8 @@ mod specified_scale_consumer_tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, -2000.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     });
                 }
                 let output = fit_popup_frame(&ctx, viewport, events, &mut open, &mut value);
@@ -88201,7 +88725,7 @@ mod specified_scale_consumer_tests {
             assert!(help_seen, "scroll reaches the wrapped help");
             assert!(background_seen, "inspect the actual painted HUD background");
             assert_eq!(
-                ctx.style().spacing.scroll.floating_allocated_width,
+                ctx.global_style().spacing.scroll.floating_allocated_width,
                 0.0,
                 "popup gutter must not change the shared style"
             );
@@ -88221,13 +88745,13 @@ mod specified_scale_consumer_tests {
         app.fit_popup_open = true;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 614.0));
         let draw = |app: &mut App, events| {
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
                     ..Default::default()
                 },
-                |ctx| app.render_fullscreen_viewport(ctx),
+                |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
             )
         };
         let mut output = draw(&mut app, vec![]);
@@ -88287,28 +88811,30 @@ mod specified_scale_consumer_tests {
         );
         let edit_id = egui::Id::new(("comic_text_edit", 1_u64));
         let draw = |app: &mut App, events, time, expect_committed| {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1200.0, 800.0),
-                    )),
-                    events,
-                    time: Some(time),
-                    ..Default::default()
-                },
-                |ctx| {
-                    app.update_ime_state(ctx);
-                    if expect_committed {
-                        assert!(
-                            !app.ime_input_active(ctx),
-                            "Commit ends shortcut suppression immediately"
-                        );
-                    }
-                    // Includes fullscreen input handling and src/ui_text.rs's actual body TextEdit.
-                    app.render_fullscreen_viewport(ctx);
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        events,
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.update_ime_state(ctx);
+                        if expect_committed {
+                            assert!(
+                                !app.ime_input_active(ctx),
+                                "Commit ends shortcut suppression immediately"
+                            );
+                        }
+                        // Includes fullscreen input handling and src/ui_text.rs's actual body TextEdit.
+                        ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+                    },
+                )
+                .drop_without_applying_deltas();
             assert!(app.text_mode);
             assert_eq!(app.fullscreen_idx, Some(0));
         };
@@ -88408,7 +88934,7 @@ mod specified_scale_consumer_tests {
         app.fit_popup_open = true;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         let draw = |app: &mut App, events| {
-            ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
@@ -88424,7 +88950,7 @@ mod specified_scale_consumer_tests {
                             crate::keyboard_input::KeyboardOwner::TextInput { .. }
                         ));
                     }
-                    app.render_fullscreen_viewport(ctx);
+                    ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                 },
             )
         };
@@ -88442,6 +88968,8 @@ mod specified_scale_consumer_tests {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, -200.0),
                         modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
                     },
                 ],
             );
@@ -88456,7 +88984,7 @@ mod specified_scale_consumer_tests {
         let edit_id = ctx
             .memory(|memory| memory.focused())
             .expect("click starts numeric editing");
-        assert!(ctx.wants_keyboard_input());
+        assert!(ctx.egui_wants_keyboard_input());
         assert!(egui::TextEdit::load_state(&ctx, edit_id).is_some());
         assert_eq!(
             ctx.data(|data| data.get_temp::<String>(edit_id)),
@@ -88616,6 +89144,8 @@ mod specified_scale_consumer_tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, -150.0),
                 modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             },
         ];
         fit_popup_frame(&ctx, rect, scroll, &mut open, &mut value);
@@ -89100,7 +89630,7 @@ pub(crate) mod page_turn_submission_tests {
         run: impl FnMut(&mut egui::Ui, &egui::Context),
     ) -> egui::FullOutput {
         let mut run = run;
-        ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -89109,9 +89639,11 @@ pub(crate) mod page_turn_submission_tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| run(ui, ctx));
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| run(ui, ctx))
+                });
             },
         )
     }
@@ -89211,17 +89743,19 @@ pub(crate) mod page_turn_submission_tests {
         events: Vec<egui::Event>,
         mut run: impl FnMut(&egui::Context),
     ) {
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(600.0, 400.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ctx| run(ctx),
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| run(ctx),
+            )
+            .drop_without_applying_deltas();
     }
 
     fn pressed(key: egui::Key) -> egui::Event {
@@ -89343,44 +89877,48 @@ pub(crate) mod page_turn_submission_tests {
         );
         // Press while submitting B's mandatory flat. Release is the next frame's
         // real widget action, so close must win over the now-adopted continuation.
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(600.0, 400.0),
-                )),
-                events: vec![
-                    egui::Event::PointerMoved(close_pos),
-                    egui::Event::PointerButton {
-                        pos: close_pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                assert!(matches!(
-                    app.begin_current_page_turn_frame_for_test(ctx),
-                    PageTurnFrameEntry::Continue {
-                        committed: false,
-                        ..
-                    }
-                ));
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let (composition, sources) = draw_current(&mut app, ui, ctx);
-                        app.emit_fs_page_turn_ready_for_display_unit(
-                            ctx,
-                            &composition,
-                            FsPageTurnDecision::normal(),
-                            &sources,
-                        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 400.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(close_pos),
+                        egui::Event::PointerButton {
+                            pos: close_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(matches!(
+                        app.begin_current_page_turn_frame_for_test(ctx),
+                        PageTurnFrameEntry::Continue {
+                            committed: false,
+                            ..
+                        }
+                    ));
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let (composition, sources) = draw_current(&mut app, ui, ctx);
+                                app.emit_fs_page_turn_ready_for_display_unit(
+                                    ctx,
+                                    &composition,
+                                    FsPageTurnDecision::normal(),
+                                    &sources,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         frame_with_events(
             &ctx,
             vec![egui::Event::PointerButton {
@@ -89404,35 +89942,39 @@ pub(crate) mod page_turn_submission_tests {
         let ctx = egui::Context::default();
         let mut app = ready_app(&ctx, SpreadMode::Single);
         seed_interrupted_leaf(&ctx, &mut app, 2);
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(900.0, 600.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        assert!(matches!(
-                            app.begin_current_page_turn_frame_for_test(ctx),
-                            PageTurnFrameEntry::Continue {
-                                committed: false,
-                                ..
-                            }
-                        ));
-                        let (composition, sources) = draw_current(&mut app, ui, ctx);
-                        app.emit_fs_page_turn_ready_for_display_unit(
-                            ctx,
-                            &composition,
-                            FsPageTurnDecision::normal(),
-                            &sources,
-                        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                assert!(matches!(
+                                    app.begin_current_page_turn_frame_for_test(ctx),
+                                    PageTurnFrameEntry::Continue {
+                                        committed: false,
+                                        ..
+                                    }
+                                ));
+                                let (composition, sources) = draw_current(&mut app, ui, ctx);
+                                app.emit_fs_page_turn_ready_for_display_unit(
+                                    ctx,
+                                    &composition,
+                                    FsPageTurnDecision::normal(),
+                                    &sources,
+                                );
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         frame_with_events(&ctx, vec![], |ctx| {
             assert!(app.commit_page_turn_continuation(ctx));
             assert_eq!(app.fullscreen_idx, Some(2));
@@ -89534,58 +90076,65 @@ pub(crate) mod page_turn_submission_tests {
         let ctx = egui::Context::default();
         let mut app = ready_app(&ctx, SpreadMode::Single);
         seed_interrupted_leaf(&ctx, &mut app, 2);
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(600.0, 400.0),
-                )),
-                events: vec![
-                    pressed(egui::Key::ArrowRight),
-                    egui::Event::PointerMoved(egui::pos2(300.0, 200.0)),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, 120.0),
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                app.page_turn_pre_draw(ctx);
-                let mut operation = None;
-                let key = app.handle_fs_key_input_with_operation(ctx, 1, false, &mut operation);
-                assert!(!key.page_nav.is_none());
-                assert!(matches!(operation, Some(ViewerOperationId::Key(_))));
-                let wheel_operation = app
-                    .page_turn_pointer_navigation_operation(ctx, "wheel")
-                    .expect("immutable wheel ingress");
-                let state = app.prepare_fullscreen_state(ctx, 1, FsPageTurnDecision::normal());
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let (wheel, _) = app.handle_fs_wheel_and_click_with_geometry_and_operation(
-                            ui,
-                            ctx,
-                            ui.max_rect(),
-                            &state,
-                            StillSeekGeometry::bar_only(),
-                            false,
-                            0,
-                            &mut None,
-                            None,
-                            false,
-                            &mut operation,
-                        );
-                        assert!(!wheel.is_none());
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 400.0),
+                    )),
+                    events: vec![
+                        pressed(egui::Key::ArrowRight),
+                        egui::Event::PointerMoved(egui::pos2(300.0, 200.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, 120.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.page_turn_pre_draw(ctx);
+                    let mut operation = None;
+                    let key = app.handle_fs_key_input_with_operation(ctx, 1, false, &mut operation);
+                    assert!(!key.page_nav.is_none());
+                    assert!(matches!(operation, Some(ViewerOperationId::Key(_))));
+                    let wheel_operation = app
+                        .page_turn_pointer_navigation_operation(ctx, "wheel")
+                        .expect("immutable wheel ingress");
+                    let state = app.prepare_fullscreen_state(ctx, 1, FsPageTurnDecision::normal());
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let (wheel, _) = app
+                                    .handle_fs_wheel_and_click_with_geometry_and_operation(
+                                        ui,
+                                        ctx,
+                                        ui.max_rect(),
+                                        &state,
+                                        StillSeekGeometry::bar_only(),
+                                        false,
+                                        0,
+                                        &mut None,
+                                        None,
+                                        false,
+                                        &mut operation,
+                                    );
+                                assert!(!wheel.is_none());
+                            })
                     });
-                assert_eq!(
-                    operation,
-                    Some(wheel_operation),
-                    "only the winning wheel owns its command"
-                );
-            },
-        );
+                    assert_eq!(
+                        operation,
+                        Some(wheel_operation),
+                        "only the winning wheel owns its command"
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
         #[cfg(windows)]
         crate::key_input::clear_test_frame();
     }
@@ -89939,7 +90488,7 @@ pub(crate) mod page_turn_submission_tests {
             drop(held);
             let native_id = native.paint_texture_id();
             let mut submitted_sources = None;
-            let output = ctx.run(
+            let output = ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -89948,62 +90497,73 @@ pub(crate) mod page_turn_submission_tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let rect = ui.max_rect();
-                            let transform =
-                                DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-                                    pixel_fit: RectPixelFit::Texels,
-                                    page_idx: 1,
-                                    viewport_rect: rect,
-                                    source_size: native.size_vec2(),
-                                    texture_size: native.size_vec2(),
-                                    rotation: crate::rotation_db::Rotation::None,
-                                    free_rotation_rad: 0.0,
-                                    content_bbox: None,
-                                    fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
-                                    fit_scale_limits: app
-                                        .fullscreen_fit_scale_limits(ctx.pixels_per_point()),
-                                    pixels_per_point: ctx.pixels_per_point(),
-                                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                                })
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let rect = ui.max_rect();
+                                let transform = DisplayedImageTransform::resolve(
+                                    DisplayedImageTransformInput {
+                                        pixel_fit: RectPixelFit::Texels,
+                                        page_idx: 1,
+                                        viewport_rect: rect,
+                                        source_size: native.size_vec2(),
+                                        texture_size: native.size_vec2(),
+                                        rotation: crate::rotation_db::Rotation::None,
+                                        free_rotation_rad: 0.0,
+                                        content_bbox: None,
+                                        fit_mode: FullscreenFitInput::legacy(
+                                            FullscreenFitMode::Page,
+                                        ),
+                                        fit_scale_limits: app
+                                            .fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+                                        pixels_per_point: ctx.pixels_per_point(),
+                                        placement: ResolvedDisplayPlacement::Normal {
+                                            zoom_pan: None,
+                                        },
+                                    },
+                                )
                                 .unwrap();
-                            let page = PreparedPagedPage {
-                                occurrence: SpreadPageOccurrence::navigation(1, 1),
-                                transform,
-                                resource: native.clone().into(),
-                                painter: ui.painter().clone(),
-                                underlay: FsBgStyle::Solid(egui::Color32::BLACK),
-                                spine: None,
-                                live: false,
-                            };
-                            app.fullscreen_page_layout
-                                .begin(FullscreenPageLayoutKind::Single);
-                            app.fullscreen_page_layout
-                                .push_occurrence(transform, page.occurrence);
-                            // This is an already normally prepared Native output at the submission
-                            // boundary; OFF and ineligible-ON canonical rebinds retain only its allocation.
-                            let sources =
-                                app.submit_fs_spread_prepared(ctx, [Some(page), None], false, true);
-                            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission
-                            else {
-                                panic!("canonical receipt");
-                            };
-                            assert!(receipt.has_presentation_binding());
-                            assert!(!receipt.was_accepted());
-                            assert!(sources.pages[0].resource.source_texture().is_none());
-                            assert_eq!(sources.pages[0].resource.paint_texture_id(), native_id);
-                            let composition = app.spread_display_composition_for_anchor(1);
-                            app.emit_fs_page_turn_ready_for_display_unit(
-                                ctx,
-                                &composition,
-                                FsPageTurnDecision::normal(),
-                                &sources,
-                            );
-                            assert!(sources.paint_page(ui.painter(), 1, &transform, None));
-                            submitted_sources = Some(sources);
-                        });
+                                let page = PreparedPagedPage {
+                                    occurrence: SpreadPageOccurrence::navigation(1, 1),
+                                    transform,
+                                    resource: native.clone().into(),
+                                    painter: ui.painter().clone(),
+                                    underlay: FsBgStyle::Solid(egui::Color32::BLACK),
+                                    spine: None,
+                                    live: false,
+                                };
+                                app.fullscreen_page_layout
+                                    .begin(FullscreenPageLayoutKind::Single);
+                                app.fullscreen_page_layout
+                                    .push_occurrence(transform, page.occurrence);
+                                // This is an already normally prepared Native output at the submission
+                                // boundary; OFF and ineligible-ON canonical rebinds retain only its allocation.
+                                let sources = app.submit_fs_spread_prepared(
+                                    ctx,
+                                    [Some(page), None],
+                                    false,
+                                    true,
+                                );
+                                let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission
+                                else {
+                                    panic!("canonical receipt");
+                                };
+                                assert!(receipt.has_presentation_binding());
+                                assert!(!receipt.was_accepted());
+                                assert!(sources.pages[0].resource.source_texture().is_none());
+                                assert_eq!(sources.pages[0].resource.paint_texture_id(), native_id);
+                                let composition = app.spread_display_composition_for_anchor(1);
+                                app.emit_fs_page_turn_ready_for_display_unit(
+                                    ctx,
+                                    &composition,
+                                    FsPageTurnDecision::normal(),
+                                    &sources,
+                                );
+                                assert!(sources.paint_page(ui.painter(), 1, &transform, None));
+                                submitted_sources = Some(sources);
+                            })
+                    });
                 },
             );
             drop(native);
@@ -90165,7 +90725,8 @@ pub(crate) mod page_turn_submission_tests {
                 let mut textures = None;
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(620.0, 400.0))
-                    .build(|ctx| {
+                    .build_ui(|root_ui| {
+                        let ctx = &root_ui.ctx().clone();
                         if textures.is_none() {
                             let glyphs = [
                                 [14u8, 17, 17, 31, 17, 17, 17],
@@ -90220,7 +90781,7 @@ pub(crate) mod page_turn_submission_tests {
                         }
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(25)))
-                            .show(ctx, |ui| {
+                            .show(root_ui, |ui| {
                                 let make = |incoming: bool| CanonicalUnit {
                                     layout,
                                     pixels_per_point: 1.0,
@@ -90356,7 +90917,8 @@ mod music_overflow_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(width, 300.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -90366,7 +90928,7 @@ mod music_overflow_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| surface(ui, true, panel));
+                    .show(root_ui, |ui| surface(ui, true, panel));
             });
         harness.run();
         harness.snapshot(name);
@@ -90391,7 +90953,7 @@ mod music_overflow_tests {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
             for _ in 0..3 {
-                let output = ctx.run(
+                let output = ctx.run_pass(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -90400,37 +90962,40 @@ mod music_overflow_tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE)
-                            .show(ctx, |ui| {
-                                surface(ui, true, false);
-                                let controls: Vec<_> = [
-                                    "music_top_close",
-                                    "music_top_overflow",
-                                    "music_top_window",
-                                    "music_top_side_panel_mode",
-                                    "music_top_back_to_video",
-                                    "music_top_vst",
-                                    "music_row_minus",
-                                    "music_row_plus",
-                                ]
-                                .into_iter()
-                                .map(|name| {
-                                    ctx.read_response(ui.id().with((name, 0usize)))
-                                        .unwrap()
-                                        .rect
-                                })
-                                .collect();
-                                for (i, rect) in controls.iter().enumerate() {
-                                    assert!(
-                                        ui.max_rect().contains_rect(*rect),
-                                        "{width}: {rect:?}"
-                                    );
-                                    for other in &controls[i + 1..] {
-                                        assert!(!rect.intersects(*other), "{width}");
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                root_ui,
+                                |ui| {
+                                    surface(ui, true, false);
+                                    let controls: Vec<_> = [
+                                        "music_top_close",
+                                        "music_top_overflow",
+                                        "music_top_window",
+                                        "music_top_side_panel_mode",
+                                        "music_top_back_to_video",
+                                        "music_top_vst",
+                                        "music_row_minus",
+                                        "music_row_plus",
+                                    ]
+                                    .into_iter()
+                                    .map(|name| {
+                                        ctx.read_response(ui.id().with((name, 0usize)))
+                                            .unwrap()
+                                            .rect
+                                    })
+                                    .collect();
+                                    for (i, rect) in controls.iter().enumerate() {
+                                        assert!(
+                                            ui.max_rect().contains_rect(*rect),
+                                            "{width}: {rect:?}"
+                                        );
+                                        for other in &controls[i + 1..] {
+                                            assert!(!rect.intersects(*other), "{width}");
+                                        }
                                     }
-                                }
-                            });
+                                },
+                            )
+                        });
                     },
                 );
                 let title = output
@@ -90464,90 +91029,102 @@ mod music_overflow_tests {
     #[test]
     fn music_overflow_parked_hud_has_no_overflow_widget() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                surface(ui, false, false);
-                assert!(
-                    ctx.read_response(ui.id().with(("music_top_overflow", 0usize)))
-                        .is_none()
-                );
-                assert!(
-                    ctx.read_response(ui.id().with(("music_top_close", 0usize)))
-                        .is_some()
-                );
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        surface(ui, false, false);
+                        assert!(
+                            ctx.read_response(ui.id().with(("music_top_overflow", 0usize)))
+                                .is_none()
+                        );
+                        assert!(
+                            ctx.read_response(ui.id().with(("music_top_close", 0usize)))
+                                .is_some()
+                        );
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
     }
 
     #[test]
     fn music_overflow_parked_hud_retains_existing_narrow_control_geometry() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(320.0, 300.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        surface(ui, false, false);
-                        let names = [
-                            "music_top_close",
-                            "music_top_window",
-                            "music_top_side_panel_mode",
-                            "music_top_back_to_video",
-                            "music_top_vst",
-                        ];
-                        let rects: Vec<_> = names
-                            .into_iter()
-                            .map(|name| {
-                                ctx.read_response(ui.id().with((name, 0usize)))
-                                    .unwrap()
-                                    .rect
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                surface(ui, false, false);
+                                let names = [
+                                    "music_top_close",
+                                    "music_top_window",
+                                    "music_top_side_panel_mode",
+                                    "music_top_back_to_video",
+                                    "music_top_vst",
+                                ];
+                                let rects: Vec<_> = names
+                                    .into_iter()
+                                    .map(|name| {
+                                        ctx.read_response(ui.id().with((name, 0usize)))
+                                            .unwrap()
+                                            .rect
+                                    })
+                                    .collect();
+                                for rect in &rects {
+                                    assert_eq!(rect.width(), 28.0);
+                                }
+                                for pair in rects.windows(2) {
+                                    assert_eq!(pair[0].left() - pair[1].right(), 8.0);
+                                }
+                                for name in ["music_row_minus", "music_row_plus"] {
+                                    assert_eq!(
+                                        ctx.read_response(ui.id().with((name, 0usize)))
+                                            .unwrap()
+                                            .rect
+                                            .width(),
+                                        26.0
+                                    );
+                                }
                             })
-                            .collect();
-                        for rect in &rects {
-                            assert_eq!(rect.width(), 28.0);
-                        }
-                        for pair in rects.windows(2) {
-                            assert_eq!(pair[0].left() - pair[1].right(), 8.0);
-                        }
-                        for name in ["music_row_minus", "music_row_plus"] {
-                            assert_eq!(
-                                ctx.read_response(ui.id().with((name, 0usize)))
-                                    .unwrap()
-                                    .rect
-                                    .width(),
-                                26.0
-                            );
-                        }
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
     }
 
     #[test]
     fn music_overflow_backing_id_matches_real_ui_builder_in_owned_and_normal_frames() {
         let ctx = egui::Context::default();
         for disabled in [false, true, false] {
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let mut builder = egui::UiBuilder::new()
-                            .id_salt(MUSIC_VIEW_BACKING_UI_SALT)
-                            .max_rect(ui.max_rect());
-                        if disabled {
-                            builder = builder.disabled();
-                        }
-                        let child = ui.new_child(builder);
-                        assert_eq!(child.id(), music_view_backing_ui_id(ui.id()));
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let mut builder = egui::UiBuilder::new()
+                                    .id_salt(MUSIC_VIEW_BACKING_UI_SALT)
+                                    .max_rect(ui.max_rect());
+                                if disabled {
+                                    builder = builder.disabled();
+                                }
+                                let child = ui.new_child(builder);
+                                assert_eq!(child.id(), music_view_backing_ui_id(ui.id()));
+                            })
                     });
-            });
+                })
+                .drop_without_applying_deltas();
         }
     }
 
@@ -90616,17 +91193,17 @@ mod music_overflow_tests {
         events: Vec<egui::Event>,
         modifiers: egui::Modifiers,
     ) -> egui::FullOutput {
-        ctx.run(
+        ctx.run_pass(
             egui::RawInput {
+                events: vec![egui::Event::ModifiersChanged(modifiers)],
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(820.0, 600.0),
                 )),
                 events,
-                modifiers,
                 ..Default::default()
             },
-            |ctx| app.render_fullscreen_viewport(ctx),
+            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
         )
     }
 
@@ -90761,6 +91338,8 @@ mod music_overflow_tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, -120.0),
                 modifiers,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
             },
         ]
     }
@@ -90772,35 +91351,39 @@ mod music_overflow_tests {
         pos: egui::Pos2,
     ) -> MusicViewFrameUiState {
         let mut state = None;
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-                events: vec![egui::Event::PointerMoved(pos)],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        let full = ui.max_rect();
-                        let reserved = if app.resolved_still_chrome().info_locked {
-                            crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full.width() * 0.5)
-                        } else {
-                            0.0
-                        };
-                        let content = egui::Rect::from_min_max(
-                            full.min,
-                            full.max - egui::vec2(reserved, 0.0),
-                        );
-                        let input = app.begin_music_overflow_frame_input(ctx, full, 0);
-                        state =
-                            Some(app.draw_fs_music_view(
-                                ui, ctx, full, content, reserved, 0, false, input,
-                            ));
-                        app.draw_music_overflow_panel(ui, ctx, full);
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    events: vec![egui::Event::PointerMoved(pos)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root_ui, |ui| {
+                                let full = ui.max_rect();
+                                let reserved = if app.resolved_still_chrome().info_locked {
+                                    crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
+                                        .min(full.width() * 0.5)
+                                } else {
+                                    0.0
+                                };
+                                let content = egui::Rect::from_min_max(
+                                    full.min,
+                                    full.max - egui::vec2(reserved, 0.0),
+                                );
+                                let input = app.begin_music_overflow_frame_input(ctx, full, 0);
+                                state = Some(app.draw_fs_music_view(
+                                    ui, ctx, full, content, reserved, 0, false, input,
+                                ));
+                                app.draw_music_overflow_panel(ui, ctx, full);
+                            })
                     });
-            },
-        );
+                },
+            )
+            .drop_without_applying_deltas();
         state.expect("actual music view handler returned panel visibility")
     }
 
@@ -91354,15 +91937,17 @@ mod music_overflow_tests {
         app.close_fullscreen();
         assert!(app.fullscreen_idx.is_none());
         // The root UI still consumes release while the fullscreen routing surface is absent.
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![button(start, false)],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |_ui| {});
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![button(start, false)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui, |_ui| {}));
+                },
+            )
+            .drop_without_applying_deltas();
         // Reinstall only the disposable disconnected media fixture; no decoder/file open is run.
         let path = app.tmp.path().join("music-overflow-reopened.flac");
         install_fixture_media(&mut app, path);
@@ -91456,15 +92041,19 @@ mod music_overflow_tests {
                     ..Default::default()
                 },
             );
-            let _ = ctx.run(raw, |ctx| {
-                let first = music_overflow_frame_input(ctx, full, owner, true, open);
-                let replay = music_overflow_frame_input(ctx, full, owner, true, false);
-                assert_eq!(first.owns_pointer, replay.owns_pointer);
-                owned = first.owns_pointer;
-            });
+            let _ = ctx
+                .run_pass(raw, |ctx| {
+                    let first = music_overflow_frame_input(ctx, full, owner, true, open);
+                    let replay = music_overflow_frame_input(ctx, full, owner, true, false);
+                    assert_eq!(first.owns_pointer, replay.owns_pointer);
+                    owned = first.owns_pointer;
+                })
+                .drop_without_applying_deltas();
             owned
         };
-        let _ = ctx.run(Default::default(), |_ctx| {});
+        let _ = ctx
+            .run_pass(Default::default(), |_ctx| {})
+            .drop_without_applying_deltas();
         assert!(child_frame(
             vec![button(egui::PointerButton::Middle, true)],
             true
@@ -91474,12 +92063,14 @@ mod music_overflow_tests {
             "child passes preserve an active lease while ROOT has not advanced"
         );
         for _ in 0..2 {
-            let _ = ctx.run(Default::default(), |ctx| {
-                assert!(
-                    !music_overflow_frame_input(ctx, full, owner, true, false).owns_pointer,
-                    "child ownership cannot suppress the ROOT viewport"
-                );
-            });
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    assert!(
+                        !music_overflow_frame_input(ctx, full, owner, true, false).owns_pointer,
+                        "child ownership cannot suppress the ROOT viewport"
+                    );
+                })
+                .drop_without_applying_deltas();
         }
         assert!(
             !child_frame(
@@ -91504,20 +92095,22 @@ mod music_overflow_tests {
             .center();
         let run = |events, focused, context, active, open| {
             let mut result = MusicOverflowFrameInput::default();
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(full),
-                    events,
-                    focused,
-                    ..Default::default()
-                },
-                |ctx| {
-                    result = music_overflow_frame_input(ctx, full, context, active, open);
-                    let replay = music_overflow_frame_input(ctx, full, context, active, false);
-                    assert_eq!(replay.owns_pointer, result.owns_pointer);
-                    assert_eq!(replay.dismiss, result.dismiss);
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(full),
+                        events,
+                        focused,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        result = music_overflow_frame_input(ctx, full, context, active, open);
+                        let replay = music_overflow_frame_input(ctx, full, context, active, false);
+                        assert_eq!(replay.owns_pointer, result.owns_pointer);
+                        assert_eq!(replay.dismiss, result.dismiss);
+                    },
+                )
+                .drop_without_applying_deltas();
             result.owns_pointer
         };
         let mouse = |button, pressed| egui::Event::PointerButton {

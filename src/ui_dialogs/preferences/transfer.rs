@@ -515,8 +515,9 @@ mod tests {
         app.show_settings_restore = true;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_settings_restore_dialog(ctx);
                     app.show_preferences_dialog(ctx);
                 },
@@ -629,8 +630,9 @@ mod tests {
         app.show_settings_restore = true;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_settings_restore_dialog(ctx);
                     app.show_preferences_dialog(ctx);
                 },
@@ -676,8 +678,9 @@ mod tests {
         app.show_settings_restore = true;
         crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_settings_restore_dialog(ctx);
                     app.show_preferences_dialog(ctx);
                 },
@@ -699,8 +702,9 @@ mod tests {
             }
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1200.0, 900.0))
-                .build_state(
-                    |ctx, app| {
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
                         app.show_settings_restore_dialog(ctx);
                         app.show_preferences_dialog(ctx);
                     },
@@ -790,8 +794,9 @@ mod tests {
         }
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_preferences_dialog(ctx);
                     app.show_settings_restore_dialog(ctx);
                 },
@@ -851,8 +856,9 @@ mod tests {
             app.open_settings_restore_dialog();
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1200.0, 950.0))
-                .build_state(
-                    |ctx, app| {
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
                         // App::update draws these dialogs in this order.
                         app.show_preferences_dialog(ctx);
                         app.show_operation_customize_dialog(ctx);
@@ -956,8 +962,9 @@ mod tests {
         let generation = crate::settings::save_generation();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(
-                |ctx, app| {
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_preferences_dialog(ctx);
                     app.show_settings_restore_dialog(ctx);
                 },
@@ -1201,23 +1208,25 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&ctx);
         for key in [egui::Key::Enter, egui::Key::Escape] {
-            let _ = ctx.run(
-                egui::RawInput {
-                    events: vec![
-                        egui::Event::Ime(egui::ImeEvent::Enabled),
-                        egui::Event::Ime(egui::ImeEvent::Preedit("移行".into())),
-                        egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                    ..Default::default()
-                },
-                |ctx| app.show_settings_restore_dialog(ctx),
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        events: vec![
+                            egui::Event::Ime(egui::ImeEvent::Enabled),
+                            egui::Event::Ime(egui::ImeEvent::Preedit("移行".into())),
+                            egui::Event::Key {
+                                key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| app.show_settings_restore_dialog(ctx),
+                )
+                .drop_without_applying_deltas();
             assert!(matches!(
                 app.settings_restore_state.preferences_transfer.as_deref(),
                 Some(PreferencesTransferState::Explanation { .. })
@@ -1248,16 +1257,17 @@ mod tests {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1700.0, 500.0))
-                .build_state(
-                    move |ctx, app| {
+                .build_ui_state(
+                    move |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
                         if !fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             fonts_ready = true;
                             ctx.request_repaint();
                             return;
                         }
-                        app.render_menubar(ctx);
-                        app.render_toolbar(ctx);
+                        app.render_menubar(root_ui);
+                        app.render_toolbar(root_ui);
                         app.show_settings_restore_dialog(ctx);
                     },
                     app,

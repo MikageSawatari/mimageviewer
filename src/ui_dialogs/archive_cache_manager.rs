@@ -59,6 +59,7 @@ impl App {
         let (safe_rect, dialog_size) = manager_geometry(ctx);
 
         egui::Window::new("変換済みアーカイブ管理")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -92,6 +93,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let (safe_rect, dialog_size) = manager_geometry(ctx);
         egui::Window::new("EPUB 変換キャッシュ管理")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -165,6 +167,7 @@ impl App {
         }
         let mut open = true;
         egui::Window::new("EPUB の変換結果をすべて削除")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -202,6 +205,7 @@ impl App {
         let mut confirm_open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
         egui::Window::new("アーカイブキャッシュの全削除")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut confirm_open)
             .collapsible(false)
             .resizable(false)
@@ -476,6 +480,10 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
     });
     if let Some(result) = &app.epub_cache_manager_result {
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .max_height(120.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
@@ -606,6 +614,10 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
 
 fn archive_cache_entry_scroll_area(height: f32) -> egui::ScrollArea {
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .max_height(height.max(1.0))
         .id_salt("archive_cache_entries")
         // 横方向を内容幅へ縮めない。ダイアログの利用可能幅を使い切ることで、縦
@@ -615,6 +627,10 @@ fn archive_cache_entry_scroll_area(height: f32) -> egui::ScrollArea {
 
 fn epub_cache_entry_scroll_area(height: f32) -> egui::ScrollArea {
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .max_height(height.max(1.0))
         .id_salt("epub_cache_entries")
         .auto_shrink([false, false])
@@ -732,12 +748,14 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            let _ = ctx.run(input(), |ctx| app.show_epub_cache_manager_dialog(ctx));
+            let _ = ctx
+                .run_pass(input(), |ctx| app.show_epub_cache_manager_dialog(ctx))
+                .drop_without_applying_deltas();
         }
         let rect = ctx
             .memory(|memory| memory.area_rect(egui::Id::new("EPUB 変換キャッシュ管理")))
             .expect("manager window must be laid out");
-        let style = ctx.style();
+        let style = ctx.global_style();
         let frame = egui::Frame::window(&style);
         let heading = egui::TextStyle::Heading.resolve(&style);
         let title_inner_height = ctx.fonts_mut(|fonts| fonts.row_height(&heading));
@@ -757,7 +775,9 @@ mod tests {
                 pressed,
                 modifiers: egui::Modifiers::NONE,
             });
-            let _ = ctx.run(frame, |ctx| app.show_epub_cache_manager_dialog(ctx));
+            let _ = ctx
+                .run_pass(frame, |ctx| app.show_epub_cache_manager_dialog(ctx))
+                .drop_without_applying_deltas();
         }
         assert!(!app.show_epub_cache_manager);
         assert!(!app.epub_cache_confirm_delete_all);
@@ -774,19 +794,23 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run(raw, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_width(600.0);
-                let output =
-                    archive_cache_entry_scroll_area(ui.available_height()).show(ui, |ui| {
-                        ui.set_min_width(120.0);
-                        for _ in 0..40 {
-                            ui.label("row");
-                        }
-                    });
-                inner_width = output.inner_rect.width();
-            });
-        });
+        let _ = ctx
+            .run_pass(raw, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(600.0);
+                        let output =
+                            archive_cache_entry_scroll_area(ui.available_height()).show(ui, |ui| {
+                                ui.set_min_width(120.0);
+                                for _ in 0..40 {
+                                    ui.label("row");
+                                }
+                            });
+                        inner_width = output.inner_rect.width();
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
 
         assert!(
             inner_width > 550.0,
@@ -805,18 +829,22 @@ mod tests {
             ..Default::default()
         };
         let mut heights = (0.0, 0.0);
-        let _ = ctx.run(raw, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_height(500.0);
-                heights.0 = archive_cache_entry_scroll_area(ui.available_height())
-                    .show(ui, |ui| {
-                        ui.label("row");
+        let _ = ctx
+            .run_pass(raw, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_height(500.0);
+                        heights.0 = archive_cache_entry_scroll_area(ui.available_height())
+                            .show(ui, |ui| {
+                                ui.label("row");
+                            })
+                            .inner_rect
+                            .height();
+                        heights.1 = ui.available_height();
                     })
-                    .inner_rect
-                    .height();
-                heights.1 = ui.available_height();
-            });
-        });
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(heights.0 > 400.0, "table height: {}", heights.0);
         assert!(heights.1 < 100.0, "unused height: {}", heights.1);
     }
@@ -832,17 +860,21 @@ mod tests {
             ..Default::default()
         };
         let mut height = 0.0;
-        let _ = ctx.run(raw, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_height(500.0);
-                height = epub_cache_entry_scroll_area(ui.available_height())
-                    .show(ui, |ui| {
-                        ui.label("row");
+        let _ = ctx
+            .run_pass(raw, |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_height(500.0);
+                        height = epub_cache_entry_scroll_area(ui.available_height())
+                            .show(ui, |ui| {
+                                ui.label("row");
+                            })
+                            .inner_rect
+                            .height();
                     })
-                    .inner_rect
-                    .height();
-            });
-        });
+                });
+            })
+            .drop_without_applying_deltas();
         assert!(height > 400.0, "EPUB table height: {height}");
     }
 }

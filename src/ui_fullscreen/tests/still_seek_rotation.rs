@@ -254,7 +254,7 @@ fn overlay_output(
     hover: Option<egui::Pos2>,
 ) -> egui::FullOutput {
     let before = crate::rotation_db::read_operations_for_test();
-    let output = ctx.run(
+    let output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -264,8 +264,10 @@ fn overlay_output(
             ..Default::default()
         },
         |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.draw_fullscreen_seek_overlay(ui, ctx, ctx.content_rect(), 3, false, false);
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    app.draw_fullscreen_seek_overlay(ui, ctx, ctx.content_rect(), 3, false, false);
+                })
             });
         },
     );
@@ -802,7 +804,8 @@ fn still_seek_f6_real_overlay_rotation_snapshots() {
         let hover = std::cell::Cell::new(egui::Pos2::ZERO);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 480.0))
-            .build(|ctx| {
+            .build_ui(|root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !initialized {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -811,7 +814,7 @@ fn still_seek_f6_real_overlay_rotation_snapshots() {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let full = ctx.content_rect();
                         let media = app.fullscreen_media_rect(full, 3, false);
                         let pages = if spread.is_spread() {

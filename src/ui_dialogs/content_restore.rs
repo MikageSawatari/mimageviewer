@@ -147,6 +147,7 @@ pub fn render_content_restore_modal(
 
     let mut result = None;
     egui::Window::new("編集内容の復元")
+        .drag_area(egui::WindowDrag::Anywhere)
         .id(egui::Id::new("content_restore_modal"))
         .order(egui::Order::Foreground)
         .resizable(true)
@@ -207,6 +208,10 @@ fn render_content_restore_contents_with_list_height(
     let selector_width = (ui.max_rect().width() - SOURCE_SELECTOR_MARGIN).max(200.0);
     let list_top = ui.cursor().top();
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("content_restore_candidate_list")
         .max_height(list_max_height)
         .auto_shrink([false, true])
@@ -373,26 +378,30 @@ mod tests {
         let mut dont_ask_again = false;
         let mut height = 0.0;
         for _ in 0..3 {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(860.0, screen_height),
-                    )),
-                    ..egui::RawInput::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.set_width(820.0);
-                        height = render_content_restore_contents_with_list_height(
-                            ui,
-                            &mut rows,
-                            &mut dont_ask_again,
-                        )
-                        .1;
-                    });
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(860.0, screen_height),
+                        )),
+                        ..egui::RawInput::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                ui.set_width(820.0);
+                                height = render_content_restore_contents_with_list_height(
+                                    ui,
+                                    &mut rows,
+                                    &mut dont_ask_again,
+                                )
+                                .1;
+                            })
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
         }
         height
     }
@@ -521,18 +530,20 @@ mod tests {
         let mut dont_ask_again = false;
         let mut heights = Vec::new();
         for _ in 0..8 {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1280.0, 900.0),
-                    )),
-                    ..egui::RawInput::default()
-                },
-                |ctx| {
-                    let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        ..egui::RawInput::default()
+                    },
+                    |ctx| {
+                        let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
+                    },
+                )
+                .drop_without_applying_deltas();
             if let Some(rect) =
                 ctx.memory(|memory| memory.area_rect(egui::Id::new("content_restore_modal")))
             {

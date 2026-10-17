@@ -132,7 +132,7 @@ impl App {
         let mut scale = state.options.scale;
         let mut quality = state.options.quality;
 
-        egui::Window::new("AI動画アップスケール登録")
+        egui::Window::new("AI動画アップスケール登録").drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("video_upscale_register_dialog"))
             .open(&mut open)
             .resizable(false)
@@ -286,6 +286,7 @@ impl App {
         let mut action = TaskUiAction::None;
 
         egui::Window::new("アップスケールタスク")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("video_upscale_tasks_window"))
             .open(&mut open)
             .resizable(true)
@@ -325,6 +326,10 @@ impl App {
                 }
 
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for task in &tasks {

@@ -103,8 +103,9 @@ fn view_harness(
     mut state: EditorUiState,
 ) -> Harness<'static, Vec<EditorUiAction>> {
     let mut fonts_ready = false;
-    test_ui::builder().with_size(physical).build_state(
-        move |ctx, actions: &mut Vec<EditorUiAction>| {
+    test_ui::builder().with_size(physical).build_ui_state(
+        move |ui, actions: &mut Vec<EditorUiAction>| {
+            let ctx = &ui.ctx().clone();
             mimageviewer::os_theme::apply_resolved(ctx, theme);
             // Geometry and interaction tests do not need real-time scrolling
             // animation; the production ScrollArea still uses its normal style.
@@ -117,7 +118,7 @@ fn view_harness(
                 return;
             }
             *actions = show_window(
-                ctx,
+                ui,
                 egui::Id::new("composition_snapshot"),
                 &view,
                 &mut state,
@@ -449,8 +450,9 @@ fn composition_editor_hud_real_entry_and_indicator_c9() {
             let mut fonts_ready = false;
             let mut h = test_ui::builder()
                 .with_size(egui::vec2(450.0, 200.0))
-                .build_state(
-                    move |ctx, activated: &mut bool| {
+                .build_ui_state(
+                    move |ui, activated: &mut bool| {
+                        let ctx = &ui.ctx().clone();
                         mimageviewer::os_theme::apply_resolved(ctx, theme);
                         if !fonts_ready {
                             mimageviewer::ui_fonts::configure_fonts(ctx);
@@ -458,7 +460,7 @@ fn composition_editor_hud_real_entry_and_indicator_c9() {
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
                             *activated |=
                                 mimageviewer::draw_composition_editor_hud_snapshot_fixture(
                                     ui, available, true,
@@ -493,7 +495,7 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
     let mut state = EditorUiState::default();
     let mut actions = Vec::new();
     for key in [egui::Key::Enter, egui::Key::Escape] {
-        let _ = ctx.run(
+        ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -508,7 +510,8 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
                 }],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 actions = show_window(
                     ctx,
                     egui::Id::new("filtered_keys"),
@@ -517,11 +520,13 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
                     DialogKeys::default(),
                 );
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert!(!actions.contains(&EditorUiAction::Save));
         assert!(!actions.contains(&EditorUiAction::Cancel));
     }
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+    ctx.run_ui(egui::RawInput::default(), |ui| {
+        let ctx = &ui.ctx().clone();
         actions = show_window(
             ctx,
             egui::Id::new("filtered_keys"),
@@ -532,6 +537,7 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
                 escape: true,
             },
         );
-    });
+    })
+    .drop_without_applying_deltas();
     assert!(actions.contains(&EditorUiAction::Cancel));
 }

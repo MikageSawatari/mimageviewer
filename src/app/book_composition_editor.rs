@@ -489,7 +489,6 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         ctx.input_mut(|input| {
-            input.raw_scroll_delta = egui::Vec2::ZERO;
             input.smooth_scroll_delta = egui::Vec2::ZERO;
             input.events.clear();
         });

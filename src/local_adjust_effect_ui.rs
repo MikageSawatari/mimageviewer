@@ -13,7 +13,7 @@ impl LabHoverTipExt for egui::Response {
 
 fn lab_combo_box<R>(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
     accessible_label: &str,
     selected_text: impl Into<egui::WidgetText>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -10981,7 +10981,8 @@ mod tests {
         let mut quality = RepairQuality::Standard;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(250.0, 220.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -11022,6 +11023,6 @@ mod tests {
             harness.ctx.options(|options| options.theme_preference),
             egui::ThemePreference::Light
         );
-        assert!(!harness.ctx.style().visuals.dark_mode);
+        assert!(!harness.ctx.global_style().visuals.dark_mode);
     }
 }

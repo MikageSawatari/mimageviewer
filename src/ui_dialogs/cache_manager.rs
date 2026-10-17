@@ -44,6 +44,7 @@ impl App {
             let busy = self.cache_maint_pending.is_some();
 
             egui::Window::new("サムネイルキャッシュ管理")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
@@ -199,6 +200,7 @@ impl App {
             let mut confirm_open = true;
             let escape_pressed = self.dialog_escape_pressed(ctx);
             egui::Window::new("キャッシュの全削除")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .open(&mut confirm_open)
                 .collapsible(false)
                 .resizable(false)

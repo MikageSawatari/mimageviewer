@@ -180,8 +180,9 @@ mod tests {
                 let mut fonts_ready = false;
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(1920.0, 1440.0))
-                    .build_state(
-                        move |ctx, state: &mut State| {
+                    .build_ui_state(
+                        move |root_ui, state: &mut State| {
+                            let ctx = &root_ui.ctx().clone();
                             ctx.options_mut(|o| o.max_passes = max_passes.try_into().unwrap());
                             crate::settings::apply_ui_scale_factor(ctx, scale);
                             if !fonts_ready {
@@ -265,13 +266,14 @@ mod tests {
             egui::vec2(480.0, 360.0),
         ] {
             let mut fonts_ready = false;
-            let mut harness = crate::test_ui::builder().with_size(size).build_state(
-                move |ctx,
+            let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+                move |root_ui,
                       state: &mut (
                     crate::settings::Settings,
                     bool,
                     Option<(egui::Rect, egui::Rect)>,
                 )| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         fonts_ready = true;
@@ -318,9 +320,11 @@ mod tests {
             // Modal ownership and Area geometry are published on the next frame.
             let mut start_id = None;
             for _ in 0..3 {
-                let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                    start_id = Some(draw_first_setup_dialog(ctx, &mut app.settings).inner.id);
-                });
+                let _ = ctx
+                    .run_pass(egui::RawInput::default(), |ctx| {
+                        start_id = Some(draw_first_setup_dialog(ctx, &mut app.settings).inner.id);
+                    })
+                    .drop_without_applying_deltas();
             }
             if focus_start {
                 ctx.memory_mut(|memory| memory.request_focus(start_id.unwrap()));
@@ -337,27 +341,29 @@ mod tests {
                 repeat: false,
                 modifiers: egui::Modifiers::NONE,
             });
-            let _ = ctx.run(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    let enter = app.dialog_enter_pressed(ctx);
-                    let response = draw_first_setup_dialog(ctx, &mut app.settings);
-                    let ime_active = app.ime_input_active(ctx);
-                    assert_eq!(
-                        first_setup_should_confirm(&response, enter, ime_active),
-                        expected
-                    );
-                    if expected && !focus_start {
-                        ctx.memory_mut(|memory| {
-                            memory.request_focus(egui::Id::new("focused_option"))
-                        });
-                        assert!(!first_setup_should_confirm(&response, enter, ime_active));
-                    }
-                },
-            );
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let enter = app.dialog_enter_pressed(ctx);
+                        let response = draw_first_setup_dialog(ctx, &mut app.settings);
+                        let ime_active = app.ime_input_active(ctx);
+                        assert_eq!(
+                            first_setup_should_confirm(&response, enter, ime_active),
+                            expected
+                        );
+                        if expected && !focus_start {
+                            ctx.memory_mut(|memory| {
+                                memory.request_focus(egui::Id::new("focused_option"))
+                            });
+                            assert!(!first_setup_should_confirm(&response, enter, ime_active));
+                        }
+                    },
+                )
+                .drop_without_applying_deltas();
             assert!(!app.settings.first_setup_completed);
         }
     }

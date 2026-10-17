@@ -158,6 +158,7 @@ impl App {
         let mut cancel = false;
         let mut close = false;
         egui::Window::new("メタデータを整理")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
             .default_width(520.0)

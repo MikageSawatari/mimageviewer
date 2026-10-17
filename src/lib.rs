@@ -526,8 +526,8 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
         Err(_) => Some(1),
     };
 
-    wgpu_options.present_mode = present_mode;
-    wgpu_options.desired_maximum_frame_latency = desired_maximum_frame_latency;
+    wgpu_options.surface.present_mode = present_mode;
+    wgpu_options.surface.desired_maximum_frame_latency = desired_maximum_frame_latency;
     logger::log(format!(
         "wgpu presentation: present_mode={present_mode:?} \
          desired_maximum_frame_latency={desired_maximum_frame_latency:?}"
@@ -1628,6 +1628,7 @@ pub fn run() -> eframe::Result {
         ));
     }
     let options = eframe::NativeOptions {
+        system_font_fallback: false,
         viewport,
         wgpu_options,
         ..Default::default()
@@ -1778,6 +1779,8 @@ pub fn run() -> eframe::Result {
             #[cfg(windows)]
             startup_windows_diag::mark("app.creator.start", 0, || serde_json::json!({}));
             #[cfg(windows)]
+            cc.egui_ctx
+                .options_mut(|options| options.quit_shortcuts.clear());
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);

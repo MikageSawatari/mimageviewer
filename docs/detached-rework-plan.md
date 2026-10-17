@@ -5580,3 +5580,19 @@ wgpu／glowのfeature別に同じ実integrationを使い、両backendの既存ro
 **実装担当の内部確認**として3種類の部分復元で失敗を確認し、復元後の非対話gateを実行した。
 正式な独立ACCEPTではない。段2準備graphの実装完了と後続引継ぎ一覧は段2台帳へ記録する。
 root製品graph・両lock・schedulerは不変。live・製品は起動していない。
+
+#### 2026-10-17 段3の実装途中記録・設計判断待ち
+
+段2の4 crateを正式vendorへコピーし、製品graphをegui 0.37 / wgpu30へoffline解決した。
+App::logic/ui、root Ui・viewport callback、入力、native GPU/delta/IME control配送を移行中。
+これは**実装担当の内部確認**であり、段3完了・正式な独立ACCEPTではない。
+
+製品C1の正式接続で、App起点で既に終了した子のbackend退役手順が未定義であることを確認した。
+`close_all_detached_viewers_for_mode_change`は旧空immediate UIによるcleanupを残す一方、
+`finish_active_detached_session_close`はruntime/bindingを先に終端する。
+段2のClose hookは存続ownerの承認を前提とするため、その後のIDだけでは対象を同定できない。
+Fullのlogicはrun_ui内で呼ばれ、pass外専用のContext退役APIも直接使えない。
+既存Closingの寿命をbackend受理まで延ばすか、承認済み退役のtyped commandを用意するか、
+設計判断と独立レビューを要する。合意済み範囲の実装完了とは扱わず、構造を追加する前に停止した。
+Remoteはlogicへ結線せず旧UI checkpointに残す。強制UI・pending bool等の代用品は追加しない。
+詳細と分野別差分・未実施gateは[段3台帳](egui-0.37-stage3-verification.md)へ記録した。

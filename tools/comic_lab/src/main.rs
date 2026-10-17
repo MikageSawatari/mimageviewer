@@ -293,7 +293,7 @@ fn lab_dark_visuals() -> egui::Visuals {
 /// resolve against the OS light style).
 fn apply_dark_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
-    ctx.style_mut(|style| {
+    ctx.global_style_mut(|style| {
         style.visuals = lab_dark_visuals();
     });
 }
@@ -756,7 +756,8 @@ impl ComicLab {
         }
     }
 
-    fn draw_menu_bar(&mut self, ctx: &egui::Context) {
+    fn draw_menu_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         let recent_files = self.recent_files.clone();
         let current_path = self.image.as_ref().map(|img| img.path.clone());
         let has_image = current_path.is_some();
@@ -764,7 +765,7 @@ impl ComicLab {
         let mut do_save = false;
         let mut do_reload = false;
 
-        egui::TopBottomPanel::top("comic_lab_menubar").show(ctx, |ui| {
+        egui::Panel::top("comic_lab_menubar").show(root_ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("読み込み", |ui| {
                     if ui.button("画像を開く...").clicked() {
@@ -1226,7 +1227,7 @@ impl ComicLab {
         } else {
             "スタンプを追加"
         };
-        egui::Window::new(title)
+        egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -1290,7 +1291,7 @@ impl ComicLab {
                 }
 
                 // Emoji grid.
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -2154,6 +2155,7 @@ impl ComicLab {
             .unwrap_or_default();
 
         egui::Window::new("フォントを見本から選択")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -2234,6 +2236,10 @@ impl ComicLab {
                 let sample = self.font_dialog_sample.clone();
 
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show_rows(ui, FONT_CARD_H + 8.0, rows, |ui, row_range| {
                         for row in row_range {
@@ -2793,17 +2799,18 @@ impl ComicLab {
 }
 
 impl eframe::App for ComicLab {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root_ui.ctx().clone();
         self.drain_font_scripts(ctx);
         self.handle_dropped_files(ctx);
-        self.draw_menu_bar(ctx);
-        self.draw_left_panel(ctx);
-        self.draw_right_panel(ctx);
+        self.draw_menu_bar(root_ui);
+        self.draw_left_panel(root_ui);
+        self.draw_right_panel(root_ui);
 
         // Object-level undo/redo BEFORE the canvas bakes, so a Ctrl+Z/Y frame
         // shows the restored state immediately (not one frame late). Skipped
         // while a text field is focused so the TextEdit keeps Ctrl+Z / Delete.
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             let undo = ctx.input(|i| {
                 i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift
             });
@@ -2819,7 +2826,7 @@ impl eframe::App for ComicLab {
             }
         }
 
-        self.draw_canvas(ctx);
+        self.draw_canvas(root_ui);
         self.draw_add_dialog(ctx);
         self.draw_add_window_dialog(ctx);
         self.draw_onomatopoeia_dialog(ctx);
@@ -2827,7 +2834,7 @@ impl eframe::App for ComicLab {
         self.draw_stamp_dialog(ctx);
 
         // Commit a coalesced undo snapshot once the interaction settles.
-        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input();
         if !busy {
             self.commit_pending();
         }
@@ -2836,11 +2843,12 @@ impl eframe::App for ComicLab {
 
 impl ComicLab {
     /// Left panel: add tools + object cards + action buttons (補正レイヤー風)。
-    fn draw_left_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("comic_left")
+    fn draw_left_panel(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        egui::Panel::left("comic_left")
             .resizable(false)
-            .exact_width(LEFT_W)
-            .show(ctx, |ui| {
+            .exact_size(LEFT_W)
+            .show(root_ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("吹き出し / テキスト");
                 ui.separator();
@@ -2903,15 +2911,20 @@ impl ComicLab {
     }
 
     /// Right panel: detailed settings for the selected object (補正レイヤー風)。
-    fn draw_right_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("comic_right")
+    fn draw_right_panel(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        egui::Panel::right("comic_right")
             .resizable(false)
-            .exact_width(RIGHT_W)
-            .show(ctx, |ui| {
+            .exact_size(RIGHT_W)
+            .show(root_ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("詳細設定");
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.draw_properties(ui);
@@ -2944,6 +2957,10 @@ impl ComicLab {
         let mut select: Option<u64> = None;
         let card_w = LEFT_W - 20.0;
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .max_height(300.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -3111,7 +3128,7 @@ impl ComicLab {
         }
         let mut open = self.show_add_dialog;
         let mut chosen: Option<BubblePreset> = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -3126,6 +3143,7 @@ impl ComicLab {
         let default_w = max_w.min(540.0);
         let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("吹き出しを追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             // Fresh id so egui doesn't restore the full-width size remembered from
             // the earlier horizontal_wrapped layout (a .max_width clamp can't shrink
             // an already-remembered window size — Codex).
@@ -3149,6 +3167,10 @@ impl ComicLab {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let cols = grid_cols(ui.available_width(), PRESET_CELL_W);
@@ -3181,7 +3203,7 @@ impl ComicLab {
         }
         let mut open = self.show_add_window_dialog;
         let mut chosen: Option<usize> = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -3194,6 +3216,7 @@ impl ComicLab {
         let default_w = max_w.min(640.0);
         let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("メッセージウィンドウを追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("add_window_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
@@ -3212,6 +3235,10 @@ impl ComicLab {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let cols = grid_cols(ui.available_width(), WINDOW_PRESET_CELL_W);
@@ -3321,7 +3348,7 @@ impl ComicLab {
         }
         let mut open = self.show_onomatopoeia_dialog;
         let mut chosen: Option<OnomatopoeiaPreset> = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -3332,6 +3359,7 @@ impl ComicLab {
         let default_w = max_w.min(860.0);
         let default_h = (avail.height() - 120.0).clamp(300.0, 660.0);
         egui::Window::new("オノマトペを追加")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("onomatopoeia_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
@@ -3352,6 +3380,10 @@ impl ComicLab {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let cols = grid_cols(ui.available_width(), ONOMATO_PRESET_CELL_W);
@@ -5057,8 +5089,9 @@ impl ComicLab {
         }
     }
 
-    fn draw_canvas(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn draw_canvas(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
+        egui::CentralPanel::default().show(root_ui, |ui| {
             let avail = ui.available_rect_before_wrap();
             let (resp, painter) = ui.allocate_painter(avail.size(), Sense::click_and_drag());
             let canvas_rect = resp.rect;
@@ -5807,7 +5840,7 @@ impl ComicLab {
 
         // Delete selected with Delete key — but NOT while editing text (the
         // TextEdit must keep Delete for character deletion).
-        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             if let Some(id) = self.selected {
                 self.objects.retain(|o| o.id != id);
                 self.tail_stash.remove(&id);
@@ -7679,7 +7712,7 @@ fn draw_text_body(ui: &mut egui::Ui, tb: &mut TextBlock, sel: u64) -> TextSectio
     dirty |= te_out.response.changed();
     let text_sel: Option<(usize, usize)> = te_out
         .cursor_range
-        .map(|r| (r.primary.index, r.secondary.index));
+        .map(|r| (r.primary.index.0, r.secondary.index.0));
 
     // Marker-insert buttons (only when markup is enabled). Placed right under
     // the textbox so a marker pair wraps the current selection at the cursor.
@@ -8051,14 +8084,15 @@ fn recent_files_path() -> PathBuf {
 mod sample_tests {
     use super::*;
 
-    fn text_body_pass(ctx: &egui::Context, tb: &mut TextBlock, events: Vec<egui::Event>) {
-        let _ = ctx.run(
+    fn text_body_pass(root_ui: &mut egui::Ui, tb: &mut TextBlock, events: Vec<egui::Event>) {
+        let ctx = &root_ui.ctx().clone();
+        let _ = ctx.run_pass(
             egui::RawInput {
                 events,
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let _ = draw_text_body(ui, tb, 1);
                 });
             },

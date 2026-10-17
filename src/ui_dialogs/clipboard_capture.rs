@@ -253,6 +253,7 @@ impl App {
         let mut close = can_close && escape;
         let mut save = false;
         let mut window = egui::Window::new("クリップボードの画像を選んで保存")
+            .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::new("clipboard-capture-selection"))
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
             .default_width(720.0)
@@ -379,6 +380,10 @@ fn draw_selection_contents(
     ui.style_mut().spacing.scroll =
         super::non_overlapping_dialog_scroll_style(ui.style().spacing.scroll);
     egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
         .id_salt("clipboard-capture-cells")
         .auto_shrink([false, false])
         .max_height(height)
@@ -646,8 +651,9 @@ mod tests {
         let output = app.tmp.path().join("paste");
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 700.0))
-            .build_state(
-                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_capture_selection_dialog(ctx)
                 },
                 app,
@@ -677,8 +683,9 @@ mod tests {
         for route in ["button", "escape", "title"] {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(900.0, 700.0))
-                .build_state(
-                    |ctx, app: &mut crate::app::AppTestEnvForTest| {
+                .build_ui_state(
+                    |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                        let ctx = &root_ui.ctx().clone();
                         app.show_capture_selection_dialog(ctx)
                     },
                     ready_dialog(),
@@ -699,8 +706,9 @@ mod tests {
     fn clipboard_minimum_dialog_edit_save_reload_sets_next_dialog_initial_value() {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 700.0))
-            .build_state(
-                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_capture_selection_dialog(ctx)
                 },
                 ready_dialog(),
@@ -762,8 +770,9 @@ mod tests {
     fn clipboard_save_and_escape_in_same_frame_keeps_saving_modal() {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 700.0))
-            .build_state(
-                |ctx, app: &mut crate::app::AppTestEnvForTest| {
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = &root_ui.ctx().clone();
                     app.show_capture_selection_dialog(ctx)
                 },
                 ready_dialog(),

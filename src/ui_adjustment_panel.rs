@@ -213,7 +213,8 @@ mod adjust_scope_selector_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 72.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -223,7 +224,7 @@ mod adjust_scope_selector_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let mut measured = measured_in_ui.lock().unwrap();
                         measured.clear();
                         for max_chars in [7, 8] {
@@ -254,7 +255,8 @@ mod adjust_scope_selector_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 180.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -264,7 +266,7 @@ mod adjust_scope_selector_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         let mut measured = measured_in_ui.lock().unwrap();
                         measured.clear();
                         for label in [
@@ -1623,7 +1625,8 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 200.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -1631,7 +1634,7 @@ mod local_adjust_segmentation_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
                     let mut add_layer_dialog_open = false;
                     let mut select_layer: Option<usize> = None;
@@ -1672,7 +1675,8 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 90.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -1680,7 +1684,7 @@ mod local_adjust_segmentation_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let mut params = crate::colorize::ColorizeParams::default();
                     let mut slots = crate::colorize::ColorizePresetSlots {
                         slots: std::array::from_fn(|_| Some(params.clone())),
@@ -1698,7 +1702,8 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 92.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -1706,7 +1711,7 @@ mod local_adjust_segmentation_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     let mut params = crate::colorize::ColorizeParams::default();
                     params.palette = crate::colorize::ColorizePalette::Custom;
                     params.luminance_weight = 35;
@@ -1744,44 +1749,47 @@ mod local_adjust_segmentation_tests {
         let mut fonts_ready = false;
         let layers = std::sync::Arc::new(layers);
         let layers_for_render = std::sync::Arc::clone(&layers);
-        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut add_layer_dialog_open = false;
-                let mut select_layer: Option<usize> = None;
-                let mut set_enabled: Option<(usize, bool)> = None;
-                let mut update_layer: Option<(
-                    usize,
-                    crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
-                )> = None;
-                let mut move_layer: Option<(usize, usize)> = None;
-                let mut duplicate_layer: Option<usize> = None;
-                let mut delete_layer: Option<usize> = None;
-                let mut preview_flag = preview_to_selected_layer;
-                super::draw_local_adjust_layer_list(
-                    ui,
-                    260.0,
-                    &layers_for_render,
-                    selected_layer,
-                    (1920, 1080),
-                    None,
-                    &mut add_layer_dialog_open,
-                    &mut select_layer,
-                    &mut set_enabled,
-                    &mut update_layer,
-                    &mut move_layer,
-                    &mut duplicate_layer,
-                    &mut delete_layer,
-                    &mut preview_flag,
-                );
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    let mut add_layer_dialog_open = false;
+                    let mut select_layer: Option<usize> = None;
+                    let mut set_enabled: Option<(usize, bool)> = None;
+                    let mut update_layer: Option<(
+                        usize,
+                        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                    )> = None;
+                    let mut move_layer: Option<(usize, usize)> = None;
+                    let mut duplicate_layer: Option<usize> = None;
+                    let mut delete_layer: Option<usize> = None;
+                    let mut preview_flag = preview_to_selected_layer;
+                    super::draw_local_adjust_layer_list(
+                        ui,
+                        260.0,
+                        &layers_for_render,
+                        selected_layer,
+                        (1920, 1080),
+                        None,
+                        &mut add_layer_dialog_open,
+                        &mut select_layer,
+                        &mut set_enabled,
+                        &mut update_layer,
+                        &mut move_layer,
+                        &mut duplicate_layer,
+                        &mut delete_layer,
+                        &mut preview_flag,
+                    );
+                });
             });
-        });
 
         harness.run();
         harness.snapshot(name);
@@ -1896,7 +1904,8 @@ mod local_adjust_segmentation_tests {
         );
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 590.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -1904,7 +1913,7 @@ mod local_adjust_segmentation_tests {
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.set_min_width(300.0);
                     ui.set_max_width(300.0);
                     crate::local_adjust_effect_ui::draw_effect_params(
@@ -10822,7 +10831,8 @@ mod creative_lut_ui_tests {
         let creative_luts = crate::creative_lut::builtin_creative_lut_entries();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(380.0, 520.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -10832,7 +10842,7 @@ mod creative_lut_ui_tests {
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
-                    .show(ctx, |ui| {
+                    .show(root_ui, |ui| {
                         crate::os_theme::apply_dark_ui(ui);
                         ui.set_max_width(320.0);
                         ui.label("Creative LUT");
@@ -10852,7 +10862,7 @@ mod creative_lut_ui_tests {
             harness.ctx.options(|options| options.theme_preference),
             egui::ThemePreference::Light
         );
-        assert!(!harness.ctx.style().visuals.dark_mode);
+        assert!(!harness.ctx.global_style().visuals.dark_mode);
     }
 }
 
@@ -10934,10 +10944,12 @@ mod bookmark_title_edit_tests {
         enter_pressed: bool,
     ) -> (egui::Id, bool) {
         let mut output = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let (response, submit) =
-                draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
-            output = Some((response.id, submit));
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let (response, submit) =
+                    draw_bookmark_title_edit(ui, 42, title, request_focus, enter_pressed);
+                output = Some((response.id, submit));
+            })
         });
         output.expect("bookmark title editor response")
     }
@@ -10959,14 +10971,18 @@ mod bookmark_title_edit_tests {
         let ctx = egui::Context::default();
         let mut title = String::new();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+            })
+            .drop_without_applying_deltas();
 
         let mut editor_id = None;
-        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-        });
+        let _ = ctx
+            .run_pass(ime_commit_and_enter_input(), |ctx| {
+                editor_id = Some(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "\u{3042}");
         assert_eq!(ctx.memory(|memory| memory.focused()), editor_id);
@@ -10977,21 +10993,27 @@ mod bookmark_title_edit_tests {
         let ctx = egui::Context::default();
         let mut title = String::new();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(ime_commit_and_enter_input(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::Text("\u{7d9a}".to_owned())],
-                ..Default::default()
-            },
-            |ctx| {
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
                 let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-            },
-        );
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(ime_commit_and_enter_input(), |ctx| {
+                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![egui::Event::Text("\u{7d9a}".to_owned())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "\u{3042}\u{7d9a}");
     }
@@ -11002,25 +11024,31 @@ mod bookmark_title_edit_tests {
         let mut title = String::from("title");
         let mut request_focus = true;
         let mut submit_count = 0;
-        let _ = ctx.run(Default::default(), |ctx| {
-            let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::Enter)],
-                ..Default::default()
-            },
-            |ctx| {
-                if draw_editor(ctx, &mut title, &mut request_focus, true).1 {
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                let _ = draw_editor(ctx, &mut title, &mut request_focus, false);
+            })
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::Enter)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    if draw_editor(ctx, &mut title, &mut request_focus, true).1 {
+                        submit_count += 1;
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                if draw_editor(ctx, &mut title, &mut request_focus, false).1 {
                     submit_count += 1;
                 }
-            },
-        );
-        let _ = ctx.run(Default::default(), |ctx| {
-            if draw_editor(ctx, &mut title, &mut request_focus, false).1 {
-                submit_count += 1;
-            }
-        });
+            })
+            .drop_without_applying_deltas();
 
         assert_eq!(submit_count, 1);
     }
@@ -11031,45 +11059,56 @@ mod bookmark_title_edit_tests {
         let mut title = String::from("bookmark");
         let mut request_focus = true;
         let mut ids = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+            })
+            .drop_without_applying_deltas();
 
-        let _ = ctx.run(
-            egui::RawInput {
-                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                events: vec![key_event_with_modifiers(
-                    egui::Key::A,
-                    egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
-                )],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::Backspace)],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: std::iter::once(egui::Event::ModifiersChanged(
+                        egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    ))
+                    .chain(vec![key_event_with_modifiers(
+                        egui::Key::A,
+                        egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    )])
+                    .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                },
+            )
+            .drop_without_applying_deltas();
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::Backspace)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert!(title.is_empty());
         assert_eq!(ctx.memory(|memory| memory.focused()), ids.last().copied());
 
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
-                ..Default::default()
-            },
-            |ctx| {
-                ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events: vec![key_event(egui::Key::A), egui::Event::Text("a".to_owned())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ids.push(draw_editor(ctx, &mut title, &mut request_focus, false).0);
+                },
+            )
+            .drop_without_applying_deltas();
 
         assert_eq!(title, "a");
         assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
@@ -11081,27 +11120,31 @@ mod bookmark_title_edit_tests {
         let mut title = String::new();
         let mut request_focus = false;
         let mut editor_id = None;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for row_id in order {
-                    if *row_id == target {
-                        editor_id = Some(
-                            draw_bookmark_title_edit(
-                                ui,
-                                *row_id,
-                                &mut title,
-                                &mut request_focus,
-                                false,
-                            )
-                            .0
-                            .id,
-                        );
-                    } else {
-                        let _ = ui.button(format!("row-{row_id}"));
-                    }
-                }
-            });
-        });
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        for row_id in order {
+                            if *row_id == target {
+                                editor_id = Some(
+                                    draw_bookmark_title_edit(
+                                        ui,
+                                        *row_id,
+                                        &mut title,
+                                        &mut request_focus,
+                                        false,
+                                    )
+                                    .0
+                                    .id,
+                                );
+                            } else {
+                                let _ = ui.button(format!("row-{row_id}"));
+                            }
+                        }
+                    })
+                });
+            })
+            .drop_without_applying_deltas();
         editor_id.expect("target bookmark row")
     }
 
@@ -12474,7 +12517,7 @@ impl App {
             return;
         }
         if !self.ime_input_active(ctx)
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && self.keymap.consume_action(ctx, KeyAction::LaToolBucket)
         {
             self.set_local_adjust_mask_tool_from_shortcut(LocalAdjustMaskTool::Bucket);
@@ -14800,7 +14843,7 @@ impl App {
         }
         let mut open = self.local_adjust_add_layer_dialog_open;
         let mut add_requested = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14808,6 +14851,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("補正レイヤーを追加")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
@@ -14827,6 +14871,10 @@ impl App {
                 );
                     ui.separator();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(320.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -14899,7 +14947,7 @@ impl App {
         let mut open = self.local_adjust_change_mask_dialog_open;
         let mut keep_manual_override = self.local_adjust_change_mask_keep_manual_override;
         let mut selected_kind = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -14907,6 +14955,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("マスク種類変更")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(70.0, 54.0))
@@ -14927,6 +14976,10 @@ impl App {
                     );
                     ui.separator();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(320.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -14992,7 +15045,7 @@ impl App {
         }
         let mut open = self.local_adjust_effect_picker_dialog_open;
         let mut picked_effect = None;
-        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
                 1.0,
@@ -15000,6 +15053,7 @@ impl App {
             ));
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("加工内容を選択")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .frame(dialog_frame)
                 .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
@@ -15029,6 +15083,10 @@ impl App {
                     ui.separator();
                     let query = effect_query.trim();
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .max_height(440.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -15315,6 +15373,10 @@ impl App {
                                 ui.set_max_width(LOCAL_ADJUST_PANEL_W);
                                 ui.set_min_height(body_height);
                                 egui::ScrollArea::vertical()
+                                    .scroll_source(egui::scroll_area::ScrollSource {
+                                        drag: egui::scroll_area::DragScroll::Always,
+                                        ..Default::default()
+                                    })
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
@@ -15425,6 +15487,10 @@ impl App {
                         ui.set_min_height(body_height);
                         ui.set_max_height(body_height);
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .max_height(body_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
@@ -15724,6 +15790,10 @@ impl App {
         let mut save_title = None;
         let mut cancel_title_edit = false;
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .auto_shrink([false, false])
             .max_height(body_height - 32.0)
             .show(ui, |ui| {
@@ -16042,6 +16112,7 @@ impl App {
         let mut canceled = false;
         crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("このお気に入りの標準設定が削除されます")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .order(egui::Order::Debug)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .collapsible(false)
@@ -16633,7 +16704,7 @@ impl App {
                 // ScrollArea は親 UI の available_rect を上限にするため、body_rect と
                 // 同じ高さの親領域を明示確保してから置く。これでコンテンツが短い
                 // 場合もパネル下端近くまで暗背景 + 操作領域が伸びる。
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .max_height(body_height)
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, false])
@@ -17039,6 +17110,7 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("画像補正保存スロット名")
+            .drag_area(egui::WindowDrag::Anywhere)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))

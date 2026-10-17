@@ -550,14 +550,15 @@ impl App {
         true
     }
 
-    pub(super) fn render_everything_search_bar(&mut self, ctx: &egui::Context) {
+    pub(super) fn render_everything_search_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = &root_ui.ctx().clone();
         let enter = self.dialog_enter_pressed(ctx);
         let escape = self.dialog_escape_pressed(ctx);
         let mut send = false;
         let mut close = false;
         let mut back = false;
         let running = self.everything_search_progress_visible();
-        egui::TopBottomPanel::top("global_search_bar").show(ctx,|ui| {
+        egui::Panel::top("global_search_bar").show(root_ui,|ui| {
             ui.add_enabled_ui(!running,|ui| {
                 let controls = ui::draw_everything_controls(ui,&mut self.global_search.query,&mut self.global_search.focus_request);
                 self.global_search.has_focus = controls.has_focus;
