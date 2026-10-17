@@ -525,6 +525,53 @@ fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consum
 }
 
 #[test]
+fn close_return_empty_bookmark_poll_adopts_empty_live_grid() {
+    let mut env = app();
+    let target = BookmarkViewReturnTarget::Media(env.tmp.path().join("target.mp4"));
+    main_bookmarks(&mut env, target.clone());
+    active(&mut env, 94_006, target, None);
+    let ctx = egui::Context::default();
+    let viewport = register(&mut env, &ctx, 94_006);
+    let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    close_logic(&mut backend, &mut env, viewport);
+    env.scroll_offset_y = 420.0;
+    let generation = env.items_generation;
+    let tx = ready_read_model_with_rows(&mut env, vec![]);
+    ctx.run_ui(Default::default(), |ui| env.poll_bookmark_browser(ui.ctx()))
+        .drop_without_applying_deltas();
+    assert!(tx.send(Err("already consumed".into())).is_err());
+    assert_ne!(env.items_generation, generation, "all rows were removed");
+    assert!(env.bookmark_browser_rows.is_empty());
+    assert!(env.items.is_empty());
+    assert_eq!(env.selected, None);
+    assert_eq!(env.scroll_offset_y, 420.0);
+    assert!(env.take_pending_return_to_parent_nav().is_none());
+    let Some(BookmarkViewState::Restoring { grid }) = env.bookmark_view_state.as_ref() else {
+        panic!("the return consumer must adopt the live empty grid");
+    };
+    assert!(
+        grid.row_keys.is_empty(),
+        "deleted rows cannot return as saved keys"
+    );
+    assert_eq!(grid.selected_key, None);
+    assert_eq!(grid.opened_key, (0, 2));
+    assert_eq!(grid.scroll_offset_y, 420.0);
+    env.finish_page_identity_preparation_for_test();
+
+    // The unchanged-empty read model consumes Restoring without resurrecting rows.
+    let tx = ready_read_model_with_rows(&mut env, vec![]);
+    ctx.run_ui(Default::default(), |ui| env.poll_bookmark_browser(ui.ctx()))
+        .drop_without_applying_deltas();
+    assert!(tx.send(Err("already consumed".into())).is_err());
+    assert!(env.bookmark_view_state.is_none());
+    assert!(env.bookmark_browser_rows.is_empty());
+    assert!(env.items.is_empty());
+    assert_eq!(env.selected, None);
+    assert_eq!(env.scroll_offset_y, 420.0);
+    assert!(!env.pending_return_to_parent.is_pending());
+}
+
+#[test]
 fn close_return_bookmark_delete_receipt_preserves_live_main_position_before_consumer() {
     let mut env = app();
     let target = BookmarkViewReturnTarget::Media(env.tmp.path().join("target.mp4"));

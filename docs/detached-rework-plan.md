@@ -5709,3 +5709,13 @@ PNG更新・新ignore・製品build/launch・live・test-fullは行わず、未�
 実immediate子の通常wheel→Alt+wheel＋単クリックをroot復帰後に適用し、子由来の操作IDと診断、親入力不変を確認する。
 今回2件の補修に対する限定独立source確認（Sol / xhigh、読み取り専用）もACCEPT・追加指摘なし。
 実行と変異検証は段3台帳の「再確認の残件への対応（7cb0494f9後）」を正本とし、設計担当の最終受入とは区別する。
+
+#### 2026-10-17 段3・最終全件との再照合（3aa2d8eda後）
+
+A〜D独立レビューACCEPT後の設計担当の全件では、分類外が3名残った。
+resolver取消の既存テストはmain rowsなし・生成不能な保存keyというfixtureだったため、実在Media行を既存installerで採用する形へ補修した。
+Close帰還consumerのlive row keys採用は維持し、全行削除後の空read-model→帰還consumer→同内容refreshの回帰を追加した。
+製品の所有構造・終了寿命・consumerは変更していない。独立premise / source確認（Sol / xhigh）はACCEPT。
+live keysの再捕捉を省く変異で新回帰が失敗し、復元後に指定の限定確認を行った。
+HUDのWin32通知前提とmetadata testの既存同期競合候補は、製品退行の根拠と分けて設計担当のテスト判断待ちとする。
+詳細は段3台帳の分類第3版を正本とし、過去の「未分類0」や全件の分類記録は履歴として保持する。

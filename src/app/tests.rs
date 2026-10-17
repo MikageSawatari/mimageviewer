@@ -69374,15 +69374,34 @@ mod still_window_mode_key_tests {
         let request_id = crate::bookmark_browser::BookmarkOpenRequestId(507);
         let media = app.tmp.path().join("slow-media.mp4");
         let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(media.clone());
+        app.bookmark_browser_rows = vec![crate::bookmark_browser::BookmarkBrowserRow {
+            source: crate::bookmark_browser::BookmarkRowSource::Media {
+                id: 2,
+                path: media.clone(),
+                pts_secs: 3.0,
+                title: None,
+                is_audio: false,
+            },
+            item: GridItem::Video(media.clone()),
+            relative_page_provenance: None,
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 1,
+            missing: false,
+        }];
+        assert!(app.install_bookmark_view_rows());
+        app.finish_page_identity_preparation_for_test();
+        app.selected = Some(0);
         app.bookmark_open_request_seq = request_id.0;
-        app.items_are_bookmark_view = true;
         app.scroll_offset_y = 145.0;
-        let return_grid = BookmarkViewReturnGridState {
-            row_keys: vec![(2, 2)],
-            selected_key: Some((2, 2)),
-            opened_key: (2, 2),
-            scroll_offset_y: app.scroll_offset_y,
-        };
+        let return_grid = BookmarkViewReturnGridState::capture(
+            &app.bookmark_browser_rows,
+            app.selected,
+            app.bookmark_browser_rows[0].stable_key(),
+            app.scroll_offset_y,
+        );
+        assert_eq!(return_grid.row_keys, vec![(0, 2)]);
+        assert_eq!(return_grid.selected_key, Some((0, 2)));
         app.bookmark_view_state = Some(BookmarkViewState::Opening {
             target: target.clone(),
             grid: return_grid.clone(),
@@ -69470,6 +69489,8 @@ mod still_window_mode_key_tests {
             "late resolver completion must not resurrect the retired shell"
         );
 
+        // The surviving main grid can change selection before the retirement consumer.
+        app.selected = None;
         run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.active_detached_session.is_none());

@@ -2,7 +2,9 @@
 
 ## 状態（2026-10-17）
 
-**最新状態（7cb0494f9後の再確認）:** 残るCのP3・DのP2はコードで成立を確認し、既存owner内で補修した。新規2回帰は旧処理へのsource変異で各1件の指定assert失敗を確認し、復元後は成功。限定lib42件成功、両integration9件中8件成功・1件は既存PNG2枚の不一致（geometry全12ケース成功）。core check、全test targetコンパイル（23 executable）、fmtは成功。末尾の「再確認の残件への対応（7cb0494f9後）」を今回の正本とする。lib全件は再実行せず、元290失敗の分類第2版（補修180／PNG103／段4差7）を維持する。HEAD `7cb0494f9`、ブランチ`egui-036`のまま未コミット・未ステージで返す。以下は実装担当の内部確認で、設計担当の最終受入とは区別する。
+**最新状態（3aa2d8eda後、分類第3版）:** A〜D独立レビューACCEPT後に設計担当が実行した全件113失敗を照合した。PNG103・段4差7に加え、bookmark fixture移行漏れ1、既存HUDのWin32通知前提1、既存metadata testの同期競合候補1。bookmark fixtureを実在rowの採用へ補修し、空一覧採用回帰も追加した。復元後の関連596件（指定3件を含む）は全成功、全23 test executableのコンパイル・fmtも成功。HUDとmetadataは限定成功だけで解消扱いせず、既存テストの設計判断待ち2件を第3版に明示する。末尾の「最終ソース全件との照合」を今回の正本とする。製品コード・PNG・ignoreは変更せず、lib全件も再実行しない。HEAD `3aa2d8eda`、ブランチ`egui-036`のまま未コミット・未ステージで返す。以下は実装担当の内部確認で、設計担当の最終受入とは区別する。
+
+**再確認2件の補修時の報告（履歴、7cb0494f9後）:** 残るCのP3・DのP2はコードで成立を確認し、既存owner内で補修した。新規2回帰は旧処理へのsource変異で各1件の指定assert失敗を確認し、復元後は成功。限定lib42件成功、両integration9件中8件成功・1件は既存PNG2枚の不一致（geometry全12ケース成功）。core check、全test targetコンパイル（23 executable）、fmtは成功。末尾の「再確認の残件への対応（7cb0494f9後）」を今回の正本とする。lib全件は再実行せず、元290失敗の分類第2版（補修180／PNG103／段4差7）を維持する。HEAD `7cb0494f9`、ブランチ`egui-036`のまま未コミット・未ステージで返す。以下は実装担当の内部確認で、設計担当の最終受入とは区別する。
 
 **初回レビュー補修時の報告（履歴・分類第2版）:** 設計担当の段3コミット`1e55235f1`に対する独立レビューA〜Dの9指摘を補修し、変異による検出と指定の限定確認を完了した。末尾の「独立レビュー指摘への対応」を今回の正本とする。旧9件を再分類し、元の全件290失敗は補修成功180・PNG比較103・段4のlayout/挙動差7とした。lib全件は利用者指定により再実行していない。全test targetコンパイル（23 executable）・core/test-script check・fmtは成功。HEADとブランチを維持し、未コミット・未ステージで返す。これは実装担当の内部確認であり、設計担当の最終受入とは区別する。
 
@@ -1033,3 +1035,142 @@ nextest両コマンドの共通引数は`--no-tests fail --ignore-default-filter
 新規ignore・期待値の弱化・PNG baseline更新はない。今回の2指摘は補修済みで、設計書との食い違いはない。
 段4への7 layout / 挙動差、PNGの段4b比較・段5更新、警告の段5整理は従来どおり残る。
 A・Bや今回変更しないvendor / GPU / Close / gamepadの証拠は、設計担当の再確認ACCEPTと前節の有効な結果を再利用する。
+
+### 最終ソース全件との照合（3aa2d8eda後、分類第3版）
+
+設計担当が補修を`3aa2d8eda`へコミットし、A〜Dの独立レビュー4本がACCEPTとなった後、
+同じ最終ソースで`test-lib-full.ps1`を実行した。runは
+`target/test-lib-full/runs/20261017T061555884Z-f72ea765`。
+JUnitを再集計すると**総数13,493（skip59を含む）／実行13,434／成功13,321／失敗113**。
+これは設計担当が実行した全件であり、今回の実装担当はlib全件を再実行していない。
+
+分類第2版との照合では、PNG103件と段4のlayout / 挙動差7件が全て失敗名と一致した。
+PNG分類なのに成功した名前は0件。残る3件のうちbookmarkの1件は旧`resolved`にあり、
+HUDとmetadataの2件は旧290失敗の集合外だった。以下の判断・限定実行は**実装担当の内部確認**。
+
+#### 1. Bookmark resolver取消後のrow keys
+
+`detached_media_bookmark_resolve_cancel_preserves_target_until_exact_retirement`は、
+旧全件でも失敗していたが、`v46-postfull-contract-final`でPreparing mediaの終端捕捉等を補修した時点では成功していた。
+7cbのClose帰還修正は、consumerより前に変更ありread-modelが採用されたときのlive一覧キーを帰還snapshotへ反映する。
+その後の`review-final-lib`はこの既存テストを選択していなかったため、第2版が旧成功を無条件に引き継いだのは検証証拠の再利用不備だった。
+
+現在の失敗は**fixtureの段3移行漏れ**。mainの`bookmark_browser_rows`は空なのに、
+Opening snapshotには生成不能な`(2, 2)`を保存していた。`stable_key()`はMedia `(0, id)`とBook `(1, id)`のみを生成する。
+7cbのconsumerが現在の空keysを採ること自体は、帰還待ち中の全行削除でも必要な契約である。
+空のときだけ旧keysへ戻すguardやconsumerの巻戻しは行わない。
+
+`src/app/tests.rs`のfixtureを実在Media行id2の既存installer採用へ直し、既存hydration ownerの完了後にOpening gridをcaptureした。
+キャンセル後・consumer前のmain選択解除も明示し、target保持・late resolver拒否・exact owner退役・scroll / grid・一回消費のassertを維持した。
+新規`close_return_empty_bookmark_poll_adopts_empty_live_grid`は、実read-modelの全行削除→Terminal consumer→同内容空refreshを通し、
+空keys / 選択なし / opened keyとscroll保持 / Restoringの一回消費を検査する。
+独立premise確認と補修差分の限定source確認（`gpt-6.1-sol` / `xhigh`、読み取り専用）はACCEPT。
+製品consumer・所有構造・終了寿命は変更していない。
+
+#### 2. HUDのexternal raise
+
+`hud_geometry_ignores_nozorder_but_external_zorder_still_requests_raise`の対象ファイル
+`src/video/native_window_host/hud_window.rs`は、master `2d75d0c41`とHEAD `3aa2d8eda`で完全同一。
+テスト導入の`27fa289ee`（2026-10-15）から該当構造は同じで、1e→3aaにも対象HUD・event route・focus fake等の関連変更はない。
+実`CreateWindowExW`→直接`SetWindowPos`→`hud_wnd_proc`→`send_hud_raise`はegui / eframeやnative focus fakeを通らない。
+raiseは専用latest slotへ配送して直後にdrainされる。段3によるイベント消失を示す差分は確認できない。
+
+テスト外のWin32状態に依存する前提は、実`SetWindowPos`が`WM_WINDOWPOSCHANGING`を
+**`!SWP_NOZORDER`かつ`hwndInsertAfter`が0または-1**で届けること。
+テストは隠れたTOPMOST HUDを一つだけ作り、相対z-orderを事前に作らず、TOP / TOPMOSTへの操作にraise1件を期待している。
+この前提をテストは確立していない。既存`probe-hidden-hud-zorder.ps1`は対照的に、隠れたeditorをHUD前へ配置して順序を確認してから各操作を行う。
+
+直前全件`20261017T034945177Z-04c522be`では成功、今回全件では失敗し、今回の実装担当の初回限定実行では成功した。
+したがって**既存の実Win32状態に依存するテスト前提が原因候補**であり、段3退行の根拠はない。
+ただし失敗時の実通知fieldsは記録されておらず、通知なし・NOZORDER化・実HWNDへの正規化のどれかは未確定。
+利用者desktop上の特定の別topmost窓が原因、とまでは断定しない。
+
+製品修正やignoreは入れない。設計担当へ、実通知fieldsと相対順の観測、およびhandler/event routeの正負条件と
+隠れたsiblingを使う実Win32復旧検査をどう分けるか、テストの扱いを返す。probe・live・製品起動は実行していない。
+
+#### 3. Metadata transferとresume writerの待機
+
+`zip_save_retired_owner_precedes_metadata_preview_import_and_export`の
+`src/app/book_composition_editor/metadata_transfer_tests.rs`と`src/book_resume_db.rs`はmasterとHEADで完全同一。
+同名テストはmasterにもあり、`check_transfer` / `assert_resume_once` / writerの返信順序も同じである。
+
+**既存のテスト同期競合がsource上成立する。** `assert_resume_once`は`read_position_after`の返信を待つが、
+workerは`ReadPositionAfter`の返信send（`book_resume_db.rs:697`）の後でpendingを減算する（同:734）。
+warm snapshot経路もRecordの完了watermark公開（同:620）とpending減算の間に即座に返信できる（同:813〜821）。
+したがって、返信を受けたテストが先行してImport / Exportのreadinessを問うと、
+`rename_migration_writers_busy`→`BookResumeWriter::is_busy()`が正当にbusyを返し、WaitingForWritersが残り得る。
+返信の「cutoffまでの保存位置が読めた」は「writer全体がidle」の保証ではない。
+
+同じファイルのGeneric migrationテストは、まさにこの返信→pending減算の隙間をコメントし、
+resumeの全assert後に既存DropでFIFOをdrain / joinしてから次の受付を検査している（同:439〜442）。これはmasterにもある。
+段3は退役後resumeの配送をglobal persistへ整理しているが、masterも退役ownerで同じ`record_identity`をenqueueする。
+この同期競合を段3が新規導入した根拠はなく、製品の保存順序違反も確認していない。
+
+今回の1回のログにはentry / failureの組やbusy内訳がないため、その実測失敗がこの隙間だったとの断定は避ける。
+限定初回は成功。製品コード・テストの待機・assert・ignoreは変更せず、既存テスト課題として設計担当へ返す。
+補修候補は、保存一回のassert後に既存Genericテストと同じdrain / joinで他writerの完了条件を明示し、
+composition ticketの回収境界を独立に検査すること。sleep / retry / busy契約の緩和は不要である。
+
+#### 全件失敗分類の第3版
+
+正本は`target/egui037-stage3-review-classification-v3.json`。
+生成・重複欠落検査は`target/egui037-stage3-review3-classify.py`に保存する。
+第2版JSONと上の履歴は変更せず、第3版では**全件実行時の113失敗**と**補修後の限定証拠**を分ける。
+
+| 3aa2d8edaで観測した113失敗 | 件数 | 第3版での判断 |
+| --- | --- | --- |
+| PNG比較 | 103 | 第2版の全103名と一致。baseline更新は段5 |
+| 段4のlayout / 挙動差 | 7 | 第2版の全7名と一致。従来の段4表を維持 |
+| Bookmark resolver取消のfixture移行漏れ | 1 | 実在rowを採用するfixtureへ補修し、限定再実行で成功を確認 |
+| 既存HUDのWin32通知前提 | 1 | masterと同じ経路。失敗時通知未記録のため正確な環境要因は未確定、設計担当のテスト判断待ち |
+| 既存metadata testの同期競合候補 | 1 | masterと同じ返信→pending減算の隙間が成立。1回の実測内訳は未記録、設計担当のテスト判断待ち |
+| 合計 | **113** | 全件JUnitの失敗名を重複・欠落なく覆う |
+
+第2版の元290名については、他の`resolved`179名が今回の全件で成功していることを再確認し、
+残るbookmarkの1名には今回の補修後の限定成功を割り当てる。
+これにより元290名の追跡は補修180／PNG103／段4差7のまま、追加の既存テスト課題2名を`pending`として区別する。
+**第3版の追跡全体は292名、pending2は既存テストの設計判断待ちであり、解消済みと扱わない。**
+今回の限定実行でHUDやmetadataが成功しても、全件で起きた失敗が解消した証明にはしない。
+製品の段3契約を変える修正・ignore・assert弱化・PNG更新は行わない。
+
+#### 第3版の限定再実行・変異（実装担当の内部確認）
+
+Cargoは従来と同じoffline・直列、`CARGO_BUILD_JOBS=1`・`MSBUILDDISABLENODEREUSE=1`。
+live・製品build/launch・`test-full.ps1`・lib全件は実行していない。今回の恒久Rust変更はテスト2ファイルだけで、製品バイナリは作らない。
+各command / exit / 秒は`target/egui037-stage3-<label>.json`、選択件数と本文は同名`-tests.json` / `-junit.xml`を参照する。
+
+| 対象 | 初回3件filter（未補修3aa） | 復元後の関連filter |
+| --- | --- | --- |
+| `detached_media_bookmark_resolve_cancel_preserves_target_until_exact_retirement` | 1選択・1失敗。空rows対生成不能な保存keyの不一致を再現 | 1選択・1成功。実在行fixtureへ補修 |
+| `hud_geometry_ignores_nozorder_but_external_zorder_still_requests_raise` | 1選択・1成功 | 1選択・1成功。未補修の既存テスト判断待ちを維持 |
+| `zip_save_retired_owner_precedes_metadata_preview_import_and_export` | 1選択・1成功 | 1選択・1成功。未補修の既存同期競合候補を維持 |
+| 新規`close_return_empty_bookmark_poll_adopts_empty_live_grid` | 補修後の2件filterで1選択・1成功 | 1選択・1成功 |
+
+source変異`review3-mut-stale-keys`は、`close_return.rs`のconsumerから現在のrow keysの再捕捉だけを省き、
+7cbより前と同じ保存keysの保持へ戻したもの。新規空一覧回帰を1件選択し、
+`deleted rows cannot return as saved keys`のassertで1件失敗（exit100 / 57.48秒）した。
+コンパイル・起動失敗ではなく、空採用後に古い30行のキーが復活する契約違反を検出している。
+`finally`で元のbyte列へ復元してから、以下の最終確認を実行した。
+
+```powershell
+$filter = 'test(close_return) | test(bookmark_return) | test(unchanged_bookmark_refresh) | test(still_window_mode_key_tests) | test(video::native_window_host::hud_window::tests) | test(app::book_composition_editor::metadata_transfer_tests) | test(book_resume_db::tests)'
+cargo nextest run -p mimageviewer --lib -E $filter --no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --offline
+```
+
+最終関連filterの内訳は、Close帰還16、bookmark return5、同内容refresh1、still-window-mode549、
+HUD2、metadata-transfer5、resume DB18で、合計596件すべて成功（重複なし・skipなし）。
+
+| label | コマンド | 結果 | exit / 秒 |
+| --- | --- | --- | --- |
+| `review3-initial-three` | `cargo nextest run -p mimageviewer --lib -E '<指定3件のOR>'`＋従来共通引数 | 3選択・2成功・1失敗（bookmark） | 100 / 2.88 |
+| `review3-bookmark-green` | `cargo nextest run -p mimageviewer --lib -E 'test(detached_media_bookmark_resolve_cancel_preserves_target_until_exact_retirement) \| test(close_return_empty_bookmark_poll_adopts_empty_live_grid)'`＋従来共通引数 | 2選択・2成功 | 0 / 280.12 |
+| `review3-mut-stale-keys` | `cargo nextest run -p mimageviewer --lib -E 'test(close_return_empty_bookmark_poll_adopts_empty_live_grid)'`＋従来共通引数 | 1選択・指定assertで1失敗（変異検出） | 100 / 57.48 |
+| `review3-final-related` | 上記の`cargo nextest run` | 596選択・596成功 | 0 / 76.97 |
+| `review3-final-tests-no-run` | `cargo test -p mimageviewer --tests --no-run --offline` | 23 executableコンパイル、実行なし | 0 / 81.85 |
+| `review3-final-fmt` | `cargo fmt --check` | 成功 | 0 / 13.72 |
+| `review3-final-diff` | `git diff --check` | 成功 | 0 / 0.08 |
+| `review3-final-classification` | `python target/egui037-stage3-review3-classify.py` | 113失敗の完全被覆・追跡292名の重複なし・179名の全件成功／1名の補修後成功・master同一性を検証し第3版生成 | 0 / 0.21 |
+
+前節の第2版の段4表・全件分類は過去の記録として保持し、上記を更新後の第3版とする。
+HUDは失敗時Win32通知の観測とテストの前提、metadataはactorのidleまで待つ検査の整理を設計担当へ返す。
+今回の修正で新しい設計契約や製品の操作変更はない。
