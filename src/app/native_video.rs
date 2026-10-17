@@ -6217,7 +6217,7 @@ impl App {
                 if let Some(target_secs) = target_secs
                     && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
                 {
-                    player.seek_with_play_state(target_secs, true);
+                    player.seek_with_play_state(target_secs, true, crate::video::SeekOrigin::User);
                     self.mark_native_video_hud_activity(ctx);
                     self.apply_loop_mode_to_player(fs_idx);
                 }
@@ -7020,7 +7020,7 @@ impl App {
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
         {
-            player.seek(target_secs);
+            player.seek(target_secs, crate::video::SeekOrigin::User);
             self.mark_native_video_hud_activity(ctx);
             true
         } else {
@@ -7085,7 +7085,7 @@ impl App {
                     ],
                 );
             }
-            player.seek(target_secs);
+            player.seek(target_secs, crate::video::SeekOrigin::User);
             player.set_native_tile_overlay(None);
             true
         } else {
@@ -7115,7 +7115,7 @@ impl App {
             // 旧コードは `if !is_playing() { toggle_play() }` で「念のため再生」を
             // 意図していたが、intent ベースの toggle_play (= 2026-05 修正) では
             // `intent_playing()=true` を見て Pause に反転していたバグ。
-            player.seek(0.0);
+            player.seek(0.0, crate::video::SeekOrigin::User);
             true
         } else {
             false
@@ -7417,7 +7417,12 @@ impl App {
             }
             crate::settings::BoundaryDecision::Loop { seek_to } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.seek(seek_to);
+                    player.seek(
+                        seek_to,
+                        crate::video::SeekOrigin::Internal(
+                            crate::video::InternalContinuation::Loop,
+                        ),
+                    );
                     // loop_target は同区間の開始 (= seek_to) で維持
                     player.set_loop_target_secs(seek_to);
                 }
@@ -12702,7 +12707,7 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
                     // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
-                    player.seek(0.0);
+                    player.seek(0.0, crate::video::SeekOrigin::User);
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
@@ -13392,7 +13397,7 @@ impl App {
         match target {
             Some(marker) => {
                 if let Some(player) = self.fs_video_player(fs_idx) {
-                    player.seek(marker.pts);
+                    player.seek(marker.pts, crate::video::SeekOrigin::User);
                 }
                 // CH/BM ループ中ならマーカージャンプ後に loop_target を更新
                 self.apply_loop_mode_to_player(fs_idx);
@@ -13429,7 +13434,7 @@ impl App {
                 // J キーで前のマーカーが見つからない (= 最初のマーカー手前または空) かつ
                 // 既に先頭に居なければ動画先頭へ seek。
                 if let Some(player) = self.fs_video_player(fs_idx) {
-                    player.seek(0.0);
+                    player.seek(0.0, crate::video::SeekOrigin::User);
                 }
                 self.apply_loop_mode_to_player(fs_idx);
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
@@ -14438,7 +14443,10 @@ impl App {
             player.set_media_visual_mode(music_core::MediaVisualMode::Video);
             let pos = player.position().max(0.0);
             let _ = player.take_native_output();
-            player.seek(pos);
+            player.seek(
+                pos,
+                crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Transport),
+            );
             if let Some(config) = config {
                 match player.attach_native_output_from_config(config) {
                     Ok(()) => {
@@ -14788,7 +14796,9 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn native_video_seek_relative_with_hint(&mut self, fs_idx: usize, delta_secs: f64) {
         let outcome = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.seek_relative(delta_secs),
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.seek_relative(delta_secs, crate::video::SeekOrigin::User)
+            }
             _ => return,
         };
         let hint = match outcome {

@@ -566,6 +566,11 @@ sidecarの全file無制限read、EXIF全展開は新経路へ持ち込まない�
 - 推奨はpause／seek／buffering／同じ曲のloop／F12移送／最小化では保持。
   EOF後の連続再生は次mediaの採用で置換し、Remoteの移行途中のstop／cancelによる空表示を許す。
   Localの最終停止はclear、RemoteのEOF／最終停止Pauseは保持。
+  Local最終EOF後のSpace、および再生を強制するユーザーseek (W／シークバー／←→／マーカー移動) は
+  UserPlayの実Playing成功で同じ曲を再公開する。再生中のseekと同曲の内部Loop巻戻しは新startを作らない。
+  連続再生の候補確認中は最終EOFではない。playerのcancel／errorはreconcile、単体再生の最終EOF
+  (連続進行しないタイルを含む) はAppのpoll末尾、連続再生の次候補なしは既存navigationの結果確定でclearする。
+  Collectionの同source再利用も保持し、最終結果は現在のplayer／seek世代／EOF／metadata ownerに一致させる。
   sourceの明示refresh／pin更新／metadata変更は同じmediaでも新revision。
   定期file pollやframeごとのbase64生成をしない。
 - ownerはtypedな `Empty` / `Media { identity, revision, text, artwork: Pending|Absent|Ready }` を

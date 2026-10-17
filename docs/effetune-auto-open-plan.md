@@ -60,14 +60,17 @@
   `PlaybackStart` (None / AwaitingSuccess{id, origin} / SuccessReady{id, origin} / Established{id, origin})
   を置く案とする。AppやNormalizeScanStateに自動表示用pending／再開判定boolを分散しない。
   originはNewSource／UserPlay／ContinuousAdvance。新規autoplay open、ユーザーのpause・EOF後のplay、
-  別sourceへの連続進行でのみ新しいstartを作る。paused openは成功待ちを作らず、後のUserPlayで作る。
+  別sourceへの連続進行でのみ新しいstartを作る。EOF後のplayには、再生を強制するユーザーseek
+  (W／シークバー／←→／マーカー移動) も含む。paused openは成功待ちを作らず、後のUserPlayで作る。
 - 起動・キー・HUD・cached player再利用・EOF入口でtransport要求に**明示的な由来**を渡す。
   一般の `set_playing(true)` をUserPlayとみなす既定／fallbackは作らず、同型call siteを全て分類する。
   ユーザーplayをnormalize scanへ委譲する前にも同じstartを登録し、scan後の再開はそのstartを継続する。
   実際の表示処理は入口で呼ばない。ユーザーpause／close／source置換は未消費のstartを終了／破棄する。
 - normalizeのpauseと全復帰経路 (仮測定、完了、失敗、取消し、supersede、worker開始失敗、
   deferred scan不開始) は **InternalContinuation::Normalize** として既存startを保持する。
-  seek、DSP取得、音声トラック切替、loopも内部継続として扱う。内部pauseはユーザーpauseに読み替えない。
+  通常再生中のseek、内部seek、DSP取得、音声トラック切替、loopも内部継続として扱う。
+  ユーザーseekはEOFまたは再生意図なしの入口で、DSP取得・normalizeへ委譲する前にUserPlayを登録し、
+  最終的な新startの要否はactorの既存ガードで決める。内部pauseはユーザーpauseに読み替えない。
   初回playがscan待ちならAwaitingSuccessが維持され、初めてPlayingになったときだけ成功を生成する。
   既に成功済みの継続再生を測定した場合はEstablishedのままなので、復帰しても成功を再生成しない。
 - `SuccessReady` はpollで取り出すと**適格性に関係なくEstablishedへ遷移**する。
@@ -80,6 +83,44 @@
   成功→抑止往復→pollの場合も棄却する。最小化→復元、Remote取得→drain完了もrevisionが進むため含む。
   候補条件はopen要求時でなく再生成功時に採取する。成功時にblockedなら復帰後もその事実を棄却する。
   「OFFで動画成功→ONへ変更→同じ再生中にnormalize」は成功済みstartの内部継続なので発火しない。
+
+### EOF後のユーザーseek入口の分類（2026-10-17）
+
+ClaudeCodeが試作ビルドの隔離data-dirで音楽EOF→Wの再生と曲名未復帰を観測した。
+masterの実機再現は未確認。同じコード経路でUserPlay登録が欠け、連続再生では候補worker待ちの
+EOFも最終EOFとしてclearしていた。登録と最終EOF確定を既存のowner境界へ揃える。
+`seek` / `seek_relative` / `seek_with_play_state` は `SeekOrigin` 必須とし、由来の既定値を設けない。
+新pending・再公開専用状態・retryは追加しない。再生のモーダル化は通常操作を止めるため採らず、
+既存actorのstartとnavigationの結果確定を使う（設計の簡素化）。
+
+| 呼び出し元（同型入口を含む全製品call site） | API／分類 |
+| --- | --- |
+| `app.rs` ブックマークopen位置適用 | `seek` User。新規openの未確定startはactorが重複登録を防ぐ |
+| `app.rs` cached videoのresume無視で先頭へ戻す | `seek` Internal Transport。open側がNewSource／ContinuousAdvanceを別途登録 |
+| `app.rs` 動画連続EOFの同曲、動画音声モードの同曲／source-swap不成立、音楽連続EOFの同曲 | `seek` Internal Loop（4箇所）。続く `set_playing_internal(Loop)` も継続 |
+| `app.rs` 音楽ブックマーク区間の自動巻戻し | `seek` Internal Loop |
+| `collection_navigation.rs` 同sourceへのEOF着地 | `seek` Internal Loop。新しいopenをせず既存playerを再利用 |
+| `native_video.rs` seek stripの確定 | `seek_with_play_state(..., true)` User |
+| `native_video.rs` HUD seek、タイル選択、頭出しcommand | `seek` User（各1箇所） |
+| `native_video.rs` W hotkey、J/Kのマーカー／前マーカー無しで先頭へ移動 | `seek` User（3箇所） |
+| `native_video.rs` CH/BM区間境界の自動巻戻し | `seek` Internal Loop |
+| `native_video.rs` 音声モードから映像へ戻す際の同位置再提示 | `seek` Internal Transport |
+| `native_video.rs` 相対seek＋境界通知 | `seek_relative` User。実seekしないAtStart／AtEndでは登録しない |
+| `gamepad_input.rs` マーカーピッカー、非Windows相対seek | `seek` / `seek_relative` User。Windows相対seekは上記handler |
+| `ui_fullscreen.rs` ←→と段階別seek（6箇所）、W、J/Kのマーカー／先頭移動（3箇所） | `seek_relative` / `seek` User |
+| `ui_music_panels.rs` `music_seek_to` | `seek` User。HUD・timeline・bookmark・←→・`music_seek_start`（W）・command poleが合流。Wの先行内部Playを撤去 |
+| `test_script` | `run_action`等の既存KeyAction／handlerに合流するユーザー入力。独立したseek由来を作らない |
+| `VideoPlayer::select_audio_track` | `seek_with_play_state` Internal AudioTrack。EOF中は選択をdeferしseekしない |
+| `VideoPlayer` DSP開始失敗、metadata後の取得不開始、旧取得完了、Ready、timeout／reset失敗 | `seek_with_play_state(..., false)` Internal Dsp（5箇所）。後続の再生もDsp継続 |
+| `VideoPlayer::seek_paused` | 再生しない精密seek。startを破棄。現在の直接callerはunit testのみ |
+| `VideoPlayer::step_frame` | キー／HUDのユーザー操作だが必ずpause。内部のpaused/frame-step seek、startは破棄 |
+| `seek_for_remote_streaming` | Remote専用の世代1対1の内部seek。Local UserPlayを登録しない。現在の直接callerはRemote世代回帰testのみ |
+| `VideoPlayer` pending resume、engineのloop／EOF replay／open resume | 公開seek APIを経由しない内部遷移。open／toggle側のstartを保持 |
+| `video/mod.rs`・`video/audio.rs` の既存seek回帰test | 明示User（paused／Remote専用testは各専用API）。製品call siteへのfallbackなし |
+
+真のユーザーpause後はSpace同様に新UserPlay。autoplay準備中（実Playing前／intent=true）のseekは
+初回startを保持し、既存AwaitingをDSP／normalizeへ委譲しても成功は一度だけ消費する。
+連続再生の同source巻戻しはLoopのままで自動表示の判定機会を増やさない。
 
 ## 適格性・非同期表示の境界
 

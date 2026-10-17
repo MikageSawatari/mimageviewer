@@ -767,7 +767,7 @@ impl App {
     /// を再計算するため `apply_music_loop_mode` を必ず通す (旧区間の target 残留を防ぐ、Codex P2)。
     pub(crate) fn music_seek_to(&mut self, fs_idx: usize, secs: f64) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.seek(secs.max(0.0));
+            player.seek(secs.max(0.0), crate::video::SeekOrigin::User);
         }
         self.apply_music_loop_mode(fs_idx);
     }
@@ -790,12 +790,9 @@ impl App {
     }
 
     /// 頭出し (先頭 0.0 へ seek + 即再生)。下 HUD の 頭出しボタンと W キー (VideoSeekStart) の
-    /// 共通実体。動画の rewind (= seek(0.0) + play) の音声版で、明示 `set_playing(true)` で
-    /// 一時停止中でも頭から再生を開始する (seek 自体の autoplay intent に依存しない)。
+    /// 共通実体。ユーザー seek 自体が再生開始を要求する。先に内部 Play を送ると
+    /// EOF が Seeking へ進んでしまい、UserPlay の登録境界を失うため送らない。
     pub(crate) fn music_seek_start(&mut self, fs_idx: usize) {
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_playing(true);
-        }
         self.music_seek_to(fs_idx, 0.0);
     }
 

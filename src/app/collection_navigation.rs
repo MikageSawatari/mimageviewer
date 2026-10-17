@@ -3711,7 +3711,10 @@ impl App {
             if let Some(fs_idx) = self.fullscreen_idx
                 && let Some(super::FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
-                player.seek(0.0);
+                player.seek(
+                    0.0,
+                    crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
+                );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
@@ -4425,12 +4428,29 @@ impl App {
                 let _ = native_toast;
                 self.release_fs_nav_lock();
             }
-            CollectionNavigationAction::VideoContinuousEof { .. }
-            | CollectionNavigationAction::MusicContinuousEof { .. } => {
+            CollectionNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+                ..
+            }
+            | CollectionNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+                ..
+            } => {
+                #[cfg(windows)]
+                self.finish_local_now_playing_eof(*fs_idx, *seek_serial);
+                #[cfg(not(windows))]
+                let _ = (fs_idx, seek_serial);
                 self.show_feedback_toast("コレクション末尾です".into());
             }
             #[cfg(windows)]
-            CollectionNavigationAction::VideoAudioModeContinuousEof { .. } => {
+            CollectionNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+                ..
+            } => {
+                self.finish_local_now_playing_eof(*fs_idx, *seek_serial);
                 self.show_feedback_toast("コレクション末尾です".into());
             }
         }
@@ -8420,6 +8440,113 @@ mod tests {
         assert_ne!(view.collection_navigation_sequence(), initial_sequence);
         assert!(view.take_collection_navigation_retired_fs_lock());
         assert!(!view.take_collection_navigation_retired_fs_lock());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn now_playing_collection_same_source_eof_reuses_start_and_final_tail_clears() {
+        use crate::effetune::NowPlayingOwner;
+        use crate::video::{PlaybackStartOrigin, VideoContinuousMode, VideoPlayer};
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("single.mp3");
+        std::fs::write(&path, b"identity-only fixture").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("single.db"));
+        let created = recv(client.create_collection("single".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &path,
+                            CollectionResolvedKind::Audio,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.fullscreen_idx = Some(0);
+        app.video_continuous_mode = VideoContinuousMode::ContinuousLoop;
+        let player = VideoPlayer::local_ready_disconnected_for_test(path.clone());
+        player.bind_playback_viewer_context(app.projected_viewer_context_id().serial());
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let identity = player.media_identity();
+        let success = player.take_playback_success().unwrap();
+        player.mark_eof_for_test(30.0);
+        let serial = player.current_seek_serial();
+        app.fs_cache.insert(
+            0,
+            super::super::FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        let revision = app.effetune.now_playing_snapshot_for_test().revision;
+        let mut request = manual_navigation_request(&mut app, 0);
+        request.action = CollectionNavigationAction::MusicContinuousEof {
+            fs_idx: 0,
+            seek_serial: serial,
+            wraps: true,
+        };
+        // handle_music_continuous_eof claims this generation before enqueueing navigation.
+        app.video_continuous_last_eof = Some((0, serial));
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Audio);
+        assert!(app.collection_navigation_exact_target_is_current(&request, &prepared, &target));
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        app.commit_collection_navigation(
+            &egui::Context::default(),
+            request,
+            client.subscribe().unwrap(),
+            prepared,
+            CollectionNavigationPreflightReady {
+                owner: crate::pdf_loader::LeasedEpubPath::try_new(path).unwrap(),
+                target,
+                payload: CollectionNavigationPreflightPayload::Media,
+                rejected: vec![],
+            },
+        );
+        let Some(super::super::FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) else {
+            panic!()
+        };
+        assert_eq!(player.current_seek_serial(), serial + 1);
+        player.complete_seek_for_test(0.0);
+        assert!(player.take_playback_success().is_none());
+        app.publish_mounted_local_now_playing(&[]);
+        assert_eq!(
+            app.effetune.now_playing_snapshot_for_test().revision,
+            revision
+        );
+        let Some(super::super::FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) else {
+            panic!()
+        };
+        player.mark_eof_for_test(30.0);
+        let serial = player.current_seek_serial();
+        app.finish_collection_navigation_without_target(
+            &egui::Context::default(),
+            &CollectionNavigationAction::MusicContinuousEof {
+                fs_idx: 0,
+                seek_serial: serial,
+                wraps: false,
+            },
+        );
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]

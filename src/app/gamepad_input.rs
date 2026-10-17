@@ -3358,7 +3358,7 @@ impl App {
         self.clear_native_video_picker_overlay(ctx);
         self.gamepad_state.require_directional_neutral();
         if let Some(player) = self.fs_video_player(fs_idx) {
-            player.seek(marker.pts);
+            player.seek(marker.pts, crate::video::SeekOrigin::User);
         }
         #[cfg(windows)]
         {
@@ -6462,7 +6462,8 @@ impl App {
                         if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
                             self.fs_cache.get(&fs_idx)
                         {
-                            let _ = player.seek_relative(delta_secs);
+                            let _ =
+                                player.seek_relative(delta_secs, crate::video::SeekOrigin::User);
                         }
                     }
                 }
