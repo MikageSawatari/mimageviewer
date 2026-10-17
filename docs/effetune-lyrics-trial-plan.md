@@ -1,6 +1,6 @@
 # 音響調整の歌詞連携 試作計画 (EffeTune Mixwright Lyrics)
 
-状態: **設計初版。独立設計レビュー前、実装未着手**。2026-10-17。
+状態: **第 2 版。第 1 回独立設計レビュー (REJECT、§10) の指摘を反映、再レビュー待ち。実装未着手**。2026-10-17。
 目的は製品化ではなく、**作者 (Frieve-A) へ相談する前に、ホストから歌詞と再生位置を渡す方式が
 実際に噛み合うかを、動く試作で確かめること**。試作は配布しない。
 Coordinator は ClaudeCode。実装は Codex (mIV 側・Mixwright 側とも)。
@@ -57,10 +57,15 @@ Coordinator は ClaudeCode。実装は Codex (mIV 側・Mixwright 側とも)。
 - 処理後のチャンクは、プラグインなどの合計遅延を引いた聞こえる位置
   `audible_pts_secs` を持つ (`audio.rs:1586` `audible_pts_after_latency`, `:764` `ProcessedChunk`)。
 - 出力コールバック `fill_output` がチャンクを取り出すたびに、`AvClock::set_audio_pts` で再生時計を合わせる
-  (`audio.rs:3980`, `src/video/clock.rs:441`)。`AvClock::now_secs()` は atomics だけで読め、
-  一時停止中は止まり、シーク中は移動先を返す (`clock.rs:611-630`)。`Arc<AvClock>` は複数のスレッドで共有される。
-  **これは映像と音声を合わせるのに使っている時計そのもの**。ただし WASAPI のバッファと
-  デバイスの遅延は引いていない (cpal の `OutputCallbackInfo` は使っていない、`audio.rs:1768`)。
+  (`audio.rs:3980`, `src/video/clock.rs:441`)。`AvClock::now_secs()` は一時停止中は止まり、
+  シーク中は移動先を返す (`clock.rs:611-630`)。内部の MasterClock は短い Mutex を取る
+  (`src/video/engine/clock.rs:185`)。`Arc<AvClock>` は複数のスレッドで共有される。
+  **これは映像を合わせるための表示用の時計**で、聞こえているサンプルの位置そのものではない。
+  シーク先の override、外挿、wall-rate cap、monotonic guard を含む。例えば速度変更の直後は、
+  処理済みのチャンクが旧速度のまま残る一方で cap は新速度を使うので、可聴 PTS と差が残る可能性が
+  コードから読み取れる (実機では未確認)。可聴 PTS と時計の差は既存の診断値
+  `audio_audible_pts_bits` / `audio_lead_ms_bits` に出る (`audio.rs:3999-4011`)。
+  また WASAPI のバッファとデバイスの遅延は引いていない (cpal の `OutputCallbackInfo` は使っていない、`audio.rs:1768`)。
 - 処理はこの時計より先に進む。処理済みキューの目標は 0.10 秒で、1 チャンク分を足して最大 0.15 秒ほど
   (`audio.rs:1995`, `:3048`)。これにデバイス側のバッファが加わる。
 - **メディアの位置はブリッジに渡っていない**。共有メモリのリングは PCM だけを運ぶ (`src/video/dsp/bridge.rs:58-78`)。
@@ -95,10 +100,13 @@ mIV が `AvClock` の位置・再生中かどうか・速度に、送った時�
   `position + (now − hostTime) × rate` を計算して返す。telemetry は 60 Hz で読まれる
   (`ui-shim/vst-audio-manager.js:981`)。JS は受け取った時点からの `performance.now()` の差で
   フレームごとに補間する。プロセス間の時計の対応を JS に持ち込まない。
-- 合うもの: 映像と同じ時計なので、**動画では映像と歌詞が同じずれ方になる**。プラグインの遅延は
-  `audible_pts_secs` で引き済みなので、プラグイン側で自分の遅延を**引き直してはいけない**。
-- ずれるもの: デバイス側のバッファ分 (共有モードで通常は数十 ms、Bluetooth では百数十 ms 以上と言われる。
-  mIV では未計測) だけ歌詞が早く出る。映像も同じだけ早い。Visualizer の Offset で手動補正できる。
+- **「映像の時計に追従すること」と「実際の音に一致すること」は別の性質**として扱う。
+  - 映像の時計への追従: 映像と同じ時計なので、動画では映像と歌詞が同じずれ方になる。
+    プラグインの遅延は `audible_pts_secs` で引き済み (速度込み) なので、プラグイン側で自分の遅延を**引き直してはいけない**。
+  - 実際の音とのずれは、少なくとも次の 2 つの和になる。
+    (1) 時計と可聴 PTS の差 (速度変更・遅延の変化・シーク・DSP の引き継ぎ・EOF やループの直後に出得る。§2)。
+    (2) デバイス側のバッファ (共有モードで通常は数十 ms、Bluetooth では百数十 ms 以上と言われる。mIV では未計測)。
+    (2) は映像も同じだけ早い。どちらも試作で測って切り分ける (§6.3)。Visualizer の Offset で手動補正できる。
 - Visualizer のグラフ (スペクトルやメーター) は処理した時点の音で描かれる見込み
   (プラグインの処理中に解析し telemetry で渡す作り)。その場合、**歌詞はグラフより 0.1〜0.15 秒 + デバイス分だけ遅れて見える**。音に対しては歌詞のほうが正しい。
 - 一時停止・シーク・速度変更・曲の切り替えは、すべて時計の状態の変化として 1 か所で拾える (§4.3)。
@@ -134,9 +142,25 @@ Now Playing の受信からの処理量で位置を推定する。シーク・�
 **試作は方式 A で作る**。音声経路を触らず、映像と同じ時計に揃えられる。
 状態の組み合わせ (一時停止・シーク・速度・曲の切り替え・Remote) を「時計を読む 1 か所」に集められる
 (CLAUDE.md「設計の簡素化」)。方式 B と比べて作者側の変更も小さい。
-確認では、ずれの実測 (§6.3 の Offset 合わせ) で、方式 A のずれが許容範囲かを見る。
+確認では、記録による時計の誤差の測定 (§6.1 の D 記録) と、利用者の総合的な見え方 (§6.3) を分けて、
+方式 A のずれが許容範囲かを見る。
 
 ## 4. 試作の設計
+
+### 4.0 曲の世代で、歌詞と位置を同じ曲に結び付ける
+
+曲情報と位置は別の通知で届くので、受け取る側で組み合わせを確かめないと、
+**前の曲の歌詞を新しい曲の位置で描く**ことが起こり得る。既存の C++ の mailbox は、notify の実行中に届いた
+最新版を保留し、実行が終わってから配送する (`crates/vst3-host/include/now_playing.h:187-216`)。
+曲情報と位置を別々の mailbox に入れると、曲 A の曲情報を notify している間に届いた曲 B の位置が、
+曲 B の曲情報より先にプラグインへ届く。送る前に識別子を照合するだけでは防げない。
+
+- **曲の世代 `mediaGeneration` (u64)** を Now Playing の所有者が持つ。メディアの採用 (Local / Remote)・
+  clear のたびに 1 つ進める。A→B→A も毎回別の世代になる。
+- 既存の snapshot の `revision` (画像の完成でも進む) とは別物。歌詞や画像が後から届いても世代は変わらない。
+- 曲情報と位置の**両方の通知に世代を載せる**。プラグインは、最新の曲情報と最新の位置の世代が一致し、
+  かつ位置が `available=1` のときだけ歌詞を描く。一致しない間は歌詞を描かない (Lyrics 項目は空)。
+- これにより C++ の mailbox は今の 1 件保留の形のまま 2 つ並べてよく、配送の順序を揃える仕組みは足さない。
 
 ### 4.1 歌詞の本文と曲の長さ (Now Playing の拡張)
 
@@ -144,22 +168,35 @@ Now Playing の受信からの処理量で位置を推定する。シーク・�
 
 | 属性 | VST3 型 | 内容 |
 | --- | --- | --- |
-| `lyrics` | `setString` | LRC 形式または時刻なしの歌詞本文。試作の上限は 262,144 UTF-16 単位 (終端を除く) |
-| `durationSeconds` | `setFloat` | 曲の長さ。不明なら属性を付けない |
+| `mediaGeneration` | `setInt` | §4.0 の曲の世代 |
+| `lyricsSidecar` | `setString` | 同名 `.lrc` の本文 (文字コードを直したもの)。無ければ付けない。上限 262,144 UTF-16 単位 |
+| `lyricsEmbedded` | `setString` | 曲ファイルのタグにある歌詞の本文。無ければ付けない。上限は同じ |
+| `durationSeconds` | `setFloat` | 曲の長さ。不明なら付けない |
 
-- 本文は mIV が 1 つだけ選んで送る。選び方は上流の `chooseLyrics` と同じにする。
-  時刻付きの判定は「行頭に `[mm:ss` 形式の時刻があるか」だけを見る。
-  解析はプラグイン側の上流 `parseLrc` に任せ、mIV は LRC を解析しない。
-- 空の `lyrics` は「歌詞なし」。snapshot の差し替えという既存の意味をそのまま守る。
-- mIV の取得元 (試作の範囲):
+- **どちらの歌詞を使うかはプラグインが上流のコードで決める**。プラグインはそれぞれを上流の `parseLrc` で解析し、
+  `selectLyrics({ sidecar, embedded })` に渡す (`js/library/metadata/lyrics.js`)。
+  これで「時刻付きの判定」「メタデータ行だけの `.lrc` は歌詞なし扱いでタグへ戻る」「`[ar:A][00:01.00]本文` のような行」
+  「`[00:99]` は無効な時刻」などが上流と同じになる。mIV は LRC を解析も分類もしない
+  (同じ規則を 2 か所に書かない)。
+- 上流との既知の違い: 上流は曲ファイルの複数の歌詞タグを順に見て最初の時刻付きを選ぶ (`lyricsFromMetadata`)。
+  試作の mIV はタグを 1 つしか送らない (FFmpeg のメタデータで最初に見つかったもの)。
+  複数の歌詞タグを持つファイルでは選ばれるものが違い得る。SYLT と CUE は扱わない (§9)。
+- 取得元 (試作の範囲):
   - 同名 `.lrc`: 同じフォルダ・同じ stem・大文字小文字を区別しない。1 MiB まで。
     文字コードは BOM (UTF-8 / UTF-16) → 正しい UTF-8 → Shift_JIS の順に判定する (`encoding_rs` は依存済み)。
-    読み込みは Now Playing の画像用 worker の同じ仕事の中で行い、UI スレッドで `read_dir` も `stat` もしない。
+    上流は Shift_JIS 以外も自動判定するので、その差は試作の既知の違いとする。
   - 埋め込み: 音声のデコード worker が `VideoInfo` を作るときに、フォーマットのメタデータから
     `lyrics` で始まるキー (ID3 USLT は `lyrics-eng` のような名前になる見込み) と
     `UNSYNCEDLYRICS` / `LYRICS` を読む。実際のキー名は試作の最初に FFmpeg で確かめる (§6.1)。
-  - SYLT (ID3 の時刻付き歌詞) は FFmpeg のメタデータに出ない見込みなので、試作では扱わない。
-  - CUE シートの区間は扱わない。
+- **画像用 worker の結果を「曲情報の補完結果」に広げる**。今の完了処理は画像が取れたときだけ snapshot を更新し、
+  画像が無いと `Absent` にするだけ (`src/effetune/now_playing.rs:304-315`、`now_playing/artwork.rs:201`)。
+  代表画像の無い FLAC + `.lrc` は主な試験素材なので、このままでは歌詞が公開されない。
+  - worker の 1 件の仕事で、画像と `.lrc` を**独立に**取りに行く。片方の失敗や欠落はもう片方に影響しない。
+  - 完了時は、画像 (Ready / Absent) と sidecar 歌詞 (Ready / Absent) を合わせて、送る内容が変わるときだけ
+    新しい revision の snapshot を公開する。画像なし・歌詞ありでも公開する。
+  - 既存の取消・revision の照合・最新 1 件の保留はそのまま使う。
+  - 埋め込みの歌詞は `VideoInfo` と一緒に届くので、title などと同じく最初の text snapshot から含める。
+- UI スレッドでは `read_dir` も `stat` もファイル読み込みもしない (既存の Now Playing と同じ)。
 - 曲の長さは、既にある再生情報の duration を使う。
 
 ### 4.2 再生位置 (新しい通知)
@@ -168,12 +205,15 @@ Now Playing の受信からの処理量で位置を推定する。シーク・�
 
 | 属性 | VST3 型 | 内容 |
 | --- | --- | --- |
+| `mediaGeneration` | `setInt` | §4.0 の曲の世代 |
 | `available` | `setInt` | 1 = 位置あり、0 = 位置なし (Remote・停止中・曲なし)。0 のとき他の属性は無視 |
 | `playing` | `setInt` | 1 = 進行中、0 = 一時停止 |
 | `positionSeconds` | `setFloat` | メディア時刻 (秒)。プラグインの遅延は引き済み |
 | `rate` | `setFloat` | 再生速度 (一時停止中も現在の値) |
-| `hostTimeNanoseconds` | `setInt` | 位置を読んだ瞬間の `steady_clock` (Windows では QPC 由来の ns) |
+| `hostTimeNanoseconds` | `setInt` | 位置を読んだ瞬間の単調時計 (Windows では QPC を ns に換算した値) |
 
+- 時計: MSVC の `std::chrono::steady_clock` は QPC を ns に換算した値で、プロセス固有の起点を引かない
+  (第 1 回レビューで確認)。mIV の Rust 側も QPC を同じ換算で読めば共通の時計になる。
 - 旧版のプラグインは未知の ID を SDK の通常の扱いにするだけなので、mIV は結果を気にしない (ログだけ残す)。
 - プラグインは最新の 1 件だけを持つ。保存しない。プラグインの再初期化のたびに mIV が再送する
   (Now Playing と同じ規則)。
@@ -181,44 +221,58 @@ Now Playing の受信からの処理量で位置を推定する。シーク・�
 ### 4.3 mIV 側: 位置を送る仕組み
 
 ```text
-Now Playing の所有者 (Local のメディア 1 つ)
-  └ 所有者に対応する player の Arc<AvClock> と識別子を、位置の送り手に登録
+Now Playing の所有者 (唯一の正本)
+  Empty
+  Media { identity, generation, revision, text, artwork, lyrics,
+          position_source: Local(Arc<AvClock>) | Unavailable (Remote) }
 位置の送り手 (effetune-host-control worker 内の小さな状態)
-  ├ 200 ms ごとに clock.now_secs() / is_playing() / playback_speed() と QPC を読む
+  ├ 所有者の状態から (generation, position_source) を写し取る
+  ├ Local のとき 200 ms ごとに clock.now_secs() / is_playing() / playback_speed() と QPC を読む
   ├ 予測 (前回の送信からの外挿) との差が 20 ms を超えた、再生状態か速度が変わった、
   │   または前回の送信から 1 秒たったときだけ送る
-  └ 所有者が変わった・消えた → すぐに available=0 を送る
+  └ 世代が変わった・Unavailable・Empty → その世代で available=0 をすぐ送る
 ```
 
+- **時計は所有者の状態に持たせる**。送り手に別の登録を作らない。Local の player を採用するときに
+  その player の `Arc<AvClock>` を、Remote の採用では `Unavailable` を、同じ所有者の更新で入れる。
+  旧 player の時計で新しい曲の位置を送ることは、世代と時計が同じ状態から一緒に読まれるので起こらない。
 - **時計を読む場所を 1 つにする**: 一時停止・シーク・速度変更・ループ・曲の切り替えを、
-  それぞれの入口に呼び出しを足して拾うことはしない。時計の状態の変化として送り手が拾う。
-  入口を列挙して漏れを塞ぐ必要が無くなる (CLAUDE.md「設計の簡素化」)。
-- 200 ms / 20 ms / 1 秒は試作の初期値で、§6.3 の結果を見て調整する。シークの反映は最大 200 ms 遅れる。
-- 所有者と時計の対応は Now Playing の所有者の識別子をそのまま使う。DSP の所有トークンを代わりにしない
-  (now-playing 計画 §3.1 と同じ)。所有者が切り替わるときは、旧 player の時計で新しい曲の位置を送らないよう、
-  識別子が一致するときだけ送る。
-- 送り手は worker 上で動き、UI スレッドは識別子と `Arc<AvClock>` を渡すだけ。毎フレームの処理や再描画の要求は足さない
-  (アイドル時の健全性を保つ)。所有者がいないときは 200 ms の起床もしない (channel の `recv` で待つ)。
+  それぞれの入口に呼び出しを足して拾うことはしない。時計の状態の変化として送り手が拾う
+  (CLAUDE.md「設計の簡素化」)。
+- 200 ms / 20 ms / 1 秒は試作の初期値で、§6 の結果を見て調整する。200 ms は**読み取りの間隔**であって、
+  表示に反映されるまでの上限ではない。GUI スレッドへの配送、実行中の telemetry 要求、描画の待ちが加わる。
+- `now_secs()` は短い Mutex を取る (§2) が、5 Hz の読み取りなので試作では問題にしない。
+- DSP の所有トークンを所有者の代わりにしない (now-playing 計画 §3.1 と同じ)。
+- 送り手は worker 上で動き、UI スレッドは所有者の更新を今までどおり渡すだけ。毎フレームの処理や再描画の要求は足さない
+  (アイドル時の健全性を保つ)。Local の位置が無いときは 200 ms の起床もしない (channel の `recv` で待つ)。
 - RT スレッド (`fill_output`) には何も足さない。
 - 単一 player が鳴る利用者前提 (now-playing 計画 §0) を引き継ぐ。
-- detached viewer の述語や viewport の経路には触れない。所有者の登録は Now Playing と同じ境界で行う。
+- detached viewer の述語や viewport の経路には触れない。所有者の更新は Now Playing と同じ境界で行う。
+- 確認用に、送るたびに「送った位置・その瞬間の可聴 PTS の診断値 (`audio_audible_pts_bits`)・lead の診断値」を
+  perf ログへ 1 行残す (§6.1 の D 記録)。試作だけの記録で、製品化の際に見直す。
 
 ### 4.4 Remote・ポータブル版・歌詞のない曲
 
-- Remote 配信の所有者のときは、歌詞を空にして `available=0` を送る。端末の位置が分からないため、
-  試作では表示しない。将来の案は §8。
+- Remote 配信の所有者のときは、歌詞の属性を付けず、`available=0` を送る。端末の位置が分からないため、
+  試作では表示しない。Remote 中は音響調整の窓自体が開けない (`src/effetune/mod.rs:914`、
+  `crates/vst3-host/include/gui_visibility.h:5`) ので、この契約は自動テストで確かめる (§6.1)。将来の案は §8。
 - ポータブル版は音響調整が無いので何もしない (既存どおり)。
-- 歌詞のない曲は `lyrics` を空にする。位置は送ってよい (Lyrics 以外の項目は位置を使わない)。
+- 歌詞のない曲は歌詞の属性を付けない。位置は送ってよい (Lyrics 以外の項目は位置を使わない)。
 
 ### 4.5 IPC と C++ ブリッジ
 
-- `Cmd::SetNowPlaying` に `lyrics` と `duration_seconds` (wire 名は `durationSeconds`) を足す。
-- `Cmd::SetPlaybackPosition { slot_id, available, playing, position_seconds, rate, host_time_ns }` を足す。
-  応答は返さない (SetNowPlaying と同じ)。
+- `Cmd::SetNowPlaying` に `media_generation`、`lyrics_sidecar`、`lyrics_embedded`、`duration_seconds` を足す
+  (wire 名は §4.1 の属性名)。
+- `Cmd::SetPlaybackPosition { slot_id, media_generation, available, playing, position_seconds, rate, host_time_ns }`
+  を足す。応答は返さない (SetNowPlaying と同じ)。
 - `PROTOCOL_VERSION` を 7 → 8 に上げる (`crates/vst3-host/include/protocol.h:102`, `src/video/dsp/bridge.rs:42`)。
   host の exe は CMake で作り直す。
-- C++ は Now Playing と同じ mailbox と GUI スレッドへの post で notify する。位置の通知は最新値で上書きし、
-  途中の値は捨ててよい。音声スレッドでは notify しない。
+- C++ の Now Playing の解析は、決まったキーの集合を前提にしている (`now_playing.h:181` の `seen != 255`)。
+  新しいキーを加えた形に直し、キーが欠けたときの扱い (任意属性) を決める。
+  最大の画像と最大の歌詞 2 本を同時に載せた frame が 32 MiB の上限に収まることを境界テストで確かめる
+  (第 1 回レビューで計算上は収まると確認済み)。
+- 位置の通知は、Now Playing と同じ形の 1 件保留の mailbox をもう 1 つ持ち、GUI スレッドへの post で notify する。
+  最新値で上書きし、途中の値は捨ててよい。順序の保証は §4.0 の世代で受け取る側が確かめる。音声スレッドでは notify しない。
 - 歌詞の UTF-8 → UTF-16 変換は既存の strict 変換を使い、上限でスカラー値の途中を切らない。
 
 ### 4.6 Mixwright 側 (試作ブランチ)
@@ -227,28 +281,34 @@ Now Playing の所有者 (Local のメディア 1 つ)
 上流の EffeTune 本体 (submodule) には手を入れず、既存の流儀どおり `tools/build-ui-assets.mjs` の差し替えで済ませる。
 
 1. `src/plugin/plugin_processor.cpp` の `notify` (`:476` 付近):
-   - NowPlaying で `lyrics` と `durationSeconds` を任意属性として読む。上限超過・不正な UTF-16 は
-     既存の項目と同じく `kInvalidArgument` とし、前の snapshot を保つ。
+   - NowPlaying で `mediaGeneration`、`lyricsSidecar`、`lyricsEmbedded`、`durationSeconds` を任意属性として読む。
+     上限超過・不正な UTF-16 は既存の項目と同じく `kInvalidArgument` とし、前の snapshot を保つ。
    - `EffeTune.PlaybackPosition` を受け、最新値を 1 件持つ。
-2. `appendNowPlayingSnapshot` (`:531`) で `lyrics` と `durationSeconds` を JSON に含める。
+2. `appendNowPlayingSnapshot` (`:531`) で上の 4 つを JSON に含める。
    revision の扱いは今のまま (歌詞の本文は revision が変わったときだけ運ぶ)。
-3. telemetry 応答 (`:4300` 付近) に `playback: { available, playing, positionSeconds, rate }` を足す。
-   `positionSeconds` は応答を作る時点で外挿した値にする。
-4. `ui-shim/vst-audio-manager.js`: 位置を受け取った時点の `performance.now()` と一緒に持ち、
-   `getHostLyrics()` が `{ data, time, duration, isStopped }` を返す。`data` は Now Playing の revision ごとに
-   `parseLrc` → `boundLyrics` を 1 回だけ行って保持する。
+3. **`telemetry/read` と `host/getInfo` の両方の応答**に、同じ位置の snapshot
+   `playback: { mediaGeneration, available, playing, positionSeconds, rate }` を足す
+   (`:4144` と `:4300` 付近)。`positionSeconds` は応答を作る時点で外挿した値にする。
+   非表示中は `host/getInfo` しか読まれず (`ui-shim/vst-audio-manager.js:1022-1038`)、起動時も `host/getInfo` から始まる。
+4. `ui-shim/vst-audio-manager.js`:
+   - 位置は、非表示時の早期 return より**前**で、受け取った時点の `performance.now()` と一緒に採用する。
+     再表示の直後に telemetry の破棄だけで終わる回でも、古い位置で描かないようにする。
+   - `getHostLyrics()` が `{ data, time, duration, isStopped }` を返す。曲情報と位置の世代が一致し `available=1` のときだけ
+     `data` を返し、それ以外は `null`。`data` は Now Playing の revision ごとに、§4.1 の `parseLrc` と
+     `selectLyrics` を 1 回だけ行って保持する。
 5. `tools/build-ui-assets.mjs`: `visualizer-view.js` の `lyrics()` を `getHostLyrics()` に差し替える
    (`metadata()` の差し替え `:360-371` と同じ方式)。Lyrics の追加メニューと Lyric Stage の除外
    (`:82`, `:404`) は試作では外す。製品でどうするか (ホストが歌詞を送るときだけ出す等) は作者の判断に委ねる。
+   `selectLyrics` などの関数が配布物に残っているかを確かめ、足りなければ verify の許可リストを直す。
 6. `tools/verify-ui-assets.mjs` と `tests/esm/vst-upstream-ui.test.mjs` の除外前提を試作に合わせて直す。
-7. `docs/host-now-playing.md` に試作の契約 (§4.1, §4.2) を追記し、相談用の下書きにする。
+7. `docs/host-now-playing.md` に試作の契約 (§4.0〜4.2) を追記し、相談用の下書きにする。
 
 ## 5. 作業の分け方とブランチ
 
 | 区切り | 場所 | 内容 |
 | --- | --- | --- |
 | T1 | `G:\home\effetune-mixwright-trial` (`miv-lyrics-trial`) | §4.6 の変更、上流テストの更新と追加、ビルドと ctest |
-| T2 | 新しい worktree `G:\home\mimageviewer-lyrics` (`effetune-lyrics-trial`、master から) | §4.1〜4.5 の mIV 側。T1 と同時に進めてよい (触るファイルが重ならない) |
+| T2 | 新しい worktree `G:\home\mimageviewer-lyrics` (`effetune-lyrics-trial`、master から) | §4.0〜4.5 の mIV 側。T1 と同時に進めてよい (触るファイルが重ならない) |
 | T3 | T2 の worktree | 試作バンドルを差し込んだ確認用ビルド、試験素材、利用者の実機確認 (§6) |
 | T4 | ClaudeCode | 結果をまとめ、作者への相談文と変更の要点 (patch) を用意する。送るのは利用者 |
 
@@ -260,79 +320,121 @@ Now Playing の所有者 (Local のメディア 1 つ)
   T2 の最初にコードで確かめる。
 - 配布用のビルドは、承認済みの公式バンドルの hash を検査する (`scripts/effetune-distribution.ps1`) ので、
   試作バンドルが配布物に混ざることは無い。この検査は緩めない。
+- **プラグインの保存領域を分ける**: Visualizer のレイアウトは自動で保存され
+  (`external/effetune/js/visualizer/visualizer-view.js:210`)、WebView の保存先はホスト exe のファイル名から決まる
+  (`choc_WebView.h:1853` `getUserDataFolder`。mIV では `%APPDATA%\mimageviewer-vst3-host.exe\`)。
+  mIV の `--data-dir` ではこれを分けられない。試作ブランチでは host の exe 名を
+  `mimageviewer-vst3-host-lyrics-trial.exe` に変え、実利用中の Visualizer のレイアウトを汚さない。
+  変更の範囲 (CMake の出力名・core が起動する名前・identity の検査) は T2 の最初にコードで確かめる。
+- それでも分けられないもの: Mixwright の設定 `%APPDATA%\Frieve\EffeTunePlugin\config.json`
+  (`src/bridge/config_store.cpp:26`) とプリセット (`%APPDATA%\effetune\` または同フォルダ) は DAW と共有される。
+  確認中は Mixwright の設定画面を変えず、プリセットを保存しない (§6.3 の注意に書く)。
 - 永続データは増やさない (歌詞・位置は保存しない)。未出荷の試作なので移行は不要。
 
 ## 6. 確認の手順
 
 エージェントは製品バイナリを起動しない (CLAUDE.md)。表示とずれの確認は利用者の実機で行い、
-エージェントは自動テストと素材の準備を担う。
+エージェントは自動テスト・素材・記録の分析を担う。
 
-### 6.1 自動テスト (Codex / ClaudeCode)
+### 6.1 自動テストと記録 (Codex / ClaudeCode)
 
 - Mixwright: `ctest --preset windows-release` 全件。追加するテスト:
-  - native: NowPlaying の `lyrics` / `durationSeconds` の受理・上限・不正値で前の snapshot が残ること、
-    PlaybackPosition の受理と外挿 (時刻を差し替えられる形で)、`available=0` で位置が消えること。
-  - esm: `getHostLyrics()` が revision ごとに 1 回だけ解析すること、外挿と一時停止、Offset とフェードが上流と同じ入力で動くこと。
+  - native: NowPlaying の新しい属性の受理・上限・不正値で前の snapshot が残ること、
+    PlaybackPosition の受理と外挿 (時刻を差し替えられる形で)、`available=0` で位置が消えること、
+    `telemetry/read` と `host/getInfo` の両方に同じ位置が載ること。
+  - esm: `getHostLyrics()` が revision ごとに 1 回だけ解析すること、**世代が一致しない間は `null`**、
+    外挿と一時停止、起動時 (`host/getInfo` から開始)、非表示中の一時停止・シーク → 再表示で古い位置を使わないこと、
+    Offset とフェードが上流と同じ入力で動くこと。
+  - 選択: `[ar:A][00:01.00]本文`、`[00:99]`、メタデータ行だけの `.lrc` (タグへ戻る)、時刻なし `.lrc` と時刻付きタグ。
 - mIV: `.\scripts\test-focused.ps1` に加えて、次を対象を絞って実行する。
-  - `Cmd` の直列化 (キーの順、`cmd` が先頭、利用者の文字列で誤認しないこと)。
-  - `.lrc` の選び方 (大文字小文字、時刻付きの優先、1 MiB 超の拒否、UTF-8 / UTF-16 / Shift_JIS)。
+  - `Cmd` の直列化 (キーの順、`cmd` が先頭、利用者の文字列で誤認しないこと)。C++ の解析で新しいキーを読むこと、
+    最大の画像と最大の歌詞 2 本を載せた frame の境界。
+  - 所有者と世代: A→B→A、旧所有者の clear、Remote への切り替え、ブリッジの再登録での再送、
+    **曲 A の notify 中に曲 B の曲情報と位置が届く順序** (位置が先に届いても世代が違うので描かれないこと)。
+  - Remote: 歌詞の属性が付かず `available=0` になること、Remote 終了後に旧い歌詞・位置が戻らないこと。
+  - `.lrc` の探し方 (大文字小文字、1 MiB 超の拒否、UTF-8 / UTF-16 / Shift_JIS)。
+  - **画像なし + 歌詞あり**で歌詞が公開されること、画像の失敗が歌詞に影響しないこと、その逆。
   - 埋め込みのキー: FFmpeg で USLT 付き MP3・LYRICS 付き FLAC・`©lyr` 付き M4A を作り、実際のキー名を確かめるテスト。
   - 位置の送り手: 偽の時計で、一時停止・シーク・速度変更・所有者の交代・所有者の消滅で何が送られるか、
-    同じ状態が続くときは 1 秒おきの再送だけになること、所有者がいないときは起床しないこと。
+    同じ状態が続くときは 1 秒おきの再送だけになること、Local の位置が無いときは起床しないこと。
   - protocol v8 の handshake と、v7 host を拒否すること。
 - `cargo check -p mimageviewer --bin mimageviewer-core`、C++ host の CMake ビルド、`.\scripts\build-dev.ps1`。
+- **D 記録 (時計の誤差の測定)**: §4.3 の perf ログの行から、送った位置と可聴 PTS の診断値の差を場面ごとに集計する
+  スクリプトを用意する (Python、リポジトリ内 `scripts/`)。場面は、通常再生・速度変更の直後・遅延の変化
+  (EffeTune の読み込み直後の 0→128 サンプル)・シーク・DSP の引き継ぎ (曲の切り替え)・EOF とループ。
+  これで「時計と可聴 PTS の差」(§3 方式 A の (1)) を、利用者の見え方とは別に数字で確かめる。
+  デバイス側の遅延 (2) はこの記録には出ない。
 
-### 6.2 試験素材 (エージェントが作る、リポジトリ外の `target\lyrics-trial\`)
+### 6.2 試験素材と測定用レイアウト (エージェントが作る、リポジトリ外の `target\lyrics-trial\`)
 
-- `beep-60s.flac`: 2 秒ごとに 50 ms の短いビープ (0 秒から 58 秒まで 30 回)。
+- `beep-60s.flac`: 2 秒ごとに 50 ms の短いビープ (0 秒から 58 秒まで 30 回)。代表画像なし。
   `beep-60s.lrc`: 各ビープと同じ時刻に行 `01`〜`30`。1 行は Enhanced LRC で 0.5 秒ごとの単語時刻を付ける。
 - `beep-60s-sjis.lrc` (Shift_JIS で同じ内容)、`BEEP-60S.LRC` (大文字の名前)。
 - 埋め込みの確認用: USLT 付き MP3、LYRICS 付き FLAC、`©lyr` 付き M4A (時刻付きと時刻なしの両方)。
 - 歌詞なしの曲、時刻なしの `.lrc` だけの曲、ビープ入りの短い動画 (映像にも秒数を焼き込む)。
 - 素材は生成スクリプトで作り、市販曲の歌詞は使わない。
+- **測定用レイアウト**: Lyric Stage は行の移動に 0.4 秒の遷移を使う
+  (`external/effetune/presets/visualizer/16x9.json:4595` `lyricsStepDuration`) ので、行の切り替わりのどこを
+  ビープに合わせるかで演出が測定値に混ざる。測定は次の設定の Lyrics 項目 1 つだけのレイアウトで行う。
+  View = Single line、Show next line = オフ、Step transition time = 0、Fade-in / Fade-out time = 0、Offset = 0、
+  Word highlight = オフ。比べる瞬間は「**表示の数字が次の数字に変わった瞬間**」とビープの鳴り始め。
+  手順書には各設定項目の画面上の名前を書く。
 
 ### 6.3 利用者の実機確認 (試作の確認用ビルド)
 
-準備: 起動中の mIV を終了 → T3 の確認用ビルドを起動 → 音響調整の窓を開いて Visualizer にし、
-Lyric Stage (16:9) を選ぶ。隔離した data-dir で起動する手順を併記する。
+準備: 起動中の mIV を終了 → T3 の確認用ビルドを隔離した data-dir で起動 → 音響調整の窓を開いて Visualizer にする。
+
+隔離の範囲 (手順書の冒頭に書く):
+- mIV の設定・キャッシュ・ログは `--data-dir` で分かれる。
+- Visualizer のレイアウトは、試作の host 名を変えたことで実利用中のものと分かれる (§5)。
+- Mixwright の設定とプリセットは DAW と共有なので、確認中は設定画面を変えず、プリセットを保存しない。
 
 | # | 操作 | 見るところ |
 | --- | --- | --- |
-| 1 | `beep-60s.flac` を再生 | ビープと行の切り替わりが合うか。早い / 遅いと感じるか |
-| 2 | Lyrics 項目の Offset を ±0.05 秒ずつ動かし、いちばん合う値を探す | **合った Offset の値** (方式 A のずれの実測値)。スピーカーとヘッドホン (使っていれば Bluetooth も) で |
-| 3 | 一時停止して 3 秒待ち、再開 | 停止中に行が進まないか、再開後すぐ合うか |
-| 4 | シークバーで前後に飛ぶ、矢印キーで飛ぶ | 飛んだ先の行に切り替わるまでの遅れ (最大 0.2 秒の想定) |
-| 5 | 速度 0.5 倍 / 2 倍 | 行の切り替わりがビープに付いてくるか |
-| 6 | ループ再生で曲末から曲頭へ | 曲頭の行に戻るか、フェードイン / フェードアウト |
-| 7 | 別の曲 → 元の曲 | 前の曲の歌詞が残らないか |
-| 8 | 再生中に音響調整の窓を閉じて開き直す | 開き直した直後から正しい行か |
-| 9 | ビープ入りの動画 | 映像の秒数・ビープ・歌詞の行がそろうか |
+| 1 | 測定用レイアウト (§6.2) で `beep-60s.flac` を 1.0 倍で再生 | 数字の切り替わりとビープが合うか。早い / 遅いと感じるか |
+| 2 | 同じ条件で Offset を ±0.05 秒ずつ動かし、いちばん合う値を探す | **1.0 倍での総合的な補正値** (主観)。スピーカーとヘッドホン (使っていれば Bluetooth も) で |
+| 3 | 一時停止して 3 秒待ち、再開 | 停止中に数字が進まないか、再開後すぐ合うか |
+| 4 | シークバーで前後に飛ぶ、矢印キーで飛ぶ | 飛んだ先の数字に切り替わるまでの遅れ |
+| 5 | Offset を 0 に戻し、速度 0.5 倍 / 2 倍 | 数字の切り替わりがビープに付いてくるか (Offset は速度に比例しないので 0 で見る) |
+| 6 | ループ再生で曲末から曲頭へ | 曲頭の数字に戻るか |
+| 7 | 別の曲 → 元の曲 | 前の曲の歌詞が残らないか、切り替え直後に別の曲の歌詞が一瞬出ないか |
+| 8 | 再生中に音響調整の窓を閉じて開き直す | 開き直した直後から正しい数字か |
+| 9 | ビープ入りの動画 | 映像の秒数・ビープ・数字がそろうか |
 | 10 | Shift_JIS の `.lrc`、大文字の名前、埋め込みの各形式、歌詞なし | 表示されるか、文字化けしないか、歌詞なしで前の歌詞が残らないか |
-| 11 | Remote で再生 | 歌詞が出ないこと (試作の仕様) |
-| 12 | 手元の実際の曲と LRC | 実用上ずれが気になるか (主観) |
+| 11 | Remote で再生してから終了し、ローカルで別の曲を再生 | 旧い歌詞・位置が戻らず、新しい曲の歌詞に切り替わるか |
+| 12 | Lyric Stage (16:9) で手元の実際の曲と LRC | 実用上ずれが気になるか (主観。演出込みの見え方) |
 
-結果は「# ごとに OK / 気になる点」と、#2 の Offset の値を返してもらう。
-#2 の値が数十 ms 以内なら方式 A のまま相談する。大きい場合は、デバイスの遅延を時計に含める
-(cpal のタイムスタンプを使う) 案を mIV 側の課題として検討する。方式 B へは、それでも不足するときだけ戻る。
+結果は「# ごとに OK / 気になる点」と、#2 の Offset の値を返してもらう。確認後に perf ログ (隔離 data-dir の `logs`) を
+受け取り、§6.1 の D 記録と合わせて判断する。
+
+判断:
+- D 記録の差が小さく (数十 ms 以内)、#2 の値も小さい → 方式 A のまま相談する。
+- D 記録の差が場面によって大きい → 時計と可聴 PTS の差が原因。位置の出どころを可聴 PTS 側に寄せる案を mIV 側で検討する。
+- D 記録の差は小さいのに #2 の値が大きい → デバイス側の遅延が主な原因と考えられる。
+  cpal のタイムスタンプを使ってデバイスの遅延を含める案を mIV 側で検討する。
+- 方式 B へは、これらでも不足するときだけ戻る。
 
 ## 7. 単純化の検討 (CLAUDE.md「設計の簡素化」)
 
 1. **位置の変化を 1 か所で拾う**: 採用。入口ごとの通知は足さない (§4.3)。
-2. **歌詞の選択と解析をどちらか一方に寄せる**: 解析はプラグイン (上流のコード)、選択は mIV。
-   2 本の候補を送ってプラグインに選ばせる案は、契約が複雑になるので採らない。
-3. **Remote を試作から外す**: 採用。位置の出どころが無いので「表示しない」に固定する。
-4. **配送の保証・再試行**: 作らない。最新値の再送 (1 秒おきと再初期化時) だけ。
+2. **歌詞の選択規則を 1 か所に置く**: 第 2 版で変更。初版は mIV が 1 本選んで送る案だったが、
+   行頭の時刻だけを見る簡易判定では上流と同じ選択にならない (第 1 回レビュー P2-5)。同じ規則を Rust に写すと
+   2 か所で保守することになるので、候補 2 本を送り、選択と解析は上流のコードに任せる。
+3. **配送の順序を揃える仕組みを作らない**: 採用。曲の世代を両方の通知に載せ、受け取る側で一致を確かめるだけにする (§4.0)。
+4. **Remote を試作から外す**: 採用。位置の出どころが無いので「表示しない」に固定する。
+5. **配送の保証・再試行**: 作らない。最新値の再送 (1 秒おきと再初期化時) だけ。
    まれな失敗は割り切り (ログのみ)。
-5. **モーダル化**: 該当しない (長い処理が無い)。
+6. **モーダル化**: 該当しない (長い処理が無い)。
 
 ## 8. 作者への相談で決めること (試作の結果と一緒に出す)
 
 - 歌詞と位置の契約を `EffeTune.NowPlaying` の拡張 + 新 ID にするか、別の形にするか。ID の名前。
+- 曲の世代で歌詞と位置を結び付ける形でよいか。
 - 時計の共通化を契約にどう書くか (Windows の QPC、macOS の `mach_absolute_time`、
   あるいはプラグインが受信時刻で記録する簡易版)。
-- 歌詞の上限 (試作は 262,144 UTF-16 単位)。
+- 歌詞の上限 (試作は 262,144 UTF-16 単位を 2 本)。候補 2 本を送ってプラグインが選ぶ形でよいか。
 - ホストが歌詞を送るときだけ Lyrics 項目と Lyric Stage を出すか、常に出すか。
-- 解析をプラグインで行う前提でよいか (SYLT のような形式をホストが LRC に直して送る扱い)。
+- SYLT のような形式をホストが LRC に直して送る扱い。
 - Remote のように「位置が分からない」ホスト状態の扱い。
 - 試作で見つかった上流側の小さな問題 (MSVC 14.50 の C4458 など)。
 
@@ -342,3 +444,27 @@ Lyric Stage (16:9) を選ぶ。隔離した data-dir で起動する手順を併
 - mIV 自身による歌詞表示。
 - SYLT・CUE・ストリームの歌詞、Remote 端末での歌詞表示。
 - 試作バンドルの配布、公開文書・マニュアルの更新 (試作なので行わない)。
+
+## 10. レビュー記録
+
+### 10.1 第 1 回独立設計レビュー (2026-10-17、GPT-6.1 Sol / xhigh、read-only)
+
+対象は初版 (6fe048b9c)。Codex SID `01a14811-72b4-7600-9500-ff93bb2cfe0b`。判定 **REJECT**。
+方式 A と試作の範囲には賛成。曲情報と位置の整合と、表示の演出と時計の誤差の切り分けが未確定という理由。
+ClaudeCode が各指摘の根拠のコードを読み、8 件すべてを正しいと判断して第 2 版に反映した。
+
+| 指摘 | 内容 | 反映先 |
+| --- | --- | --- |
+| P1 | 別々の mailbox では、曲 A の歌詞を曲 B の位置で描く組み合わせを防げない | §4.0 (曲の世代)、§4.3 (時計を所有者の状態に持たせる)、§4.5、§6.1 |
+| P2 | `now_secs()` は表示用の時計で、ずれはデバイス分だけではない。atomics だけで読めるという記述も誤り (Mutex を取る) | §2、§3 方式 A、§6.1 の D 記録、§6.3 の判断 |
+| P2 | Lyric Stage は 0.4 秒の遷移を使うので Offset 合わせに演出が混ざる。Offset は速度に比例しない | §6.2 の測定用レイアウト、§6.3 #2・#5 |
+| P2 | 今の worker は画像が取れたときだけ公開するので、画像なし + 歌詞ありが公開されない | §4.1 (曲情報の補完結果)、§6.1 |
+| P2 | 行頭の時刻だけの判定では上流と同じ選択にならない | §4.1 (候補 2 本 + 上流の `selectLyrics`)、§7.2 |
+| P3 | 非表示時と起動時は `host/getInfo` を読むので、telemetry だけでは古い位置で描き得る | §4.6.3〜4、§6.1 |
+| P3 | Remote 中は音響調整の窓が開けないので、「歌詞が出ない」を目視できない | §4.4、§6.1、§6.3 #11 |
+| P3 | mIV の隔離 data-dir ではプラグインの保存領域が分かれない | §5 (host の exe 名を変える)、§6.3 の隔離の範囲 |
+
+レビューで確認できた前提: `audible_pts_secs` が速度込みで DSP の遅延を引いていること、リングは PCM だけで
+ProcessContext は処理フレーム数と常時 kPlaying であること、MSVC の `steady_clock` が QPC 由来で共通の時計に使えること、
+音楽の矢印キーのシーク・速度変更・ループが実装されていること、プラグイン版でも Lyrics の Offset を編集できること、
+最大の画像と歌詞を同時に載せても 32 MiB に収まること。FFmpeg の歌詞のキー名は未確認のまま (§6.1 で確かめる)。
