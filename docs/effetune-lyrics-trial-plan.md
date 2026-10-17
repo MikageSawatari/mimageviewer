@@ -758,3 +758,33 @@ protocol v8 の試作なので通常版のbackupを上書きせず、試作用�
 - 利用者向けの手順は [effetune-lyrics-trial-smoke.md](effetune-lyrics-trial-smoke.md)。測定用レイアウトの項目名は上流の日本語訳
   (`external/effetune/js/locales/ja.json5`) から取った。
 - 実機での動作はまだ誰も確かめていない。
+
+## 13. 同期の測定結果 (2026-10-17、ClaudeCode が隔離 data-dir で実行)
+
+利用者の許可を得て、ClaudeCode が確認用ビルドを隔離 data-dir で起動し、音と画面を同じ QPC の時計で記録して比べた。
+道具は `scripts/lyrics-trial-sync/` (WASAPI ループバック録音 `loopback.cpp`、画面の領域を約 6 ms 間隔で記録する `capture.py`、
+ビープの鳴り始めと中央の行の数字の切り替わりを対応付ける `analyze.py`)。測定用レイアウト (§6.2) で `beep-60s.flac` を 1.0 倍で再生した。
+「差」= 数字が切り替わった時刻 − ビープが Windows のミキサーに届いた時刻 (ループバックの QPC)。ミキサーより後の機器の遅れは含まない。
+
+| 条件 | 対応付けた回数 | 差の中央値 | 範囲 |
+| --- | --- | --- | --- |
+| オフセット 0 | 19 | −58 ms (歌詞が早い) | −60〜−40 ms |
+| オフセット ＋0.05 秒 | 18 | ＋0.4 ms | −1〜＋19 ms |
+
+- オフセットを ＋0.05 秒にすると差がほぼ 50 ms 分動いたので、測定の仕組みは働いている。約 3 回に 1 回、＋18 ms 前後の値が出る (画面の更新の都合と考えられる、未検証)。
+- 同じ時間帯の D 記録: 時計と可聴 PTS の差 (lead) は中央値 −0.0002 ms・絶対値 p95 0.72 ms・最大 10 ms (213 行)。
+  E 記録: プラグイン内の往復時間の中央値 0.8 ms (5 秒窓の p95 の最大 22 ms)、描画間隔の中央値 6.1 ms。
+- §6.3 の判断に当てはめると、合う Offset は正 (歌詞が音より早い) で、D・E とも小さい。早さはソフトウェアの配送・描画では説明できず、
+  mIV が cpal に渡してからミキサーに届くまで (WASAPI 共有モードのバッファとエンジン) の遅れと合う向き。ミキサーより後の機器の遅れはこれに加わる。
+- 方式 A のままで、mIV が送る位置に出力側の遅れ (cpal の `OutputCallbackInfo` のタイムスタンプ、または WASAPI の遅延) を含めれば、
+  手動のオフセットなしでミキサーの時点まで合わせられる見込み。機器の遅れ (Bluetooth など) は利用者のオフセットに残る。未実装。
+- 映像も同じ時計で出しているので、mIV の動画でも映像が音より同程度早い可能性がある。映像は表示側の遅れもあるため、ここからは判断できない (未確認)。
+
+### 13.1 測定中に見つかったこと
+
+- **曲を最後まで再生したあと W キーで頭から再生し直すと、Visualizer の曲名・歌詞が戻らない**。最後まで再生すると Local の所有者が clear され
+  (`available=0`、世代 4)、再生し直しても新しい採用 (`PlaybackSuccess`) が起きないので送り直されない (`src/app.rs` の
+  `publish_mounted_local_now_playing`、`adopted_start` と所有者の判定)。この部分は試作で変えておらず、出荷済みの Now Playing にもある挙動と考えられる (実機の確認はこの試作版だけ)。
+- ClaudeCode の操作ミス: 前面化のつもりで computer-use の `open_application` を使い、試作版 core が**引数なし (実 `%APPDATA%\mimageviewer`)** で起動した (PID 40908、18:19:50)。
+  試作 host も単体で 5 回起動した。core は既存の settings.db を読み込み (移行の記録なし)、起動時の控え `settings.db.bak1` (18:19:51) を作り、設定を 3 回保存した。
+  利用者がトレイから終了する。試作 host の展開物 `%APPDATA%\mimageviewer\vst3\hosts\ecdd0b4c…\mimageviewer-vst3-host-lyrics-trial.exe` が実データ側に残る。
