@@ -1428,12 +1428,12 @@ impl ReconcileDurationCounter {
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let _ = self
             .operations
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_add(1))
             });
         let _ = self
             .total_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_add(elapsed_us))
             });
         self.max_us.fetch_max(elapsed_us, Ordering::Relaxed);

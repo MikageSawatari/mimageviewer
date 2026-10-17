@@ -14597,7 +14597,7 @@ mod tests {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let zip_path = data_dir.path().join("book.zip");
 
-        let mut png = |width: u32, height: u32| {
+        let png = |width: u32, height: u32| {
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
                 .write_to(

@@ -68,7 +68,7 @@ pub(super) fn draw_whats_new_dialog(
             #[cfg(test)]
             ui.ctx().data_mut(|data| {
                 data.insert_temp(
-                    egui::Id::new("whats_new_scroll_layout"),
+                    egui::Id::unique("whats_new_scroll_layout"),
                     crate::test_ui::scroll_layout::ScrollLayout::from_output(&body),
                 );
             });
@@ -148,7 +148,7 @@ mod tests {
                 }
                 let read = || {
                     harness.ctx.data(|data| {
-                        data.get_temp::<ScrollLayout>(egui::Id::new("whats_new_scroll_layout"))
+                        data.get_temp::<ScrollLayout>(egui::Id::unique("whats_new_scroll_layout"))
                             .unwrap()
                     })
                 };
@@ -170,7 +170,7 @@ mod tests {
                 harness
                     .ctx
                     .data(|data| {
-                        data.get_temp::<ScrollLayout>(egui::Id::new("whats_new_scroll_layout"))
+                        data.get_temp::<ScrollLayout>(egui::Id::unique("whats_new_scroll_layout"))
                             .unwrap()
                     })
                     .assert_scrolled_to_end(before, harness.ctx.pixels_per_point());

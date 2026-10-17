@@ -30,7 +30,7 @@ pub(crate) enum Action {
 /// The same process modal blocks pointer/focus in every displayed viewport,
 /// including a sibling that does not own the conversion's dialog.
 pub(crate) fn block_background(ctx: &egui::Context) {
-    let _ = egui::Modal::new(egui::Id::new("image_folder_zip_input_barrier"))
+    let _ = egui::Modal::new(egui::Id::unique("image_folder_zip_input_barrier"))
         .frame(egui::Frame::NONE)
         .backdrop_color(egui::Color32::TRANSPARENT)
         .show(ctx, |_| {});
@@ -53,7 +53,7 @@ pub(crate) fn draw(
     let result = matches!(phase, Phase::Result { .. });
     let notice = matches!(phase, Phase::GuideConfirm(_));
     egui::Window::new("画像フォルダを ZIP に変換").drag_area(egui::WindowDrag::Anywhere)
-        .id(egui::Id::new("image_folder_zip_modal"))
+        .id(egui::Id::unique("image_folder_zip_modal"))
         .order(egui::Order::Foreground)
         .open(&mut open).collapsible(false).resizable(true)
         .default_pos(rect.min+egui::vec2(20.0,20.0))

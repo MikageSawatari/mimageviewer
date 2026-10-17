@@ -3941,7 +3941,7 @@ fn virtual_desktop_coordinate_tolerance() -> Result<[i32; 2], String> {
 
 fn allocate_step_token_in(next_serial: &AtomicU32) -> Result<usize, String> {
     let serial = next_serial
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
             if (STEP_TOKEN_SERIAL_MIN..STEP_TOKEN_SERIAL_MAX).contains(&serial) {
                 Some(serial + 1)
             } else if serial == STEP_TOKEN_SERIAL_MAX {
@@ -4070,7 +4070,7 @@ mod tests {
             clip_rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(400.0, 64.0)),
             layer_id: egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("native_video_top_bar"),
+                egui::Id::unique("native_video_top_bar"),
             ),
             sense: if enabled {
                 egui::Sense::click()
@@ -4121,7 +4121,7 @@ mod tests {
             clip_rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(200.0, 36.0)),
             layer_id: egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("native_video_top_bar"),
+                egui::Id::unique("native_video_top_bar"),
             ),
             sense: if enabled {
                 egui::Sense::click()
@@ -4997,7 +4997,7 @@ mod tests {
                     observation.interact_rect = observation.rect;
                 }
                 "clip" => observation.clip_rect = observation.clip_rect.shrink(1.0),
-                "layer" => observation.layer_id.id = egui::Id::new("replacement_layer"),
+                "layer" => observation.layer_id.id = egui::Id::unique("replacement_layer"),
                 "sense" => observation.sense = egui::Sense::hover(),
                 "disabled" | "disabled_reenabled" => observation.enabled = false,
                 "hidden_reappeared" => logical.audio_controls.clear(),

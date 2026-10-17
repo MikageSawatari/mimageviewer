@@ -2790,16 +2790,18 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(240.0, 80.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                let texture = texture.get_or_insert_with(|| {
-                    ctx.load_texture(
-                        "timeline_bass_partial",
-                        image.clone(),
-                        egui::TextureOptions::NEAREST,
-                    )
-                });
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.image((texture.id(), egui::vec2(200.0, 32.0)));
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    let texture = texture.get_or_insert_with(|| {
+                        ctx.load_texture(
+                            "timeline_bass_partial",
+                            image.clone(),
+                            egui::TextureOptions::NEAREST,
+                        )
+                    });
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.image((texture.id(), egui::vec2(200.0, 32.0)));
+                    });
                 });
             });
         harness.run();
@@ -2824,38 +2826,40 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(660.0, 80.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                let textures = textures.get_or_insert_with(|| {
-                    images
-                        .iter()
-                        .enumerate()
-                        .map(|(i, image)| {
-                            ctx.load_texture(
-                                format!("key_state_{i}"),
-                                image.clone(),
-                                egui::TextureOptions::NEAREST,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for (texture, label) in
-                            textures
-                                .iter()
-                                .zip(["Pending", "No key (silence)", "C major"])
-                        {
-                            ui.vertical(|ui| {
-                                ui.label(label);
-                                ui.image((texture.id(), egui::vec2(200.0, 32.0)));
-                            });
-                        }
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let textures = textures.get_or_insert_with(|| {
+                        images
+                            .iter()
+                            .enumerate()
+                            .map(|(i, image)| {
+                                ctx.load_texture(
+                                    format!("key_state_{i}"),
+                                    image.clone(),
+                                    egui::TextureOptions::NEAREST,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (texture, label) in
+                                textures
+                                    .iter()
+                                    .zip(["Pending", "No key (silence)", "C major"])
+                            {
+                                ui.vertical(|ui| {
+                                    ui.label(label);
+                                    ui.image((texture.id(), egui::vec2(200.0, 32.0)));
+                                });
+                            }
+                        });
                     });
                 });
             });

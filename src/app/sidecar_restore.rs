@@ -2998,6 +2998,10 @@ fn probe_requires_preview_clear(result: &crate::sidecar_import::SidecarProbeResu
     )
 }
 
+#[expect(
+    deprecated,
+    reason = "Retain the compatibility IME cancellation edge while discarding modal semantic input"
+)]
 fn sidecar_restore_retains_egui_event(event: &egui::Event) -> bool {
     matches!(
         event,
@@ -4606,6 +4610,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn semantic_input_is_discarded_but_release_edges_are_retained() {
         let key = |pressed| egui::Event::Key {
             key: egui::Key::A,

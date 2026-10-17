@@ -134,7 +134,7 @@ pub fn render_content_restore_modal(
     // リサイズのためで、「背面は触れない」という合図と、背面ボタンへクリックが
     // 抜けない性質まで手放す意図はない (`modal_dialog_block_reason` はポインタ
     // ナビまでは止めない — backlog §1.134)。窓より 1 段下の order に置く。
-    egui::Area::new(egui::Id::new("content_restore_backdrop"))
+    egui::Area::new(egui::Id::unique("content_restore_backdrop"))
         .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .sense(egui::Sense::CLICK | egui::Sense::DRAG)
@@ -148,7 +148,7 @@ pub fn render_content_restore_modal(
     let mut result = None;
     egui::Window::new("編集内容の復元")
         .drag_area(egui::WindowDrag::Anywhere)
-        .id(egui::Id::new("content_restore_modal"))
+        .id(egui::Id::unique("content_restore_modal"))
         .order(egui::Order::Foreground)
         .resizable(true)
         .collapsible(false)
@@ -545,7 +545,7 @@ mod tests {
                 )
                 .drop_without_applying_deltas();
             if let Some(rect) =
-                ctx.memory(|memory| memory.area_rect(egui::Id::new("content_restore_modal")))
+                ctx.memory(|memory| memory.area_rect(egui::Id::unique("content_restore_modal")))
             {
                 heights.push(rect.height());
             }

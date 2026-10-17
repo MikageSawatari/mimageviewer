@@ -464,7 +464,7 @@ impl MusicSpectrumState {
     ) {
         let response = ui.interact(
             rect,
-            ui.id().with("music_spectrum_panel"),
+            ui.scope_id().with("music_spectrum_panel"),
             egui::Sense::hover(),
         );
         let painter = ui.painter_at(rect);

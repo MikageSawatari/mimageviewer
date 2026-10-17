@@ -443,7 +443,7 @@ pub(crate) fn migrate_page_paths_at(
             continue;
         }
         let mut composition = row.composition;
-        let mut rewrite = |page: &mut CompositionPageRef| {
+        let rewrite = |page: &mut CompositionPageRef| {
             let CompositionPageRef::RelativePath { path } = page else {
                 return;
             };

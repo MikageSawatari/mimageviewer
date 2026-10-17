@@ -1901,6 +1901,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn image_folder_zip_modal_blocks_inputs_and_notice_escape_preserves_reader() {
         use egui_kittest::kittest::Queryable;
         for composing in [false, true] {

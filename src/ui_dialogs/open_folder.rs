@@ -142,6 +142,10 @@ mod ime_handler_tests {
         Password,
     }
 
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn run_committed_dialog_key(dialog: Dialog, key: egui::Key, same_pass: bool) {
         let mut env = crate::app::setup_app_for_test();
         let target = env.tmp.path().join("committed-folder");

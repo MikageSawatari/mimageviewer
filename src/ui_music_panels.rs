@@ -62,7 +62,7 @@ pub(crate) fn music_audio_track_popup_open(
 #[cfg(all(windows, feature = "test-script"))]
 pub(crate) fn test_script_music_audio_track_popup_open(ctx: &egui::Context) -> bool {
     ctx.data(|data| {
-        data.get_temp::<egui::Id>(egui::Id::new("test_script_music_audio_track_popup_id"))
+        data.get_temp::<egui::Id>(egui::Id::unique("test_script_music_audio_track_popup_id"))
             .and_then(|id| data.get_temp::<bool>(id))
             .unwrap_or(false)
     })
@@ -142,7 +142,10 @@ pub(crate) fn draw_music_audio_track_selector(
     ui.ctx().data_mut(|data| data.insert_temp(id, open));
     #[cfg(feature = "test-script")]
     ui.ctx().data_mut(|data| {
-        data.insert_temp(egui::Id::new("test_script_music_audio_track_popup_id"), id)
+        data.insert_temp(
+            egui::Id::unique("test_script_music_audio_track_popup_id"),
+            id,
+        )
     });
     commands.into_iter().find_map(|command| match command {
         NativeOverlayCommand::SelectAudioTrack { stream_index } => Some(stream_index),
@@ -702,7 +705,7 @@ fn draw_music_file_navigation(
     {
         let rect = rects[index];
         let response = ui
-            .interact(rect, ui.id().with((name, fs_idx)), sense)
+            .interact(rect, ui.scope_id().with((name, fs_idx)), sense)
             .hover_tip_dark(label_with_shortcut(label, shortcuts[index]));
         // Scan layout can allocate less than the icon's fixed 12pt width.
         // Paint and input must stay within the same slot at every HUD width.
@@ -1038,7 +1041,7 @@ impl App {
         // 背面のタイムライン/スペクトラムへクリック/ドラッグを漏らさない。
         let _ = ui.interact(
             panel_rect,
-            ui.id().with(("music_right_bg", fs_idx)),
+            ui.scope_id().with(("music_right_bg", fs_idx)),
             egui::Sense::click_and_drag(),
         );
 
@@ -1063,7 +1066,7 @@ impl App {
         let lock_response = ui
             .interact(
                 lock_rect,
-                ui.id().with(("music_right_lock", fs_idx)),
+                ui.scope_id().with(("music_right_lock", fs_idx)),
                 egui::Sense::click(),
             )
             .on_hover_text(crate::ui_helpers::chrome_lock_hint(
@@ -1113,7 +1116,7 @@ impl App {
             let close_response = ui
                 .interact(
                     close_rect,
-                    ui.id().with(("music_right_close", fs_idx)),
+                    ui.scope_id().with(("music_right_close", fs_idx)),
                     egui::Sense::click(),
                 )
                 .on_hover_text("閉じる");
@@ -1322,7 +1325,7 @@ impl App {
         // ── 左端ホバー一覧パネル本体 ──
         if show_panel {
             let opts = music_jump_panel_options(has_chapters);
-            egui::Area::new(egui::Id::new(("music_jump_panel", fs_idx)))
+            egui::Area::new(egui::Id::unique(("music_jump_panel", fs_idx)))
                 .order(egui::Order::Foreground)
                 .fixed_pos(panel_rect.min)
                 .show(ctx, |ui| {
@@ -1354,7 +1357,7 @@ impl App {
                         let close_response = ui
                             .interact(
                                 close_rect,
-                                ui.id().with(("music_left_close", fs_idx)),
+                                ui.scope_id().with(("music_left_close", fs_idx)),
                                 egui::Sense::click(),
                             )
                             .hover_tip_dark("閉じる");
@@ -1380,7 +1383,7 @@ impl App {
         // `Order::Foreground` より下) に置き、ダイアログのクリックを塞がないようにする。
         let modal_open = title_edit.is_some() || bulk.is_some();
         if modal_open {
-            egui::Area::new(egui::Id::new(("music_modal_backdrop", fs_idx)))
+            egui::Area::new(egui::Id::unique(("music_modal_backdrop", fs_idx)))
                 .order(egui::Order::Middle)
                 .fixed_pos(full_rect.min)
                 .show(ctx, |ui| {
@@ -1391,7 +1394,7 @@ impl App {
                     );
                     let _ = ui.interact(
                         full_rect,
-                        egui::Id::new(("music_modal_backdrop_sink", fs_idx)),
+                        egui::Id::unique(("music_modal_backdrop_sink", fs_idx)),
                         egui::Sense::click_and_drag(),
                     );
                 });
@@ -1563,12 +1566,17 @@ impl App {
                                 Some(crate::video::AudioTrackSelectionDisplayState::Deferred)
                             ),
                         ),
-                        music_audio_track_selector_id(ui.id(), fs_idx, player.path()),
+                        music_audio_track_selector_id(ui.scope_id(), fs_idx, player.path()),
                     )
                 }),
                 _ => None,
             })
-            .unwrap_or_else(|| (Vec::new(), ui.id().with(("music_audio_track_menu", fs_idx))));
+            .unwrap_or_else(|| {
+                (
+                    Vec::new(),
+                    ui.scope_id().with(("music_audio_track_menu", fs_idx)),
+                )
+            });
         // 前/次ファイル移動 intent (-1 = 前, +1 = 次)。動画 HUD の ↑↓ = VideoPrevFile/NextFile
         // と同一挙動 (末尾でまとめて適用)。
         // 音量ノーマライズボタン (Norm) の左クリック intent。スキャン機構が windows 限定の
@@ -1644,7 +1652,7 @@ impl App {
         }
         let seek_resp = ui.interact(
             bar_rect.expand2(egui::vec2(0.0, 7.0)),
-            ui.id().with(("music_hud_seek", fs_idx)),
+            ui.scope_id().with(("music_hud_seek", fs_idx)),
             seek_sense,
         );
         if (seek_resp.clicked() || seek_resp.dragged())
@@ -1977,7 +1985,11 @@ fn draw_music_playback_row(
         // 頭出し (動画 replay = 頭出し + 即再生と同義)
 
         let resp = ui
-            .interact(r, ui.id().with(("music_hud_start", fs_idx)), button_sense)
+            .interact(
+                r,
+                ui.scope_id().with(("music_hud_start", fs_idx)),
+                button_sense,
+            )
             .hover_tip_dark(label_with_shortcut("頭出し", sc_seek_start.as_deref()));
         draw_overlay_button_bg(&painter, r, resp.hovered(), false);
         draw_overlay_replay_icon(&painter, r.center(), bsz * 0.36);
@@ -1995,7 +2007,11 @@ fn draw_music_playback_row(
         // 再生 / 一時停止
 
         let resp = ui
-            .interact(r, ui.id().with(("music_hud_play", fs_idx)), button_sense)
+            .interact(
+                r,
+                ui.scope_id().with(("music_hud_play", fs_idx)),
+                button_sense,
+            )
             .hover_tip_dark(label_with_shortcut(
                 if playing { "一時停止" } else { "再生" },
                 sc_play.as_deref(),
@@ -2039,7 +2055,11 @@ fn draw_music_playback_row(
         };
 
         let resp = ui
-            .interact(r, ui.id().with(("music_hud_loop", fs_idx)), button_sense)
+            .interact(
+                r,
+                ui.scope_id().with(("music_hud_loop", fs_idx)),
+                button_sense,
+            )
             .hover_tip_dark(label_with_shortcut(loop_tooltip, sc_loop.as_deref()));
         draw_overlay_button_bg(
             &painter,
@@ -2085,7 +2105,7 @@ fn draw_music_playback_row(
         let resp = ui
             .interact(
                 r,
-                ui.id().with(("music_hud_continuous", fs_idx)),
+                ui.scope_id().with(("music_hud_continuous", fs_idx)),
                 button_sense,
             )
             .hover_tip_dark(cont_tooltip);
@@ -2118,7 +2138,11 @@ fn draw_music_playback_row(
         // 前ブックマーク (|◀)
 
         let resp = ui
-            .interact(r, ui.id().with(("music_hud_prevbm", fs_idx)), button_sense)
+            .interact(
+                r,
+                ui.scope_id().with(("music_hud_prevbm", fs_idx)),
+                button_sense,
+            )
             .hover_tip_dark(label_with_shortcut(
                 "前のブックマーク",
                 sc_marker_prev.as_deref(),
@@ -2138,7 +2162,11 @@ fn draw_music_playback_row(
         // 次ブックマーク (▶|)
 
         let resp = ui
-            .interact(r, ui.id().with(("music_hud_nextbm", fs_idx)), button_sense)
+            .interact(
+                r,
+                ui.scope_id().with(("music_hud_nextbm", fs_idx)),
+                button_sense,
+            )
             .hover_tip_dark(label_with_shortcut(
                 "次のブックマーク",
                 sc_marker_next.as_deref(),
@@ -2166,7 +2194,7 @@ fn draw_music_playback_row(
         let dot_c = lim_rect.center();
         let lim_resp = ui.interact(
             lim_rect,
-            ui.id().with(("music_hud_limiter", fs_idx)),
+            ui.scope_id().with(("music_hud_limiter", fs_idx)),
             egui::Sense::hover(),
         );
         painter.circle_filled(
@@ -2232,7 +2260,7 @@ fn draw_music_playback_row(
         } else {
             &mut dummy_vol_target
         };
-        let volume_id = ui.id().with(("music_hud_vol", fs_idx));
+        let volume_id = ui.scope_id().with(("music_hud_vol", fs_idx));
         let volume_change = ui
             .add_enabled_ui(interactive, |ui| {
                 draw_overlay_volume_slider(
@@ -2286,7 +2314,7 @@ fn draw_music_playback_row(
         let norm_resp = ui
             .interact(
                 norm_rect,
-                ui.id().with(("music_hud_normalize", fs_idx)),
+                ui.scope_id().with(("music_hud_normalize", fs_idx)),
                 button_sense,
             )
             .hover_tip_dark(norm_tooltip);
@@ -2333,7 +2361,7 @@ fn draw_music_playback_row(
         let mresp = ui
             .interact(
                 mute_r,
-                ui.id().with(("music_hud_mute", fs_idx)),
+                ui.scope_id().with(("music_hud_mute", fs_idx)),
                 button_sense,
             )
             .hover_tip_dark(label_with_shortcut(
@@ -2374,8 +2402,8 @@ fn draw_music_playback_row(
             &mut dummy_speed_popup
         };
         let mut speed_popup_rect_sink = None;
-        let speed_id = ui.id().with(("music_hud_speed", fs_idx));
-        let speed_popup_id = ui.id().with(("music_hud_speed_popup", fs_idx));
+        let speed_id = ui.scope_id().with(("music_hud_speed", fs_idx));
+        let speed_popup_id = ui.scope_id().with(("music_hud_speed_popup", fs_idx));
         set_speed = ui
             .add_enabled_ui(interactive, |ui| {
                 draw_overlay_speed_control(
@@ -2451,7 +2479,8 @@ fn draw_music_normalize_progress(
     {
         ui.interact(
             shield,
-            ui.id().with(("music_normalize_backdrop", fs_idx, index)),
+            ui.scope_id()
+                .with(("music_normalize_backdrop", fs_idx, index)),
             egui::Sense::click_and_drag(),
         );
     }
@@ -2521,7 +2550,7 @@ fn draw_music_normalize_progress(
     let cancel_resp = ui
         .interact(
             cancel_rect,
-            ui.id().with(("music_normalize_cancel", fs_idx)),
+            ui.scope_id().with(("music_normalize_cancel", fs_idx)),
             egui::Sense::click(),
         )
         .hover_tip_dark("キャンセル [ESC]");
@@ -2610,7 +2639,7 @@ fn draw_music_playback_snapshot(ui: &mut egui::Ui, multitrack: bool) {
         &chrome,
         &layout,
         &rows,
-        ui.id().with("track"),
+        ui.scope_id().with("track"),
         false,
         MusicHudPresentation::Interactive,
         &crate::keymap::Keymap::empty(),
@@ -2651,7 +2680,7 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
         &chrome,
         &layout,
         &[],
-        ui.id().with("track"),
+        ui.scope_id().with("track"),
         false,
     );
     let ctx = ui.ctx().clone();
@@ -2775,7 +2804,7 @@ mod tests {
                 chrome.normalize_ui_state = crate::video::normalize_types::NormalizeUiState::Off;
                 let mut last_volume = None;
                 let mut speed_open = false;
-                let selector_id = egui::Id::new("tracks_hud_selector");
+                let selector_id = egui::Id::unique("tracks_hud_selector");
                 let mut clock = 0.0;
                 let mut frame = |events| {
                     clock += 1.0 / 60.0;
@@ -2923,7 +2952,7 @@ mod tests {
                                                 egui::pos2(0.0, 140.0 - MUSIC_HUD_HEIGHT),
                                                 ui.max_rect().max,
                                             );
-                                            let id = ui.id().with("track");
+                                            let id = ui.scope_id().with("track");
                                             let layout = music_hud_row_layout(
                                                 hud,
                                                 measure_music_hud_row(ui, &chrome, tracks),
@@ -2964,9 +2993,11 @@ mod tests {
                                                     .enumerate()
                                             {
                                                 assert_eq!(
-                                                    ctx.read_response(ui.id().with((name, 0usize)))
-                                                        .unwrap()
-                                                        .rect,
+                                                    ctx.read_response(
+                                                        ui.scope_id().with((name, 0usize))
+                                                    )
+                                                    .unwrap()
+                                                    .rect,
                                                     nav[index]
                                                 );
                                             }
@@ -3145,7 +3176,7 @@ mod tests {
                             &chrome,
                             &layout,
                             &[],
-                            ui.id().with("track"),
+                            ui.scope_id().with("track"),
                             false,
                             MusicHudPresentation::Disabled,
                             &crate::keymap::Keymap::empty(),
@@ -3165,7 +3196,7 @@ mod tests {
                             &chrome,
                             &layout,
                             &[],
-                            ui.id().with("track"),
+                            ui.scope_id().with("track"),
                             false,
                             MusicHudPresentation::Interactive,
                             &crate::keymap::Keymap::empty(),
@@ -3183,7 +3214,7 @@ mod tests {
                             &chrome,
                             &layout,
                             &[],
-                            ui.id().with("track"),
+                            ui.scope_id().with("track"),
                             false,
                             MusicHudPresentation::Interactive,
                             &crate::keymap::Keymap::empty(),
@@ -3219,12 +3250,16 @@ mod tests {
                             .show(root_ui, |ui| {
                                 draw_music_normalize_snapshot_fixture(ui);
                                 navigation = Some([
-                                    ctx.read_response(ui.id().with(("music_hud_prevfile", 0usize)))
-                                        .unwrap()
-                                        .rect,
-                                    ctx.read_response(ui.id().with(("music_hud_nextfile", 0usize)))
-                                        .unwrap()
-                                        .rect,
+                                    ctx.read_response(
+                                        ui.scope_id().with(("music_hud_prevfile", 0usize)),
+                                    )
+                                    .unwrap()
+                                    .rect,
+                                    ctx.read_response(
+                                        ui.scope_id().with(("music_hud_nextfile", 0usize)),
+                                    )
+                                    .unwrap()
+                                    .rect,
                                 ]);
                             })
                     });
@@ -3577,22 +3612,26 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 280.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    let id = ui.id().with("fixture_audio_track_popup");
-                    ui.ctx().data_mut(|data| data.insert_temp(id, true));
-                    let rect =
-                        egui::Rect::from_min_size(egui::pos2(235.0, 210.0), egui::vec2(62.0, 28.0));
-                    super::draw_music_audio_track_selector(ui, rect, &rows, true, id);
-                    #[cfg(feature = "test-script")]
-                    assert!(super::test_script_music_audio_track_popup_open(ui.ctx()));
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let id = ui.scope_id().with("fixture_audio_track_popup");
+                        ui.ctx().data_mut(|data| data.insert_temp(id, true));
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(235.0, 210.0),
+                            egui::vec2(62.0, 28.0),
+                        );
+                        super::draw_music_audio_track_selector(ui, rect, &rows, true, id);
+                        #[cfg(feature = "test-script")]
+                        assert!(super::test_script_music_audio_track_popup_open(ui.ctx()));
+                    });
                 });
             });
         harness.run();
@@ -3719,7 +3758,7 @@ mod tests {
                                         measure_music_hud_row(ui, &chrome, &rows),
                                     );
                                     let id = music_audio_track_selector_id(
-                                        ui.id(),
+                                        ui.scope_id(),
                                         0,
                                         Path::new("tracks.mka"),
                                     );
@@ -3742,7 +3781,7 @@ mod tests {
                                         layout.rects[MusicHudItem::Track as usize],
                                         music_audio_track_popup_open(
                                             ctx,
-                                            ui.id(),
+                                            ui.scope_id(),
                                             0,
                                             Path::new("tracks.mka"),
                                         ),

@@ -434,6 +434,10 @@ fn real_escape_cancels_direct_draft_without_a_second_confirmation_phase() {
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn confirmation_keyboard_uses_ime_helpers_and_escape_only_dismisses_the_front_dialog() {
     for confirmation in [
         ui::EditorConfirmation::Remove,

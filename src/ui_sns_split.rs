@@ -806,7 +806,7 @@ impl App {
         let mut close = false;
         let mut export_requested = false;
 
-        egui::Area::new(egui::Id::new("sns_split_panel"))
+        egui::Area::new(egui::Id::unique("sns_split_panel"))
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
@@ -815,7 +815,7 @@ impl App {
                         egui::Pos2::ZERO,
                         egui::vec2(PANEL_W + 12.0, panel_height + 12.0),
                     ),
-                    egui::Id::new("sns_split_panel_click_sink"),
+                    egui::Id::unique("sns_split_panel_click_sink"),
                     egui::Sense::click(),
                 );
                 egui::Frame::popup(ui.style())

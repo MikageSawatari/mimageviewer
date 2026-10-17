@@ -25,7 +25,7 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
     install(&ctx);
     let budget = VramPoolBudget::from_pool_bytes(Some(12_655_263_744), VramBudgetMode::Fullscreen);
     assert_eq!(page_turn_pin_limit(budget), 1_012_421_099);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_test_budget"), budget));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget));
     let mut app = ready_app(&ctx, SpreadMode::Ltr);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 200;
@@ -391,12 +391,12 @@ fn real_offer_and_prepared_pin_boundaries_admit_equality_and_reject_excess() {
             assert_eq!(page_turn_pin_limit(budget), limit);
             if !prepared {
                 ctx.data_mut(|data| {
-                    data.insert_temp(egui::Id::new("page_turn_test_budget"), budget)
+                    data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget)
                 });
             } else {
                 ctx.data_mut(|data| {
                     data.insert_temp(
-                        egui::Id::new("page_turn_test_budget"),
+                        egui::Id::unique("page_turn_test_budget"),
                         VramPoolBudget::from_pool_bytes(
                             Some(1024 * 1024 * 1024),
                             VramBudgetMode::Fullscreen,
@@ -440,7 +440,7 @@ fn real_offer_and_prepared_pin_boundaries_admit_equality_and_reject_excess() {
                 incoming[0].resource =
                     crate::gpu_lanczos::test_native_resource(source.clone(), [40, 60]).into();
                 ctx.data_mut(|data| {
-                    data.insert_temp(egui::Id::new("page_turn_test_budget"), budget)
+                    data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget)
                 });
                 app.fullscreen_idx = Some(1);
                 let receipt = app
@@ -458,7 +458,7 @@ fn prepared_pin_recheck_rejects_output_that_exceeds_budget_after_input_release()
     install(&ctx);
     let budget =
         VramPoolBudget::from_pool_bytes(Some(16 * 1024 * 1024), VramBudgetMode::Fullscreen);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_test_budget"), budget));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_test_budget"), budget));
     let mut app = ready_app(&ctx, SpreadMode::Single);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 200;

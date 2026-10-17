@@ -198,7 +198,7 @@ fn show_delete_confirm_modal(
     let dialog_width = (content_rect.width() - 32.0).clamp(240.0, 520.0);
     let target_list_height = (content_rect.height() - 180.0).clamp(100.0, 320.0);
     let has_target_list = label.contains("\n\n対象:");
-    egui::Modal::new(egui::Id::new("delete_confirm_modal")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("delete_confirm_modal")).show(ctx, |ui| {
         ui.set_min_width(dialog_width.min(320.0));
         ui.set_max_width(dialog_width);
         ui.heading("削除の確認");
@@ -835,7 +835,7 @@ impl crate::app::App {
         let pos = self.context_menu_pos;
         egui::Window::new("bookmark-grid-context")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("bookmark_grid_context_menu"))
+            .id(egui::Id::unique("bookmark_grid_context_menu"))
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
@@ -1002,7 +1002,7 @@ impl crate::app::App {
         let mut open = true;
         egui::Window::new("context_menu")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("grid_ctx_menu"))
+            .id(egui::Id::unique("grid_ctx_menu"))
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -2107,7 +2107,7 @@ impl crate::app::App {
         let mut open = true;
         egui::Window::new("fs_context_menu")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("fs_ctx_menu"))
+            .id(egui::Id::unique("fs_ctx_menu"))
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -2191,7 +2191,7 @@ impl crate::app::App {
             }
             ctx.data_mut(|data| {
                 data.insert_temp(
-                    egui::Id::new(DELETE_CONFIRM_SELECTION_ID),
+                    egui::Id::unique(DELETE_CONFIRM_SELECTION_ID),
                     content.kind.initial_selection(),
                 );
             });
@@ -2199,7 +2199,7 @@ impl crate::app::App {
         }
         let label = self.delete_confirm_label.clone().unwrap_or_default();
         let selection = ctx
-            .data(|data| data.get_temp(egui::Id::new(DELETE_CONFIRM_SELECTION_ID)))
+            .data(|data| data.get_temp(egui::Id::unique(DELETE_CONFIRM_SELECTION_ID)))
             .unwrap_or(DeleteConfirmSelection::Cancel);
 
         // CLAUDE.md の IME 定型どおり Modal closure の前で capture する。
@@ -2215,7 +2215,7 @@ impl crate::app::App {
         );
         ctx.data_mut(|data| {
             data.insert_temp(
-                egui::Id::new(DELETE_CONFIRM_SELECTION_ID),
+                egui::Id::unique(DELETE_CONFIRM_SELECTION_ID),
                 key_response.selection,
             );
         });
@@ -2263,7 +2263,7 @@ impl crate::app::App {
         let canceling = pending.cancel.load(std::sync::atomic::Ordering::Relaxed);
 
         let mut cancel_requested = false;
-        egui::Modal::new(egui::Id::new("delete_progress_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("delete_progress_modal")).show(ctx, |ui| {
             ui.set_min_width(280.0);
             ui.heading("削除中");
             ui.add_space(4.0);
@@ -4596,24 +4596,26 @@ mod delete_confirm_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    if ui.button("Background action").clicked() {
-                        clicked_in_ui.store(true, Ordering::Relaxed);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
                     }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        if ui.button("Background action").clicked() {
+                            clicked_in_ui.store(true, Ordering::Relaxed);
+                        }
+                    });
+                    let _ = show_delete_confirm_modal(
+                        ctx,
+                        "sample.jpg をゴミ箱に移動しますか？",
+                        DeleteConfirmSelection::Delete,
+                    );
                 });
-                let _ = show_delete_confirm_modal(
-                    ctx,
-                    "sample.jpg をゴミ箱に移動しますか？",
-                    DeleteConfirmSelection::Delete,
-                );
             });
 
         harness.get_by_label("Background action").click();
@@ -4693,6 +4695,10 @@ mod delete_confirm_tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn delete_confirm_y_n_enter_act_immediately_after_ime_commit() {
         for same_pass in [true, false] {
             for (key, expected) in [

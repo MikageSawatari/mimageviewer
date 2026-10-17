@@ -708,7 +708,7 @@ impl App {
                 .and_then(|name| name.to_str())
                 .unwrap_or("EPUB");
             egui::Window::new("EPUB を PDF に変換").drag_area(egui::WindowDrag::Anywhere)
-                .id(egui::Id::new("epub_convert_dialog"))
+                .id(egui::Id::unique("epub_convert_dialog"))
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)

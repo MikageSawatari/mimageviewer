@@ -292,3 +292,9 @@ empty repeated delivery, manager-generated sets and free-only cleanup without a
 UI pass, and no duplicate consumer entry. This is dispatcher/resource evidence,
 not an end-to-end native WindowEvent or real-GL test. A missing GPU adapter fails
 the wgpu regression. Execution/mutation results belong in the stage-3 ledger.
+# Stage 5 Rust warning cleanup (2026-10-17)
+
+The mIV window-witness serial counter uses `AtomicU64::try_update` instead of
+the deprecated `fetch_update` alias, with identical arguments, orderings and
+closure. Local Rust standard-library rustdoc metadata confirms stabilization
+in Rust 1.95.0, matching this crate's MSRV. See the stage-5 verification ledger.

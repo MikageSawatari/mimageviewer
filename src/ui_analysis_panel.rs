@@ -1052,7 +1052,7 @@ impl App {
         );
         let close_resp = ui.interact(
             cb_rect,
-            egui::Id::new("analysis_close_btn"),
+            egui::Id::unique("analysis_close_btn"),
             egui::Sense::click(),
         );
         ui.painter().rect_filled(

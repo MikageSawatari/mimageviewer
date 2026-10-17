@@ -925,7 +925,7 @@ fn retained_material_entry_view_trim_single_detect_and_seed_wait_for_original() 
             ..Default::default()
         };
         let before = app.view_trim_book_settings;
-        let seed_id = egui::Id::new(("view_trim_auto_page_seed_pending", 0usize));
+        let seed_id = egui::Id::unique(("view_trim_auto_page_seed_pending", 0usize));
         ctx.data_mut(|data| data.insert_temp(seed_id, true));
         let (sender, cancel) = pending_original(&mut app);
         app.request_view_trim_original_action(&ctx, 0, SpreadPair::Single, action);

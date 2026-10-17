@@ -44,7 +44,7 @@ impl Default for GridObservation {
 }
 
 fn observation_id() -> egui::Id {
-    egui::Id::new("test-script-root-grid-observation")
+    egui::Id::unique("test-script-root-grid-observation")
 }
 
 pub(crate) fn publish(ctx: &egui::Context, observation: GridObservation) {

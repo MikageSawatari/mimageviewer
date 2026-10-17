@@ -875,7 +875,7 @@ fn draw_dialog(
     let mut action = DialogAction::None;
     let mut export_recursive_changed = None;
     let recursive = state.recursive;
-    egui::Modal::new(egui::Id::new("metadata_transfer_modal")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("metadata_transfer_modal")).show(ctx, |ui| {
         ui.set_min_width(430.0);
         ui.heading(match state.operation {
             Operation::Export => "メタ情報をエクスポート",
@@ -1099,7 +1099,6 @@ fn progress_widget_height(progress: TransferProgress) -> f32 {
         .with_context_setup(crate::ui_fonts::configure_fonts)
         .with_size(egui::vec2(430.0, 240.0))
         .build_ui(move |root_ui| {
-            let ctx = &root_ui.ctx().clone();
             egui::CentralPanel::default().show(root_ui, |ui| {
                 let top = ui.cursor().top();
                 draw_progress(ui, Some(&progress));

@@ -835,10 +835,10 @@ impl App {
             ctx.memory_mut(|memory| {
                 memory.set_modal_layer(egui::LayerId::new(
                     egui::Order::Foreground,
-                    egui::Id::new("composition-editor-owner-notice"),
+                    egui::Id::unique("composition-editor-owner-notice"),
                 ))
             });
-            egui::Area::new(egui::Id::new("composition-editor-owner-notice"))
+            egui::Area::new(egui::Id::unique("composition-editor-owner-notice"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(ctx.content_rect().min + egui::vec2(12.0, 12.0))
                 .show(ctx, |ui| {
@@ -849,7 +849,7 @@ impl App {
                 });
             return;
         }
-        let marker = egui::Id::new(("composition-editor-drawn", owner.request_id));
+        let marker = egui::Id::unique(("composition-editor-drawn", owner.request_id));
         let frame = ctx.cumulative_frame_nr();
         if ctx.data(|data| data.get_temp::<u64>(marker)) == Some(frame) {
             return;
@@ -894,7 +894,7 @@ impl App {
                 }
                 ui::show_window(
                     ctx,
-                    egui::Id::new(("book-composition-editor", owner.request_id)),
+                    egui::Id::unique(("book-composition-editor", owner.request_id)),
                     &session.view,
                     &mut session.ui,
                     keys,
@@ -912,7 +912,7 @@ impl App {
                 );
                 ui::show_window(
                     ctx,
-                    egui::Id::new(("book-composition-editor", owner.request_id)),
+                    egui::Id::unique(("book-composition-editor", owner.request_id)),
                     &view,
                     &mut ui::EditorUiState::default(),
                     keys,

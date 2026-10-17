@@ -141,7 +141,7 @@ pub fn show_file_organize_modal(
     destinations: &[FileOrganizeDestination],
     focus: &mut Option<(usize, Option<ShellTransferOperation>)>,
 ) -> egui::ModalResponse<Option<FileOrganizeUiAction>> {
-    egui::Modal::new(egui::Id::new("file_organize_modal")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("file_organize_modal")).show(ctx, |ui| {
         ui.set_width((ctx.content_rect().width() - 48.0).clamp(240.0, 780.0));
         ui.heading("ファイル整理先");
         render_file_organize_contents(ui, sources, destinations, focus)

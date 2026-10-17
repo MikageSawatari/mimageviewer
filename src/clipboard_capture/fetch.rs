@@ -707,7 +707,7 @@ fn fetch_image(
 fn reserve_bytes(session: &Session, count: u64) -> Result<(), String> {
     session
         .bytes
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
             old.checked_add(count).filter(|n| *n <= SESSION_BYTES)
         })
         .map(|_| ())

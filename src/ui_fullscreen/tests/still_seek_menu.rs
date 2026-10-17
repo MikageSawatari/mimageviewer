@@ -101,8 +101,8 @@ fn menu_frame(
                     .frame(egui::Frame::NONE)
                     .show(root_ui, |ui| {
                         app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                        toggle =
-                            ctx.read_response(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
+                        toggle = ctx
+                            .read_response(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
                     })
             });
         },
@@ -145,8 +145,8 @@ fn touch_toggle_frame(
                     .frame(egui::Frame::NONE)
                     .show(root_ui, |ui| {
                         app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                        toggle =
-                            ctx.read_response(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
+                        toggle = ctx
+                            .read_response(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID));
                     })
             });
         },
@@ -206,7 +206,7 @@ fn menu_key_frame(key: egui::Key) -> (FsKeyAction, bool) {
     let size = egui::vec2(640.0, 360.0);
     egui::Popup::open_id(
         &ctx,
-        egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
+        egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
     );
     let mut action = FsKeyAction {
         page_transition: Default::default(),
@@ -634,23 +634,25 @@ fn still_seek_popup_regular_and_narrow_snapshots() {
         let mut harness = crate::test_ui::builder()
             .with_size(size)
             .build_ui(|root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !initialized {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    egui::Popup::open_id(
-                        ctx,
-                        egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
-                    );
-                    initialized = true;
-                    ctx.request_repaint();
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(root_ui, |ui| {
-                        let full = ctx.content_rect();
-                        app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                    });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !initialized {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        egui::Popup::open_id(
+                            ctx,
+                            egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
+                        );
+                        initialized = true;
+                        ctx.request_repaint();
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| {
+                            let full = ctx.content_rect();
+                            app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                        });
+                });
             });
         harness.run();
         harness.snapshot(name);

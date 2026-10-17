@@ -78,7 +78,7 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
 }
 
 fn text_contrast_id() -> egui::Id {
-    egui::Id::new("miv_text_contrast")
+    egui::Id::unique("miv_text_contrast")
 }
 
 /// Context に最後に適用した文字コントラストを返す。独立したテスト Context や

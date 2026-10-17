@@ -119,7 +119,7 @@ impl App {
                 #[cfg(test)]
                 ctx.data_mut(|data| {
                     data.insert_temp(
-                        egui::Id::new("about_outer_scroll_geometry"),
+                        egui::Id::unique("about_outer_scroll_geometry"),
                         (ui.clip_rect(), ui.cursor().min.y),
                     )
                 });
@@ -373,7 +373,7 @@ mod tests {
         }
         let geometry = || {
             ctx.data(|data| {
-                data.get_temp::<(egui::Rect, f32)>(egui::Id::new("about_outer_scroll_geometry"))
+                data.get_temp::<(egui::Rect, f32)>(egui::Id::unique("about_outer_scroll_geometry"))
                     .unwrap()
             })
         };

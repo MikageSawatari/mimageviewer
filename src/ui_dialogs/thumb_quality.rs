@@ -159,7 +159,7 @@ fn draw_thumb_quality_panel(
 #[cfg(test)]
 fn thumb_quality_dialog_observation(ctx: &egui::Context) -> ThumbQualityPanelAction {
     ctx.data(|data| {
-        data.get_temp(egui::Id::new(THUMB_QUALITY_DIALOG_OBSERVATION_ID))
+        data.get_temp(egui::Id::unique(THUMB_QUALITY_DIALOG_OBSERVATION_ID))
             .unwrap_or_default()
     })
 }
@@ -210,7 +210,7 @@ mod tests {
             .drop_without_applying_deltas();
         ctx.memory(|memory| {
             memory
-                .area_rect(egui::Id::new(THUMB_QUALITY_DIALOG_ID))
+                .area_rect(egui::Id::unique(THUMB_QUALITY_DIALOG_ID))
                 .expect("thumb quality dialog must be rendered")
         })
     }
@@ -640,7 +640,7 @@ impl App {
                 egui::Rect::from_center_size(layout.safe_rect.center(), layout.default_size);
 
             egui::Window::new(THUMB_QUALITY_DIALOG_ID).drag_area(egui::WindowDrag::Anywhere)
-                .id(egui::Id::new(THUMB_QUALITY_DIALOG_ID))
+                .id(egui::Id::unique(THUMB_QUALITY_DIALOG_ID))
                 .open(&mut open)
                 .resizable(true)
                 .collapsible(false)
@@ -840,7 +840,7 @@ impl App {
                     #[cfg(test)]
                     ui.ctx().data_mut(|data| {
                         data.insert_temp(
-                            egui::Id::new(THUMB_QUALITY_DIALOG_OBSERVATION_ID),
+                            egui::Id::unique(THUMB_QUALITY_DIALOG_OBSERVATION_ID),
                             panel_b_observation,
                         );
                     });

@@ -254,7 +254,7 @@ impl App {
         let mut save = false;
         let mut window = egui::Window::new("クリップボードの画像を選んで保存")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("clipboard-capture-selection"))
+            .id(egui::Id::unique("clipboard-capture-selection"))
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
             .default_width(720.0)
             .min_width(450.0)
@@ -431,7 +431,8 @@ fn draw_selection_contents(
 pub fn draw_capture_selection_snapshot_fixture(ui: &mut egui::Ui, saving: bool) {
     let ctx = ui.ctx().clone();
     let mut preview = FetchedImage::snapshot_preview();
-    let texture = ctx.load_texture(
+    let texture = crate::ui_helpers::load_snapshot_texture(
+        &ctx,
         "clipboard-capture-snapshot-preview",
         std::mem::replace(
             &mut preview.thumbnail,
@@ -444,7 +445,8 @@ pub fn draw_capture_selection_snapshot_fixture(ui: &mut egui::Ui, saving: bool) 
         image.width = 640;
         image.height = 480;
         image.content_hash = [1; 32];
-        let texture = ctx.load_texture(
+        let texture = crate::ui_helpers::load_snapshot_texture(
+            &ctx,
             "clipboard-capture-snapshot-second",
             std::mem::replace(
                 &mut image.thumbnail,

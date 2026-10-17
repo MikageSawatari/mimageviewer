@@ -3874,7 +3874,7 @@ impl crate::app::App {
                     }
                 });
         let mut disconnect = false;
-        egui::Modal::new(egui::Id::new("remote_session_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("remote_session_modal")).show(ctx, |ui| {
             ui.heading(match phase {
                 super::session::RemoteControlPhase::AcquiringRemote => "リモート接続の準備中",
                 super::session::RemoteControlPhase::DrainingRemote => {
@@ -4105,7 +4105,7 @@ impl crate::app::App {
         let mut begin_session_logout = false;
         egui::Window::new("リモート接続")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("remote_connection_dialog"))
+            .id(egui::Id::unique("remote_connection_dialog"))
             .collapsible(false)
             .resizable(false)
             .default_width(560.0)
@@ -4284,7 +4284,7 @@ impl crate::app::App {
                                     edit.password(true)
                                         .desired_width(260.0)
                                         .hint_text("6文字以上（半角英数字・記号、空白なし）")
-                                        .id(egui::Id::new("remote_connection_pin"))
+                                        .id(egui::Id::unique("remote_connection_pin"))
                                 },
                             );
                             if *request_focus {
@@ -4476,7 +4476,7 @@ impl crate::app::App {
         if logout_confirmation_open {
             let mut confirm = false;
             let mut cancel = escape_pressed;
-            let response = egui::Modal::new(egui::Id::new("remote_logout_all_confirm")).show(
+            let response = egui::Modal::new(egui::Id::unique("remote_logout_all_confirm")).show(
                 ctx,
                 |ui| {
                     ui.set_min_width(420.0);
@@ -5275,7 +5275,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.remote_session_ui.connection_dialog = Some(RemoteConnectionDialogState::new(true));
-        let id = egui::Id::new("remote_connection_dialog");
+        let id = egui::Id::unique("remote_connection_dialog");
         let draw = |app: &mut crate::app::App, events| {
             ctx.run_ui(
                 egui::RawInput {

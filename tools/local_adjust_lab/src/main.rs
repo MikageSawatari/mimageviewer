@@ -5282,14 +5282,14 @@ impl LocalAdjustLabApp {
             .unwrap_or(fallback_rect)
             .expand2(egui::vec2(4.0, 8.0));
 
-        egui::Area::new(egui::Id::new("local_adjust_lab_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_lab_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("local_adjust_lab_panel_sink"),
+                    egui::Id::unique("local_adjust_lab_panel_sink"),
                     Sense::click_and_drag(),
                 );
                 let frame_response = egui::Frame::popup(ui.style())
@@ -5396,14 +5396,14 @@ impl LocalAdjustLabApp {
             .unwrap_or(fallback_rect)
             .expand2(egui::vec2(4.0, 8.0));
 
-        egui::Area::new(egui::Id::new("local_adjust_lab_tool_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_lab_tool_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("local_adjust_lab_tool_panel_sink"),
+                    egui::Id::unique("local_adjust_lab_tool_panel_sink"),
                     Sense::click_and_drag(),
                 );
                 let frame_response = egui::Frame::popup(ui.style())
@@ -7540,7 +7540,7 @@ impl LocalAdjustLabApp {
                 let (linear_changed, linear_used) = draw_linear_gradient_handles(
                     ui,
                     rect,
-                    ui.id().with(("mask_linear_gradient", layer_idx)),
+                    ui.scope_id().with(("mask_linear_gradient", layer_idx)),
                     &mut mask.start,
                     &mut mask.end,
                     visuals,
@@ -7573,7 +7573,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used) = drag_norm_handle(
                     ui,
                     rect,
-                    ui.id().with(("radial_center", layer_idx)),
+                    ui.scope_id().with(("radial_center", layer_idx)),
                     center,
                     &mut mask.center,
                     "center",
@@ -7581,7 +7581,7 @@ impl LocalAdjustLabApp {
                 let inner_x_resp = ui
                     .interact(
                         Rect::from_center_size(inner_x_handle, egui::vec2(24.0, 24.0)),
-                        ui.id().with(("radial_inner_x", layer_idx)),
+                        ui.scope_id().with(("radial_inner_x", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("内側 横");
@@ -7597,7 +7597,7 @@ impl LocalAdjustLabApp {
                 let inner_y_resp = ui
                     .interact(
                         Rect::from_center_size(inner_y_handle, egui::vec2(24.0, 24.0)),
-                        ui.id().with(("radial_inner_y", layer_idx)),
+                        ui.scope_id().with(("radial_inner_y", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("内側 縦");
@@ -7613,7 +7613,7 @@ impl LocalAdjustLabApp {
                 let outer_x_resp = ui
                     .interact(
                         Rect::from_center_size(outer_x_handle, egui::vec2(24.0, 24.0)),
-                        ui.id().with(("radial_outer_x", layer_idx)),
+                        ui.scope_id().with(("radial_outer_x", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("外側 横");
@@ -7628,7 +7628,7 @@ impl LocalAdjustLabApp {
                 let outer_y_resp = ui
                     .interact(
                         Rect::from_center_size(outer_y_handle, egui::vec2(24.0, 24.0)),
-                        ui.id().with(("radial_outer_y", layer_idx)),
+                        ui.scope_id().with(("radial_outer_y", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("外側 縦");
@@ -7752,7 +7752,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("radial_blur_center", layer_idx)),
+                    ui.scope_id().with(("radial_blur_center", layer_idx)),
                     &mut params.center,
                     "放射ぼかし中心",
                     Color32::from_rgb(185, 235, 255),
@@ -7768,7 +7768,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("wave_distortion_center", layer_idx)),
+                    ui.scope_id().with(("wave_distortion_center", layer_idx)),
                     &mut params.center,
                     "波形中心",
                     Color32::from_rgb(170, 235, 255),
@@ -7786,7 +7786,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("pinch_spherize_center", layer_idx)),
+                    ui.scope_id().with(("pinch_spherize_center", layer_idx)),
                     &mut params.center,
                     "つまむ/魚眼中心",
                     Color32::from_rgb(185, 235, 255),
@@ -7806,7 +7806,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("twirl_center", layer_idx)),
+                    ui.scope_id().with(("twirl_center", layer_idx)),
                     &mut params.center,
                     "渦巻き中心",
                     Color32::from_rgb(190, 225, 255),
@@ -7826,7 +7826,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("polar_coordinates_center", layer_idx)),
+                    ui.scope_id().with(("polar_coordinates_center", layer_idx)),
                     &mut params.center,
                     "極座標中心",
                     Color32::from_rgb(190, 225, 255),
@@ -7846,7 +7846,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("lens_correction_center", layer_idx)),
+                    ui.scope_id().with(("lens_correction_center", layer_idx)),
                     &mut params.center,
                     "レンズ補正中心",
                     Color32::from_rgb(190, 225, 255),
@@ -7864,7 +7864,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used) = drag_norm_handle(
                     ui,
                     rect,
-                    ui.id().with(("god_rays_center", layer_idx)),
+                    ui.scope_id().with(("god_rays_center", layer_idx)),
                     center,
                     &mut params.center,
                     "光源位置",
@@ -7897,7 +7897,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("lens_flare_center", layer_idx)),
+                    ui.scope_id().with(("lens_flare_center", layer_idx)),
                     &mut params.center,
                     "フレア光源位置",
                     Color32::from_rgb(255, 232, 135),
@@ -7927,7 +7927,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("light_leak_center", layer_idx)),
+                    ui.scope_id().with(("light_leak_center", layer_idx)),
                     &mut params.center,
                     "ライトリーク光源位置",
                     Color32::from_rgb(255, 188, 120),
@@ -7948,7 +7948,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("backlight_haze_center", layer_idx)),
+                    ui.scope_id().with(("backlight_haze_center", layer_idx)),
                     &mut params.center,
                     "逆光ヘイズ光源位置",
                     Color32::from_rgb(255, 226, 165),
@@ -7969,7 +7969,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("speed_lines_center", layer_idx)),
+                    ui.scope_id().with(("speed_lines_center", layer_idx)),
                     &mut params.center,
                     "集中線/スピード線中心",
                     Color32::from_rgb(215, 250, 255),
@@ -7997,7 +7997,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
                     rect,
-                    ui.id().with(("radial_flash_center", layer_idx)),
+                    ui.scope_id().with(("radial_flash_center", layer_idx)),
                     &mut params.center,
                     "集中線フラッシュ中心",
                     Color32::from_rgb(255, 245, 170),
@@ -8016,7 +8016,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used) = drag_norm_handle(
                     ui,
                     rect,
-                    ui.id().with(("spotlight_center", layer_idx)),
+                    ui.scope_id().with(("spotlight_center", layer_idx)),
                     center,
                     &mut params.center,
                     "スポットライト位置",
@@ -8125,7 +8125,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used) = drag_norm_handle(
                     ui,
                     rect,
-                    ui.id().with(("tilt_center", layer_idx)),
+                    ui.scope_id().with(("tilt_center", layer_idx)),
                     center,
                     &mut params.center,
                     "中心",
@@ -8133,7 +8133,7 @@ impl LocalAdjustLabApp {
                 let focus_resp = ui
                     .interact(
                         Rect::from_center_size(focus_handle, egui::vec2(26.0, 26.0)),
-                        ui.id().with(("tilt_focus", layer_idx)),
+                        ui.scope_id().with(("tilt_focus", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("焦点幅");
@@ -8154,7 +8154,7 @@ impl LocalAdjustLabApp {
                 let outer_resp = ui
                     .interact(
                         Rect::from_center_size(outer_handle, egui::vec2(28.0, 28.0)),
-                        ui.id().with(("tilt_outer", layer_idx)),
+                        ui.scope_id().with(("tilt_outer", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("ぼかし境界");
@@ -8204,7 +8204,7 @@ impl LocalAdjustLabApp {
                 let (center_changed, center_used) = drag_norm_handle(
                     ui,
                     rect,
-                    ui.id().with(("tilt_radial_center", layer_idx)),
+                    ui.scope_id().with(("tilt_radial_center", layer_idx)),
                     center,
                     &mut params.center,
                     "中心",
@@ -8212,7 +8212,7 @@ impl LocalAdjustLabApp {
                 let inner_x_resp = ui
                     .interact(
                         Rect::from_center_size(inner_x_handle, egui::vec2(26.0, 26.0)),
-                        ui.id().with(("tilt_inner_x", layer_idx)),
+                        ui.scope_id().with(("tilt_inner_x", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("焦点 横");
@@ -8226,7 +8226,7 @@ impl LocalAdjustLabApp {
                 let inner_y_resp = ui
                     .interact(
                         Rect::from_center_size(inner_y_handle, egui::vec2(26.0, 26.0)),
-                        ui.id().with(("tilt_inner_y", layer_idx)),
+                        ui.scope_id().with(("tilt_inner_y", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("焦点 縦");
@@ -8240,7 +8240,7 @@ impl LocalAdjustLabApp {
                 let outer_x_resp = ui
                     .interact(
                         Rect::from_center_size(outer_x_handle, egui::vec2(28.0, 28.0)),
-                        ui.id().with(("tilt_outer_x", layer_idx)),
+                        ui.scope_id().with(("tilt_outer_x", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("ぼかし境界 横");
@@ -8257,7 +8257,7 @@ impl LocalAdjustLabApp {
                 let outer_y_resp = ui
                     .interact(
                         Rect::from_center_size(outer_y_handle, egui::vec2(28.0, 28.0)),
-                        ui.id().with(("tilt_outer_y", layer_idx)),
+                        ui.scope_id().with(("tilt_outer_y", layer_idx)),
                         Sense::drag(),
                     )
                     .lab_hover_tip("ぼかし境界 縦");
@@ -23881,7 +23881,7 @@ fn draw_color_gradient_geometry_handles(
             let (changed, used) = draw_linear_gradient_handles(
                 ui,
                 rect,
-                ui.id()
+                ui.scope_id()
                     .with(("effect_linear_gradient", id_label, layer_idx)),
                 &mut start,
                 &mut end,
@@ -23895,7 +23895,7 @@ fn draw_color_gradient_geometry_handles(
         ColorOverlayShape::Radial => draw_radial_circle_gradient_handles(
             ui,
             rect,
-            ui.id()
+            ui.scope_id()
                 .with(("effect_radial_gradient", id_label, layer_idx)),
             &mut geometry.center,
             &mut geometry.radius,

@@ -2888,12 +2888,12 @@ fn fs_navigator_interaction_active(owner: FullscreenNavigatorInteractionOwner) -
 }
 
 fn fs_navigator_frame_input_cache_id() -> egui::Id {
-    egui::Id::new("fs_navigator_frame_input_snapshots")
+    egui::Id::unique("fs_navigator_frame_input_snapshots")
 }
 
 pub(crate) fn install_fs_navigator_input_tracking(ctx: &egui::Context) {
     page_turn::install(ctx);
-    let installation_id = egui::Id::new("miv_fs_navigator_input_tracking_installed");
+    let installation_id = egui::Id::unique("miv_fs_navigator_input_tracking_installed");
     let already_installed = ctx.data_mut(|data| {
         if data.get_temp::<bool>(installation_id).unwrap_or(false) {
             true
@@ -5593,7 +5593,7 @@ fn draw_spread_shift_marker(ui: &mut egui::Ui, rect: egui::Rect, view: &SpreadSh
         }
         ui.interact(
             egui::Rect::from_center_size(center, egui::vec2(12.0, 12.0)),
-            egui::Id::new("spread_shift_marker"),
+            egui::Id::unique("spread_shift_marker"),
             egui::Sense::hover(),
         )
         .on_hover_text(format!("{}\n{}", view.status, view.anchor));
@@ -5777,7 +5777,7 @@ fn music_overflow_frame_input(
     music_active: bool,
     panel_open: bool,
 ) -> MusicOverflowFrameInput {
-    let id = egui::Id::new(("music_overflow_input_router", ctx.viewport_id()));
+    let id = egui::Id::unique(("music_overflow_input_router", ctx.viewport_id()));
     let mut router = ctx
         .data(|data| data.get_temp::<MusicOverflowInputRouter>(id))
         .unwrap_or_default();
@@ -5866,7 +5866,7 @@ fn draw_fs_overflow_panel_row(
         egui::vec2(ui.available_width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
         sense,
     );
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let background = if selected {
         egui::Color32::from_rgb(54, 93, 142)
     } else if enabled && response.hovered() {
@@ -5950,7 +5950,7 @@ fn draw_fs_overflow_panel_surface(
     );
     let _sink = ui.interact(
         panel_rect,
-        egui::Id::new("fs_overflow_panel_sink"),
+        egui::Id::unique("fs_overflow_panel_sink"),
         egui::Sense::click(),
     );
 
@@ -5992,7 +5992,7 @@ fn draw_fs_overflow_panel_surface(
     );
     let close_response = child.interact(
         close_rect,
-        egui::Id::new("fs_overflow_panel_close"),
+        egui::Id::unique("fs_overflow_panel_close"),
         egui::Sense::click(),
     );
     if close_response.hovered() {
@@ -6039,7 +6039,7 @@ fn draw_fs_overflow_panel_surface(
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(
-                        egui::Id::new("fs_overflow_scroll_test_clip"),
+                        egui::Id::unique("fs_overflow_scroll_test_clip"),
                         ui.clip_rect(),
                     );
                 });
@@ -6056,7 +6056,7 @@ fn draw_fs_overflow_panel_surface(
                             (!view.composition_available).then_some("書庫・PDF・EPUB の本で使えます"),
                         );
                         #[cfg(test)]
-                        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("fs_composition_editor_entry_test_rect"), response.rect));
+                        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::unique("fs_composition_editor_entry_test_rect"), response.rect));
                         if response.clicked() { action = Some(FsOverflowPanelAction::EditComposition); }
                         for row in &view.root_rows {
                             let response = draw_fs_overflow_panel_row(
@@ -6140,7 +6140,7 @@ fn draw_fs_overflow_panel_surface(
         #[cfg(test)]
         ui.ctx().data_mut(|data| {
             data.insert_temp(
-                egui::Id::new("fs_overflow_scroll_test_layout"),
+                egui::Id::unique("fs_overflow_scroll_test_layout"),
                 (
                     output.inner_rect,
                     output.content_size,
@@ -6623,7 +6623,7 @@ struct StillTouchFirstRunHelpState {
 }
 
 fn still_touch_first_run_help_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new((
+    egui::Id::unique((
         "miv_touch_first_run_help",
         ctx.viewport_id(),
         crate::touch_correlation::TouchSurface::StillFullscreen,
@@ -6733,7 +6733,7 @@ struct StillTouchChromeLatch {
 }
 
 fn still_touch_chrome_latch_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new((
+    egui::Id::unique((
         "miv_touch_chrome_latch",
         ctx.viewport_id(),
         crate::touch_correlation::TouchSurface::StillFullscreen,
@@ -6787,7 +6787,7 @@ fn set_still_touch_chrome_latch(ctx: &egui::Context, latch: StillTouchChromeLatc
 }
 
 fn fs_rotation_popup_open(ctx: &egui::Context) -> bool {
-    egui::Popup::is_id_open(ctx, egui::Id::new("fs_rotation_btn").with("popup"))
+    egui::Popup::is_id_open(ctx, egui::Id::unique("fs_rotation_btn").with("popup"))
 }
 
 const FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID: &str = "fullscreen_still_seek_strip";
@@ -6795,7 +6795,7 @@ const FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID: &str = "fullscreen_still_seek_strip
 fn fs_still_seek_strip_popup_open(ctx: &egui::Context) -> bool {
     egui::Popup::is_id_open(
         ctx,
-        egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
+        egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
     )
 }
 
@@ -6956,7 +6956,7 @@ fn draw_still_seek_strip_menu(
                                       current,
                                       value| {
                         let response =
-                            ui.interact(item_rect, ui.id().with(id), egui::Sense::click());
+                            ui.interact(item_rect, ui.scope_id().with(id), egui::Sense::click());
                         response.widget_info(|| {
                             egui::WidgetInfo::selected(
                                 egui::Role::Button,
@@ -7342,7 +7342,7 @@ fn music_panel_callout_edges_without_touch_handles(handle_rects: [egui::Rect; 2]
 }
 
 fn music_touch_observed_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new(("miv_music_touch_observed", ctx.viewport_id()))
+    egui::Id::unique(("miv_music_touch_observed", ctx.viewport_id()))
 }
 
 fn observe_music_touch_for_panel_handles(ctx: &egui::Context, gestures_disabled: bool) -> bool {
@@ -7881,7 +7881,7 @@ fn draw_spread_mode_rows(
         let item_rect = allocate_spread_popup_row(scroll_ui);
         let item_resp = scroll_ui.interact(
             item_rect,
-            egui::Id::new(format!("spread_popup_{}", mode.to_int())),
+            egui::Id::unique(format!("spread_popup_{}", mode.to_int())),
             egui::Sense::click(),
         );
         let is_current = if composition_owned && mode.is_spread() {
@@ -8078,7 +8078,7 @@ fn draw_singleton_spread_endpoint_popup(
                 let rect = allocate_spread_popup_row(ui);
                 let response = ui.interact(
                     rect,
-                    egui::Id::new(format!(
+                    egui::Id::unique(format!(
                         "singleton_spread_placement_popup_{endpoint}_{}",
                         preference.to_int()
                     )),
@@ -8168,7 +8168,7 @@ mod singleton_spread_endpoint_popup_tests {
             frame(&ctx, &mut saved, animation, vec![]);
             for endpoint in 0..2 {
                 let response = ctx
-                    .read_response(egui::Id::new(format!(
+                    .read_response(egui::Id::unique(format!(
                         "singleton_spread_placement_popup_{endpoint}_{}",
                         SingletonSpreadPlacementPreference::Place.to_int()
                     )))
@@ -10247,7 +10247,7 @@ fn feedback_toast_layer_id(drawing_surface: crate::app::ActionSurface) -> egui::
         crate::app::ActionSurface::MainWindow => "feedback_toast_main_window",
         crate::app::ActionSurface::Viewer => "feedback_toast_viewer",
     };
-    egui::LayerId::new(egui::Order::Tooltip, egui::Id::new(id))
+    egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique(id))
 }
 
 fn feedback_toast_rect(
@@ -10395,7 +10395,7 @@ fn draw_music_top_chrome_surface(
         let resp = ui
             .interact(
                 rect,
-                ui.id().with(("music_top_close", fs_idx)),
+                ui.scope_id().with(("music_top_close", fs_idx)),
                 egui::Sense::click(),
             )
             .hover_tip_dark("閉じる".to_string());
@@ -10413,7 +10413,11 @@ fn draw_music_top_chrome_surface(
         first_right_control_left = first_right_control_left.min(rect.left());
         top_rx -= button_size + button_gap;
         let resp = ui
-            .interact(rect, ui.id().with(("music_top_overflow", fs_idx)), sense)
+            .interact(
+                rect,
+                ui.scope_id().with(("music_top_overflow", fs_idx)),
+                sense,
+            )
             .hover_tip_dark("音名の色".to_string());
         painter.rect_filled(
             rect,
@@ -10433,8 +10437,9 @@ fn draw_music_top_chrome_surface(
         }
         response.overflow_clicked = interactive && resp.clicked();
         #[cfg(test)]
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(egui::Id::new("music_overflow_button_rect"), rect));
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::unique("music_overflow_button_rect"), rect)
+        });
     }
 
     if chrome.show_window_toggle {
@@ -10445,7 +10450,11 @@ fn draw_music_top_chrome_surface(
         first_right_control_left = first_right_control_left.min(rect.left());
         top_rx -= button_size + button_gap;
         let resp = ui
-            .interact(rect, ui.id().with(("music_top_window", fs_idx)), sense)
+            .interact(
+                rect,
+                ui.scope_id().with(("music_top_window", fs_idx)),
+                sense,
+            )
             .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
         painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
         draw_overlay_window_toggle_icon(&painter, rect);
@@ -10472,7 +10481,7 @@ fn draw_music_top_chrome_surface(
         let resp = ui
             .interact(
                 rect,
-                ui.id().with(("music_top_side_panel_mode", fs_idx)),
+                ui.scope_id().with(("music_top_side_panel_mode", fs_idx)),
                 sense,
             )
             .hover_tip_dark(keymap.chord_list_bracket_label(&tip, KeyAction::FsToggleMetadata));
@@ -10505,7 +10514,7 @@ fn draw_music_top_chrome_surface(
         let resp = ui
             .interact(
                 rect,
-                ui.id().with(("music_top_back_to_video", fs_idx)),
+                ui.scope_id().with(("music_top_back_to_video", fs_idx)),
                 sense,
             )
             .hover_tip_dark(back_tip);
@@ -10523,7 +10532,7 @@ fn draw_music_top_chrome_surface(
         first_right_control_left = first_right_control_left.min(rect.left());
         top_rx -= button_size + button_gap;
         let resp = ui
-            .interact(rect, ui.id().with(("music_top_vst", fs_idx)), sense)
+            .interact(rect, ui.scope_id().with(("music_top_vst", fs_idx)), sense)
             .hover_tip_dark("VST プラグイン画面を開く".to_string());
         painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
         draw_overlay_vst3_top_icon(&painter, rect);
@@ -10550,8 +10559,16 @@ fn draw_music_top_chrome_surface(
             egui::pos2(cx + group_w * 0.5 - btn * 0.5, cy),
             egui::vec2(btn, btn),
         );
-        let minus_resp = ui.interact(minus_rect, ui.id().with(("music_row_minus", fs_idx)), sense);
-        let plus_resp = ui.interact(plus_rect, ui.id().with(("music_row_plus", fs_idx)), sense);
+        let minus_resp = ui.interact(
+            minus_rect,
+            ui.scope_id().with(("music_row_minus", fs_idx)),
+            sense,
+        );
+        let plus_resp = ui.interact(
+            plus_rect,
+            ui.scope_id().with(("music_row_plus", fs_idx)),
+            sense,
+        );
         painter.rect_filled(minus_rect, 4.0, top_btn_bg(minus_resp.hovered()));
         let m = minus_rect.center();
         painter.line_segment(
@@ -12315,7 +12332,7 @@ impl App {
         } else {
             self.fullscreen_viewport_id()
         };
-        let order_id = egui::Id::new(("fs_original_preview_call_order", viewport));
+        let order_id = egui::Id::unique(("fs_original_preview_call_order", viewport));
         let observed_call_order = ctx.data_mut(|data| {
             let mut order = data
                 .get_temp::<FsOriginalPreviewFrameCallOrder>(order_id)
@@ -12328,7 +12345,7 @@ impl App {
             data.insert_temp(order_id, order);
             order.next_call_order
         });
-        let cache_id = egui::Id::new(("fs_original_preview_active", viewport));
+        let cache_id = egui::Id::unique(("fs_original_preview_active", viewport));
         if let Some(sample) = ctx
             .data(|data| data.get_temp::<FsOriginalPreviewFrameSample>(cache_id))
             .filter(|sample| {
@@ -15522,7 +15539,7 @@ fn continuous_reading_response_drag_delta(
     enabled: bool,
     pointer_down: bool,
 ) -> egui::Vec2 {
-    let state_id = egui::Id::new(("continuous_reading_drag_state", ctx.viewport_id()));
+    let state_id = egui::Id::unique(("continuous_reading_drag_state", ctx.viewport_id()));
     let Some(session_started_at) = session_started_at.filter(|_| enabled) else {
         ctx.data_mut(|data| data.remove_temp::<ContinuousReadingDragState>(state_id));
         return egui::Vec2::ZERO;
@@ -18511,7 +18528,7 @@ fn draw_music_touch_panel_handle(
     bar_rect: egui::Rect,
     edge: crate::ui_helpers::PanelEdge,
 ) -> bool {
-    egui::Area::new(egui::Id::new((
+    egui::Area::new(egui::Id::unique((
         "music_touch_panel_handle",
         ctx.viewport_id(),
         edge,
@@ -18521,7 +18538,7 @@ fn draw_music_touch_panel_handle(
     .show(ctx, |ui| {
         ui.set_min_size(bar_rect.size());
         let rect = egui::Rect::from_min_size(ui.min_rect().min, bar_rect.size());
-        let hit_id = ui.id().with(("music_touch_panel_handle_hit", edge));
+        let hit_id = ui.scope_id().with(("music_touch_panel_handle_hit", edge));
         let response = interact_touch_panel_handle(ui, rect, hit_id);
         paint_panel_callout_chrome(ui, rect, edge, false, response.hovered());
         response.on_hover_text("パネルを開く").clicked()
@@ -19946,7 +19963,7 @@ impl App {
 
         let _ = ui.interact(
             full_rect,
-            egui::Id::new(("fs_touch_first_run_help_sink", ctx.viewport_id())),
+            egui::Id::unique(("fs_touch_first_run_help_sink", ctx.viewport_id())),
             egui::Sense::click_and_drag(),
         );
         paint_still_touch_first_run_help_overlay(
@@ -19999,7 +20016,7 @@ impl App {
             let response = interact_touch_panel_handle(
                 ui,
                 rect,
-                egui::Id::new(("fs_touch_panel_handle", edge)),
+                egui::Id::unique(("fs_touch_panel_handle", edge)),
             );
             let action = still_side_panel_action_for_handle_edge(edge);
             paint_panel_callout_chrome(ui, rect, edge, false, response.hovered());
@@ -20040,7 +20057,7 @@ impl App {
             let bar_rect = panel_callout_bar_rect(full_rect, edge);
             let response = ui.interact(
                 bar_rect,
-                egui::Id::new(("fs_panel_callout", edge)),
+                egui::Id::unique(("fs_panel_callout", edge)),
                 egui::Sense::click(),
             );
             let fill = if response.hovered() {
@@ -20241,7 +20258,7 @@ impl App {
                 crate::ui_helpers::PanelEdge::Right => self.metadata_panel_click_shown(),
                 crate::ui_helpers::PanelEdge::Top => false,
             };
-            let clicked = egui::Area::new(egui::Id::new(("music_panel_callout", fs_idx, edge)))
+            let clicked = egui::Area::new(egui::Id::unique(("music_panel_callout", fs_idx, edge)))
                 .order(crate::ui_helpers::PANEL_CALLOUT_ORDER)
                 .fixed_pos(bar_rect.min)
                 .show(ctx, |ui| {
@@ -20249,7 +20266,8 @@ impl App {
                     let rect = egui::Rect::from_min_size(ui.min_rect().min, bar_rect.size());
                     let response = ui.interact(
                         rect,
-                        ui.id().with(("music_panel_callout_hit", fs_idx, edge)),
+                        ui.scope_id()
+                            .with(("music_panel_callout_hit", fs_idx, edge)),
                         egui::Sense::click(),
                     );
                     let fill = if response.hovered() {
@@ -22782,7 +22800,7 @@ impl App {
                 self.settings.ui_scale_factor,
                 self.settings.always_on_top,
             );
-            let mut viewport_close_requested = false;
+            let viewport_close_requested = false;
             let mut bar_close_requested = false;
             let mut placement_update = None;
             let mut focused_now = false;
@@ -24339,7 +24357,7 @@ impl App {
             let strip_lock_response = ui
                 .interact(
                     strip_lock_rect,
-                    egui::Id::new("fullscreen_still_seek_strip_lock"),
+                    egui::Id::unique("fullscreen_still_seek_strip_lock"),
                     egui::Sense::click(),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -25476,7 +25494,6 @@ impl App {
     }
 
     pub(crate) fn render_fullscreen_viewport(&mut self, root_ui: &mut egui::Ui) {
-        let ctx = &root_ui.ctx().clone();
         self.render_fullscreen_viewport_with_root_input(root_ui, None);
     }
 
@@ -28253,7 +28270,6 @@ impl App {
                 let test_script_pointer_show =
                     crate::test_script::pointer_input::enter_show(test_script_pointer_show_owner);
                 main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx_ui, _class| {
-                    let vp_ctx = &vp_ctx_ui.ctx().clone();
                     render_fs_body(vp_ctx_ui, false);
                 });
                 #[cfg(all(windows, feature = "test-script"))]
@@ -28797,17 +28813,17 @@ impl App {
         };
         ctx.data(|data| {
             (
-                data.get_temp::<FsPageTurnFrameDecision>(egui::Id::new((
+                data.get_temp::<FsPageTurnFrameDecision>(egui::Id::unique((
                     "fs_page_turn_decision",
                     viewport,
                 )))
                 .map(|sample| sample.frame_nr),
-                data.get_temp::<FsOriginalPreviewFrameSample>(egui::Id::new((
+                data.get_temp::<FsOriginalPreviewFrameSample>(egui::Id::unique((
                     "fs_original_preview_active",
                     viewport,
                 )))
                 .map(|sample| sample.frame_nr),
-                data.get_temp::<FsPageTurnPhysicalInputFrameSample>(egui::Id::new((
+                data.get_temp::<FsPageTurnPhysicalInputFrameSample>(egui::Id::unique((
                     "fs_page_turn_physical_input_held",
                     viewport,
                 )))
@@ -28828,7 +28844,7 @@ impl App {
         viewport: egui::ViewportId,
     ) -> FsPageTurnPhysicalInput {
         let frame_nr = ctx.cumulative_frame_nr();
-        let cache_id = egui::Id::new(("fs_page_turn_physical_input_held", viewport));
+        let cache_id = egui::Id::unique(("fs_page_turn_physical_input_held", viewport));
         if let Some(sample) = ctx
             .data(|data| data.get_temp::<FsPageTurnPhysicalInputFrameSample>(cache_id))
             .filter(|sample| sample.frame_nr == frame_nr)
@@ -29056,7 +29072,7 @@ impl App {
             } else {
                 self.fullscreen_viewport_id()
             };
-            let cache_id = egui::Id::new(("fs_page_turn_decision", viewport));
+            let cache_id = egui::Id::unique(("fs_page_turn_decision", viewport));
             let frame_nr = ctx.cumulative_frame_nr();
             ctx.data_mut(|data| {
                 data.insert_temp(
@@ -29132,7 +29148,7 @@ impl App {
             let (page_turn_input_held, ordinary_blocker, viewport) =
                 self.fs_page_turn_input_held(ctx, fs_idx);
             let frame_nr = ctx.cumulative_frame_nr();
-            let cache_id = egui::Id::new(("fs_page_turn_decision", viewport));
+            let cache_id = egui::Id::unique(("fs_page_turn_decision", viewport));
             let cache_lookup_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
             let cached = ctx
                 .data(|data| data.get_temp::<FsPageTurnFrameDecision>(cache_id))
@@ -29155,7 +29171,7 @@ impl App {
             if let Some(perf) = perf {
                 perf.cache_hit = Some(false);
             }
-            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
+            let burst_id = egui::Id::unique(("fs_page_turn_burst", viewport));
             let mut burst_state = ctx
                 .data(|data| data.get_temp::<FsPageTurnBurstState>(burst_id))
                 .unwrap_or_default();
@@ -29217,7 +29233,7 @@ impl App {
         {
             let (held, blocker, viewport) = self.fs_page_turn_input_held(ctx, current_idx);
             let moved = target_idx.is_some_and(|target_idx| target_idx != current_idx);
-            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
+            let burst_id = egui::Id::unique(("fs_page_turn_burst", viewport));
             let state = if held && blocker.is_none() && moved {
                 // 同じ押下の続き (キーリピート / 連打) で初めて通し描画へ上げる。
                 // 1 回目は `Armed` に留めるので、単発のページ送りは元の画質のまま。
@@ -29231,7 +29247,7 @@ impl App {
             } else {
                 FsPageTurnBurstState::Idle
             };
-            let decision_id = egui::Id::new(("fs_page_turn_decision", viewport));
+            let decision_id = egui::Id::unique(("fs_page_turn_decision", viewport));
             ctx.data_mut(|data| {
                 data.insert_temp(burst_id, state);
                 // The frame began before navigation was resolved. Make the target
@@ -29354,7 +29370,7 @@ impl App {
             .iter()
             .any(|page| page.provenance == FsDisplayUnitPageProvenance::Holdover);
         let viewport = self.fs_trace_viewport(ctx, captured_display_unit);
-        let cache_id = egui::Id::new(("fs_paint_display_unit", viewport));
+        let cache_id = egui::Id::unique(("fs_paint_display_unit", viewport));
         let previous = ctx.data(|data| data.get_temp::<FsPaintDisplayUnitSignature>(cache_id));
         let changed_pages = trace_pages
             .iter()
@@ -29819,7 +29835,7 @@ impl App {
                 .map(|page| (page.occurrence, page.texture_id, page.source))
                 .collect(),
         };
-        let cache_id = egui::Id::new(("fs_page_turn_ready", self.fullscreen_viewport_id()));
+        let cache_id = egui::Id::unique(("fs_page_turn_ready", self.fullscreen_viewport_id()));
         if !fs_page_turn_ready_signature_changed(
             ctx.data(|data| data.get_temp::<FsPageTurnReadySignature>(cache_id))
                 .as_ref(),
@@ -32465,7 +32481,7 @@ impl App {
         record_bar_button_touch_frame(ctx, self.frame_counter, bar_rect);
         let mut ui = egui::Ui::new(
             ctx.clone(),
-            egui::Id::new("fs_frame_close_owner"),
+            egui::Id::unique("fs_frame_close_owner"),
             egui::UiBuilder::new()
                 .layer_id(egui::LayerId::background())
                 .max_rect(full_rect),
@@ -34056,7 +34072,7 @@ impl App {
         );
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let fs_music_view_active = self.fs_music_view_active(fs_idx);
-        let pano_active_now = self.is_panorama_mode_active(fs_idx);
+        let _pano_active_now = self.is_panorama_mode_active(fs_idx);
         if key_p_pin {
             self.toggle_folder_pin_for_idx(fs_idx);
         }
@@ -35702,7 +35718,7 @@ impl App {
         // area in egui's layer hit-test. ScrollArea therefore cannot own wheel
         // input there. Register exactly the popup rectangle, leaving outside
         // input with the existing backing owner.
-        egui::Area::new(egui::Id::new("fs_overflow_panel_foreground"))
+        egui::Area::new(egui::Id::unique("fs_overflow_panel_foreground"))
             .order(egui::Order::Foreground)
             .fixed_pos(panel_rect.min)
             .movable(false)
@@ -35837,7 +35853,7 @@ impl App {
         if !ui
             .interact(
                 fs_navigator_close_button_rect(header_rect),
-                egui::Id::new("fs_navigator_close").with(id_prefix),
+                egui::Id::unique("fs_navigator_close").with(id_prefix),
                 egui::Sense::click(),
             )
             .on_hover_text("ナビゲータを閉じる")
@@ -36085,7 +36101,7 @@ impl App {
             let _ = ui
                 .interact(
                     rect,
-                    egui::Id::new("panorama_navigator_corner").with(index),
+                    egui::Id::unique("panorama_navigator_corner").with(index),
                     egui::Sense::click(),
                 )
                 .on_hover_text(tooltip);
@@ -36094,7 +36110,7 @@ impl App {
             let _ = ui
                 .interact(
                     fs_navigator_close_button_rect(layout.header_rect),
-                    egui::Id::new("fs_navigator_close").with("panorama"),
+                    egui::Id::unique("fs_navigator_close").with("panorama"),
                     egui::Sense::click(),
                 )
                 .on_hover_text("ナビゲータを閉じる");
@@ -36102,7 +36118,7 @@ impl App {
         let _ = ui
             .interact(
                 layout.canvas_rect,
-                egui::Id::new("panorama_navigator_canvas"),
+                egui::Id::unique("panorama_navigator_canvas"),
                 egui::Sense::click_and_drag(),
             )
             .on_hover_text(
@@ -36427,7 +36443,7 @@ impl App {
             let _ = ui
                 .interact(
                     rect,
-                    egui::Id::new("fs_navigator_corner").with(index),
+                    egui::Id::unique("fs_navigator_corner").with(index),
                     egui::Sense::click(),
                 )
                 .on_hover_text(tooltip);
@@ -36436,7 +36452,7 @@ impl App {
             let _ = ui
                 .interact(
                     fs_navigator_close_button_rect(layout.header_rect),
-                    egui::Id::new("fs_navigator_close").with("flat"),
+                    egui::Id::unique("fs_navigator_close").with("flat"),
                     egui::Sense::click(),
                 )
                 .on_hover_text("ナビゲータを閉じる");
@@ -36445,7 +36461,7 @@ impl App {
         let _ = ui
             .interact(
                 layout.canvas_rect,
-                egui::Id::new("fs_navigator_canvas"),
+                egui::Id::unique("fs_navigator_canvas"),
                 egui::Sense::click_and_drag(),
             )
             .on_hover_text(
@@ -37330,7 +37346,6 @@ impl App {
         // 同じ面の認識器を回す呼び出しが下に複数ある。接触の開始フレームを処理した
         // 呼び出しが所有者を決めるので、**全部で同じ値を使う**。
         let touch_tap_zones = self.fs_touch_tap_zones_enabled();
-        let mut close = false;
         const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
         let (primary_pressed, pointer_primary_down, primary_released) = ctx.input(|i| {
             (
@@ -38255,7 +38270,7 @@ impl App {
         let in_video_tile = false;
         let fs_response = ui.interact(
             full_rect,
-            egui::Id::new("fs_click"),
+            egui::Id::unique("fs_click"),
             egui::Sense::click_and_drag(),
         );
         let continuous_touch_delta = continuous_reading_response_drag_delta(
@@ -38323,7 +38338,7 @@ impl App {
                         };
                         Some(crate::ui_music_panels::music_audio_track_popup_open(
                             ctx,
-                            music_view_backing_ui_id(ui.id()),
+                            music_view_backing_ui_id(ui.scope_id()),
                             idx,
                             player.path(),
                         ))
@@ -49586,7 +49601,7 @@ impl App {
                 );
                 let item_resp = ui.interact(
                     item_rect,
-                    egui::Id::new(("fs_panorama_projection_item", mode.shader_code())),
+                    egui::Id::unique(("fs_panorama_projection_item", mode.shader_code())),
                     egui::Sense::click(),
                 );
                 let is_current = panorama_projection.normalized() == mode;
@@ -49855,7 +49870,10 @@ impl App {
                                 let item_rect = allocate_spread_popup_row(scroll_ui);
                                 let item_resp = scroll_ui.interact(
                                     item_rect,
-                                    egui::Id::new(format!("reading_flow_popup_{}", flow.to_int())),
+                                    egui::Id::unique(format!(
+                                        "reading_flow_popup_{}",
+                                        flow.to_int()
+                                    )),
                                     egui::Sense::click(),
                                 );
                                 let is_current = *reading_flow == flow;
@@ -49915,7 +49933,7 @@ impl App {
                                         let item_rect = allocate_spread_popup_row(scroll_ui);
                                         let item_resp = scroll_ui.interact(
                                             item_rect,
-                                            egui::Id::new(format!(
+                                            egui::Id::unique(format!(
                                                 "reading_direction_popup_{}",
                                                 direction.to_int()
                                             )),
@@ -49971,7 +49989,7 @@ impl App {
                                         let item_rect = allocate_spread_popup_row(scroll_ui);
                                         let item_resp = scroll_ui.interact(
                                             item_rect,
-                                            egui::Id::new(format!(
+                                            egui::Id::unique(format!(
                                                 "final_cover_spread_popup_{}",
                                                 preference.to_int()
                                             )),
@@ -50025,7 +50043,7 @@ impl App {
                                             let item_rect = allocate_spread_popup_row(scroll_ui);
                                             let item_resp = scroll_ui.interact(
                                                 item_rect,
-                                                egui::Id::new(format!(
+                                                egui::Id::unique(format!(
                                                     "page_alone_popup_{endpoint}_{}",
                                                     preference.to_int()
                                                 )),
@@ -50076,7 +50094,7 @@ impl App {
                     #[cfg(test)]
                     ctx.data_mut(|data| {
                         data.insert_temp(
-                            egui::Id::new("fs_spread_popup_scroll_test_output"),
+                            egui::Id::unique("fs_spread_popup_scroll_test_output"),
                             (
                                 scroll_output.id,
                                 scroll_output.state.clamped_offset(),
@@ -50311,7 +50329,7 @@ impl App {
                 );
                 let response = ui.interact(
                     row_rect,
-                    ui.id().with(("fs_top_bar_page_info", row)),
+                    ui.scope_id().with(("fs_top_bar_page_info", row)),
                     egui::Sense::hover(),
                 );
                 let full_text = if info_text.is_empty() {
@@ -50606,7 +50624,7 @@ fn fs_fit_popup_row(
 ) -> egui::Response {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
-    let response = ui.interact(rect, ui.id().with(id), egui::Sense::click());
+    let response = ui.interact(rect, ui.scope_id().with(id), egui::Sense::click());
     let fill = if active {
         egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
     } else if response.hovered() {
@@ -50862,11 +50880,11 @@ fn draw_fs_fit_popup(
                 ),
             );
             data.insert_temp(
-                egui::Id::new("fs_fit_popup_scroll_layout"),
+                egui::Id::unique("fs_fit_popup_scroll_layout"),
                 (scroll_output.inner_rect, bar, scroll_output.content_size),
             );
             data.insert_temp(
-                egui::Id::new("fs_fit_popup_scroll_offset"),
+                egui::Id::unique("fs_fit_popup_scroll_offset"),
                 scroll_output.state.clamped_offset(),
             );
         });
@@ -51129,7 +51147,8 @@ impl App {
         full_rect: egui::Rect,
         ctx: &egui::Context,
     ) {
-        let indicator_id = egui::Id::new(("fs_colorize_wait_indicator_visible", ctx.viewport_id()));
+        let indicator_id =
+            egui::Id::unique(("fs_colorize_wait_indicator_visible", ctx.viewport_id()));
         let Some((target_idx, started_at)) = self
             .fs_holdover_tex
             .as_ref()
@@ -51410,7 +51429,9 @@ impl App {
             && !self.any_dialog_open())
         .then(|| {
             ctx.memory(|memory| {
-                memory.area_rect(egui::Id::new(crate::ui_main::CHECKED_SELECTION_OVERLAY_ID))
+                memory.area_rect(egui::Id::unique(
+                    crate::ui_main::CHECKED_SELECTION_OVERLAY_ID,
+                ))
             })
         })
         .flatten();
@@ -51433,7 +51454,7 @@ impl App {
             let resp = toast_ui
                 .interact(
                     toast_rect,
-                    egui::Id::new("feedback_toast_reveal_capture"),
+                    egui::Id::unique("feedback_toast_reveal_capture"),
                     egui::Sense::click(),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -52436,7 +52457,7 @@ impl App {
 
         let _response = ui.interact(
             full_rect,
-            egui::Id::new("fs_capture_region_selection"),
+            egui::Id::unique("fs_capture_region_selection"),
             egui::Sense::click_and_drag(),
         );
         let seek_height = self
@@ -55424,7 +55445,7 @@ impl App {
     /// 描くので、glyph 非依存に三角を painter で描く (UI グリフ選定ルール)。呼び出し側は
     /// このボタン矩形を seek 抑止にも使う。
     fn draw_music_scroll_button(ui: &egui::Ui, rect: egui::Rect, up: bool) -> bool {
-        let id = ui.id().with(("music_tl_scroll", up));
+        let id = ui.scope_id().with(("music_tl_scroll", up));
         let resp = ui.interact(rect, id, egui::Sense::click());
         let painter = ui.painter_at(rect);
         let bg = if resp.is_pointer_button_down_on() {
@@ -55617,8 +55638,9 @@ impl App {
         );
         let ui = &mut backing_ui;
         #[cfg(test)]
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(egui::Id::new("music_backing_drawn_ui_id"), ui.id()));
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::unique("music_backing_drawn_ui_id"), ui.scope_id())
+        });
         // 音楽ビューは動画フルスクリーンと同じく黒背景ベースで統一する。App テーマが Light でも
         // ここは常にダーク配色にする (CLAUDE.md「フルスクリーン内は黒背景ベース統一」、実機 FB:
         // 上下バーが Light 基調で中央のダーク波形と食い違っていた)。
@@ -55849,7 +55871,7 @@ impl App {
                 };
                 Some(crate::ui_music_panels::music_audio_track_popup_open(
                     ctx,
-                    ui.id(),
+                    ui.scope_id(),
                     fs_idx,
                     player.path(),
                 ))
@@ -56044,7 +56066,7 @@ impl App {
                 probe.auto_scrolled = outcome.auto_scrolled;
                 probe.offset = sa_output.state.clamped_offset();
                 probe.content = sa_output.content_size;
-                let probe_id = egui::Id::new(("music_pan_probe", ctx.viewport_id()));
+                let probe_id = egui::Id::unique(("music_pan_probe", ctx.viewport_id()));
                 ctx.data_mut(|data| data.insert_temp(probe_id, probe));
             }
             const SCROLL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
@@ -56414,7 +56436,7 @@ mod music_full_width_hud_tests {
                 ctx.root_ui(|root_ui| egui::CentralPanel::default().frame(egui::Frame::NONE).show(root_ui, |ui| {
                     app.draw_parked_live_music_window(ui, ctx, ui.max_rect(), &info, &mut false);
                     for name in ["music_hud_prevfile", "music_hud_nextfile"] {
-                        let response = ctx.read_response(ui.id().with((name, info.fs_idx)))
+                        let response = ctx.read_response(ui.scope_id().with((name, info.fs_idx)))
                             .expect("parked target's arrows must be registered independently of B's scan");
                         assert!(!response.sense.senses_click());
                         nav.push(response.rect);
@@ -56707,7 +56729,7 @@ mod music_full_width_hud_tests {
                             );
                             let response = |name| {
                                 ctx.read_response(
-                                    music_view_backing_ui_id(ui.id()).with((name, 0usize)),
+                                    music_view_backing_ui_id(ui.scope_id()).with((name, 0usize)),
                                 )
                             };
                             let panel = response("music_right_bg");
@@ -57019,7 +57041,7 @@ mod tests {
                 if frame == 1 {
                     close = if music {
                         ctx.read_response(
-                            egui::Id::new("central_panel").with(("music_right_close", 0usize)),
+                            egui::Id::unique("central_panel").with(("music_right_close", 0usize)),
                         )
                         .map(|response| response.rect.center())
                         .unwrap_or(egui::pos2(panel.right() - 44.0, panel.top() + 16.0))
@@ -62274,7 +62296,7 @@ mod tests {
                             projection_items = crate::panorama::PanoProjection::all()
                                 .iter()
                                 .filter_map(|mode| {
-                                    ctx.read_response(egui::Id::new((
+                                    ctx.read_response(egui::Id::unique((
                                         "fs_panorama_projection_item",
                                         mode.shader_code(),
                                     )))
@@ -62341,7 +62363,7 @@ mod tests {
                         egui::Rect,
                         egui::Vec2,
                     ) = ctx.data(|data| {
-                        data.get_temp(egui::Id::new("fs_spread_popup_scroll_test_output"))
+                        data.get_temp(egui::Id::unique("fs_spread_popup_scroll_test_output"))
                             .unwrap()
                     });
                     ScrollLayout {
@@ -62521,7 +62543,7 @@ mod tests {
                 });
             })
             .drop_without_applying_deltas();
-        ctx.read_response(egui::Id::new(format!(
+        ctx.read_response(egui::Id::unique(format!(
             "singleton_spread_placement_popup_1_{}",
             target.to_int()
         )))
@@ -62631,13 +62653,13 @@ mod tests {
             );
             for id in &binding_and_helper_ids {
                 let response = ctx
-                    .read_response(egui::Id::new(id))
+                    .read_response(egui::Id::unique(id))
                     .expect("the real popup keeps binding/helper rows visible");
                 assert_eq!(response.enabled(), !extracted_result, "{id}");
             }
             for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
                 assert_eq!(
-                    ctx.read_response(egui::Id::new(format!("spread_popup_{}", mode.to_int())))
+                    ctx.read_response(egui::Id::unique(format!("spread_popup_{}", mode.to_int())))
                         .is_some(),
                     !extracted_result,
                     "cover binding is unavailable in the extracted popup"
@@ -62655,7 +62677,7 @@ mod tests {
                     edit(&mut expected);
                     expected.open = false;
                 }
-                spread_popup_test_click(&ctx, full_rect, &mut state, egui::Id::new(id));
+                spread_popup_test_click(&ctx, full_rect, &mut state, egui::Id::unique(id));
                 assert_eq!(state, expected, "extracted={extracted_result} row={id}");
             }
         }
@@ -62680,7 +62702,7 @@ mod tests {
                 let mut expected = state.clone();
                 expected.reading_flow = flow;
                 expected.open = false;
-                let id = egui::Id::new(format!("reading_flow_popup_{}", flow.to_int()));
+                let id = egui::Id::unique(format!("reading_flow_popup_{}", flow.to_int()));
                 spread_popup_test_frame(
                     &ctx,
                     full_rect,
@@ -62731,7 +62753,7 @@ mod tests {
                 );
 
                 let popup_point = ctx
-                    .read_response(egui::Id::new(format!(
+                    .read_response(egui::Id::unique(format!(
                         "spread_popup_{}",
                         SpreadMode::all()[0].to_int()
                     )))
@@ -62746,7 +62768,7 @@ mod tests {
                     target,
                 );
                 assert!(
-                    ctx.read_response(egui::Id::new(format!(
+                    ctx.read_response(egui::Id::unique(format!(
                         "spread_popup_{}",
                         SpreadMode::all()[0].to_int()
                     )))
@@ -62769,7 +62791,7 @@ mod tests {
                 spread_popup_test_frame(&ctx, full_rect, Vec::new(), &mut state, target);
                 spread_popup_test_frame(&ctx, full_rect, Vec::new(), &mut state, target);
                 let target_rect = ctx
-                    .read_response(egui::Id::new(format!(
+                    .read_response(egui::Id::unique(format!(
                         "singleton_spread_placement_popup_1_{}",
                         target.to_int()
                     )))
@@ -62780,7 +62802,7 @@ mod tests {
                     "height={height} target={target:?} did not scroll into view: {target_rect:?}"
                 );
 
-                let target_id = egui::Id::new(format!(
+                let target_id = egui::Id::unique(format!(
                     "singleton_spread_placement_popup_1_{}",
                     target.to_int()
                 ));
@@ -62898,7 +62920,7 @@ mod tests {
             "fs_overflow_btn",
             "fs_close_btn",
         ]
-        .map(egui::Id::new);
+        .map(egui::Id::unique);
         assert_eq!(
             baseline.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             expected_left_to_right,
@@ -63083,11 +63105,11 @@ mod tests {
                             )
                             .drop_without_applying_deltas();
                         let (inner, content, offset) = ctx.data(|data| {
-                            data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
+                            data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                                 .unwrap()
                         });
                         let clip = ctx.data(|data| {
-                            data.get_temp::<egui::Rect>(egui::Id::new(
+                            data.get_temp::<egui::Rect>(egui::Id::unique(
                                 "fs_overflow_scroll_test_clip",
                             ))
                             .unwrap()
@@ -63183,82 +63205,85 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(size)
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
-                    .show(root_ui, |ui| {
-                        let root_rows = vec![
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::SpreadAdjustment,
-                                label: "見開きの調整".into(),
-                                status: "調整なし  >".into(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::NavigatorToggle,
-                                label: "ナビゲータ [Alt+N]".to_string(),
-                                status: "ON".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::NavigatorPosition,
-                                label: "ナビゲータ位置".to_string(),
-                                status: "右下  >".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::ImageAnalysis,
-                                label: "分析ツール [Shift+Z]".to_string(),
-                                status: "OFF".to_string(),
-                                enabled: false,
-                                disabled_reason: Some(
-                                    "分析ツールは見開きの2ページ表示中は使えません",
-                                ),
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::PixelGrid,
-                                label: "ピクセルグリッド [G]".to_string(),
-                                status: "ON".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::LoupeLock,
-                                label: "ルーペ固定 [M]".to_string(),
-                                status: "OFF".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                        ];
-                        let mut root_rows = root_rows;
-                        root_rows.insert(3, animation_row.clone());
-                        let view = FsOverflowPanelView {
-                            state,
-                            root_rows,
-                            navigator_corner: FullscreenNavigatorCorner::BottomRight,
-                            shift: Default::default(),
-                            composition_available: true,
-                            composition_managed: false,
-                            music_note_color_scheme: Default::default(),
-                        };
-                        let panel_rect = fs_overflow_panel_rect(ctx.content_rect(), state).unwrap();
-                        let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
-                    });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+                        .show(root_ui, |ui| {
+                            let root_rows = vec![
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::SpreadAdjustment,
+                                    label: "見開きの調整".into(),
+                                    status: "調整なし  >".into(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::NavigatorToggle,
+                                    label: "ナビゲータ [Alt+N]".to_string(),
+                                    status: "ON".to_string(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::NavigatorPosition,
+                                    label: "ナビゲータ位置".to_string(),
+                                    status: "右下  >".to_string(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::ImageAnalysis,
+                                    label: "分析ツール [Shift+Z]".to_string(),
+                                    status: "OFF".to_string(),
+                                    enabled: false,
+                                    disabled_reason: Some(
+                                        "分析ツールは見開きの2ページ表示中は使えません",
+                                    ),
+                                },
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::PixelGrid,
+                                    label: "ピクセルグリッド [G]".to_string(),
+                                    status: "ON".to_string(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::LoupeLock,
+                                    label: "ルーペ固定 [M]".to_string(),
+                                    status: "OFF".to_string(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                            ];
+                            let mut root_rows = root_rows;
+                            root_rows.insert(3, animation_row.clone());
+                            let view = FsOverflowPanelView {
+                                state,
+                                root_rows,
+                                navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                                shift: Default::default(),
+                                composition_available: true,
+                                composition_managed: false,
+                                music_note_color_scheme: Default::default(),
+                            };
+                            let panel_rect =
+                                fs_overflow_panel_rect(ctx.content_rect(), state).unwrap();
+                            let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
+                        });
+                });
             });
         harness.run();
         if size.y >= 520.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
-                data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
+                data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                     .unwrap()
             });
             crate::test_ui::scroll_layout::ScrollLayout {
@@ -68512,86 +68537,98 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if texture.is_none() {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    let mut image =
-                        egui::ColorImage::filled([64, 96], egui::Color32::from_rgb(28, 38, 58));
-                    for y in 0..96 {
-                        for x in 0..64 {
-                            image[(x, y)] = if x == 31 || y == 47 {
-                                egui::Color32::from_rgb(238, 238, 226)
-                            } else if x < 32 && y < 48 {
-                                egui::Color32::from_rgb(198, 48 + y as u8, 42)
-                            } else if x >= 32 && y < 48 {
-                                egui::Color32::from_rgb(38, 92, 184 + (x / 4) as u8)
-                            } else if x < 32 {
-                                egui::Color32::from_rgb(38, 126 + x as u8, 78)
-                            } else {
-                                egui::Color32::from_rgb(180 + (x / 4) as u8, 94 + (y / 4) as u8, 38)
-                            };
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if texture.is_none() {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        let mut image =
+                            egui::ColorImage::filled([64, 96], egui::Color32::from_rgb(28, 38, 58));
+                        for y in 0..96 {
+                            for x in 0..64 {
+                                image[(x, y)] = if x == 31 || y == 47 {
+                                    egui::Color32::from_rgb(238, 238, 226)
+                                } else if x < 32 && y < 48 {
+                                    egui::Color32::from_rgb(198, 48 + y as u8, 42)
+                                } else if x >= 32 && y < 48 {
+                                    egui::Color32::from_rgb(38, 92, 184 + (x / 4) as u8)
+                                } else if x < 32 {
+                                    egui::Color32::from_rgb(38, 126 + x as u8, 78)
+                                } else {
+                                    egui::Color32::from_rgb(
+                                        180 + (x / 4) as u8,
+                                        94 + (y / 4) as u8,
+                                        38,
+                                    )
+                                };
+                            }
                         }
+                        texture = Some(ctx.load_texture(
+                            "similar-preview-navigator-snapshot",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        ctx.request_repaint();
+                        return;
                     }
-                    texture = Some(ctx.load_texture(
-                        "similar-preview-navigator-snapshot",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                    ctx.request_repaint();
-                    return;
-                }
 
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(10, 12, 16)))
-                    .show(root_ui, |ui| {
-                        let host_rect = ui.max_rect();
-                        let body_rect = host_rect.shrink2(egui::vec2(30.0, 22.0));
-                        let texture = texture.as_ref().expect("snapshot texture");
-                        let source_size = egui::vec2(1200.0, 1800.0);
-                        let mut input = DisplayedImageGeometryInput {
-                            viewport_rect: body_rect,
-                            source_size,
-                            texture_size: texture.size_vec2(),
-                            rotation: crate::rotation_db::Rotation::None,
-                            free_rotation_rad: 0.0,
-                            content_bbox: None,
-                            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
-                            fit_scale_limits: FullscreenFitScaleLimits::default(),
-                            pixels_per_point: ctx.pixels_per_point(),
-                            placement: ResolvedDisplayPlacement::Normal {
-                                zoom_pan: Some((2.1, egui::vec2(520.0, -520.0))),
-                            },
-                            pixel_fit: RectPixelFit::Texels,
-                        };
-                        let initial = resolve_fs_image_geometry(input, Some(source_size))
-                            .expect("initial preview body geometry");
-                        let correction =
-                            pan_correction_for_minimum_overlap(initial.full_image_rect, body_rect);
-                        assert_ne!(correction, egui::Vec2::ZERO);
-                        input.placement = ResolvedDisplayPlacement::Normal {
-                            zoom_pan: Some((2.1, egui::vec2(520.0, -520.0) + correction)),
-                        };
-                        let geometry = resolve_fs_image_geometry(input, Some(source_size))
-                            .expect("clamped preview body geometry");
-                        let body_painter = ui.painter().with_clip_rect(body_rect);
-                        geometry.paint_texture(&body_painter, texture.id(), egui::Color32::WHITE);
-                        let layout = build_similar_preview_navigator_layout(
-                            geometry,
-                            body_rect,
-                            body_rect,
-                            190.0,
-                            FullscreenNavigatorCorner::BottomRight,
-                        )
-                        .expect("preview navigator layout");
-                        paint_similar_preview_navigator_surface(
-                            ui.painter(),
-                            &layout,
-                            texture.id(),
-                            FullscreenNavigatorCorner::BottomRight,
-                            true,
-                        );
-                    });
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(10, 12, 16)))
+                        .show(root_ui, |ui| {
+                            let host_rect = ui.max_rect();
+                            let body_rect = host_rect.shrink2(egui::vec2(30.0, 22.0));
+                            let texture = texture.as_ref().expect("snapshot texture");
+                            let source_size = egui::vec2(1200.0, 1800.0);
+                            let mut input = DisplayedImageGeometryInput {
+                                viewport_rect: body_rect,
+                                source_size,
+                                texture_size: texture.size_vec2(),
+                                rotation: crate::rotation_db::Rotation::None,
+                                free_rotation_rad: 0.0,
+                                content_bbox: None,
+                                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                                pixels_per_point: ctx.pixels_per_point(),
+                                placement: ResolvedDisplayPlacement::Normal {
+                                    zoom_pan: Some((2.1, egui::vec2(520.0, -520.0))),
+                                },
+                                pixel_fit: RectPixelFit::Texels,
+                            };
+                            let initial = resolve_fs_image_geometry(input, Some(source_size))
+                                .expect("initial preview body geometry");
+                            let correction = pan_correction_for_minimum_overlap(
+                                initial.full_image_rect,
+                                body_rect,
+                            );
+                            assert_ne!(correction, egui::Vec2::ZERO);
+                            input.placement = ResolvedDisplayPlacement::Normal {
+                                zoom_pan: Some((2.1, egui::vec2(520.0, -520.0) + correction)),
+                            };
+                            let geometry = resolve_fs_image_geometry(input, Some(source_size))
+                                .expect("clamped preview body geometry");
+                            let body_painter = ui.painter().with_clip_rect(body_rect);
+                            geometry.paint_texture(
+                                &body_painter,
+                                texture.id(),
+                                egui::Color32::WHITE,
+                            );
+                            let layout = build_similar_preview_navigator_layout(
+                                geometry,
+                                body_rect,
+                                body_rect,
+                                190.0,
+                                FullscreenNavigatorCorner::BottomRight,
+                            )
+                            .expect("preview navigator layout");
+                            paint_similar_preview_navigator_surface(
+                                ui.painter(),
+                                &layout,
+                                texture.id(),
+                                FullscreenNavigatorCorner::BottomRight,
+                                true,
+                            );
+                        });
+                });
             });
         harness.run();
         harness.snapshot("similar_preview_navigator_dark");
@@ -75094,7 +75131,7 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let control = egui::Rect::from_center_size(screen.center(), egui::vec2(80.0, 48.0));
         let pos = control.center();
-        let control_id = egui::Id::new("foreground_reclaim_control_probe");
+        let control_id = egui::Id::unique("foreground_reclaim_control_probe");
 
         // Prime egui's previous-pass hit test for the synthetic primary click.
         let _ = ctx
@@ -75213,7 +75250,7 @@ mod tests {
                                     let response = interact_touch_panel_handle(
                                         ui,
                                         handle,
-                                        egui::Id::new((
+                                        egui::Id::unique((
                                             "fs_touch_panel_handle",
                                             crate::ui_helpers::PanelEdge::Left,
                                         )),
@@ -75336,7 +75373,7 @@ mod tests {
                             );
                             let response = ui.interact(
                                 screen,
-                                egui::Id::new("touch_pan_canvas_probe"),
+                                egui::Id::unique("touch_pan_canvas_probe"),
                                 egui::Sense::click_and_drag(),
                             );
                             probe = DragProbe {
@@ -77089,7 +77126,7 @@ mod tests {
                 |ctx| {
                     ctx.root_ui(|root_ui| {
                         egui::CentralPanel::default().show(root_ui, |ui| {
-                            let id = ui.id().with("music_audio_popup_wheel_regression");
+                            let id = ui.scope_id().with("music_audio_popup_wheel_regression");
                             ctx.data_mut(|data| data.insert_temp(id, true));
                             let button = egui::Rect::from_min_size(
                                 egui::pos2(200.0, 270.0),
@@ -77113,7 +77150,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let mut text = String::new();
-        let edit_id = egui::Id::new("music_ctrl_wheel_text_edit");
+        let edit_id = egui::Id::unique("music_ctrl_wheel_text_edit");
         let _ = ctx
             .run_pass(Default::default(), |ctx| {
                 ctx.root_ui(|root_ui| {
@@ -77165,6 +77202,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn music_ctrl_wheel_blocks_row_step_during_ime_input() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
@@ -80129,54 +80170,66 @@ mod tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(640.0, 360.0))
                 .build_ui(|root_ui| {
-                    let ctx = &root_ui.ctx().clone();
-                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                    if texture.is_none() {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        let mut image = egui::ColorImage::filled(
-                            [120, 180],
-                            egui::Color32::from_rgb(220, 215, 195),
-                        );
-                        for y in 12..168 {
-                            for x in 12..108 {
-                                image[(x, y)] =
-                                    egui::Color32::from_rgb(70 + x as u8, 85 + y as u8 / 2, 135);
-                            }
-                        }
-                        let tex =
-                            ctx.load_texture("seek-test-page", image, egui::TextureOptions::LINEAR);
-                        app.thumbnails = vec![
-                            ThumbnailState::Loaded {
-                                tex: tex.clone(),
-                                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                                    evaluated_display_px: 180,
-                                },
-                                from_edit_preview: false,
-                                rendered_at_px: 180,
-                                source_dims: Some((120, 180)),
-                                layout_dims: None,
-                            };
-                            app.items.len()
-                        ];
-                        texture = Some(tex);
-                        ctx.request_repaint();
-                        return;
-                    }
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(root_ui, |ui| {
-                            let full = ctx.content_rect();
-                            let media = app.fullscreen_media_rect(full, 3, false);
-                            let tex = texture.as_ref().unwrap();
-                            ui.painter().image(
-                                tex.id(),
-                                fit_texture_rect(tex.size_vec2(), media),
-                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                                egui::Color32::WHITE,
+                    crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
+                        crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                        if texture.is_none() {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            let mut image = egui::ColorImage::filled(
+                                [120, 180],
+                                egui::Color32::from_rgb(220, 215, 195),
                             );
-                            app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
-                            app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
-                        });
+                            for y in 12..168 {
+                                for x in 12..108 {
+                                    image[(x, y)] = egui::Color32::from_rgb(
+                                        70 + x as u8,
+                                        85 + y as u8 / 2,
+                                        135,
+                                    );
+                                }
+                            }
+                            let tex = ctx.load_texture(
+                                "seek-test-page",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            app.thumbnails = vec![
+                                ThumbnailState::Loaded {
+                                    tex: tex.clone(),
+                                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                                        evaluated_display_px: 180,
+                                    },
+                                    from_edit_preview: false,
+                                    rendered_at_px: 180,
+                                    source_dims: Some((120, 180)),
+                                    layout_dims: None,
+                                };
+                                app.items.len()
+                            ];
+                            texture = Some(tex);
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                            root_ui,
+                            |ui| {
+                                let full = ctx.content_rect();
+                                let media = app.fullscreen_media_rect(full, 3, false);
+                                let tex = texture.as_ref().unwrap();
+                                ui.painter().image(
+                                    tex.id(),
+                                    fit_texture_rect(tex.size_vec2(), media),
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                                app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                                app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                            },
+                        );
+                    });
                 });
             harness.run();
             harness.snapshot(name);
@@ -80370,10 +80423,11 @@ mod tests {
                 bar_mode == StillSeekBarWithStrip::Hide
             );
             let toggle = ctx
-                .read_response(egui::Id::new("fullscreen_still_seek_strip"))
+                .read_response(egui::Id::unique("fullscreen_still_seek_strip"))
                 .expect("the fitted strip-toggle response must exist");
-            let bar_lock = ctx.read_response(egui::Id::new("fullscreen_seek_lock"));
-            let strip_lock = ctx.read_response(egui::Id::new("fullscreen_still_seek_strip_lock"));
+            let bar_lock = ctx.read_response(egui::Id::unique("fullscreen_seek_lock"));
+            let strip_lock =
+                ctx.read_response(egui::Id::unique("fullscreen_still_seek_strip_lock"));
             assert_eq!(bar_lock.is_some(), bar_mode == StillSeekBarWithStrip::Show);
             assert_eq!(
                 strip_lock.is_some(),
@@ -81993,83 +82047,86 @@ mod tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(720.0, 420.0))
                 .build_ui(|root_ui| {
-                    let ctx = &root_ui.ctx().clone();
-                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                    if !textures_ready {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        for (idx, base, accent, accent_on_left) in [
-                            (
-                                0usize,
-                                egui::Color32::from_rgb(24, 55, 112),
-                                egui::Color32::from_rgb(220, 72, 78),
-                                true,
-                            ),
-                            (
-                                3usize,
-                                egui::Color32::from_rgb(172, 132, 48),
-                                egui::Color32::from_rgb(58, 205, 132),
-                                false,
-                            ),
-                        ] {
-                            let size = [180usize, 260usize];
-                            let mut image = egui::ColorImage::filled(size, base);
-                            for y in 12..248 {
-                                for x in 12..168 {
-                                    let border = !(20..160).contains(&x) || !(20..240).contains(&y);
-                                    let stripe = if accent_on_left { x < 48 } else { x >= 132 };
-                                    if border || stripe {
-                                        image[(x, y)] = accent;
+                    crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                        let ctx = &root_ui.ctx().clone();
+                        crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                        if !textures_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            for (idx, base, accent, accent_on_left) in [
+                                (
+                                    0usize,
+                                    egui::Color32::from_rgb(24, 55, 112),
+                                    egui::Color32::from_rgb(220, 72, 78),
+                                    true,
+                                ),
+                                (
+                                    3usize,
+                                    egui::Color32::from_rgb(172, 132, 48),
+                                    egui::Color32::from_rgb(58, 205, 132),
+                                    false,
+                                ),
+                            ] {
+                                let size = [180usize, 260usize];
+                                let mut image = egui::ColorImage::filled(size, base);
+                                for y in 12..248 {
+                                    for x in 12..168 {
+                                        let border =
+                                            !(20..160).contains(&x) || !(20..240).contains(&y);
+                                        let stripe = if accent_on_left { x < 48 } else { x >= 132 };
+                                        if border || stripe {
+                                            image[(x, y)] = accent;
+                                        }
                                     }
                                 }
+                                let tex = ctx.load_texture(
+                                    format!("final-cover-visual-{idx}"),
+                                    image.clone(),
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                app.fs_cache.insert(
+                                    idx,
+                                    crate::fs_animation::FsCacheEntry::Static {
+                                        tex,
+                                        pixels: std::sync::Arc::new(image),
+                                        source_dims: Some(size),
+                                        load_seq: 0,
+                                        animation: crate::fs_animation::StaticAnimationState::Still,
+                                    },
+                                );
                             }
-                            let tex = ctx.load_texture(
-                                format!("final-cover-visual-{idx}"),
-                                image.clone(),
-                                egui::TextureOptions::LINEAR,
-                            );
-                            app.fs_cache.insert(
-                                idx,
-                                crate::fs_animation::FsCacheEntry::Static {
-                                    tex,
-                                    pixels: std::sync::Arc::new(image),
-                                    source_dims: Some(size),
-                                    load_seq: 0,
-                                    animation: crate::fs_animation::StaticAnimationState::Still,
-                                },
-                            );
+                            textures_ready = true;
+                            ctx.request_repaint();
+                            return;
                         }
-                        textures_ready = true;
-                        ctx.request_repaint();
-                        return;
-                    }
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
-                        .show(root_ui, |ui| {
-                            let full = ctx.content_rect();
-                            let image_rect = full.shrink(18.0);
-                            let composition = app.spread_display_composition_for_anchor(3);
-                            let screen = composition.pages_in_screen_order(mode);
-                            let [left, right] = screen.as_slice() else {
-                                panic!("the final unit must contain last plus cover");
-                            };
-                            app.draw_fs_spread(
-                                ui,
-                                ctx,
-                                image_rect,
-                                left.idx,
-                                right.idx,
-                                false,
-                                FsPageTurnDecision::normal(),
-                                None,
-                            );
-                            assert!(app.fullscreen_page_layout.rebind_occurrences(&screen));
-                            assert_eq!(
-                                app.fullscreen_page_number_label(3),
-                                Some(format!("{} / {}", app.items.len(), app.items.len())),
-                                "the supplement must not change the page count"
-                            );
-                            app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
-                        });
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
+                            .show(root_ui, |ui| {
+                                let full = ctx.content_rect();
+                                let image_rect = full.shrink(18.0);
+                                let composition = app.spread_display_composition_for_anchor(3);
+                                let screen = composition.pages_in_screen_order(mode);
+                                let [left, right] = screen.as_slice() else {
+                                    panic!("the final unit must contain last plus cover");
+                                };
+                                app.draw_fs_spread(
+                                    ui,
+                                    ctx,
+                                    image_rect,
+                                    left.idx,
+                                    right.idx,
+                                    false,
+                                    FsPageTurnDecision::normal(),
+                                    None,
+                                );
+                                assert!(app.fullscreen_page_layout.rebind_occurrences(&screen));
+                                assert_eq!(
+                                    app.fullscreen_page_number_label(3),
+                                    Some(format!("{} / {}", app.items.len(), app.items.len())),
+                                    "the supplement must not change the page count"
+                                );
+                                app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                            });
+                    });
                 });
             harness.run();
             harness.snapshot(name);
@@ -84681,7 +84738,7 @@ mod tests {
                 |ctx| {
                     let painter = ctx.layer_painter(egui::LayerId::new(
                         egui::Order::Foreground,
-                        egui::Id::new("compare-wipe-boundary-test"),
+                        egui::Id::unique("compare-wipe-boundary-test"),
                     ));
                     App::paint_compare_wipe_affordance(&painter, image, 0.25, affordance);
                 },
@@ -88560,7 +88617,7 @@ mod specified_scale_consumer_tests {
             let favorite_before = app.favorite_view_states.clone();
             let cap = ctx
                 .data(|data| {
-                    data.get_temp::<egui::Rect>(egui::Id::new("specified_scale_max_response"))
+                    data.get_temp::<egui::Rect>(egui::Id::unique("specified_scale_max_response"))
                 })
                 .unwrap();
             // DragValue paints its numeric and suffix atoms separately in 0.37.
@@ -88648,7 +88705,7 @@ mod specified_scale_consumer_tests {
                 output = fit_popup_frame(&ctx, viewport, vec![], &mut open, &mut value);
             }
             let (inner, _, content) = ctx.data(|data| {
-                data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
                     "fs_fit_popup_scroll_layout",
                 ))
                 .unwrap()
@@ -88657,7 +88714,7 @@ mod specified_scale_consumer_tests {
                 inner,
                 content,
                 offset: ctx.data(|data| {
-                    data.get_temp(egui::Id::new("fs_fit_popup_scroll_offset"))
+                    data.get_temp(egui::Id::unique("fs_fit_popup_scroll_offset"))
                         .unwrap()
                 }),
             };
@@ -88724,7 +88781,7 @@ mod specified_scale_consumer_tests {
                 }
                 let (inner, _, content) = ctx
                     .data(|data| {
-                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
                             "fs_fit_popup_scroll_layout",
                         ))
                     })
@@ -88733,7 +88790,7 @@ mod specified_scale_consumer_tests {
                     inner,
                     content,
                     offset: ctx.data(|data| {
-                        data.get_temp(egui::Id::new("fs_fit_popup_scroll_offset"))
+                        data.get_temp(egui::Id::unique("fs_fit_popup_scroll_offset"))
                             .unwrap()
                     }),
                 }
@@ -88793,7 +88850,7 @@ mod specified_scale_consumer_tests {
         };
         let metadata = || {
             ctx.data(|data| {
-                data.get_temp::<(egui::Rect, egui::Vec2, egui::Vec2)>(egui::Id::new(
+                data.get_temp::<(egui::Rect, egui::Vec2, egui::Vec2)>(egui::Id::unique(
                     "metadata_scroll_test_layout",
                 ))
             })
@@ -88833,8 +88890,8 @@ mod specified_scale_consumer_tests {
             app.spread_popup_open = popup == 1;
             app.slideshow_popup_open = popup == 2;
             let menu_id = match popup {
-                3 => Some(egui::Id::new("fs_rotation_btn").with("popup")),
-                4 => Some(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")),
+                3 => Some(egui::Id::unique("fs_rotation_btn").with("popup")),
+                4 => Some(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")),
                 _ => None,
             };
             if let Some(id) = menu_id {
@@ -88847,7 +88904,7 @@ mod specified_scale_consumer_tests {
             let point = if popup == 0 {
                 let inner = ctx
                     .data(|data| {
-                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
                             "fs_fit_popup_scroll_layout",
                         ))
                     })
@@ -88906,7 +88963,7 @@ mod specified_scale_consumer_tests {
             if popup == 0 {
                 assert!(
                     ctx.data(|data| data
-                        .get_temp::<egui::Vec2>(egui::Id::new("fs_fit_popup_scroll_offset")))
+                        .get_temp::<egui::Vec2>(egui::Id::unique("fs_fit_popup_scroll_offset")))
                         .unwrap()
                         .y
                         > 0.0,
@@ -88921,7 +88978,7 @@ mod specified_scale_consumer_tests {
 
     #[cfg(windows)]
     fn metadata_scroll_state(ctx: &egui::Context) -> (egui::Rect, egui::Vec2, egui::Vec2) {
-        ctx.data(|data| data.get_temp(egui::Id::new("metadata_scroll_test_layout")))
+        ctx.data(|data| data.get_temp(egui::Id::unique("metadata_scroll_test_layout")))
             .unwrap()
     }
 
@@ -88974,7 +89031,7 @@ mod specified_scale_consumer_tests {
                 let _ = draw(&mut app, vec![]);
             }
             let button = ctx
-                .read_response(egui::Id::new("fs_overflow_btn"))
+                .read_response(egui::Id::unique("fs_overflow_btn"))
                 .unwrap()
                 .rect;
             let _ = draw(&mut app, click(button.center()));
@@ -88983,7 +89040,7 @@ mod specified_scale_consumer_tests {
                 let _ = draw(&mut app, vec![]);
             }
             let front: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
-                .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+                .data(|data| data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout")))
                 .unwrap();
             let panel = metadata_scroll_state(&ctx).0;
             let overlap = front.0.intersect(panel);
@@ -89001,7 +89058,7 @@ mod specified_scale_consumer_tests {
             assert_eq!(metadata_scroll_state(&ctx).2, before);
             if size.y < 300.0 {
                 let after: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
-                    .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+                    .data(|data| data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout")))
                     .unwrap();
                 assert!(after.1.y > after.0.height());
                 assert!(
@@ -89056,14 +89113,14 @@ mod specified_scale_consumer_tests {
             } else {
                 "fs_margin_fit_btn"
             };
-            let button = ctx.read_response(egui::Id::new(id)).unwrap().rect;
+            let button = ctx.read_response(egui::Id::unique(id)).unwrap().rect;
             let _ = draw(&mut app, click(button.center()));
             let mut output = draw(&mut app, vec![]);
             for _ in 0..5 {
                 output = draw(&mut app, vec![]);
             }
             let close_pos = if overflow {
-                ctx.read_response(egui::Id::new("fs_overflow_panel_close"))
+                ctx.read_response(egui::Id::unique("fs_overflow_panel_close"))
                     .unwrap()
                     .rect
                     .center()
@@ -89129,7 +89186,7 @@ mod specified_scale_consumer_tests {
             let _ = draw(&mut app, vec![]);
         }
         let button = ctx
-            .read_response(egui::Id::new("fs_overflow_btn"))
+            .read_response(egui::Id::unique("fs_overflow_btn"))
             .unwrap()
             .rect;
         let _ = draw(&mut app, click(button.center()));
@@ -89138,7 +89195,7 @@ mod specified_scale_consumer_tests {
         }
         assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
         let front: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
-            .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+            .data(|data| data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout")))
             .unwrap();
         let overlap = front.0.intersect(metadata_scroll_state(&ctx).0);
         assert!(overlap.is_positive());
@@ -89233,7 +89290,7 @@ mod specified_scale_consumer_tests {
             let _ = draw(&mut app, vec![]);
         }
         let button = ctx
-            .read_response(egui::Id::new("fs_overflow_btn"))
+            .read_response(egui::Id::unique("fs_overflow_btn"))
             .unwrap()
             .rect;
         let _ = draw(&mut app, click(button.center()));
@@ -89241,7 +89298,7 @@ mod specified_scale_consumer_tests {
             let _ = draw(&mut app, vec![]);
         }
         let entry: egui::Rect = ctx
-            .data(|data| data.get_temp(egui::Id::new("fs_composition_editor_entry_test_rect")))
+            .data(|data| data.get_temp(egui::Id::unique("fs_composition_editor_entry_test_rect")))
             .unwrap();
         assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
         let _ = draw(&mut app, vec![egui::Event::PointerMoved(entry.center())]);
@@ -89342,7 +89399,7 @@ mod specified_scale_consumer_tests {
                 |ctx| {
                     ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
                     let raw = FsNavigatorFrameInput::for_current_pass(ctx);
-                    ctx.data_mut(|data| data.insert_temp(egui::Id::new("front_raw_wheel"), raw));
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("front_raw_wheel"), raw));
                 },
             ))
         };
@@ -89350,7 +89407,7 @@ mod specified_scale_consumer_tests {
             let _ = draw(&mut app, vec![]);
         }
         let button = ctx
-            .read_response(egui::Id::new("fs_overflow_btn"))
+            .read_response(egui::Id::unique("fs_overflow_btn"))
             .unwrap()
             .rect;
         let _ = draw(&mut app, click(button.center()));
@@ -89358,7 +89415,7 @@ mod specified_scale_consumer_tests {
             let _ = draw(&mut app, vec![]);
         }
         let front: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
-            .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+            .data(|data| data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout")))
             .unwrap();
         let image_rect = app.fullscreen_media_rect(viewport, 0, false);
         let navigator = app.fs_navigator_layout(image_rect).unwrap();
@@ -89377,7 +89434,7 @@ mod specified_scale_consumer_tests {
         let _ = draw(&mut app, popup_wheel_events(overlap.center()));
         assert!(
             ctx.data(
-                |data| data.get_temp::<FsNavigatorFrameInput>(egui::Id::new("front_raw_wheel"))
+                |data| data.get_temp::<FsNavigatorFrameInput>(egui::Id::unique("front_raw_wheel"))
             )
             .unwrap()
             .wheel_y_in(overlap)
@@ -89395,12 +89452,12 @@ mod specified_scale_consumer_tests {
             let _ = draw(&mut app, vec![]);
         }
         let after: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
-            .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+            .data(|data| data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout")))
             .unwrap();
         assert!(after.2.y > front.2.y, "front overflow still scrolls");
         assert_eq!(metadata_scroll_state(&ctx).2, before_metadata);
         let close = ctx
-            .read_response(egui::Id::new("fs_overflow_panel_close"))
+            .read_response(egui::Id::unique("fs_overflow_panel_close"))
             .unwrap()
             .rect
             .center();
@@ -89482,7 +89539,7 @@ mod specified_scale_consumer_tests {
             let mut background_seen = false;
             for frame in 0..90 {
                 let previous = ctx.data(|data| {
-                    data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                    data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
                         "fs_fit_popup_scroll_layout",
                     ))
                 });
@@ -89500,7 +89557,7 @@ mod specified_scale_consumer_tests {
                 let output = fit_popup_frame(&ctx, viewport, events, &mut open, &mut value);
                 let (inner, bar, content) = ctx
                     .data(|data| {
-                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
                             "fs_fit_popup_scroll_layout",
                         ))
                     })
@@ -89524,7 +89581,7 @@ mod specified_scale_consumer_tests {
                 }
                 for axis in ["幅", "高さ"] {
                     if let Some(unit) = ctx.data(|data| {
-                        data.get_temp::<egui::Rect>(egui::Id::new((
+                        data.get_temp::<egui::Rect>(egui::Id::unique((
                             "specified_scale_unit_response",
                             axis,
                         )))
@@ -89538,7 +89595,7 @@ mod specified_scale_consumer_tests {
                     }
                 }
                 if let Some(cap) = ctx.data(|data| {
-                    data.get_temp::<egui::Rect>(egui::Id::new("specified_scale_max_response"))
+                    data.get_temp::<egui::Rect>(egui::Id::unique("specified_scale_max_response"))
                 }) {
                     if bar.is_positive() {
                         assert!(
@@ -89606,6 +89663,10 @@ mod specified_scale_consumer_tests {
     }
 
     #[cfg(windows)]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn run_text_mode_annotation_ime_enter(same_pass: bool) {
         use comic_core::{AnnotationObject, TextBlock};
 
@@ -89636,7 +89697,7 @@ mod specified_scale_consumer_tests {
                 },
             )],
         );
-        let edit_id = egui::Id::new(("comic_text_edit", 1_u64));
+        let edit_id = egui::Id::unique(("comic_text_edit", 1_u64));
         let draw = |app: &mut App, events, time, expect_committed| {
             let _ = ctx
                 .run_pass(
@@ -89746,6 +89807,10 @@ mod specified_scale_consumer_tests {
     }
 
     #[cfg(windows)]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn run_specified_scale_real_numeric_ime_popup(
         key: egui::Key,
         size: egui::Vec2,
@@ -90026,7 +90091,10 @@ mod specified_scale_consumer_tests {
         assert!(painted_label(&output, "％").is_some());
         let unit = ctx
             .data(|data| {
-                data.get_temp::<egui::Rect>(egui::Id::new(("specified_scale_unit_response", "幅")))
+                data.get_temp::<egui::Rect>(egui::Id::unique((
+                    "specified_scale_unit_response",
+                    "幅",
+                )))
             })
             .expect("the actual ComboBox response owns the width unit hitbox");
         assert!(rect.contains_rect(unit));
@@ -91579,120 +91647,128 @@ pub(crate) mod page_turn_submission_tests {
                 let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(620.0, 400.0))
                     .build_ui(|root_ui| {
-                        let ctx = &root_ui.ctx().clone();
-                        if textures.is_none() {
-                            let glyphs = [
-                                [14u8, 17, 17, 31, 17, 17, 17],
-                                [30, 17, 17, 30, 17, 17, 30],
-                                [14, 17, 16, 16, 16, 17, 14],
-                                [30, 17, 17, 17, 17, 17, 30],
-                            ];
-                            let loaded: Vec<_> = glyphs
-                                .into_iter()
-                                .enumerate()
-                                .map(|(idx, glyph)| {
-                                    let mut image =
-                                        egui::ColorImage::filled([100, 150], egui::Color32::WHITE);
-                                    let accent = [
-                                        egui::Color32::from_rgb(40, 80, 190),
-                                        egui::Color32::from_rgb(200, 65, 60),
-                                        egui::Color32::from_rgb(25, 150, 100),
-                                        egui::Color32::from_rgb(150, 70, 180),
-                                    ][idx];
-                                    for y in 0..150 {
-                                        for x in 0..100 {
-                                            image[(x, y)] = if (x / 10 + y / 10) % 2 == 0 {
-                                                egui::Color32::from_gray(235)
-                                            } else {
-                                                egui::Color32::from_gray(205)
-                                            };
-                                            if x < 5 || x >= 95 || y < 5 || y >= 145 {
-                                                image[(x, y)] = accent;
+                        crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                            let ctx = &root_ui.ctx().clone();
+                            if textures.is_none() {
+                                let glyphs = [
+                                    [14u8, 17, 17, 31, 17, 17, 17],
+                                    [30, 17, 17, 30, 17, 17, 30],
+                                    [14, 17, 16, 16, 16, 17, 14],
+                                    [30, 17, 17, 17, 17, 17, 30],
+                                ];
+                                let loaded: Vec<_> = glyphs
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(idx, glyph)| {
+                                        let mut image = egui::ColorImage::filled(
+                                            [100, 150],
+                                            egui::Color32::WHITE,
+                                        );
+                                        let accent = [
+                                            egui::Color32::from_rgb(40, 80, 190),
+                                            egui::Color32::from_rgb(200, 65, 60),
+                                            egui::Color32::from_rgb(25, 150, 100),
+                                            egui::Color32::from_rgb(150, 70, 180),
+                                        ][idx];
+                                        for y in 0..150 {
+                                            for x in 0..100 {
+                                                image[(x, y)] = if (x / 10 + y / 10) % 2 == 0 {
+                                                    egui::Color32::from_gray(235)
+                                                } else {
+                                                    egui::Color32::from_gray(205)
+                                                };
+                                                if x < 5 || x >= 95 || y < 5 || y >= 145 {
+                                                    image[(x, y)] = accent;
+                                                }
                                             }
                                         }
-                                    }
-                                    for (row, bits) in glyph.into_iter().enumerate() {
-                                        for col in 0..5 {
-                                            if bits & (1 << (4 - col)) != 0 {
-                                                for y in 30 + row * 10..40 + row * 10 {
-                                                    for x in 25 + col * 10..35 + col * 10 {
-                                                        image[(x, y)] = accent;
+                                        for (row, bits) in glyph.into_iter().enumerate() {
+                                            for col in 0..5 {
+                                                if bits & (1 << (4 - col)) != 0 {
+                                                    for y in 30 + row * 10..40 + row * 10 {
+                                                        for x in 25 + col * 10..35 + col * 10 {
+                                                            image[(x, y)] = accent;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    ctx.load_texture(
-                                        format!("curl-visual-{idx}"),
-                                        image,
-                                        egui::TextureOptions::LINEAR,
-                                    )
-                                })
-                                .collect();
-                            textures = Some(loaded);
-                            ctx.request_repaint();
-                        }
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(25)))
-                            .show(root_ui, |ui| {
-                                let make = |incoming: bool| CanonicalUnit {
-                                    layout,
-                                    pixels_per_point: 1.0,
-                                    spine_x: (layout != UnitLayout::Single).then_some(309.0),
-                                    gutter_width: if layout == UnitLayout::Single {
-                                        0.0
-                                    } else {
-                                        10.0
-                                    },
-                                    pages: (0..if layout == UnitLayout::Single { 1 } else { 2 })
-                                        .map(|slot| {
-                                            let x = if layout == UnitLayout::Single {
-                                                190.0
-                                            } else {
-                                                64.0 + slot as f32 * 250.0
-                                            };
-                                            let rect = egui::Rect::from_min_size(
-                                                egui::pos2(x, 20.0),
-                                                egui::vec2(240.0, 360.0),
-                                            );
-                                            let idx = slot + if incoming { 2 } else { 0 };
-                                            CanonicalPage {
-                                                occurrence: Some(slot as u64),
-                                                rect,
-                                                clip_rect: ui.max_rect(),
-                                                material: PageMaterial::Texture {
-                                                    texture_id: textures.as_ref().unwrap()[idx]
-                                                        .id(),
-                                                    uv: [
-                                                        egui::pos2(0.0, 0.0),
-                                                        egui::pos2(1.0, 0.0),
-                                                        egui::pos2(1.0, 1.0),
-                                                        egui::pos2(0.0, 1.0),
-                                                    ],
-                                                    available_uv: egui::Rect::from_min_max(
-                                                        egui::Pos2::ZERO,
-                                                        egui::pos2(1.0, 1.0),
-                                                    ),
-                                                },
-                                                underlay: Some(PageMaterial::Blank {
-                                                    color: egui::Color32::WHITE,
-                                                }),
-                                            }
+                                        ctx.load_texture(
+                                            format!("curl-visual-{idx}"),
+                                            image,
+                                            egui::TextureOptions::LINEAR,
+                                        )
+                                    })
+                                    .collect();
+                                textures = Some(loaded);
+                                ctx.request_repaint();
+                            }
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(25)))
+                                .show(root_ui, |ui| {
+                                    let make = |incoming: bool| CanonicalUnit {
+                                        layout,
+                                        pixels_per_point: 1.0,
+                                        spine_x: (layout != UnitLayout::Single).then_some(309.0),
+                                        gutter_width: if layout == UnitLayout::Single {
+                                            0.0
+                                        } else {
+                                            10.0
+                                        },
+                                        pages: (0..if layout == UnitLayout::Single {
+                                            1
+                                        } else {
+                                            2
                                         })
-                                        .collect(),
-                                };
-                                page_turn::paint_projection_for_test(
-                                    ui.painter(),
-                                    &make(false),
-                                    &make(true),
-                                    TurnDirection {
-                                        reading_rtl: rtl,
-                                        forward: true,
-                                    },
-                                    progress,
-                                )
-                                .expect("supported visible mesh pose");
-                            });
+                                            .map(|slot| {
+                                                let x = if layout == UnitLayout::Single {
+                                                    190.0
+                                                } else {
+                                                    64.0 + slot as f32 * 250.0
+                                                };
+                                                let rect = egui::Rect::from_min_size(
+                                                    egui::pos2(x, 20.0),
+                                                    egui::vec2(240.0, 360.0),
+                                                );
+                                                let idx = slot + if incoming { 2 } else { 0 };
+                                                CanonicalPage {
+                                                    occurrence: Some(slot as u64),
+                                                    rect,
+                                                    clip_rect: ui.max_rect(),
+                                                    material: PageMaterial::Texture {
+                                                        texture_id: textures.as_ref().unwrap()[idx]
+                                                            .id(),
+                                                        uv: [
+                                                            egui::pos2(0.0, 0.0),
+                                                            egui::pos2(1.0, 0.0),
+                                                            egui::pos2(1.0, 1.0),
+                                                            egui::pos2(0.0, 1.0),
+                                                        ],
+                                                        available_uv: egui::Rect::from_min_max(
+                                                            egui::Pos2::ZERO,
+                                                            egui::pos2(1.0, 1.0),
+                                                        ),
+                                                    },
+                                                    underlay: Some(PageMaterial::Blank {
+                                                        color: egui::Color32::WHITE,
+                                                    }),
+                                                }
+                                            })
+                                            .collect(),
+                                    };
+                                    page_turn::paint_projection_for_test(
+                                        ui.painter(),
+                                        &make(false),
+                                        &make(true),
+                                        TurnDirection {
+                                            reading_rtl: rtl,
+                                            forward: true,
+                                        },
+                                        progress,
+                                    )
+                                    .expect("supported visible mesh pose");
+                                });
+                        });
                     });
                 harness.run();
                 harness.snapshot(format!("page_turn_animation_{layout_name}_{pose}"));
@@ -91771,17 +91847,19 @@ mod music_overflow_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(width, 300.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(root_ui, |ui| surface(ui, true, panel));
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root_ui, |ui| surface(ui, true, panel));
+                });
             });
         harness.run();
         harness.snapshot(name);
@@ -91832,7 +91910,7 @@ mod music_overflow_tests {
                                     ]
                                     .into_iter()
                                     .map(|name| {
-                                        ctx.read_response(ui.id().with((name, 0usize)))
+                                        ctx.read_response(ui.scope_id().with((name, 0usize)))
                                             .unwrap()
                                             .rect
                                     })
@@ -91890,11 +91968,11 @@ mod music_overflow_tests {
                     egui::CentralPanel::default().show(root_ui, |ui| {
                         surface(ui, false, false);
                         assert!(
-                            ctx.read_response(ui.id().with(("music_top_overflow", 0usize)))
+                            ctx.read_response(ui.scope_id().with(("music_top_overflow", 0usize)))
                                 .is_none()
                         );
                         assert!(
-                            ctx.read_response(ui.id().with(("music_top_close", 0usize)))
+                            ctx.read_response(ui.scope_id().with(("music_top_close", 0usize)))
                                 .is_some()
                         );
                     })
@@ -91931,7 +92009,7 @@ mod music_overflow_tests {
                                 let rects: Vec<_> = names
                                     .into_iter()
                                     .map(|name| {
-                                        ctx.read_response(ui.id().with((name, 0usize)))
+                                        ctx.read_response(ui.scope_id().with((name, 0usize)))
                                             .unwrap()
                                             .rect
                                     })
@@ -91944,7 +92022,7 @@ mod music_overflow_tests {
                                 }
                                 for name in ["music_row_minus", "music_row_plus"] {
                                     assert_eq!(
-                                        ctx.read_response(ui.id().with((name, 0usize)))
+                                        ctx.read_response(ui.scope_id().with((name, 0usize)))
                                             .unwrap()
                                             .rect
                                             .width(),
@@ -91975,7 +92053,10 @@ mod music_overflow_tests {
                                     builder = builder.disabled();
                                 }
                                 let child = ui.new_child(builder);
-                                assert_eq!(child.id(), music_view_backing_ui_id(ui.id()));
+                                assert_eq!(
+                                    child.scope_id(),
+                                    music_view_backing_ui_id(ui.scope_id())
+                                );
                             })
                     });
                 })
@@ -92110,7 +92191,7 @@ mod music_overflow_tests {
         }
         // Read the actually painted HUD button rather than calculating an independent target.
         let button: egui::Rect = ctx
-            .data(|data| data.get_temp(egui::Id::new("music_overflow_button_rect")))
+            .data(|data| data.get_temp(egui::Id::unique("music_overflow_button_rect")))
             .expect("actual music menu button");
         let _ = frame(
             app,
@@ -92132,13 +92213,13 @@ mod music_overflow_tests {
     }
 
     fn music_pan_probe(ctx: &egui::Context) -> MusicTimelinePanProbe {
-        let id = egui::Id::new(("music_pan_probe", ctx.viewport_id()));
+        let id = egui::Id::unique(("music_pan_probe", ctx.viewport_id()));
         ctx.data(|data| data.get_temp(id))
             .expect("the real timeline ScrollArea was rendered")
     }
 
     fn music_input_router(ctx: &egui::Context) -> MusicOverflowInputRouter {
-        let id = egui::Id::new(("music_overflow_input_router", ctx.viewport_id()));
+        let id = egui::Id::unique(("music_overflow_input_router", ctx.viewport_id()));
         ctx.data(|data| data.get_temp(id))
             .expect("the music input router was driven")
     }
@@ -92360,7 +92441,7 @@ mod music_overflow_tests {
                 MusicNoteColorScheme::Chromatic
             );
             let close = ctx
-                .read_response(egui::Id::new("fs_overflow_panel_close"))
+                .read_response(egui::Id::unique("fs_overflow_panel_close"))
                 .unwrap()
                 .rect;
             let _ = frame(
@@ -92406,7 +92487,7 @@ mod music_overflow_tests {
                 before
             );
             let close = ctx
-                .read_response(egui::Id::new("fs_overflow_panel_close"))
+                .read_response(egui::Id::unique("fs_overflow_panel_close"))
                 .unwrap()
                 .rect
                 .center();
@@ -92526,7 +92607,7 @@ mod music_overflow_tests {
                 let _ = frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
             }
             let backing_id: egui::Id = ctx
-                .data(|data| data.get_temp(egui::Id::new("music_backing_drawn_ui_id")))
+                .data(|data| data.get_temp(egui::Id::unique("music_backing_drawn_ui_id")))
                 .expect("actual backing UI producer ID");
             let selector_id =
                 crate::ui_music_panels::music_audio_track_selector_id(backing_id, 0, &path);

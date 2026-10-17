@@ -1185,7 +1185,7 @@ fn run_worker(
                 let mut hints = MaintenanceHints::default();
                 let result = match action {
                     MaintenanceAction::PagePaths(mappings) => {
-                        connection = None;
+                        drop(connection.take());
                         store::migrate_page_paths_at(&data_dir, &mappings).map(|_| ())
                     }
                     MaintenanceAction::RenameBookRoot { source, target } => {
@@ -1202,7 +1202,7 @@ fn run_worker(
                         })
                     }
                 };
-                connection = None;
+                drop(connection.take());
                 let previous = shared.admission.lock().unwrap().snapshot.take().unwrap();
                 let epoch = previous.maintenance_epoch;
                 let (opened, mut snapshot) = open_snapshot(

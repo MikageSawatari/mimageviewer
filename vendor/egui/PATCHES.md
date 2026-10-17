@@ -193,3 +193,11 @@ acceptance and command results belong in the stage-3 verification ledger.
   early-return / unwind restoration, limits/direct/empty output, actual plugin
   mutation/IME output and receipt-model observation, and nested immediate retry.
   Receipt-model tests are not evidence for the product page-turn plugin.
+
+## Stage 5: Rust 1.99 warning cleanup (2026-10-17)
+
+- `src/containers/scene.rs`: remove the `core::f32` module import so
+  `f32::EPSILON` resolves to the primitive associated constant instead of the
+  deprecated module constant. The numeric value and scene behavior are unchanged.
+  No TextEdit compatibility patch is added; the upstream 0.37 same-batch pointer
+  focus/Text behavior was explicitly accepted by the mIV user.

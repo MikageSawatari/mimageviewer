@@ -1591,7 +1591,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::AcqRel);
             if self
                 .failures_remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

@@ -10982,36 +10982,38 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(250.0, 220.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    crate::os_theme::apply_dark_ui(ui);
-                    ui.set_max_width(150.0);
-                    lab_combo_box(
-                        ui,
-                        "repair_quality_theme_regression",
-                        "補修の品質",
-                        repair_quality_label(quality),
-                        |ui| {
-                            for candidate in [
-                                RepairQuality::Fast,
-                                RepairQuality::Standard,
-                                RepairQuality::High,
-                            ] {
-                                ui.selectable_value(
-                                    &mut quality,
-                                    candidate,
-                                    repair_quality_label(candidate),
-                                );
-                            }
-                        },
-                    );
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        crate::os_theme::apply_dark_ui(ui);
+                        ui.set_max_width(150.0);
+                        lab_combo_box(
+                            ui,
+                            "repair_quality_theme_regression",
+                            "補修の品質",
+                            repair_quality_label(quality),
+                            |ui| {
+                                for candidate in [
+                                    RepairQuality::Fast,
+                                    RepairQuality::Standard,
+                                    RepairQuality::High,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut quality,
+                                        candidate,
+                                        repair_quality_label(candidate),
+                                    );
+                                }
+                            },
+                        );
+                    });
                 });
             });
 

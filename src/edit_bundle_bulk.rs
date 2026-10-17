@@ -1307,7 +1307,7 @@ impl App {
                     BulkPageEditOp::Reset { .. } => "コピー元",
                 };
                 egui::Window::new("編集内容をまとめて貼り付け")
-                    .id(egui::Id::new("edit_bundle_bulk_paste_confirm"))
+                    .id(egui::Id::unique("edit_bundle_bulk_paste_confirm"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1344,7 +1344,7 @@ impl App {
                     action = BulkDialogAction::CloseConfirm;
                 }
                 egui::Window::new("編集内容をリセット")
-                    .id(egui::Id::new("edit_bundle_bulk_reset_confirm"))
+                    .id(egui::Id::unique("edit_bundle_bulk_reset_confirm"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1430,7 +1430,7 @@ impl App {
                     AfterLocalAdjustFence::Single { .. } => (None, 0),
                 };
                 egui::Window::new("編集内容を処理する準備")
-                    .id(egui::Id::new("edit_bundle_local_adjust_fence"))
+                    .id(egui::Id::unique("edit_bundle_local_adjust_fence"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1459,7 +1459,7 @@ impl App {
                 }
                 let cancel_requested = run.cancel.load(Ordering::Relaxed);
                 egui::Window::new("編集内容を一括処理")
-                    .id(egui::Id::new("edit_bundle_bulk_progress"))
+                    .id(egui::Id::unique("edit_bundle_bulk_progress"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)

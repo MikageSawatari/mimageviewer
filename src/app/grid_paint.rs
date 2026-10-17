@@ -1528,7 +1528,8 @@ mod book_resume_meter_tests {
         color: egui::Color32,
     ) -> ThumbnailState {
         ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+            tex: crate::ui_helpers::load_snapshot_texture(
+                ctx,
                 format!("meter-solid-{dims:?}-{color:?}"),
                 egui::ColorImage::new(dims, vec![color; dims[0] * dims[1]]),
                 Default::default(),
@@ -2492,7 +2493,8 @@ mod book_resume_meter_tests {
     ) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let thumb = ThumbnailState::Loaded {
-            tex: ui.ctx().load_texture(
+            tex: crate::ui_helpers::load_snapshot_texture(
+                ui.ctx(),
                 format!("resume-fixture-{}-{}", rect.min.x, rect.min.y),
                 egui::ColorImage::new([1, 1], vec![color]),
                 Default::default(),
@@ -2846,15 +2848,17 @@ mod book_resume_meter_tests {
             .with_size(egui::vec2(580.0, 1190.0))
             .with_pixels_per_point(dpi)
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, reserved_meter_fixture);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, reserved_meter_fixture);
+                });
             });
         harness.run();
         harness.snapshot(name);
@@ -2903,15 +2907,17 @@ mod book_resume_meter_tests {
             .with_size(egui::vec2(480.0, 400.0))
             .with_pixels_per_point(dpi)
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| build_ui(ui));
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| build_ui(ui));
+                });
             });
         harness.run();
         harness.snapshot(name);
@@ -3376,7 +3382,8 @@ fn snapshot_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
         }
     }
     ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+        tex: crate::ui_helpers::load_snapshot_texture(
+            ctx,
             name,
             egui::ColorImage::new(size, pixels),
             Default::default(),

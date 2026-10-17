@@ -182,7 +182,7 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
     let ctx = egui::Context::default();
     install(&ctx);
     crate::key_input::install_operation_input_plugin(&ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(&ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -409,7 +409,7 @@ fn first_pointer_click_reaches_started_and_finished(root: bool, mode: SpreadMode
     let ctx = egui::Context::default();
     install(&ctx);
     install_fs_navigator_input_tracking(&ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(&ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -558,7 +558,7 @@ fn ready_single_viewer(ctx: &egui::Context) -> (crate::app::AppTestEnvForTest, e
     install(ctx);
     install_fs_navigator_input_tracking(ctx);
     crate::key_input::install_operation_input_plugin(ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(ctx, SpreadMode::Single);
     app.settings.page_turn_animation_enabled = true;
     let viewport = app.fullscreen_viewport_id();
@@ -1048,7 +1048,7 @@ fn ready_wheel_viewer(
     install(ctx);
     install_fs_navigator_input_tracking(ctx);
     crate::key_input::install_operation_input_plugin(ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -1402,7 +1402,7 @@ fn horizontal_wheel_and_sibling_delivery_do_not_turn_the_owner_page() {
         raw_wheel(egui::vec2(0.0, -120.0)),
         |_, ctx| {
             observe_pointer_transaction(ctx);
-            let id = egui::Id::new(("page_turn_pointer_transaction", sibling));
+            let id = egui::Id::unique(("page_turn_pointer_transaction", sibling));
             let transaction = ctx
                 .data(|data| data.get_temp::<PointerTransaction>(id))
                 .unwrap();

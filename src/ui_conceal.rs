@@ -2236,7 +2236,7 @@ impl App {
         let sink_rect =
             egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, panel_h + 8.0));
 
-        egui::Area::new(egui::Id::new("conceal_panel"))
+        egui::Area::new(egui::Id::unique("conceal_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
@@ -2244,7 +2244,7 @@ impl App {
                 // 1. sink を widget より前に登録 (egui の hit test 後勝ちルール対策)
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("conceal_panel_click_sink"),
+                    egui::Id::unique("conceal_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 // 2. Frame::popup で背景 + 内容を描く (auto-size、clipping なし)

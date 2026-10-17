@@ -631,7 +631,6 @@ mod egui037_connection_tests;
 mod viewport_retirement;
 #[cfg(all(test, windows))]
 mod viewport_retirement_tests;
-pub(crate) use subfolder_expansion::listing_sort_metas_for_items;
 pub(crate) use subfolder_expansion::{SubfolderExpansionEntry, listing_sort_metas_for_entries};
 #[cfg(all(windows, feature = "test-script"))]
 pub(crate) mod release_checks;
@@ -678,12 +677,12 @@ pub(crate) use detached_window_manager::{
 pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
 use folder_scan::is_miv_upscaled_derivative;
 #[cfg(test)]
+pub(crate) use folder_scan::materialize_local_folder_listing;
+#[cfg(test)]
 pub(crate) use folder_scan::scan_directory;
 #[cfg(test)]
 use folder_scan::scan_directory_with_convertible_archives;
-pub(crate) use folder_scan::{
-    ScannedDir, materialize_local_folder_listing, scan_directory_with_settings, signature_from_scan,
-};
+pub(crate) use folder_scan::{ScannedDir, scan_directory_with_settings, signature_from_scan};
 pub use grid_paint::draw_audio_thumbnail_indicator_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_collection_placeholder_snapshot_fixture;
@@ -692,7 +691,7 @@ pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
     ThumbnailHitAreas, draw_cell, draw_cell_with_hit_areas, draw_cut_badge,
     draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
-    paint_thumbnail_resume_meter, primary_grid_tag_for_badge, tq_draw_preview,
+    primary_grid_tag_for_badge, tq_draw_preview,
 };
 pub(crate) use grid_paint::{audio_thumbnail_indicator_parts, paint_audio_thumbnail_indicator};
 use metadata_ops::{
@@ -26433,9 +26432,9 @@ impl App {
     fn apply_external_rescan_with_cause(
         &mut self,
         folder: PathBuf,
-        new_mtime: std::time::SystemTime,
+        _new_mtime: std::time::SystemTime,
         scan: folder_scan::ScannedDir,
-        new_sig: folder_scan::FolderScanSignature,
+        _new_sig: folder_scan::FolderScanSignature,
         cause: book_append_refresh::FolderRefreshCause,
     ) -> bool {
         if cause.is_passive_observation() && !self.folder_observation_allowed() {
@@ -31592,7 +31591,7 @@ impl App {
         self.poll_startup_init();
         let overlay_now = self.indexer_init.overlay_active();
         let overlay_was_visible = ctx.data_mut(|data| {
-            let id = egui::Id::new("startup.overlay.previous-root-pass");
+            let id = egui::Id::unique("startup.overlay.previous-root-pass");
             let previous = data.get_temp::<bool>(id).unwrap_or(true);
             data.insert_temp(id, overlay_now);
             previous
@@ -37181,7 +37180,7 @@ impl App {
         // existing_keys は **全階層** のキー (全 leaf entry_name + 全 dir の zipdir:) を
         // 集める。ルート階層しか materialize しないので、これがないと深い階層の
         // サムネが delete_missing で stale 削除されて再生成ループになる (Codex P2)。
-        let mut existing_keys: std::collections::HashSet<String> =
+        let existing_keys: std::collections::HashSet<String> =
             tree.all_cache_keys().into_iter().collect();
         let mut pinned_keys = Vec::new();
         // 本ごとピン (Model B) の代表サムネは zipdir:{prefix}#pin:{entry} キーで保存される。

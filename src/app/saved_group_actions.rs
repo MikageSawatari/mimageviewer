@@ -292,7 +292,7 @@ impl App {
         };
         let mut cancel = false;
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        egui::Modal::new(egui::Id::new("saved_group_open_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("saved_group_open_modal")).show(ctx, |ui| {
             ui.set_min_width(360.0);
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -802,6 +802,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn saved_group_escape_is_ime_aware_and_cancels_only_the_captured_request() {
         let mut app = crate::app::setup_app_for_test();
         let root = app.tmp.path().join("books");

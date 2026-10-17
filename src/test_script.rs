@@ -4854,7 +4854,7 @@ fn peek_pending_action_from(
 }
 
 fn action_pass_observation_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new("miv.test_script.action_pass_observation").with(viewport_id)
+    egui::Id::unique("miv.test_script.action_pass_observation").with(viewport_id)
 }
 
 fn action_pass_observation(ctx: &egui::Context) -> Option<TestScriptActionPassObservation> {
@@ -8985,7 +8985,7 @@ mod tests {
                 if guard == "edit" {
                     app.erase_mode = true;
                 }
-                let field_id = egui::Id::new("semantic-action-text-owner");
+                let field_id = egui::Id::unique("semantic-action-text-owner");
                 let mut text = String::new();
                 let mut request_focus = true;
                 let draw_field =
@@ -10030,7 +10030,7 @@ mod tests {
                 region_geometry_token: 1,
                 press_page_index: 2,
                 press_item_identity: "page-2".to_string(),
-                widget_id: egui::Id::new("poisoned-pointer-track"),
+                widget_id: egui::Id::unique("poisoned-pointer-track"),
                 press_rect: rect,
                 coordinate_frame: rect,
                 press_pixels_per_point: 1.0,
@@ -10061,7 +10061,7 @@ mod tests {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 let _ = ui.interact(
                     rect,
-                    egui::Id::new("poisoned-pointer-track"),
+                    egui::Id::unique("poisoned-pointer-track"),
                     egui::Sense::click_and_drag(),
                 );
             })
@@ -10101,7 +10101,7 @@ mod tests {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 let response = ui.interact(
                     rect,
-                    egui::Id::new("poisoned-pointer-track"),
+                    egui::Id::unique("poisoned-pointer-track"),
                     egui::Sense::click_and_drag(),
                 );
                 assert!(

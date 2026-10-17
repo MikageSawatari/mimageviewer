@@ -390,7 +390,7 @@ impl App {
         let canceling = pending.cancel.load(Ordering::Relaxed);
 
         let mut cancel_requested = false;
-        egui::Modal::new(egui::Id::new("batch_convert_progress_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("batch_convert_progress_modal")).show(ctx, |ui| {
             ui.set_min_width(320.0);
             ui.heading("ZIP に変換中");
             ui.add_space(4.0);

@@ -284,7 +284,7 @@ impl App {
         let panel_h = panel_rect.height();
         let mut close = false;
 
-        egui::Area::new(egui::Id::new("export_crop_panel"))
+        egui::Area::new(egui::Id::unique("export_crop_panel"))
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
@@ -293,7 +293,7 @@ impl App {
                         egui::Pos2::ZERO,
                         egui::vec2(PANEL_W + 12.0, panel_h + 12.0),
                     ),
-                    egui::Id::new("export_crop_panel_click_sink"),
+                    egui::Id::unique("export_crop_panel_click_sink"),
                     egui::Sense::click(),
                 );
                 egui::Frame::popup(ui.style())

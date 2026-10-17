@@ -24,9 +24,9 @@ pub(super) struct MainFrameNavigation {
 
 impl App {
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
-    pub(super) fn render_update_begin(&mut self, ctx: &egui::Context) {
+    pub(super) fn render_update_begin(&mut self, _ctx: &egui::Context) {
         #[cfg(test)]
-        super::egui037_connection_tests::observe("update_begin", self, ctx);
+        super::egui037_connection_tests::observe("update_begin", self, _ctx);
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         // Remote service runs in logic. Display continuation stays at the old
@@ -2052,7 +2052,6 @@ impl App {
         ui: &mut egui::Ui,
         pre_grid_perf: &mut Option<PreGridPerfRecorder>,
     ) -> (Option<PathBuf>, Option<egui::Rect>) {
-        let ctx = &ui.ctx().clone();
         // ── 検索バー ─────────────────────────────────────────────────
         self.render_search_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::SearchBar);

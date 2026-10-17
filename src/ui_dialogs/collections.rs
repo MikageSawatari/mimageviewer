@@ -3811,7 +3811,7 @@ impl App {
         let mut action = None;
         let mut cancel_worker = false;
         egui::Window::new("コレクションの管理").drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("collection_manager"))
+            .id(egui::Id::unique("collection_manager"))
             .open(&mut open)
             .default_size(egui::vec2(720.0, 440.0))
             .min_size(egui::vec2(620.0, 320.0))
@@ -4084,7 +4084,7 @@ impl App {
         let mut cancel = false;
         egui::Window::new("コレクション処理")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("collection_detached_operation_status"))
+            .id(egui::Id::unique("collection_detached_operation_status"))
             .collapsible(false)
             .resizable(false)
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
@@ -4369,7 +4369,7 @@ impl App {
             CollectionDialogOperation::Name { action, mut draft } => {
                 let mut keep = true;
                 let mut submit = false;
-                egui::Modal::new(egui::Id::new("collection_name_modal")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("collection_name_modal")).show(ctx, |ui| {
                     let field_label = ui.heading(match action {
                         NameAction::Create => "コレクションを作成",
                         NameAction::Rename { .. } => "コレクション名を変更",
@@ -4404,7 +4404,7 @@ impl App {
                 name,
             } => {
                 let mut decision = None;
-                egui::Modal::new(egui::Id::new("collection_delete_modal")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("collection_delete_modal")).show(ctx, |ui| {
                     ui.heading("コレクションを削除");
                     ui.label(format!("「{name}」の定義と参照を削除します。"));
                     ui.label("元のファイルやフォルダは削除しません。");
@@ -4434,7 +4434,7 @@ impl App {
                 origin,
             } => {
                 let mut decision = None;
-                egui::Modal::new(egui::Id::new("collection_remove_modal")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("collection_remove_modal")).show(ctx, |ui| {
                     ui.heading("コレクションから外す");
                     ui.label(format!(
                         "{} 件の参照をコレクションから外します。",
@@ -4486,7 +4486,7 @@ impl App {
                     return;
                 }
                 let mut decision = None;
-                egui::Modal::new(egui::Id::new("collection_import_preview_modal")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("collection_import_preview_modal")).show(ctx, |ui| {
                     ui.heading("インポート内容の確認");
                     ui.label(format!("追加先: {}", self.collection_ui.catalog.as_ref().and_then(|catalog| catalog.definitions.iter().find(|item| item.id == collection_id)).map(|item| item.name.as_str()).unwrap_or("不明")));
                     ui.weak("この確認までは対象ファイルやフォルダへアクセスしていません。確認後に存在と種類を調べます。");
@@ -4657,7 +4657,7 @@ impl App {
         let mut discard = false;
         egui::Window::new(title)
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("collection_reorder_window"))
+            .id(egui::Id::unique("collection_reorder_window"))
             .open(&mut window_open)
             .collapsible(false)
             .resizable(true)
@@ -6617,19 +6617,21 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.heading("画像一覧");
-                    ui.label("コレクション管理は独立したウィンドウで表示されます。");
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("画像一覧");
+                        ui.label("コレクション管理は独立したウィンドウで表示されます。");
+                    });
+                    ui_app.borrow_mut().show_collection_manager(ctx);
                 });
-                ui_app.borrow_mut().show_collection_manager(ctx);
             });
         harness.step();
         if preview {
@@ -6678,19 +6680,21 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.heading("画像一覧");
-                    ui.label("コレクションの項目を選択しています。");
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("画像一覧");
+                        ui.label("コレクションの項目を選択しています。");
+                    });
+                    app.show_collection_manager(ctx);
                 });
-                app.show_collection_manager(ctx);
             });
         harness.run();
         harness.get_by_label("コレクションから外す");
@@ -6712,19 +6716,21 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.heading("画像一覧");
-                    ui.label("コレクションの参照順を編集中です。");
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("画像一覧");
+                        ui.label("コレクションの参照順を編集中です。");
+                    });
+                    app.draw_collection_reorder(ctx);
                 });
-                app.draw_collection_reorder(ctx);
             });
         harness.run();
         harness.get_by_label("閉じる");

@@ -681,7 +681,7 @@ impl App {
         if let Some(message) = message {
             super::show_startup_modal(
                 ctx,
-                egui::Id::new("settings_family_operation_modal"),
+                egui::Id::unique("settings_family_operation_modal"),
                 |ui| {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -773,8 +773,10 @@ impl App {
         // 背景の通常 UI を操作できてしまい、Terminal の「続行不可」分類が画面上は
         // 機能しなかった。Modal なら backdrop が背景クリックを全部吸う + 背景フォーカスを
         // 完全に奪う。
-        let response =
-            super::show_startup_modal(ctx, egui::Id::new("settings_restore_result_modal"), |ui| {
+        let response = super::show_startup_modal(
+            ctx,
+            egui::Id::unique("settings_restore_result_modal"),
+            |ui| {
                 draw_settings_restore_result_content(
                     ui,
                     title,
@@ -782,7 +784,8 @@ impl App {
                     kind,
                     remote_resume_error.as_deref(),
                 )
-            });
+            },
+        );
 
         let (mut closing, retry_remote, exit_for_remote) = response.inner;
 
@@ -2197,22 +2200,24 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 420.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::ui_fonts::configure_fonts(ctx);
-                if !fonts_ready {
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.heading("操作カスタマイズの差分");
-                    ui.horizontal(|ui| {
-                        let _ = ui.selectable_label(false, "標準");
-                        let _ = ui.selectable_label(true, "現在");
-                        let _ = ui.selectable_label(false, "前世代");
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::ui_fonts::configure_fonts(ctx);
+                    if !fonts_ready {
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("操作カスタマイズの差分");
+                        ui.horizontal(|ui| {
+                            let _ = ui.selectable_label(false, "標準");
+                            let _ = ui.selectable_label(true, "現在");
+                            let _ = ui.selectable_label(false, "前世代");
+                        });
+                        ui.separator();
+                        draw_operation_diff(ui, &operation_diff);
                     });
-                    ui.separator();
-                    draw_operation_diff(ui, &operation_diff);
                 });
             });
         harness.run();
@@ -2225,33 +2230,37 @@ pub(super) fn draw_restore_result_snapshot_fixture(ctx: &egui::Context, fixture:
         "設定の復元に失敗しました。".to_owned(),
         "読み込みエラーの詳細。".repeat(240),
     ];
-    super::show_startup_modal(ctx, egui::Id::new("settings_restore_result_modal"), |ui| {
-        let kind = match fixture {
-            "restore_success" => ResultKind::Success,
-            "restore_recoverable" | "restore_remote" => ResultKind::FailedRecoverable,
-            _ => ResultKind::FailedTerminal,
-        };
-        let remote_error = "リモート再接続エラーの詳細。".repeat(120);
-        let success_lines = vec![
-            "設定の復元が完了しました。".to_owned(),
-            "退避ファイル: 設定バックアップ。".repeat(100),
-        ];
-        draw_settings_restore_result_content(
-            ui,
-            if kind == ResultKind::Success {
-                "復元完了"
-            } else {
-                "エラー"
-            },
-            if kind == ResultKind::Success {
-                &success_lines
-            } else {
-                &lines
-            },
-            kind,
-            (fixture == "restore_remote").then_some(remote_error.as_str()),
-        )
-    });
+    super::show_startup_modal(
+        ctx,
+        egui::Id::unique("settings_restore_result_modal"),
+        |ui| {
+            let kind = match fixture {
+                "restore_success" => ResultKind::Success,
+                "restore_recoverable" | "restore_remote" => ResultKind::FailedRecoverable,
+                _ => ResultKind::FailedTerminal,
+            };
+            let remote_error = "リモート再接続エラーの詳細。".repeat(120);
+            let success_lines = vec![
+                "設定の復元が完了しました。".to_owned(),
+                "退避ファイル: 設定バックアップ。".repeat(100),
+            ];
+            draw_settings_restore_result_content(
+                ui,
+                if kind == ResultKind::Success {
+                    "復元完了"
+                } else {
+                    "エラー"
+                },
+                if kind == ResultKind::Success {
+                    &success_lines
+                } else {
+                    &lines
+                },
+                kind,
+                (fixture == "restore_remote").then_some(remote_error.as_str()),
+            )
+        },
+    );
 }
 
 pub(super) fn draw_restore_list_snapshot_fixture(ctx: &egui::Context) {

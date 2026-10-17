@@ -262,7 +262,7 @@ fn draw_startup_worker_notice(
     let mut close = false;
     egui::Window::new(title)
         .drag_area(egui::WindowDrag::Anywhere)
-        .id(egui::Id::new(id))
+        .id(egui::Id::unique(id))
         .default_pos(egui::pos2(
             content.max.x - width - 36.0,
             content.min.y + 56.0,
@@ -390,7 +390,7 @@ mod tests {
                         move |root_ui, rects: &mut Option<(f32, f32, egui::Rect)>| {
                             let ctx = &root_ui.ctx().clone();
                             crate::settings::apply_ui_scale_factor(ctx, scale);
-                            egui::Modal::new(egui::Id::new("body_sizing")).show(ctx, |ui| {
+                            egui::Modal::new(egui::Id::unique("body_sizing")).show(ctx, |ui| {
                                 ui.set_width(480.0_f32.min(ctx.content_rect().width() - 48.0));
                                 ui.heading("Heading");
                                 ui.add_space(8.0);

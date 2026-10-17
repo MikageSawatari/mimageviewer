@@ -486,7 +486,7 @@ struct CachedKeyboardOwner {
 }
 
 fn owner_cache_id(viewport: egui::ViewportId) -> egui::Id {
-    egui::Id::new(("keyboard_owner_for_pass", viewport))
+    egui::Id::unique(("keyboard_owner_for_pass", viewport))
 }
 
 pub(crate) fn cached_keyboard_owner(ctx: &egui::Context) -> Option<KeyboardOwner> {
@@ -522,6 +522,34 @@ pub(crate) fn keymap_owner_blocks_shortcuts(ctx: &egui::Context) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "Compare the 0.37 compatibility constructor with its exact replacement"
+    )]
+    fn migrated_id_keys_preserve_root_child_and_session_memory_identity() {
+        let legacy = [
+            egui::Id::new("content_restore_modal"),
+            egui::Id::new(("keyboard_owner_for_pass", egui::ViewportId::ROOT)),
+            egui::Id::new(42_u64),
+        ];
+        let migrated = [
+            egui::Id::unique("content_restore_modal"),
+            egui::Id::unique(("keyboard_owner_for_pass", egui::ViewportId::ROOT)),
+            egui::Id::unique(42_u64),
+        ];
+        let ctx = egui::Context::default();
+        for (legacy, migrated) in legacy.into_iter().zip(migrated) {
+            assert_eq!(legacy, migrated);
+            assert_eq!(
+                legacy.with("child").with(("nested", 7_u64)),
+                migrated.with("child").with(("nested", 7_u64))
+            );
+            ctx.data_mut(|data| data.insert_temp(legacy, 123_u64));
+            assert_eq!(ctx.data(|data| data.get_temp::<u64>(migrated)), Some(123));
+        }
+    }
+
     fn scope(surface: ShortcutSurface) -> ShortcutScope {
         ShortcutScope::new(egui::ViewportId::ROOT, surface)
     }
@@ -539,8 +567,8 @@ mod tests {
 
     #[test]
     fn keyboard_owner_decision_covers_every_owner_and_text_phase() {
-        let text_id = egui::Id::new("text");
-        let ui_id = egui::Id::new("focused-ui");
+        let text_id = egui::Id::unique("text");
+        let ui_id = egui::Id::unique("focused-ui");
 
         let mut input = snapshot();
         input.text_input = Some(TextInputClaim::new(text_id, TextInputPhase::Focused));
@@ -606,10 +634,10 @@ mod tests {
         input.modal = true;
         input.viewport_focused = false;
         input.text_input = Some(TextInputClaim::new(
-            egui::Id::new("text"),
+            egui::Id::unique("text"),
             TextInputPhase::Focused,
         ));
-        input.focused_ui = Some(egui::Id::new("ui"));
+        input.focused_ui = Some(egui::Id::unique("ui"));
         input.shortcut_scope = Some(scope(ShortcutSurface::Fullscreen));
         assert_eq!(decide_keyboard_owner(input), KeyboardOwner::Modal);
     }
@@ -618,10 +646,10 @@ mod tests {
     fn ime_composing_is_text_input_even_with_generic_focused_ui() {
         let mut input = snapshot();
         input.text_input = Some(TextInputClaim::new(
-            egui::Id::new("ime-widget"),
+            egui::Id::unique("ime-widget"),
             TextInputPhase::ImeComposing,
         ));
-        input.focused_ui = Some(egui::Id::new("ime-widget"));
+        input.focused_ui = Some(egui::Id::unique("ime-widget"));
         assert!(matches!(
             decide_keyboard_owner(input),
             KeyboardOwner::TextInput {
@@ -646,7 +674,7 @@ mod tests {
 
     #[test]
     fn pending_focus_claim_clears_when_target_focuses() {
-        let widget_id = egui::Id::new("target");
+        let widget_id = egui::Id::unique("target");
         let claim = Some(PendingTextInputFocusClaim::new(
             egui::ViewportId::ROOT,
             widget_id,
@@ -671,7 +699,7 @@ mod tests {
     fn pending_focus_claim_clears_when_another_widget_focuses() {
         let claim = Some(PendingTextInputFocusClaim::new(
             egui::ViewportId::ROOT,
-            egui::Id::new("target"),
+            egui::Id::unique("target"),
             10,
         ));
         let transition = transition_pending_focus_claim(
@@ -679,7 +707,7 @@ mod tests {
             PendingFocusEvent::ObservePass {
                 viewport: egui::ViewportId::ROOT,
                 pass: 11,
-                focused_widget: Some(egui::Id::new("other")),
+                focused_widget: Some(egui::Id::unique("other")),
             },
         );
         assert_eq!(transition.claim, None);
@@ -690,7 +718,7 @@ mod tests {
     fn pending_focus_claim_clears_when_editing_ends() {
         let claim = Some(PendingTextInputFocusClaim::new(
             egui::ViewportId::ROOT,
-            egui::Id::new("target"),
+            egui::Id::unique("target"),
             10,
         ));
         let transition = transition_pending_focus_claim(claim, PendingFocusEvent::EditingEnded);
@@ -700,7 +728,7 @@ mod tests {
 
     #[test]
     fn pending_focus_claim_expires_after_one_unfocused_pass() {
-        let widget_id = egui::Id::new("target");
+        let widget_id = egui::Id::unique("target");
         let claim = Some(PendingTextInputFocusClaim::new(
             egui::ViewportId::ROOT,
             widget_id,
@@ -740,7 +768,7 @@ mod tests {
     fn another_viewport_does_not_age_or_use_pending_focus_claim() {
         let claim = Some(PendingTextInputFocusClaim::new(
             egui::ViewportId::from_hash_of("child"),
-            egui::Id::new("target"),
+            egui::Id::unique("target"),
             10,
         ));
         let transition = transition_pending_focus_claim(
@@ -769,12 +797,12 @@ mod tests {
             KeyboardOwner::Modal,
             KeyboardOwner::TextInput {
                 viewport: egui::ViewportId::ROOT,
-                widget_id: egui::Id::new("text"),
+                widget_id: egui::Id::unique("text"),
                 phase: TextInputPhase::Focused,
             },
             KeyboardOwner::FocusedUi {
                 viewport: egui::ViewportId::ROOT,
-                widget_id: egui::Id::new("ui"),
+                widget_id: egui::Id::unique("ui"),
             },
             KeyboardOwner::Unclaimed,
         ] {
@@ -792,7 +820,7 @@ mod tests {
         ] {
             let owner = KeyboardOwner::TextInput {
                 viewport: egui::ViewportId::ROOT,
-                widget_id: egui::Id::new("text"),
+                widget_id: egui::Id::unique("text"),
                 phase,
             };
             assert_eq!(owner.fullscreen_raw_key_permit(), None, "{phase:?}");
@@ -801,7 +829,7 @@ mod tests {
         assert!(
             KeyboardOwner::FocusedUi {
                 viewport: egui::ViewportId::ROOT,
-                widget_id: egui::Id::new("slider"),
+                widget_id: egui::Id::unique("slider"),
             }
             .fullscreen_raw_key_permit()
             .is_some()
@@ -870,20 +898,20 @@ mod tests {
                             input.text_input = tracked_text_focus
                                 .then(|| {
                                     TextInputClaim::new(
-                                        egui::Id::new("tracked-text"),
+                                        egui::Id::unique("tracked-text"),
                                         TextInputPhase::Focused,
                                     )
                                 })
                                 .or_else(|| {
                                     ime_composing.then(|| {
                                         TextInputClaim::new(
-                                            egui::Id::new("ime-text"),
+                                            egui::Id::unique("ime-text"),
                                             TextInputPhase::ImeComposing,
                                         )
                                     })
                                 });
                             input.focused_ui =
-                                wants_keyboard_input.then(|| egui::Id::new("egui-owner"));
+                                wants_keyboard_input.then(|| egui::Id::unique("egui-owner"));
                             input.shortcut_scope =
                                 viewport_focused.then(|| scope(ShortcutSurface::Main));
                             assert_eq!(
@@ -912,7 +940,7 @@ mod tests {
             for wants_keyboard_input in [false, true] {
                 let mut input = snapshot();
                 input.viewport_focused = viewport_focused;
-                input.focused_ui = wants_keyboard_input.then(|| egui::Id::new("egui-owner"));
+                input.focused_ui = wants_keyboard_input.then(|| egui::Id::unique("egui-owner"));
                 input.shortcut_scope = viewport_focused.then(|| scope(ShortcutSurface::Main));
                 assert_eq!(
                     decide_keyboard_owner(input).blocks_legacy_keymap_shortcuts(),
@@ -927,8 +955,8 @@ mod tests {
             TextInputPhase::ImeComposing,
         ] {
             let mut input = snapshot();
-            input.focused_ui = Some(egui::Id::new("egui-text-owner"));
-            input.text_input = Some(TextInputClaim::new(egui::Id::new("tracked-text"), phase));
+            input.focused_ui = Some(egui::Id::unique("egui-text-owner"));
+            input.text_input = Some(TextInputClaim::new(egui::Id::unique("tracked-text"), phase));
             assert!(
                 decide_keyboard_owner(input).blocks_legacy_keymap_shortcuts(),
                 "{phase:?} must preserve the prior wants_keyboard_input=true answer"
@@ -937,7 +965,7 @@ mod tests {
 
         let mut pending = snapshot();
         pending.text_input = Some(TextInputClaim::new(
-            egui::Id::new("pending"),
+            egui::Id::unique("pending"),
             TextInputPhase::PendingFocus,
         ));
         assert!(

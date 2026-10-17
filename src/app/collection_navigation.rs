@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::folder_scan::ScannedDir;
-#[cfg(test)]
-use super::top_level_grid_view::CollectionGridThumbnailSources;
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridLoadState, CollectionGridNavigationSources,
-    CollectionGridPosition, CollectionGridPreparedInstall, CollectionGridPreparedThumbnailDelivery,
-    CollectionGridPresentationSources, CollectionGridSession, CollectionGridViewportAnchor,
-    TopLevelGridRestore, TopLevelGridSurface,
+    CollectionGridPosition, CollectionGridPreparedInstall, CollectionGridPresentationSources,
+    CollectionGridSession, CollectionGridViewportAnchor, TopLevelGridRestore, TopLevelGridSurface,
+};
+#[cfg(test)]
+use super::top_level_grid_view::{
+    CollectionGridPreparedThumbnailDelivery, CollectionGridThumbnailSources,
 };
 use super::{App, FolderOpenOutcome, HistoryTrigger, ManualMediaNavigationLanding};
 use crate::collection_store::{

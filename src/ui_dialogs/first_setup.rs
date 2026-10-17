@@ -55,7 +55,7 @@ pub fn draw_first_setup_dialog(
     ctx: &egui::Context,
     settings: &mut crate::settings::Settings,
 ) -> egui::ModalResponse<egui::Response> {
-    super::show_startup_modal(ctx, egui::Id::new("first_setup_modal"), |ui| {
+    super::show_startup_modal(ctx, egui::Id::unique("first_setup_modal"), |ui| {
         ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
         ui.heading("初回設定");
         ui.add_space(8.0);
@@ -307,6 +307,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn first_setup_enter_confirms_defaults_but_ime_enter_and_escape_do_not() {
         for (key, composing, focus_start, expected) in [
             (egui::Key::Enter, false, false, true),
@@ -364,7 +368,7 @@ mod tests {
                         );
                         if expected && !focus_start {
                             ctx.memory_mut(|memory| {
-                                memory.request_focus(egui::Id::new("focused_option"))
+                                memory.request_focus(egui::Id::unique("focused_option"))
                             });
                             assert!(!first_setup_should_confirm(&response, enter, ime_active));
                         }

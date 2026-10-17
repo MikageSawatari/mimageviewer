@@ -124,7 +124,7 @@ fn view_harness(
             }
             *actions = show_window(
                 ui,
-                egui::Id::new("composition_snapshot"),
+                egui::Id::unique("composition_snapshot"),
                 &view,
                 &mut state,
                 DialogKeys::default(),
@@ -488,11 +488,13 @@ fn composition_editor_hud_real_entry_and_indicator_c9() {
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default().show(ui, |ui| {
-                            *activated |=
-                                mimageviewer::draw_composition_editor_hud_snapshot_fixture(
-                                    ui, available, true,
-                                );
+                        test_ui::full_viewport_ui(ui, |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
+                                *activated |=
+                                    mimageviewer::draw_composition_editor_hud_snapshot_fixture(
+                                        ui, available, true,
+                                    );
+                            });
                         });
                     },
                     false,
@@ -542,7 +544,7 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
                 let ctx = &ui.ctx().clone();
                 actions = show_window(
                     ctx,
-                    egui::Id::new("filtered_keys"),
+                    egui::Id::unique("filtered_keys"),
                     &view,
                     &mut state,
                     DialogKeys::default(),
@@ -557,7 +559,7 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
         let ctx = &ui.ctx().clone();
         actions = show_window(
             ctx,
-            egui::Id::new("filtered_keys"),
+            egui::Id::unique("filtered_keys"),
             &view,
             &mut state,
             DialogKeys {

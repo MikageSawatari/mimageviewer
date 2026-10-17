@@ -4233,7 +4233,7 @@ mod tests {
             egui::Pos2::ZERO,
             egui::vec2(64.0, 64.0),
         ));
-        let mut output = ctx.run_pass(raw, |ctx| {
+        let output = ctx.run_pass(raw, |ctx| {
             let painter = ctx.debug_painter().with_clip_rect(clip_rect);
             painter.image(
                 texture_id,

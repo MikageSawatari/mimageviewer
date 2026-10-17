@@ -13,6 +13,32 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// Own immutable snapshot assets until their Context is dropped. kittest 0.37
+/// handles texture frees before capture, so draw-local handles cannot own them.
+/// Content and sampling are part of the key: fixture names alone can repeat.
+/// This is only for the snapshot fixture entry points, not product image loading.
+pub(crate) fn load_snapshot_texture(
+    ctx: &egui::Context,
+    name: impl Into<String>,
+    image: egui::ColorImage,
+    options: egui::TextureOptions,
+) -> egui::TextureHandle {
+    let name = name.into();
+    let key = egui::Id::unique((
+        "snapshot-texture-asset",
+        &name,
+        image.size,
+        &image.pixels,
+        options,
+    ));
+    if let Some(texture) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(key)) {
+        return texture;
+    }
+    let texture = ctx.load_texture(name, image, options);
+    ctx.data_mut(|data| data.insert_temp(key, texture.clone()));
+    texture
+}
+
 /// Virtualized grids own the complete row slot (tile plus their explicit gap).
 /// egui's show_rows otherwise adds Ui item_spacing a second time.
 pub(crate) fn show_fixed_slot_rows<R>(
@@ -410,7 +436,7 @@ pub(crate) fn draw_panel_tab_button(
     label: &str,
     selected: bool,
 ) -> egui::Response {
-    let response = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let response = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
     let background = if selected {
         egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
     } else if response.hovered() {
@@ -2679,6 +2705,68 @@ pub fn draw_centered_elided_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_texture_assets_survive_local_drop_without_name_or_context_aliasing() {
+        fn harness(colors: [egui::Color32; 2]) -> egui_kittest::Harness<'static, ()> {
+            crate::test_ui::builder()
+                .with_size(egui::vec2(64.0, 32.0))
+                .build_ui(move |ui| {
+                    for (index, color) in colors.into_iter().enumerate() {
+                        // Same name, distinct immutable assets. The local handle
+                        // is dropped before kittest processes this pass's delta.
+                        let texture = load_snapshot_texture(
+                            ui.ctx(),
+                            "same-fixture-name",
+                            egui::ColorImage::new([4, 4], vec![color; 16]),
+                            egui::TextureOptions::NEAREST,
+                        );
+                        let x = 8.0 + 24.0 * index as f32;
+                        ui.ctx()
+                            .layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::unique("fixture-assets"),
+                            ))
+                            .image(
+                                texture.id(),
+                                egui::Rect::from_min_size(
+                                    egui::pos2(x, 8.0),
+                                    egui::vec2(16.0, 16.0),
+                                ),
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                    }
+                })
+        }
+        fn assert_pixels(h: &mut egui_kittest::Harness<'_, ()>, colors: [egui::Color32; 2]) {
+            let image = h.render().expect("offscreen fixture readback");
+            for (index, color) in colors.into_iter().enumerate() {
+                assert_eq!(
+                    image.get_pixel(12 + 24 * index as u32, 12).0,
+                    color.to_array()
+                );
+            }
+        }
+        let first_colors = [egui::Color32::RED, egui::Color32::GREEN];
+        let second_colors = [egui::Color32::BLUE, egui::Color32::YELLOW];
+        let mut first = harness(first_colors);
+        let mut second = harness(second_colors);
+        first.run();
+        second.run();
+        let allocated = first.ctx.tex_manager().read().num_allocated();
+        first.run_steps(6);
+        assert_eq!(
+            first.ctx.tex_manager().read().num_allocated(),
+            allocated,
+            "repeated passes reuse the same fixture assets"
+        );
+        assert_pixels(&mut first, first_colors);
+        assert_pixels(&mut second, second_colors);
+        drop(first);
+        second.run_steps(2);
+        assert_pixels(&mut second, second_colors);
+    }
 
     #[test]
     fn typed_format_badge_colors_preserve_archives_and_distinguish_video() {

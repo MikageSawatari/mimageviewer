@@ -99,7 +99,7 @@ impl App {
                             .add(
                                 egui::TextEdit::singleline(&mut days_str)
                                     .desired_width(48.0)
-                                    .horizontal_align(egui::Align::Center),
+                                    .align(egui::Align2::CENTER_TOP),
                             )
                             .labelled_by(field_label.id);
                         if resp.changed() {

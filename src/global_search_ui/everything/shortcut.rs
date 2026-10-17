@@ -89,6 +89,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn everything_ctrl_r_reopen_selects_previous_query_and_typing_replaces_it() {
         #[cfg(windows)]
         let _serial = crate::key_input::lock_test_input();
@@ -326,7 +330,7 @@ mod tests {
                 egui::Modifiers::CTRL,
                 Some(KeyboardOwner::TextInput {
                     viewport: egui::ViewportId::ROOT,
-                    widget_id: egui::Id::new("everything-ime-field"),
+                    widget_id: egui::Id::unique("everything-ime-field"),
                     phase,
                 }),
             );

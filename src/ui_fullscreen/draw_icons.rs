@@ -31,7 +31,7 @@ struct BarButtonTouchState {
 }
 
 fn bar_button_touch_state_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new((module_path!(), ctx.viewport_id(), line!()))
+    egui::Id::unique((module_path!(), ctx.viewport_id(), line!()))
 }
 
 fn begin_bar_button_touch_frame(
@@ -286,7 +286,7 @@ pub(super) fn draw_bar_button_in_rect(
     icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
 ) -> BarButtonResponse {
     debug_assert!(rect.is_positive());
-    let id = egui::Id::new(id);
+    let id = egui::Id::unique(id);
     let resp = ui.interact(rect, id, egui::Sense::click());
     let bg = bg_fn(resp.hovered());
     let painter = ui.painter().with_clip_rect(rect);
@@ -330,7 +330,7 @@ mod bar_button_touch_tests {
 
     fn target(id: u64, left: f32) -> BarButtonTouchTarget {
         BarButtonTouchTarget {
-            id: egui::Id::new(id),
+            id: egui::Id::unique(id),
             rect: egui::Rect::from_min_size(
                 egui::pos2(left, 6.0),
                 egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
@@ -558,7 +558,7 @@ pub(super) fn test_arm_bar_button_touch_click(ctx: &egui::Context, id: &str, bar
             BarButtonTouchState {
                 prepared_pass: Some(pass),
                 bar_rect: Some(bar_rect),
-                resolved_ids: vec![egui::Id::new(id)],
+                resolved_ids: vec![egui::Id::unique(id)],
                 ..Default::default()
             },
         );

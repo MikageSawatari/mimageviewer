@@ -1724,43 +1724,45 @@ mod local_adjust_segmentation_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 200.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
-                    let mut add_layer_dialog_open = false;
-                    let mut select_layer: Option<usize> = None;
-                    let mut set_enabled: Option<(usize, bool)> = None;
-                    let mut update_layer: Option<(
-                        usize,
-                        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
-                    )> = None;
-                    let mut move_layer: Option<(usize, usize)> = None;
-                    let mut duplicate_layer: Option<usize> = None;
-                    let mut delete_layer: Option<usize> = None;
-                    let mut preview_to_selected_layer = false;
-                    super::draw_local_adjust_layer_list(
-                        ui,
-                        260.0,
-                        &layers,
-                        0,
-                        (1920, 1080),
-                        None,
-                        &mut add_layer_dialog_open,
-                        &mut select_layer,
-                        &mut set_enabled,
-                        &mut update_layer,
-                        &mut move_layer,
-                        &mut duplicate_layer,
-                        &mut delete_layer,
-                        &mut preview_to_selected_layer,
-                    );
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
+                        let mut add_layer_dialog_open = false;
+                        let mut select_layer: Option<usize> = None;
+                        let mut set_enabled: Option<(usize, bool)> = None;
+                        let mut update_layer: Option<(
+                            usize,
+                            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                        )> = None;
+                        let mut move_layer: Option<(usize, usize)> = None;
+                        let mut duplicate_layer: Option<usize> = None;
+                        let mut delete_layer: Option<usize> = None;
+                        let mut preview_to_selected_layer = false;
+                        super::draw_local_adjust_layer_list(
+                            ui,
+                            260.0,
+                            &layers,
+                            0,
+                            (1920, 1080),
+                            None,
+                            &mut add_layer_dialog_open,
+                            &mut select_layer,
+                            &mut set_enabled,
+                            &mut update_layer,
+                            &mut move_layer,
+                            &mut duplicate_layer,
+                            &mut delete_layer,
+                            &mut preview_to_selected_layer,
+                        );
+                    });
                 });
             });
 
@@ -1774,20 +1776,22 @@ mod local_adjust_segmentation_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 90.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    let mut params = crate::colorize::ColorizeParams::default();
-                    let mut slots = crate::colorize::ColorizePresetSlots {
-                        slots: std::array::from_fn(|_| Some(params.clone())),
-                    };
-                    super::draw_colorize_preset_slots(ui, &mut params, &mut slots);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut params = crate::colorize::ColorizeParams::default();
+                        let mut slots = crate::colorize::ColorizePresetSlots {
+                            slots: std::array::from_fn(|_| Some(params.clone())),
+                        };
+                        super::draw_colorize_preset_slots(ui, &mut params, &mut slots);
+                    });
                 });
             });
 
@@ -1801,19 +1805,21 @@ mod local_adjust_segmentation_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 92.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    let mut params = crate::colorize::ColorizeParams::default();
-                    params.palette = crate::colorize::ColorizePalette::Custom;
-                    params.luminance_weight = 35;
-                    super::draw_colorize_gradient_preview(ui, &params);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        let mut params = crate::colorize::ColorizeParams::default();
+                        params.palette = crate::colorize::ColorizePalette::Custom;
+                        params.luminance_weight = 35;
+                        super::draw_colorize_gradient_preview(ui, &params);
+                    });
                 });
             });
 
@@ -2005,27 +2011,29 @@ mod local_adjust_segmentation_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 590.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_min_width(300.0);
-                    ui.set_max_width(300.0);
-                    crate::local_adjust_effect_ui::draw_effect_params(
-                        ui,
-                        &mut layer,
-                        (1920, 1080),
-                        false,
-                        None,
-                        None,
-                        false,
-                        true,
-                    );
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_min_width(300.0);
+                        ui.set_max_width(300.0);
+                        crate::local_adjust_effect_ui::draw_effect_params(
+                            ui,
+                            &mut layer,
+                            (1920, 1080),
+                            false,
+                            None,
+                            None,
+                            false,
+                            true,
+                        );
+                    });
                 });
             });
 
@@ -9451,7 +9459,7 @@ fn draw_header_icon_button(
     disabled_tooltip: Option<&str>,
     icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
 ) -> egui::Response {
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let resp = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
     let bg = if !enabled {
         egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
     } else if active {
@@ -9544,7 +9552,7 @@ fn draw_left_panel_tab_button(
 fn draw_left_panel_close_button(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
     let response = ui.interact(
         rect,
-        egui::Id::new("left_panel_close"),
+        egui::Id::unique("left_panel_close"),
         egui::Sense::click(),
     );
     if response.hovered() {
@@ -9782,7 +9790,7 @@ fn draw_colorize_settings(
     // OFF にした時点で対象の選択が消える。有効な間の値をセッション内に控えておき、ON に戻す
     // ときに復元する。有効な間は毎フレーム上書きするため、スロット読み込みなど UI 以外の
     // 書き手が mode を変えても追随し、控えが実態からずれない (= 対象の正本は常に mode)。
-    let restore_mode_id = egui::Id::new("colorize_last_enabled_mode");
+    let restore_mode_id = egui::Id::unique("colorize_last_enabled_mode");
     if params.colorize.mode != ColorizeMode::Disabled {
         let mode = params.colorize.mode;
         ui.data_mut(|data| data.insert_temp(restore_mode_id, mode));
@@ -10932,22 +10940,24 @@ mod creative_lut_ui_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(380.0, 520.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
-                    .show(root_ui, |ui| {
-                        crate::os_theme::apply_dark_ui(ui);
-                        ui.set_max_width(320.0);
-                        ui.label("Creative LUT");
-                        draw_image_creative_lut_combo(ui, &mut selected_id, &creative_luts);
-                    });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)))
+                        .show(root_ui, |ui| {
+                            crate::os_theme::apply_dark_ui(ui);
+                            ui.set_max_width(320.0);
+                            ui.label("Creative LUT");
+                            draw_image_creative_lut_combo(ui, &mut selected_id, &creative_luts);
+                        });
+                });
             });
 
         harness.get_by_role(egui::accesskit::Role::ComboBox).click();
@@ -10967,7 +10977,7 @@ mod creative_lut_ui_tests {
 }
 
 pub(crate) fn book_bookmark_title_edit_widget_id(bookmark_id: i64) -> egui::Id {
-    egui::Id::new("book_bookmark_title_edit").with(bookmark_id)
+    egui::Id::unique("book_bookmark_title_edit").with(bookmark_id)
 }
 
 fn draw_bookmark_title_edit(
@@ -11043,7 +11053,6 @@ mod bookmark_title_edit_tests {
         request_focus: &mut bool,
         enter_pressed: bool,
     ) -> (egui::Id, bool) {
-        let ctx = &root_ui.ctx().clone();
         let mut output = None;
         {
             egui::CentralPanel::default().show(root_ui, |ui| {
@@ -11055,6 +11064,10 @@ mod bookmark_title_edit_tests {
         output.expect("bookmark title editor response")
     }
 
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn ime_commit_and_enter_input() -> egui::RawInput {
         egui::RawInput {
             events: vec![
@@ -15426,14 +15439,14 @@ impl App {
         let mut effect_requests = LocalEffectPanelRequests::default();
         let mut bitmap_mask_op = None;
 
-        egui::Area::new(egui::Id::new("local_adjust_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("local_adjust_panel_click_sink"),
+                    egui::Id::unique("local_adjust_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -15604,14 +15617,14 @@ impl App {
                     });
             });
 
-        egui::Area::new(egui::Id::new("local_adjust_tool_panel"))
+        egui::Area::new(egui::Id::unique("local_adjust_tool_panel"))
             .fixed_pos(tool_panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
                 ui.interact(
                     tool_sink_rect,
-                    egui::Id::new("local_adjust_tool_panel_click_sink"),
+                    egui::Id::unique("local_adjust_tool_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())

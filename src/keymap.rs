@@ -6925,7 +6925,7 @@ struct PageTurnEdgeHold {
 }
 
 fn page_turn_edge_hold_id(viewport: egui::ViewportId) -> egui::Id {
-    egui::Id::new(("page_turn_edge_hold", viewport))
+    egui::Id::unique(("page_turn_edge_hold", viewport))
 }
 
 /// Leave the edge's own answer to "is the key still down" where the rest of the pass can find it.
@@ -9929,7 +9929,7 @@ mod tests {
         ctx.root_ui(|root_ui| {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
-                let _ = ui.interact(rect, egui::Id::new(id), egui::Sense::click_and_drag());
+                let _ = ui.interact(rect, egui::Id::unique(id), egui::Sense::click_and_drag());
             })
         });
     }
@@ -13280,10 +13280,9 @@ mod tests {
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_fallback_text");
+        let text_id = egui::Id::unique("keymap_owned_fallback_text");
         let mut text = String::new();
         ctx.run_ui(Default::default(), |ui| {
-            let ctx = &ui.ctx().clone();
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
@@ -13312,10 +13311,9 @@ mod tests {
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_win32_text");
+        let text_id = egui::Id::unique("keymap_owned_win32_text");
         let mut text = String::new();
         ctx.run_ui(Default::default(), |ui| {
-            let ctx = &ui.ctx().clone();
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
@@ -13403,10 +13401,9 @@ mod tests {
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_pressed_text");
+        let text_id = egui::Id::unique("keymap_owned_pressed_text");
         let mut text = String::new();
         ctx.run_ui(Default::default(), |ui| {
-            let ctx = &ui.ctx().clone();
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
@@ -13437,10 +13434,9 @@ mod tests {
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
-        let text_id = egui::Id::new("keymap_owned_hold_text");
+        let text_id = egui::Id::unique("keymap_owned_hold_text");
         let mut text = String::new();
         ctx.run_ui(Default::default(), |ui| {
-            let ctx = &ui.ctx().clone();
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
@@ -13594,12 +13590,11 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
-        let first_id = egui::Id::new("keymap_tab_first_text");
-        let second_id = egui::Id::new("keymap_tab_second_text");
+        let first_id = egui::Id::unique("keymap_tab_first_text");
+        let second_id = egui::Id::unique("keymap_tab_second_text");
         let mut first = String::new();
         let mut second = String::new();
         ctx.run_ui(Default::default(), |ui| {
-            let ctx = &ui.ctx().clone();
             egui::CentralPanel::default().show(ui, |ui| {
                 let first_response = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
                 let _ = ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
@@ -13648,7 +13643,7 @@ mod tests {
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
-        let focused_id = egui::Id::new("modal_focus_surface");
+        let focused_id = egui::Id::unique("modal_focus_surface");
         ctx.run_ui(Default::default(), |root_ui| {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));

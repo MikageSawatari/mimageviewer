@@ -170,7 +170,7 @@ impl App {
 
         let window_response = crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("VST3").drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("vst3-playback-panel"))
+            .id(egui::Id::unique("vst3-playback-panel"))
             .frame(frame)
             .open(&mut open)
             .default_pos(initial_pos)

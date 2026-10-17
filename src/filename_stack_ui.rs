@@ -441,7 +441,7 @@ fn read_stack_candidate(
         #[cfg(test)]
         if order.read_failures.as_ref().is_some_and(|remaining| {
             remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                     count.checked_sub(1)
                 })
                 .is_ok()
@@ -1075,11 +1075,13 @@ impl crate::app::App {
                 }
                 let view = Arc::new(view);
                 let (items, metas) = view.materialize_aggregated();
-                let mut order = StackCandidateOrder::new(items, metas);
+                let order = StackCandidateOrder::new(items, metas);
                 #[cfg(test)]
-                {
+                let order = {
+                    let mut order = order;
                     order.read_failures = worker_source.read_failures.clone();
-                }
+                    order
+                };
                 let read = read_stack_candidate(
                     order,
                     worker_source.available_edits,

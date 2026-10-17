@@ -1415,9 +1415,8 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if state.favorite_view_state_clear_confirm_open {
         let mut clear = false;
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::new("favorite_view_state_clear_confirm")).show(
-            ui.ctx(),
-            |ui| {
+        let response = egui::Modal::new(egui::Id::unique("favorite_view_state_clear_confirm"))
+            .show(ui.ctx(), |ui| {
                 ui.set_min_width(420.0);
                 ui.heading("お気に入りの表示状態をすべてクリアしますか？");
                 ui.label("お気に入り本体は削除されません。次回入ったときに改めて記憶します。");
@@ -1430,8 +1429,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         cancel = true;
                     }
                 });
-            },
-        );
+            });
         if clear {
             state.favorite_view_state_clear_requested = true;
             state.favorite_view_state_clear_confirm_open = false;
@@ -5168,7 +5166,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 );
                                                 status.widget_info(|| {
                                                     egui::WidgetInfo::labeled(
-                                                        egui::WidgetType::Label,
+                                                        egui::Role::Label,
                                                         true,
                                                         format!(
                                                             "{}はこの場面で対象外",
@@ -5189,7 +5187,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 );
                                                 status.widget_info(|| {
                                                     egui::WidgetInfo::labeled(
-                                                        egui::WidgetType::Label,
+                                                        egui::Role::Label,
                                                         true,
                                                         format!("{}は項目非表示中", item.label()),
                                                     )
@@ -5207,7 +5205,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 );
                                                 status.widget_info(|| {
                                                     egui::WidgetInfo::labeled(
-                                                        egui::WidgetType::Label,
+                                                        egui::Role::Label,
                                                         true,
                                                         format!("{}はこの場面で先頭", item.label()),
                                                     )
@@ -5237,7 +5235,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                     .on_hover_text("上へ");
                                 up.widget_info(|| {
                                     egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Button,
+                                        egui::Role::Button,
                                         up_enabled,
                                         format!("{}を上へ", item.label()),
                                     )
@@ -5256,7 +5254,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                     .on_hover_text("下へ");
                                 down.widget_info(|| {
                                     egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Button,
+                                        egui::Role::Button,
                                         down_enabled,
                                         format!("{}を下へ", item.label()),
                                     )
@@ -5304,7 +5302,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                         });
                                         combo.response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::ComboBox,
+                                                egui::Role::ComboBox,
                                                 true,
                                                 format!("{}の前の区切り線", item.label()),
                                             )
@@ -5326,7 +5324,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                             );
                                         response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::Button,
+                                                egui::Role::Button,
                                                 false,
                                                 format!(
                                                     "{}の前の区切り線（先頭のため非表示）",
@@ -5345,7 +5343,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                         );
                                         response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::Button,
+                                                egui::Role::Button,
                                                 false,
                                                 format!(
                                                     "{}の前の区切り線（項目が非表示）",
@@ -5363,7 +5361,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                             ui.add_enabled(false, egui::Button::new("対象外"));
                                         response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::Button,
+                                                egui::Role::Button,
                                                 false,
                                                 format!(
                                                     "{}の前の区切り線（この場面では対象外）",
@@ -5383,7 +5381,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                         .on_hover_text("この項目の区切り線を既定に戻す");
                                     reset.widget_info(|| {
                                         egui::WidgetInfo::labeled(
-                                            egui::WidgetType::Button,
+                                            egui::Role::Button,
                                             true,
                                             format!(
                                                 "{}の区切り線を既定に戻す",
@@ -10091,7 +10089,7 @@ pub(super) fn draw_fullscreen_specified_scale_axis_controls(
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
         data.insert_temp(
-            egui::Id::new(("specified_scale_unit_response", label)),
+            egui::Id::unique(("specified_scale_unit_response", label)),
             _unit_response.response.rect,
         );
     });
@@ -10127,7 +10125,10 @@ pub(super) fn draw_fullscreen_specified_scale_max_controls(
     crate::ui_helpers::set_accessibility_label(&response, "自動フィットの最大倍率（共通）");
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
-        data.insert_temp(egui::Id::new("specified_scale_max_response"), response.rect);
+        data.insert_temp(
+            egui::Id::unique("specified_scale_max_response"),
+            response.rect,
+        );
     });
     if response.changed() {
         *max_tenths = ((number * 10.0).round() as u32).clamp(
@@ -10666,16 +10667,18 @@ mod page_turn_animation_settings_tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 320.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                    });
                 });
             });
         harness.run();

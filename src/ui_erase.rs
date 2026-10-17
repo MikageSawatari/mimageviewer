@@ -2405,7 +2405,7 @@ impl App {
         let mut mask_delete_clicked = false;
         let mut persist_inpaint_tone_tolerance = false;
 
-        egui::Area::new(egui::Id::new("erase_tool_panel"))
+        egui::Area::new(egui::Id::unique("erase_tool_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
@@ -2415,7 +2415,7 @@ impl App {
                 //    優先しつつ、widget 外の隙間/Frame 外周は sink が拾う)。
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("erase_panel_click_sink"),
+                    egui::Id::unique("erase_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 let frame_response = egui::Frame::popup(ui.style())

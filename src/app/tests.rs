@@ -7600,6 +7600,10 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
 
 #[test]
 #[cfg(windows)]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
@@ -14341,7 +14345,7 @@ mod startup_open_path_resolve_tests {
             output.viewport_output.len()
         );
         assert!(
-            ctx.memory(|memory| memory.area_rect(egui::Id::new("epub_convert_dialog")))
+            ctx.memory(|memory| memory.area_rect(egui::Id::unique("epub_convert_dialog")))
                 .is_some(),
             "conversion dialog must be drawn in the active detached frame"
         );
@@ -28951,6 +28955,10 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn facet_name_debounce_does_not_apply_during_ime_input() {
         let mut app = setup_app();
         app.facet_name_input = "未確定".to_owned();
@@ -41656,7 +41664,7 @@ mod favorite_adjustment_defaults_tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::Area::new(egui::Id::new("rename_recovery_background_test"))
+                egui::Area::new(egui::Id::unique("rename_recovery_background_test"))
                     .fixed_pos(egui::pos2(20.0, 20.0))
                     .show(ctx, |ui| {
                         if ui
@@ -51482,7 +51490,7 @@ mod favorite_adjustment_defaults_tests {
     fn pending_text_focus_claim_expires_after_the_next_unfocused_app_pass() {
         let app = setup_app();
         let ctx = egui::Context::default();
-        let widget_id = egui::Id::new("pending-bookmark-title");
+        let widget_id = egui::Id::unique("pending-bookmark-title");
 
         ctx.begin_pass(Default::default());
         assert!(matches!(
@@ -97978,7 +97986,7 @@ fn tooltip_layer_does_not_disable_normal_grid_wheel() {
         .push(egui::Event::PointerMoved(egui::pos2(80.0, 80.0)));
 
     ctx.run_pass(input, |ctx| {
-        egui::Area::new(egui::Id::new("grid_hover_tooltip"))
+        egui::Area::new(egui::Id::unique("grid_hover_tooltip"))
             .order(egui::Order::Tooltip)
             .fixed_pos(egui::pos2(40.0, 40.0))
             .show(ctx, |ui| {
@@ -98643,7 +98651,7 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
             let rect = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(32.0, 32.0));
             let _ = ui.interact(
                 rect,
-                egui::Id::new("fullscreen_tab_round_trip_surface"),
+                egui::Id::unique("fullscreen_tab_round_trip_surface"),
                 egui::Sense::click_and_drag(),
             );
         })
@@ -99273,6 +99281,10 @@ fn fullscreen_focus_loss_clears_zoom_transient_without_rearming_from_z_edge() {
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
     let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
@@ -99298,6 +99310,10 @@ fn destroyed_ime_viewport_does_not_block_sibling_fullscreen_shortcuts() {
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event() {
     let _input_guard = crate::key_input::lock_test_input();
     let (mut app, _fs_idx, ctx) = setup_fullscreen_fixed_key_test();
@@ -99319,6 +99335,10 @@ fn ime_activity_recovers_when_enabled_viewport_disappears_without_terminal_event
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() {
     let _input_guard = crate::key_input::lock_test_input();
 
@@ -99331,7 +99351,7 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
     app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     let ctx = egui::Context::default();
     crate::ime_focus::install_ime_input_policy(&ctx);
-    let field_id = egui::Id::new("ime-bookmark-title-focus-contract");
+    let field_id = egui::Id::unique("ime-bookmark-title-focus-contract");
     let mut title = String::new();
     let mut request_focus = true;
     let draw_field = |ctx: &egui::Context, title: &mut String, request_focus: &mut bool| {

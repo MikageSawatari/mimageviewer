@@ -3172,10 +3172,11 @@ impl crate::app::App {
         };
         let count = preparing.requests.len();
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::new("external_tool_preparing")).show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            cancel = draw_external_tool_preparing_body(ui, count);
-        });
+        let response =
+            egui::Modal::new(egui::Id::unique("external_tool_preparing")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                cancel = draw_external_tool_preparing_body(ui, count);
+            });
         if cancel || response.should_close() || self.dialog_escape_pressed(ctx) {
             self.external_tool_operation = ExternalOperation::Idle;
         } else {
@@ -3390,8 +3391,8 @@ impl crate::app::App {
         };
         let mut launch = false;
         let mut cancel = false;
-        let response =
-            egui::Modal::new(egui::Id::new("external_tool_launch_confirmation")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("external_tool_launch_confirmation"))
+            .show(ctx, |ui| {
                 ui.set_min_width(440.0);
                 if confirmation_target_count.is_some() {
                     ui.heading("複数の対象を外部ツールで開きますか？");
@@ -3468,8 +3469,8 @@ impl crate::app::App {
         let (completed, total, stage) = pending.progress.snapshot();
         let can_cancel = pending.can_cancel_before_launch();
         let mut cancel = false;
-        let response =
-            egui::Modal::new(egui::Id::new("external_tool_materialize_progress")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("external_tool_materialize_progress"))
+            .show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading("外部ツールへ渡すファイルを準備中");
                 ui.add_space(8.0);
@@ -3557,7 +3558,7 @@ impl crate::app::App {
         );
         let mut selected_tool = None;
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::new("external_tool_picker")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("external_tool_picker")).show(ctx, |ui| {
             ui.set_min_width(360.0);
             ui.heading(match target_kind {
                 ExternalToolPickerTargetKind::GridItems => "外部ツールを選択",

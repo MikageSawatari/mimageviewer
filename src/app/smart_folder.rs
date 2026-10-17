@@ -9103,7 +9103,7 @@ impl App {
             self.smart_folder_local_search_reapply = Some(self.search_query.clone());
         }
         let PreparedSmartFolder {
-            mut snapshot,
+            snapshot,
             presentation,
             items,
             image_metas,
@@ -9692,7 +9692,7 @@ impl App {
             let scanning = matches!(transition.phase, SmartFolderTransitionPhase::RootScan(_));
             let counting = matches!(transition.phase, SmartFolderTransitionPhase::RootCount(_));
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_transition_progress_modal")).show(
+            egui::Modal::new(egui::Id::unique("smart_folder_transition_progress_modal")).show(
                 ctx,
                 |ui| {
                     ui.set_min_width(460.0);
@@ -9758,7 +9758,7 @@ impl App {
             let name = confirm.snapshot.definition.name.clone();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_transition_large_confirm")).show(
+            egui::Modal::new(egui::Id::unique("smart_folder_transition_large_confirm")).show(
                 ctx,
                 |ui| {
                     ui.heading("スマートフォルダを表示");
@@ -9807,7 +9807,7 @@ impl App {
             let name = confirm.snapshot.definition.name.clone();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_large_confirm")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("smart_folder_large_confirm")).show(ctx, |ui| {
                 ui.heading("スマートフォルダを表示");
                 ui.label(format!("「{name}」の結果は {count} 件です。"));
                 ui.label("一覧の準備に時間とメモリを使用する可能性があります。");
@@ -9856,7 +9856,7 @@ impl App {
             return;
         };
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("smart_folder_progress_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("smart_folder_progress_modal")).show(ctx, |ui| {
             // サブ展開と同じ幅・構成にして、走査中は背面の一覧を操作できないことを
             // 見た目でも明示する。処理本体と cancel の所有境界は変更しない。
             ui.set_min_width(460.0);

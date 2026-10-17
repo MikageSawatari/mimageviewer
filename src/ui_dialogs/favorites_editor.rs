@@ -1194,7 +1194,7 @@ impl App {
             if let Some((name, path)) = target {
                 let mut close_confirm = false;
                 let mut confirmed = false;
-                let response = egui::Modal::new(egui::Id::new("favorite_delete_confirm_modal"))
+                let response = egui::Modal::new(egui::Id::unique("favorite_delete_confirm_modal"))
                     .show(ctx, |ui| {
                         ui.set_min_width(420.0);
                         ui.heading("お気に入りを削除");
@@ -1778,33 +1778,35 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 360.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.heading("お気に入りの Full 結果");
-                    for (label, state) in [
-                        ("Full 完了 / 起動時確認省略", IndexScanState::Monitoring),
-                        ("新しい Full を開始", IndexScanState::Scanning),
-                        ("アイテム索引 Full 失敗", IndexScanState::Failed),
-                        ("コンテナ索引 Full 失敗", IndexScanState::Failed),
-                        ("観測未完了", IndexScanState::Incomplete),
-                        ("Full 取消", IndexScanState::Stopped),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.label(label);
-                            draw_state_inline(ui, true, Some(state), 12345);
-                        });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
                     }
-                    ui.separator();
-                    draw_fts_maintenance_state(ui, MaintenanceState::Ready);
-                    draw_fts_maintenance_state(ui, MaintenanceState::RebuildOnRestart);
-                    draw_fts_maintenance_state(ui, MaintenanceState::RebuildRequestFailed);
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("お気に入りの Full 結果");
+                        for (label, state) in [
+                            ("Full 完了 / 起動時確認省略", IndexScanState::Monitoring),
+                            ("新しい Full を開始", IndexScanState::Scanning),
+                            ("アイテム索引 Full 失敗", IndexScanState::Failed),
+                            ("コンテナ索引 Full 失敗", IndexScanState::Failed),
+                            ("観測未完了", IndexScanState::Incomplete),
+                            ("Full 取消", IndexScanState::Stopped),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.label(label);
+                                draw_state_inline(ui, true, Some(state), 12345);
+                            });
+                        }
+                        ui.separator();
+                        draw_fts_maintenance_state(ui, MaintenanceState::Ready);
+                        draw_fts_maintenance_state(ui, MaintenanceState::RebuildOnRestart);
+                        draw_fts_maintenance_state(ui, MaintenanceState::RebuildRequestFailed);
+                    });
                 });
             });
         harness.run();
@@ -2112,40 +2114,43 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 270.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(egui::RichText::new("別バージョン索引の進行状態").strong());
-                    ui.separator();
-                    egui::Grid::new("similar_index_progress_snapshot")
-                        .num_columns(3)
-                        .spacing(egui::vec2(10.0, 5.0))
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for (fixture_label, enabled, progress) in &fixtures {
-                                ui.label(egui::RichText::new(*fixture_label).size(11.0));
-                                draw_similar_state_inline(ui, *enabled, progress);
-                                if let Some(activity) =
-                                    similar_index_progress_presentation(*enabled, progress).activity
-                                {
-                                    draw_background_indexer_activity_row(
-                                        ui,
-                                        "別バージョン",
-                                        &activity,
-                                    );
-                                } else {
-                                    ui.label("");
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(egui::RichText::new("別バージョン索引の進行状態").strong());
+                        ui.separator();
+                        egui::Grid::new("similar_index_progress_snapshot")
+                            .num_columns(3)
+                            .spacing(egui::vec2(10.0, 5.0))
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (fixture_label, enabled, progress) in &fixtures {
+                                    ui.label(egui::RichText::new(*fixture_label).size(11.0));
+                                    draw_similar_state_inline(ui, *enabled, progress);
+                                    if let Some(activity) =
+                                        similar_index_progress_presentation(*enabled, progress)
+                                            .activity
+                                    {
+                                        draw_background_indexer_activity_row(
+                                            ui,
+                                            "別バージョン",
+                                            &activity,
+                                        );
+                                    } else {
+                                        ui.label("");
+                                    }
+                                    ui.end_row();
                                 }
-                                ui.end_row();
-                            }
-                        });
+                            });
+                    });
                 });
             });
         harness.run();

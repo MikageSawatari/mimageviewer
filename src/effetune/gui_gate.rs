@@ -137,7 +137,7 @@ impl GuiGate {
         self.update_auto_factor(factor, blocked, false);
     }
     pub(crate) fn invalidate_auto(&self) {
-        let _ = self.state().auto_presentation.fetch_update(
+        let _ = self.state().auto_presentation.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |value| Some(value + (1 << AUTO_BITS)),

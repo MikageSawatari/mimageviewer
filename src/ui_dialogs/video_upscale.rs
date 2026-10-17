@@ -133,7 +133,7 @@ impl App {
         let mut quality = state.options.quality;
 
         egui::Window::new("AI動画アップスケール登録").drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("video_upscale_register_dialog"))
+            .id(egui::Id::unique("video_upscale_register_dialog"))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -287,7 +287,7 @@ impl App {
 
         egui::Window::new("アップスケールタスク")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("video_upscale_tasks_window"))
+            .id(egui::Id::unique("video_upscale_tasks_window"))
             .open(&mut open)
             .resizable(true)
             .default_size(egui::vec2(620.0, 420.0))

@@ -15,11 +15,12 @@ use super::native_cursor::{
     reduce_cursor_routing_batch,
 };
 use super::native_diagnostics::{DiagnosticSample, NativeDiagnostics};
+#[cfg(any(test, feature = "test-script"))]
+use super::native_window::NativeVideoMouseButton;
 use super::native_window::{
-    NativeCursorOwnershipEdge, NativeRaiseSample, NativeVideoMouseButton, NativeVideoTouchPhase,
-    NativeVideoWindowEvent, NativeVideoWindowEventEnvelope, NativeVideoWindowSource,
-    NativeWindowEventReceiver, NativeWindowEventRoute, native_window_event_route,
-    post_typed_pump_quit,
+    NativeCursorOwnershipEdge, NativeRaiseSample, NativeVideoTouchPhase, NativeVideoWindowEvent,
+    NativeVideoWindowEventEnvelope, NativeVideoWindowSource, NativeWindowEventReceiver,
+    NativeWindowEventRoute, native_window_event_route, post_typed_pump_quit,
 };
 use super::native_window_host::{
     NativeHudWindowRequest, NativeRenderTargetTransfer, NativeWindowHost, NativeWindowHostConfig,
@@ -2379,8 +2380,8 @@ mod tests {
     fn native_ime_interrupt_real_focus_output_survives_visual_replacement_and_epoch_retirement() {
         use std::cell::Cell;
         let context = egui::Context::default();
-        let id = egui::Id::new("native-interrupt-source");
-        let destination = egui::Id::new("native-interrupt-destination");
+        let id = egui::Id::unique("native-interrupt-source");
+        let destination = egui::Id::unique("native-interrupt-destination");
         let mut text = "日本語 sample".to_owned();
         let raw = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(

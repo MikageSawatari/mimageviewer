@@ -1065,7 +1065,7 @@ fn sorted_entry_indices_for_view(
     display_order: &crate::settings::GridDisplayOrder,
     root: &Path,
     cancel: Option<&AtomicBool>,
-    mut progress: Option<&mut dyn FnMut(usize)>,
+    progress: Option<&mut dyn FnMut(usize)>,
     chunk_size: usize,
 ) -> Option<Vec<usize>> {
     sorted_entry_indices_for_request(
@@ -2777,7 +2777,7 @@ impl App {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned());
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("subfolder_expansion_scan_modal")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("subfolder_expansion_scan_modal")).show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -2821,7 +2821,7 @@ impl App {
             let item_count = confirm.snapshot.entries.len();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("subfolder_expansion_confirm")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("subfolder_expansion_confirm")).show(ctx, |ui| {
                 ui.set_min_width(420.0);
                 ui.heading("大量の項目をサブ展開");
                 ui.add_space(8.0);
@@ -2865,7 +2865,7 @@ impl App {
         };
         let progress = pending.progress.clone();
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("subfolder_expansion_install_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("subfolder_expansion_install_modal")).show(ctx, |ui| {
             // 数百万件の進捗でも件数行が折り返されない幅を確保する。
             ui.set_min_width(460.0);
             ui.horizontal(|ui| {

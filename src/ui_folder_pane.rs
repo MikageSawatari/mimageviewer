@@ -429,38 +429,43 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 240.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                let panel = egui::Panel::left("folder_tree_pane_sort_min_width_test")
-                    .resizable(false)
-                    .exact_size(FOLDER_PANE_MIN_WIDTH)
-                    .show(root_ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let drive =
-                                egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
-                                    .width(54.0)
-                                    .selected_text("C:")
-                                    .show_ui(ui, |_| {});
-                            crate::ui_helpers::set_accessibility_label(&drive.response, "Drive");
-                            let selected = folder_tree_sort_combo(
-                                ui,
-                                crate::settings::FolderTreeSortOrder::NameAsc,
-                            );
-                            assert_eq!(selected, crate::settings::FolderTreeSortOrder::NameAsc);
-                            ui.small_button("↻")
-                        })
-                        .inner
-                        .rect
-                    });
-                captured
-                    .lock()
-                    .unwrap()
-                    .push((panel.response.rect, panel.inner));
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let panel = egui::Panel::left("folder_tree_pane_sort_min_width_test")
+                        .resizable(false)
+                        .exact_size(FOLDER_PANE_MIN_WIDTH)
+                        .show(root_ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let drive =
+                                    egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
+                                        .width(54.0)
+                                        .selected_text("C:")
+                                        .show_ui(ui, |_| {});
+                                crate::ui_helpers::set_accessibility_label(
+                                    &drive.response,
+                                    "Drive",
+                                );
+                                let selected = folder_tree_sort_combo(
+                                    ui,
+                                    crate::settings::FolderTreeSortOrder::NameAsc,
+                                );
+                                assert_eq!(selected, crate::settings::FolderTreeSortOrder::NameAsc);
+                                ui.small_button("↻")
+                            })
+                            .inner
+                            .rect
+                        });
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((panel.response.rect, panel.inner));
+                });
             });
 
         harness.run_steps(3);
@@ -483,7 +488,6 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(800.0, 480.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
                 captured
                     .lock()
                     .unwrap()
@@ -500,7 +504,6 @@ mod tests {
     }
 
     fn draw_loading_width_test_panel(root_ui: &mut egui::Ui) -> f32 {
-        let ctx = &root_ui.ctx().clone();
         {
             egui::Panel::left("folder_tree_pane_loading_width_test")
                 .resizable(true)

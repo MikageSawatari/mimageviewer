@@ -218,7 +218,7 @@ impl App {
         let enter_pressed = self.dialog_enter_pressed(ctx);
 
         let response =
-            egui::Modal::new(egui::Id::new("subfolder_expansion_dialog")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("subfolder_expansion_dialog")).show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.heading("サブ展開");
                 ui.add_space(8.0);

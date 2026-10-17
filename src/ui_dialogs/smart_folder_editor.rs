@@ -936,9 +936,8 @@ impl App {
             if let Some(name) = target {
                 let mut confirmed = false;
                 let mut cancel = false;
-                let response = egui::Modal::new(egui::Id::new("smart_folder_delete_confirm")).show(
-                    ctx,
-                    |ui| {
+                let response = egui::Modal::new(egui::Id::unique("smart_folder_delete_confirm"))
+                    .show(ctx, |ui| {
                         ui.heading("スマートフォルダを削除");
                         ui.label(format!(
                             "「{name}」を削除します。実ファイルは削除されません。"
@@ -951,8 +950,7 @@ impl App {
                                 cancel = true;
                             }
                         });
-                    },
-                );
+                    });
                 if confirmed {
                     if let Some(index) = self
                         .settings

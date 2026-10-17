@@ -63,7 +63,7 @@ struct PadNavigationDispatchScope {
 impl Drop for PadNavigationDispatchScope {
     fn drop(&mut self) {
         self.ctx.data_mut(|data| {
-            let id = egui::Id::new("page_turn_pad_dispatch");
+            let id = egui::Id::unique("page_turn_pad_dispatch");
             data.remove::<PadNavigationDispatch>(id);
             if let Some(previous) = self.previous {
                 data.insert_temp(id, previous);
@@ -1919,7 +1919,7 @@ impl App {
         draw_gamepad_list_picker_overlay_layout(
             ui.ctx(),
             full_rect,
-            egui::Id::new("gamepad_favorite_picker_overlay"),
+            egui::Id::unique("gamepad_favorite_picker_overlay"),
             GamepadListPickerHeading::FavoriteTabs(tab),
             "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
             len,
@@ -1974,7 +1974,7 @@ impl App {
         draw_gamepad_list_picker_overlay_layout(
             ui.ctx(),
             full_rect,
-            egui::Id::new("gamepad_video_marker_picker_overlay"),
+            egui::Id::unique("gamepad_video_marker_picker_overlay"),
             GamepadListPickerHeading::Title("ブックマーク / チャプター"),
             "上下:選択  A:移動  B/Select:閉じる",
             markers.len(),
@@ -2010,7 +2010,7 @@ impl App {
         draw_gamepad_list_picker_overlay_layout(
             ui.ctx(),
             full_rect,
-            egui::Id::new("gamepad_location_picker_overlay"),
+            egui::Id::unique("gamepad_location_picker_overlay"),
             GamepadListPickerHeading::Title("場所"),
             "上下:選択  A:移動  B/Select:閉じる",
             picker.entries.len(),
@@ -2111,7 +2111,7 @@ impl App {
     pub(crate) fn sample_gamepad_input(&mut self, ctx: &egui::Context) -> GamepadFrameBatch {
         let track_presentation = self.page_turn_operation_tracking_needed();
         let transaction_id = if track_presentation {
-            egui::Id::new("gamepad_operation_ingress")
+            egui::Id::unique("gamepad_operation_ingress")
         } else {
             egui::Id::NULL
         };
@@ -2216,7 +2216,7 @@ impl App {
     /// delivery stay on the UI side; the physical owner retains facts until taken.
     fn gamepad_batch_from_physical_input(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         physical: PadPhysicalHandoff,
         enabled: bool,
         now: Instant,
@@ -2499,7 +2499,7 @@ impl App {
             return None;
         }
         self.page_turn_external_operation(ctx, operation_id, phase, "gamepad_dispatch");
-        let id = egui::Id::new("page_turn_pad_dispatch");
+        let id = egui::Id::unique("page_turn_pad_dispatch");
         let dispatch = PadNavigationDispatch {
             frame: ctx.cumulative_frame_nr(),
             destination: self.page_turn_destination(),
@@ -2524,7 +2524,7 @@ impl App {
             return None;
         }
         ctx.data(|data| {
-            data.get_temp::<PadNavigationDispatch>(egui::Id::new("page_turn_pad_dispatch"))
+            data.get_temp::<PadNavigationDispatch>(egui::Id::unique("page_turn_pad_dispatch"))
         })
         .filter(|dispatch| {
             dispatch.frame == ctx.cumulative_frame_nr()
@@ -8185,7 +8185,7 @@ fn draw_gamepad_ring_picker_overlay_layout(
     let scrollbar_gutter = if count > visible_rows { 18.0 } else { 0.0 };
     let mut content_rect = egui::Rect::NOTHING;
     let mut selected_rect = None;
-    let area = egui::Area::new(egui::Id::new("gamepad_ring_picker_overlay"))
+    let area = egui::Area::new(egui::Id::unique("gamepad_ring_picker_overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(panel_rect.min)
         .show(ctx, |ui| {
@@ -9130,7 +9130,7 @@ mod tests {
                                     Some(draw_gamepad_list_picker_overlay_layout(
                                         ctx,
                                         egui::Rect::from_min_size(egui::Pos2::ZERO, size),
-                                        egui::Id::new("list_picker_geometry_fixture"),
+                                        egui::Id::unique("list_picker_geometry_fixture"),
                                         heading,
                                         footer,
                                         len,
@@ -9947,7 +9947,7 @@ mod tests {
             kinds.push(batch.actions_for_test()[0].kind);
             assert!(
                 ctx.data(
-                    |data| data.get_temp::<super::SampledPadTransaction>(egui::Id::new(
+                    |data| data.get_temp::<super::SampledPadTransaction>(egui::Id::unique(
                         "gamepad_operation_ingress"
                     ))
                 )
@@ -10385,6 +10385,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn gamepad_text_input_gate_unions_all_three_surfaces() {
         let no_presenter_input =
             crate::video::native_presenter::NativeOverlayInputRouting::default();
@@ -12096,7 +12100,7 @@ mod physical_boundary_tests {
         assert!(batch.session_ended_for_test());
         assert!(
             ctx.data(|data| data
-                .get_temp::<SampledPadTransaction>(egui::Id::new("gamepad_operation_ingress")))
+                .get_temp::<SampledPadTransaction>(egui::Id::unique("gamepad_operation_ingress")))
                 .is_none()
         );
         assert!(app.gamepad.take_pending().events.is_empty());

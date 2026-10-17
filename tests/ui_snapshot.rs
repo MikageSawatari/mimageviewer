@@ -171,7 +171,9 @@ fn everything_search_progress_snapshot(
             ctx.request_repaint();
             return;
         }
-        egui::CentralPanel::default().show(ui, |_| {});
+        test_ui::full_viewport_ui(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |_| {});
+        });
         mimageviewer::draw_everything_progress_snapshot_fixture(ctx);
     });
     // The shared production body has an intentionally animated progress spinner.
@@ -813,11 +815,14 @@ fn folder_toolbar_snapshot_status_label_rejects_high_dpi_overflow() {
 }
 
 /// Actual control styles, including the reported count and omitted-entry badge.
-/// All positions/row settings get geometry checks; persist only unique pixels.
+/// All positions/row settings get geometry checks. Keep the 23 named baselines
+/// while separately asserting the 22 distinct layouts adopted for egui 0.37.
 #[test]
 fn folder_toolbar_flexible_snapshots() {
+    use egui_kittest::kittest::NodeT;
     let mut snapshots = egui_kittest::SnapshotResults::default();
     let mut unique = std::collections::HashSet::new();
+    let mut named = 0;
     for (size, width, zoom) in [
         ("normal", 1120.0, 1.0),
         ("narrow", 360.0, 1.0),
@@ -854,20 +859,21 @@ fn folder_toolbar_flexible_snapshots() {
                     harness.run();
                     // Verify the alias policy with pixels too, so a regression
                     // cannot silently turn a required baseline into a duplicate.
-                    // First position: no preceding row. Narrow: every combination
-                    // wraps. Full controls also wrap at the last normal position
-                    // and both non-first positions at 150% DPI.
-                    let duplicate = !new_row
+                    // 0.37 WidgetAtom also wraps the full controls at normal/middle.
+                    // Keep the previous named image even though it now aliases
+                    // its row counterpart, so every baseline is regenerated.
+                    let named_duplicate = !new_row
                         && (before == 0
                             || size == "narrow"
                             || (buttons && (size == "dpi150" || before == 2)));
+                    let pixel_duplicate = !new_row && (before == 0 || size == "narrow" || buttons);
                     let pixels = harness.render().unwrap();
                     assert_eq!(
                         unique.insert((pixels.width(), pixels.height(), pixels.into_raw())),
-                        !duplicate,
+                        !pixel_duplicate,
                         "unexpected snapshot alias: {size} {position} row={new_row} buttons={buttons}"
                     );
-                    if !duplicate {
+                    if !named_duplicate {
                         let name = format!(
                             "folder_toolbar_{size}_{position}_{}{}",
                             if new_row { "row" } else { "inline" },
@@ -876,15 +882,56 @@ fn folder_toolbar_flexible_snapshots() {
                         println!("folder baseline: {name}");
                         harness.snapshot(name);
                         snapshots.extend(harness.take_snapshot_results());
+                        named += 1;
+                    }
+                    // Layout adoption still requires the address and fixed
+                    // actions to remain inside the logical viewport and hit-testable.
+                    let viewport = harness.ctx.content_rect();
+                    let input = harness.get_by_label("Folder address").rect();
+                    assert!(viewport.contains_rect(input));
+                    assert!(
+                        input.width() >= mimageviewer::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH
+                    );
+                    let labels: &[&str] = if buttons {
+                        &[
+                            "場所▼",
+                            "非表示 321 件",
+                            "スタック",
+                            "サブ展開",
+                            "📌",
+                            "履歴▼",
+                            "♡",
+                        ]
+                    } else {
+                        &["場所▼"]
+                    };
+                    for label in labels {
+                        let node = harness.get_by_label(*label);
+                        let rect = node.rect();
+                        let id = egui_id_from_accesskit(node.accesskit_node().id());
+                        assert!(
+                            viewport.contains_rect(rect),
+                            "{size}/{position}: {label} {rect:?}"
+                        );
+                        harness.hover_at(rect.center());
+                        harness.run();
+                        let response = harness.ctx.read_response(id).unwrap();
+                        assert!(response.contains_pointer(), "{size}/{position}: {label}");
+                        assert!(response.interact_rect.contains_rect(rect));
                     }
                 }
             }
         }
     }
+    assert_eq!(
+        named, 23,
+        "all existing folder baselines must be regenerated"
+    );
+    assert_eq!(unique.len(), 22, "adopted 0.37 layout aliases changed");
 }
 
 /// Generate decision material without adopting the old matrix's alias policy.
-/// The original alias assert stays active in folder_toolbar_flexible_snapshots.
+/// The adopted alias contract is asserted in folder_toolbar_flexible_snapshots.
 #[test]
 fn egui037_stage4_folder_toolbar_comparison_materials() {
     use egui_kittest::kittest::NodeT;
@@ -1127,11 +1174,13 @@ fn snapshot_color_presets(name: &str, width: f32) {
                 ctx.request_repaint();
                 return;
             }
-            egui::CentralPanel::default().show(ui, |ui| {
-                let available = ui.available_width();
-                let response = mimageviewer::draw_color_presets_snapshot_fixture(ui);
-                assert!(response.rect.width() <= available + 0.1);
-                assert!(response.rect.height() >= 48.0);
+            test_ui::full_viewport_ui(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let available = ui.available_width();
+                    let response = mimageviewer::draw_color_presets_snapshot_fixture(ui);
+                    assert!(response.rect.width() <= available + 0.1);
+                    assert!(response.rect.height() >= 48.0);
+                });
             });
         });
     harness.run();
@@ -3601,15 +3650,17 @@ fn content_restore_prompt_long_paths() {
                 ctx.request_repaint();
                 return;
             }
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.heading("画像一覧");
+            test_ui::full_viewport_ui(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.heading("画像一覧");
+                });
             });
             let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
         });
     harness.run();
     let modal = harness
         .ctx
-        .memory(|m| m.area_rect(egui::Id::new("content_restore_modal")))
+        .memory(|m| m.area_rect(egui::Id::unique("content_restore_modal")))
         .expect("the modal has to be on screen");
     assert!(
         modal.width() <= WINDOW_SIZE.x,
@@ -3677,16 +3728,18 @@ fn content_restore_prompt_light() {
                 ctx.request_repaint();
                 return;
             }
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.heading("画像一覧");
-                ui.label("モーダル表示中は背景の一覧を操作できません。");
-                ui.add_space(12.0);
-                for name in ["IMG_0421.jpg", "chapter03.cbz", "scan.pdf"] {
-                    ui.group(|ui| {
-                        ui.set_min_size(egui::vec2(180.0, 56.0));
-                        ui.label(name);
-                    });
-                }
+            test_ui::full_viewport_ui(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.heading("画像一覧");
+                    ui.label("モーダル表示中は背景の一覧を操作できません。");
+                    ui.add_space(12.0);
+                    for name in ["IMG_0421.jpg", "chapter03.cbz", "scan.pdf"] {
+                        ui.group(|ui| {
+                            ui.set_min_size(egui::vec2(180.0, 56.0));
+                            ui.label(name);
+                        });
+                    }
+                });
             });
             let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
         });
@@ -4230,7 +4283,9 @@ fn image_folder_zip_harness(
             ctx.request_repaint();
             return;
         }
-        egui::CentralPanel::default().show(ui, |_| {});
+        test_ui::full_viewport_ui(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |_| {});
+        });
         mimageviewer::draw_image_folder_zip_snapshot(ctx, phase);
     })
 }

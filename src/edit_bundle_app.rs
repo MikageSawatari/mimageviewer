@@ -376,7 +376,7 @@ impl App {
         self.poll_edit_bundle_workers(ctx);
         if self.edit_bundle_apply_pending.is_some() {
             egui::Window::new("編集内容を貼り付け")
-                .id(egui::Id::new("edit_bundle_paste_progress"))
+                .id(egui::Id::unique("edit_bundle_paste_progress"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -400,7 +400,7 @@ impl App {
             .map(|clipboard| clipboard.source_label.as_str())
             .unwrap_or("コピー元");
         egui::Window::new("編集内容を貼り付け")
-            .id(egui::Id::new("edit_bundle_paste_confirm"))
+            .id(egui::Id::unique("edit_bundle_paste_confirm"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)

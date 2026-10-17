@@ -100,7 +100,6 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let ctx = &ui.ctx().clone();
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ui, |ui| {

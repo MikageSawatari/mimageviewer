@@ -124,7 +124,7 @@ struct PointerPresses {
 
 fn observe_pointer_transaction(ctx: &egui::Context) {
     let viewport = ctx.viewport_id();
-    let id = egui::Id::new(("page_turn_pointer_transaction", viewport));
+    let id = egui::Id::unique(("page_turn_pointer_transaction", viewport));
     let frame = ctx.cumulative_frame_nr();
     if ctx
         .data(|d| d.get_temp::<PointerTransaction>(id))
@@ -134,7 +134,7 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
     }
     let mut facts = Vec::new();
     let batch = next_operation_batch();
-    let press_id = egui::Id::new(("page_turn_pointer_presses", viewport));
+    let press_id = egui::Id::unique(("page_turn_pointer_presses", viewport));
     let mut presses = ctx
         .data(|d| d.get_temp::<PointerPresses>(press_id))
         .unwrap_or_default();
@@ -245,7 +245,7 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
 }
 
 pub(crate) fn install(ctx: &egui::Context) {
-    let id = egui::Id::new("page_turn_pointer_tracking_installed");
+    let id = egui::Id::unique("page_turn_pointer_tracking_installed");
     if ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false) {
         return;
     }
@@ -255,7 +255,7 @@ pub(crate) fn install(ctx: &egui::Context) {
         "page_turn_pointer_tracking",
         Arc::new(|ctx| {
             if ctx
-                .data(|d| d.get_temp::<bool>(egui::Id::new("page_turn_input_enabled")))
+                .data(|d| d.get_temp::<bool>(egui::Id::unique("page_turn_input_enabled")))
                 .unwrap_or(false)
             {
                 observe_pointer_transaction(ctx);
@@ -965,7 +965,9 @@ fn page_turn_pin_limit(budget: crate::vram_budget::VramPoolBudget) -> u64 {
 fn page_turn_budget(app: &App, ctx: &egui::Context) -> crate::vram_budget::VramPoolBudget {
     #[cfg(test)]
     if let Some(budget) = ctx.data(|data| {
-        data.get_temp::<crate::vram_budget::VramPoolBudget>(egui::Id::new("page_turn_test_budget"))
+        data.get_temp::<crate::vram_budget::VramPoolBudget>(egui::Id::unique(
+            "page_turn_test_budget",
+        ))
     }) {
         return budget;
     }
@@ -1437,14 +1439,14 @@ impl App {
     pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
         self.flush_submitted_page_turn_ready(ctx);
         if !self.settings.page_turn_animation_enabled && !self.page_turn_completion_active() {
-            let enabled_id = egui::Id::new("page_turn_input_enabled");
+            let enabled_id = egui::Id::unique("page_turn_input_enabled");
             if ctx.data(|d| d.get_temp::<bool>(enabled_id)) == Some(true) {
                 ctx.data_mut(|d| d.insert_temp(enabled_id, false));
             }
             self.page_turn_presentation.deactivate("disabled");
             return;
         }
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
         // The ordinary key handler resolves this same pass owner. Resolve it
         // before observing its immutable edges too: an absent cached owner is
         // deliberately fail-closed, not evidence that this pass blocks keys.
@@ -1484,9 +1486,9 @@ impl App {
         if key_admission_blocked {
             facts.clear();
         }
-        let id = egui::Id::new(("page_turn_pointer_transaction", source));
+        let id = egui::Id::unique(("page_turn_pointer_transaction", source));
         if let Some(mut transaction) = ctx.data(|d| d.get_temp::<PointerTransaction>(id)) {
-            let press_id = egui::Id::new(("page_turn_pointer_presses", source));
+            let press_id = egui::Id::unique(("page_turn_pointer_presses", source));
             let mut presses = ctx
                 .data(|d| d.get_temp::<PointerPresses>(press_id))
                 .unwrap_or_default();
@@ -1561,7 +1563,7 @@ impl App {
         let mut facts = Vec::with_capacity(operations.len());
         for &(operation_id, phase, cause) in operations {
             if let ViewerOperationId::Pad { batch, .. } = operation_id {
-                let id = egui::Id::new("page_turn_pad_destination");
+                let id = egui::Id::unique("page_turn_pad_destination");
                 let original = ctx.data(|d| d.get_temp::<(u64, PresentationDestination)>(id));
                 if original.is_some_and(|(old_batch, d)| old_batch == batch && d != destination) {
                     continue;
@@ -1571,7 +1573,7 @@ impl App {
                 }
             }
             if let ViewerOperationId::Slideshow(batch) = operation_id {
-                let id = egui::Id::new("page_turn_slideshow_ingress");
+                let id = egui::Id::unique("page_turn_slideshow_ingress");
                 if ctx.data(|d| d.get_temp::<u64>(id)) != Some(batch) {
                     crate::key_input::trace_page_turn_operation_ingress(
                         || format!("{operation_id:?}"),

@@ -2098,7 +2098,7 @@ impl App {
         );
         let _ = ui.interact(
             panel_rect,
-            egui::Id::new("metadata_panel_bg"),
+            egui::Id::unique("metadata_panel_bg"),
             egui::Sense::click(),
         );
 
@@ -2138,7 +2138,7 @@ impl App {
         );
         let lock_resp = ui.interact(
             lock_rect,
-            egui::Id::new("metadata_lock_btn"),
+            egui::Id::unique("metadata_lock_btn"),
             egui::Sense::click(),
         );
         let locked_now = self.fs_info_panel.locked;
@@ -2188,7 +2188,7 @@ impl App {
             LAST_METADATA_CLOSE_BUTTON_RECT.with(|rect| rect.set(Some(close_rect)));
             let close_resp = ui.interact(
                 close_rect,
-                egui::Id::new("metadata_close_btn"),
+                egui::Id::unique("metadata_close_btn"),
                 egui::Sense::click(),
             );
             let close_bg = if close_resp.hovered() {
@@ -2704,7 +2704,7 @@ impl App {
         #[cfg(test)]
         ctx.data_mut(|data| {
             data.insert_temp(
-                egui::Id::new("metadata_scroll_test_layout"),
+                egui::Id::unique("metadata_scroll_test_layout"),
                 (
                     scroll_output.inner_rect,
                     scroll_output.content_size,
@@ -7605,7 +7605,7 @@ mod similar_panel_tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
         let mut state = SimilarPanelState::default();
         let mut origin_columns = None;
-        let drag_owner_id = egui::Id::new("book-strip-overlapping-drag-owner");
+        let drag_owner_id = egui::Id::unique("book-strip-overlapping-drag-owner");
         let mut strip_rect = None;
 
         let _ = ctx
@@ -7736,7 +7736,7 @@ mod similar_panel_tests {
         let strip = crate::similar_index::BookStripView::new(&relations.origin, &relations.hits[0]);
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 160.0));
-        let drag_owner_id = egui::Id::new("book-strip-top-drag-owner");
+        let drag_owner_id = egui::Id::unique("book-strip-top-drag-owner");
         let mut state = SimilarPanelState::default();
         let mut origin_columns = None;
         let mut strip_rect = None;

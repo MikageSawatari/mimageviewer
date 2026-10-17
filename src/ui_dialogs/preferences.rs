@@ -274,7 +274,7 @@ fn draw_discard_changes_confirm(
 ) -> Option<bool> {
     let mut discard = false;
     let mut keep_editing = false;
-    let response = egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+    let response = egui::Modal::new(egui::Id::unique(id)).show(ctx, |ui| {
         ui.set_min_width(420.0);
         ui.heading(title);
         ui.add_space(8.0);
@@ -3624,7 +3624,7 @@ impl App {
 
         egui::Window::new("操作カスタマイズ")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("operation_customize_dialog_v2"))
+            .id(egui::Id::unique("operation_customize_dialog_v2"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -4313,7 +4313,6 @@ mod tests {
             .with_size(egui::vec2(700.0, 650.0))
             .build_ui_state(
                 |root_ui, state| {
-                    let ctx = &root_ui.ctx().clone();
                     egui::CentralPanel::default().show(root_ui, |ui| draw_page(ui, state, false));
                 },
                 state,
@@ -5965,17 +5964,19 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 320.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    let _ = draw_preference_search_results(ui, "GPU");
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let _ = draw_preference_search_results(ui, "GPU");
+                    });
                 });
             });
         harness.run();
@@ -5998,30 +5999,32 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 700.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            draw_context_menu_layout_settings(
-                                ui,
-                                &mut layout,
-                                &mut scenario,
-                                &mut expanded,
-                                0,
-                            );
-                        });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_context_menu_layout_settings(
+                                    ui,
+                                    &mut layout,
+                                    &mut scenario,
+                                    &mut expanded,
+                                    0,
+                                );
+                            });
+                    });
                 });
             });
         harness.run();
@@ -6051,7 +6054,6 @@ mod tests {
             .with_size(egui::vec2(700.0, 520.0))
             .build_ui_state(
                 |root_ui, state| {
-                    let ctx = &root_ui.ctx().clone();
                     egui::CentralPanel::default().show(root_ui, |ui| {
                         egui::ScrollArea::vertical()
                             .scroll_source(egui::scroll_area::ScrollSource {
@@ -6119,17 +6121,19 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 340.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    page_parallelism(ui, &mut state);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        page_parallelism(ui, &mut state);
+                    });
                 });
             });
         harness.run();
@@ -6172,17 +6176,19 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(780.0, 300.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    page_duplicate_files(ui, &mut state);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        page_duplicate_files(ui, &mut state);
+                    });
                 });
             });
         harness.run();
@@ -6196,17 +6202,19 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 230.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    draw_recycle_bin_delete_confirmation_setting(ui, &mut settings);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_recycle_bin_delete_confirmation_setting(ui, &mut settings);
+                    });
                 });
             });
         harness.run();
@@ -6229,24 +6237,26 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 680.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            page_folder(ui, &mut state);
-                        });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                page_folder(ui, &mut state);
+                            });
+                    });
                 });
             });
         harness.run();
@@ -6269,24 +6279,26 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 360.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            page_spread_mode(ui, &mut state);
-                        });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                page_spread_mode(ui, &mut state);
+                            });
+                    });
                 });
             });
         harness.run();
@@ -6300,17 +6312,19 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 100.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    draw_final_cover_spread_setting(ui, &mut enabled);
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_final_cover_spread_setting(ui, &mut enabled);
+                    });
                 });
             });
         harness.run();
@@ -6328,22 +6342,24 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 180.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    draw_singleton_spread_placement_setting(
-                        ui,
-                        &mut first_enabled,
-                        &mut last_enabled,
-                        animation_enabled,
-                    );
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_singleton_spread_placement_setting(
+                            ui,
+                            &mut first_enabled,
+                            &mut last_enabled,
+                            animation_enabled,
+                        );
+                    });
                 });
             });
         harness.run();
@@ -6395,26 +6411,28 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(size)
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            draw_still_seek_strip_settings(ui, &mut settings);
-                            draw_still_seek_preview_size_settings(ui, &mut settings);
-                        });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_still_seek_strip_settings(ui, &mut settings);
+                                draw_still_seek_preview_size_settings(ui, &mut settings);
+                            });
+                    });
                 });
             });
         harness.run();
@@ -6443,18 +6461,20 @@ mod tests {
             .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(size)
             .build_ui(|root_ui| {
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            draw_video_seek_strip_height_settings(ui, &mut settings);
-                            draw_video_seek_preview_size_settings(ui, &mut settings);
-                        });
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_video_seek_strip_height_settings(ui, &mut settings);
+                                draw_video_seek_preview_size_settings(ui, &mut settings);
+                            });
+                    });
                 });
             });
         harness.run();
@@ -7831,7 +7851,6 @@ mod tests {
             .with_size(egui::vec2(600.0, 2400.0))
             .build_ui_state(
                 |root_ui, state| {
-                    let ctx = &root_ui.ctx().clone();
                     egui::CentralPanel::default().show(root_ui, |ui| draw_page(ui, state, false));
                 },
                 state,
@@ -7872,7 +7891,6 @@ mod tests {
             .with_size(egui::vec2(600.0, 400.0))
             .build_ui_state(
                 |root_ui, state| {
-                    let ctx = &root_ui.ctx().clone();
                     egui::CentralPanel::default().show(root_ui, |ui| draw_page(ui, state, false));
                 },
                 state,
@@ -8230,6 +8248,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn specified_scale_preferences_numeric_editor_ime_enter_escape_keeps_dialog_open() {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         use egui_kittest::kittest::Queryable;
@@ -8986,7 +9008,6 @@ mod tests {
             .with_size(egui::vec2(760.0, 950.0))
             .build_ui_state(
                 |root_ui, state| {
-                    let ctx = &root_ui.ctx().clone();
                     egui::CentralPanel::default().show(root_ui, |ui| {
                         egui::ScrollArea::vertical()
                             .scroll_source(egui::scroll_area::ScrollSource {

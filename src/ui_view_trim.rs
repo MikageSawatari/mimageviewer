@@ -1304,7 +1304,7 @@ impl App {
         }
         ctx.data_mut(|data| {
             data.insert_temp(
-                egui::Id::new(("view_trim_auto_page_seed_pending", anchor)),
+                egui::Id::unique(("view_trim_auto_page_seed_pending", anchor)),
                 false,
             )
         });
@@ -1449,7 +1449,8 @@ impl App {
         };
         // Auto → Manual → このページは 2 クリックになるため、Auto から Manual へ入った
         // 事実だけ UI 一時状態に保持し、次の page_apply ON で従来の自動余白シードを使う。
-        let auto_page_seed_pending_id = egui::Id::new(("view_trim_auto_page_seed_pending", fs_idx));
+        let auto_page_seed_pending_id =
+            egui::Id::unique(("view_trim_auto_page_seed_pending", fs_idx));
         let mut auto_page_seed_pending = ui.ctx().data(|data| {
             data.get_temp::<bool>(auto_page_seed_pending_id)
                 .unwrap_or(false)
@@ -1832,7 +1833,7 @@ impl App {
         let panel_h = panel_rect.height();
         let mut close = false;
 
-        egui::Area::new(egui::Id::new("view_trim_panel"))
+        egui::Area::new(egui::Id::unique("view_trim_panel"))
             .order(egui::Order::Foreground)
             .fixed_pos(panel_pos)
             .show(ctx, |ui| {
@@ -1841,7 +1842,7 @@ impl App {
                         egui::Pos2::ZERO,
                         egui::vec2(PANEL_W + 12.0, panel_h + 12.0),
                     ),
-                    egui::Id::new("view_trim_panel_click_sink"),
+                    egui::Id::unique("view_trim_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())

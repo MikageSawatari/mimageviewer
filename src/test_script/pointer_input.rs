@@ -1561,7 +1561,7 @@ mod tests {
             revision: 0,
             regions: vec![NamedRegion {
                 id: RegionId::StillSeekTrack,
-                widget_id: egui::Id::new("pointer-track"),
+                widget_id: egui::Id::unique("pointer-track"),
                 rect,
                 coordinate_frame: rect,
                 geometry_token: 0,
@@ -1639,7 +1639,7 @@ mod tests {
                 region_geometry_token: 6,
                 press_page_index: 2,
                 press_item_identity: "page-2".to_string(),
-                widget_id: egui::Id::new("pointer-track"),
+                widget_id: egui::Id::unique("pointer-track"),
                 press_rect: egui::Rect::from_min_max(
                     egui::pos2(10.0, 20.0),
                     egui::pos2(110.0, 40.0),
@@ -1900,7 +1900,7 @@ mod tests {
             egui::CentralPanel::default().show(ui, |ui| {
                 let _ = ui.interact(
                     rect,
-                    egui::Id::new("pointer-track"),
+                    egui::Id::unique("pointer-track"),
                     egui::Sense::click_and_drag(),
                 );
             })
@@ -1937,7 +1937,7 @@ mod tests {
             egui::CentralPanel::default().show(ui, |ui| {
                 let response = ui.interact(
                     rect,
-                    egui::Id::new("pointer-track"),
+                    egui::Id::unique("pointer-track"),
                     egui::Sense::click_and_drag(),
                 );
                 assert!(
@@ -2167,7 +2167,7 @@ mod tests {
             egui::Rect::from_min_max(egui::pos2(10.0, 60.0), egui::pos2(210.0, 104.0));
         let mut frame = region_frame(&owner, 2, "page-2", press_rect);
         frame.regions[0].id = RegionId::StillSeekStripRow;
-        frame.regions[0].widget_id = egui::Id::new("pointer-strip");
+        frame.regions[0].widget_id = egui::Id::unique("pointer-strip");
         frame.regions[0].coordinate_frame = coordinate_frame;
         let mut latch = prepared_step(
             &owner,
@@ -2179,7 +2179,7 @@ mod tests {
         .step
         .latch;
         latch.region = SyntheticPointerRegion::StillSeekStripRow;
-        latch.widget_id = egui::Id::new("pointer-strip");
+        latch.widget_id = egui::Id::unique("pointer-strip");
         latch.press_rect = press_rect;
         latch.coordinate_frame = coordinate_frame;
 

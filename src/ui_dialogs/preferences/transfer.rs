@@ -204,7 +204,7 @@ impl App {
         let escape = !busy && self.dialog_escape_pressed(ctx);
         let mut choose_file = None;
         let mut close = false;
-        egui::Modal::new(egui::Id::new("preferences_transfer_dialog")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("preferences_transfer_dialog")).show(ctx, |ui| {
             ui.set_width(420.0);
             match transfer {
                 PreferencesTransferState::Explanation { action, feedback } => {
@@ -1214,6 +1214,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn preferences_transfer_explanation_ime_enter_escape_does_not_select_or_close() {
         let mut app = crate::app::setup_app_for_test();
         app.show_settings_restore = true;

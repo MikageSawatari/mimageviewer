@@ -595,11 +595,11 @@ pub(crate) fn touch_gestures_disabled() -> bool {
 }
 
 fn state_id(viewport: egui::ViewportId, surface: TouchSurface) -> egui::Id {
-    egui::Id::new(("miv_touch_correlation", viewport, surface))
+    egui::Id::unique(("miv_touch_correlation", viewport, surface))
 }
 
 fn driven_surface_id(viewport: egui::ViewportId) -> egui::Id {
-    egui::Id::new(("miv_touch_correlation_driven_surface", viewport))
+    egui::Id::unique(("miv_touch_correlation_driven_surface", viewport))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

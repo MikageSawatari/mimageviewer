@@ -128,7 +128,7 @@ fn records() -> &'static Mutex<Vec<WindowRecord>> {
 
 fn next_token() -> u64 {
     NEXT_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .expect("mImageViewer native window witness token space exhausted")

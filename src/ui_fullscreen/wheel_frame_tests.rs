@@ -993,14 +993,16 @@ fn install_immediate_child_input(ctx: &egui::Context, focused: bool, events: Vec
     ctx.set_embed_viewports(false);
     ctx.data_mut(|data| {
         data.insert_temp(
-            egui::Id::new("wheel_immediate_child_input"),
+            egui::Id::unique("wheel_immediate_child_input"),
             (focused, events),
         )
     });
     egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
         let (focused, events) = ctx.data(|data| {
-            data.get_temp::<(bool, Vec<egui::Event>)>(egui::Id::new("wheel_immediate_child_input"))
-                .unwrap()
+            data.get_temp::<(bool, Vec<egui::Event>)>(egui::Id::unique(
+                "wheel_immediate_child_input",
+            ))
+            .unwrap()
         });
         let mut raw = egui::RawInput {
             viewport_id: viewport.ids.this,

@@ -3067,7 +3067,7 @@ impl App {
         let append_undo_pending = self.book_append_undo_in_progress();
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
-        egui::Area::new(egui::Id::new("text_panel"))
+        egui::Area::new(egui::Id::unique("text_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
@@ -3077,7 +3077,7 @@ impl App {
                 }
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("text_panel_click_sink"),
+                    egui::Id::unique("text_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -3324,7 +3324,7 @@ impl App {
         // しっぽ stash は App 状態だが、closure は self を借りないので `objects` と同様に
         // 一旦ローカルへ取り出して &mut を渡し、closure 後に書き戻す。
         let mut tail_stash = std::mem::take(&mut self.comic_tail_stash);
-        egui::Area::new(egui::Id::new("text_detail_panel"))
+        egui::Area::new(egui::Id::unique("text_detail_panel"))
             .fixed_pos(detail_rect.min)
             .order(egui::Order::Foreground)
             .interactable(true)
@@ -3334,7 +3334,7 @@ impl App {
                 }
                 ui.interact(
                     detail_rect,
-                    egui::Id::new("text_detail_panel_click_sink"),
+                    egui::Id::unique("text_detail_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 egui::Frame::popup(ui.style())
@@ -3570,7 +3570,7 @@ impl App {
             ));
         egui::Window::new("吹き出しを追加")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("text_add_bubble_dialog"))
+            .id(egui::Id::unique("text_add_bubble_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -3680,7 +3680,7 @@ impl App {
             ));
         egui::Window::new("注釈を追加")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("text_add_annotation_dialog"))
+            .id(egui::Id::unique("text_add_annotation_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -3781,7 +3781,7 @@ impl App {
             ));
         egui::Window::new("メッセージウィンドウを追加")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("text_add_window_dialog"))
+            .id(egui::Id::unique("text_add_window_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -3975,7 +3975,7 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("オノマトペを追加").drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("text_add_onomatopoeia_dialog"))
+            .id(egui::Id::unique("text_add_onomatopoeia_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -4292,7 +4292,7 @@ impl App {
             ));
         egui::Window::new("フォントを見本から選択")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("text_font_dialog"))
+            .id(egui::Id::unique("text_font_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -4880,7 +4880,7 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("text_add_stamp_dialog"))
+            .id(egui::Id::unique("text_add_stamp_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
             .collapsible(false)
@@ -7407,7 +7407,7 @@ fn edit_object_ui(
 /// ので、ここでは `changed` を立てるだけ (リンク解除は呼び出し側のスタイル差分判定に任せる)。
 fn text_body_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, sel: u64) {
     // 安定 id を与えて記号挿入後にキャレットを復元できるようにする。
-    let text_edit_id = egui::Id::new(("comic_text_edit", sel));
+    let text_edit_id = egui::Id::unique(("comic_text_edit", sel));
     let te_out = egui::TextEdit::multiline(&mut t.text)
         .id(text_edit_id)
         .desired_rows(3)
@@ -10049,7 +10049,7 @@ mod tests {
             priming_input.events.truncate(1);
             let _ = ctx
                 .run_pass(priming_input, |ctx| {
-                    egui::Area::new(egui::Id::new(0xC010_57u64))
+                    egui::Area::new(egui::Id::unique(0xC010_57u64))
                         .fixed_pos(egui::pos2(400.0, 100.0))
                         .order(egui::Order::Foreground)
                         .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));
@@ -10063,7 +10063,7 @@ mod tests {
                     ctx,
                     ctx.input(|input| input.pointer.interact_pos()),
                 ));
-                egui::Area::new(egui::Id::new(0xC010_57u64))
+                egui::Area::new(egui::Id::unique(0xC010_57u64))
                     .fixed_pos(egui::pos2(400.0, 100.0))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| ui.set_min_size(egui::vec2(100.0, 100.0)));

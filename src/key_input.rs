@@ -53,7 +53,7 @@ fn operation_input_observation_enabled(_ctx: &egui::Context) -> bool {
     // fixture flag controls only this test Context, never production policy.
     #[cfg(test)]
     if let Some(enabled) =
-        _ctx.data(|data| data.get_temp::<bool>(egui::Id::new("page_turn_input_enabled")))
+        _ctx.data(|data| data.get_temp::<bool>(egui::Id::unique("page_turn_input_enabled")))
     {
         return enabled;
     }
@@ -2788,7 +2788,7 @@ fn egui_key_operation_batch(
     ctx: &egui::Context,
     viewport: egui::ViewportId,
 ) -> Option<Arc<[KeyOperationEdge]>> {
-    let id = egui::Id::new(("key_operation_ingress", viewport));
+    let id = egui::Id::unique(("key_operation_ingress", viewport));
     let frame_nr = ctx.cumulative_frame_nr_for(viewport);
     let first_pass_nr = ctx
         .cumulative_pass_nr_for(viewport)
@@ -4250,7 +4250,7 @@ mod tests {
     #[test]
     fn egui_operation_snapshot_survives_consumption_replay_and_same_time_next_batch() {
         let ctx = egui::Context::default();
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
         ctx.add_plugin(super::KeyOperationInputPlugin);
         let event = |pressed| egui::Event::Key {
             key: egui::Key::ArrowRight,
@@ -4269,7 +4269,7 @@ mod tests {
             let ctx = &ui.ctx().clone();
             assert!(
                 ctx.data(
-                    |data| data.get_temp::<super::EguiKeyOperationBatch>(egui::Id::new((
+                    |data| data.get_temp::<super::EguiKeyOperationBatch>(egui::Id::unique((
                         "key_operation_ingress",
                         egui::ViewportId::ROOT
                     )))
@@ -4346,7 +4346,7 @@ mod tests {
             first
         };
         let ctx = egui::Context::default();
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), false));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), false));
         super::install_operation_input_plugin(&ctx);
         let mut matches = 0;
         ctx.run_ui(
@@ -4368,12 +4368,9 @@ mod tests {
                 assert_eq!(guard.operation_frame.capacity(), 0);
                 drop(guard);
                 assert!(
-                    ctx.data(
-                        |data| data.get_temp::<super::EguiKeyOperationBatch>(egui::Id::new((
-                            "key_operation_ingress",
-                            viewport
-                        )))
-                    )
+                    ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(
+                        egui::Id::unique(("key_operation_ingress", viewport))
+                    ))
                     .is_none()
                 );
                 let consumed =
@@ -4408,7 +4405,7 @@ mod tests {
     #[test]
     fn off_egui_observer_is_lazy_but_matched_generic_identity_survives_replay() {
         let ctx = egui::Context::default();
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), false));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), false));
         super::install_operation_input_plugin(&ctx);
         let mut original = None;
         ctx.run_ui(
@@ -4424,7 +4421,7 @@ mod tests {
             },
             |ui| {
                 let ctx = &ui.ctx().clone();
-                let id = egui::Id::new(("key_operation_ingress", ctx.viewport_id()));
+                let id = egui::Id::unique(("key_operation_ingress", ctx.viewport_id()));
                 if ctx.current_pass_index() == 0 {
                     assert!(
                         ctx.data(|data| data.get_temp::<super::EguiKeyOperationBatch>(id))
@@ -4474,7 +4471,7 @@ mod tests {
         let ctx = egui::Context::default();
         super::install_operation_input_plugin(&ctx);
         let viewport = egui::ViewportId::ROOT;
-        let id = egui::Id::new(("key_operation_ingress", viewport));
+        let id = egui::Id::unique(("key_operation_ingress", viewport));
         ctx.run_ui(Default::default(), |ui| {
             let ctx = &ui.ctx().clone();
             assert!(
@@ -5327,7 +5324,7 @@ mod tests {
                 region_geometry_token: 11,
                 press_page_index: 2,
                 press_item_identity: "page-2".to_string(),
-                widget_id: egui::Id::new("pointer-track"),
+                widget_id: egui::Id::unique("pointer-track"),
                 press_rect: rect,
                 coordinate_frame: rect,
                 press_pixels_per_point: 1.0,

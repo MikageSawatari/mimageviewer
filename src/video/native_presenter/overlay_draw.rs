@@ -44,7 +44,7 @@ pub(super) fn draw_native_perf_overlay(
     latest: NativeOverlayPerfSnapshot,
     origin: egui::Pos2,
 ) {
-    egui::Area::new(egui::Id::new("native_video_perf_overlay"))
+    egui::Area::new(egui::Id::unique("native_video_perf_overlay"))
         .order(egui::Order::Middle)
         .fixed_pos(origin)
         .show(ctx, |ui| {
@@ -466,7 +466,7 @@ pub(super) fn draw_native_video_left_panel(
     let panel_rect = native_jump_panel_rect(overlay_height_points, bottom_bar_height);
     let mut close_clicked = false;
 
-    egui::Area::new(egui::Id::new("native_video_jump_panel"))
+    egui::Area::new(egui::Id::unique("native_video_jump_panel"))
         .order(egui::Order::Foreground)
         .fixed_pos(panel_rect.min)
         .show(ctx, |ui| {
@@ -508,7 +508,7 @@ pub(super) fn draw_native_video_left_panel(
                 );
                 let response = ui.interact(
                     rect,
-                    egui::Id::new(("native_video_left_panel_tab", index)),
+                    egui::Id::unique(("native_video_left_panel_tab", index)),
                     egui::Sense::click(),
                 );
                 draw_overlay_button_bg(&painter, rect, response.hovered(), *panel_tab == tab);
@@ -566,7 +566,7 @@ pub(super) fn draw_native_video_left_panel(
                 );
                 let response = ui.interact(
                     close_rect,
-                    egui::Id::new("native_jump_close"),
+                    egui::Id::unique("native_jump_close"),
                     egui::Sense::click(),
                 );
                 draw_overlay_button_bg(ui.painter(), close_rect, response.hovered(), false);
@@ -594,7 +594,7 @@ fn draw_native_video_adjustment_body(
     let painter = ui.painter().clone();
     let _ = ui.interact(
         rect,
-        egui::Id::new("native_video_adjustment_panel_bg"),
+        egui::Id::unique("native_video_adjustment_panel_bg"),
         egui::Sense::click(),
     );
     let tab_gap = 4.0;
@@ -612,7 +612,7 @@ fn draw_native_video_adjustment_body(
         );
         let response = ui.interact(
             tab_rect,
-            egui::Id::new(("native_video_adjustment_tab", index)),
+            egui::Id::unique(("native_video_adjustment_tab", index)),
             egui::Sense::click(),
         );
         draw_overlay_button_bg(&painter, tab_rect, response.hovered(), *tab == value);
@@ -1060,7 +1060,7 @@ pub(crate) fn draw_native_jump_panel_body(
     );
     let _ = ui.interact(
         rect,
-        egui::Id::new("native_video_jump_panel_bg"),
+        egui::Id::unique("native_video_jump_panel_bg"),
         egui::Sense::click(),
     );
     painter.text(
@@ -1082,7 +1082,7 @@ pub(crate) fn draw_native_jump_panel_body(
         );
         let bulk_resp = ui.interact(
             bulk_rect,
-            egui::Id::new("native_jump_bulk_bookmark"),
+            egui::Id::unique("native_jump_bulk_bookmark"),
             egui::Sense::click(),
         );
         draw_overlay_button_bg(&painter, bulk_rect, bulk_resp.hovered(), false);
@@ -1109,7 +1109,7 @@ pub(crate) fn draw_native_jump_panel_body(
         );
         let pin_resp = ui.interact(
             pin_rect,
-            egui::Id::new("native_jump_pin_here"),
+            egui::Id::unique("native_jump_pin_here"),
             egui::Sense::click(),
         );
         draw_overlay_button_bg(&painter, pin_rect, pin_resp.hovered(), false);
@@ -1136,7 +1136,7 @@ pub(crate) fn draw_native_jump_panel_body(
     );
     let bm_resp = ui.interact(
         bm_rect,
-        egui::Id::new("native_jump_bookmark_here"),
+        egui::Id::unique("native_jump_bookmark_here"),
         egui::Sense::click(),
     );
     draw_overlay_button_bg(&painter, bm_rect, bm_resp.hovered(), false);
@@ -1388,7 +1388,7 @@ pub(super) fn draw_native_jump_row(
             );
             let edit_resp = ui.interact(
                 edit_rect,
-                egui::Id::new(("native_jump_edit", id)),
+                egui::Id::unique(("native_jump_edit", id)),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(&painter, edit_rect, edit_resp.hovered(), false);
@@ -1417,7 +1417,7 @@ pub(super) fn draw_native_jump_row(
             );
             let delete_resp = ui.interact(
                 delete_rect,
-                egui::Id::new(("native_jump_delete", id)),
+                egui::Id::unique(("native_jump_delete", id)),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(&painter, delete_rect, delete_resp.hovered(), false);
@@ -1440,7 +1440,7 @@ pub(super) fn draw_native_jump_row(
             );
             let delete_resp = ui.interact(
                 delete_rect,
-                egui::Id::new("native_jump_delete_pin"),
+                egui::Id::unique("native_jump_delete_pin"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(&painter, delete_rect, delete_resp.hovered(), false);
@@ -1503,7 +1503,7 @@ pub(crate) fn draw_native_bookmark_title_editor(
     let mut clear = false;
     let mut cancel = false;
 
-    let area_response = egui::Area::new(egui::Id::new("native_video_bookmark_title_editor"))
+    let area_response = egui::Area::new(egui::Id::unique("native_video_bookmark_title_editor"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {
@@ -1738,7 +1738,7 @@ pub(super) fn draw_native_video_touch_first_run_help(
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,
-        egui::Id::new("native_video_touch_first_run_help"),
+        egui::Id::unique("native_video_touch_first_run_help"),
     ));
     paint_native_video_touch_first_run_help(
         &painter,
@@ -1790,7 +1790,7 @@ pub(super) fn draw_native_shortcut_help_dialog(
     let mut close_requested = false;
     let scroll_max_h = (dialog_h - 104.0).max(120.0);
 
-    let area_response = egui::Area::new(egui::Id::new("native_video_shortcut_help_dialog"))
+    let area_response = egui::Area::new(egui::Id::unique("native_video_shortcut_help_dialog"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {
@@ -2000,7 +2000,7 @@ pub(crate) fn draw_native_bulk_bookmark_dialog(
     // 余裕を見て 340。これで残りが textarea に割り当てられる。
     let textarea_max_h = (dialog_h - 340.0).max(80.0);
 
-    let area_response = egui::Area::new(egui::Id::new("native_video_bulk_bookmark_dialog"))
+    let area_response = egui::Area::new(egui::Id::unique("native_video_bulk_bookmark_dialog"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {
@@ -2403,7 +2403,7 @@ fn draw_native_top_button_enabled(
     } else {
         egui::Sense::hover()
     };
-    let resp = ui.interact(rect, egui::Id::new(id), sense);
+    let resp = ui.interact(rect, egui::Id::unique(id), sense);
     #[cfg(feature = "test-script")]
     if let Some(observation_out) = observation_out {
         *observation_out = Some(
@@ -2521,7 +2521,7 @@ pub(super) fn draw_native_bar_lock_button(
     bar: crate::video::NativeVideoBar,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> egui::Rect {
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let resp = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
     draw_overlay_button_bg(painter, rect, resp.hovered(), locked);
     crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
         painter,
@@ -2809,7 +2809,7 @@ pub(super) fn draw_native_panel_callout(
 ) -> bool {
     let bar = native_panel_callout_bar_rect(overlay_width_points, overlay_height_points, left);
     let mut clicked = false;
-    egui::Area::new(egui::Id::new(if left {
+    egui::Area::new(egui::Id::unique(if left {
         "native_left_panel_callout"
     } else {
         "native_right_panel_callout"
@@ -2821,7 +2821,7 @@ pub(super) fn draw_native_panel_callout(
         let rect = egui::Rect::from_min_size(ui.min_rect().min, bar.size());
         let response = ui.interact(
             rect,
-            egui::Id::new(if left {
+            egui::Id::unique(if left {
                 "native_left_panel_callout_hit"
             } else {
                 "native_right_panel_callout_hit"
@@ -2868,7 +2868,7 @@ pub(super) fn draw_native_touch_panel_handle(
     left: bool,
 ) -> bool {
     let mut clicked = false;
-    egui::Area::new(egui::Id::new(if left {
+    egui::Area::new(egui::Id::unique(if left {
         "native_left_touch_panel_handle"
     } else {
         "native_right_touch_panel_handle"
@@ -2880,7 +2880,7 @@ pub(super) fn draw_native_touch_panel_handle(
         let local_rect = egui::Rect::from_min_size(ui.min_rect().min, rect.size());
         let response = ui.interact(
             local_rect,
-            egui::Id::new(if left {
+            egui::Id::unique(if left {
                 "native_left_touch_panel_handle_hit"
             } else {
                 "native_right_touch_panel_handle_hit"
@@ -2925,7 +2925,7 @@ pub(super) fn draw_native_frame_step_button(
     hold: &mut Option<NativeFrameStepHold>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> bool {
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let resp = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
     draw_overlay_button_bg(painter, rect, resp.hovered(), false);
     draw_overlay_frame_step_icon(painter, rect, direction);
     let resp = resp.hover_tip_dark(tooltip);
@@ -3330,7 +3330,7 @@ pub(super) fn native_checkmark_rect(overlay_width_points: f32, top: f32) -> egui
 }
 
 pub(super) fn draw_native_checkmark(ctx: &egui::Context, overlay_width_points: f32, top: f32) {
-    egui::Area::new(egui::Id::new("native_video_checkmark"))
+    egui::Area::new(egui::Id::unique("native_video_checkmark"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
@@ -3415,7 +3415,7 @@ pub(super) fn draw_native_center_status(
         title,
         body.is_some(),
     );
-    egui::Area::new(egui::Id::new("native_video_center_status"))
+    egui::Area::new(egui::Id::unique("native_video_center_status"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
         .interactable(false)
@@ -3521,7 +3521,7 @@ pub(super) fn draw_native_toast(
         )
     };
     let area_rect = rect.expand(4.0);
-    egui::Area::new(egui::Id::new("native_video_toast"))
+    egui::Area::new(egui::Id::unique("native_video_toast"))
         .order(egui::Order::Foreground)
         .fixed_pos(area_rect.min)
         .interactable(false)
@@ -3579,7 +3579,7 @@ pub(super) fn draw_native_ring_guide_overlay(
         guide,
     );
     let radius = ((outer_rect.width().min(outer_rect.height()) - 224.0) * 0.5).clamp(120.0, 164.0);
-    let area_response = egui::Area::new(egui::Id::new("native_video_ring_guide_overlay"))
+    let area_response = egui::Area::new(egui::Id::unique("native_video_ring_guide_overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(outer_rect.min)
         .interactable(false)
@@ -4012,7 +4012,7 @@ fn draw_native_ring_picker_overlay_layout(
         .selected_row
         .map(|row| row.min(picker.rows.len().saturating_sub(1)));
 
-    let area_response = egui::Area::new(egui::Id::new("native_video_ring_picker_overlay"))
+    let area_response = egui::Area::new(egui::Id::unique("native_video_ring_picker_overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(panel_rect.min)
         .interactable(false)
@@ -4211,7 +4211,7 @@ pub(super) fn draw_native_file_navigation_ui(
             shortcuts.and_then(|s| s.next_file.as_deref()),
         ),
     ] {
-        let response = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+        let response = ui.interact(rect, egui::Id::unique(id), egui::Sense::click());
         let painter = ui.painter().with_clip_rect(rect);
         draw_overlay_button_bg(&painter, rect, response.hovered(), false);
         draw_overlay_arrow_icon(&painter, rect, delta);
@@ -4233,7 +4233,7 @@ pub(super) fn draw_native_scan_file_navigation(
     shortcuts: Option<&NativeOverlayShortcutLabels>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
-    egui::Area::new(egui::Id::new("native_video_file_navigation_hud"))
+    egui::Area::new(egui::Id::unique("native_video_file_navigation_hud"))
         .order(egui::Order::Foreground)
         .fixed_pos(rects[0].min)
         .movable(false)
@@ -4268,7 +4268,7 @@ pub(super) fn draw_native_normalize_progress(
     .into_iter()
     .enumerate()
     {
-        egui::Area::new(egui::Id::new(("native_video_normalize_shield", index)))
+        egui::Area::new(egui::Id::unique(("native_video_normalize_shield", index)))
             .order(egui::Order::Foreground)
             .fixed_pos(shield.min)
             .movable(false)
@@ -4276,12 +4276,12 @@ pub(super) fn draw_native_normalize_progress(
                 ui.set_min_size(shield.size());
                 ui.interact(
                     shield,
-                    egui::Id::new(("native_video_normalize_blocker", index)),
+                    egui::Id::unique(("native_video_normalize_blocker", index)),
                     egui::Sense::click_and_drag(),
                 );
             });
     }
-    egui::Area::new(egui::Id::new("native_video_normalize_progress"))
+    egui::Area::new(egui::Id::unique("native_video_normalize_progress"))
         .order(egui::Order::Foreground)
         .fixed_pos(panel_rect.min)
         .movable(false)
@@ -4353,7 +4353,7 @@ pub(super) fn draw_native_normalize_progress(
             );
             let cancel_resp = ui.interact(
                 cancel_rect,
-                egui::Id::new("native_video_normalize_cancel"),
+                egui::Id::unique("native_video_normalize_cancel"),
                 egui::Sense::click(),
             );
             let cancel_color = if cancel_resp.hovered() {
@@ -4517,7 +4517,7 @@ fn draw_native_panorama_projection_popup(
     );
     let mut selected = None;
     let mut drawn_popup_rect = popup_rect;
-    egui::Area::new(egui::Id::new("native_panorama_projection_popup"))
+    egui::Area::new(egui::Id::unique("native_panorama_projection_popup"))
         .order(egui::Order::Foreground)
         .fixed_pos(popup_rect.min)
         .show(ctx, |ui| {
@@ -4553,7 +4553,7 @@ fn draw_native_panorama_projection_popup(
                 let item_rect = native_panorama_projection_popup_row_rect(rect, row_index);
                 let item_resp = ui.interact(
                     item_rect,
-                    egui::Id::new(("native_panorama_projection_item", mode.shader_code())),
+                    egui::Id::unique(("native_panorama_projection_item", mode.shader_code())),
                     egui::Sense::click(),
                 );
                 if item_resp.hovered() {
@@ -4650,7 +4650,7 @@ pub(super) fn draw_native_top_bar(
     }
     let mut panorama_projection_button_rect = None;
     let mut vst_button_rect = None;
-    let layout = egui::Area::new(egui::Id::new("native_video_top_bar"))
+    let layout = egui::Area::new(egui::Id::unique("native_video_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
@@ -4840,7 +4840,7 @@ pub(super) fn draw_native_top_bar(
                 };
                 let projection_resp = ui.interact(
                     projection_rect,
-                    egui::Id::new("native_top_panorama_projection"),
+                    egui::Id::unique("native_top_panorama_projection"),
                     projection_sense,
                 );
                 draw_overlay_button_bg(
@@ -5084,7 +5084,7 @@ pub(super) fn draw_native_top_bar_tile(
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> NativeTopBarLayout {
-    egui::Area::new(egui::Id::new("native_video_tile_top_bar"))
+    egui::Area::new(egui::Id::unique("native_video_tile_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
@@ -5264,7 +5264,7 @@ pub(super) fn draw_native_navigation_preview(
     preview_texture_id: Option<egui::TextureId>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> NativeTopBarLayout {
-    egui::Area::new(egui::Id::new("native_video_navigation_preview"))
+    egui::Area::new(egui::Id::unique("native_video_navigation_preview"))
         .order(egui::Order::Background)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
@@ -5282,7 +5282,7 @@ pub(super) fn draw_native_navigation_preview(
             painter.rect_filled(full_rect, 0.0, egui::Color32::BLACK);
             let _ = ui.interact(
                 full_rect,
-                egui::Id::new("native_video_navigation_preview_bg"),
+                egui::Id::unique("native_video_navigation_preview_bg"),
                 egui::Sense::click(),
             );
 
@@ -5300,7 +5300,7 @@ pub(super) fn draw_native_navigation_preview(
             }
         });
 
-    egui::Area::new(egui::Id::new("native_video_navigation_preview_top_bar"))
+    egui::Area::new(egui::Id::unique("native_video_navigation_preview_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
@@ -5388,7 +5388,7 @@ pub(super) fn draw_native_vst3_panel(
     let saved_pos_was_clamped = saved_pos
         .map(|pos| (pos - default_pos).length_sq() > 0.25)
         .unwrap_or(false);
-    let inner = egui::Area::new(egui::Id::new("native_video_vst3_panel"))
+    let inner = egui::Area::new(egui::Id::unique("native_video_vst3_panel"))
         .order(egui::Order::Foreground)
         .default_pos(default_pos)
         .movable(true)
@@ -6139,7 +6139,7 @@ pub(super) fn draw_native_metadata_panel(
         overlay_height_points,
         bottom_bar_height,
     );
-    egui::Area::new(egui::Id::new("native_video_metadata_panel"))
+    egui::Area::new(egui::Id::unique("native_video_metadata_panel"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
         .show(ctx, |ui| {
@@ -6163,7 +6163,7 @@ pub(super) fn draw_native_metadata_panel(
             );
             let _ = ui.interact(
                 rect,
-                egui::Id::new("native_video_metadata_panel_bg"),
+                egui::Id::unique("native_video_metadata_panel_bg"),
                 egui::Sense::click(),
             );
             painter.text(
@@ -6181,7 +6181,7 @@ pub(super) fn draw_native_metadata_panel(
             );
             let lock_response = ui.interact(
                 lock_rect,
-                egui::Id::new("native_metadata_lock"),
+                egui::Id::unique("native_metadata_lock"),
                 egui::Sense::click(),
             );
             draw_overlay_button_bg(
@@ -6217,7 +6217,7 @@ pub(super) fn draw_native_metadata_panel(
                 );
                 let response = ui.interact(
                     close_rect,
-                    egui::Id::new("native_metadata_close"),
+                    egui::Id::unique("native_metadata_close"),
                     egui::Sense::click(),
                 );
                 draw_overlay_button_bg(painter, close_rect, response.hovered(), false);
@@ -6538,7 +6538,7 @@ pub(super) fn draw_native_tile_overlay(
     // するので、グリッド背景を 1 回クリックしただけで grid が上バーの上に昇格し、
     // grid 先頭の全画面不透明黒塗りが上バーを丸ごと隠してしまう (= 上バーのボタンも
     // 押せなくなる)。Order を分ければ描画順は固定で `move_to_top` の影響を受けない。
-    egui::Area::new(egui::Id::new("native_video_tile_overlay"))
+    egui::Area::new(egui::Id::unique("native_video_tile_overlay"))
         .order(egui::Order::Background)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
@@ -6551,7 +6551,7 @@ pub(super) fn draw_native_tile_overlay(
             painter.rect_filled(full_rect, 0.0, egui::Color32::BLACK);
             let _ = ui.interact(
                 full_rect,
-                egui::Id::new("native_video_tile_overlay_bg"),
+                egui::Id::unique("native_video_tile_overlay_bg"),
                 egui::Sense::click(),
             );
 
@@ -6658,7 +6658,7 @@ pub(super) fn draw_native_tile_overlay(
 
                 let resp = ui.interact(
                     cell_rect,
-                    egui::Id::new(("native_video_tile", idx)),
+                    egui::Id::unique(("native_video_tile", idx)),
                     egui::Sense::click(),
                 );
                 if resp.hovered() {
@@ -7992,7 +7992,7 @@ pub(crate) mod tests {
         harness.run();
         let close = harness
             .ctx
-            .read_response(egui::Id::new("native_metadata_close"))
+            .read_response(egui::Id::unique("native_metadata_close"))
             .expect("raw locked/effective unlocked must expose the close hit")
             .rect
             .center();
@@ -8766,45 +8766,47 @@ pub(crate) mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 64.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
 
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |_| {});
-                let mut commands = Vec::new();
-                let _ = draw_native_top_bar(
-                    ctx,
-                    720.0,
-                    64.0,
-                    71.0,
-                    100.0,
-                    None,
-                    None,
-                    None,
-                    &mut projection_popup_open,
-                    &mut projection_popup_rect,
-                    &title,
-                    false,
-                    true,
-                    false,
-                    false,
-                    crate::settings::FsSidePanelMode::Hover,
-                    false,
-                    false,
-                    false,
-                    &mut commands,
-                    #[cfg(feature = "test-script")]
-                    &mut None,
-                    #[cfg(feature = "test-script")]
-                    None,
-                    #[cfg(feature = "test-script")]
-                    &mut None,
-                );
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |_| {});
+                    let mut commands = Vec::new();
+                    let _ = draw_native_top_bar(
+                        ctx,
+                        720.0,
+                        64.0,
+                        71.0,
+                        100.0,
+                        None,
+                        None,
+                        None,
+                        &mut projection_popup_open,
+                        &mut projection_popup_rect,
+                        &title,
+                        false,
+                        true,
+                        false,
+                        false,
+                        crate::settings::FsSidePanelMode::Hover,
+                        false,
+                        false,
+                        false,
+                        &mut commands,
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                        #[cfg(feature = "test-script")]
+                        None,
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                    );
+                });
             });
         harness.run();
         harness.snapshot("native_video_top_bar_long_title");
@@ -8819,8 +8821,6 @@ pub(crate) mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
-
                 egui::CentralPanel::default().show(root_ui, |ui| {
                     let painter = ui.painter().clone();
                     let mut commands = Vec::new();
@@ -8886,41 +8886,43 @@ pub(crate) mod tests {
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(340.0, 650.0))
             .build_ui(move |root_ui| {
-                let ctx = &root_ui.ctx().clone();
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
 
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(root_ui, |_| {});
-                let mut commands = Vec::new();
-                draw_native_video_left_panel(
-                    ctx,
-                    650.0,
-                    crate::video::native_presenter::HUD_BOTTOM_HEIGHT,
-                    0.0,
-                    &entries,
-                    &jump_texture_ids,
-                    None,
-                    &mut bookmark_title_edit,
-                    &mut bulk_bookmark_dialog,
-                    &mut panel_tab,
-                    &mut adjustment_tab,
-                    &mut adjustments,
-                    &mut scale_filter,
-                    &mut downscale_smoothing_percent,
-                    scale_outside_note.as_deref(),
-                    &mut anime4k_budget,
-                    &anime4k_status,
-                    &preset_slots,
-                    &creative_luts,
-                    &mut commands,
-                    false,
-                    None,
-                );
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |_| {});
+                    let mut commands = Vec::new();
+                    draw_native_video_left_panel(
+                        ctx,
+                        650.0,
+                        crate::video::native_presenter::HUD_BOTTOM_HEIGHT,
+                        0.0,
+                        &entries,
+                        &jump_texture_ids,
+                        None,
+                        &mut bookmark_title_edit,
+                        &mut bulk_bookmark_dialog,
+                        &mut panel_tab,
+                        &mut adjustment_tab,
+                        &mut adjustments,
+                        &mut scale_filter,
+                        &mut downscale_smoothing_percent,
+                        scale_outside_note.as_deref(),
+                        &mut anime4k_budget,
+                        &anime4k_status,
+                        &preset_slots,
+                        &creative_luts,
+                        &mut commands,
+                        false,
+                        None,
+                    );
+                });
             });
 
         harness.run();

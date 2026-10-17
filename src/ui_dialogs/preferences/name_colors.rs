@@ -187,7 +187,7 @@ struct ActiveHexEditor {
 }
 
 fn editor_id() -> egui::Id {
-    egui::Id::new("details_name_active_hex_editor")
+    egui::Id::unique("details_name_active_hex_editor")
 }
 
 pub(super) fn clear_hex_editor(ctx: &egui::Context) {
@@ -317,7 +317,6 @@ mod tests {
                 .with_size(egui::vec2(760.0, 1200.0))
                 .build_ui_state(
                     |root_ui, draft| {
-                        let ctx = &root_ui.ctx().clone();
                         egui::CentralPanel::default().show(root_ui, |ui| {
                             draw_settings(ui, draft);
                         });
@@ -350,7 +349,6 @@ mod tests {
             .with_size(egui::vec2(680.0, 1200.0))
             .build_ui_state(
                 |root_ui, draft| {
-                    let ctx = &root_ui.ctx().clone();
                     egui::CentralPanel::default().show(root_ui, |ui| {
                         draw_settings(ui, draft);
                     });
@@ -464,6 +462,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn hex_handler_ime_preedit_does_not_publish_an_rgb_value() {
         let ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&ctx);

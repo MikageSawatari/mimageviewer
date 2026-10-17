@@ -3152,7 +3152,7 @@ impl ComicLab {
             // Fresh id so egui doesn't restore the full-width size remembered from
             // the earlier horizontal_wrapped layout (a .max_width clamp can't shrink
             // an already-remembered window size — Codex).
-            .id(egui::Id::new("add_bubble_dialog_grid"))
+            .id(egui::Id::unique("add_bubble_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
             // No pivot: a CENTER_CENTER pivot makes resizing feel odd (size changes
@@ -3222,7 +3222,7 @@ impl ComicLab {
         let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("メッセージウィンドウを追加")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("add_window_dialog_grid"))
+            .id(egui::Id::unique("add_window_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
             .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
@@ -3365,7 +3365,7 @@ impl ComicLab {
         let default_h = (avail.height() - 120.0).clamp(300.0, 660.0);
         egui::Window::new("オノマトペを追加")
             .drag_area(egui::WindowDrag::Anywhere)
-            .id(egui::Id::new("onomatopoeia_dialog_grid"))
+            .id(egui::Id::unique("onomatopoeia_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
             .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
@@ -7708,7 +7708,7 @@ fn draw_text_body(ui: &mut egui::Ui, tb: &mut TextBlock, sel: u64) -> TextSectio
     let mut dirty = false;
     let mut break_link = false;
 
-    let text_edit_id = egui::Id::new(("comic_text_edit", sel));
+    let text_edit_id = egui::Id::unique(("comic_text_edit", sel));
     let te_out = egui::TextEdit::multiline(&mut tb.text)
         .id(text_edit_id)
         .desired_rows(3)
@@ -8121,7 +8121,7 @@ mod sample_tests {
     fn text_body_ime_commit_then_normal_enter_inserts_one_newline() {
         for same_pass in [true, false] {
             let ctx = egui::Context::default();
-            let field_id = egui::Id::new(("comic_text_edit", 1_u64));
+            let field_id = egui::Id::unique(("comic_text_edit", 1_u64));
             let mut tb = TextBlock {
                 text: String::new(),
                 ..Default::default()
@@ -8165,7 +8165,7 @@ mod sample_tests {
     #[test]
     fn text_body_normal_enter_inserts_a_newline_without_ime() {
         let ctx = egui::Context::default();
-        let field_id = egui::Id::new(("comic_text_edit", 1_u64));
+        let field_id = egui::Id::unique(("comic_text_edit", 1_u64));
         let mut tb = TextBlock {
             text: String::new(),
             ..Default::default()
