@@ -746,3 +746,15 @@ protocol v8 の試作なので通常版のbackupを上書きせず、試作用�
 | `scripts/analyze-lyrics-trial.py` (新規) | D記録の場面別・除外理由別集計 |
 | `scripts/test_analyze_lyrics_trial.py` (新規) | Dの除外/場面/世代/分位点回帰 |
 | 本設計書 | T2実装と確認事実、検証、T3引継ぎ |
+
+## 12. T3 の準備 (2026-10-17、ClaudeCode)
+
+- T1 (Mixwright `miv-lyrics-trial` 3843b96) のビルド済みバンドル
+  `G:\home\effetune-mixwright-trialuild\windows-release\VST3\Release\EffeTune Mixwright.vst3` を
+  `.\scriptsuild-dev.ps1 -EffetuneBundle <そのパス>` で dev-runtime に置いた。dev-runtime のバンドルが元と完全に同じこと、
+  JS に P2 の修正 (歌詞用 listener が `telemetryWasHidden` に触れない) が入っていることを確かめた。
+- 試験素材は `python scripts/generate-lyrics-trial-assets.py` で `target/lyrics-trial/assets` に生成した (FFmpeg)。
+  ビープが 2 秒ごとに 50 ms 鳴ること (silencedetect)、埋め込みの歌詞のキー (MP3 / M4A は `lyrics`、FLAC は `LYRICS`) を ffprobe で確かめた。
+- 利用者向けの手順は [effetune-lyrics-trial-smoke.md](effetune-lyrics-trial-smoke.md)。測定用レイアウトの項目名は上流の日本語訳
+  (`external/effetune/js/locales/ja.json5`) から取った。
+- 実機での動作はまだ誰も確かめていない。
