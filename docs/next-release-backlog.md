@@ -171,6 +171,20 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 
+### 1.392 `--features test-script` のときだけ走るテストが 2 件、master で落ちている — 通常の全件実行に入っていない (2026-10-17)
+
+- 観測 (ClaudeCode が master `0af8c32d7` で `cargo nextest run -p mimageviewer --lib --features test-script -E 'test(/…/)'`、2026-10-17):
+  - `app::tests::test_script_counts_the_actual_refresh_folder_request` (`src/app/tests.rs` 2483 行付近): `reload_current_folder_preserving_override`
+    の後も `test_script_folder_load_requests` が増えない (left 1 / right 2)。RatingSort smoke が使う計数なので、smoke の判定が狂う可能性がある (未確認)。
+  - `test_script::tests::phase_3b_tray_projection_absence_is_an_environment_failure` (`src/test_script.rs` 6880 行付近): `release_check_close("after-loading")`
+    の結果が EnvironmentFailure ではなく ScriptFailure。Phase 3b の実装が進んだ後の古い期待値の可能性がある (未確認)。
+  - §1.391 の作業中に Codex も同じ 2 件の失敗を報告した (ブランチ `panorama-click-move`、単独・直列でも同じ)。
+- 背景: `scripts/test-lib-full.ps1` と `test-focused.ps1` は既定の feature で走るので、`test-script` feature のテストはどちらにも入らない。
+  いつから落ちているかは未確認。
+- 対応: 2 件の原因をそれぞれ確かめて直す (製品の計数経路の退行か、テストの期待値が古いのか)。あわせて `test-script` feature の lib テストを
+  定期的に回す入口 (test-lib-full のオプションか、リリース前の手順) を検討する。
+- 規模 / 優先度: Small / P3。
+
 ### 1.391 ui-smoke `NativeTopPanoramaClick` が押下の前に必ず止まる — クリック先へカーソルを動かす手順が無い (2026-10-17)
 
 - 観測 (ClaudeCode の隔離 portable 実行。2026-10-17 未明に 2 回、同日昼に利用者の了承を得て 1 回): 3 回とも、ボタン操作の補助プログラムが
