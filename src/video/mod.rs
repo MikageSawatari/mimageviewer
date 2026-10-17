@@ -13230,6 +13230,92 @@ mod tests {
         assert_ne!(first.id, next.id);
     }
 
+    #[test]
+    fn playback_start_user_seek_and_play_during_normalize_preserve_established_start() {
+        use super::{InternalContinuation, PlaybackStartOrigin, SeekOrigin};
+        for route in [
+            "seek",
+            "relative",
+            "with_play_state",
+            "toggle",
+            "explicit_play",
+        ] {
+            let player = playback_start_test_player();
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::UserPlay);
+            let first = player.take_playback_success().unwrap();
+            player.set_playing_internal(false, InternalContinuation::Normalize);
+            assert!(!player.intent_playing());
+            match route {
+                "seek" => player.seek(5.0, SeekOrigin::User),
+                "relative" => {
+                    player.seek_relative(5.0, SeekOrigin::User);
+                }
+                "with_play_state" => player.seek_with_play_state(5.0, true, SeekOrigin::User),
+                "toggle" => player.toggle_play(),
+                "explicit_play" => {
+                    player.set_playing_with_origin(true, PlaybackStartOrigin::UserPlay)
+                }
+                _ => unreachable!(),
+            }
+            player.complete_seek_for_test(5.0);
+            player.set_playing_internal(true, InternalContinuation::Normalize);
+            assert!(player.take_playback_success().is_none(), "{route}");
+            assert!(player.playback_success_is_current(first.id), "{route}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn playback_start_established_dsp_wait_user_seek_has_no_new_success() {
+        use super::{PlaybackStartOrigin, SeekOrigin};
+        for from_eof in [false, true] {
+            let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+                "dsp-established.mp4".into(),
+            );
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::UserPlay);
+            let first = player.take_playback_success().unwrap();
+            if from_eof {
+                player.mark_eof_for_test(30.0);
+            }
+            player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+                super::audio::AudioDspChain {
+                    user: None,
+                    effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                    coordinator: std::sync::Arc::new(
+                        super::dsp::coordinator::DspProcessingCoordinator::default(),
+                    ),
+                },
+                true,
+            ));
+            // First seek starts acquisition; the second arrives while its internal Pause is active.
+            player.seek(0.0, SeekOrigin::User);
+            assert!(matches!(
+                &*player.dsp_handoff.lock().unwrap(),
+                super::LocalDspAcquisition::Waiting(_)
+            ));
+            assert!(!player.intent_playing());
+            player.seek(5.0, SeekOrigin::User);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !player.audio.as_ref().unwrap().has_dsp_token()
+                && std::time::Instant::now() < deadline
+            {
+                player.poll_dsp_acquisition();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(player.audio.as_ref().unwrap().has_dsp_token());
+            player.complete_seek_for_test(5.0);
+            if from_eof {
+                let replay = player.take_playback_success().unwrap();
+                assert_eq!(replay.origin, PlaybackStartOrigin::UserPlay);
+                assert_ne!(replay.id, first.id);
+            } else {
+                assert!(player.take_playback_success().is_none());
+                assert!(player.playback_success_is_current(first.id));
+            }
+            assert!(player.take_playback_success().is_none());
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn playback_start_eof_user_seek_survives_dsp_wait_and_normalize_once() {

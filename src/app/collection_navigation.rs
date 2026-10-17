@@ -65,17 +65,20 @@ enum CollectionNavigationAction {
     VideoContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
         wraps: bool,
     },
     #[cfg(windows)]
     VideoAudioModeContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
         wraps: bool,
     },
     MusicContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
         wraps: bool,
     },
 }
@@ -1594,7 +1597,7 @@ impl App {
         request.lease.activate(now, "admission");
         if !self.collection_navigation_request_is_current(&request) {
             request.lease.finish(now, "replaced");
-            self.finish_collection_navigation_without_target_no_context(&request.action);
+            self.finish_collection_navigation_rejected_request(ctx, &request);
             return;
         }
         if !request.lease.is_due(now) {
@@ -1612,7 +1615,7 @@ impl App {
             Ok(None) => {
                 self.finish_collection_navigation_read_error(
                     ctx,
-                    &request.action,
+                    &request,
                     "保存先が利用できません",
                 );
                 return;
@@ -1622,7 +1625,7 @@ impl App {
                 return;
             }
             Err(error) => {
-                self.finish_collection_navigation_store_error(ctx, &request.action, &error);
+                self.finish_collection_navigation_store_error(ctx, &request, &error);
                 return;
             }
         };
@@ -1637,7 +1640,7 @@ impl App {
                     return;
                 }
                 Err(error) => {
-                    self.finish_collection_navigation_store_error(ctx, &request.action, &error);
+                    self.finish_collection_navigation_store_error(ctx, &request, &error);
                     return;
                 }
             },
@@ -1649,7 +1652,7 @@ impl App {
                 return;
             }
             Err(error) => {
-                self.finish_collection_navigation_store_error(ctx, &request.action, &error);
+                self.finish_collection_navigation_store_error(ctx, &request, &error);
                 return;
             }
         };
@@ -1710,11 +1713,19 @@ impl App {
     fn finish_collection_navigation_read_error(
         &mut self,
         ctx: &egui::Context,
-        action: &CollectionNavigationAction,
+        request: &CollectionNavigationRequest,
         reason: &str,
     ) {
-        self.finish_collection_navigation_without_target_no_context(action);
-        if matches!(action, CollectionNavigationAction::Slideshow { .. }) {
+        if !self.collection_navigation_request_owner_is_current(request) {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+            return;
+        }
+        // A terminal failure consumes this EOF claim. Rolling it back would silently retry
+        // the same EOF and could resume an internal loop after its metadata was cleared.
+        if !self.finish_collection_navigation_eof(&request.action) {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+        }
+        if request.is_slideshow() {
             self.stop_slideshow_playback();
         }
         self.show_feedback_toast(format!("コレクションを読み込めませんでした: {reason}"));
@@ -1724,13 +1735,13 @@ impl App {
     fn finish_collection_navigation_store_error(
         &mut self,
         ctx: &egui::Context,
-        action: &CollectionNavigationAction,
+        request: &CollectionNavigationRequest,
         error: &CollectionStoreError,
     ) {
         crate::logger::log(format!(
             "[collection-nav] terminal store read failed: {error}"
         ));
-        self.finish_collection_navigation_read_error(ctx, action, &error.user_message());
+        self.finish_collection_navigation_read_error(ctx, request, &error.user_message());
     }
 
     pub(crate) fn start_collection_manual_navigation(
@@ -1998,12 +2009,16 @@ impl App {
         let Some(origin) = self.collection_root_navigation_origin(fs_idx, false) else {
             return false;
         };
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return false;
+        };
         self.enqueue_or_reuse_collection_automatic_navigation(
             ctx,
             origin,
             CollectionNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 wraps: self.video_continuous_mode.wraps(),
             },
         )
@@ -2019,12 +2034,16 @@ impl App {
         let Some(origin) = self.collection_root_navigation_origin(fs_idx, false) else {
             return false;
         };
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return false;
+        };
         self.enqueue_or_reuse_collection_automatic_navigation(
             ctx,
             origin,
             CollectionNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 wraps: self.video_continuous_mode.wraps(),
             },
         )
@@ -2039,12 +2058,16 @@ impl App {
         let Some(origin) = self.collection_root_navigation_origin(fs_idx, false) else {
             return false;
         };
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return false;
+        };
         self.enqueue_or_reuse_collection_automatic_navigation(
             ctx,
             origin,
             CollectionNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 wraps: self.video_continuous_mode.wraps(),
             },
         )
@@ -2286,7 +2309,7 @@ impl App {
                 let _ = sender.send(result);
             });
         if spawn.is_err() {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
         self.top_level_grid_view
@@ -2334,7 +2357,7 @@ impl App {
                     CollectionNavigationTargetKind::OuterContainer,
                 );
             } else {
-                self.finish_collection_navigation_without_target(ctx, &request.action);
+                self.finish_collection_navigation_request_without_target(ctx, &request);
             }
             return;
         }
@@ -2427,7 +2450,7 @@ impl App {
                 let _ = sender.send(result);
             });
         if spawn.is_err() {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
         self.top_level_grid_view
@@ -2473,7 +2496,7 @@ impl App {
         match pending {
             CollectionNavigationPending::RequestNeeded { request, watch } => {
                 if !self.collection_navigation_request_is_current(&request) {
-                    self.finish_collection_navigation_without_target_no_context(&request.action);
+                    self.finish_collection_navigation_rejected_request(ctx, &request);
                 } else if !request.lease.is_due(Instant::now()) {
                     self.top_level_grid_view
                         .set_collection_navigation_pending(Some(
@@ -2490,35 +2513,36 @@ impl App {
             } => {
                 let observation = observe_revision(&watch, request.origin.collection_id);
                 match receiver.try_recv() {
-                    Ok(Ok(snapshot)) => match observation {
-                        RevisionObservation::Deleted => {
-                            self.finish_collection_navigation_without_target(ctx, &request.action)
+                    Ok(Ok(snapshot)) => {
+                        match observation {
+                            RevisionObservation::Deleted => self
+                                .finish_collection_navigation_request_without_target(ctx, &request),
+                            RevisionObservation::Revision(revision)
+                                if revision > snapshot.revision() =>
+                            {
+                                self.restart_collection_navigation(ctx, request)
+                            }
+                            _ if snapshot.collection_id() == request.origin.collection_id => self
+                                .spawn_collection_navigation_prepare(ctx, request, watch, snapshot),
+                            _ => self
+                                .finish_collection_navigation_request_without_target(ctx, &request),
                         }
-                        RevisionObservation::Revision(revision)
-                            if revision > snapshot.revision() =>
-                        {
-                            self.restart_collection_navigation(ctx, request)
-                        }
-                        _ if snapshot.collection_id() == request.origin.collection_id => {
-                            self.spawn_collection_navigation_prepare(ctx, request, watch, snapshot)
-                        }
-                        _ => self.finish_collection_navigation_without_target(ctx, &request.action),
-                    },
+                    }
                     Ok(Err(error)) if error.is_read_retryable() => {
                         self.defer_collection_navigation_read(ctx, request, Some(watch));
                     }
                     Ok(Err(error)) => {
-                        self.finish_collection_navigation_store_error(ctx, &request.action, &error)
+                        self.finish_collection_navigation_store_error(ctx, &request, &error)
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => self
                         .finish_collection_navigation_read_error(
                             ctx,
-                            &request.action,
+                            &request,
                             "応答が途切れました",
                         ),
                     Err(crossbeam_channel::TryRecvError::Empty) => {
                         if matches!(observation, RevisionObservation::Deleted) {
-                            self.finish_collection_navigation_without_target(ctx, &request.action);
+                            self.finish_collection_navigation_request_without_target(ctx, &request);
                         } else {
                             self.top_level_grid_view
                                 .set_collection_navigation_pending(Some(
@@ -2541,7 +2565,7 @@ impl App {
             } => match observe_revision(&watch, request.origin.collection_id) {
                 RevisionObservation::Deleted => {
                     cancel.store(true, Ordering::Release);
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 }
                 RevisionObservation::Revision(revision) if revision > exact_revision => {
                     cancel.store(true, Ordering::Release);
@@ -2591,7 +2615,7 @@ impl App {
                         self.finish_collection_navigation_without_target_no_context(&request.action)
                     }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.finish_collection_navigation_without_target(ctx, &request.action)
+                        self.finish_collection_navigation_request_without_target(ctx, &request)
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         self.top_level_grid_view
@@ -2617,7 +2641,7 @@ impl App {
             } => match observe_revision(&watch, request.origin.collection_id) {
                 RevisionObservation::Deleted => {
                     cancel.cancel();
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 }
                 RevisionObservation::Revision(revision)
                     if revision > prepared.collection_revision =>
@@ -2640,7 +2664,7 @@ impl App {
                         // poll observation and this landing reply.
                         match observe_revision(&watch, request.origin.collection_id) {
                             RevisionObservation::Deleted => self
-                                .finish_collection_navigation_without_target(ctx, &request.action),
+                                .finish_collection_navigation_request_without_target(ctx, &request),
                             RevisionObservation::Revision(revision)
                                 if revision > prepared.collection_revision =>
                             {
@@ -2659,7 +2683,7 @@ impl App {
                                 )
                             }
                             _ => self
-                                .finish_collection_navigation_without_target(ctx, &request.action),
+                                .finish_collection_navigation_request_without_target(ctx, &request),
                         }
                     }
                     Ok(Ok(None)) => {
@@ -2693,14 +2717,14 @@ impl App {
                                 CollectionNavigationTargetKind::OuterContainer,
                             );
                         } else {
-                            self.finish_collection_navigation_without_target(ctx, &request.action)
+                            self.finish_collection_navigation_request_without_target(ctx, &request)
                         }
                     }
                     Ok(Err(CollectionPrepareError::Cancelled)) => {
                         self.finish_collection_navigation_without_target_no_context(&request.action)
                     }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.finish_collection_navigation_without_target(ctx, &request.action)
+                        self.finish_collection_navigation_request_without_target(ctx, &request)
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         self.top_level_grid_view
@@ -2749,7 +2773,7 @@ impl App {
                         ));
                 } else {
                     self.pdf_password_request = None;
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 }
             }
             CollectionNavigationPending::PdfPasswordPreflighting {
@@ -2767,7 +2791,7 @@ impl App {
                     || matches!(observation, RevisionObservation::Deleted)
                 {
                     cancel.cancel();
-                    self.finish_collection_navigation_without_target(ctx, &request.action);
+                    self.finish_collection_navigation_request_without_target(ctx, &request);
                 } else if matches!(
                     observation,
                     RevisionObservation::Revision(revision)
@@ -2858,7 +2882,7 @@ impl App {
                         Ok(Ok(_))
                         | Ok(Err(_))
                         | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            self.finish_collection_navigation_without_target(ctx, &request.action)
+                            self.finish_collection_navigation_request_without_target(ctx, &request)
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => self
                             .top_level_grid_view
@@ -3007,11 +3031,20 @@ impl App {
         &self,
         request: &CollectionNavigationRequest,
     ) -> bool {
+        !self
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| matches!(session.load, CollectionGridLoadState::Deleted { .. }))
+            && self.collection_navigation_request_owner_is_current(request)
+    }
+
+    /// A deleted Collection cannot supply a target, but still owns its fullscreen EOF terminal.
+    fn collection_navigation_request_owner_is_current(
+        &self,
+        request: &CollectionNavigationRequest,
+    ) -> bool {
         let owner_current = match self.top_level_grid_view.collection_session() {
-            Some(session) => {
-                session.identity.collection_id == request.origin.collection_id
-                    && !matches!(session.load, CollectionGridLoadState::Deleted { .. })
-            }
+            Some(session) => session.identity.collection_id == request.origin.collection_id,
             None => matches!(
                 self.top_level_grid_view.return_to(),
                 Some(TopLevelGridRestore::Collection(restore))
@@ -3044,27 +3077,40 @@ impl App {
             CollectionNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             }
             | CollectionNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             } => {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_continuous_mode.is_enabled()
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+                    && self.media_navigation_eof_transport_is_current(
+                        *fs_idx,
+                        *seek_serial,
+                        *player_identity,
+                    )
             }
             #[cfg(windows)]
             CollectionNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             } => {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_continuous_mode.is_enabled()
                     && self.video_audio_mode == Some(*fs_idx)
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+                    && self.media_navigation_eof_transport_is_current(
+                        *fs_idx,
+                        *seek_serial,
+                        *player_identity,
+                    )
             }
             CollectionNavigationAction::OuterGrid { .. } => {
                 self.fullscreen_idx.is_none()
@@ -3666,13 +3712,13 @@ impl App {
             .as_ref()
             .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
         {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
 
         match observe_revision(&watch, request.origin.collection_id) {
             RevisionObservation::Deleted => {
-                self.finish_collection_navigation_without_target(ctx, &request.action);
+                self.finish_collection_navigation_request_without_target(ctx, &request);
                 return;
             }
             RevisionObservation::Revision(revision) if revision > prepared.collection_revision => {
@@ -3698,7 +3744,7 @@ impl App {
             return;
         }
         if !self.collection_navigation_exact_target_is_current(&request, &prepared, &ready.target) {
-            self.finish_collection_navigation_without_target(ctx, &request.action);
+            self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
         let loops_current_media = request
@@ -3729,7 +3775,7 @@ impl App {
                     Ok(request) => request,
                     Err(reason) => {
                         self.show_open_admission_refusal(reason);
-                        self.finish_collection_navigation_without_target(ctx, &request.action);
+                        self.finish_collection_navigation_request_without_target(ctx, &request);
                         return;
                     }
                 };
@@ -4382,6 +4428,65 @@ impl App {
         ctx.request_repaint();
     }
 
+    fn finish_collection_navigation_rejected_request(
+        &mut self,
+        ctx: &egui::Context,
+        request: &CollectionNavigationRequest,
+    ) {
+        if request.action.is_media_eof()
+            && self.collection_navigation_request_owner_is_current(request)
+        {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
+        } else {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+        }
+    }
+
+    fn finish_collection_navigation_request_without_target(
+        &mut self,
+        ctx: &egui::Context,
+        request: &CollectionNavigationRequest,
+    ) {
+        if !request.action.is_media_eof()
+            || self.collection_navigation_request_owner_is_current(request)
+        {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
+        } else {
+            self.finish_collection_navigation_without_target_no_context(&request.action);
+        }
+    }
+
+    fn finish_collection_navigation_eof(&mut self, action: &CollectionNavigationAction) -> bool {
+        match action {
+            CollectionNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            }
+            | CollectionNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
+                true
+            }
+            #[cfg(windows)]
+            CollectionNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+                ..
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn finish_collection_navigation_without_target(
         &mut self,
         ctx: &egui::Context,
@@ -4431,26 +4536,26 @@ impl App {
             CollectionNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             }
             | CollectionNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             } => {
-                #[cfg(windows)]
-                self.finish_local_now_playing_eof(*fs_idx, *seek_serial);
-                #[cfg(not(windows))]
-                let _ = (fs_idx, seek_serial);
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
                 self.show_feedback_toast("コレクション末尾です".into());
             }
             #[cfg(windows)]
             CollectionNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
                 ..
             } => {
-                self.finish_local_now_playing_eof(*fs_idx, *seek_serial);
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
                 self.show_feedback_toast("コレクション末尾です".into());
             }
         }
@@ -6582,6 +6687,7 @@ mod tests {
         let video = CollectionNavigationAction::VideoContinuousEof {
             fs_idx: 0,
             seek_serial: 7,
+            player_identity: 0,
             wraps: false,
         };
         assert!(!pending.matches_automatic_intent(&origin_at_request, &video));
@@ -6590,6 +6696,7 @@ mod tests {
             &CollectionNavigationAction::VideoContinuousEof {
                 fs_idx: 0,
                 seek_serial: 8,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -6610,6 +6717,7 @@ mod tests {
             &CollectionNavigationAction::VideoContinuousEof {
                 fs_idx: 0,
                 seek_serial: 7,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -6618,6 +6726,7 @@ mod tests {
             &CollectionNavigationAction::VideoContinuousEof {
                 fs_idx: 0,
                 seek_serial: 8,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -6626,6 +6735,7 @@ mod tests {
             &CollectionNavigationAction::MusicContinuousEof {
                 fs_idx: 0,
                 seek_serial: 7,
+                player_identity: 0,
                 wraps: false,
             },
         ));
@@ -8444,6 +8554,233 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn now_playing_collection_eof_terminal_errors_and_cancellations_respect_request_owner() {
+        use crate::effetune::NowPlayingOwner;
+        use crate::video::{PlaybackStartOrigin, VideoContinuousMode, VideoPlayer};
+        for kind in ["music", "video", "audio_mode"] {
+            for terminal in [
+                "read_error",
+                "disconnected",
+                "prepare_error",
+                "deleted",
+                "deleted_disconnected",
+                "deleted_deferred",
+                "deleted_admission",
+                "cancelled",
+                "superseded",
+                "context",
+                "player",
+                "seek",
+            ] {
+                let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+                let temp = tempfile::tempdir().unwrap();
+                let (mut app, client) = start_ready_app(&temp.path().join("eof.db"));
+                let created = recv(client.create_collection("eof".into()).unwrap());
+                let collection_id = created.collection_id();
+                app.top_level_grid_view.begin(
+                    TopLevelGridSurface::Collection(CollectionGridIdentity { collection_id }),
+                    None,
+                );
+                let path = temp.path().join("failed-eof.mp3");
+                app.items = vec![if kind == "music" {
+                    super::super::GridItem::Audio(path.clone())
+                } else {
+                    super::super::GridItem::Video(path.clone())
+                }];
+                app.fullscreen_idx = Some(0);
+                if kind == "audio_mode" {
+                    app.video_audio_mode = Some(0);
+                }
+                app.video_continuous_mode = VideoContinuousMode::ContinuousLoop;
+                let player = VideoPlayer::local_ready_disconnected_for_test(path);
+                player.bind_playback_viewer_context(app.projected_viewer_context_id().serial());
+                player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+                let identity = player.media_identity();
+                let success = player.take_playback_success().unwrap();
+                player.set_loop_enabled(false);
+                player.mark_eof_for_test(30.0);
+                let serial = player.current_seek_serial();
+                app.fs_cache.insert(
+                    0,
+                    super::super::FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+                app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+                assert_eq!(
+                    app.effetune.now_playing_owner(),
+                    Some(NowPlayingOwner::Local(identity))
+                );
+                app.video_continuous_last_eof = Some((0, serial));
+                let action = match kind {
+                    "music" => CollectionNavigationAction::MusicContinuousEof {
+                        fs_idx: 0,
+                        seek_serial: serial,
+                        player_identity: identity,
+                        wraps: true,
+                    },
+                    "video" => CollectionNavigationAction::VideoContinuousEof {
+                        fs_idx: 0,
+                        seek_serial: serial,
+                        player_identity: identity,
+                        wraps: true,
+                    },
+                    "audio_mode" => CollectionNavigationAction::VideoAudioModeContinuousEof {
+                        fs_idx: 0,
+                        seek_serial: serial,
+                        player_identity: identity,
+                        wraps: true,
+                    },
+                    _ => unreachable!(),
+                };
+                let mut request = CollectionNavigationRequest {
+                    origin: CollectionNavigationOrigin {
+                        context_id: app.collection_grid_context_id(),
+                        collection_id,
+                        surface_generation: app.top_level_grid_view.generation(),
+                        items_generation: app.items_generation,
+                        intent_sequence: app.top_level_grid_view.collection_navigation_sequence(),
+                        anchor: None,
+                    },
+                    action,
+                    root_thumbnail_sources: None,
+                    perf_started_at: None,
+                    lease: navigation_test_lease(),
+                    book_owner: None,
+                    navigation: None,
+                };
+                assert!(app.collection_navigation_request_is_current(&request));
+                let revision = app.effetune.now_playing_snapshot_for_test().revision;
+                let ctx = egui::Context::default();
+                match terminal {
+                    "deleted"
+                    | "deleted_disconnected"
+                    | "deleted_deferred"
+                    | "deleted_admission" => {
+                        app.top_level_grid_view
+                            .collection_session_mut()
+                            .unwrap()
+                            .load = CollectionGridLoadState::Deleted { installed: None };
+                        assert!(!app.collection_navigation_request_is_current(&request));
+                        assert!(app.collection_navigation_request_owner_is_current(&request));
+                    }
+                    "superseded" => {
+                        app.top_level_grid_view
+                            .advance_collection_navigation_sequence();
+                    }
+                    "context" => {
+                        request.origin.context_id = super::super::ViewerContextId::for_test(
+                            app.projected_viewer_context_id().serial() + 100,
+                        );
+                    }
+                    "player" => {
+                        let replacement = VideoPlayer::local_ready_disconnected_for_test(
+                            temp.path().join("replacement.mp3"),
+                        );
+                        replacement.mark_eof_for_test(30.0);
+                        app.fs_cache.insert(
+                            0,
+                            super::super::FsCacheEntry::Video {
+                                player: Box::new(replacement),
+                                load_seq: 0,
+                            },
+                        );
+                    }
+                    "seek" => {
+                        if let Some(super::super::FsCacheEntry::Video { player, .. }) =
+                            app.fs_cache.get(&0)
+                        {
+                            player.seek(0.0, crate::video::SeekOrigin::User);
+                        }
+                    }
+                    _ => {}
+                }
+                if terminal == "deleted_deferred" {
+                    app.top_level_grid_view
+                        .set_collection_navigation_pending(Some(
+                            CollectionNavigationPending::RequestNeeded {
+                                request,
+                                watch: None,
+                            },
+                        ));
+                    app.poll_collection_navigation(&ctx);
+                } else if terminal == "deleted_admission" {
+                    app.start_or_defer_collection_navigation(&ctx, request, None);
+                } else if matches!(terminal, "prepare_error" | "cancelled") {
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    if terminal == "cancelled" {
+                        sender.send(Err(CollectionPrepareError::Cancelled)).unwrap();
+                    }
+                    drop(sender);
+                    app.top_level_grid_view
+                        .set_collection_navigation_pending(Some(
+                            CollectionNavigationPending::Preparing {
+                                request,
+                                watch: client.subscribe().unwrap(),
+                                exact_revision: created.revision(),
+                                cancel: Arc::new(AtomicBool::new(false)),
+                                receiver,
+                            },
+                        ));
+                    app.poll_collection_navigation(&ctx);
+                } else if matches!(terminal, "disconnected" | "deleted_disconnected") {
+                    let (sender, receiver) = crossbeam_channel::unbounded();
+                    drop(sender);
+                    app.top_level_grid_view
+                        .set_collection_navigation_pending(Some(
+                            CollectionNavigationPending::Snapshot {
+                                request,
+                                watch: client.subscribe().unwrap(),
+                                receiver,
+                            },
+                        ));
+                    app.poll_collection_navigation(&ctx);
+                } else {
+                    if terminal == "deleted" {
+                        app.finish_collection_navigation_request_without_target(&ctx, &request);
+                    } else {
+                        app.finish_collection_navigation_read_error(
+                            &ctx,
+                            &request,
+                            "fixture failure",
+                        );
+                    }
+                }
+                let is_failure = matches!(
+                    terminal,
+                    "read_error"
+                        | "disconnected"
+                        | "prepare_error"
+                        | "deleted"
+                        | "deleted_disconnected"
+                        | "deleted_deferred"
+                        | "deleted_admission"
+                );
+                assert_eq!(
+                    app.effetune.now_playing_owner().is_none(),
+                    is_failure,
+                    "{kind}/{terminal}"
+                );
+                assert_eq!(
+                    app.video_continuous_last_eof,
+                    is_failure.then_some((0, serial)),
+                    "{kind}/{terminal}"
+                );
+                if !is_failure {
+                    assert_eq!(
+                        app.effetune.now_playing_snapshot_for_test().revision,
+                        revision,
+                        "{kind}/{terminal}"
+                    );
+                }
+                app.shutdown_collection_runtime_for_exit();
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn now_playing_collection_same_source_eof_reuses_start_and_final_tail_clears() {
         use crate::effetune::NowPlayingOwner;
         use crate::video::{PlaybackStartOrigin, VideoContinuousMode, VideoPlayer};
@@ -8498,6 +8835,7 @@ mod tests {
         request.action = CollectionNavigationAction::MusicContinuousEof {
             fs_idx: 0,
             seek_serial: serial,
+            player_identity: identity,
             wraps: true,
         };
         // handle_music_continuous_eof claims this generation before enqueueing navigation.
@@ -8542,6 +8880,7 @@ mod tests {
             &CollectionNavigationAction::MusicContinuousEof {
                 fs_idx: 0,
                 seek_serial: serial,
+                player_identity: identity,
                 wraps: false,
             },
         );
@@ -9254,6 +9593,7 @@ mod tests {
         let eof = CollectionNavigationAction::MusicContinuousEof {
             fs_idx: 4,
             seek_serial: 9,
+            player_identity: 0,
             wraps: true,
         };
         assert_eq!(eof.target_kind(), CollectionNavigationTargetKind::Audio);

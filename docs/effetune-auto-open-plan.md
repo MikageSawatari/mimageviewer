@@ -73,6 +73,9 @@
   最終的な新startの要否はactorの既存ガードで決める。内部pauseはユーザーpauseに読み替えない。
   初回playがscan待ちならAwaitingSuccessが維持され、初めてPlayingになったときだけ成功を生成する。
   既に成功済みの継続再生を測定した場合はEstablishedのままなので、復帰しても成功を再生成しない。
+  actorは非EOFのSuccessReady／Establishedに対するUserPlay再登録も保持する。
+  transportのautoplay=falseだけではユーザーpauseと判断しない。ユーザーpauseはstartをNoneへ破棄し、
+  DSP／normalizeの内部pauseは既存startを保持するため、後続のseek／playもこの区別に従う。
 - `SuccessReady` はpollで取り出すと**適格性に関係なくEstablishedへ遷移**する。
   設定OFF／全画面／tray／最小化／Remote／対象外／Spentでもdrainして棄却する。
   設定ON時だけ成功を読む早期returnは不可。判定時に現在source・viewer bindingが一致し、
@@ -121,6 +124,37 @@ EOFも最終EOFとしてclearしていた。登録と最終EOF確定を既存の
 真のユーザーpause後はSpace同様に新UserPlay。autoplay準備中（実Playing前／intent=true）のseekは
 初回startを保持し、既存AwaitingをDSP／normalizeへ委譲しても成功は一度だけ消費する。
 連続再生の同source巻戻しはLoopのままで自動表示の判定機会を増やさない。
+
+### 内部停止と終端エラーの追補（2026-10-17 独立レビュー P2）
+
+内部停止中のUserPlay登録漏れ防止は入口のintentだけでは完結しない。actorの既存PlaybackStartを
+正本とし、成功済みstartを保持する。新boolや別のpendingは追加しない。
+
+| 同型の再開入口 | 登録／破棄の規則 |
+| --- | --- |
+| `seek`／`seek_relative`／再生する`seek_with_play_state`（W・HUD・バー・マーカー等） | EOFまたはintentなしでDSP取得前に登録要求。actorがAwaitingと非EOFの成功済みstartを保持 |
+| `toggle_play`（Space・HUD・音楽／fullscreen） | 同じactor規則。ユーザーPause／DSP取得取消はstartを破棄 |
+| nativeのnormalize委譲前の登録、`set_playing_with_origin(true, UserPlay)` | 同じactor規則。normalizeの内部Pause／復帰は破棄しない |
+
+新規／cached openは明示したNewSource／ContinuousAdvanceであり、このUserPlayの重複抑止とは分ける。
+
+連続EOFの候補解決では次の終端を区別する。context照合は既存request／pendingを再利用し、
+EOF actionに開始時のplayer identityを保持する。context tokenの二重管理や別窓移譲の変更は不要。
+長い処理のモーダル化は通常のseek／navigationを制限するため採らず、既存ownerで確定する。
+
+| 経路／終端 | Now Playing／EOF claim |
+| --- | --- |
+| Collection read client不在、subscribe／loadの終端エラー、snapshot応答切断 | requestのcontext・surface・items・intentと元player・seek世代を照合し、現在のEOFだけclear。claimは処理済みで保持 |
+| Collection削除・候補なし、prepare／preflightの開始失敗・エラー・応答切断 | request所有の終端も同じ照合を通す。元playerの最終EOFをclearしclaim保持 |
+| Folder resolverの開始失敗・送信失敗・応答切断・resolver消失 | 同期受付またはpendingのowner window・items・入力・fullscreenを照合し、元player・seek世代のEOFだけclear。claim保持 |
+| supersede、古いrequest／result、別contextによる取消、workerのCancelled | clearしない。既存の取消／dedup解除のみ |
+| CollectionのretryableなBusy／Starting、revision更新による再準備 | 非終端。既存待機／再準備を継続しclearしない |
+| PDF password取消／開始失敗／古い対象 | 静止画・外側コンテナ用。media EOF候補はPDFを選ばないためEOF clear対象外 |
+
+終端エラーでclaimを戻すと同じEOFを自動再要求し、clear後に内部Loopが再開し得るため戻さない。
+CollectionのDeletedは新targetの採用を拒否するが、同じcontextに残ったplayerのEOF終端は許可する。
+採用可否とrequestの所有証明を分け、削除だけで終端をstale取消へ読み替えない。
+再試行・復旧処理や再公開専用の状態は追加しない。
 
 ## 適格性・非同期表示の境界
 

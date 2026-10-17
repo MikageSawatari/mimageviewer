@@ -269,7 +269,15 @@ impl EngineActor {
     /// Register before normalization/DSP delegation can pause the transport.
     pub fn register_playback_start(&mut self, origin: PlaybackStartOrigin) {
         if origin == PlaybackStartOrigin::UserPlay {
-            if matches!(self.playback_start, PlaybackStart::AwaitingSuccess { .. }) {
+            // Internal pauses retain the logical start even when transport autoplay is false.
+            // Only EOF, or a user pause that discarded the start, can start a new UserPlay.
+            if matches!(self.playback_start, PlaybackStart::AwaitingSuccess { .. })
+                || (self.state != EngineState::Eof
+                    && matches!(
+                        self.playback_start,
+                        PlaybackStart::SuccessReady(_) | PlaybackStart::Established { .. }
+                    ))
+            {
                 return;
             }
             if self.opts.autoplay && self.state != EngineState::Eof {
@@ -1091,6 +1099,29 @@ mod tests {
                 "continuation {continuation:?}"
             );
             assert!(actor.playback_success_is_current(success.id));
+        }
+    }
+
+    #[test]
+    fn playback_start_user_play_during_internal_pause_preserves_ready_or_established_start() {
+        for drain_first in [false, true] {
+            for continuation in [InternalContinuation::Dsp, InternalContinuation::Normalize] {
+                let (mut actor, _) = playback_start_actor(true, true);
+                playback_start_first_frame(&mut actor);
+                let first = actor.pending_playback_success_for_test().unwrap();
+                if drain_first {
+                    assert_eq!(actor.take_playback_success(), Some(first));
+                }
+                actor.apply_internal_continuation(false, continuation);
+                assert!(!actor.opts.autoplay);
+                actor.register_playback_start(PlaybackStartOrigin::UserPlay);
+                actor.apply_internal_continuation(true, continuation);
+                if !drain_first {
+                    assert_eq!(actor.take_playback_success(), Some(first));
+                }
+                assert!(actor.take_playback_success().is_none());
+                assert!(actor.playback_success_is_current(first.id));
+            }
         }
     }
 

@@ -571,6 +571,11 @@ sidecarの全file無制限read、EXIF全展開は新経路へ持ち込まない�
   連続再生の候補確認中は最終EOFではない。playerのcancel／errorはreconcile、単体再生の最終EOF
   (連続進行しないタイルを含む) はAppのpoll末尾、連続再生の次候補なしは既存navigationの結果確定でclearする。
   Collectionの同source再利用も保持し、最終結果は現在のplayer／seek世代／EOF／metadata ownerに一致させる。
+  Collection読取／応答切断、Folder候補resolverの終端失敗も最終停止として既存clearへ合流する。
+  既存request／pendingのcontext・世代と、EOF actionに保持した元player identity・seek世代を照合する。
+  supersede／別context／staleによる取消はclearしない。終端失敗はEOF claimを保持して同じEOFを再要求しない。
+  DSP／normalizeの内部Pause中のユーザーseek／playは既存の成功済みPlaybackStartを保持する。
+  ユーザーPauseでstartを破棄した後の再開とEOF後の再開だけが新UserPlayとなる。
   sourceの明示refresh／pin更新／metadata変更は同じmediaでも新revision。
   定期file pollやframeごとのbase64生成をしない。
 - ownerはtypedな `Empty` / `Media { identity, revision, text, artwork: Pending|Absent|Ready }` を

@@ -85148,6 +85148,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             action: MediaNavigationAction::VideoContinuousEof {
                 fs_idx: video,
                 seek_serial: 99,
+                player_identity: 0,
             },
             started_at: std::time::Instant::now(),
         });
@@ -86130,6 +86131,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             action: MediaNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity: 0,
             },
             started_at: std::time::Instant::now(),
         });
@@ -86158,16 +86160,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx: key.0,
                 seek_serial: key.1,
+                player_identity: 0,
             },
             MediaNavigationAction::MusicContinuousEof {
                 fs_idx: key.0,
                 seek_serial: key.1,
+                player_identity: 0,
             },
         ];
         #[cfg(windows)]
         actions.push(MediaNavigationAction::VideoAudioModeContinuousEof {
             fs_idx: key.0,
             seek_serial: key.1,
+            player_identity: 0,
         });
 
         for action in actions {
@@ -101225,6 +101230,7 @@ mod rating_write_failure_tests {
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx: 1,
                 seek_serial: 2,
+                player_identity: 0,
             }
             .history_trigger(),
             HistoryTrigger::AutoAdvance
@@ -101234,6 +101240,7 @@ mod rating_write_failure_tests {
             MediaNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx: 1,
                 seek_serial: 2,
+                player_identity: 0,
             }
             .history_trigger(),
             HistoryTrigger::AutoAdvance
@@ -101242,6 +101249,7 @@ mod rating_write_failure_tests {
             MediaNavigationAction::MusicContinuousEof {
                 fs_idx: 1,
                 seek_serial: 2,
+                player_identity: 0,
             }
             .history_trigger(),
             HistoryTrigger::AutoAdvance

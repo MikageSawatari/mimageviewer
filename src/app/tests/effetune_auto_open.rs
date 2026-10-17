@@ -95,6 +95,52 @@ fn effetune_auto_open_same_source_eof_loop_does_not_reconsider_armed_session() {
 }
 
 #[test]
+fn effetune_auto_open_internal_pause_user_seek_or_play_keeps_armed() {
+    for route in ["w", "bar", "space"] {
+        let mut app = setup_app_for_test();
+        prepare(&mut app);
+        app.settings.effetune_auto_open_on_video = false;
+        app.publish_effetune_auto_setting();
+        let path = app.tmp.path().join("internal-pause.mp4");
+        successful_player(&mut app, path);
+        let ctx = egui::Context::default();
+        app.poll_video(&ctx);
+        assert!(!requested(&app));
+        app.settings.effetune_auto_open_on_video = true;
+        app.publish_effetune_auto_setting();
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) {
+            player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
+        }
+        match route {
+            "w" => app.handle_native_video_seek_to_start_command(&ctx, 0),
+            "bar" => app.handle_native_video_seek_command(&ctx, 0, 5.0),
+            "space" => app.handle_native_video_toggle_play_command(&ctx, 0),
+            _ => unreachable!(),
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) {
+            player.complete_seek_for_test(5.0);
+            player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
+            assert!(
+                player.pending_playback_success_for_test().is_none(),
+                "{route}"
+            );
+        }
+        app.poll_video(&ctx);
+        assert!(!requested(&app), "{route}");
+        // A genuine user pause discards the old start; the next user start can still open.
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&0) {
+            player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::UserPlay);
+        }
+        app.poll_video(&ctx);
+        assert!(
+            requested(&app),
+            "internal continuation must leave Armed: {route}"
+        );
+    }
+}
+
+#[test]
 fn effetune_auto_open_poll_accepts_adopted_success_once() {
     let mut app = setup_app_for_test();
     let gate = prepare(&mut app);
