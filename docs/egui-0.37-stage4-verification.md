@@ -1,5 +1,7 @@
 # egui 0.37 段4 検証台帳
 
+> 2026-10-17 `1992ef33a` 後の追補: 末尾「interaction snapshotによる先行focus案の評価」を追加した。snapshotのhit所有確定という前提は成立するが、先行focus単独では誤配送・IME重複・入力欠落が残り、今回指示の採用条件を満たさない。製品/vendor実装は未変更で返す。
+
 > 2026-10-17 採択後の追補: 対象HEADは `017f1d8b1`。利用者は0.37の字面/baseline/hinting（保存値維持）・色付きemoji・寸法を採択した。今回の補修・検証は末尾「採択後の補修」を正本とし、以下の未採択時点の比較・結果は履歴として保持する。HEXは別の入力契約であり、TextEdit外への影響が必要なら実装前停止、という追加指示を適用する。
 
 対象は `65beeb2f0` からの未コミット差分。Rust 1.99.0、Windows、egui/eframe 0.37.0、wgpu 30、offline。以下は**実装担当の内部確認**であり、利用者による外観採択・設計担当の受入とは区別する。段3の分類第3版と独立レビューACCEPTは過去の証拠として保持する。
@@ -330,3 +332,65 @@ relatedの失敗は `file_organize_destinations_location_toggle_snapshot`、`fil
 - **HEXは設計範囲の判断待ち、4aは受入保留。** 前述のAtom側の純粋配置/再layoutとFnOnceの扱いを設計担当へ返す。両方向・singleline/multiline・hint/prefix/suffix・IME・選択/caret・Ctrl+A/helperの追加回帰、およびvendor PATCHES記録は修正実装とともに行う。既存HEX回帰を操作分割等で成功へ変えていない。
 - `target/egui037-stage4-adopt-final-validation.json` に復元後の4 Rust source hash、5件＋新規scope/既存固定操作の7件成功、変異4失敗、各最終command、baseline **445枚不変**を保存した。段3の分類第3版・既存HUD/metadata課題・§1.380残件は変更していない。
 - HEAD `017f1d8b1` / branch `egui-036` の未コミット差分。git add/commit/branch操作/pushなし。lib全件・live・製品起動・test-fullなし。HEXで自動test greenの前提が成立していないためverification binaryも作成していない。
+
+## interaction snapshotによる先行focus案の評価（2026-10-17、1992ef33a）
+
+**実装担当の内部確認。** 対象HEADは寸法採択補修を含む `1992ef33a`、開始時worktreeはclean。設計担当の小さい案をsourceと一時的なvendor単体診断で評価した。**採用条件を満たさず、製品/vendorの恒久実装は行わない。** この結論は先行focus単独案についてであり、Atom全体の作り直しが唯一の解であると確定したものではない。
+
+### 1. snapshotの前提は成立するが、focus/selectionの全処理ではない
+
+- `context.rs` のbegin_pass（521–559付近）は、前passのwidget rect・今passのpointer入力からhit testを行い、`interaction::interact` により `InteractionSnapshot` を確定する。
+- `get_response`（1813–1952付近）はこのsnapshotを読み、今widgetのenabled/sense、pointer press/release、潜在click/drag owner等からResponseを作る。今passにrectが移動しても、新たなhit testは行わない。診断 `snapshot_focus_probe_moved_rect_keeps_begin_pass_click_owner` は、今rectがclick位置を含まない配置へ移っても、begin_passで決まったclicked ownerと実Responseが一致することを検査し成功した。
+- ただし「interactはそれを読むだけ」はfocusまで含めると不正確。`get_response` は `SurrenderFocusOn` とhoverから旧focusをsurrenderする副作用も持つ。さらにTextEditのfocus要求はbuilderの `pointer_interaction` / clicked後であり、カーソル配置はそこで初めて行われる。
+- **前の静的な推測を補正:** TextEdit冒頭の `ui.widget_style(id, &classes)`（builder 543付近）→`theme/mod.rs::widget_style`（32付近）→`read_response`→`get_response` により、既にevents前にも通常のsurrenderが起きる。このため「旧欄が先ならpress/release同batchでも必ず旧欄へ入る」という推測は誤り。focusだけ先行する診断でも、release同batchでは旧欄を変えず新欄へ入力できた。defaultは `SurrenderFocusOn::Clicks` なので、**releaseのないpressだけのbatchではこのsurrenderは起きない**。
+
+snapshotは新しい判定源として有効であり、旧rectへ独自fallbackして判定し直す必要はない。しかし、それだけで0.33の「pointer selection→events」の順序にはならない。
+
+### 2. caret位置だけに収まらない反例
+
+診断はTextEditの `owns_ime_events` 取得直前へ `cfg(test)` の仮hookを入れた。enabled/interactive・click/drag sense・mouse primaryの通常欄だけで調べた。focus-only版と、events前に追加の `read_response` を呼ぶ版を用意した。後者は通常もtheme経由で既に呼ばれるsurrender判定を繰り返すもので、既存の呼出しより早める変更ではない。内部の古い矩形をcursor配置には使わず、Atom配置・events・後続pointer処理は変更していない。これらの限られた条件で反例があるため、全pointer種類の実装へ進めない。
+
+| 操作・条件 | 仮案の実測 | 判定 |
+|---|---|---|
+| press/release＋Ctrl+A＋Text、両方向、singleline/multiline、装飾なし/あり | 新欄だけを `X` に置換、旧欄不変。全8条件成功 | HEXと同じ全選択置換は成立。ただし後のpointer選択はevents後に走る |
+| 旧欄Aを先に描画、Bへのpress＋Ctrl+A＋Text（releaseなし）、default Clicks | `['old','new']` → **`['X','X']`**。events前に追加のread_responseを呼ぶ版でも検出 | 旧欄AがTextを先に処理し、Bも同じfiltered eventsを読む。入力は消費されずcloneされるため二重配送。誤欄への変更でありcaret差ではない |
+| `abcdef` の `bcd` を選択中、末尾click＋Text `X` | **`aXef`**（single/multiline×装飾有無の全4条件）。0.33順序なら `abcdefX` | 既存選択をclickで解除する前にTextが置換。旧文字列の削除を伴い、caret位置だけではない。既存0.37にもある順序差を先行focusだけでは解消できない |
+| click＋Preedit `a`、次pass Commit `A`、新欄は空 | 装飾なしは **`aA`**、hint/prefix/suffixありは **`Aa`**。single/multilineの全4条件 | click処理がcompositionの選択をcollapseし `cursor_purpose=Selection` に戻す。次commitがpreeditを置換できず未確定文字が残る |
+| click＋Preedit `a`＋Commit `A` を同batch、両方向、single/multiline×装飾有無 | 新欄だけ `A`、全8条件成功 | events内で完結する組合せは成立するが、上のpassを跨ぐ通常IMEを保証しない |
+| `owns_ime_events` を読んだ後にだけ先行focus | 新欄がfocusを得ても、同batch Commit `A` は**未入力（空）** | optsの所有値がfalseのまま。取得順を後へずらす必要があるが、それだけでは上のcomposition破壊を解消しない |
+
+文字挿入位置についても、既存caretを使うevents→clickの順のままなので、click位置へ挿入する0.33の順序を再現できない。Ctrl+Aは挿入範囲を全選択で上書きするため文字内容だけは一致する。hint・prefix/suffixはこの順序差を解消せず、empty hint galleyとpointer位置の違いでIMEの残る文字順まで変わることを上表で確認した。AtomのFnOnceを再実行する変更は一切加えていない。
+
+IME所有の根拠は `memory/mod.rs::owns_ime_events`（1081付近、現在のhas_focusを返す）、`request_focus`（935付近、IME中断要求も発行）、builderの所有取得617・events呼出し676・IME受付1382・Preedit/Commit1450–1477・後続pointer872–885。欄に渡す所有値・composition選択・pointerによるfocus/selectionを揃える設計が必要であり、入力延期・batch分割・追加repaint・アプリguard・IME helperでの吸収は実装していない。
+
+### 3. 診断証拠と復元
+
+`target/egui037-snapshot-focus-probe.rs` は候補の評価用コード、`target/egui037-snapshot-focus-probe-builder.rs` は仮hookを含むsource保存、`target/egui037-snapshot-focus-probe.py` はfinallyで元bytesへ復元する実行器。**恒久の成功回帰として追加したものではなく、採用候補に契約assertを向けた診断**である。製品/vendor差分、PATCHES変更、新ignoreは残していない。元 `hex_focus_transfer_keeps_the_new_editors_partial_input` は維持する。
+
+- 初回compileは診断側の `Id::from(&str)` が未実装で失敗し、`Id::new` へ修正した。初回logを `snapshot-focus-probe-compile-error.log` に保存。compile失敗を反例の根拠にしない。
+- `snapshot-focus-probe`: 6選択/2成功/4契約失敗、ignore0、exit101 / 4.25秒。最初の条件だけで失敗したmatrixを、次の版では全条件を走査してから集約assertするようにした。
+- **`snapshot-focus-probe-v2`: 8選択/4成功/4契約失敗、ignore0、exit101 / 6.39秒。** 上表の誤配送、既存選択の削除、IME重複、IME欠落をそれぞれ独立したtestで検出した。snapshot/移動rect、release時のfocus-only、Ctrl+A matrix、IME同batch matrixは成功。PNG/GPU初期化を使わないpure UI診断である。
+- 復元後のSHA-256とexact bytes一致は `target/egui037-snapshot-focus-probe-restored.json`。builderの `git diff` も空。最終filterは仮hookを除いた正式graphで実行する。
+- 別contextのSol/xhighも読み取り専用でsource確認し、既存選択の削除・IME composition破壊・press-only誤配送はcaret差の範囲外という判断で一致した。上のthemeによる既存の早期surrenderを含め、実測結果を最終の根拠とする。
+
+**設計担当への返却:** snapshotに関する前提そのものを否定する理由はない。一方、先行focusだけの案は今回認められた「差があってもcaret位置だけ」の条件を満たさないため採用しない。pointer selectionとevents、IME所有確定の順序を一緒に扱う次の設計判断が必要。今回の判断だけでAtom配置変更を開始しない。ime_focus helperの製品経路は正式graphのfocus/ime filterで既存回帰を確認し、新案の成立確認や追加回帰の完了とは扱わない。
+
+### 4. 復元後の限定検証
+
+`target/egui037-stage4-snapshot-final-<label>.json/.log` にcommand・集計・失敗本文を保存した。offline / jobs1 / MSBuild node reuse無効 / snapshot更新変数なし。vendor testの成功は仮案を除いた正式sourceに対する結果である。
+
+| label / コマンド（すべて `--offline`） | 選択 / 成功 / 失敗 / ignore | exit / 秒 |
+|---|---|---|
+| `focus` / `cargo test -p mimageviewer --lib focus` | 136 / 135 / 1既知HEX / 0 | 101 / 142.13 |
+| `ime` / `cargo test -p mimageviewer --lib ime` | 504 / 498 / 3 PNG / 3既存 | 101 / 102.67 |
+| `keyboard` / `cargo test -p mimageviewer --lib keyboard` | 51 / 51 / 0 / 0 | 0 / 7.04 |
+| `vendor-text_edit` / `cargo test -p egui --lib text_edit` | 4 / 4 / 0 / 0 | 0 / 5.34 |
+| `vendor-text_cursor_state` / `cargo test -p egui --lib text_cursor_state` | 9 / 9 / 0 / 0 | 0 / 0.75 |
+| `vendor-ime_interrupt` / `cargo test -p egui --lib ime_interrupt` | 6 / 6 / 0 / 0 | 0 / 0.53 |
+| `all-tests` / `cargo test -p mimageviewer --tests --no-run` | 23 test executableのコンパイル、実行なし | 0 / 95.75 |
+| `fmt` / `cargo fmt --check`（offline環境） | 成功 | 0 / 15.22 |
+| `diff` / `git diff --check` | 成功 | 0 / 0.03 |
+
+focusの唯一の失敗は元 `hex_focus_transfer_keeps_the_new_editors_partial_input` の元assert。imeの失敗は `timeline_bass_partial_raster_snapshot`、`timeline_key_states_raster_snapshot`、`native_video_adjustment_anime4k_panel_snapshot` の画像比較のみ。既存ignoreは変更せず、0選択・仮案のcompile失敗・元HEXの失敗を成功扱いにしていない。
+
+最終照合は `target/egui037-snapshot-focus-final-validation.json`。builderはHEADのbytesと完全一致、baseline PNG445枚のhash不変、診断8件/失敗4件、正式graphの全9 commandと23 executableを照合した。追跡対象の変更はこの台帳のみ。HEAD `1992ef33a` / branch `egui-036` のまま、git add/commit/branch操作/pushなし。lib全件・live・製品起動・test-fullなし。製品挙動を変更していない調査・文書のみの引渡しなのでverification binaryは作成していない。
