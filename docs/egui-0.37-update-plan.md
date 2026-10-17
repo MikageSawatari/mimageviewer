@@ -2,6 +2,8 @@
 
 # 改訂履歴
 
+- **2026-10-17 HEX操作差の採択:** 別欄からのpointer click（press/release）と文字入力が同じRawInput batchに入ると、focusは新欄へ移るが最初のTextは新欄に入らない0.37の挙動を利用者が受け入れた。eguiは改修しない。通常の別pass入力保持と同batchでの採択結果を別回帰にし、段4aの保留を閉じる。詳細は§5と段4台帳。
+
 - **2026-10-17 段4採択:** §5の字面/baseline/hinting（保存済み補正値維持）、color emoji（固定印を含む）、margin/min sizeは0.37を採用。残る5回帰は到達性を保つ新寸法の根拠へ移し、PNG更新は段5に残す。HEXの同batch入力欠落は別のvendor TextEdit修正として扱う。
 
 ## 第4.6版 — 2026-10-17
@@ -2103,7 +2105,9 @@ root・各crate・ラボmanifestを棚卸しし、旧新版eguiの型を分裂�
 
 **PNG baseline更新は段5で行う。** 本採択を理由にこの段で更新しない。§1.380の既存残件、実HWND/DComp/monitor DPIの成立とは区別する。
 
-**HEXは採択対象の外観差ではない。** 設計担当はvendor TextEditの修正を第一候補とし、クリックinteraction/focus→イベント処理→必要な再layoutをTextEditの1 passに閉じて、同batchの入力を保持する方針を指示した。延期・batch分割・追加repaint・アプリ局所guardは使わない。TextEdit外（Atom全体等）へ影響が広がる必要を見つけた場合は実装前に設計担当へ返す。元HEX回帰を維持し、両方向、singleline/multiline、hint/prefix/suffix、IME、選択/caret、Ctrl+A、ime_focus helperを検証対象とする。
+**HEXの操作差は2026-10-17、利用者決定で受け入れ。** 別欄にfocusがある状態で、新欄へのpointer click（press/release）→Ctrl+A→Text等が同じRawInput batchに入ると、0.37では新欄のevents処理時点でfocusがなく、最初のTextが新欄に入らない。pass終了時には新欄へfocusが移り、後の別passの文字は受け取る。新欄をclickしたpassと文字入力が別passに届く通常経路では、部分入力の保持・続きの入力・完成値の反映を維持する。同batchの回帰では旧欄/別欄を変えないこと、新欄へのfocus移動、後続入力の到達を固定する。入力イベントの実配送を製品側で分割・延期する変更ではない。
+
+それ以前のvendor TextEdit修正第一候補は採らず、**eguiは改修しない**。設計担当からのAstra（medium）確認結果によれば、既存機能を保った小さい修正は成立せず、直す場合はAtomの配置・再計測、FnOnce装飾、pointer選択とIMEを含む入力所有まで広げ、数百〜1,000行程度とテストを要する。先行focusだけでは誤配送・IME重複/欠落が残る。調査と本家への未送付報告候補は段4台帳に保持する。この採択は先行focus仮案の副作用を製品へ入れる承認ではない。
 
 | 項目 | 推奨 |
 |---|---|
@@ -2115,9 +2119,10 @@ root・各crate・ラボmanifestを棚卸しし、旧新版eguiの型を分裂�
 | **一般の連続クリック分類** | **本家0.37の距離6 points未満・新時間条件の採用を推奨。利用者確認前に操作差を確定しない** |
 | 端fade | 旧外観維持を初期案 |
 | margin／min size | 2026-10-17、0.37寸法を採択。到達性を保証する回帰へ移行 |
+| HEXの同batch pointer focus＋Text | 2026-10-17、0.37の最初のText不受理を受け入れ。focus移動と別passの部分入力保持を検査し、eguiは改修しない |
 | system fallback | 既存明示chain基準 |
 | Ctrl+Shift+C/X/V | 通常／nativeとも保持 |
-| 受信済み入力・release確定 | 保持。取消仕様へ変えない |
+| 受信済み入力・release確定 | 保持。取消仕様へ変えない。TextEdit同batch focus＋Textは上記の採択例外 |
 | gamepad保持軸の復帰後継続 | 現行どおり。中立通過を要求しない |
 
 連続クリックでは、同じ広いwidget上でも位置が6 points以上離れる操作や、旧triple条件だけ成立する操作が変わる。音量・速度reset、reader、resize reset、文字選択の代表例を示す。旧判定や別タイマーによる互換化は推奨しない。採用不可の場合は実装前に範囲を再設計する。

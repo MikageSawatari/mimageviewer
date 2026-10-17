@@ -493,95 +493,168 @@ mod tests {
         assert_eq!(rgb, [168, 126, 0]);
     }
 
+    fn hex_editor_pair_pass(
+        ctx: &egui::Context,
+        colors: &mut [[u8; 3]; 2],
+        events: Vec<egui::Event>,
+    ) -> [egui::Response; 2] {
+        let mut responses = Vec::new();
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 160.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        for (index, rgb) in colors.iter_mut().enumerate() {
+                            ui.push_id(index, |ui| {
+                                responses.push(draw_rgb_editor(ui, rgb));
+                            });
+                        }
+                    })
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        responses.try_into().expect("two real HEX editors")
+    }
+
+    fn hex_editor_click_events(position: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    fn hex_editor_replace_events(text: &str) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            },
+            egui::Event::Text(text.into()),
+        ]
+    }
+
+    fn assert_active_hex_editor(ctx: &egui::Context, id: egui::Id, text: &str) {
+        let editor = ctx
+            .data(|data| data.get_temp::<ActiveHexEditor>(editor_id()))
+            .expect("focused HEX editor owns its text");
+        assert_eq!(editor.widget_id, id);
+        assert_eq!(editor.text, text);
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+    }
+
     #[test]
     fn hex_focus_transfer_keeps_the_new_editors_partial_input() {
-        fn pass(
-            ctx: &egui::Context,
-            colors: &mut [[u8; 3]; 2],
-            events: Vec<egui::Event>,
-        ) -> ([egui::Id; 2], [egui::Rect; 2]) {
-            let mut ids = [egui::Id::NULL; 2];
-            let mut rects = [egui::Rect::NOTHING; 2];
-            let _ = ctx
-                .run_pass(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(400.0, 160.0),
-                        )),
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        ctx.root_ui(|root_ui| {
-                            egui::CentralPanel::default().show(root_ui, |ui| {
-                                for index in 0..2 {
-                                    ui.push_id(index, |ui| {
-                                        let response = draw_rgb_editor(ui, &mut colors[index]);
-                                        ids[index] = response.id;
-                                        rects[index] = response.rect;
-                                    });
-                                }
-                            })
-                        });
-                    },
-                )
-                .drop_without_applying_deltas();
-            (ids, rects)
+        for target in 0..2 {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            crate::ime_focus::install_ime_input_policy(&ctx);
+            let mut colors = [[55; 3], [66; 3]];
+            let original = colors;
+            let initial = hex_editor_pair_pass(&ctx, &mut colors, vec![]);
+            let old_id = initial[1 - target].id;
+            let new_id = initial[target].id;
+            ctx.memory_mut(|memory| memory.request_focus(old_id));
+            let focused = hex_editor_pair_pass(&ctx, &mut colors, vec![]);
+            assert_eq!(focused[target].id, new_id);
+
+            // 利用者採択: 通常のclickと文字入力は別passとして検査する。
+            // 同batchの0.37差は下の専用回帰で固定し、製品側で入力を分割しない。
+            let clicked = hex_editor_pair_pass(
+                &ctx,
+                &mut colors,
+                hex_editor_click_events(focused[target].rect.center()),
+            );
+            assert!(clicked[target].clicked());
+            assert_active_hex_editor(&ctx, new_id, &format_hex(original[target]));
+            assert!(!ctx.memory(|memory| memory.has_focus(old_id)));
+
+            hex_editor_pair_pass(&ctx, &mut colors, hex_editor_replace_events("#A87"));
+            assert_eq!(colors, original, "partial input must not publish an RGB");
+            assert_active_hex_editor(&ctx, new_id, "#A87");
+            assert!(!hex_input_ready(&ctx));
+
+            hex_editor_pair_pass(&ctx, &mut colors, vec![]);
+            assert_active_hex_editor(&ctx, new_id, "#A87");
+            assert!(
+                !hex_input_ready(&ctx),
+                "an idle pass must keep partial input"
+            );
+
+            hex_editor_pair_pass(&ctx, &mut colors, vec![egui::Event::Text("E00".into())]);
+            let mut expected = original;
+            expected[target] = [168, 126, 0];
+            assert_eq!(colors, expected, "only the new field may publish its RGB");
+            assert_active_hex_editor(&ctx, new_id, "#A87E00");
+            assert!(hex_input_ready(&ctx));
         }
-        let ctx = egui::Context::default();
-        crate::ui_fonts::configure_fonts(&ctx);
-        crate::ime_focus::install_ime_input_policy(&ctx);
-        let mut colors = [[55; 3]; 2];
-        let (ids, rects) = pass(&ctx, &mut colors, vec![]);
-        ctx.memory_mut(|memory| memory.request_focus(ids[1]));
-        let (focused_ids, focused_rects) = pass(&ctx, &mut colors, vec![]);
-        assert_eq!(focused_ids, ids);
-        let position = rects[0].center();
-        assert!(
-            focused_rects[0].contains(position),
-            "real click remains inside the current editor"
-        );
-        let select_all = egui::Modifiers {
-            ctrl: true,
-            command: true,
-            ..Default::default()
-        };
-        pass(
-            &ctx,
-            &mut colors,
-            vec![
-                egui::Event::PointerMoved(position),
-                egui::Event::PointerButton {
-                    pos: position,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: Default::default(),
-                },
-                egui::Event::PointerButton {
-                    pos: position,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: Default::default(),
-                },
-                egui::Event::Key {
-                    key: egui::Key::A,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: select_all,
-                },
-                egui::Event::Text("#A87".into()),
-            ],
-        );
-        assert_eq!(colors, [[55; 3]; 2]);
-        assert!(
-            !hex_input_ready(&ctx),
-            "the old field must not discard the new field's input"
-        );
-        pass(&ctx, &mut colors, vec![egui::Event::Text("E00".into())]);
-        assert_eq!(colors, [[168, 126, 0], [55; 3]]);
-        assert!(hex_input_ready(&ctx));
+    }
+
+    #[test]
+    fn hex_focus_transfer_same_batch_adopts_egui037_without_cross_field_edits() {
+        for target in 0..2 {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            crate::ime_focus::install_ime_input_policy(&ctx);
+            let mut colors = [[55; 3], [66; 3]];
+            let original = colors;
+            let initial = hex_editor_pair_pass(&ctx, &mut colors, vec![]);
+            let old_id = initial[1 - target].id;
+            let new_id = initial[target].id;
+            ctx.memory_mut(|memory| memory.request_focus(old_id));
+            let focused = hex_editor_pair_pass(&ctx, &mut colors, vec![]);
+            let mut same_batch = hex_editor_click_events(focused[target].rect.center());
+            same_batch.extend(hex_editor_replace_events("#A87"));
+            let responses = hex_editor_pair_pass(&ctx, &mut colors, same_batch);
+
+            // 2026-10-17採択: 0.37では新欄へのfocusより先にeventsが処理される。
+            // このbatchのTextはどちらにも入力されず、focusだけが移る。
+            assert!(responses[target].clicked());
+            assert!(responses[target].gained_focus());
+            assert!(responses.iter().all(|response| !response.changed()));
+            assert_eq!(
+                colors, original,
+                "same-batch text must not alter either RGB"
+            );
+            assert_active_hex_editor(&ctx, new_id, &format_hex(original[target]));
+            assert!(!ctx.memory(|memory| memory.has_focus(old_id)));
+            assert!(
+                hex_input_ready(&ctx),
+                "dropped text must not create a partial draft"
+            );
+
+            // focus確定後の新しい入力は届き、旧欄には入らない。
+            hex_editor_pair_pass(&ctx, &mut colors, hex_editor_replace_events("#A87E00"));
+            let mut expected = original;
+            expected[target] = [168, 126, 0];
+            assert_eq!(colors, expected);
+            assert_active_hex_editor(&ctx, new_id, "#A87E00");
+        }
     }
 
     #[test]

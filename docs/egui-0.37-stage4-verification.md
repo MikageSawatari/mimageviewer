@@ -1,5 +1,7 @@
 # egui 0.37 段4 検証台帳
 
+> 2026-10-17 `6337efc80` 後の利用者決定: **HEX同batchの0.37操作差は受け入れ、eguiは改修しない。** 最新の契約・検証・4a受入は末尾「HEX操作差の利用者採択と4a受入」を正本とする。以下の停止・保留・失敗記録は、決定前の調査履歴として残す。
+
 > 2026-10-17 `1992ef33a` 後の追補: 末尾「interaction snapshotによる先行focus案の評価」を追加した。snapshotのhit所有確定という前提は成立するが、先行focus単独では誤配送・IME重複・入力欠落が残り、今回指示の採用条件を満たさない。製品/vendor実装は未変更で返す。
 
 > 2026-10-17 採択後の追補: 対象HEADは `017f1d8b1`。利用者は0.37の字面/baseline/hinting（保存値維持）・色付きemoji・寸法を採択した。今回の補修・検証は末尾「採択後の補修」を正本とし、以下の未採択時点の比較・結果は履歴として保持する。HEXは別の入力契約であり、TextEdit外への影響が必要なら実装前停止、という追加指示を適用する。
@@ -15,7 +17,7 @@ baseline PNG、既存の寸法・操作assert、ignoreは変更しない。HUD z
 - `src/video/native_presenter/render_core.rs`: 既存clipboard readerのtest側だけにスコープ付きtext/read-count fixtureを置いた。製品reader・イベント配送の動作は変えていない。通常のCtrl+Shift+C/Xに加え、Ctrl+Shift+Vの改行正規化・一度だけの読取り・空clipboard・release時の重複抑止・IME中断とcommit後の配送を実handlerで検査する。
 - root/FS/兄弟contextの退役、取消、focus/repeat、復帰、viewport所有入力、gamepad保持軸、wheel、popup、IMEは段3の正式graphを再利用し、今回の限定filterにも対応付ける。新しい非表示受付やpending stateは作らない。
 - 連続クリックは利用者が既に採択した本家0.37の6pt条件を維持する。再採択を求めない。
-- **HEX同一batchのfocus切替は判断待ち。** `hex_focus_transfer_keeps_the_new_editors_partial_input` は今回も元assertで失敗する。0.37のTextEditではAtom計測中のイベント処理がpointer focus確定より先に走り、別fieldをclick→Ctrl+A→Textした新fieldが同batchのTextを処理できず、未処理で残る（段3の観測でも新fieldはfocus/gained=true、changed=false）。margin変更では直らない。入力再送・delay・guardや期待値変更は行わず、TextEditのイベント/focus所有を修正する範囲の設計判断へ返す。従来操作の維持を確認したとは記録しない。
+- **HEX同一batchのfocus切替は利用者決定で受け入れ（2026-10-17）。** 0.37のTextEditではAtom計測中のイベント処理がpointer focus確定より先に走り、別fieldをclick（press/release）→Ctrl+A→Textした新fieldはfocusを得ても同batchのTextを取り込まない。eguiは改修せず、通常の別passでの部分入力保持と、この同batch結果の独立回帰へ契約を更新する。従来の同batch操作が維持されたという判定ではない。元assertの失敗・停止・先行focus診断は後述の履歴に保持し、最新の結果は末尾に記録する。
 
 ### 回帰の対応付け
 
@@ -394,3 +396,55 @@ IME所有の根拠は `memory/mod.rs::owns_ime_events`（1081付近、現在のh
 focusの唯一の失敗は元 `hex_focus_transfer_keeps_the_new_editors_partial_input` の元assert。imeの失敗は `timeline_bass_partial_raster_snapshot`、`timeline_key_states_raster_snapshot`、`native_video_adjustment_anime4k_panel_snapshot` の画像比較のみ。既存ignoreは変更せず、0選択・仮案のcompile失敗・元HEXの失敗を成功扱いにしていない。
 
 最終照合は `target/egui037-snapshot-focus-final-validation.json`。builderはHEADのbytesと完全一致、baseline PNG445枚のhash不変、診断8件/失敗4件、正式graphの全9 commandと23 executableを照合した。追跡対象の変更はこの台帳のみ。HEAD `1992ef33a` / branch `egui-036` のまま、git add/commit/branch操作/pushなし。lib全件・live・製品起動・test-fullなし。製品挙動を変更していない調査・文書のみの引渡しなのでverification binaryは作成していない。
+
+## HEX操作差の利用者採択と4a受入（2026-10-17、6337efc80）
+
+**実装担当の内部確認。** 設計担当が前の評価を `6337efc80` としてコミットした後、利用者は「別欄からのpointer clickと文字入力が同じbatchに届くと、最初の入力分が新欄に入らない」というegui 0.37の操作差を受け入れ、eguiを改修しないと決定した。設計書§5の表・本文と改訂履歴へこの決定を反映した。以前のvendor修正案・4a保留は経緯として残し、現時点の未解決の受入阻害とは扱わない。
+
+### 採択した契約と回帰
+
+製品側で入力を延期・分割・再送していない。**今回の回帰変更は利用者決定に合わせた契約の書き換え**であり、同batchでも入力を保てるとする旧契約を、黙ってassert削除やignoreで通す変更ではない。通常の入力保持は元のtest名で検査し、受け入れた差も別のassert付き回帰で固定する。
+
+| 契約 / 回帰 | 検査する性質 |
+|---|---|
+| 通常のclick後、文字が別passに届く / `hex_focus_transfer_keeps_the_new_editors_partial_input` | 実 `draw_rgb_editor` → `ime_focus::add_singleline` を使用。両方向のfocus移動、新欄の `#A87` がRGBをまだ変更しないこと、空passを挟んでもownerと部分文字列を保つこと、続き `E00` を受け取って新欄だけが完成RGBへ変わることを検査 |
+| 同batchの採択結果 / `hex_focus_transfer_same_batch_adopts_egui037_without_cross_field_edits` | primary press/release→Ctrl+A→Textを一つのRawInputへ投入。両方向で新欄clicked/gained_focus、両欄changed=false、異なる元RGBが両方不変、active editorは新欄の元全文、部分draft未生成を検査。その後の別passの新しい入力は新欄だけへ届くことも検査 |
+
+2つの欄の初期RGBを `[55;3]` / `[66;3]` と区別し、同じ値のために誤欄への変更を見逃さない。通常経路はframe待ちで入力条件を収束させるものではなく、利用者が行うclickと後続文字入力をそれぞれのRawInputとして与える。新しい同batch回帰にはまったく同じclick/key/Textを同時投入するため、0.37差をテストから隠していない。旧欄のlost_focusによるcleanupが新欄のownerを削除しない既存の所有境界も、両方向のactive editor assertで維持する。
+
+### Astra確認結果（設計担当から共有された要点）
+
+設計担当がAstra（medium）へ論点を絞って確認した結果、既存機能を保つ小さい修正は成立せず、直すには**Atomの配置・再計測・FnOnce装飾・入力所有まで広げ、数百〜1,000行程度＋テスト**が必要との結論だった。これは今回実装した行数や当方による別のAstra実行ではなく、利用者決定とともに受領した設計確認である。
+
+落とし穴は、(1) eventsを後へ移すだけではmultiline高さ、hint、prefix/suffixのgeometryが古い、(2) FnOnce装飾の単純な再実行/cloneで機能を落とす、(3)先行focusだけではclick選択よりeventsが先のままで、既存選択の削除やIME composition範囲の破壊が残る、(4) focusとIME所有の取得順を変えると誤配送・重複/欠落が起こること。前節の仮案で観測した副作用は不採用案の結果であり、今回製品へ導入していない。利用者は費用と操作差を踏まえて本家0.37のままを採択した。
+
+### 本家への報告候補（未送付）
+
+- 対象: egui 0.37.0 `widgets/text_edit/builder.rs` の同batch focus移動とText。mIV固有のHEX parserとは独立したTextEditの処理順の問題。
+- 再現: 安定IdのTextEditを同じUiに2個描き、rectを登録するpassを実行する。片方にfocusを与えて次passを描く。もう一方の実矩形内へのPointerMoved＋primary press/release＋Ctrl+A＋Text（例 `replacement`）を、一つのRawInputへ順に入れて描く。新欄はfocusを得るがTextは取り込まずchanged=false。clickだけを先のRawInputへ入れ、後のRawInputでCtrl+A/Textを送れば置換される。
+- 0.33.3との差: 旧vendorはinteract→pointerによるfocus/selection→eventsの順だった。0.37はAtom計測中のhandle_events→allocate/interact→pointer focus/selectionの順で、初回の入力時点では新欄にfocusがない。theme経由のread_responseは旧focusを解放できるが、新欄へのpointer focusを先に与える処理ではない。
+- 修正を検討する場合: 計測・interaction・events・再layout・paintを整理し、singleline/multiline、hint、FnOnceを含むprefix/suffix、選択/caret、Ctrl+A、IME preedit/commitと所有を保つ。snapshotのclicked ownerを早く読むだけではselection/IMEの順序は直らない。前節の診断source/logは反例の補足資料として使える。
+- mIVでは2026-10-17に現挙動を受け入れ、vendorに互換patchを加えない。報告の送付・issue作成・外部への連絡は行っていない。PATCHES.mdも実装patchがないため変更しない。
+
+### 採択後の検証と4a受入
+
+`cargo test -p mimageviewer --lib hex_focus_transfer --offline`: **2選択/2成功、失敗/ignore0、exit0 / 224.68秒**。各test内で両方向を検査し、通常経路と採択した同batchの結果が両方成立した。
+
+変更は `#[cfg(test)]` 内のfixture/helperと2つの回帰、および文書だけである。別contextのSol/xhighが読み取り専用で確認し、実製品のdraw/helperを通ること、両方向・部分入力・idle保持・誤欄不変の検査、明示採択の範囲だけを変える契約について必須修正なしと判断した。設計担当の独立受入を代替する記録ではない。
+
+最終指定commandの証拠は `target/egui037-stage4-hex-adopt-final-<label>.json/.log`。offline / jobs1 / MSBuild node reuse無効 / snapshot更新変数なし、0選択を成功としない。
+
+| コマンド（cargoは `--offline`） | 選択 / 成功 / 失敗 / ignore | exit / 秒 |
+|---|---|---|
+| `cargo test -p mimageviewer --lib focus` | 137 / 137 / 0 / 0 | 0 / 13.95 |
+| `cargo test -p mimageviewer --lib ime` | 504 / 498 / 3 PNG / 3既存 | 101 / 104.99 |
+| `cargo test -p mimageviewer --lib keyboard` | 51 / 51 / 0 / 0 | 0 / 6.73 |
+| `cargo test -p mimageviewer --tests --no-run` | 23 test executableのコンパイル、実行なし | 0 / 92.57 |
+| `cargo fmt --check`（offline環境） | 成功 | 0 / 15.29 |
+| `git diff --check` | 成功 | 0 / 0.03 |
+
+IMEの失敗3件は `timeline_bass_partial_raster_snapshot`、`timeline_key_states_raster_snapshot`、`native_video_adjustment_anime4k_panel_snapshot`。既存の画像比較エラーであり、今回の指定filterに画像比較以外の失敗はない。PNG不一致を成功へ読み替えず、段5のbaseline更新対象として残す。ignore3件は元のまま。
+
+**4a受入を閉じる。** これまでの4a指定・補完filter/実製品handler回帰の成立証拠を引き継ぎ、残っていたHEXの操作差は利用者決定で受け入れた。新しい通常経路・同batch採択回帰はいずれも成功し、今回の指定filterの機能回帰失敗は0件。従来の同batch挙動を修復したという意味ではなく、利用者が採択した0.37契約での受入完了である。実HWND/IME/monitor DPIの別枠検証や§1.380残件を完了扱いにはしない。
+
+最終照合 `target/egui037-hex-adopt-final-validation.json`: 製品コード（name_colorsのcfg(test)より前）・vendorは不変、PNG baseline **445枚不変**、2回帰成功、指定6 commandと23 executableを照合した。HEAD `6337efc80` / branch `egui-036` の未コミット差分は設計書・本台帳・testコードのみ。git add/commit/branch操作/pushなし。lib全件・live・製品起動・test-fullなし。製品挙動を変更しないtest/文書変更なのでverification binaryは作成していない。段5へPNG更新を渡す。
