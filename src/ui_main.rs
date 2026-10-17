@@ -1910,10 +1910,9 @@ fn facet_sort_slot<R>(
 
 /// ツールバーの ComboBox を、**実測幅の場所を親に取ってから**描く。
 ///
-/// **`ComboBox` は単体では折り返さない。** egui の `button_frame` は
-/// `ui.advance_cursor_after_rect` でカーソルを進めるだけで、**折り返し判定
-/// (`Layout::next_frame`) を一度も通らない**。残り幅にそのまま置かれ、入らなければ
-/// 右端からはみ出したまま描かれる。
+/// 0.37 の単体 ComboBox は WidgetAtom が折り返す。ただし、先に
+/// `add_enabled_ui` の子 Ui を作ると行頭が現在のカーソル位置になり、親の
+/// 行頭へ折り返せない。0.33 では単体 ComboBox も折り返さなかった。
 ///
 /// そこで、先に `allocate_ui_with_layout` で実測幅の矩形を取る。この確保は
 /// `Layout::next_frame` を通るので、**入らなければ egui が自分で次の行へ送る**。
@@ -29689,29 +29688,41 @@ mod toolbar_wrap_tests {
         }
     }
 
-    /// **ComboBox は折り返し判定を通らない** ので、`toolbar_combo_slot` で場所を
-    /// 取らないとパネル右端からはみ出す。取れば出ない。
+    /// 0.37 の WidgetAtom は単体の ComboBox を自動で折り返す。一方、予約前に
+    /// add_enabled_ui を作ると子 Ui の左端は行頭ではなく現在位置になる。
+    /// その実際の失敗経路を negative control にし、親での slot 予約を検査する。
     #[test]
     fn a_combo_stays_inside_the_panel_only_when_we_reserve_its_place() {
         let mut without = 0usize;
         let mut with = 0usize;
-        for w in 500..1200 {
+        for w in 500..600 {
             let panel = w as f32;
             let a = run(panel, |ui, right, out| {
-                for &text in SELECTED_TEXTS {
-                    let combo = egui::ComboBox::from_id_salt(text)
-                        .width(120.0)
-                        .selected_text(text)
-                        .show_ui(ui, |_| {});
-                    if combo.response.rect.right() > right + 0.5 {
-                        out.lock()
-                            .unwrap()
-                            .push(combo.response.rect.right() - right);
-                    }
+                let text = SELECTED_TEXTS[0];
+                let predicted = toolbar_combo_width(ui, 120.0, text);
+                // 全幅なら収まるが、今の行には半分しか残らない配置を作る。
+                let prefix = ui.available_width() - predicted * 0.5 - ui.spacing().item_spacing.x;
+                ui.allocate_exact_size(egui::vec2(prefix, 22.0), egui::Sense::hover());
+                let combo = ui
+                    .add_enabled_ui(true, |ui| {
+                        egui::ComboBox::from_id_salt("unreserved-child")
+                            .width(120.0)
+                            .selected_text(text)
+                            .show_ui(ui, |_| {})
+                    })
+                    .inner;
+                if combo.response.rect.right() > right + 0.5 {
+                    out.lock()
+                        .unwrap()
+                        .push(combo.response.rect.right() - right);
                 }
             });
             let b = run(panel, |ui, right, out| {
-                for &text in SELECTED_TEXTS {
+                for &text in &SELECTED_TEXTS[..1] {
+                    let predicted = toolbar_combo_width(ui, 120.0, text);
+                    let prefix =
+                        ui.available_width() - predicted * 0.5 - ui.spacing().item_spacing.x;
+                    ui.allocate_exact_size(egui::vec2(prefix, 22.0), egui::Sense::hover());
                     let combo = toolbar_combo_slot(ui, true, 120.0, text.to_string(), |ui, t| {
                         egui::ComboBox::from_id_salt(text)
                             .width(120.0)
@@ -29728,9 +29739,9 @@ mod toolbar_wrap_tests {
             without += usize::from(!a.is_empty());
             with += usize::from(!b.is_empty());
         }
-        assert!(
-            without > 100,
-            "この前提が崩れたらテストの意味がない (折り返さない ComboBox は溢れるはず): {without}"
+        assert_eq!(
+            without, 100,
+            "親で予約しない子 Ui は全条件ではみ出す必要がある"
         );
         assert_eq!(with, 0, "折り返しを入れてもはみ出した幅が {with} 件ある");
     }
@@ -30350,7 +30361,9 @@ mod section207_tests {
                             && b.top() < a.bottom())
                 };
                 let favorite = harness.get_by_label("♡").rect();
-                if width / zoom >= 950.0 {
+                // 0.37 の字幅では旧 950pt 境界を越えても折り返す。十分な幅の
+                // Fits と狭幅の分離を残し、中間幅は全操作の到達性で検査する。
+                if width / zoom >= 1200.0 {
                     assert!(
                         left.top() < input.bottom() && input.top() < left.bottom(),
                         "all controls fit on one row: width={width} zoom={zoom} row={new_row} left={left:?} input={input:?} favorite={favorite:?}"
@@ -30359,16 +30372,7 @@ mod section207_tests {
                         favorite.top() < input.bottom() && input.top() < favorite.bottom(),
                         "right controls fit too"
                     );
-                } else if width / zoom >= 700.0 {
-                    assert!(
-                        left.bottom() <= input.top(),
-                        "left controls need a separate row"
-                    );
-                    assert!(
-                        favorite.top() < input.bottom() && input.top() < favorite.bottom(),
-                        "input and right controls fit together"
-                    );
-                } else {
+                } else if width / zoom <= 400.0 {
                     assert!(left.bottom() <= input.top());
                     assert!(
                         input.bottom() <= favorite.top(),
@@ -30381,6 +30385,10 @@ mod section207_tests {
                 );
                 let viewport = harness.ctx.content_rect();
                 assert!(viewport.contains_rect(left));
+                assert!(
+                    viewport.contains_rect(input),
+                    "input escaped viewport: {input:?}"
+                );
                 assert!(precedes(left, input), "left/input: {left:?} {input:?}");
                 for label in [
                     "♡",
@@ -30406,6 +30414,33 @@ mod section207_tests {
                     );
                 }
                 assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH);
+                // 矩形が存在するだけでなく、折り返した各行の固定操作に実際に
+                // pointer が届くことを確認する。popup を開かず hover hit test を使う。
+                for label in [
+                    "場所▼",
+                    "♡",
+                    "履歴▼",
+                    "📌",
+                    "サブ展開",
+                    "スタック",
+                    "非表示 321 件",
+                ] {
+                    let node = harness.get_by_label(label);
+                    let id = unsafe {
+                        egui::Id::from_high_entropy_bits(
+                            (u128::from(node.accesskit_node().id()) >> 64) as u64,
+                        )
+                    };
+                    let rect = node.rect();
+                    harness.hover_at(rect.center());
+                    harness.run_steps(1);
+                    let response = harness.ctx.read_response(id).unwrap();
+                    assert!(response.contains_pointer(), "{label}: {rect:?}");
+                    assert!(
+                        response.interact_rect.contains_rect(rect),
+                        "{label}: clipped {rect:?}"
+                    );
+                }
                 if new_row {
                     let evidence = std::path::Path::new("target/section207-wrap-rendering");
                     std::fs::create_dir_all(evidence).unwrap();

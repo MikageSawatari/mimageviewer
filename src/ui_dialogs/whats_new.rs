@@ -62,9 +62,18 @@ pub(super) fn draw_whats_new_dialog(
             ui.add_space(6.0);
             let footer =
                 super::startup_dialog_footer_height(ui, &["すべての変更を見る", "閉じる"], 4.0);
-            super::startup_dialog_scroll_body(ui, "whats_new_scroll", footer, |ui| {
+            let body = super::startup_dialog_scroll_body(ui, "whats_new_scroll", footer, |ui| {
                 crate::version_highlights::render(ui, &entries);
             });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("whats_new_scroll_layout"),
+                    crate::test_ui::scroll_layout::ScrollLayout::from_output(&body),
+                );
+            });
+            #[cfg(not(test))]
+            let _ = body;
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("すべての変更を見る").clicked() {
@@ -84,7 +93,8 @@ mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
 
     #[test]
-    fn version_highlights_initial_width_keeps_previous_reading_area() {
+    fn version_highlights_initial_width_respects_037_window_budget() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
             for scale in [1.0, 2.0] {
                 let mut fonts_ready = false;
@@ -112,7 +122,15 @@ mod tests {
                     .save(dir.join(format!("whats-new-{}x{}-scale{scale}.png", size.x, size.y)))
                     .unwrap();
                 let viewport = harness.ctx.content_rect();
-                let intended_width = 650.0_f32.min(viewport.width()).floor();
+                // 利用者が比較資料で採択した0.37の実寸を基準にする。
+                // 小画面200%では Window/Resize の初期内寸制約と内容の実測で
+                // 外幅537ptになる（旧546pt）。他3条件は指定外幅650ptを保つ。
+                // Resizeの初期desired_sizeだけでは内容計測後の外寸を表せない。
+                let intended_width = if size.x == 1093.0 && scale == 2.0 {
+                    537.0
+                } else {
+                    650.0
+                };
                 for frame in 0..8 {
                     let window = harness
                         .ctx
@@ -123,8 +141,39 @@ mod tests {
                         "size={size:?} scale={scale} frame={frame}: intended={intended_width} actual={window:?}"
                     );
                     assert!(viewport.contains_rect(window));
+                    for label in ["Close window", "すべての変更を見る", "閉じる"] {
+                        assert!(viewport.contains_rect(harness.get_by_label(label).rect()));
+                    }
                     harness.run_steps(1);
                 }
+                let read = || {
+                    harness.ctx.data(|data| {
+                        data.get_temp::<ScrollLayout>(egui::Id::new("whats_new_scroll_layout"))
+                            .unwrap()
+                    })
+                };
+                let before = read();
+                before.assert_height(
+                    HeightExpectation::Scrolls,
+                    viewport,
+                    harness.ctx.pixels_per_point(),
+                );
+                harness.event(egui::Event::PointerMoved(before.inner.center()));
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -100000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.run_steps(40);
+                harness
+                    .ctx
+                    .data(|data| {
+                        data.get_temp::<ScrollLayout>(egui::Id::new("whats_new_scroll_layout"))
+                            .unwrap()
+                    })
+                    .assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
             }
         }
     }

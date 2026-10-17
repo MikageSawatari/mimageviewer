@@ -41,7 +41,9 @@ use comic_core::{
 use std::collections::{HashMap, HashSet};
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
-const PANEL_W: f32 = 268.0;
+// 0.37 の塗り色 + 不透明度の行は 268.21875pt。整数 pt の本文予算を
+// 269pt に切り上げ、描画のはみ出しを許容誤差で隠さない。
+const PANEL_W: f32 = 269.0;
 /// ラベル・色ボタンと横並びにする Slider の幅。Area の auto-size が PANEL_W を
 /// 超えて詳細パネル幅を変えないよう、横並び行だけ既定値より狭くする。
 const DETAIL_ROW_SLIDER_W: f32 = 70.0;
@@ -10819,11 +10821,15 @@ mod tests {
         );
     }
 
-    fn bubble_body_rendered_width(fill: Option<Rgba>) -> f32 {
+    fn bubble_body_rendered_width(fill: Option<Rgba>, height: f32) -> f32 {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use egui_kittest::kittest::{NodeT, Queryable};
         use std::sync::{Arc, Mutex};
 
         let measured = Arc::new(Mutex::new(0.0));
         let measured_in_ui = Arc::clone(&measured);
+        let layout = Arc::new(Mutex::new(None));
+        let rendered_layout = Arc::clone(&layout);
         let mut fonts_ready = false;
         let mut bubble = BubbleObject {
             shape: BubbleShape::RoundRect {
@@ -10847,28 +10853,94 @@ mod tests {
                 }
                 egui::CentralPanel::default().show(root_ui, |ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(PANEL_W, 680.0),
+                        egui::vec2(PANEL_W, height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_min_width(PANEL_W);
                             ui.set_max_width(PANEL_W);
                             let mut changed = false;
-                            bubble_body_ui(ui, &mut bubble, &mut changed);
-                            *measured_in_ui.lock().expect("width capture") = ui.min_rect().width();
+                            let output = egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .max_height(height)
+                                .show(ui, |ui| {
+                                    bubble_body_ui(ui, &mut bubble, &mut changed);
+                                    *measured_in_ui.lock().expect("width capture") =
+                                        ui.min_rect().width();
+                                });
+                            *rendered_layout.lock().unwrap() =
+                                Some(ScrollLayout::from_output(&output));
                         },
                     );
                 });
             });
         harness.run();
+        let before = layout.lock().unwrap().unwrap();
+        before.assert_height(
+            if height > 600.0 {
+                HeightExpectation::Fits
+            } else {
+                HeightExpectation::Scrolls
+            },
+            harness.ctx.content_rect(),
+            harness.ctx.pixels_per_point(),
+        );
+        if height < 600.0 {
+            harness.event(egui::Event::PointerMoved(before.inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -4000.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.run_steps(40);
+            layout
+                .lock()
+                .unwrap()
+                .unwrap()
+                .assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+        }
+        let last = harness.get_by_role_and_label(egui::accesskit::Role::Slider, "余白");
+        let last_rect = last.rect();
+        let last_id = unsafe {
+            egui::Id::from_high_entropy_bits((u128::from(last.accesskit_node().id()) >> 64) as u64)
+        };
+        assert!(
+            layout
+                .lock()
+                .unwrap()
+                .unwrap()
+                .inner
+                .contains_rect(last_rect),
+            "last slider clipped: {last_rect:?}"
+        );
+        harness.hover_at(last_rect.center());
+        harness.run_steps(1);
+        assert!(
+            harness
+                .ctx
+                .read_response(last_id)
+                .unwrap()
+                .contains_pointer()
+        );
+        for slider in harness.get_all_by_role(egui::accesskit::Role::Slider) {
+            let rect = slider.rect();
+            assert!(
+                rect.left() >= before.inner.left() && rect.right() <= before.inner.right(),
+                "slider escaped body horizontally: {rect:?} {:?}",
+                before.inner
+            );
+        }
         let dir = std::path::Path::new("target/egui037-stage4b-compare/current-materials");
         std::fs::create_dir_all(dir).unwrap();
         harness
             .render()
             .unwrap()
-            .save(dir.join(if fill.is_some() {
-                "bubble-body-fill.png"
-            } else {
-                "bubble-body-no-fill.png"
+            .save(dir.join(match (fill.is_some(), height > 600.0) {
+                (true, true) => "bubble-body-fill.png",
+                (false, true) => "bubble-body-no-fill.png",
+                (true, false) => "bubble-body-fill-short-at-end.png",
+                (false, false) => "bubble-body-no-fill-short-at-end.png",
             }))
             .unwrap();
         let width = *measured.lock().expect("width result");
@@ -10879,11 +10951,13 @@ mod tests {
     #[test]
     fn bubble_body_stays_within_panel_width_with_fill_on_or_off() {
         for fill in [None, Some(Rgba::WHITE)] {
-            let width = bubble_body_rendered_width(fill);
-            assert!(
-                width <= PANEL_W,
-                "bubble body width {width} exceeded PANEL_W {PANEL_W} (fill={fill:?})"
-            );
+            for height in [680.0, 120.0] {
+                let width = bubble_body_rendered_width(fill, height);
+                assert!(
+                    width <= PANEL_W,
+                    "bubble body width {width} exceeded PANEL_W {PANEL_W} (fill={fill:?} height={height})"
+                );
+            }
         }
     }
 

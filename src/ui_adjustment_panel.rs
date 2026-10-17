@@ -298,7 +298,93 @@ mod adjust_scope_selector_tests {
         assert_eq!(sizes.len(), 5, "all action labels were rendered");
         for (label, size) in sizes.iter() {
             assert!(size.x <= 258.0, "{label} was {}px wide", size.x);
-            assert!(size.y <= 24.0, "{label} was {}px high", size.y);
+            // 0.37 の日本語 Button 行高 21pt + 縦 padding 2pt × 2。
+            assert_eq!(size.y, 25.0, "{label} action height changed");
+        }
+    }
+
+    #[test]
+    fn adjust_scope_actions_fit_or_scroll_to_the_last_action() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+
+        for height in [180.0, 80.0] {
+            let observed = Arc::new(Mutex::new(None));
+            let rendered = Arc::clone(&observed);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(300.0, 240.0))
+                .build_ui(move |ui| {
+                    let output = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(258.0, height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .max_height(height)
+                                    .show(ui, |ui| {
+                                        let mut last = None;
+                                        for label in [
+                                            "共通の標準からコピー",
+                                            "現在の設定値を標準に反映",
+                                            ADJUST_ALIGN_ALL_STANDARD_LABEL,
+                                            ADJUST_ALIGN_ALL_PAGE_LABEL,
+                                            "個別設定を解除 [Q]",
+                                        ] {
+                                            let response = ui.button(label);
+                                            assert!(response.rect.width() <= 258.0);
+                                            last = Some((response.id, response.rect));
+                                        }
+                                        last.unwrap()
+                                    })
+                            },
+                        )
+                        .inner;
+                    *rendered.lock().unwrap() =
+                        Some((ScrollLayout::from_output(&output), output.inner));
+                });
+            harness.run();
+            let (before, _) = observed.lock().unwrap().unwrap();
+            before.assert_height(
+                if height == 180.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                harness.ctx.content_rect(),
+                harness.ctx.pixels_per_point(),
+            );
+            if height == 80.0 {
+                harness.event(egui::Event::PointerMoved(before.inner.center()));
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -4000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.run_steps(40);
+                let (after, (id, rect)) = observed.lock().unwrap().unwrap();
+                after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+                assert!(
+                    after.inner.contains_rect(rect),
+                    "last action clipped: {rect:?}"
+                );
+                harness.hover_at(rect.center());
+                harness.run_steps(1);
+                assert!(harness.ctx.read_response(id).unwrap().contains_pointer());
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    harness.run_steps(1);
+                }
+                assert!(harness.ctx.read_response(id).unwrap().clicked());
+            }
         }
     }
 }

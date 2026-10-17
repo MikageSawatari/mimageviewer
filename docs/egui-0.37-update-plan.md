@@ -2,6 +2,8 @@
 
 # 改訂履歴
 
+- **2026-10-17 段4採択:** §5の字面/baseline/hinting（保存済み補正値維持）、color emoji（固定印を含む）、margin/min sizeは0.37を採用。残る5回帰は到達性を保つ新寸法の根拠へ移し、PNG更新は段5に残す。HEXの同batch入力欠落は別のvendor TextEdit修正として扱う。
+
 ## 第4.6版 — 2026-10-17
 
 対象は第4.5版とWIPコミット`fe32f2e88`。段3台帳の「再開後の設計担当へ返す論点」全文・補修追記と、Close、bookmark／navigation、discard／immediateのdelta経路を読み取り専用で照合した。第4.5版の型付き退役と既存の独立設計ACCEPTは維持する。本追補の実装・独立レビュー・テスト・製品起動は未実施。
@@ -2091,16 +2093,28 @@ root・各crate・ラボmanifestを棚卸しし、旧新版eguiの型を分裂�
 
 0.37を目標にする決定は受領済み。以下の外観・操作差は比較可能な結果を用意して確認する。
 
+### 2026-10-17 利用者の採択（段4）
+
+比較資料24組を提示したうえで、利用者は次を決定した。以下は上の履歴時点の未採択方針に優先する。
+
+1. **字面・baseline・hintingは0.37の描画をそのまま採る。** 保存済みFontTweak等の値は現状維持し、新たな旧版合わせを加えない。
+2. **color emojiは色付きをそのまま採る。** アプリ固定の印（📌等）も対象で、単色化しない。Twemoji注釈SVG等の別経路は変更しない。
+3. **margin / min sizeは0.37の寸法を採る。** 残るadjustment scope action高、What's New reading area、reported folder controlsのwrap、bubble body横幅、combo negative controlの5件は、Fits/Scrolls・末尾到達・固定操作到達・viewport包含を保証する検査を維持/追加し、0.37寸法に基づく期待値へ移す。許容誤差だけの拡大やassertの削除では解消しない。negative controlはWidgetAtom wrap下でもslot予約欠落による画面外を検出する形へ再設計する。
+
+**PNG baseline更新は段5で行う。** 本採択を理由にこの段で更新しない。§1.380の既存残件、実HWND/DComp/monitor DPIの成立とは区別する。
+
+**HEXは採択対象の外観差ではない。** 設計担当はvendor TextEditの修正を第一候補とし、クリックinteraction/focus→イベント処理→必要な再layoutをTextEditの1 passに閉じて、同batchの入力を保持する方針を指示した。延期・batch分割・追加repaint・アプリ局所guardは使わない。TextEdit外（Atom全体等）へ影響が広がる必要を見つけた場合は実装前に設計担当へ返す。元HEX回帰を維持し、両方向、singleline/multiline、hint/prefix/suffix、IME、選択/caret、Ctrl+A、ime_focus helperを検証対象とする。
+
 | 項目 | 推奨 |
 |---|---|
-| 字面／baseline／hinting | fallback・保存値を保持して比較整理 |
-| color emoji | 代表比較を提示 |
+| 字面／baseline／hinting | 2026-10-17、0.37描画を採択。FontTweak等の保存値を維持 |
+| color emoji | 2026-10-17、固定印を含む色付きを採択 |
 | Window本文drag | 必要箇所で従来操作保持 |
 | mouse drag scroll | 旧版で使えた画面は保持 |
 | Panel collapse／double-click | 既存操作維持を初期案 |
 | **一般の連続クリック分類** | **本家0.37の距離6 points未満・新時間条件の採用を推奨。利用者確認前に操作差を確定しない** |
 | 端fade | 旧外観維持を初期案 |
-| margin／min size | 到達性を保証した比較案 |
+| margin／min size | 2026-10-17、0.37寸法を採択。到達性を保証する回帰へ移行 |
 | system fallback | 既存明示chain基準 |
 | Ctrl+Shift+C/X/V | 通常／nativeとも保持 |
 | 受信済み入力・release確定 | 保持。取消仕様へ変えない |

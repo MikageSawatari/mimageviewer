@@ -1,5 +1,7 @@
 # egui 0.37 段4 検証台帳
 
+> 2026-10-17 採択後の追補: 対象HEADは `017f1d8b1`。利用者は0.37の字面/baseline/hinting（保存値維持）・色付きemoji・寸法を採択した。今回の補修・検証は末尾「採択後の補修」を正本とし、以下の未採択時点の比較・結果は履歴として保持する。HEXは別の入力契約であり、TextEdit外への影響が必要なら実装前停止、という追加指示を適用する。
+
 対象は `65beeb2f0` からの未コミット差分。Rust 1.99.0、Windows、egui/eframe 0.37.0、wgpu 30、offline。以下は**実装担当の内部確認**であり、利用者による外観採択・設計担当の受入とは区別する。段3の分類第3版と独立レビューACCEPTは過去の証拠として保持する。
 
 baseline PNG、既存の寸法・操作assert、ignoreは変更しない。HUD z-orderとmetadata transferの既存テスト課題2件は対象外。実Window、live、製品起動、製品バイナリ、test-full、lib全件は実行しない。GPU試験はoffscreen、native入力試験はhandlerへのfake入力であり、デスクトップ入力やOS clipboardを使わない。
@@ -230,3 +232,101 @@ nextestは `cargo nextest run -p mimageviewer <target> -E '<filter>' --no-tests 
 - 最終artifact検証 `target/egui037-stage4-final-artifact-validation.json`: 24組、原寸/hash、最終Rust source11ファイルのhash、9新規test成功、索引の全linkを照合した。HEAD `65beeb2f0` / branch `egui-036` のまま。
 - 段5へは採択後のPNG更新/Id警告整理と、選択外Context-root fixtureのwrapper棚卸しを渡す。§1.380既存残件を解消扱いにしない。
 - cargo test greenの前提はHEX/未採択assertで成立していないため、通常profileのverification binaryは作成していない。製品起動/live/test-full/lib全件なし。git add/commit/branch操作/pushなし。
+
+## 採択後の補修（2026-10-17、017f1d8b1から）
+
+**実装担当の内部確認。** §5および改訂履歴へ利用者の決定を記録した。新しいフォント補正・単色化は加えず、保存済み値と0.37の描画を維持する。PNG baseline更新は段5のままである。
+
+### HEXの実装前停止: TextEdit外の計測・配置境界
+
+設計担当の第一候補はvendor TextEdit修正である。その前提をsourceで確認したが、「影響がTextEditの外（Atom全体など）へ広がる場合は実装前に止めて論点を返す」という今回の条件に達した。**HEX関連の製品/vendorコードは未変更、未解決。** 5寸法採択の独立した補修とは分ける。
+
+再現手順（報告は未送信）:
+
+1. 同じUiに異なるIdのTextEditを2つ描き、一方へfocusを与える。
+2. もう一方の実矩形内へのPointerMoved、primary press/release、Ctrl+A、Textを一つのRawInputへ入れる。
+3. 0.33.3ではinteraction→pointer request_focus/selection→eventsの順に処理し、新欄が同batchの文字を消費する。
+4. 0.37では `widgets/text_edit/builder.rs` のAtom計測中に `handle_events` が走り、その後にallocate/interactとpointer request_focusが走る。新欄はfocusを得てもchanged=false、Textが未処理で残る。元HEX回帰がこの欠落を検出する。
+
+既存APIで不足する境界:
+
+| 確認箇所 | 根拠と制約 |
+|---|---|
+| `atomics/widget_atom.rs::WidgetAtom::measure` / `SizedWidgetAtom::allocate` | 計測とallocationの分離は既存APIで可能。Uiのplacerをread-onlyに使えば親cursorを進めず外枠の候補も求められる |
+| `atomics/container_atom.rs::SizedContainerAtom::paint_at_with_selection` | frame/grow/gap/align/directionを反映した内部atomの配置矩形はpaint時に初めて求まる。描画とnested widget interactionを伴わずcustom rectを取得するAPIがない |
+| `SizedContainerAtom` の `DerefMut<[SizedAtom]>` | 本文atomのsizeだけ変えてもprivateなinner_size/grow_count等の集計が古い。outer/intrinsic/paint geometryの整合が崩れる |
+| `atomics/atom_kind.rs::AtomClosure` / Clone | prefix/suffix/hintにはFnOnce closureを含められる。AtomKind::ClosureのcloneはEmptyになり、単純な2回measureでは機能が落ちる。本文寸法に依存するshrink prefix/suffixの有効構成もある |
+| IME | owns_ime_eventsをfocus確定前に読む箇所もあり、通常Textだけ動かしてIMEを修正済みとはできない。選択/caret/IME所有を同じphase設計で検証する必要がある |
+
+allocation後へイベント処理だけ移す案は、hint切替・multiline高さ・Frame/prefix/suffixの配置を古いまま残す。古いpassのrectへfallbackする、paintを計測へ流用する、TextEditへAtom配置式を複製する案も採らない。とくにpaint流用はnested prefix/suffix widgetのinteractionを二重実行し得る。
+
+**設計担当へ返す最小の論点:** Atom側で(a)計測済みcontainerの副作用なしpositioned rect算出をpaintから分離し、(b)本文/hint変更後のinner/outer/intrinsic/growを整合させる再layoutを設計する範囲拡張が必要。(a)だけでは足りず、本文に依存するshrink prefix/suffixとFnOnceを再実行せずどう保持するかを定義する。TextEditの1 pass内でinteraction/focus→events→必要な再layout→1回のpaint/allocationを完結し、Atomの既存描画結果を変えない設計と独立レビューが次の前提になる。新APIの実装やAtom全体の変更はまだ行っていない。
+
+別contextの `gpt-6.1-sol / xhigh` も読み取り専用で確認し、既存APIだけで現機能を保ってTextEdit内に閉じる正しい案を認められず、上の停止条件に該当するとの独立判断で一致した。これは機能を落とす案の採択や修正完了の宣言ではない。vendor PATCHESへの修正記録と両方向/singleline/multiline/hint/prefix/suffix/IME/選択/caret/Ctrl+A/helperの追加回帰は、この設計範囲が決まってから行う。
+
+### 5寸法回帰の採択内容
+
+以下は許容誤差の拡大ではなく、利用者が採択した0.37の寸法と到達性を新しい契約にしたもの。元のPNG比較・その他の操作回帰・negative controlは削除していない。
+
+| 対象 | 採択後の根拠・変更 | 到達性の検査 |
+|---|---|---|
+| adjustment scope action | 本文幅258ptを維持し、各action高を旧上限24ptから実寸**25pt等値**へ | 追加 `adjust_scope_actions_fit_or_scroll_to_the_last_action`: 同じ5buttonのScrollArea fixtureで180ptはFits、80ptはScrolls。wheelを一度送り、末尾offset・最後buttonの包含/hover/clickを検査。製品パネル全体の試験と称さない。製品の本文全体ScrollAreaは維持 |
+| What's New reading area | 旧 `version_highlights_initial_width_keeps_previous_reading_area` を `version_highlights_initial_width_respects_037_window_budget` へ改名。1093×614/200%は比較で採択した**537pt**、他の3画面/scale条件は**650pt**を基準とする | 全4条件・8passの外幅/viewport、固定3操作の包含、実wheel→本文末尾を検査。既存 `version_highlights_window_and_close_button_stay_stable` のWindow/Close安定・実hit/click回帰も維持 |
+| reported folder controls | 旧950ptの1行要求を維持せず、1200pt以上のFits/400pt以下の分離と、中間幅の複数rowを採択 | 全matrixで左→input→右の順序、input最小幅、viewport包含、固定7操作の実pointer受付/clipを検査 |
+| bubble body | 268.21875ptの行を誤差で許さず、共通注釈panelの整数本文幅を**268→269pt**へ拡大。製品変更はこの定数だけで、同じPANEL_Wを使う他の注釈panelにも適用される | fill有無×680pt Fits/120pt Scrolls、本文幅≤PANEL_W、全slider水平包含、実wheel→末尾、「余白」Sliderの包含/hit。名前が同じSpinButtonと区別しRoleも指定。関連ui_text回帰を追加実行 |
+| combo negative control | 単体ComboBoxはWidgetAtomがwrapするという0.37の前提へ。実測combo幅の半分だけ残す配置で、予約前にadd_enabled_uiを作る実際の欠落経路を負例とする | 500–599ptの**全100条件で負例は画面外**、親slotを先に取る正例は**画面外0件**。長文/enabled/disabledの既存別回帰も残す |
+
+初回 `adopt-initial`: 6選択/4成功/2失敗、exit100 / 173.15秒。bubbleの「余白」はSliderとSpinButtonの両方に付くためqueryをRole::Sliderへ限定した。What's NewはResizeの初期desired_sizeだけから組み立てた式が536.5ptを予測し、内容計測後の外幅537ptと不一致だった。vendorの丸めを整数point丸めと誤記せず、比較で実際に採択された537/650ptを基準にした。製品の幅計算や閾値許容誤差は変えていない。
+
+補修後 `adopt-corrected`: **7選択/7成功、失敗/skip0、exit0 / 132.95秒**。上表の5件・新規scope末尾回帰・既存What's New固定操作回帰を実行した。各JSONのcommandとJUnitに選択名を保存する。5件は別実装contextのSol/highが担当し、別のSol/xhighによるsourceレビューは修正必須findingなし。上のquery/537pt補修後も最終sourceと実行結果を確認する。
+
+### 採択後の検出力確認
+
+`adopt-mutation`: **4選択/4失敗、skip0、exit100 / 140.18秒**。同時に次の独立した変異を入れ、各testがそれぞれの契約assertで落ちることをJUnitとlogで確認した。build失敗やPNG差を検出の根拠にしていない。runnerのfinallyで4ファイルを元bytesへ復元し、一致を確認した。
+
+| 変異 | 検出した回帰 | 失敗の根拠 |
+|---|---|---|
+| scope action fixtureのwheel量を0へ | `adjust_scope_actions_fit_or_scroll_to_the_last_action` | offset=0のままで末尾scroll検査が失敗 |
+| What's Newのwheel量を0へ | `version_highlights_initial_width_respects_037_window_budget` | offset=0のままで末尾scroll検査が失敗 |
+| 共通本文幅を269から268ptへ戻す | `bubble_body_stays_within_panel_width_with_fill_on_or_off` | 実本文268.21875ptが本文幅268ptを超過 |
+| `toolbar_combo_slot` の親予約を除き、先に子Uiを作る | `a_combo_stays_inside_the_panel_only_when_we_reserve_its_place` | 正例まで全100条件が画面外となり、期待0に反する |
+
+以下の最終検証は復元後のsourceに対して行う。選択件数はnextestでは保存JUnit、cargo testでは最終集計を採用し、0件を成功としない。
+
+### 採択後の最終検証
+
+保存先は `target/egui037-stage4-adopt-final-<label>.json/.log`。nextestは同名のJUnitも保存した。すべてoffline、jobs=1、MSBuild node reuse無効、snapshot更新環境変数なし。以下の `mIV lib <filter>` は `cargo test -p mimageviewer --lib <filter> --offline`、`egui lib <filter>` は `cargo test -p egui --lib <filter> --offline` を表す。
+
+| label / コマンド | 選択 / 成功 / 失敗 / ignore | exit / 秒 |
+|---|---|---|
+| `related` / nextest: scope2件、version_highlights、ui_text、toolbar_wrap_tests、section207_testsの和集合 | 113 / 109 / 4 PNG / 0 | 100 / 177.98 |
+| `4a-ime` / mIV lib `ime` | 504 / 498 / 3 PNG / 3既存 | 101 / 97.42 |
+| `4a-focus` / mIV lib `focus` | 136 / 135 / 1 HEX / 0 | 101 / 13.66 |
+| `4a-keyboard` / mIV lib `keyboard` | 51 / 51 / 0 / 0 | 0 / 6.71 |
+| `4a-keymap` / mIV lib `keymap` | 172 / 172 / 0 / 0 | 0 / 2.25 |
+| `4a-gamepad` / mIV lib `gamepad` | 105 / 105 / 0 / 0 | 0 / 22.29 |
+| `4a-specified_scale` / mIV lib `specified_scale` | 70 / 70 / 0 / 0 | 0 / 19.88 |
+| `4a-fullscreen_overflow` / mIV lib `fullscreen_overflow` | 8 / 4 / 4 PNG / 0 | 101 / 2.23 |
+| `4a-navigator` / mIV lib `navigator` | 66 / 64 / 2 PNG / 0 | 101 / 6.97 |
+| `4b-ui_fonts` / mIV lib `ui_fonts` | 12 / 12 / 0 / 0 | 0 / 0.97 |
+| `4b-ui_font_catalog` / mIV lib `ui_font_catalog` | 7 / 7 / 0 / 0 | 0 / 0.84 |
+| `4b-calculated_` / mIV lib `calculated_` | 12 / 12 / 0 / 0 | 0 / 2.62 |
+| `4b-startup_dialog` / mIV lib `startup_dialog` | 5 / 5 / 0 / 0 | 0 / 0.93 |
+| `vendor-text_edit` / egui lib `text_edit` | 4 / 4 / 0 / 0 | 0 / 3.10 |
+| `vendor-text_cursor_state` / egui lib `text_cursor_state` | 9 / 9 / 0 / 0 | 0 / 0.74 |
+| `vendor-ime_interrupt` / egui lib `ime_interrupt` | 6 / 6 / 0 / 0 | 0 / 0.53 |
+| `core` / `cargo check -p mimageviewer --bin mimageviewer-core --offline` | check成功 | 0 / 14.49 |
+| `all-tests` / `cargo test -p mimageviewer --tests --no-run --offline` | 23 test executableをコンパイル、実行なし | 0 / 129.84 |
+| `fmt` / `cargo fmt --check` | 成功 | 0 / 14.98 |
+| `glyphs` / `python scripts/check_ui_glyphs.py` | 危険glyph検出0 | 0 / 2.29 |
+| `diff` / `git diff --check` | 成功 | 0 / 0.06 |
+
+relatedの失敗は `file_organize_destinations_location_toggle_snapshot`、`file_organize_destinations_location_menu_navigation_and_snapshot`、`file_organize_destinations_many_location_entries_scroll_and_select_last`、`annotation_add_dialog_snapshot_dark`。すべて画像比較まで到達しており、採択した5件・末尾到達・固定操作の回帰は成功した。4aの失敗は元のHEX1件とPNGのみ。既存ignore3件は変更していない。filter間で同じPNGが選ばれるため、上表を相互排他的な全件分類とは呼ばない。vendorの既存回帰19件成功も、同batchのfocus移動が修正済みである証拠にはしない。
+
+### 採択後の引渡し状態
+
+- 字面/baseline/hinting・color emoji・寸法の採択は設計書§5と改訂履歴に反映した。比較索引冒頭にも採択を追記し、従来24組を採択前の記録として保持した。
+- 5件の期待値補修と到達性検査は成功。許容誤差の拡大、assertだけの削除、新しいignoreはない。共通注釈本文幅の1pt拡大以外の製品寸法計算は変更していない。
+- **HEXは設計範囲の判断待ち、4aは受入保留。** 前述のAtom側の純粋配置/再layoutとFnOnceの扱いを設計担当へ返す。両方向・singleline/multiline・hint/prefix/suffix・IME・選択/caret・Ctrl+A/helperの追加回帰、およびvendor PATCHES記録は修正実装とともに行う。既存HEX回帰を操作分割等で成功へ変えていない。
+- `target/egui037-stage4-adopt-final-validation.json` に復元後の4 Rust source hash、5件＋新規scope/既存固定操作の7件成功、変異4失敗、各最終command、baseline **445枚不変**を保存した。段3の分類第3版・既存HUD/metadata課題・§1.380残件は変更していない。
+- HEAD `017f1d8b1` / branch `egui-036` の未コミット差分。git add/commit/branch操作/pushなし。lib全件・live・製品起動・test-fullなし。HEXで自動test greenの前提が成立していないためverification binaryも作成していない。
