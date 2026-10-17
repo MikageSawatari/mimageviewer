@@ -826,6 +826,9 @@ mod tests {
         settings.skip_image_if_video_exists = true;
         settings.video_thumb_use_sidecar_image = true;
         let make = |settings| NowPlayingInput {
+            lyrics_embedded: None,
+            duration_seconds: None,
+            position_source: crate::effetune::now_playing::PositionSource::Unavailable,
             path: path.clone(),
             title: None,
             album: None,
@@ -884,6 +887,9 @@ mod tests {
         settings.skip_image_if_video_exists = true;
         settings.video_thumb_use_sidecar_image = true;
         let mut input = NowPlayingInput {
+            lyrics_embedded: None,
+            duration_seconds: None,
+            position_source: crate::effetune::now_playing::PositionSource::Unavailable,
             path,
             title: None,
             album: None,

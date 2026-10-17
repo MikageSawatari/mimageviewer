@@ -39,7 +39,8 @@ use windows::core::{HSTRING, PCWSTR};
 /// v5: checked GUI-thread presentation outcomes and shared suppression epochs.
 // v6: bounded, fire-and-forget Now Playing snapshots.
 // v7: frame-scoped GUI close/normal geometry and taskbar presentation commands.
-pub const PROTOCOL_VERSION: u32 = 7;
+// v8: 試作の歌詞・曲の世代・再生位置通知。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 pub(crate) fn require_current_protocol(reported: u32) -> Result<(), String> {
     if reported == PROTOCOL_VERSION {
@@ -91,12 +92,45 @@ pub enum Cmd {
     SetNowPlaying {
         slot_id: u64,
         revision: u64,
+        #[serde(rename = "mediaGeneration")]
+        media_generation: u64,
+        #[serde(
+            rename = "lyricsSidecar",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        lyrics_sidecar: Option<Arc<str>>,
+        #[serde(
+            rename = "lyricsEmbedded",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        lyrics_embedded: Option<Arc<str>>,
+        #[serde(
+            rename = "durationSeconds",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        duration_seconds: Option<f64>,
         title: Arc<str>,
         album: Arc<str>,
         artist: Arc<str>,
         artwork: Arc<str>,
         #[serde(rename = "artworkMimeType")]
         artwork_mime_type: Arc<str>,
+    },
+    #[serde(rename = "set_playback_position")]
+    SetPlaybackPosition {
+        slot_id: u64,
+        #[serde(rename = "mediaGeneration")]
+        media_generation: u64,
+        available: u32,
+        playing: u32,
+        #[serde(rename = "positionSeconds")]
+        position_seconds: f64,
+        rate: f64,
+        #[serde(rename = "hostTimeNanoseconds")]
+        host_time_ns: u64,
     },
     Hello {
         version: u32,
@@ -1687,7 +1721,7 @@ mod concurrent_state_tests {
     use super::*;
 
     #[test]
-    fn protocol_handshake_rejects_v6_ready_before_any_audio_or_gui_command() {
+    fn protocol_handshake_rejects_v7_ready_before_any_audio_or_gui_command() {
         let (bridge, commands, events) = Bridge::fake_host_for_test();
         bridge
             .send(&Cmd::Hello {
@@ -1699,12 +1733,12 @@ mod concurrent_state_tests {
             .unwrap();
         assert_eq!(hello["cmd"], "hello");
         assert_eq!(hello["version"], PROTOCOL_VERSION);
-        events.emit(Event::Ready { version: 6 });
+        events.emit(Event::Ready { version: 7 });
         let Event::Ready { version } = bridge.recv().unwrap() else {
             panic!("fake legacy host must reply Ready")
         };
         let error = require_current_protocol(version).unwrap_err();
-        assert!(error.contains("bridge reported 6"));
+        assert!(error.contains("bridge reported 7"));
         assert!(
             commands.try_recv().is_err(),
             "rejected peer must not receive open or show_gui"
@@ -2152,11 +2186,41 @@ mod effetune_host_handler_tests {
 mod now_playing_wire_tests {
     use super::*;
     #[test]
+    fn lyrics_position_typed_wire_order_and_roundtrip() {
+        let command = Cmd::SetPlaybackPosition {
+            slot_id: 17,
+            media_generation: 42,
+            available: 1,
+            playing: 0,
+            position_seconds: 2.5,
+            rate: 2.0,
+            host_time_ns: 123456,
+        };
+        let wire = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"cmd":"set_playback_position","slot_id":17,"mediaGeneration":42,"available":1,"playing":0,"positionSeconds":2.5,"rate":2.0,"hostTimeNanoseconds":123456}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Cmd>(&wire).unwrap(),
+            Cmd::SetPlaybackPosition {
+                media_generation: 42,
+                available: 1,
+                playing: 0,
+                ..
+            }
+        ));
+    }
+    #[test]
     fn now_playing_typed_command_serializes_cmd_first_with_exact_wire_keys() {
         let title = "曲😀 \\\"cmd\\\": \\\"slot_id\\\" \\\\ tail";
         let command = Cmd::SetNowPlaying {
             slot_id: 17,
             revision: 4,
+            media_generation: 2,
+            lyrics_sidecar: None,
+            lyrics_embedded: None,
+            duration_seconds: Some(60.0),
             title: title.into(),
             album: "アルバム".into(),
             artist: "artist".into(),
@@ -2184,7 +2248,9 @@ mod now_playing_wire_tests {
                 "album",
                 "artist",
                 "artwork",
-                "artworkMimeType"
+                "artworkMimeType",
+                "mediaGeneration",
+                "durationSeconds"
             ]
             .into_iter()
             .collect()
@@ -2210,6 +2276,10 @@ mod now_playing_wire_tests {
         let command = Cmd::SetNowPlaying {
             slot_id: 3,
             revision: 8,
+            media_generation: 2,
+            lyrics_sidecar: Some("\u{0001}".repeat(262_144).into()),
+            lyrics_embedded: Some("\u{0001}".repeat(262_144).into()),
+            duration_seconds: None,
             title: "曲😀".into(),
             album: "".into(),
             artist: "".into(),

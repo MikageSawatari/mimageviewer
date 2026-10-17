@@ -64,12 +64,24 @@ impl FakeHost {
                         // RegisterBridge resends the current snapshot before GUI work.
                         // Consume only its exact fire-and-forget wire shape: metadata
                         // must neither synthesize an ACK nor alter GUI observations.
-                        let keys = value
+                        let mut keys = value
                             .as_object()
                             .unwrap()
                             .keys()
                             .map(String::as_str)
                             .collect::<std::collections::BTreeSet<_>>();
+                        for key in ["lyricsSidecar", "lyricsEmbedded"] {
+                            if keys.remove(key) {
+                                let text = value[key].as_str().unwrap();
+                                assert!(
+                                    text.encode_utf16().count() <= 262_144 && !text.contains('\0')
+                                );
+                            }
+                        }
+                        if keys.remove("durationSeconds") {
+                            let duration = value["durationSeconds"].as_f64().unwrap();
+                            assert!(duration.is_finite() && duration > 0.0);
+                        }
                         assert_eq!(
                             keys,
                             [
@@ -80,12 +92,14 @@ impl FakeHost {
                                 "album",
                                 "artist",
                                 "artwork",
-                                "artworkMimeType"
+                                "artworkMimeType",
+                                "mediaGeneration"
                             ]
                             .into_iter()
                             .collect()
                         );
                         assert_eq!(value["slot_id"], 0);
+                        assert!(value["mediaGeneration"].as_u64().is_some());
                         let revision = value["revision"].as_u64().unwrap();
                         assert!(metadata_revision.is_none_or(|previous| revision >= previous));
                         metadata_revision = Some(revision);
@@ -112,6 +126,37 @@ impl FakeHost {
                                     <= 8 * 1024 * 1024
                             );
                         }
+                    }
+                    "set_playback_position" => {
+                        // The independent latest lane has no ACK and cannot change GUI intent.
+                        let keys = value
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        assert_eq!(
+                            keys,
+                            [
+                                "cmd",
+                                "slot_id",
+                                "mediaGeneration",
+                                "available",
+                                "playing",
+                                "positionSeconds",
+                                "rate",
+                                "hostTimeNanoseconds"
+                            ]
+                            .into_iter()
+                            .collect()
+                        );
+                        assert_eq!(value["slot_id"], 0);
+                        assert!(value["mediaGeneration"].as_u64().is_some());
+                        assert!(value["available"].as_u64().unwrap() <= 1);
+                        assert!(value["playing"].as_u64().unwrap() <= 1);
+                        assert!(value["positionSeconds"].as_f64().unwrap().is_finite());
+                        assert!(value["rate"].as_f64().unwrap() > 0.0);
+                        assert!(value["hostTimeNanoseconds"].as_u64().is_some());
                     }
                     "query_gui_size" => events.emit(Event::GuiSize {
                         width: 640,

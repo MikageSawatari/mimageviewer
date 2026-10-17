@@ -648,9 +648,9 @@ public:
         return thread_id_.load(std::memory_order_acquire);
     }
 
-    void bind_now_playing(const std::shared_ptr<NowPlayingMailbox>& mailbox) {
+    void bind_now_playing(const std::shared_ptr<NotificationMailbox>& mailbox, size_t lane = 0) {
         std::lock_guard<std::mutex> lock(now_playing_mutex_);
-        now_playing_mailbox_ = mailbox; // Same canonical slot incarnation owner.
+        notification_mailboxes_[lane] = mailbox; // Same canonical slot incarnation owner.
     }
 
     // A timeout means the slot GUI thread is stuck in plugin code. The bridge
@@ -672,7 +672,7 @@ public:
         post_task([task]() {
             (*task)();
         });
-        const auto wait = await_gui_future(future, timeout, [this] { return now_playing_mailbox(); });
+        const auto wait = await_gui_notifications(future, timeout, [this] { return notification_mailboxes(); });
         if (wait.outcome == GuiFutureWait::NowPlayingTimeout) terminate_now_playing_timeout(wait.mailbox);
         if (wait.outcome == GuiFutureWait::GuiTimeout) {
             DWORD gui_tid = thread_id_.load(std::memory_order_acquire);
@@ -703,7 +703,7 @@ public:
         post_task([task]() {
             (*task)();
         });
-        const auto wait = await_gui_future(future, timeout, [this] { return now_playing_mailbox(); });
+        const auto wait = await_gui_notifications(future, timeout, [this] { return notification_mailboxes(); });
         if (wait.outcome == GuiFutureWait::NowPlayingTimeout) terminate_now_playing_timeout(wait.mailbox);
         if (wait.outcome == GuiFutureWait::GuiTimeout) {
             DWORD gui_tid = thread_id_.load(std::memory_order_acquire);
@@ -730,12 +730,15 @@ public:
     }
 
 private:
-    std::shared_ptr<NowPlayingMailbox> now_playing_mailbox() {
+    std::vector<std::shared_ptr<NotificationMailbox>> notification_mailboxes() {
         std::lock_guard<std::mutex> lock(now_playing_mutex_);
-        return now_playing_mailbox_.lock();
+        std::vector<std::shared_ptr<NotificationMailbox>> owners;
+        for (const auto& weak : notification_mailboxes_)
+            if (auto owner = weak.lock()) owners.push_back(std::move(owner));
+        return owners;
     }
     std::mutex now_playing_mutex_;
-    std::weak_ptr<NowPlayingMailbox> now_playing_mailbox_;
+    std::weak_ptr<NotificationMailbox> notification_mailboxes_[2];
     void ensure_started() {
         if (running_.load(std::memory_order_acquire)) {
             return;
@@ -2583,6 +2586,25 @@ void PluginLoader::post_now_playing(std::shared_ptr<NowPlayingMailbox> mailbox,
                 notify_now_playing(host_app_.get(), component_.get(), controller_.get(), snapshot);
             }
         }, wake); // Return via control, never inline recurse.
+    });
+}
+
+void PluginLoader::post_playback_position(std::shared_ptr<PlaybackPositionMailbox> mailbox,
+                                        std::function<void(std::shared_ptr<PlaybackPositionMailbox>)> wake) {
+    if (!gui_thread_ || editor_quarantined_.load(std::memory_order_acquire)) {
+        mailbox->close();
+        blog("playback_position slot=%llu receiver=unavailable", static_cast<unsigned long long>(mailbox->slot_id));
+        return;
+    }
+    gui_thread_->bind_now_playing(mailbox, 1);
+    gui_thread_->post_async([this, mailbox = std::move(mailbox), wake = std::move(wake)]() {
+        execute_now_playing(mailbox, GetTickCount64(), [this](const auto& snapshot) {
+            if (!component_ || editor_quarantined_.load(std::memory_order_acquire)) {
+                blog("playback_position slot=%llu receiver=unavailable", static_cast<unsigned long long>(snapshot.slot_id));
+            } else {
+                notify_playback_position(host_app_.get(), component_.get(), controller_.get(), snapshot);
+            }
+        }, wake);
     });
 }
 

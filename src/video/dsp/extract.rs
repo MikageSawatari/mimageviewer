@@ -1,5 +1,5 @@
 //! VST3 host を data_dir/vst3/hosts/<content hash>/ に展開する。
-//! host の basename は維持し、CRT は検索対象外の vcrt/ に置く。
+//! 試作では展開時だけ host の basename を変える。CRT は検索対象外の vcrt/ に置く。
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -112,7 +112,8 @@ fn prepare_bridge(base: &std::path::Path) -> std::io::Result<PathBuf> {
     for &(name, bytes) in HOST_VCRT {
         ensure_bytes(&runtime.join(name), bytes)?;
     }
-    let exe = dir.join("mimageviewer-vst3-host.exe");
+    // 試作: only the extracted basename changes, isolating WebView user data.
+    let exe = dir.join("mimageviewer-vst3-host-lyrics-trial.exe");
     ensure_bytes(&exe, BRIDGE_EXE_BYTES)?;
     Ok(exe)
 }
@@ -168,7 +169,10 @@ mod tests {
         let legacy = temp.path().join("msvcp140.dll");
         std::fs::write(&legacy, b"legacy in-use CRT").unwrap();
         let exe = super::prepare_bridge(temp.path()).unwrap();
-        assert_eq!(exe.file_name().unwrap(), "mimageviewer-vst3-host.exe");
+        assert_eq!(
+            exe.file_name().unwrap(),
+            "mimageviewer-vst3-host-lyrics-trial.exe"
+        );
         assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy in-use CRT");
         for &(name, bytes) in super::HOST_VCRT {
             assert!(!exe.parent().unwrap().join(name).exists());

@@ -1026,12 +1026,23 @@ impl EffetuneController {
                 let mut presentation_bridge = std::sync::Weak::<DspBridge>::new();
                 let mut now_playing_revision = None;
                 let mut show_in_taskbar = true;
-                while let Ok(command) = host_rx.recv() {
+                let mut position = now_playing::position::Sender::default();
+                loop {
+                    if let Some(core) = host_now_playing.upgrade() { position.update(&core, &presentation_bridge); }
+                    let command = match position.wait() {
+                        Some(timeout) => match host_rx.recv_timeout(timeout) {
+                            Ok(command) => command,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        },
+                        None => match host_rx.recv() { Ok(command) => command, Err(_) => break },
+                    };
                     match command {
                         HostCommand::RegisterBridge(bridge) => {
                             presentation_bridge = bridge;
                             if let Some(bridge) = presentation_bridge.upgrade() { bridge.set_gui_show_in_taskbar(show_in_taskbar); }
                             now_playing_revision = None;
+                            position.reset();
                             if let Some(core) = host_now_playing.upgrade() { send_latest_now_playing(&core, &presentation_bridge, &mut now_playing_revision); }
                         }
                         HostCommand::RefreshNowPlaying => {

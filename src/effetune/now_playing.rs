@@ -10,6 +10,35 @@ use std::{
 };
 
 mod artwork;
+pub(crate) mod lyrics;
+pub(super) mod position;
+
+#[derive(Clone)]
+pub(crate) enum PositionSource {
+    Unavailable,
+    Local {
+        clock: Arc<crate::video::clock::AvClock>,
+        diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
+    },
+}
+impl PositionSource {
+    fn same(&self, rhs: &Self) -> bool {
+        match (self, rhs) {
+            (Self::Unavailable, Self::Unavailable) => true,
+            (
+                Self::Local {
+                    clock: a,
+                    diagnostics: da,
+                },
+                Self::Local {
+                    clock: b,
+                    diagnostics: db,
+                },
+            ) => Arc::ptr_eq(a, b) && Arc::ptr_eq(da, db),
+            _ => false,
+        }
+    }
+}
 
 /// Borrow the wire-visible prefix without examining the suffix after the limit.
 /// The host accepts at most 4096 UTF-16 units, and NUL terminates its text.
@@ -58,9 +87,20 @@ pub(crate) struct NowPlayingInput {
     pub album: Option<String>,
     pub artist: Option<String>,
     pub artwork: NowPlayingArtworkSource,
+    pub lyrics_embedded: Option<String>,
+    pub duration_seconds: Option<f64>,
+    pub position_source: PositionSource,
 }
 impl NowPlayingInput {
     fn bound_text(&mut self) {
+        self.lyrics_embedded = self
+            .lyrics_embedded
+            .take()
+            .map(|text| lyrics::prefix(&text).to_owned())
+            .filter(|text| !text.is_empty());
+        self.duration_seconds = self
+            .duration_seconds
+            .filter(|value| value.is_finite() && *value > 0.0);
         for text in [&mut self.title, &mut self.album, &mut self.artist]
             .into_iter()
             .flatten()
@@ -77,6 +117,9 @@ impl NowPlayingInput {
             && self.title == rhs.title
             && self.album == rhs.album
             && self.artist == rhs.artist
+            && self.lyrics_embedded == rhs.lyrics_embedded
+            && self.duration_seconds == rhs.duration_seconds
+            && self.position_source.same(&rhs.position_source)
             && self.artwork.same(&rhs.artwork)
     }
 }
@@ -133,7 +176,12 @@ impl NowPlayingArtworkSource {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct NowPlayingSnapshot {
+    pub media_generation: u64,
+    pub lyrics_sidecar: Option<Arc<str>>,
+    pub lyrics_embedded: Option<Arc<str>>,
+    pub duration_seconds: Option<f64>,
     pub revision: u64,
     pub title: Arc<str>,
     pub album: Arc<str>,
@@ -145,6 +193,10 @@ impl NowPlayingSnapshot {
     fn empty(revision: u64) -> Self {
         Self {
             revision,
+            media_generation: 0,
+            lyrics_sidecar: None,
+            lyrics_embedded: None,
+            duration_seconds: None,
             title: "".into(),
             album: "".into(),
             artist: "".into(),
@@ -170,6 +222,8 @@ impl NowPlayingSnapshot {
         Self {
             revision,
             title: title.into(),
+            lyrics_embedded: input.lyrics_embedded.as_deref().map(Into::into),
+            duration_seconds: input.duration_seconds,
             album: bounded_text_prefix(input.album.as_deref().unwrap_or("")).into(),
             artist: bounded_text_prefix(input.artist.as_deref().unwrap_or("")).into(),
             ..Self::empty(revision)
@@ -179,6 +233,10 @@ impl NowPlayingSnapshot {
         crate::video::dsp::bridge::Cmd::SetNowPlaying {
             slot_id,
             revision: self.revision,
+            media_generation: self.media_generation,
+            lyrics_sidecar: self.lyrics_sidecar.clone(),
+            lyrics_embedded: self.lyrics_embedded.clone(),
+            duration_seconds: self.duration_seconds,
             title: Arc::clone(&self.title),
             album: Arc::clone(&self.album),
             artist: Arc::clone(&self.artist),
@@ -220,6 +278,7 @@ impl OwnerState {
     }
 }
 struct ArtJob {
+    read_lyrics: bool,
     revision: u64,
     input: Arc<NowPlayingInput>,
     cancel: Arc<AtomicBool>,
@@ -246,6 +305,15 @@ impl Core {
     }
     pub(super) fn snapshot(&self) -> Arc<NowPlayingSnapshot> {
         self.state.lock().unwrap().snapshot()
+    }
+    pub(super) fn position(&self) -> (u64, PositionSource) {
+        let state = self.state.lock().unwrap();
+        let generation = state.snapshot().media_generation;
+        let source = match &*state {
+            OwnerState::Media { input, .. } => input.position_source.clone(),
+            OwnerState::Empty(_) => PositionSource::Unavailable,
+        };
+        (generation, source)
     }
     pub(super) fn refresh_consumed(&self) {
         self.refresh_pending.store(false, Ordering::Release);
@@ -277,6 +345,7 @@ impl Core {
             return;
         }
         if let OwnerState::Media {
+            owner,
             input,
             snapshot,
             artwork,
@@ -286,12 +355,9 @@ impl Core {
             if !matches!(artwork, ArtworkState::Deferred) {
                 return;
             }
-            if matches!(input.artwork, NowPlayingArtworkSource::None) {
-                *artwork = ArtworkState::Absent;
-                return;
-            }
             let cancel = Arc::new(AtomicBool::new(false));
             let job = ArtJob {
+                read_lyrics: matches!(owner, NowPlayingOwner::Local(_)),
                 revision: snapshot.revision,
                 input: Arc::clone(input),
                 cancel: Arc::clone(&cancel),
@@ -302,6 +368,12 @@ impl Core {
         }
     }
     fn complete(&self, job: &ArtJob, result: Result<Option<artwork::EncodedArt>, String>) {
+        // This completion belongs to the supplementation worker, before its short owner lock.
+        let lyrics = if job.read_lyrics {
+            lyrics::read_sidecar(&job.input.path, &job.cancel)
+        } else {
+            Ok(None)
+        };
         if job.cancel.load(Ordering::Acquire) {
             return;
         }
@@ -315,31 +387,45 @@ impl Core {
         if snapshot.revision != job.revision || !self.active.load(Ordering::Acquire) {
             return;
         }
-        match result {
+        let (art, art_warning) = match result {
             Ok(Some(art)) => {
-                let warning = art.warning;
-                let revision = self.next_revision();
-                *snapshot = Arc::new(NowPlayingSnapshot {
-                    revision,
-                    title: Arc::clone(&snapshot.title),
-                    album: Arc::clone(&snapshot.album),
-                    artist: Arc::clone(&snapshot.artist),
-                    artwork: art.base64,
-                    artwork_mime_type: art.mime.into(),
-                });
-                *artwork = ArtworkState::Ready;
-                drop(state);
-                self.refresh();
-                if let Some(error) = warning {
-                    self.warn(format!("画像を読み込めませんでした: {error}"));
-                }
+                let warning = art.warning.clone();
+                (Some(art), warning)
             }
-            Ok(None) => *artwork = ArtworkState::Absent,
-            Err(error) => {
-                *artwork = ArtworkState::Absent;
-                drop(state);
-                self.warn(format!("画像を読み込めませんでした: {error}"));
+            Ok(None) => (None, None),
+            Err(error) => (None, Some(error)),
+        };
+        let (sidecar, lyrics_warning) = match lyrics {
+            Ok(text) => (text.map(Arc::<str>::from), None),
+            Err(error) => (None, Some(error)),
+        };
+        *artwork = if art.is_some() {
+            ArtworkState::Ready
+        } else {
+            ArtworkState::Absent
+        };
+        let changed = art.as_ref().is_some_and(|art| {
+            art.base64 != snapshot.artwork || art.mime != &*snapshot.artwork_mime_type
+        }) || snapshot.lyrics_sidecar != sidecar;
+        if changed {
+            let mut next = (**snapshot).clone();
+            next.revision = self.next_revision();
+            if let Some(art) = art {
+                next.artwork = art.base64;
+                next.artwork_mime_type = art.mime.into();
             }
+            next.lyrics_sidecar = sidecar;
+            *snapshot = Arc::new(next);
+        }
+        drop(state);
+        if changed {
+            self.refresh();
+        }
+        if let Some(error) = art_warning {
+            self.warn(format!("画像を読み込めませんでした: {error}"));
+        }
+        if let Some(error) = lyrics_warning {
+            crate::logger::log(format!("[EffeTune lyrics] {error}"));
         }
     }
 }
@@ -409,6 +495,10 @@ impl NowPlaying {
         if !self.available {
             return;
         }
+        if matches!(owner, NowPlayingOwner::Remote { .. }) {
+            input.lyrics_embedded = None;
+            input.position_source = PositionSource::Unavailable;
+        }
         input.bound_text();
         let mut state = self.core.state.lock().unwrap();
         if matches!(&*state,OwnerState::Media {owner:existing,input:old,..} if *existing==owner && old.same(&input))
@@ -417,7 +507,18 @@ impl NowPlaying {
         }
         state.cancel();
         let revision = self.core.next_revision();
-        let snapshot = Arc::new(NowPlayingSnapshot::text(revision, &input));
+        let generation = match &*state {
+            OwnerState::Media {
+                owner: old,
+                input: old_input,
+                snapshot,
+                ..
+            } if *old == owner && old_input.path == input.path => snapshot.media_generation,
+            _ => state.snapshot().media_generation + 1,
+        };
+        let mut snapshot = NowPlayingSnapshot::text(revision, &input);
+        snapshot.media_generation = generation;
+        let snapshot = Arc::new(snapshot);
         *state = OwnerState::Media {
             owner,
             input: Arc::new(input),
@@ -436,9 +537,10 @@ impl NowPlaying {
             return;
         }
         state.cancel();
-        *state = OwnerState::Empty(Arc::new(NowPlayingSnapshot::empty(
-            self.core.next_revision(),
-        )));
+        let generation = state.snapshot().media_generation + 1;
+        let mut empty = NowPlayingSnapshot::empty(self.core.next_revision());
+        empty.media_generation = generation;
+        *state = OwnerState::Empty(Arc::new(empty));
         self.core.queue.0.lock().unwrap().pending = None;
         drop(state);
         self.core.refresh();
@@ -505,22 +607,31 @@ impl NowPlaying {
             NowPlayingArtworkSource::None => sidecar.is_none(),
         }
     }
-    pub(super) fn refresh_input(&self, owner: NowPlayingOwner, input: NowPlayingInput) {
-        // Explicit source refresh is a new media revision even for an equal descriptor.
+    pub(super) fn refresh_input(&self, owner: NowPlayingOwner, mut input: NowPlayingInput) {
         if !self.available {
             return;
         }
-        {
-            let mut state = self.core.state.lock().unwrap();
-            if !matches!(&*state,OwnerState::Media {owner:existing,..} if *existing==owner) {
-                return;
-            }
-            state.cancel();
-            *state = OwnerState::Empty(Arc::new(NowPlayingSnapshot::empty(
-                self.core.next_revision(),
-            )));
+        if matches!(owner, NowPlayingOwner::Remote { .. }) {
+            input.lyrics_embedded = None;
+            input.position_source = PositionSource::Unavailable;
         }
-        self.publish(owner, input);
+        input.bound_text();
+        let mut state = self.core.state.lock().unwrap();
+        if !matches!(&*state, OwnerState::Media {owner: existing,..} if *existing == owner) {
+            return;
+        }
+        let generation = state.snapshot().media_generation;
+        state.cancel();
+        let mut snapshot = NowPlayingSnapshot::text(self.core.next_revision(), &input);
+        snapshot.media_generation = generation;
+        *state = OwnerState::Media {
+            owner,
+            input: Arc::new(input),
+            snapshot: Arc::new(snapshot),
+            artwork: ArtworkState::Deferred,
+        };
+        drop(state);
+        self.core.refresh();
     }
     pub(super) fn take_warning(&self) -> Option<String> {
         self.core.warning.lock().unwrap().take()
@@ -539,6 +650,93 @@ impl Drop for NowPlaying {
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn lyrics_supplement_without_art_and_independent_failures_preserve_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.flac");
+        std::fs::write(path.with_extension("lrc"), "[00:01.00]sidecar").unwrap();
+        let (now, _rx) = service(true);
+        now.set_active(true);
+        let owner = NowPlayingOwner::Local(1);
+        let mut source = input(path.to_str().unwrap());
+        source.lyrics_embedded = Some("embedded".into());
+        source.duration_seconds = Some(60.0);
+        now.publish(owner, source.clone());
+        let text = now.core.snapshot();
+        assert_eq!(text.lyrics_embedded.as_deref(), Some("embedded"));
+        let job = ArtJob {
+            read_lyrics: true,
+            revision: text.revision,
+            input: Arc::new(source.clone()),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        now.core.complete(&job, Err("failed image".into()));
+        let supplemented = now.core.snapshot();
+        assert_eq!(supplemented.media_generation, text.media_generation);
+        assert!(supplemented.revision > text.revision);
+        assert_eq!(
+            supplemented.lyrics_sidecar.as_deref(),
+            Some("[00:01.00]sidecar")
+        );
+        assert!(supplemented.artwork.is_empty());
+        now.refresh_input(owner, source.clone());
+        let refreshed = now.core.snapshot();
+        assert_eq!(refreshed.media_generation, text.media_generation);
+        std::fs::write(path.with_extension("lrc"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let job = ArtJob {
+            revision: refreshed.revision,
+            ..job
+        };
+        now.core.complete(
+            &job,
+            Ok(Some(artwork::EncodedArt {
+                base64: "YWJj".into(),
+                mime: "image/png",
+                warning: None,
+            })),
+        );
+        let snapshot = now.core.snapshot();
+        assert_eq!(&*snapshot.artwork, "YWJj");
+        assert!(snapshot.lyrics_sidecar.is_none());
+        assert_eq!(snapshot.media_generation, text.media_generation);
+        now.clear(owner);
+        assert!(now.core.snapshot().media_generation > snapshot.media_generation);
+        now.core.complete(&job, Ok(None));
+        assert!(now.core.snapshot().lyrics_embedded.is_none());
+    }
+
+    #[test]
+    fn lyrics_worker_publishes_no_artwork_source_and_remote_omits_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.flac");
+        std::fs::write(path.with_extension("lrc"), "sidecar").unwrap();
+        let (now, rx) = service(true);
+        now.set_active(true);
+        now.publish(NowPlayingOwner::Local(1), input(path.to_str().unwrap()));
+        rx.recv().unwrap();
+        now.core.refresh_consumed();
+        now.core.start_artwork();
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("lyric-only completion publishes");
+        let snapshot = now.core.snapshot();
+        assert!(snapshot.artwork.is_empty());
+        assert_eq!(snapshot.lyrics_sidecar.as_deref(), Some("sidecar"));
+        let generation = snapshot.media_generation;
+        let mut source = input(path.to_str().unwrap());
+        source.lyrics_embedded = Some("embedded".into());
+        let remote = NowPlayingOwner::Remote {
+            session: 1,
+            registration: 1,
+        };
+        now.publish(remote, source);
+        now.core.start_artwork();
+        let value = serde_json::to_value(now.core.snapshot().command(0)).unwrap();
+        assert!(value.get("lyricsSidecar").is_none() && value.get("lyricsEmbedded").is_none());
+        assert!(now.core.snapshot().media_generation > generation);
+        assert!(matches!(now.core.position().1, PositionSource::Unavailable));
+        now.clear(remote);
+        assert!(now.core.snapshot().lyrics_sidecar.is_none());
+    }
     fn input(path: &str) -> NowPlayingInput {
         NowPlayingInput {
             path: path.into(),
@@ -546,6 +744,9 @@ mod tests {
             album: None,
             artist: None,
             artwork: NowPlayingArtworkSource::None,
+            lyrics_embedded: None,
+            duration_seconds: None,
+            position_source: PositionSource::Unavailable,
         }
     }
     fn service(available: bool) -> (NowPlaying, mpsc::Receiver<HostCommand>) {
@@ -594,6 +795,7 @@ mod tests {
         now.publish(owner, source.clone());
         let text = now.core.snapshot();
         let job = ArtJob {
+            read_lyrics: true,
             revision: text.revision,
             input: Arc::new(source),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -669,6 +871,7 @@ mod tests {
         now.clear(old);
         assert_eq!(now.core.snapshot().revision, snapshot.revision);
         let job = ArtJob {
+            read_lyrics: true,
             revision: snapshot.revision,
             input: Arc::new(input("new.mp3")),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -789,13 +992,28 @@ mod tests {
         assert_eq!(first["cmd"], "set_now_playing");
         assert_eq!(first["slot_id"], 17);
         assert_eq!(first["title"], "a");
+        let first_position = commands.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(first_position["cmd"], "set_playback_position");
+        assert_eq!(first_position["slot_id"], 17);
+        assert_eq!(first_position["available"], 0);
+        assert_eq!(first_position["mediaGeneration"], first["mediaGeneration"]);
         register();
         let second = commands.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(first, second);
+        let second_position = commands.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            second_position["mediaGeneration"],
+            first_position["mediaGeneration"]
+        );
+        assert_eq!(second_position["available"], 0);
         controller.clear_now_playing(owner);
         let clear = commands.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(clear["title"], "");
         assert_eq!(clear["artworkMimeType"], "");
+        let clear_position = commands.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(clear_position["cmd"], "set_playback_position");
+        assert_eq!(clear_position["mediaGeneration"], clear["mediaGeneration"]);
+        assert_eq!(clear_position["available"], 0);
         controller
             .host_tx
             .send(HostCommand::RegisterBridge(Arc::downgrade(&bridge)))
@@ -804,6 +1022,12 @@ mod tests {
             commands.recv_timeout(Duration::from_secs(3)).unwrap(),
             clear
         );
+        let resent_clear_position = commands.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            resent_clear_position["mediaGeneration"],
+            clear["mediaGeneration"]
+        );
+        assert_eq!(resent_clear_position["available"], 0);
         assert!(
             host.fake_command_threads_for_test()
                 .iter()

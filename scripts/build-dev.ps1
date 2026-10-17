@@ -30,6 +30,8 @@
 
 [CmdletBinding()]
 param(
+    # Trial (shisaku): stage this complete bundle only in dev-runtime.
+    [string] $EffetuneBundle,
     [switch] $TestScript,
     # Fail when an exact staged development executable is running instead of
     # stopping it. This keeps a live verification runtime intact.
@@ -134,8 +136,20 @@ function Copy-IfChanged {
 }
 
 function Copy-EffetuneBundleIfChanged {
-    $source = Join-Path $repoRoot 'vendor\effetune-mixwright\EffeTune Mixwright.vst3'
+    $source = if ($EffetuneBundle) {
+        (Resolve-Path -LiteralPath $EffetuneBundle).Path
+    } else {
+        Join-Path $repoRoot 'vendor\effetune-mixwright\EffeTune Mixwright.vst3'
+    }
     $destination = Join-Path $outputDir 'effetune\EffeTune Mixwright.vst3'
+    $source = [IO.Path]::GetFullPath($source).TrimEnd('\', '/')
+    $destination = [IO.Path]::GetFullPath($destination).TrimEnd('\', '/')
+    $separator = [IO.Path]::DirectorySeparatorChar
+    if ($source.Equals($destination, [StringComparison]::OrdinalIgnoreCase) -or
+        $source.StartsWith($destination + $separator, [StringComparison]::OrdinalIgnoreCase) -or
+        $destination.StartsWith($source + $separator, [StringComparison]::OrdinalIgnoreCase)) {
+        throw '[build-dev] EffeTune source and destination overlap'
+    }
     if (-not (Test-Path -LiteralPath $source -PathType Container)) {
         throw "[build-dev] required EffeTune bundle is missing: $source"
     }

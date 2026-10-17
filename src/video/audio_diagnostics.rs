@@ -31,6 +31,102 @@ use std::time::Instant;
 
 static NEXT_AUDIO_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 試作専用 single-writer snapshot. All accesses, including payload, are SeqCst.
+#[derive(Default)]
+pub(crate) struct LyricsTrialLead {
+    sequence: AtomicU64,
+    lead_bits: AtomicU64,
+    pump_serial: AtomicU64,
+    clock_serial_before: AtomicU64,
+    clock_serial_after: AtomicU64,
+    wall_ns: AtomicU64,
+}
+#[derive(Debug, PartialEq)]
+pub(crate) struct LyricsTrialLeadSample {
+    pub sequence: u64,
+    pub lead_ms: f64,
+    pub pump_serial: u64,
+    pub clock_serial_before: u64,
+    pub clock_serial_after: u64,
+    pub wall_ns: u64,
+}
+impl LyricsTrialLead {
+    pub(super) fn record(
+        &self,
+        lead_ms: f64,
+        pump_serial: u64,
+        before: u64,
+        after: u64,
+        wall_ns: u64,
+    ) {
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+        self.lead_bits.store(lead_ms.to_bits(), Ordering::SeqCst);
+        self.pump_serial.store(pump_serial, Ordering::SeqCst);
+        self.clock_serial_before.store(before, Ordering::SeqCst);
+        self.clock_serial_after.store(after, Ordering::SeqCst);
+        self.wall_ns.store(wall_ns, Ordering::SeqCst);
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn read(&self) -> Option<LyricsTrialLeadSample> {
+        self.read_report().ok().flatten()
+    }
+    pub(crate) fn read_report(&self) -> Result<Option<LyricsTrialLeadSample>, ()> {
+        self.read_once(|| {})
+    }
+    fn read_once(&self, between: impl FnOnce()) -> Result<Option<LyricsTrialLeadSample>, ()> {
+        let sequence = self.sequence.load(Ordering::SeqCst);
+        if sequence == 0 {
+            return Ok(None);
+        }
+        if sequence % 2 != 0 {
+            return Err(());
+        }
+        let sample = LyricsTrialLeadSample {
+            sequence,
+            lead_ms: f64::from_bits(self.lead_bits.load(Ordering::SeqCst)),
+            pump_serial: self.pump_serial.load(Ordering::SeqCst),
+            clock_serial_before: self.clock_serial_before.load(Ordering::SeqCst),
+            clock_serial_after: self.clock_serial_after.load(Ordering::SeqCst),
+            wall_ns: self.wall_ns.load(Ordering::SeqCst),
+        };
+        between();
+        if self.sequence.load(Ordering::SeqCst) == sequence {
+            Ok(Some(sample))
+        } else {
+            Err(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod lyrics_trial_tests {
+    use super::*;
+    #[test]
+    fn lyrics_trial_sample_rejects_interleaving_without_retry_and_clear_preserves_it() {
+        let diagnostics = AudioDiagnostics::new(Instant::now());
+        let lead = &diagnostics.lyrics_trial_lead;
+        assert!(lead.read().is_none());
+        lead.record(4.0, 2, 2, 2, 10);
+        let sample = lead.read().unwrap();
+        assert_eq!(sample.sequence, 2);
+        diagnostics.clear_audio_position();
+        assert_eq!(lead.read(), Some(sample));
+        assert!(lead.read_once(|| lead.record(5.0, 2, 3, 3, 11)).is_err());
+        let interrupted = lead.read().unwrap();
+        assert_eq!(
+            (
+                interrupted.pump_serial,
+                interrupted.clock_serial_before,
+                interrupted.clock_serial_after
+            ),
+            (2, 3, 3)
+        );
+        lead.sequence.store(5, Ordering::SeqCst);
+        assert!(lead.read().is_none());
+    }
+}
+
 fn atomic_fetch_max(target: &AtomicU64, value: u64) {
     let mut current = target.load(Ordering::Relaxed);
     while value > current {
@@ -42,6 +138,8 @@ fn atomic_fetch_max(target: &AtomicU64, value: u64) {
 }
 
 pub struct AudioDiagnostics {
+    /// 試作 D 記録。RT callback だけが書き、clear/reset からは変更しない。
+    pub(crate) lyrics_trial_lead: LyricsTrialLead,
     /// 起動時刻。`wall_ns_now()` の基準。
     started_at: Instant,
 
@@ -140,6 +238,7 @@ pub struct AudioDiagnostics {
 impl AudioDiagnostics {
     pub fn new(started_at: Instant) -> Self {
         Self {
+            lyrics_trial_lead: LyricsTrialLead::default(),
             started_at,
             audio_stream_id: AtomicU64::new(0),
             callback_count: AtomicU64::new(0),

@@ -10,11 +10,16 @@
 // stdin がクローズされたら bridge は graceful shutdown する。
 //
 // ### 親 → bridge (要求):
-//   {"cmd":"hello","version":7}
+//   {"cmd":"hello","version":8}
 //   {"cmd":"set_now_playing","slot_id":<u64>,"revision":<u64>,"title":"",
 //    "album":"","artist":"","artwork":"<base64>","artworkMimeType":""}
 //     Complete snapshot; revision orders updates within the slot incarnation.
 //     No reply event. GUI notify results go to stderr; hung execution exits host.
+//     Optional trial attributes: mediaGeneration (u64), lyricsSidecar/lyricsEmbedded
+//     (262144 UTF-16 units each), durationSeconds (finite nonnegative double).
+//   {"cmd":"set_playback_position","slot_id":<u64>,"mediaGeneration":<u64>,
+//    "available":<0|1>,"playing":<0|1>,"positionSeconds":<f64>,"rate":<f64>,
+//    "hostTimeNanoseconds":<u64>} // latest only, GUI notify, no reply
 //   {"cmd":"show_gui","slot_id":<u64>,"owner_hwnd":<u64>,"unowned":<0|1>,
 //    "main_hwnd":<u64>, ...} // unowned=1: owner=0; main is DPI/minimize reference only
 //   {"cmd":"sync_gui_main_visibility","slot_id":<u64>} // read current IsIconic, preserve desired visibility
@@ -31,7 +36,7 @@
 //   {"cmd":"shutdown"}              // bridge 終了
 //
 // ### bridge → 親 (応答 / 通知):
-//   {"event":"ready","version":7,"shm_name":"<Windows 名前付きオブジェクト>",
+//   {"event":"ready","version":8,"shm_name":"<Windows 名前付きオブジェクト>",
 //    "shm_size":<u64>,"sig_in":"<event名>","sig_out":"<event名>"}
 //   {"event":"loaded","plugin_name":"<UTF-8>","latency_samples":<u32>,
 //    "params":[{"id":<u32>,"name":"<UTF-8>","default":<f64>}, ...]}
@@ -99,7 +104,8 @@ static_assert(sizeof(ShmHeader) == 272,
 // v0.8.x 以前の bridge exe (= version=1 を返すだけ) は新 Rust 側の比較で reject され、
 // stale bridge による IPC スキーマ不整合を検出できる。
 // v7 requires frame-scoped GUI close/normal geometry and taskbar presentation.
-constexpr uint32_t PROTOCOL_VERSION = 7;
+// v8 adds the lyrics trial attributes and independent playback-position notify.
+constexpr uint32_t PROTOCOL_VERSION = 8;
 
 // 制御メッセージの最大長。
 // 通常は 1 KB 未満だが、`plugin_state` event (= IComponent::getState チャンク) は
