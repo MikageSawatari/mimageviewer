@@ -135,6 +135,9 @@ Mixwright v0.14.0 release commit `e4147644305f0d373e362fc1485b4cb9889e5b63` の
   ARIAバンク、生成波形、Sample Shift、発音表示は同梱コードにあるため維持する。
   保存先の静的確認はClaudeCodeの2026-10-18記録、過去の実行観測はv0.13.0であり、
   v0.14.0で実行した証拠としては扱わない。
+- `eq.json`: 独立レビューの P3 対応。新しい「モバイルでは…1バンドだけ表示」の段落を除く。
+  `vst-bootstrap.js:399` が `window.electronAPI` を定義し、`layout-mode-manager.js:59` は
+  常にデスクトップ表示を選ぶので、同梱版ではモバイルの単一バンド編集に切り替わらない。
 - `reverb.json`: IRライブラリの「すべて選択」「全選択解除」を残し、従来どおり
   保存先をmIV同梱版の説明に訂正する。
 - Note SpectrogramのInstrument (3)/(9)、Highlight等は同梱コードと照合して採用。

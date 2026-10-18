@@ -291,7 +291,8 @@ class GenerationTests(unittest.TestCase):
         for name, data in output.items():
             if name.endswith('.html'):
                 with self.subTest(page=name):
-                    for absent in ['AIアシスタントから操作する', 'MCPをセットアップ', 'リモートコントロール...', 'ヘルプ</strong> メニュー']:
+                    # The VST shim always selects the desktop layout (no mobile band editor).
+                    for absent in ['AIアシスタントから操作する', 'MCPをセットアップ', 'リモートコントロール...', 'ヘルプ</strong> メニュー', 'モバイルでは']:
                         self.assertNotIn(absent, data.decode())
         self.assertIn('Instrument (3)', output['analyzer-note-spectrogram.html'].decode())
         self.assertIn('Needle Response', output['analyzer-analog-meter.html'].decode())
