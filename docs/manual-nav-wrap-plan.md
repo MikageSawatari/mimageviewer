@@ -1,6 +1,6 @@
 # 通常閲覧の手動前後移動ループ (§1.400) 設計
 
-作成: 2026-10-18 (設計 = ClaudeCode Opus 5.5)。状態: 設計案 (独立レビュー前)。
+作成: 2026-10-18 (設計 = ClaudeCode Opus 5.5)。状態: 設計案 第2版 (独立レビュー第1回の指摘を反映)。
 バックログ: [next-release-backlog.md §1.400](next-release-backlog.md)。5ch >>585〜587。
 
 関連: [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md)、
@@ -56,6 +56,13 @@
   0 件ではフルスクリーン自体が開かないので扱わない。
 - 1 枚の横長ページを分割した 2 ステップだけの一覧では、後半の「次」は同じページの前半へ移る
   (同一ページ内の左右移動。既存の `Split` 同一 source 経路で処理し、再読込しない)。
+- **既存の着地規則に従う経路 (本項目では変えない)**: 動画・音声の前後移動とコレクションの
+  前後移動は、非同期に移動先 index を決めて通常の open で着地する。分割ページへ着地するときの
+  側は既存の既定 (`landing_step`: 読み始め側) で、折り返さない通常の「前」(動画→直前の横長
+  画像) と同じ。また本の構成の許可待ち (Checking) を経た通常の別ページ `Split` 着地も、側を
+  保持せず既定側へ着地する。折り返しもこれらと同じ規則に従い、側を保持する仕組みは足さない
+  (後退の折り返しで末尾ページの読み始め側に着く場合がある)。直すなら非折り返しの同じ経路と
+  まとめて別項目で扱う。
 
 ## 4. 構造: 折り返しは「移動先の解決」で 1 回だけ決める
 
@@ -100,13 +107,27 @@
     (`admit_book_page_navigation` → `begin_fs_page_navigation_sequence` →
     `land_still_page_navigation_target`、slice は着地できたときだけ確定) を通し、
     ページめくりは `page_turn_excluded_navigation_with_operation(.., "navigation_wrap", ..)`。
-    同一ページ内の `slice` 移動 (`target.idx == fs_idx`) は既存の同一 source 分岐と同じ扱い。
+    同一ページ内の `slice` 移動 (`target.idx == fs_idx`) は既存の同一 source 分岐と同じ扱い
+    (コレクション分岐にも渡さない。§4.3)。
   - `FsPageNav::Delta`: 解決 helper へ `wrap` を渡し、`wrapped == true` ならページめくりを
     `"navigation_wrap"` で除外する。境界案内は `None` のとき (折り返せなかったとき) だけ出す。
+    **各呼び出し箇所は現在使っている列をそのまま使う** (単ページは `adjacent_page_navigation_idx`
+    と同じ Audio を含む前後移動対象の列、連結読みは `get_still_image_indices`)。
+    `get_nav_indices` (Audio を含まない) へ置き換えない。
+  - **本の構成の許可判定へ入力方向を渡す**: `admit_book_page_navigation` は移動先と現在位置の
+    列内順から `Next` / `Previous` を推定する (`book_target_navigation_purpose`)。折り返しでは
+    これが反転し (末尾→先頭が `Previous` になる)、折り返し先が非表示ページのとき逆方向へ探して
+    閉じてしまう。折り返し (`Wrap` と `wrapped == true` の Delta) では、入力方向から
+    `BookTargetPurpose::Next` (forward) / `Previous` (backward) を明示して渡す口
+    (`admit_book_page_navigation_with_purpose` 等) を使う。折り返し以外は現行の推定のまま。
+    許可待ちの継続探索 (`book_composition_permission` の Hidden skip) は `wrap = false` のまま。
   - ページめくり barrier 前の先行解決 (`resolved`) も同じ helper と `Wrap` を扱い、
-    barrier に渡る移動先が通常経路と一致するようにする。
-  - コレクション分岐 (`collection_delta`) は `Wrap { forward }` を `±1` として渡し、
-    request に `wrap` を載せる (§4.3)。
+    barrier に渡る移動先が通常経路と一致するようにする。barrier 経由で defer された継続は
+    既存の continuation 方針 (演出なしの即時切り替え、理由 `stage1_continuation_instant`、
+    `accept_rendition = false`) のまま扱う。`navigation_wrap` の理由は defer されなかった
+    通常経路でだけ記録する (barrier 内部は変更しない)。
+  - コレクション分岐 (`collection_delta`) は `Wrap { forward }` (別 source のとき) を `±1` として
+    渡し、request に `wrap` を載せる (§4.3)。
 - `navigate_native_video_fullscreen`: `Wrap { forward, .. }` は `start_manual_media_navigation`
   へ `delta = ±1, wrap = true` で渡す。`Delta` の場合も `wrap = 設定値` を渡す。
 - `start_manual_media_navigation(.., wrap)` → `collect_manual_media_navigation_candidates(.., wrap)`:
@@ -121,7 +142,9 @@
   `start_manual_media_navigation` を呼ぶので、同じ `wrap = 設定値` を渡す。この入口は
   `current_grid_order()` を使っている (現行のまま。順序の取り方は本項目で変えない)。
 - 単ページの見開きずらし系操作 (`FsSpreadShift*`、リングの `ImageSpreadShift*`) は単ページ /
-  分割では通常の 1 ページ移動 (`Delta`) なので、Delta の解決側で一律に折り返る。
+  分割では通常の 1 ページ移動 (`Delta`) なので、Delta の解決側で一律に折り返る。分割表示中は
+  これらは**ページ (source) 単位**の移動で、半ページのステップ列を使わない (現行どおり)。
+  折り返しても先頭 / 末尾ページへ既定の側で着地する (通常の半ページ送りの §3 規則とは異なる)。
   `queue_spread_shift_action_for_frame` の単ページ分岐 (barrier 中に直接
   `adjacent_page_navigation_idx` を呼ぶ箇所) も同じ helper へ置き換える。見開きでの nudge
   (`compute_spread_offset_nudge`) は対象外で、端では現行どおり何もしない。
@@ -129,14 +152,27 @@
 ### 4.3 コレクション
 
 `CollectionNavigationAction::Manual` に `wrap: bool` を追加し、request 作成時の設定値を載せる。
-解決 (`resolve_prepared_collection_navigation`、`src/collection_store/prepare.rs`) には既に
-`CollectionNavigationTail::Loop` があり、スライドショーの `LoopFolder` と連続再生の EOF ループが
-使っている。`CollectionNavigationAction::tail()` が `Manual` に `Stop` を返している箇所を、
-`wrap` なら `Loop` を返すようにする (新しい解決処理は足さない)。
-`finish_collection_navigation_without_target` の境界案内は折り返せなかったときだけ出る
-(既存の結果分岐のまま)。`accumulate_manual` は `wrap` が異なる request を合流させない
-(設定変更をまたいだ連打の混在は合流させず新規 request にする)。
-`handle_fs_navigation` のコレクション分岐へは `Wrap { forward }` を `±1` として渡す。
+
+- 解決 (`resolve_prepared_collection_navigation`、`src/collection_store/prepare.rs`) の既存
+  `CollectionNavigationTail::Loop` (スライドショーの `LoopFolder` と連続再生の EOF ループ用) は
+  **現在項目を候補に含む** (前進は `0..=position`、後退は見開き partner を含み得る)。これは
+  自動送りでは正しい (1 件なら同じものを再生し直す) が、手動の折り返しでは 1 件・1 見開き・
+  他候補全欠損のときに自分へ戻ってしまい、§3 の「動けないときは折り返さない」に反する。
+  そこで Tail に手動用の `WrapExcludingCurrent` (名前は実装で確定) を足す。折り返し部分から
+  **現在の表示単位に属する位置 (primary と、解決できた partner の両方)** を除く。
+  既存の `Loop` の意味は変えない。
+- `CollectionNavigationAction::tail()` は `Manual { wrap: true }` で新 Tail、`wrap: false` で
+  現行の `Stop` を返す。
+- `finish_collection_navigation_without_target` の境界案内は折り返せなかったときだけ出る
+  (既存の結果分岐のまま)。
+- **`wrap` は継続にも引き継ぐ**: `AwaitingManualContinuation` は request とは別の payload を持ち、
+  `accumulate_manual` はこの状態にも合流し、残りの入力は新しい Manual request として再発行される。
+  `wrap` を continuation にも保持し、両方の合流経路で `wrap` が一致するときだけ合流させ、
+  再発行には保持していた `wrap` を渡す (途中で設定を変えても、進行中の連打は開始時の値で揃う。
+  設定変更後の新しい入力は合流せず新しい request になる)。
+- `handle_fs_navigation` のコレクション分岐へは、別 source の `Wrap { forward }` を `±1` として
+  渡す。同じ source 内の左右移動 (`Wrap.idx == fs_idx`) は既存の同一 source `Split` と同じく
+  コレクション分岐より前にページ内で処理する。
 
 ## 5. ページめくり演出
 
@@ -175,6 +211,13 @@
 - 独立 detached 静止画窓の物理順 (`DetachedPhysical` bundle) も、その窓の一覧として同じに扱う。
 - 新しい窓間の状態や IPC は追加しない。detached 述語 / viewport 経路には触れない
   (触れる必要が出たら止めて `detached-rework-plan.md` §2 に従う)。
+- **既存の制約 (本項目では変えない)**: 動画・音声の候補解決 (`media_navigation_pending` /
+  resolver) は App 共通で、新しい要求は owner を比べず進行中の要求を置き換える
+  (`start_media_navigation_candidate_resolution`)。別の窓で動画の前後移動の解決中に、ある窓で
+  動画の前後移動をすると先の解決が取り消される。これは折り返しの有無に関係ない既存の構造で、
+  本項目は新しい共通状態を足さないが、この干渉を解消もしない。上の「他の窓を変えない」は、
+  静止画の解決・表示単位・演出状態と、本項目が足す状態についての保証である。
+  媒体解決の context 所有化が必要なら detached リワーク側の項目として扱う。
 
 ## 8. 境界案内との関係
 
@@ -222,6 +265,17 @@ mIV Remote の Web UI は端末側 (`crates/remote-web/web/app.js` の `changeIm
 - 境界案内: 折り返したときは `fs_boundary_hint` が None、折り返せないときは `Edge`。
 - 複数窓: detached context で折り返しても main context の `fullscreen_idx` / items が変わらない。
 - 設定: 既定 OFF、JSON 往復、旧 JSON (項目なし) で OFF、settings_transfer の往復。
+- コレクション: 1 画像・1 媒体・1 見開き・他候補全欠損で、両方向とも折り返さず境界案内。
+  native swap 待ち中の queued steps が設定変更をまたいでも開始時の `wrap` で揃う。
+  1 枚の横長画像 (2 step) のコレクションで同一 source の左右移動がコレクション要求にならない。
+- 本の構成: 折り返し先が非表示ページのとき、forward は先頭から後ろへ、backward は末尾から
+  前へ有限に探して着地する (閉じない)。Checking からの再開でも方向が保たれる。
+- 対象集合: 単ページで Audio が混在する順でも折り返し先が現行の前後移動対象と一致する。
+  空列・current が一覧外。
+- 入口: touch の PageSide、マウス割り当て、音楽 HUD の前後ボタン、単ページ / 分割のずらし操作。
+- 対象外操作の不変: ループ ON でも Home / End・固定ジャンプ・見開き nudge・seek・Ctrl+↑↓・
+  スライドショー・再生 EOF の動作が OFF と同じ。境界案内 OFF でも折り返せない場合に
+  `FsBoundaryHint::Edge` が生成される。
 
 ## 13. 検討して採らなかった案
 
