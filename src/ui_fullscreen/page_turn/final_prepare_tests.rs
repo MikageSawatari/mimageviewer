@@ -27,6 +27,16 @@ fn accept_current(app: &mut App, ctx: &egui::Context) {
     assert!(app.page_turn_current_unit_presented());
 }
 
+/// These fixtures drive the real paged draw without App::ui. Observe its live
+/// dispatch explicitly, then invoke the same post-output hook as native wgpu.
+fn finish_live_registration(app: &mut App, ctx: &egui::Context, root_frame: u64) {
+    frame(ctx, |ui, ctx| {
+        draw_current(app, ui, ctx);
+        app.observe_live_paged_for_final_prepare();
+    });
+    eframe::App::on_native_wgpu_root_output_finalized(app, ctx, root_frame, 1);
+}
+
 #[test]
 fn d3_2_real_producer_requires_accepted_output_before_initial_open_prefetch() {
     let ctx = egui::Context::default();
@@ -49,6 +59,13 @@ fn d3_2_real_producer_requires_accepted_output_before_initial_open_prefetch() {
     assert!(!app.final_composite_cache.contains_key(&key));
     begin_registration_frame(&mut app, 10);
     app.service_final_prepare_before_lookup(&ctx);
+    assert!(app.exact_complete_final_composite_texture(1).is_none());
+    assert_eq!(
+        app.final_effect_pending.len(),
+        1,
+        "early service retains CpuReady"
+    );
+    finish_live_registration(&mut app, &ctx, 10);
     assert!(app.exact_complete_final_composite_texture(1).is_some());
     assert!(app.final_effect_pending.is_empty());
 }
@@ -154,6 +171,14 @@ fn d3_2_pair_cpu_ready_pages_share_one_registration_per_root_frame() {
 
     begin_registration_frame(&mut app, 20);
     app.service_final_prepare_before_lookup(&ctx);
+    assert_eq!(
+        app.final_effect_pending.len(),
+        2,
+        "early service cannot allocate"
+    );
+    assert!(app.exact_complete_final_composite_texture(2).is_none());
+    assert!(app.exact_complete_final_composite_texture(3).is_none());
+    finish_live_registration(&mut app, &ctx, 20);
     let first = [2, 3]
         .into_iter()
         .filter(|&idx| app.exact_complete_final_composite_texture(idx).is_some())
@@ -175,6 +200,8 @@ fn d3_2_pair_cpu_ready_pages_share_one_registration_per_root_frame() {
     assert!(ctx.tex_manager().write().take_delta().is_empty());
     begin_registration_frame(&mut app, 21);
     app.service_final_prepare_before_lookup(&ctx);
+    assert_eq!(app.final_effect_pending.len(), 1);
+    finish_live_registration(&mut app, &ctx, 21);
     assert!(app.exact_complete_final_composite_texture(2).is_some());
     assert!(app.exact_complete_final_composite_texture(3).is_some());
     assert_eq!(
@@ -246,6 +273,8 @@ fn prepared_native_turn() -> (
     wait_ready(&mut app, 1);
     begin_registration_frame(&mut app, 30);
     app.service_final_prepare_before_lookup(&ctx);
+    assert!(app.exact_complete_final_composite_texture(1).is_none());
+    finish_live_registration(&mut app, &ctx, 30);
     let prepared = app.exact_complete_final_composite_texture(1).unwrap().id();
     assert!(app.current_edit_result_texture(1).is_none());
     let mut templates = Vec::new();
@@ -511,7 +540,7 @@ fn seed_window_owner(app: &mut App, ctx: &egui::Context) {
 
 #[cfg(windows)]
 #[test]
-fn d3_2_real_ready_result_survives_mount_deposit_and_shares_registration_with_main() {
+fn d3_2_real_ready_result_survives_mount_deposit_until_live_hook_or_display_promotion() {
     let ctx = egui::Context::default();
     let mut app = fixture(&ctx, SpreadMode::Single);
     accept_current(&mut app, &ctx);
@@ -535,6 +564,8 @@ fn d3_2_real_ready_result_survives_mount_deposit_and_shares_registration_with_ma
     }
     begin_registration_frame(&mut app, 40);
     app.service_final_prepare_before_lookup(&ctx);
+    assert!(app.exact_complete_final_composite_texture(1).is_none());
+    finish_live_registration(&mut app, &ctx, 40);
     let main_id = app.exact_complete_final_composite_texture(1).unwrap().id();
     assert!(app.final_effect_pending.is_empty());
     app.with_window_context_for_test(sibling, |owner| {
@@ -542,11 +573,24 @@ fn d3_2_real_ready_result_survives_mount_deposit_and_shares_registration_with_ma
         assert_eq!(
             owner.final_effect_pending.len(),
             1,
-            "main consumed the app-common frame slot"
+            "mount and early service preserve the sibling CpuReady"
         );
         assert!(owner.exact_complete_final_composite_texture(1).is_none());
         begin_registration_frame(owner, 41);
         owner.service_final_prepare_before_lookup(&ctx);
+        owner.observe_live_paged_for_final_prepare();
+    });
+    assert!(app.active_detached_window_id().is_none());
+    eframe::App::on_native_wgpu_root_output_finalized(&mut *app, &ctx, 41, 1);
+    app.with_window_context_for_test(sibling, |owner| {
+        assert_eq!(owner.final_effect_pending.len(), 1);
+        assert!(
+            owner.exact_complete_final_composite_texture(1).is_none(),
+            "a fork without an active runtime binding is not a live final-hook route"
+        );
+        // An actual display request still promotes and consumes that exact
+        // prepared result immediately; it does not wait for speculative admission.
+        assert!(owner.ensure_final_composite_texture(&ctx, 1).is_some());
         assert!(owner.exact_complete_final_composite_texture(1).is_some());
         assert!(owner.final_effect_pending.is_empty());
     });
@@ -572,6 +616,28 @@ fn d3_2_snapshot_resume_adopts_its_real_ready_result_without_changing_main() {
     });
     begin_registration_frame(&mut app, 50);
     assert!(app.activate_detached_image_window_snapshot(&ctx, 93_202));
+    app.with_active_viewer_context(|owner| {
+        assert_eq!(owner.final_effect_pending.len(), 1);
+        assert!(owner.exact_complete_final_composite_texture(1).is_none());
+    })
+    .unwrap();
+    eframe::App::on_native_wgpu_root_output_finalized(&mut *app, &ctx, 50, 1);
+    begin_registration_frame(&mut app, 51);
+    app.with_active_viewer_context(|owner| {
+        assert_eq!(
+            owner.final_effect_pending.len(),
+            1,
+            "resume alone is not live drawing"
+        );
+        assert_eq!(owner.detached_viewer_window_id(), Some(93_202));
+        frame(&ctx, |ui, ctx| {
+            draw_current(owner, ui, ctx);
+            owner.observe_live_paged_for_final_prepare();
+        });
+    })
+    .unwrap();
+    assert_eq!(app.active_detached_window_id(), Some(93_202));
+    eframe::App::on_native_wgpu_root_output_finalized(&mut *app, &ctx, 51, 1);
     app.with_active_viewer_context(|owner| {
         assert!(owner.final_effect_pending.is_empty());
         assert!(owner.exact_complete_final_composite_texture(1).is_some());

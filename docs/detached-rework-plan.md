@@ -5777,3 +5777,27 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
 - 独立 Sol/xhigh の実装前構造レビューは ACCEPT WITH CHANGES。同じ context の service/pending/移譲の修正であり、
   症状パッチではないことに合意。完成 source レビューも ACCEPT、P1/P2 残件なしで構造修正への合意を再確認した。
   動的検証結果はこの source 判定と分け、`target/d3-2-handoff.md` へ記録する。
+
+
+#### D3-4(a) 実装追補（2026-10-18、実機未確認）
+
+- 正本は紙めくり計画 §27.17.14.10/.11。ClaudeCodeの設計記録と独立Sol/xhighの前提・完成sourceレビューで、
+  既存runtime/binding/dispatchの観測と資源移譲に限る構造修正であり、症状パッチではないことに合意した。
+- `begin_page_turn_viewer_frame` の通常paged描画入口でcontext/destinationを既存 `SpeculativeGpuFrame` に観測する。
+  候補のないownerも含む。ROOT `App::ui` の各pass開始で観測値だけを更新する。
+  mainは実dispatchを通った現在main context、active F12はactive sessionと `locate_window_context` のbinding、
+  runtime Opening/Resuming/Activeを `final_prepare_route_is_current` で再照合する。
+  `ContextResidence::AtRest` は保管位置でありpark判定に使わない。mount、backstopへの入場、
+  passive Parked/ParkedLiveのsnapshot描画だけでは通常live paged経路の証拠にしない。
+- actual offer/curl/mandatory canonical提出の活動は同じouter frameの全retryで単調に保持する。
+  Aをpark/cancelしても当該frameの活動を消さない。次frameは活動を持ち越さず、現在liveのBを再評価する。
+  Aのpresentation state、accepted materials、canonical receipt、leaseをBの登録のために変更しない。
+- `finalize_speculative_gpu_output` はnative wgpu ROOTの全retry後に既存ownerを `with_viewer_context_state` で訪ねる。
+  既存資源の一時移譲であり、publicationを採用するmountではない。hookから入力配送、permission再開、UI実行、
+  viewport生成・再生成、begin/end pass、discard要求は呼ばない。新しいHWND推測・placement・時間窓・detached flagはない。
+- 早期serviceは受信・失効照合・receipt反映・表示用/共有handle採用を維持し、非共有の新規投機登録だけを最終hookへ移す。
+  旧 `LegacyPrefetch` もON/pagedでは非表示GPU登録だけ同じ枠へ通す。park保持・LegacyDisplay・OFF/連結/Splitは従来どおり。
+  exact表示昇格は同passで採用し、incomplete AI publication後も通常品質producerを進める。
+- 通常upload/枠使用済みの既存wakeは最終境界へ移す。演出理由・VRAM不足の保留では追加wakeを発行しない。
+  Computingの既存worker pollは維持し、最終枠へ移したLegacy CpuReadyは16ms pollから除外する。別queue/heartbeatはない。
+- 回帰・完成レビューの結果は紙めくり計画の実装記録および `target/d3-4a-handoff.md` に記録する。

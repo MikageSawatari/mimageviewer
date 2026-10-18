@@ -53720,6 +53720,7 @@ mod pipeline_cache_refactor_tests {
                 output_complete: true,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -53828,6 +53829,7 @@ mod pipeline_cache_refactor_tests {
                 output_complete: true,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyPrefetch,
+                gpu_diagnostics: Default::default(),
             },
         );
         let reused = app.start_final_effect_worker(
@@ -53908,6 +53910,7 @@ mod pipeline_cache_refactor_tests {
                 output_complete: true,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         let old_holdover = ctx.load_texture(
@@ -54039,6 +54042,7 @@ mod pipeline_cache_refactor_tests {
                 output_complete: false,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -54085,6 +54089,7 @@ mod pipeline_cache_refactor_tests {
                 output_complete: true,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -57419,6 +57424,7 @@ mod pipeline_cache_refactor_tests {
                 output_complete: true,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
 
@@ -57480,6 +57486,7 @@ mod pipeline_cache_refactor_tests {
                     } else {
                         FinalEffectOrigin::LegacyDisplay
                     },
+                    gpu_diagnostics: Default::default(),
                 },
             );
         }
@@ -59682,6 +59689,7 @@ mod pipeline_cache_refactor_tests {
                 output_complete: pending.output_complete,
                 nearest_sampler: pending.nearest_sampler,
                 origin: pending.origin,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);

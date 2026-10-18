@@ -12364,6 +12364,7 @@ pub(crate) struct FinalEffectPending {
     nearest_sampler: bool,
     /// 非表示ページの先読みとして起動した worker。表示要求時は同じ job を昇格して再利用する。
     origin: final_prepare::FinalEffectOrigin,
+    gpu_diagnostics: final_prepare_budget::FinalPrepareGpuDiagnostics,
 }
 
 /// Build the low-resolution page-turn rendition synchronously on the UI thread.
@@ -85460,6 +85461,19 @@ impl App {
         ctx: &egui::Context,
         completed: Vec<FinalCompositeKey>,
     ) {
+        self.adopt_final_prepare_results(
+            ctx,
+            completed,
+            final_prepare_budget::FinalPrepareAdoption::BeforeLookup,
+        );
+    }
+
+    fn adopt_final_prepare_results(
+        &mut self,
+        ctx: &egui::Context,
+        completed: Vec<FinalCompositeKey>,
+        phase: final_prepare_budget::FinalPrepareAdoption,
+    ) {
         let mut had_updates = false;
         for key in completed {
             let Some(pending) = self.final_effect_pending.get(&key) else {
@@ -85471,7 +85485,7 @@ impl App {
                 }
                 continue;
             }
-            let speculative = pending.origin.is_speculative();
+            let speculative = self.final_prepare_is_speculative_allocation(pending);
             let prepared = !pending.origin.is_legacy();
             let shared_texture = match &pending.state {
                 FinalEffectState::CpuReady(FinalEffectReady::Prepared(ready)) => {
@@ -85498,16 +85512,42 @@ impl App {
                 }) {
                     continue;
                 }
-                let FinalEffectState::CpuReady(FinalEffectReady::Prepared(ready)) = &pending.state
-                else {
-                    continue;
+                let upload_size = match &pending.state {
+                    FinalEffectState::CpuReady(FinalEffectReady::Prepared(ready)) => {
+                        ready.upload.size
+                    }
+                    FinalEffectState::CpuReady(FinalEffectReady::Legacy(
+                        FinalCompositeResult::Ready { pixels, .. },
+                    )) => gpu_clamped_dimensions(pixels.size),
+                    _ => continue,
                 };
                 let options = if pending.nearest_sampler {
                     egui::TextureOptions::NEAREST
                 } else {
                     DISPLAY_IMAGE_TEXTURE_OPTIONS
                 };
-                let upload_size = ready.upload.size;
+                if shared_texture.is_none() {
+                    let deferred = match phase {
+                        final_prepare_budget::FinalPrepareAdoption::BeforeLookup => {
+                            Some(final_prepare_budget::FinalPrepareGpuDeferred::BeforeFinalOutput)
+                        }
+                        final_prepare_budget::FinalPrepareAdoption::RootFinalized(reason) => reason,
+                    };
+                    if let Some(reason) = deferred {
+                        self.record_final_prepare_gpu_deferred(key, reason);
+                        if matches!(
+                            reason,
+                            final_prepare_budget::FinalPrepareGpuDeferred::OrdinaryUpload
+                                | final_prepare_budget::FinalPrepareGpuDeferred::FrameBusy
+                        ) {
+                            // Move the existing busy-frame wake to the final boundary;
+                            // early service no longer consumes or retries the GPU slot.
+                            ctx.request_repaint_of(egui::ViewportId::ROOT);
+                            ctx.request_repaint_of(self.page_turn_destination().viewport);
+                        }
+                        continue;
+                    }
+                }
                 let admission = if shared_texture.is_some() {
                     final_prepare_budget::FinalPrepareGpuAdmission::Admitted
                 } else {
@@ -85516,11 +85556,21 @@ impl App {
                 match admission {
                     final_prepare_budget::FinalPrepareGpuAdmission::Admitted => {}
                     final_prepare_budget::FinalPrepareGpuAdmission::FrameBusy => {
+                        self.record_final_prepare_gpu_deferred(
+                            key,
+                            final_prepare_budget::FinalPrepareGpuDeferred::FrameBusy,
+                        );
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                         ctx.request_repaint_of(self.page_turn_destination().viewport);
                         continue;
                     }
-                    final_prepare_budget::FinalPrepareGpuAdmission::OverBudget => continue,
+                    final_prepare_budget::FinalPrepareGpuAdmission::OverBudget => {
+                        self.record_final_prepare_gpu_deferred(
+                            key,
+                            final_prepare_budget::FinalPrepareGpuDeferred::OverBudget,
+                        );
+                        continue;
+                    }
                 }
             }
             let Some(pending) = self.final_effect_pending.remove(&key) else {
@@ -85609,12 +85659,12 @@ impl App {
                     if pending.output_complete {
                         self.continuous_page_transitions.remove(&key.edit_key.idx);
                     } else {
-                        self.set_continuous_page_transition(key.edit_key.idx, texture);
+                        self.set_continuous_page_transition(key.edit_key.idx, texture.clone());
                     }
                     self.comic_cache.remove(&key.edit_key.idx);
                     self.cancel_comic_bake_for_idx(key.edit_key.idx);
                     self.invalidate_final_prepare_decision(ctx);
-                    if prepared && crate::perf::is_enabled() {
+                    if (prepared || speculative) && crate::perf::is_enabled() {
                         crate::perf::event(
                             "fs",
                             "final_prepare_registered",
@@ -85630,6 +85680,45 @@ impl App {
                                 ("source_generation", key.edit_key.source_gen.into()),
                                 ("speculative", speculative.into()),
                                 ("shared", shared_registration.into()),
+                                ("texture", format!("{:?}", texture.id()).into()),
+                                (
+                                    "options",
+                                    format!(
+                                        "{:?}",
+                                        if pending.nearest_sampler {
+                                            egui::TextureOptions::NEAREST
+                                        } else {
+                                            DISPLAY_IMAGE_TEXTURE_OPTIONS
+                                        }
+                                    )
+                                    .into(),
+                                ),
+                                (
+                                    "bytes",
+                                    crate::vram_budget::rgba8_texels_to_bytes(
+                                        crate::vram_budget::texture_size_texels(
+                                            texture.size(),
+                                            !pending.nearest_sampler
+                                                && DISPLAY_IMAGE_TEXTURE_OPTIONS
+                                                    .mipmap_mode
+                                                    .is_some(),
+                                        ),
+                                    )
+                                    .into(),
+                                ),
+                                (
+                                    "origin",
+                                    (if matches!(pending.origin, FinalEffectOrigin::LegacyPrefetch)
+                                    {
+                                        "legacy_prefetch"
+                                    } else if speculative {
+                                        "speculative"
+                                    } else {
+                                        "display_prepared"
+                                    })
+                                    .into(),
+                                ),
+                                ("outer_frame", self.speculative_gpu_frame.frame.into()),
                                 (
                                     "stage",
                                     (if shared_registration {
@@ -85701,6 +85790,7 @@ impl App {
         }
         if self.final_effect_pending.iter().any(|(key, pending)| {
             pending.origin.is_legacy()
+                && !self.final_prepare_is_speculative_allocation(pending)
                 && self.fullscreen_idx.is_none_or(|idx| {
                     self.final_prepare_work_admission(idx)
                         .admits_backlog_upload(
@@ -85891,6 +85981,7 @@ impl App {
                         } else {
                             FinalEffectOrigin::LegacyDisplay
                         },
+                        gpu_diagnostics: Default::default(),
                     },
                 );
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -96390,7 +96481,17 @@ impl eframe::App for App {
         self.service_app_logic(ctx, frame);
     }
 
+    fn on_native_wgpu_root_output_finalized(
+        &mut self,
+        ctx: &egui::Context,
+        producing_root_frame: u64,
+        num_completed_passes: usize,
+    ) {
+        self.finalize_speculative_gpu_output(ctx, producing_root_frame, num_completed_passes);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.speculative_gpu_frame.begin_pass();
         let ctx = &ui.ctx().clone();
         self.begin_grid_click_input_frame(ctx);
         static FIRST_UPDATE: std::sync::atomic::AtomicBool =

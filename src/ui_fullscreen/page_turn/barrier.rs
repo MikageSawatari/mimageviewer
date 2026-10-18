@@ -136,6 +136,7 @@ impl App {
             return;
         }
         *completion = FlatCompletion::Submitted(receipt.clone());
+        self.note_page_turn_gpu_activity();
     }
 
     pub(crate) fn page_turn_completion_active(&self) -> bool {

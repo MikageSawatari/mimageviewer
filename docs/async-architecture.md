@@ -2126,3 +2126,12 @@ viewのページ名/状態/unitの投影はdraft変更時に更新し、静止�
 poll、context退避／復帰、変換終端は同じBoxを移し、owner、modal、receiver、lease、
 取消・Dropの境界は変更しない。新しいpending stateや受付の排他は追加しない。
 Appサイズ上限と通常stackでのcapture回帰を維持し、poll／context移譲のallocation保持も検査する。
+
+
+## 紙めくりD3-4(a)の配送観測（2026-10-18）
+
+CPU worker/pending/permit/予約の所有はD3-2のまま。早期serviceは受信・検証・通常採用を続け、
+非共有の新規投機GPU登録だけROOT最終outputへ移す。ON/pagedのLegacyPrefetchも同じ枠を使う。
+既存frame ownerのpass観測と単調活動を使い、待機queueを増やさない。
+TextureDelivery observerは既存queue提出後・renderer lock外・free前の診断だけを通知する。
+App/UI再入、追加submit、GPU完了ticketはない。詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.15を参照。

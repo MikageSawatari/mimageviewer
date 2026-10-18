@@ -149,7 +149,10 @@ fn d3_2_worker_finishes_while_really_parked_and_resume_adopts_before_lookup() {
     begin_registration_frame(&mut app, 100);
     assert!(app.activate_detached_image_window_snapshot(&ctx, 94_101));
     app.with_active_viewer_context(|owner| {
-        assert!(owner.final_effect_pending.is_empty());
+        // Resume receives CpuReady, but D3-4(a) reserves new speculative
+        // allocation for finalized output. A display request still takes it now.
+        assert!(owner.final_effect_pending.contains_key(&key));
+        assert!(owner.ensure_final_composite_texture(&ctx, 1).is_some());
         assert!(owner.final_composite_cache.contains_key(&key));
         crate::app::final_prepare_tests::expect_adopted_before_lookup(key, || {
             assert!(owner.resolve_fs_display_tex(1, false).is_some());
@@ -208,6 +211,7 @@ fn d3_2_legacy_colorize_and_lut_computing_channel_survives_real_park() {
                         output_complete: true,
                         nearest_sampler: false,
                         origin: FinalEffectOrigin::LegacyDisplay,
+                        gpu_diagnostics: Default::default(),
                     },
                 );
                 (key, cancel)
@@ -388,6 +392,8 @@ fn d3_2_promote_transfers_same_pending_lease_and_sibling_mutations_are_isolated(
                 wait_ready(owner, 1);
                 begin_registration_frame(owner, 102);
                 owner.service_final_prepare_before_lookup(&ctx);
+                assert!(owner.final_effect_pending.contains_key(&key));
+                assert!(owner.ensure_final_composite_texture(&ctx, 1).is_some());
                 assert!(owner.exact_complete_final_composite_texture(1).is_some());
                 assert!(owner.final_effect_pending.is_empty());
             })
@@ -477,6 +483,7 @@ fn d3_2_active_viewer_production_update_restarts_blocked_sibling_on_release_repa
     frame(&ctx, |ui, _| {
         assert!(app.update_active_viewer_context(ui, None).updated);
     });
+    app.finalize_speculative_gpu_output(&ctx, 105, 1);
     app.with_active_viewer_context(|owner| {
         assert!(owner.final_composite_cache.contains_key(&key));
         assert!(owner.final_effect_pending.is_empty());

@@ -21663,6 +21663,15 @@ impl App {
         window.texture.retain_native_output_for_paint(&painter);
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn draw_detached_snapshot_for_gpu_test(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        window: &crate::app::DeferredDetachedImageWindowView,
+    ) {
+        Self::draw_detached_image_window_snapshot(ui, full_rect, window);
+    }
+
     #[cfg(windows)]
     fn draw_detached_image_window_snapshot(
         ui: &mut egui::Ui,
@@ -32809,6 +32818,7 @@ impl App {
         embedded: bool,
         root_input: Option<&FullscreenRootFrameInput>,
     ) -> PageTurnFrameEntry {
+        self.observe_live_paged_for_final_prepare();
         if !self.page_turn_barrier_active() {
             self.page_turn_pre_draw(ctx);
             self.service_final_prepare_before_lookup(ctx);

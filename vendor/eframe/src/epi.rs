@@ -217,6 +217,22 @@ pub trait App {
     /// (A "viewport" in egui means an native OS window).
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame);
 
+    /// Called once after native wgpu ROOT Full output (including all retries) is final,
+    /// before its texture delta is handed to the renderer. Not called for children,
+    /// LogicOnly, Glow or Web. The frame number is captured before the ROOT run;
+    /// the Context's ROOT counter has already advanced when this hook runs.
+    ///
+    /// May reconcile existing resources, register textures, and request a future repaint.
+    /// Must not run UI, input delivery, viewport creation, passes, or request discard.
+    /// All TextureManager changes, including frees, join this same output's delivery.
+    fn on_native_wgpu_root_output_finalized(
+        &mut self,
+        _ctx: &egui::Context,
+        _producing_root_frame: u64,
+        _num_completed_passes: usize,
+    ) {
+    }
+
     /// Get a handle to the app.
     ///
     /// Can be used from web to interact or other external context.

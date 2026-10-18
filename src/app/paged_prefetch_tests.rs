@@ -65,15 +65,87 @@ pub(crate) fn retain_pdf_ai(app: &mut App, idx: usize) -> FinalCompositeKey {
     app.final_composite_key_for_pixels(edit_key, [4, 6], &params)
 }
 
+fn wait_pending_composite_pixels(app: &mut App, deadline: std::time::Instant) {
+    for pending in app.final_effect_pending.values_mut() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let ready = match &pending.state {
+            FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)) => {
+                FinalEffectReady::Legacy(
+                    rx.recv_timeout(remaining)
+                        .expect("composite worker did not finish"),
+                )
+            }
+            FinalEffectState::Computing(FinalEffectReceiver::Prepared { rx, .. }) => {
+                FinalEffectReady::Prepared(
+                    rx.recv_timeout(remaining)
+                        .expect("composite worker did not finish"),
+                )
+            }
+            FinalEffectState::CpuReady(_) => continue,
+        };
+        pending.state = FinalEffectState::CpuReady(ready);
+    }
+}
+
+/// Static main-viewer fixtures have no App::ui dispatch. Advance its ordinary
+/// live paged observation and finalized-output boundary explicitly, one ROOT
+/// frame per allocation. This does not invoke draw/AI/source production.
 pub(crate) fn complete_pending_composites(app: &mut App, ctx: &egui::Context) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    complete_pending_composites_before(
+        app,
+        ctx,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    );
+}
+
+pub(crate) fn complete_pending_composites_before(
+    app: &mut App,
+    ctx: &egui::Context,
+    deadline: std::time::Instant,
+) {
+    wait_pending_composite_pixels(app, deadline);
+    app.poll_final_effects(ctx);
     while !app.final_effect_pending.is_empty() {
-        app.poll_final_effects(ctx);
-        assert!(
-            std::time::Instant::now() < deadline,
-            "composite worker did not finish"
+        assert_eq!(
+            app.projected_viewer_context_id(),
+            app.viewer_context_main(),
+            "an unbound sibling requires an explicit display request, not speculative registration"
         );
-        std::thread::yield_now();
+        assert!(app.page_turn_destination().window.is_none());
+        assert!(
+            !app.page_turn_presentation_pending(),
+            "fixture needs a static opportunity"
+        );
+        let count = app.final_effect_pending.len();
+        let root_frame = app.speculative_gpu_frame.frame.map_or(0, |frame| frame + 1);
+        super::final_prepare::tests::begin_registration_frame(app, root_frame);
+        app.observe_live_paged_for_final_prepare();
+        eframe::App::on_native_wgpu_root_output_finalized(app, ctx, root_frame, 1);
+        assert!(
+            app.final_effect_pending.len() < count,
+            "a static main-viewer opportunity must adopt a ready composite"
+        );
+    }
+}
+
+/// Display consumers in unbound sibling fixtures must promote their exact ready
+/// work explicitly. Mount/deposit alone never counts as a live drawing route.
+pub(crate) fn complete_pending_composites_for_display(app: &mut App, ctx: &egui::Context) {
+    wait_pending_composite_pixels(
+        app,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    );
+    let keys: Vec<_> = app.final_effect_pending.keys().copied().collect();
+    for key in keys {
+        let texture = app
+            .ensure_final_composite_texture(ctx, key.edit_key.idx)
+            .expect("the display request must consume its ready composite");
+        assert!(!app.final_effect_pending.contains_key(&key));
+        assert_eq!(
+            app.final_composite_cache.get(&key).unwrap().texture.id(),
+            texture.id(),
+            "display promotion must publish the same prepared key"
+        );
     }
 }
 
@@ -416,6 +488,7 @@ fn paged_prefetch_reconcile_warm_and_poll_preserve_sibling_cache_and_channels() 
                 output_complete: true,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyPrefetch,
+                gpu_diagnostics: Default::default(),
             },
         );
     });
@@ -474,6 +547,13 @@ fn paged_prefetch_reconcile_warm_and_poll_preserve_sibling_cache_and_channels() 
         owner.prefetch_retained_paged_composites(&ctx, 19);
         owner.poll_final_effects(&ctx);
         owner.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert_eq!(
+            owner.final_effect_pending.len(),
+            1,
+            "early sibling receipt keeps speculative CpuReady without a live dispatch"
+        );
+        assert!(owner.final_composite_cache.is_empty());
+        complete_pending_composites_for_display(owner, &ctx);
         assert!(owner.final_effect_pending.is_empty());
         assert!(owner.fs_pending.is_empty());
         assert!(

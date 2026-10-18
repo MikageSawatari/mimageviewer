@@ -262,6 +262,29 @@ impl HeadlessEpiIntegration {
     pub fn update(&mut self, app: &mut dyn epi::App, input: egui::RawInput) -> egui::FullOutput {
         self.0.update(app, None, input)
     }
+    /// Run the native wgpu ROOT Full boundary, including its post-retry hook and
+    /// texture-delta handoff. Does not create a renderer or submit GPU work.
+    #[cfg(feature = "wgpu_no_default_features")]
+    pub fn update_native_wgpu(
+        &mut self,
+        app: &mut dyn epi::App,
+        input: egui::RawInput,
+    ) -> egui::FullOutput {
+        assert_eq!(input.viewport_id, egui::ViewportId::ROOT);
+        let producing_root_frame = self
+            .0
+            .egui_ctx
+            .cumulative_frame_nr_for(egui::ViewportId::ROOT);
+        let mut output = self.0.update(app, None, input);
+        super::wgpu_integration::finalize_native_wgpu_root_output(
+            app,
+            &self.0.egui_ctx,
+            egui::ViewportId::ROOT,
+            producing_root_frame,
+            &mut output,
+        );
+        output
+    }
     /// Run real root logic without UI, preserving the unconsumed input.
     pub fn update_logic_only(
         &mut self,

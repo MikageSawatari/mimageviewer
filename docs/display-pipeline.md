@@ -3218,3 +3218,13 @@ local paged見開きのcompositionは演出ON時だけ先頭・末尾配置を�
 通常Pairと同じtexture/role付きreceiptでめくり、白companionの拒否は維持する。
 ON/OFFによるgeometry変更では同じpresentation ownerの
 旧flat/ready/receiptを失効し、一件のcontinuationを新canonical採用まで保持する。
+
+
+## 紙めくりD3-4(a)の投機登録境界（2026-10-18）
+
+非共有finalの新規投機登録はnative wgpu ROOTの全retry後のoutput hookで行う。
+通常の表示昇格・同期takeover・共有handle採用はlookup前のserviceを維持する。
+最終passの通常live paged dispatchと現在runtime/session/binding、当該outer frameのoffer/curl/mandatory canonical活動で排他する。
+追加delta/freeは返却済みoutputに `append_texture_delta` で結合して既存配送へ渡す。
+ON/pagedのLegacyPrefetchも同じ非表示登録枠に含め、OFF/連結/Split/通常表示は維持する。Native prewarmは次chunk。
+詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.14.10/.11、§27.17.15を参照。

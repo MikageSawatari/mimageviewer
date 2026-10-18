@@ -123,7 +123,7 @@ pub(crate) fn wait_ready(app: &mut App, idx: usize) -> FinalCompositeKey {
     key
 }
 
-fn unit(app: &App, idx: usize) -> FinalPrepareUnit {
+pub(crate) fn unit(app: &App, idx: usize) -> FinalPrepareUnit {
     FinalPrepareUnit {
         context: app.projected_viewer_context_id(),
         items_generation: app.items_generation,
@@ -133,14 +133,14 @@ fn unit(app: &App, idx: usize) -> FinalPrepareUnit {
     }
 }
 
-fn start(app: &mut App, ctx: &egui::Context, idx: usize) -> bool {
+pub(crate) fn start(app: &mut App, ctx: &egui::Context, idx: usize) -> bool {
     let Some((key, pixels, size, plan)) = app.final_prepare_plan_from_resident(idx) else {
         return false;
     };
     app.spawn_prepared_final_job(ctx, key, pixels, size, plan, unit(app, idx))
 }
 
-fn app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+pub(crate) fn app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
     let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
         ctx,
         crate::settings::SpreadMode::Single,

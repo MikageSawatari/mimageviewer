@@ -1426,6 +1426,68 @@ pub(crate) fn take_test_events() -> Vec<(ViewerOperationFact, &'static str, &'st
 }
 
 impl App {
+    #[cfg(test)]
+    pub(crate) fn page_turn_gpu_fingerprint_for_test(&self) -> String {
+        let unit = |unit: &Arc<PaintedUnit>| {
+            format!(
+                "{:p}:{}:{}",
+                Arc::as_ptr(unit),
+                unit.reserved_bytes.load(Ordering::Relaxed),
+                unit.material_diagnostics()
+            )
+        };
+        let state = match &self.page_turn_presentation.state {
+            PresentationState::Inactive => "inactive".to_owned(),
+            PresentationState::Flat(u) => format!("flat:{}", unit(u)),
+            PresentationState::Offered { outgoing, offer } => format!(
+                "offered:{}:{:p}:{:p}",
+                unit(outgoing),
+                Arc::as_ptr(&offer.ready_sources),
+                Arc::as_ptr(&offer.submission)
+            ),
+            PresentationState::Turning {
+                outgoing,
+                incoming,
+                offer,
+                ..
+            } => format!(
+                "turning:{}:{}:{:p}:{:p}",
+                unit(outgoing),
+                unit(incoming),
+                Arc::as_ptr(&offer.ready_sources),
+                Arc::as_ptr(&offer.submission)
+            ),
+            PresentationState::Completing {
+                incoming,
+                completion,
+                diagnostics,
+                ..
+            } => {
+                let receipt = match completion {
+                    FlatCompletion::NeedFlat => "need".to_owned(),
+                    FlatCompletion::Submitted(r) => format!(
+                        "{}:{}:{}:{:?}",
+                        r.frame,
+                        r.pass,
+                        r.was_accepted(),
+                        r.pages()
+                    ),
+                };
+                format!(
+                    "completing:{}:{}:{:p}",
+                    unit(incoming),
+                    receipt,
+                    Arc::as_ptr(&diagnostics.tracker)
+                )
+            }
+        };
+        format!(
+            "{}:leases={}",
+            state,
+            self.page_turn_leases.reserved_bytes()
+        )
+    }
+
     /// Existing accepted output, never CPU readiness or a newly registered
     /// texture, authorizes background work for the following unit.
     pub(crate) fn page_turn_current_unit_presented(&self) -> bool {
@@ -2284,6 +2346,7 @@ impl App {
                 ("incoming_inputs", ready_sources.diagnostics()),
             ],
         );
+        self.note_page_turn_gpu_activity();
         self.page_turn_presentation.state = PresentationState::Offered {
             outgoing,
             offer: AcceptedOffer {
@@ -2789,6 +2852,9 @@ impl App {
                 submission_event = self.page_turn_completion_event(&receipt);
             }
             self.record_page_turn_completion_flat(&receipt);
+        }
+        if curl {
+            self.note_page_turn_gpu_activity();
         }
         queue_submission(ctx, receipt.clone(), submission_event);
         Some(receipt)

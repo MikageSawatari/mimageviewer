@@ -416,6 +416,7 @@ impl App {
                         output_complete: true,
                         nearest_sampler,
                         origin: FinalEffectOrigin::Speculative(unit),
+                        gpu_diagnostics: Default::default(),
                     },
                 );
                 true
@@ -439,7 +440,9 @@ impl App {
     ) -> PreparedFinalDisplay {
         let Some(key) = self.final_effect_pending.iter().find_map(|(key, pending)| {
             (key.edit_key.idx == idx
-                && !pending.origin.is_legacy()
+                && (!pending.origin.is_legacy()
+                    || (matches!(pending.origin, FinalEffectOrigin::LegacyPrefetch)
+                        && self.defer_legacy_final_prefetch_registration()))
                 && self.final_prepare_pending_is_current(*key, pending))
             .then_some(*key)
         }) else {
@@ -454,13 +457,36 @@ impl App {
             .get(&key)
             .is_some_and(|p| matches!(p.state, FinalEffectState::CpuReady(_)));
         if ready {
+            let legacy = matches!(
+                self.final_effect_pending[&key].origin,
+                FinalEffectOrigin::LegacyPrefetch
+            );
+            let output_complete = self.final_effect_pending[&key].output_complete;
             self.final_effect_pending
                 .get_mut(&key)
                 .unwrap()
                 .origin
                 .promote();
             self.adopt_final_prepare_results_before_lookup(ctx, vec![key]);
-            return PreparedFinalDisplay::Handled(self.exact_complete_final_composite_texture(idx));
+            if legacy && !output_complete {
+                // As with the old early poll, publication of an intermediate AI
+                // result must still let the ordinary quality producer run now.
+                return PreparedFinalDisplay::Continue;
+            }
+            return PreparedFinalDisplay::Handled(if legacy {
+                self.final_composite_cache
+                    .get(&key)
+                    .map(|entry| entry.texture.clone())
+            } else {
+                self.exact_complete_final_composite_texture(idx)
+            });
+        }
+        if matches!(
+            self.final_effect_pending[&key].origin,
+            FinalEffectOrigin::LegacyPrefetch
+        ) && !self.final_effect_pending[&key].output_complete
+        {
+            return PreparedFinalDisplay::Continue;
         }
         let params = self.effective_params(idx);
         if !self.post_filter_bypassed

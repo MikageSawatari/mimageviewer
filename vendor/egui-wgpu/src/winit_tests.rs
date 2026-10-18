@@ -423,6 +423,186 @@ fn mipmap_submission_tracks_later_writes_without_duplicate_empty_submit() {
     }
 }
 
+struct SubmissionObservationProbe {
+    state: RenderState,
+    events: Vec<(crate::TextureDeliverySubmitted, SubmissionCounts, bool)>,
+}
+
+thread_local! {
+    static DELIVERY_OBSERVATION: std::cell::RefCell<Option<SubmissionObservationProbe>> = const { std::cell::RefCell::new(None) };
+}
+
+fn delivery_observation_enabled() -> bool {
+    DELIVERY_OBSERVATION.with(|probe| probe.borrow().is_some())
+}
+
+fn record_delivery_observation(event: crate::TextureDeliverySubmitted) {
+    DELIVERY_OBSERVATION.with(|probe| {
+        let mut probe = probe.borrow_mut();
+        let probe = probe.as_mut().expect("observer enabled for this thread");
+        // The callback must run outside the renderer lock, after submission and before free.
+        let exists = probe
+            .state
+            .renderer
+            .read()
+            .texture(&event.texture_id)
+            .is_some();
+        probe.events.push((event, submission_counts(), exists));
+    });
+}
+
+fn install_test_delivery_observer(state: &RenderState) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        assert!(crate::install_texture_delivery_observer(
+            delivery_observation_enabled,
+            record_delivery_observation,
+        ));
+    });
+    DELIVERY_OBSERVATION.with(|probe| {
+        *probe.borrow_mut() = Some(SubmissionObservationProbe {
+            state: state.clone(),
+            events: Vec::new(),
+        });
+    });
+}
+
+#[test]
+fn texture_delivery_observer_follows_normal_drop_mip_and_no_paint_submission_before_free() {
+    let Some(mut painter) = headless_painter() else {
+        return;
+    };
+    let state = painter.render_state().unwrap();
+    for mipmapped in [false, true] {
+        for route in ["normal", "drop", "no-paint", "no-surface"] {
+            install_test_delivery_observer(&state);
+            let id = TextureId::Managed(441);
+            let mut delta = TexturesDelta::default();
+            delta.push(
+                id,
+                ImageDelta::full(
+                    ColorImage::filled([2, 2], Color32::WHITE),
+                    TextureOptions::NEAREST
+                        .with_mipmap_mode(mipmapped.then_some(TextureFilter::Nearest)),
+                ),
+            );
+            // Direct insertion preserves the update alongside a free of the same entry.
+            delta.free.insert(id);
+            let before = submission_counts();
+            match route {
+                "no-paint" => painter.apply_textures_delta(&mut delta),
+                "no-surface" => paint_without_surface(&mut painter, &mut delta),
+                _ => {
+                    let mut delivery = TextureDelivery::begin(
+                        Some(&state),
+                        &mut delta,
+                        crate::atlas_diag::Site::AppliedPaint,
+                        None,
+                    )
+                    .unwrap();
+                    DELIVERY_OBSERVATION
+                        .with(|probe| assert!(probe.borrow().as_ref().unwrap().events.is_empty()));
+                    assert_eq!(delivery.queue_needs_submit, !mipmapped);
+                    if route == "normal" {
+                        delivery.submit([]);
+                    }
+                }
+            }
+            let expected_counts = SubmissionCounts {
+                normal: before.normal + usize::from(route == "normal"),
+                empty: before.empty + usize::from(route != "normal" && !mipmapped),
+            };
+            assert_eq!(
+                submission_counts(),
+                expected_counts,
+                "observer adds no submissions"
+            );
+            DELIVERY_OBSERVATION.with(|probe| {
+                let probe = probe.borrow_mut().take().unwrap();
+                assert_eq!(probe.events.len(), 1, "each update observed exactly once");
+                let (event, counts, existed) = probe.events[0];
+                assert_eq!(counts, expected_counts, "event follows returned submit");
+                assert!(existed, "free must follow observer");
+                assert_eq!(event.renderer, state.renderer.read().diag_id());
+                assert_eq!(event.texture_id, id);
+                assert_eq!(event.bytes, 16);
+                assert_eq!(event.mipmap, mipmapped);
+                assert!(event.batch > 0);
+                assert_eq!(
+                    event.site,
+                    if route == "no-paint" {
+                        crate::atlas_diag::Site::AppliedNoPaint
+                    } else {
+                        crate::atlas_diag::Site::AppliedPaint
+                    }
+                );
+            });
+            assert!(state.renderer.read().texture(&id).is_none());
+            assert!(delta.is_empty());
+        }
+    }
+}
+
+#[test]
+fn texture_delivery_observer_skips_disabled_absent_renderer_and_unchanged_updates() {
+    let Some(painter) = headless_painter() else {
+        return;
+    };
+    let state = painter.render_state().unwrap();
+    install_test_delivery_observer(&state);
+    let id = TextureId::Managed(442);
+    let mut delta = full(id, Color32::WHITE);
+    assert!(
+        TextureDelivery::begin(
+            None,
+            &mut delta,
+            crate::atlas_diag::Site::AppliedNoPaint,
+            None
+        )
+        .is_none()
+    );
+    DELIVERY_OBSERVATION.with(|probe| assert!(probe.borrow().as_ref().unwrap().events.is_empty()));
+    // Disabling before begin must not allocate or retain per-update diagnostic metadata.
+    DELIVERY_OBSERVATION.with(|probe| {
+        probe.borrow_mut().take();
+    });
+    {
+        let delivery = TextureDelivery::begin(
+            Some(&state),
+            &mut delta,
+            crate::atlas_diag::Site::AppliedNoPaint,
+            None,
+        )
+        .unwrap();
+        assert!(delivery.observation.is_none());
+    }
+    install_test_delivery_observer(&state);
+    let mut invalid = TexturesDelta::default();
+    invalid.push(
+        id,
+        ImageDelta::partial(
+            [2, 2],
+            ColorImage::filled([1, 1], Color32::WHITE),
+            TextureOptions::NEAREST,
+        ),
+    );
+    {
+        let _delivery = TextureDelivery::begin(
+            Some(&state),
+            &mut invalid,
+            crate::atlas_diag::Site::AppliedNoPaint,
+            None,
+        )
+        .unwrap();
+    }
+    DELIVERY_OBSERVATION.with(|probe| {
+        assert!(
+            probe.borrow_mut().take().unwrap().events.is_empty(),
+            "skipped write is not submitted evidence"
+        )
+    });
+}
+
 #[test]
 fn removing_one_viewport_retires_only_its_surface_and_attachments() {
     struct Tracked(Arc<AtomicUsize>);

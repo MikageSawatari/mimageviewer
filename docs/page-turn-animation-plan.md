@@ -5214,3 +5214,37 @@ detachedの変更は、既存runtime・session／context binding・実描画disp
 残る [P3] を次のとおり確定する: **hook で生じた追加 delta を `FullOutput.textures_delta` へ結合するときは、通常の `TexturesDelta::append` ではなく、
 既存の `append_texture_delta` (`vendor/eframe/src/native/viewport_lifecycle.rs:77`) を使う** (通常の append は新しい free に対応する古い set を消すため)。
 回帰に「通常 pass で texture を更新・描画し、hook でその旧 entry が解放される場合も、更新が配送されてから描画後に free される」を加える。
+
+
+#### 27.17.15 D3-4(a) 実装記録（2026-10-18、実機未確認）
+
+- §27.17.14.10/.11に従い、通常serviceのselector非依存採用を `FinalPrepareAdoption` で区別し、
+  非共有の新規投機final登録だけをnative wgpu ROOTの最終output hookに移した。
+  通常表示昇格・同期takeover・共有handle・source先読み・CPU preparationは既存入口を維持する。
+  現在comicの独立した新規投機登録producerはなく、通常comic/display登録は変更しない。
+- eframeはupdate前の生成元ROOT frameを捕捉し、全retry後に既定no-op App hookを一度呼ぶ。
+  追加set/freeは `append_texture_delta` で返却済みFullOutputに結合し、既存produced/pending/deliveryへ一度渡す。
+  max_passes、子viewport、LogicOnly、egui retry/counter/pluginの契約を変更しない。
+- 既存 `SpeculativeGpuFrame` のpass限定destination観測と単調 `PageTurnActivity` を使う。
+  active F12は既存runtime/session/bindingと通常live dispatchの両方を再照合し、AtRestをparkに流用しない。
+  parked Aを解除せず、同frameの活動はBを保留し、次の静止frameでBを登録する。
+- 待機state/bool/pending/queue/timerは増やさない。既存pending ownerに診断専用 `FinalPrepareGpuDiagnostics` の理由bitsetを追加した。
+  perf有効時だけ同一候補・同一理由を一度記録し、要求所有や採用可否を表現しない。
+- 登録eventへtexture/options/bytes/origin/outer_frame、最終hook eventへCPU ms/pass数を追加。
+  `TextureDelivery` のsubmit後・renderer lock外・free前の軽量observerはApp/UIへ再入せず、追加submitをしない。
+  eventは提出証拠でありGPU実完了やready証拠ではない。perf無効時は詳細構築/配送追跡を行わない。
+- 最終検証・一時変異の証拠は `target/d3-4a-*`、引継ぎは `target/d3-4a-handoff.md`。
+  正式八条件性能runとmotion評価は未実施。App::ui計測からhookへ移った時間を性能改善とみなさない。
+  (b)のcanonical demand/Native prewarm、backing確認、Native提出/lookup eventは今回有効化しない。
+
+##### 27.17.15.1 同型producerの確認：LegacyPrefetch
+
+- `is_speculative()` はD3-2 CPU ownerの種別であり、非表示allocation policy全体の定義ではない。
+  `prefetch_final_effects → spawn_final_effect_job(prefetch=true)` の `LegacyPrefetch` も、
+  演出ON・paged・非Splitの非表示final新規登録であるため、同じ最終枠/VRAM admissionへ移す。
+  CPU開始、受信、park保持は変更しない。OFF/連結/Split/LegacyDisplayは従来どおり。
+- exact LegacyPrefetchの表示要求は同じpendingをその場で昇格する。完成済みなら同pass採用し、
+  未完成なら同じworkerを非blockingで表示用に保持する。incomplete publicationは通常品質producerを同passで進める。
+- 独立sourceレビューで同型経路の追加P2として確認し、対象に含める判断に合意した。
+  演出保留の余分な即時repaintと、Legacy CpuReadyの16ms poll loopも除去した。
+  通常upload/枠使用済みの既存wakeだけを最終境界へ移し、Computing/通常表示のpollは維持する。
