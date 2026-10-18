@@ -5207,3 +5207,10 @@ detachedの変更は、既存runtime・session／context binding・実描画disp
 - native wgpuのROOT最終hook、生成元frame番号、追加deltaの取得・appendを一組として独立再レビューする。App末尾を最終確定境界とする旧案は撤回する。
 - live経路の観測値を最終passへ更新し、runtime所有を再照合する実装について、active at-rest・passive snapshot・backstop・park／resumeの兄弟経路を確認する。
 - 転送分割、canonical key共有、Native一時allocation会計、GPU実完了ticketを任意診断に留める方針、既存性能gateは変更しない。実GPU競合の解消は実装後の計測で判定する。
+
+##### 27.17.14.11 改訂 1 の再レビュー結果（2026-10-18）
+
+実装前の独立再レビュー (Sol / xhigh、`ebf0996a0`) は ACCEPT WITH CHANGES。P2-1 / P2-2 は解消、D3-4(a) は着手可、detached は §11 の合意内。
+残る [P3] を次のとおり確定する: **hook で生じた追加 delta を `FullOutput.textures_delta` へ結合するときは、通常の `TexturesDelta::append` ではなく、
+既存の `append_texture_delta` (`vendor/eframe/src/native/viewport_lifecycle.rs:77`) を使う** (通常の append は新しい free に対応する古い set を消すため)。
+回帰に「通常 pass で texture を更新・描画し、hook でその旧 entry が解放される場合も、更新が配送されてから描画後に free される」を加える。
