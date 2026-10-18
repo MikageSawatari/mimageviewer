@@ -106682,24 +106682,133 @@ mod background_click_scroll_regression_tests {
     }
 
     #[test]
-    fn letterbox_real_grid_folder_and_drive_icons_protect_only_drawn_area() {
-        for drive in [false, true] {
+    fn letterbox_real_grid_folder_icons_own_inner_area_with_setting_on_and_off() {
+        for (drive, virtual_dir, enabled) in [
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
             let mut harness = letterbox_harness([40, 120]);
             harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
-            harness.state_mut().app.items[0] = GridItem::Folder("C:\\".into());
+            let folder = harness.state().app.tmp.path().join("selected-folder");
+            if virtual_dir {
+                harness.state_mut().app.zip_nav = Some(metadata_panel_test_zip_nav(
+                    "book.zip".into(),
+                    &["chapter/page.png"],
+                ));
+            }
+            harness.state_mut().app.items[0] = if virtual_dir {
+                GridItem::ZipDir {
+                    zip_path: "book.zip".into(),
+                    dir_prefix: "chapter/".into(),
+                    is_archive: false,
+                    representative: None,
+                }
+            } else {
+                GridItem::Folder(folder.clone())
+            };
             harness.state_mut().app.items_are_drive_list = drive;
+            harness
+                .state_mut()
+                .app
+                .settings
+                .grid_background_double_click_parent = enabled;
             harness.state_mut().app.selected = None;
             harness.run_steps(4);
             let rect = cell_rect(&harness);
-            click(
-                &mut harness,
-                rect.min + egui::vec2(5.0, rect.height() * 0.5),
-            );
-            assert_eq!(harness.state().app.selected, None);
-            click(&mut harness, rect.center() - egui::vec2(0.0, 14.0));
+            let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            click(&mut harness, pos);
             assert_eq!(harness.state().app.selected, Some(0));
             assert!(harness.state().navs.is_empty());
+            click(&mut harness, pos);
+            if virtual_dir {
+                assert_eq!(
+                    harness.state().app.zip_nav.as_ref().unwrap().current(),
+                    &["chapter"]
+                );
+                assert!(harness.state().navs.is_empty());
+            } else {
+                assert!(matches!(harness.state().navs.as_slice(),
+                    [crate::ui_main::AddressBarNav::Direct(path, _)] if path == &folder));
+            }
         }
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_icon_padding_and_empty_space_still_return_to_parent() {
+        for empty_space in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.state_mut().app.items[0] = GridItem::Folder("folder".into());
+            harness.state_mut().app.thumbnails[0] = ThumbnailState::Failed;
+            harness.run_steps(4);
+            let rect = cell_rect(&harness);
+            let pos = if empty_space {
+                rect.right_center() + egui::vec2(20.0, 0.0)
+            } else {
+                rect.left_center() + egui::vec2(2.0, 0.0)
+            };
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, pos);
+            assert!(matches!(harness.state().navs.as_slice(),
+                [crate::ui_main::AddressBarNav::Direct(path, _)]
+                    if Some(path.as_path()) == harness.state().app.current_folder.as_deref().and_then(|p| p.parent())));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_icon_loading_keeps_drag_press_owner() {
+        let mut harness = letterbox_harness([40, 120]);
+        let loaded = harness.state().app.thumbnails[0].clone();
+        let folder = harness.state().app.tmp.path().join("folder");
+        harness.state_mut().app.items[0] = GridItem::Folder(folder.clone());
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+        harness.run_steps(4);
+        let pos = cell_rect(&harness).left_center() + egui::vec2(5.0, 0.0);
+        press(&mut harness, pos);
+        assert!(matches!(
+            harness.state().app.grid_click_pairing.primary_press,
+            Some((_, _, GridPressTarget::Cell(0)))
+        ));
+        harness.state_mut().app.thumbnails[0] = loaded;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        assert_eq!(
+            harness
+                .state()
+                .app
+                .pending_native_drag
+                .as_ref()
+                .unwrap()
+                .paths,
+            vec![folder]
+        );
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_icon_touch_cancel_and_double_tap() {
+        let mut harness = letterbox_harness([40, 120]);
+        let folder = harness.state().app.tmp.path().join("folder");
+        harness.state_mut().app.items[0] = GridItem::Folder(folder.clone());
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Evicted;
+        harness.state_mut().app.selected = None;
+        harness.run_steps(4);
+        let pos = cell_rect(&harness).left_center() + egui::vec2(5.0, 0.0);
+        touch_event(&mut harness, egui::TouchPhase::Start, pos);
+        touch_event(&mut harness, egui::TouchPhase::Cancel, pos);
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().navs.is_empty());
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        assert!(matches!(harness.state().navs.as_slice(),
+            [crate::ui_main::AddressBarNav::Direct(path, _)] if path == &folder));
     }
 
     #[test]
