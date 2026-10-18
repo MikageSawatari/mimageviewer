@@ -812,6 +812,8 @@ fn paint_cell(
             | ThumbnailState::Evicted
             | ThumbnailState::NoArt
             | ThumbnailState::Failed => {
+                // Icon-only folders own the same inner display area used for drawing.
+                record(inner);
                 if is_drive_list {
                     record(draw_drive_icon(painter, inner, dark));
                 } else {
@@ -1012,6 +1014,7 @@ fn paint_cell(
                     | ThumbnailState::Evicted
                     | ThumbnailState::NoArt
                     | ThumbnailState::Failed => {
+                        record(inner);
                         record(paint_lower_caption(
                             painter,
                             inner.center() - egui::vec2(0.0, 14.0),
