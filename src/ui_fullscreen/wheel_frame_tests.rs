@@ -928,7 +928,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
 
 #[cfg(windows)]
 #[test]
-fn egui037_wheel_frame_true_close_stops_only_projected_timer_and_manual_stop_closes_popup() {
+fn egui037_wheel_frame_true_close_stops_only_projected_timer_and_manual_stop_keeps_settings() {
     let _serial = crate::key_input::lock_test_input();
     use crate::app::{ContinuousReadingScrollTransition, HistoryTrigger};
 
@@ -953,16 +953,22 @@ fn egui037_wheel_frame_true_close_stops_only_projected_timer_and_manual_stop_clo
         });
     app.slideshow_scroll_range_cache = Some((1, 30.0, 40.0));
     let main_deadline = app.slideshow_next_at;
-    app.slideshow_popup_open = true;
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
 
     app.with_window_context_for_test(closing, |viewer| {
-        assert!(viewer.slideshow_popup_open);
+        assert_eq!(
+            viewer.fs_overflow_panel_state,
+            FsOverflowPanelState::Slideshow
+        );
         viewer.finish_fullscreen_navigation_for_true_close();
         assert!(!viewer.slideshow_playing);
         assert!(viewer.slideshow_anchor_idx.is_none());
         assert!(viewer.continuous_reading_scroll_transition.is_none());
         assert!(viewer.slideshow_scroll_range_cache.is_none());
-        assert!(viewer.slideshow_popup_open);
+        assert_eq!(
+            viewer.fs_overflow_panel_state,
+            FsOverflowPanelState::Slideshow
+        );
         assert_eq!(viewer.fullscreen_idx, Some(0));
     });
     assert_eq!(app.fullscreen_idx, Some(1));
@@ -974,17 +980,17 @@ fn egui037_wheel_frame_true_close_stops_only_projected_timer_and_manual_stop_clo
         Some(ContinuousReadingScrollTransition::AwaitingReanchor { .. })
     ));
     assert_eq!(app.slideshow_scroll_range_cache, Some((1, 30.0, 40.0)));
-    assert!(app.slideshow_popup_open);
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Slideshow);
 
     assert!(app.stop_slideshow_playback());
     assert!(!app.slideshow_playing);
     assert!(app.slideshow_anchor_idx.is_none());
     assert!(app.continuous_reading_scroll_transition.is_none());
     assert!(app.slideshow_scroll_range_cache.is_none());
-    assert!(!app.slideshow_popup_open);
-    app.slideshow_popup_open = true;
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Slideshow);
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
     assert!(!app.stop_slideshow_playback());
-    assert!(!app.slideshow_popup_open);
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Slideshow);
 }
 
 /// Real nested immediate passes: returning from the child switches this same

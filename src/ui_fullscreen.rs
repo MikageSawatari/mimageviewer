@@ -26,6 +26,10 @@ mod prefetch_revision_tests;
 #[cfg(test)]
 mod retained_material_entry_tests;
 #[cfg(test)]
+mod slideshow_settings_tests;
+#[cfg(test)]
+mod slideshow_tests;
+#[cfg(test)]
 mod wheel_frame_tests;
 #[cfg(test)]
 pub(crate) use page_turn::take_test_events as take_page_turn_test_events;
@@ -5568,6 +5572,35 @@ struct FsOverflowPanelView {
     music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     composition_available: bool,
     composition_managed: bool,
+    slideshow: FsSlideshowSettings,
+}
+
+/// Copy-only projection of the existing global settings. No playback clock is owned here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FsSlideshowSettings {
+    interval_secs: f32,
+    wait_secs: f32,
+    scroll_secs: f32,
+    scroll_percent: u32,
+    end_action: SlideshowEndAction,
+}
+
+impl FsSlideshowSettings {
+    fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            interval_secs: settings.slideshow_interval_secs,
+            wait_secs: settings.slideshow_continuous_wait_secs,
+            scroll_secs: settings.slideshow_continuous_scroll_secs,
+            scroll_percent: settings.slideshow_continuous_scroll_percent,
+            end_action: settings.slideshow_end_action,
+        }
+    }
+}
+
+impl Default for FsSlideshowSettings {
+    fn default() -> Self {
+        Self::from_settings(&crate::settings::Settings::default())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5600,7 +5633,7 @@ fn draw_spread_shift_marker(ui: &mut egui::Ui, rect: egui::Rect, view: &SpreadSh
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FsOverflowPanelAction {
     Close,
     Back,
@@ -5611,6 +5644,10 @@ enum FsOverflowPanelAction {
     SetShiftMemory(bool),
     SetMusicNoteColor(crate::music_note_color::MusicNoteColorScheme),
     EditComposition,
+    SetSlideshow {
+        values: FsSlideshowSettings,
+        persist: bool,
+    },
 }
 
 /// One frame's root-menu input boundary. An editor adoption retires the
@@ -5634,6 +5671,8 @@ fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
         FsOverflowPanelState::SpreadAdjustment => 6,
         FsOverflowPanelState::MusicNoteColor => 2,
+        // Fixed back row + four 48pt sliders + two 24pt headings + three end rows.
+        FsOverflowPanelState::Slideshow => 9,
     }
 }
 
@@ -5932,6 +5971,46 @@ fn draw_fs_overflow_panel_row(
     }
 }
 
+fn draw_fs_slideshow_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    slider: egui::Slider<'_>,
+) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let mut row =
+        ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(12.0, 2.0))));
+    row.spacing_mut().slider_width = (row.available_width() - 85.0).max(60.0);
+    let label_response = row.label(label);
+    let response = row.add(slider).labelled_by(label_response.id);
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::unique(("fs_slideshow_slider_test_rect", label)),
+            response.rect,
+        );
+        data.insert_temp(
+            egui::Id::unique(("fs_slideshow_slider_test_id", label)),
+            response.id,
+        );
+    });
+    response
+}
+
+fn draw_fs_slideshow_heading(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(13.0),
+        ui.visuals().weak_text_color(),
+    );
+}
+
 fn draw_fs_overflow_panel_surface(
     ui: &mut egui::Ui,
     panel_rect: egui::Rect,
@@ -5971,6 +6050,7 @@ fn draw_fs_overflow_panel_surface(
         FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
         FsOverflowPanelState::SpreadAdjustment => "見開きの調整",
         FsOverflowPanelState::MusicNoteColor => "音名の色",
+        FsOverflowPanelState::Slideshow => "スライドショー",
         FsOverflowPanelState::Closed => return None,
     };
     child.painter().text(
@@ -6011,7 +6091,7 @@ fn draw_fs_overflow_panel_surface(
         .clicked()
         .then_some(FsOverflowPanelAction::Close);
 
-    let body_rect = egui::Rect::from_min_max(
+    let mut body_rect = egui::Rect::from_min_max(
         egui::pos2(
             panel_rect.left() + FS_OVERFLOW_PANEL_PADDING,
             header_rect.bottom() + FS_OVERFLOW_PANEL_PADDING,
@@ -6021,6 +6101,35 @@ fn draw_fs_overflow_panel_surface(
             panel_rect.bottom() - FS_OVERFLOW_PANEL_PADDING,
         ),
     );
+    // Slideshow settings remain usable while pages advance. Keep Back with the header
+    // so only the settings body scrolls, even in a short viewport.
+    if view.state == FsOverflowPanelState::Slideshow && body_rect.is_positive() {
+        let back_rect = egui::Rect::from_min_size(
+            body_rect.min,
+            egui::vec2(body_rect.width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
+        );
+        let mut back = child.new_child(egui::UiBuilder::new().max_rect(back_rect));
+        let response = draw_fs_overflow_panel_row(
+            &mut back,
+            "slideshow_back",
+            "<  戻る",
+            "",
+            false,
+            true,
+            None,
+        );
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("fs_slideshow_back_test_rect"),
+                response.rect,
+            )
+        });
+        if response.clicked() {
+            action = Some(FsOverflowPanelAction::Back);
+        }
+        body_rect.min.y += FS_OVERFLOW_PANEL_ROW_HEIGHT;
+    }
     if body_rect.is_positive() {
         let mut body = child.new_child(egui::UiBuilder::new().max_rect(body_rect));
         body.set_clip_rect(body_rect);
@@ -6122,6 +6231,33 @@ fn draw_fs_overflow_panel_surface(
                         if ui.add_enabled(view.shift.enabled, egui::Checkbox::new(&mut memory, "見開きの調整を本ごとに記憶する"))
                             .on_hover_text("全冊に効く設定です。OFFでも保存済み調整は保持し、次回ONの再入場で使います").changed() {
                             action = Some(FsOverflowPanelAction::SetShiftMemory(memory));
+                        }
+                    }
+                    FsOverflowPanelState::Slideshow => {
+                        let mut values = view.slideshow;
+                        let mut changed = false;
+                        let mut persist = false;
+                        let mut record = |response: egui::Response| {
+                            changed |= response.changed();
+                            persist |= response.drag_stopped() || (response.changed() && !response.dragged());
+                        };
+                        record(draw_fs_slideshow_slider(ui, "ページ送り間隔:", egui::Slider::new(&mut values.interval_secs, 0.5..=30.0).suffix(" 秒").fixed_decimals(1)));
+                        draw_fs_slideshow_heading(ui, "連結読みスライドショー:");
+                        record(draw_fs_slideshow_slider(ui, "待機時間:", egui::Slider::new(&mut values.wait_secs, 0.1..=30.0).suffix(" 秒").fixed_decimals(1)));
+                        record(draw_fs_slideshow_slider(ui, "スクロール時間:", egui::Slider::new(&mut values.scroll_secs, 0.0..=5.0).suffix(" 秒").fixed_decimals(1)));
+                        record(draw_fs_slideshow_slider(ui, "1回のスクロール量:", egui::Slider::new(&mut values.scroll_percent, 1..=100).suffix(" %")));
+                        draw_fs_slideshow_heading(ui, "フォルダの最後まで進んだら:");
+                        for end_action in [SlideshowEndAction::LoopFolder, SlideshowEndAction::NextFolder, SlideshowEndAction::Stop] {
+                            let selected = values.end_action == end_action;
+                            if draw_fs_overflow_panel_row(ui, ("slideshow_end", end_action as u8), end_action.label(),
+                                if selected { "選択中" } else { "" }, selected, true, None).clicked() {
+                                values.end_action = end_action;
+                                changed = true;
+                                persist = true;
+                            }
+                        }
+                        if changed || persist {
+                            action = Some(FsOverflowPanelAction::SetSlideshow { values, persist });
                         }
                     }
                     FsOverflowPanelState::MusicNoteColor => {
@@ -6472,7 +6608,6 @@ struct StillTopBarVisibilityInputs {
     side_panel_visible: bool,
     spread_popup_open: bool,
     fit_popup_open: bool,
-    slideshow_popup_open: bool,
     rotation_popup_open: bool,
     panorama_projection_popup_open: bool,
     overflow_panel_open: bool,
@@ -6486,7 +6621,6 @@ fn still_top_bar_visible_from_inputs(input: StillTopBarVisibilityInputs) -> bool
         || input.side_panel_visible
         || input.spread_popup_open
         || input.fit_popup_open
-        || input.slideshow_popup_open
         || input.rotation_popup_open
         || input.panorama_projection_popup_open
         || input.overflow_panel_open
@@ -6530,7 +6664,6 @@ struct StillTouchInputEnabledInputs {
     context_menu_open: bool,
     spread_popup_open: bool,
     fit_popup_open: bool,
-    slideshow_popup_open: bool,
     rotation_popup_open: bool,
     panorama_projection_popup_open: bool,
     compare_wipe_active: bool,
@@ -6554,7 +6687,6 @@ fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
         && !input.context_menu_open
         && !input.spread_popup_open
         && !input.fit_popup_open
-        && !input.slideshow_popup_open
         && !input.rotation_popup_open
         && !input.panorama_projection_popup_open
         && !input.compare_wipe_active
@@ -7588,7 +7720,7 @@ fn should_handle_fullscreen_wheel(
     in_video_tile: bool,
     ctrl_held: bool,
     modal_for_keys: bool,
-    // 表示モード / フィット / スライドショーのポップアップメニュー表示中は、メニュー上でも画像上でも
+    // 表示モード / フィットのポップアップや「…」パネル表示中は、メニュー上でも画像上でも
     // ホイールを背後のページ送り・連結スクロール・ズームへ流さない (modal と同様に全抑制)。
     popup_open: bool,
 ) -> bool {
@@ -18700,6 +18832,7 @@ pub fn draw_spread_shift_hud_snapshot_fixture(ui: &mut egui::Ui, unresolved: boo
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
         shift,
         music_note_color_scheme: Default::default(),
+        slideshow: Default::default(),
         composition_available: false,
         composition_managed: false,
     };
@@ -18723,6 +18856,7 @@ pub fn draw_composition_editor_hud_snapshot_fixture(
         composition_available: available,
         composition_managed: managed,
         music_note_color_scheme: Default::default(),
+        slideshow: Default::default(),
     };
     let rect = egui::Rect::from_min_size(
         ui.max_rect().min,
@@ -27543,7 +27677,7 @@ impl App {
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
                             // 専用トグルがある。
                             let show_window_toggle = cfg!(windows) && !is_video_mode && !detached;
-                            let slideshow_was_playing = self.slideshow_playing;
+                            let mut slideshow_pressed = false;
                             // 360 度パノラマビュー: 検出 + アクティブ状態を計算
                             // (docs/panorama-360-view-plan.md §5.3)。is_panorama_mode_active
                             // は state Some + detect Some を要求するが、ボタン表示は
@@ -27609,7 +27743,6 @@ impl App {
                                     side_panel_visible,
                                     spread_popup_open: self.spread_popup_open,
                                     fit_popup_open: self.fit_popup_open,
-                                    slideshow_popup_open: self.slideshow_popup_open,
                                     rotation_popup_open: fs_rotation_popup_open(ctx),
                                     panorama_projection_popup_open: self
                                         .panorama_projection_popup_open,
@@ -27664,9 +27797,8 @@ impl App {
                                 side_panel_visible,
                                 self.fs_overflow_panel_state.is_open(),
                                 &mut overflow_request,
-                                &mut self.slideshow_playing,
-                                &mut self.settings.slideshow_interval_secs,
-                                &mut self.settings.slideshow_end_action,
+                                self.slideshow_playing,
+                                &mut slideshow_pressed,
                                 current_rotation,
                                 &mut rotation_choice,
                                 panorama_trigger,
@@ -27694,10 +27826,6 @@ impl App {
                                 fit_no_upscale,
                                 fit_no_downscale,
                                 &mut self.fit_popup_open,
-                                &mut self.slideshow_popup_open,
-                                &mut self.settings.slideshow_continuous_wait_secs,
-                                &mut self.settings.slideshow_continuous_scroll_secs,
-                                &mut self.settings.slideshow_continuous_scroll_percent,
                                 &mut specified_scale_edit,
                                 &mut specified_scale_max_edit,
                                 specified_scale_favorite,
@@ -27804,12 +27932,8 @@ impl App {
                                 // モード切替が次の入力まで反映されない (Codex P2)。
                                 ctx.request_repaint_of(egui::ViewportId::ROOT);
                             }
-                            if !slideshow_was_playing && self.slideshow_playing {
-                                self.schedule_next_slideshow_from_now();
-                            } else if slideshow_was_playing && !self.slideshow_playing {
-                                self.slideshow_anchor_idx = None;
-                                self.continuous_reading_scroll_transition = None;
-                                self.slideshow_scroll_range_cache = None;
+                            if slideshow_pressed {
+                                self.toggle_fullscreen_slideshow(fs_idx);
                             }
                             // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
                             #[cfg(windows)]
@@ -32181,7 +32305,6 @@ impl App {
             context_menu_open: self.fs_context_menu_idx.is_some(),
             popup_open: self.spread_popup_open
                 || self.fit_popup_open
-                || self.slideshow_popup_open
                 || self.panorama_projection_popup_open
                 || fs_still_seek_strip_popup_open(ctx),
             ime_active: target
@@ -32471,7 +32594,6 @@ impl App {
             side_panel_visible,
             spread_popup_open: self.spread_popup_open,
             fit_popup_open: self.fit_popup_open,
-            slideshow_popup_open: self.slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
             panorama_projection_popup_open: self.panorama_projection_popup_open,
             overflow_panel_open: self.fs_overflow_panel_state.is_open(),
@@ -32763,7 +32885,6 @@ impl App {
             ) || self.test_script_pending_text_input_focus(),
             self.spread_popup_open
                 || self.fit_popup_open
-                || self.slideshow_popup_open
                 || self.panorama_projection_popup_open
                 || fs_rotation_popup_open(ctx)
                 || fs_still_seek_strip_popup_open(ctx),
@@ -32805,6 +32926,15 @@ impl App {
 
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::mark_action_pass_eligible(ctx);
+
+        // Slideshow is a settings surface: focused sliders and their numeric editors own
+        // arrows/text/IME, rather than dismissing the panel and navigating the page behind it.
+        if self.fs_overflow_panel_state == FsOverflowPanelState::Slideshow
+            && ctx.memory(|memory| memory.focused().is_some())
+        {
+            self.fs_zoom_reset_transient();
+            return action;
+        }
 
         // The overflow panel is a menu, so the next keystroke closes it - and then goes on to do
         // whatever it was going to do. It does not swallow the key: a menu that eats the input
@@ -34816,18 +34946,7 @@ impl App {
         // 開始時のみ、現在ページが画像系アイテム (Image/ZipImage/PdfPage) かを確認する。
         // 非画像アイテム上では開始させない (停止操作は常に許可)。
         if key_s {
-            self.slideshow_popup_open = false;
-            if self.slideshow_playing {
-                self.stop_slideshow_playback();
-            } else if matches!(
-                self.items.get(fs_idx),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            ) {
-                self.slideshow_playing = true;
-                self.schedule_next_slideshow_from_now();
-            }
+            self.toggle_fullscreen_slideshow(fs_idx);
         }
 
         if key_seek_strip_toggle {
@@ -35438,6 +35557,12 @@ impl App {
                     true,
                     None,
                 ),
+                FullscreenOverflowItemId::SlideshowSettings => (
+                    item.label().into(),
+                    format!("{:.1} 秒  >", self.settings.slideshow_interval_secs),
+                    true,
+                    None,
+                ),
                 FullscreenOverflowItemId::ImageAnalysis => {
                     let enabled =
                         self.analysis_mode || (!is_spread_double && self.reading_flow.is_paged());
@@ -35500,6 +35625,7 @@ impl App {
             composition_available: self.composition_editor_available(),
             composition_managed: self.pairing_edit_availability()
                 == crate::spread_shift::PairingEditAvailability::Composed,
+            slideshow: FsSlideshowSettings::from_settings(&self.settings),
         }
     }
 
@@ -35648,11 +35774,7 @@ impl App {
         }) {
             return Some(FsHudPopupWheelTarget::Overflow);
         }
-        if self.fit_popup_open
-            || self.spread_popup_open
-            || self.slideshow_popup_open
-            || self.panorama_projection_popup_open
-        {
+        if self.fit_popup_open || self.spread_popup_open || self.panorama_projection_popup_open {
             return Some(FsHudPopupWheelTarget::TopBar);
         }
         None
@@ -35668,7 +35790,6 @@ impl App {
             FsHudPopupWheelTarget::TopBar => {
                 self.fit_popup_open
                     || self.spread_popup_open
-                    || self.slideshow_popup_open
                     || self.panorama_projection_popup_open
                     || fs_rotation_popup_open(ctx)
             }
@@ -35702,6 +35823,7 @@ impl App {
             navigator_corner: FullscreenNavigatorCorner::BottomRight,
             shift: Default::default(),
             music_note_color_scheme: self.settings.music_note_color_scheme,
+            slideshow: FsSlideshowSettings::from_settings(&self.settings),
             composition_available: false,
             composition_managed: false,
         };
@@ -35796,6 +35918,9 @@ impl App {
                 FullscreenOverflowItemId::PageTurnAnimationToggle => {
                     self.toggle_page_turn_animation()
                 }
+                FullscreenOverflowItemId::SlideshowSettings => {
+                    self.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+                }
                 FullscreenOverflowItemId::ImageAnalysis => {
                     let available =
                         self.analysis_mode || (!is_spread_double && self.reading_flow.is_paged());
@@ -35839,6 +35964,17 @@ impl App {
             }
             FsOverflowPanelAction::SetMusicNoteColor(scheme) => {
                 self.set_music_note_color_scheme(scheme);
+            }
+            FsOverflowPanelAction::SetSlideshow { values, persist } => {
+                self.settings.slideshow_interval_secs = values.interval_secs;
+                self.settings.slideshow_continuous_wait_secs = values.wait_secs;
+                self.settings.slideshow_continuous_scroll_secs = values.scroll_secs;
+                self.settings.slideshow_continuous_scroll_percent = values.scroll_percent;
+                self.settings.slideshow_end_action = values.end_action;
+                // Do not reschedule the current page. The next transition reads these values.
+                if persist {
+                    self.settings.save();
+                }
             }
             FsOverflowPanelAction::SetShiftMemory(enabled) => {
                 if view.shift.enabled {
@@ -37935,7 +38071,6 @@ impl App {
                     side_panel_visible,
                     spread_popup_open: self.spread_popup_open,
                     fit_popup_open: self.fit_popup_open,
-                    slideshow_popup_open: self.slideshow_popup_open,
                     rotation_popup_open: fs_rotation_popup_open(ctx),
                     panorama_projection_popup_open: self.panorama_projection_popup_open,
                     overflow_panel_open: self.fs_overflow_panel_state.is_open(),
@@ -37948,7 +38083,6 @@ impl App {
         // 筆以外、各パネル上、popup / modal 中は input に触れず、下流の従来経路へ残す。
         let edit_popup_open = self.spread_popup_open
             || self.fit_popup_open
-            || self.slideshow_popup_open
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
             || fs_still_seek_strip_popup_open(ctx)
@@ -37976,7 +38110,6 @@ impl App {
             context_menu_open: self.fs_context_menu_idx.is_some(),
             spread_popup_open: self.spread_popup_open,
             fit_popup_open: self.fit_popup_open,
-            slideshow_popup_open: self.slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx) || fs_still_seek_strip_popup_open(ctx),
             panorama_projection_popup_open: self.panorama_projection_popup_open,
             compare_wipe_active,
@@ -38365,7 +38498,6 @@ impl App {
                 modal_for_keys,
                 self.spread_popup_open
                     || self.fit_popup_open
-                    || self.slideshow_popup_open
                     || self.panorama_projection_popup_open
                     || fs_rotation_popup_open(ctx)
                     || fs_still_seek_strip_popup_open(ctx)
@@ -38426,7 +38558,6 @@ impl App {
                         modal_for_keys,
                         self.spread_popup_open
                             || self.fit_popup_open
-                            || self.slideshow_popup_open
                             || self.panorama_projection_popup_open,
                         suppress_egui_wheel,
                         handle_wheel_here,
@@ -39118,7 +39249,6 @@ impl App {
         }
         if self.spread_popup_open
             || self.fit_popup_open
-            || self.slideshow_popup_open
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(_ctx)
             || fs_still_seek_strip_popup_open(_ctx)
@@ -39202,7 +39332,6 @@ impl App {
         // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
         let popup_open = self.spread_popup_open
             || self.fit_popup_open
-            || self.slideshow_popup_open
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
             || fs_still_seek_strip_popup_open(ctx);
@@ -39337,7 +39466,6 @@ impl App {
             && self.fs_context_menu_idx.is_none()
             && !self.spread_popup_open
             && !self.fit_popup_open
-            && !self.slideshow_popup_open
             && !self.panorama_projection_popup_open
             && !fs_rotation_popup_open(ctx)
             && !fs_still_seek_strip_popup_open(ctx)
@@ -39617,12 +39745,25 @@ impl App {
         was_playing
     }
 
+    /// HUD・キー/マウス割当・リング/ジェスチャで共有する、active viewer のトグル出口。
+    pub(crate) fn toggle_fullscreen_slideshow(&mut self, fs_idx: usize) {
+        if self.slideshow_playing {
+            self.stop_slideshow_playback();
+        } else if matches!(
+            self.items.get(fs_idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        ) {
+            self.slideshow_playing = true;
+            self.schedule_next_slideshow_from_now();
+        }
+    }
+
     /// 既存の手動停止と remote session lock が共有する停止入口。
-    /// 表示位置と fullscreen/window 構成は保持し、popup も閉じる。
+    /// 表示位置と fullscreen/window 構成、全体設定パネルは保持する。
     pub(crate) fn stop_slideshow_playback(&mut self) -> bool {
-        let was_playing = self.stop_projected_slideshow_playback();
-        self.slideshow_popup_open = false;
-        was_playing
+        self.stop_projected_slideshow_playback()
     }
 
     /// フォルダ内の先頭の静止画系アイテム (Video 除外) へ折り返す。
@@ -43050,7 +43191,6 @@ impl App {
         self.reset_live_spread_shift(false);
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
-        self.slideshow_popup_open = false;
         self.panorama_projection_popup_open = false;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         if !self.reading_flow.is_paged() {
@@ -43347,7 +43487,6 @@ impl App {
         self.spread_mode = mode;
         self.reading_direction = direction;
         self.spread_popup_open = false;
-        self.slideshow_popup_open = false;
         self.panorama_projection_popup_open = false;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         if !self.reading_flow.is_paged() {
@@ -48826,7 +48965,6 @@ impl App {
             && !music_view_frame_ui.blocks_cursor_auto_hide()
             && !self.spread_popup_open
             && !self.fit_popup_open
-            && !self.slideshow_popup_open
             && !self.panorama_projection_popup_open
             && !fs_still_seek_strip_popup_open(ctx)
             && self.fs_context_menu_idx.is_none()
@@ -48851,9 +48989,8 @@ impl App {
         side_panel_visible: bool,
         overflow_panel_open: bool,
         overflow_request: &mut Option<FsOverflowOpenRequest>,
-        slideshow_playing: &mut bool,
-        slideshow_interval: &mut f32,
-        slideshow_end_action: &mut SlideshowEndAction,
+        slideshow_playing: bool,
+        slideshow_pressed: &mut bool,
         current_rotation: crate::rotation_db::Rotation,
         rotation_choice: &mut Option<crate::rotation_db::Rotation>,
         // 360 度パノラマビュー (docs/panorama-360-view-plan.md §5.3):
@@ -48896,10 +49033,6 @@ impl App {
         fit_no_upscale: bool,
         fit_no_downscale: bool,
         fit_popup_open: &mut bool,
-        slideshow_popup_open: &mut bool,
-        slideshow_continuous_wait_secs: &mut f32,
-        slideshow_continuous_scroll_secs: &mut f32,
-        slideshow_continuous_scroll_percent: &mut u32,
         specified_scale_edit: &mut crate::settings::FullscreenSpecifiedScale,
         specified_scale_max_edit: &mut u32,
         specified_scale_favorite: bool,
@@ -48953,7 +49086,6 @@ impl App {
 
         let popup_wheel_owned = *fit_popup_open
             || *spread_popup_open
-            || *slideshow_popup_open
             || *panorama_projection_popup_open
             || fs_rotation_popup_open(ctx);
         let hover_in_top = ctx.input(|i| {
@@ -48972,7 +49104,6 @@ impl App {
             side_panel_visible,
             spread_popup_open: *spread_popup_open,
             fit_popup_open: *fit_popup_open,
-            slideshow_popup_open: *slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
             panorama_projection_popup_open: *panorama_projection_popup_open,
             overflow_panel_open,
@@ -49200,14 +49331,8 @@ impl App {
         // ▶/⏸ スライドショーボタン (画像モード) または ▦ タイルボタン (動画モード)
         // 360 モード中は非表示。
         if panorama_mode_active {
-            if *slideshow_popup_open {
-                *slideshow_popup_open = false;
-            }
             // skip
         } else if is_video {
-            if *slideshow_popup_open {
-                *slideshow_popup_open = false;
-            }
             let tile_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -49229,14 +49354,13 @@ impl App {
                 *page_nav = FsPageNav::None;
             }
         } else {
-            let play_btn_x = next_x;
             let play_resp = draw_bar_button(
                 ui,
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
                 "fs_play_btn",
                 |hovered| {
-                    if *slideshow_playing {
+                    if slideshow_playing {
                         egui::Color32::from_rgba_unmultiplied(60, 180, 60, 200)
                     } else if hovered {
                         egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
@@ -49246,14 +49370,14 @@ impl App {
                 },
                 false,
                 |p, c, r| {
-                    if *slideshow_playing {
+                    if slideshow_playing {
                         draw_pause_icon(p, c, r);
                     } else {
                         draw_play_triangle(p, c, r);
                     }
                 },
             );
-            let play_resp = if *slideshow_playing {
+            let play_resp = if slideshow_playing {
                 play_resp.hover_tip_dark(
                     keymap.first_chord_bracket_label("スライドショー停止", KeyAction::FsSlideshow),
                 )
@@ -49262,178 +49386,13 @@ impl App {
                     keymap.first_chord_bracket_label("スライドショー", KeyAction::FsSlideshow),
                 )
             };
-            let slideshow_resp_rect = play_resp.rect;
             if play_resp.clicked() {
-                if *slideshow_playing {
-                    *slideshow_playing = false;
-                    *slideshow_popup_open = false;
-                } else {
-                    *slideshow_popup_open = !*slideshow_popup_open;
-                    *spread_popup_open = false;
-                    *fit_popup_open = false;
-                }
+                *slideshow_pressed = true;
             }
             if play_resp.hovered() {
                 *page_nav = FsPageNav::None;
             }
 
-            if *slideshow_popup_open {
-                let popup_w = 330.0_f32;
-                let popup_h = 350.0_f32;
-                let popup_x_min = bar_rect.min.x + 8.0;
-                let popup_x_max = (bar_rect.max.x - popup_w - 8.0).max(popup_x_min);
-                let popup_x =
-                    (play_btn_x - popup_w + BAR_BUTTON_SIZE).clamp(popup_x_min, popup_x_max);
-                let popup_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_x, bar_rect.max.y + 4.0),
-                    egui::vec2(popup_w, popup_h),
-                );
-                ui.painter().rect_filled(
-                    popup_rect,
-                    6.0,
-                    egui::Color32::from_rgba_unmultiplied(30, 30, 30, 244),
-                );
-                ui.painter().rect_stroke(
-                    popup_rect,
-                    6.0,
-                    egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
-                    ),
-                    egui::StrokeKind::Outside,
-                );
-
-                let mut toggle_slideshow = false;
-                let shortcut = keymap.first_chord_label(KeyAction::FsSlideshow);
-                let button_label = match (*slideshow_playing, shortcut.as_deref()) {
-                    (true, Some(label)) => format!("停止 [{label}]"),
-                    (true, None) => "停止".to_owned(),
-                    (false, Some(label)) => format!("開始 [{label}]"),
-                    (false, None) => "開始".to_owned(),
-                };
-                let inner = popup_rect.shrink2(egui::vec2(12.0, 10.0));
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(inner)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                    |child_ui| {
-                        child_ui.set_width(inner.width());
-                        child_ui.spacing_mut().item_spacing.y = 7.0;
-                        child_ui.label(
-                            egui::RichText::new("スライドショー")
-                                .strong()
-                                .color(egui::Color32::from_gray(230)),
-                        );
-
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("ページ送り")
-                                    .color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_interval, 0.5..=30.0)
-                                    .suffix(" 秒")
-                                    .fixed_decimals(1),
-                            )
-                            .labelled_by(label.id);
-                        });
-
-                        child_ui.add_space(2.0);
-                        child_ui.label(
-                            egui::RichText::new("連結読み")
-                                .size(11.0)
-                                .color(egui::Color32::from_gray(150)),
-                        );
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("待機").color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_continuous_wait_secs, 0.1..=30.0)
-                                    .suffix(" 秒")
-                                    .fixed_decimals(1),
-                            )
-                            .labelled_by(label.id);
-                        });
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("移動時間")
-                                    .color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_continuous_scroll_secs, 0.0..=5.0)
-                                    .suffix(" 秒")
-                                    .fixed_decimals(1),
-                            )
-                            .labelled_by(label.id);
-                        });
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("移動量").color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_continuous_scroll_percent, 1..=100)
-                                    .suffix(" %"),
-                            )
-                            .labelled_by(label.id);
-                        });
-
-                        child_ui.add_space(2.0);
-                        child_ui.label(
-                            egui::RichText::new("最後まで進んだら")
-                                .size(11.0)
-                                .color(egui::Color32::from_gray(150)),
-                        );
-                        for action in [
-                            SlideshowEndAction::LoopFolder,
-                            SlideshowEndAction::NextFolder,
-                            SlideshowEndAction::Stop,
-                        ] {
-                            child_ui.radio_value(
-                                slideshow_end_action,
-                                action,
-                                egui::RichText::new(action.label())
-                                    .color(egui::Color32::from_gray(220)),
-                            );
-                        }
-
-                        child_ui.add_space(4.0);
-                        let fill = if *slideshow_playing {
-                            egui::Color32::from_rgb(96, 96, 96)
-                        } else {
-                            egui::Color32::from_rgb(70, 130, 210)
-                        };
-                        if child_ui
-                            .add_sized(
-                                egui::vec2(inner.width(), 30.0),
-                                egui::Button::new(
-                                    egui::RichText::new(button_label)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(fill),
-                            )
-                            .clicked()
-                        {
-                            toggle_slideshow = true;
-                        }
-                    },
-                );
-
-                if toggle_slideshow {
-                    *slideshow_playing = !*slideshow_playing;
-                    *slideshow_popup_open = false;
-                }
-
-                if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
-                    if !popup_rect.contains(pos)
-                        && !slideshow_resp_rect.contains(pos)
-                        && ctx.input(|i| i.pointer.any_pressed())
-                    {
-                        *slideshow_popup_open = false;
-                    }
-                }
-            }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
@@ -49797,7 +49756,6 @@ impl App {
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
                 *fit_popup_open = false;
-                *slideshow_popup_open = false;
             }
             if spread_resp.hovered() {
                 *page_nav = FsPageNav::None;
@@ -50174,7 +50132,6 @@ impl App {
             if mf_resp.clicked() {
                 *fit_popup_open = !*fit_popup_open;
                 *spread_popup_open = false;
-                *slideshow_popup_open = false;
             }
             if mf_resp.hovered() {
                 *page_nav = FsPageNav::None;
@@ -50240,7 +50197,6 @@ impl App {
         if popup_wheel_owned
             || *fit_popup_open
             || *spread_popup_open
-            || *slideshow_popup_open
             || *panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
         {
@@ -62197,9 +62153,7 @@ mod tests {
                             let mut page_nav = FsPageNav::None;
                             let mut side_panel_mode_pressed = false;
                             let mut overflow_request = None;
-                            let mut slideshow_playing = false;
-                            let mut slideshow_interval = 5.0;
-                            let mut slideshow_end_action = SlideshowEndAction::default();
+                            let slideshow_playing = false;
                             let mut rotation_choice = None;
                             let mut panorama_pressed = false;
                             let mut panorama_projection_popup_open = panorama_projection_list_open;
@@ -62216,10 +62170,6 @@ mod tests {
                             let mut spread_popup_open = false;
                             let mut local_adjust_mode = false;
                             let mut fit_popup_open = false;
-                            let mut slideshow_popup_open = false;
-                            let mut slideshow_wait = 1.0;
-                            let mut slideshow_scroll = 1.0;
-                            let mut slideshow_percent = 100;
                             let mut fit_mode_choice = None;
                             let mut fit_no_upscale_choice = None;
                             let mut fit_no_downscale_choice = None;
@@ -62243,9 +62193,8 @@ mod tests {
                                 false,
                                 false,
                                 &mut overflow_request,
-                                &mut slideshow_playing,
-                                &mut slideshow_interval,
-                                &mut slideshow_end_action,
+                                slideshow_playing,
+                                &mut false,
                                 crate::rotation_db::Rotation::None,
                                 &mut rotation_choice,
                                 // 投影一覧を出すシナリオでは 360 表示中として描く
@@ -62276,10 +62225,6 @@ mod tests {
                                 false,
                                 false,
                                 &mut fit_popup_open,
-                                &mut slideshow_popup_open,
-                                &mut slideshow_wait,
-                                &mut slideshow_scroll,
-                                &mut slideshow_percent,
                                 &mut crate::settings::FullscreenSpecifiedScale::default(),
                                 &mut {
                                     crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
@@ -62456,19 +62401,13 @@ mod tests {
                             let mut page_nav = FsPageNav::None;
                             let mut side_panel_mode_pressed = false;
                             let mut overflow_request = None;
-                            let mut slideshow_playing = false;
-                            let mut slideshow_interval = 5.0;
-                            let mut slideshow_end_action = SlideshowEndAction::default();
+                            let slideshow_playing = false;
                             let mut rotation_choice = None;
                             let mut panorama_pressed = false;
                             let mut panorama_projection_popup_open = false;
                             let mut panorama_projection_choice = None;
                             let mut local_adjust_mode = false;
                             let mut fit_popup_open = false;
-                            let mut slideshow_popup_open = false;
-                            let mut slideshow_wait = 1.0;
-                            let mut slideshow_scroll = 1.0;
-                            let mut slideshow_percent = 100;
                             let mut fit_mode_choice = None;
                             let mut fit_no_upscale_choice = None;
                             let mut fit_no_downscale_choice = None;
@@ -62492,9 +62431,8 @@ mod tests {
                                 false,
                                 false,
                                 &mut overflow_request,
-                                &mut slideshow_playing,
-                                &mut slideshow_interval,
-                                &mut slideshow_end_action,
+                                slideshow_playing,
+                                &mut false,
                                 crate::rotation_db::Rotation::None,
                                 &mut rotation_choice,
                                 None,
@@ -62526,10 +62464,6 @@ mod tests {
                                 false,
                                 false,
                                 &mut fit_popup_open,
-                                &mut slideshow_popup_open,
-                                &mut slideshow_wait,
-                                &mut slideshow_scroll,
-                                &mut slideshow_percent,
                                 &mut crate::settings::FullscreenSpecifiedScale::default(),
                                 &mut {
                                     crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
@@ -63069,9 +63003,11 @@ mod tests {
             FsOverflowPanelState::NavigatorPosition,
             FsOverflowPanelState::SpreadAdjustment,
             FsOverflowPanelState::MusicNoteColor,
+            FsOverflowPanelState::Slideshow,
         ] {
             for size in [
                 egui::vec2(1200.0, 800.0),
+                egui::vec2(1093.0, 614.0),
                 egui::vec2(320.0, 200.0),
                 egui::vec2(320.0, 180.0),
             ] {
@@ -63105,6 +63041,7 @@ mod tests {
                         composition_available: true,
                         composition_managed: true,
                         music_note_color_scheme: Default::default(),
+                        slideshow: Default::default(),
                     };
                     let draw = |events| {
                         let _ = ctx
@@ -63165,7 +63102,13 @@ mod tests {
                         // content as well as viewport height: Fits alone would also accept
                         // a budget that accidentally counts the ambient spacing twice.
                         let expected_body = fs_overflow_panel_body_row_count(state) as f32
-                            * FS_OVERFLOW_PANEL_ROW_HEIGHT;
+                            * FS_OVERFLOW_PANEL_ROW_HEIGHT
+                            - if state == FsOverflowPanelState::Slideshow {
+                                // Back is fixed above the scrolling body.
+                                FS_OVERFLOW_PANEL_ROW_HEIGHT
+                            } else {
+                                0.0
+                            };
                         let tolerance = 1.0 / ctx.pixels_per_point();
                         assert!(
                             (before.content.y - expected_body).abs() <= tolerance,
@@ -63289,6 +63232,16 @@ mod tests {
                             ];
                             let mut root_rows = root_rows;
                             root_rows.insert(3, animation_row.clone());
+                            root_rows.insert(
+                                4,
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::SlideshowSettings,
+                                    label: "スライドショー".into(),
+                                    status: "3.0 秒  >".into(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                            );
                             let view = FsOverflowPanelView {
                                 state,
                                 root_rows,
@@ -63297,6 +63250,7 @@ mod tests {
                                 composition_available: true,
                                 composition_managed: false,
                                 music_note_color_scheme: Default::default(),
+                                slideshow: Default::default(),
                             };
                             let panel_rect =
                                 fs_overflow_panel_rect(ctx.content_rect(), state).unwrap();
@@ -63305,7 +63259,7 @@ mod tests {
                 });
             });
         harness.run();
-        if size.y >= 520.0 {
+        if size.y >= 600.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
                 data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                     .unwrap()
@@ -63335,7 +63289,7 @@ mod tests {
 
     #[test]
     fn fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height() {
-        for size in [egui::vec2(720.0, 520.0), egui::vec2(720.0, 720.0)] {
+        for size in [egui::vec2(720.0, 600.0), egui::vec2(720.0, 720.0)] {
             // The shared fixture retains its original Fits assertion; no PNG is
             // needed to detect the 8pt viewport shrink from build_ui's outer frame.
             let _ = fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
@@ -63367,7 +63321,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root_tall",
             FsOverflowPanelState::Root,
-            egui::vec2(720.0, 520.0),
+            egui::vec2(720.0, 600.0),
             false,
         );
     }
@@ -63379,6 +63333,16 @@ mod tests {
             FsOverflowPanelState::Root,
             egui::vec2(720.0, 440.0),
             true,
+        );
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_snapshot_slideshow() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_slideshow",
+            FsOverflowPanelState::Slideshow,
+            egui::vec2(1093.0, 614.0),
+            false,
         );
     }
 
@@ -75667,7 +75631,6 @@ mod tests {
             side_panel_visible: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             overflow_panel_open: false,
@@ -75697,7 +75660,6 @@ mod tests {
             context_menu_open: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             compare_wipe_active: false,
@@ -75720,7 +75682,6 @@ mod tests {
             side_panel_visible: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             overflow_panel_open: false,
@@ -75922,10 +75883,6 @@ mod tests {
                 ..enabled
             },
             StillTouchInputEnabledInputs {
-                slideshow_popup_open: true,
-                ..enabled
-            },
-            StillTouchInputEnabledInputs {
                 rotation_popup_open: true,
                 ..enabled
             },
@@ -75967,7 +75924,6 @@ mod tests {
             context_menu_open: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             compare_wipe_active: false,
@@ -87647,9 +87603,7 @@ mod specified_scale_consumer_tests {
                         let mut page_nav = FsPageNav::None;
                         let mut side_panel_mode_pressed = false;
                         let mut overflow_request = None;
-                        let mut slideshow_playing = false;
-                        let mut slideshow_interval = 5.0;
-                        let mut slideshow_end_action = SlideshowEndAction::default();
+                        let slideshow_playing = false;
                         let mut rotation_choice = None;
                         let mut panorama_pressed = false;
                         let mut panorama_projection_popup_open = false;
@@ -87663,10 +87617,6 @@ mod specified_scale_consumer_tests {
                             crate::settings::PageAlonePreferences::default();
                         let mut local_adjust_mode = false;
                         let mut fit_popup_open = *open;
-                        let mut slideshow_popup_open = false;
-                        let mut slideshow_wait = 1.0;
-                        let mut slideshow_scroll = 1.0;
-                        let mut slideshow_percent = 100;
                         let mut fit_mode_choice = None;
                         let mut fit_no_upscale_choice = None;
                         let mut fit_no_downscale_choice = None;
@@ -87690,9 +87640,8 @@ mod specified_scale_consumer_tests {
                             false,
                             false,
                             &mut overflow_request,
-                            &mut slideshow_playing,
-                            &mut slideshow_interval,
-                            &mut slideshow_end_action,
+                            slideshow_playing,
+                            &mut false,
                             crate::rotation_db::Rotation::None,
                             &mut rotation_choice,
                             None,
@@ -87720,10 +87669,6 @@ mod specified_scale_consumer_tests {
                             false,
                             false,
                             &mut fit_popup_open,
-                            &mut slideshow_popup_open,
-                            &mut slideshow_wait,
-                            &mut slideshow_scroll,
-                            &mut slideshow_percent,
                             value,
                             &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
                             false,
@@ -88912,7 +88857,11 @@ mod specified_scale_consumer_tests {
         for popup in 0..5 {
             app.fit_popup_open = popup == 0;
             app.spread_popup_open = popup == 1;
-            app.slideshow_popup_open = popup == 2;
+            app.fs_overflow_panel_state = if popup == 2 {
+                FsOverflowPanelState::Slideshow
+            } else {
+                FsOverflowPanelState::Closed
+            };
             let menu_id = match popup {
                 3 => Some(egui::Id::unique("fs_rotation_btn").with("popup")),
                 4 => Some(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")),
@@ -91921,6 +91870,7 @@ mod music_overflow_tests {
                 navigator_corner: FullscreenNavigatorCorner::BottomRight,
                 shift: Default::default(),
                 music_note_color_scheme: MusicNoteColorScheme::Fifths,
+                slideshow: Default::default(),
                 composition_available: false,
                 composition_managed: false,
             };

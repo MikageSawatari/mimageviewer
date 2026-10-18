@@ -55,11 +55,18 @@
 
 ### 1.396 スライドショーボタンを即時開始・停止にし、設定を上 HUD の「…」へ移す — 5ch >>579〜580 (2026-10-18)
 
+- 状態: **実装済み・実機確認待ち**。
 - 要望: 再生ボタンを押したら設定画面を挟まず開始したい。キー・リング・ジェスチャでは既に即時開始・停止できるとの補足あり。利用者方針: 表示間隔などは閲覧中にも変更したいため、環境設定に残しつつ上 HUD の「…」から開けるようにする。
-- 現状 (コード確認): `src/ui_fullscreen.rs` の再生ボタンは、停止中ならスライドショー設定 popup を開き、その中の開始ボタンで再生する。再生中の停止や既存 `KeyAction::FsSlideshow` などは即時操作になっている。
-- 対応: HUD の再生ボタンも既存の開始・停止経路へ接続し、表示間隔・連結読みの待ち時間/スクロール・末尾動作などの設定は「…」のスライドショー設定へ移す。既存の `FsOverflowPanelState` に沿ってサブパネルを持ち、別の popup 状態を重ねない。環境設定側の変更・保存も維持する。
-- 検証: ボタン/キー/マウスの開始・停止の一致、再生中の設定変更と次の切替時刻、連結読み・末尾動作、通常/F12/複数窓での状態分離、設定パネルの見切れ・外側クリックを確認する。スライドショーの表示完了待ちやページめくりの仕組みは維持する。
-- 関連: [display-pipeline.md](display-pipeline.md)。実装時にマニュアルのスライドショー説明も更新する。規模 / 優先度: Small〜Medium / P3。
+- 対応: HUD の再生ボタンを 1 クリック即時開始 / 停止へ変更し、`KeyAction::FsSlideshow`・マウス割当・リング・ジェスチャと単一出口へ接続する。開始は `Image` / `ZipImage` / `PdfPage` に限定し、停止時の解放も共通化する。旧設定 popup を削除し、既存 `FsOverflowPanelState` のスライドショーサブパネルへ設定を移す。
+- パネル: root のページめくりアニメーション直後に追加し、ページ送り間隔を表示する。環境設定と同じ表示間隔・連結読みの待機時間 / スクロール時間 / スクロール量・末尾動作を編集し、開始 / 停止ボタンは置かない。ファイル切替ではこのサブパネルだけを維持し、fullscreen close / 前面所有権の解放では閉じる。
+- 反映時点: 再生中の変更は次の切替から適用し、現在の `slideshow_next_at` は変更しない。進捗リングは現設定の間隔を使うため、変更後に一時的にずれる既知制約を明記する。表示完了待ち・ページめくり・連結読みの仕組み、環境設定側の変更・保存は維持する。
+- 調査: 通常の閲覧入口で「再生ボタンが出るが開始できない」項目は見つからない。動画・音声は別 HUD、フォルダ・書庫・スタック等は既存の一覧移動 / 展開 / 変換 / 拒否へ分岐する。通常の次フォルダ移動では既存の fullscreen close → reopen 境界で設定パネルも閉じる。ZIP 内 DFS 等は既存経路の close 有無に従う。
+- 自動検証 (2026-10-19、`slideshow-1396` / `fb14a73a1` からの未コミット差分): core の `cargo check` 成功、関連 nextest **42 成功 / 0 失敗**、`cargo test --test ui_snapshot` **186 成功 / 0 失敗**。`cargo fmt --check`、UI グリフ 0 件、製品ページ 49 カードの文字数検査も成功。独立レビューは別担当で実施 (結果は下に追記)。lib 全件は検収側の担当とし、実アプリは起動していない。
+- 関連 filter: `cargo nextest run --no-fail-fast -p mimageviewer --lib -E 'test(/slideshow_|overflow_panel|popup_wheel|wheel_frame_true_close|still_touch_input_availability|still_top_bar.*visibility/)'`。`MSBUILDDISABLENODEREUSE=1` で実行。最終ログは `target/slideshow-tests-final.log` / `target/slideshow-ui-snapshot.log` / `target/slideshow-check-final.log`。新規回帰は 3 入口・非静止画拒否・停止 cleanup / collection intent 取消・自動送り・context 分離・mouse / touch slider の所有と確定保存・数値欄入力・時計維持・固定ヘッダー / 戻るを検査する。
+- スナップショット: `UPDATE_SNAPSHOTS=1` で `fullscreen_overflow_panel_root.png` / `fullscreen_overflow_panel_root_tall.png` / `fullscreen_overflow_panel_page_turn_on.png` を更新し、`fullscreen_overflow_panel_slideshow.png` を追加（4 枚計 153,594 bytes、`tests/snapshots/`）。通常比較でも成功。最終目視は ClaudeCode の検収へ引き継ぐ。
+- 確認用ビルド: `MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1` で `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` 成功。通常プロファイルの core / Remote / EPUB 変換ワーカーを生成し、付属 DLL の依存関係検査も `runtime=4 pe=3` で成功した。ログは `target/slideshow-build-dev.log`。起動は行っていない。
+- 実機確認待ち: ボタン/キー/マウスの開始・停止の一致、再生中の設定変更と次の切替時刻、連結読み・末尾動作、通常/F12/複数窓での状態分離、設定パネルの見切れ・外側クリック。
+- 関連: [display-pipeline.md](display-pipeline.md)、マニュアルのフルスクリーン / スライドショー設定説明を更新。規模 / 優先度: Small〜Medium / P3。
 
 ### 1.387 サブモニターの動画全画面で HUD の点滅が残る — 5ch >>557〜570 (2026-10-16)
 

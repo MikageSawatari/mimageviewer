@@ -1829,7 +1829,7 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.add_space(6.0);
         ui.label(
-            egui::RichText::new("フルスクリーンで S キーまたは ▶ ボタンで開始 / 停止")
+            egui::RichText::new("フルスクリーンで S キーまたは ▶ ボタンで開始 / 停止。上部の「…」からも設定を変更できます")
                 .size(11.0)
                 .color(hint),
         );
