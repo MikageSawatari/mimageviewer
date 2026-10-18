@@ -151,21 +151,23 @@ class ConverterTests(unittest.TestCase):
 
 class GenerationTests(unittest.TestCase):
     def test_snapshot_cannot_be_silently_relabelled_for_new_bundle(self):
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with Mixwright v0.12.0, not v0.13.0'):
-            docs.generate(docs.ROOT / 'third_party/effetune-docs/03bffda3', 'v0.13.0')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with Mixwright v0.12.0, not v0.14.0'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/03bffda3', 'v0.14.0')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with Mixwright v0.13.0, not v0.14.0'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/6791afdf', 'v0.14.0')
 
     def test_snapshot_matches_output_and_preserves_license_images(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.14.0')
         self.assertEqual(len(output), 137)  # 20 category/guide/index/license + 113 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
-                self.assertEqual((docs.MANUAL / 'effetune/v0.13.0' / name).read_bytes(), data)
+                self.assertEqual((docs.MANUAL / 'effetune/v0.14.0' / name).read_bytes(), data)
                 if name.endswith('.html'):
                     text = data.decode()
                     self.assertNotIn('sidebar-section', text)
                     self.assertIn('href="../../style.css"', text)
                     self.assertIn('href="license.html"', text)
-                    self.assertIn('6791afdfc6f4e6c913b9f48c8189a44e29a09bde', text)
+                    self.assertIn('01c96f00f8e93595aefab96de4bc4d210e61c53b', text)
                     self.assertNotIn('{%', text)
                     self.assertNotIn('<p></p>', text)
                     self.assertNotIn('<li></li>', text)
@@ -175,7 +177,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(output['images/' + path.name], path.read_bytes())
 
     def test_snapshot_split_navigation_index_and_override_survival(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.14.0').items() if name.endswith('.html')}
         eq = output['eq.html'].split('<main class="content">')[1]
         self.assertIn('id="スペクトラムオーバーレイ"', eq)
         self.assertIn('href="eq-15band-geq.html"', eq)
@@ -190,7 +192,7 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('rel="prev"', geq)
         self.assertIn('rel="prev" href="eq-tonal-balance-eq.html"', output['eq-tone-control.html'])
         self.assertNotIn('rel="next"', output['eq-tone-control.html'])
-        self.assertIn('<a href="index.html">EffeTune 説明書</a><span class="sep">›</span><a href="eq.html">イコライザープラグイン</a><span class="sep">›</span><span aria-current="page">15Band GEQ</span>', geq)
+        self.assertIn('<a href="index.html">EffeTune 説明書</a><span class="sep">›</span><a href="eq.html">イコライザープラグイン - パラメトリック・グラフィック・リニアフェーズEQとルーム補正</a><span class="sep">›</span><span aria-current="page">15Band GEQ</span>', geq)
         self.assertIn('href="eq-15band-geq.html"', output['index.html'])
         self.assertIn('href="control-section.html"', output['control.html'])
         self.assertNotIn('rel="next"', output['control-section.html'])
@@ -205,7 +207,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('visualizer.html', output)
 
     def test_readme_basic_operations_keep_vst_features_and_exclude_other_platforms(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.14.0').items() if name.endswith('.html')}
         body = output['README.html'].split('<main class="content">')[1].split('</main>')[0]
         for heading in ['Visualizerで音を表示する', 'エフェクトチェーンの作成', 'プリセットの使用', '保存データのバックアップと復元', 'セクション機能の使用方法', 'ABパイプライン機能の使用', 'エフェクト選択とキーボードショートカット', 'よく使われるエフェクトの組み合わせ']:
             self.assertIn(heading, body)
@@ -232,7 +234,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('href="controller-mapping.html"', body)
 
     def test_new_effects_and_expanded_visualizer_keep_bundled_operations(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.14.0').items() if name.endswith('.html')}
         for page in ['analyzer-analog-meter.html', 'analyzer-rhythm-analyzer.html', 'eq-tonal-balance-eq.html', 'others-sfz-note-player.html', 'resonator-adaptive-prediction.html']:
             self.assertIn(page, output)
             self.assertIn('href="' + page + '"', output['index.html'])
@@ -253,16 +255,16 @@ class GenerationTests(unittest.TestCase):
                 self.assertNotIn('省電力', text)
                 self.assertNotIn('非表示時は表示専用DSPをスキップ', text)
         body = output['visualizer.html'].split('<main class="content">')[1].split('</main>')[0]
-        for retained in ['共通の10種類', 'このほかの4種類', 'Fretboard', 'Guitar', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback']:
+        for retained in ['共通の10種類', 'このほかの6種類', 'Fretboard', 'Guitar', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback', 'Edge Fade', 'Cinema Strip', 'Meter Bridge']:
             self.assertIn(retained, body)
         for excluded in ['クリーンフィード', 'Macでは', 'WebAssembly 音声処理を使用する', 'ハードウェア アクセラレーションを使用', 'v0.12.0']:
             self.assertNotIn(excluded, body)
-        self.assertIn('6791afdfc6f4e6c913b9f48c8189a44e29a09bde', body)
+        self.assertIn('01c96f00f8e93595aefab96de4bc4d210e61c53b', body)
         for information in ['代表画像をこの表示へ自動で渡します', '長辺1024ピクセル', '最初の一枚', '曲が終わっても情報を残し', '起動時の表示にも指定できます']:
             self.assertIn(information, body)
         self.assertNotIn('この表示には渡されません', body)
         sfz = output['others-sfz-note-player.html']
-        for usable in ['Select SFZ Folder', '元の音源フォルダを保管', '音源への参照だけ', '256 MiB']:
+        for usable in ['SFZ Library', 'フォルダーを取り込む', 'ファイルを取り込む', '元の音源フォルダを保管', '音源への参照だけ', '256 MiB', 'Sample Shift', 'ARIA', 'sfz-references.json', '元のファイルは削除しません']:
             self.assertIn(usable, sfz)
         for other_product in ['Electron 版', 'Web 版', 'Import Folder']:
             self.assertNotIn(other_product, sfz)
@@ -276,8 +278,26 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('次/前のプリセット', controller)
         self.assertNotIn('Safari', controller)
 
+    def test_bundled_tour_and_visualizer_exclude_standalone_services(self):
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.14.0')
+        readme = output['README.html'].decode().split('<main class="content">')[1].split('</main>')[0]
+        self.assertIn('設定メニューの <strong>画面の案内を見る</strong>', readme)
+        self.assertIn('音楽や動画は mImageViewer で再生してください', readme)
+        visualizer = output['visualizer.html'].decode().split('<main class="content">')[1].split('</main>')[0]
+        for retained in ['Lyrics</strong> は追加メニューにありません', 'レイアウトにある Lyrics アイテムは編集できます', '再生中の歌詞は渡されません', '既存または読み込んだ Lyrics アイテムを編集する場合', 'Edge Fade', 'Custom']:
+            self.assertIn(retained, visualizer)
+        for absent in ['Lyric Stage', '.lrc', '内蔵プレーヤーで再生している曲の歌詞', 'Clean Feed', '横に流れる歌詞']:
+            self.assertNotIn(absent, visualizer)
+        for name, data in output.items():
+            if name.endswith('.html'):
+                with self.subTest(page=name):
+                    for absent in ['AIアシスタントから操作する', 'MCPをセットアップ', 'リモートコントロール...', 'ヘルプ</strong> メニュー']:
+                        self.assertNotIn(absent, data.decode())
+        self.assertIn('Instrument (3)', output['analyzer-note-spectrogram.html'].decode())
+        self.assertIn('Needle Response', output['analyzer-analog-meter.html'].decode())
+
     def test_bundled_prediction_and_rhythm_exclude_standalone_requirements(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.14.0').items() if name.endswith('.html')}
         prediction = output['resonator-adaptive-prediction.html']
         self.assertIn('native 音声処理を使います', prediction)
         self.assertIn('WebAssembly の有効化操作は不要', prediction)
@@ -296,8 +316,8 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('<meta http-equiv="refresh" content="0; url=v0.12.0/index.html">', text)
         self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune/v0.12.0/index.html">', text)
         self.assertIn('<a href="v0.12.0/index.html">', text)
-        self.assertNotEqual(docs.entry_page('v0.12.0'), docs.entry_page('v0.13.0'))
-        self.assertEqual((docs.MANUAL / 'effetune/index.html').read_bytes(), docs.entry_page('v0.13.0'))
+        self.assertNotEqual(docs.entry_page('v0.12.0'), docs.entry_page('v0.14.0'))
+        self.assertEqual((docs.MANUAL / 'effetune/index.html').read_bytes(), docs.entry_page('v0.14.0'))
 
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:
@@ -331,18 +351,18 @@ class GenerationTests(unittest.TestCase):
                 self.assertEqual(run('--version', 'v0.12.0'), 1)
                 vendor = root / 'vendor/effetune-mixwright'
                 vendor.mkdir(parents=True)
-                (vendor / 'VERSION').write_text('v0.13.0\n', encoding='utf-8')
+                (vendor / 'VERSION').write_text('v0.14.0\n', encoding='utf-8')
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
-                self.assertTrue((root / 'manual/effetune/v0.13.0/index.html').exists())
-                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.13.0'))
+                self.assertTrue((root / 'manual/effetune/v0.14.0/index.html').exists())
+                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.14.0'))
                 self.assertEqual(output.read_bytes(), b'current')  # Check mode flags old versions without deleting them.
                 self.assertEqual(run('--check'), 1)
                 shutil.rmtree(output.parent)
                 self.assertEqual(run('--check'), 0)
                 htaccess = root / '.htaccess'
                 original = htaccess.read_bytes()
-                self.assertIn(b'/v0.13.0/%1 [R=301,L]', original)
-                htaccess.write_bytes(original.replace(b'v0.13.0/%1', b'v0.12.0/%1'))
+                self.assertIn(b'/v0.14.0/%1 [R=301,L]', original)
+                htaccess.write_bytes(original.replace(b'v0.14.0/%1', b'v0.12.0/%1'))
                 self.assertEqual(run('--check'), 1)
                 self.assertNotEqual(htaccess.read_bytes(), original)
                 self.assertEqual(run(), 0)
@@ -356,14 +376,14 @@ class GenerationTests(unittest.TestCase):
             htaccess.write_bytes(b'<IfModule mod_rewrite.c>\n</IfModule>\n')
             with patch.object(docs, 'ROOT', root), patch.object(docs, 'MANUAL', root / 'manual'), patch.object(docs, 'generate', return_value={'index.html': b'current'}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 def run(*args):
-                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.13.0', *args]):
+                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.14.0', *args]):
                         return docs.main()
                 self.assertEqual(run(), 0)
                 base = root / 'manual/effetune'
                 (base / 'notes').mkdir()
                 self.assertEqual(run('--check'), 0)
                 before = htaccess.read_bytes()
-                for name in ['v0.12.0', 'v0.14.0-beta.1', 'v-archive']:
+                for name in ['v0.13.0', 'v0.12.0', 'v0.15.0-beta.1', 'v-archive']:
                     old = base / name
                     old.mkdir()
                     self.assertEqual(run('--check'), 1)
@@ -377,15 +397,15 @@ class RedirectTests(unittest.TestCase):
     HTACCESS = b'<IfModule mod_rewrite.c>\n  RewriteEngine On\n  RewriteCond %{HTTP_HOST} ^www\\.mikage\\.to$ [NC]\n  RewriteRule ^(.*)$ https://mikage.to/mimageviewer/$1 [R=301,L]\n</IfModule>\n# Other configuration\n'
 
     def test_single_redirect_rule_current_files_and_removed_page_fallback(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0')
-        lines = [line.split() for line in docs.redirect_block('v0.13.0', output).splitlines() if line.strip().startswith('Rewrite')]
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.14.0')
+        lines = [line.split() for line in docs.redirect_block('v0.14.0', output).splitlines() if line.strip().startswith('Rewrite')]
         keep, fallback, rule = lines
         self.assertEqual(keep[0:2], ['RewriteCond', '$1'])
         self.assertEqual(keep[3], '[OR]')
         self.assertEqual(fallback[0:2], ['RewriteCond', 'index.html'])
         self.assertEqual(rule[0], 'RewriteRule')
         self.assertEqual(rule[3], '[R=301,L]')
-        self.assertEqual(rule[2], 'https://mikage.to/mimageviewer/manual/effetune/v0.13.0/%1')
+        self.assertEqual(rule[2], 'https://mikage.to/mimageviewer/manual/effetune/v0.14.0/%1')
 
         def target(path):
             match = re.fullmatch(rule[1], path)
@@ -397,38 +417,38 @@ class RedirectTests(unittest.TestCase):
             return rule[2].replace('%1', condition[1])
 
         base = 'manual/effetune/'
-        current = 'https://mikage.to/mimageviewer/manual/effetune/v0.13.0/'
-        for version in ['v0.12.0', 'v0.11.1', 'v0.14.0', 'v1.2.3-beta.1']:
+        current = 'https://mikage.to/mimageviewer/manual/effetune/v0.14.0/'
+        for version in ['v0.13.0', 'v0.12.0', 'v0.11.1', 'v0.15.0', 'v1.2.3-beta.1']:
             for name in output:
                 with self.subTest(version=version, name=name):
                     self.assertEqual(target(base + version + '/' + name), current + name)
             for removed in ['', '/', '/removed.html', '/nested/removed.html', '/eq-15band-peq.html/extra', '/images/missing.png']:
                 self.assertEqual(target(base + version + removed), current + 'index.html')
-        for path in ['v0.13.0', 'v0.13.0/', 'v0.13.0/index.html', 'v0.13.0/removed.html', 'index.html', 'vfoo/index.html', 'v0.12/index.html', 'v0.13.00x/index.html']:
+        for path in ['v0.14.0', 'v0.14.0/', 'v0.14.0/index.html', 'v0.14.0/removed.html', 'index.html', 'vfoo/index.html', 'v0.12/index.html', 'v0.14.00x/index.html']:
             self.assertIsNone(target(base + path))
         self.assertIsNone(target('manual/other/v0.12.0/index.html'))
 
     def test_marked_block_updates_only_generated_section_and_keeps_lf(self):
-        first = docs.updated_htaccess(self.HTACCESS, 'v0.13.0', {'index.html': b'', 'retired.html': b''})
-        self.assertEqual(docs.updated_htaccess(first, 'v0.13.0', {'retired.html': b'', 'index.html': b''}), first)
-        second = docs.updated_htaccess(first, 'v0.14.0', {'index.html': b''})
-        self.assertNotIn(b'v0.13.0', second)
+        first = docs.updated_htaccess(self.HTACCESS, 'v0.14.0', {'index.html': b'', 'retired.html': b''})
+        self.assertEqual(docs.updated_htaccess(first, 'v0.14.0', {'retired.html': b'', 'index.html': b''}), first)
+        second = docs.updated_htaccess(first, 'v0.15.0', {'index.html': b''})
+        self.assertNotIn(b'v0.14.0', second)
         self.assertNotIn(b'retired', second)
         self.assertEqual(second.count(docs.REDIRECT_BEGIN.encode()), 1)
         start = second.index(docs.REDIRECT_BEGIN.encode())
         end = second.index(docs.REDIRECT_END.encode()) + len(docs.REDIRECT_END) + 1
         self.assertEqual(second[:start] + second[end:], self.HTACCESS.replace(b'</IfModule>', b'\n</IfModule>'))
-        self.assertEqual(docs.updated_htaccess(self.HTACCESS.replace(b'\n', b'\r\n'), 'v0.14.0', {'index.html': b''}), second)
+        self.assertEqual(docs.updated_htaccess(self.HTACCESS.replace(b'\n', b'\r\n'), 'v0.15.0', {'index.html': b''}), second)
         self.assertNotIn(b'\r', second)
 
     def test_invalid_configuration_fails_instead_of_overwriting_unrelated_rules(self):
-        block = docs.redirect_block('v0.13.0', {'index.html': b''}).encode()
+        block = docs.redirect_block('v0.14.0', {'index.html': b''}).encode()
         for data in [b'', self.HTACCESS * 2, self.HTACCESS + block,
                      self.HTACCESS.replace(b'</IfModule>', docs.REDIRECT_BEGIN.encode() + b'\n</IfModule>'),
                      self.HTACCESS.replace(b'</IfModule>', block + block + b'</IfModule>'),
                      self.HTACCESS.replace(b'</IfModule>', block.replace(docs.REDIRECT_END.encode(), b'') + b'</IfModule>')]:
             with self.subTest(data=data), self.assertRaises(docs.ConversionError):
-                docs.updated_htaccess(data, 'v0.13.0', {'index.html': b''})
+                docs.updated_htaccess(data, 'v0.14.0', {'index.html': b''})
 
 
 class SplitTests(unittest.TestCase):

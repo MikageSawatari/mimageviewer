@@ -1,5 +1,11 @@
 [
   {
+    "operation": "insert_note",
+    "heading_id": "基本操作---effetune",
+    "note": "初めて EffeTune の画面を開くと、エフェクトの追加や音の調整に使う場所を案内します。設定メニューの **画面の案内を見る** から、いつでも見直せます。案内中の「DAW」は、ここでは音声を渡す mImageViewer を指します。音楽や動画は mImageViewer で再生してください。",
+    "reason": "v0.14.0 effetune.html:181 and js/ui/state-manager.js:126-127 use tour.menu; js/locales/ja.json5:2,10-12 provide the Japanese label and VST host wording. No standalone Help menu."
+  },
+  {
     "operation": "replace_paragraph",
     "anchor": "PCではヘッダー、モバイルでは **プレーヤー** タブ、デスクトップアプリでは **表示** メニューから **Visualizer** を開きます。組み込みプリセットを選ぶか **Edit** で音声グラフ、ジャケット画像、曲情報を配置できます。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。詳しくは[Visualizerガイド](visualizer.md)をご覧ください。",
     "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンで開きます。組み込みプリセットを選ぶか **Edit** で音声グラフ、代表画像、曲情報を配置できます。音響調整を使用中はmImageViewerが再生中の情報を自動で渡します。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。詳しくは[Visualizerガイド](visualizer.md)をご覧ください。",
@@ -27,25 +33,25 @@
     "operation": "replace_paragraph",
     "anchor": "既存の `.effetune_preset` ファイルの読み込み、書き出し、共有は、引き続きエフェクトチェーン全体のプリセットとして機能します。",
     "replacement": "既存の `.effetune_preset` ファイルは、EffeTune の窓へドラッグ＆ドロップすると読み込めます。mImageViewer の EffeTune では、現在のチェーンを `.effetune_preset` ファイルとして書き出すことはできません。名前を付けて残すには **パイプラインプリセット** の **保存**、保存済みデータをファイルにまとめるには **設定 > バックアップ / 復元** を使います。チェーンを URL で共有するには、**Effect Pipeline** エリアの右上にある **共有** ボタンを押します。現在選択しているチェーンの設定を含む EffeTune Web アプリの URL がクリップボードへコピーされます。",
-    "reason": "VST onExportPreset is eventNoop (vst-bootstrap.js:354). Preset drops are loaded by ui/pipeline/ui-event-handler.js:469-520, named saves by ui/pipeline/preset-manager.js:213-240, backups by vst-bootstrap.js:192-224, and URL sharing by ui-manager.js:1389-1406."
+    "reason": "v0.14.0 vst-bootstrap.js onExportPreset remains eventNoop; ui/pipeline/ui-event-handler.js supports preset drops, preset-manager.js named saves, vst-bootstrap.js backup, ui-manager.js URL sharing."
   },
   {
     "operation": "replace_inline",
     "anchor": "起動時はパイプラインAのみが読み込まれ、パイプラインBは必要に応じて作成されます",
     "replacement": "初回はAのみがあり、パイプラインBは必要に応じて作成されます。次回以降の起動時は、保存されたA/B両方の内容と、どちらを選択していたかが復元されます",
-    "reason": "app.js:914-995 restores saved pipelineA, pipelineB and currentPipeline; app.js:1059-1065 assigns B and restores the selection instead of always choosing A."
+    "reason": "v0.14.0 app.js restores pipelineA, pipelineB and currentPipeline and updates the pipeline toggle; retain saved A/B and selection semantics."
   },
   {
     "operation": "replace_inline",
     "anchor": "デフォルトで「A」を表示（パイプラインAがアクティブ）",
     "replacement": "初回は「A」を表示します。次回以降は、復元された選択状態に応じて「A」または「B」を表示します",
-    "reason": "app.js:1070 refreshes the toggle after restoring currentPipeline; ui-manager.js updatePipelineToggleButton displays audioManager.currentPipeline."
+    "reason": "v0.14.0 app.js restores pipelineA, pipelineB and currentPipeline and updates the pipeline toggle; retain saved A/B and selection semantics."
   },
   {
     "operation": "replace_paragraph",
     "anchor": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果を、ウェブ版、デスクトップ版、ブラウザ拡張の間で移行できます。項目ごと、またはカテゴリ単位で選択できます。プリセットを選ぶと、そのプリセットに必要なデータも選択されます。必要なデータの選択を外すと、それを使うプリセットも選択から外れます。",
     "replacement": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果をバックアップまたは復元できます。項目ごと、またはカテゴリ単位で選択できます。プリセットを選ぶと、そのプリセットに必要なデータも選択されます。必要なデータの選択を外すと、それを使うプリセットも選択から外れます。",
-    "reason": "Native backup/export is implemented in vst-bootstrap.js:190-224; remove platform migration claims."
+    "reason": "v0.14.0 vst-bootstrap.js retains native backup/export; remove platform migration claims."
   },
   {
     "operation": "replace_paragraph",

@@ -14,9 +14,9 @@
   新版の更新時にも独立版の操作条件が再流入しないことを確認する。
 
 ```powershell
-python scripts/gen-effetune-docs.py --version v0.13.0
+python scripts/gen-effetune-docs.py --version v0.14.0
 python scripts/test_gen_effetune_docs.py
-python scripts/gen-effetune-docs.py --version v0.13.0 --check
+python scripts/gen-effetune-docs.py --version v0.14.0 --check
 python scripts/gen-sitemap-xml.py
 ```
 
@@ -43,8 +43,10 @@ python scripts/gen-sitemap-xml.py
 `/dsp/...` などは上流サイトを指す。
 
 `--check` は版フォルダー内のファイルに加え入口ページの欠落・古い内容も検出する。
-入口を切り替えても、以前の版フォルダーは変更しない。予期しないファイルがある場合、
-通常生成も勝手に削除せず失敗する。
+現在版だけを公開する。入口の切り替え後は、以前の版フォルダーを明示的に公開ツリーから除く。
+旧版URLは `.htaccess` の生成ブロックで現在版へ301転送する。同名ページが無ければ目次へ送る。
+`--check` は空の旧版フォルダーも拒否する。予期しないファイルがある場合、通常生成も
+勝手に削除せず失敗する。
 生成 HTML には `.gitattributes` の `effetune/**/*.html` の LF 指定が適用される。
 
 ## 訂正ルールと分割
@@ -104,6 +106,44 @@ README の Web アプリ用 HTML は変換対象に入らない。
 | オーディオのリセット、周波数特性測定と補正 | 同梱版で各入口が非表示。保存済み測定を使う Room EQ の説明は既存ページに残す |
 | トラブルシューティングとFAQ、技術情報（ブラウザ互換性、ブラウザサポートの詳細、推奨サンプルレート） | ブラウザ／独立アプリの要件・設定。mIV の利用条件は mIV ページで案内 |
 | 利用可能なエフェクト、開発ガイド | エフェクト一覧は生成目次に全111件掲載済み。開発ガイドは利用者向け操作の対象外 |
+
+## 現在の同梱版と訂正 (2026-10-18)
+
+既定 snapshot は `01c96f00f8e93595aefab96de4bc4d210e61c53b`。
+Mixwright v0.14.0 release commit `e4147644305f0d373e362fc1485b4cb9889e5b63` の
+`external/effetune` submodule に対応する。旧snapshotと上流原文は変更しない。
+公開出力は133 HTML + 4画像、エフェクト113件。再生成コマンドは冒頭のとおり。
+生成後は `manual/effetune/v0.13.0/` を公開ツリーから除き、入口・mIVマニュアルのリンク・
+`.htaccess` の転送先・sitemapを一緒に更新する。サイトマップの日付確定はコミット後に再生成する。
+
+- `README.json`: 初回案内を同梱VSTの設定メニューから開く説明を追加。
+  `effetune.html:181` は英語の Take the tour、`js/ui/state-manager.js:126–127` は
+  `tour.menu` を適用し、`js/locales/ja.json5:2` の表示名は「画面の案内を見る」。
+  独立版のヘルプメニューや内蔵プレーヤーを案内せず、案内中のDAWはmIVを指すと補う。
+  READMEの節選別は維持し、新しいMCP節・LANリモート操作を採用しない。
+  `vst-bootstrap.js` の electronAPI に remoteV1 はない。
+- `visualizer.json`: Lyricsを追加できる説明と埋込歌詞／LRCの自動取得説明を除く。
+  `visualizer-editor.js:575` はLyricsを追加メニューから除外するが、既存・取り込んだ
+  Lyricsアイテムの編集は残る。mIVは歌詞を送らず、ライブの歌詞表示はできないと明記する。
+  同梱presetにLyric Stageはない。Cinema StripにはLyricsアイテムが一つ残るため、
+  プリセット全体を除外せず、波形とスペクトログラムを案内する。
+  Edge Fadeの処理説明、Analog Meter Custom、新しいレイアウトは採用し、
+  Edge FadeのClean Feedへの言及だけ除く。拡大・サイズ変更のMac用修飾キーも訂正する。
+- `others.json`: SFZ Libraryのファイル／フォルダ選択、参照先登録、登録だけの削除を案内。
+  native-serviceの `selectFolder` / `selectFiles` と `vst-bootstrap.js:255` のoptions転送を照合。
+  Web版のサンプルコピー・端末内ライブラリ削除・再取り込みの説明は残さない。
+  ARIAバンク、生成波形、Sample Shift、発音表示は同梱コードにあるため維持する。
+  保存先の静的確認はClaudeCodeの2026-10-18記録、過去の実行観測はv0.13.0であり、
+  v0.14.0で実行した証拠としては扱わない。
+- `reverb.json`: IRライブラリの「すべて選択」「全選択解除」を残し、従来どおり
+  保存先をmIV同梱版の説明に訂正する。
+- Note SpectrogramのInstrument (3)/(9)、Highlight等は同梱コードと照合して採用。
+  独立版の表示・省電力・曲変更による自動解析の既存訂正は維持する。
+  selectionと各reasonの参照は新版で再確認し、古い版を根拠にした記述を更新した。
+- 回帰は旧v0.12.0/v0.13.0 snapshotの新版への付け替え拒否、生成物全137ファイル、
+  旧版URLの転送、独立版MCP／LAN／歌詞取得の説明が流入しないことを検査する。
+
+以降は各更新時点の記録。
 
 ## 同梱版更新 (2026-10-04)
 
