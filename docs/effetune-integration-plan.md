@@ -809,15 +809,23 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   (説明書の注記どおり)。最終ステップは「設定の Help からガイド」。
   SFZ Note Player の「SFZ Library…」→「ファイルを取り込む…」で SineTest.sfz を登録・読み込みできた。
   `%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json` に名前・path・root・`bankPaths`・`importedAt` を記録し、
-  サンプルのコピーは無く、元フォルダーも変更されなかった。試験音が一定音のため発音は未確認。
+  サンプルのコピーは無く、元フォルダーも変更されなかった。登録を消した状態では「SFZ が見つかりません」と出た。
+  「フォルダーを取り込む…」でも同じ形で登録だけが記録された。音高の変わる合成音
+  (`target/hw-0140/melody/melody.wav`) の再生で Voices 1/32 となり鍵盤表示が反応した (発音を確認)。
+  ビジュアライザー編集の追加メニューは Album〜Text の16種で Lyrics は無かった (説明書の訂正どおり)。
+- 通信 (ClaudeCode、`Get-NetTCPConnection` / `Get-NetUDPEndpoint` で core とその子孫を記録、
+  `target/hw-0140/net-log.txt`): 音響調整を開いた待機中と、再生・SFZ 読み込み中のどちらも
+  Listen と UDP は無し。外向きは WebView2 から `2603:1046:c09:20bf::2:443` と `2620:1ec:33::11:443` だけ
+  (どちらも Microsoft の割り当て帯。WebView2 が独自に名前解決するためホスト名は未確認)。
+  core と専用ホスト自身の TCP は無し。privacy の「WebView2 が Microsoft に更新を確認する」と矛盾しない。
 - 観測 (ClaudeCode、本更新とは別件): 曲が最後まで再生されて Now Playing が消えたあと、
   リピートを ON にして ▶ で再生し直す・同じ曲や別の曲を一覧から開き直す、のいずれでも
   mIV が Now Playing を送らなかった (同じ起動中、ログに notify が無い)。送るかどうかは本体の判断で、
   本体コードは master `76aebc18f` と同じ。EOF 後の再生し直しの不具合 (master `184de0a7b` で修正) が
   本ブランチの基点に入っていないことと関係する可能性がある。起動し直すと正常に送られた。
-- 後片付け: `Frieve\EffeTunePlugin` は試験前の状態に戻した (案内表示済みの印・SFZ 登録を除去)。
-  `%APPDATA%\mimageviewer-vst3-host.exe` (WebView の保存先。ビジュアライザーのプリセットを
-  Now Playing に切り替えた) は、別作業の WebView2 プロセスが同じ保存先を使って残っているため戻していない。
+- 後片付け: 利用者の了承を得て、同じ WebView 保存先を使って残っていた別作業の WebView2 本体プロセス
+  4つ (親は終了済み) を止めた。`Frieve\EffeTunePlugin` と `%APPDATA%\mimageviewer-vst3-host.exe` を
+  試験前の退避分に戻し、どちらも退避分と完全一致 (試験後の状態は `target/hw-0140/after-test`)。
   `%APPDATA%\effetune` は試験の前後で差が無い。
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
