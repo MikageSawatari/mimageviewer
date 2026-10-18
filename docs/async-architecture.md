@@ -52,6 +52,14 @@ output hookはoperation/destinationと既存終端を照合し、取消/close後
 準備待ち、専用tick/worker/queue、UI同期I/Oは追加しない。OFF・slideshow等の既存timerを維持する。
 素材所有は[page-turn計画 §27.11](page-turn-animation-plan.md)、時計と検証は同§27.12を正本とする。
 
+D3-1（2026-10-18）は既存 final-effect の receiver と context-local cache のまま、
+`collect_final_prepare_results` と `adopt_final_prepare_results_before_lookup` に分離する。
+採用可能な既存結果は呼出し内の一時 Vec で移譲し、未 admit の legacy rendition 仕事は元の receiver に残す。
+新しい CpuReady owner・permit・容量予約・投機 worker はまだ作らない（D3-2）。
+入力・permission の再開・実表示復帰は selector 非依存の共通 service を通るが、単なる context mount は通さない。
+app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
+通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用意し、本番の投機 claim は未接続。
+
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 
 `run_music_analysis` はデコード成功と取消なしを確認し、必要な `TimelineComplete` の送信後に

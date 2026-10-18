@@ -52668,6 +52668,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: pixels.size,
                 pixels: Arc::clone(&pixels),
@@ -52805,6 +52806,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: pixels.size,
                 pixels,
@@ -53635,6 +53637,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: edit_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
@@ -53787,6 +53790,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: cached_pixels.size,
                 pixels: cached_pixels,
@@ -53877,6 +53881,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: provisional_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
@@ -53948,6 +53953,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: complete_pixels.size,
                 pixels: complete_pixels,
@@ -57966,6 +57972,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: monochrome.size,
                 pixels: Arc::clone(&monochrome),
@@ -59546,6 +59553,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
@@ -59774,6 +59782,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             current_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: current_pixels.size,
                 pixels: current_pixels,
@@ -59823,6 +59832,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             target_final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: prefetched_pixels.size,
                 pixels: prefetched_pixels,
@@ -60888,6 +60898,7 @@ mod pipeline_display_edit_split_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: image.size,
                 pixels: Arc::new(image),

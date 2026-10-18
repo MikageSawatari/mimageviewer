@@ -5748,3 +5748,17 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
   fork は receiver / cancel / permit を共有しない。A の close・採用・取消が B へ作用しない。park は新しい投機開始だけを止め、
   既存の表示用カラー化 / LUT 要求は保持する (`viewer_context_registry.rs` の現行監査を維持)。
 - 実装後に記録するもの: 実際に触れた関数、park / resume 契約の実装、兄弟 context 不変の検証結果、完成レビューでの合意。
+
+#### D3-1 実装追補（2026-10-18、実機未確認）
+
+- `update_active_viewer_context` は retained-shift 採用後・gamepad 配送前に同じ context の service を行う。
+  `activate_detached_image_window_snapshot` と ParkedLive の実表示再開は、既存 mount/runtime/retained-shift 再開後に接続した。
+  `with_viewer_context` 等の汎用 mount/deposit には採用を追加していない。
+- `begin_page_turn_viewer_frame`、共通非 close navigation、decision/nav-lock、permission resume、既存 continuation に
+  `service_final_prepare_before_lookup` を接続。close/retire の既存優先、入力 edge の単一観測を維持する。
+  冒頭の detached visibility probe は paint source を捕捉しない非確定参照として明記した。
+- 既存 `final_effect_pending` の park 除外分類は変更しない。結果採用と decision cache 失効は mount された owner のみ。
+  新規投機、CpuReady、permit、予約は D3-1 では導入せず、fork は既存の非共有 receiver/cancel 契約を維持する。
+- 独立 Sol/xhigh の途中レビューでも、既存 context の service/receipt/採用境界へ限定した構造修正であり、症状パッチではないと確認。
+  観測による slideshow cache 置換と通常登録 marker の不足の2指摘は修正し、コード上の解消を再確認済み。
+  兄弟不変の実行結果と独立完成判定は、page-turn 計画 §27.17.12 と同じ `target/d3-1-handoff.md` に記録する。

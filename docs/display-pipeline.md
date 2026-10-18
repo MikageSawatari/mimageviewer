@@ -110,6 +110,15 @@ PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに�
 GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
 [詳細](pdf-render-epoch-ownership-plan.md)。
 
+2026-10-18 D3-1: final-effect の受信と採用を表示 decision から分離した。
+各入力・描画・permission continuation・実表示再開の入口で、確定済み失効の後に
+保持 presentation の accepted receipt、final 結果の exact 再照合・採用、通常 selector の順で処理する。
+通常 source の selector 照合が必要な receipt は採用後へ残す。受信は非 blocking・再入可能で、
+公開時は当該 viewport の decision cache だけを失効する。一般画像の exact complete final も
+edit texture 確保前に再利用する。通常同期 miss、無補正 handle 共有、D2 素材、D4 時計は維持する。
+次 unit は通常 composition の実 occurrence/role から観測するだけで、投機準備は開始しない。
+slideshow の still-only unit 計算は表示 cache を置換しない。詳細・検証は page-turn 計画 §27.17.12。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で

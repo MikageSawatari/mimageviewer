@@ -4561,3 +4561,33 @@ script既定のdev-runtimeを使わず、準備済みportableと使い捨てdata
   - **入口表の補正 (D3-1 の brief に反映)**: viewport 行では、`begin_page_turn_viewer_frame` より前にある detached 表示準備用の resident lookup
     (`src/ui_fullscreen.rs:25719` / `:25914`) も接続対象に加えるか、表示選択を確定しない参照として扱いを明記する。root 転送キー (`:25943`) と
     viewport 自身のキー処理 (`:26446`) が root 専用 (`:31751`) と別経路であることも brief に書く。
+
+#### 27.17.12 D3-1 実装記録（2026-10-18、実機未確認）
+
+- 対象HEADは `93a1ba1b5`、`pageturn-d3`。主な関数・経路は設計記載と一致。
+  `ui_fullscreen.rs:25914` は先行 lookup 自体ではなく `begin_page_turn_viewer_frame` の呼出し。
+  `:25719` の lookup は detached の visibility/readiness 用の非確定参照で、paint/offer/receipt の素材を捕捉しない。
+  同参照は従来どおりとし、実際の選択は frame service を通す。barrier ありは既存 close 優先を維持し、
+  barrier なしは既存 pre-draw → 通常入力の順序を維持する。新しい close sample/条件は加えない。
+  root 転送キー・viewport 自身のキーは
+  root 専用キーと別入口のまま、共通 navigation handler の非 close 境界で再照合する。受理した close は同 handler の採用を通さない。
+- `collect_final_prepare_results` は既存 typed target の admission だけを参照し、decision/selector/ensure/登録を呼ばない。
+  D3-1 では CpuReady を作らず、受信した既存結果を呼出し内だけの Vec で採用へ move する。
+  deferred legacy 結果は元の receiver 内に保持し、既存カラー化/LUT の rendition gate を維持する。
+  採用は cancel/items/item/source/edit/params/bg を再照合し、公開後は当該 destination の decision cache だけを失効する。
+- receipt の binding/composition/layout/geometry 検証と通常 source 照合を分離。
+  保持 presentation と一致する accepted receipt だけを採用前に反映し、通常 receipt は採用後の selector 照合へ残す。
+  提出素材の binding は receipt/held、operation 照合は既存 submission ledger、canonical 採用と N→N+1 は
+  既存 FlatCompletion owner が担う。prefix は新しい operation 完了・continuation-ready の証拠を作らない。
+  pre-draw の入力 edge 観測を共通 service から再実行しない。未 accepted の receipt は同じ pending に残す。
+- 次 unit の需要は通常 unit ordinal/composition から純粋計算する。slideshow は共通 builder と既存 metadata snapshot から
+  still-only の別 Vec を作り、表示 unit cache を置換しない。未確定 metadata のため新しい I/O/準備を始めない。
+  演出 ON/paged の perf event のみで、一般 final/Native/comic の投機は未有効。
+- GPU 枠は app 共通、ROOT cumulative frame ごとに一度だけ更新。既存通常 source/edit/final の登録を記録し、
+  投機 claim は本番から呼ばない。final entry に実 TextureOptions を保持し、Nearest の mip 無しと正確な mip 和で増分判定する。
+  thumbnail を含む全 context resident と予定増分の比較には、対応する全 pool 予算を使う（fullscreen 部分枠との二重控除を避ける）。
+- D3-2 持越し: Computing/CpuReady の排他 owner、共通実行 permit、unit/bytes 予約、解放通知、一般 final worker/clamp/takeover。
+  D3-3 の編集 CPU-only/comic、D3-4 の canonical demand/Native prewarm/配送計装も未実装。
+- 検証ログ・環境準備は `target/d3-1-*`。製品/portable smoke 起動、commit は行わない。
+  自動検証のコマンド・件数・終了コード、途中失敗と一時変異の復元証拠、独立完成レビューは
+  `target/d3-1-handoff.md` に集約する。実機・性能 gate は本実装セッションでは実行しない。

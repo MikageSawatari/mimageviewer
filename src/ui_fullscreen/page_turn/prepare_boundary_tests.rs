@@ -182,6 +182,7 @@ fn publish_quality(
             app.final_composite_cache.insert(
                 key,
                 crate::app::FinalCompositeEntry {
+                    texture_options: egui::TextureOptions::LINEAR,
                     canonical_dims: None,
                     source_size: size,
                     pixels,

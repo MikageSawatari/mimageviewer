@@ -122,7 +122,11 @@ impl ViewerTextureCaches<'_> {
         }
         for (key, entry) in self.final_composite_cache {
             if includes_idx(indices, key.edit_key.idx) {
-                accountant.add_texture(VramSubsystem::FinalCompositeCache, &entry.texture, true);
+                accountant.add_texture(
+                    VramSubsystem::FinalCompositeCache,
+                    &entry.texture,
+                    entry.texture_options.mipmap_mode.is_some(),
+                );
             }
         }
         for (&idx, entry) in self.adjustment_cache {

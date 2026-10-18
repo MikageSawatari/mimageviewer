@@ -1424,6 +1424,37 @@ pub(crate) fn take_test_events() -> Vec<(ViewerOperationFact, &'static str, &'st
 }
 
 impl App {
+    /// Accepted output evidence is independent of current cache quality. Match
+    /// the exact held occurrence/source/paint and binding before final publication.
+    pub(super) fn page_turn_receipt_matches_held(&self, receipt: &SubmittedUnitReceipt) -> bool {
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Turning { incoming: unit, .. }
+            | PresentationState::Completing { incoming: unit, .. } => unit,
+            _ => return false,
+        };
+        receipt.was_accepted()
+            && receipt.has_presentation_binding()
+            && receipt.content_matches(self)
+            && receipt.destination() == self.page_turn_destination()
+            && unit.destination == receipt.destination()
+            && unit.items == self.items_generation
+            && unit.mode == self.spread_mode
+            && unit.slice == self.fullscreen_page_slice
+            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+            && unit.pages.len() == receipt.pages().len()
+            && unit.pages.iter().all(|page| {
+                receipt
+                    .pages()
+                    .iter()
+                    .any(|(occurrence, source, paint, area)| {
+                        *occurrence == page.occurrence
+                            && *source == page.resource.source_texture_id()
+                            && *paint == page.resource.paint_texture_id()
+                            && *area > 0.0
+                    })
+            })
+    }
+
     /// Preferences and HUD adopt the same global setting before any next turn.
     pub(crate) fn adopt_page_turn_animation_settings(&mut self, enabled: bool, duration_ms: u32) {
         if self.settings.page_turn_animation_enabled != enabled
@@ -1437,6 +1468,7 @@ impl App {
     }
 
     pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
+        self.service_final_prepare_before_lookup(ctx);
         self.flush_submitted_page_turn_ready(ctx);
         if !self.settings.page_turn_animation_enabled && !self.page_turn_completion_active() {
             let enabled_id = egui::Id::unique("page_turn_input_enabled");
@@ -1729,6 +1761,8 @@ impl App {
     /// Resident-only counterpart of ordinary processed + fallback selection.
     /// Incomplete final output is displayable; this never invokes a producer.
     fn page_turn_resident_source(&self, idx: usize) -> Option<(egui::TextureHandle, &'static str)> {
+        #[cfg(test)]
+        crate::app::final_prepare_tests::observe_lookup(self);
         let edit_key = self.current_edit_result_key(idx);
         let final_entry = self
             .final_composite_cache

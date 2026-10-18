@@ -1767,6 +1767,7 @@ impl App {
         }
     }
     fn resume_qualified_book_target(&mut self, ctx: &egui::Context, intent: &OpenIntent) {
+        self.service_final_prepare_before_lookup(ctx);
         match &intent.route {
             BookTargetRoute::FullscreenOpen(metadata_boundary) => self
                 .open_fullscreen_with_metadata_boundary(

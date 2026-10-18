@@ -655,6 +655,9 @@ pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
 #[cfg(windows)]
 use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerContextRegistry};
+mod final_prepare_budget;
+#[cfg(test)]
+pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
 mod viewer_session;
 mod vram_accounting;
@@ -11523,6 +11526,7 @@ pub(crate) struct FinalCompositeEntry {
     pub(crate) source_size: [usize; 2],
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) texture: egui::TextureHandle,
+    pub(crate) texture_options: egui::TextureOptions,
     /// false は AI 完了待ち中の暫定プレビュー。AI 到着後の再合成中も表示用に保持し、
     /// 完成結果が届いたら同じ key を上書きする。
     pub(crate) complete: bool,
@@ -18796,6 +18800,7 @@ pub struct App {
     pub(crate) last_input_at: Option<std::time::Instant>,
     /// フレーム番号 (update 呼出しのたびに +1)
     pub(crate) frame_counter: u64,
+    speculative_gpu_frame: final_prepare_budget::SpeculativeGpuFrame,
     /// 近モノクロ要約の同期計算を全 viewer context 合算で 1 frame 1 回に制限する。
     colorize_mono_summary_last_reconcile_frame: u64,
     /// local / conceal / edit materialization の GPU upload を 1 frame 1 枚に制限する。
@@ -21221,6 +21226,7 @@ impl App {
             grid_pointer_trace: None,
             last_input_at: None,
             frame_counter: 0,
+            speculative_gpu_frame: Default::default(),
             colorize_mono_summary_last_reconcile_frame: u64::MAX,
             last_edit_materialize_upload_frame: u64::MAX,
             perf_last_frame_begin: None,
@@ -63165,6 +63171,7 @@ impl App {
         let activation = self.with_viewer_context(context_id, |app| {
             app.activate_mounted_as_independent_detached(id);
             app.adopt_active_detached_viewport_runtime_from_passive("resume_parked_live_media");
+            app.service_final_prepare_before_lookup(ctx);
             Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
         });
         let Ok(source) = activation else {
@@ -64763,6 +64770,7 @@ impl App {
                 app.adopt_active_detached_viewport_runtime_from_passive("resume_viewer_context");
                 app.begin_retained_shift_readoption(ctx);
                 app.rearm_final_ai_prefetch_after_detached_resume();
+                app.service_final_prepare_before_lookup(ctx);
                 Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
             });
             let Ok(source) = activation else {
@@ -64991,6 +64999,7 @@ impl App {
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
                 app.poll_retained_shift_readoption(ctx);
+                app.service_final_prepare_before_lookup(ctx);
                 // 前面の viewer への入力は、この context の polling / 描画より前に配る。
                 // ここは mount 済みなので、`fullscreen_idx` も items も**この viewer のもの**
                 // (2026-08-29 レビュー R-02)。
@@ -79033,6 +79042,7 @@ impl App {
             let upload = clamp_for_gpu(&pixels);
             let [w, h] = pixels.size;
             let upload_t0 = std::time::Instant::now();
+            self.speculative_gpu_frame.note_ordinary_upload();
             let handle = ctx.load_texture(
                 format!("ai_fs_{idx}_{bg}"),
                 upload.into_owned(),
@@ -82170,6 +82180,7 @@ impl App {
         }
         if needs_upload {
             self.last_edit_materialize_upload_frame = self.frame_counter;
+            self.speculative_gpu_frame.note_ordinary_upload();
         }
 
         let repaint = self.apply_edit_materialize_result(ctx, idx, result, pending.request);
@@ -82438,6 +82449,7 @@ impl App {
                 let upload_t0 = std::time::Instant::now();
                 let upload = clamp_for_gpu(&pixels);
                 self.last_edit_materialize_upload_frame = self.frame_counter;
+                self.speculative_gpu_frame.note_ordinary_upload();
                 let texture = ctx.load_texture(
                     format!(
                         "local_adjust_layer_bypass_{}_{}_{}_{}_{}",
@@ -82507,6 +82519,7 @@ impl App {
                 let upload_t0 = std::time::Instant::now();
                 let upload = clamp_for_gpu(&pixels);
                 self.last_edit_materialize_upload_frame = self.frame_counter;
+                self.speculative_gpu_frame.note_ordinary_upload();
                 let texture = ctx.load_texture(
                     format!(
                         "local_adjust_prefix_preview_{}_{}_{}_{}_{}",
@@ -82913,6 +82926,7 @@ impl App {
             .cloned()
             .or_else(|| self.current_raw_source_pixels(idx))?;
         let source_pixels = self.black_flatten_erase_source_if_needed(idx, source_pixels);
+        self.speculative_gpu_frame.note_ordinary_upload();
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
             (*source_pixels).clone(),
@@ -83279,6 +83293,7 @@ impl App {
                 self.edit_result_cache.get_mut(&key)?.texture = Some(texture);
             } else if self.last_edit_materialize_upload_frame != self.frame_counter {
                 self.last_edit_materialize_upload_frame = self.frame_counter;
+                self.speculative_gpu_frame.note_ordinary_upload();
                 let upload_t0 = std::time::Instant::now();
                 let texture = upload_edit_result_texture(ctx, &key, &pixels);
                 self.bind_display_texture_identity(&texture, key.item_id);
@@ -83302,6 +83317,7 @@ impl App {
             Some(texture)
         } else if self.last_edit_materialize_upload_frame != self.frame_counter {
             self.last_edit_materialize_upload_frame = self.frame_counter;
+            self.speculative_gpu_frame.note_ordinary_upload();
             let upload_t0 = std::time::Instant::now();
             let texture = upload_edit_result_texture(ctx, &key, &pixels);
             self.bind_display_texture_identity(&texture, key.item_id);
@@ -85374,12 +85390,24 @@ impl App {
         }
     }
 
-    fn poll_final_effects(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_final_effects(&mut self, ctx: &egui::Context) {
+        let completed = self.collect_final_prepare_results();
+        self.adopt_final_prepare_results_before_lookup(ctx, completed);
+    }
+
+    /// Nonblocking receipt only. Until D3-2 adds a bounded CpuReady owner,
+    /// legacy deferred work stays in its original receiver; eligible results
+    /// move directly to adoption in the same call, without another queue.
+    fn collect_final_prepare_results(
+        &mut self,
+    ) -> Vec<(FinalCompositeKey, FinalEffectPending, FinalCompositeResult)> {
+        #[cfg(test)]
+        let _receipt_scope = final_prepare_tests::ReceiptScope::enter();
         if self.final_effect_pending.is_empty() {
-            return;
+            return Vec::new();
         }
         let page_turn_work_gate = self.fullscreen_idx.map(|fs_idx| {
-            let decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+            let decision = self.final_prepare_work_admission(fs_idx);
             let target_pages = if decision.defers_non_target_full_resolution_work() {
                 self.fs_navigation_rendition_target_pages(fs_idx)
                     .unwrap_or_default()
@@ -85408,17 +85436,38 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
             }
         }
-        let had_updates = !completed.is_empty() || !disconnected.is_empty();
         for key in disconnected {
             self.final_effect_pending.remove(&key);
             self.final_composite_cache
                 .remove_with_drop_reason(&key, "worker_disconnected");
         }
-        for (key, result) in completed {
-            let Some(pending) = self.final_effect_pending.remove(&key) else {
-                continue;
-            };
-            if pending.items_generation != self.items_generation {
+        completed
+            .into_iter()
+            .filter_map(|(key, result)| {
+                self.final_effect_pending
+                    .remove(&key)
+                    .map(|pending| (key, pending, result))
+            })
+            .collect()
+    }
+
+    fn adopt_final_prepare_results_before_lookup(
+        &mut self,
+        ctx: &egui::Context,
+        completed: Vec<(FinalCompositeKey, FinalEffectPending, FinalCompositeResult)>,
+    ) {
+        let had_updates = !completed.is_empty();
+        for (key, pending, result) in completed {
+            if pending.cancel.load(Ordering::Relaxed)
+                || pending.items_generation != self.items_generation
+                || !self.edit_key_describes_current_page(&key.edit_key, key.edit_key.idx)
+                || key
+                    != self.final_composite_key_for_pixels(
+                        self.current_edit_result_key(key.edit_key.idx),
+                        pending.source_size,
+                        self.effective_params(key.edit_key.idx),
+                    )
+            {
                 continue;
             }
             match result {
@@ -85435,6 +85484,7 @@ impl App {
                     };
                     let clamp_ms = clamp_started.elapsed().as_secs_f64() * 1000.0;
                     let load_texture_started = std::time::Instant::now();
+                    self.speculative_gpu_frame.note_ordinary_upload();
                     let texture = ctx.load_texture(
                         format!(
                             "final_effect_{}_{}_{}_{}",
@@ -85459,6 +85509,11 @@ impl App {
                     self.final_composite_cache.insert(
                         key,
                         FinalCompositeEntry {
+                            texture_options: (if pending.nearest_sampler {
+                                egui::TextureOptions::NEAREST
+                            } else {
+                                DISPLAY_IMAGE_TEXTURE_OPTIONS
+                            }),
                             canonical_dims: pending.canonical_dims,
                             source_size: pending.source_size,
                             pixels,
@@ -85475,6 +85530,7 @@ impl App {
                     }
                     self.comic_cache.remove(&key.edit_key.idx);
                     self.cancel_comic_bake_for_idx(key.edit_key.idx);
+                    self.invalidate_final_prepare_decision(ctx);
                     if crate::perf::is_enabled() {
                         let colorize_mode = match timing.colorize_mode {
                             crate::colorize::ColorizeMode::Disabled => "disabled",
@@ -85532,11 +85588,15 @@ impl App {
                 }
             }
         }
-        if self
-            .final_effect_pending
-            .keys()
-            .any(final_effect_is_admitted)
-        {
+        if self.final_effect_pending.keys().any(|key| {
+            self.fullscreen_idx.is_none_or(|idx| {
+                self.final_prepare_work_admission(idx)
+                    .admits_backlog_upload(
+                        self.fs_navigation_rendition_target_pages(idx)
+                            .is_some_and(|pages| pages.contains(&key.edit_key.idx)),
+                    )
+            })
+        }) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if had_updates {
@@ -85799,6 +85859,7 @@ impl App {
         };
         let [fc_w, fc_h] = post_filtered.size;
         let t_up0 = perf_on.then(std::time::Instant::now);
+        self.speculative_gpu_frame.note_ordinary_upload();
         let texture = ctx.load_texture(
             format!(
                 "final_composite_{}_{}_{}_{}",
@@ -85815,6 +85876,7 @@ impl App {
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: tex_opts,
                 canonical_dims,
                 source_size: edit_size,
                 pixels: post_filtered,
@@ -85894,13 +85956,13 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        #[cfg(test)]
+        final_prepare_tests::observe_lookup(self);
         self.poll_final_effects(ctx);
         if self.fs_entry_is_animated(idx) {
             return None;
         }
-        if self.page_turn_prefetch_policy_enabled()
-            && let Some(texture) = self.exact_complete_final_composite_texture(idx)
-        {
+        if let Some(texture) = self.exact_complete_final_composite_texture(idx) {
             return Some(texture);
         }
         // 画像オープン時のフリーズ調査用 perf 計装 (--perf-log)。この関数の build 経路
@@ -86066,6 +86128,7 @@ impl App {
             let upload = clamp_for_gpu(&post_filtered);
             let fc_clamp_ms = t_clamp0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             let t_up0 = perf_on.then(std::time::Instant::now);
+            self.speculative_gpu_frame.note_ordinary_upload();
             let texture = ctx.load_texture(
                 format!(
                     "final_composite_{}_{}_{}_{}",
@@ -86084,6 +86147,7 @@ impl App {
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: tex_opts,
                 canonical_dims,
                 source_size: edit_pixels.size,
                 pixels: post_filtered,
@@ -86165,9 +86229,6 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
-            return None;
-        }
         self.exact_complete_final_composite_entry(idx)
             .map(|(_, entry)| entry.texture.clone())
     }
@@ -89608,6 +89669,7 @@ impl App {
         } else {
             DISPLAY_IMAGE_TEXTURE_OPTIONS
         };
+        self.speculative_gpu_frame.note_ordinary_upload();
         let tex = ctx.load_texture(format!("adj_{idx}"), upload.into_owned(), tex_opts);
         // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
         // source_dims は fs_cache 側に保存されているのでここは None でよい。
@@ -91817,6 +91879,7 @@ impl App {
             prefetch_perf,
             PollPrefetchPerfStage::BuildStaticFsCacheEntry,
         );
+        self.speculative_gpu_frame.note_ordinary_upload();
         let handle = ctx.load_texture(
             format!("fs_{key}"),
             upload.into_owned(),
@@ -92745,6 +92808,9 @@ impl App {
                     StaticAnimationState::Still,
                 ),
                 FsLoadResult::Animated(frames) => {
+                    if !frames.is_empty() {
+                        self.speculative_gpu_frame.note_ordinary_upload();
+                    }
                     let mut frame_pixels = Vec::with_capacity(frames.len());
                     let textures: Vec<(egui::TextureHandle, f64)> = frames
                         .into_iter()
@@ -92792,6 +92858,7 @@ impl App {
                     let pixels = std::sync::Arc::new(ci);
                     let upload = clamp_for_gpu(&pixels);
                     let [w, h] = pixels.size;
+                    self.speculative_gpu_frame.note_ordinary_upload();
                     let handle = ctx.load_texture(
                         format!("fs_{key}"),
                         upload.into_owned(),
@@ -95102,6 +95169,7 @@ impl App {
         self.service_initial_worker_results(ctx, &mut update_perf);
         self.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);
         self.reconcile_edit_preview_refreshes(ctx);
+        self.service_final_prepare_before_lookup(ctx);
         // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
         // 立った同フレームで holdover を捨てて新画面に切り替える)。
         self.poll_fs_nav_lock(ctx);
@@ -96196,6 +96264,8 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.speculative_gpu_frame
+            .begin(ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT));
         self.service_app_logic(ctx, frame);
     }
 

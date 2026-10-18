@@ -356,6 +356,7 @@ impl App {
         if !ready {
             return None;
         }
+        self.service_final_prepare_before_lookup(ctx);
         self.flush_submitted_page_turn_ready(ctx);
         // Presentation adoption precedes ordinary navigation completion. Keep
         // the same typed command if its matching observer has not retired yet.

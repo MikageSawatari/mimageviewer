@@ -25,6 +25,8 @@ pub(super) struct MainFrameNavigation {
 impl App {
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_update_begin(&mut self, _ctx: &egui::Context) {
+        self.speculative_gpu_frame
+            .begin(_ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT));
         #[cfg(test)]
         super::egui037_connection_tests::observe("update_begin", self, _ctx);
         self.acknowledge_tray_resident_media_wake();
@@ -1931,7 +1933,9 @@ impl App {
             self.reconcile_panorama_session_intent(fs_idx);
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
+            self.service_final_prepare_before_lookup(ctx);
             let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+            self.observe_next_final_unit_demand();
             if page_turn_decision.admits_navigation_target_materialization() {
                 let continuous_keep_set = if !self.reading_flow.is_paged()
                     && self.fs_vertical_cache_keep_set.contains(&fs_idx)

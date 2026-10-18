@@ -39,6 +39,8 @@ use eframe::egui;
 
 #[cfg(test)]
 mod book_composition_tests;
+#[cfg(test)]
+mod next_final_demand_tests;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11010,6 +11012,8 @@ impl App {
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        #[cfg(test)]
+        crate::app::final_prepare_tests::observe_lookup(self);
         let texture = self.resolve_fs_display_tex_from_caches(idx, include_thumb)?;
         self.display_texture_matches_page(&texture, idx)
             .then_some(texture)
@@ -13244,6 +13248,32 @@ impl App {
         }
     }
 
+    /// Read only the already-bound target. In particular this must not resolve
+    /// navigation readiness: that resolver selects textures and belongs after
+    /// final-result adoption. Existing rendition admission remains target-scoped.
+    pub(crate) fn final_prepare_work_admission(&self, fs_idx: usize) -> FsPageTurnDecision {
+        let (active, ready) = self.fs_navigation_sequence_rendition_state(fs_idx);
+        page_turn_decision_for_inputs(active, ready)
+    }
+
+    pub(crate) fn invalidate_final_prepare_decision(&self, ctx: &egui::Context) {
+        let viewport = self.page_turn_destination().viewport;
+        ctx.data_mut(|data| {
+            data.remove::<FsPageTurnFrameDecision>(egui::Id::unique((
+                "fs_page_turn_decision",
+                viewport,
+            )));
+        });
+    }
+
+    /// All mutations/invalidation belonging to this entry have already run.
+    /// Do not sample input, poll permission, start producers, or select a display
+    /// source here. Re-entry may receive a newly arrived result in the same frame.
+    pub(crate) fn service_final_prepare_before_lookup(&mut self, ctx: &egui::Context) {
+        self.reflect_held_page_turn_receipt_before_lookup(ctx);
+        self.poll_final_effects(ctx);
+    }
+
     pub(crate) fn fs_navigation_rendition_target_pages(&self, fs_idx: usize) -> Option<Vec<usize>> {
         self.fs_holdover_tex
             .as_ref()
@@ -13702,6 +13732,7 @@ impl App {
                 self.bind_fs_navigation_sequence_to_current_target();
             }
             if let Some(idx) = self.fullscreen_idx {
+                self.service_final_prepare_before_lookup(ctx);
                 let original_preview_active = self.original_preview_active_for_frame(ctx, idx);
                 self.resolve_fs_navigation_sequence_target(ctx, idx, original_preview_active);
             }
@@ -13739,6 +13770,7 @@ impl App {
             self.fs_holdover_tex = None;
             return;
         };
+        self.service_final_prepare_before_lookup(ctx);
         let has_full = matches!(
             self.fs_cache.get(&idx),
             Some(FsCacheEntry::Static { .. })
@@ -15796,6 +15828,34 @@ struct SpreadDisplayUnit {
 pub(crate) struct PagedPrefetchTargets {
     pub(crate) current_position: usize,
     pub(crate) targets: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NextFinalUnitDemand {
+    Boundary,
+    Unit(Vec<SpreadPageOccurrence>),
+}
+
+/// The unit ordinal, never an image index or physical direction, advances.
+/// Composition owns blank/vacant paper and cover supplements; only real page
+/// occurrences become pixel demand. No source lookup or preparation occurs.
+fn next_final_unit_demand(
+    units: &[SpreadDisplayUnit],
+    current: usize,
+    mode: SpreadMode,
+    final_cover: bool,
+    placement: crate::settings::SingletonSpreadEndpointSettings,
+    eligible: bool,
+) -> NextFinalUnitDemand {
+    let Some(next) = current.checked_add(1).filter(|next| *next < units.len()) else {
+        return NextFinalUnitDemand::Boundary;
+    };
+    match resolve_spread_display_composition(units, next, mode, final_cover, placement, eligible) {
+        Some(composition) => {
+            NextFinalUnitDemand::Unit(composition.pages_in_reading_order().to_vec())
+        }
+        None => NextFinalUnitDemand::Boundary,
+    }
 }
 
 /// A page's role inside one visible reading unit. Navigation is projected only
@@ -19680,6 +19740,126 @@ impl App {
             current_position,
             targets,
         })
+    }
+
+    /// Observation only in D3-1. Slideshow uses its actual installed still-image
+    /// navigation list; Collection's future snapshot is never guessed here.
+    pub(crate) fn observe_next_final_unit_demand(&self) {
+        if !crate::perf::is_enabled()
+            || !self.settings.page_turn_animation_enabled
+            || !self.reading_flow.is_paged()
+            || self.spread_mode.is_split()
+        {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        #[cfg(windows)]
+        if self.slideshow_playing
+            && matches!(
+                self.navigation_scope,
+                crate::app::ViewerNavigationScope::CollectionRoot
+            )
+        {
+            return;
+        }
+        let Some(demand) = self.next_final_unit_demand_from_snapshot(idx) else {
+            return;
+        };
+        let (boundary, pages) = match demand {
+            NextFinalUnitDemand::Boundary => (true, Vec::new()),
+            NextFinalUnitDemand::Unit(pages) => (false, pages),
+        };
+        crate::perf::event("fs", "next_final_unit_demand", None, self.input_seq, &[
+            ("items_generation", self.items_generation.into()),
+            ("viewport", format!("{:?}", self.page_turn_destination().viewport).into()),
+            ("anchor", idx.into()),
+            ("slideshow", self.slideshow_playing.into()),
+            ("boundary", boundary.into()),
+            ("pages", serde_json::Value::Array(pages.iter().map(|page| serde_json::json!({"idx": page.idx, "anchor": page.navigation_anchor_idx, "role": format!("{:?}", page.role)})).collect())),
+        ]);
+    }
+
+    fn next_final_unit_demand_from_snapshot(&self, idx: usize) -> Option<NextFinalUnitDemand> {
+        let cache = &self.spread_display_units_cache;
+        let token = cache.token.as_ref()?;
+        if token.items_generation != self.items_generation
+            || token.spread_mode != self.spread_mode
+            || token.landscape_epoch != cache.landscape_epoch
+            || cache.rotation_recheck_all
+            || !cache.rotation_recheck_indices.is_empty()
+        {
+            return None;
+        }
+        // Observing slideshow must not install its still-only topology into the
+        // visible unit owner: that Arc is also the accepted receipt's layout proof.
+        let slideshow_nav = self.slideshow_playing.then(|| {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_reader_order())
+        });
+        let nav = slideshow_nav.as_deref().unwrap_or(&token.nav);
+        let slideshow_units = slideshow_nav.as_ref().map(|_| {
+            if !self.spread_mode.is_spread() {
+                return nav
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &idx)| {
+                        SpreadDisplayUnit::singleton(
+                            position,
+                            idx,
+                            SpreadDisplaySingletonCause::UnpairedSlot,
+                        )
+                    })
+                    .collect();
+            }
+            let complete = self.spread_complete_book_context_eligible()
+                && self.spread_complete_page_permutation(nav);
+            let alone = if complete {
+                self.page_alone_enabled_for_current_book()
+            } else {
+                Default::default()
+            };
+            let empty = HashMap::new();
+            let overrides = self
+                .composed_book_layout()
+                .map(|layout| &layout.page_overrides)
+                .unwrap_or(&empty);
+            build_spread_display_units_with_overrides(
+                nav,
+                self.spread_mode,
+                token.shift_anchor_idx,
+                alone,
+                overrides,
+                |_, idx| cache.landscape_indices.contains(&idx),
+                |idx| is_spread_pairable_item(self.items.get(idx)),
+            )
+        });
+        let units = slideshow_units.as_deref().unwrap_or(&cache.units);
+        let Some((position, _)) = find_spread_display_unit(&units, idx) else {
+            return None;
+        };
+        let cover = self.final_cover_spread_enabled_for_current_book();
+        let placement = self.spread_singleton_display_endpoint_settings();
+        let eligible = self.spread_complete_book_context_eligible()
+            && self.spread_complete_page_permutation(nav);
+        Some(
+            match next_final_unit_demand(
+                &units,
+                position,
+                self.spread_mode,
+                cover,
+                placement,
+                eligible,
+            ) {
+                NextFinalUnitDemand::Unit(pages) => NextFinalUnitDemand::Unit(
+                    pages
+                        .into_iter()
+                        .filter(|page| is_spread_pairable_item(self.items.get(page.idx)))
+                        .collect(),
+                ),
+                boundary => boundary,
+            },
+        )
     }
 
     pub(crate) fn book_target_presentation_demand(
@@ -25716,6 +25896,10 @@ impl App {
             detached_open_pending,
             detached_open_holdover_ready,
         ) = if detached && !embedded {
+            // Visibility/readiness probe only: this &self lookup neither captures
+            // a paint source nor accepts an offer/receipt. Actual viewport selection
+            // passes begin_page_turn_viewer_frame's service prefix. Existing close
+            // ordering is retained separately for barrier/no-barrier paths.
             let display_ready = self.resolve_fs_display_tex(fs_idx, true).is_some();
             let cache_state = match self.fs_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Static { .. }) => "static",
@@ -29104,6 +29288,9 @@ impl App {
         fs_idx: usize,
         perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
     ) -> FsPageTurnDecision {
+        #[cfg(test)]
+        crate::app::final_prepare_tests::assert_outside_receipt();
+        self.service_final_prepare_before_lookup(ctx);
         let demand = self.book_target_presentation_demand(fs_idx);
         if !matches!(
             self.book_presentation_allowed(&demand),
@@ -29638,22 +29825,23 @@ impl App {
     /// Emit readiness only after the final visible display-unit source has been
     /// selected (including holdovers). Spread pages are accepted only as a complete
     /// unit, so the trace cannot report a half-painted pair as ready.
-    pub(crate) fn flush_submitted_page_turn_ready(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending_fs_page_turn_ready.take() else {
-            return;
-        };
+    fn take_matching_submitted_page_turn_ready(&mut self) -> Option<PendingFsPageTurnReady> {
+        let pending = self.pending_fs_page_turn_ready.take()?;
         let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
-            return;
+            return None;
         };
-        if !receipt.was_accepted()
-            || pending.items_generation != self.items_generation
+        if !receipt.was_accepted() {
+            self.pending_fs_page_turn_ready = Some(pending);
+            return None;
+        }
+        if pending.items_generation != self.items_generation
             || pending.mode != self.spread_mode
             || pending.slice != self.fullscreen_page_slice
             || !Arc::ptr_eq(&pending.units, &self.spread_display_units_cache.units)
             || self.fullscreen_idx != Some(pending.composition.navigation_anchor_idx())
             || !receipt.matches_sources(self.page_turn_destination(), &pending.sources)
         {
-            return;
+            return None;
         }
         let current =
             self.spread_display_composition_for_anchor(pending.composition.navigation_anchor_idx());
@@ -29680,65 +29868,99 @@ impl App {
                         page.transform.uv_rect,
                     )
                 }))
-            || pending.sources.pages.iter().any(|page| {
-                let native_presentation = matches!(
-                    &page.resource,
-                    FullscreenPaintPayload::PresentationMaterial(_)
-                ) && page.resource.lanczos_output().is_some();
-                if native_presentation
-                    && (!receipt.has_presentation_binding() || !receipt.content_matches(self))
-                {
-                    return true;
-                }
-                let held = matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
-                    .then(|| self.page_turn_held_resource(page.idx()))
-                    .flatten()
-                    .filter(|resource| {
-                        resource.source_texture_id() == page.resource.source_texture_id()
-                            && resource.source_generation() == page.resource.source_generation()
-                    });
-                let generation_matches = held.is_some()
-                    || match page.resource.source_generation() {
-                        Some(generation) => {
-                            generation.items == self.items_generation
-                                && generation.input
-                                    == self.input_generation.get(&page.idx()).copied().unwrap_or(0)
-                        }
-                        // Legacy Direct thumbnails/animations have no producer generation.
-                        // Their owning source resolver below still checks the current identity.
-                        None => matches!(
-                            &page.resource,
-                            FullscreenPaintPayload::NormalResource(
-                                FullscreenPaintResource::Direct { .. }
-                            ) | FullscreenPaintPayload::PresentationMaterial(_)
-                        ),
-                    };
-                let presentation_matches = native_presentation
-                    && receipt.has_presentation_binding()
-                    && receipt.content_matches(self)
-                    && page.resource.source_generation().is_some()
-                    && held.as_ref().is_none_or(|resource| {
-                        resource.paint_texture_id() == page.resource.paint_texture_id()
-                    });
-                let current_source = match pending.source_policy {
-                    FsSubmittedSourcePolicy::Normal => held
-                        .and_then(|resource| resource.source_texture().cloned())
-                        .or_else(|| self.resolve_fs_display_tex(page.idx(), true)),
-                    FsSubmittedSourcePolicy::Original => self
-                        .resolve_original_preview_tex(page.idx())
-                        .or_else(|| self.fs_thumbnail_texture_for_display(page.idx())),
-                    FsSubmittedSourcePolicy::Passthrough => {
-                        self.cached_passthrough_rendition(page.idx())
-                    }
-                };
-                !generation_matches
-                    || (page.provenance == FsDisplayUnitPageProvenance::Live
-                        && !presentation_matches
-                        && !current_source.is_some_and(|texture| {
-                            texture.id() == page.resource.source_texture_id()
-                        }))
-            })
         {
+            return None;
+        }
+        Some(pending)
+    }
+
+    /// Before adoption, only held presentation proof may retire the observer.
+    /// Ordinary receipts retain their original selector validation after adoption.
+    pub(crate) fn reflect_held_page_turn_receipt_before_lookup(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.take_matching_submitted_page_turn_ready() else {
+            return;
+        };
+        let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
+            return;
+        };
+        if !matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
+            || !self.page_turn_receipt_matches_held(receipt)
+        {
+            self.pending_fs_page_turn_ready = Some(pending);
+            return;
+        }
+        self.emit_fs_page_turn_ready_for_submitted_display_unit(
+            ctx,
+            &pending.composition,
+            pending.decision,
+            &pending.sources,
+        );
+    }
+
+    pub(crate) fn flush_submitted_page_turn_ready(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.take_matching_submitted_page_turn_ready() else {
+            return;
+        };
+        let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
+            return;
+        };
+        if pending.sources.pages.iter().any(|page| {
+            let native_presentation = matches!(
+                &page.resource,
+                FullscreenPaintPayload::PresentationMaterial(_)
+            ) && page.resource.lanczos_output().is_some();
+            if native_presentation
+                && (!receipt.has_presentation_binding() || !receipt.content_matches(self))
+            {
+                return true;
+            }
+            let held = matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
+                .then(|| self.page_turn_held_resource(page.idx()))
+                .flatten()
+                .filter(|resource| {
+                    resource.source_texture_id() == page.resource.source_texture_id()
+                        && resource.source_generation() == page.resource.source_generation()
+                });
+            let generation_matches = held.is_some()
+                || match page.resource.source_generation() {
+                    Some(generation) => {
+                        generation.items == self.items_generation
+                            && generation.input
+                                == self.input_generation.get(&page.idx()).copied().unwrap_or(0)
+                    }
+                    // Legacy Direct thumbnails/animations have no producer generation.
+                    // Their owning source resolver below still checks the current identity.
+                    None => matches!(
+                        &page.resource,
+                        FullscreenPaintPayload::NormalResource(
+                            FullscreenPaintResource::Direct { .. }
+                        ) | FullscreenPaintPayload::PresentationMaterial(_)
+                    ),
+                };
+            let presentation_matches = native_presentation
+                && receipt.has_presentation_binding()
+                && receipt.content_matches(self)
+                && page.resource.source_generation().is_some()
+                && held.as_ref().is_none_or(|resource| {
+                    resource.paint_texture_id() == page.resource.paint_texture_id()
+                });
+            let current_source = match pending.source_policy {
+                FsSubmittedSourcePolicy::Normal => held
+                    .and_then(|resource| resource.source_texture().cloned())
+                    .or_else(|| self.resolve_fs_display_tex(page.idx(), true)),
+                FsSubmittedSourcePolicy::Original => self
+                    .resolve_original_preview_tex(page.idx())
+                    .or_else(|| self.fs_thumbnail_texture_for_display(page.idx())),
+                FsSubmittedSourcePolicy::Passthrough => {
+                    self.cached_passthrough_rendition(page.idx())
+                }
+            };
+            !generation_matches
+                || (page.provenance == FsDisplayUnitPageProvenance::Live
+                    && !presentation_matches
+                    && !current_source
+                        .is_some_and(|texture| texture.id() == page.resource.source_texture_id()))
+        }) {
             return;
         }
         self.emit_fs_page_turn_ready_for_submitted_display_unit(
@@ -32529,6 +32751,7 @@ impl App {
     ) -> PageTurnFrameEntry {
         if !self.page_turn_barrier_active() {
             self.page_turn_pre_draw(ctx);
+            self.service_final_prepare_before_lookup(ctx);
             return PageTurnFrameEntry::Continue {
                 close_response: None,
                 committed: false,
@@ -32571,6 +32794,7 @@ impl App {
                 .blocks_legacy_keymap_shortcuts()
                 && !root_permitted);
         if owned_elsewhere {
+            self.service_final_prepare_before_lookup(ctx);
             return PageTurnFrameEntry::Continue {
                 close_response: None,
                 committed: false,
@@ -32656,6 +32880,7 @@ impl App {
             self.page_turn_pre_draw(&root.context);
         }
         self.page_turn_pre_draw(ctx);
+        self.service_final_prepare_before_lookup(ctx);
         // This is already accepted, recipient-bound navigation. Committing its
         // canonical flat receipt does not sample fresh keys or current levels;
         // a keyboard permit would strand unfocused wheel/slideshow continuations.
@@ -40998,6 +41223,12 @@ impl App {
     ) {
         if self.viewer_mutation_modal_active() {
             return;
+        }
+        // Covers root forwarded keys and this viewport's own key handler after
+        // their settings/edit mutations, as well as mouse/gamepad navigation.
+        // Accepted close always keeps priority over adoption.
+        if !close_fs && !close_to_page_list {
+            self.service_final_prepare_before_lookup(ctx);
         }
         // A manual navigation intent retires rating restoration even when the
         // page-turn barrier defers its dispatch until an adopted flat frame.
@@ -67330,6 +67561,7 @@ mod tests {
         app.final_composite_cache.insert(
             key,
             crate::app::FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: [8, 12],
                 pixels,
