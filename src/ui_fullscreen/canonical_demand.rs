@@ -220,6 +220,9 @@ impl App {
         ctx: &egui::Context,
         demand: &CanonicalUnitDemand,
     ) -> bool {
+        if !self.canonical_native_demand_was_observed(demand) {
+            return false;
+        }
         self.collect_next_canonical_demand(ctx, demand.view)
             .is_ok_and(|current| current == *demand)
     }
@@ -331,7 +334,7 @@ impl App {
             return Err(Missing::Ineligible);
         }
         let composition = self
-            .final_unit_composition_from_snapshot(anchor, FinalUnitPosition::Next)
+            .resident_final_unit_composition_from_snapshot(anchor, FinalUnitPosition::Next)
             .ok_or(Missing::Topology)?
             .ok_or(Missing::Boundary)?;
         let occurrences = composition.pages_in_screen_order(self.spread_mode);
@@ -626,3 +629,9 @@ impl App {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod topology_tests;
+
+#[cfg(test)]
+mod draw_key_tests;

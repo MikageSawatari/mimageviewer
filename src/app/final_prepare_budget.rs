@@ -121,6 +121,13 @@ pub(super) fn speculative_vram_admitted(
 }
 
 impl App {
+    pub(crate) fn canonical_native_demand_was_observed(
+        &self,
+        demand: &crate::ui_fullscreen::canonical_demand::CanonicalUnitDemand,
+    ) -> bool {
+        self.speculative_gpu_frame.canonical.contains(demand)
+    }
+
     pub(crate) fn observe_canonical_native_demand(
         &mut self,
         demand: crate::ui_fullscreen::canonical_demand::CanonicalUnitDemand,
@@ -557,7 +564,9 @@ impl App {
         }
         // All contexts' final/comic registrations get first use of the common
         // slot. Native requests must never jump ahead of another owner's final.
-        let candidates = std::mem::take(&mut self.speculative_gpu_frame.canonical);
+        // Keep the current callback values available during revalidation: an
+        // older view must not become current merely by replaying its saved view.
+        let candidates = self.speculative_gpu_frame.canonical.clone();
         for unit in candidates {
             if !live.contains(&unit.destination) {
                 continue;
@@ -566,6 +575,7 @@ impl App {
                 app.finalize_native_prewarm(ctx, &unit, blocked);
             });
         }
+        self.speculative_gpu_frame.canonical.clear();
         self.speculative_gpu_frame
             .native_diagnostics
             .retain(|saved| live.contains(&saved.destination));

@@ -6,7 +6,7 @@ impl App {
     }
 }
 
-fn ready_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEnvForTest {
+pub(super) fn ready_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEnvForTest {
     let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
@@ -40,7 +40,7 @@ fn ready_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEnvFor
     app
 }
 
-fn view(ui: &egui::Ui) -> CanonicalViewInputs {
+pub(super) fn view(ui: &egui::Ui) -> CanonicalViewInputs {
     CanonicalViewInputs {
         full_rect: ui.max_rect(),
         base_clip: ui.painter().clip_rect(),
@@ -48,7 +48,7 @@ fn view(ui: &egui::Ui) -> CanonicalViewInputs {
     }
 }
 
-fn actual_transforms(
+pub(super) fn actual_transforms(
     app: &mut App,
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -135,7 +135,7 @@ fn assert_actual_geometry(
     demand
 }
 
-fn accept_current(app: &mut App, ctx: &egui::Context) {
+pub(super) fn accept_current(app: &mut App, ctx: &egui::Context) {
     let current = app.fullscreen_idx.unwrap();
     app.spread_display_composition_for_anchor(current);
     app.fullscreen_seek_info_cached(current);
@@ -340,6 +340,7 @@ fn canonical_native_demand_matches_actual_single_and_pair_draw_geometry() {
                 app.settings.fullscreen_fit_mode = fit_mode;
                 crate::ui_fullscreen::page_turn_submission_tests::frame(&ctx, |ui, ctx| {
                     let demand = app.collect_next_canonical_demand(ctx, view(ui)).unwrap();
+                    app.observe_canonical_native_demand(demand.clone());
                     assert!(app.canonical_unit_demand_is_current(ctx, &demand));
                     let next = demand.composition.navigation_anchor_idx;
                     app.fullscreen_idx = Some(next);
@@ -422,6 +423,7 @@ fn canonical_native_demand_revalidates_the_whole_pair_and_view_policy() {
     let mut app = ready_app(&ctx, SpreadMode::Ltr);
     crate::ui_fullscreen::page_turn_submission_tests::frame(&ctx, |ui, ctx| {
         let demand = app.collect_next_canonical_demand(ctx, view(ui)).unwrap();
+        app.observe_canonical_native_demand(demand.clone());
         assert_eq!(demand.pages.len(), 2);
         app.settings.spread_page_gap_px += 3;
         assert!(!app.canonical_unit_demand_is_current(ctx, &demand));
@@ -457,6 +459,7 @@ fn canonical_native_demand_requires_accepted_current_and_selected_resident_mater
     let mut app = ready_app(&ctx, SpreadMode::Single);
     super::super::page_turn_submission_tests::frame(&ctx, |ui, ctx| {
         let demand = app.collect_next_canonical_demand(ctx, view(ui)).unwrap();
+        app.observe_canonical_native_demand(demand.clone());
         let mut params = app.effective_params(1).clone();
         params.post_filter = PostFilter::Nearest;
         app.adjustment_page_params.insert(1, params);

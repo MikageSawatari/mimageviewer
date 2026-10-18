@@ -190,12 +190,17 @@ fn d3_4b_root_hook_waits_for_backing_without_claim_then_normal_prepare_hits() {
             .product::<usize>()
     );
     // Hits neither allocate nor consume the next frame, even on repeated hooks.
+    crate::ui_fullscreen::reset_native_topology_work_counts_for_test();
     capture(&mut app, &ctx, 402);
     app.finalize_speculative_gpu_output(&ctx, 402, 2);
     app.finalize_speculative_gpu_output(&ctx, 402, 2);
     assert_eq!(
         app.speculative_gpu_frame.state,
         RegistrationState::Available
+    );
+    assert_eq!(
+        crate::ui_fullscreen::native_topology_work_counts_for_test(),
+        [0; 5]
     );
 }
 
@@ -204,10 +209,15 @@ fn d3_4b_activity_and_changed_inputs_do_not_claim_and_quiet_opportunity_resumes(
     let ctx = egui::Context::default();
     let mut app = ready(&ctx);
     deliver(&app, &ctx);
+    crate::ui_fullscreen::reset_native_topology_work_counts_for_test();
     capture(&mut app, &ctx, 410);
     app.note_page_turn_gpu_activity();
     app.finalize_speculative_gpu_output(&ctx, 410, 1);
     assert_eq!(app.fs_lanczos_cache.outputs().count(), 0);
+    assert_eq!(
+        crate::ui_fullscreen::native_topology_work_counts_for_test(),
+        [0; 5]
+    );
     capture(&mut app, &ctx, 411);
     let old = app.effective_params(1).clone();
     let mut changed = old.clone();

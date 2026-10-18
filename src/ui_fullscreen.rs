@@ -16828,6 +16828,26 @@ fn reset_final_cover_eligibility_scan_count_for_test() {
 fn final_cover_eligibility_scan_count_for_test() -> usize {
     FINAL_COVER_ELIGIBILITY_SCAN_COUNT.get()
 }
+
+#[cfg(test)]
+pub(crate) fn reset_native_topology_work_counts_for_test() {
+    reset_final_cover_eligibility_scan_count_for_test();
+    reset_spread_display_units_build_count_for_test();
+    PREFETCH_NAV_COMPARISON_ELEMENTS.set(0);
+    PREFETCH_POSITION_SCANS.set(0);
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+}
+
+#[cfg(test)]
+pub(crate) fn native_topology_work_counts_for_test() -> [usize; 5] {
+    [
+        final_cover_eligibility_scan_count_for_test(),
+        spread_display_units_build_count_for_test(),
+        PREFETCH_NAV_COMPARISON_ELEMENTS.get(),
+        PREFETCH_POSITION_SCANS.get(),
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+    ]
+}
 #[cfg(test)]
 fn build_spread_display_units_with_landscape(
     nav: &[usize],
@@ -19843,6 +19863,85 @@ impl App {
                 None => NextFinalUnitDemand::Boundary,
             },
         )
+    }
+
+    /// Read only proofs already adopted by the ordinary navigation/unit owners.
+    /// Native observation must not rebuild either the book permutation proof or
+    /// slideshow's still-only navigation/units on each callback and replay.
+    fn resident_final_unit_composition_from_snapshot(
+        &self,
+        idx: usize,
+        requested: FinalUnitPosition,
+    ) -> Option<Option<SpreadDisplayComposition>> {
+        let cache = &self.spread_display_units_cache;
+        let token = cache.token.as_ref()?;
+        if token.items_generation != self.items_generation
+            || token.spread_mode != self.spread_mode
+            || token.landscape_epoch != cache.landscape_epoch
+            || token.shift_anchor_idx != self.spread_shift_anchor_idx()
+            || cache.rotation_recheck_all
+            || !cache.rotation_recheck_indices.is_empty()
+            || self.viewer_navigation_caches.source
+                != Some((self.items_generation, self.reading_flow))
+        {
+            return None;
+        }
+        let owns_nav = self
+            .viewer_navigation_caches
+            .nav_indices
+            .as_ref()
+            .is_some_and(|nav| Arc::ptr_eq(nav, &token.nav))
+            || (self.slideshow_playing
+                && self
+                    .viewer_navigation_caches
+                    .still_image_indices
+                    .as_ref()
+                    .is_some_and(|nav| Arc::ptr_eq(nav, &token.nav)));
+        let composed = self.composed_layout_token().and_then(|(scope, token)| {
+            self.composed_book_layout()
+                .map(|layout| (scope, token, composition_view_direction(layout.direction)))
+        });
+        if !owns_nav || token.composed != composed {
+            return None;
+        }
+        // Each non-pairable media item owns a non-image singleton unit. This
+        // token-derived index therefore proves the installed topology is also
+        // the slideshow topology without enumerating/filtering the book again.
+        if self.slideshow_playing && cache.image_unit_positions.len() != cache.units.len() {
+            return None;
+        }
+        // Single has no endpoint/cover composition policy. For spreads, absence
+        // of the installed complete-list proof is unknown, never assumed false.
+        let eligible =
+            if self.spread_mode.is_spread() && self.spread_complete_book_context_eligible() {
+                cache.complete_page_permutation?
+            } else {
+                false
+            };
+        let page_alone = if self.spread_mode.has_cover() && eligible {
+            self.page_alone_enabled_for_current_book()
+        } else {
+            Default::default()
+        };
+        if token.page_alone != page_alone {
+            return None;
+        }
+        let position = cache.unit_position(idx)?;
+        let position = match requested {
+            FinalUnitPosition::Current => position,
+            FinalUnitPosition::Next => match position.checked_add(1) {
+                Some(next) if next < cache.units.len() => next,
+                _ => return Some(None),
+            },
+        };
+        Some(resolve_spread_display_composition(
+            &cache.units,
+            position,
+            self.spread_mode,
+            self.final_cover_spread_enabled_for_current_book(),
+            self.spread_singleton_display_endpoint_settings(),
+            eligible,
+        ))
     }
 
     /// The installed topology's complete composition, including singleton slots

@@ -1053,12 +1053,47 @@ fn resource_lanczos_key(
     )
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NativeLookupForTest {
+    pub(crate) source_texture_id: egui::TextureId,
+    pub(crate) key: Option<LanczosCacheKey>,
+    pub(crate) outcome: &'static str,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NATIVE_LOOKUPS_FOR_TEST: std::cell::RefCell<Option<Vec<NativeLookupForTest>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn begin_native_lookup_observation_for_test() {
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| *lookups.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_native_lookups_for_test() -> Vec<NativeLookupForTest> {
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| lookups.borrow_mut().take().unwrap_or_default())
+}
+
 fn record_native_lookup(
     render_state: Option<&egui_wgpu::RenderState>,
     resource: &FullscreenPaintResource,
     key: Option<LanczosCacheKey>,
     outcome: &'static str,
 ) {
+    #[cfg(test)]
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| {
+        if let Some(lookups) = lookups.borrow_mut().as_mut() {
+            lookups.push(NativeLookupForTest {
+                source_texture_id: resource.source_texture_id(),
+                key,
+                outcome,
+            });
+        }
+    });
     if !crate::perf::is_enabled() {
         return;
     }

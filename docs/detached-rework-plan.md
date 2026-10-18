@@ -5814,3 +5814,10 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
   park した A の演出状態・receipt・material／lease を B の投機のために解除しない。同 frame の活動記録は (a) と同じく維持する。
 - 新しい HWND 推測・placement・時間窓・detached flag は追加しない。設計担当の既存合意範囲を使い、独立 Sol/xhigh の実装前確認でも症状パッチではない構造拡張と確認した。
   完成 source 判定と ROOT／viewport／discard／park／兄弟不変／batch lifetime の実行結果は `target/d3-4b-handoff.md` に分けて記録する。
+
+##### D3-4(b) 独立完成レビュー対応（2026-10-19）
+
+- canonical の追加需要は既存 installed unit token の完全性証拠と索引を読み、未採用は見送る。新しい cache owner や context 世代の一括失効は追加しない。
+- 既存 App frame owner の最新 callback 値と再照合し、旧 viewport view を現行と扱わない。最終 hook 中も同じ値 owner を保持し、処理後に消費するだけで、mount／park／promote の意味は変えない。
+- 実 child callback の異なる ppp／clip と ROOT での再照合を headless テストに含める。runtime／binding／dispatch 述語、HWND、placement、viewport 生成、permission は変更しない。
+  設計担当が妥当と判断した P2 二件への修正であり、独立 source 再レビューも既存 owner 内の構造的修正として合意。検証記録は `target/d3-4b-fix-*`。

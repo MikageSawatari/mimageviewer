@@ -5288,3 +5288,15 @@ detachedの変更は、既存runtime・session／context binding・実描画disp
 - 単純化は (a) の既存 frame owner／最終境界と通常 cache／submit／lease の再利用で行う。待機 state、別 queue、同期 metadata 準備を追加しない。
   まれな失敗は既存の割り切り方針を維持する。検証・一時変異・制限は `target/d3-4b-*` に残す。
   実機での 27〜63ms 改善、正式八条件性能 gate と motion 評価は未確認であり、自動回帰の成功と区別する。
+
+##### 27.17.16.1 独立完成レビュー P2 対応（e92000b10、2026-10-19）
+
+- canonical 候補の収集・再照合は `resident_final_unit_composition_from_snapshot` から、既存 `SpreadDisplayUnitsCache` の同じ installed token が所有する完全性証拠・頁→unit 索引だけを読む。
+  通常 navigation owner の Arc identity、items／composed／mode／shift／landscape／page-alone を照合し、証拠が未採用なら見送る。Single の endpoint policy に不要な完全性判定は行わない。
+  slideshow は既存の image-unit 索引が installed topology の still-only 性を証明する場合だけ扱い、nav／unit 列を収集側で再構築しない。停止後は通常 nav の採用を必要とする。
+  CPU 準備・D3-1 の観測用 resolver は従来の slideshow 需要を維持する。新しい cache owner や cold 準備は追加しない。
+- 最新 callback の view 値との一致を既存 `SpeculativeGpuFrame.canonical` で確認してから resident 値を再照合する。
+  最終 hook は候補値を一時 clone し、処理後に既存 frame owner から消費する。保存済みの旧 view を再生するだけでは現行証拠にならない。別 owner／待機 state／追加 repaint はない。
+- 実 Single／Pair painter の clip／ROI から通常 resolve が生成した Native key を test-only observer で取得し、prewarm の key／hit と比較する。
+  PDF layout と raster の相違、SpecifiedScale、ROOT と異なる子 viewport ppp、実 callback の resize／DPI／clip 更新と旧候補失効、warm 時の全頁走査ゼロを回帰で確認する。
+  検証・prewarm 側だけの ROI 一時変異と SHA-256 復元の記録は `target/d3-4b-fix-*`。実機性能・正式八条件／motion は今回も未計測。
