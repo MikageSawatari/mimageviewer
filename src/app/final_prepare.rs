@@ -99,6 +99,63 @@ fn prepared_output_bytes(size: [usize; 2], filter: crate::adjustment::PostFilter
 }
 
 impl App {
+    /// Exact resident inputs only: no ensure, DB hydration, materialization or upload.
+    /// Native prewarm must target the handle ordinary preparation can really adopt.
+    pub(crate) fn resident_final_prepare_texture(
+        &self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
+        if let Some((_, final_entry)) = self.exact_complete_final_composite_entry(idx) {
+            if self.comic_pages.contains(&idx)
+                || self.comic_demo_enabled
+                || self.comic_cache.contains_key(&idx)
+            {
+                let comic = self.comic_cache.get(&idx)?;
+                let preview_scale = if self.text_mode {
+                    self.settings.text_preview_scale.clamp(1, 8)
+                } else {
+                    1
+                };
+                return (Arc::ptr_eq(&comic.base, &final_entry.pixels)
+                    && comic.comic_gen == self.comic_generation
+                    && comic.dims == final_entry.pixels.size
+                    && comic.preview_scale == preview_scale
+                    && self.display_texture_matches_page(&comic.texture, idx))
+                .then(|| comic.texture.clone());
+            }
+            return Some(final_entry.texture.clone());
+        }
+        if self.comic_pages.contains(&idx) || self.comic_demo_enabled {
+            return None;
+        }
+        let (edit_key, pixels) = self.resident_final_prepare_input(idx)?;
+        let params = self.effective_params(idx);
+        if !params.is_color_identity()
+            || params.effective_smart_sharpen(false) != 0
+            || params.colorize.is_enabled()
+            || self.creative_lut_requires_final_effect(params)
+            || !matches!(
+                params.post_filter,
+                crate::adjustment::PostFilter::None | crate::adjustment::PostFilter::Nearest
+            )
+            || self
+                .final_ai_key_for_pixels(edit_key, pixels.size, params)
+                .is_some_and(|key| !self.final_ai_failed.contains(&key))
+        {
+            return None;
+        }
+        self.edit_result_cache
+            .get(&edit_key)
+            .and_then(|entry| entry.texture.as_ref())
+            .filter(|texture| self.display_texture_matches_page(texture, idx))
+            .cloned()
+            .or_else(|| self.shared_source_texture_for_edit(ctx, &edit_key, &pixels))
+    }
+
     fn final_prepare_wake(&self, ctx: &egui::Context) -> FinalPrepareWake {
         FinalPrepareWake {
             ctx: ctx.clone(),

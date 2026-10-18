@@ -5264,3 +5264,27 @@ detachedの変更は、既存runtime・session／context binding・実描画disp
 - 見開きの後半 4 回 (補正あり) は、受理から初回 curl までが 27〜63ms。この間に 2 頁分の `gpu.lanczos_regenerate` (表示用 Native 出力の生成) が走る。
   D3-4(b) (canonical demand と Native prewarm) の対象。補正なし 04 単ページの初回 41ms は 1 回目 (起動直後) だけ。
 - 最大間隔 35ms (補正なし・見開き) の 1 回は原因未確認。
+
+#### 27.17.16 D3-4(b) 実装記録（2026-10-19、実機未確認）
+
+- 通常 Single／Pair と `ui_fullscreen::canonical_demand` の値計算を共有する。次 unit は既存 snapshot resolver の composition を使い、
+  Blank／Vacant／表紙補助の role と navigation anchor を保持する。表示 anchor や layout cache を投機のために書き換えない。
+  Pair の高さ合わせ・bbox・fit・gap・物理 pixel 丸め・左右移動、Single／Pair の clip と最終 transform を通常描画と共用する。
+- 実 UI callback の viewport 矩形・基底 clip・ppp を既存 `SpeculativeGpuFrame` の当該 pass 限りの値候補へ渡す。
+  同じ resident collector で composition、選択 handle／寸法／世代、編集 key／params、回転・trim・fit・chrome を最終 hook で再照合する。
+  回転・auto bbox・fit basis が未採用なら見送り、cold `get_rotation`／`cached_margin_bbox` を呼ばない。
+  既存 Remote 操作所有権も共有 collector で照合し、候補収集後の Remote 取得では hook の再照合で見送る。
+- exact complete final、照合済み comic、無変換の resident source／edit handle を選ぶ。CPU-only 結果や stale best-effort final を Native 成功にしない。
+  通常 prepare と共通の key／branch／work plan を非生成 query で調べ、Native 不要・hit は枠を使わない。
+- allocation は (a) の native wgpu ROOT 最終 output hook に限定する。全 live context の final 登録を先に回し、Native はその後に処理する。
+  backing の存在・寸法・RGBA8 format を確認し、renderer lock 解放後に通常の全 context 会計で出力＋実 branch の一時 texture を admission する。
+  実行側でも backing を再検査・clone し、lock を解放してから allocation 直前に App 共通枠を claim する。未配送・失効・不成立で枠を先取りしない。
+  提出後は残りの頁を再照会し、未完了 miss の既存枠待ち wake だけを使う。最後の頁の提出や全 hit に追加 repaint を足さない。
+- 出力は通常 `fs_lanczos_cache` と `LanczosOutputs` 会計に置く。offer 前の pin 予約、演出専用 cache／queue／GPU 完了 ticket は追加しない。
+  通常 offer は Normal 入力のまま、最初の通常 prepare の exact hit と既存 D2 handoff で Native lease へ移る。held／receipt と D4 時計は変更しない。
+- `fs.final_prepare_native_submitted`／`fs.final_prepare_native_lookup` は共通 key・TextureId・renderer で相関できる。
+  `fs.final_prepare_gpu_deferred` に Native の backing／resident 入力／失効／計画／予算理由を記録する。
+  既存 frame owner 内の route ごとの最新 identity／有限理由値は perf 専用で、候補や資源を保持せず、採用・claim・wake 判定に使用しない。
+- 単純化は (a) の既存 frame owner／最終境界と通常 cache／submit／lease の再利用で行う。待機 state、別 queue、同期 metadata 準備を追加しない。
+  まれな失敗は既存の割り切り方針を維持する。検証・一時変異・制限は `target/d3-4b-*` に残す。
+  実機での 27〜63ms 改善、正式八条件性能 gate と motion 評価は未確認であり、自動回帰の成功と区別する。

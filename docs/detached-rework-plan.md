@@ -5801,3 +5801,16 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
 - 通常upload/枠使用済みの既存wakeは最終境界へ移す。演出理由・VRAM不足の保留では追加wakeを発行しない。
   Computingの既存worker pollは維持し、最終枠へ移したLegacy CpuReadyは16ms pollから除外する。別queue/heartbeatはない。
 - 回帰・完成レビューの結果は紙めくり計画の実装記録および `target/d3-4a-handoff.md` に記録する。
+
+#### D3-4(b) 実装追補（2026-10-19、実機未確認）
+
+- 紙めくり計画 §27.17.14.4/.5/.10/.11 の範囲で、通常 callback の所有 viewport／ppp／clip と次 composition の resident 値を読む。
+  通常 Single／Pair の geometry を共有し、frame 限りの候補を既存 App 共通 `SpeculativeGpuFrame` に移譲する。
+  detached の runtime／binding／live dispatch 判定と context 訪問は (a) の `final_prepare_route_is_current`／`with_viewer_context_state` をそのまま使う。
+- allocation は既存 ROOT 最終 output hook のみ。通常 UI、入力、permission、viewport 生成へ再入しない。
+  全 context の final 登録後に Native を判定する。renderer lock 中に context 訪問や会計 walker を実行しない。
+- Native cache は各 context の通常 `fs_lanczos_cache` 単独 owner、候補と一件枠は App owner。
+  fork／mount／park／promote の資源移譲や receiver 寿命を変更せず、単なる mount／passive snapshot から候補を作らない。
+  park した A の演出状態・receipt・material／lease を B の投機のために解除しない。同 frame の活動記録は (a) と同じく維持する。
+- 新しい HWND 推測・placement・時間窓・detached flag は追加しない。設計担当の既存合意範囲を使い、独立 Sol/xhigh の実装前確認でも症状パッチではない構造拡張と確認した。
+  完成 source 判定と ROOT／viewport／discard／park／兄弟不変／batch lifetime の実行結果は `target/d3-4b-handoff.md` に分けて記録する。

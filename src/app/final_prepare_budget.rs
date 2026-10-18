@@ -17,19 +17,62 @@ pub(super) struct SpeculativeGpuFrame {
     state: RegistrationState,
     /// Final-pass dispatch observations only; no work or resources are owned here.
     live_paged: Vec<crate::ui_fullscreen::PresentationDestination>,
+    /// Value-only demands from the owning UI callbacks, valid for this pass only.
+    canonical: Vec<crate::ui_fullscreen::canonical_demand::CanonicalUnitDemand>,
+    /// Perf-only bounded values, never consulted by admission or repaint policy.
+    native_diagnostics: Vec<NativeGpuDiagnostics>,
+}
+
+struct NativeGpuDiagnostics {
+    destination: crate::ui_fullscreen::PresentationDestination,
+    identity: String,
+    reasons: Vec<&'static str>,
+}
+
+impl NativeGpuDiagnostics {
+    fn first(&mut self, identity: &str, reason: &'static str) -> bool {
+        if self.identity != identity {
+            self.identity = identity.to_owned();
+            self.reasons.clear();
+        }
+        if self.reasons.contains(&reason) {
+            return false;
+        }
+        self.reasons.push(reason);
+        true
+    }
+}
+
+fn speculative_native_vram_admitted(
+    resident_bytes: u64,
+    allocation: crate::gpu_lanczos::NativeAllocationBytes,
+    budget: Option<u64>,
+) -> bool {
+    budget.is_none_or(|limit| {
+        resident_bytes
+            .checked_add(allocation.output_bytes)
+            .and_then(|total| total.checked_add(allocation.temporary_bytes))
+            .is_some_and(|total| total <= limit)
+    })
 }
 
 impl SpeculativeGpuFrame {
     pub(super) fn begin(&mut self, root_frame: u64) {
         if self.frame != Some(root_frame) {
+            // Also bound diagnostics on backends without the native ROOT hook.
+            let previous_live = &self.live_paged;
+            self.native_diagnostics
+                .retain(|saved| previous_live.contains(&saved.destination));
             self.frame = Some(root_frame);
             self.state = RegistrationState::Available;
             self.live_paged.clear();
+            self.canonical.clear();
         }
     }
 
     pub(super) fn begin_pass(&mut self) {
         self.live_paged.clear();
+        self.canonical.clear();
     }
 
     pub(super) fn observe(&mut self, destination: crate::ui_fullscreen::PresentationDestination) {
@@ -78,6 +121,237 @@ pub(super) fn speculative_vram_admitted(
 }
 
 impl App {
+    pub(crate) fn observe_canonical_native_demand(
+        &mut self,
+        demand: crate::ui_fullscreen::canonical_demand::CanonicalUnitDemand,
+    ) {
+        self.speculative_gpu_frame
+            .canonical
+            .retain(|previous| previous.destination != demand.destination);
+        self.speculative_gpu_frame.canonical.push(demand);
+    }
+
+    pub(crate) fn observe_canonical_native_unavailable(&mut self, reason: &'static str) {
+        let route = self.page_turn_destination();
+        self.speculative_gpu_frame
+            .canonical
+            .retain(|candidate| candidate.destination != route);
+        if crate::perf::is_enabled() {
+            let identity = format!(
+                "{}:{:?}:resident",
+                self.items_generation, self.fullscreen_idx
+            );
+            self.record_native_prepare_gpu_deferred(route, &identity, reason, None);
+        }
+    }
+
+    fn record_native_prepare_gpu_deferred(
+        &mut self,
+        destination: crate::ui_fullscreen::PresentationDestination,
+        identity: &str,
+        reason: &'static str,
+        key: Option<crate::gpu_lanczos::LanczosCacheKey>,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let diagnostics = &mut self.speculative_gpu_frame.native_diagnostics;
+        let index = diagnostics
+            .iter()
+            .position(|saved| saved.destination == destination);
+        let saved = match index {
+            Some(index) => &mut diagnostics[index],
+            None => {
+                diagnostics.push(NativeGpuDiagnostics {
+                    destination,
+                    identity: identity.to_owned(),
+                    reasons: Vec::new(),
+                });
+                diagnostics.last_mut().unwrap()
+            }
+        };
+        if !saved.first(identity, reason) {
+            return;
+        }
+        crate::perf::event(
+            "fs",
+            "final_prepare_gpu_deferred",
+            None,
+            self.input_seq,
+            &[
+                ("context", destination.context.serial().into()),
+                ("stage", "native".into()),
+                ("reason", reason.into()),
+                (
+                    "native_key",
+                    key.map(|key| key.perf_key().into())
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                ("outer_frame", self.speculative_gpu_frame.frame.into()),
+            ],
+        );
+    }
+
+    fn finalize_native_prewarm(
+        &mut self,
+        ctx: &egui::Context,
+        unit: &crate::ui_fullscreen::canonical_demand::CanonicalUnitDemand,
+        blocked: bool,
+    ) {
+        use crate::gpu_lanczos::{NativePrewarmExecution, NativePrewarmQuery};
+        let identity = crate::perf::is_enabled().then(|| format!("{unit:?}"));
+        let identity = identity.as_deref().unwrap_or("");
+        if !self.canonical_unit_demand_is_current(ctx, unit) {
+            self.record_native_prepare_gpu_deferred(
+                unit.destination,
+                identity,
+                "inputs_changed",
+                None,
+            );
+            return;
+        }
+        for page in &unit.pages {
+            let Some(resource) = self.canonical_demand_resource_if_current(ctx, unit, page) else {
+                self.record_native_prepare_gpu_deferred(
+                    unit.destination,
+                    identity,
+                    "inputs_changed",
+                    None,
+                );
+                return;
+            };
+            let render_state = self.wgpu_render_state.clone();
+            let query = self.fs_lanczos_cache.query_prewarm(
+                render_state.as_ref(),
+                &resource,
+                page.transform.total_scale,
+                page.transform.pixels_per_point,
+                page.visible_region,
+                page.post_filter,
+                page.smoothing_percent,
+                page.anime_source_limit,
+            );
+            let plan = match query {
+                NativePrewarmQuery::Hit(_) | NativePrewarmQuery::NotNeeded => continue,
+                NativePrewarmQuery::Unavailable(reason) => {
+                    self.record_native_prepare_gpu_deferred(
+                        unit.destination,
+                        identity,
+                        reason.as_str(),
+                        None,
+                    );
+                    if matches!(
+                        reason,
+                        crate::gpu_lanczos::NativePrewarmUnavailable::MissingBacking
+                    ) && matches!(
+                        self.speculative_gpu_frame.state,
+                        RegistrationState::OrdinaryUpload | RegistrationState::SpeculativeSubmitted
+                    ) {
+                        // An allocation in this output has not reached the normal
+                        // delivery owner yet. Reevaluate after that delivery.
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        ctx.request_repaint_of(unit.destination.viewport);
+                    }
+                    continue;
+                }
+                NativePrewarmQuery::Miss(plan) => plan,
+            };
+            let reason = match self.speculative_gpu_frame.state {
+                RegistrationState::PageTurnActivity => {
+                    Some(FinalPrepareGpuDeferred::AnimationActivity)
+                }
+                _ if blocked => Some(FinalPrepareGpuDeferred::LivePresentation),
+                RegistrationState::OrdinaryUpload => Some(FinalPrepareGpuDeferred::OrdinaryUpload),
+                RegistrationState::SpeculativeSubmitted => Some(FinalPrepareGpuDeferred::FrameBusy),
+                RegistrationState::Available => None,
+            };
+            if let Some(reason) = reason {
+                self.record_native_prepare_gpu_deferred(
+                    unit.destination,
+                    identity,
+                    reason.name(),
+                    Some(plan.key()),
+                );
+                if matches!(
+                    reason,
+                    FinalPrepareGpuDeferred::OrdinaryUpload | FinalPrepareGpuDeferred::FrameBusy
+                ) {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.request_repaint_of(unit.destination.viewport);
+                }
+                return;
+            }
+            // query released its renderer lock. The normal walker accounts every
+            // context/cache/retained batch, deduplicating the usual output IDs.
+            let allocation = plan.allocation();
+            if !speculative_native_vram_admitted(
+                self.vram_accounting_snapshot().total_bytes(),
+                allocation,
+                self.vram_pool_budget().pool_bytes,
+            ) {
+                self.record_native_prepare_gpu_deferred(
+                    unit.destination,
+                    identity,
+                    "vram_admission",
+                    Some(plan.key()),
+                );
+                continue;
+            }
+            let Some(render_state) = render_state else {
+                continue;
+            };
+            let outcome =
+                self.fs_lanczos_cache
+                    .execute_prewarm(&render_state, &resource, plan, |_| {
+                        self.speculative_gpu_frame.claim()
+                    });
+            match outcome {
+                NativePrewarmExecution::Hit => {}
+                NativePrewarmExecution::Unavailable(reason) => {
+                    self.record_native_prepare_gpu_deferred(
+                        unit.destination,
+                        identity,
+                        reason.as_str(),
+                        Some(plan.key()),
+                    );
+                }
+                NativePrewarmExecution::Submitted {
+                    output_texture_id,
+                    stats,
+                } => {
+                    if crate::perf::is_enabled() {
+                        let key = plan.key();
+                        crate::perf::event(
+                            "fs",
+                            "final_prepare_native_submitted",
+                            None,
+                            self.input_seq,
+                            &[
+                                ("renderer", render_state.renderer.read().diag_id().into()),
+                                ("context", unit.destination.context.serial().into()),
+                                (
+                                    "source_texture_id",
+                                    format!("{:?}", key.source_texture_id()).into(),
+                                ),
+                                ("output_texture_id", format!("{output_texture_id:?}").into()),
+                                ("native_key", key.perf_key().into()),
+                                ("scale_branch", key.scale_branch().as_str().into()),
+                                ("roi", format!("{:?}", key.visible_source_uv_rect()).into()),
+                                ("target", serde_json::json!(key.target_size())),
+                                ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
+                                ("output_bytes", allocation.output_bytes.into()),
+                                ("temporary_bytes", allocation.temporary_bytes.into()),
+                                ("outer_frame", self.speculative_gpu_frame.frame.into()),
+                            ],
+                        );
+                    }
+                    // Only a remaining miss may request the existing busy-frame
+                    // wake. A final hit/Native submission adds no idle repaint.
+                }
+            }
+        }
+    }
+
     pub(super) fn defer_legacy_final_prefetch_registration(&self) -> bool {
         self.settings.page_turn_animation_enabled
             && self.reading_flow.is_paged()
@@ -264,9 +538,9 @@ impl App {
             RegistrationState::SpeculativeSubmitted => Some(FinalPrepareGpuDeferred::FrameBusy),
             RegistrationState::Available => None,
         };
-        for route in live {
+        for route in &live {
             let _ = self.with_viewer_context_state(route.context, |app| {
-                if app.page_turn_destination() != route
+                if app.page_turn_destination() != *route
                     || app.fullscreen_idx.is_none()
                     || !app.reading_flow.is_paged()
                     || app.spread_mode.is_split()
@@ -281,6 +555,20 @@ impl App {
                 );
             });
         }
+        // All contexts' final/comic registrations get first use of the common
+        // slot. Native requests must never jump ahead of another owner's final.
+        let candidates = std::mem::take(&mut self.speculative_gpu_frame.canonical);
+        for unit in candidates {
+            if !live.contains(&unit.destination) {
+                continue;
+            }
+            let _ = self.with_viewer_context_state(unit.destination.context, |app| {
+                app.finalize_native_prewarm(ctx, &unit, blocked);
+            });
+        }
+        self.speculative_gpu_frame
+            .native_diagnostics
+            .retain(|saved| live.contains(&saved.destination));
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "fs",
@@ -440,3 +728,7 @@ mod tests {
 #[cfg(test)]
 #[path = "final_prepare_budget/tests.rs"]
 mod scheduling_tests;
+
+#[cfg(test)]
+#[path = "final_prepare_budget/native_tests.rs"]
+mod native_tests;

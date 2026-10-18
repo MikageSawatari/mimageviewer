@@ -72791,6 +72791,8 @@ impl App {
 
     /// 指定 idx の回転角度を取得する（キャッシュ + DB）。
     pub(crate) fn get_rotation(&mut self, idx: usize) -> crate::rotation_db::Rotation {
+        #[cfg(test)]
+        crate::ui_fullscreen::canonical_demand::assert_ordinary_metadata_allowed();
         if let Some(&rot) = self.rotation_cache.get(&idx) {
             return rot;
         }

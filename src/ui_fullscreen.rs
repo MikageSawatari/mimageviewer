@@ -18,6 +18,7 @@
 //! v0.9.0 で native presenter に移行済。新規追加 / 移植時に「ui_fullscreen.rs を見て
 //! しまう」誤認を避けるため明示。
 
+pub(crate) mod canonical_demand;
 #[cfg(test)]
 mod native_focus_tests;
 mod page_turn;
@@ -19829,6 +19830,29 @@ impl App {
         idx: usize,
         requested: FinalUnitPosition,
     ) -> Option<NextFinalUnitDemand> {
+        Some(
+            match self.final_unit_composition_from_snapshot(idx, requested)? {
+                Some(composition) => NextFinalUnitDemand::Unit(
+                    composition
+                        .pages_in_reading_order()
+                        .iter()
+                        .copied()
+                        .filter(|page| is_spread_pairable_item(self.items.get(page.idx)))
+                        .collect(),
+                ),
+                None => NextFinalUnitDemand::Boundary,
+            },
+        )
+    }
+
+    /// The installed topology's complete composition, including singleton slots
+    /// and cover roles. Observation and Native demand must not reconstruct it
+    /// from a flattened list of page indices.
+    fn final_unit_composition_from_snapshot(
+        &self,
+        idx: usize,
+        requested: FinalUnitPosition,
+    ) -> Option<Option<SpreadDisplayComposition>> {
         let cache = &self.spread_display_units_cache;
         let token = cache.token.as_ref()?;
         if token.items_generation != self.items_generation
@@ -19889,37 +19913,23 @@ impl App {
         let placement = self.spread_singleton_display_endpoint_settings();
         let eligible = self.spread_complete_book_context_eligible()
             && self.spread_complete_page_permutation(nav);
-        let demand = match requested {
-            FinalUnitPosition::Current => resolve_spread_display_composition(
-                &units,
-                position,
-                self.spread_mode,
-                cover,
-                placement,
-                eligible,
-            )
-            .map(|composition| {
-                NextFinalUnitDemand::Unit(composition.pages_in_reading_order().to_vec())
-            })
-            .unwrap_or(NextFinalUnitDemand::Boundary),
-            FinalUnitPosition::Next => next_final_unit_demand(
-                &units,
-                position,
-                self.spread_mode,
-                cover,
-                placement,
-                eligible,
-            ),
+        let position = match requested {
+            FinalUnitPosition::Current => position,
+            FinalUnitPosition::Next => {
+                match position.checked_add(1).filter(|next| *next < units.len()) {
+                    Some(next) => next,
+                    None => return Some(None),
+                }
+            }
         };
-        Some(match demand {
-            NextFinalUnitDemand::Unit(pages) => NextFinalUnitDemand::Unit(
-                pages
-                    .into_iter()
-                    .filter(|page| is_spread_pairable_item(self.items.get(page.idx)))
-                    .collect(),
-            ),
-            boundary => boundary,
-        })
+        Some(resolve_spread_display_composition(
+            &units,
+            position,
+            self.spread_mode,
+            cover,
+            placement,
+            eligible,
+        ))
     }
 
     pub(crate) fn book_target_presentation_demand(
@@ -26731,6 +26741,7 @@ impl App {
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
                             full_rect, fs_idx, state.is_video, still_seek_geometry,
                         );
+                        self.record_next_canonical_native_demand(ui);
                         if key_action.close {
                             close_fs = true;
                         }
@@ -42018,6 +42029,8 @@ impl App {
     /// 余白カット用の中身 bbox を取得 (キャッシュ付き)。余白なし / pixels 未取得
     /// (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の pixels から検出する。
     pub(crate) fn cached_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
+        #[cfg(test)]
+        canonical_demand::assert_ordinary_metadata_allowed();
         if !self.is_raw_page(idx) {
             self.ensure_original_material_for_entry(
                 idx,
@@ -42410,16 +42423,17 @@ impl App {
             let Some(transform) = transform else {
                 return None;
             };
-            let needs_clip = zoom_pan.is_some()
-                || free_rotation_rad.abs() > TRANSFORM_EPSILON
-                || fit_bbox.is_some()
-                || !matches!(fit_mode, FullscreenFitMode::Page)
-                || fit_scale_limits.active();
-            let painter = if needs_clip {
-                ui.painter().with_clip_rect(full_rect)
-            } else {
-                ui.painter().clone()
-            };
+            let painter = ui
+                .painter()
+                .with_clip_rect(canonical_demand::single_clip_rect(
+                    ui.painter().clip_rect(),
+                    full_rect,
+                    zoom_pan,
+                    free_rotation_rad,
+                    content_bbox,
+                    fit_mode,
+                    fit_scale_limits,
+                ));
             let white = white_companion_override
                 .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
             let Some(paint_resource) = self.prepare_fs_paged_paint_payload(
@@ -48311,18 +48325,17 @@ impl App {
 
         // ズーム/パンが有効な場合は image_rect でクリップする
         // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
-        let painter = if zoom_pan.is_some()
-            || content_left.is_some()
-            || content_right.is_some()
-            || !matches!(fit_mode, FullscreenFitMode::Page)
-            || fit_scale_limits.active()
-            || self.fs_zoom_mode_engaged()
-        {
-            // ZipPla ズーム中は cover で image_rect 外へはみ出すので必ずクリップする。
-            ui.painter().with_clip_rect(image_rect)
-        } else {
-            ui.painter().clone()
-        };
+        let painter = ui
+            .painter()
+            .with_clip_rect(canonical_demand::spread_clip_rect(
+                ui.painter().clip_rect(),
+                image_rect,
+                zoom_pan,
+                [content_left, content_right],
+                fit_mode,
+                fit_scale_limits,
+                self.fs_zoom_mode_engaged(),
+            ));
         let left_allow_thumbnail = display_override.is_none()
             && !settling_with_renditions
             && (pass_through
@@ -48344,26 +48357,20 @@ impl App {
             let left_bbox = content_left.unwrap_or(full_bbox);
             let right_bbox = content_right.unwrap_or(full_bbox);
             let content_active = content_left.is_some() || content_right.is_some();
-            let geometry = spread_layout_geometry(
-                ls,
-                rs,
-                left_bbox,
-                right_bbox,
-                spread_should_match_page_heights(fit_mode),
-            );
             let specified = display_override
                 .and_then(|(left, _)| fit_input_specified_size(left.fit_input))
                 .unwrap_or(self.settings.fullscreen_specified_scale);
-            let Some(auto_fit) = resolve_paged_auto_fit(
+            let Some((geometry, auto_fit)) = canonical_demand::spread_auto_layout(
+                [ls, rs],
+                [content_left, content_right],
                 fit_mode,
                 specified,
-                image_rect,
-                geometry.fit_size,
-                spread_gap,
-                fit_scale_limits,
                 display_override
                     .and_then(|(left, _)| fit_input_specified_max_tenths(left.fit_input))
                     .unwrap_or(self.settings.fullscreen_specified_scale_max_tenths),
+                image_rect,
+                spread_gap,
+                fit_scale_limits,
             ) else {
                 return FsNavigatorTextureSources::default();
             };
@@ -48838,14 +48845,7 @@ impl App {
                     .unwrap_or(tex_size)
             }
         };
-        let display_size = match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(layout_size.y, layout_size.x)
-            }
-            _ => layout_size,
-        };
-        let page_rect = fit_display_size_in_rect(rect, display_size);
-        resolve_fs_transform_in_layout_rect(
+        canonical_demand::spread_page_transform(
             DisplayedImageTransformInput {
                 pixel_fit: RectPixelFit::Texels,
                 page_idx: idx,
@@ -48863,7 +48863,8 @@ impl App {
                 pixels_per_point,
                 placement,
             },
-            page_rect,
+            layout_size,
+            rect,
         )
     }
 

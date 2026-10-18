@@ -68,6 +68,12 @@ park は開始済み final-effect を保持し、新しい D3 開始を止める
 app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
 通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。
 
+D3-4(b) の Native 候補は既存 App 共通 frame owner に当該 pass の値だけを置く。
+最終 hook は通常の全 context final 登録を先に処理し、同じ canonical 入力を再照合してから
+非生成 query・全 pool の出力＋一時 allocation 会計・backing 再検査・直前 claim の順で進む。
+renderer lock を context 訪問／会計へ持ち越さず、通常 `fs_lanczos_cache`／submit／Native lease を使う。
+park／mount／fork の新しい非同期 owner は作らず、cold metadata 準備も追加しない。
+
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 
 `run_music_analysis` はデコード成功と取消なしを確認し、必要な `TimelineComplete` の送信後に

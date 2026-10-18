@@ -488,7 +488,7 @@ fn d3_4_live_sibling_excludes_legacy_prefetch_until_park() {
 }
 
 #[cfg(windows)]
-fn active_owner(app: &mut App, ctx: &egui::Context, window: u64) -> ViewerContextId {
+pub(super) fn active_owner(app: &mut App, ctx: &egui::Context, window: u64) -> ViewerContextId {
     let id = app.build_active_context_for_test(Some(window), DetachedSource::Image, |owner| {
         // Construct only this context's resident data. Creating another
         // AppTestEnv here would recursively acquire its process-wide test lock.
@@ -564,7 +564,7 @@ fn navigate(app: &mut App, ctx: &egui::Context) {
 }
 
 #[cfg(windows)]
-fn set_presentation(app: &mut App, ctx: &egui::Context, state: &str) {
+pub(super) fn set_presentation(app: &mut App, ctx: &egui::Context, state: &str) {
     frame(ctx, |ui, ctx| {
         navigate(app, ctx);
         if state != "offered" {

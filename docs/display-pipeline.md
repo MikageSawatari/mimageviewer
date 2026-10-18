@@ -3226,5 +3226,12 @@ ON/OFFによるgeometry変更では同じpresentation ownerの
 通常の表示昇格・同期takeover・共有handle採用はlookup前のserviceを維持する。
 最終passの通常live paged dispatchと現在runtime/session/binding、当該outer frameのoffer/curl/mandatory canonical活動で排他する。
 追加delta/freeは返却済みoutputに `append_texture_delta` で結合して既存配送へ渡す。
-ON/pagedのLegacyPrefetchも同じ非表示登録枠に含め、OFF/連結/Split/通常表示は維持する。Native prewarmは次chunk。
+ON/pagedのLegacyPrefetchも同じ非表示登録枠に含め、OFF/連結/Split/通常表示は維持する。
 詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.14.10/.11、§27.17.15を参照。
+
+D3-4(b) は通常 Single／Pair と canonical geometry を共有し、採用済み resident 入力だけから
+次 composition の Native 需要を frame 限りの値で求める。未配送 backing・cold 回転／auto bbox・
+未確定 fit basis は見送り、通常表示は従来の prepare を行う。同じ ROOT 最終 hook で全 context の
+final 登録を先に処理し、通常 Native key／plan と出力＋一時 allocation 会計を使って最大一件を生成する。
+出力は通常 `fs_lanczos_cache` に置き、最初の通常 prepare の hit と既存 D2 handoff を使う。
+held／canonical receipt／D4 時計へ後付けせず、parked snapshot や単なる mount から開始しない。
