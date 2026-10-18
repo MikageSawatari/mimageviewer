@@ -62988,6 +62988,7 @@ mod still_window_mode_key_tests {
             &[old_idx, old_idx + 1],
             old_idx,
             1,
+            false,
             "test_missing",
             ManualMediaNavigationLanding::NativeVideo,
         );
@@ -63042,6 +63043,7 @@ mod still_window_mode_key_tests {
             &[old_idx, next_idx],
             old_idx,
             1,
+            false,
             "test_provisional",
             ManualMediaNavigationLanding::NativeVideo,
         );
@@ -63248,6 +63250,7 @@ mod still_window_mode_key_tests {
                 &display_order,
                 old_idx,
                 1,
+                false,
                 source,
                 ManualMediaNavigationLanding::NativeVideo,
             );
@@ -86425,7 +86428,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(eof_result.missing, vec![(missing, missing_path.clone())]);
 
         let manual_candidates =
-            App::collect_manual_media_navigation_candidates(&app.items, &order, current, 1);
+            App::collect_manual_media_navigation_candidates(&app.items, &order, current, 1, false);
         let manual_result = App::resolve_media_navigation_candidates(
             &manual_candidates,
             1,
@@ -107256,3 +107259,6 @@ mod merge_adoption_tests;
 
 #[path = "tests/bookmark_build_adoption.rs"]
 mod bookmark_build_adoption_tests;
+
+#[path = "tests/manual_nav_wrap.rs"]
+mod manual_nav_wrap;

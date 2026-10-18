@@ -10220,6 +10220,11 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         ui.small("静止画・本の画像外、静止画サムネイル列の空欄、動画の映像外に共通で使います。透過画像内の黒 / 白 / 市松、音声画面、操作パネルは変わりません。");
     });
     ui.add_space(8.0);
+    ui.label(egui::RichText::new("前後移動").strong());
+    anchored(ui, state, "spread/manual-nav-wrap", |ui, state| {
+        draw_fullscreen_manual_nav_wrap_setting(ui, &mut state.settings.fullscreen_manual_nav_wrap);
+    });
+    ui.add_space(8.0);
     ui.label(egui::RichText::new("案内と状況表示").strong());
     anchored(ui, state, "spread/boundary-notice", |ui, state| {
         ui.checkbox(
@@ -10629,6 +10634,106 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         );
         ui.small(s.panorama_projection.description());
     });
+}
+
+pub(super) fn draw_fullscreen_manual_nav_wrap_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "先頭 / 末尾で反対側の端へ移る (ループ)");
+    ui.small(
+        "手動の前後移動を、現在の閲覧順の中で折り返します。別フォルダや別の本へは移りません。",
+    );
+    ui.small("一覧のカーソル移動、スライドショー、動画・音声の連続再生のループとは別の設定です。");
+}
+
+#[cfg(test)]
+mod fullscreen_manual_nav_wrap_setting_tests {
+    use super::*;
+
+    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+        let mut fonts_ready = false;
+        let mut enabled = enabled;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(400.0, 150.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.label(egui::RichText::new("前後移動").strong());
+                        draw_fullscreen_manual_nav_wrap_setting(ui, &mut enabled);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_snapshot_light_off() {
+        snapshot(
+            "fullscreen_manual_nav_wrap_setting_light_off",
+            crate::os_theme::ResolvedTheme::Light,
+            false,
+        );
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_snapshot_dark_on() {
+        snapshot(
+            "fullscreen_manual_nav_wrap_setting_dark_on",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+        );
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_toggle_preserves_other_policies() {
+        use egui_kittest::kittest::Queryable;
+
+        let settings = Settings::default();
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(400.0, 150.0))
+            .build_ui_state(
+                |root_ui, (settings, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_fullscreen_manual_nav_wrap_setting(
+                            ui,
+                            &mut settings.fullscreen_manual_nav_wrap,
+                        );
+                    });
+                },
+                (settings, false),
+            );
+        harness.run();
+        let original = harness.state().0.clone();
+        for enabled in [true, false] {
+            harness
+                .get_by_label("先頭 / 末尾で反対側の端へ移る (ループ)")
+                .click();
+            harness.run();
+            let current = &harness.state().0;
+            assert_eq!(current.fullscreen_manual_nav_wrap, enabled);
+            assert_eq!(current.grid_cursor_wrap, original.grid_cursor_wrap);
+            assert_eq!(current.slideshow_end_action, original.slideshow_end_action);
+            assert_eq!(current.video_loop_mode, original.video_loop_mode);
+            assert_eq!(
+                current.fullscreen_boundary_notice_visible,
+                original.fullscreen_boundary_notice_visible
+            );
+        }
+    }
 }
 
 pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {

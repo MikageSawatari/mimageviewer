@@ -814,6 +814,7 @@ impl App {
             &display_order,
             fs_idx,
             delta,
+            self.manual_nav_wrap_enabled(),
             "music_window_manual",
             crate::app::ManualMediaNavigationLanding::Fullscreen,
         );
@@ -2698,6 +2699,50 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_nav_wrap_music_hud_sends_finite_rotated_candidates_with_the_setting() {
+        for wrap in [false, true] {
+            for forward in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                app.items = (0..4)
+                    .map(|idx| {
+                        let path = app.tmp.path().join(format!("media-{idx}.mp3"));
+                        if idx == 2 {
+                            crate::grid_item::GridItem::Image(path)
+                        } else {
+                            crate::grid_item::GridItem::Audio(path)
+                        }
+                    })
+                    .collect();
+                app.visible_indices = vec![0, 1, 2, 3];
+                app.settings.fullscreen_manual_nav_wrap = wrap;
+                let current = if forward { 3 } else { 0 };
+                app.fullscreen_idx = Some(current);
+                let ctx = egui::Context::default();
+                let (candidates, count, source) =
+                    app.capture_manual_media_request_for_test(|app| {
+                        app.music_navigate_file(&ctx, current, if forward { 1 } else { -1 });
+                    });
+                let expected = if !wrap {
+                    vec![]
+                } else if forward {
+                    vec![0, 1, 2]
+                } else {
+                    vec![3, 2, 1]
+                };
+                assert_eq!(candidates, expected);
+                assert_eq!(count, 1);
+                assert_eq!(source, "music_window_manual");
+                assert!(!candidates.contains(&current));
+                assert_eq!(
+                    app.fullscreen_idx,
+                    Some(current),
+                    "the request waits for resolver completion"
+                );
+            }
+        }
+    }
+
     #[test]
     fn section1373_music_bookmark_handlers_share_video_write_admission() {
         use crate::app::book_append_producer_tests::{

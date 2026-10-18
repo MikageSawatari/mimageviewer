@@ -1722,6 +1722,16 @@ impl App {
                         let nav = self.get_nav_indices();
                         let target = match self.spread_page_nav_for_indices(&nav, intent.idx, dir) {
                             crate::ui_fullscreen::FsPageNav::Target(target) => Some(target),
+                            crate::ui_fullscreen::FsPageNav::Split(step) => {
+                                // A hidden source has no readable half. When the
+                                // next step is its other half, skip the source
+                                // rather than attempting that half again.
+                                if step.source_idx != intent.idx {
+                                    Some(step.source_idx)
+                                } else {
+                                    crate::ui_helpers::adjacent_idx_in_order(&nav, intent.idx, dir)
+                                }
+                            }
                             crate::ui_fullscreen::FsPageNav::Delta(delta) => nav
                                 .iter()
                                 .position(|idx| *idx == intent.idx)
@@ -1804,3 +1814,7 @@ impl App {
 #[cfg(test)]
 #[path = "book_composition_permission_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/manual_nav_wrap_book.rs"]
+mod manual_nav_wrap_book;

@@ -18128,6 +18128,13 @@ impl FsFrameState {
 }
 
 /// フルスクリーンのページ移動結果。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FsWrapTarget {
+    pub(crate) idx: usize,
+    pub(crate) slice: Option<crate::page_split::PageSlice>,
+    pub(crate) forward: bool,
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FsPageNav {
     #[default]
@@ -18136,6 +18143,8 @@ pub(crate) enum FsPageNav {
     Delta(i32),
     /// 見開き表示で解決済みの次の表示単位先頭。
     Target(usize),
+    /// Manual end-to-end jump, excluded from adjacent page-turn animation.
+    Wrap(FsWrapTarget),
     /// 見開き表示の先頭 / 末尾に、その入力 1 回で到達した。
     Boundary { at_end: bool },
     /// 横長分割での移動先。**同じページの反対側も、別ページも同じ変種で表す**
@@ -19887,6 +19896,7 @@ impl App {
         steps: &[crate::page_split::PresentationStep],
         fs_idx: usize,
         dir: i32,
+        wrap: bool,
     ) -> FsPageNav {
         let at = steps
             .iter()
@@ -19901,6 +19911,18 @@ impl App {
             crate::page_split::step_backward(steps, at)
         };
         match moved {
+            crate::page_split::StepMove::AtEnd if wrap && steps.len() > 1 => {
+                let step = if dir > 0 {
+                    steps[0]
+                } else {
+                    steps[steps.len() - 1]
+                };
+                FsPageNav::Wrap(FsWrapTarget {
+                    idx: step.source_idx,
+                    slice: Some(step.slice),
+                    forward: dir > 0,
+                })
+            }
             crate::page_split::StepMove::AtEnd => FsPageNav::Boundary { at_end: dir > 0 },
             crate::page_split::StepMove::WithinPage { to }
             | crate::page_split::StepMove::ToAnotherPage { to } => FsPageNav::Split(to),
@@ -31232,7 +31254,16 @@ impl App {
         } else {
             self.get_nav_indices()
         };
-        self.spread_page_nav_for_indices(&nav, fs_idx, base_delta)
+        self.spread_page_nav_for_indices_wrapping(
+            &nav,
+            fs_idx,
+            base_delta,
+            self.manual_nav_wrap_enabled(),
+        )
+    }
+
+    pub(crate) fn manual_nav_wrap_enabled(&self) -> bool {
+        self.settings.fullscreen_manual_nav_wrap
     }
 
     pub(crate) fn spread_page_nav_for_indices(
@@ -31241,12 +31272,22 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) -> FsPageNav {
+        self.spread_page_nav_for_indices_wrapping(nav, fs_idx, base_delta, false)
+    }
+
+    fn spread_page_nav_for_indices_wrapping(
+        &mut self,
+        nav: &[usize],
+        fs_idx: usize,
+        base_delta: i32,
+        wrap: bool,
+    ) -> FsPageNav {
         let dir = base_delta.signum();
         if dir == 0 {
             return FsPageNav::None;
         }
         if let Some(steps) = self.build_presentation_steps_for_nav(nav) {
-            return self.split_page_nav(&steps, fs_idx, dir);
+            return self.split_page_nav(&steps, fs_idx, dir, wrap);
         }
         if !self.spread_mode.is_spread() {
             return FsPageNav::Delta(base_delta);
@@ -31258,6 +31299,17 @@ impl App {
         let target_unit_pos = unit_pos as i32 + dir;
         if (0..units.len() as i32).contains(&target_unit_pos) {
             FsPageNav::Target(units[target_unit_pos as usize].anchor_idx())
+        } else if wrap && units.len() > 1 {
+            let unit = if dir > 0 {
+                &units[0]
+            } else {
+                &units[units.len() - 1]
+            };
+            FsPageNav::Wrap(FsWrapTarget {
+                idx: unit.anchor_idx(),
+                slice: None,
+                forward: dir > 0,
+            })
         } else {
             FsPageNav::Boundary { at_end: dir > 0 }
         }
@@ -31344,16 +31396,17 @@ impl App {
             if let Some((target, anchor)) = self.compute_spread_offset_nudge(fs_idx, dir) {
                 self.page_turn_defer_spread_shift(ctx, target, operation, anchor);
             }
-        } else if let Some(target) = crate::ui_helpers::adjacent_page_navigation_idx(
+        } else if let Some(target) = crate::ui_helpers::adjacent_page_navigation_idx_wrapping(
             &self.items,
             self.current_reader_order(),
             fs_idx,
             dir.signum(),
             false,
+            self.manual_nav_wrap_enabled(),
         ) {
             self.page_turn_defer_navigation(
                 ctx,
-                target,
+                target.idx,
                 None,
                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                 operation,
@@ -39556,7 +39609,7 @@ impl App {
             FsPageNav::Delta(delta) => {
                 crate::ui_helpers::adjacent_idx_in_order(&image_indices, cur, delta)
             }
-            FsPageNav::None | FsPageNav::Boundary { .. } => None,
+            FsPageNav::None | FsPageNav::Boundary { .. } | FsPageNav::Wrap(_) => None,
         };
         if let Some(idx) = next_idx {
             // フォルダ内の次の静止画系アイテムへ前進。
@@ -39909,9 +39962,19 @@ impl App {
     }
 
     fn admit_book_page_navigation(&mut self, ctx: &egui::Context, target: usize) -> Option<usize> {
+        self.admit_book_page_navigation_with_purpose(ctx, target, None)
+    }
+
+    fn admit_book_page_navigation_with_purpose(
+        &mut self,
+        ctx: &egui::Context,
+        target: usize,
+        purpose: Option<crate::app::book_composition_permission::BookTargetPurpose>,
+    ) -> Option<usize> {
         let target = self.poll_and_remap_book_target(ctx, target)?;
         let contract = crate::fs_page_load_scheduler::FsPageLoadContract::Sequential;
-        let purpose = self.book_target_navigation_purpose(target, contract);
+        let purpose =
+            purpose.unwrap_or_else(|| self.book_target_navigation_purpose(target, contract));
         let deferred = if self
             .fullscreen_idx
             .is_some_and(|current| self.continuous_reading_active_for_idx(current))
@@ -41026,6 +41089,11 @@ impl App {
                 ))
             } else {
                 match page_nav {
+                    FsPageNav::Wrap(target) => Some((
+                        target.idx,
+                        target.slice,
+                        crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    )),
                     FsPageNav::Target(target) => Some((
                         target,
                         None,
@@ -41038,23 +41106,25 @@ impl App {
                     )),
                     FsPageNav::Delta(delta) if delta != 0 => {
                         let target = if self.continuous_reading_active_for_idx(fs_idx) {
-                            crate::ui_helpers::adjacent_idx_in_order(
+                            crate::ui_helpers::adjacent_idx_in_order_wrapping(
                                 &self.get_still_image_indices(),
                                 fs_idx,
                                 delta.signum(),
+                                self.manual_nav_wrap_enabled(),
                             )
                         } else {
-                            crate::ui_helpers::adjacent_page_navigation_idx(
+                            crate::ui_helpers::adjacent_page_navigation_idx_wrapping(
                                 &self.items,
                                 self.current_reader_order(),
                                 fs_idx,
                                 delta.signum(),
                                 false,
+                                self.manual_nav_wrap_enabled(),
                             )
                         };
                         target.map(|target| {
                             (
-                                target,
+                                target.idx,
                                 None,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                             )
@@ -41223,6 +41293,9 @@ impl App {
             // against the actor's latest prepared order. Movement to the other half of the same
             // split image remains an in-page operation and stays on the existing path below.
             let collection_delta = match page_nav {
+                FsPageNav::Wrap(target) if target.idx != fs_idx => {
+                    Some(if target.forward { 1 } else { -1 })
+                }
                 FsPageNav::Delta(delta) => Some(delta),
                 FsPageNav::Target(target) => navigable_delta_between(
                     &self.items,
@@ -41237,7 +41310,7 @@ impl App {
                     fs_idx,
                     step.source_idx,
                 ),
-                FsPageNav::None | FsPageNav::Split(_) => None,
+                FsPageNav::None | FsPageNav::Split(_) | FsPageNav::Wrap(_) => None,
             };
             if jump_to.is_none()
                 && let Some(delta) = collection_delta
@@ -41246,6 +41319,7 @@ impl App {
                     fs_idx,
                     delta,
                     crate::app::ManualMediaNavigationLanding::Fullscreen,
+                    self.manual_nav_wrap_enabled(),
                 )
             {
                 self.page_turn_excluded_navigation_with_operation(
@@ -41283,6 +41357,78 @@ impl App {
                         FsNavigationPerfSpan::LandTarget,
                         land_perf_t0,
                     );
+                }
+            } else if let FsPageNav::Wrap(target) = page_nav {
+                let current_is_media = matches!(
+                    self.items.get(fs_idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                );
+                if current_is_media {
+                    let display_order = self.current_reader_order().to_vec();
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "navigation_wrap",
+                        operation,
+                    );
+                    self.start_manual_media_navigation(
+                        ctx,
+                        &display_order,
+                        fs_idx,
+                        if target.forward { 1 } else { -1 },
+                        true,
+                        "media_window_manual",
+                        crate::app::ManualMediaNavigationLanding::Fullscreen,
+                    );
+                } else if target.idx == fs_idx {
+                    if let Some(slice) = target.slice {
+                        self.page_turn_excluded_navigation_with_operation(
+                            ctx,
+                            "navigation_wrap",
+                            operation,
+                        );
+                        self.set_fullscreen_page_slice_for_display_unit(slice);
+                        self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
+                        self.fs_boundary_hint = None;
+                        ctx.request_repaint();
+                    }
+                } else if !self.fs_navigation_sequence_blocks_new_target()
+                    && let Some(new_idx) = self.admit_book_page_navigation_with_purpose(
+                        ctx,
+                        target.idx,
+                        Some(if target.forward {
+                            crate::app::book_composition_permission::BookTargetPurpose::Next
+                        } else {
+                            crate::app::book_composition_permission::BookTargetPurpose::Previous
+                        }),
+                    )
+                {
+                    let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
+                    let accept_rendition =
+                        self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, Some(new_idx));
+                    if self.begin_fs_page_navigation_sequence(
+                        ctx,
+                        fs_idx,
+                        new_idx,
+                        accept_rendition,
+                    ) {
+                        self.page_turn_excluded_navigation_with_operation(
+                            ctx,
+                            "navigation_wrap",
+                            operation,
+                        );
+                        self.land_still_page_navigation_target(
+                            ctx,
+                            fs_idx,
+                            new_idx,
+                            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            &mut fs_navigation_perf,
+                        );
+                        if self.fullscreen_idx == Some(new_idx)
+                            && let Some(slice) = target.slice
+                        {
+                            self.set_fullscreen_page_slice_for_display_unit(slice);
+                        }
+                    }
                 }
             } else if let FsPageNav::Split(step) = page_nav {
                 if step.source_idx == fs_idx {
@@ -41368,6 +41514,7 @@ impl App {
                             &display_order,
                             fs_idx,
                             delta,
+                            self.manual_nav_wrap_enabled(),
                             "media_window_manual",
                             crate::app::ManualMediaNavigationLanding::Fullscreen,
                         );
@@ -41478,24 +41625,40 @@ impl App {
                         &display_order,
                         fs_idx,
                         nav_delta,
+                        self.manual_nav_wrap_enabled(),
                         "media_window_manual",
                         crate::app::ManualMediaNavigationLanding::Fullscreen,
                     );
-                } else if let Some(new_idx) = if self.continuous_reading_active_for_idx(fs_idx) {
+                } else if let Some(step) = if self.continuous_reading_active_for_idx(fs_idx) {
                     let nav = self.get_still_image_indices();
-                    crate::ui_helpers::adjacent_idx_in_order(&nav, fs_idx, nav_delta.signum())
+                    crate::ui_helpers::adjacent_idx_in_order_wrapping(
+                        &nav,
+                        fs_idx,
+                        nav_delta.signum(),
+                        self.manual_nav_wrap_enabled(),
+                    )
                 } else {
-                    crate::ui_helpers::adjacent_page_navigation_idx(
+                    crate::ui_helpers::adjacent_page_navigation_idx_wrapping(
                         &self.items,
                         &display_order,
                         fs_idx,
                         nav_delta.signum(),
                         false,
+                        self.manual_nav_wrap_enabled(),
                     )
                 } {
+                    let new_idx = step.idx;
                     let moved = new_idx != fs_idx;
                     if (!moved || !self.fs_navigation_sequence_blocks_new_target())
-                        && let Some(new_idx) = self.admit_book_page_navigation(ctx, new_idx)
+                        && let Some(new_idx) = self.admit_book_page_navigation_with_purpose(
+                            ctx,
+                            new_idx,
+                            step.wrapped.then_some(if nav_delta > 0 {
+                                crate::app::book_composition_permission::BookTargetPurpose::Next
+                            } else {
+                                crate::app::book_composition_permission::BookTargetPurpose::Previous
+                            }),
+                        )
                     {
                         let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
                         let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
@@ -41519,7 +41682,13 @@ impl App {
                             sequence_started
                         } {
                             if self.settings.page_turn_animation_enabled {
-                                if !moved {
+                                if step.wrapped {
+                                    self.page_turn_excluded_navigation_with_operation(
+                                        ctx,
+                                        "navigation_wrap",
+                                        operation,
+                                    );
+                                } else if !moved {
                                     self.page_turn_excluded_navigation_with_operation(
                                         ctx,
                                         "navigation_no_movement",
@@ -93486,3 +93655,7 @@ mod music_overflow_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_fullscreen/manual_nav_wrap_tests.rs"]
+mod manual_nav_wrap_tests;
