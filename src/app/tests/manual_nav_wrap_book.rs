@@ -51,7 +51,7 @@ fn fixture(
     let ctx = egui::Context::default();
     crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
     for idx in 0..4 {
-        let dims = if mode == SpreadMode::Single || portrait == Some(idx) {
+        let dims = if mode == SpreadMode::Single || mode.is_spread() || portrait == Some(idx) {
             [1000, 2000]
         } else {
             [2000, 1000]
@@ -284,5 +284,376 @@ fn manual_nav_wrap_all_hidden_continuation_stops_at_source_edge_without_rewrappi
             OpenPermission::Idle
         ));
         owner.shutdown_and_join();
+    }
+}
+
+fn assert_unit_checking(env: &mut App, idx: usize, purpose: BookTargetPurpose) {
+    let demand = env.book_target_presentation_demand(idx);
+    let OpenPermission::Checking { intent, candidates } = &env.book_composition_permission.open
+    else {
+        panic!("expected pending permission for unit at {idx}");
+    };
+    assert_eq!(intent.idx, idx);
+    assert_eq!(intent.purpose, purpose);
+    assert!(matches!(
+        intent.route,
+        BookTargetRoute::FullscreenNavigation
+    ));
+    assert!(candidates.iter().map(OpenCandidate::occurrence).eq(demand));
+}
+
+fn assert_hidden_wrap_returns_to_origin_boundary(
+    mode: SpreadMode,
+    current: usize,
+    allowed: &[usize],
+    forward: bool,
+    slice: PageSlice,
+) {
+    let hidden = (0..4)
+        .filter(|idx| !allowed.contains(idx))
+        .map(|idx| idx as u32)
+        .collect::<Vec<_>>();
+    let (mut env, ctx, owner) = fixture(mode, &hidden, None);
+    env.fullscreen_idx = Some(current);
+    env.selected = Some(current);
+    env.fullscreen_page_slice = slice;
+    let purpose = if forward {
+        BookTargetPurpose::Next
+    } else {
+        BookTargetPurpose::Previous
+    };
+    navigate(&mut env, &ctx, current, if forward { 1 } else { -1 });
+    let mut finished = false;
+    for _ in 0..8 {
+        let OpenPermission::Checking { intent, .. } = &env.book_composition_permission.open else {
+            panic!("hidden traversal must await its next candidate or finish at the boundary");
+        };
+        let target = intent.idx;
+        assert_unit_checking(&mut env, target, purpose);
+        // Keep each completion outside the owner for one poll. Neither the
+        // original wrap nor a Hidden skip may move the shown unit while Checking.
+        let held = hold_current_completion(&mut env);
+        run_pass(&ctx, |ctx| env.poll_book_presentation_permission(ctx));
+        assert_unit_checking(&mut env, target, purpose);
+        assert_eq!(env.fullscreen_idx, Some(current));
+        assert_eq!(env.fullscreen_page_slice, slice);
+        for (deliver, reply) in held {
+            deliver.send(reply).unwrap();
+        }
+        run_pass(&ctx, |ctx| env.poll_book_presentation_permission(ctx));
+        assert_eq!(env.fullscreen_idx, Some(current));
+        assert_eq!(env.selected, Some(current));
+        assert_eq!(env.fullscreen_page_slice, slice);
+        if let Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) =
+            env.fs_boundary_hint
+        {
+            assert_eq!(at_end, forward);
+            assert!(matches!(
+                env.book_composition_permission.open,
+                OpenPermission::Idle
+            ));
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "no other readable unit must end at the input boundary"
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn manual_nav_wrap_hidden_single_page_return_to_origin_is_boundary_after_checking() {
+    for forward in [false, true] {
+        let current = if forward { 3 } else { 0 };
+        assert_hidden_wrap_returns_to_origin_boundary(
+            SpreadMode::Single,
+            current,
+            &[current],
+            forward,
+            PageSlice::Full,
+        );
+    }
+}
+
+#[test]
+fn manual_nav_wrap_hidden_spread_return_to_origin_unit_is_boundary_after_checking() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        for forward in [false, true] {
+            let origin = if forward { [2, 3] } else { [0, 1] };
+            // The shown anchor may be either real page in the same unit.
+            for current in origin {
+                assert_hidden_wrap_returns_to_origin_boundary(
+                    mode,
+                    current,
+                    &origin,
+                    forward,
+                    PageSlice::Full,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn manual_nav_wrap_hidden_split_return_to_origin_source_is_boundary_after_checking() {
+    for mode in [SpreadMode::SplitLtr, SpreadMode::SplitRtl] {
+        for forward in [false, true] {
+            let current = if forward { 3 } else { 0 };
+            let slice = match (mode, forward) {
+                (SpreadMode::SplitLtr, true) | (SpreadMode::SplitRtl, false) => PageSlice::Right,
+                _ => PageSlice::Left,
+            };
+            assert_hidden_wrap_returns_to_origin_boundary(
+                mode,
+                current,
+                &[current],
+                forward,
+                slice,
+            );
+        }
+    }
+}
+
+#[test]
+fn manual_nav_wrap_hidden_spread_origin_survivor_is_boundary_after_checking() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        for forward in [false, true] {
+            let current = if forward { 2 } else { 0 };
+            // The source anchor is now Hidden, but its permitted partner still
+            // belongs to the unit shown when the manual wrap started.
+            assert_hidden_wrap_returns_to_origin_boundary(
+                mode,
+                current,
+                &[current + 1],
+                forward,
+                PageSlice::Full,
+            );
+        }
+    }
+}
+
+#[test]
+fn manual_nav_wrap_nonwrapped_same_unit_permission_keeps_navigation() {
+    let (mut env, ctx, owner) = fixture(SpreadMode::Ltr, &[], None);
+    env.fullscreen_idx = Some(1);
+    env.selected = Some(1);
+    run_pass(&ctx, |ctx| {
+        env.handle_fs_navigation(
+            ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            FsPageNav::Target(0),
+            None,
+            1,
+        );
+    });
+    assert_unit_checking(&mut env, 0, BookTargetPurpose::Previous);
+    let OpenPermission::Checking { intent, .. } = &env.book_composition_permission.open else {
+        unreachable!();
+    };
+    assert!(
+        intent.navigation_origin.is_empty(),
+        "ordinary admission must not own a wrap origin"
+    );
+    complete_current(&mut env, &ctx);
+    assert_eq!(env.fullscreen_idx, Some(0));
+    assert!(env.fs_boundary_hint.is_none());
+    owner.shutdown_and_join();
+}
+
+fn hide_every_page_except(env: &mut App, current: usize) {
+    let GridItem::PdfPage { pdf_path, .. } = &env.items[current] else {
+        unreachable!();
+    };
+    let scope = crate::book_scope::BookScopeKey::document(pdf_path).unwrap();
+    let mut record =
+        BookComposition::new(ReadingDirection::Ltr, (0..4).map(document_page).collect());
+    record.hidden_pages = (0..4)
+        .filter(|idx| *idx != current as u32)
+        .map(document_page)
+        .collect();
+    env.book_composition_service
+        .as_ref()
+        .unwrap()
+        .save(scope, PageDomain::Document, record)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+}
+
+fn finish_origin_recheck(env: &mut App, ctx: &egui::Context, current: usize, forward: bool) {
+    let purpose = if forward {
+        BookTargetPurpose::Next
+    } else {
+        BookTargetPurpose::Previous
+    };
+    for target in if forward {
+        vec![0, 1, 2, 3]
+    } else {
+        vec![3, 2, 1, 0]
+    } {
+        let OpenPermission::Checking { intent, .. } = &env.book_composition_permission.open else {
+            panic!("stale continuation must recheck source {target}");
+        };
+        assert_eq!(intent.idx, target);
+        assert_eq!(intent.purpose, purpose);
+        assert_eq!(intent.navigation_origin.len(), 1);
+        complete_current(env, ctx);
+        assert_eq!(env.fullscreen_idx, Some(current));
+        assert_eq!(env.fullscreen_page_slice, PageSlice::Full);
+    }
+    assert!(
+        matches!(env.fs_boundary_hint, Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == forward)
+    );
+    assert!(matches!(
+        env.book_composition_permission.open,
+        OpenPermission::Idle
+    ));
+}
+
+#[test]
+fn manual_nav_wrap_origin_survives_stale_permission_recheck() {
+    for flow in [
+        crate::settings::ReadingFlow::Paged,
+        crate::settings::ReadingFlow::Vertical,
+    ] {
+        for forward in [false, true] {
+            let current = if forward { 3 } else { 0 };
+            let (mut env, ctx, owner) = fixture(SpreadMode::Single, &[], None);
+            env.fullscreen_idx = Some(current);
+            env.selected = Some(current);
+            env.reading_flow = flow;
+            navigate(&mut env, &ctx, current, if forward { 1 } else { -1 });
+            // Stop precisely between qualification and its internal callback,
+            // then invalidate that proof through the real composition service.
+            let replies = hold_current_completion(&mut env);
+            let OpenPermission::Checking {
+                intent,
+                mut candidates,
+            } = std::mem::take(&mut env.book_composition_permission.open)
+            else {
+                unreachable!();
+            };
+            for (candidate, (_, reply)) in candidates.iter_mut().zip(replies) {
+                let permission = reply.status.unwrap();
+                assert!(matches!(permission, CandidatePermission::Allowed(_)));
+                candidate.state = OpenCandidateState::Complete(permission);
+            }
+            env.publish_qualified_book_candidates(&candidates);
+            env.book_composition_permission.open = OpenPermission::Resuming {
+                intent: intent.clone(),
+                candidates,
+            };
+            hide_every_page_except(&mut env, current);
+            run_pass(&ctx, |ctx| env.resume_qualified_book_target(ctx, &intent));
+            finish_origin_recheck(&mut env, &ctx, current, forward);
+            owner.shutdown_and_join();
+        }
+    }
+}
+
+#[test]
+fn manual_nav_wrap_continuous_inline_permission_keeps_origin_until_commit() {
+    use crate::app::book_composition_runtime::{BookCompositionSource, ViewerBookComposition};
+    use crate::fs_page_load_scheduler::FsPageLoadContract;
+    for flow in [
+        crate::settings::ReadingFlow::Vertical,
+        crate::settings::ReadingFlow::Horizontal,
+    ] {
+        for forward in [false, true] {
+            let current = if forward { 3 } else { 0 };
+            let target = if forward { 0 } else { 3 };
+            let purpose = if forward {
+                BookTargetPurpose::Next
+            } else {
+                BookTargetPurpose::Previous
+            };
+            let inferred = if forward {
+                BookTargetPurpose::Previous
+            } else {
+                BookTargetPurpose::Next
+            };
+            let (mut env, _ctx, owner) = fixture(SpreadMode::Single, &[], None);
+            let GridItem::PdfPage { pdf_path: root, .. } = env.items[0].clone() else {
+                unreachable!();
+            };
+            let scope = crate::book_scope::BookScopeKey::document(&root).unwrap();
+            let prepared = env
+                .book_composition_service
+                .as_ref()
+                .unwrap()
+                .prepare(scope.clone(), PageDomain::Document)
+                .recv_timeout(WAIT)
+                .unwrap();
+            let record = prepared.status.unwrap().map(Arc::new);
+            let rows = crate::app::book_materialization::project_document_composition(
+                &root,
+                4,
+                (env.items.clone(), vec![None; 4]),
+                env.settings.file_type_visibility.clone(),
+                prepared.token,
+                record.as_ref().map(|record| &record.composition),
+            )
+            .unwrap();
+            env.page_identity_index = rows.page_identities;
+            env.book_composition = ViewerBookComposition::Accepted {
+                scope,
+                token: prepared.token,
+                record,
+                layout: rows.composition,
+                source: BookCompositionSource::Document {
+                    count: 4,
+                    metadata: None,
+                    physical_source: root,
+                    read_target: None,
+                },
+                generation: env.items_generation,
+                cause: Default::default(),
+            };
+            env.fullscreen_idx = Some(current);
+            env.reading_flow = flow;
+            let origin = env.capture_book_navigation_origin();
+            assert!(!env.defer_book_composition_wrapped_navigation(
+                target,
+                FsPageLoadContract::Sequential,
+                purpose,
+                origin
+            ));
+            assert!(
+                matches!(&env.book_composition_permission.open, OpenPermission::Resuming { intent, .. } if intent.navigation_origin.len() == 1 && intent.route == BookTargetRoute::ContinuousSeek)
+            );
+            // The existing seek commit consumes this proof, without starting a
+            // new episode or changing the ordinary empty-origin path.
+            assert!(!env.defer_book_composition_continuous_seek(
+                target,
+                FsPageLoadContract::Sequential,
+                inferred
+            ));
+            assert!(matches!(
+                env.book_composition_permission.open,
+                OpenPermission::Idle
+            ));
+            let origin = env.capture_book_navigation_origin();
+            assert!(!env.defer_book_composition_wrapped_navigation(
+                target,
+                FsPageLoadContract::Sequential,
+                purpose,
+                origin
+            ));
+            hide_every_page_except(&mut env, current);
+            assert!(env.defer_book_composition_continuous_seek(
+                target,
+                FsPageLoadContract::Sequential,
+                inferred
+            ));
+            finish_origin_recheck(&mut env, &_ctx, current, forward);
+            owner.shutdown_and_join();
+        }
     }
 }

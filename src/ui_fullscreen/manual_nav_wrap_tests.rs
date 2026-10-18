@@ -96,6 +96,32 @@ fn manual_nav_wrap_split_ltr_rtl_land_on_reading_order_slices() {
 }
 
 #[test]
+fn manual_nav_wrap_origin_excludes_final_cover_supplement() {
+    let ctx = egui::Context::default();
+    let mut env = ready_app(&ctx, SpreadMode::LtrCover);
+    env.current_folder = Some("c:/page-turn".into());
+    env.settings.final_cover_spread_enabled = true;
+    let nav = env.get_nav_indices();
+    let units = env.build_spread_display_units_for_nav(&nav);
+    let last = units.last().unwrap().anchor_idx();
+    env.fullscreen_idx = Some(last);
+    let demand = env.book_target_presentation_demand(last);
+    assert!(
+        demand
+            .iter()
+            .any(|page| page.role == crate::book_composition::PresentationRole::Supplement)
+    );
+    let origin = env.capture_book_navigation_origin();
+    assert_eq!(
+        origin
+            .iter()
+            .map(|position| position.page)
+            .collect::<Vec<_>>(),
+        vec![last]
+    );
+}
+
+#[test]
 fn manual_nav_wrap_single_unit_keeps_boundary_even_when_notice_is_hidden() {
     for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::SplitRtl] {
         for forward in [false, true] {

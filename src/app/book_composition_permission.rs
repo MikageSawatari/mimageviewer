@@ -47,6 +47,9 @@ struct OpenIntent {
     contract: FsPageLoadContract,
     purpose: BookTargetPurpose,
     route: BookTargetRoute,
+    // Only a manual endpoint wrap owns an origin. Logical identities survive
+    // projection remaps while Hidden skips keep this same permission intent.
+    navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
 }
 impl OpenIntent {
     fn presentation_demand(
@@ -1158,6 +1161,7 @@ impl App {
             contract,
             purpose,
             BookTargetRoute::FullscreenOpen(metadata_boundary),
+            Vec::new(),
         )
     }
     pub(crate) fn defer_book_composition_navigation_open(
@@ -1175,8 +1179,63 @@ impl App {
             contract,
             purpose,
             BookTargetRoute::FullscreenNavigation,
+            Vec::new(),
         )
     }
+    pub(crate) fn capture_book_navigation_origin(
+        &mut self,
+    ) -> Vec<crate::book_resume_db::ReadingPosition> {
+        self.fullscreen_idx
+            .map(|current| {
+                self.book_target_presentation_demand(current)
+                    .into_iter()
+                    .filter(|page| page.role == PresentationRole::Navigation)
+                    .filter_map(|page| {
+                        let identity = self
+                            .source_composition_candidate(page.item_index)
+                            .map(|candidate| candidate.identity)
+                            .or_else(|| {
+                                crate::book_resume_db::PageIdentity::for_item(
+                                    self.items.get(page.item_index)?,
+                                    None,
+                                )
+                            })?;
+                        Some(crate::book_resume_db::ReadingPosition {
+                            page: page.item_index,
+                            identity: Some(identity),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn defer_book_composition_wrapped_navigation(
+        &mut self,
+        idx: usize,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
+    ) -> bool {
+        let route = if self
+            .fullscreen_idx
+            .is_some_and(|current| self.continuous_reading_active_for_idx(current))
+        {
+            BookTargetRoute::ContinuousSeek
+        } else {
+            BookTargetRoute::FullscreenNavigation
+        };
+        self.defer_book_composition_target_route(
+            idx,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+            contract,
+            purpose,
+            route,
+            navigation_origin,
+        )
+    }
+
     pub(crate) fn defer_book_composition_slideshow_open(
         &mut self,
         idx: usize,
@@ -1190,6 +1249,7 @@ impl App {
             FsPageLoadContract::Sequential,
             purpose,
             BookTargetRoute::Slideshow { slice },
+            Vec::new(),
         )
     }
     pub(crate) fn defer_book_composition_slideshow_slice(
@@ -1229,6 +1289,7 @@ impl App {
             contract,
             purpose,
             BookTargetRoute::ContinuousSeek,
+            Vec::new(),
         )
     }
     pub(crate) fn defer_book_composition_zip_dfs_open(
@@ -1243,6 +1304,7 @@ impl App {
             FsPageLoadContract::Sequential,
             BookTargetPurpose::FirstInBook,
             BookTargetRoute::ZipDfs(continuation),
+            Vec::new(),
         )
     }
     pub(crate) fn defer_book_composition_deferred_open(
@@ -1258,6 +1320,7 @@ impl App {
             FsPageLoadContract::Sequential,
             purpose,
             BookTargetRoute::DeferredBook(Box::new(deferred)),
+            Vec::new(),
         )
     }
     /// Qualify a new episode from the source manifest already validated by the
@@ -1440,6 +1503,7 @@ impl App {
         contract: FsPageLoadContract,
         purpose: BookTargetPurpose,
         route: BookTargetRoute,
+        navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
     ) -> bool {
         let context_id = self.spread_shift_context_id().serial();
         self.book_composition_permission
@@ -1464,13 +1528,23 @@ impl App {
             contract,
             purpose,
             route: route.clone(),
+            navigation_origin,
         };
         // Internal common-open callbacks retain their typed continuation on a stale-proof
         // recheck. External opens can supersede Checking; Resuming marks this callback.
         let captured = match &self.book_composition_permission.open {
             OpenPermission::Resuming {
                 intent: accepted, ..
-            } if matches!(&route, BookTargetRoute::FullscreenOpen(_)) => Some(accepted),
+            } if matches!(&route, BookTargetRoute::FullscreenOpen(_))
+                || (!accepted.navigation_origin.is_empty()
+                    && route == accepted.route
+                    && matches!(
+                        &route,
+                        BookTargetRoute::FullscreenNavigation | BookTargetRoute::ContinuousSeek
+                    )) =>
+            {
+                Some(accepted)
+            }
             OpenPermission::Checking {
                 intent: accepted, ..
             }
@@ -1535,7 +1609,8 @@ impl App {
         if let Some(candidates) = self.qualify_book_unit_from_current_projection(&intent, &demand) {
             self.publish_qualified_book_candidates(&candidates);
             self.book_composition_permission.open = match intent.route {
-                BookTargetRoute::FullscreenOpen(_) | BookTargetRoute::ContinuousSeek => {
+                BookTargetRoute::FullscreenOpen(_) => OpenPermission::Idle,
+                BookTargetRoute::ContinuousSeek if intent.navigation_origin.is_empty() => {
                     OpenPermission::Idle
                 }
                 _ => OpenPermission::Resuming { intent, candidates },
@@ -1754,6 +1829,24 @@ impl App {
                     }
                 }
             }
+            ctx.request_repaint();
+            return;
+        }
+        // Hidden pages may have exhausted the rest of a wrapped list and led
+        // back to the original source/unit (including an allowed spread partner).
+        // Wait for Allowed before stopping: an origin that is itself Hidden
+        // still follows the existing finite search/close path above.
+        if matches!(
+            intent.purpose,
+            BookTargetPurpose::Next | BookTargetPurpose::Previous
+        ) && intent.navigation_origin.iter().any(|origin| {
+            self.page_identity_index.resolve(origin)
+                == super::file_type_resume::PositionResolution::Restored(intent.idx)
+        }) {
+            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                at_end: intent.purpose == BookTargetPurpose::Next,
+                at: std::time::Instant::now(),
+            });
             ctx.request_repaint();
             return;
         }

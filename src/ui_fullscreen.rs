@@ -39971,11 +39971,21 @@ impl App {
         target: usize,
         purpose: Option<crate::app::book_composition_permission::BookTargetPurpose>,
     ) -> Option<usize> {
+        // Capture before polling: adopting a new projection can remap pages and
+        // change their pairing while this request still owns its original unit.
+        let navigation_origin = purpose.map(|_| self.capture_book_navigation_origin());
         let target = self.poll_and_remap_book_target(ctx, target)?;
         let contract = crate::fs_page_load_scheduler::FsPageLoadContract::Sequential;
         let purpose =
             purpose.unwrap_or_else(|| self.book_target_navigation_purpose(target, contract));
-        let deferred = if self
+        let deferred = if let Some(navigation_origin) = navigation_origin {
+            self.defer_book_composition_wrapped_navigation(
+                target,
+                contract,
+                purpose,
+                navigation_origin,
+            )
+        } else if self
             .fullscreen_idx
             .is_some_and(|current| self.continuous_reading_active_for_idx(current))
         {
