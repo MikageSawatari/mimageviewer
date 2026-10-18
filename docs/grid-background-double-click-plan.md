@@ -247,3 +247,9 @@ SearchContainerは独自の代表枠・階層ラベルを持つため、全セ�
 - 初回native buildはG:上のMSBuild並列実行／PDB作成で失敗。検証プロセス内の`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1`、`_CL_=/Z7`で準備し、その後のfocusedはjobs=24。設定ファイルは変更していない。FFmpeg DLL 6本を`target/debug/deps`へコピー。
 - ログ: `target/1399-{red-valid,focused,mutation-zipdir,mutation-whole-cell,restored,check,fmt}.log`。変異の復元時はmtimeを進めて再コンパイルし、変異版実行体の再利用を避けた。
 - 2項目統合後の全lib結果は`target/test-lib-full/`台帳を参照。製品build・live試験は今回の依頼により実施しない。
+
+## §1.399 の実機確認 (2026-10-18)
+
+設計担当 (ClaudeCode) が確認用ビルド (`backlog-1399`、`c84bea5dd`) を使い捨ての data-dir で起動し、設定「サムネイルの余白部分のダブルクリックで親フォルダへ移動」を ON にして確かめた。
+代表画像のないフォルダ (空のフォルダ、テキストだけのフォルダ、ZIP だけのフォルダ) のアイコンから離れたセル内側をダブルクリックすると、そのフォルダが開いた。
+空の一覧の余白と、一覧のセルより下の空き領域のダブルクリックでは、従来どおり親フォルダへ戻った。

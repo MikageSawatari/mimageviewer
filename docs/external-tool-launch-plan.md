@@ -1251,3 +1251,8 @@ container でも stack でもない場合だけ source-only refresh。
   処理時間は利用者を待たせてよい (利用者判断 2026-09-02)。
 - 外部ツールの `TempEdited` と `Merged` は同じ `bake_stage_external_tool` を読む。
   名称は画面一致を約束する「表示どおり」ではなく、段の中身を示す「表示用補正」とした。
+
+## §1.397 の実機確認 (2026-10-18)
+
+設計担当 (ClaudeCode) が確認用ビルド (`backlog-1399`、`c84bea5dd`) を使い捨ての data-dir で起動し、Explorer (`C:\Windows\explorer.exe`) を外部ツールのスロット 1 に登録、
+「外部ツール1を起動」に Ctrl+F9 を割り当てて確かめた。一覧で実フォルダを選んで Ctrl+F9 を押すと、Explorer がそのフォルダを開いた (Shell の窓一覧で開いた場所を確認)。
