@@ -793,6 +793,33 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   証跡は `target/effetune-014-verification/` と `target/effetune-014-core-tests*.log`。
   製品・pluginの起動とコミットは行わない。最終配布・署名・実機確認はClaudeCodeの検収対象。
 
+実機確認 (2026-10-18、利用者の許可を得て ClaudeCode が隔離 data-dir で操作。build-dev の確認用ビルド):
+
+- 手順: master の確認用ビルド (Mixwright v0.13.0) を `target/hw-0140/data13` で起動し、
+  チェーン Stereo Balance 20%・Volume -3 dB・Level Meter を作って窓を閉じて保存
+  (`effetune/mixwright-state.json`、appVersion 0.13.0)。そのデータの複製 `data14` を本ブランチ
+  (v0.14.0) で起動した。EffeTune の共有保存先3か所は試験前に `target/hw-0140/appdata-backup` へ退避。
+- 観測 (ClaudeCode): v0.14.0 の画面表記は version 0.14.0。v0.13.0 のチェーンと値がそのまま
+  読み込まれ、再生で Level Meter が振れて R が L より 2 dB 大きい (Balance 20% と整合)。
+  窓を閉じると v0.14.0 が状態を書き直し (Balance が float32 の 0.20000000298…)、内容は同じ。
+  ビジュアライザーの Now Playing プリセットに代表画像と曲名 (タグ無しのためファイル名) が出た。
+  ログでは revision 2 で画像 16,308 bytes を notify し tresult=0。
+  初回の案内は保存済み状態がある環境では自動で出ず、設定メニューの「画面の案内を見る」で
+  10 ステップが mIV の窓内に表示され「完了」で閉じた。2 ステップ目は DAW の語を使う
+  (説明書の注記どおり)。最終ステップは「設定の Help からガイド」。
+  SFZ Note Player の「SFZ Library…」→「ファイルを取り込む…」で SineTest.sfz を登録・読み込みできた。
+  `%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json` に名前・path・root・`bankPaths`・`importedAt` を記録し、
+  サンプルのコピーは無く、元フォルダーも変更されなかった。試験音が一定音のため発音は未確認。
+- 観測 (ClaudeCode、本更新とは別件): 曲が最後まで再生されて Now Playing が消えたあと、
+  リピートを ON にして ▶ で再生し直す・同じ曲や別の曲を一覧から開き直す、のいずれでも
+  mIV が Now Playing を送らなかった (同じ起動中、ログに notify が無い)。送るかどうかは本体の判断で、
+  本体コードは master `76aebc18f` と同じ。EOF 後の再生し直しの不具合 (master `184de0a7b` で修正) が
+  本ブランチの基点に入っていないことと関係する可能性がある。起動し直すと正常に送られた。
+- 後片付け: `Frieve\EffeTunePlugin` は試験前の状態に戻した (案内表示済みの印・SFZ 登録を除去)。
+  `%APPDATA%\mimageviewer-vst3-host.exe` (WebView の保存先。ビジュアライザーのプリセットを
+  Now Playing に切り替えた) は、別作業の WebView2 プロセスが同じ保存先を使って残っているため戻していない。
+  `%APPDATA%\effetune` は試験の前後で差が無い。
+
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
 - 独立コードレビュー (実装者と別の Sol、5 回) の最終判定: SHIP-FOR-USER-TEST。
