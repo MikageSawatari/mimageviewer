@@ -80,29 +80,25 @@ pub fn apply(src: &ColorImage, filter: PostFilter) -> ColorImage {
 /// 出力長辺のハードキャップ (CRT 系のメモリ暴走防止)。
 const CRT_OUTPUT_MAX: u32 = 4096;
 
-/// CRT 系の適応アップスケール倍率 (ソース長辺に応じて)。
-/// さらに出力が `CRT_OUTPUT_MAX` を超えないよう呼び出し側でクランプする。
-fn crt_upscale_factor(w: usize, h: usize) -> usize {
-    let longest = w.max(h) as u32;
-    if longest <= 1024 {
+/// CRT の倍率と出力寸法の正本。既存の上限超過 source は縮小しない。
+/// CPU 結果予約と実際の CRT 合成で同じ geometry を使う。
+fn crt_output_geometry([w, h]: [usize; 2]) -> (usize, [usize; 2]) {
+    let longest = w.max(h);
+    let preferred_factor = if longest as u32 <= 1024 {
         4
-    } else if longest <= 2048 {
+    } else if longest as u32 <= 2048 {
         2
     } else {
         1
-    }
-}
-
-/// 出力長辺が `CRT_OUTPUT_MAX` を超えないような倍率に丸める。
-fn clamp_upscale(w: usize, h: usize, factor: usize) -> usize {
-    let longest = w.max(h).max(1);
-    let max_factor = (CRT_OUTPUT_MAX as usize / longest).max(1);
-    factor.min(max_factor)
+    };
+    let max_factor = (CRT_OUTPUT_MAX as usize / longest.max(1)).max(1);
+    let factor = preferred_factor.min(max_factor);
+    (factor, [w * factor, h * factor])
 }
 
 /// Exact output extent without running a filter; shared with CPU reservations.
 pub(crate) fn output_dimensions([w, h]: [usize; 2], filter: PostFilter) -> [usize; 2] {
-    let factor = match filter {
+    match filter {
         PostFilter::CrtSimple
         | PostFilter::CrtFull
         | PostFilter::CrtArcade
@@ -110,10 +106,9 @@ pub(crate) fn output_dimensions([w, h]: [usize; 2], filter: PostFilter) -> [usiz
         | PostFilter::ComboPc98Crt
         | PostFilter::ComboMsx2PlusCrt
         | PostFilter::ComboMegaDriveCrt
-        | PostFilter::ComboSfcCrt => clamp_upscale(w, h, crt_upscale_factor(w, h)),
-        _ => 1,
-    };
-    [w * factor, h * factor]
+        | PostFilter::ComboSfcCrt => crt_output_geometry([w, h]).1,
+        _ => [w, h],
+    }
 }
 
 /// 指定 bit 数で RGB 各チャンネルを量子化する。
@@ -305,9 +300,7 @@ mod crt {
 
     fn crt_common(src: &ColorImage, params: CrtParams) -> ColorImage {
         let [src_w, src_h] = src.size;
-        let factor = clamp_upscale(src_w, src_h, crt_upscale_factor(src_w, src_h));
-        let out_w = src_w * factor;
-        let out_h = src_h * factor;
+        let (factor, [out_w, out_h]) = crt_output_geometry(src.size);
 
         // ソースから明度マップを作って bloom 用 (bloom > 0 の場合のみ)
         let bloom_map = if params.bloom > 0.0 {
@@ -1798,6 +1791,46 @@ mod tests {
         let out = apply(&src, PostFilter::CrtSimple);
         // 3000 > 2048 なので factor=1、CRT_OUTPUT_MAX=4096 に収まる
         assert_eq!(out.size, [3000, 3000]);
+    }
+
+    #[test]
+    fn crt_output_dimensions_match_all_variants_at_scale_boundaries() {
+        let filters = [
+            PostFilter::CrtSimple,
+            PostFilter::CrtFull,
+            PostFilter::CrtArcade,
+            PostFilter::ComboFamicomCrt,
+            PostFilter::ComboPc98Crt,
+            PostFilter::ComboMsx2PlusCrt,
+            PostFilter::ComboMegaDriveCrt,
+            PostFilter::ComboSfcCrt,
+        ];
+        // Explicit expected factors guard the shared policy as well as agreement
+        // between prediction and execution. Above the cap, source stays at 1x.
+        for (longest, expected_factor) in [
+            (1023, 4),
+            (1024, 4),
+            (1025, 2),
+            (2047, 2),
+            (2048, 2),
+            (2049, 1),
+            (4095, 1),
+            (4096, 1),
+            (4097, 1),
+        ] {
+            for size in [[longest, 3], [3, longest]] {
+                let expected = [size[0] * expected_factor, size[1] * expected_factor];
+                assert_eq!(crt_output_geometry(size), (expected_factor, expected));
+                let src = make_test_image(size[0], size[1]);
+                for filter in filters {
+                    let predicted = output_dimensions(size, filter);
+                    assert_eq!(predicted, expected, "{filter:?}, source={size:?}");
+                    let out = apply(&src, filter);
+                    assert_eq!(out.size, predicted, "{filter:?}, source={size:?}");
+                    assert_eq!(out.pixels.len(), predicted[0] * predicted[1]);
+                }
+            }
+        }
     }
 
     #[test]
