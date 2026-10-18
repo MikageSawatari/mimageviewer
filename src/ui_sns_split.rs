@@ -1118,6 +1118,7 @@ impl App {
         transform: &DisplayedImageTransform,
         image_size: [usize; 2],
         pointer_allowed: bool,
+        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
     ) -> bool {
         let Some(layout) = self.sns_split else {
             return false;
@@ -1173,6 +1174,9 @@ impl App {
             );
         }
 
+        if overflow_pointer_input.owns(egui::PointerButton::Primary) {
+            return false;
+        }
         if !pointer_allowed {
             self.sns_split_drag = None;
             return false;

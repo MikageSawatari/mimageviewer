@@ -450,13 +450,34 @@ fn overflow_outside_right_drag_can_continue_into_panel() {
 }
 
 fn render_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+    render_frame_with_modifiers(app, ctx, events, egui::Modifiers::NONE);
+}
+
+fn render_frame_with_modifiers(
+    app: &mut App,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+) {
+    render_frame_in_rect(app, ctx, events, modifiers, viewport());
+}
+
+fn render_frame_in_rect(
+    app: &mut App,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+    rect: egui::Rect,
+) {
     app.frame_counter += 1;
     ctx.run_ui(
         egui::RawInput {
-            screen_rect: Some(viewport()),
+            screen_rect: Some(rect),
             time: Some(app.frame_counter as f64 / 60.0),
             focused: true,
-            events,
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                .chain(events)
+                .collect(),
             ..Default::default()
         },
         |ui| app.render_fullscreen_viewport(ui),
@@ -882,4 +903,1162 @@ fn overflow_touch_cancel_without_primary_release_allows_next_outside_navigator_d
         ],
     );
     assert!(!app.fs_primary_suppression.is_active());
+}
+
+fn landscape_sources(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+    crate::ui_fonts::configure_fonts(ctx);
+    page_turn::install(ctx);
+    install_fs_navigator_input_tracking(ctx);
+    // Populate the source before the first input/preparation frame. Replacing a source
+    // after ready() has prepared the portrait leaves its accepted presentation material
+    // live, which would test a source-replacement lifecycle instead of this input owner.
+    let mut app = crate::app::setup_app_for_test();
+    app.items = (0..4)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("c:/overflow/{idx}.png"))))
+        .collect();
+    app.visible_indices = vec![0, 1, 2, 3];
+    app.fullscreen_idx = Some(1);
+    app.items_generation = 41;
+    app.spread_mode = SpreadMode::Single;
+    app.reading_flow = ReadingFlow::Paged;
+    app.settings.touch_still_chrome_learned = true;
+    // This fixture begins with an already-focused viewer; focus-return click suppression
+    // has separate coverage and must not intercept the outside brush control case.
+    app.fs_prev_focused = true;
+    #[cfg(windows)]
+    {
+        app.native_video_in_window_active = true;
+    }
+    app.settings.fullscreen_top_bar_locked = true;
+    app.settings.fullscreen_navigator_visible = false;
+    let pixels = Arc::new(egui::ColorImage::filled(
+        [320, 160],
+        egui::Color32::LIGHT_BLUE,
+    ));
+    for idx in 0..4 {
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(
+                    format!("overflow-landscape-{idx}"),
+                    (*pixels).clone(),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels: Arc::clone(&pixels),
+                source_dims: Some([320, 160]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.record_page_dims_for_spread(idx, (320, 160));
+    }
+    app
+}
+
+fn rendered_landscape(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+    let mut app = landscape_sources(ctx);
+    for _ in 0..4 {
+        render_frame(&mut app, ctx, vec![]);
+    }
+    let page = app
+        .fullscreen_page_layout
+        .single_page()
+        .expect("real image drawing must publish a page");
+    assert!(
+        page.transform.paint_rect.width() > page.transform.paint_rect.height() * 1.5,
+        "actual painted page: {:?}",
+        page.transform.paint_rect
+    );
+    assert_eq!(page.page_idx(), 1);
+    app
+}
+
+fn wipe_fraction(app: &App) -> f32 {
+    match app.compare_view_mode {
+        crate::app::CompareViewMode::Wipe { fraction, .. } => fraction,
+        mode => panic!("wipe unexpectedly ended: {mode:?}"),
+    }
+}
+
+#[test]
+fn overflow_real_wipe_drag_respects_panel_press_origin_in_both_directions() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for inside in [true, false] {
+        for direction in [-1.0, 1.0] {
+            let ctx = egui::Context::default();
+            let mut app = rendered_landscape(&ctx);
+            let painted = app
+                .fullscreen_page_layout
+                .single_page()
+                .unwrap()
+                .transform
+                .paint_rect;
+            let panel =
+                fs_overflow_panel_rect(viewport(), FsOverflowPanelState::Slideshow).unwrap();
+            let overlap = painted.intersect(panel).shrink(15.0);
+            assert!(
+                overlap.width() > 90.0 && overlap.height() > 90.0,
+                "paint={painted:?}, panel={panel:?}"
+            );
+            let pixels = Arc::new(egui::ColorImage::filled(
+                [320, 160],
+                egui::Color32::LIGHT_RED,
+            ));
+            app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+                pixels: Arc::clone(&pixels),
+                indicator_pixels: Arc::clone(&pixels),
+                indicator_texture: None,
+                display_name: "overflow pin".into(),
+                source_idx: 42,
+                external_item_key: None,
+                source_size: [320, 160],
+            });
+            app.compare_preparation =
+                crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+                    key: 1,
+                    current_idx: 1,
+                    pinned_source_idx: 42,
+                    current_input_size: [320, 160],
+                    pinned_input_size: [320, 160],
+                    target_size: [320, 160],
+                    pixels: crate::app::ComparePreparedPixels::WipeTextures {
+                        pinned: Arc::clone(&pixels),
+                        current: pixels,
+                    },
+                    pinned_texture: None,
+                    current_texture: None,
+                    diff_texture: None,
+                });
+            let draw_rect = App::compare_image_draw_rect(
+                app.fullscreen_media_rect(viewport(), 1, false),
+                [320, 160],
+                app.fs_zoom_pan(),
+                app.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+            )
+            .unwrap();
+            let start = if inside {
+                overlap.center()
+            } else {
+                draw_rect.lerp_inside(egui::vec2(0.3, 0.5))
+            };
+            assert_eq!(panel.contains(start), inside);
+            assert!(draw_rect.contains(start));
+            let fraction = (start.x - draw_rect.left()) / draw_rect.width();
+            app.compare_view_mode = crate::app::CompareViewMode::wipe(fraction);
+            app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+            render_frame(&mut app, &ctx, vec![]);
+            assert!(app.compare_prepared_pair_matches(1));
+            assert!(!app.settings.fullscreen_navigator_visible);
+            let end = start + egui::vec2(direction * 60.0, 0.0);
+            drag(&mut app, &ctx, egui::PointerButton::Primary, start, end);
+            if inside {
+                assert_eq!(
+                    wipe_fraction(&app),
+                    fraction,
+                    "panel drag direction={direction}"
+                );
+            } else {
+                assert!(
+                    (wipe_fraction(&app) - fraction) * direction > 0.02,
+                    "outside drag direction={direction}"
+                );
+            }
+            assert_eq!(app.fullscreen_idx, Some(1));
+        }
+    }
+}
+
+fn rendered_analysis(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+    let mut app = rendered_landscape(ctx);
+    app.settings
+        .ring_shortcuts
+        .set_right_drag_mode(RightDragContext::ImageFullscreen, RightDragMode::Disabled);
+    app.toggle_analysis_mode();
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    for _ in 0..4 {
+        render_frame(&mut app, ctx, vec![]);
+    }
+    assert!(app.analysis_mode);
+    let page = app
+        .fullscreen_page_layout
+        .single_page()
+        .expect("analysis must paint the real landscape page");
+    assert!(page.transform.paint_rect.width() > page.transform.paint_rect.height() * 1.5);
+    assert!(
+        page.transform
+            .paint_rect
+            .intersect(fs_overflow_panel_rect(viewport(), FsOverflowPanelState::Slideshow).unwrap())
+            .width()
+            > 25.0
+    );
+    app
+}
+
+fn analysis_start(app: &App, inside: bool) -> egui::Pos2 {
+    let paint = app
+        .fullscreen_page_layout
+        .single_page()
+        .unwrap()
+        .transform
+        .paint_rect;
+    let panel = fs_overflow_panel_rect(viewport(), FsOverflowPanelState::Slideshow).unwrap();
+    let start = if inside {
+        paint.intersect(panel).shrink(8.0).center()
+    } else {
+        paint.lerp_inside(egui::vec2(0.35, 0.5))
+    };
+    assert!(paint.contains(start));
+    assert_eq!(panel.contains(start), inside);
+    start
+}
+
+#[test]
+fn overflow_real_analysis_primary_pan_and_guide_preserve_outside_operations() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for guide in [false, true] {
+        for inside in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = rendered_analysis(&ctx);
+            let start = analysis_start(&app, inside);
+            let end = start + egui::vec2(-35.0, 30.0);
+            let mods = if guide {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            };
+            let before = app.analysis_pan;
+            let event = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                pressed,
+                button: egui::PointerButton::Primary,
+                modifiers: mods,
+            };
+            render_frame_with_modifiers(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(start), event(start, true)],
+                mods,
+            );
+            render_frame_with_modifiers(&mut app, &ctx, vec![egui::Event::PointerMoved(end)], mods);
+            render_frame_with_modifiers(&mut app, &ctx, vec![event(end, false)], mods);
+            if guide {
+                if inside {
+                    assert!(app.analysis_guide_drag.is_none());
+                } else {
+                    let (a, b, color) = app
+                        .analysis_guide_drag
+                        .expect("outside Shift drag still creates a guide");
+                    assert_ne!(a, b);
+                    assert_eq!(color, 0);
+                }
+                assert_eq!(app.analysis_pan, before);
+            } else if inside {
+                assert_eq!(app.analysis_pan, before);
+            } else {
+                assert_ne!(
+                    app.analysis_pan, before,
+                    "outside primary drag must still pan"
+                );
+            }
+            assert!(app.analysis_pan_drag_start.is_none());
+            assert_eq!(app.fullscreen_idx, Some(1));
+        }
+    }
+}
+
+#[test]
+fn overflow_real_analysis_secondary_filter_is_blocked_only_for_the_owned_button() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for inside in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_analysis(&ctx);
+        let start = analysis_start(&app, inside);
+        let mods = egui::Modifiers::CTRL;
+        render_frame_with_modifiers(&mut app, &ctx, vec![egui::Event::PointerMoved(start)], mods);
+        let sampled = app
+            .analysis_hover_color
+            .expect("the actual analysis painter must sample the displayed pixels first");
+        let event = |pressed| egui::Event::PointerButton {
+            pos: start,
+            pressed,
+            button: egui::PointerButton::Secondary,
+            modifiers: mods,
+        };
+        assert_eq!(app.analysis_filter_mag, 0);
+        assert!(app.analysis_pinned_color.is_none());
+        render_frame_with_modifiers(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), event(true)],
+            mods,
+        );
+        if inside {
+            assert_eq!(app.analysis_filter_mag, 0);
+            assert!(app.analysis_pinned_color.is_none());
+        } else {
+            assert_eq!(app.analysis_filter_mag, 5);
+            assert_eq!(app.analysis_pinned_color, Some(sampled));
+        }
+        render_frame_with_modifiers(&mut app, &ctx, vec![event(false)], mods);
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn overflow_same_pass_text_entry_does_not_reuse_the_old_panel_press() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for inside in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_landscape(&ctx);
+        app.editing_addon_declined_session = true;
+        // F13 is unbound by default; F6 is already consumed by RatingItemClear.
+        app.keymap = Keymap::from_ini_str("[FsImage]\nFsTextMode = F13\n");
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        for _ in 0..3 {
+            render_frame(&mut app, &ctx, vec![]);
+        }
+        let paint = app
+            .fullscreen_page_layout
+            .single_page()
+            .unwrap()
+            .transform
+            .paint_rect;
+        let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+        let outside = paint.lerp_inside(egui::vec2(0.4, 0.5));
+        let start = if inside {
+            paint.intersect(panel).shrink(15.0).center()
+        } else {
+            outside
+        };
+        assert_eq!(panel.contains(start), inside);
+        assert!(!panel.contains(outside));
+        // Move out before the canvas consumer runs. This also proves that the old
+        // foreground layer's hit test cannot accidentally make this test pass.
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(start, egui::PointerButton::Primary, true),
+                egui::Event::Key {
+                    key: egui::Key::F13,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(outside),
+            ],
+        );
+        assert!(
+            app.text_mode,
+            "the actual key handler must enter text editing"
+        );
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_eq!(
+            app.text_marquee.is_some(),
+            !inside,
+            "old overflow press ownership must survive mode entry"
+        );
+        assert!(app.text_drag.is_none());
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![button(outside, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn overflow_real_bookmark_row_keeps_press_ownership_after_release_moves_outside() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 800.0));
+    for inside in [true, false] {
+        let ctx = egui::Context::default();
+        // Install the ZIP identities before any display material is accepted.
+        let mut app = landscape_sources(&ctx);
+        for idx in [1, 3] {
+            app.items[idx] = GridItem::ZipImage {
+                zip_path: PathBuf::from("c:/overflow/book.zip"),
+                entry_name: format!("{idx}.png"),
+            };
+        }
+        let draft = app
+            .current_book_bookmark_draft(3)
+            .expect("ZIP page has a bookmark identity");
+        let container_key = crate::book_bookmarks::container_key(&draft.container_path);
+        app.current_book_bookmarks = vec![crate::book_bookmarks::BookBookmark {
+            id: 139601,
+            container_key: container_key.clone(),
+            container_path: draft.container_path,
+            container_kind: draft.container_kind,
+            page_identity: draft.page_identity,
+            page_index_hint: draft.page_index_hint,
+            created_at_ms: 1,
+            // Frame rows use their content's natural width. A realistic Japanese title
+            // makes this row reach the overflow edge at 640pt; the outer 292pt panel
+            // alone does not guarantee that a short ASCII row occupies the overlap.
+            title: Some("入力所有を確認する移動先ページ".into()),
+        }];
+        app.current_book_bookmarks_key = Some(crate::app::BookBookmarkProjectionKey {
+            container_key,
+            visibility: app.listing_file_type_visibility().clone(),
+            context_id: app.virtual_list_context_id(),
+            items_generation: app.items_generation,
+        });
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+        app.settings.fullscreen_left_panel_tab = crate::settings::FullscreenLeftPanelTab::Bookmarks;
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        for _ in 0..5 {
+            render_frame_in_rect(&mut app, &ctx, vec![], egui::Modifiers::NONE, rect);
+        }
+        let row: egui::Rect = ctx
+            .data(|data| data.get_temp(egui::Id::unique(("fs_bookmark_row_test_rect", 139601_i64))))
+            .expect("the production bookmark row must actually be drawn");
+        let panel = fs_overflow_panel_rect(rect, FsOverflowPanelState::Slideshow).unwrap();
+        let start = egui::pos2(
+            panel.left() + if inside { 2.0 } else { -2.0 },
+            row.center().y,
+        );
+        let end = start - egui::vec2(4.0, 0.0);
+        assert!(
+            row.contains(start) && row.contains(end),
+            "row={row:?}, panel={panel:?}"
+        );
+        assert_eq!(panel.contains(start), inside);
+        assert!(!panel.contains(end));
+        render_frame_in_rect(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start)],
+            egui::Modifiers::NONE,
+            rect,
+        );
+        render_frame_in_rect(
+            &mut app,
+            &ctx,
+            vec![button(start, egui::PointerButton::Primary, true)],
+            egui::Modifiers::NONE,
+            rect,
+        );
+        render_frame_in_rect(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(end),
+                button(end, egui::PointerButton::Primary, false),
+            ],
+            egui::Modifiers::NONE,
+            rect,
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(if inside { 1 } else { 3 }),
+            "only an outside-start bookmark click may jump"
+        );
+    }
+}
+
+#[test]
+fn overflow_same_pass_local_adjust_entry_preserves_owned_press_and_outside_brush() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for inside in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_landscape(&ctx);
+        app.editing_addon_declined_session = true;
+        app.keymap = Keymap::from_ini_str("[FsImage]\nFsLocalAdjustMode = F13\n");
+        app.local_adjust_page_layers.insert(
+            1,
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
+                "overflow mask",
+                local_adjust_core::LocalMask::RasterVector(
+                    local_adjust_core::RasterVectorMask::empty(320, 160),
+                ),
+                local_adjust_core::LocalEffect::None,
+            )]),
+        );
+        app.local_adjust_selected_layers.insert(1, 0);
+        app.local_adjust_mask_edit_target = crate::app::LocalAdjustMaskEditTarget::Base;
+        app.local_adjust_mask_tool = crate::app::LocalAdjustMaskTool::Brush;
+        app.local_adjust_mask_paint_add = true;
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        for _ in 0..3 {
+            render_frame(&mut app, &ctx, vec![]);
+        }
+        let paint = app
+            .fullscreen_page_layout
+            .single_page()
+            .unwrap()
+            .transform
+            .paint_rect;
+        let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+        let outside = paint.lerp_inside(egui::vec2(0.4, 0.5));
+        assert!(!app.local_adjust_panel_rect(viewport()).contains(outside));
+        assert!(
+            !app.local_adjust_tool_panel_rect(viewport())
+                .contains(outside)
+        );
+        let start = if inside {
+            paint.intersect(panel).shrink(15.0).center()
+        } else {
+            outside
+        };
+        assert_eq!(panel.contains(start), inside);
+        let before = Arc::clone(&app.local_adjust_page_layers[&1]);
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(start, egui::PointerButton::Primary, true),
+                egui::Event::Key {
+                    key: egui::Key::F13,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(outside),
+            ],
+        );
+        assert!(
+            app.local_adjust_mode,
+            "the production key path must enter local adjustment"
+        );
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        if inside {
+            assert!(app.local_adjust_mask_brush_stroke.is_none());
+            assert_eq!(app.local_adjust_page_layers[&1].as_ref(), before.as_ref());
+        } else {
+            assert!(
+                app.local_adjust_mask_brush_stroke.is_some(),
+                "outside press must still start a real mask stroke"
+            );
+            assert_ne!(app.local_adjust_page_layers[&1].as_ref(), before.as_ref());
+        }
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![button(outside, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn overflow_held_press_cannot_become_conceal_pipeline_eye_preview_after_mode_entry() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_landscape(&ctx);
+    app.conceal_tool = crate::conceal::ConcealTool::Brush;
+    app.keymap = Keymap::from_ini_str("[FsImage]\nFsConcealMode = F6\n");
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    for _ in 0..3 {
+        render_frame(&mut app, &ctx, vec![]);
+    }
+    let paint = app
+        .fullscreen_page_layout
+        .single_page()
+        .unwrap()
+        .transform
+        .paint_rect;
+    let start = paint
+        .intersect(fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap())
+        .shrink(15.0)
+        .center();
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(start),
+            button(start, egui::PointerButton::Primary, true),
+        ],
+    );
+    assert_eq!(
+        app.fs_primary_suppression,
+        FullscreenPrimarySuppression::OverflowStream
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Key {
+            key: egui::Key::F6,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    // Adopt through the real worker-completion entry. The worker's disk/decode timing
+    // is unrelated to pointer ownership and must not determine this regression.
+    assert!(app.complete_conceal_mode_entry(
+        1,
+        Arc::new(egui::ColorImage::filled(
+            [320, 160],
+            egui::Color32::LIGHT_BLUE
+        )),
+        "overflow-fixture",
+        vec![false; 320 * 160],
+        vec![],
+    ));
+    render_frame(&mut app, &ctx, vec![]);
+    let canvas = app
+        .fullscreen_page_layout
+        .single_page()
+        .unwrap()
+        .transform
+        .paint_rect
+        .lerp_inside(egui::vec2(0.4, 0.5));
+    assert!(!app.conceal_panel_rect(viewport()).contains(canvas));
+    render_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(canvas)]);
+    assert!(
+        !app.conceal_mask
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|pixel| *pixel),
+        "the old panel hold cannot paint the new conceal canvas"
+    );
+    let eye = app
+        .conceal_preview_button_rect
+        .expect("real conceal overlay must draw the eye control")
+        .center();
+    let probe = || {
+        ctx.data(|data| {
+            data.get_temp::<bool>(egui::Id::unique("conceal_pipeline_preview_test_active"))
+        })
+        .expect("sample preview before the overlay can overwrite it")
+    };
+    render_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(eye)]);
+    assert!(
+        !probe(),
+        "the overflow-owned physical hold cannot activate pipeline preview"
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(eye, egui::PointerButton::Primary, false)],
+    );
+    assert!(!app.fs_primary_suppression.is_active());
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(eye, egui::PointerButton::Primary, true)],
+    );
+    assert!(
+        probe(),
+        "a new press on the eye keeps the existing preview behavior"
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(eye, egui::PointerButton::Primary, false)],
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(canvas),
+            button(canvas, egui::PointerButton::Primary, true),
+        ],
+    );
+    assert!(
+        app.conceal_mask
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|pixel| *pixel),
+        "a fresh canvas press must still paint conceal masks"
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(canvas, egui::PointerButton::Primary, false)],
+    );
+}
+
+#[test]
+fn overflow_same_pass_erase_entry_preserves_owned_press_and_outside_brush() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for inside in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_landscape(&ctx);
+        app.keymap = Keymap::from_ini_str("[FsImage]\nFsEraseMode = F6\n");
+        app.erase_tool = crate::app::EraseTool::Brush;
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        for _ in 0..3 {
+            render_frame(&mut app, &ctx, vec![]);
+        }
+        let paint = app
+            .fullscreen_page_layout
+            .single_page()
+            .unwrap()
+            .transform
+            .paint_rect;
+        let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+        let outside = paint.lerp_inside(egui::vec2(0.4, 0.5));
+        let start = if inside {
+            paint.intersect(panel).shrink(15.0).center()
+        } else {
+            outside
+        };
+        assert_eq!(panel.contains(start), inside);
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(start, egui::PointerButton::Primary, true),
+                egui::Event::Key {
+                    key: egui::Key::F6,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(outside),
+            ],
+        );
+        assert!(
+            app.erase_mode,
+            "the production key path must enter erase mode"
+        );
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_eq!(
+            app.erase_mask.as_ref().unwrap().iter().any(|pixel| *pixel),
+            !inside,
+            "only an outside press may start painting"
+        );
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![button(outside, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn overflow_same_pass_sns_entry_preserves_owned_press_and_outside_drag() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for inside in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_landscape(&ctx);
+        app.keymap = Keymap::from_ini_str("[FsImage]\nFsSnsSplitMode = F6\n");
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        for _ in 0..3 {
+            render_frame(&mut app, &ctx, vec![]);
+        }
+        let paint = app
+            .fullscreen_page_layout
+            .single_page()
+            .unwrap()
+            .transform
+            .paint_rect;
+        let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+        let outside = paint.lerp_inside(egui::vec2(0.4, 0.5));
+        let start = if inside {
+            paint.intersect(panel).shrink(15.0).center()
+        } else {
+            outside
+        };
+        assert_eq!(panel.contains(start), inside);
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(start, egui::PointerButton::Primary, true),
+                egui::Event::Key {
+                    key: egui::Key::F6,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(outside),
+            ],
+        );
+        assert!(
+            app.sns_split.is_some(),
+            "the assigned FsSnsSplitMode key must enter SNS split"
+        );
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_eq!(
+            app.sns_split_drag.is_some(),
+            !inside,
+            "only an outside press may begin the split drag"
+        );
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![button(outside, egui::PointerButton::Primary, false)],
+        );
+        assert!(app.sns_split_drag.is_none());
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn overflow_real_seek_ignores_panel_press_but_accepts_a_fresh_outside_click() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_landscape(&ctx);
+    app.settings.set_still_seek_bar_locked(true);
+    app.settings.still_seek_strip_visible = false;
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    for _ in 0..4 {
+        render_frame(&mut app, &ctx, vec![]);
+    }
+    assert!(
+        app.fs_seek_overlay_visible,
+        "the real seek overlay must be painted"
+    );
+    let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+    let start = panel.center();
+    let bar = app
+        .still_seek_geometry_for_idx(viewport(), 1, false)
+        .bar_rect(viewport())
+        .unwrap();
+    let target = bar.lerp_inside(egui::vec2(0.65, 0.5));
+    assert!(!panel.contains(target));
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(start),
+            button(start, egui::PointerButton::Primary, true),
+        ],
+    );
+    render_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(target)]);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(target, egui::PointerButton::Primary, false)],
+    );
+    assert_eq!(
+        app.fullscreen_idx,
+        Some(1),
+        "the panel's released press cannot become a seek click"
+    );
+    assert!(matches!(
+        app.fs_seek_gesture,
+        StillSeekGesture::Idle | StillSeekGesture::StripCommitted { .. }
+    ));
+    render_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(target)]);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(target, egui::PointerButton::Primary, true)],
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(target, egui::PointerButton::Primary, false)],
+    );
+    assert_ne!(
+        app.fullscreen_idx,
+        Some(1),
+        "fresh outside press must still reach the actual seek handler"
+    );
+}
+
+#[test]
+fn overflow_real_touch_menu_key_dismissal_keeps_the_physical_contact_owned() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_landscape(&ctx);
+    app.fs_zoom = 2.0;
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    for _ in 0..4 {
+        render_frame(&mut app, &ctx, vec![]);
+    }
+    let start = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state)
+        .unwrap()
+        .center();
+    let outside = egui::pos2(150.0, 400.0);
+    assert!(
+        !fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state)
+            .unwrap()
+            .contains(outside)
+    );
+    let before = (app.fs_zoom, app.fs_pan);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(start, egui::TouchPhase::Start),
+            egui::Event::PointerMoved(start),
+            button(start, egui::PointerButton::Primary, true),
+            egui::Event::Key {
+                key: egui::Key::F13,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(outside, egui::TouchPhase::Move),
+            egui::Event::PointerMoved(outside),
+        ],
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(outside, egui::TouchPhase::End),
+            button(outside, egui::PointerButton::Primary, false),
+        ],
+    );
+    render_frame(&mut app, &ctx, vec![egui::Event::PointerGone]);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!((app.fs_zoom, app.fs_pan), before);
+    assert!(!app.fs_primary_suppression.is_active());
+    let end = outside + egui::vec2(50.0, 35.0);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(outside, egui::TouchPhase::Start),
+            egui::Event::PointerMoved(outside),
+            button(outside, egui::PointerButton::Primary, true),
+        ],
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(end, egui::TouchPhase::Move),
+            egui::Event::PointerMoved(end),
+        ],
+    );
+    assert_ne!(
+        app.fs_pan, before.1,
+        "a fresh outside contact must still pan the zoomed page"
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(end, egui::TouchPhase::End),
+            button(end, egui::PointerButton::Primary, false),
+        ],
+    );
+    assert!(!app.fs_primary_suppression.is_active());
+}
+
+#[test]
+fn overflow_primary_press_does_not_cancel_an_outside_secondary_ring_or_gesture() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for mode in [RightDragMode::RingShortcut, RightDragMode::MouseGesture] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_landscape(&ctx);
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(RightDragContext::ImageFullscreen, mode.clone());
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        for _ in 0..3 {
+            render_frame(&mut app, &ctx, vec![]);
+        }
+        let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+        let outside = egui::pos2(350.0, 400.0);
+        let inside = panel.center();
+        assert!(!panel.contains(outside));
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(outside),
+                button(outside, egui::PointerButton::Secondary, true),
+            ],
+        );
+        let recognizer_active = |app: &App| match mode {
+            RightDragMode::RingShortcut => app.mouse_ring_flick.is_some(),
+            RightDragMode::MouseGesture => app.mouse_gesture.is_some(),
+            _ => unreachable!(),
+        };
+        assert!(recognizer_active(&app));
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(inside),
+                button(inside, egui::PointerButton::Primary, true),
+            ],
+        );
+        assert!(
+            recognizer_active(&app),
+            "the front primary press cannot cancel another button's outside owner: {mode:?}"
+        );
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![button(inside, egui::PointerButton::Primary, false)],
+        );
+        assert!(recognizer_active(&app));
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(outside),
+                button(outside, egui::PointerButton::Secondary, false),
+            ],
+        );
+        assert!(app.mouse_ring_flick.is_none() && app.mouse_gesture.is_none());
+    }
+}
+
+#[test]
+fn overflow_real_metadata_hold_preview_requires_an_unowned_new_press() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_landscape(&ctx);
+    app.fs_info_panel.locked = true;
+    app.similar_panel.select_similar_tab_for_test();
+    let origin = match &app.items[1] {
+        GridItem::Image(path) => path.clone(),
+        _ => unreachable!(),
+    };
+    let target = app.tmp.path().join("metadata-candidate.png");
+    let target_key = crate::similar_index::item_key_for_file(&target);
+    app.similar_panel
+        .set_item_query_override_for_test(crate::similar_index::ItemQuery::Ready(
+            crate::similar_index::ItemMatches {
+                origin: crate::similar_index::OriginItem {
+                    item_key: crate::similar_index::item_key_for_file(&origin),
+                    kind: crate::similar_db::ItemKind::Image,
+                    mtime: 1,
+                    file_size: 1,
+                    width: 320,
+                    height: 160,
+                    format: crate::similar_image::SimilarImageFormat::Png,
+                    target: Some(crate::similar_index::SimilarItemTarget::File(origin)),
+                },
+                hits: vec![crate::similar_index::QueryHit {
+                    item_id: 139601,
+                    item_key: target_key.clone(),
+                    kind: crate::similar_db::ItemKind::Image,
+                    container_key: None,
+                    page_index: None,
+                    distance: 1,
+                    band: crate::similar_index::MatchBand::OtherVersion,
+                    mtime: 1,
+                    file_size: 1,
+                    width: 320,
+                    height: 160,
+                    format: crate::similar_image::SimilarImageFormat::Png,
+                    target: Some(crate::similar_index::SimilarItemTarget::File(target)),
+                }],
+            },
+        ));
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    for _ in 0..5 {
+        render_frame(&mut app, &ctx, vec![]);
+    }
+    let peek: egui::Rect = ctx
+        .data(|data| {
+            data.get_temp(egui::Id::unique((
+                "similar_hit_peek_test_rect",
+                target_key.clone(),
+            )))
+        })
+        .expect("the actual Similar-tab candidate must draw its hold-preview button");
+    let pos = peek.center();
+    let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+    assert!(
+        panel.contains_rect(peek),
+        "hold button={peek:?}, overflow={panel:?}"
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(pos),
+            button(pos, egui::PointerButton::Primary, true),
+        ],
+    );
+    assert_eq!(
+        app.fs_primary_suppression,
+        FullscreenPrimarySuppression::OverflowStream
+    );
+    assert!(
+        app.similar_panel
+            .preview
+            .active_candidate_for_test()
+            .is_none()
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Key {
+            key: egui::Key::F13,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    assert!(
+        app.similar_panel
+            .preview
+            .active_candidate_for_test()
+            .is_none(),
+        "closing the menu while held cannot reuse its old press for preview"
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(pos, egui::PointerButton::Primary, false)],
+    );
+    assert!(!app.fs_primary_suppression.is_active());
+    let _completion = app
+        .similar_panel
+        .preview
+        .queue_test_completion_for_next_press();
+    render_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(pos, egui::PointerButton::Primary, true)],
+    );
+    let (candidate, _) = app
+        .similar_panel
+        .preview
+        .active_candidate_for_test()
+        .expect("a fresh unowned press on the actual metadata button must begin preview");
+    assert_eq!(candidate.item_key, target_key);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(pos, egui::PointerButton::Primary, false)],
+    );
+    assert!(
+        app.similar_panel
+            .preview
+            .active_candidate_for_test()
+            .is_none()
+    );
 }

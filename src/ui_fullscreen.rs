@@ -108,14 +108,14 @@ pub(crate) struct FullscreenSecondaryPressOwner {
 
 /// Resolved before front UI actions, shared by all backing input consumers in this pass.
 #[derive(Clone, Copy, Default)]
-struct FsOverflowPointerFrameInput {
+pub(crate) struct FsOverflowPointerFrameInput {
     primary_owned: bool,
     secondary_owned: bool,
     secondary_owner: Option<FullscreenSecondaryPressOwner>,
 }
 
 impl FsOverflowPointerFrameInput {
-    fn owns(self, button: egui::PointerButton) -> bool {
+    pub(crate) fn owns(self, button: egui::PointerButton) -> bool {
         match button {
             egui::PointerButton::Primary => self.primary_owned,
             egui::PointerButton::Secondary => self.secondary_owned,
@@ -24059,6 +24059,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn draw_fullscreen_seek_overlay(
         &mut self,
         ui: &mut egui::Ui,
@@ -24077,6 +24078,7 @@ impl App {
             seek_geometry,
             side_panel_visible,
             touch_chrome_latched,
+            FsOverflowPointerFrameInput::default(),
         )
     }
 
@@ -24086,6 +24088,7 @@ impl App {
         ctx: &egui::Context,
         toggle_rect: Option<egui::Rect>,
         strip_visible: bool,
+        overflow_pointer_input: FsOverflowPointerFrameInput,
     ) {
         let Some(toggle_rect) = toggle_rect.map(|rect| rect.intersect(ui.clip_rect())) else {
             return;
@@ -24102,14 +24105,16 @@ impl App {
             draw_still_seek_strip_icon,
         )
         .hover_tip_dark("サムネイル列の表示と高さ");
-        if let Some(choice) = draw_still_seek_strip_popup(
-            &strip_resp,
-            strip_visible,
-            self.settings.still_seek_strip_height,
-            self.settings.still_seek_strip_height_values,
-            self.settings.still_seek_preview_size,
-            self.settings.still_seek_preview_size_values,
-        ) {
+        if !overflow_pointer_input.primary_owned
+            && let Some(choice) = draw_still_seek_strip_popup(
+                &strip_resp,
+                strip_visible,
+                self.settings.still_seek_strip_height,
+                self.settings.still_seek_strip_height_values,
+                self.settings.still_seek_preview_size,
+                self.settings.still_seek_preview_size_values,
+            )
+        {
             match choice {
                 StillSeekStripMenuChoice::Visible(visible) => {
                     self.set_still_seek_strip_visible(ctx, visible);
@@ -24133,6 +24138,7 @@ impl App {
         seek_geometry: StillSeekGeometry,
         side_panel_visible: bool,
         touch_chrome_latched: bool,
+        overflow_pointer_input: FsOverflowPointerFrameInput,
     ) -> Option<usize> {
         self.fs_seek_overlay_visible = false;
         self.poll_still_seek_rotations();
@@ -24144,7 +24150,8 @@ impl App {
             return None;
         }
 
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
+        let primary_allowed = !overflow_pointer_input.primary_owned;
+        let primary_down = primary_allowed && ctx.input(|i| i.pointer.primary_down());
         let bottom_lock = self.settings.still_bottom_lock();
         let locked = self.resolved_still_chrome().bottom_lock.bar_locked();
         let raw_locked = bottom_lock.bar_locked();
@@ -24220,7 +24227,13 @@ impl App {
         // With a visible seek bar this control belongs to the bar. When the bar is hidden
         // it overlays the page cells and must be registered after the strip body instead.
         if bar_rect.is_some() || !info.has_page_strip_content() {
-            self.draw_fullscreen_still_seek_strip_toggle(ui, ctx, controls.toggle, strip_visible);
+            self.draw_fullscreen_still_seek_strip_toggle(
+                ui,
+                ctx,
+                controls.toggle,
+                strip_visible,
+                overflow_pointer_input,
+            );
         }
         if let Some(lock_rect) = controls.bar_lock.map(|rect| rect.intersect(ui.clip_rect()))
             && lock_rect.is_positive()
@@ -24241,7 +24254,7 @@ impl App {
                 },
                 raw_locked && !locked,
             ));
-            if lock_resp.clicked() {
+            if primary_allowed && lock_resp.clicked() {
                 self.settings.set_still_seek_bar_locked(!raw_locked);
                 self.settings.save();
                 ctx.request_repaint();
@@ -24454,22 +24467,29 @@ impl App {
             // The response handler owns the immutable press origin, live center, and release
             // commit. The page-position sync above is the only non-close path that discards a
             // committed center.
-            let strip_interaction = handle_still_seek_strip_response(
-                &strip_response,
-                strip_layout_center,
-                info.current_pos,
-                total,
-                geometry.drag_step_width,
-                // Rect::bottom is exclusive at the monitor edge. Keep the shared close
-                // predicate unchanged, but cap its boundary at the last physical pixel.
-                strip_rect
-                    .bottom()
-                    .min((full_rect.bottom() - 1.0 / ctx.pixels_per_point()).max(full_rect.top())),
-                strip_lock_rect,
-                strip_toggle_rect,
-                strip_is_rtl,
-                &mut self.fs_seek_gesture,
-            );
+            let strip_interaction = if primary_allowed {
+                handle_still_seek_strip_response(
+                    &strip_response,
+                    strip_layout_center,
+                    info.current_pos,
+                    total,
+                    geometry.drag_step_width,
+                    // Rect::bottom is exclusive at the monitor edge. Keep the shared close
+                    // predicate unchanged, but cap its boundary at the last physical pixel.
+                    strip_rect.bottom().min(
+                        (full_rect.bottom() - 1.0 / ctx.pixels_per_point()).max(full_rect.top()),
+                    ),
+                    strip_lock_rect,
+                    strip_toggle_rect,
+                    strip_is_rtl,
+                    &mut self.fs_seek_gesture,
+                )
+            } else {
+                StillSeekStripInteraction {
+                    closed_by_drag: false,
+                    note_seek_activity: false,
+                }
+            };
             let strip_closed_by_drag = strip_interaction.closed_by_drag;
             #[cfg(all(windows, feature = "test-script"))]
             {
@@ -24518,6 +24538,7 @@ impl App {
                 self.note_fullscreen_seek_activity();
             }
             if !strip_closed_by_drag
+                && primary_allowed
                 && strip_response.clicked()
                 && let Some(source_pos) = pointed_source_pos
                 && let Some(resolved) = resolve_still_seek_target(
@@ -24607,7 +24628,7 @@ impl App {
                     },
                     strip_locked && !self.resolved_still_chrome().bottom_lock.strip_locked(),
                 ));
-            if strip_lock_response.clicked() {
+            if primary_allowed && strip_lock_response.clicked() {
                 self.settings.set_still_seek_strip_locked(!strip_locked);
                 self.settings.save();
                 ctx.request_repaint();
@@ -24620,6 +24641,7 @@ impl App {
                     ctx,
                     strip_toggle_rect,
                     strip_visible,
+                    overflow_pointer_input,
                 );
             }
         }
@@ -24735,8 +24757,14 @@ impl App {
                     }
                 }
 
-                let interaction =
-                    handle_still_seek_track_response(&response, &mut self.fs_seek_gesture);
+                let interaction = if primary_allowed {
+                    handle_still_seek_track_response(&response, &mut self.fs_seek_gesture)
+                } else {
+                    StillSeekTrackInteraction {
+                        action: StillSeekTrackAction::None,
+                        note_seek_activity: false,
+                    }
+                };
                 if interaction.note_seek_activity {
                     self.fs_seek_drag_active = true;
                     self.note_fullscreen_seek_activity();
@@ -27217,7 +27245,7 @@ impl App {
                         // 単一ページ表示で消しゴムを描画する。
                         if self.erase_mode && !is_spread_double && !state.original_preview_active {
                             if let Some(transform) = single_transform.as_ref() {
-                                self.handle_erase_paint(ctx, transform);
+                                self.handle_erase_paint(ctx, transform, overflow_pointer_input);
                                 self.draw_erase_overlay(ui, ctx, transform);
                             }
                             ctx.request_repaint();
@@ -27233,7 +27261,7 @@ impl App {
                         if self.conceal_mode && !is_spread_double && !state.original_preview_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
-                                self.handle_conceal_paint(ctx, transform);
+                                self.handle_conceal_paint(ctx, transform, overflow_pointer_input);
                                 self.draw_conceal_overlay(ui, ctx, transform);
                             }
                             ctx.request_repaint();
@@ -27249,7 +27277,7 @@ impl App {
                                 // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
                                 // 漏れるのを防ぐ)。ダイアログ自体の描画は draw_text_overlay で行う。
                                 if !self.text_subdialog_open() {
-                                    self.handle_text_canvas_input(ctx, transform);
+                                    self.handle_text_canvas_input(ctx, transform, overflow_pointer_input);
                                 }
                                 self.draw_text_overlay(ui, ctx, transform);
                             }
@@ -27264,7 +27292,7 @@ impl App {
                         {
                             if let Some(transform) = single_transform.as_ref() {
                                 let la_input_t0 = std::time::Instant::now();
-                                self.handle_local_adjust_canvas_input(ctx, full_rect, transform);
+                                self.handle_local_adjust_canvas_input(ctx, full_rect, transform, overflow_pointer_input);
                                 fs_la_canvas_input_ms =
                                     la_input_t0.elapsed().as_secs_f64() * 1000.0;
                                 let la_overlay_t0 = std::time::Instant::now();
@@ -27294,6 +27322,7 @@ impl App {
                                     transform,
                                     image_size,
                                     pointer_allowed,
+                                    overflow_pointer_input,
                                 );
                                 ctx.request_repaint();
                             } else if self.sns_split.is_some() {
@@ -27534,6 +27563,7 @@ impl App {
                                 full_rect,
                                 image_rect,
                                 pixels.as_deref(),
+                                overflow_pointer_input,
                             );
                             if close_analysis {
                                 // × も Z / ホバーボタンと同じ経路 (ズーム/パン引き継ぎ込み) に
@@ -27627,7 +27657,7 @@ impl App {
                                 full_rect,
                                 still_seek_height,
                             );
-                            self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
+                            self.draw_adjustment_panel(ui, panel_rect, state.image_dims, overflow_pointer_input);
                             metadata_panel_demand_checked = true;
                             right_panel_visible = self.draw_metadata_panel(
                                 ui,
@@ -27635,7 +27665,7 @@ impl App {
                                 full_rect,
                                 info_panel_lock_effective,
                                 still_seek_height,
-                            );
+                             overflow_pointer_input, );
                             side_panel_visible |= right_panel_visible;
                         } else if panorama_mode_active_now {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
@@ -27660,7 +27690,7 @@ impl App {
                                 full_rect,
                                 info_panel_lock_effective,
                                 still_seek_height,
-                            );
+                             overflow_pointer_input, );
                             side_panel_visible = right_panel_visible;
                         }
                         if !metadata_panel_demand_checked {
@@ -27703,6 +27733,7 @@ impl App {
                                 still_seek_geometry,
                                 side_panel_visible,
                                 touch_chrome_latched,
+                                overflow_pointer_input,
                             )
                         {
                             if !continuation_committed {
@@ -37608,7 +37639,7 @@ impl App {
         });
         if self.cancel_mouse_right_drag_on_primary_press(
             crate::ring_shortcut::RightDragOwner::Root,
-            primary_pressed,
+            primary_pressed && !overflow_pointer_input.primary_owned,
         ) {
             self.fs_primary_suppression.arm_pointer_stream();
         }
@@ -37851,7 +37882,7 @@ impl App {
                         cancelled: touch_frame.touch_cancelled(),
                     },
                 );
-                if let Some(scope) = touch_scope {
+                if let Some(scope) = touch_scope.filter(|_| !overflow_pointer_input.primary_owned) {
                     if help_phase.is_none()
                         && touch_frame
                             .commands()
@@ -38352,6 +38383,11 @@ impl App {
         let mut touch_help_learned_this_frame = false;
         if touch_input_enabled {
             for command in touch_frame.clone().into_commands() {
+                // Drive the recognizer through its terminal frame above, but never reuse a
+                // front-owned promoted pointer after an early UI action closed the panel.
+                if overflow_pointer_input.primary_owned {
+                    continue;
+                }
                 if let Some(help_phase) = touch_help_phase_for_commands {
                     if still_touch_first_run_help_tap_action(help_phase, command)
                         == StillTouchFirstRunHelpTapAction::LearnAndShowChrome
@@ -38504,7 +38540,8 @@ impl App {
                 )
             })
             .unwrap_or(compare_base_rect);
-        if !cursor_in_panel
+        if !overflow_pointer_input.primary_owned
+            && !cursor_in_panel
             && self.handle_compare_wipe_drag(ctx, compare_drag_rect, compare_base_rect)
         {
             return FsWheelFrameResult::default();
@@ -57202,7 +57239,14 @@ mod tests {
                                         app.draw_fs_music_right_panel(ui, ctx, panel, 0);
                                     } else {
                                         let lock = app.resolved_still_chrome().info_locked;
-                                        app.draw_metadata_panel(ui, ctx, rect, lock, 0.0);
+                                        app.draw_metadata_panel(
+                                            ui,
+                                            ctx,
+                                            rect,
+                                            lock,
+                                            0.0,
+                                            Default::default(),
+                                        );
                                     }
                                 })
                             });
@@ -69975,7 +70019,14 @@ mod tests {
             .run_pass(navigator_ordered_input(Vec::new(), 0.6), |ctx| {
                 ctx.root_ui(|root_ui| {
                     egui::CentralPanel::default().show(root_ui, |ui| {
-                        assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+                        assert!(app.draw_metadata_panel(
+                            ui,
+                            ctx,
+                            full_rect,
+                            true,
+                            0.0,
+                            Default::default()
+                        ));
                     })
                 });
             })

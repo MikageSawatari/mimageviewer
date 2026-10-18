@@ -13622,7 +13622,14 @@ mod paused_similar_feature_tests {
             ctx.run_pass(input, |ctx| {
                 ctx.root_ui(|root_ui| {
                     egui::CentralPanel::default().show(root_ui, |ui| {
-                        assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+                        assert!(app.draw_metadata_panel(
+                            ui,
+                            ctx,
+                            full_rect,
+                            true,
+                            0.0,
+                            Default::default()
+                        ));
                     })
                 });
             })

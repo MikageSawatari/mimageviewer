@@ -118,7 +118,7 @@ fn frame(
             events,
             ..Default::default()
         },
-        |ctx| app.handle_local_adjust_canvas_input(ctx, full_rect, transform),
+        |ctx| app.handle_local_adjust_canvas_input(ctx, full_rect, transform, Default::default()),
     )
     .drop_without_applying_deltas();
 }

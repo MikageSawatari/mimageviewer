@@ -2050,8 +2050,16 @@ impl App {
         full_rect: egui::Rect,
         lock_effective: bool,
         seek_height: f32,
+        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
     ) -> bool {
-        self.draw_metadata_panel_inner(ui, ctx, full_rect, lock_effective, seek_height)
+        self.draw_metadata_panel_inner(
+            ui,
+            ctx,
+            full_rect,
+            lock_effective,
+            seek_height,
+            overflow_pointer_input,
+        )
     }
 
     /// Draw the item-independent frame shared by a live metadata panel and a deferred
@@ -2289,6 +2297,7 @@ impl App {
         full_rect: egui::Rect,
         lock_effective: bool,
         seek_height: f32,
+        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
     ) -> bool {
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         let tag_picker_open = self.fullscreen_tag_picker_open;
@@ -2725,7 +2734,9 @@ impl App {
         if let Some(hit) = similar_actions.pin_hit.take() {
             self.pin_similar_hit(ctx, &hit, full_rect);
         }
-        if let Some(hit) = similar_actions.peek_press.take() {
+        if !overflow_pointer_input.owns(egui::PointerButton::Primary)
+            && let Some(hit) = similar_actions.peek_press.take()
+        {
             self.begin_similar_preview_from_panel(ctx, &hit, full_rect);
         }
         if similar_actions.open_favorites {
@@ -4961,6 +4972,13 @@ fn draw_similar_hit_buttons(
             .on_hover_text(
                 "押している間だけこの画像を表示する。準備が終わる前に離した場合は元の画像を保つ",
             );
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique(("similar_hit_peek_test_rect", hit.item_key.clone())),
+                peek.rect,
+            )
+        });
         if peek.is_pointer_button_down_on() && ui.input(|input| input.pointer.primary_pressed()) {
             actions.peek_press = crate::similar_preview::SimilarPreviewCandidate::for_hit(hit);
         }
