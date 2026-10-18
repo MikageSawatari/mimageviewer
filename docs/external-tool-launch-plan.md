@@ -378,7 +378,7 @@ ACL 保護下の到達できないパスとして保存されていた。3 件�
 | 起動元 | 対象 |
 | --- | --- |
 | グリッド右クリック | `checked` が空でなければ `checked`、空なら右クリックした項目 |
-| グリッドのキー操作 | 同上 (`checked` 優先、無ければ `selected`) |
+| グリッドのキー操作 | 同上 (`checked` 優先、無ければ `selected`)。実フォルダは選択フォルダ自身のパスを渡す（§1.397） |
 | フルスクリーン / 連結読み | 現在ページ。**見開き中の 1〜2 件化 (`SpreadPolicy`) は P4** (§4.5 の 2026-08-31 決定)。それまでは現在ページ 1 件 |
 | 動画・音声再生中 | 再生中の動画 1 本 (+ `VideoPolicy`) |
 | コンテナー対象の起動 | 現在のフォルダー / ZIP / PDF 本体 1 件 |
@@ -393,6 +393,26 @@ ACL 保護下の到達できないパスとして保存されていた。3 件�
 元アーカイブを渡す。検索・タグ・履歴・snapshot 等、現在地を 1 コンテナーに定められない集約ビューの
 背景では起動を拒否する。ページ対象の仮想ページ全体拒否は P3 で解除済みで、実体化できる
 ZIP / PDF ページは `PayloadPolicy` に従って渡す (§4.3、§4.5)。
+
+§1.397（2026-10-18）: キー・固定スロット・ツール選択でも実Folderを受け入れる。
+`LaunchTarget::from_grid_item`を対象種別解決の正本とし、設定画面の対象／引数previewと
+メニューcapabilityの`add_grid_item`が同じresolverを使う。Folderは`RealFile`、
+実体化要求は`MaterializeSource::File { image_page: false }`とする。3種類のpayloadすべてで
+既存の非画像`DirectOriginal`を使い、選択フォルダを親へ置換せず、コピー・画像decode・編集読込みを行わない。
+ZIP内directoryは`Virtual(ArchiveDirectory)`で拒否し、混在集合も部分起動しない。
+キーのchecked優先・表示順・件数制限と、右クリックのコンテナ1件を渡す入口は維持する。
+既存の`ExternalToolPicker`／`ExternalTool1..10`を使い、新しいKeyAction・既定キーは追加しない。
+既存の準備modalと単一operation ownerを使うため、新たな非同期状態／待機／復旧処理は不要。
+まれな失敗は既定の割り切り方針を維持する。
+
+**§1.397 自動検証（2026-10-18、backlog-1399の未コミット差分）**
+
+- `external_tool::tests::folder_target_*`の4件を追加。単独／混在checked・表示順・Single/Each/Batchと上限・コンテナ1件・ZipDir拒否・設定preview・picker／固定slotを検査する。
+- 画像拡張子で終わる実directoryを3種類のpayloadで準備し、`image_page: false`／編集なし／元pathの返却／一時出力directory未作成を検査。外部processを起動せず、slotは要求構築までで止める。
+- 修正前は4件中1成功・3失敗（exit 101）。resolverだけをFolder対応にして旧capability分岐を残す変異は、3成功・1失敗（exit 101）で表示／実行の不一致を検出。最終コードは`add_grid_item`から共通resolverへ委譲する。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/external_tool/)' --no-fail-fast`: 103成功、exit 0。`cargo check -p mimageviewer --bin mimageviewer-core`と`cargo fmt --check`もexit 0。
+- `python scripts/check_ui_glyphs.py`: 0件、exit 0。`python scripts/check_site_cards.py`: 49カード、違反0件、exit 0。既存snapshot差なし、PNG更新なし。
+- ログは`target/1397-{red,mutation-capability,focused,check,fmt}.log`。native依存の初回準備条件は[§1.399検証記録](grid-background-double-click-plan.md#自動検証2026-10-18backlog-1399の未コミット差分)を共有する。2項目統合後の全lib結果は`target/test-lib-full/`台帳を参照。製品build・live試験は今回の依頼により実施しない。
 
 
 **連結読み中はどうするか (2026-08-29 調査)**

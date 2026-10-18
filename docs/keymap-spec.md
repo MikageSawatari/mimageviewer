@@ -236,6 +236,8 @@ ZIP/PDF内ページは実ファイルに置き換えず拒否し、入力時に�
 外部ツール起動は `ExternalToolPicker`、固定スロットの `ExternalTool1..10`、
 コンテナー用ピッカーの `ExternalToolForContainer` を、いずれも標準キーなしの `Grid` Action として扱う。
 固定スロットは登録順の 1〜10 番に対応し、ツールを並べ替えると同じ Action が指すツールも変わる。
+`ExternalToolPicker`／固定スロットはchecked優先、なければselectedの実フォルダを含む項目を渡す。
+実フォルダは選択したフォルダ自身のパスで、ZIP内directoryは対象外。`ExternalToolForContainer`の現在地1件という意味は変えない（§1.397）。
 動的な Action は作らず、設定 UI では対応するスロット番号を明示する。
 同時に有効になり得る Action へ同じキーを割り当てた場合や、予約扱いの
 Escape / 修飾なし矢印キー、サムネイル一覧の <kbd>Shift</kbd>+矢印範囲選択へ割り当てた場合は
