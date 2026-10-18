@@ -7,7 +7,7 @@ Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 
 
 ## 0. 目的と決定済み事項
 
-EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.13.0、WebView2 UI、AVX2/FMA 必須) を
+EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.14.0、WebView2 UI、AVX2/FMA 必須) を
 mIV の音声経路へ組み込み、エフェクト処理とビジュアライザーを使えるようにする。
 
 利用者と合意済みの方針 (2026-09-27):
@@ -378,7 +378,7 @@ enum EffectiveState {
 
 ## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
-- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.13.0、未署名)。
+- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.14.0、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
 - 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
@@ -722,6 +722,111 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 自動削除より単純で誤削除を避けられる残存検査を選択した。現在版の正本は vendor VERSION で、生成時に
 `.htaccess` の印付きブロックも更新する。全他版を一つの301規則で同名ファイルへ、廃止ページは現在版の index.html へ送る。
 公開時はサーバ上の旧版も削除し、生成物と `.htaccess` を同時反映する。sitemap はコミット後に再生成する。
+
+### 10.6 同梱版更新 (2026-10-18)
+
+既存の§10.5（説明ページの更新手順）は保持し、今回の同梱更新を§10.6に記録する。
+
+- 利用者決定: 次のリリースで Mixwright v0.14.0 を同梱する。**歌詞連携は入れない**。
+  bridge protocol、Now Playing の送信内容、mIV の UI・挙動は変更しない。
+  既存の署名前承認hash、署名後stage検証、世代公開・lease・cleanup、portable非同梱を維持する。
+- 原本は `C:/home/miv-tools/effetune-mixwright-0.14.0/EffeTune-Mixwright-windows-x64.zip`。
+  SHA-256 は `9c2586ed3fd19345f0d2b14b98613bc050d393a9bebf94c3ffc83ff86c425c1d`。
+  取得・上流release notes一致・展開物照合はClaudeCodeのcommit `058513108` の検証記録。
+  この実装では外部原本を変更せず、承認manifestも再生成しない。
+- vendorは全462ファイルのbundleと `VERSION`（`v0.14.0` + LF）。全463行の
+  `third_party/effetune-mixwright/v0.14.0/manifest.sha256` と実ファイル集合・SHA-256を照合する。
+  v0.13.0から追加15・削除1（`webview/js/remote/client-csp-guards.js`）。旧版の追跡資料は保持する。
+  3通知はv0.13.0とバイト同一。aboutは新版pathの上流3通知を表示し、補足通知は再開しない。
+  HarmNet重みの `effetune_dsp_0.13.0` と旧版state fixtureは別の根拠なので変更しない。
+- 上流 `docs/host-now-playing.md` は無変更、`PluginStateDocument.formatVersion` は1のまま
+  （ClaudeCode静的照合）。新しいhost契約や歌詞のpayloadは追加しない。
+- Remote静的確認（ClaudeCode）: plugin PEの通信系import
+  WS2_32 / WinHTTP / WinINet / URLMonが見当たらない状況は旧版と同じ。
+  同梱Remote JSは `electronAPI.remoteV1` が無いと起動せず、VSTのelectronAPIには提供されない。
+  `vst-bootstrap.js` の旧版との差はSFZ selectへのoptions引数転送だけ。
+  native全体の通信不使用や実機listen状況の証明とは扱わない。
+- SFZ静的確認（ClaudeCodeおよび実装時の同梱JS照合）: 登録先は引き続き
+  `sfz-references.json`。file/folder選択モード、`bankPaths`、`importedAt` が追加され、
+  サンプルのコピーを示す変更は見当たらない。`NativeSfzLibraryService.selectFiles` /
+  `selectFolder` → `vst-bootstrap.js` のoptions転送と、参照元の直接readを確認した。
+  既存の登録先・元ファイルを残す削除・Adaptive Predictionの説明を変える根拠は無いため、
+  privacy日英・製品ページの本文は変更しない。
+  v0.13.0の実行観測を新版の実行証拠とはしない。
+- 説明書は `third_party/effetune-docs/01c96f00/`（正確なcommitは同directoryのSOURCE.md）を
+  使用。独立版MCP・LANリモートは節選別で除外する。日本語tour.menuの
+  「画面の案内を見る」は同梱localeと一致し、設定メニューから開く案内を加える。
+  Lyricsは追加不可・既存/取込itemの編集だけ可・再生中の歌詞無しと訂正。
+  Lyric Stageは非同梱だが、Cinema StripのLyrics itemは残っているため、
+  同presetの利用可能なグラフ説明は残す。Edge FadeのClean Feed言及を除き、
+  Analog Meter Custom、Note Spectrogramの楽器色、SFZファイル/フォルダ・ARIA・Sample Shiftは維持。
+  詳細は [overrideの記録](effetune-docs-overrides/README.md#現在の同梱版と訂正-2026-10-18)。
+  133 HTML + 4画像を新版に生成し、公開ツリーのv0.13.0を除去、旧URLを新版へ301転送する。
+  入口2本とsitemapも更新する。既存の上流snapshotや過去の検証記録は書き換えない。
+- 最深path gate: 新462ファイルで、vendor入力rootからの最長相対名は104 UTF-16単位。
+  `EffeTune Mixwright.vst3/Contents/Resources/webview/features/measurement/audio-utils/channel-selection.js`。
+  従来と同じ40文字のユーザー名・45文字のgeneration、mIV版 `4.7.1` を使う
+  `C:\Users\<40文字>\AppData\Roaming\mimageviewer\runtime\4.7.1\effetune\<45文字>\`
+  は148単位、合計252単位。`effetune_bundle.rs::check_publish_path_length` の最大259に対し
+  **余裕7単位**。任意のAPPDATA長まで通る保証ではなく、実際の絶対pathのgateを維持する。
+
+非起動検証（今回の未コミット差分）:
+
+- 配布PowerShell回帰はexit 0。欠落・追加・hash改変・偽署名・reparse拒否を維持し、
+  旧v0.13.0と任意VERSIONの拒否も追加。実vendorの承認検査もexit 0、463エントリ一致。
+- 通常 `cargo test -p mimageviewer-launcher effetune` はreleaseのcore / remote /
+  EPUB workerが未作成のためexit 101、build段階で停止。代わりに同じ `build_effetune_source.rs` を
+  `rustc --test` で実行し、実vendor463件の照合を含む4テスト成功・失敗0・ignored 0。
+- 本体 `cargo nextest run -p mimageviewer --lib -E 'test(/effetune|about/)'` はexit 0、
+  122件成功・失敗0（対象外13,203件）。初回はLibRawソース不足とturbojpegのMSBuild失敗。
+  LibRawを別worktreeから実体コピーし、MSBuildのnode reuse無効化・build jobs 1、
+  FFmpeg/VC runtimeのDLL実体を `target/debug/deps` に配置して完走した。
+  同ソースのCMake直列buildもexit 0。ソース・期待値を緩めてbuildを通していない。
+- 生成器テストはexit 0、28件成功。新版 `--check` は137ファイル＋入口＋転送が一致。
+  sitemapは212 URL。カードは49件・超過0、UIグリフは危険文字0。
+  `scripts/test_public_privacy_scope.py` は9件中3件失敗する。原因は今回の更新ではなく、
+  製品ページのカード短縮 (`3fdb14a1d`、2026-10-11) で画像AI見出しの「本体の」と
+  WebView2自身の更新確認の注記が落ちたこと。公開文面の判断が要るため本更新では扱わず別件とする。
+- 承認ZIPのSHA-256、通知3本の旧版とのバイト同一性、全463入力hash、最深pathを再照合。
+  既存§10.2〜§10.5、§11以降、Now Playing計画の本文は保持した。
+  原本、上流repo、承認manifest、HarmNet重み、旧state fixture、bridge protocolは変更しない。
+  証跡は `target/effetune-014-verification/` と `target/effetune-014-core-tests*.log`。
+  製品・pluginの起動とコミットは行わない。最終配布・署名・実機確認はClaudeCodeの検収対象。
+
+実機確認 (2026-10-18、利用者の許可を得て ClaudeCode が隔離 data-dir で操作。build-dev の確認用ビルド):
+
+- 手順: master の確認用ビルド (Mixwright v0.13.0) を `target/hw-0140/data13` で起動し、
+  チェーン Stereo Balance 20%・Volume -3 dB・Level Meter を作って窓を閉じて保存
+  (`effetune/mixwright-state.json`、appVersion 0.13.0)。そのデータの複製 `data14` を本ブランチ
+  (v0.14.0) で起動した。EffeTune の共有保存先3か所は試験前に `target/hw-0140/appdata-backup` へ退避。
+- 観測 (ClaudeCode): v0.14.0 の画面表記は version 0.14.0。v0.13.0 のチェーンと値がそのまま
+  読み込まれ、再生で Level Meter が振れて R が L より 2 dB 大きい (Balance 20% と整合)。
+  窓を閉じると v0.14.0 が状態を書き直し (Balance が float32 の 0.20000000298…)、内容は同じ。
+  ビジュアライザーの Now Playing プリセットに代表画像と曲名 (タグ無しのためファイル名) が出た。
+  ログでは revision 2 で画像 16,308 bytes を notify し tresult=0。
+  初回の案内は保存済み状態がある環境では自動で出ず、設定メニューの「画面の案内を見る」で
+  10 ステップが mIV の窓内に表示され「完了」で閉じた。2 ステップ目は DAW の語を使う
+  (説明書の注記どおり)。最終ステップは「設定の Help からガイド」。
+  SFZ Note Player の「SFZ Library…」→「ファイルを取り込む…」で SineTest.sfz を登録・読み込みできた。
+  `%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json` に名前・path・root・`bankPaths`・`importedAt` を記録し、
+  サンプルのコピーは無く、元フォルダーも変更されなかった。登録を消した状態では「SFZ が見つかりません」と出た。
+  「フォルダーを取り込む…」でも同じ形で登録だけが記録された。音高の変わる合成音
+  (`target/hw-0140/melody/melody.wav`) の再生で Voices 1/32 となり鍵盤表示が反応した (発音を確認)。
+  ビジュアライザー編集の追加メニューは Album〜Text の16種で Lyrics は無かった (説明書の訂正どおり)。
+- 通信 (ClaudeCode、`Get-NetTCPConnection` / `Get-NetUDPEndpoint` で core とその子孫を記録、
+  `target/hw-0140/net-log.txt`): 音響調整を開いた待機中と、再生・SFZ 読み込み中のどちらも
+  Listen と UDP は無し。外向きは WebView2 から `2603:1046:c09:20bf::2:443` と `2620:1ec:33::11:443` だけ
+  (どちらも Microsoft の割り当て帯。WebView2 が独自に名前解決するためホスト名は未確認)。
+  core と専用ホスト自身の TCP は無し。privacy の「WebView2 が Microsoft に更新を確認する」と矛盾しない。
+- 観測 (ClaudeCode、本更新とは別件): 曲が最後まで再生されて Now Playing が消えたあと、
+  リピートを ON にして ▶ で再生し直す・同じ曲や別の曲を一覧から開き直す、のいずれでも
+  mIV が Now Playing を送らなかった (同じ起動中、ログに notify が無い)。送るかどうかは本体の判断で、
+  本体コードは master `76aebc18f` と同じ。EOF 後の再生し直しの不具合 (master `184de0a7b` で修正) が
+  本ブランチの基点に入っていないことと関係する可能性がある。起動し直すと正常に送られた。
+- 後片付け: 利用者の了承を得て、同じ WebView 保存先を使って残っていた別作業の WebView2 本体プロセス
+  4つ (親は終了済み) を止めた。`Frieve\EffeTunePlugin` と `%APPDATA%\mimageviewer-vst3-host.exe` を
+  試験前の退避分に戻し、どちらも退避分と完全一致 (試験後の状態は `target/hw-0140/after-test`)。
+  `%APPDATA%\effetune` は試験の前後で差が無い。
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 

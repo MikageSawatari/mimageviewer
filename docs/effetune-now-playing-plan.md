@@ -1,5 +1,7 @@
 # §1.359 EffeTune Mixwright v0.13.0 更新と Now Playing 連携
 
+v0.14.0 への同梱版更新は [integration-plan §10.6](effetune-integration-plan.md#106-同梱版更新-2026-10-18) を参照。
+
 状態: **実装レビューのP2×4／P3×1を修正・自動再検証・確認build完了、実機／公開前gate待ち**。2026-10-10。§7は全項目回答済み。
 対象は **v4.5.0 の次のリリース**。Coordinator は ClaudeCode、実装担当は Codex。
 調査基準は `next-effetune` / `33a018417e13a271be2da2c109fa571f64079684`。
