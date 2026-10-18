@@ -5762,3 +5762,5 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
 - 独立 Sol/xhigh の途中レビューでも、既存 context の service/receipt/採用境界へ限定した構造修正であり、症状パッチではないと確認。
   観測による slideshow cache 置換と通常登録 marker の不足の2指摘は修正し、コード上の解消を再確認済み。
   兄弟不変の実行結果と独立完成判定は、page-turn 計画 §27.17.12 と同じ `target/d3-1-handoff.md` に記録する。
+- 独立完成レビュー (ClaudeCode が別 session で依頼した Sol / xhigh、2026-10-18、`7388b3f2d`): ACCEPT、P1〜P3 なし。完成差分で
+  「症状パッチではなく構造的修正」に合意。root キー各経路と mounted update 全体の順序の一部は文字列検査で、全入口の端から端までの動的検証ではない (レビュー所見)。
