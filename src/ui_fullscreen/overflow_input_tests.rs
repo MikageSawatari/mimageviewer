@@ -469,20 +469,31 @@ fn render_frame_in_rect(
     modifiers: egui::Modifiers,
     rect: egui::Rect,
 ) {
+    render_output_in_rect(app, ctx, events, modifiers, rect).drop_without_applying_deltas();
+}
+
+fn render_output_in_rect(
+    app: &mut App,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+    rect: egui::Rect,
+) -> egui::FullOutput {
     app.frame_counter += 1;
-    ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(rect),
-            time: Some(app.frame_counter as f64 / 60.0),
-            focused: true,
-            events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
-                .chain(events)
-                .collect(),
-            ..Default::default()
-        },
-        |ui| app.render_fullscreen_viewport(ui),
+    crate::test_ui::headless_paint_output(
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                time: Some(app.frame_counter as f64 / 60.0),
+                focused: true,
+                events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
+                    .chain(events)
+                    .collect(),
+                ..Default::default()
+            },
+            |ui| app.render_fullscreen_viewport(ui),
+        ),
     )
-    .drop_without_applying_deltas();
 }
 
 fn rendered_navigator(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
@@ -2061,4 +2072,560 @@ fn overflow_real_metadata_hold_preview_requires_an_unowned_new_press() {
             .active_candidate_for_test()
             .is_none()
     );
+}
+
+fn overlapping_popup_viewport() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 614.0))
+}
+
+fn overflow_area_layer() -> egui::LayerId {
+    egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("fs_overflow_panel_foreground"),
+    )
+}
+
+fn seek_popup_id() -> egui::Id {
+    egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")
+}
+
+fn painted_text_center(output: &egui::FullOutput, expected: &str) -> egui::Pos2 {
+    fn find(shape: &egui::Shape, clip: egui::Rect, expected: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == expected => {
+                let center = text.galley.rect.translate(text.pos.to_vec2()).center();
+                clip.contains(center).then_some(center)
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, clip, expected)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|shape| find(&shape.shape, shape.clip_rect, expected))
+        .unwrap_or_else(|| panic!("the actual seek popup must visibly paint {expected:?}"))
+}
+
+fn open_real_seek_popup_above_slideshow(app: &mut App, ctx: &egui::Context) -> egui::Pos2 {
+    let rect = overlapping_popup_viewport();
+    app.settings.set_still_seek_bar_locked(true);
+    app.settings.still_seek_strip_visible = false;
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    for _ in 0..4 {
+        render_frame_in_rect(app, ctx, vec![], egui::Modifiers::NONE, rect);
+    }
+    let film = ctx
+        .read_response(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID))
+        .expect("the real locked seek bar must expose its film button")
+        .rect
+        .center();
+    render_frame_in_rect(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(film)],
+        egui::Modifiers::NONE,
+        rect,
+    );
+    render_frame_in_rect(
+        app,
+        ctx,
+        vec![button(film, egui::PointerButton::Primary, true)],
+        egui::Modifiers::NONE,
+        rect,
+    );
+    render_frame_in_rect(
+        app,
+        ctx,
+        vec![button(film, egui::PointerButton::Primary, false)],
+        egui::Modifiers::NONE,
+        rect,
+    );
+    assert!(fs_still_seek_strip_popup_open(ctx));
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Slideshow);
+    for _ in 0..3 {
+        render_frame_in_rect(app, ctx, vec![], egui::Modifiers::NONE, rect);
+    }
+    let output = render_output_in_rect(app, ctx, vec![], egui::Modifiers::NONE, rect);
+    // Smallest is below the overflow panel at this viewport; use the next
+    // actual row so the hit genuinely lies in both visible surfaces.
+    let preset = crate::settings::StillSeekStripHeight::Small;
+    let labels = crate::seek_strip_menu::SeekStripMenuLabels::for_viewport(rect);
+    let label = labels.preset(
+        preset.label(),
+        app.settings.still_seek_strip_height_values.points(preset),
+    );
+    let pos = painted_text_center(&output, &label);
+    output.drop_without_applying_deltas();
+    let overflow = fs_overflow_panel_rect(rect, app.fs_overflow_panel_state).unwrap();
+    let popup = egui::AreaState::load(ctx, seek_popup_id())
+        .expect("the real seek menu must register an Area")
+        .rect();
+    assert!(
+        overflow.contains(pos) && popup.contains(pos),
+        "selected row must truly overlap: row={pos:?}, overflow={overflow:?}, popup={popup:?}"
+    );
+    assert_ne!(
+        ctx.layer_id_at(pos),
+        Some(overflow_area_layer()),
+        "the newer seek popup must actually be above overflow"
+    );
+    pos
+}
+
+#[test]
+fn overflow_top_layer_seek_popup_accepts_real_mouse_and_touch_row_selection() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for promoted_touch in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_landscape(&ctx);
+        let pos = open_real_seek_popup_above_slideshow(&mut app, &ctx);
+        assert_ne!(
+            app.settings.still_seek_strip_height,
+            crate::settings::StillSeekStripHeight::Small
+        );
+        let exclusions = app
+            .capture_fs_overflow_pointer_input(&ctx, overlapping_popup_viewport())
+            .1;
+        assert!(
+            !exclusions.iter().any(|rect| rect.contains(pos)),
+            "overflow touch exclusion must leave the higher seek row usable"
+        );
+        let mut press = vec![
+            egui::Event::PointerMoved(pos),
+            button(pos, egui::PointerButton::Primary, true),
+        ];
+        if promoted_touch {
+            press.insert(0, touch(pos, egui::TouchPhase::Start));
+        }
+        render_frame_in_rect(
+            &mut app,
+            &ctx,
+            press,
+            egui::Modifiers::NONE,
+            overlapping_popup_viewport(),
+        );
+        assert_ne!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::OverflowStream,
+            "higher popup press cannot belong to overflow"
+        );
+        let mut release = vec![button(pos, egui::PointerButton::Primary, false)];
+        if promoted_touch {
+            release.insert(0, touch(pos, egui::TouchPhase::End));
+        }
+        render_frame_in_rect(
+            &mut app,
+            &ctx,
+            release,
+            egui::Modifiers::NONE,
+            overlapping_popup_viewport(),
+        );
+        assert_eq!(
+            app.settings.still_seek_strip_height,
+            crate::settings::StillSeekStripHeight::Small,
+            "the real popup row must remain selectable: touch={promoted_touch}"
+        );
+        assert!(!fs_still_seek_strip_popup_open(&ctx));
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn overflow_top_layer_secondary_press_does_not_claim_the_higher_seek_popup() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_landscape(&ctx);
+    let pos = open_real_seek_popup_above_slideshow(&mut app, &ctx);
+    render_frame_in_rect(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(pos),
+            button(pos, egui::PointerButton::Secondary, true),
+        ],
+        egui::Modifiers::NONE,
+        overlapping_popup_viewport(),
+    );
+    assert!(
+        !matches!(
+            app.fs_secondary_press,
+            FullscreenSecondaryPress::Overflow { .. }
+        ),
+        "secondary uses the same actual front layer as primary and touch"
+    );
+    // Releasing in another popup retains master behavior, including its existing
+    // fullscreen close/gesture rules. This change only restricts overflow ownership.
+    render_frame_in_rect(
+        &mut app,
+        &ctx,
+        vec![button(pos, egui::PointerButton::Secondary, false)],
+        egui::Modifiers::NONE,
+        overlapping_popup_viewport(),
+    );
+}
+
+#[test]
+fn overflow_nonoverlapping_front_region_still_shields_the_real_wipe_with_seek_popup_open() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_landscape(&ctx);
+    open_real_seek_popup_above_slideshow(&mut app, &ctx);
+    let rect = overlapping_popup_viewport();
+    let popup = egui::AreaState::load(&ctx, seek_popup_id()).unwrap().rect();
+    let overflow = fs_overflow_panel_rect(rect, app.fs_overflow_panel_state).unwrap();
+    let draw = App::compare_image_draw_rect(
+        app.fullscreen_media_rect(rect, 1, false),
+        [320, 160],
+        app.fs_zoom_pan(),
+        app.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+    )
+    .unwrap();
+    let unoccluded =
+        egui::Rect::from_min_max(overflow.min, egui::pos2(overflow.right(), popup.top()))
+            .intersect(draw)
+            .shrink(12.0);
+    assert!(
+        unoccluded.width() > 80.0 && unoccluded.height() > 50.0,
+        "must expose real overflow above the seek popup: {unoccluded:?}"
+    );
+    let start = unoccluded.center();
+    assert!(!popup.contains(start));
+    assert_eq!(ctx.layer_id_at(start), Some(overflow_area_layer()));
+    let pixels = Arc::new(egui::ColorImage::filled(
+        [320, 160],
+        egui::Color32::LIGHT_RED,
+    ));
+    app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+        pixels: Arc::clone(&pixels),
+        indicator_pixels: Arc::clone(&pixels),
+        indicator_texture: None,
+        display_name: "front ownership pin".into(),
+        source_idx: 42,
+        external_item_key: None,
+        source_size: [320, 160],
+    });
+    app.compare_preparation =
+        crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+            key: 1,
+            current_idx: 1,
+            pinned_source_idx: 42,
+            current_input_size: [320, 160],
+            pinned_input_size: [320, 160],
+            target_size: [320, 160],
+            pixels: crate::app::ComparePreparedPixels::WipeTextures {
+                pinned: Arc::clone(&pixels),
+                current: pixels,
+            },
+            pinned_texture: None,
+            current_texture: None,
+            diff_texture: None,
+        });
+    let fraction = (start.x - draw.left()) / draw.width();
+    app.compare_view_mode = crate::app::CompareViewMode::wipe(fraction);
+    let exclusions = app.capture_fs_overflow_pointer_input(&ctx, rect).1;
+    assert!(exclusions.iter().any(|rect| rect.contains(start)));
+    render_frame_in_rect(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(start),
+            button(start, egui::PointerButton::Primary, true),
+        ],
+        egui::Modifiers::NONE,
+        rect,
+    );
+    assert_eq!(
+        app.fs_primary_suppression,
+        FullscreenPrimarySuppression::OverflowStream
+    );
+    let end = start - egui::vec2(55.0, 0.0);
+    render_frame_in_rect(
+        &mut app,
+        &ctx,
+        vec![egui::Event::PointerMoved(end)],
+        egui::Modifiers::NONE,
+        rect,
+    );
+    render_frame_in_rect(
+        &mut app,
+        &ctx,
+        vec![button(end, egui::PointerButton::Primary, false)],
+        egui::Modifiers::NONE,
+        rect,
+    );
+    assert_eq!(wipe_fraction(&app), fraction);
+    assert_eq!(app.fullscreen_idx, Some(1));
+}
+
+#[test]
+fn overflow_first_open_and_sizing_pass_claim_each_button_before_the_area_can_interact() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for passes in [1, 2] {
+        for (kind, promoted_touch) in [
+            (egui::PointerButton::Primary, false),
+            (egui::PointerButton::Secondary, false),
+            (egui::PointerButton::Primary, true),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+            let mut app = rendered_landscape(&ctx);
+            app.fs_zoom = 2.0;
+            let rect = overlapping_popup_viewport();
+            for _ in 0..3 {
+                render_frame_in_rect(&mut app, &ctx, vec![], egui::Modifiers::NONE, rect);
+            }
+            assert!(egui::AreaState::load(&ctx, overflow_area_layer().id).is_none());
+            app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+            let inside = fs_overflow_panel_rect(rect, app.fs_overflow_panel_state)
+                .unwrap()
+                .center();
+            let before = app.fs_pan;
+            let mut press = vec![
+                egui::Event::PointerMoved(inside),
+                button(inside, kind, true),
+            ];
+            if promoted_touch {
+                press.insert(0, touch(inside, egui::TouchPhase::Start));
+            }
+            render_frame_in_rect(&mut app, &ctx, press, egui::Modifiers::NONE, rect);
+            let area = egui::AreaState::load(&ctx, overflow_area_layer().id)
+                .expect("first production draw must register overflow's Area");
+            if passes == 1 {
+                assert!(
+                    !area.interactable,
+                    "one-pass first draw must really exercise egui's noninteractive sizing pass"
+                );
+            }
+            if kind == egui::PointerButton::Primary {
+                assert_eq!(
+                    app.fs_primary_suppression,
+                    FullscreenPrimarySuppression::OverflowStream,
+                    "first-open primary/touch ownership must not depend on last frame's area"
+                );
+            } else {
+                assert!(matches!(
+                    app.fs_secondary_press,
+                    FullscreenSecondaryPress::Overflow { .. }
+                ));
+            }
+            let end = inside - egui::vec2(70.0, 50.0);
+            let mut movement = vec![egui::Event::PointerMoved(end)];
+            if promoted_touch {
+                movement.insert(0, touch(end, egui::TouchPhase::Move));
+            }
+            render_frame_in_rect(&mut app, &ctx, movement, egui::Modifiers::NONE, rect);
+            let mut release = vec![button(end, kind, false)];
+            if promoted_touch {
+                release.insert(0, touch(end, egui::TouchPhase::End));
+            }
+            render_frame_in_rect(&mut app, &ctx, release, egui::Modifiers::NONE, rect);
+            assert_eq!(
+                app.fs_pan, before,
+                "sizing/open press must not pan the backing image: passes={passes}, button={kind:?}, touch={promoted_touch}"
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(!app.fs_primary_suppression.is_active());
+            assert_eq!(app.fs_secondary_press, FullscreenSecondaryPress::Idle);
+        }
+    }
+}
+
+#[test]
+fn overflow_closed_state_does_not_reclaim_buttons_or_touch_from_a_stale_area() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for (kind, promoted_touch) in [
+        (egui::PointerButton::Primary, false),
+        (egui::PointerButton::Secondary, false),
+        (egui::PointerButton::Primary, true),
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_landscape(&ctx);
+        app.fs_zoom = 2.0;
+        let rect = overlapping_popup_viewport();
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        for _ in 0..4 {
+            render_frame_in_rect(&mut app, &ctx, vec![], egui::Modifiers::NONE, rect);
+        }
+        let old = fs_overflow_panel_rect(rect, app.fs_overflow_panel_state).unwrap();
+        let start = old.center();
+        assert_eq!(ctx.layer_id_at(start), Some(overflow_area_layer()));
+        assert!(egui::AreaState::load(&ctx, overflow_area_layer().id).is_some());
+        // Close through the state owner before the next pass. The previous frame's
+        // Area still exists in egui memory; it must not resurrect a closed menu.
+        app.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        let (closed_input, closed_surface) = app.capture_fs_overflow_pointer_input(&ctx, rect);
+        assert!(!closed_input.owns(kind));
+        assert!(
+            closed_surface.is_empty(),
+            "a closed panel has no touch exclusion despite its retained Area"
+        );
+        let mut press = vec![egui::Event::PointerMoved(start), button(start, kind, true)];
+        if promoted_touch {
+            press.insert(0, touch(start, egui::TouchPhase::Start));
+        }
+        render_frame_in_rect(&mut app, &ctx, press, egui::Modifiers::NONE, rect);
+        assert_ne!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::OverflowStream
+        );
+        assert!(!matches!(
+            app.fs_secondary_press,
+            FullscreenSecondaryPress::Overflow { .. }
+        ));
+        let end = start - egui::vec2(70.0, 50.0);
+        if kind == egui::PointerButton::Primary {
+            let mut movement = vec![egui::Event::PointerMoved(end)];
+            if promoted_touch {
+                movement.insert(0, touch(end, egui::TouchPhase::Move));
+            }
+            render_frame_in_rect(&mut app, &ctx, movement, egui::Modifiers::NONE, rect);
+        }
+        // Keep the unowned right-click a short click. A release event itself
+        // carries position and must not accidentally turn this into a drag.
+        let release_pos = if kind == egui::PointerButton::Secondary {
+            start
+        } else {
+            end
+        };
+        let mut release = vec![button(release_pos, kind, false)];
+        if promoted_touch {
+            release.insert(0, touch(end, egui::TouchPhase::End));
+        }
+        render_frame_in_rect(&mut app, &ctx, release, egui::Modifiers::NONE, rect);
+        if kind == egui::PointerButton::Secondary {
+            assert_eq!(
+                app.fullscreen_idx, None,
+                "master's fresh unowned short right-click still closes fullscreen"
+            );
+        } else {
+            assert_eq!(app.fullscreen_idx, Some(1));
+            // egui can retain its previous widget as the owner of the first
+            // press at the just-closed Area. That master's Response lifetime
+            // is separate from overflow's captured ownership: end that press,
+            // then verify that a genuinely fresh canvas contact still works.
+            render_frame_in_rect(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerGone],
+                egui::Modifiers::NONE,
+                rect,
+            );
+            assert_ne!(ctx.layer_id_at(start), Some(overflow_area_layer()));
+            render_frame_in_rect(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(start)],
+                egui::Modifiers::NONE,
+                rect,
+            );
+            let before = app.fs_pan;
+            let mut fresh = vec![button(start, egui::PointerButton::Primary, true)];
+            if promoted_touch {
+                fresh.insert(0, touch(start, egui::TouchPhase::Start));
+            }
+            render_frame_in_rect(&mut app, &ctx, fresh, egui::Modifiers::NONE, rect);
+            let fresh_end = start + egui::vec2(45.0, 25.0);
+            let mut movement = vec![egui::Event::PointerMoved(fresh_end)];
+            if promoted_touch {
+                movement.insert(0, touch(fresh_end, egui::TouchPhase::Move));
+            }
+            render_frame_in_rect(&mut app, &ctx, movement, egui::Modifiers::NONE, rect);
+            assert_ne!(
+                app.fs_pan, before,
+                "closed overflow cannot block a fresh canvas drag after the previous egui owner retires: touch={promoted_touch}"
+            );
+            let mut release = vec![button(fresh_end, egui::PointerButton::Primary, false)];
+            if promoted_touch {
+                release.insert(0, touch(fresh_end, egui::TouchPhase::End));
+            }
+            render_frame_in_rect(&mut app, &ctx, release, egui::Modifiers::NONE, rect);
+        }
+    }
+}
+
+#[test]
+fn overflow_surface_matches_top_area_at_popup_edges_and_adjacent_floats() {
+    let panel = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(500.0, 400.0));
+    let popup_rects = [
+        egui::Rect::from_min_max(egui::pos2(180.0, 140.0), egui::pos2(420.0, 320.0)),
+        egui::Rect::from_min_max(egui::pos2(250.0, 120.0), egui::pos2(250.0, 350.0)),
+        egui::Rect::from_min_max(egui::pos2(140.0, 250.0), egui::pos2(460.0, 250.0)),
+        egui::Rect::from_min_max(egui::pos2(250.0, 250.0), egui::pos2(250.0, 250.0)),
+        egui::Rect::from_min_max(egui::pos2(50.0, 180.0), egui::pos2(100.0, 250.0)),
+        egui::Rect::from_min_max(egui::pos2(500.0, 180.0), egui::pos2(550.0, 250.0)),
+    ];
+    for popup_rect in popup_rects {
+        let ctx = egui::Context::default();
+        let overflow = overflow_area_layer();
+        let popup = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("overflow_surface_boundary_popup"),
+        );
+        // Register actual egui Area geometry in z-order. Zero-sized Areas are
+        // intentional: egui's inclusive hit-test also owns their line/point.
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(viewport()),
+                ..Default::default()
+            },
+            |ui| {
+                ui.ctx().memory_mut(|memory| {
+                    for (layer, rect) in [(overflow, panel), (popup, popup_rect)] {
+                        memory.areas_mut().set_state(
+                            layer,
+                            egui::AreaState {
+                                pivot_pos: Some(rect.min),
+                                size: Some(rect.size()),
+                                interactable: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(ctx.layer_id_at(popup_rect.center()), Some(popup));
+        let surface = fs_overflow_pointer_surface(&ctx, Some(panel));
+        let axis_points = |values: [f32; 6]| {
+            values
+                .into_iter()
+                .flat_map(|value| [value.next_down(), value, value.next_up()])
+                .collect::<Vec<_>>()
+        };
+        let xs = axis_points([
+            panel.left(),
+            panel.right(),
+            panel.center().x,
+            popup_rect.left(),
+            popup_rect.right(),
+            popup_rect.center().x,
+        ]);
+        let ys = axis_points([
+            panel.top(),
+            panel.bottom(),
+            panel.center().y,
+            popup_rect.top(),
+            popup_rect.bottom(),
+            popup_rect.center().y,
+        ]);
+        for x in xs {
+            for &y in &ys {
+                let pos = egui::pos2(x, y);
+                let top = ctx.layer_id_at(pos);
+                let expected = panel.contains(pos) && top == Some(overflow);
+                let actual = surface.iter().any(|rect| rect.contains(pos));
+                assert_eq!(
+                    actual, expected,
+                    "button/touch surface differs from egui at {pos:?}: popup={popup_rect:?}, top={top:?}, surface={surface:?}"
+                );
+            }
+        }
+    }
 }

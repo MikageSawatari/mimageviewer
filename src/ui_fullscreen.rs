@@ -124,6 +124,89 @@ impl FsOverflowPointerFrameInput {
     }
 }
 
+/// Project the current overflow surface through egui's layer hit-test once per pass.
+/// The same surface is used by both buttons and by the touch classifier.
+fn fs_overflow_pointer_surface(ctx: &egui::Context, panel: Option<egui::Rect>) -> Vec<egui::Rect> {
+    let Some(panel) = panel else {
+        return Vec::new();
+    };
+    let overflow = egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("fs_overflow_panel_foreground"),
+    );
+    let (allowed, layers) = ctx.memory(|memory| {
+        (
+            memory.is_above_modal_layer(overflow),
+            memory
+                .layer_ids()
+                .filter(|layer| {
+                    layer.order >= egui::Order::Foreground && memory.areas().is_visible(layer)
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    if !allowed {
+        return Vec::new();
+    }
+
+    // Split at interactive Area boundaries, so the top layer is constant inside
+    // each piece. Do not register/move an Area here: that would reorder open menus.
+    let mut pieces = vec![panel];
+    for layer in layers {
+        let Some(state) = egui::AreaState::load(ctx, layer.id).filter(|state| state.interactable)
+        else {
+            continue;
+        };
+        let rect = ctx
+            .layer_transform_to_global(layer)
+            .map_or(state.rect(), |transform| transform * state.rect());
+        pieces = pieces
+            .into_iter()
+            .flat_map(|piece| {
+                let intersection = piece.intersect(rect);
+                if intersection.min.x <= intersection.max.x
+                    && intersection.min.y <= intersection.max.y
+                {
+                    // Rect::contains includes both edges. Partition representable coordinates
+                    // without shared edges, including single-coordinate lines at Area borders.
+                    [
+                        egui::Rect::from_min_max(
+                            piece.min,
+                            egui::pos2(piece.max.x, intersection.min.y.next_down()),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(piece.min.x, intersection.max.y.next_up()),
+                            piece.max,
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(piece.min.x, intersection.min.y),
+                            egui::pos2(intersection.min.x.next_down(), intersection.max.y),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(intersection.max.x.next_up(), intersection.min.y),
+                            egui::pos2(piece.max.x, intersection.max.y),
+                        ),
+                        intersection,
+                    ]
+                    .into_iter()
+                    .filter(|rect| rect.min.x <= rect.max.x && rect.min.y <= rect.max.y)
+                    .collect::<Vec<_>>()
+                } else {
+                    vec![piece]
+                }
+            })
+            .collect();
+    }
+    pieces.retain(|piece| {
+        ctx.layer_id_at(piece.center()).is_none_or(|top| {
+            // A newly opened/sizing Area has no interactive hit yet. Its current
+            // rectangle may cover backing layers, but never another foreground UI.
+            top == overflow || top.order < egui::Order::Foreground
+        })
+    });
+    pieces
+}
+
 impl FullscreenSecondaryPressOwner {
     fn new(
         viewer_context: crate::app::ViewerContextId,
@@ -213,7 +296,7 @@ impl FullscreenSecondaryPress {
     fn overflow_owns_input(
         &mut self,
         owner: Option<FullscreenSecondaryPressOwner>,
-        panel: Option<egui::Rect>,
+        visible_panel: &[egui::Rect],
         input: &egui::InputState,
     ) -> bool {
         if matches!(self, Self::Overflow { owner: captured } if Some(*captured) != owner) {
@@ -229,7 +312,9 @@ impl FullscreenSecondaryPress {
             } = event
             {
                 if *pressed {
-                    if let Some(owner) = owner.filter(|_| panel.is_some_and(|r| r.contains(*pos))) {
+                    if let Some(owner) =
+                        owner.filter(|_| visible_panel.iter().any(|r| r.contains(*pos)))
+                    {
                         *self = Self::Overflow { owner };
                         owned = true;
                     } else if matches!(self, Self::Overflow { .. }) {
@@ -24088,7 +24173,6 @@ impl App {
         ctx: &egui::Context,
         toggle_rect: Option<egui::Rect>,
         strip_visible: bool,
-        overflow_pointer_input: FsOverflowPointerFrameInput,
     ) {
         let Some(toggle_rect) = toggle_rect.map(|rect| rect.intersect(ui.clip_rect())) else {
             return;
@@ -24105,16 +24189,14 @@ impl App {
             draw_still_seek_strip_icon,
         )
         .hover_tip_dark("サムネイル列の表示と高さ");
-        if !overflow_pointer_input.primary_owned
-            && let Some(choice) = draw_still_seek_strip_popup(
-                &strip_resp,
-                strip_visible,
-                self.settings.still_seek_strip_height,
-                self.settings.still_seek_strip_height_values,
-                self.settings.still_seek_preview_size,
-                self.settings.still_seek_preview_size_values,
-            )
-        {
+        if let Some(choice) = draw_still_seek_strip_popup(
+            &strip_resp,
+            strip_visible,
+            self.settings.still_seek_strip_height,
+            self.settings.still_seek_strip_height_values,
+            self.settings.still_seek_preview_size,
+            self.settings.still_seek_preview_size_values,
+        ) {
             match choice {
                 StillSeekStripMenuChoice::Visible(visible) => {
                     self.set_still_seek_strip_visible(ctx, visible);
@@ -24227,13 +24309,7 @@ impl App {
         // With a visible seek bar this control belongs to the bar. When the bar is hidden
         // it overlays the page cells and must be registered after the strip body instead.
         if bar_rect.is_some() || !info.has_page_strip_content() {
-            self.draw_fullscreen_still_seek_strip_toggle(
-                ui,
-                ctx,
-                controls.toggle,
-                strip_visible,
-                overflow_pointer_input,
-            );
+            self.draw_fullscreen_still_seek_strip_toggle(ui, ctx, controls.toggle, strip_visible);
         }
         if let Some(lock_rect) = controls.bar_lock.map(|rect| rect.intersect(ui.clip_rect()))
             && lock_rect.is_positive()
@@ -24641,7 +24717,6 @@ impl App {
                     ctx,
                     strip_toggle_rect,
                     strip_visible,
-                    overflow_pointer_input,
                 );
             }
         }
@@ -26492,7 +26567,7 @@ impl App {
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
-                        let overflow_pointer_input = self.capture_fs_overflow_pointer_input(ctx, full_rect);
+                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_overflow_pointer_input(ctx, full_rect);
                         let music_overflow_input = self.begin_music_overflow_frame_input(ctx, full_rect, fs_idx);
                         let mut hud_popup_wheel = self
                             .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx, music_overflow_input)
@@ -26782,6 +26857,7 @@ impl App {
                                 || mouse_nav.is_some() || jump_to.is_some(),
                             true,
                             overflow_pointer_input,
+                            &overflow_touch_excluded,
                         );
                         if let Some(mut proposal) = wheel_result.deferred.take() {
                             proposal.frame_navigation_allowed = !continuation_committed;
@@ -37577,7 +37653,8 @@ impl App {
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
-        let overflow_pointer_input = self.capture_fs_overflow_pointer_input(ctx, full_rect);
+        let (overflow_pointer_input, overflow_touch_excluded) =
+            self.capture_fs_overflow_pointer_input(ctx, full_rect);
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
@@ -37593,6 +37670,7 @@ impl App {
             false,
             false,
             overflow_pointer_input,
+            &overflow_touch_excluded,
         );
         (result.page_nav, result.close)
     }
@@ -37613,6 +37691,7 @@ impl App {
         suppress_wheel_navigation: bool,
         merge_at_frame_tail: bool,
         overflow_pointer_input: FsOverflowPointerFrameInput,
+        overflow_touch_excluded: &[egui::Rect],
     ) -> FsWheelFrameResult {
         *navigator_reservation = None;
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx)
@@ -37859,9 +37938,7 @@ impl App {
                     crate::touch_input::TapZoneGeometry {
                         surface: full_rect,
                         excluded: if help_phase.is_none() {
-                            fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
-                                .into_iter()
-                                .collect()
+                            overflow_touch_excluded.to_vec()
                         } else {
                             Vec::new()
                         },
@@ -38303,11 +38380,9 @@ impl App {
         if top_bar_visible {
             touch_excluded.push(fullscreen_top_bar_rect(full_rect));
         }
-        // 右上の overflow panel はページ送り面ではない。panel state と同じ純粋な矩形計算を
-        // touch classifier に渡し、行・戻る・閉じる操作を PageSide へ再分類させない。
-        if let Some(rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state) {
-            touch_excluded.push(rect);
-        }
+        // Use the same frontmost surface captured for both pointer buttons. A popup
+        // above overflow keeps its pre-existing touch handling instead of becoming overflow.
+        touch_excluded.extend_from_slice(overflow_touch_excluded);
         // ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
         // 除外しないと、隅ボタンも閉じるボタンも押せないまま、触れた指がページを送る。
         if let Some(navigator_rect) = self.fullscreen_navigator_panel_rect(ctx, full_rect) {
@@ -39456,8 +39531,11 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-    ) -> FsOverflowPointerFrameInput {
-        let panel = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state);
+    ) -> (FsOverflowPointerFrameInput, Vec<egui::Rect>) {
+        let visible_panel = fs_overflow_pointer_surface(
+            ctx,
+            fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state),
+        );
         let secondary_owner = self.fullscreen_idx.map(|fs_idx| {
             FullscreenSecondaryPressOwner::new(
                 self.edit_request_owner_context(),
@@ -39466,11 +39544,11 @@ impl App {
                 self.current_right_drag_context(),
             )
         });
-        ctx.input(|input| {
+        let pointer = ctx.input(|input| {
             if input.events.iter().any(|event| {
                 matches!(event, egui::Event::PointerButton {
                     button: egui::PointerButton::Primary, pressed: true, pos, ..
-                } if panel.is_some_and(|rect| rect.contains(*pos)))
+                } if visible_panel.iter().any(|rect| rect.contains(*pos)))
             }) {
                 self.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
             }
@@ -39486,12 +39564,13 @@ impl App {
                 primary_owned,
                 secondary_owned: self.fs_secondary_press.overflow_owns_input(
                     secondary_owner,
-                    panel,
+                    &visible_panel,
                     input,
                 ),
                 secondary_owner,
             }
-        })
+        });
+        (pointer, visible_panel)
     }
 
     fn dismiss_fs_overflow_on_touch_tap(
@@ -39505,7 +39584,7 @@ impl App {
                     | crate::touch_input::TouchCommand::PageSide { .. }
             )
         {
-            // Panel contacts are excluded by the shared rect. Only spend outside taps;
+            // Frontmost panel contacts are excluded by the shared surface. Only spend outside taps;
             // the caller still drives recognizer ownership through its terminal frame.
             self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
             true
