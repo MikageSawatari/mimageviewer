@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
+    #[cfg(windows)]
+    hwnd: isize,
     alpha_mode: wgpu::CompositeAlphaMode,
     width: u32,
     height: u32,
@@ -194,13 +196,23 @@ impl Painter {
             return Ok(());
         };
 
+        // DXGI allows only one flip-model swap chain per HWND. End the old surface before
+        // configuring its replacement; keep only the already validated size/owner values.
+        let (width, height, resizing) = (old_state.width, old_state.height, old_state.resizing);
+        #[cfg(windows)]
+        let hwnd = old_state.hwnd;
+        #[cfg(windows)]
+        drop(old_state);
+
         let surface = self.instance.create_surface(Arc::clone(window))?;
         self.install_surface(
             surface,
             viewport_id,
-            old_state.width,
-            old_state.height,
-            old_state.resizing,
+            width,
+            height,
+            resizing,
+            #[cfg(windows)]
+            hwnd,
         );
         Ok(())
     }
@@ -234,19 +246,18 @@ impl Painter {
         profiling::scope!("Painter::set_window"); // profile_function gives bad names for async functions
 
         if let Some(window) = window {
-            let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
                 let observe = viewport_id == ViewportId::ROOT && self.startup_present.pending();
                 if observe {
                     self.config.startup_begin(StartupGpuStage::SurfaceCreate);
                 }
-                let surface = self.instance.create_surface(window);
+                let surface = self.instance.create_surface(Arc::clone(&window));
                 if observe {
                     self.config
                         .startup_end(StartupGpuStage::SurfaceCreate, surface.is_ok());
                 }
                 let surface = surface?;
-                self.add_surface(surface, viewport_id, size).await?;
+                self.add_surface(surface, viewport_id, &window).await?;
             }
         } else {
             self.remove_viewport(viewport_id);
@@ -268,7 +279,6 @@ impl Painter {
         profiling::scope!("Painter::set_window_unsafe"); // profile_function gives bad names for async functions
 
         if let Some(window) = window {
-            let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
                 let observe = viewport_id == ViewportId::ROOT && self.startup_present.pending();
                 if observe {
@@ -285,7 +295,7 @@ impl Painter {
                         .startup_end(StartupGpuStage::SurfaceCreate, surface.is_ok());
                 }
                 let surface = surface?;
-                self.add_surface(surface, viewport_id, size).await?;
+                self.add_surface(surface, viewport_id, window).await?;
             }
         } else {
             self.remove_viewport(viewport_id);
@@ -294,6 +304,8 @@ impl Painter {
     }
 
     fn remove_viewport(&mut self, viewport_id: ViewportId) {
+        // Windows size constraints deliberately survive surface removal. The same HWND and
+        // Painter use a fixed device limit; value-only subclass refdata lives until NCDESTROY.
         remove_viewport_resources(
             viewport_id,
             &mut self.surfaces,
@@ -306,7 +318,7 @@ impl Painter {
         &mut self,
         surface: wgpu::Surface<'static>,
         viewport_id: ViewportId,
-        size: winit::dpi::PhysicalSize<u32>,
+        window: &winit::window::Window,
     ) -> Result<(), crate::WgpuError> {
         if self.render_state.is_none() {
             let render_state =
@@ -314,7 +326,34 @@ impl Painter {
                     .await?;
             self.render_state = Some(render_state);
         }
-        self.install_surface(surface, viewport_id, size.width, size.height, false);
+        #[cfg(windows)]
+        let (hwnd, size) = {
+            use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+            let RawWindowHandle::Win32(handle) = window.window_handle()?.as_raw() else {
+                return Err(std::io::Error::other("expected a Win32 surface window").into());
+            };
+            let hwnd = handle.hwnd.get();
+            let limit = self
+                .render_state
+                .as_ref()
+                .unwrap()
+                .device
+                .limits()
+                .max_texture_dimension_2d;
+            crate::window_size_limit::register(hwnd, limit)?;
+            (hwnd, crate::window_size_limit::enforce(hwnd, limit)?)
+        };
+        #[cfg(not(windows))]
+        let size = window.inner_size();
+        self.install_surface(
+            surface,
+            viewport_id,
+            size.width,
+            size.height,
+            false,
+            #[cfg(windows)]
+            hwnd,
+        );
         Ok(())
     }
 
@@ -329,6 +368,7 @@ impl Painter {
         width: u32,
         height: u32,
         resizing: bool,
+        #[cfg(windows)] hwnd: isize,
     ) {
         let alpha_mode = {
             // Panic: We use the same failure mode as `resize_and_generate_depth_texture_view_and_msaa_view`
@@ -368,6 +408,8 @@ impl Painter {
             viewport_id,
             SurfaceState {
                 surface,
+                #[cfg(windows)]
+                hwnd,
                 width,
                 height,
                 alpha_mode,
@@ -410,10 +452,38 @@ impl Painter {
         let height = height_in_pixels.get();
 
         let render_state = self.render_state.as_ref().unwrap();
+        #[cfg(windows)]
+        let (width, height) = {
+            let limit = render_state.device.limits().max_texture_dimension_2d;
+            if width > limit || height > limit {
+                // A caller can bypass WINDOWPOSCHANGING with SWP_NOSENDCHANGING. Correct
+                // the actual window once, never configure a surface-only clipped size.
+                let hwnd = self.surfaces.get(&viewport_id).unwrap().hwnd;
+                match crate::window_size_limit::enforce(hwnd, limit) {
+                    Ok(size) => (size.width, size.height),
+                    Err(error) => {
+                        log::error!(
+                            "Failed to constrain surface window for {viewport_id:?}: {error}"
+                        );
+                        self.remove_viewport(viewport_id);
+                        return;
+                    }
+                }
+            } else {
+                (width, height)
+            }
+        };
         let surface_state = self.surfaces.get_mut(&viewport_id).unwrap();
 
         surface_state.width = width;
         surface_state.height = height;
+
+        // Native correction can reveal a minimized (zero-sized) client. All later direct
+        // reconfigure paths use only these validated dimensions, including Lost recreation.
+        #[cfg(windows)]
+        if width == 0 || height == 0 {
+            return;
+        }
 
         Self::configure_surface(
             surface_state,
@@ -701,6 +771,11 @@ impl Painter {
         let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
             return vsync_sec;
         };
+
+        #[cfg(windows)]
+        if surface_state.width == 0 || surface_state.height == 0 {
+            return vsync_sec;
+        }
 
         probe.outcome = PaintOutcome::Skipped;
         if observe {

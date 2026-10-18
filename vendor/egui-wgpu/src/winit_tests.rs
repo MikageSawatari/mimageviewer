@@ -6,6 +6,137 @@ use epaint::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(windows)]
+#[test]
+fn surface_size_limit_constrains_initial_safe_unsafe_resize_and_recreate() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetWindowRect, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOZORDER,
+        SetWindowPos,
+    };
+    use winit::{
+        event_loop::EventLoop,
+        platform::windows::EventLoopBuilderExtWindows as _,
+        raw_window_handle::{HasWindowHandle as _, RawWindowHandle},
+        window::Window,
+    };
+    const LIMIT: u32 = 1024;
+    let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+    #[expect(deprecated)] // Hidden standalone test windows, no application/event-loop run.
+    let window = Arc::new(
+        event_loop
+            .create_window(
+                Window::default_attributes()
+                    .with_visible(false)
+                    .with_inner_size(winit::dpi::PhysicalSize::new(1600, 1400)),
+            )
+            .unwrap(),
+    );
+    let RawWindowHandle::Win32(handle) = window.window_handle().unwrap().as_raw() else {
+        panic!("expected Win32 window")
+    };
+    let hwnd = handle.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+    assert!(
+        window.inner_size().width > LIMIT,
+        "fixture must exceed the limit before registration"
+    );
+
+    let mut config = WgpuConfiguration::default();
+    let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup else {
+        unreachable!()
+    };
+    setup.instance_descriptor.backends = wgpu::Backends::DX12;
+    // Match eframe's instance setup; wgpu 30's unsafe from_window target needs the
+    // display on the instance, whereas safe create_surface also accepts it from Window.
+    setup.display_handle = Some(Box::new(event_loop.owned_display_handle()));
+    let descriptor = Arc::clone(&setup.device_descriptor);
+    setup.device_descriptor = Arc::new(move |adapter| {
+        let mut descriptor = descriptor(adapter);
+        descriptor.required_limits.max_texture_dimension_2d = LIMIT;
+        descriptor
+    });
+    let mut painter = pollster::block_on(Painter::new(
+        Context::default(),
+        config,
+        false,
+        RendererOptions {
+            depth_stencil_format: Some(wgpu::TextureFormat::Depth24Plus),
+            msaa_samples: 4,
+            ..Default::default()
+        },
+    ));
+    // Like the mandatory discard GPU regressions, unavailable prerequisites fail explicitly.
+    // No adapter/device/window error is silently counted as a passing test.
+    pollster::block_on(painter.set_window(ViewportId::ROOT, Some(Arc::clone(&window))))
+        .expect("surface_size_limit requires a window-compatible wgpu adapter");
+    assert_eq!(painter.max_texture_side(), Some(LIMIT as usize));
+    let assert_bounded = |painter: &Painter| {
+        let mut outer = windows_sys::Win32::Foundation::RECT::default();
+        let mut client = windows_sys::Win32::Foundation::RECT::default();
+        assert_ne!(unsafe { GetWindowRect(hwnd, &mut outer) }, 0);
+        assert_ne!(unsafe { GetClientRect(hwnd, &mut client) }, 0);
+        assert!(
+            outer.right - outer.left <= LIMIT as i32 && outer.bottom - outer.top <= LIMIT as i32
+        );
+        let state = &painter.surfaces[&ViewportId::ROOT];
+        assert_eq!(
+            (state.width, state.height),
+            (
+                (client.right - client.left) as u32,
+                (client.bottom - client.top) as u32
+            )
+        );
+        assert!(state.width <= LIMIT && state.height <= LIMIT);
+        assert!(painter.depth_texture_view.contains_key(&ViewportId::ROOT));
+        assert!(painter.msaa_texture_view.contains_key(&ViewportId::ROOT));
+    };
+    assert_bounded(&painter);
+    let bypass = || {
+        assert_ne!(
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    1800,
+                    1500,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                )
+            },
+            0
+        );
+        let mut client = windows_sys::Win32::Foundation::RECT::default();
+        assert_ne!(unsafe { GetClientRect(hwnd, &mut client) }, 0);
+        assert!(client.right > LIMIT as i32);
+        (
+            NonZeroU32::new(client.right as u32).unwrap(),
+            NonZeroU32::new(client.bottom as u32).unwrap(),
+        )
+    };
+    let (width, height) = bypass();
+    painter.on_window_resized(ViewportId::ROOT, width, height);
+    assert_bounded(&painter);
+    // Status-based reconfiguration uses the same validated SurfaceState dimensions.
+    let state = &painter.surfaces[&ViewportId::ROOT];
+    Painter::configure_surface(
+        state,
+        painter.render_state.as_ref().unwrap(),
+        &painter.config,
+        ViewportId::ROOT,
+        false,
+    );
+    painter.recreate_surface(ViewportId::ROOT, &window).unwrap();
+    assert_bounded(&painter);
+    pollster::block_on(painter.set_window(ViewportId::ROOT, None)).unwrap();
+    // The subclass intentionally survives removal, and the unsafe attachment must reacquire
+    // the corrected size after device initialization just like the safe attachment.
+    bypass();
+    unsafe { pollster::block_on(painter.set_window_unsafe(ViewportId::ROOT, Some(&window))) }
+        .unwrap();
+    assert_bounded(&painter);
+    pollster::block_on(painter.set_window(ViewportId::ROOT, None)).unwrap();
+}
+
 fn headless_painter() -> Option<Painter> {
     let mut config = WgpuConfiguration::default();
     let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup else {

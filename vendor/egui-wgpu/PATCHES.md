@@ -28,6 +28,7 @@ root製品graph・依存切替・eframeの接続は対象外。
 | atlas overflow skip-write | (b) 既存範囲のみ | 旧処理を保持。根治策として広げず、通常配送はpixel回帰で検証 |
 | 無描画delta完結 | (b) | renderer準備済みならsurface lookup前にset drain。通常／no-surface／早期終了の同じownerでsubmit→free drain |
 | 対象surfaceだけの破棄 | (b) | safe／unsafe set_window(id,None)とも対象surface・depth・MSAAだけを同一helperで除去。rendererは共有のまま |
+| Windowsのsurface窓寸法制約 (§1.395) | (b) 新規 | Painterが全viewportのHWNDへdevice上限を登録し、外寸・configure寸法をmax_texture_dimension_2d以下に保つ。safe／unsafe取り付けはdevice確立→登録→実窓補正→実client寸法でinstall。共通resizeはsubclass迂回時に実窓を一度補正。status再configure／Lost再作成も検証済み寸法を使う。device上限8192・非Windowsは維持し、解除はWM_NCDESTROYだけ |
 | startup GPU stage／root present observer | (b) | 新しいasync adapter列挙・Instance保持へ適応。set／終了処理の既存TextureDelivery spanを保持し、RootPresentedは実Queue::present返却後のみ |
 | atlas-probe／capture outcome | (b) | drain前に適用権のない文字列summaryだけ採取。完結後の結果分類を保持し、capture-only等の新版経路も区別 |
 | screenshot／readback診断 | (b) | 本家ScreenshotCallbackへ適応。viewport相関、format／map／mapped-range失敗、callback request数を診断する |
@@ -93,6 +94,25 @@ native presenterが既存renderer ownerでtexture更新のGPU commandを提出�
 `renderer::TextureUpdateSubmission` をcrate rootから明示公開した。新しいrendererやdelta queueは追加しない。
 製品の各FullOutput consumerはmap型deltaを順序どおりdrainし、必要なsubmissionの後でfreeする。
 正式graphでの検証結果は [段3台帳](../../docs/egui-0.37-stage3-verification.md) に記録する。
+
+## Windows surface窓寸法制約 (2026-10-18、§1.395)
+
+`window_size_limit`のsubclassはHWND所有スレッドで登録し、値だけのdevice上限を保持する。
+WM_WINDOWPOSCHANGING／WM_GETMINMAXINFOではDefSubclassProcによるwinitの補正後に上限を適用する。
+surfaceだけのclampは行わず、enforceは実窓を補正してGetClientRectの実寸を返す。
+初回登録・補正失敗はWgpuErrorへ返す。resize補正失敗はログを残して対象surfaceを外す。
+set_window(None)／viewport削除でsubclassは外さない。同じHWND・Painter・固定device上限の寿命で
+無害であり、Painterへのpointerを持たず、WM_NCDESTROYで自動解除する。
+追加pending／retry／App側の窓制御・detached述語変更はない。
+
+追加回帰は純関数4件、非表示Win32 HWND7件、実Painter1件（1024のdevice、初回safe／unsafe取り付け、
+subclass迂回resize、status再configure、Lost再作成、depth／MSAA）。GPU前提不成立は明示失敗とする。
+`test-lib-full.ps1`は本体lib限定なので含まれないが、`test-full.ps1`の無filter vendor nextestに含まれる。
+専用実行: `cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib`。
+
+この実Painter回帰で、既存のLost再作成が旧surfaceを新surfaceのconfigureまで保持し、DXGIの
+同一HWNDのswap chain制約で`Invalid surface`になることも確認した。Windowsだけ、関数の既存契約
+どおり旧surfaceを先にdropし、検証済みの寸法とHWND値だけを新surfaceへ渡す順序へ修正した。
 
 
 ## Stage 3: discard texture delivery (design revision 4.6, 2026-10-17)
