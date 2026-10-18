@@ -3,6 +3,40 @@ use super::*;
 use crate::app::final_prepare::tests::{begin_registration_frame, wait_ready};
 use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, frame, ready_app};
 
+#[cfg(windows)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct AcceptedCompletionReceiptForTest {
+    destination: PresentationDestination,
+    frame: u64,
+    pass: u64,
+    pages: Vec<ReceiptPage>,
+    accepted: bool,
+}
+
+#[cfg(windows)]
+impl App {
+    pub(crate) fn accepted_completion_receipt_for_test(&self) -> AcceptedCompletionReceiptForTest {
+        let PresentationState::Completing {
+            completion: FlatCompletion::Submitted(receipt),
+            ..
+        } = &self.page_turn_presentation.state
+        else {
+            panic!("expected Completing::Submitted before and after park");
+        };
+        assert!(receipt.was_accepted(), "canonical output must be accepted");
+        assert!(!receipt.curl, "receipt must describe canonical flat output");
+        assert!(!receipt.pages().is_empty());
+        assert_eq!(receipt.destination, self.page_turn_destination());
+        AcceptedCompletionReceiptForTest {
+            destination: receipt.destination,
+            frame: receipt.frame,
+            pass: receipt.pass,
+            pages: receipt.pages().to_vec(),
+            accepted: receipt.was_accepted(),
+        }
+    }
+}
+
 fn fixture(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEnvForTest {
     install(ctx);
     let mut app = ready_app(ctx, mode);

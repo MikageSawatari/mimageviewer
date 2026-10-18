@@ -640,6 +640,69 @@ fn d3_4_each_parked_presentation_blocks_same_frame_only_and_keeps_ownership() {
 
 #[cfg(windows)]
 #[test]
+fn d3_4_parked_submitted_canonical_receipt_survives_other_context_registration_and_snapshot() {
+    let ctx = egui::Context::default();
+    install_presentation(&ctx);
+    let mut app = app(&ctx);
+    let key = ready_candidate(&mut app, &ctx);
+    let window = 94_405;
+    let id = active_owner(&mut app, &ctx, window);
+    begin(&mut app, 120);
+    let accepted = app
+        .with_active_viewer_context(|owner| {
+            set_presentation(owner, &ctx, "completing");
+            adopt_interrupted_target(&ctx, owner);
+            (
+                owner.accepted_completion_receipt_for_test(),
+                owner.page_turn_gpu_fingerprint_for_test(),
+            )
+        })
+        .unwrap();
+    assert!(app.pause_current_active_viewer_context(&ctx));
+    assert_eq!(
+        app.detached_window_state(window),
+        Some(DetachedWindowState::Parked)
+    );
+    assert_eq!(app.viewer_context_residence(id), ContextResidence::AtRest);
+    let snapshot = app
+        .detached_image_windows
+        .iter()
+        .find(|snapshot| snapshot.id == window)
+        .unwrap();
+    let view = app.deferred_detached_image_window_view(
+        snapshot,
+        app.detached_viewer_window_placement(),
+        false,
+    );
+    for number in [120, 121] {
+        if number == 121 {
+            begin(&mut app, number);
+        }
+        app.observe_live_paged_for_final_prepare();
+        app.finalize_speculative_gpu_output(&ctx, number, 1);
+        if number == 120 {
+            assert_pending(&app, key);
+        } else {
+            assert!(app.final_composite_cache.contains_key(&key));
+        }
+        let painted = frame(&ctx, |ui, _| {
+            App::draw_detached_snapshot_for_gpu_test(ui, ui.max_rect(), &view);
+        });
+        assert!(!painted.shapes.is_empty(), "parked A must actually paint");
+        assert_eq!(
+            app.with_viewer_context(id, |owner| (
+                owner.accepted_completion_receipt_for_test(),
+                owner.page_turn_gpu_fingerprint_for_test(),
+            ))
+            .unwrap(),
+            accepted,
+            "park, B registration and A snapshot must preserve accepted receipt/material/lease"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn d3_4_each_live_presentation_blocks_without_a_candidate_and_completion_resumes() {
     for state in ["offered", "turning", "completing"] {
         let ctx = egui::Context::default();
