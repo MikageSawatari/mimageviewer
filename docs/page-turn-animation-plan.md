@@ -5000,3 +5000,210 @@ detachedへ触れる範囲は、既存contextのread-only観測、既存service�
 D3-4 を (a) 投機 GPU 仕事の時機調整と配送観測、(b) canonical demand の共有と Native prewarm の二つに分け、(a) を先に実装・計測する。
 262MB 転送の分割は採らない (必要と分かったら別設計)。静止機会の無い連続入力で投機登録を必ず進める保証はしない best-effort とし、
 表示要求は投機枠を待たない。この線引きは通常利用の待ちを増やさないため利用者判断は要らない (案の末尾どおり)。
+
+##### 27.17.14.10 改訂 1: 実装前レビュー (CHANGES REQUESTED、P2 × 2) への対応（2026-10-18）
+
+実装前独立レビュー (Sol / xhigh) は、(1) parked context に残る演出状態が他 context の投機を止め続けること、(2) `App::ui` 末尾では discard retry 後の offer を
+排除できないこと、の P2 2 件を指摘した (P1 / P3 なし、detached 範囲は合意)。設計担当は妥当と判断し、調査担当が次の改訂を出した。
+**以下は §27.17.14 の該当箇所 (冒頭の実行条件、27.17.14.2、27.17.14.6 の計測、27.17.14.7 の回帰、27.17.14.8 の chunk) を置き換える。**
+食い違う場合はこの改訂 1 を正とする。
+
+| 指摘 | 改訂箇所 |
+|---|---|
+| P2-1：parkedに残る演出状態が他contextを止める | 冒頭の実行条件、§27.17.14.2のlive描画対象述語、§27.17.14.7のpark回帰、§27.17.14.8の所有境界 |
+| P2-2：App末尾ではdiscard retry後のofferを排除できない | §27.17.14.2の最終output hook・delta引渡し・frame番号、§27.17.14.6の計測補足、§27.17.14.7のretry回帰、§27.17.14.8の変更範囲・見積り |
+
+以下を§27.17.14の置換・追補案とする。**確認済み**はHEAD `679db7895`の静的確認、**設計案／推測**は変更後の提案を表す。今回も変更・ビルド・起動・テスト実行は行っていない。
+
+##### 冒頭の実行条件を置換
+
+投機final／comicの新規登録と投機Native miss生成は、**既存runtime上でページめくりを描画・進行するcontextにOffered／Turning／Completingがなく、当該ROOT outer frameの全retryが終了した後**にだけ実行する。さらに、そのouter frameに実際の演出活動があれば、park・取消後も投機allocationを見送る。
+
+CPU準備・結果受信、既存handleの共有、通常表示要求、source先読み、通常AI等は継続する。parked contextの保持presentationを消去・進行させて排他を解除する方式は採らない。
+
+---
+
+##### 27.17.14.2 投機登録の実行境界〔置換〕
+
+**結論：App末尾は候補の収集までとし、allocationはnative wgpu側の「ROOT最終output確定後・delta引渡し前」のhookに集約する。**
+
+**確認済み：** `App::ui`の後にもpluginの`on_end_pass`とoutput hookが実行され、その結果でdiscard retryが決まる。retry前にはtexture配送が行われ、ROOT cumulative frame番号の更新はretry終了後である。
+
+根拠：`vendor/egui/src/context.rs:1066`、`:1190`、`:1199`、`:1211`、`:1222`、`:3061`。
+
+したがってApp末尾の`will_discard`確認や一件枠だけでは、「pass 0で登録済み、pass 1でoffer成立」を防げない。これは旧案の排他境界の不足として訂正する。
+
+**接続候補の比較：**
+
+| 候補 | 判断 |
+|---|---|
+| App末尾／pluginのend-pass | 後続plugin・output処理からdiscardされ得るため不採用 |
+| 次outer frame先頭で前frameの静止結果を使う | 次frame自身の入力・retryでofferが成立し得る。前frameの静止だけでは排他を証明できず、不採用 |
+| ROOTの全retry終了後・delta引渡し前のeframe hook | 当該frameの最終結果を確認でき、新規deltaを同じ配送ownerへ渡せるため採用 |
+
+**設計案：hookの具体位置**
+
+`vendor/eframe/src/native/wgpu_integration.rs`で、`integration.update(...)`が返った直後、現行の`record_produced`と共有`pending_deltas`への移譲より前に、ROOT専用のhookを一度呼ぶ。
+
+根拠：`vendor/eframe/src/native/wgpu_integration.rs:952`、`:962`、`:968`、`:974`。`EpiIntegration::update`内の`run_ui`は全retry終了後に返る：`vendor/eframe/src/native/epi_integration.rs:455`、`:479`。
+
+仮称を`App::on_native_wgpu_root_output_finalized`とし、`vendor/eframe/src/epi.rs`のApp traitへ既定no-opを追加する。契約は以下とする。
+
+1. native wgpuのROOT Full処理でのみ、一回呼ぶ。即時子viewport、deferred子viewport、LogicOnlyから呼ばない。
+2. `integration.update`へ入る前のROOT frame番号を値として捕捉し、hookへ渡す。
+3. App側は既存pending／cache、最終passの候補値、現在runtimeを再照合し、共通枠で最大一件の投機allocationを行う。
+4. hook後、eframe側がTextureManagerの未引渡しdeltaを取得し、返却済み`full_output.textures_delta`へappendする。
+5. その結合済みdeltaを既存の`record_produced → pending_deltas → 配送`へ一度だけ渡す。
+
+順序の概略は次となる。
+
+```text
+producing_root_frameを捕捉
+  → integration.update
+      → ROOT pass 0
+      → plugin/end-pass/output処理
+      → 必要ならdiscard配送・retry
+      → 最終pass確定
+  → ROOT finalized hook
+      → 再照合・投機allocation最大一件
+  → TextureManagerの追加deltaをFullOutputへappend
+  → 既存pending_deltasへ移譲
+  → 通常paintまたは無描画配送
+```
+
+TextureManagerへの公開入口は既存`Context::tex_manager`を使う。追加deltaにはhook内の登録だけでなく、その際のhandle解放によるfreeも含め、取得した全量を既存ownerへ移す。独立した投機delta queueは作らない。
+
+根拠：`vendor/egui/src/context.rs:3015`。無描画時の配送も既存経路にある：`vendor/eframe/src/native/wgpu_integration.rs:1101`、`:1104`、`:1108`。
+
+hookからはUI、入力配送、permission再開、viewport生成、`run_ui`／`begin_pass`／`end_pass`、discard要求を呼ばない。候補再照合、既存cacheへの登録、Native生成、次回repaint要求に限定する。これによりhookの後に当該ROOT frameの新しいofferを成立させる再passを作らない。
+
+`max_passes`到達でdiscard要求が残ったまま返る場合も、`run_ui`の返却を最終確定境界とする。`requested_discard == true`だけでhookを再実行・待機させない。
+
+根拠：`vendor/egui/src/context.rs:1203`。
+
+**frame枠と候補値の寿命**
+
+- 既存`SpeculativeGpuFrame`のouter frame枠・通常登録記録・演出活動記録は、全retryで単調に保持する。
+- 最終hookでは、更新後の`ctx.cumulative_frame_nr_for(ROOT)`で`begin`を呼ばない。捕捉済みの生成元frame番号と既存枠を照合する。
+- 最終passのlive経路・canonical候補は、既存frame owner内の一時的な値として更新する。ROOT再pass開始時にはこれらの観測値だけを更新し、使用済み枠・活動記録を消さない。
+- 破棄passで実際に成立したoffer／curl／mandatory canonical提出の活動記録は、最終passが静止でも保持する。そのframeの投機は見送り、次の機会で再評価する。
+- 新しい待機state／bool／timerは追加しない。要求所有は既存pending／cacheのままとする。
+
+根拠：現行枠の更新・claimは`src/app/final_prepare_budget.rs:19`、`:34`、App側開始位置は`src/app.rs:96387`。
+
+**排他対象となるcontext**
+
+「mounted／at-restの全presentation」を走査する旧条件を、次へ置換する。
+
+```text
+最終passで通常のlive paged描画経路に属する
+かつ、その経路の所有が現在runtimeでも有効
+かつ、presentationがOffered／Turning／Completing
+```
+
+live経路のcontext／destinationは、通常描画の所有contextが確定した入口で値として観測する。投機候補のないcontextも観測対象に含める。単なるmount、資源poll、passive snapshot描画はlive経路の証拠にしない。
+
+| 経路 | 使用する既存情報 |
+|---|---|
+| main／embedded／通常fullscreen | 実際の描画dispatch結果と所有context・destination。main描画を行う既存判定を共有し、単にmain bundleが存在するだけでは対象にしない |
+| active F12 | `active_detached_session`、`locate_window_context`によるcontext結付け、`DetachedWindowRuntime.state`、通常live描画dispatch |
+| passive Parked | snapshot経路なので対象外。保持presentationは読むだけで、解除のために変更しない |
+| passive ParkedLive | media等のlive性をページめくり進行と同一視しない。通常live paged経路へ入っていないsnapshot側は対象外 |
+| Closing／退役済み／結付け失効 | 現在のlive経路から外す。ただし既に記録した当該frameの演出活動は消さない |
+
+具体的な根拠：
+
+- active sessionからcontextを求め、passive snapshotへの移譲を区別する既存処理：`src/app.rs:2719`、`:2725`。
+- runtimeの状態と所有：`src/app/detached_window_manager.rs:22`、`:463`。
+- active at-rest ownerの通常更新：`src/app.rs:61997`、`:64983`。
+- main描画dispatch：`src/app.rs:4410`、`:95480`、`:95498`。
+- 通常page-turn入口：`src/ui_fullscreen.rs:26158`、`:32806`。通常子viewport描画は即時経路：同`:28516`。
+- backstopも既存active sessionのbindingからownerを求める：`src/ui_fullscreen.rs:25313`、`:25334`。
+- passive側の分配とsnapshot描画：`src/ui_fullscreen.rs:22771`、`:22917`。
+
+`ContextResidence::AtRest`は資源の保管位置であり、parkの判定に使わない。active F12もat-rest ownerをmountして進行するためである。逆に、runtimeがOpening／Resuming／Activeでも、通常live paged描画経路へ入っていないことを無視して排他対象にはしない。既存の経路観測とruntime所有を組み合わせる。
+
+**parkと活動記録**
+
+parkはsnapshotを保存し、runtimeをParkedへ移す一方、presentationを終了させない。passive側はsnapshotを描き、元のTurning等を進行させない。
+
+根拠：`src/app.rs:61052`、`:61075`、`src/app/viewer_context_registry.rs:3067`、`src/ui_fullscreen.rs:22917`。
+
+したがって、Aが演出後にparkされた場合は次のように扱う。
+
+- **同outer frame**：Aの実演出活動記録が残るため、Bの投機allocationも見送る。
+- **次の静止機会**：Aは現在のlive進行対象から外れる。Bが有効なら、Aの保持状態に妨げられず進める。
+- Aのstate／receipt／leaseを消去・強制再開しない。既存のpark／resume契約を維持する。
+
+**早期service・通常要求との関係**
+
+早期serviceはreceipt反映・受信・失効照合・表示用採用を継続し、新規投機allocationだけを最終hookへ移す。通常表示への昇格・同期takeover、共有handle、Native hitは従来どおりである。
+
+canonical flat受理後も、途中の`Completing → Flat`代入直後には登録しない。残るnavigationと全retryの結果を最終hookで確認する。
+
+根拠：`src/ui_fullscreen.rs:13272`、`src/app/final_prepare.rs:439`、`src/ui_fullscreen/page_turn/barrier.rs:379`、`:392`。
+
+---
+
+##### 27.17.14.6への追補：frameと最終hookの計測
+
+登録／Native提出eventの`outer_frame`は、hook時点の更新後counterではなく、**生成元ROOT frame番号**を記録する。最終pass数と、最終hookのCPU所要時間も記録する。
+
+最終hookは`App::ui`の外へ移るため、既存のApp update時間だけでは費用を捕捉できない。hook費用を別eventで計測し、backend配送・入力応答の集計へ含める。App計測から外れたことを性能改善として扱わない。
+
+`gpu.texture_delivery_submitted`は、hookから追加したdeltaも既存`TextureDelivery`で提出された後に記録する。通常delta・discard時の通常配送・free順序は変更しない。GPU実完了ticketは任意の診断証拠のままとする。
+
+---
+
+##### 27.17.14.7の回帰表を追加・置換
+
+| 検査 | 必須条件 |
+|---|---|
+| A演出→park→B静止 | AをOffered／Turning／Completingの各状態からpark。同frameは活動記録でBを保留し、次の予算・枠がある静止機会ではBが進む |
+| parked所有不変 | park完了直後を基準に、Bの準備とAのsnapshot描画を進めても、Aのpresentation state、receiptの内容・受理状態、保持material／lease所有が変わらない。Aを再開・終了させてBを進める実装は失敗 |
+| at-restとの区別 | active F12のat-rest ownerは排他対象となる。単なるmountはlive描画扱いにならず、passive Parked／ParkedLive snapshotは排他対象にならない |
+| end-pass discard→retry offer | pass 0は静止。App処理後のplugin `on_end_pass`からdiscardを要求し、pass 1の実handlerでofferを成立させる。pass 0の末尾・discard配送に投機deltaがなく、最終hookでも投機allocationゼロ |
+| retry後も静止 | 複数passを経ても最終hookは一回。候補・予算があれば投機allocationは一件だけ。生成deltaが同じFullOutput／共有pendingへ一度だけ渡る |
+| 破棄passの活動 | pass 0でoffer／curl活動、最終passでcancelまたはparkとなっても当該frameは投機ゼロ。次frameへ活動記録を持ち越して停止し続けない |
+| frame番号 | 全retryと最終hookが同じ生成元frame枠を使用。`run_ui`返却後のcounter更新で枠を再初期化しない |
+| max_passes | 最終passにdiscard要求が残っていてもhookを重複実行しない。既存の最終output採用規則と整合する |
+| viewport／LogicOnly | 即時子viewportのretryを含めROOT hookは一回。deferred子viewport・LogicOnlyから投機allocation hookを呼ばない |
+| delta／free | hookで登録・旧entry解放が起きてもdeltaを失わず、通常set／mip／submit／free順序を維持。非描画配送・退役経路も検査 |
+| 二context・通常要求 | Bのlive演出でAの投機は保留するが、Aの通常表示要求・source先読みは維持。Bをparkした後のAの進行と兄弟不変を検査 |
+
+discard回帰はApp末尾のmock判定だけで済ませず、実際の`Context::run_ui`、end-pass plugin、retry、最終hook、delta移譲を通す。加えて既存offer handlerを使うApp側回帰を接続する。
+
+**性能gateは既存条件を維持する。** 八条件、miss／skipを含む正式分母、静止中の入力応答、通常producerとの重複を測る。今回の修正で実GPU競合が解消したとは扱わない。
+
+---
+
+##### 27.17.14.8 chunk・概算・detached境界〔置換〕
+
+**二chunkを維持し、(a)に最終output hookと配送接続の回帰を含める。**
+
+| chunk | 完成物・主な対象 | 概算 |
+|---|---|---|
+| D3-4(a)：時機調整＋配送観測 | 早期採用から投機allocationを分離。最終passのlive経路観測、runtime再照合、park後も単調なframe活動記録。native wgpuのROOT最終output hookと追加deltaの引渡し。discard／park／二context回帰、登録・配送計測。`app.rs`、`app/final_prepare*`、`viewer_context_registry.rs`、`ui_fullscreen.rs`、page-turn入口、`vendor/eframe/src/epi.rs`、`vendor/eframe/src/native/wgpu_integration.rs`、`vendor/egui-wgpu` | **3〜5日** |
+| D3-4(b)：canonical demand＋Native prewarm | 通常geometry共有、非生成key／plan照会、backing確認、共通枠・VRAM接続、通常cacheへの生成、key／寿命／会計回帰。allocationの実行位置は(a)の最終hookを使用 | **3〜5日** |
+
+**合計6〜10実装日程度の推測**へ更新する。独立レビュー修正、正式性能run、利用者のmotion評価待ちは別とする。
+
+vendor変更はnative wgpuの最終境界と配送観測に限定する。eguiのretry算法・frame counter更新・plugin順序は変更しない。Glow／Webの描画契約へ同じhookを広げない。既存のegui multipassを実際に通す検証と、eframe／egui-wgpuのvendor graph検証を(a)の完成条件に含める。
+
+detachedの変更は、既存runtime・session／context binding・実描画dispatchの観測と、既存資源移譲に限定する。新しいdetachedフラグ、HWND推測、viewport再生成、時間窓を追加しない。
+
+`docs/detached-rework-plan.md` §11には、従来項目に加えて次を記録する。
+
+- live進行対象の判定元となった関数・runtime情報。
+- mounted／at-restとlive／parkedを同一視しないこと。
+- parkは現在の排他対象から外すが、当該frameの活動記録は消さないこと。
+- 「A演出→park→B静止」でBが再開し、park完了後のAのstate／receipt／leaseが不変である検証結果。
+- 最終hookから通常UI・入力配送へ再入しない所有境界。
+
+既存の構造修正への合意範囲を維持する。今回の静的確認を実行検証結果として記録しない。
+
+##### 未確定・要レビュー点〔該当項目を置換〕
+
+- native wgpuのROOT最終hook、生成元frame番号、追加deltaの取得・appendを一組として独立再レビューする。App末尾を最終確定境界とする旧案は撤回する。
+- live経路の観測値を最終passへ更新し、runtime所有を再照合する実装について、active at-rest・passive snapshot・backstop・park／resumeの兄弟経路を確認する。
+- 転送分割、canonical key共有、Native一時allocation会計、GPU実完了ticketを任意診断に留める方針、既存性能gateは変更しない。実GPU競合の解消は実装後の計測で判定する。
