@@ -1471,6 +1471,12 @@ device要求上限8192、非Windows、`src/`の窓制御・detached述語・rect
 純関数・非表示HWND・実Painterの自動回帰を追加する。実装担当による製品起動・画面操作は行わず、
 設計担当の最終受入・利用者による実機確認とは区別する。
 
+同日、設計担当の実機確認で製品loggerが寸法制約のlog facade警告を転送しないことが判明したため、
+固定target `egui_wgpu::surface_window_limit`のWarn以上だけを既存の非同期sinkへ接続した。
+全viewport共通の診断境界の修正であり、窓制御・detached状態は変更しない。
+LimitingはHWNDごとの対話リサイズ中の最初のclampを記録して後続を抑制し、
+対話外の明示resize・Correcting・失敗ログは毎回残す。状態は対話終了／HWND破棄で削除する。
+
 ### 2026-10-15 C1採択: 独立readerの受動更新停止
 
 **現在の利用者採択はC1だけ。案Aは不採用の履歴として保持し、source／main-owner境界の考え方だけを参照する。**

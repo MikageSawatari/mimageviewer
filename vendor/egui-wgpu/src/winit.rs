@@ -327,7 +327,7 @@ impl Painter {
             self.render_state = Some(render_state);
         }
         #[cfg(windows)]
-        let (hwnd, size) = {
+        let (hwnd, size) = (|| {
             use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
             let RawWindowHandle::Win32(handle) = window.window_handle()?.as_raw() else {
                 return Err(std::io::Error::other("expected a Win32 surface window").into());
@@ -341,8 +341,13 @@ impl Painter {
                 .limits()
                 .max_texture_dimension_2d;
             crate::window_size_limit::register(hwnd, limit)?;
-            (hwnd, crate::window_size_limit::enforce(hwnd, limit)?)
-        };
+            Ok::<_, crate::WgpuError>((hwnd, crate::window_size_limit::enforce(hwnd, limit)?))
+        })()
+        .inspect_err(|error| {
+            log::error!(target: crate::window_size_limit::LOG_TARGET,
+                "Failed to attach constrained surface window for {viewport_id:?}: {error}"
+            );
+        })?;
         #[cfg(not(windows))]
         let size = window.inner_size();
         self.install_surface(
@@ -462,7 +467,7 @@ impl Painter {
                 match crate::window_size_limit::enforce(hwnd, limit) {
                     Ok(size) => (size.width, size.height),
                     Err(error) => {
-                        log::error!(
+                        log::error!(target: crate::window_size_limit::LOG_TARGET,
                             "Failed to constrain surface window for {viewport_id:?}: {error}"
                         );
                         self.remove_viewport(viewport_id);

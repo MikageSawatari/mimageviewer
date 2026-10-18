@@ -1,7 +1,7 @@
 //! The Painter's device limit is a constraint on the native window, not just its surface.
 #![expect(unsafe_code)]
 
-use std::io;
+use std::{cell::RefCell, collections::HashMap, io};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     System::Threading::GetCurrentThreadId,
@@ -9,8 +9,8 @@ use windows_sys::Win32::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
             GetClientRect, GetWindowRect, GetWindowThreadProcessId, MINMAXINFO, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WINDOWPOS, WM_GETMINMAXINFO,
-            WM_NCDESTROY, WM_WINDOWPOSCHANGING,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WINDOWPOS, WM_ENTERSIZEMOVE,
+            WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_NCDESTROY, WM_WINDOWPOSCHANGING,
         },
     },
 };
@@ -18,6 +18,22 @@ use winit::dpi::PhysicalSize;
 
 // The callback/ID pair is private to this module. Refdata is a value, never a Painter pointer.
 const SUBCLASS_ID: usize = 0x6567_736c;
+pub(crate) const LOG_TARGET: &str = "egui_wgpu::surface_window_limit";
+
+thread_local! {
+    // Only active native move/size loops have an entry (whether their first clamp was logged).
+    // This belongs to the HWND's thread, without a Painter pointer or cross-thread lock.
+    static DRAG_WARNINGS: RefCell<HashMap<isize, bool>> = RefCell::new(HashMap::new());
+}
+
+fn should_log_limiting(hwnd: HWND) -> bool {
+    DRAG_WARNINGS.with(
+        |warnings| match warnings.borrow_mut().get_mut(&(hwnd as isize)) {
+            Some(warned) => !std::mem::replace(warned, true),
+            None => true, // Explicit resizes outside a drag always retain their diagnostic.
+        },
+    )
+}
 
 fn limited_size(width: i32, height: i32, flags: u32, limit: i32) -> (i32, i32) {
     if flags & SWP_NOSIZE != 0 {
@@ -35,6 +51,14 @@ unsafe extern "system" fn size_limit_proc(
     _id: usize,
     limit: usize,
 ) -> LRESULT {
+    let incoming_size = if message == WM_WINDOWPOSCHANGING {
+        // SAFETY: This message owns a live WINDOWPOS. Only observe it before the chain;
+        // DefWindowProc can already cap it using our WM_GETMINMAXINFO constraint.
+        let pos = unsafe { &*(lparam as *const WINDOWPOS) };
+        Some((pos.cx, pos.cy))
+    } else {
+        None
+    };
     // winit must first apply its fullscreen and min/max-inner-size adjustments.
     // SAFETY: The subclass chain owns these message arguments for this invocation.
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
@@ -42,14 +66,31 @@ unsafe extern "system" fn size_limit_proc(
         WM_WINDOWPOSCHANGING => {
             // SAFETY: WM_WINDOWPOSCHANGING supplies a live, mutable WINDOWPOS.
             let pos = unsafe { &mut *(lparam as *mut WINDOWPOS) };
-            let requested = (pos.cx, pos.cy);
+            let adjusted = (pos.cx, pos.cy);
             let limited = limited_size(pos.cx, pos.cy, pos.flags, limit as i32);
-            if limited != requested {
-                log::warn!(
-                    "Limiting HWND {hwnd:?} outer size {requested:?} to {limited:?} (device limit {limit})"
-                );
-                (pos.cx, pos.cy) = limited;
+            let incoming = incoming_size.unwrap();
+            let requested =
+                if limited_size(incoming.0, incoming.1, pos.flags, limit as i32) != incoming {
+                    incoming
+                } else {
+                    adjusted // winit may itself enlarge a request before our final constraint.
+                };
+            if pos.flags & SWP_NOSIZE == 0 && limited != requested {
+                // Log the first actual clamp in every drag, even if the window was already
+                // at the limit. Later messages can arrive once per mouse motion.
+                if should_log_limiting(hwnd) {
+                    log::warn!(target: LOG_TARGET,
+                        "Limiting HWND {hwnd:?} outer size {requested:?} to {limited:?} (device limit {limit})"
+                    );
+                }
             }
+            (pos.cx, pos.cy) = limited;
+        }
+        WM_ENTERSIZEMOVE => {
+            DRAG_WARNINGS.with(|warnings| warnings.borrow_mut().insert(hwnd as isize, false));
+        }
+        WM_EXITSIZEMOVE => {
+            DRAG_WARNINGS.with(|warnings| warnings.borrow_mut().remove(&(hwnd as isize)));
         }
         WM_GETMINMAXINFO => {
             // SAFETY: WM_GETMINMAXINFO supplies a live, mutable MINMAXINFO.
@@ -60,6 +101,7 @@ unsafe extern "system" fn size_limit_proc(
             info.ptMaxSize.y = info.ptMaxSize.y.min(limit as i32);
         }
         WM_NCDESTROY => {
+            DRAG_WARNINGS.with(|warnings| warnings.borrow_mut().remove(&(hwnd as isize)));
             // SAFETY: Remove only this callback/ID, on the window's destruction thread.
             unsafe { RemoveWindowSubclass(hwnd, Some(size_limit_proc), SUBCLASS_ID) };
         }
@@ -112,7 +154,7 @@ pub(crate) fn enforce(hwnd: isize, limit: u32) -> io::Result<PhysicalSize<u32>> 
     let requested = (rect.right - rect.left, rect.bottom - rect.top);
     let limited = limited_size(requested.0, requested.1, 0, limit as i32);
     if limited != requested {
-        log::warn!(
+        log::warn!(target: LOG_TARGET,
             "Correcting HWND {hwnd:?} outer size {requested:?} to {limited:?} (device limit {limit})"
         );
         // SAFETY: HWND is on this thread. Send WINDOWPOSCHANGING so the same constraint also

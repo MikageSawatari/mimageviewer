@@ -105,6 +105,13 @@ set_window(None)／viewport削除でsubclassは外さない。同じHWND・Paint
 無害であり、Painterへのpointerを持たず、WM_NCDESTROYで自動解除する。
 追加pending／retry／App側の窓制御・detached述語変更はない。
 
+寸法制約の警告・取り付け／resize補正失敗は固定target `egui_wgpu::surface_window_limit`へ出し、
+製品loggerはこのtargetのWarn以上だけを既存の非同期sinkへ転送する（他のegui-wgpu診断は対象外）。
+Limitingは各HWNDのWM_ENTERSIZEMOVE～WM_EXITSIZEMOVEで最初の実clampを必ず記録し、
+後続だけを抑制する。抑制状態は所有threadの対話操作中だけ保持し、終了／WM_NCDESTROYで削除する。
+対話操作外のLimiting、Correctingと失敗は抑制しない。非表示HWNDのログ回帰3件を追加した。
+DefSubclassProc内でmin/max制約が先に寸法を下げる場合も、処理前の要求値を観測して記録する。
+
 追加回帰は純関数4件、非表示Win32 HWND7件、実Painter1件（1024のdevice、初回safe／unsafe取り付け、
 subclass迂回resize、status再configure、Lost再作成、depth／MSAA）。GPU前提不成立は明示失敗とする。
 `test-lib-full.ps1`は本体lib限定なので含まれないが、`test-full.ps1`の無filter vendor nextestに含まれる。

@@ -11,6 +11,40 @@ use windows_sys::Win32::{
 // cannot accidentally pass just because DefWindowProc already capped the request.
 const LIMIT: u32 = 1024;
 
+thread_local! {
+    static CAPTURED_WARNINGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+struct WarningCapture;
+impl log::Log for WarningCapture {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == LOG_TARGET && metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            CAPTURED_WARNINGS.with(|warnings| {
+                if let Some(warnings) = warnings.borrow_mut().as_mut() {
+                    warnings.push(record.args().to_string());
+                }
+            });
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn capture_warnings(action: impl FnOnce()) -> Vec<String> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        log::set_logger(&WarningCapture).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+    CAPTURED_WARNINGS.with(|warnings| *warnings.borrow_mut() = Some(Vec::new()));
+    action();
+    CAPTURED_WARNINGS.with(|warnings| warnings.borrow_mut().take().unwrap())
+}
+
 struct TestWindow(HWND);
 
 impl TestWindow {
@@ -51,6 +85,10 @@ impl TestWindow {
 
     fn register(&self) {
         register(self.0 as isize, LIMIT).unwrap();
+    }
+
+    fn message(&self, message: u32) {
+        unsafe { SendMessageW(self.0, message, 0, 0) };
     }
 
     fn resize(&self, x: i32, y: i32, width: i32, height: i32, flags: u32) {
@@ -267,4 +305,82 @@ fn hwnd_registration_rejects_a_different_thread() {
     })
     .join()
     .unwrap();
+}
+
+#[test]
+fn hwnd_drag_logs_first_clamp_once_per_loop_and_explicit_resizes_each_time() {
+    let window = TestWindow::new();
+    window.register();
+    for _ in 0..2 {
+        let warnings = capture_warnings(|| {
+            window.message(WM_ENTERSIZEMOVE);
+            window.resize(100, 110, 900, 700, 0); // Does not consume the first warning.
+            window.resize(100, 110, 12000, 9000, SWP_NOSIZE);
+            for i in 0..100 {
+                window.resize(100, 110, 12000 + i, 9000, 0);
+            }
+            window.resize(100, 110, 12000, 700, 0); // Different clamped result, same drag.
+            window.message(WM_EXITSIZEMOVE);
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("Limiting HWND"));
+        assert!(warnings[0].contains("device limit 1024"));
+    }
+    let warnings = capture_warnings(|| {
+        window.resize(100, 110, 12000, 9000, 0);
+        window.resize(100, 110, 12000, 9000, 0);
+    });
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+}
+
+#[test]
+fn hwnd_drag_warning_state_is_per_window_and_removed_on_destroy() {
+    let first = TestWindow::new();
+    let second = TestWindow::new();
+    first.register();
+    second.register();
+    let first_hwnd = first.0 as isize;
+    let warnings = capture_warnings(|| {
+        first.message(WM_ENTERSIZEMOVE);
+        second.message(WM_ENTERSIZEMOVE);
+        first.resize(100, 110, 12000, 9000, 0);
+        second.resize(100, 110, 12000, 9000, 0);
+        drop(first);
+        DRAG_WARNINGS.with(|warnings| {
+            let warnings = warnings.borrow();
+            assert!(!warnings.contains_key(&first_hwnd));
+            assert_eq!(warnings.get(&(second.0 as isize)), Some(&true));
+        });
+        second.resize(100, 110, 12000, 9000, 0);
+        second.message(WM_EXITSIZEMOVE);
+        DRAG_WARNINGS.with(|warnings| {
+            assert!(!warnings.borrow().contains_key(&(second.0 as isize)));
+        });
+        second.resize(100, 110, 12000, 9000, 0);
+    });
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    second.assert_bounded();
+}
+
+#[test]
+fn hwnd_drag_never_suppresses_enforce_diagnostics() {
+    let window = TestWindow::new();
+    window.register();
+    let warnings = capture_warnings(|| {
+        window.message(WM_ENTERSIZEMOVE);
+        window.resize(100, 110, 12000, 9000, 0);
+        for _ in 0..2 {
+            window.resize(100, 110, 12000, 9000, SWP_NOSENDCHANGING);
+            enforce(window.0 as isize, LIMIT).unwrap();
+        }
+        window.message(WM_EXITSIZEMOVE);
+    });
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert!(warnings[0].starts_with("Limiting HWND"));
+    assert!(
+        warnings[1..]
+            .iter()
+            .all(|warning| warning.starts_with("Correcting HWND"))
+    );
+    window.assert_bounded();
 }
