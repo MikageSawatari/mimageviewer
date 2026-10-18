@@ -1461,6 +1461,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 実装担当もPainterの初回safe／unsafe取り付け、共通resize、status再configure、Lost再作成をsourceで確認した。
 Windowsの全viewportで、renderer所有者である`vendor/egui-wgpu::Painter`がHWNDへ固定device上限を登録し、
 窓の外寸とconfigure寸法を`max_texture_dimension_2d`以下に保つ。
+panicの境界はconfigureへ渡す物理client寸法のdevice上限超過であり、外寸も同じ上限以下にするのは
+その不変条件を保証するための保守的な設計である。
 取り付け時はdevice確立後にsubclass登録・実窓補正を済ませ、再取得した実client寸法だけをinstallへ渡す。
 subclass迂回のresizeも同じ補正へ通し、surfaceだけをclampしない。解除はWM_NCDESTROYに集約する。
 実Painter回帰で判明したDXGIの同一HWND制約にも従い、WindowsのLost再作成では旧surfaceを先にdropし、
@@ -1474,8 +1476,13 @@ device要求上限8192、非Windows、`src/`の窓制御・detached述語・rect
 同日、設計担当の実機確認で製品loggerが寸法制約のlog facade警告を転送しないことが判明したため、
 固定target `egui_wgpu::surface_window_limit`のWarn以上だけを既存の非同期sinkへ接続した。
 全viewport共通の診断境界の修正であり、窓制御・detached状態は変更しない。
-LimitingはHWNDごとの対話リサイズ中の最初のclampを記録して後続を抑制し、
-対話外の明示resize・Correcting・失敗ログは毎回残す。状態は対話終了／HWND破棄で削除する。
+LimitingはDefSubclassProc前の要求が上限超過、または処理後の寸法を実際にclampした
+各WM_WINDOWPOSCHANGINGにつき1件記録する。winitが要求を大きくした場合も記録する。
+ログ抑制状態とWM_ENTERSIZEMOVE／WM_EXITSIZEMOVE追跡は撤去し、Correcting・失敗も毎回残す。
+通常の対話リサイズはWM_GETMINMAXINFOのptMaxTrackSizeで上限に止まる。
+従来のWM_ENTERSIZEMOVE後のSetWindowPos100回試験は合成された超過要求であり、通常ドラッグの証拠とはしない。
+実Painterのzero-client取り付け・描画でconfigure／acquireを行わず、非ゼロresize後は描画できることも
+非対話回帰の対象とし、製品の実機受入とは区別する。
 
 ### 2026-10-15 C1採択: 独立readerの受動更新停止
 

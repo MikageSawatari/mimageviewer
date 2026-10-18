@@ -1,4 +1,5 @@
 use super::*;
+use std::cell::RefCell;
 use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
@@ -85,10 +86,6 @@ impl TestWindow {
 
     fn register(&self) {
         register(self.0 as isize, LIMIT).unwrap();
-    }
-
-    fn message(&self, message: u32) {
-        unsafe { SendMessageW(self.0, message, 0, 0) };
     }
 
     fn resize(&self, x: i32, y: i32, width: i32, height: i32, flags: u32) {
@@ -308,77 +305,66 @@ fn hwnd_registration_rejects_a_different_thread() {
 }
 
 #[test]
-fn hwnd_drag_logs_first_clamp_once_per_loop_and_explicit_resizes_each_time() {
+fn hwnd_logs_each_oversized_request_but_not_within_limit_or_nosize() {
     let window = TestWindow::new();
     window.register();
-    for _ in 0..2 {
-        let warnings = capture_warnings(|| {
-            window.message(WM_ENTERSIZEMOVE);
-            window.resize(100, 110, 900, 700, 0); // Does not consume the first warning.
-            window.resize(100, 110, 12000, 9000, SWP_NOSIZE);
-            for i in 0..100 {
-                window.resize(100, 110, 12000 + i, 9000, 0);
-            }
-            window.resize(100, 110, 12000, 700, 0); // Different clamped result, same drag.
-            window.message(WM_EXITSIZEMOVE);
-        });
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].starts_with("Limiting HWND"));
-        assert!(warnings[0].contains("device limit 1024"));
-    }
     let warnings = capture_warnings(|| {
+        window.resize(100, 110, 900, 700, 0);
+        window.resize(100, 110, 12000, 9000, SWP_NOSIZE);
         window.resize(100, 110, 12000, 9000, 0);
         window.resize(100, 110, 12000, 9000, 0);
     });
     assert_eq!(warnings.len(), 2, "{warnings:?}");
+    for warning in warnings {
+        assert!(warning.starts_with("Limiting HWND"));
+        assert!(warning.contains("(12000, 9000)"));
+        assert!(warning.contains("device limit 1024"));
+    }
 }
 
 #[test]
-fn hwnd_drag_warning_state_is_per_window_and_removed_on_destroy() {
-    let first = TestWindow::new();
-    let second = TestWindow::new();
-    first.register();
-    second.register();
-    let first_hwnd = first.0 as isize;
+fn hwnd_logs_post_chain_clamp_even_when_input_is_within_limit() {
+    let window = TestWindow::new();
+    assert_ne!(
+        unsafe { SetWindowSubclass(window.0, Some(minmax_proc), 1, 0) },
+        0
+    );
+    window.register();
+    let mut pos = WINDOWPOS {
+        hwnd: window.0,
+        cx: 800,
+        cy: 600,
+        flags: SWP_NOZORDER | SWP_NOACTIVATE,
+        ..Default::default()
+    };
     let warnings = capture_warnings(|| {
-        first.message(WM_ENTERSIZEMOVE);
-        second.message(WM_ENTERSIZEMOVE);
-        first.resize(100, 110, 12000, 9000, 0);
-        second.resize(100, 110, 12000, 9000, 0);
-        drop(first);
-        DRAG_WARNINGS.with(|warnings| {
-            let warnings = warnings.borrow();
-            assert!(!warnings.contains_key(&first_hwnd));
-            assert_eq!(warnings.get(&(second.0 as isize)), Some(&true));
-        });
-        second.resize(100, 110, 12000, 9000, 0);
-        second.message(WM_EXITSIZEMOVE);
-        DRAG_WARNINGS.with(|warnings| {
-            assert!(!warnings.borrow().contains_key(&(second.0 as isize)));
-        });
-        second.resize(100, 110, 12000, 9000, 0);
+        unsafe {
+            SendMessageW(
+                window.0,
+                WM_WINDOWPOSCHANGING,
+                0,
+                &mut pos as *mut _ as isize,
+            )
+        };
     });
-    assert_eq!(warnings.len(), 3, "{warnings:?}");
-    second.assert_bounded();
+    assert_eq!((pos.cx, pos.cy), (LIMIT as i32, LIMIT as i32));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("(12000, 9000)"));
 }
 
 #[test]
-fn hwnd_drag_never_suppresses_enforce_diagnostics() {
+fn hwnd_logs_each_enforce_correction() {
     let window = TestWindow::new();
     window.register();
     let warnings = capture_warnings(|| {
-        window.message(WM_ENTERSIZEMOVE);
-        window.resize(100, 110, 12000, 9000, 0);
         for _ in 0..2 {
             window.resize(100, 110, 12000, 9000, SWP_NOSENDCHANGING);
             enforce(window.0 as isize, LIMIT).unwrap();
         }
-        window.message(WM_EXITSIZEMOVE);
     });
-    assert_eq!(warnings.len(), 3, "{warnings:?}");
-    assert!(warnings[0].starts_with("Limiting HWND"));
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
     assert!(
-        warnings[1..]
+        warnings
             .iter()
             .all(|warning| warning.starts_with("Correcting HWND"))
     );

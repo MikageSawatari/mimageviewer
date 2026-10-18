@@ -105,15 +105,22 @@ set_window(None)／viewport削除でsubclassは外さない。同じHWND・Paint
 無害であり、Painterへのpointerを持たず、WM_NCDESTROYで自動解除する。
 追加pending／retry／App側の窓制御・detached述語変更はない。
 
+configureへ渡す物理client寸法をdeviceの`max_texture_dimension_2d`（既定8192）以下にするのが
+不変条件であり、外寸も同じ上限に保つのはその保証のための保守的な設計である。
+
 寸法制約の警告・取り付け／resize補正失敗は固定target `egui_wgpu::surface_window_limit`へ出し、
 製品loggerはこのtargetのWarn以上だけを既存の非同期sinkへ転送する（他のegui-wgpu診断は対象外）。
-Limitingは各HWNDのWM_ENTERSIZEMOVE～WM_EXITSIZEMOVEで最初の実clampを必ず記録し、
-後続だけを抑制する。抑制状態は所有threadの対話操作中だけ保持し、終了／WM_NCDESTROYで削除する。
-対話操作外のLimiting、Correctingと失敗は抑制しない。非表示HWNDのログ回帰3件を追加した。
-DefSubclassProc内でmin/max制約が先に寸法を下げる場合も、処理前の要求値を観測して記録する。
+Limitingは、DefSubclassProc前の要求が上限超過、またはDefSubclassProc後の寸法を実際にclampした
+各WM_WINDOWPOSCHANGINGにつき1件記録する。winitが要求を大きくする場合も後者で記録する。
+ログ抑制状態やWM_ENTERSIZEMOVE／WM_EXITSIZEMOVEの追跡は持たず、Correctingと失敗も毎回残す。
+通常の対話リサイズはWM_GETMINMAXINFOのptMaxTrackSizeで上限に止まり、超過要求の反復を防ぐ。
+WM_ENTERSIZEMOVE後にSetWindowPosで100回超過要求した従来の合成試験は、通常ドラッグの証拠ではない。
+非表示HWNDのログ回帰は要求ごとの記録を検査し、通常ドラッグの実機受入とは区別する。
 
-追加回帰は純関数4件、非表示Win32 HWND7件、実Painter1件（1024のdevice、初回safe／unsafe取り付け、
-subclass迂回resize、status再configure、Lost再作成、depth／MSAA）。GPU前提不成立は明示失敗とする。
+追加回帰は純関数・非表示Win32 HWND・実Painterを使い、1024のdevice、初回safe／unsafe取り付け、
+subclass迂回resize、status再configure、Lost再作成、depth／MSAAを検査する。
+実Painterのzero-client取り付けと描画ではconfigure／acquireを行わず、非ゼロresize後に描画できることも
+非対話回帰の対象とする。GPU前提不成立は明示失敗とする。
 `test-lib-full.ps1`は本体lib限定なので含まれないが、`test-full.ps1`の無filter vendor nextestに含まれる。
 専用実行: `cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib`。
 
