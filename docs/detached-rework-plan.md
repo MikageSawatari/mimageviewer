@@ -5736,3 +5736,15 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
 初回FullなしのContext終了と旧native replacementのsource根拠、回帰の適用範囲、
 実deviceの修正前0×0 validation再現・修正後結果は[段7起動補修台帳](egui-0.37-stage7-startup-atlas-verification.md)へ記録する。
 実装担当は製品起動・liveを実行しない。設計担当の修正後実機確認・最終受入とは区別する。
+
+### §11 追補: 紙めくり D3 の通常準備の所有・採用境界（2026-10-18、設計合意・未実装）
+
+- 対象: [page-turn 計画 §27.17](page-turn-animation-plan.md) 改訂 1 (master `720a3ca5a`)。次の unit の final / Native 出力を先回り準備する
+  (利用者採択の案 A)。D3 は採用 service、viewport の最初の表示選択、mount / park / resume の経路に触れる。
+- 合意: 独立 reviewer (Sol / xhigh、再レビュー) と ClaudeCode の双方が、§27.17.9 の具体範囲で「症状パッチではなく構造的修正」であることに合意した。
+  条件は、既存 context の service と cache / pending / 需要の移譲に限定すること、mount だけで採用・投機再開を行わないこと、
+  HWND 推測・viewport 再生成・placement 保存経路・時間窓・新しい detached フラグを足さないこと。
+- 所有の不変条件: 完成 final は context 内の `final_composite_cache`、作業中は同じ context の pending map (`Computing | CpuReady`)。
+  fork は receiver / cancel / permit を共有しない。A の close・採用・取消が B へ作用しない。park は新しい投機開始だけを止め、
+  既存の表示用カラー化 / LUT 要求は保持する (`viewer_context_registry.rs` の現行監査を維持)。
+- 実装後に記録するもの: 実際に触れた関数、park / resume 契約の実装、兄弟 context 不変の検証結果、完成レビューでの合意。

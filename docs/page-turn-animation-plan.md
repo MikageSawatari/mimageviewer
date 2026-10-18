@@ -4550,3 +4550,14 @@ script既定のdev-runtimeを使わず、準備済みportableと使い捨てdata
   投機実行数、park 時の既存カラー化 / LUT の寿命、観測条件の分離、comic の入力準備と登録)。設計担当は 5 件とも妥当と判断し、
   調査担当が上の改訂 1 で対応した。GPU 実完了 ticket は診断用の任意証拠に格下げ。投機の同時実行 1 件・CpuReady 2 unit / 1GiB は設計値。
   detached は方向のみ合意済みで、改訂 1 の具体範囲は再レビューで確認する。
+- **独立再レビュー (2026-10-18、改訂 1 に対して)**: ACCEPT WITH CHANGES。detached の具体範囲 (§27.17.9 の条件) で「症状パッチではなく
+  構造的修正」と合意 (`docs/detached-rework-plan.md` §11 に記録)。D3-1 は着手可 (新しい投機仕事は有効化しない範囲)。残りを次のとおり確定する。
+  - **permit / 予約容量の解放通知 (D3-2 有効化前に必須)**: permit と CPU 結果予約の返却を、既存の当該 context の service への非 blocking 通知
+    (repaint 要求) に接続する。別 queue・常時 heartbeat は作らない。回帰「A を取消 → B は permit 取得不可 → 入力も定期 poll も止まる →
+    A の実終了 → 追加入力なしで B が開始」を D3-2 に入れる。通常の取消・容量待ちの進行契約であり、まれな失敗の回復ではない。
+  - **Frozen 試験の条件分け (該当試験の実装前に確定)**: (a) 準備 hit・安定 key では、presentation 消費のための重複 ensure / 登録 / resample が
+    無いこと、(b) 同期 miss と通常品質 publication (同じ unit の AI 完了後の final 更新など) では、既存の表示契約と producer の進行を維持し、
+    残る仕事と停止を記録すること、(c) 両方で accepted 素材と canonical receipt が不変であること。試験のために通常品質の更新を止めない。
+  - **入口表の補正 (D3-1 の brief に反映)**: viewport 行では、`begin_page_turn_viewer_frame` より前にある detached 表示準備用の resident lookup
+    (`src/ui_fullscreen.rs:25719` / `:25914`) も接続対象に加えるか、表示選択を確定しない参照として扱いを明記する。root 転送キー (`:25943`) と
+    viewport 自身のキー処理 (`:26446`) が root 専用 (`:31751`) と別経路であることも brief に書く。
