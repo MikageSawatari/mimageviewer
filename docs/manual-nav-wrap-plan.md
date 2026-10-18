@@ -323,3 +323,25 @@ mIV Remote の Web UI は端末側 (`crates/remote-web/web/app.js` の `changeIm
   不採用: barrier continuation へ purpose を持たせる変更。非折り返しの continuation にも同じ制約が
   あり、barrier は D3 (`pageturn-d3`) が変更中のため、§4.2 に既存の制約、§5 に D3 への申し送りとして
   記録した。レビュー担当は分割側と媒体 pending を既存制約とする判断には反対しないとした。
+
+## 15. 実装と独立コードレビューの記録
+
+- 実装: Codex GPT-6.1 Sol / high、session `01a14f82-7214-7702-85e2-6eae118e87ad`。
+  8e998abe4 (本体)、03a0451ef (manual/settings.html の設定行)。
+- 独立コードレビュー: 実装者とは別の GPT-6.1 Sol / xhigh (read-only)、session
+  `01a14fd7-a74d-7c01-9b5c-e232ec480ae3`。
+  - 第 1 回 (8e998abe4): ACCEPT WITH CHANGES、P2 1 件 — 他のページがすべて非表示のとき、折り返しの
+    Hidden skip が起点へ戻って同じページへ再着地し、境界案内を出さない。→ 105155946 で、起点の
+    表示単位の identity を既存の許可 intent に持たせ、起点へ戻ったら Edge で終える。
+  - 第 2 回 (105155946): ACCEPT WITH CHANGES、P2 1 件 — 通常画像を起点とする混在一覧では、
+    Hidden skip が許可チェック対象外の通常画像へ当たると「開こうとしたページが見つかりません」で
+    止まる (非折り返しにも同じ既存不具合)。→ 877b01f46 で、許可チェック対象外の項目を有効な候補と
+    して既存の着地経路へ渡す。
+  - 第 3 回 (877b01f46): ACCEPT、指摘なし。
+- 本体 lib 全件: 105155946 で 13,561 件成功 (既定並列)。最終確認は 877b01f46 で実施。
+- 実装時の観測 (未解決・本項目と無関係と判断): 既定 24 並列の lib 全件で、既存テスト 4 件
+  (`real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch`、
+  `close_return_changed_bookmark_poll_preserves_live_main_position_before_consumer`、
+  `section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps`、
+  `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`) が断続的に失敗・終了残留した。
+  個別実行と以後の全件実行では成功。別 worktree の全件テストと同時に走っていた。
