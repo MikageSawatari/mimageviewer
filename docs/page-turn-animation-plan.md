@@ -4061,3 +4061,27 @@ UI snapshot、diff check、本体lib全件の順に実行する。`test-focused.
 edit-result / final が source と同じ画素の原寸テクスチャを登録し直していたこと (調査は本書の記録と `5ceb32dc0` のコミットを参照)。
 補正・AI・カラー化などで画素が変わるページは従来どおり別テクスチャを作るので、その場合の滑らかさは別に測る必要がある (D3 の対象)。
 利用者の観測 (2026-10-17): この計測中のテスト画面を見て「滑らかだった」。通常の利用データ・補正ありのページでの確認はまだ。
+
+### 27.15 egui 0.37 上の再計測と、補正ありのページの停止の内訳（2026-10-18、ClaudeCode が隔離 portable で実行）
+
+egui 0.37 を取り込んだ master (`2a79a0c11`、§1.394 を含む) の `build-dev.ps1 -TestScript` で、§27.13 と同じ手順
+(03 / 04、演出 ON 200ms、1 回ずつ 8 回、2.5 秒間隔、使い捨て data-dir) を、補正なしと、全体補正
+(`global_preset` の明るさ +15・コントラスト +10) ありで測った。利用者の実機での見え方の確認ではない。
+証跡は `target/page-turn-smoke/e37-<03|04>-<single|rtl>-<plain|adj>/logs/`、実行 script は `pageturn-measure-d4*.rhai` と同じ内容。
+
+| 条件 | 1 回の演出の curl frame 数 | 受理から初回 curl | frame 間隔の最大 |
+| --- | --- | --- | --- |
+| 補正なし、単ページ (03 / 04) | 27〜34 | 4〜7ms | 8〜23ms |
+| 補正なし、見開き RtlCover (03 / 04) | 25〜33 | 4〜14ms | 8〜25ms |
+| 補正あり、単ページ (03 / 04) | 11〜29 | 87〜166ms | 31〜66ms |
+| 補正あり、見開き RtlCover (03 / 04) | 2〜28 (最初の 2 回は 2〜10) | 100〜359ms | 37〜198ms |
+
+- 補正なしは egui 0.37 でも §27.14 と同等で、退行はない。
+- 補正ありの停止は、めくり始めの frame で UI スレッドが次頁の final を作っていることによる。`fs.final_composite_build` は 1 頁
+  (8000×8192) あたり `adjust_ms` 55〜88ms (CPU の補正) と `upload_ms` 67〜77ms (ColorImage の複製と `load_texture`)。
+  見開きでは 2 頁分が同じ時期に走り、例えば 04 見開きの 1 frame は `run=201.7ms paint=90.5ms delta_bytes=524288600`
+  (8000×8192×4 の 2 枚) で計 292ms だった (`fs_viewport_breakdown`: setup 74ms、media 127ms、closure 外 91ms)。
+- 次頁の原寸 source は先読みで resident だが、補正後の final は表示される時点で初めて作られる。先読みは final を作らない
+  (§27.5 P2-2 の「一般 final を事前完成させる契約はない」と一致)。無補正では source を共有するので (§27.14) この仕事が無い。
+- したがって D3 の対象は「画素が変わるページ (補正・AI・カラー化・LUT・sharpen・post) の final を、めくりの前に用意する」こと。
+  CPU の補正 (D3a) と、登録・GPU 転送 (D3b) の両方が演出の frame に乗っており、片方だけでは見開きの停止が残る見込み (推測、未計測)。
