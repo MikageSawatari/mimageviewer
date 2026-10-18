@@ -2602,6 +2602,8 @@ fn compact_key_action_label(action: KeyAction) -> String {
         KeyAction::GlobalFavSearch => "コンテナ検索",
         KeyAction::GlobalMetadataSearch => "アイテム検索",
         KeyAction::GlobalOpenFolder => "フォルダを開く",
+        KeyAction::ClearVideoMediaMemory => "再生位置・視聴済み・音声トラック選択を全件クリア",
+        KeyAction::ClearBookResumePositions => "本の読書位置を全件クリア",
         KeyAction::ToggleDetachedViewerMode => "別ウィンドウ",
         KeyAction::HelpShowContextShortcuts => "ショートカット一覧",
         KeyAction::GridSelectAll => "表示中を全チェック",

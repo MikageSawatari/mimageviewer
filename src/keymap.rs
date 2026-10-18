@@ -1411,6 +1411,8 @@ pub enum KeyAction {
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
     ToggleAlwaysOnTop,
+    ClearVideoMediaMemory,
+    ClearBookResumePositions,
     UndoLastAction,
     HelpShowContextShortcuts,
     GridFavoritePrev,
@@ -1981,6 +1983,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
     KeyAction::ToggleAlwaysOnTop,
+    KeyAction::ClearVideoMediaMemory,
+    KeyAction::ClearBookResumePositions,
     KeyAction::UndoLastAction,
     KeyAction::HelpShowContextShortcuts,
     KeyAction::GridFavoritePrev,
@@ -3992,6 +3996,8 @@ impl KeyAction {
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             ToggleAlwaysOnTop => "ToggleAlwaysOnTop",
+            ClearVideoMediaMemory => "ClearVideoMediaMemory",
+            ClearBookResumePositions => "ClearBookResumePositions",
             UndoLastAction => "UndoLastAction",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
@@ -4719,6 +4725,8 @@ impl KeyAction {
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
             ToggleAlwaysOnTop => "常に最前面を切り替える",
+            ClearVideoMediaMemory => "再生位置・視聴済み記録と音声トラックの選択をすべてクリア",
+            ClearBookResumePositions => "本の読書位置をすべてクリア",
             UndoLastAction => "直前の操作を元に戻す",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
@@ -5281,6 +5289,8 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
+            | ClearVideoMediaMemory
+            | ClearBookResumePositions
             | UndoLastAction
             | HelpShowContextShortcuts => KeyContext::Global,
             GlobalEverythingSearch
@@ -5790,6 +5800,8 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
+            | ClearVideoMediaMemory
+            | ClearBookResumePositions
             | UndoLastAction
             | HelpShowContextShortcuts
             | GlobalEverythingSearch
@@ -6339,7 +6351,9 @@ impl KeyAction {
             GlobalEverythingSearch => ChordList::one(Chord::ctrl(R)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
-            ToggleAlwaysOnTop => ChordList::EMPTY,
+            ToggleAlwaysOnTop | ClearVideoMediaMemory | ClearBookResumePositions => {
+                ChordList::EMPTY
+            }
             UndoLastAction => ChordList::one(Chord::ctrl(Z)),
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
@@ -8414,7 +8428,10 @@ impl Keymap {
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
             ) || matches!(
                 action,
-                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+                KeyAction::ToggleDetachedViewerMode
+                    | KeyAction::ToggleAlwaysOnTop
+                    | KeyAction::ClearVideoMediaMemory
+                    | KeyAction::ClearBookResumePositions
             )
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
@@ -9507,7 +9524,10 @@ pub fn native_video_fullscreen_shortcut_key(
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
             ) || matches!(
                 action,
-                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+                KeyAction::ToggleDetachedViewerMode
+                    | KeyAction::ToggleAlwaysOnTop
+                    | KeyAction::ClearVideoMediaMemory
+                    | KeyAction::ClearBookResumePositions
             )
         })
         .any(|action| fallback.matches_vk_action(action, key))
@@ -14929,6 +14949,69 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn saved_position_clear_actions_are_unassigned_global_and_roundtrip_ini_and_settings() {
+        let actions = [
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
+        ];
+        let ini = "[Global]\nClearVideoMediaMemory = F16\nClearBookResumePositions = F17\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&encoded).unwrap());
+        for (action, key) in actions.into_iter().zip([KeyName::F16, KeyName::F17]) {
+            assert!(ALL_ACTIONS.contains(&action));
+            assert_eq!(action.context(), KeyContext::Global);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert!(Keymap::empty().effective_chords(action).is_empty());
+            assert_eq!(restored.effective_chords(action), vec![Chord::key(key)]);
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert!(
+                Keymap::default_reference_ini()
+                    .contains(&format!("# {} = none", action.ini_name()))
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saved_position_clear_bindings_reach_native_forwarding_and_egui_once() {
+        let _guard = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::from_ini_str(
+            "[Global]\nClearVideoMediaMemory = F16\nClearBookResumePositions = F17\n",
+        );
+        keymap.install_global_native_video_shortcuts();
+        for (action, key, vk) in [
+            (KeyAction::ClearVideoMediaMemory, egui::Key::F16, 0x7f),
+            (KeyAction::ClearBookResumePositions, egui::Key::F17, 0x80),
+        ] {
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, key, egui::Modifiers::NONE);
+            assert!(keymap.consume_action_no_repeat(&ctx, action));
+            assert!(!keymap.consume_action_no_repeat(&ctx, action));
+            ctx.end_pass().drop_without_applying_deltas();
+            let native = crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
+                virtual_key: vk,
+                scan_code: 0,
+                extended: false,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                repeat: false,
+            };
+            assert!(native_video_fullscreen_shortcut_key(&native));
+        }
+        Keymap::empty().install_global_native_video_shortcuts();
     }
 
     #[test]

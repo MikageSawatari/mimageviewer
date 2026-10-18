@@ -1335,9 +1335,7 @@ pub(crate) struct PreferencesState {
 impl PreferencesState {
     fn clear_video_media_memory(&mut self) {
         self.video_media_memory_clear_requested = true;
-        self.settings.video_resume_positions.clear();
-        self.settings.video_watched_to_end.clear();
-        self.settings.video_audio_track_choices.clear();
+        self.settings.clear_video_media_memory();
     }
     pub(super) fn select_external_tool(
         &mut self,
@@ -2410,9 +2408,7 @@ fn merge_video_media_memory_for_preferences(
     clear_requested: bool,
 ) {
     if clear_requested {
-        edited.video_resume_positions.clear();
-        edited.video_watched_to_end.clear();
-        edited.video_audio_track_choices.clear();
+        edited.clear_video_media_memory();
     } else {
         // 再生位置・視聴済みの保存と選択の確定・削除・リネームは表示中も live を更新する。
         // 環境設定側の編集意図はクリアだけなので、OK 時には最新の利用記録を移す。
@@ -2812,6 +2808,11 @@ impl App {
             // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
             // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
             // Settings に追加した場合はここにも追記が必要。
+            // Only accepted OK clears invalidate captured media updates. Draft edits,
+            // unsaved-change comparisons and Cancel leave the live generation alone.
+            if state.video_media_memory_clear_requested {
+                self.advance_media_memory_clear_generation();
+            }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
             self.install_preferences_settings(state.settings);
             if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
@@ -5177,6 +5178,28 @@ mod tests {
     }
 
     #[test]
+    fn saved_position_preferences_only_accepted_ok_advances_media_clear_generation() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let generation = app.media_memory_clear_generation;
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.pref_state = Some(Box::new(state));
+        let _ = app.preferences_dialog_has_unsaved_changes(); // Preview must not advance it.
+        assert_eq!(app.media_memory_clear_generation, generation);
+        app.discard_preferences_dialog();
+        assert_eq!(app.media_memory_clear_generation, generation);
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.pref_state = Some(Box::new(state));
+        app.apply_preferences_dialog(&ctx);
+        assert_eq!(app.media_memory_clear_generation, generation + 1);
+        app.pref_state = Some(Box::new(preferences_state_for_test(&app.settings)));
+        app.apply_preferences_dialog(&ctx);
+        assert_eq!(app.media_memory_clear_generation, generation + 1);
+    }
+
+    #[test]
     fn resume_meter_preferences_toggle_requeues_media_metadata_with_duration_badge_off() {
         use crate::app::LazyColumnState;
         use crate::grid_item::GridItem;
@@ -5430,6 +5453,40 @@ mod tests {
                 app.discard_preferences_dialog();
             }
             assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+        }
+    }
+
+    #[test]
+    fn preferences_ok_and_cancel_do_not_restore_media_memory_cleared_live() {
+        for commit in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let key = "media/cleared-live.mkv".to_owned();
+            app.settings
+                .video_resume_positions
+                .insert(key.clone(), 18.0);
+            app.settings.video_watched_to_end.insert(key.clone());
+            app.settings
+                .video_audio_track_choices
+                .insert(key, saved_audio_choice_for_preferences_test(2));
+            let mut state = preferences_state_for_test(&app.settings);
+            app.execute_saved_position_clear(
+                crate::keymap::KeyAction::ClearVideoMediaMemory,
+                crate::app::ActionSurface::MainWindow,
+            );
+            assert!(
+                !state.settings.video_resume_positions.is_empty(),
+                "draft is stale"
+            );
+            if commit {
+                prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+                app.install_preferences_settings(state.settings);
+            } else {
+                app.pref_state = Some(Box::new(state));
+                app.discard_preferences_dialog();
+            }
+            assert!(app.settings.video_resume_positions.is_empty());
+            assert!(app.settings.video_watched_to_end.is_empty());
+            assert!(app.settings.video_audio_track_choices.is_empty());
         }
     }
 

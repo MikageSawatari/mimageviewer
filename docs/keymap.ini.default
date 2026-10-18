@@ -59,6 +59,8 @@
 # GlobalOpenFolder = Ctrl+O ; フォルダを開くダイアログを表示する
 # ToggleDetachedViewerMode = F12 ; 画像・動画ビューアの別ウィンドウモードを切り替える
 # ToggleAlwaysOnTop = none ; 常に最前面を切り替える
+# ClearVideoMediaMemory = none ; 再生位置・視聴済み記録と音声トラックの選択をすべてクリア
+# ClearBookResumePositions = none ; 本の読書位置をすべてクリア
 # UndoLastAction = Ctrl+Z ; 直前の操作を元に戻す
 # HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
 
