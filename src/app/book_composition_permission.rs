@@ -1818,8 +1818,23 @@ impl App {
                         if let Some(target) = target {
                             intent.clear_skipped_source_slice();
                             intent.idx = target;
-                            let demand = self.book_target_presentation_demand(target);
-                            self.begin_qualified_book_unit(intent, demand);
+                            // The mixed list may leave a composition source for
+                            // an ordinary image or media leaf. That item needs
+                            // no book permission; keep its normal landing route.
+                            if matches!(
+                                intent.route,
+                                BookTargetRoute::FullscreenNavigation
+                                    | BookTargetRoute::ContinuousSeek
+                            ) && self.items.get(target).is_some()
+                                && self.presentation_candidate(target).is_none()
+                            {
+                                if !self.finish_book_navigation_at_origin(ctx, &intent) {
+                                    self.resume_qualified_book_target(ctx, &intent);
+                                }
+                            } else {
+                                let demand = self.book_target_presentation_demand(target);
+                                self.begin_qualified_book_unit(intent, demand);
+                            }
                         } else if let BookTargetRoute::ZipDfs(continuation) = &intent.route {
                             self.book_composition_permission.open =
                                 OpenPermission::ContinueDfs(*continuation);
@@ -1832,10 +1847,27 @@ impl App {
             ctx.request_repaint();
             return;
         }
-        // Hidden pages may have exhausted the rest of a wrapped list and led
-        // back to the original source/unit (including an allowed spread partner).
-        // Wait for Allowed before stopping: an origin that is itself Hidden
-        // still follows the existing finite search/close path above.
+        // Checked candidates must be Allowed before testing the origin. A
+        // Hidden origin still follows the existing finite search/close above.
+        if self.finish_book_navigation_at_origin(ctx, &intent) {
+            return;
+        }
+        // Publish the exact qualified occurrence into this context's visible episode before
+        // its continuation commits slice/selection/timer effects. A prior half cannot grant it.
+        self.publish_qualified_book_candidates(&candidates);
+        self.book_composition_permission.open = OpenPermission::Resuming {
+            intent: intent.clone(),
+            candidates,
+        };
+        self.resume_qualified_book_target(ctx, &intent);
+    }
+
+    /// Shared terminal for checked Allowed and valid permission-free targets.
+    fn finish_book_navigation_at_origin(
+        &mut self,
+        ctx: &egui::Context,
+        intent: &OpenIntent,
+    ) -> bool {
         if matches!(
             intent.purpose,
             BookTargetPurpose::Next | BookTargetPurpose::Previous
@@ -1848,16 +1880,9 @@ impl App {
                 at: std::time::Instant::now(),
             });
             ctx.request_repaint();
-            return;
+            return true;
         }
-        // Publish the exact qualified occurrence into this context's visible episode before
-        // its continuation commits slice/selection/timer effects. A prior half cannot grant it.
-        self.publish_qualified_book_candidates(&candidates);
-        self.book_composition_permission.open = OpenPermission::Resuming {
-            intent: intent.clone(),
-            candidates,
-        };
-        self.resume_qualified_book_target(ctx, &intent);
+        false
     }
     fn publish_qualified_book_candidates(&mut self, candidates: &[OpenCandidate]) {
         for candidate in candidates {

@@ -131,6 +131,8 @@
     その source を次候補にし、同じ source の反対側なら飛ばして次の source へ進む (非表示 source の
     残り半分を再採用しない)。探索は nav 列の端で止まる有限探索 (`wrap = false`) のまま。
     見開き (`Target`) と単ページ (`Delta`) の扱いは変えない。
+    通常閲覧の Hidden skip では、許可チェック対象外の画像・媒体も有効候補として既存の着地経路へ渡す。
+    非折り返しで同じ候補に到達して停止していた既存不具合も、この経路で修正する。
   - ページめくり barrier 前の先行解決 (`resolved`) も同じ helper と `Wrap` を扱い、
     barrier に渡る移動先が通常経路と一致するようにする。barrier 経由で defer された継続は
     既存の continuation 方針 (演出なしの即時切り替え、理由 `stage1_continuation_instant`、

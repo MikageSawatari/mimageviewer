@@ -657,3 +657,155 @@ fn manual_nav_wrap_continuous_inline_permission_keeps_origin_until_commit() {
         }
     }
 }
+
+fn install_mixed_image_rows(env: &mut AppTestEnvForTest, pages: &[Option<u32>]) {
+    let GridItem::PdfPage { pdf_path: root, .. } = env.items[0].clone() else {
+        unreachable!();
+    };
+    let image_path = env.tmp.path().join("ordinary-origin.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([255; 4]))
+        .save(&image_path)
+        .unwrap();
+    env.items = pages
+        .iter()
+        .map(|page| match page {
+            Some(page_num) => GridItem::PdfPage {
+                pdf_path: root.clone(),
+                page_num: *page_num,
+                content_type: None,
+            },
+            None => GridItem::Image(image_path.clone()),
+        })
+        .collect();
+    env.thumbnails = vec![ThumbnailState::Pending; pages.len()];
+    env.image_metas = vec![None; pages.len()];
+    env.visible_indices = (0..pages.len()).collect();
+    env.items_generation += 1;
+    env.page_identity_index = Arc::new(PreparedPageIdentityIndex::prepare(
+        &env.items,
+        None,
+        env.settings.file_type_visibility.clone(),
+    ));
+    env.viewer_navigation_caches.invalidate();
+    env.fs_cache.retain(|idx, _| *idx < pages.len());
+}
+
+#[test]
+fn manual_nav_wrap_hidden_pdf_returns_to_plain_image_origin_at_boundary() {
+    use crate::settings::ReadingFlow;
+    for flow in [
+        ReadingFlow::Paged,
+        ReadingFlow::Vertical,
+        ReadingFlow::Horizontal,
+    ] {
+        for forward in [false, true] {
+            let (mut env, ctx, owner) = fixture(SpreadMode::Single, &[0], None);
+            let pages = if forward {
+                [Some(0), None]
+            } else {
+                [None, Some(0)]
+            };
+            install_mixed_image_rows(&mut env, &pages);
+            let current = usize::from(forward);
+            env.reading_flow = flow;
+            env.fullscreen_idx = Some(current);
+            env.selected = Some(current);
+            env.fullscreen_page_slice = PageSlice::Full;
+            navigate(&mut env, &ctx, current, if forward { 1 } else { -1 });
+            assert!(
+                matches!(&env.book_composition_permission.open, OpenPermission::Checking { intent, .. }
+                if intent.idx == 1 - current && intent.navigation_origin.len() == 1)
+            );
+            complete_current(&mut env, &ctx);
+            assert_eq!(env.fullscreen_idx, Some(current));
+            assert_eq!(env.selected, Some(current));
+            assert_eq!(env.fullscreen_page_slice, PageSlice::Full);
+            assert!(
+                matches!(env.fs_boundary_hint, Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == forward)
+            );
+            assert!(
+                env.fs_feedback_toast.is_none(),
+                "a valid ordinary image is not a missing page"
+            );
+            assert!(matches!(
+                env.book_composition_permission.open,
+                OpenPermission::Idle
+            ));
+            owner.shutdown_and_join();
+        }
+    }
+}
+
+#[test]
+fn manual_nav_wrap_nonwrapped_hidden_pdf_lands_on_plain_image() {
+    use crate::settings::ReadingFlow;
+    for flow in [
+        ReadingFlow::Paged,
+        ReadingFlow::Vertical,
+        ReadingFlow::Horizontal,
+    ] {
+        for wrap in [false, true] {
+            for forward in [false, true] {
+                let (mut env, ctx, owner) = fixture(SpreadMode::Single, &[1], None);
+                let pages = if forward {
+                    [Some(0), Some(1), None]
+                } else {
+                    [None, Some(1), Some(0)]
+                };
+                install_mixed_image_rows(&mut env, &pages);
+                let current = if forward { 0 } else { 2 };
+                let target = 2 - current;
+                env.settings.fullscreen_manual_nav_wrap = wrap;
+                env.reading_flow = flow;
+                env.fullscreen_idx = Some(current);
+                env.selected = Some(current);
+                navigate(&mut env, &ctx, current, if forward { 1 } else { -1 });
+                assert!(
+                    matches!(&env.book_composition_permission.open, OpenPermission::Checking { intent, .. }
+                    if intent.idx == 1 && intent.navigation_origin.is_empty())
+                );
+                complete_current(&mut env, &ctx);
+                assert_eq!(env.fullscreen_idx, Some(target));
+                assert_eq!(env.selected, Some(target));
+                assert!(env.fs_boundary_hint.is_none());
+                assert!(
+                    env.fs_feedback_toast.is_none(),
+                    "Hidden skip must land through its ordinary route"
+                );
+                owner.shutdown_and_join();
+            }
+        }
+    }
+}
+
+#[test]
+fn manual_nav_wrap_permission_free_hidden_skip_keeps_other_routes_unchanged() {
+    for route in [
+        BookTargetRoute::FullscreenOpen(FsMetadataBoundary::Manual),
+        BookTargetRoute::ZipDfs(BookDfsContinuation::Navigation { forward: true }),
+        BookTargetRoute::Slideshow { slice: None },
+    ] {
+        let (mut env, ctx, owner) = fixture(SpreadMode::Single, &[1], None);
+        install_mixed_image_rows(&mut env, &[Some(0), Some(1), None]);
+        env.fullscreen_idx = Some(0);
+        env.selected = Some(0);
+        env.slideshow_playing = true;
+        navigate(&mut env, &ctx, 0, 1);
+        let OpenPermission::Checking { intent, .. } = &mut env.book_composition_permission.open
+        else {
+            unreachable!();
+        };
+        intent.route = route;
+        complete_current(&mut env, &ctx);
+        assert_eq!(env.fullscreen_idx, Some(0));
+        assert!(env.fs_boundary_hint.is_none());
+        assert!(
+            matches!(&env.fs_feedback_toast, Some((message, ..)) if message == "開こうとしたページが見つかりません")
+        );
+        assert!(matches!(
+            env.book_composition_permission.open,
+            OpenPermission::Idle
+        ));
+        owner.shutdown_and_join();
+    }
+}
