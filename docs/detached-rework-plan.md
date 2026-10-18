@@ -5764,3 +5764,16 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
   兄弟不変の実行結果と独立完成判定は、page-turn 計画 §27.17.12 と同じ `target/d3-1-handoff.md` に記録する。
 - 独立完成レビュー (ClaudeCode が別 session で依頼した Sol / xhigh、2026-10-18、`7388b3f2d`): ACCEPT、P1〜P3 なし。完成差分で
   「症状パッチではなく構造的修正」に合意。root キー各経路と mounted update 全体の順序の一部は文字列検査で、全入口の端から端までの動的検証ではない (レビュー所見)。
+
+#### D3-2 実装追補（2026-10-18、完成 source レビュー ACCEPT・実機未確認）
+
+- 新しい一般 final の開始は root の `render_prepare_fullscreen_materials` と独立 viewer の
+  `update_active_viewer_context` の既存非 target work 境界に限る。単なる mount/deposit から開始しない。
+- 同じ context の `final_effect_pending` が Computing/CpuReady と要求種別を所有し、fork は新しい空 map、
+  park/promote は既存の資源移譲を使う。cancel/close/内容失効は当該 owner の公開権だけを外す。
+  worker の App 共通 permit は実終了まで、出力予約は登録/破棄まで保持する。
+- park は既存表示用カラー化/LUT と開始済み新 D3 worker を cancel せず保持する。park 中に次 job を開始しない。
+  復帰の D3-1 service で exact 再照合して採用し、host/window identity の変更から新しい detached 述語を推測しない。
+- 独立 Sol/xhigh の実装前構造レビューは ACCEPT WITH CHANGES。同じ context の service/pending/移譲の修正であり、
+  症状パッチではないことに合意。完成 source レビューも ACCEPT、P1/P2 残件なしで構造修正への合意を再確認した。
+  動的検証結果はこの source 判定と分け、`target/d3-2-handoff.md` へ記録する。

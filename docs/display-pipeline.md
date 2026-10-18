@@ -110,6 +110,13 @@ PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに�
 GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
 [詳細](pdf-render-epoch-ownership-plan.md)。
 
+2026-10-18 D3-2: ON/paged の現在 unit の受理後だけ、通常 fullscreen work から次 unit の
+一般 final を CPU 先回り準備する。入力は既存 CPU pixels のみで、新しい編集 materialization や I/O は行わない。
+共有 final executor と同じ Triangle 表示 clamp を worker 上で実行し、正本/表示用 Arc を同じ pending の CpuReady に保持する。
+登録は共通投機枠と実 options の VRAM admission を使う。表示要求は CpuReady を通常登録へ引き取り、
+同期可能な未完成仕事は公開権を外して同期 takeover する。カラー化/LUT 待ちは同 worker を表示へ昇格する。
+無補正 source 共有、初回/OFF の同 pass 完成、保持 presentation と canonical receipt は維持する。
+
 2026-10-18 D3-1: final-effect の受信と採用を表示 decision から分離した。
 各入力・描画・permission continuation・実表示再開の入口で、確定済み失効の後に
 保持 presentation の accepted receipt、final 結果の exact 再照合・採用、通常 selector の順で処理する。

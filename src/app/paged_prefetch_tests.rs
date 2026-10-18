@@ -411,11 +411,11 @@ fn paged_prefetch_reconcile_warm_and_poll_preserve_sibling_cache_and_channels() 
                 canonical_dims: None,
                 source_size: [4, 6],
                 cancel: effect_cancel_for_owner,
-                rx: effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(effect_rx)),
                 items_generation: generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: true,
+                origin: FinalEffectOrigin::LegacyPrefetch,
             },
         );
     });

@@ -55,10 +55,18 @@ output hookはoperation/destinationと既存終端を照合し、取消/close後
 D3-1（2026-10-18）は既存 final-effect の receiver と context-local cache のまま、
 `collect_final_prepare_results` と `adopt_final_prepare_results_before_lookup` に分離する。
 採用可能な既存結果は呼出し内の一時 Vec で移譲し、未 admit の legacy rendition 仕事は元の receiver に残す。
-新しい CpuReady owner・permit・容量予約・投機 worker はまだ作らない（D3-2）。
+この段階では新しい CpuReady owner・permit・容量予約・投機 worker は作らなかった。
+
+D3-2 は同じ pending を `Computing | CpuReady` に拡張する。新 D3 の worker は App 共通の
+実行 permit（1件）と出力予約（context 1 unit／全体2 unit／1GiB）を同時に取得してから開始する。
+取消・receiver 除去・同期 takeover でも permit は実終了まで保持し、出力予約は channel と結果へ追随する。
+返却は同じ資源 owner に登録した既存 service 宛先を非 blocking repaint で起こす。新しい要求 queue や heartbeat はない。
+CPU-ready の採用は selector を呼ばず、要求時 identity と世代を照合して既存 final cache へ move する。
+既存 legacy 表示/先読みの要求範囲と通常登録は維持し、これらを含む全 CPU 仕事が1件になるとは主張しない。
+park は開始済み final-effect を保持し、新しい D3 開始を止める。詳細は [D3計画](page-turn-animation-plan.md) §27.17.13。
 入力・permission の再開・実表示復帰は selector 非依存の共通 service を通るが、単なる context mount は通さない。
 app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
-通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用意し、本番の投機 claim は未接続。
+通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。
 
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 

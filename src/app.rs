@@ -655,7 +655,10 @@ pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
 #[cfg(windows)]
 use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerContextRegistry};
+pub(crate) mod final_prepare;
 mod final_prepare_budget;
+mod final_prepare_cpu;
+use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, FinalEffectState};
 #[cfg(test)]
 pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
@@ -12355,12 +12358,12 @@ pub(crate) struct FinalEffectPending {
     canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     source_size: [usize; 2],
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<FinalCompositeResult>,
+    state: final_prepare::FinalEffectState,
     items_generation: u64,
     output_complete: bool,
     nearest_sampler: bool,
     /// 非表示ページの先読みとして起動した worker。表示要求時は同じ job を昇格して再利用する。
-    prefetch: bool,
+    origin: final_prepare::FinalEffectOrigin,
 }
 
 /// Build the low-resolution page-turn rendition synchronously on the UI thread.
@@ -18801,6 +18804,7 @@ pub struct App {
     /// フレーム番号 (update 呼出しのたびに +1)
     pub(crate) frame_counter: u64,
     speculative_gpu_frame: final_prepare_budget::SpeculativeGpuFrame,
+    final_prepare_cpu: final_prepare_cpu::FinalPrepareCpuBudget,
     /// 近モノクロ要約の同期計算を全 viewer context 合算で 1 frame 1 回に制限する。
     colorize_mono_summary_last_reconcile_frame: u64,
     /// local / conceal / edit materialization の GPU upload を 1 frame 1 枚に制限する。
@@ -21227,6 +21231,7 @@ impl App {
             last_input_at: None,
             frame_counter: 0,
             speculative_gpu_frame: Default::default(),
+            final_prepare_cpu: Default::default(),
             colorize_mono_summary_last_reconcile_frame: u64::MAX,
             last_edit_materialize_upload_frame: u64::MAX,
             perf_last_frame_begin: None,
@@ -65113,6 +65118,7 @@ impl App {
                     let page_turn_decision = app.fs_page_turn_decision_for_frame(ctx, fs_idx);
                     if page_turn_decision.admits_non_target_full_resolution_work() {
                         app.reconcile_paged_prefetch_window(fs_idx);
+                        app.prefetch_next_final_unit(ctx, fs_idx);
                         app.prefetch_final_ai(ctx, fs_idx);
                     } else {
                         app.poll_final_effects(ctx);
@@ -79401,6 +79407,12 @@ impl App {
             .map(|(_, idx)| idx)
             .collect::<HashSet<_>>();
         keep.insert(current_idx);
+        // D3 reuses resident input for the actual next unit (slideshow may have
+        // a different still-only composition). Retain it without adding decode
+        // or AI targets to either configured prefetch range.
+        if let Some(pages) = self.next_final_prepare_occurrences(current_idx) {
+            keep.extend(pages.into_iter().map(|page| page.idx));
+        }
         Some(keep)
     }
 
@@ -79631,7 +79643,7 @@ impl App {
         if self
             .final_effect_pending
             .values()
-            .any(|pending| !pending.cancel.load(Ordering::Relaxed))
+            .any(|pending| pending.origin.is_legacy() && !pending.cancel.load(Ordering::Relaxed))
         {
             return;
         }
@@ -79734,10 +79746,9 @@ impl App {
         continuous_prepare_set: Option<&std::collections::HashSet<usize>>,
     ) {
         if self.post_filter_bypassed
-            || self
-                .final_effect_pending
-                .values()
-                .any(|pending| !pending.cancel.load(Ordering::Relaxed))
+            || self.final_effect_pending.values().any(|pending| {
+                pending.origin.is_legacy() && !pending.cancel.load(Ordering::Relaxed)
+            })
         {
             return;
         }
@@ -85381,7 +85392,10 @@ impl App {
         let keys: Vec<FinalCompositeKey> = self
             .final_effect_pending
             .iter()
-            .filter_map(|(key, pending)| (pending.prefetch && Some(*key) != keep).then_some(*key))
+            .filter_map(|(key, pending)| {
+                (matches!(pending.origin, FinalEffectOrigin::LegacyPrefetch) && Some(*key) != keep)
+                    .then_some(*key)
+            })
             .collect();
         for key in keys {
             if let Some(pending) = self.final_effect_pending.remove(&key) {
@@ -85395,12 +85409,9 @@ impl App {
         self.adopt_final_prepare_results_before_lookup(ctx, completed);
     }
 
-    /// Nonblocking receipt only. Until D3-2 adds a bounded CpuReady owner,
-    /// legacy deferred work stays in its original receiver; eligible results
-    /// move directly to adoption in the same call, without another queue.
-    fn collect_final_prepare_results(
-        &mut self,
-    ) -> Vec<(FinalCompositeKey, FinalEffectPending, FinalCompositeResult)> {
+    /// Nonblocking receipt only. Ready pixels stay in their existing pending
+    /// owner until admitted; the returned keys carry no result or resource.
+    fn collect_final_prepare_results(&mut self) -> Vec<FinalCompositeKey> {
         #[cfg(test)]
         let _receipt_scope = final_prepare_tests::ReceiptScope::enter();
         if self.final_effect_pending.is_empty() {
@@ -85424,14 +85435,14 @@ impl App {
         };
         let mut completed = Vec::new();
         let mut disconnected = Vec::new();
-        for (&key, pending) in &self.final_effect_pending {
-            if !final_effect_is_admitted(&key) {
+        for (&key, pending) in &mut self.final_effect_pending {
+            if pending.origin.is_legacy() && !final_effect_is_admitted(&key) {
                 // The worker retains its channel result. Once the paint source admits this page,
                 // a later poll consumes it without restarting the work.
                 continue;
             }
-            match pending.rx.try_recv() {
-                Ok(result) => completed.push((key, result)),
+            match pending.state.receive() {
+                Ok(()) => completed.push(key),
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
             }
@@ -85442,34 +85453,100 @@ impl App {
                 .remove_with_drop_reason(&key, "worker_disconnected");
         }
         completed
-            .into_iter()
-            .filter_map(|(key, result)| {
-                self.final_effect_pending
-                    .remove(&key)
-                    .map(|pending| (key, pending, result))
-            })
-            .collect()
     }
 
     fn adopt_final_prepare_results_before_lookup(
         &mut self,
         ctx: &egui::Context,
-        completed: Vec<(FinalCompositeKey, FinalEffectPending, FinalCompositeResult)>,
+        completed: Vec<FinalCompositeKey>,
     ) {
-        let had_updates = !completed.is_empty();
-        for (key, pending, result) in completed {
-            if pending.cancel.load(Ordering::Relaxed)
-                || pending.items_generation != self.items_generation
-                || !self.edit_key_describes_current_page(&key.edit_key, key.edit_key.idx)
-                || key
-                    != self.final_composite_key_for_pixels(
-                        self.current_edit_result_key(key.edit_key.idx),
-                        pending.source_size,
-                        self.effective_params(key.edit_key.idx),
-                    )
-            {
+        let mut had_updates = false;
+        for key in completed {
+            let Some(pending) = self.final_effect_pending.get(&key) else {
+                continue;
+            };
+            if !self.final_prepare_pending_is_current(key, pending) {
+                if let Some(pending) = self.final_effect_pending.remove(&key) {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
                 continue;
             }
+            let speculative = pending.origin.is_speculative();
+            let prepared = !pending.origin.is_legacy();
+            let shared_texture = match &pending.state {
+                FinalEffectState::CpuReady(FinalEffectReady::Prepared(ready)) => {
+                    self.shared_prepared_final_texture(ctx, key, ready, pending.nearest_sampler)
+                }
+                _ => None,
+            };
+            if speculative {
+                if let FinalEffectOrigin::Speculative(unit) = &pending.origin {
+                    if !self.speculative_final_unit_is_needed(unit) {
+                        if let Some(pending) = self.final_effect_pending.remove(&key) {
+                            pending.cancel.store(true, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                }
+                if self.fullscreen_idx.is_some_and(|idx| {
+                    !self
+                        .final_prepare_work_admission(idx)
+                        .admits_backlog_upload(
+                            self.fs_navigation_rendition_target_pages(idx)
+                                .is_some_and(|pages| pages.contains(&key.edit_key.idx)),
+                        )
+                }) {
+                    continue;
+                }
+                let FinalEffectState::CpuReady(FinalEffectReady::Prepared(ready)) = &pending.state
+                else {
+                    continue;
+                };
+                let options = if pending.nearest_sampler {
+                    egui::TextureOptions::NEAREST
+                } else {
+                    DISPLAY_IMAGE_TEXTURE_OPTIONS
+                };
+                let upload_size = ready.upload.size;
+                let admission = if shared_texture.is_some() {
+                    final_prepare_budget::FinalPrepareGpuAdmission::Admitted
+                } else {
+                    self.admit_final_prepare_registration(upload_size, options)
+                };
+                match admission {
+                    final_prepare_budget::FinalPrepareGpuAdmission::Admitted => {}
+                    final_prepare_budget::FinalPrepareGpuAdmission::FrameBusy => {
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        ctx.request_repaint_of(self.page_turn_destination().viewport);
+                        continue;
+                    }
+                    final_prepare_budget::FinalPrepareGpuAdmission::OverBudget => continue,
+                }
+            }
+            let Some(pending) = self.final_effect_pending.remove(&key) else {
+                continue;
+            };
+            let FinalEffectState::CpuReady(ready) = pending.state else {
+                continue;
+            };
+            // Keep the result reservation through registration/publication. It is
+            // not returned by receipt, promotion, or speculative frame deferral.
+            let _reservation = match &ready {
+                FinalEffectReady::Prepared(ready) => Some(ready.reservation.clone()),
+                _ => None,
+            };
+            let (result, prepared_upload) = match ready {
+                FinalEffectReady::Legacy(result) => (result, None),
+                FinalEffectReady::Prepared(ready) => (
+                    FinalCompositeResult::Ready {
+                        pixels: ready.pixels,
+                        elapsed_ms: ready.elapsed_ms,
+                        timing: ready.timing,
+                    },
+                    Some((ready.upload, ready.clamp_ms)),
+                ),
+            };
+            had_updates = true;
             match result {
                 FinalCompositeResult::Ready {
                     pixels,
@@ -85478,25 +85555,31 @@ impl App {
                 } => {
                     let upload_started = std::time::Instant::now();
                     let clamp_started = std::time::Instant::now();
-                    let upload = match clamp_for_gpu(&pixels) {
-                        std::borrow::Cow::Borrowed(_) => Arc::clone(&pixels),
-                        std::borrow::Cow::Owned(image) => Arc::new(image),
-                    };
-                    let clamp_ms = clamp_started.elapsed().as_secs_f64() * 1000.0;
+                    let (upload, clamp_ms) = prepared_upload.unwrap_or_else(|| {
+                        (
+                            final_prepare::final_upload_pixels(&pixels),
+                            clamp_started.elapsed().as_secs_f64() * 1000.0,
+                        )
+                    });
                     let load_texture_started = std::time::Instant::now();
-                    self.speculative_gpu_frame.note_ordinary_upload();
-                    let texture = ctx.load_texture(
-                        format!(
-                            "final_effect_{}_{}_{}_{}",
-                            key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
-                        ),
-                        upload,
-                        if pending.nearest_sampler {
-                            egui::TextureOptions::NEAREST
-                        } else {
-                            DISPLAY_IMAGE_TEXTURE_OPTIONS
-                        },
-                    );
+                    let shared_registration = shared_texture.is_some();
+                    if !speculative && shared_texture.is_none() {
+                        self.speculative_gpu_frame.note_ordinary_upload();
+                    }
+                    let texture = shared_texture.unwrap_or_else(|| {
+                        ctx.load_texture(
+                            format!(
+                                "final_effect_{}_{}_{}_{}",
+                                key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
+                            ),
+                            upload,
+                            if pending.nearest_sampler {
+                                egui::TextureOptions::NEAREST
+                            } else {
+                                DISPLAY_IMAGE_TEXTURE_OPTIONS
+                            },
+                        )
+                    });
                     let load_texture_ms = load_texture_started.elapsed().as_secs_f64() * 1000.0;
                     let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                     let [width, height] = pixels.size;
@@ -85531,6 +85614,34 @@ impl App {
                     self.comic_cache.remove(&key.edit_key.idx);
                     self.cancel_comic_bake_for_idx(key.edit_key.idx);
                     self.invalidate_final_prepare_decision(ctx);
+                    if prepared && crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "final_prepare_registered",
+                            None,
+                            self.input_seq,
+                            &[
+                                (
+                                    "context",
+                                    self.projected_viewer_context_id().serial().into(),
+                                ),
+                                ("idx", key.edit_key.idx.into()),
+                                ("items_generation", pending.items_generation.into()),
+                                ("source_generation", key.edit_key.source_gen.into()),
+                                ("speculative", speculative.into()),
+                                ("shared", shared_registration.into()),
+                                (
+                                    "stage",
+                                    (if shared_registration {
+                                        "shared_handle"
+                                    } else {
+                                        "texture_delta_registered"
+                                    })
+                                    .into(),
+                                ),
+                            ],
+                        );
+                    }
                     if crate::perf::is_enabled() {
                         let colorize_mode = match timing.colorize_mode {
                             crate::colorize::ColorizeMode::Disabled => "disabled",
@@ -85572,7 +85683,7 @@ impl App {
                                     "effective_tone_radius",
                                     f64::from(effective_tone_radius).into(),
                                 ),
-                                ("prefetch", pending.prefetch.into()),
+                                ("prefetch", pending.origin.is_prefetch().into()),
                                 ("complete", pending.output_complete.into()),
                                 ("w", (width as u64).into()),
                                 ("h", (height as u64).into()),
@@ -85588,14 +85699,15 @@ impl App {
                 }
             }
         }
-        if self.final_effect_pending.keys().any(|key| {
-            self.fullscreen_idx.is_none_or(|idx| {
-                self.final_prepare_work_admission(idx)
-                    .admits_backlog_upload(
-                        self.fs_navigation_rendition_target_pages(idx)
-                            .is_some_and(|pages| pages.contains(&key.edit_key.idx)),
-                    )
-            })
+        if self.final_effect_pending.iter().any(|(key, pending)| {
+            pending.origin.is_legacy()
+                && self.fullscreen_idx.is_none_or(|idx| {
+                    self.final_prepare_work_admission(idx)
+                        .admits_backlog_upload(
+                            self.fs_navigation_rendition_target_pages(idx)
+                                .is_some_and(|pages| pages.contains(&key.edit_key.idx)),
+                        )
+                })
         }) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
@@ -85640,7 +85752,7 @@ impl App {
         }
         if reuse_prefetch {
             if let Some(pending) = self.final_effect_pending.get_mut(&key) {
-                pending.prefetch = false;
+                pending.origin.promote();
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return existing_texture;
@@ -85770,11 +85882,15 @@ impl App {
                         canonical_dims: self.canonical_source_dimensions(key.edit_key.idx),
                         source_size,
                         cancel,
-                        rx,
+                        state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                         items_generation: self.items_generation,
                         output_complete,
                         nearest_sampler,
-                        prefetch,
+                        origin: if prefetch {
+                            FinalEffectOrigin::LegacyPrefetch
+                        } else {
+                            FinalEffectOrigin::LegacyDisplay
+                        },
                     },
                 );
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -85965,6 +86081,11 @@ impl App {
         if let Some(texture) = self.exact_complete_final_composite_texture(idx) {
             return Some(texture);
         }
+        if let final_prepare::PreparedFinalDisplay::Handled(texture) =
+            self.take_prepared_final_for_display(ctx, idx)
+        {
+            return texture;
+        }
         // 画像オープン時のフリーズ調査用 perf 計装 (--perf-log)。この関数の build 経路
         // (キャッシュミス時) は UI スレッドで同期実行され、AI アップスケール後の大判
         // 画像では post_filter + GPU upload が数百ms かかりうる。cat="fs" /
@@ -86125,7 +86246,7 @@ impl App {
             (reused, 0.0, 0.0)
         } else {
             let t_clamp0 = perf_on.then(std::time::Instant::now);
-            let upload = clamp_for_gpu(&post_filtered);
+            let upload = final_prepare::final_upload_pixels(&post_filtered);
             let fc_clamp_ms = t_clamp0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             let t_up0 = perf_on.then(std::time::Instant::now);
             self.speculative_gpu_frame.note_ordinary_upload();
@@ -86137,7 +86258,7 @@ impl App {
                     final_key.params_hash,
                     final_key.bg
                 ),
-                upload.into_owned(),
+                upload,
                 tex_opts,
             );
             let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
@@ -98096,6 +98217,17 @@ pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::C
 pub(crate) const MAX_TEXTURE_DIM: usize =
     crate::canonical_image_loader::CANONICAL_RASTER_MAX_LONG_EDGE as usize;
 
+fn gpu_clamped_dimensions([w, h]: [usize; 2]) -> [usize; 2] {
+    if w <= MAX_TEXTURE_DIM && h <= MAX_TEXTURE_DIM {
+        return [w, h];
+    }
+    let scale = MAX_TEXTURE_DIM as f64 / w.max(h) as f64;
+    [
+        ((w as f64 * scale).round() as usize).max(1),
+        ((h as f64 * scale).round() as usize).max(1),
+    ]
+}
+
 /// GPU テクスチャ上限を超える `ColorImage` を縮小して返す。
 /// 上限内であればクローンせず共有参照をそのまま `Cow::Borrowed` で返す。
 ///
@@ -98110,12 +98242,14 @@ pub(crate) fn clamp_for_gpu(ci: &egui::ColorImage) -> std::borrow::Cow<'_, egui:
         return std::borrow::Cow::Borrowed(ci);
     }
     // 長辺を MAX_TEXTURE_DIM に収めるスケール
-    let scale = MAX_TEXTURE_DIM as f64 / w.max(h) as f64;
-    let new_w = ((w as f64 * scale).round() as u32).max(1);
-    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    let [new_w, new_h] = gpu_clamped_dimensions(ci.size);
     let t0 = std::time::Instant::now();
     let dynimg = color_image_to_dynamic(ci);
-    let resized = dynimg.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+    let resized = dynimg.resize_exact(
+        new_w as u32,
+        new_h as u32,
+        image::imageops::FilterType::Triangle,
+    );
     crate::logger::log(format!(
         "  clamp_for_gpu (UI-thread fallback): {w}x{h} → {new_w}x{new_h} (limit {MAX_TEXTURE_DIM}) in {:.0}ms",
         t0.elapsed().as_secs_f64() * 1000.0

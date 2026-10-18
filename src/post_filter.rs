@@ -100,6 +100,22 @@ fn clamp_upscale(w: usize, h: usize, factor: usize) -> usize {
     factor.min(max_factor)
 }
 
+/// Exact output extent without running a filter; shared with CPU reservations.
+pub(crate) fn output_dimensions([w, h]: [usize; 2], filter: PostFilter) -> [usize; 2] {
+    let factor = match filter {
+        PostFilter::CrtSimple
+        | PostFilter::CrtFull
+        | PostFilter::CrtArcade
+        | PostFilter::ComboFamicomCrt
+        | PostFilter::ComboPc98Crt
+        | PostFilter::ComboMsx2PlusCrt
+        | PostFilter::ComboMegaDriveCrt
+        | PostFilter::ComboSfcCrt => clamp_upscale(w, h, crt_upscale_factor(w, h)),
+        _ => 1,
+    };
+    [w * factor, h * factor]
+}
+
 /// 指定 bit 数で RGB 各チャンネルを量子化する。
 /// ハードウェアカラー空間 (MD=3bit, ゲームギア=4bit, SFC=5bit) をエミュレートするのに使う。
 #[inline]

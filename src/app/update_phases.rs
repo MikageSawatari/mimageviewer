@@ -1987,6 +1987,7 @@ impl App {
                 // 後継 (= ページ送り時 AI を待たされる退行を直す)。
                 if page_turn_decision.admits_non_target_full_resolution_work() {
                     self.reconcile_paged_prefetch_window(fs_idx);
+                    self.prefetch_next_final_unit(ctx, fs_idx);
                     self.prefetch_final_ai(ctx, fs_idx);
                 } else {
                     // Target final-effect results are part of materialization; unrelated

@@ -1,5 +1,5 @@
-//! D3 GPU admission foundation. No production caller starts speculative work
-//! until D3-2/3/4 have installed their bounded CPU and resource owners.
+//! App-wide D3 registration admission, shared by bounded final preparation and
+//! later comic/Native producers. Ordinary display uploads never wait on it.
 use super::*;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,6 +59,25 @@ pub(super) fn speculative_vram_admitted(
 }
 
 impl App {
+    pub(super) fn admit_final_prepare_registration(
+        &mut self,
+        size: [usize; 2],
+        options: egui::TextureOptions,
+    ) -> FinalPrepareGpuAdmission {
+        if !speculative_vram_admitted(
+            self.vram_accounting_snapshot().total_bytes(),
+            size,
+            options,
+            self.vram_pool_budget().pool_bytes,
+        ) {
+            FinalPrepareGpuAdmission::OverBudget
+        } else if self.speculative_gpu_frame.claim() {
+            FinalPrepareGpuAdmission::Admitted
+        } else {
+            FinalPrepareGpuAdmission::FrameBusy
+        }
+    }
+
     #[allow(dead_code)] // D3-1 never invokes an allocation through this gate.
     pub(super) fn admit_speculative_gpu_allocation(
         &mut self,
@@ -74,6 +93,12 @@ impl App {
             self.vram_pool_budget().pool_bytes,
         ) && self.speculative_gpu_frame.claim()
     }
+}
+
+pub(super) enum FinalPrepareGpuAdmission {
+    Admitted,
+    FrameBusy,
+    OverBudget,
 }
 
 #[cfg(test)]

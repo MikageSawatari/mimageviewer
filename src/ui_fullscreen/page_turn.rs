@@ -12,6 +12,8 @@ mod cover_tests;
 #[cfg(test)]
 mod draw_submit_tests;
 #[cfg(test)]
+mod final_prepare_tests;
+#[cfg(test)]
 mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
@@ -1424,6 +1426,33 @@ pub(crate) fn take_test_events() -> Vec<(ViewerOperationFact, &'static str, &'st
 }
 
 impl App {
+    /// Existing accepted output, never CPU readiness or a newly registered
+    /// texture, authorizes background work for the following unit.
+    pub(crate) fn page_turn_current_unit_presented(&self) -> bool {
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Flat(unit) if unit.evidence.was_accepted() => unit,
+            PresentationState::Turning {
+                incoming,
+                clock: MotionClock::Running { .. },
+                ..
+            } => incoming,
+            PresentationState::Completing { incoming, .. } if incoming.evidence.was_accepted() => {
+                incoming
+            }
+            _ => return false,
+        };
+        unit.destination == self.page_turn_destination()
+            && unit.items == self.items_generation
+            && unit.mode == self.spread_mode
+            && unit.slice == self.fullscreen_page_slice
+            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+            && self.fullscreen_idx.is_some_and(|idx| {
+                unit.pages
+                    .iter()
+                    .any(|page| page.occurrence.navigation_anchor_idx == idx)
+            })
+    }
+
     /// Accepted output evidence is independent of current cache quality. Match
     /// the exact held occurrence/source/paint and binding before final publication.
     pub(super) fn page_turn_receipt_matches_held(&self, receipt: &SubmittedUnitReceipt) -> bool {

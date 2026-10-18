@@ -70,11 +70,11 @@ pub(crate) fn queued_final(app: &mut App, idx: usize) -> FinalCompositeKey {
             canonical_dims: None,
             source_size: size,
             cancel: Arc::new(AtomicBool::new(false)),
-            rx,
+            state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
             items_generation: app.items_generation,
             output_complete: true,
             nearest_sampler: false,
-            prefetch: false,
+            origin: FinalEffectOrigin::LegacyDisplay,
         },
     );
     key

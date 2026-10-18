@@ -4591,3 +4591,40 @@ script既定のdev-runtimeを使わず、準備済みportableと使い捨てdata
 - 検証ログ・環境準備は `target/d3-1-*`。製品/portable smoke 起動、commit は行わない。
   自動検証のコマンド・件数・終了コード、途中失敗と一時変異の復元証拠、独立完成レビューは
   `target/d3-1-handoff.md` に集約する。実機・性能 gate は本実装セッションでは実行しない。
+
+#### 27.17.13 D3-2 実装記録（2026-10-18、完成 source レビュー ACCEPT・実機未確認）
+
+- 基準は D3-1 と独立完成記録後の `f18240311`。既存 final-effect の入口条件・executor・同期 miss は設計の前提と一致した。
+  新しい一般 final だけを `prefetch_next_final_unit` から開始する。root と独立 viewer の既存 fullscreen work で、
+  現 unit の accepted 出力が成立した後に、同じ installed navigation/composition の次 unit を扱う。
+  OFF、一覧、未提示の初回 open、連結、Split、Remote に新しい投機を開始しない。
+- `FinalEffectPending` の同じ map 内で `Computing | CpuReady` を排他所有する。
+  `LegacyDisplay / LegacyPrefetch / Speculative / DisplayPrepared` が要求種別と表示昇格を区別する。
+  従来カラー化/LUT/Retained 復元の範囲・通常登録は維持し、同 key の重複排除は全 origin 共通。
+  旧入口の busy 判定は legacy に限定し、新 D3 の登録待ちだけで旧先読みを止めない。
+  実走行1件・context 1 unit／全体2 unit／1GiBは**新 D3 由来**の保証であり、旧先読み・AI・表示 CPU 全体の上限ではない。
+- `final_prepare_cpu` は App 共通で bundle に移さない。`try_start` は permit と出力予約を同じ短い metadata lock で判定する。
+  取得できなければ lease/thread を作らず、同 lock 内に service の宛先だけを登録する（要求 queue ではない）。
+  返却で宛先を take して unlock 後に ROOT と対象 viewport へ repaint する。常時 heartbeat は追加しない。
+  permit は worker closure の実終了まで、予約 Arc は pending／worker／channel／CpuReady から登録・破棄まで保持する。
+  Pair の別出力は bytes を加算し、同じ予約の clone と canonical/upload 同一 Arc は重複計上しない。
+- CPU 入力は exact な既存 edit pixels、未編集 resident source、または完成済み exact final AI pixels のみ。
+  erase/local/conceal/mask/comic の materialization・DB/font 読取や新しい AI 推論を開始しない。
+  AI は従来 AiJob の補正済み結果から後段 plan を作り、UI で補正し直さない。
+  worker は共有 executor と従来 Triangle clamp を実行する。CRT の出力倍率と clamp 寸法計算を予約と共有する。
+- 受信は CpuReady への遷移だけ、採用は要求時 key/items/item/source/edit/params/context/occurrence を再照合する。
+  obsolete 判定も現在 unit／次 unit の共通需要を使い、表示引取り直前の current Computing を捨てない。
+  登録は実 options の全 resident admission と App 共通 outer-frame 枠を通す。共有 handle は登録枠を消費しない。
+  枠待ちは次 outer frame を要求し、VRAM 不足では再描画ループを作らない。
+- 表示 ensure は edit texture 確保より前に同 key CpuReady を通常登録へ引き取る。
+  同期可能な Computing miss は receiver と旧公開権を外して同期 takeover（join しない）。
+  カラー化/LUT の Computing は同 worker を表示へ昇格し、permit・予約を保持したまま従来の表示待ちを続ける。
+- park は新規開始だけを止める。開始済み worker と legacy display を cancel せず、同 pending/channel の結果を有界保持する。
+  汎用 mount に service や開始を加えない。binding は payload context が正本で、F12 の host 変更で旧 job を別 context に付け替えない。
+  容量不足時は新規開始を見送り、本段では圧力による CpuReady 退去を追加しない。parked 予約が保持される間の即時開始は保証しない。
+- held/accepted/canonical/N→N+1、D2 lease、D4 時計、Remote IPC は変更しない。
+  D3-3 の編集入力・comic、D3-4 の Native/GPU配送・submit 準備は未実装。GPU 登録を実転送完了とは扱わない。
+- 自動検証・一時変異の復元・独立完成レビューと実機未確認事項は `target/d3-2-*` に記録する。
+  Sol / xhigh の独立完成 source レビューは ACCEPT。独立 F12 の work 接続、current unit の Computing 保持、
+  AI 失敗後の無補正共有を修正して再レビューした。自動検証の実行結果は source 判定と分け、handoff の台帳で確認する。
+  commit・製品/portable smoke 起動は行わない。

@@ -15831,9 +15831,14 @@ pub(crate) struct PagedPrefetchTargets {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum NextFinalUnitDemand {
+pub(crate) enum NextFinalUnitDemand {
     Boundary,
     Unit(Vec<SpreadPageOccurrence>),
+}
+
+enum FinalUnitPosition {
+    Current,
+    Next,
 }
 
 /// The unit ordinal, never an image index or physical direction, advances.
@@ -19781,7 +19786,49 @@ impl App {
         ]);
     }
 
-    fn next_final_unit_demand_from_snapshot(&self, idx: usize) -> Option<NextFinalUnitDemand> {
+    /// The same pure installed topology as observation, including slideshow's
+    /// actual still-only destination. Never opens the next book or collection.
+    pub(crate) fn next_final_prepare_occurrences(
+        &self,
+        idx: usize,
+    ) -> Option<Vec<SpreadPageOccurrence>> {
+        #[cfg(windows)]
+        if self.slideshow_playing
+            && matches!(
+                self.navigation_scope,
+                crate::app::ViewerNavigationScope::CollectionRoot
+            )
+        {
+            return None;
+        }
+        match self.next_final_unit_demand_from_snapshot(idx)? {
+            NextFinalUnitDemand::Boundary => None,
+            NextFinalUnitDemand::Unit(pages) => Some(pages),
+        }
+    }
+
+    pub(crate) fn next_final_unit_demand_from_snapshot(
+        &self,
+        idx: usize,
+    ) -> Option<NextFinalUnitDemand> {
+        self.final_unit_demand_from_snapshot(idx, FinalUnitPosition::Next)
+    }
+
+    pub(crate) fn current_final_prepare_occurrences(
+        &self,
+        idx: usize,
+    ) -> Option<Vec<SpreadPageOccurrence>> {
+        match self.final_unit_demand_from_snapshot(idx, FinalUnitPosition::Current)? {
+            NextFinalUnitDemand::Boundary => None,
+            NextFinalUnitDemand::Unit(pages) => Some(pages),
+        }
+    }
+
+    fn final_unit_demand_from_snapshot(
+        &self,
+        idx: usize,
+        requested: FinalUnitPosition,
+    ) -> Option<NextFinalUnitDemand> {
         let cache = &self.spread_display_units_cache;
         let token = cache.token.as_ref()?;
         if token.items_generation != self.items_generation
@@ -19842,24 +19889,37 @@ impl App {
         let placement = self.spread_singleton_display_endpoint_settings();
         let eligible = self.spread_complete_book_context_eligible()
             && self.spread_complete_page_permutation(nav);
-        Some(
-            match next_final_unit_demand(
+        let demand = match requested {
+            FinalUnitPosition::Current => resolve_spread_display_composition(
                 &units,
                 position,
                 self.spread_mode,
                 cover,
                 placement,
                 eligible,
-            ) {
-                NextFinalUnitDemand::Unit(pages) => NextFinalUnitDemand::Unit(
-                    pages
-                        .into_iter()
-                        .filter(|page| is_spread_pairable_item(self.items.get(page.idx)))
-                        .collect(),
-                ),
-                boundary => boundary,
-            },
-        )
+            )
+            .map(|composition| {
+                NextFinalUnitDemand::Unit(composition.pages_in_reading_order().to_vec())
+            })
+            .unwrap_or(NextFinalUnitDemand::Boundary),
+            FinalUnitPosition::Next => next_final_unit_demand(
+                &units,
+                position,
+                self.spread_mode,
+                cover,
+                placement,
+                eligible,
+            ),
+        };
+        Some(match demand {
+            NextFinalUnitDemand::Unit(pages) => NextFinalUnitDemand::Unit(
+                pages
+                    .into_iter()
+                    .filter(|page| is_spread_pairable_item(self.items.get(page.idx)))
+                    .collect(),
+            ),
+            boundary => boundary,
+        })
     }
 
     pub(crate) fn book_target_presentation_demand(
@@ -90679,6 +90739,10 @@ mod specified_scale_consumer_tests {
 pub(crate) mod page_turn_submission_tests {
     use super::*;
 
+    pub(crate) fn install_presentation(ctx: &egui::Context) {
+        page_turn::install(ctx);
+    }
+
     #[test]
     fn source_texture_sharing_actual_draw_preserves_single_spread_on_off_and_resize() {
         for enabled in [false, true] {
@@ -90779,6 +90843,14 @@ pub(crate) mod page_turn_submission_tests {
             app.record_page_dims_for_spread(idx, (80, 120));
         }
         app
+    }
+
+    pub(crate) fn draw_current_without_sources(
+        app: &mut App,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+    ) {
+        let _ = draw_current(app, ui, ctx);
     }
 
     pub(crate) fn draw_current(

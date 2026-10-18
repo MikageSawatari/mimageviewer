@@ -53715,11 +53715,11 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: edit_pixels.size,
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: final_effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
             },
         );
         app.poll_final_effects(&ctx);
@@ -53823,11 +53823,11 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: source.size,
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: prefetch_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(prefetch_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: true,
+                origin: FinalEffectOrigin::LegacyPrefetch,
             },
         );
         let reused = app.start_final_effect_worker(
@@ -53846,7 +53846,7 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.final_effect_pending
                 .get(&final_key)
-                .is_some_and(|pending| !pending.prefetch),
+                .is_some_and(|pending| !pending.origin.is_prefetch()),
             "the matching prefetch must still be promoted instead of restarted"
         );
         drop(prefetch_tx);
@@ -53903,11 +53903,11 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: final_effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
             },
         );
         let old_holdover = ctx.load_texture(
@@ -54034,11 +54034,11 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: false,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
             },
         );
         app.poll_final_effects(&ctx);
@@ -54080,11 +54080,11 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
             },
         );
         app.poll_final_effects(&ctx);
@@ -57414,11 +57414,11 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::clone(&effect_cancel),
-                rx: effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
             },
         );
 
@@ -57471,11 +57471,15 @@ mod pipeline_cache_refactor_tests {
                     canonical_dims: None,
                     source_size: [1, 1],
                     cancel: Arc::new(AtomicBool::new(false)),
-                    rx,
+                    state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                     items_generation,
                     output_complete: true,
                     nearest_sampler: false,
-                    prefetch: idx != target_idx,
+                    origin: if idx != target_idx {
+                        FinalEffectOrigin::LegacyPrefetch
+                    } else {
+                        FinalEffectOrigin::LegacyDisplay
+                    },
                 },
             );
         }
@@ -59658,8 +59662,11 @@ mod pipeline_cache_refactor_tests {
             .final_effect_pending
             .remove(&final_key)
             .expect("neighbor colorize prefetch must start");
-        let result = pending
-            .rx
+        let FinalEffectState::Computing(FinalEffectReceiver::Legacy(ref effect_rx)) = pending.state
+        else {
+            panic!("legacy prefetch receiver");
+        };
+        let result = effect_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("colorize prefetch result");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -59670,11 +59677,11 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: pending.source_size,
                 cancel: pending.cancel,
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation: pending.items_generation,
                 output_complete: pending.output_complete,
                 nearest_sampler: pending.nearest_sampler,
-                prefetch: pending.prefetch,
+                origin: pending.origin,
             },
         );
         app.poll_final_effects(&ctx);
@@ -59741,7 +59748,7 @@ mod pipeline_cache_refactor_tests {
             .get(&final_key)
             .expect("same pending must remain");
         assert!(Arc::ptr_eq(&original_cancel, &promoted.cancel));
-        assert!(!promoted.prefetch);
+        assert!(!promoted.origin.is_prefetch());
         assert!(!original_cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert!(
             displayed.is_none(),
