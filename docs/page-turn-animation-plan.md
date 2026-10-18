@@ -4097,3 +4097,422 @@ GPU メモリの増加 (8000×8192 で 1 頁あたり約 250MB、見開きは約
 - C は登録と GPU 転送 (1 頁約 150ms) がめくり始めに残り、見開きの停止を解かないので採らない。
 - §27.5 の P2-2 (要求開始・描画前の採用・cache miss 時の表示) と P2-3 (GPU 準備の開始・完了・最初の表示選択) は、
   案 A の設計の中で確定させ、実装前に独立レビューを受ける。詳細設計は次項以降に書く。
+
+### 27.17 D3 設計案（下書き）
+
+**結論：通常の final pipeline を使い、現在 unit の表示が成立した後に次 unit の final と通常 Native 出力を準備する。画素は既存 `final_composite_cache`、Native 出力は既存 `fs_lanczos_cache` が所有し、演出専用 cache は作らない。**
+
+初回 open・一覧からの open・演出 OFF に一律の worker 待ちを入れない。準備が間に合わない通常表示は、現在の同期完成経路と既存の faithful-display 規則を維持する。したがって、案 A は**準備済みの頁送りから停止を除く設計**であり、cold・連打・設定変更直後まで無条件に停止ゼロを保証するものではない。
+
+推奨する実装範囲は次のとおり。
+
+- local paged・演出 ON で、次 unit を優先して一般 final の先回り準備を追加する。
+- CPU 段は既存 final-effect executor を再利用する。AI・編集結果は既存 producer/cache を入力とする。
+- GPU 準備は「CPU 完成」「texture 登録」「転送・mip 提出」「通常 Native 出力準備」を区別する。
+- 完了採用を resident lookup／offer より前の共通境界へ集約し、準備済み final を最初から選ぶ。
+- 前 unit は既存完成 cache をまず利用する。往路で未表示だった前 unit の新規準備は、次 unit より低優先とする。
+- OFF への新しい投機準備、連結読みへの拡張、Remote の準備方式変更は、今回の基本範囲に含めない。共通の clone 削減・exact hit 改善は適用できる。
+
+本稿は `master fa086f0cd6969b60013f93e7d1454b03761dcbb9` の静的調査に基づく下書きである。開始時・終了時とも作業ツリーは clean。ファイル変更、ビルド、製品起動、実測は実施していない。以下の「確認済み」はコード・文書・保存済みログの確認、「提案」は未実装の設計、「推測」は未計測の性能見込みを表す。設計決定・検収と独立レビューは未了。
+
+#### 27.17.1 観測された停止と現在の経路
+
+**確認済み：一般の source 先読みは、補正済み final の先読みではない。** 色補正だけの頁では、source が resident でも初回の通常表示選択が final を同期生成する。
+
+保存済みログでも、04 見開き補正ありの idx1・2 について、`adjust_ms=61.7453/88.0149`、`upload_ms=71.3319/70.7644` を確認した。これは ClaudeCode が実行した隔離計測のログであり、本調査による新しい実行結果ではない。
+
+根拠：`target/page-turn-smoke/e37-04-rtl-adj/logs/perf_events.jsonl:889`、同`:896`。計測条件と全体の整理は `docs/page-turn-animation-plan.md:4065`。
+
+| 段階 | 現在作るもの・残る同期処理 |
+| --- | --- |
+| source 先読み | decode／PDF render 等を worker で実施。結果を `fs_upload_backlog` へ集め、UI 側で source texture を登録する。一般 final は作らない |
+| source 採用時の補正 | 通常静止画では、現在 anchor のロード完了時だけ `apply_sync_adjustment` を呼ぶ。先読み頁は表示時の final pipeline に任せる |
+| edit result | `ensure_edit_result_pixels_cpu` は edit pixels を確保し、edit の表示 texture は作らない。ただし下位の erase/local/conceal 実体化を呼ぶため、関数全体が非同期・GPU 非接触という意味ではない |
+| final AI | 既存 `AiJobQueue` の単一 worker と優先キューで処理。先読みは CPU edit pixels を渡し、必要な色補正も worker 側で実行できる |
+| final-effect 先読み | カラー化／Creative LUT がある頁を主対象に、色補正・sharpen・カラー化・LUT・post の CPU 結果を作る。一般の「色補正だけ」の頁は対象外 |
+| final-effect 採用 | `poll_final_effects` が UI 側で clamp と `load_texture` を行い、`final_composite_cache` へ入れる |
+| 通常 final | `ensure_final_composite_texture` は edit 確保、色補正、AI 解決、sharpen、post、clamp、登録を同じ呼出しで実行できる。カラー化／LUT の後段だけ既存 worker へ渡す分岐がある |
+| Native Lanczos | final 等の texture と実表示需要から、通常 prepare が必要時に生成・登録・submit。source 先読みだけでは次 unit の Native 出力は保証されない |
+
+主な根拠：
+
+- source 登録と現在頁限定の同期補正：`src/app.rs:91814`、`:91848`。
+- backlog の選択と採用：`src/app.rs:92543`、`:92589`。
+- CPU-only edit と下位実体化：`src/app.rs:83334`、`:83360`。
+- 一般 final を除外する先読み条件：`src/app.rs:79764`。
+- AI 先読みの投入：`src/app.rs:79952`、`:79976`。AI job の補正入力：`:85320`。
+- worker 採用：`src/app.rs:85377`、`:85430`。
+- 同期 final：`src/app.rs:85921`、`:85967`、`:86017`、`:86041`。
+- Native cache miss の生成：`src/gpu_lanczos.rs:1210`、`:1238`、`:1350`。
+
+補足すべき例外が二つある。
+
+1. **Retained PDF FinalAi は既に最終素材を先回り復元する経路がある。** `prefetch_retained_paged_composites` は、カラー化／LUT がなくても既存 AI pixels から final-effect worker を起動する。一般画像の補正 final が未準備であることと区別する。根拠：`src/app.rs:79613`。
+2. **無補正は source→edit→final の handle 共有で重複登録を避ける。** D3 でもこの経路を worker 化・再登録してはならない。根拠：`src/app.rs:83231`、`:83278`、`:86055`、`docs/display-pipeline.md:3080`。
+
+#### 27.17.2 「次の unit」の決定
+
+**提案：idx±1 や左右キーから推定せず、通常 navigation が使う unit と composition から需要を導出する。** source 用の頁集合と、GPU 出力用の occurrence／geometry は分ける。
+
+既存 `page_turn_prefetch_targets` は、通常の nav/unit cache を取得し、各 unit の `pages_in_reading_order()` を列挙する。組を予算境界で分割せず、遠い表紙 supplement も含められる。この構造を共用する。ただし返値は頁単位へ平坦化され、画像 unit を媒体越しに探索するため、「直後の操作先」と完全に同義ではない。D3 の最優先対象は通常送りで解決した直後の unit とし、その先の画像は既存 source/AI 先読みへ任せる。
+
+根拠：`src/ui_fullscreen.rs:19599`、`:19610`、`:19627`、`:19647`、`:19666`。通常送りとの照合例：`:40249`。
+
+| 場面 | D3 の対象 |
+| --- | --- |
+| 単頁 | 読書順で次の unit の実頁 |
+| LTR／RTL 見開き | 通常 builder の次 unit 全体。左右の配置は composition から導出し、key の物理方向と混同しない |
+| 表紙単独・横長単独・Alone | 一つの singleton unit。次の Pair なら両実頁を準備する |
+| Blank／Vacant・共通の黒paper | 新しい画像処理・原寸 texture を作らない。実画像だけを準備し、空 slot と紙は通常 geometry／描画規則を使う |
+| 末尾＋補助表紙 | 末尾 navigation 頁と遠い表紙 source の両方。source は dedup できるが、表紙先頭と末尾 supplement の occurrence は別 |
+| 最後の頁 | 通常送りの Boundary を尊重する。隣本を投機 open／列挙しない |
+| 連結読み | 現行 visible／prepare band を維持。「次 unit 一件」を新設しない |
+| スライドショー | 通常の自動送り先を優先。静止画列を使うため、混在媒体では手動送りの次対象と異なり得る |
+
+根拠：occurrence と role は `src/ui_fullscreen.rs:15801`、composition は`:15838`、BlankOpposite／末尾表紙は`:16129`、`:16148`。スライドショーの対象列と歩幅は`:39524`、末尾処理は`:39575`。
+
+**戻る方向の推奨：既存 cache を優先し、次 unit の準備後に不足分だけ補う。**
+
+直前に表示した unit の final は通常 keep-set 内に残り、Native も既存 cache に残る可能性が高い。一方、初回に本の途中を開いた場合、予算退去、補正変更、別 geometry では前 unit の完成を保証できない。「戻る準備は常に不要」とはしない。新しい backward 専用 slot は作らず、既存後方範囲内の不足を低優先で埋める。
+
+根拠：final/edit の keep-set 退去は `src/app.rs:87138`、Native の頁保持は`:77525`。Native は全体64件・source family 当たり2 target の上限を持つため、永久 hit ではない（`src/gpu_lanczos.rs:30`、`:1454`）。
+
+source／AI の設定済み先読み範囲は縮小しない。ゼロ方向に新たな decode・AI 推論を強制せず、既に resident／retained の入力の再利用と、新規推論の許可を区別する。これは §26.8 の独立予算を維持する方針である。
+
+#### 27.17.3 所有者・key・寿命
+
+**提案：完成 final の所有者は既存 `final_composite_cache` とする。次 unit 専用の完成 slot は不要。** 作業中の所有者も既存 `final_effect_pending` を一般 final 準備へ拡張し、カラー化用と D3 用に同じ key の job を二重所有しない。
+
+| 対象 | 所有・identity |
+| --- | --- |
+| CPU final pixels／表示 texture | context 内の `final_composite_cache[FinalCompositeKey]` |
+| 実行中・CPU 完成未登録 | 同じ context の一般化した `final_effect_pending` |
+| AI 入力／結果 | 既存 final-AI owner／cache。D3 が推論 queue を複製しない |
+| edit materialization | 既存 erase/local/conceal owner。D3 は同じ key の結果を消費する |
+| Native 出力 | context 内の `fs_lanczos_cache[LanczosCacheKey]` |
+| 演出の保持 | D2 の `PresentationMaterial`。Native は出力 lease のみ、Managed は実 handle |
+| GPU の配送完了証拠 | 通常 texture／prepare owner に属する ticket。page-turn operation の新しい待機 state にしない |
+
+`FinalCompositeKey` は edit key・最終パラメータ hash・AI 背景 mode を持つ。edit key には item identity、items 世代、source／erase／local／conceal の世代がある。source_size／canonical_dims も既存 entry の意味を維持する。
+
+根拠：`src/app.rs:10181`、`:10953`、`:85103`、`:12350`。cache/pending の context 登録と交換は `src/app/viewer_context_registry.rs:1834`、`:3792`。
+
+**採用時は「現在の idx」へ key を付け替えない。** 要求時 key、現在の exact key、items 世代、cancel、context owner、必要な permission／content binding を照合する。既存 final-effect poll は取り出した pending の items 世代を確認するが、D3 で寿命・対象を広げる際には exact key の採用前検証も明示する。現行が通常操作で stale 表示を起こすと確定した主張ではなく、拡張後の必須不変条件である。
+
+根拠：`src/app.rs:85417`、`:85453`。AI の key＋job_id 採用規則は`:87005`。
+
+| 操作・終了 | 処理 |
+| --- | --- |
+| 別頁・方向反転 | 新しい需要を導出し、同じ exact key は継続。範囲外 job は既存 cancel、完成 cache は keep-set に従う |
+| 連打・長押し | 既存 navigation sequence／一件 continuation を維持。通過頁ごとの新しい無制限 queue を作らない |
+| 別本・Ctrl+↑↓・items 交換 | 旧 owner の job／需要を退役。遅着は旧 receiver／key の結果として破棄 |
+| 補正・AI・編集変更 | 既存の該当段の失効へ接続。post／sharpen だけなら AI 結果を保持する |
+| resize／DPI／fit／回転／trim | CPU final が有効なら保持。Native の需要 key を再導出し、不一致出力を使わない |
+| close／context retire | 当該 context の job と通常準備を取消。生存 batch の lease は最後の drop まで保持 |
+| F12 mount／deposit／promote | context identity と cache／pending／需要を一緒に移す |
+| F12 fork | 作業 ticket／receiver／cancel token を共有しない。新 owner。兄弟の取消・drain を行わない |
+| park | 投機開始を止め、既存 park 方針に従って要求を退役。復帰後、最初の lookup 前に再検証する |
+
+失効の既存境界は `src/app.rs:81635`、session close は`:81665`、補正変更は`:90010`、keep-set cancel は`:87168`。context retire の cancel は `src/app/viewer_context_registry.rs:2654`。
+
+単純化として、modal 化・reader の閉じ直しは採らない。頁送り、close、F12 を不便にするためである。採る単純化は、**通常 pipeline の単一 owner、同一 key の合流、完成物の既存 cache への集約**である。新しい `next_final_ready`／`upload_pending` 等の bool は不要。未登録 pixels を保持する必要がある場合は、既存 pending の状態を `Computing | CpuReady` の排他的 enum に置き換える。
+
+まれな失敗は割り切り（ログ＋通知、必要な演出省略）。再試行・途中状態の保存・復旧のための待機は追加しない。通常の連打・close・遅着は、まれな失敗として扱わず上記所有境界で処理する。
+
+#### 27.17.4 P2-2：開始・採用・cache miss の契約
+
+**要求開始の推奨境界は、現在 unit 全体の通常表示が成立し、現在対象の materialization／navigation が落ち着いた後の fullscreen work 境界とする。** 「数百ms入力がない」等の新しい settle timer は使わない。
+
+初回 open の同期完成を先回り仕事で挟まず、現在 unit の採用済み表示を起点に次回 work service で需要を導出する。以後、source、edit、AI の完成に応じ、同じ exact key の次段だけを進める。Pair は片頁ずつ CPU 実行できるが、unit の需要としては両頁を保持する。
+
+既存の接続候補は `reconcile_paged_prefetch_window`／`prefetch_final_ai` を呼ぶ fullscreen work 部分である。active detached にも同型の処理がある。
+
+根拠：`src/app.rs:65087`、`:65104`、`:79886`。既存 current-loading 抑止は`:77556`。
+
+**描画前採用は、各 context／表示 pass の最初の resident lookup より前に一度行う。** offer の後で初めて poll すると、完成していた final ではなく raw／thumbnail を accepted source として固定してしまう。
+
+順序の契約は次とする。
+
+1. close／retire／items・設定変更を解決し、旧要求を失効させる。
+2. 既存 submission receipt を反映する。
+3. 当該 context の準備完了を非 blocking で回収・検証・採用する。
+4. continuation commit／通常 navigation の offer／最初の通常表示選択を行う。
+5. 描画後の成立情報から、次回 service 用の需要を更新する。
+
+continuation commit 自体が次の offer を行えるため、採用はその前に置く。root の入力処理が viewport 描画より先に offer する経路にも、同じ採用境界を適用する。
+
+根拠：close→pre_draw→continuation の現在境界は `src/ui_fullscreen.rs:32524`、`:32579`、`:32655`。offer の resident 捕捉は `src/ui_fullscreen/page_turn.rs:2060`。
+
+重複防止は既存 frame／pass identity を用いる。outer frame だけの stamp で子 viewport の最初の採用を省かない。root と viewport が同じ context を service しても receiver の結果を二度採用せず、別 context の初回採用を抑止しない。最初の選択時点までに受信済みの結果を、無条件に次 pass へ送らない。
+
+parked／at-rest context は既存の mount service 方針に接続する。新しい全 context 常時 poll loop は作らない。parked の最初の表示再開も同じ採用境界を通す。現状の `ContextAsyncOwner` には独立した final-effect service がないため、一般 final 準備 owner の pending 判定・service・park 終端を登録する必要がある。
+
+根拠：`src/app/viewer_context_registry.rs:1983`、`:2099`、`:2169`、`:2188`。
+
+**cache miss の表示契約は次のように固定する。**
+
+| 場面 | 表示・準備 |
+| --- | --- |
+| exact final hit | edit の表示 texture 確保より先に返す。余分な画素処理・登録なし |
+| 初回表示・一覧 open・OFF、従来同期完成できる miss | 同じ pass で従来どおり同期完成。新 worker 完了待ちを強制しない |
+| 上記で同じ key の D3 worker が未完了 | 完了済みなら採用。未完了なら旧 job を取消・結果の採用権を外し、同期要求が引き取る。待機・join しない |
+| カラー化／LUT の未完了 | 現行 faithful rendition／holdover／loading の規則を維持。未加工画像を新たな代役にしない |
+| AI 未完了 | 現行 provisional と `complete=false` の意味を維持。D3 の都合で complete にしない |
+| ON の素材不足 | §22 の resident 規則と既存 instant 条件。新しい final-ready 待ちを作らない |
+
+ここで重要な実装修正候補は、**一般画像にも exact final の早期 hit を使うこと**である。現在の `exact_complete_final_composite_entry` は一般画像を検証できるが、texture helper は PDF 限定で、通常 ensure はその後 `ensure_edit_result_pixels` を通る。先回り final があっても edit texture を追加登録する経路を残すと D3 の効果を損なう。
+
+根拠：`src/app.rs:85897`、`:85921`、`:86164`、`:86177`。
+
+同期 takeover は未完了 worker の計算が直ちに停止する保証ではない。一時的な CPU 重複は起こり得るが、結果の公開権は一つにする。これを避けるため利用者の初回表示を待たせる案は採らない。
+
+#### 27.17.5 P2-3：登録・実転送・mip・Native 出力
+
+**提案：次 unit の通常 GPU 準備を段階化する。`load_texture` が返っただけで「GPU 準備済み」と判定しない。**
+
+egui 0.37 の現コードで確認した配送契約は以下である。
+
+| 境界 | 確認済みの処理 |
+| --- | --- |
+| `Context::load_texture` | `ImageData` への変換、TextureManager の allocation／delta 登録。GPU 転送ではない |
+| eframe | FullOutput の delta を共有 pending へ移す。描画しない経路も `apply_textures_delta` で配送する |
+| renderer | pixels を借用して `queue.write_texture`。options が mip を要求すると mip chain を allocation |
+| mip | base 書込み後に mip を生成・submit |
+| delivery 終端 | 未提出の write が残れば empty submit。その後 free |
+| discard retry | 完了 pass の texture delta を配送してから再 pass に進む |
+
+根拠：`vendor/egui/src/context.rs:2929`、`vendor/eframe/src/native/wgpu_integration.rs:974`、`:1101`、`:2043`、`vendor/egui-wgpu/src/renderer.rs:680`、`:768`、`:838`、`vendor/egui-wgpu/src/mipmap.rs:79`、`:134`、`vendor/egui-wgpu/src/winit.rs:1050`、`:1094`。
+
+**準備 frame の契約案：**
+
+| 時点 | 処理 |
+| --- | --- |
+| F0 以前 | worker で final pixels と upload 用 pixels を完成 |
+| F0 | UI が exact key を再検証し、Arc を渡して final texture を登録。通常 cache へ採用 |
+| F0 backend | 通常 delta 配送で原寸転送・必要な mip を提出。次頁の shape を描く必要はない |
+| F1 以降 | renderer に backing texture が存在することを確認し、次 unit の canonical 需要で通常 Native 出力を準備 |
+| 準備完了後 | 次の offer が final を選び、最初の通常 prepare は同じ Native key に hit |
+| 間に合わない操作 | 従来の通常登録／同期 prepare を許可。新しい待機や output 未完成だけを理由にした instant を追加しない |
+
+F0／F1 は最短例であり、見開き2頁を同じ frame に強制しない。次 unit の全実頁について準備を進める。
+
+「転送・mip を演出前に済ませた」という性能証拠には、submit 時刻だけでなく、可能なら **queue 完了の非 blocking ticket** を付ける。callback／非 blocking poll の結果を通常 GPU owner が採用し、投機準備の完了診断に使う。UI で GPU 完了を待たず、通常表示の可否をこの ticket 待ちに変えない。submit 済み・paint 可能・GPU 実完了を別項目で記録する。
+
+この ticket は新しい page-turn 待機 state ではない。必要な状態は既存 entry／通常 prepare owner 内の排他的な配送段階として持ち、`cpu complete` と GPU 実完了を混同しない。具体的な vendor hook は独立設計レビュー対象とする。
+
+**`fs_upload_backlog` との関係：現状を「1 frame 1枚」とは扱わない。**
+
+実装は poll 一回につき current と other の最大2結果を選ぶ。root／viewport の複数 poll を合算した上限ではない。edit materialization の `last_edit_materialize_upload_frame` は別の1 frame 1枚規則であり、final-effect poll も独立している。
+
+根拠：`src/app.rs:92543`、`:92567`、`:83280`、`:85417`。
+
+D3 は source の型付き backlog に final を混ぜず、既存 final pending の `CpuReady` で登録待ちを保持する。新規の投機登録は app 全体の outer frame で最大1枚とし、同 frame に既存の大きい source/edit 登録があれば次の通常準備機会へ回す。**現在頁の表示登録や既存 source 先読みを、新しい1枚枠で絞らない。** 件数と実 bytes を併記し、1枚250MiBの仕事を「小さい」と扱わない。
+
+**Native Lanczos の事前生成も対象とする。** 原寸 final の先回りだけでは最初の通常 prepare に Native miss が残る。通常 fit の next-unit geometry を、通常描画と共有する純粋な需要計算から導出して既存 cache を温める。
+
+根拠：Native key は texture ID／source 世代、target size、scale branch、smoothing、ROI を含む（`src/gpu_lanczos.rs:936`）。生成は renderer の backing texture を必要とする（同`:1245`）。同じ F0 の未配送 handle に resolve を呼んでも Native 化を保証できない。
+
+実装上は、通常 single／Pair の canonical layout から **値だけの prepare demand** を抽出して共有する。`fullscreen_idx` を一時的に次頁へ書き換えて通常 draw を呼ぶ方式は採らない。需要には viewport／ppp、各頁の canonical 寸法・trim・回転・fit、clip／ROI、補助表紙 role、実効 filter を含める。演出中の pose から導出しない。
+
+最初の表示への接続は次の二点で保証する。
+
+- offer 前採用により、resident source lookup の先頭で exact final を選ぶ。
+- 実 draw と先回り prepare が同じ需要 key を使い、既存 Native 出力を通常 prepare から D2 material handoff へ渡す。
+
+根拠：final 優先選択は `src/ui_fullscreen/page_turn.rs:1731`、accepted 入力は`:2085`、通常 prepare→bind は `src/ui_fullscreen.rs:42124`、`:42155`、Native hit は `src/gpu_lanczos.rs:1217`。
+
+#### 27.17.6 CPU 段・clone・同期経路の扱い
+
+**提案：既存 `FinalCompositePlan`／`execute_final_composite` を一般 final 先読みに広げる。** 新しい補正計算式や別の適用順は作らない。
+
+この executor は既に、色補正→sharpen→カラー化→LUT→post と段間 cancel を持つ。AI 前後の source 選択と `used_upscale` は adapter が解決する。色補正だけの頁を除外する入口条件を外し、post bypass 中も色補正まで不要と誤判定しない。
+
+根拠：`src/final_composite.rs:54`、`:99`、`:116`、`:157`。現在の先読み除外条件は `src/app.rs:79726`、`:79766`。
+
+| 処理 | 推奨 |
+| --- | --- |
+| 一般補正・sharpen・post | 次 unit の既存 final-effect worker で実行 |
+| AI 入力の補正 | 既存 AiJob の `adjust_before_ai` を利用し、UI で先に補正し直さない |
+| clamp | final の正本 pixels と upload 用 pixels を区別し、現在と同じ表示結果になる処理を worker で実行 |
+| `ColorImage` の複製 | 基本は除去。必要な変換・複製だけ worker 側へ置く |
+| edit materialization | 既存 erase/local/conceal worker の CPU 結果を利用。final 用に中間 texture を要求しない |
+| metadata／mask 入力 | cold DB read、rasterize、black flatten を投機開始の UI 前処理へ持ち込まない |
+
+**67〜77ms の `upload_ms` は、GPU 転送時間と同義ではない。** 8000×8192 は `clamp_for_gpu` が Borrowed を返す寸法内であり、その後の `into_owned()` は全 `ColorImage` を複製する。現 final-effect poll は既に Arc を `load_texture` へ渡す実装になっている。D3 はその方式を一般 final でも使える。
+
+根拠：`src/app.rs:86065`、`:86077`、`:98037`、`:85432`、`:85438`。`load_texture` 自体の処理は `vendor/egui/src/context.rs:2935`。
+
+**推測：** この全画素 clone を除けば、UI 登録部分は key 検証・Arc／handle 操作・manager 登録が中心になる。ただし67〜77ms全体が clone だと計測で分離したわけではなく、削減幅や「1ms未満」は未確定。backend の原寸転送・mip は残る。§27.15 の約90msの paint 費用が clone 削減だけで消えるとはしない。
+
+`apply_sync_adjustment` 全体を今回一律 worker 化することは勧めない。この関数は現在頁ロード直後の暫定表示を作り、世代更新も行う。単純移管は初回表示のチラつき防止経路を変える。D3 の次 unit はこの同期関数を呼ばず、一般 final worker で直接準備する。既存同期表示の clone 削減は可能だが、表示時刻を変える統合は別の coherent chunk とする。
+
+根拠：`src/app.rs:89581`、`:89611`、`:89626`、`:91848`。
+
+**編集済み頁は入口の追加作業が必要。** 現 `ensure_edit_result_pixels_cpu` は下位で texture ensure を呼び得る。また `auto_apply_saved_mask` は mask の有無を調べる前に erase 入力を解決し、black flatten、その後 DB read／rasterize を行う。単にこの関数を次 unit に呼ぶだけでは、裏の CPU 処理を UI に移しただけになる。
+
+根拠：`src/app.rs:83368`、`:83398`、`src/ui_erase.rs:2977`、`:3194`。
+
+既存 materialization owner に CPU-only 消費の入口を設け、同じ結果を final 入力と表示用 texture 化で共用する。新しい独立 edit cache／erase job は作らない。上位編集が未完了なら final を complete として作らない。
+
+注釈は final のさらに上にある既存 comic pipeline を維持する。D3 final と取り違えて省略しない。必要な next-unit comic bake は既存 owner に接続し、最終的に paint する comic texture から Native 需要を導出する。注釈を外した final だけで全描画経路の GPU 準備完了を主張しない。
+
+根拠：`src/ui_fullscreen.rs:12594`、`src/app.rs:86781`、`:86818`。
+
+#### 27.17.7 VRAM 会計と予算
+
+**提案：先回り final／Native は通常 resident 会計へ入れ、演出 pin の予約には事前加算しない。** offer／material handoff 後は、同じ allocation を D2 の既存 pin admission で評価する。
+
+現行会計は mounted／at-rest の通常 cache、兄弟 context、presentation lease／batch を同じ TextureId 集合で dedup する。新しい完成 slot を作らず既存 cache に入れれば、この列挙を利用できる。
+
+根拠：`src/app/vram_accounting.rs:77`、`:123`、`:264`、`:365`。
+
+追加量は、論理頁数ではなく未共有 allocation で見積もる。
+
+- RGBA8 原寸 final：`4 × width × height`。
+- mip あり：各辺を半減して1までの実和。8000×8192 は base **262,144,000 B＝250MiB**、完全 mip 込み **349,525,084 B≒333.33MiB**。
+- 次の見開き2頁なら final 約666.67MiBに、実 Native 出力、必要な編集／comic 中間 texture 等を加える。
+- 無補正の source 共有なら同じ ID の追加 final allocation はゼロ。
+- CPU final／upload pixels、delta が保持する Arc は CPU メモリとして別集計する。
+
+算式の正本は `src/vram_budget.rs:111`。通常 final の mip options は `src/app.rs:416`。
+
+会計上の注意：現 `FinalCompositeCache` の walker は mip を一律 true としている。一方 Nearest final は1 mipで登録される。D3 の予算見積りと新しい配送段階では実 options を保持・参照し、この保守的な既存計上と実 allocation を混同しない。修正するなら共有 ID の分類順を含めた会計 chunk 内で行う。
+
+根拠：`src/app/vram_accounting.rs:125`、`src/app.rs:86044`。
+
+**予算不足では新しい投機準備を行わず、従来表示へ戻す方針を推奨する。** これは先回り投資の admission であり、通常の表示要求を拒否する理由ではない。新規登録前・Native allocation 前に、全 context の resident と未採用の予約増分を評価する。完成待ち GPU texture が cache 外に生存する設計なら、その ticket／lease も通常会計に列挙する。
+
+登録を見送った結果を毎 frame 再生成しない。CpuReady を既存 pending に保持するか、需要／予算変更時に再評価する。容量不足で現在表示・既存先読みを追い出して D3 を優先しない。
+
+`page_turn_pin_limit` は fullscreen 枠の10%、無制限設定時1GiBを維持する。D2 Native は出力だけを pin、Managed は実 handle／mip を pin。通常 resident と pin は別の判定であり、両者の数値を足して総 VRAM にしない。
+
+根拠：`src/ui_fullscreen/page_turn.rs:959`、`:2414`、`src/gpu_lanczos.rs:687`。Native／通常 source の境界は §27.4・§27.7 を維持する。
+
+#### 27.17.8 OFF・スライドショー・Remote と D4
+
+**OFF の推奨：今回、新しい一般 final の投機準備は開始しない。** OFF の頁送りも速くなる利点はあるが、D3 の背景登録・GPU 競合を全利用へ広げることになる。まず ON で成立性を確認する。既存カラー化／AI先読みは維持し、exact hit の前倒しと clone 削減は OFF・初回表示にも適用する。
+
+現行の unit 先読み policy も animation ON／paged／非 Split／非 Remote に限定されている。OFF を含めて unit 先読みに変更するなら、単に animation 条件を削るのではなく、範囲・ゼロ設定・費用を含めた別採択とする。
+
+根拠：`src/app.rs:79369`、`docs/page-turn-animation-plan.md:3320`。
+
+**スライドショーは ON の通常 paged 対象に含める。** 現在 unit の成立後から次の自動送り先を準備し、期限を準備完了に合わせて延長しない。interval < D の instant、その他は canonical flat 採用後から保存間隔全体を数える契約を維持する。LoopFolder は先頭が同じ installed 列から確定できる場合だけ余力で準備可能。NextFolder／Collection の将来 snapshot を推測して open しない。
+
+根拠：`src/ui_fullscreen.rs:39546`、`:39575`、`docs/page-turn-animation-plan.md:2387`。
+
+**Remote の独自準備方式は変更しない。** PC の D3 admission は既存 Remote ownership gate に従う。共通 executor を修正する場合は Remote adapter と画素同等性を検証するが、Remote 用 GPU final cache や IPC field は追加しない。
+
+根拠：`src/app.rs:79887`、`src/final_composite.rs:1`、`:54`。
+
+**D4 は変更しない。** final／Native が準備済みなら、受理後最初の適格な描画 pass で p=0 の curl を提出できる想定である。ただし output hook、frame scheduling、backend／present の時間までゼロになるという意味ではない。
+
+未完了の場合：
+
+- accept 時に displayable source がなければ現行 instant。
+- resident source があれば通常の一回 prepare を行う。未準備 Native を新しい skip 理由にしない。
+- `AwaitingAcceptedOutput` は最初の非 discard curl output 採用待ちであり、CPU final／GPU job 待ちの state に転用しない。
+- 初回採用後は既存 wall clock で進める。late result、再 pass、cancel 後の hook で原点を更新・復活させない。
+
+根拠：`src/ui_fullscreen/page_turn.rs:593`、`:1055`、`:2460`、`docs/page-turn-animation-plan.md:3468`。
+
+#### 27.17.9 chunk 分割・完成物・概算
+
+一つの chunk を一人の writer が所有し、共有 file の並行編集は行わない。以下は実装作業日の概算で、独立レビューの待ち時間と実機枠は別。既存 worker の一般化で収まることを前提とする。
+
+| chunk | 完成物・主な file | 主な検証 | 概算 |
+| --- | --- | --- | --- |
+| D3-1：需要・採用境界 | 次 unit の共通需要、offer 前の一回採用、一般画像の exact hit 前倒し。`app.rs`、`ui_fullscreen.rs`、`page_turn.rs`、context registry | single／LTR／RTL／表紙／横長／Blank／Vacant／末尾表紙、root／viewport／continuation、OFF／初回の同 pass 完成 | 2〜3日 |
+| D3-2：一般 final CPU 準備 | final-effect owner の一般化、CpuReady、同期 takeover、Arc 登録、worker clamp。`app.rs`、`final_composite.rs` | 段順・画素一致、AI pending／failed、bypass、同 key 合流、取消・late、worker 未完了でも初回／OFFを待たせない | 2〜3日 |
+| D3-3：編集済み頁の入力 | 既存 materialization の CPU-only 接続、mask／flatten の背景準備、comic 接続。`app.rs`、`ui_erase.rs`、既存 edit worker | 編集待ちを complete にしない、mask変更、透過、保存済み編集、copy/export、兄弟context、途中取消 | 2〜4日 |
+| D3-4：GPU prepare | 投機登録 pacing、配送 ticket／計装、共有 canonical demand、通常 Native prewarm／handoff。`gpu_lanczos.rs`、`ui_fullscreen.rs`、必要な vendor 配送点 | 未配送／未完了、無描画・discard・free、Pair2頁、ROI／DPI／resize、Direct／Nearest、Native hit、最後のbatch lifetime | 3〜5日 |
+| D3-5：会計・統合 gate | resident／予約増分・実mip、全context監査、解析器、文書、最終検証。`app/vram_accounting.rs`、`vram_budget.rs`、`analyze_perf.py`、関連docs | 共有ID、予算境界、A close後のB、park／fork／promote、late結果、D2／D4／flat-first／媒体境界 | 2〜3日 |
+
+**合計11〜18作業日＋独立設計／完成レビュー・修正・承認済み計測枠。** 旧D3aだけの3〜5日では、一般 final のCPU移管、編集入力、GPU配送とNative需要、multi-contextの全範囲を覆えない。
+
+独立設計レビューは D3-1 着手前に所有・同期 miss 契約を確認し、D3-4 着手前に canonical demand と配送完了の具体案を確認する。完成レビューは coherent chunk ごとに実施し、成功した同一 source／条件の検証台帳を再利用する。
+
+detached 述語を性能逃がしに変更する案は含まないが、**採用 service、viewport の最初の選択、mount／park の経路には触れる**。これは通常準備の context 所有を揃える構造変更として、ClaudeCode と独立 reviewer の具体的合意を得て `docs/detached-rework-plan.md` §11 に記録する。既に合意済みとは扱わない。
+
+根拠：`CLAUDE.md:98`、`docs/detached-rework-plan.md:35`。
+
+#### 27.17.10 自動検証・性能 gate・隔離計測
+
+**自動検証は状態／handler／会計の狭い検査から開始し、snapshot、共有変更の full gate へ進む。** ビルド・実測は今回未実施。
+
+特に次を必須にする。
+
+- CPU 完成が offer 前に届いた場合、最初の accepted source が final で、同 key の同期再生成・edit 追加登録がない。
+- root／viewport の重複 service、discard／再 pass、parked 復帰でも採用は一回。別 context の結果を drain しない。
+- miss 時の初回・一覧 open・OFF は従来どおり同 pass 完成。worker 待ちを意図的に挿入すると失敗する回帰。
+- 転送未提出、mip あり／なし、Native 未生成／需要不一致を区別。登録済み handle をGPU実完了と誤認する変異を検出する。
+- 同じ本・頁のA/BでAだけ別本／close／補正変更。Bの job、世代、cache、会計を維持する。
+- CPU／GPU late結果、同期 takeover 後の旧結果、最後の batch drop、予算未満／等値／超過を検査する。
+- D2 の source-free Native、Managed、ROI、元画像表示、D4初回原点、canonical flat→次frame continuationを維持する。
+
+実装後の gate は focused→snapshot→`scripts/test-full.ps1`。vendor 配送点を変更した場合は vendor graph を含める。実機確認用 build とライブ実行は既存運用に従う。
+
+**性能 gate は §27.9.2 を基準に、準備 hit と miss を分けて報告する。** 分ける目的は原因の識別であり、miss／skip を分母から除いて合格にするためではない。
+
+| 対応する gate | D3 で追加する証拠 |
+| --- | --- |
+| 開始率90%／完走率95%、3run×30機会 | 次unit需要、CPU ready、登録、GPU提出／完了、Native hit、全skip理由を operation に相関 |
+| warm 60Hz／200ms の curl間隔 p95≤20ms・最大≤33.4ms〔提案値〕 | accept前の準備状態と、curl中に残った通常CPU／転送／mip／resampleを分離 |
+| CPU追加p95≤0.5ms/context、GPU追加≤2ms/4K〔既存仮gate〕 | 演出自体の費用と背景準備の費用を別計上 |
+| OFF／held／seek／連結の退行なし | 初回完成pass、first-visible、最終画質到達、既存source／AI先読みの開始・件数・到達時間 |
+| cold／open 別報告 | 初回同期処理、takeover、準備の間に合わない頻度、静止中の入力応答への影響 |
+
+根拠：`docs/page-turn-animation-plan.md:3593`、`:3613`。
+
+**注意：未完了時の同期完成を保つ以上、全 miss の Frozen frame から同期処理が必ず消えるとは言えない。** §27.9.2 の「Frozen frame に同期 ensure／upload／resample がない」という試験は、準備済みの通常 warm 経路では必須とする。同時に miss の既存表示契約を検査し、そこで残る停止を記録する。全ケース無条件のゼロ処理を要求するなら、同期 fallback 維持との整合を設計レビューで解く必要がある。miss を隠して gate 達成とは報告しない。
+
+隔離計測では、まず §27.15 と同じ03／04、Single／RtlCover、plain／明るさ+15・コントラスト+10、ON200ms、8回・2.5秒間隔で比較する。その後、正式 gate の3run×30機会、逆方向、OFF、AI／カラー化／LUT／sharpen／post、編集済み頁、二F12を別 profile として追加する。
+
+既存スクリプトは `-Script`、`-SettingsOverride`、`-Exe` を指定できる。**既定 `-Exe` は dev-runtime なので、エージェント計測では必ず準備済み portable を明示する。** 実行はシナリオ・時間・desktop使用・使い捨てデータ範囲を示した別の明示承認枠で行う。
+
+以下は将来の計測担当用コマンド案であり、本調査では実行していない。`d3-measure.rhai` は実装時に用意し、§27.15の単発8回を再現する。長押し用 `measure.rhai` をそのまま代用しない。
+
+```powershell
+.\scripts\prepare-portable-smoke.ps1 -TestScript
+
+$overlay = '{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":200,"default_spread_mode":"RtlCover","global_preset":{"brightness":15.0,"contrast":10.0,"gamma":1.0,"saturation":0.0,"temperature":0.0,"black_point":0,"white_point":255,"midtone":1.0}}'
+
+.\scripts\page-turn-smoke.ps1 `
+  -Exe .\target\portable-smoke\mimageviewer.exe `
+  -Script .\scripts\page-turn\d3-measure.rhai `
+  -Folder .\target\repro\page-turn-budget-571-20261016\04_extreme_8000x8192.zip `
+  -ScriptDataDir .\target\portable-smoke\data `
+  -SettingsOverride $overlay `
+  -RunTimeoutSeconds 180
+```
+
+各run後、次runで使い捨て data が消される前に、logs・settings override・script hash・source hash・GPU／driver・viewport物理寸法・ppp・foreground条件・証跡先を `target/page-turn-smoke/d3-<profile>-<run>/` へ保存する。通常設定をコピーしない。portable build と §27.15 の診断 dev build の差を記録し、将来 exact release 性能は同じ最適化条件の対照で測る。
+
+根拠：`scripts/page-turn-smoke.ps1:29`、`:198`、`:226`、`:367`、`scripts/prepare-portable-smoke.ps1:17`。保存済み補正条件は `target/page-turn-smoke/e37-04-rtl-adj/settings-override.json:1`。
+
+準備完了を待つ特別な sleep を測定 script に追加して合格させない。2.5秒の既存条件で間に合うかを測り、別に準備時間分布と連続入力時の hit率を出す。backend 約90msが静止 frame に移っただけで入力応答が悪化した場合も報告する。先回り配置だけで不十分なら、転送分割／backend仕事の移管を追加設計し、全producer停止や既存先読み削減へ逃げない。
+
+#### 未確定・要レビュー点
+
+- **P2-2 の採用境界の具体的差分。** root入力、viewport、continuation、permission再開、parked復帰の全入口で「最初の lookup 前」を満たす位置を、実装前レビューで確定する。
+- **GPU 完了 ticket の実装範囲。** submit／paint可能性だけを根拠に実完了と呼ばない。非 blocking completion の通知・採用を通常GPU ownerへ収める具体案が必要。
+- **次 unit の canonical demand 抽出。** Pair、補助表紙、trim／回転／ROI／DPIで通常 draw と完全に同じ key を生成できることを先に検証する。
+- **編集済み頁のCPU-only入力。** 既存 materialization owner で収まるかが工数の主な変動要因。mask／black flatten／comic のUI残作業を未調査のまま「全final worker化済み」としない。
+- **性能の未確定部分。** clone削減幅、背景転送の静止中入力への影響、AI競合下の準備時間、予算不足時のhit率は未計測。転送分割等が必要なら追加工数を再見積もりする。
+- **利用者判断候補：OFFへ新しい投機準備を広げるか。** 推奨は今回ONのみ。OFFにも広げれば頁送り待ちを減らせる一方、常時の背景負荷と検証範囲が増える。ONのみで既存OFF動作は維持できるため、実装開始を止める質問にはしない。
+- **利用者判断が必要になる条件：通常利用の待ちを増やす案しか性能gateを満たせない場合。** 同期missをworker待ちに変える案は初回／OFFの完成を遅らせる。現案は同期fallbackを維持する。将来それを変更する必要が出た時点で、追加GPU改修の費用と表示遅延の選択肢を提示する。
+- **提案性能値の固定。** p95≤20ms・最大≤33.4ms等は §27.9.2 の提案gateであり、確定済み受入値として扱わない。許容済みのVRAM増加・背景CPU/GPU仕事、案Aの採否、D4時計は再質問しない。
+
+#### 27.17.11 設計担当の検収メモ（2026-10-18、ClaudeCode）
+
+上の下書き (調査担当 Sol / high、読み取り専用、`fa086f0cd` の静的調査) を設計案として採る。独立設計レビュー前で、確定ではない。
+
+- **所有**: 完成 final は既存 `final_composite_cache`、作業中は既存 `final_effect_pending` を一般 final へ広げ
+  `Computing | CpuReady` の排他 enum にする。新しい bool / 専用 slot は作らない。
+- **miss 時**: 初回表示・一覧からの open・演出 OFF は、従来どおり同じ pass で同期完成する (worker 待ちを足さない)。
+  したがって案 A の効果は「準備が間に合った頁送り」に限られ、cold・連打・設定変更直後の停止は残り得る。miss を分母から外して合格にしない。
+- **範囲**: 先回りは演出 ON の paged だけ。OFF へ広げるかは、ON での成立を測ってから利用者に諮る (下書きの推奨どおり)。
+  exact final hit の前倒しと ColorImage 複製の削減は ON / OFF 共通で入れてよい。
+- **detached**: 採用 service、viewport の最初の表示選択、mount / park の経路に触れる。CLAUDE.md の凍結ルールに従い、
+  ClaudeCode と独立 reviewer の双方が「症状パッチではなく構造的修正である」ことに合意してから着手し、`docs/detached-rework-plan.md` §11 に記録する。
+- **順序**: 独立設計レビュー (本案全体、特に P2-2 の採用境界と所有) → D3-1 → D3-2 → (D3-4 の前に canonical demand と GPU 完了 ticket の
+  具体案を再レビュー) → D3-3 / D3-4 → D3-5。各 chunk は完成レビューを受け、§27.15 の条件で効果を測る。
