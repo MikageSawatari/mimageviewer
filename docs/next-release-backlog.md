@@ -282,6 +282,10 @@ liveテスト、`test-full.ps1`、`probe-*.ps1`、git add・コミット・ブ�
 - 方針: 実時計に依存するテストは fake clock / 明示的な時刻注入へ移す (ページめくり D4 で時計を型に分けるのに合わせる)。
   時間上限は負荷で変わらない検査 (完了の通知・状態) に置き換える。上の 2 件は、テスト同士が同じファイル・同じ marker を
   共有していないかを先に調べる。assert を弱めない、retry を足さない。§1.321 / §1.334 と同じ系統。
+- 2026-10-18 追記 (ClaudeCode、master `155b8dabf` の全件実行): `startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` が
+  `db.scanned_once_matches(&fingerprint)` の assertion (`src/similar_index.rs` 11083 行) で 1 件だけ落ちた。直前の全件では成功。
+  **単独実行でも 13 回中 1 回落ちた** (並行負荷が無くても起きる)。マージは similar_index に触れていない (master との差分なし)。
+  「並行負荷のときだけ」という見立てはこのテストには当てはまらない可能性があり、時刻・ファイル時刻の粒度など単独で起きる原因を先に調べる。
 - 規模 / 優先度: Small〜Medium / P2 (全件テストの偽失敗でリリース判断が止まる)。
 
 ### 1.334 `zip_loader::tests::shared_directory_cache_reparses_when_the_archive_identity_changes` が全体実行でまれに落ちる — テスト側の共有キャッシュ (2026-10-05)
