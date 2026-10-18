@@ -20,6 +20,8 @@
 
 #[cfg(test)]
 mod native_focus_tests;
+#[cfg(test)]
+mod overflow_input_tests;
 mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
@@ -123,6 +125,9 @@ impl FullscreenSecondaryPressOwner {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FullscreenSecondaryPress {
     Idle,
+    Overflow {
+        owner: FullscreenSecondaryPressOwner,
+    },
     Armed {
         owner: FullscreenSecondaryPressOwner,
         started_at: std::time::Instant,
@@ -168,7 +173,7 @@ impl FullscreenSecondaryPress {
         new_generation: u64,
         new_idx: usize,
     ) {
-        if let Self::Armed { owner, .. } = self
+        if let Self::Armed { owner, .. } | Self::Overflow { owner } = self
             && owner.viewer_context == viewer_context
             && owner.items_generation == old_generation
             && owner.fs_idx == old_idx
@@ -180,9 +185,51 @@ impl FullscreenSecondaryPress {
 
     fn start_pos(self) -> Option<egui::Pos2> {
         match self {
-            Self::Idle => None,
+            Self::Idle | Self::Overflow { .. } => None,
             Self::Armed { start_pos, .. } => Some(start_pos),
         }
+    }
+
+    /// A press begun in overflow belongs to it through release, even after leaving its rect.
+    /// Reuse the secondary sequence owner instead of creating a separate pending latch.
+    fn overflow_owns_input(
+        &mut self,
+        owner: Option<FullscreenSecondaryPressOwner>,
+        panel: Option<egui::Rect>,
+        input: &egui::InputState,
+    ) -> bool {
+        if matches!(self, Self::Overflow { owner: captured } if Some(*captured) != owner) {
+            self.cancel();
+        }
+        let mut owned = matches!(self, Self::Overflow { .. });
+        for event in &input.events {
+            if let egui::Event::PointerButton {
+                button: egui::PointerButton::Secondary,
+                pressed,
+                pos,
+                ..
+            } = event
+            {
+                if *pressed {
+                    if let Some(owner) = owner.filter(|_| panel.is_some_and(|r| r.contains(*pos))) {
+                        *self = Self::Overflow { owner };
+                        owned = true;
+                    } else if matches!(self, Self::Overflow { .. }) {
+                        self.cancel();
+                    }
+                } else if matches!(self, Self::Overflow { .. }) {
+                    owned = true;
+                    self.cancel();
+                }
+            }
+        }
+        // Retire lost terminal edges, but keep this terminal frame owned.
+        if matches!(self, Self::Overflow { .. })
+            && (!input.focused || !input.pointer.secondary_down())
+        {
+            self.cancel();
+        }
+        owned
     }
 
     fn advance(
@@ -37714,12 +37761,24 @@ impl App {
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_primary_suppression.arm_pointer_stream();
+                let touch_scope = self.fullscreen_idx.map(|fs_idx| StillTouchChromeLatch {
+                    fs_idx,
+                    session_started_at: self.fullscreen_opened_at(),
+                });
+                let help_phase =
+                    touch_scope.and_then(|scope| still_touch_first_run_help_phase(ctx, scope));
                 let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                     ctx,
                     crate::touch_correlation::TouchSurface::StillFullscreen,
                     crate::touch_input::TapZoneGeometry {
                         surface: full_rect,
-                        excluded: Vec::new(),
+                        excluded: if help_phase.is_none() {
+                            fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
+                                .into_iter()
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
                         behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                             accepts_pinch: true,
                             tap_zones: touch_tap_zones,
@@ -37737,19 +37796,27 @@ impl App {
                         cancelled: touch_frame.touch_cancelled(),
                     },
                 );
-                if let Some(idx) = self.fullscreen_idx {
-                    let scope = StillTouchChromeLatch {
-                        fs_idx: idx,
-                        session_started_at: self.fullscreen_opened_at(),
-                    };
-                    let help_phase = still_touch_first_run_help_phase(ctx, scope);
+                if let Some(scope) = touch_scope {
+                    if help_phase.is_none()
+                        && touch_frame
+                            .commands()
+                            .iter()
+                            .copied()
+                            .any(|command| self.dismiss_fs_overflow_on_touch_tap(command))
+                    {
+                        return FsWheelFrameResult::default();
+                    }
                     match still_touch_foreground_reclaim_action(
                         help_phase,
                         touch_frame.is_active(),
                         touch_frame.commands(),
                     ) {
                         StillTouchForegroundReclaimAction::ToggleChrome => {
-                            toggle_still_touch_chrome_latch(ctx, idx, self.fullscreen_opened_at());
+                            toggle_still_touch_chrome_latch(
+                                ctx,
+                                scope.fs_idx,
+                                self.fullscreen_opened_at(),
+                            );
                         }
                         StillTouchForegroundReclaimAction::LearnAndShowChrome => {
                             set_still_touch_chrome_latch(ctx, scope, true);
@@ -38245,6 +38312,9 @@ impl App {
                     }
                     // Every command belongs to the modal guide while it is
                     // visible. In particular, PageSide never reaches page_nav.
+                    continue;
+                }
+                if self.dismiss_fs_overflow_on_touch_tap(command) {
                     continue;
                 }
                 if touch_panel_tap_command_dismisses_before_dispatch(
@@ -39285,6 +39355,26 @@ impl App {
         }
     }
 
+    fn dismiss_fs_overflow_on_touch_tap(
+        &mut self,
+        command: crate::touch_input::TouchCommand,
+    ) -> bool {
+        if self.fs_overflow_panel_state.is_open()
+            && matches!(
+                command,
+                crate::touch_input::TouchCommand::ToggleChrome
+                    | crate::touch_input::TouchCommand::PageSide { .. }
+            )
+        {
+            // Panel contacts are excluded by the shared rect. Only spend outside taps;
+            // the caller still drives recognizer ownership through its terminal frame.
+            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            true
+        } else {
+            false
+        }
+    }
+
     fn recognize_fs_secondary_input(
         &mut self,
         ctx: &egui::Context,
@@ -39313,6 +39403,23 @@ impl App {
         let secondary_down = ctx.input(|i| i.pointer.secondary_down());
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let secondary_released = ctx.input(|i| i.pointer.secondary_released());
+        let press_owner = self.fullscreen_idx.map(|fs_idx| {
+            FullscreenSecondaryPressOwner::new(
+                self.edit_request_owner_context(),
+                self.items_generation,
+                fs_idx,
+                right_drag_context,
+            )
+        });
+        let overflow_rect = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state);
+        if ctx.input(|input| {
+            self.fs_secondary_press
+                .overflow_owns_input(press_owner, overflow_rect, input)
+        }) {
+            self.cancel_mouse_ring_flick();
+            self.cancel_mouse_gesture();
+            return FsSecondaryAction::None;
+        }
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
         let passive_secondary_pos = fullscreen_pointer_pos_or(
             ctx,
@@ -39349,16 +39456,7 @@ impl App {
             None
         };
         let passive_press_owner = fullscreen_secondary_press_owner_for_frame(
-            self.fullscreen_idx.map(|fs_idx| {
-                FullscreenSecondaryPressOwner::new(
-                    // This existing helper is the cross-platform current projection owner;
-                    // edit requests and physical pointer sequences need the same exact scope.
-                    self.edit_request_owner_context(),
-                    self.items_generation,
-                    fs_idx,
-                    right_drag_context,
-                )
-            }),
+            press_owner,
             &right_drag_mode,
             right_drag_context,
             right_drag_gate_reject.is_some(),
@@ -48967,6 +49065,7 @@ impl App {
             && !self.fit_popup_open
             && !self.panorama_projection_popup_open
             && !fs_still_seek_strip_popup_open(ctx)
+            && !self.fs_overflow_panel_state.is_open()
             && self.fs_context_menu_idx.is_none()
             && !self.any_dialog_open()
     }
@@ -62949,12 +63048,15 @@ mod tests {
         assert_eq!(root.right(), full_rect.right() - FS_OVERFLOW_PANEL_MARGIN);
         assert_eq!(submenu.min, root.min);
         assert_eq!(submenu.width(), root.width());
-        assert_eq!(
-            root.height() - submenu.height(),
-            FS_OVERFLOW_PANEL_ROW_HEIGHT * 3.0
-        );
-        assert_eq!(root.height(), 444.0);
-        assert_eq!(submenu.height(), 300.0);
+        for (state, rect) in [
+            (FsOverflowPanelState::Root, root),
+            (FsOverflowPanelState::NavigatorPosition, submenu),
+        ] {
+            assert_eq!(
+                rect.height() - FS_OVERFLOW_PANEL_HEADER_HEIGHT - FS_OVERFLOW_PANEL_PADDING * 2.0,
+                fs_overflow_panel_body_row_count(state) as f32 * FS_OVERFLOW_PANEL_ROW_HEIGHT
+            );
+        }
         assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
 
         let narrow = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(300.0, 180.0));
@@ -88985,7 +89087,15 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_overflow_wheel_reaches_real_front_panel_only_inside_its_rect() {
-        for size in [egui::vec2(820.0, 240.0), egui::vec2(820.0, 600.0)] {
+        // Keep an exposed metadata body beneath the root menu as its row count changes.
+        let tall_height = TOP_BAR_HEIGHT
+            + FS_OVERFLOW_PANEL_MARGIN * 2.0
+            + FS_OVERFLOW_PANEL_PADDING * 2.0
+            + FS_OVERFLOW_PANEL_HEADER_HEIGHT
+            + fs_overflow_panel_body_row_count(FsOverflowPanelState::Root) as f32
+                * FS_OVERFLOW_PANEL_ROW_HEIGHT
+            + 200.0;
+        for size in [egui::vec2(820.0, 240.0), egui::vec2(820.0, tall_height)] {
             let (ctx, mut app, viewport) = specified_popup_metadata_fixture(size);
             let mut frame = 0;
             let mut draw = |app: &mut App, events| {
@@ -89039,7 +89149,15 @@ mod specified_scale_consumer_tests {
                     "the front overflow ScrollArea receives the wheel"
                 );
             } else {
-                let outside = egui::pos2(panel.center().x, panel.bottom() - 20.0);
+                let overflow_rect =
+                    fs_overflow_panel_rect(viewport, app.fs_overflow_panel_state).unwrap();
+                // Use the metadata body below the front panel, however many root rows exist.
+                let outside_body = egui::Rect::from_min_max(
+                    egui::pos2(panel.left(), panel.top().max(overflow_rect.bottom())),
+                    panel.max,
+                );
+                assert!(outside_body.is_positive());
+                let outside = outside_body.center();
                 assert!(
                     !fs_overflow_panel_rect(viewport, app.fs_overflow_panel_state)
                         .unwrap()

@@ -1734,9 +1734,15 @@ active CentralPanelの `ui.max_rect()` から一度解決した `StillSeekGeomet
 ナビゲータ位置 → ページめくりアニメーション → スライドショー → 分析ツール →
 ピクセルグリッド → ルーペ固定の固定順にする。行高は 48pt、
 ヘッダーと閉じる hit target は 44pt とし、短い viewport では本文だけをスクロールする。同じ純粋な
-panel rect resolver を描画と `touch_excluded` が共有する。表示中は既存の overflow 入力境界で
-背面の wheel・キャンバスの pointer / navigator 操作を止める。モーダルダイアログ扱いにはせず、
-設定部品にフォーカスがなければ従来どおり次のキーで閉じ、そのキーの操作へ進む。
+panel rect resolver を描画・`touch_excluded`・右ボタン入力の開始判定が共有する。
+パネル内の wheel はパネルが受け、パネル外の wheel は背面へ流れる。スライドショー設定中も
+外側の wheel でページ送り・ズームでき、パネルは維持する。外側の左クリック / タップは
+パネルを閉じるだけで消費し、その入力でページ送りやバー表示切替をしない。
+スワイプ・ドラッグ等の連続操作は既存の扱いを維持する。パネル内で始まった右ボタン入力は
+既存の `FullscreenSecondaryPress` の overflow 所有状態が移動・解放まで所有し、矩形外へ出ても
+右クリック終了・リング・ジェスチャへ渡さない。外側で始まった右入力は従来どおり扱う。
+パネル表示中はカーソル自動非表示の clean 判定を false にする。モーダルダイアログ扱いにはせず、
+フォーカス中の設定部品へはキーを渡し、それ以外のキーはパネルを閉じて通常の操作へ進む。
 touch recognizer 自体は terminal frame まで駆動して ownership を残さない。状態表示や
 実効 shortcut label は既存 state / keymap の読み取りだけで組み立て、UI 描画のための同期 I/O は行わない。
 
