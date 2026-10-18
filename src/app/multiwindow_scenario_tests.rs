@@ -3217,13 +3217,13 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
             owner.fullscreen_idx = Some(0);
             owner.viewer_presentation = ViewerPresentation::DetachedWindow;
             owner.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
-            owner.video_continuous_last_eof = Some((0, 1));
+            let player = crate::video::VideoPlayer::disconnected_for_test(source, 3.0);
+            // The EOF request must own the player's actual transport generation.
+            owner.video_continuous_last_eof = Some((0, player.current_seek_serial()));
             owner.fs_cache.insert(
                 0,
                 FsCacheEntry::Video {
-                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
-                        source, 3.0,
-                    )),
+                    player: Box::new(player),
                     load_seq: 0,
                 },
             );
@@ -3236,10 +3236,11 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
         );
         assert!(
             app.with_window_viewer_context(window_id, |owner| {
+                let (_, seek_serial) = owner.video_continuous_last_eof.unwrap();
                 if is_audio {
-                    owner.start_collection_music_eof_navigation(&ctx, 0, 1)
+                    owner.start_collection_music_eof_navigation(&ctx, 0, seek_serial)
                 } else {
-                    owner.start_collection_video_eof_navigation(&ctx, 0, 1)
+                    owner.start_collection_video_eof_navigation(&ctx, 0, seek_serial)
                 }
             })
             .unwrap()

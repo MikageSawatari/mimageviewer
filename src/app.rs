@@ -13393,15 +13393,18 @@ enum MediaNavigationAction {
     VideoContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
     },
     #[cfg(windows)]
     VideoAudioModeContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
     },
     MusicContinuousEof {
         fs_idx: usize,
         seek_serial: u64,
+        player_identity: u64,
     },
     Manual {
         fs_idx: usize,
@@ -31119,7 +31122,10 @@ impl App {
             return;
         }
         let owner = crate::effetune::NowPlayingOwner::Local(player.media_identity());
-        if player.local_now_playing_finished() {
+        if player.local_now_playing_finished()
+            || ((!self.video_continuous_mode.is_enabled() || self.video_tile_mode_active)
+                && player.is_at_non_loop_eof())
+        {
             self.effetune.clear_now_playing(owner);
             return;
         }
@@ -31154,6 +31160,55 @@ impl App {
         }
         let input = self.now_playing_input_for_player(player, sidecar.cloned());
         self.effetune.publish_now_playing(owner, input);
+    }
+
+    /// Continuous navigation has resolved a final EOF, rather than a pending loop/next source.
+    /// Match the transport generation as well as the metadata owner before clearing it.
+    #[cfg(windows)]
+    fn finish_local_now_playing_eof(&mut self, fs_idx: usize, seek_serial: u64) {
+        if self.fullscreen_idx == Some(fs_idx)
+            && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+            && player.current_seek_serial() == seek_serial
+            && player.is_at_non_loop_eof()
+        {
+            self.effetune
+                .clear_now_playing(crate::effetune::NowPlayingOwner::Local(
+                    player.media_identity(),
+                ));
+        }
+    }
+
+    fn media_navigation_player_identity(&self, fs_idx: usize) -> Option<u64> {
+        let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+            return None;
+        };
+        Some(player.media_identity())
+    }
+
+    fn finish_owned_local_now_playing_eof(
+        &mut self,
+        fs_idx: usize,
+        seek_serial: u64,
+        player_identity: u64,
+    ) {
+        if !self.media_navigation_eof_transport_is_current(fs_idx, seek_serial, player_identity) {
+            return;
+        }
+        #[cfg(windows)]
+        self.finish_local_now_playing_eof(fs_idx, seek_serial);
+        #[cfg(not(windows))]
+        let _ = seek_serial;
+    }
+
+    fn media_navigation_eof_transport_is_current(
+        &self,
+        fs_idx: usize,
+        seek_serial: u64,
+        player_identity: u64,
+    ) -> bool {
+        self.fullscreen_idx == Some(fs_idx)
+            && matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { player, .. })
+                if player.media_identity() == player_identity && player.current_seek_serial() == seek_serial)
     }
 
     #[cfg(windows)]
@@ -51206,7 +51261,7 @@ impl App {
             player.path().display(),
             self.viewer_presentation
         ));
-        player.seek(target);
+        player.seek(target, crate::video::SeekOrigin::User);
         crate::logger::log(format!(
             "[bookmark-open] seek issued path={} after={:.3} serial_after={}",
             player.path().display(),
@@ -68615,7 +68670,12 @@ impl App {
                     }
                     if video_ignore_resume_once {
                         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-                            player.seek(0.0);
+                            player.seek(
+                                0.0,
+                                crate::video::SeekOrigin::Internal(
+                                    crate::video::InternalContinuation::Transport,
+                                ),
+                            );
                         }
                     }
                     // タイルモード (video_tile_*) は native presenter 前提の Windows 専用。
@@ -93314,15 +93374,18 @@ impl App {
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                ..
             }
             | MediaNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                ..
             } => Some((*fs_idx, *seek_serial)),
             #[cfg(windows)]
             MediaNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                ..
             } => Some((*fs_idx, *seek_serial)),
             MediaNavigationAction::Manual { .. } => None,
         }
@@ -93333,22 +93396,38 @@ impl App {
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
+                ..
             }
             | MediaNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
+                ..
             } => {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+                    && self.media_navigation_eof_transport_is_current(
+                        *fs_idx,
+                        *seek_serial,
+                        *player_identity,
+                    )
             }
             #[cfg(windows)]
             MediaNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
+                ..
             } => {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_audio_mode == Some(*fs_idx)
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
+                    && self.media_navigation_eof_transport_is_current(
+                        *fs_idx,
+                        *seek_serial,
+                        *player_identity,
+                    )
                     && !self.video_presentation_transition.is_transitioning()
                     && self.native_video_source_swap_pending.is_none()
                     && self.native_video_fast_swap_pending.is_none()
@@ -93381,6 +93460,59 @@ impl App {
         };
         self.rollback_media_navigation_eof_dedup(&pending.action, reason);
         true
+    }
+
+    fn finish_media_navigation_eof_failure(&mut self, action: &MediaNavigationAction) {
+        match action {
+            MediaNavigationAction::VideoContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+            }
+            | MediaNavigationAction::MusicContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
+            }
+            #[cfg(windows)]
+            MediaNavigationAction::VideoAudioModeContinuousEof {
+                fs_idx,
+                seek_serial,
+                player_identity,
+            } => {
+                self.finish_owned_local_now_playing_eof(*fs_idx, *seek_serial, *player_identity);
+            }
+            MediaNavigationAction::Manual { .. } => {}
+        }
+    }
+
+    fn media_navigation_pending_is_current(&self, pending: &MediaNavigationPending) -> bool {
+        Self::media_navigation_result_is_current(
+            pending.items_generation,
+            self.items_generation,
+            pending.input_seq,
+            self.input_seq,
+            pending.owner_window_id,
+            self.current_media_navigation_owner(),
+            pending.fullscreen_idx,
+            self.fullscreen_idx,
+        ) && self.media_navigation_action_can_apply(&pending.action)
+    }
+
+    fn finish_failed_media_navigation_pending(&mut self, reason: &'static str) {
+        let Some(pending) = self.media_navigation_pending.take() else {
+            return;
+        };
+        if self.media_navigation_pending_is_current(&pending) {
+            crate::logger::log(format!(
+                "[media-nav] terminal candidate resolution failed: reason={reason}"
+            ));
+            self.finish_media_navigation_eof_failure(&pending.action);
+        } else {
+            self.rollback_media_navigation_eof_dedup(&pending.action, reason);
+        }
     }
 
     fn current_media_navigation_owner(&self) -> Option<u64> {
@@ -93440,7 +93572,7 @@ impl App {
             crate::logger::log(format!(
                 "[media-nav] resolver thread spawn failed: source={source}"
             ));
-            self.rollback_media_navigation_eof_dedup(&action, "resolver_spawn_failed");
+            self.finish_media_navigation_eof_failure(&action);
             return;
         };
 
@@ -93462,7 +93594,7 @@ impl App {
                 "[media-nav] resolver request channel disconnected: request_id={request_id} source={source}"
             ));
             self.media_navigation_resolver = None;
-            self.rollback_media_navigation_eof_dedup(&action, "resolver_disconnected");
+            self.finish_media_navigation_eof_failure(&action);
             return;
         }
         if crate::perf::is_enabled() {
@@ -93547,7 +93679,7 @@ impl App {
             let received = match self.media_navigation_resolver.as_ref() {
                 Some(resolver) => resolver.result_rx.try_recv(),
                 None => {
-                    self.discard_media_navigation_pending("resolver_missing");
+                    self.finish_failed_media_navigation_pending("resolver_missing");
                     return;
                 }
             };
@@ -93559,7 +93691,7 @@ impl App {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.media_navigation_resolver = None;
-                    self.discard_media_navigation_pending("resolver_disconnected");
+                    self.finish_failed_media_navigation_pending("resolver_disconnected");
                     return;
                 }
             };
@@ -93646,6 +93778,7 @@ impl App {
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                ..
             } => self.apply_video_continuous_eof_target(
                 ctx,
                 fs_idx,
@@ -93657,6 +93790,7 @@ impl App {
             MediaNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                ..
             } => self.apply_video_audio_mode_continuous_eof_target(
                 ctx,
                 fs_idx,
@@ -93667,6 +93801,7 @@ impl App {
             MediaNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                ..
             } => self.apply_music_continuous_eof_target(
                 ctx,
                 fs_idx,
@@ -93785,6 +93920,9 @@ impl App {
         if self.video_continuous_last_eof == Some(eof_key) {
             return;
         }
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return;
+        };
         self.video_continuous_last_eof = Some(eof_key);
 
         if self.start_collection_video_eof_navigation(ctx, fs_idx, seek_serial) {
@@ -93806,6 +93944,7 @@ impl App {
             MediaNavigationAction::VideoContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
             },
         );
     }
@@ -93825,6 +93964,8 @@ impl App {
         }
         let Some(next_idx) = target_idx else {
             #[cfg(windows)]
+            self.finish_local_now_playing_eof(fs_idx, seek_serial);
+            #[cfg(windows)]
             self.show_native_video_overlay_toast(
                 "フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string(),
                 false,
@@ -93836,7 +93977,10 @@ impl App {
 
         if next_idx == fs_idx {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.seek(0.0);
+                player.seek(
+                    0.0,
+                    crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
+                );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
@@ -93923,6 +94067,9 @@ impl App {
         if self.video_continuous_last_eof == Some(eof_key) {
             return;
         }
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return;
+        };
         self.video_continuous_last_eof = Some(eof_key);
 
         if self.start_collection_video_audio_mode_eof_navigation(ctx, fs_idx, seek_serial) {
@@ -93944,6 +94091,7 @@ impl App {
             MediaNavigationAction::VideoAudioModeContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
             },
         );
     }
@@ -93969,13 +94117,18 @@ impl App {
             return;
         }
         let Some(next_idx) = target_idx else {
+            #[cfg(windows)]
+            self.finish_local_now_playing_eof(fs_idx, seek_serial);
             self.show_feedback_toast("フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string());
             return;
         };
         if next_idx == fs_idx {
             // フォルダ内に動画が 1 本だけ: 先頭へ戻して再生継続 (音声モード維持)。
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.seek(0.0);
+                player.seek(
+                    0.0,
+                    crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
+                );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
@@ -94002,7 +94155,10 @@ impl App {
                  restarting current in audio mode"
             ));
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.seek(0.0);
+                player.seek(
+                    0.0,
+                    crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
+                );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
         }
@@ -94121,7 +94277,12 @@ impl App {
             }
             crate::settings::BoundaryDecision::Loop { seek_to } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.seek(seek_to);
+                    player.seek(
+                        seek_to,
+                        crate::video::SeekOrigin::Internal(
+                            crate::video::InternalContinuation::Loop,
+                        ),
+                    );
                     player.set_loop_target_secs(seek_to);
                 }
                 self.last_loop_pos.insert(fs_idx, (seek_to, serial));
@@ -94217,6 +94378,9 @@ impl App {
         if self.video_continuous_last_eof == Some(eof_key) {
             return;
         }
+        let Some(player_identity) = self.media_navigation_player_identity(fs_idx) else {
+            return;
+        };
         self.video_continuous_last_eof = Some(eof_key);
 
         if self.start_collection_music_eof_navigation(ctx, fs_idx, seek_serial) {
@@ -94238,6 +94402,7 @@ impl App {
             MediaNavigationAction::MusicContinuousEof {
                 fs_idx,
                 seek_serial,
+                player_identity,
             },
         );
     }
@@ -94256,12 +94421,17 @@ impl App {
             return;
         }
         let Some(next_idx) = target_idx else {
+            #[cfg(windows)]
+            self.finish_local_now_playing_eof(fs_idx, seek_serial);
             self.show_feedback_toast("フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string());
             return;
         };
         if next_idx == fs_idx {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.seek(0.0);
+                player.seek(
+                    0.0,
+                    crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
+                );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
@@ -98495,6 +98665,286 @@ mod now_playing_lifecycle_tests {
     use super::*;
     use crate::effetune::NowPlayingOwner;
 
+    fn player(app: &App) -> &crate::video::VideoPlayer {
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player
+    }
+
+    #[test]
+    fn now_playing_eof_resolver_failures_clear_only_current_owner_and_do_not_retry() {
+        for kind in ["music", "video", "audio_mode"] {
+            for terminal in [
+                "send",
+                "disconnected",
+                "missing",
+                "superseded",
+                "context",
+                "player",
+                "seek",
+            ] {
+                let mut app = setup_app_for_test();
+                let path = app.tmp.path().join("failed-eof.mp3");
+                install_player(&mut app, path.clone());
+                if kind != "music" {
+                    app.items[0] = GridItem::Video(path);
+                }
+                if kind == "audio_mode" {
+                    app.video_audio_mode = Some(0);
+                }
+                adopt(&mut app);
+                app.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
+                player(&app).set_loop_enabled(false);
+                player(&app).mark_eof_for_test(30.0);
+                let serial = player(&app).current_seek_serial();
+                let (request_tx, request_rx) = mpsc::channel();
+                let (result_tx, result_rx) = mpsc::channel();
+                app.media_navigation_resolver = Some(MediaNavigationResolver {
+                    request_tx,
+                    result_rx,
+                    next_request_id: 1,
+                });
+                let request_rx = if terminal == "send" {
+                    drop(request_rx);
+                    None
+                } else {
+                    Some(request_rx)
+                };
+                let ctx = egui::Context::default();
+                let start = |app: &mut App| match kind {
+                    "music" => app.handle_music_continuous_eof(&ctx, 0, serial),
+                    "video" => app.handle_video_continuous_eof(&ctx, 0, serial),
+                    "audio_mode" => app.handle_video_audio_mode_continuous_eof(&ctx, 0, serial),
+                    _ => unreachable!(),
+                };
+                start(&mut app);
+                let is_failure = matches!(terminal, "send" | "disconnected" | "missing");
+                if terminal != "send" {
+                    request_rx.as_ref().unwrap().try_recv().unwrap();
+                    match terminal {
+                        "superseded" => {
+                            app.discard_media_navigation_pending("superseded");
+                        }
+                        "context" => {
+                            app.items_generation += 1;
+                        }
+                        "player" => {
+                            let replacement = app.tmp.path().join("replacement.mp3");
+                            install_player(&mut app, replacement);
+                            adopt(&mut app);
+                            player(&app).mark_eof_for_test(30.0);
+                        }
+                        "seek" => {
+                            player(&app).seek(0.0, crate::video::SeekOrigin::User);
+                        }
+                        "missing" => {
+                            app.media_navigation_resolver = None;
+                        }
+                        _ => {}
+                    }
+                    drop(result_tx);
+                    app.poll_media_navigation_pending(&ctx);
+                }
+                let owner = app.effetune.now_playing_owner();
+                assert_eq!(owner.is_none(), is_failure, "{kind}/{terminal}");
+                assert_eq!(
+                    app.video_continuous_last_eof,
+                    is_failure.then_some((0, serial)),
+                    "{kind}/{terminal}"
+                );
+                if is_failure {
+                    let revision = app.effetune.now_playing_snapshot_for_test().revision;
+                    start(&mut app);
+                    assert!(
+                        app.media_navigation_pending.is_none(),
+                        "terminal failure must not retry"
+                    );
+                    assert_eq!(
+                        app.effetune.now_playing_snapshot_for_test().revision,
+                        revision
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn now_playing_eof_user_seek_handlers_and_space_republish_same_track() {
+        for route in ["music_w", "native_w", "bar", "music_bar", "left", "space"] {
+            let mut app = setup_app_for_test();
+            app.settings.video_loop_mode = crate::settings::VideoLoopMode::Off;
+            app.video_continuous_mode = crate::video::VideoContinuousMode::Off;
+            let path = app.tmp.path().join("replay.mp3");
+            install_player(&mut app, path);
+            if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&0) {
+                player.set_now_playing_metadata_for_test(Some("Replay title"), None, None);
+            }
+            let identity = adopt(&mut app);
+            player(&app).set_loop_enabled(false);
+            player(&app).mark_eof_for_test(30.0);
+            app.publish_mounted_local_now_playing(&[]);
+            app.reconcile_local_now_playing();
+            assert_eq!(app.effetune.now_playing_owner(), None, "{route}");
+            let clear_revision = app.effetune.now_playing_snapshot_for_test().revision;
+            let ctx = egui::Context::default();
+            match route {
+                "music_w" => app.music_seek_start(0),
+                "native_w" => app.handle_native_video_seek_to_start_command(&ctx, 0),
+                "bar" => app.handle_native_video_seek_command(&ctx, 0, 5.0),
+                "music_bar" => app.music_seek_to(0, 5.0),
+                "left" => app.music_seek_relative(0, -10.0),
+                "space" => app.handle_native_video_toggle_play_command(&ctx, 0),
+                _ => unreachable!(),
+            }
+            assert!(player(&app).intent_playing(), "{route}");
+            player(&app).complete_seek_for_test(player(&app).position());
+            app.poll_video(&ctx);
+            assert_eq!(
+                app.effetune.now_playing_owner(),
+                Some(NowPlayingOwner::Local(identity)),
+                "{route}"
+            );
+            let snapshot = app.effetune.now_playing_snapshot_for_test();
+            assert_eq!(&*snapshot.title, "Replay title", "{route}");
+            assert!(snapshot.revision > clear_revision);
+            assert!(player(&app).take_playback_success().is_none());
+        }
+    }
+
+    #[test]
+    fn now_playing_continuous_eof_wait_then_same_track_loop_keeps_revision() {
+        for (kind, next) in [
+            ("music", Some(0)),
+            ("music", None),
+            ("video", Some(0)),
+            ("video", None),
+            ("audio_mode", Some(0)),
+            ("audio_mode", None),
+        ] {
+            let mut app = setup_app_for_test();
+            let path = app.tmp.path().join("single.mp3");
+            install_player(&mut app, path.clone());
+            if kind != "music" {
+                app.items[0] = GridItem::Video(path);
+            }
+            if kind == "audio_mode" {
+                app.video_audio_mode = Some(0);
+            }
+            let identity = adopt(&mut app);
+            app.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
+            player(&app).set_loop_enabled(false);
+            player(&app).mark_eof_for_test(30.0);
+            let revision = app.effetune.now_playing_snapshot_for_test().revision;
+            // A real handler/resolver handshake, held deterministically before the response.
+            let (request_tx, request_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            app.media_navigation_resolver = Some(MediaNavigationResolver {
+                request_tx,
+                result_rx,
+                next_request_id: 1,
+            });
+            let ctx = egui::Context::default();
+            let serial = player(&app).current_seek_serial();
+            match kind {
+                "music" => app.handle_music_continuous_eof(&ctx, 0, serial),
+                "video" => app.handle_video_continuous_eof(&ctx, 0, serial),
+                "audio_mode" => app.handle_video_audio_mode_continuous_eof(&ctx, 0, serial),
+                _ => unreachable!(),
+            }
+            let request = request_rx.try_recv().unwrap();
+            app.publish_mounted_local_now_playing(&[]);
+            app.reconcile_local_now_playing();
+            assert_eq!(
+                app.effetune.now_playing_owner(),
+                Some(NowPlayingOwner::Local(identity))
+            );
+            assert_eq!(
+                app.effetune.now_playing_snapshot_for_test().revision,
+                revision
+            );
+            result_tx
+                .send(MediaNavigationResolverResponse {
+                    request_id: request.request_id,
+                    result: MediaNavigationResolveResult {
+                        target_idx: next,
+                        missing: vec![],
+                    },
+                })
+                .unwrap();
+            app.poll_media_navigation_pending(&ctx);
+            if next.is_some() {
+                player(&app).complete_seek_for_test(0.0);
+                app.poll_video(&ctx);
+                app.reconcile_local_now_playing();
+                assert_eq!(
+                    app.effetune.now_playing_owner(),
+                    Some(NowPlayingOwner::Local(identity))
+                );
+                assert_eq!(
+                    app.effetune.now_playing_snapshot_for_test().revision,
+                    revision
+                );
+                assert!(player(&app).take_playback_success().is_none());
+            } else {
+                assert_eq!(app.effetune.now_playing_owner(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn now_playing_final_eof_generation_and_owner_must_match() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("stale.mp3");
+        install_player(&mut app, path);
+        let identity = adopt(&mut app);
+        player(&app).mark_eof_for_test(30.0);
+        let serial = player(&app).current_seek_serial();
+        app.music_seek_start(0);
+        app.finish_local_now_playing_eof(0, serial);
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        player(&app).complete_seek_for_test(0.0);
+        player(&app).mark_eof_for_test(30.0);
+        let current = player(&app).current_seek_serial();
+        app.finish_local_now_playing_eof(0, serial);
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        let remote = NowPlayingOwner::Remote {
+            session: 1,
+            registration: 2,
+        };
+        let input = app.now_playing_input_for_player(player(&app), None);
+        app.effetune.publish_now_playing(remote, input);
+        app.finish_local_now_playing_eof(0, current);
+        assert_eq!(app.effetune.now_playing_owner(), Some(remote));
+    }
+
+    #[test]
+    fn now_playing_continuous_off_and_tile_eof_are_final() {
+        for tile in [false, true] {
+            let mut app = setup_app_for_test();
+            let path = app.tmp.path().join("terminal.mp3");
+            install_player(&mut app, path);
+            adopt(&mut app);
+            app.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
+            player(&app).mark_eof_for_test(30.0);
+            app.publish_mounted_local_now_playing(&[]);
+            assert!(app.effetune.now_playing_owner().is_some());
+            if tile {
+                app.video_tile_mode_active = true;
+            } else {
+                app.video_continuous_mode = crate::video::VideoContinuousMode::Off;
+            }
+            app.publish_mounted_local_now_playing(&[]);
+            assert_eq!(app.effetune.now_playing_owner(), None);
+        }
+    }
+
     #[test]
     fn now_playing_app_descriptor_clones_bounded_unicode_and_nul_prefixes() {
         let app = setup_app_for_test();
@@ -98653,6 +99103,7 @@ mod now_playing_lifecycle_tests {
         };
         player.set_loop_enabled(false);
         player.mark_eof_for_test(30.0);
+        app.publish_mounted_local_now_playing(&[]);
         app.reconcile_local_now_playing();
         assert_eq!(app.effetune.now_playing_owner(), None);
         install_player(&mut app, path);

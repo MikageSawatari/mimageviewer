@@ -1191,6 +1191,13 @@ keyframe が疎すぎる material unavailable も同じ UI surface と入力 gat
 
 #### `mod.rs` (`VideoPlayer`)
 - 公開 API (`open` / `tick` / `seek` / `set_volume` / `set_loop_enabled` / `shutdown`)
+- 再生するseek APIは必須の `SeekOrigin::User` / `Internal(InternalContinuation)` を受ける。
+  UserはEOF／再生意図なしの受付時、DSP取得より前にUserPlayを登録し、actorの既存start判定を使う。
+  内部Pauseでは非EOFのSuccessReady／Establishedを保持し、ユーザーPauseによるNoneへの破棄と区別する。
+  Loop・音声トラック・DSP・cached openの内部seekはstartを増やさず、seekによる再生強制は従来どおり。
+  Now Playingの最終EOFはAppの再生方針／連続navigationの結果確定が判断する。
+  非同期の次候補確認中をplayerのEOF状態だけでclearしない。詳細と全入口分類は
+  [EffeTune自動表示計画](effetune-auto-open-plan.md#eof後のユーザーseek入口の分類2026-10-17) を参照。
 - decoder スレッド・audio スレッドのライフサイクル管理
 - native presenter のライフタイム管理 (`native_output: Option<NativeVideoOutput>`)
 - remote-owned player に限る headless video output consumer の起動・停止・join
