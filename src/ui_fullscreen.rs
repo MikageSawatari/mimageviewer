@@ -106,6 +106,24 @@ pub(crate) struct FullscreenSecondaryPressOwner {
     context: crate::ring_shortcut::RightDragContext,
 }
 
+/// Resolved before front UI actions, shared by all backing input consumers in this pass.
+#[derive(Clone, Copy, Default)]
+struct FsOverflowPointerFrameInput {
+    primary_owned: bool,
+    secondary_owned: bool,
+    secondary_owner: Option<FullscreenSecondaryPressOwner>,
+}
+
+impl FsOverflowPointerFrameInput {
+    fn owns(self, button: egui::PointerButton) -> bool {
+        match button {
+            egui::PointerButton::Primary => self.primary_owned,
+            egui::PointerButton::Secondary => self.secondary_owned,
+            _ => false,
+        }
+    }
+}
+
 impl FullscreenSecondaryPressOwner {
     fn new(
         viewer_context: crate::app::ViewerContextId,
@@ -2016,6 +2034,7 @@ pub(crate) enum FullscreenPrimarySuppression {
     #[default]
     Idle,
     PointerStream,
+    OverflowStream,
     TouchStream,
 }
 
@@ -2068,7 +2087,9 @@ impl FullscreenPrimarySuppression {
     ) -> FullscreenPrimarySuppressionDecision {
         match event {
             FullscreenPrimarySuppressionEvent::PointerStreamStarted => {
-                *self = Self::PointerStream;
+                if *self != Self::OverflowStream {
+                    *self = Self::PointerStream;
+                }
                 FullscreenPrimarySuppressionDecision::Suppress
             }
             FullscreenPrimarySuppressionEvent::PointerFrame { released } => {
@@ -2077,7 +2098,7 @@ impl FullscreenPrimarySuppression {
                 } else {
                     FullscreenPrimarySuppressionDecision::Allow
                 };
-                if released && *self == Self::PointerStream {
+                if released && matches!(self, Self::PointerStream | Self::OverflowStream) {
                     *self = Self::Idle;
                 }
                 decision
@@ -2088,6 +2109,15 @@ impl FullscreenPrimarySuppression {
                 completed,
                 cancelled,
             } => {
+                // Front widgets retain their promoted primary stream even when the backing
+                // touch driver is disabled. Physical release/liveness or a touch terminal
+                // retires this owner.
+                if *self == Self::OverflowStream {
+                    if cancelled || completed {
+                        *self = Self::Idle;
+                    }
+                    return FullscreenPrimarySuppressionDecision::Suppress;
+                }
                 // PointerStream is provisional until raw-touch correlation has
                 // identified the source. From that point the touch frame is
                 // authoritative for this pass: canvas gestures are allowed,
@@ -2590,6 +2620,25 @@ struct FsNavigatorFrameInputSnapshots {
 }
 
 impl FsNavigatorFrameInput {
+    fn without_overflow_buttons(mut self, front: FsOverflowPointerFrameInput) -> Self {
+        for event in &mut self.events {
+            if let FsNavigatorInputEvent::PointerButton { button, pos, .. } = event
+                && front.owns(*button)
+            {
+                // The position belongs to wheel targeting and any non-owned gesture too.
+                *event = FsNavigatorInputEvent::PointerMoved(*pos);
+            }
+        }
+        if front.primary_owned {
+            self.primary_down = false;
+        }
+        if front.secondary_owned {
+            self.secondary_down = false;
+        }
+        // Positions, focus, wheel, and the other button retain their original event order.
+        self
+    }
+
     fn record_current_pass(ctx: &egui::Context) {
         let viewport = ctx.viewport_id();
         let pass_nr = ctx.cumulative_pass_nr();
@@ -26415,6 +26464,7 @@ impl App {
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
+                        let overflow_pointer_input = self.capture_fs_overflow_pointer_input(ctx, full_rect);
                         let music_overflow_input = self.begin_music_overflow_frame_input(ctx, full_rect, fs_idx);
                         let mut hud_popup_wheel = self
                             .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx, music_overflow_input)
@@ -26703,6 +26753,7 @@ impl App {
                                 || ctrl_nav.is_some() || sibling_nav.is_some()
                                 || mouse_nav.is_some() || jump_to.is_some(),
                             true,
+                            overflow_pointer_input,
                         );
                         if let Some(mut proposal) = wheel_result.deferred.take() {
                             proposal.frame_navigation_allowed = !continuation_committed;
@@ -37495,6 +37546,7 @@ impl App {
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
+        let overflow_pointer_input = self.capture_fs_overflow_pointer_input(ctx, full_rect);
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
@@ -37509,6 +37561,7 @@ impl App {
             navigation_operation,
             false,
             false,
+            overflow_pointer_input,
         );
         (result.page_nav, result.close)
     }
@@ -37528,9 +37581,11 @@ impl App {
         navigation_operation: &mut Option<ViewerOperationId>,
         suppress_wheel_navigation: bool,
         merge_at_frame_tail: bool,
+        overflow_pointer_input: FsOverflowPointerFrameInput,
     ) -> FsWheelFrameResult {
         *navigator_reservation = None;
-        let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx);
+        let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx)
+            .without_overflow_buttons(overflow_pointer_input);
         if front_wheel_owner.is_some() {
             // The begin-pass capture remains intact. Both immediate and reserved consumers
             // receive the same projection, retaining pointer/focus/release gesture ownership.
@@ -38515,6 +38570,10 @@ impl App {
             // evidence, not a new cross-frame owner.
             primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
         }
+        if overflow_pointer_input.primary_owned {
+            // A terminal TouchFrame::Allow must not reuse the front widget's release.
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
+        }
         // ── フォーカス復帰クリック / touch replacement の抑制 ──
         let wheel_options = ctx.options(|o| o.input_options);
         let wheel_segments =
@@ -38663,6 +38722,7 @@ impl App {
             seek_panel_rect,
             seek_panel_interactive,
             prev_foreground_hwnd,
+            overflow_pointer_input,
         );
         // Preserve the released wheel-before-click classification without mutating
         // a page which an intermediate navigation has already left.
@@ -39355,6 +39415,48 @@ impl App {
         }
     }
 
+    fn capture_fs_overflow_pointer_input(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> FsOverflowPointerFrameInput {
+        let panel = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state);
+        let secondary_owner = self.fullscreen_idx.map(|fs_idx| {
+            FullscreenSecondaryPressOwner::new(
+                self.edit_request_owner_context(),
+                self.items_generation,
+                fs_idx,
+                self.current_right_drag_context(),
+            )
+        });
+        ctx.input(|input| {
+            if input.events.iter().any(|event| {
+                matches!(event, egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary, pressed: true, pos, ..
+                } if panel.is_some_and(|rect| rect.contains(*pos)))
+            }) {
+                self.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
+            }
+            let primary_owned =
+                self.fs_primary_suppression == FullscreenPrimarySuppression::OverflowStream;
+            if primary_owned
+                && (!input.focused
+                    || (!input.pointer.primary_down() && !input.pointer.primary_released()))
+            {
+                self.fs_primary_suppression = FullscreenPrimarySuppression::Idle;
+            }
+            FsOverflowPointerFrameInput {
+                primary_owned,
+                secondary_owned: self.fs_secondary_press.overflow_owns_input(
+                    secondary_owner,
+                    panel,
+                    input,
+                ),
+                secondary_owner,
+            }
+        })
+    }
+
     fn dismiss_fs_overflow_on_touch_tap(
         &mut self,
         command: crate::touch_input::TouchCommand,
@@ -39384,6 +39486,7 @@ impl App {
         seek_panel_rect: egui::Rect,
         seek_panel_interactive: bool,
         prev_foreground_hwnd: usize,
+        overflow_pointer_input: FsOverflowPointerFrameInput,
     ) -> FsSecondaryAction {
         let dialog_open_for_right_drag = self.any_dialog_open();
         if dialog_open_for_right_drag {
@@ -39403,19 +39506,8 @@ impl App {
         let secondary_down = ctx.input(|i| i.pointer.secondary_down());
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let secondary_released = ctx.input(|i| i.pointer.secondary_released());
-        let press_owner = self.fullscreen_idx.map(|fs_idx| {
-            FullscreenSecondaryPressOwner::new(
-                self.edit_request_owner_context(),
-                self.items_generation,
-                fs_idx,
-                right_drag_context,
-            )
-        });
-        let overflow_rect = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state);
-        if ctx.input(|input| {
-            self.fs_secondary_press
-                .overflow_owns_input(press_owner, overflow_rect, input)
-        }) {
+        let press_owner = overflow_pointer_input.secondary_owner;
+        if overflow_pointer_input.secondary_owned {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
             return FsSecondaryAction::None;

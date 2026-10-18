@@ -61201,6 +61201,7 @@ impl App {
         // The same reason as in `close_fullscreen`: this is the other place that gives up the
         // fullscreen foreground, and a panel that only draws there must not outlive it.
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        self.fs_primary_suppression = Default::default();
         self.cancel_mouse_ring_flick();
         self.fs_secondary_press.cancel();
         self.capture_region_selection = None;

@@ -6884,6 +6884,40 @@ fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
     assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
 }
 
+#[cfg(windows)]
+#[test]
+fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
+    use crate::ui_fullscreen::FullscreenPrimarySuppression;
+
+    for state in [
+        FsOverflowPanelState::Root,
+        FsOverflowPanelState::NavigatorPosition,
+        FsOverflowPanelState::SpreadAdjustment,
+        FsOverflowPanelState::Slideshow,
+        FsOverflowPanelState::MusicNoteColor,
+    ] {
+        for pause in [true, false] {
+            let mut app = setup_app_for_test();
+            app.items = vec![GridItem::Image(app.tmp.path().join("overflow-owner.jpg"))];
+            app.fullscreen_idx = Some(0);
+            app.fs_overflow_panel_state = state;
+            app.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
+
+            if pause {
+                app.reset_detached_pause_foreground_modes(0);
+            } else {
+                app.close_fullscreen();
+            }
+
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert!(
+                !app.fs_primary_suppression.is_active(),
+                "{state:?}, pause={pause}: foreground ownership must end with the panel"
+            );
+        }
+    }
+}
+
 #[test]
 fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
     let _input_guard = crate::key_input::lock_test_input();

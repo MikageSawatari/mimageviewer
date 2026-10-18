@@ -448,3 +448,438 @@ fn overflow_outside_right_drag_can_continue_into_panel() {
         }
     }
 }
+
+fn render_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+    app.frame_counter += 1;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(viewport()),
+            time: Some(app.frame_counter as f64 / 60.0),
+            focused: true,
+            events,
+            ..Default::default()
+        },
+        |ui| app.render_fullscreen_viewport(ui),
+    )
+    .drop_without_applying_deltas();
+}
+
+fn rendered_navigator(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+    let mut app = ready(ctx);
+    app.settings.fullscreen_top_bar_locked = true;
+    app.settings.fullscreen_navigator_visible = true;
+    app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::TopRight;
+    app.settings.fullscreen_navigator_size = 520.0;
+    app.fs_zoom = 2.0;
+    for _ in 0..4 {
+        render_frame(&mut app, ctx, vec![]);
+    }
+    assert!(
+        app.fullscreen_page_layout.single_page().is_some(),
+        "the production page painter must publish its layout"
+    );
+    assert!(navigator_layout(&mut app).content_rect.is_positive());
+    app
+}
+
+fn navigator_layout(app: &mut App) -> FlatNavigatorLayout {
+    let image_rect = app.fullscreen_media_rect(viewport(), 1, false);
+    app.fs_navigator_layout(image_rect).unwrap()
+}
+
+fn drag(
+    app: &mut App,
+    ctx: &egui::Context,
+    button_kind: egui::PointerButton,
+    start: egui::Pos2,
+    end: egui::Pos2,
+) {
+    render_frame(
+        app,
+        ctx,
+        vec![
+            egui::Event::PointerMoved(start),
+            button(start, button_kind, true),
+        ],
+    );
+    render_frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+    render_frame(app, ctx, vec![button(end, button_kind, false)]);
+}
+
+#[test]
+fn overflow_buttons_preempt_real_overlapping_navigator_before_raw_dispatch() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for state in [
+        FsOverflowPanelState::Root,
+        FsOverflowPanelState::Slideshow,
+        FsOverflowPanelState::NavigatorPosition,
+        FsOverflowPanelState::SpreadAdjustment,
+    ] {
+        for button_kind in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+            let ctx = egui::Context::default();
+            let mut app = rendered_navigator(&ctx);
+            app.fs_overflow_panel_state = state;
+            render_frame(&mut app, &ctx, vec![]);
+            let overlap = navigator_layout(&mut app)
+                .content_rect
+                .intersect(fs_overflow_panel_rect(viewport(), state).unwrap())
+                .shrink(6.0);
+            assert!(overlap.width() > 50.0 && overlap.height() > 70.0);
+            let start = overlap.center() - egui::vec2(20.0, 25.0);
+            let end = overlap.center() + egui::vec2(20.0, 25.0);
+            let before = (app.fs_zoom, app.fs_pan);
+            drag(&mut app, &ctx, button_kind, start, end);
+            assert_eq!(
+                (app.fs_zoom, app.fs_pan),
+                before,
+                "front {state:?} {button_kind:?} must not pan or select-zoom the painted navigator"
+            );
+            assert!(!fs_navigator_interaction_active(
+                app.fullscreen_navigator_interaction
+            ));
+            assert_eq!(app.fullscreen_idx, Some(1));
+        }
+    }
+}
+
+#[test]
+fn overflow_leaves_outside_real_navigator_pan_and_selection_zoom_working() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for button_kind in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_navigator(&ctx);
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        render_frame(&mut app, &ctx, vec![]);
+        let layout = navigator_layout(&mut app);
+        let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+        let outside = egui::Rect::from_min_max(
+            layout.content_rect.min,
+            egui::pos2(panel.left(), layout.content_rect.bottom()),
+        )
+        .shrink(2.0);
+        assert!(
+            outside.width() > FS_NAVIGATOR_MIN_SELECTION * 2.0,
+            "must expose real navigator content outside the front panel: {outside:?}"
+        );
+        let start = outside.lerp_inside(egui::vec2(0.2, 0.3));
+        let end = outside.lerp_inside(egui::vec2(0.8, 0.6));
+        let before = (app.fs_zoom, app.fs_pan);
+        drag(&mut app, &ctx, button_kind, start, end);
+        if button_kind == egui::PointerButton::Secondary {
+            assert_ne!(app.fs_zoom, before.0, "outside right selection still zooms");
+        } else {
+            assert_ne!(app.fs_pan, before.1, "outside left drag still pans");
+        }
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Slideshow);
+    }
+}
+
+#[test]
+fn overflow_same_frame_root_close_owns_raw_navigator_click_before_state_changes() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_navigator(&ctx);
+    // Without a reserved top-bar gap, the front close button overlaps navigator canvas,
+    // rather than its header. The 4pt click movement would pan that canvas if leaked.
+    app.settings.fullscreen_top_bar_locked = false;
+    app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+    for _ in 0..4 {
+        render_frame(&mut app, &ctx, vec![]);
+    }
+    let close = ctx
+        .read_response(egui::Id::unique("fs_overflow_panel_close"))
+        .unwrap()
+        .rect
+        .center();
+    assert!(navigator_layout(&mut app).canvas_rect.contains(close));
+    render_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(close)]);
+    let before = (app.fs_zoom, app.fs_pan);
+    let start = close - egui::vec2(2.0, 0.0);
+    let end = close + egui::vec2(2.0, 0.0);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(start),
+            button(start, egui::PointerButton::Primary, true),
+            egui::Event::PointerMoved(end),
+            button(end, egui::PointerButton::Primary, false),
+        ],
+    );
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    assert_eq!((app.fs_zoom, app.fs_pan), before);
+    assert_eq!(app.fullscreen_idx, Some(1));
+}
+
+#[test]
+fn overflow_captured_buttons_preserve_outside_navigator_wheel() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for button_kind in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+        let ctx = egui::Context::default();
+        let mut app = rendered_navigator(&ctx);
+        app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+        render_frame(&mut app, &ctx, vec![]);
+        let layout = navigator_layout(&mut app);
+        let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+        let inside = layout.content_rect.intersect(panel).center();
+        let outside = egui::pos2(
+            (layout.canvas_rect.left() + panel.left()) * 0.5,
+            layout.canvas_rect.center().y,
+        );
+        assert!(!panel.contains(outside) && layout.canvas_rect.contains(outside));
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(inside),
+                button(inside, button_kind, true),
+            ],
+        );
+        let before = (app.fs_zoom, app.fs_pan);
+        let size = app.settings.fullscreen_navigator_size;
+        render_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(outside),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -120.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                },
+            ],
+        );
+        assert_ne!(
+            app.settings.fullscreen_navigator_size, size,
+            "unowned outside wheel must still resize the navigator"
+        );
+        assert_eq!(
+            (app.fs_zoom, app.fs_pan),
+            before,
+            "the captured button must not pan/select or redirect the wheel to image zoom"
+        );
+        render_frame(&mut app, &ctx, vec![button(outside, button_kind, false)]);
+        assert!(!app.fs_primary_suppression.is_active());
+        assert_eq!(app.fs_secondary_press, FullscreenSecondaryPress::Idle);
+    }
+}
+
+#[test]
+fn overflow_secondary_capture_preserves_outside_primary_navigator_pan() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_navigator(&ctx);
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    render_frame(&mut app, &ctx, vec![]);
+    let layout = navigator_layout(&mut app);
+    let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+    let outside = egui::pos2(
+        (layout.canvas_rect.left() + panel.left()) * 0.5,
+        layout.canvas_rect.center().y,
+    );
+    let inside = layout.content_rect.intersect(panel).center();
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(outside),
+            button(outside, egui::PointerButton::Primary, true),
+        ],
+    );
+    assert!(fs_navigator_interaction_active(
+        app.fullscreen_navigator_interaction
+    ));
+    let before = app.fs_pan;
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(inside),
+            button(inside, egui::PointerButton::Secondary, true),
+        ],
+    );
+    assert_ne!(
+        app.fs_pan, before,
+        "the non-owned primary pan still receives pointer movement"
+    );
+    assert!(fs_navigator_interaction_active(
+        app.fullscreen_navigator_interaction
+    ));
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(inside, egui::PointerButton::Secondary, false)],
+    );
+    assert!(fs_navigator_interaction_active(
+        app.fullscreen_navigator_interaction
+    ));
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![button(inside, egui::PointerButton::Primary, false)],
+    );
+    assert!(!fs_navigator_interaction_active(
+        app.fullscreen_navigator_interaction
+    ));
+    assert_eq!(app.fullscreen_idx, Some(1));
+}
+
+#[test]
+fn overflow_primary_stream_keeps_front_ownership_until_physical_terminal() {
+    use FullscreenPrimarySuppressionDecision::Suppress;
+    use FullscreenPrimarySuppressionEvent::{PointerFrame, PointerStreamStarted, TouchFrame};
+    let mut owner = FullscreenPrimarySuppression::OverflowStream;
+    assert_eq!(owner.apply(PointerStreamStarted), Suppress);
+    assert_eq!(owner, FullscreenPrimarySuppression::OverflowStream);
+    for (active, completed, cancelled) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        owner = FullscreenPrimarySuppression::OverflowStream;
+        assert_eq!(
+            owner.apply(TouchFrame {
+                suppresses_current_frame: false,
+                active,
+                completed,
+                cancelled
+            }),
+            Suppress
+        );
+        assert_eq!(
+            owner,
+            if completed || cancelled {
+                FullscreenPrimarySuppression::Idle
+            } else {
+                FullscreenPrimarySuppression::OverflowStream
+            }
+        );
+    }
+    owner = FullscreenPrimarySuppression::OverflowStream;
+    assert_eq!(owner.apply(PointerFrame { released: true }), Suppress);
+    assert_eq!(owner, FullscreenPrimarySuppression::Idle);
+}
+
+#[test]
+fn overflow_release_position_still_routes_wheel_outside_real_navigator() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_navigator(&ctx);
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    render_frame(&mut app, &ctx, vec![]);
+    let layout = navigator_layout(&mut app);
+    let inside = layout
+        .content_rect
+        .intersect(fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap())
+        .center();
+    let outside = egui::pos2(200.0, 600.0);
+    assert!(!layout.panel_rect.contains(outside));
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            egui::Event::PointerMoved(inside),
+            button(inside, egui::PointerButton::Secondary, true),
+        ],
+    );
+    let size = app.settings.fullscreen_navigator_size;
+    // A release carries position even without a separate PointerMoved event.
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            button(outside, egui::PointerButton::Secondary, false),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+            },
+        ],
+    );
+    assert_eq!(
+        app.settings.fullscreen_navigator_size, size,
+        "the captured release's position must move the following wheel outside the navigator"
+    );
+    assert_eq!(app.fs_secondary_press, FullscreenSecondaryPress::Idle);
+}
+
+#[test]
+fn overflow_touch_cancel_without_primary_release_allows_next_outside_navigator_drag() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = rendered_navigator(&ctx);
+    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+    render_frame(&mut app, &ctx, vec![]);
+    let layout = navigator_layout(&mut app);
+    let panel = fs_overflow_panel_rect(viewport(), app.fs_overflow_panel_state).unwrap();
+    let inside = layout.content_rect.intersect(panel).center();
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(inside, egui::TouchPhase::Start),
+            egui::Event::PointerMoved(inside),
+            button(inside, egui::PointerButton::Primary, true),
+        ],
+    );
+    assert_eq!(
+        app.fs_primary_suppression,
+        FullscreenPrimarySuppression::OverflowStream
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(inside, egui::TouchPhase::Cancel),
+            egui::Event::PointerGone,
+        ],
+    );
+    assert!(
+        !app.fs_primary_suppression.is_active(),
+        "egui-winit Cancel has no primary release edge"
+    );
+    let outside = egui::pos2(
+        (layout.canvas_rect.left() + panel.left()) * 0.5,
+        layout.canvas_rect.center().y,
+    );
+    let end = outside + egui::vec2(0.0, 40.0);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(outside, egui::TouchPhase::Start),
+            egui::Event::PointerMoved(outside),
+            button(outside, egui::PointerButton::Primary, true),
+        ],
+    );
+    let before = app.fs_pan;
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(end, egui::TouchPhase::Move),
+            egui::Event::PointerMoved(end),
+        ],
+    );
+    assert_ne!(app.fs_pan, before);
+    render_frame(
+        &mut app,
+        &ctx,
+        vec![
+            touch(end, egui::TouchPhase::End),
+            button(end, egui::PointerButton::Primary, false),
+        ],
+    );
+    assert!(!app.fs_primary_suppression.is_active());
+}

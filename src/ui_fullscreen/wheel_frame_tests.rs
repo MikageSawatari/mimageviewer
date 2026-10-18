@@ -42,6 +42,7 @@ fn collect_actual_merge(
     let idx = app.fullscreen_idx.unwrap();
     let state = app.prepare_fullscreen_state(&ctx, idx, FsPageTurnDecision::normal());
     let mut operation = None;
+    let overflow_pointer_input = app.capture_fs_overflow_pointer_input(&ctx, ui.max_rect());
     let result = app.handle_fs_wheel_and_click_frame(
         ui,
         &ctx,
@@ -56,6 +57,7 @@ fn collect_actual_merge(
         &mut operation,
         suppress_navigation,
         true,
+        overflow_pointer_input,
     );
     (result, operation)
 }
