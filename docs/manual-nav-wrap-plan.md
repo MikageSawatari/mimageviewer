@@ -1,6 +1,6 @@
 # 通常閲覧の手動前後移動ループ (§1.400) 設計
 
-作成: 2026-10-18 (設計 = ClaudeCode Opus 5.5)。状態: 設計案 第2版 (独立レビュー第1回の指摘を反映)。
+作成: 2026-10-18 (設計 = ClaudeCode Opus 5.5)。状態: 設計確定 第3版 (実装前独立レビュー 2 回、§14)。
 バックログ: [next-release-backlog.md §1.400](next-release-backlog.md)。5ch >>585〜587。
 
 関連: [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md)、
@@ -57,12 +57,12 @@
 - 1 枚の横長ページを分割した 2 ステップだけの一覧では、後半の「次」は同じページの前半へ移る
   (同一ページ内の左右移動。既存の `Split` 同一 source 経路で処理し、再読込しない)。
 - **既存の着地規則に従う経路 (本項目では変えない)**: 動画・音声の前後移動とコレクションの
-  前後移動は、非同期に移動先 index を決めて通常の open で着地する。分割ページへ着地するときの
-  側は既存の既定 (`landing_step`: 読み始め側) で、折り返さない通常の「前」(動画→直前の横長
-  画像) と同じ。また本の構成の許可待ち (Checking) を経た通常の別ページ `Split` 着地も、側を
-  保持せず既定側へ着地する。折り返しもこれらと同じ規則に従い、側を保持する仕組みは足さない
-  (後退の折り返しで末尾ページの読み始め側に着く場合がある)。直すなら非折り返しの同じ経路と
-  まとめて別項目で扱う。
+  前後移動は、非同期に移動先 index を決めて通常の open で着地する。また本の構成の許可待ち
+  (Checking) を経た別ページ `Split` 着地も、要求した側を保持しない。これらの経路で分割ページへ
+  着地するときの側は、既存の側の調整 (`ui_fullscreen.rs` の slice reconcile) が決める
+  (直前の側が Left / Right ならそれを保ち、無ければ読み始め側)。折り返さない通常の
+  「前」(動画→直前の横長画像) と同じ規則で、折り返しもこれに従い、側を保持する仕組みは足さない
+  (折り返しで期待と反対の側に着く場合がある)。直すなら非折り返しの同じ経路とまとめて別項目で扱う。
 
 ## 4. 構造: 折り返しは「移動先の解決」で 1 回だけ決める
 
@@ -121,11 +121,25 @@
     `BookTargetPurpose::Next` (forward) / `Previous` (backward) を明示して渡す口
     (`admit_book_page_navigation_with_purpose` 等) を使う。折り返し以外は現行の推定のまま。
     許可待ちの継続探索 (`book_composition_permission` の Hidden skip) は `wrap = false` のまま。
+  - **Hidden skip の分割対応 (既存不具合の同時修正)**: Hidden skip
+    (`book_composition_permission.rs` の `spread_page_nav_for_indices` 結果の match) は `Target` と
+    `Delta` だけを受け、分割表示で返る `Split` を `None` 扱いにして fullscreen を閉じる。
+    折り返さない通常の分割送りでも同じで、折り返しでは「先頭が非表示」で必ず踏む。
+    分割表示 (ステップ列あり) の skip は**source 単位**で進める: `Split(step)` が別 source なら
+    その source を次候補にし、同じ source の反対側なら飛ばして次の source へ進む (非表示 source の
+    残り半分を再採用しない)。探索は nav 列の端で止まる有限探索 (`wrap = false`) のまま。
+    見開き (`Target`) と単ページ (`Delta`) の扱いは変えない。
   - ページめくり barrier 前の先行解決 (`resolved`) も同じ helper と `Wrap` を扱い、
     barrier に渡る移動先が通常経路と一致するようにする。barrier 経由で defer された継続は
     既存の continuation 方針 (演出なしの即時切り替え、理由 `stage1_continuation_instant`、
     `accept_rendition = false`) のまま扱う。`navigation_wrap` の理由は defer されなかった
     通常経路でだけ記録する (barrier 内部は変更しない)。
+    **既存の制約 (本項目では変えない)**: barrier の continuation は slice しか保持せず、
+    flat 採用後の着地は `BookTargetPurpose::Explicit` で許可判定に入る。演出中 (Turning /
+    Completing) に入力した前後移動の移動先が Checking → Hidden になると、折り返しかどうかに
+    関係なく次候補を探さず `RequiredTargetHidden` で終わる。折り返しはこの経路に新しい分岐を
+    足さず、非折り返しの continuation と同じ扱いにする。continuation へ purpose を持たせる修正は
+    barrier を変更中の D3 側 (§5 の契約) で、非折り返しと合わせて扱う。
   - コレクション分岐 (`collection_delta`) は `Wrap { forward }` (別 source のとき) を `±1` として
     渡し、request に `wrap` を載せる (§4.3)。
 - `navigate_native_video_fullscreen`: `Wrap { forward, .. }` は `start_manual_media_navigation`
@@ -192,6 +206,10 @@
     この需要を使う場合だけ、ループ ON の最終表示単位で最初の表示単位を需要に含めてよい
     (含めなくても折り返しは平らな切り替えとして正しく動く。速さだけの差)。
   - 折り返しの ON/OFF は `App::manual_nav_wrap_enabled()` を単一の読み口とする。
+  - barrier の continuation は入力方向 (本の構成の許可判定の `Next` / `Previous`) を保持しない
+    (§4.2 の既存の制約)。D3 が continuation の payload を変えるときに、通常の前後移動と折り返しの
+    両方で入力方向を保持できるようにするのが望ましい (折り返しでは移動先との位置関係から方向を
+    推定してはならない)。
   - 本ブランチは D3 が変更中の nav-lock / sequence / 受信・採用の境界を書き換えない。
     `handle_fs_navigation` には `Wrap` の分岐を追加するだけで、既存分岐の順序と条件は変えない。
 
@@ -269,7 +287,8 @@ mIV Remote の Web UI は端末側 (`crates/remote-web/web/app.js` の `changeIm
   native swap 待ち中の queued steps が設定変更をまたいでも開始時の `wrap` で揃う。
   1 枚の横長画像 (2 step) のコレクションで同一 source の左右移動がコレクション要求にならない。
 - 本の構成: 折り返し先が非表示ページのとき、forward は先頭から後ろへ、backward は末尾から
-  前へ有限に探して着地する (閉じない)。Checking からの再開でも方向が保たれる。
+  前へ有限に探して着地する (閉じない)。Checking からの再開でも方向が保たれる。分割表示
+  (LTR / RTL) でも非表示 source を source 単位で飛ばして着地する (非折り返しの分割送りでも同じ)。
 - 対象集合: 単ページで Audio が混在する順でも折り返し先が現行の前後移動対象と一致する。
   空列・current が一覧外。
 - 入口: touch の PageSide、マウス割り当て、音楽 HUD の前後ボタン、単ページ / 分割のずらし操作。
@@ -285,3 +304,18 @@ mIV Remote の Web UI は端末側 (`crates/remote-web/web/app.js` の `changeIm
 - **キーリピート中は折り返さない**: 状態 (押し直し判定) が増え、ホイールでは定義できない。
   利用者が明示的に ON にする設定なので一律に折り返す。
 - **末尾で先頭の先読み**: §6。
+
+## 14. 実装前の独立レビュー記録
+
+レビュー担当 GPT-6.1 Sol / xhigh (read-only)、Codex session `01a14f72-a63b-7840-9a4b-779ffad0621d`。
+
+- 第 1 回 (e7ec649c6): ACCEPT WITH CHANGES、P2 5 件・P3 2 件。採用: コレクション Loop が現在項目を
+  含む → 手動用 Tail、本の構成の purpose 反転 → 入力方向を明示、continuation の wrap 引き継ぎ、
+  同一 source の左右移動をコレクション分岐に渡さない、列を置き換えない規則、試験追加。
+  既存制約として明記 (解消しない): 非同期経路・許可待ちでの分割側の非保持、媒体 resolver の
+  App 共通 pending。
+- 第 2 回 (5b2ee8f4a): ACCEPT WITH CHANGES、P2 2 件。採用: Hidden skip の分割対応
+  (非折り返しにもある既存不具合を同じ経路で修正)、分割側の説明を実際の reconcile 挙動に訂正。
+  不採用: barrier continuation へ purpose を持たせる変更。非折り返しの continuation にも同じ制約が
+  あり、barrier は D3 (`pageturn-d3`) が変更中のため、§4.2 に既存の制約、§5 に D3 への申し送りとして
+  記録した。レビュー担当は分割側と媒体 pending を既存制約とする判断には反対しないとした。
