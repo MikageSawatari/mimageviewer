@@ -518,6 +518,7 @@ fn navigation_open_waits_for_atomic_unit_then_requalifies_same_unit_survivor() {
             contract: FsPageLoadContract::Sequential,
             purpose: BookTargetPurpose::Next,
             route: BookTargetRoute::FullscreenNavigation,
+            navigation_origin: Vec::new(),
         },
         candidates,
     };
@@ -758,6 +759,7 @@ fn hidden_navigation_keeps_captured_identity_until_projection_order_is_ready() {
             contract: FsPageLoadContract::Sequential,
             purpose: BookTargetPurpose::Next,
             route: BookTargetRoute::FullscreenNavigation,
+            navigation_origin: Vec::new(),
         },
         candidates,
     };
@@ -1095,6 +1097,7 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
                 contract: FsPageLoadContract::Sequential,
                 purpose: BookTargetPurpose::FirstInBook,
                 route: BookTargetRoute::ZipDfs(continuation),
+                navigation_origin: Vec::new(),
             },
             candidates,
         };

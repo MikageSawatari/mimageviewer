@@ -1748,11 +1748,12 @@ impl TopLevelGridView {
         landing: super::ManualMediaNavigationLanding,
         still_only: bool,
         display_unit_step: bool,
+        wrap: bool,
     ) -> bool {
         self.collection_navigation_pending
             .as_mut()
             .is_some_and(|pending| {
-                pending.accumulate_manual(delta, landing, still_only, display_unit_step)
+                pending.accumulate_manual(delta, landing, still_only, display_unit_step, wrap)
             })
     }
 

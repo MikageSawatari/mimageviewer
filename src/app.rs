@@ -93584,28 +93584,68 @@ impl App {
 
     /// メディア窓の手動前後送り。欠損した実ファイルは 1 候補ずつ飛ばし、仮想 entry は
     /// 従来どおり候補に残す。delta の絶対値分だけ有効候補を進める。
+    /// 折り返しも現在項目を除いた有限列にし、欠損候補を飛ばしても一周を超えない。
     pub(crate) fn collect_manual_media_navigation_candidates(
         items: &[GridItem],
         display_order: &[usize],
         current_idx: usize,
         delta: i32,
+        wrap: bool,
     ) -> Vec<MediaNavigationCandidate> {
         let direction = delta.signum();
         if direction == 0 {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        let mut cursor = current_idx;
-        while let Some(idx) =
-            crate::ui_helpers::adjacent_navigable_idx(items, display_order, cursor, direction)
-        {
-            let Some(item) = items.get(idx) else {
-                break;
-            };
-            out.push(Self::media_navigation_candidate(item, idx));
-            cursor = idx;
+        let nav_indices = display_order
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                matches!(
+                    items.get(idx),
+                    Some(GridItem::Image(_))
+                        | Some(GridItem::Video(_))
+                        | Some(GridItem::Audio(_))
+                        | Some(GridItem::ZipImage { .. })
+                        | Some(GridItem::PdfPage { .. })
+                )
+            })
+            .collect::<Vec<_>>();
+        // 一覧外の current は従来の数値隣接 fallback だけを使い、折り返しを追加しない。
+        let wrap = wrap && nav_indices.contains(&current_idx);
+        let first = crate::ui_helpers::adjacent_idx_in_order(&nav_indices, current_idx, direction)
+            .or_else(|| {
+                wrap.then(|| {
+                    if direction > 0 {
+                        nav_indices.first().copied()
+                    } else {
+                        nav_indices.last().copied()
+                    }
+                })
+                .flatten()
+            });
+        let Some(first_pos) =
+            first.and_then(|first| nav_indices.iter().position(|&idx| idx == first))
+        else {
+            return Vec::new();
+        };
+        let mut positions = if direction > 0 {
+            (first_pos..nav_indices.len()).collect::<Vec<_>>()
+        } else {
+            (0..=first_pos).rev().collect::<Vec<_>>()
+        };
+        if wrap {
+            if direction > 0 {
+                positions.extend(0..first_pos);
+            } else {
+                positions.extend((first_pos + 1..nav_indices.len()).rev());
+            }
         }
-        out
+        positions
+            .into_iter()
+            .map(|pos| nav_indices[pos])
+            .take_while(|&idx| idx != current_idx)
+            .map(|idx| Self::media_navigation_candidate(&items[idx], idx))
+            .collect()
     }
 
     pub(crate) fn resolve_media_navigation_candidates(
@@ -93936,10 +93976,11 @@ impl App {
         display_order: &[usize],
         fs_idx: usize,
         delta: i32,
+        wrap: bool,
         source: &'static str,
         landing: ManualMediaNavigationLanding,
     ) {
-        if self.start_collection_manual_navigation(ctx, fs_idx, delta, landing) {
+        if self.start_collection_manual_navigation(ctx, fs_idx, delta, landing, wrap) {
             return;
         }
         let candidates = Self::collect_manual_media_navigation_candidates(
@@ -93947,6 +93988,7 @@ impl App {
             display_order,
             fs_idx,
             delta,
+            wrap,
         );
         self.start_media_navigation_candidate_resolution(
             ctx,
@@ -101013,3 +101055,208 @@ mod specified_scale_contract_tests {
 
 #[cfg(test)]
 mod book_composition_runtime_tests;
+
+#[cfg(test)]
+mod manual_media_nav_wrap_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn manual_nav_wrap_does_not_change_video_audio_or_audio_mode_eof_policy() {
+        use crate::video::VideoContinuousMode;
+        for manual_wrap in [false, true] {
+            for mode in [
+                VideoContinuousMode::Off,
+                VideoContinuousMode::Continuous,
+                VideoContinuousMode::ContinuousLoop,
+            ] {
+                for kind in ["video", "music", "audio_mode"] {
+                    let mut app = setup_app_for_test();
+                    app.items = (0..4)
+                        .map(|idx| {
+                            let path = app.tmp.path().join(format!("eof-{idx}.media"));
+                            if idx == 2 {
+                                GridItem::Image(path)
+                            } else {
+                                let audio = if kind == "music" { idx != 1 } else { idx == 1 };
+                                if audio {
+                                    GridItem::Audio(path)
+                                } else {
+                                    GridItem::Video(path)
+                                }
+                            }
+                        })
+                        .collect();
+                    app.visible_indices = vec![0, 1, 2, 3];
+                    app.fullscreen_idx = Some(3);
+                    app.settings.fullscreen_manual_nav_wrap = manual_wrap;
+                    app.video_continuous_mode = mode;
+                    if kind == "audio_mode" {
+                        app.video_audio_mode = Some(3);
+                    }
+                    let path = match &app.items[3] {
+                        GridItem::Audio(path) | GridItem::Video(path) => path.clone(),
+                        _ => unreachable!(),
+                    };
+                    let player =
+                        crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+                    player.mark_eof_for_test(30.0);
+                    let serial = player.current_seek_serial();
+                    app.fs_cache.insert(
+                        3,
+                        FsCacheEntry::Video {
+                            player: Box::new(player),
+                            load_seq: 0,
+                        },
+                    );
+                    let ctx = egui::Context::default();
+                    let advance = |app: &mut App| match kind {
+                        "video" => app.handle_video_continuous_eof(&ctx, 3, serial),
+                        "music" => app.handle_music_continuous_eof(&ctx, 3, serial),
+                        "audio_mode" => app.handle_video_audio_mode_continuous_eof(&ctx, 3, serial),
+                        _ => unreachable!(),
+                    };
+                    if mode == VideoContinuousMode::Off {
+                        advance(&mut app);
+                        assert!(app.media_navigation_pending.is_none());
+                        assert!(app.media_navigation_resolver.is_none());
+                        assert_eq!(app.video_continuous_last_eof, None);
+                    } else {
+                        let (candidates, count, source) =
+                            app.capture_manual_media_request_for_test(advance);
+                        assert_eq!(
+                            candidates,
+                            if mode == VideoContinuousMode::ContinuousLoop {
+                                vec![0, 3]
+                            } else {
+                                vec![]
+                            },
+                            "manual_wrap={manual_wrap} mode={mode:?} kind={kind}"
+                        );
+                        assert_eq!(count, 1);
+                        assert_eq!(
+                            source,
+                            match kind {
+                                "video" => "video_continuous_eof",
+                                "music" => "music_continuous_eof",
+                                "audio_mode" => "video_audio_mode_continuous_eof",
+                                _ => unreachable!(),
+                            }
+                        );
+                        assert_eq!(app.video_continuous_last_eof, Some((3, serial)));
+                    }
+                    assert_eq!(app.fullscreen_idx, Some(3));
+                }
+            }
+        }
+    }
+
+    fn media_items() -> Vec<GridItem> {
+        vec![
+            GridItem::Image(PathBuf::from("first.jpg")),
+            GridItem::Audio(PathBuf::from("middle.mp3")),
+            GridItem::Video(PathBuf::from("last.mp4")),
+        ]
+    }
+
+    fn indices(
+        items: &[GridItem],
+        order: &[usize],
+        current: usize,
+        delta: i32,
+        wrap: bool,
+    ) -> Vec<usize> {
+        App::collect_manual_media_navigation_candidates(items, order, current, delta, wrap)
+            .into_iter()
+            .map(|candidate| candidate.idx)
+            .collect()
+    }
+
+    #[test]
+    fn manual_media_nav_wrap_rotates_reader_order_once_and_excludes_current() {
+        let items = media_items();
+        let order = [2, 0, 1];
+        assert_eq!(indices(&items, &order, 2, 1, true), [0, 1]);
+        assert_eq!(indices(&items, &order, 2, -1, true), [1, 0]);
+        assert_eq!(indices(&items, &order, 0, 1, true), [1, 2]);
+        assert_eq!(indices(&items, &order, 0, -1, true), [2, 1]);
+        assert_eq!(indices(&items, &order, 1, 1, true), [2, 0]);
+        assert_eq!(indices(&items, &order, 1, -1, true), [0, 2]);
+        assert_eq!(indices(&items, &[0, 1, 2], 2, 1, true), [0, 1]);
+    }
+
+    #[test]
+    fn manual_media_nav_wrap_off_preserves_existing_candidate_walk() {
+        let mut items = media_items();
+        items.push(GridItem::ZipImage {
+            zip_path: PathBuf::from("book.zip"),
+            entry_name: "page.jpg".to_string(),
+        });
+        for order in [&[2, 99, 0, 3, 1][..], &[2, 0][..], &[][..]] {
+            for current in 0..5 {
+                for delta in [-3_i32, -1, 0, 1, 3] {
+                    let mut expected = Vec::new();
+                    let mut cursor = current;
+                    while let Some(next) = crate::ui_helpers::adjacent_navigable_idx(
+                        &items,
+                        order,
+                        cursor,
+                        delta.signum(),
+                    ) {
+                        expected.push(next);
+                        cursor = next;
+                    }
+                    assert_eq!(indices(&items, order, current, delta, false), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_media_nav_wrap_skips_missing_files_across_both_boundaries() {
+        let items = media_items();
+        let order = [0, 1, 2];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        for (delta, missing, target) in [(1, 2, 0), (-1, 0, 2)] {
+            let candidates =
+                App::collect_manual_media_navigation_candidates(&items, &order, 1, delta, true);
+            let existing_path = candidates[1].path.clone().unwrap();
+            let result =
+                App::resolve_media_navigation_candidates(&candidates, 1, &cancel, |path| {
+                    path == existing_path
+                });
+            assert_eq!(result.target_idx, Some(target));
+            assert_eq!(result.missing.len(), 1);
+            assert_eq!(result.missing[0].0, missing);
+        }
+    }
+
+    #[test]
+    fn manual_media_nav_wrap_single_item_and_all_missing_never_select_current() {
+        let items = media_items();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        for delta in [-1, 1] {
+            assert!(indices(&items, &[2], 2, delta, true).is_empty());
+            let candidates =
+                App::collect_manual_media_navigation_candidates(&items, &[0, 1, 2], 1, delta, true);
+            let result =
+                App::resolve_media_navigation_candidates(&candidates, 1, &cancel, |_| false);
+            assert_eq!(result.target_idx, None);
+            assert_eq!(result.missing.len(), 2);
+            assert!(result.missing.iter().all(|(idx, _)| *idx != 1));
+        }
+    }
+
+    #[test]
+    fn manual_media_nav_wrap_does_not_add_wrap_for_current_outside_order() {
+        let items = media_items();
+        for delta in [-1, 0, 1] {
+            assert_eq!(
+                indices(&items, &[2, 0], 1, delta, true),
+                indices(&items, &[2, 0], 1, delta, false),
+            );
+            assert!(indices(&items, &[], 1, delta, true).is_empty());
+        }
+        assert!(indices(&items, &[0, 1], 2, 1, true).is_empty());
+    }
+}

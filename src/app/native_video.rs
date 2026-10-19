@@ -14909,6 +14909,7 @@ impl App {
                 fs_idx,
                 base_delta,
                 crate::app::ManualMediaNavigationLanding::NativeVideo,
+                self.manual_nav_wrap_enabled(),
             ) {
                 return;
             }
@@ -14937,23 +14938,30 @@ impl App {
             fs_idx,
             base_delta,
             crate::app::ManualMediaNavigationLanding::NativeVideo,
+            self.manual_nav_wrap_enabled(),
         ) {
             return;
         }
         let display_order = self.current_reader_order().to_vec();
         let page_nav = self.spread_page_nav(base_delta);
-        let nav_delta = match page_nav {
+        let (nav_delta, wrap) = match page_nav {
             crate::ui_fullscreen::FsPageNav::None => return,
-            crate::ui_fullscreen::FsPageNav::Delta(delta) => delta,
-            crate::ui_fullscreen::FsPageNav::Target(target) => {
+            crate::ui_fullscreen::FsPageNav::Delta(delta) => {
+                (delta, self.manual_nav_wrap_enabled())
+            }
+            crate::ui_fullscreen::FsPageNav::Wrap(target) => {
+                (if target.forward { 1 } else { -1 }, true)
+            }
+            crate::ui_fullscreen::FsPageNav::Target(target) => (
                 crate::ui_fullscreen::navigable_delta_between(
                     &self.items,
                     &display_order,
                     fs_idx,
                     target,
                 )
-                .unwrap_or(base_delta)
-            }
+                .unwrap_or(base_delta),
+                self.manual_nav_wrap_enabled(),
+            ),
             crate::ui_fullscreen::FsPageNav::Boundary { at_end } => {
                 self.show_native_video_boundary_toast(ctx, at_end);
                 return;
@@ -14963,13 +14971,16 @@ impl App {
             crate::ui_fullscreen::FsPageNav::Split(step) if step.source_idx == fs_idx => return,
             crate::ui_fullscreen::FsPageNav::Split(step) => {
                 // 左右は着地側が決めるので、ここでは元ページまでの距離だけ見る。
-                crate::ui_fullscreen::navigable_delta_between(
-                    &self.items,
-                    &display_order,
-                    fs_idx,
-                    step.source_idx,
+                (
+                    crate::ui_fullscreen::navigable_delta_between(
+                        &self.items,
+                        &display_order,
+                        fs_idx,
+                        step.source_idx,
+                    )
+                    .unwrap_or(base_delta),
+                    self.manual_nav_wrap_enabled(),
                 )
-                .unwrap_or(base_delta)
             }
         };
         self.start_manual_media_navigation(
@@ -14977,6 +14988,7 @@ impl App {
             &display_order,
             fs_idx,
             nav_delta,
+            wrap,
             "native_media_window_manual",
             crate::app::ManualMediaNavigationLanding::NativeVideo,
         );
@@ -16052,6 +16064,80 @@ impl App {
 }
 
 #[cfg(all(test, windows))]
+mod manual_nav_wrap_native_media_tests {
+    use super::*;
+    use crate::ui_fullscreen::page_turn_submission_tests::ready_app;
+
+    #[test]
+    fn manual_nav_wrap_native_media_wrap_uses_input_direction_and_one_required_match() {
+        for forward in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, crate::settings::SpreadMode::Ltr);
+            app.items = (0..4)
+                .map(|idx| GridItem::Video(app.tmp.path().join(format!("video-{idx}.mp4"))))
+                .collect();
+            app.settings.fullscreen_manual_nav_wrap = true;
+            let current = if forward { 3 } else { 0 };
+            app.fullscreen_idx = Some(current);
+            let delta = if forward { 3 } else { -3 };
+            assert!(
+                matches!(app.spread_page_nav(delta), crate::ui_fullscreen::FsPageNav::Wrap(target) if target.forward == forward)
+            );
+            let (candidates, count, source) = app.capture_manual_media_request_for_test(|app| {
+                app.navigate_native_video_fullscreen(&ctx, current, delta);
+            });
+            assert_eq!(
+                candidates,
+                if forward {
+                    vec![0, 1, 2]
+                } else {
+                    vec![3, 2, 1]
+                }
+            );
+            assert_eq!(
+                count, 1,
+                "Wrap is one input-directed step, not the numeric distance across the list"
+            );
+            assert_eq!(source, "native_media_window_manual");
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_native_media_delta_uses_the_setting() {
+        for wrap in [false, true] {
+            for forward in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = ready_app(&ctx, crate::settings::SpreadMode::Single);
+                app.items = (0..4)
+                    .map(|idx| GridItem::Video(app.tmp.path().join(format!("video-{idx}.mp4"))))
+                    .collect();
+                app.settings.fullscreen_manual_nav_wrap = wrap;
+                let current = if forward { 3 } else { 0 };
+                app.fullscreen_idx = Some(current);
+                let delta = if forward { 1 } else { -1 };
+                assert!(matches!(
+                    app.spread_page_nav(delta),
+                    crate::ui_fullscreen::FsPageNav::Delta(_)
+                ));
+                let (candidates, count, _) = app.capture_manual_media_request_for_test(|app| {
+                    app.navigate_native_video_fullscreen(&ctx, current, delta);
+                });
+                let expected = if !wrap {
+                    vec![]
+                } else if forward {
+                    vec![0, 1, 2]
+                } else {
+                    vec![3, 2, 1]
+                };
+                assert_eq!(candidates, expected);
+                assert_eq!(count, 1);
+                assert!(!candidates.contains(&current));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
 mod rating_terminal_close_tests {
     use super::*;
     use crate::undo_stack::{RatingChange, TagChange, UndoEntry};
@@ -16375,6 +16461,51 @@ mod native_video_display_mode_toggle_tests {
 #[cfg(all(test, windows))]
 mod configurable_video_seek_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn manual_nav_wrap_does_not_change_native_or_music_seek_targets() {
+        for wrap in [false, true] {
+            let (mut app, idx) = setup_seek_app();
+            app.settings.fullscreen_manual_nav_wrap = wrap;
+            app.settings.video_loop_mode = crate::settings::VideoLoopMode::Off;
+            let ctx = egui::Context::default();
+            for (route, target) in [
+                ("native_bar", 5.0),
+                ("native_start", 0.0),
+                ("native_key", 83.0),
+                ("music_bar", 5.0),
+                ("music_relative", 117.0),
+                ("music_start", 0.0),
+            ] {
+                reset_seek_player(&mut app, idx);
+                match route {
+                    "native_bar" => app.handle_native_video_seek_command(&ctx, idx, 5.0),
+                    "native_start" => app.handle_native_video_seek_to_start_command(&ctx, idx),
+                    "native_key" => {
+                        assert!(matches!(
+                            app.dispatch_native_video_key_event(
+                                &ctx,
+                                idx,
+                                native_key(0x7c, false, false)
+                            ),
+                            NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackMedium)
+                        ));
+                    }
+                    "music_bar" => app.music_seek_to(idx, 5.0),
+                    "music_relative" => app.music_seek_relative(idx, 17.0),
+                    "music_start" => app.music_seek_start(idx),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    player_seek_base(&app, idx),
+                    target,
+                    "wrap={wrap} route={route}"
+                );
+                assert_eq!(app.fullscreen_idx, Some(idx));
+                assert!(app.media_navigation_pending.is_none());
+            }
+        }
+    }
 
     #[test]
     fn native_seek_start_window_event_works_without_egui_viewport_focus() {
