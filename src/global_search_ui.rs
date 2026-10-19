@@ -45,8 +45,10 @@ pub(crate) use everything::SearchOpenOrigin;
 use everything::{
     EverythingPosition, SearchAccepted, SearchProducer, SearchProjection, SearchSource,
 };
+pub(crate) use everything::{EverythingSearchEntryAvailability, everything_search_menu_button};
 pub use everything::{
-    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_everything_progress_snapshot_fixture,
+    draw_everything_search_disabled_menu_snapshot_fixture, draw_everything_search_snapshot_fixture,
 };
 
 // -----------------------------------------------------------------------

@@ -45,6 +45,9 @@ impl App {
         // This also ages a root PendingFocus claim on every pass, including
         // passes that return before the normal keyboard handler.
         let _keyboard_owner = self.keyboard_owner_for_pass(ctx);
+        // Explain Main-owned refusals before later dispatch. Fullscreen owns
+        // its input even when embedded in ROOT; never claim a viewer key here.
+        self.notify_everything_search_shortcut_refusal(ctx);
     }
 
     #[cfg(all(windows, feature = "test-script"))]
@@ -2108,5 +2111,42 @@ impl App {
     /// Must run even after update_frame returns, after this pass's modal/input gate.
     pub(super) fn post_render_sidecar_restore(&mut self, ctx: &egui::Context) {
         self.poll_sidecar_restore(ctx);
+    }
+}
+
+#[cfg(test)]
+mod everything_entry_tests {
+    use super::*;
+
+    #[test]
+    fn everything_refusal_runs_at_main_root_input_before_later_dispatch() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::R,
+                physical_key: Some(egui::Key::R),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        });
+        // Use the real owner snapshot: a linked viewer still allows Main input,
+        // although Everything's unchanged functional rule rejects that entry.
+        app.input_update_begin(&ctx);
+        assert!(app.fs_feedback_toast.is_some());
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(ActionSurface::MainWindow)
+        );
+        assert!(!app.global_search.active);
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
     }
 }

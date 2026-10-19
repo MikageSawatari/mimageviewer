@@ -7576,7 +7576,7 @@ impl App {
                                         }
                                         MenuCommandId::GlobalEverythingSearch => {
                                             let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
-                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                            if crate::global_search_ui::everything_search_menu_button(ui, &label, self.everything_search_entry_availability()).clicked() {
                                                 self.open_everything_search();
                                                 ui.close();
                                             }
@@ -7657,7 +7657,7 @@ impl App {
                                         }
                                         MenuCommandId::GlobalEverythingSearch => {
                                             let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
-                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                            if crate::global_search_ui::everything_search_menu_button(ui, &label, self.everything_search_entry_availability()).clicked() {
                                                 self.open_everything_search();
                                                 ui.close();
                                             }

@@ -4,6 +4,12 @@ v0.7.0 で導入した `egui_kittest` ベースの UI 回帰テストの運用�
 
 ## 目的
 
+Everything 検索の無効理由（§1.386）は `everything_search_disabled_menu_hover_light` /
+`everything_search_disabled_menu_hover_dark` の2枚で保持する。製品と共通の無効buttonを実際にhoverし、
+理由本文・disabled状態・メイン最小幅640pt内の収まりを検査する。2枚は計39,680 bytesで目視確認済み。
+最初の480pt fixtureはtooltip本文が右へ16ptはみ出して失敗したため、`lib.rs::MIN_INNER_SIZE` の
+初期／保存値と対話resizeに共通の下限640ptへ合わせた。製品の可否やtooltip helperの仕様は変更しない。
+
 egui の描画結果を PNG スナップショットとして保存し、意図しない見た目の変化を
 `cargo test` の段階で検出する。「ダイアログの色が変わった」「ラベルが折り返して
 レイアウトが崩れた」「テーマ切替で文字が読めない配色になった」などを早期にキャッチする。

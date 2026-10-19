@@ -5,9 +5,43 @@ mod shortcut;
 pub(super) use metadata::prepare as prepare_everything_metadata;
 pub(super) use metadata::{SearchMetadataInstall, SearchMetadataResources};
 mod ui;
+pub use ui::draw_everything_search_disabled_menu_snapshot_fixture;
+pub(crate) use ui::everything_search_menu_button;
 pub use ui::{draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture};
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// A fresh projection of the existing entry rules, not stored viewer state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EverythingSearchEntryAvailability {
+    Available,
+    ViewerContext,
+    LinkedViewer,
+    MainViewer,
+    OtherOperation,
+    RemoteControl,
+}
+
+impl EverythingSearchEntryAvailability {
+    pub(crate) fn is_allowed(self) -> bool {
+        self.reason_text().is_none()
+    }
+
+    pub(crate) fn reason_text(self) -> Option<&'static str> {
+        match self {
+            Self::Available => None,
+            Self::ViewerContext => Some("メインウィンドウの一覧から検索してください"),
+            Self::LinkedViewer => Some(
+                "連動した別ウィンドウで閲覧している間は使えません。表示を閉じてから検索してください",
+            ),
+            Self::MainViewer => Some(
+                "メインウィンドウで画像・動画などを表示している間は使えません。表示を閉じてから検索してください",
+            ),
+            Self::OtherOperation => Some("別の操作や準備が終わってから検索してください"),
+            Self::RemoteControl => Some("mIV Remote で操作中のため検索できません"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchSource {
@@ -176,9 +210,7 @@ impl App {
             }
     }
     pub(crate) fn everything_search_entry_allowed(&self) -> bool {
-        self.everything_main_grid_available()
-            && !self.common_modal_dialog_open()
-            && !self.remote_session_blocks_local_control()
+        self.everything_search_entry_availability().is_allowed()
     }
 
     pub(crate) fn open_everything_search(&mut self) {

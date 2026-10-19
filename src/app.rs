@@ -22694,15 +22694,33 @@ impl App {
         self.modal_dialog_block_reason().is_some()
     }
 
-    pub(crate) fn everything_main_grid_available(&self) -> bool {
-        if !self.main_folder_history_available() || self.fullscreen_idx.is_some() {
-            return false;
+    pub(crate) fn everything_search_entry_availability(
+        &self,
+    ) -> crate::global_search_ui::EverythingSearchEntryAvailability {
+        use crate::global_search_ui::EverythingSearchEntryAvailability as Entry;
+        // Preserve the former main-grid/modal/Remote conjunction exactly.
+        if !self.main_folder_history_available() {
+            return Entry::ViewerContext;
+        }
+        if self.fullscreen_idx.is_some() {
+            return if self.current_viewer_session_is_detached_or_switching() {
+                Entry::LinkedViewer
+            } else {
+                Entry::MainViewer
+            };
         }
         #[cfg(windows)]
         if self.native_video_fullscreen_active_for_main_backdrop() {
-            return false;
+            return Entry::MainViewer;
         }
-        true
+        // Remote is also in the common modal predicate; name it before the catch-all.
+        if self.remote_session_blocks_local_control() {
+            return Entry::RemoteControl;
+        }
+        if self.common_modal_dialog_open() {
+            return Entry::OtherOperation;
+        }
+        Entry::Available
     }
 
     pub(crate) fn finish_everything_edit_boundary(&mut self) {

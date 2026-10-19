@@ -25,6 +25,7 @@
 //! - [egui_kittest docs](https://docs.rs/egui_kittest/)
 //! - mimageviewer 側のポリシー: [docs/ui-snapshot-policy.md](../docs/ui-snapshot-policy.md)
 
+use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[path = "support/ui_harness.rs"]
@@ -92,6 +93,54 @@ fn everything_search_bar_light() {
         "everything_search_bar_light",
         mimageviewer::os_theme::ResolvedTheme::Light,
         egui::vec2(720.0, 240.0),
+    );
+}
+
+#[test]
+fn everything_search_disabled_menu_hover_light() {
+    everything_search_disabled_menu_hover_snapshot(
+        "everything_search_disabled_menu_hover_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn everything_search_disabled_menu_hover_dark() {
+    everything_search_disabled_menu_hover_snapshot(
+        "everything_search_disabled_menu_hover_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+fn everything_search_disabled_menu_hover_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        // The main window clamps both saved/initial and interactive widths to
+        // 640 points (lib.rs::MIN_INNER_SIZE). Exercise that supported minimum.
+        egui::vec2(640.0, 180.0),
+        |ui| {
+            ui.ctx()
+                .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(ui);
+        },
+        |harness| {
+            let button = harness.get_by_label("Everything ファイル名検索…  Ctrl+R");
+            assert!(button.accesskit_node().is_disabled());
+            button.hover();
+            harness.run();
+            let reason = harness.get_by_label("連動した別ウィンドウで閲覧している間は使えません。表示を閉じてから検索してください");
+            assert!(
+                harness.ctx.content_rect().contains_rect(reason.rect()),
+                "viewport={:?}, reason={:?}",
+                harness.ctx.content_rect(),
+                reason.rect()
+            );
+        },
     );
 }
 
