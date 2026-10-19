@@ -1169,15 +1169,7 @@ impl App {
                 self.finish_converted_archive_list_open(&src, restore_intent);
             }
             if let Some(deferred) = deferred {
-                let reason = self.reopen_fullscreen_after_folder_nav_load(
-                    ctx,
-                    deferred.restore_video_tile,
-                    deferred.reopen.resume_slideshow,
-                    deferred.reopen.history_trigger,
-                );
-                if reason == "enumerate_defer" {
-                    ctx.request_repaint();
-                }
+                self.resume_archive_convert_viewer_after_load(ctx, deferred);
             }
             return;
         }
@@ -1436,15 +1428,7 @@ impl App {
                     self.update_favsearch_address();
                 }
                 if let Some(deferred) = deferred_fullscreen {
-                    let reason = self.reopen_fullscreen_after_folder_nav_load(
-                        ctx,
-                        deferred.restore_video_tile,
-                        deferred.reopen.resume_slideshow,
-                        deferred.reopen.history_trigger,
-                    );
-                    if reason == "enumerate_defer" {
-                        ctx.request_repaint();
-                    }
+                    self.resume_archive_convert_viewer_after_load(ctx, deferred);
                 }
                 return;
             }

@@ -1282,7 +1282,14 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
 #[test]
 fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completion() {
     for projection in [true, false] {
-        for escape in [true, false] {
+        for close in [
+            "escape",
+            "ui_close",
+            "backend_fullscreen",
+            "backend_detached",
+            "context_retire",
+        ] {
+            let escape = close == "escape";
             let mut env = setup_app();
             let root = env.tmp.path().join("cancelled-entry.pdf");
             let data = env.tmp.path().join("cancelled-entry-data");
@@ -1341,25 +1348,45 @@ fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completi
                     .push(egui::ViewportEvent::Close);
             }
             let ctx = egui::Context::default();
-            ctx.run_pass(input, |ctx| {
-                ctx.root_ui(|ui| env.render_fullscreen_viewport(ui));
-                assert!(!env.book_deferred_open_wait_active());
-                assert!(env.whats_new_visible());
-                assert_eq!(env.modal_dialog_block_reason(), Some("whats_new"));
-                if escape {
-                    assert!(!env.dialog_escape_pressed(ctx));
-                }
-            })
-            .drop_without_applying_deltas();
+            if close.starts_with("backend_") {
+                super::tests::startup_notices::close_waiting_viewer_through_backend(
+                    &mut env,
+                    &ctx,
+                    close == "backend_detached",
+                    false,
+                );
+            } else if close == "context_retire" {
+                env.stash_mounted_as_active_for_test(1236);
+                env.remove_active_context_for_test();
+            } else {
+                ctx.run_pass(input, |ctx| {
+                    ctx.root_ui(|ui| env.render_fullscreen_viewport(ui));
+                    assert!(!env.book_deferred_open_wait_active());
+                    assert!(env.whats_new_visible());
+                    assert_eq!(env.modal_dialog_block_reason(), Some("whats_new"));
+                    if escape {
+                        assert!(!env.dialog_escape_pressed(ctx));
+                    }
+                })
+                .drop_without_applying_deltas();
+            }
+            assert!(
+                !env.book_deferred_open_wait_active(),
+                "{projection} {close}"
+            );
+            assert!(env.whats_new_visible(), "{projection} {close}");
 
             // Projection adoption still completes for the list. A retired open must
             // not be carried into its new generation. Permission replies instead
             // lose their original receiver when the qualified open retires.
             if let Some(prepared) = prepared {
-                late_projection
-                    .send(prepared.recv_timeout(WAIT).unwrap())
-                    .unwrap();
-                adopt(&mut env, &service, &scope);
+                let delivered = late_projection.send(prepared.recv_timeout(WAIT).unwrap());
+                if matches!(close, "backend_detached" | "context_retire") {
+                    assert!(delivered.is_err(), "retired context must drop its receiver");
+                } else {
+                    delivered.unwrap();
+                    adopt(&mut env, &service, &scope);
+                }
             }
             barrier(&service, &scope);
             env.poll_book_composition_read(&ctx);

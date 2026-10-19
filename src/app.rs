@@ -78006,6 +78006,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> Result<(), LocalViewerCloseFailure> {
+        self.finish_fullscreen_navigation_for_true_close();
         // 守る不変条件は「この呼び出しを抜けたとき、未実行の effect が残っていない」。
         // 「遷移中なら」で条件を付けない — `close_fullscreen` が既に `TerminalClose` を
         // 出していると state は `Stable` なのに effect だけが積まれた状態になり、

@@ -191,6 +191,19 @@ impl Clone for ViewerPresentationPermission {
         }
     }
 }
+impl ViewerPresentationPermission {
+    pub(super) fn retire_deferred_open(&mut self) {
+        if matches!(&self.open, OpenPermission::AwaitingProjection { .. })
+            || matches!(&self.open,
+                OpenPermission::Checking { intent, .. }
+                    | OpenPermission::Ready { intent, .. }
+                    | OpenPermission::Resuming { intent, .. }
+                    if matches!(intent.route, BookTargetRoute::DeferredBook(_)))
+        {
+            self.open = OpenPermission::Idle;
+        }
+    }
+}
 impl std::fmt::Debug for ViewerPresentationPermission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ViewerPresentationPermission")
@@ -408,17 +421,7 @@ impl App {
     }
 
     pub(crate) fn retire_book_deferred_open(&mut self) {
-        if matches!(
-            &self.book_composition_permission.open,
-            OpenPermission::AwaitingProjection { .. }
-        ) || matches!(&self.book_composition_permission.open,
-            OpenPermission::Checking { intent, .. }
-                | OpenPermission::Ready { intent, .. }
-                | OpenPermission::Resuming { intent, .. }
-                if matches!(intent.route, BookTargetRoute::DeferredBook(_))
-        ) {
-            self.book_composition_permission.open = OpenPermission::Idle;
-        }
+        self.book_composition_permission.retire_deferred_open();
     }
 
     /// Row replacement retires old presentation proofs but carries the source's

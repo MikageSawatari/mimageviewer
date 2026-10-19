@@ -38,6 +38,55 @@ fn deferred_navigation_reopen() -> DeferredFsReopen {
     }
 }
 
+#[cfg(windows)]
+pub(in crate::app) fn close_waiting_viewer_through_backend(
+    app: &mut App,
+    ctx: &egui::Context,
+    detached: bool,
+    mounted: bool,
+) {
+    app.fs_viewport_shown = true;
+    app.fs_viewport_presentation = Some(if detached {
+        ViewerPresentation::DetachedWindow
+    } else {
+        ViewerPresentation::Fullscreen
+    });
+    let viewport_id = if detached {
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.stash_mounted_as_active_for_test(1236);
+        // Install the real runtime/lease as well as the at-rest bundle binding.
+        app.begin_active_detached_session(1236, DetachedSource::Image);
+        App::detached_image_window_viewport_id(1236)
+    } else {
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.fullscreen_viewport_id()
+    };
+    ctx.set_embed_viewports(false);
+    ctx.run_ui(Default::default(), |ui| {
+        ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+        if detached {
+            app.capture_detached_viewport_registration(ui.ctx(), 1236);
+        } else {
+            app.fullscreen_viewport_binding =
+                viewport_retirement::ViewportCommandBinding::capture(ui.ctx(), viewport_id);
+        }
+    })
+    .drop_without_applying_deltas();
+    assert!(ctx.viewport_registration(viewport_id).is_some());
+    let accept = |app: &mut App| {
+        assert!(matches!(
+            eframe::App::on_viewport_close_requested(app, ctx, viewport_id),
+            eframe::ViewportCloseResponse::RetirementTransferred
+        ));
+    };
+    if mounted {
+        app.with_active_viewer_context(accept)
+            .expect("mounted detached close");
+    } else {
+        accept(app);
+    }
+}
+
 fn assert_startup_notices_deferred(app: &mut App) {
     assert!(!app.whats_new_visible());
     assert!(!app.common_modal_dialog_open());
@@ -143,7 +192,17 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
         ArchiveConvertProgressShared, ArchiveConvertState, ArchiveScanOutcome,
     };
     for direct in [false, true] {
-        for escape in [true, false] {
+        for close in [
+            "escape",
+            "ui_close",
+            "backend_fullscreen",
+            "backend_detached",
+            "backend_detached_mounted",
+            "context_retire",
+            "retired_owner_at_completion",
+            "internal_reopen_then_backend_fullscreen",
+        ] {
+            let escape = close == "escape";
             let mut app = setup_app();
             request_whats_new(&mut app);
             let source = app.tmp.path().join("source.7z");
@@ -194,6 +253,12 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
                 false,
                 HistoryTrigger::UserChosen
             ));
+            let original_reopen = app
+                .archive_convert
+                .as_ref()
+                .unwrap()
+                .deferred_fullscreen
+                .clone();
             if direct {
                 // Suppressed scanning is not modal. A sibling viewer may close while
                 // main's archive request is still pending; that is not its cancellation.
@@ -235,20 +300,60 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
                     .push(egui::ViewportEvent::Close);
             }
             let ctx = egui::Context::default();
-            ctx.run_pass(input, |ctx| {
-                ctx.root_ui(|ui| app.render_fullscreen_viewport(ui));
-                assert!(!app.archive_convert_deferred_fullscreen_active());
-                assert!(app.whats_new_visible());
-                if escape {
-                    assert!(!app.dialog_escape_pressed(ctx));
-                    app.show_whats_new_dialog(ctx);
-                    assert!(
-                        app.show_whats_new,
-                        "viewer Escape must not acknowledge the notice"
-                    );
-                }
-            })
-            .drop_without_applying_deltas();
+            if close == "internal_reopen_then_backend_fullscreen" {
+                let owner = app.projected_viewer_context_id();
+                app.close_fullscreen_for_folder_nav_reopen();
+                assert!(app.archive_convert_deferred_fullscreen_active());
+                assert_eq!(
+                    app.archive_convert
+                        .as_ref()
+                        .unwrap()
+                        .deferred_fullscreen
+                        .as_ref()
+                        .unwrap()
+                        .owner_context,
+                    owner
+                );
+                assert!(!app.whats_new_visible());
+            }
+            if close.starts_with("backend_") || close.starts_with("internal_reopen_") {
+                close_waiting_viewer_through_backend(
+                    &mut app,
+                    &ctx,
+                    close.starts_with("backend_detached"),
+                    close == "backend_detached_mounted",
+                );
+            } else if matches!(close, "context_retire" | "retired_owner_at_completion") {
+                let retired = app.stash_mounted_as_active_for_test(1236);
+                // Retirement must not clear the currently mounted sibling's holdover.
+                app.fs_nav_locked_gen = Some(app.items_generation);
+                app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+                app.retire_context(retired, "notice_test_source_retired", |_| ())
+                    .unwrap();
+                assert!(app.fs_nav_is_locked());
+                assert!(app.fs_holdover_tex.is_some());
+                app.release_fs_nav_lock();
+            } else {
+                ctx.run_pass(input, |ctx| {
+                    ctx.root_ui(|ui| app.render_fullscreen_viewport(ui));
+                    assert!(!app.archive_convert_deferred_fullscreen_active());
+                    assert!(app.whats_new_visible());
+                    if escape {
+                        assert!(!app.dialog_escape_pressed(ctx));
+                        app.show_whats_new_dialog(ctx);
+                        assert!(
+                            app.show_whats_new,
+                            "viewer Escape must not acknowledge the notice"
+                        );
+                    }
+                })
+                .drop_without_applying_deltas();
+            }
+            assert!(
+                !app.archive_convert_deferred_fullscreen_active(),
+                "{direct} {close}"
+            );
+            assert!(app.whats_new_visible(), "{direct} {close}");
             assert!(
                 !cancel.load(Ordering::Relaxed),
                 "closing the viewer must keep conversion running"
@@ -256,6 +361,12 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
             assert!(app.archive_convert.is_some());
             assert!(app.fs_holdover_tex.is_none());
             assert!(!app.fs_nav_is_locked());
+
+            if close == "retired_owner_at_completion" {
+                // Exercise completion's identity check independently of eager retirement:
+                // even a stale reservation carrying the old identity cannot authorize open.
+                app.archive_convert.as_mut().unwrap().deferred_fullscreen = original_reopen;
+            }
 
             // Deliver the original lifecycle's success only AFTER the real close.
             // Its list adoption remains useful, but it no longer owns a viewer open.

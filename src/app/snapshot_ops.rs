@@ -2230,7 +2230,6 @@ impl App {
         // A live return can defer content teardown until the main UI dispatcher.
         // Its accepted Close already ends this viewer's automatic navigation owner.
         self.stop_projected_slideshow_playback();
-        self.retire_book_deferred_open();
         self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
         self.cancel_inflight_order_dependent_folder_nav();
@@ -2239,22 +2238,40 @@ impl App {
             self.zip_enumerate_pending = None;
             self.pdf_password_request = None;
             self.pdf_password_pending_save = None;
-            self.pdf_password_input.clear();
-            self.pdf_password_error = None;
-            self.pdf_password_save = false;
+            // The request is bundle-owned, but the dialog editor is App-global.
+            // A sibling's surviving prompt still owns its current input/error.
+            if self.pdf_password_dialog_path().is_none() {
+                self.pdf_password_input.clear();
+                self.pdf_password_error = None;
+                self.pdf_password_save = false;
+            }
             self.fs_nav_after_pdf_enumerate = None;
         }
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
-        // Keep conversion/list adoption running, but remove its viewer continuation. This
-        // helper also releases the holdover, so run it after the sequence's exit bookkeeping.
-        // The conversion is App-global: a sibling viewer's close must not consume this intent.
-        if self
-            .archive_convert
-            .as_ref()
-            .and_then(|state| state.deferred_fullscreen.as_ref())
-            .is_some_and(|deferred| deferred.owner_context == self.projected_viewer_context_id())
-        {
-            self.clear_archive_convert_deferred_fullscreen();
+        self.retire_viewer_reopen_requests(self.projected_viewer_context_id());
+    }
+
+    /// Check the owner after list adoption, immediately before either completion reopens.
+    /// Adoption itself may retire a context; an earlier take/check is not sufficient.
+    pub(crate) fn resume_archive_convert_viewer_after_load(
+        &mut self,
+        ctx: &egui::Context,
+        deferred: crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen,
+    ) {
+        if !matches!(
+            self.viewer_context_residence(deferred.owner_context),
+            crate::app::ContextResidence::Mounted | crate::app::ContextResidence::AtRest
+        ) {
+            return;
+        }
+        let reason = self.reopen_fullscreen_after_folder_nav_load(
+            ctx,
+            deferred.restore_video_tile,
+            deferred.reopen.resume_slideshow,
+            deferred.reopen.history_trigger,
+        );
+        if reason == "enumerate_defer" {
+            ctx.request_repaint();
         }
     }
 

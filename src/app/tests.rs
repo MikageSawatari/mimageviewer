@@ -9,7 +9,7 @@ mod thumbnail_request_lifecycle;
 mod pdf_render_epoch;
 
 #[path = "tests/startup_notices.rs"]
-mod startup_notices;
+pub(super) mod startup_notices;
 
 #[cfg(windows)]
 #[test]

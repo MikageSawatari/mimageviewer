@@ -1,6 +1,37 @@
 use super::*;
 use std::collections::HashMap;
 
+impl App {
+    /// Terminal ownership boundary, shared by accepted viewer closes and context retirement.
+    /// Content-only close/reopen never comes here. Workers/list adoption remain alive.
+    pub(super) fn retire_viewer_reopen_requests(&mut self, id: ViewerContextId) {
+        if id == self.projected_viewer_context_id() {
+            self.retire_book_deferred_open();
+            if let Some(state) = self.epub_convert.as_mut() {
+                state.retire_fullscreen_reopen();
+            }
+        } else {
+            #[cfg(windows)]
+            if let Some(bundle) = self.viewer_contexts.table.retiring_slot_mut(id) {
+                bundle.book_composition_permission.retire_deferred_open();
+                if let Some(state) = bundle.epub_convert.as_mut() {
+                    state.retire_fullscreen_reopen();
+                }
+            }
+        }
+        // This state is App-global, unlike the book permission in the context bundle.
+        // Do not release the currently projected sibling's navigation lock/holdover.
+        if self
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.deferred_fullscreen.as_ref())
+            .is_some_and(|deferred| deferred.owner_context == id)
+        {
+            self.archive_convert.as_mut().unwrap().deferred_fullscreen = None;
+        }
+    }
+}
+
 /// A payload's identity, independent of its window and of the current main binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ViewerContextId(u64);
@@ -5635,6 +5666,7 @@ impl App {
         self.close_composition_editor_for_context(id);
         self.cancel_image_folder_zip_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
+        self.retire_viewer_reopen_requests(id);
         if let Some(window_id) = retiring_window {
             self.detached_window_manager
                 .transfer_viewport_retirement(window_id);

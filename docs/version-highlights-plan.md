@@ -86,11 +86,17 @@
   PDF/ZIP 列挙、製本の projection/提示許可、アーカイブ変換、sidecar 復元の reopen 待ちは
   ビューア継続として扱う。detached は既存の生存要求と退避済み context/窓も読む。
   viewport の表示済みフラグ単独は閉じた後の cleanup まで残るので、保留条件にしない。
-  待機画面の Esc / × などの真の終了では `finish_fullscreen_navigation_for_true_close()` が
-  製本の deferred open も既存の retire 経路で退役させ、変換の `deferred_fullscreen` も外す。
+  再開予約の共通終点は `retire_viewer_reopen_requests(context)` とする。
+  待機画面の Esc / × などの `finish_fullscreen_navigation_for_true_close()`、backend close が
+  通る `close_fullscreen_to_completion()`、および `retire_context()` からここへ合流し、
+  製本の deferred open を既存の permission 退役処理で退役させ、書庫・EPUB 変換の
+  `deferred_fullscreen` も外す。EPUB ダイアログ自身の Abort 契約は変えない。
   製本の projection・変換処理と一覧の更新は継続できるが、遅着完了に再オープン予約を引き継がない。
   変換 state は App 共通なので、復帰予約には発行元の既存 `ViewerContextId` を保持する。
   真の終了ではその context が一致する予約だけ外し、別ビューアの close は元の予約を消費しない。
+  context 退役成功時には予約も同時に外す規則とし、投影中の兄弟の navigation lock / holdover は触らない。
+  直接読取り・変換キャッシュの完了は一覧採用後の同じ再開 helper を通り、発行元 context の
+  residence が Mounted / AtRest（生存中）の場合だけ reopen を許可する。
   内部 close→reopen はこの終了処理へ通さず、従来どおり閲覧を継続する。
   マウス操作の移行案内と初回設定も main だけに描き共通モーダルに入る同型なので、
   それぞれの visible helper で同じ保留条件を使う。ネットワーク data_dir 通知にも適用し、
