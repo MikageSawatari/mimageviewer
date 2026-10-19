@@ -5382,3 +5382,9 @@ python scripts/analyze_perf.py target/page-turn-smoke/d34b-04-rtl-adj/logs/perf_
 旧版とのstdout／stderr／終了コード一致を確認した。例としてd34b-04-rtl-adjは21〜34コマ、受理→初回curl 5.391〜45.113ms、
 操作別間隔最大7.131〜49.512ms、Native lookup hit165／miss5／不要35。D3-2ログの配送／Native観測0件は未計装と区別できず、仕事ゼロとは解釈しない。
 解析器回帰・出力例は `target/d3-5-analyzer-*`。この診断の `status=reference` は正式gateの成功判定ではない。
+
+#### 27.17.18 独立最終レビュー（2026-10-19）
+
+master 取り込み前の独立最終レビュー (Sol / xhigh、`200bd9530`、`git diff master...HEAD`) は **ACCEPT、P1〜P3 なし、master 取り込み可**。
+D3-5 の派生 topology、§1.400 の手動ループとの整合 (末尾 Boundary 維持)、§1.395 / EffeTune v0.14.0 との接点、通常表示の不変、`page-turn-d3` 解析モード、文書の整合を確認。
+detached の完成差分は「症状パッチではなく構造的修正」と合意。正式性能 gate (3run×30 機会) と利用者の実機受入は未完了。
