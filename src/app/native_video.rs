@@ -1791,6 +1791,20 @@ impl App {
         (result.outcome != crate::video::AudioTrackSelectOutcome::Rejected).then_some(label)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn poll_audio_track_notice_toast(&mut self, fs_idx: usize) {
+        if let Some(message) = self
+            .take_audio_track_open_notice_toast(fs_idx)
+            .or_else(|| self.take_audio_track_failure_toast(fs_idx))
+        {
+            if self.fs_music_view_active(fs_idx) {
+                self.show_feedback_warning(message.to_string());
+            } else {
+                self.show_native_video_overlay_warning(message.to_string(), false);
+            }
+        }
+    }
+
     pub(crate) fn take_audio_track_failure_toast(&self, fs_idx: usize) -> Option<&'static str> {
         self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. }
@@ -11520,7 +11534,7 @@ impl App {
                 if player.seek_strip_material_availability() != unavailable {
                     player.set_seek_strip_material_availability(unavailable);
                     let text = reason.user_notice().to_string();
-                    let seconds = crate::feedback::resolve_duration(
+                    let resolved = crate::feedback::resolve_timing(
                         self.settings.notification_duration,
                         crate::feedback::FeedbackKind::Warning,
                         &text,
@@ -11530,7 +11544,7 @@ impl App {
                         text,
                         true,
                         crate::feedback::FeedbackKind::Warning,
-                        Some(std::time::Duration::from_secs_f32(seconds)),
+                        Some(resolved),
                     );
                 }
             }
@@ -14801,13 +14815,13 @@ impl App {
         kind: crate::feedback::FeedbackKind,
         timing: crate::feedback::FeedbackTiming,
     ) {
-        let seconds = crate::feedback::resolve_duration(
+        let resolved = crate::feedback::resolve_timing(
             self.settings.notification_duration,
             kind,
             &text,
             timing,
         );
-        self.publish_native_video_overlay_toast(text, centered, seconds);
+        self.publish_native_video_overlay_toast(text, centered, resolved);
     }
 
     /// Transport only: the caller has already resolved the duration. Never apply policy here.
@@ -14816,7 +14830,7 @@ impl App {
         &self,
         text: String,
         centered: bool,
-        seconds: f32,
+        resolved: crate::feedback::ResolvedFeedbackTiming,
     ) {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
@@ -14826,7 +14840,7 @@ impl App {
                 text,
                 centered,
                 crate::feedback::FeedbackKind::Info,
-                Some(std::time::Duration::from_secs_f32(seconds)),
+                Some(resolved),
             );
         }
     }

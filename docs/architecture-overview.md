@@ -884,7 +884,8 @@ PDFの仮想項目はruntime keyと同じ`page_<u32>`だけを許可し、評価
 ### 一時通知の時間ポリシー（§1.402）
 
 `feedback.rs` が情報/警告/エラーの型と表示時間の倍率を所有する。
-App の発行境界で確定した秒数を既存 toast state と native transport へ渡す。
+App の発行境界で寿命とnative fadeを確定して、既存 toast state と native transport へ渡す。
+標準は従来の面別の時間・fadeを維持し、nativeのlinger/fadeの既存不一致は今回修正しない。
 動画内部の発行元は種類を明示し、既存 NativeChromeSnapshot から選択値を読む。
 設定は既存 settings.db KV の追加項目で、旧項目欠落時は標準へ移行する。
 新しい worker・channel・detached context state は持たない。

@@ -230,10 +230,7 @@ impl App {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("debug-pipeline");
-                self.show_feedback_toast_with_duration(
-                    format!("デバッグ出力しました: {name}"),
-                    crate::feedback::FEEDBACK_TOAST_DURATION,
-                );
+                self.show_saved_output_feedback(format!("デバッグ出力しました: {name}"));
                 self.fs_feedback_toast_reveal_path = Some(done.manifest_path);
                 self.fs_feedback_toast_surface = None;
             }

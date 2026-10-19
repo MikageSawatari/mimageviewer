@@ -189,7 +189,7 @@ impl App {
 
         if apply {
             if self.tag_maintenance_rx.is_some() {
-                self.show_feedback_toast("タグの改名/統合を反映中です".to_string());
+                self.show_feedback_warning("タグの改名/統合を反映中です".to_string());
                 return;
             }
             let previous = previous_tag_defs_by_id(&self.settings.tags);

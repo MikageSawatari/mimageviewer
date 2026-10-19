@@ -88337,7 +88337,7 @@ impl App {
         kind: crate::feedback::FeedbackKind,
         timing: crate::feedback::FeedbackTiming,
     ) {
-        let seconds = crate::feedback::resolve_duration(
+        let resolved = crate::feedback::resolve_timing(
             self.settings.notification_duration,
             kind,
             &text,
@@ -88351,13 +88351,13 @@ impl App {
                         && !self.fs_music_view_active(idx)
                 });
             if surface.is_none() || native_only {
-                self.publish_native_video_overlay_toast(text.clone(), false, seconds);
+                self.publish_native_video_overlay_toast(text.clone(), false, resolved);
             }
             if native_only {
                 return;
             }
         }
-        self.fs_feedback_toast = Some((text, std::time::Instant::now(), seconds));
+        self.fs_feedback_toast = Some((text, std::time::Instant::now(), resolved.seconds));
         self.fs_feedback_toast_reveal_path = None;
         self.fs_feedback_toast_surface = surface;
     }
@@ -88430,16 +88430,25 @@ impl App {
         }
     }
 
+    pub(crate) fn show_saved_output_feedback(&mut self, text: String) {
+        self.publish_feedback_toast(
+            text,
+            None,
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::SurfaceSeconds {
+                egui: crate::feedback::FEEDBACK_TOAST_DURATION,
+                native: 1.8,
+            },
+        );
+    }
+
     pub(crate) fn show_capture_saved_toast(&mut self, path: PathBuf) {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("capture")
             .to_string();
-        self.show_feedback_toast_with_duration(
-            format!("保存しました: {name}"),
-            crate::feedback::FEEDBACK_TOAST_DURATION,
-        );
+        self.show_saved_output_feedback(format!("保存しました: {name}"));
         self.fs_feedback_toast_reveal_path = Some(path);
         self.fs_feedback_toast_surface = None;
     }
@@ -95507,23 +95516,7 @@ impl App {
             // wheel / 前-次項目ボタンが pending 中に押されたケースで「反応しない」
             // 体感バグを防ぐ (実機 fb 2026-05-26)。
             self.maybe_apply_deferred_native_video_nav(ctx);
-            if let Some(message) = self
-                .take_audio_track_open_notice_toast(fs_idx)
-                .or_else(|| self.take_audio_track_failure_toast(fs_idx))
-            {
-                let message = message.to_string();
-                let surface = if self.fs_music_view_active(fs_idx) {
-                    None
-                } else {
-                    Some(ActionSurface::Viewer)
-                };
-                self.publish_feedback_toast(
-                    message,
-                    surface,
-                    crate::feedback::FeedbackKind::Warning,
-                    crate::feedback::FeedbackTiming::Text,
-                );
-            }
+            self.poll_audio_track_notice_toast(fs_idx);
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);

@@ -2,17 +2,38 @@
 
 ## 所有と設定
 
-`feedback::resolve_duration` だけが「通知の表示時間」の倍率を適用する。
-通常通知は App の発行時に秒数を確定し、一覧・画像 viewer・F12/別窓の既存 toast state と
-native overlay へ同じ秒数を渡す。描画時には設定を読まず、窓の切替・mount/deposit で再計算しない。
+`feedback::resolve_timing` だけが「通知の表示時間」の倍率を適用する。
+App の発行時に egui の寿命、native の寿命と fade を `ResolvedFeedbackTiming` に確定する。
+一覧・画像 viewer・F12/別窓は既存 toast state の秒数、native は同じ確定済み payload を使う。
+描画時には設定を読まず、窓の切替・mount/deposit で再計算しない。
 保存先を開く `fs_feedback_toast_reveal_path`、発火面、連続通知による置換は維持する。
 
 動画内部が発行する通知（フィルタ準備・失敗、再生位置操作を使えない案内）は、既存の
-`NativeChromeSnapshot.policy` に表示時間の選択値を追加し、その設定経路を使う。
+`NativeChromeSnapshot.policy` の選択値を使う。
 `NativeRenderCore::show_overlay_toast` は未確定の通知だけを同じ関数で確定し、App から届いた
-明示 linger は再計算しない。環境設定OK後の既存 `sync_all_native_chrome_policy` が全登録contextへ反映する。
+確定 payload は再計算しない。環境設定OK後の既存 `sync_all_native_chrome_policy` が全登録contextへ反映する。
 新しい設定同期 channel、worker、context state は追加しない。
-native の fade は従来、linger と無関係に 1.8/2.5 秒で透明になっていたため、確定 linger に揃える。
+
+### 標準で維持する native の既存挙動（2026-10-20 設計判断）
+
+利用者決定「既定＝標準＝現在の秒数・見え方そのまま」を、面ごとの時間統一や既存不整合の修正より優先する。
+比較元は §1.402 実装前の `28e0aa575`。native は従来、状態の保持期限（linger）と
+fade の時計が一致していなかった。描画は linger によらず、通常は1.45秒で fade 開始・1.8秒で透明、
+中央は2.15秒で開始・2.5秒で透明になる（fade幅0.35秒）。状態だけは指定 linger まで残る。
+したがって長時間指定の拒否案内も native では先に透明になり、逆に短い linger は fade 開始前に消える。
+中央700msのシーク境界は、700msの間不透明のまま消える。
+
+この不一致を今回は修正しない。標準では寿命と旧 fade の両方をそのまま渡す。egui側の最後0.3秒のfadeも従来どおり。
+短い/長いでは適用対象の寿命・fade開始/終点・fade幅に同じ倍率を一度掛けるため、
+従来の可視時間に対して設定が効き、警告/エラーの短い設定は標準のままになる。
+`Immediate` は寿命・fadeとも倍率1とし、シーク境界に新しい fade を加えない。
+長い拒否理由を読む時間の確保という §1-11 の判断は維持するが、nativeで指定時間まで見えない
+既存問題の解消は別件として扱う。
+
+キャプチャ保存/デバッグ出力完了も、egui1.2秒・native1.8秒という既存差を維持する。
+この2入口だけ `SurfaceSeconds` に元の基本時間を明示し、共通ownerで倍率を適用する。
+音声トラック切替失敗/保存トラックの代替案内は、動画では従来のnative通常1.8秒、
+音楽ビューでは従来の本文長方式。種類は両方とも警告とする。
 
 状態の組合せを増やさない簡素化として、既存通知 state と設定 snapshot の利用を採用した。
 設定変更は次に発行する通知から反映し、表示済みの通知を延長・再生成する専用状態は設けない。
@@ -41,17 +62,18 @@ fade を含む。情報・成功の上限も同じ倍率（短い3.3秒、長い
 | 入口・用途 | 標準の基本時間 | 適用/例外 |
 | --- | --- | --- |
 | `show_feedback_toast` / warning / error | 本文長方式 | 適用。種別は発行元で明示 |
-| 面指定 `*_on` / `show_feedback_result_on` | 従来の1.2秒 | 適用。面は時間計算へ影響しない |
-| `*_with_duration` / `*_on_with_duration` | 呼び出し元の指定秒数 | 適用。指定値は標準の基本時間であり設定回避ではない |
+| 面指定 `*_on` / `show_feedback_result_on` | 従来の1.2秒 | 適用。nativeの旧fadeも保持 |
+| `*_with_duration` / `*_on_with_duration` | 呼び出し元の指定秒数 | 適用。nativeは指定lingerと旧1.8/2.5秒のfadeを別々に保持して倍率適用 |
 | 索引 worker の再起動・失敗通知集約 | 5秒 | 警告として適用 |
 | 動画ピン・未変換書庫の代表画像設定拒否 | 5秒（2箇所） | 警告として適用 |
 | 本へのページ追加の完了（除外・簡易再補完・取り消せない旨を含み得る） | 4.5秒 | 警告として適用。注意事項は省略しない |
 | メディア窓からメインへの切替と開き直し案内 | 3.5秒 | 警告として適用 |
 | ゲームパッド X ピッカーのメタデータ入口案内 | 4秒（`X_PICKER_HINT_TOAST_SECS`） | 警告として適用 |
 | パイプラインデバッグ出力開始 | 2秒 | 一時通知として適用。処理中 overlay の寿命とは独立 |
-| キャプチャ保存・デバッグ出力完了 | 1.2秒 | 適用。クリックで保存先/manifest を開く既存機能を保持。native も同じ確定秒数 |
-| native の通常/中央 toast | 1.8秒/2.5秒 | 適用。準備通知は情報、失敗・利用不能は明示した警告 |
-| native 相対シークの先頭/末尾 | 700ms | `Immediate` の例外。リピートで更新され、離した後すぐ消える操作フィードバック |
+| キャプチャ保存・デバッグ出力完了 | egui1.2秒 / native1.8秒 | 適用。既存の面ごとの差を維持し、クリックで保存先/manifestを開く機能も保持 |
+| 音声トラック切替失敗・保存トラックの代替案内 | 動画native1.8秒 / 音楽ビュー本文長方式 | 警告として適用。動画の基本時間を本文長へ変更しない |
+| native の通常/中央 toast | 1.8秒/2.5秒、最後350msでfade | 適用。fadeの開始/終点/幅も同倍率。準備通知は情報、失敗・利用不能は警告 |
+| native 相対シークの先頭/末尾 | 700ms | `Immediate` の例外。全設定で700ms不透明、fade追加なし。リピート更新する操作フィードバック |
 | `FsBoundaryHint` のナビゲーション境界・該当フォルダなし | 従来の専用2.5秒/4秒、native は専用中央表示 | 専用の操作フィードバックとして例外。通常 toast の設定に混ぜない |
 | 処理の寿命で表示/消滅する進捗、AI status、スキャン/保存/変換モーダル、seek中表示 | 処理の寿命 | 対象外。開始時に一度出る toast とは区別 |
 
@@ -101,9 +123,9 @@ helper 本文を渡す箇所を producer の分岐/戻り値まで追った。�
 部分失敗や設定引継ぎの注意は削らない。完了文を短くした結果、標準設定でも文字数方式の通知は
 短くなるが、時間式・係数自体は変えない。
 
-## 検証台帳
+## 初回実装の検証台帳（a1b88e3e5 としてcommit済み）
 
-対象は HEAD `28e0aa575` からの未コミット差分。通常feature / debug test、
+対象は HEAD `28e0aa575` からの初回実装差分。通常feature / debug test、
 `MSBUILDDISABLENODEREUSE=1`。実製品の起動・実機測定は行っていない。
 
 - `cargo check -p mimageviewer --bin mimageviewer-core -j 1`: コンパイル成功。
@@ -139,99 +161,68 @@ helper 本文を渡す箇所を producer の分岐/戻り値まで追った。�
 動画の通常通知と700msのシーク境界を確認する。新たな範囲外問題は検出していない。
 
 
-## 変更ファイル（commit引継ぎ用）
+## 独立レビュー指摘対応（2026-10-20、a1b88e3e5 からの差分）
 
-既存82件＋新規5件。commitは行っていない。
+- 音声トラック通知と保存完了のnative基本時間を1.8秒へ戻した。UI更新が呼ぶ
+  `poll_audio_track_notice_toast` を抽出し、実際の通知消費/発行経路で検証する。
+- native payloadへ確定fadeを含め、標準の1.8/2.5秒fadeと700msの不透明な境界表示を維持した。
+  長時間lingerにfadeを合わせる初回実装の変更は撤回した。
+- `処理中/進行中/反映中/クリア中/お待ち/待ってから/完了まで/実行中/準備中/保存中/読み込み中` および
+  `show_feedback_toast*` の引数を再検索し、拒否分岐と開始通知を照合した。
+  読書位置クリアの重複受付（面指定/設定画面の両方）、タグ編集の適用中の再適用、
+  コレクション一括出力の受付拒否を警告に変更した。追加の拒否取りこぼしは見つからなかった。
+  タグ改名/統合の最初の「反映中」、タグクリア開始、スキャン開始、キャプチャ保存中、
+  デバッグ出力開始、領域分割の `scope.pending_label()`、変換中止後のアップスケール削除予約は
+  実行を受理した情報通知なので変更しない（迷った対象の判断）。
+- この対応で通知本文・環境設定UI・永続化項目は変更しない。新規ファイル/PNGなし。
+- 先の検証台帳は初回実装時の履歴であり、native fadeがlingerと一致するという
+  当時の期待値は今回のテストで置き換える。
 
-新規ファイル（未追跡）:
+### 対応後の検証
 
-- `docs/notification-duration-policy.md`
-- `src/app/tests/notification_duration.rs`
-- `src/feedback.rs`
-- `tests/snapshots/notification_duration_preferences_dark_short_narrow.png`
-- `tests/snapshots/notification_duration_preferences_light_standard.png`
+- `cargo nextest run -p mimageviewer --lib -E 'test(/notification_duration|saved_position_book_clear_rejects_duplicate|all_export_keeps_its_owner|feedback_toast|native_command_bus|chrome_suppression_command_bus|a_toast_does_not_swallow|native_output_tests|audio_track.*toast|saved_audio_open_notice|native_audio_track_event|pipeline_debug|seek_relative/)' --no-fail-fast`:
+  **32件成功・失敗0・exit 0**。通常feature/debug、`MSBUILDDISABLENODEREUSE=1`。
+  `target/notice-review/focused.{stdout,stderr}.log` と `focused-result.json`。
+  追加/更新した回帰は次のとおり。
+  - `poll_audio_track_notice_toast` が実際の失敗/保存トラック代替通知を消費・発行し、
+    動画では1.8秒、音楽ビューでは本文長、短い/標準は警告を維持・長いは1.5倍、一度だけ通知。
+  - キャプチャ保存とデバッグ完了pollからegui1.2秒/native1.8秒、保存先リンク保持、倍率とfade。
+    実際の相対シーク境界ハンドラから全設定で700ms不透明の通知。
+  - 標準のnative通常/中央・指定linger0.7/1.2/1.8/2.5/3.5/5.5秒について、
+    変更前のfade式と厳密比較。全段階のfade倍率と警告/エラーの短縮防止も検証。
+  - 読書位置クリアのコマンド/設定画面からの二重受付と、コレクション一括出力の拒否ハンドラを
+    全段階で検査。元の処理票/操作ownerを保持する既存検査も維持。
+- 初回コンパイルでテストhelperの可視性とfixtureの借用を修正した後、23件中22件成功。
+  残る1件はfade開始ちょうどの丸め差（2.15秒で1.0と0.99999976）を検出した。
+  旧式の分岐をそのまま維持し、上記32件で再確認した。
+- ワークスペース全体の `cargo fmt` 実行済み、`cargo fmt --check` 成功。
+  `python scripts/check_ui_glyphs.py` は0件、`git diff --check` 成功。
+- 環境設定レイアウト/静的描画は変更しないのでsnapshot更新なし。lib全件/full gateは後続担当へ。
+- `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`:
+  **exit 0**。通常feature/dev-runtimeのcore・Remote・EPUB workerを生成（core 2分54秒）。
+  `target/notice-review/build-dev.{stdout,stderr}.log` と `build-dev-result.json`。
+  VCRT検査 runtime 4 / PE 3 成功。portable feature不使用、既存の実行中プロセスは停止しない。
+- 製品バイナリの起動なし。実機の秒数・fadeの見え方・F12/別窓・保存通知クリックは未確認。
+  利用者起動は `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+  インストール版/常駐版を先に終了する（同じmutex）。既定の `%APPDATA%\mimageviewer` の
+  実設定/データを更新し得る。確認対象は標準の動画保存通知とfade、短い設定の拒否案内、
+  長い設定の延長、全設定で変わらない700msシーク境界。新たな範囲外問題なし。
 
-既存ファイル:
+### 今回の変更ファイル（16件、新規なし）
 
-- `docs/README.md`
 - `docs/architecture-overview.md`
 - `docs/display-pipeline.md`
-- `docs/next-release-backlog.md`
-- `docs/spec.md`
-- `docs/ui-snapshot-policy.md`
+- `docs/notification-duration-policy.md`
 - `docs/video-architecture.md`
-- `htdocs/mimageviewer/index.html`
 - `htdocs/mimageviewer/manual/settings.html`
 - `src/app.rs`
-- `src/app/book_append_refresh.rs`
-- `src/app/book_append_undo.rs`
-- `src/app/book_composition_editor.rs`
-- `src/app/book_composition_permission.rs`
-- `src/app/book_composition_runtime.rs`
 - `src/app/book_resume_meter.rs`
-- `src/app/collection_grid.rs`
-- `src/app/collection_navigation.rs`
-- `src/app/color_filter.rs`
-- `src/app/content_identity_detection.rs`
-- `src/app/content_identity_restore.rs`
-- `src/app/gamepad_input.rs`
-- `src/app/image_folder_zip_operation.rs`
+- `src/app/book_resume_meter_tests.rs`
 - `src/app/native_video.rs`
-- `src/app/rating_membership_ops.rs`
-- `src/app/saved_group_actions.rs`
-- `src/app/sidecar_restore.rs`
-- `src/app/smart_folder.rs`
-- `src/app/snapshot_ops.rs`
-- `src/app/spread_shift_owner.rs`
-- `src/app/startup_ops.rs`
-- `src/app/subfolder_expansion.rs`
-- `src/app/tests.rs`
-- `src/app/update_phases.rs`
-- `src/app/viewer_context_registry.rs`
-- `src/edit_bundle_app.rs`
-- `src/edit_bundle_bulk.rs`
-- `src/external_tool.rs`
-- `src/filename_stack_ui.rs`
-- `src/global_search_ui.rs`
-- `src/global_search_ui/everything.rs`
-- `src/lib.rs`
+- `src/app/tests/notification_duration.rs`
+- `src/feedback.rs`
 - `src/pipeline_debug.rs`
-- `src/remote_ipc/ui.rs`
-- `src/settings.rs`
-- `src/settings_transfer.rs`
-- `src/tag_ops.rs`
-- `src/ui_adjustment_panel.rs`
-- `src/ui_conceal.rs`
-- `src/ui_crop.rs`
-- `src/ui_dialogs/archive_convert.rs`
-- `src/ui_dialogs/batch_convert.rs`
-- `src/ui_dialogs/clipboard_capture.rs`
 - `src/ui_dialogs/collections.rs`
-- `src/ui_dialogs/context_menu.rs`
-- `src/ui_dialogs/epub_convert.rs`
-- `src/ui_dialogs/export_batch.rs`
-- `src/ui_dialogs/file_organize.rs`
-- `src/ui_dialogs/metadata_cleanup.rs`
-- `src/ui_dialogs/metadata_transfer.rs`
-- `src/ui_dialogs/new_folder.rs`
-- `src/ui_dialogs/preferences.rs`
-- `src/ui_dialogs/preferences/pages.rs`
-- `src/ui_dialogs/preferences/search_index.rs`
-- `src/ui_dialogs/rename_item.rs`
-- `src/ui_dialogs/tag_apply.rs`
 - `src/ui_dialogs/tag_editor.rs`
-- `src/ui_dialogs/vst3_actions.rs`
-- `src/ui_dialogs/whats_new.rs`
-- `src/ui_erase.rs`
-- `src/ui_fullscreen.rs`
-- `src/ui_main.rs`
-- `src/ui_metadata_panel.rs`
-- `src/ui_music_panels.rs`
-- `src/ui_sns_split.rs`
-- `src/ui_text.rs`
-- `src/ui_view_trim.rs`
-- `src/undo_ops.rs`
 - `src/video/mod.rs`
-- `src/video/native_presenter/overlay_draw.rs`
 - `src/video/native_presenter/render_core.rs`
-- `tests/ui_snapshot.rs`

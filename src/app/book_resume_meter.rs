@@ -281,9 +281,9 @@ impl App {
                 state.book_resume_clear_result = Some(message.clone());
             }
             if let Some(surface) = surface {
-                self.show_feedback_toast_on(message, surface);
+                self.show_feedback_warning_on(message, surface);
             } else {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
             }
             return;
         }

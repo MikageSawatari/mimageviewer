@@ -12,6 +12,11 @@ pub(crate) enum FeedbackKind {
 pub(crate) enum FeedbackTiming {
     Text,
     Seconds(f32),
+    /// Preserve the existing egui/native baseline difference for saved-output notices.
+    SurfaceSeconds {
+        egui: f32,
+        native: f32,
+    },
     /// Repeated input boundary feedback; independent of reading preferences.
     Immediate(f32),
 }
@@ -33,24 +38,68 @@ pub(crate) fn feedback_toast_duration(text: &str) -> f32 {
     (FEEDBACK_TOAST_DURATION + extra as f32 * 0.12).min(5.5)
 }
 
-/// The only preference multiplier. Explicit durations are standard-time bases, not overrides.
+/// Fully resolved lifetime and legacy native fade. Transport/renderers never read preferences.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedFeedbackTiming {
+    pub(crate) seconds: f32,
+    native_linger: std::time::Duration,
+    native_fade_end: [f32; 2],
+    native_fade_duration: f32,
+}
+
+impl ResolvedFeedbackTiming {
+    pub(crate) fn native_linger(self) -> std::time::Duration {
+        self.native_linger
+    }
+
+    pub(crate) fn native_opacity_at(self, elapsed: f32, centered: bool) -> f32 {
+        let fade_end = self.native_fade_end[usize::from(centered)];
+        if elapsed > fade_end - self.native_fade_duration {
+            ((fade_end - elapsed) / self.native_fade_duration).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+}
+
+/// The only preference multiplier. Preserve each surface's pre-setting lifetime and fade,
+/// including native fade ending before a long explicit linger (and after a short one).
+pub(crate) fn resolve_timing(
+    setting: NotificationDuration,
+    kind: FeedbackKind,
+    text: &str,
+    timing: FeedbackTiming,
+) -> ResolvedFeedbackTiming {
+    let (base, native_base) = match timing {
+        FeedbackTiming::Text => {
+            let seconds = feedback_toast_duration(text);
+            (seconds, seconds)
+        }
+        FeedbackTiming::Seconds(seconds) | FeedbackTiming::Immediate(seconds) => (seconds, seconds),
+        FeedbackTiming::SurfaceSeconds { egui, native } => (egui, native),
+    };
+    let multiplier = match (timing, setting) {
+        (FeedbackTiming::Immediate(_), _) => 1.0,
+        (_, NotificationDuration::Short) if kind == FeedbackKind::Info => 0.6,
+        (_, NotificationDuration::Long) => 1.5,
+        _ => 1.0,
+    };
+    ResolvedFeedbackTiming {
+        seconds: base * multiplier,
+        native_linger: std::time::Duration::from_secs_f32(native_base * multiplier),
+        native_fade_end: [1.8 * multiplier, 2.5 * multiplier],
+        native_fade_duration: 0.35 * multiplier,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_duration(
     setting: NotificationDuration,
     kind: FeedbackKind,
     text: &str,
     timing: FeedbackTiming,
 ) -> f32 {
-    let base = match timing {
-        FeedbackTiming::Text => feedback_toast_duration(text),
-        FeedbackTiming::Seconds(seconds) => seconds,
-        FeedbackTiming::Immediate(seconds) => return seconds,
-    };
-    let multiplier = match setting {
-        NotificationDuration::Short if kind == FeedbackKind::Info => 0.6,
-        NotificationDuration::Long => 1.5,
-        _ => 1.0,
-    };
-    base * multiplier
+    resolve_timing(setting, kind, text, timing).seconds
 }
 
 #[cfg(test)]

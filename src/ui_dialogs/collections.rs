@@ -3759,7 +3759,7 @@ impl App {
 
     pub(crate) fn start_collection_export_all(&mut self, parent: PathBuf) {
         if !self.collection_export_all_available() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         let client = match self.collection_store_client_for_read() {
@@ -8860,7 +8860,17 @@ mod tests {
         assert!(app.collection_export_all_available());
         app.start_collection_export_all(temp.path().to_path_buf());
         assert!(!app.collection_export_all_available());
-        app.start_collection_export_all(temp.path().join("must-not-start"));
+        for (setting, factor) in [
+            (crate::settings::NotificationDuration::Short, 1.0),
+            (crate::settings::NotificationDuration::Standard, 1.0),
+            (crate::settings::NotificationDuration::Long, 1.5),
+        ] {
+            app.settings.notification_duration = setting;
+            app.start_collection_export_all(temp.path().join("must-not-start"));
+            let (text, _, seconds) = app.fs_feedback_toast.as_ref().unwrap();
+            assert_eq!(text, "別のコレクション処理が進行中です。");
+            assert_eq!(*seconds, 1.2 * factor);
+        }
         assert!(matches!(
             app.collection_ui.operation,
             CollectionDialogOperation::ExportAllSnapshot { .. }
