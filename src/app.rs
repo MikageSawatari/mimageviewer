@@ -79473,10 +79473,24 @@ impl App {
         // D3 reuses resident input for the actual next unit (slideshow may have
         // a different still-only composition). Retain it without adding decode
         // or AI targets to either configured prefetch range.
+        self.prepare_final_demand_topologies();
         if let Some(pages) = self.next_final_prepare_occurrences(current_idx) {
             keep.extend(pages.into_iter().map(|page| page.idx));
         }
         Some(keep)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn final_demand_keep_for_test(
+        &mut self,
+        current_idx: usize,
+    ) -> Option<HashSet<usize>> {
+        self.page_turn_prefetch_keep_set(current_idx)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn final_demand_stash_for_test(&mut self) -> ViewerContextId {
+        self.stash_mounted_and_start_fresh("d3-5-topology-promote")
     }
 
     /// Reconcile new unit dimensions, layout/settings, and completed current loads
@@ -85536,6 +85550,11 @@ impl App {
         completed: Vec<FinalCompositeKey>,
         phase: final_prepare_budget::FinalPrepareAdoption,
     ) {
+        // ROOT finalized also calls this directly after receipt. Keep the cold
+        // pure derivation at the common adoption boundary, outside collect.
+        if !completed.is_empty() {
+            self.prepare_final_demand_topologies();
+        }
         let mut had_updates = false;
         for key in completed {
             let Some(pending) = self.final_effect_pending.get(&key) else {

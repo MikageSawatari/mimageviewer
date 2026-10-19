@@ -123,7 +123,8 @@ GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用�
 通常 source の selector 照合が必要な receipt は採用後へ残す。受信は非 blocking・再入可能で、
 公開時は当該 viewport の decision cache だけを失効する。一般画像の exact complete final も
 edit texture 確保前に再利用する。通常同期 miss、無補正 handle 共有、D2 素材、D4 時計は維持する。
-次 unit は通常 composition の実 occurrence/role から観測するだけで、投機準備は開始しない。
+この D3-1 段階では次 unit を通常 composition の実 occurrence/role から観測するだけだった。
+現在は上記 D3-2 と下記 D3-4 の条件を満たす場合だけ先回り準備へ接続する。
 slideshow の still-only unit 計算は表示 cache を置換しない。詳細・検証は page-turn 計画 §27.17.12。
 
 ### 音声セルの代表画像 (§1.347、2026-10-08)
@@ -3237,3 +3238,13 @@ D3-4(b) は通常 Single／Pair と canonical geometry を共有し、採用済�
 final 登録を先に処理し、通常 Native key／plan と出力＋一時 allocation 会計を使って最大一件を生成する。
 出力は通常 `fs_lanczos_cache` に置き、最初の通常 prepare の hit と既存 D2 handoff を使う。
 held／canonical receipt／D4 時計へ後付けせず、parked snapshot や単なる mount から開始しない。
+
+2026-10-19 D3-5整理: Native canonical 候補収集・最終再照合は、既存 installed unit token の完全性証拠と
+頁→unit 索引を読む。未採用の証拠を全頁走査で補わず、その機会を見送る。slideshow も既存 still-only
+topology の採用を必要とする。最新 callback の viewport／clip／ppp と一致する frame 内候補だけを使う。
+未実体化の erase／local／conceal・mask と comic の CPU-only 接続は D3-3 として次の版の後へ延期した
+（[backlog §1.401](next-release-backlog.md#1401-ページめくり-d3-3-編集済み注釈付きの頁でも-final-を先回り準備する--d3-の残り-2026-10-19)）。
+これらの通常表示・同期 miss は維持する。完了範囲・計測の限界は [計画 §27.17.17](page-turn-animation-plan.md) を参照。
+CPU 需要用 resolver に残っていた全頁走査・mixed slideshow 列再構築は、D3-5 で同owner内の派生 record に移す。
+visible と同じ枝は既存索引を読み、異なる枝だけcoldに導出する。CPU需要は縮小せず、adoption／producer／keepの
+共有prefixで同pass採用する。通常表示token／units／receiptを準備用に置換しない。詳細は同節F1を参照。

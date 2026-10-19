@@ -41,6 +41,8 @@ use eframe::egui;
 #[cfg(test)]
 mod book_composition_tests;
 #[cfg(test)]
+mod final_demand_topology_tests;
+#[cfg(test)]
 mod next_final_demand_tests;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16386,12 +16388,123 @@ pub(crate) struct SpreadDisplayUnitsCache {
     /// Derived once with the unit token. This proves that `nav` is a complete permutation of
     /// one all-page item list; transient surface/search/stack eligibility stays outside the cache.
     complete_page_permutation: Option<bool>,
+    /// CPU demand derives other reading topologies without replacing the visible
+    /// units allocation that submitted receipts still identify.
+    final_demand_topologies: Option<FinalDemandTopologies>,
     rotation_recheck_all: bool,
     rotation_recheck_indices: HashSet<usize>,
     /// Bounded source measurements outlive a viewport presentation permit.
     /// Entries carry no image permission and are never emitted as paint pages.
     continuous_measurements: std::collections::VecDeque<ContinuousUnitMeasurement>,
     continuous_admission: ContinuousAdmissionEpisode,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FinalDemandCompleteness {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalDemandBookContext {
+    Eligible,
+    Ineligible,
+}
+
+impl FinalDemandCompleteness {
+    fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FinalDemandDerivedTopology {
+    units: Vec<SpreadDisplayUnit>,
+    positions: HashMap<usize, usize>,
+    completeness: FinalDemandCompleteness,
+}
+
+#[derive(Clone, Debug)]
+enum FinalDemandTopology {
+    /// Reuse the owner's existing units and reverse index, rather than cloning
+    /// a book-sized map merely to look up Current/Next.
+    Visible(FinalDemandCompleteness),
+    Derived(Arc<FinalDemandDerivedTopology>),
+}
+
+#[derive(Clone, Debug)]
+struct FinalDemandTopologies {
+    visible: SpreadDisplayUnitsToken,
+    visible_units: Arc<Vec<SpreadDisplayUnit>>,
+    source: (u64, ReadingFlow),
+    reader_order: (usize, usize),
+    normal_nav: Arc<Vec<usize>>,
+    still_nav: Arc<Vec<usize>>,
+    requested_page_alone: crate::settings::PageAloneSettings,
+    book_context: FinalDemandBookContext,
+    normal: FinalDemandTopology,
+    still: FinalDemandTopology,
+}
+
+impl FinalDemandTopologies {
+    fn same_visible(
+        &self,
+        token: &SpreadDisplayUnitsToken,
+        units: &Arc<Vec<SpreadDisplayUnit>>,
+    ) -> bool {
+        // Arc's derived PartialEq would walk the navigation list on every poll.
+        Arc::ptr_eq(&self.visible.nav, &token.nav)
+            && Arc::ptr_eq(&self.visible_units, units)
+            && self.visible.items_generation == token.items_generation
+            && self.visible.spread_mode == token.spread_mode
+            && self.visible.shift_anchor_idx == token.shift_anchor_idx
+            && self.visible.landscape_epoch == token.landscape_epoch
+            && self.visible.page_alone == token.page_alone
+            && self.visible.composed == token.composed
+    }
+}
+
+fn build_display_unit_topology(
+    nav: &[usize],
+    mode: SpreadMode,
+    shift: Option<usize>,
+    page_alone: crate::settings::PageAloneSettings,
+    overrides: &HashMap<usize, crate::book_composition::PageOverride>,
+    landscape: impl Fn(usize, usize) -> bool,
+    pairable: impl Fn(usize) -> bool,
+) -> Vec<SpreadDisplayUnit> {
+    #[cfg(test)]
+    SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
+    if mode.is_spread() {
+        build_spread_display_units_with_overrides(
+            nav, mode, shift, page_alone, overrides, landscape, pairable,
+        )
+    } else {
+        nav.iter()
+            .enumerate()
+            .map(|(position, &idx)| {
+                SpreadDisplayUnit::singleton(
+                    position,
+                    idx,
+                    if pairable(idx) {
+                        SpreadDisplaySingletonCause::UnpairedSlot
+                    } else {
+                        SpreadDisplaySingletonCause::NonPairableBoundary
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+fn index_display_units(units: &[SpreadDisplayUnit]) -> HashMap<usize, usize> {
+    let mut positions = HashMap::new();
+    for (position, unit) in units.iter().enumerate() {
+        for &idx in &unit.pages {
+            positions.entry(idx).or_insert(position);
+        }
+    }
+    positions
 }
 
 #[derive(Clone, Debug)]
@@ -16617,12 +16730,10 @@ impl SpreadDisplayUnitsCache {
             nav: Arc::clone(&nav),
             composed: None,
         });
-        self.tracked_indices.clear();
+        self.final_demand_topologies = None;
+        self.tracked_indices = index_display_units(&units);
         self.image_unit_positions.clear();
         for (position, unit) in units.iter().enumerate() {
-            for &idx in &unit.pages {
-                self.tracked_indices.entry(idx).or_insert(position);
-            }
             if (0..unit.pages.len()).any(|offset| {
                 image_flags
                     .get(unit.nav_start + offset)
@@ -19385,40 +19496,21 @@ impl App {
             .iter()
             .map(|&idx| is_spread_pairable_item(self.items.get(idx)))
             .collect::<Vec<_>>();
-        let units = if self.spread_mode.is_spread() {
-            let automatic_overrides = HashMap::new();
-            let overrides = self
-                .composed_book_layout()
-                .map(|layout| &layout.page_overrides)
-                .unwrap_or(&automatic_overrides);
-            build_spread_display_units_with_overrides(
-                nav,
-                self.spread_mode,
-                self.spread_shift_anchor_idx(),
-                page_alone,
-                overrides,
-                |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
-                |idx| is_spread_pairable_item(self.items.get(idx)),
-            )
-        } else {
-            nav.iter()
-                .enumerate()
-                .map(|(position, &idx)| {
-                    SpreadDisplayUnit::singleton(
-                        position,
-                        idx,
-                        if image_flags[position] {
-                            SpreadDisplaySingletonCause::UnpairedSlot
-                        } else {
-                            SpreadDisplaySingletonCause::NonPairableBoundary
-                        },
-                    )
-                })
-                .collect()
-        };
+        let automatic_overrides = HashMap::new();
+        let overrides = self
+            .composed_book_layout()
+            .map(|layout| &layout.page_overrides)
+            .unwrap_or(&automatic_overrides);
+        let units = build_display_unit_topology(
+            nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx(),
+            page_alone,
+            overrides,
+            |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
+            |idx| is_spread_pairable_item(self.items.get(idx)),
+        );
         let nav_identity = nav_identity.unwrap_or_else(|| Arc::new(nav.to_vec()));
-        #[cfg(test)]
-        SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
         self.spread_display_units_cache.install(
             nav_identity,
             self.items_generation,
@@ -19768,9 +19860,193 @@ impl App {
         })
     }
 
+    fn final_demand_book_context(&self) -> FinalDemandBookContext {
+        if self.spread_complete_book_context_eligible() {
+            FinalDemandBookContext::Eligible
+        } else {
+            FinalDemandBookContext::Ineligible
+        }
+    }
+
+    fn final_demand_visible_inputs_are_current(&self) -> bool {
+        let cache = &self.spread_display_units_cache;
+        let Some(token) = &cache.token else {
+            return false;
+        };
+        let composed = self.composed_layout_token().and_then(|(scope, token)| {
+            self.composed_book_layout()
+                .map(|layout| (scope, token, composition_view_direction(layout.direction)))
+        });
+        token.items_generation == self.items_generation
+            && token.spread_mode == self.spread_mode
+            && token.shift_anchor_idx == self.spread_shift_anchor_idx()
+            && token.landscape_epoch == cache.landscape_epoch
+            && token.composed == composed
+            && !cache.rotation_recheck_all
+            && cache.rotation_recheck_indices.is_empty()
+    }
+
+    fn final_demand_topologies_are_current(&self, saved: &FinalDemandTopologies) -> bool {
+        let cache = &self.spread_display_units_cache;
+        self.final_demand_visible_inputs_are_current()
+            && cache
+                .token
+                .as_ref()
+                .is_some_and(|token| saved.same_visible(token, &cache.units))
+            && self.viewer_navigation_caches.source == Some(saved.source)
+            && saved.source == (self.items_generation, self.reading_flow)
+            && self
+                .viewer_navigation_caches
+                .nav_indices
+                .as_ref()
+                .is_some_and(|nav| Arc::ptr_eq(nav, &saved.normal_nav))
+            && self
+                .viewer_navigation_caches
+                .still_image_indices
+                .as_ref()
+                .is_some_and(|nav| Arc::ptr_eq(nav, &saved.still_nav))
+            && saved.reader_order
+                == (
+                    self.current_reader_order().as_ptr() as usize,
+                    self.current_reader_order().len(),
+                )
+            && saved.requested_page_alone == self.page_alone_enabled_for_current_book()
+            && saved.book_context == self.final_demand_book_context()
+    }
+
+    /// One cold pure derivation under the existing unit owner. Never resolve
+    /// shift, read metadata, select a display texture, or replace visible proof.
+    pub(crate) fn prepare_final_demand_topologies(&mut self) {
+        if !self.settings.page_turn_animation_enabled
+            || !self.reading_flow.is_paged()
+            || self.spread_mode.is_split()
+            || self.fullscreen_idx.is_none()
+            || self.remote_session_blocks_local_control()
+        {
+            return;
+        }
+        // A validated resume adopts results before the runtime changes from
+        // ParkedLive to Resuming. Pure demand derivation follows that existing
+        // service boundary; mount/park themselves never call this method.
+        if !self.final_demand_visible_inputs_are_current() {
+            return;
+        }
+        if self
+            .spread_display_units_cache
+            .final_demand_topologies
+            .as_ref()
+            .is_some_and(|saved| self.final_demand_topologies_are_current(saved))
+        {
+            return;
+        }
+        let token = self
+            .spread_display_units_cache
+            .token
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Both lists use the current accepted reader order. The cold comparison
+        // proves this visible baseline belongs to that order, even when an owner
+        // was replaced with a same-content Arc without changing items generation.
+        let normal = build_nav_indices(&self.items, self.current_reader_order());
+        let still = crate::ui_helpers::still_image_display_indices(
+            &self.items,
+            self.current_reader_order(),
+        );
+        if !token.matches_nav(&normal) && !token.matches_nav(&still) {
+            return;
+        }
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        let normal_nav = match self.viewer_navigation_caches.nav_indices.as_ref() {
+            Some(nav) if nav.as_slice() == normal.as_slice() => nav.clone(),
+            _ => self.viewer_navigation_caches.install_nav_indices(normal),
+        };
+        let same_nav = normal_nav.as_slice() == still.as_slice();
+        let still_nav = match self.viewer_navigation_caches.still_image_indices.as_ref() {
+            Some(nav) if nav.as_slice() == still.as_slice() => nav.clone(),
+            _ if same_nav => {
+                self.viewer_navigation_caches.still_image_indices = Some(normal_nav.clone());
+                normal_nav.clone()
+            }
+            _ => self
+                .viewer_navigation_caches
+                .install_still_image_indices(still),
+        };
+        let normal = self.derive_final_demand_topology(&normal_nav, &token);
+        let still = if same_nav {
+            normal.clone()
+        } else {
+            self.derive_final_demand_topology(&still_nav, &token)
+        };
+        self.spread_display_units_cache.final_demand_topologies = Some(FinalDemandTopologies {
+            visible: token,
+            visible_units: self.spread_display_units_cache.units.clone(),
+            source: (self.items_generation, self.reading_flow),
+            reader_order: (
+                self.current_reader_order().as_ptr() as usize,
+                self.current_reader_order().len(),
+            ),
+            normal_nav,
+            still_nav,
+            requested_page_alone: self.page_alone_enabled_for_current_book(),
+            book_context: self.final_demand_book_context(),
+            normal,
+            still,
+        });
+    }
+
+    fn derive_final_demand_topology(
+        &self,
+        nav: &[usize],
+        token: &SpreadDisplayUnitsToken,
+    ) -> FinalDemandTopology {
+        let visible_nav = token.matches_nav(nav);
+        let complete = self.spread_mode.is_spread()
+            && self.spread_complete_book_context_eligible()
+            && self.spread_complete_page_permutation(nav);
+        let completeness = if complete {
+            FinalDemandCompleteness::Complete
+        } else {
+            FinalDemandCompleteness::Incomplete
+        };
+        let page_alone = if complete && self.spread_mode.has_cover() {
+            self.page_alone_enabled_for_current_book()
+        } else {
+            Default::default()
+        };
+        if visible_nav && token.page_alone == page_alone {
+            return FinalDemandTopology::Visible(completeness);
+        }
+        let empty = HashMap::new();
+        let overrides = self
+            .composed_book_layout()
+            .map(|layout| &layout.page_overrides)
+            .unwrap_or(&empty);
+        let units = build_display_unit_topology(
+            nav,
+            self.spread_mode,
+            token.shift_anchor_idx,
+            page_alone,
+            overrides,
+            |_, idx| {
+                self.spread_display_units_cache
+                    .landscape_indices
+                    .contains(&idx)
+            },
+            |idx| is_spread_pairable_item(self.items.get(idx)),
+        );
+        let positions = index_display_units(&units);
+        FinalDemandTopology::Derived(Arc::new(FinalDemandDerivedTopology {
+            units,
+            positions,
+            completeness,
+        }))
+    }
+
     /// Observation only in D3-1. Slideshow uses its actual installed still-image
     /// navigation list; Collection's future snapshot is never guessed here.
-    pub(crate) fn observe_next_final_unit_demand(&self) {
+    pub(crate) fn observe_next_final_unit_demand(&mut self) {
         if !crate::perf::is_enabled()
             || !self.settings.page_turn_animation_enabled
             || !self.reading_flow.is_paged()
@@ -19790,6 +20066,7 @@ impl App {
         {
             return;
         }
+        self.prepare_final_demand_topologies();
         let Some(demand) = self.next_final_unit_demand_from_snapshot(idx) else {
             return;
         };
@@ -19953,81 +20230,39 @@ impl App {
         requested: FinalUnitPosition,
     ) -> Option<Option<SpreadDisplayComposition>> {
         let cache = &self.spread_display_units_cache;
-        let token = cache.token.as_ref()?;
-        if token.items_generation != self.items_generation
-            || token.spread_mode != self.spread_mode
-            || token.landscape_epoch != cache.landscape_epoch
-            || cache.rotation_recheck_all
-            || !cache.rotation_recheck_indices.is_empty()
-        {
+        let saved = cache.final_demand_topologies.as_ref()?;
+        if !self.final_demand_topologies_are_current(saved) {
             return None;
         }
-        // Observing slideshow must not install its still-only topology into the
-        // visible unit owner: that Arc is also the accepted receipt's layout proof.
-        let slideshow_nav = self.slideshow_playing.then(|| {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_reader_order())
-        });
-        let nav = slideshow_nav.as_deref().unwrap_or(&token.nav);
-        let slideshow_units = slideshow_nav.as_ref().map(|_| {
-            if !self.spread_mode.is_spread() {
-                return nav
-                    .iter()
-                    .enumerate()
-                    .map(|(position, &idx)| {
-                        SpreadDisplayUnit::singleton(
-                            position,
-                            idx,
-                            SpreadDisplaySingletonCause::UnpairedSlot,
-                        )
-                    })
-                    .collect();
-            }
-            let complete = self.spread_complete_book_context_eligible()
-                && self.spread_complete_page_permutation(nav);
-            let alone = if complete {
-                self.page_alone_enabled_for_current_book()
-            } else {
-                Default::default()
-            };
-            let empty = HashMap::new();
-            let overrides = self
-                .composed_book_layout()
-                .map(|layout| &layout.page_overrides)
-                .unwrap_or(&empty);
-            build_spread_display_units_with_overrides(
-                nav,
-                self.spread_mode,
-                token.shift_anchor_idx,
-                alone,
-                overrides,
-                |_, idx| cache.landscape_indices.contains(&idx),
-                |idx| is_spread_pairable_item(self.items.get(idx)),
-            )
-        });
-        let units = slideshow_units.as_deref().unwrap_or(&cache.units);
-        let Some((position, _)) = find_spread_display_unit(&units, idx) else {
-            return None;
+        let topology = if self.slideshow_playing {
+            &saved.still
+        } else {
+            &saved.normal
         };
-        let cover = self.final_cover_spread_enabled_for_current_book();
-        let placement = self.spread_singleton_display_endpoint_settings();
-        let eligible = self.spread_complete_book_context_eligible()
-            && self.spread_complete_page_permutation(nav);
+        let (units, position, completeness) = match topology {
+            FinalDemandTopology::Visible(proof) => {
+                (cache.units.as_slice(), cache.unit_position(idx)?, *proof)
+            }
+            FinalDemandTopology::Derived(topology) => (
+                topology.units.as_slice(),
+                *topology.positions.get(&idx)?,
+                topology.completeness,
+            ),
+        };
         let position = match requested {
             FinalUnitPosition::Current => position,
-            FinalUnitPosition::Next => {
-                match position.checked_add(1).filter(|next| *next < units.len()) {
-                    Some(next) => next,
-                    None => return Some(None),
-                }
-            }
+            FinalUnitPosition::Next => match position.checked_add(1) {
+                Some(next) if next < units.len() => next,
+                _ => return Some(None),
+            },
         };
         Some(resolve_spread_display_composition(
-            &units,
+            units,
             position,
             self.spread_mode,
-            cover,
-            placement,
-            eligible,
+            self.final_cover_spread_enabled_for_current_book(),
+            self.spread_singleton_display_endpoint_settings(),
+            completeness.is_complete(),
         ))
     }
 

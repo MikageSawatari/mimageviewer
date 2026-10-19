@@ -74,6 +74,17 @@ D3-4(b) の Native 候補は既存 App 共通 frame owner に当該 pass の値�
 renderer lock を context 訪問／会計へ持ち越さず、通常 `fs_lanczos_cache`／submit／Native lease を使う。
 park／mount／fork の新しい非同期 owner は作らず、cold metadata 準備も追加しない。
 
+D3-5整理（2026-10-19）: Native canonical の完全性・位置検索は既存 installed topology の証拠／索引を使い、
+未採用なら skip する。slideshow の nav/unit 列も収集・再照合から再構築しない。最新 callback の値は
+既存 frame owner に置き、最終 hook の処理後に消費する。別 cache owner／queue／heartbeat は作らない。
+source／AI の既存先読み要求範囲と producer は維持する。D3-3 の編集入力・comic CPU-only 化は
+次の版の後の [backlog §1.401](next-release-backlog.md) へ延期し、通常表示要求の従来経路は保持する。
+横断監査と計測／未確認事項の正本は [page-turn 計画 §27.17.17](page-turn-animation-plan.md)。
+CPU 需要用の従来 resolver に残っていた全頁走査・mixed slideshow 列再構築も、D3-5 で同じ既存
+`SpreadDisplayUnitsCache` 内の派生 record へ移す。cold だけ導出し、warm は scalar／Arc identity と索引で読む。
+共通adoption／producer／keepのprefixで同pass採用し、ROOT直接採用も覆う。visible token／units／証拠は変更せず、
+同じ枝は既存索引を参照し、異なる枝だけ完全recordを持つ。forkのfresh owner、mount／park／promoteの移譲は維持する。
+
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 
 `run_music_analysis` はデコード成功と取消なしを確認し、必要な `TimelineComplete` の送信後に
@@ -1447,8 +1458,14 @@ mImageViewer は 2 つのリストを使い分ける:
 
 `app/vram_accounting.rs` は `fs_cache` から表示系の各派生 cache、連結 transition、
 `thumbnails` / `thumb_textures` / `thumb_adjust_tex` までを横断する。推定表示サイズではなく
-`TextureHandle::size()` と完全な mip chain を使い、同じ `TextureId` は cache をまたいでも
+`TextureHandle::size()` と登録時 options に対応する mip chain を使い、同じ `TextureId` は cache をまたいでも
 1 回だけ数える。チェック柄・スタンプ・font preview など小さく有界な texture は対象外とする。
+
+D3 の final は実登録 options の mip 有無を使い、Native 出力は RGBA8・mip なしで数える。
+mounted だけでなく registry の at-rest／parked の通常cacheも共通walkerで加算する。
+presentation の Native は出力だけをpinし、元sourceを重複pinしない。cache退去後も最後の実batch leaseが
+生存する間は既存weak inventoryから会計し、弱参照自体は寿命を延ばさない。Native admissionは出力に加え
+当該branchの実一時allocationも含める。offer前の専用pin予約・演出専用cacheは作らない。
 
 `--perf-log` が有効な場合だけ、約 1 秒に 1 回 `gpu.vram_accounting` を記録する。イベントには
 モード、全 texel/byte、共有 pool と両配分の上限、無制限フラグ、および subsystem ごとの

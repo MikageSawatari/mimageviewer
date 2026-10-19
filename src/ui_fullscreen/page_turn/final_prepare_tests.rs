@@ -81,6 +81,7 @@ fn d3_2_real_producer_requires_accepted_output_before_initial_open_prefetch() {
     // can accept it. Installed topology and resident input already exist.
     frame(&ctx, |ui, ctx| {
         draw_current(&mut app, ui, ctx);
+        app.prepare_final_demand_topologies();
         assert!(app.next_final_prepare_occurrences(0).is_some());
         assert!(!app.page_turn_current_unit_presented());
         app.prefetch_next_final_unit(ctx, 0);

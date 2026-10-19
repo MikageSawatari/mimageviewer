@@ -5317,3 +5317,66 @@ detachedの変更は、既存runtime・session／context binding・実描画disp
   アプリのログに重い仕事は記録されていない (受理の frame の次の frame が約 42ms)。GPU 側 (大きい texture の residency・driver) が原因の可能性があるが**未確認**。
   原因を決めるには PresentMon / ETW 等の GPU 側の記録が要る。D3 の範囲内で直せるとは扱わない。
 - 補正なし 04 単ページの 1 回 (9 コマ) は `cancel reason=focus_lost` (計測中にフォーカスが一瞬外れた、環境要因) で、欠陥ではない。
+
+#### 27.17.17 D3 の実装済み範囲と D3-5 横断監査（2026-10-19）
+
+利用者の2026-10-19決定により、次の版の対象は D3-1／D3-2／D3-4(a)(b)。D3-3 は次の版の後へ回し、
+[backlog §1.401](next-release-backlog.md) を残作業の正本とする。設定・操作は変わらず、マニュアル・製品ページ・CHANGELOG は今回変更しない。
+
+| chunk | 実装と完成レビュー修正の commit | 状態 |
+| --- | --- | --- |
+| D3-1 | `7388b3f2d`、レビュー記録 `f18240311` | 次 unit 需要、selector 非依存の受信・採用、receipt 分離、入口接続、exact hit と予算基盤 |
+| D3-2 | `20742ad57`、CRT 寸法正本化 `2d0f5a440` | CPU-only 一般 final、実終了までの permit、結果予約、通知、takeover、park 保持 |
+| D3-4(a) | `b727d95c7`、Submitted receipt park 回帰 `6123fd830` | ROOT 最終 output の新規投機登録、演出排他、retry を跨ぐ活動、配送観測 |
+| D3-4(b) | `e92000b10`、installed topology／実 draw 回帰 `6e688ee55` | 共通 canonical geometry と Native prewarm、通常 cache／D2 handoff、allocation 会計 |
+| D3-5 | 作業開始 `479f7f65e`（master `2410719c7` merge 済み、競合なし）、今回差分は未commit | 横断監査、下記 F1 の同owner内修正、解析器・文書整理。実行検証と通常確認 build の結果は `target/d3-5-*` に分けて記録 |
+
+計測は ClaudeCode が採取した §27.15 → §27.17.13 → §27.17.15 → §27.17.16 を正本とし、この作業では製品を起動していない。
+
+| 条件 | D3 前 §27.15 | D3-2 後 §27.17.13 | D3-4(a) 後 §27.17.15 | D3-4(b) 後 §27.17.16 |
+| --- | --- | --- | --- | --- |
+| 補正あり Single | 11〜29コマ／87〜166ms／31〜66ms | 17〜28／4〜9ms／31〜47ms | 30〜34／4〜18ms／8〜27ms | 30〜34／4〜9ms／7〜28ms |
+| 補正あり RtlCover | 2〜28／100〜359ms／37〜198ms | 18〜32／4〜39ms／14〜51ms | 29〜33／5〜63ms／8〜19ms | 21〜34／5〜44ms／7〜50ms |
+
+各欄はコマ数／受理→初回 curl／最大間隔の既存測定要約。補正なしの詳細と focus_lost による9コマの取消は元の表を参照する。
+見開き後半に残る21〜46msは原因未確認で、Native hit や準備済みだけから GPU residency／driver と断定しない。
+正式 gate（各profileの3run×30機会、§27.9.2／§27.17.10）、提案されているp95／最大間隔・追加CPU／GPU費用、
+利用者によるmotion／実機操作確認は未実施。八条件各8回の参考計測や自動回帰で代替しない。
+
+**監査 F1 と修正:** canonical Native の収集・再照合は索引化済みだったが、CPU 需要用の
+`final_unit_composition_from_snapshot` は通常 Single を含め `find_spread_display_unit` と
+`spread_complete_page_permutation` の全頁走査を残していた。通常 fullscreen work の
+`prefetch_next_final_unit`、pending の必要性照合、`page_turn_prefetch_keep_set` から呼ばれていた。
+slideshow では still 列と unit 列も都度再構築していた。D3-4(b) 修正時には mixed slideshow の CPU 需要を維持するため変更していなかった経路であり、
+今回の横断監査で追加の UI O(n) 仕事として残ることを確認した。実時間や性能 gate 不合格を測った主張ではない。
+
+既存 `SpreadDisplayUnitsCache` は表示用 token／units／索引／完全性証拠を一組だけ保持し、
+`ViewerNavigationCaches.still_image_indices` は still 列だけを持つ。mixed slideshow Pair は media 除外で組が変わるため、
+既存 image-unit 索引の filter だけでは代用できない。需要を skip して準備範囲を縮める、表示用 token を置換して receipt の証拠に触れる、
+通常経路だけ直して mixed の反復構築を残す、のいずれも採らない。
+同じ既存 owner 内に `FinalDemandTopologies` という再構築可能な派生値を置き、cold の一回だけ現 reader order と
+installed visible token の整合を証明して pure builder／完全性／頁→unit 索引を導出する。表示用 token／units／完全性証拠は書かない。
+visible と同じ枝は既存 units／索引を参照し、異なる枝だけ immutable な完全 record を持つ。warm 照合は scalar と Arc identity に限定する。
+入力世代・nav／visible Arc・composed・mode・shift・landscape／回転 dirty・page-alone／context 適格性を照合し、古い値を新需要へ流用しない。
+CPU の Current／Next／keep／pending 必要性照合は同じ snapshot read を使う。共通 adoption 入口で準備するため、
+通常 service と ROOT 最終 hook の直接 collect→adopt の両方を覆う。producer／keep と最初の perf 観測も同じ prefix を使い、
+cold を一 frame 遅延へ変えない。受信 helper は selector 非依存のまま。shift 解決を伴う navigation getter、cold DB／margin 検出、
+新 job／待機 state／queue は足さず、OFF／連結／Split／Remote／park に新しい投機を始めない。
+新しい cache owner はなく、既存 owner 内の派生 cache field が必要な理由と採用・失効契約を
+`target/d3-5-topology-design.md` に記録した。独立設計レビューは既存設計と整合する構造的修正として ACCEPT。
+監査表・根拠・実行／未実行の区分は `target/d3-5-audit.md` と `target/d3-5-handoff.md` に保存する。
+
+解析器には参考診断 `page-turn-d3` を追加した。操作は context／window／operation_id で分離し、
+重複しない curl 提出 frame 数、受理→初回 curl、curl 間隔max／p95を出す。精密な output 時計があれば使い、
+無い旧traceは event時刻へのfallbackを明示する。終端の canonical flat は curl 間隔の対象外。
+CPU完成／登録／配送submit／Native submit／Native lookupのhit・miss・不要／保留理由別件数はログ全体の観測件数として集計し、
+operation identityを持たない準備仕事を近い操作へ推定で割り当てない。配送submitをGPU実完了やOS提示と扱わない。
+
+```powershell
+python scripts/analyze_perf.py target/page-turn-smoke/d34b-04-rtl-adj/logs/perf_events.jsonl page-turn-d3 --json-out target/d3-5-example.json
+```
+
+§27.17.13／15／16 の24 archive・192操作で解析成功。旧summary／page-turn／page-turn-animationは72組で
+旧版とのstdout／stderr／終了コード一致を確認した。例としてd34b-04-rtl-adjは21〜34コマ、受理→初回curl 5.391〜45.113ms、
+操作別間隔最大7.131〜49.512ms、Native lookup hit165／miss5／不要35。D3-2ログの配送／Native観測0件は未計装と区別できず、仕事ゼロとは解釈しない。
+解析器回帰・出力例は `target/d3-5-analyzer-*`。この診断の `status=reference` は正式gateの成功判定ではない。

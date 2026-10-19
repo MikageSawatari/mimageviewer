@@ -5850,3 +5850,17 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
 - 既存 App frame owner の最新 callback 値と再照合し、旧 viewport view を現行と扱わない。最終 hook 中も同じ値 owner を保持し、処理後に消費するだけで、mount／park／promote の意味は変えない。
 - 実 child callback の異なる ppp／clip と ROOT での再照合を headless テストに含める。runtime／binding／dispatch 述語、HWND、placement、viewport 生成、permission は変更しない。
   設計担当が妥当と判断した P2 二件への修正であり、独立 source 再レビューも既存 owner 内の構造的修正として合意。検証記録は `target/d3-4b-fix-*`。
+
+##### D3-5 merge 後の横断監査（2026-10-19）
+
+- `479f7f65e`（最新master `2410719c7` merge後）で、通常producer、全contextの会計とbatch lease、park／fork／mount／promote の所有境界を再監査した。
+  静的根拠と実行gateの区別は `target/d3-5-audit.md`。runtime／binding／dispatch・HWND／placement・viewport生成は変更しない。
+- canonical Nativeとは別のCPU需要resolverに毎frameの全頁走査とmixed slideshowの列再構築が残るF1を検出した。
+  需要を減らさず、表示token／receiptを置換せず、既存SpreadDisplayUnitsCache内の派生recordへcold一回の証拠／索引を採用する。
+  同じ枝はvisible索引を参照し、異なる枝だけ完全recordを持つ。source／nav／composed／mode／shift／landscape／page-aloneを照合し、
+  warmはscalar／Arc identityだけで読む。共通adoption入口が通常serviceとROOT直接採用を覆い、producer／keep／perf観測も共有する。
+  forkはfresh owner、mount／park／promoteは既存値移譲のままで、新しいworker／pending／bool／世代／detachedフラグを足さない。
+  同owner内の再構築可能なcache field追加が必要な理由と失効契約は `target/d3-5-topology-design.md`。
+  独立設計レビューも既存合意範囲の構造的修正としてACCEPT。完成差分・実行gateの判定は `target/d3-5-*` に分けて記録する。
+- D3-3は利用者決定で次の版の後へ延期（backlog §1.401）。既存編集／comic表示経路を維持する。
+  実機操作・motion、正式3run×30機会gateは未確認。page-turn計画 §27.17.17 に実装済み範囲・計測推移・残作業をまとめた。

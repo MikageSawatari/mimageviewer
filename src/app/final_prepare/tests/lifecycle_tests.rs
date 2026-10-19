@@ -493,3 +493,157 @@ fn d3_2_active_viewer_production_update_restarts_blocked_sibling_on_release_repa
     assert!(app.final_effect_pending.is_empty());
     assert_eq!(app.final_prepare_cpu.snapshot().bytes, 0);
 }
+
+#[test]
+fn d3_5_real_parked_and_parked_live_resume_adopt_cold_valid_ready_demand() {
+    for live in [false, true] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        let window = if live { 95_512 } else { 95_511 };
+        let id = active_owner(&mut app, &ctx, window);
+        let media_path = PathBuf::from("C:/d3-lifecycle/parked-media.mp4");
+        let (key, cancel, reservation) = app
+            .with_active_viewer_context(|owner| {
+                if live {
+                    // A retained media player makes this a real ParkedLive bundle;
+                    // its shown page and the pending next unit remain still pages.
+                    owner.items[3] = GridItem::Video(media_path.clone());
+                    owner.viewer_navigation_caches.invalidate();
+                    owner.spread_display_units_cache = Default::default();
+                    owner.fs_cache.insert(
+                        3,
+                        FsCacheEntry::Video {
+                            player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                                media_path.clone(),
+                                3.0,
+                            )),
+                            load_seq: 1,
+                        },
+                    );
+                    frame(&ctx, |ui, ctx| {
+                        draw_current_without_sources(owner, ui, ctx);
+                    });
+                    assert!(owner.page_turn_current_unit_presented());
+                }
+                owner.prefetch_next_final_unit(&ctx, 0);
+                let key = wait_ready(owner, 1);
+                let cancel = owner.final_effect_pending[&key].cancel.clone();
+                let reservation = reservation_ptr(&owner.final_effect_pending[&key]);
+                owner.forget_final_demand_topologies_for_test();
+                (key, cancel, reservation)
+            })
+            .unwrap();
+        assert!(app.pause_current_active_viewer_context(&ctx));
+        assert!(app.active_viewer_context_id().is_none());
+        assert_eq!(app.viewer_context_residence(id), ContextResidence::AtRest);
+        if live {
+            app.with_viewer_context(id, |owner| {
+                owner.fs_cache.insert(
+                    3,
+                    FsCacheEntry::Video {
+                        player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                            media_path.clone(),
+                            3.0,
+                        )),
+                        load_seq: 1,
+                    },
+                );
+            })
+            .unwrap();
+            app.transition_detached_window_state(
+                window,
+                DetachedWindowState::ParkedLive,
+                "d3-5-test",
+            );
+        }
+        let expected = if live {
+            DetachedWindowState::ParkedLive
+        } else {
+            DetachedWindowState::Parked
+        };
+        assert_eq!(app.detached_window_state(window), Some(expected));
+        let budget = app.final_prepare_cpu.snapshot();
+        for _ in 0..2 {
+            app.with_viewer_context(id, |owner| {
+                assert!(
+                    !owner.has_final_demand_topologies_for_test(),
+                    "mount/park never prepares metadata or polls the receiver"
+                );
+                assert!(owner.final_effect_pending.contains_key(&key));
+                assert_eq!(
+                    reservation_ptr(&owner.final_effect_pending[&key]),
+                    reservation
+                );
+            })
+            .unwrap();
+        }
+        assert_eq!(app.final_prepare_cpu.snapshot(), budget);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.activate_detached_image_window_snapshot(&ctx, window));
+        app.with_active_viewer_context(|owner| {
+            assert!(
+                owner.has_final_demand_topologies_for_test(),
+                "the real resume adoption performs one cold pure derivation"
+            );
+            assert!(
+                owner.final_effect_pending.contains_key(&key),
+                "valid demand must not be mistaken for obsolete before Resuming"
+            );
+            assert_eq!(
+                reservation_ptr(&owner.final_effect_pending[&key]),
+                reservation
+            );
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert!(owner.ensure_final_composite_texture(&ctx, 1).is_some());
+            assert!(owner.final_composite_cache.contains_key(&key));
+            assert!(!owner.final_effect_pending.contains_key(&key));
+        })
+        .unwrap();
+        assert!(
+            app.final_effect_pending.is_empty(),
+            "the main sibling receives no result"
+        );
+    }
+}
+
+#[test]
+fn d3_5_real_computing_receipts_and_keep_reuse_warm_demand_without_restarting_work() {
+    let ctx = egui::Context::default();
+    install_presentation(&ctx);
+    let mut app = app(&ctx);
+    frame(&ctx, |ui, ctx| {
+        draw_current_without_sources(&mut app, ui, ctx);
+    });
+    let hold = WorkerHold::new();
+    app.prefetch_next_final_unit(&ctx, 0);
+    hold.entered();
+    let key = pending_key(&app, 1);
+    let cancel = app.final_effect_pending[&key].cancel.clone();
+    let reservation = reservation_ptr(&app.final_effect_pending[&key]);
+    let budget = app.final_prepare_cpu.snapshot();
+    crate::ui_fullscreen::reset_native_topology_work_counts_for_test();
+    crate::ui_fullscreen::reset_nav_indices_build_count_for_test();
+    for _ in 0..100 {
+        app.prefetch_next_final_unit(&ctx, 0);
+        assert!(app.final_demand_keep_for_test(0).unwrap().contains(&1));
+        app.poll_final_effects(&ctx);
+        assert!(matches!(
+            app.final_effect_pending[&key].state,
+            FinalEffectState::Computing(_)
+        ));
+        assert!(Arc::ptr_eq(&cancel, &app.final_effect_pending[&key].cancel));
+        assert_eq!(
+            reservation_ptr(&app.final_effect_pending[&key]),
+            reservation
+        );
+    }
+    assert_eq!(
+        crate::ui_fullscreen::native_topology_work_counts_for_test(),
+        [0; 5]
+    );
+    assert_eq!(crate::ui_fullscreen::nav_indices_build_count_for_test(), 0);
+    assert_eq!(app.final_prepare_cpu.snapshot(), budget);
+    hold.release();
+    wait_ready(&mut app, 1);
+}

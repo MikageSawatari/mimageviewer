@@ -262,6 +262,7 @@ impl App {
     /// Only the ordinary fullscreen work boundary starts producers. A mount or
     /// pre-lookup adoption service cannot call this method.
     pub(crate) fn prefetch_next_final_unit(&mut self, ctx: &egui::Context, current_idx: usize) {
+        self.prepare_final_demand_topologies();
         let demand = self.d3_final_prepare_unit(current_idx);
         let obsolete: Vec<_> = self
             .final_effect_pending

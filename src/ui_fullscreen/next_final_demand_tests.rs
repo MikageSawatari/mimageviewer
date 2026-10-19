@@ -165,6 +165,7 @@ fn d3_slideshow_observation_uses_actual_still_units_without_mutating_visible_lay
     app.visible_indices = vec![0, 1, 2, 3];
     app.details_order = app.visible_indices.clone();
     app.fullscreen_idx = Some(0);
+    app.settings.page_turn_animation_enabled = true;
     for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
         app.spread_mode = mode;
         for idx in 0..4 {
@@ -176,6 +177,7 @@ fn d3_slideshow_observation_uses_actual_still_units_without_mutating_visible_lay
         let layout = Arc::clone(&app.spread_display_units_cache.units);
         let generation = app.items_generation;
         app.slideshow_playing = true;
+        app.prepare_final_demand_topologies();
         let NextFinalUnitDemand::Unit(pages) = app.next_final_unit_demand_from_snapshot(0).unwrap()
         else {
             panic!()
