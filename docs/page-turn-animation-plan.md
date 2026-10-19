@@ -5861,3 +5861,248 @@ writer は1人とし、所有・hook 拡張・優先回収の実装前独立レ�
   通常 producer 側で同じ時点の事実から開始できない理由の妥当性、低優先投機だけを回収する処理が表示昇格・Current・legacy・park 保持物を巻き込まないこと、
   detached 憲法上「症状パッチではなく構造的修正」であること。
 - 期待値の限界 (利用者へ伝える): F12 を開いた直後、準備の時間がないまま戻ると従来どおり同期で作る。静止の機会があれば Next の後に Previous が揃う。
+
+##### 27.17.20.12 改訂 1: 実装前レビューへの対応（2026-10-19）
+
+| 指摘 | 改訂箇所 |
+|---|---|
+| P2：parked Previous の結果予約を live loop から回収できない | §27.17.20.4・.5。Next の CPU admission が予約不足で失敗した境界に、parked を含む予約 owner の回収段階を追加 |
+| P3：Native の退去なし判定が smoothing／旧 source 除去を含まない | §27.17.20.6。既存 entry の除去を文字どおりゼロと定義し、実行時の全削除規則を純粋判定へ含める |
+| 通常 producer 側を採らない理由が強すぎる | §27.17.20.7。問題を最新 callback の view と全 context の判定時点に修正 |
+| 兄弟の Unknown による全 Previous 保留の可視化 | §27.17.20.4・.9。保留対象と blocker の context／理由を診断へ記録 |
+| 追加回帰と合意状況 | §27.17.20.10、および「未確定・要レビュー点」 |
+
+**結論：上限据え置き・既存 owner の方針を維持し、予約回収を live 描画対象の列挙から分離する。Native は「旧世代の除去も含め、Previous の挿入による既存 entry の除去ゼロ」を採る。**
+
+以下は HEAD `7f858c90a843faedeb3ff7b41b512fcda0d5bf98` と独立レビュー全文の静的確認による改訂案である。作業ツリーは clean。変更・ビルド・テスト・製品起動は行っていない。「確認済み」は現行 source／文書の事実、「設計案」は未実装の変更を表す。独立レビューの反例は実行観測ではない。
+
+##### 27.17.20.4 準備順序と既存 owner の拡張〔置換：予約回収の実行境界〕
+
+Next の CPU 開始位置と、ROOT 最終 hook における Next→Previous の順序は維持する。ただし、**低優先結果予約の回収は、ROOT hook の live route loop に閉じ込めない。**
+
+**確認済み：** 現 hook の結果採用は `live_paged` から現在有効な route を選んで訪問する。parked owner の結果予約は、この loop では回収できない。
+
+根拠：`src/app/final_prepare_budget.rs:524`、`:549`。
+
+**設計案：Next CPU の予約拒否を起点に、独立した回収 helper を呼ぶ。**
+
+接続位置は `prefetch_next_final_unit` → `spawn_prepared_final_job` → `final_prepare_cpu.try_start` の予約取得境界とする。必要な resident 入力・plan・予約 bytes が確定し、Next の新規 CPU job を実際に開始しようとして予約不足になった場合だけ呼ぶ。
+
+根拠：`src/app/final_prepare.rs:264`、`:382`、`:396`。
+
+処理順は次とする。
+
+```text
+現在の Next CPU 需要・resident plan・bytes を確認
+  → try_start
+      → 成功：既存 worker を開始
+      → 実行 permit のみ不足：既存 waiter へ任せる
+      → 結果予約不足：
+          budget が既に所有する予約 unit の値を取得
+          budget lock を解放
+          parked を含む該当 owner の低優先結果だけを回収
+          元の Next 需要・key を再照合
+          try_start を一度だけ再試行
+```
+
+`try_start` は現在、実行中と予約不足をまとめて `None` にしている。これを呼出し内で消費する typed outcome に分ける。予約不足と実行中が同時に成立する場合も予約不足を識別できるようにする。要求単体で1GiBを超える等、回収しても入らない要求では owner 訪問を行わない。
+
+失敗 outcome は新しい pending／queue に保存しない。Previous の admission 失敗からは高優先回収を呼ばない。元の Next producer を ROOT 最終 hook へ移さず、hook からの Previous 開始も従来案のままとする。
+
+**Next の Native miss／Unknown だけを理由に CPU 予約回収を行わない。** GPU 段階の不足と、開始可能な Next CPU job の予約不足を区別する。
+
+##### 27.17.20.5 permit、CpuReady、登録枠、取消〔置換：parked を含む予約回収〕
+
+全上限は維持する。回収対象の探索には、既存 `FinalPrepareCpuBudget` の予約表 `BudgetState.units` を使う。同表には context・items 世代・occurrence 列を含む `FinalPrepareUnit` があり、全体上限により最大2 unitである。
+
+根拠：`src/app/final_prepare_cpu.rs:11`、`:15`、`:55`、`:70`。
+
+**設計案：予約拒否時に、この表から unit identity の一時 snapshot を得る。予約 lease の Arc は clone しない。**
+
+探索対象は次のように限定する。
+
+| 境界 | 訪問方法 |
+|---|---|
+| 予約 owner の選択 | `BudgetState.units` の最大2 unitから context ID を重複排除 |
+| owner の存在・保管位置の確認 | `with_viewer_context_ref` |
+| pending の照合・限定的な結果受信・破棄 | `with_viewer_context_state` の owner-scoped closure |
+| 訪問後 | 同 helper により元の mounted context へ戻す |
+
+根拠：`src/app/viewer_context_registry.rs:5204`、`:5340`。
+
+`viewer_context_ids()`／`other_viewer_context_ids()` は全 registry の列挙入口として存在するが、本回収では予約表から直接 owner を特定できるため使用しない。live route 一覧も回収対象の filter に使わない。active F12 の AtRest と parked の AtRest の双方へ、同じ所有境界で到達する。
+
+根拠：`src/app/viewer_context_registry.rs:230`、`:250`、`:5004`、`:5084`。
+
+budget mutex は metadata snapshot の取得までとし、registry 訪問、pending の drop、repaint まで保持しない。snapshot 後の worker 完了・予約解放に備え、各 owner 内で現在の要求を再照合する。消滅した owner や既に解放された予約は見送る。
+
+**毎 frame の全 context 走査にはしない。**
+
+- 実際の Next CPU 要求がなく、plan／bytes が未確定なら回収しない。
+- permit 不足だけなら回収しない。
+- 予約不足を確認した呼出しで、予約 owner 最大2 unitだけを訪問する。
+- 同一 producer 呼出し内で回収→再試行を反復しない。再試行は一度まで。
+- 回収しても不足する場合は、既存 waiter と資源解放通知へ戻る。追加 timer／heartbeat／再試行 bool を作らない。
+
+**回収可否は origin と、所有 context の現在需要を照合して決める。**
+
+| 所有物 | 回収段階での扱い |
+|---|---|
+| 未昇格の `Speculative(unit)` で、現在も Previous と確定する結果 | 回収候補 |
+| Current／Next の素材として必要な結果 | 保護 |
+| `DisplayPrepared` | 保護 |
+| `LegacyDisplay / LegacyPrefetch` | 保護 |
+| held／receipt／presentation／batch lease | 参照・変更しない |
+| 登録済み final／Native cache | CPU 結果予約回収の対象外 |
+| topology／役割を確定できないもの | 本回収では保護。既存失効処理の代わりに推測で破棄しない |
+
+Current／Next の保護は unit 全体の等値だけで済ませない。**回収する各 pending の exact key が、Current／Next に必要な実頁の素材として共有されていないことも確認する。** 補助表紙等で同じ source を別 occurrence が参照する場合を含む。
+
+照合は採用済み topology・現在の key／世代だけを読む。parked owner の topology を得るために描画、metadata 読取、通常 service、producer を起動しない。
+
+根拠となる既存照合：`src/app/final_prepare.rs:166`、`src/ui_fullscreen.rs:20534`、`:20872`。
+
+**結果がどこにあるかによる扱い：**
+
+| 状態 | 処理 |
+|---|---|
+| `CpuReady(Prepared)` | 対象 pending の公開権を外して破棄。結果と予約を解放 |
+| 受信済み・未登録結果 | 同じ CpuReady owner として処理。登録してから回収しない |
+| `Computing(Prepared receiver)` に未受信結果がある | 対象 receiver だけを非 blocking 受信し、同じ pending の結果として破棄する。未受信を会計外にしない |
+| receiver が Empty、実際に計算中 | 本段階で完成結果として回収しない。permit・worker 側予約は保持 |
+| 既存の高優先化規則で Computing を取消す場合 | cancel・公開権撤去だけ。実終了前に permit／worker 側予約を返さない |
+
+現在の `Computing` は worker が終了して結果が channel に入った後も、UI が受信するまではその variant のままである。したがって **`CpuReady` のみを回収対象にする実装では P2 は解消しない。**
+
+根拠：`src/app/final_prepare.rs:37`、`:45`、`:69`、`src/app/final_prepare/tests/lifecycle_tests.rs:121`。
+
+受信した低優先結果を採用 helper へ渡さず、その owner 内で破棄する。破棄までの一時値にも予約 lease が残ることを踏まえ、**一時値と pending を drop した後に**不足を再判定する。取消・受信・drop の競合は、既存 cancel／receiver／RAII の境界で閉じる。
+
+予約解放は既存 `FinalPrepareReservation::drop`、実行 permit の返却は既存 `FinalPreparePermit::drop` に任せる。既存 waiter 登録と返却時 wake の順序を維持するため、A／B の worker 終了通知が既に済んでいても、C の Next を回収直後の一度の再試行または既存解放通知で進められる。
+
+根拠：`src/app/final_prepare_cpu.rs:100`、`:215`、`:238`。
+
+**park 表との整合：** park は引き続き新規投機開始を止める操作であり、一括取消しない。今回の回収は、§27.17.3 の「投機CpuReadyは予約付きで保持可能、圧力時の投機退去対象」を具体化する。完了結果の保持場所が未受信 channel でも同じ条件を適用する。
+
+parked で実際に計算中の worker は、park を理由に止めず、実終了までの permit／予約保持を維持する。完成後は解放 wake による次の Next admission で結果を回収できる。parked の表示用カラー化／LUT、Current／Next、DisplayPrepared の保持契約は変更しない。
+
+根拠：`docs/page-turn-animation-plan.md:4211`、`:4221`。
+
+##### 27.17.20.6 Native key、戻る curl、cache admission、VRAM〔置換：退去なし判定〕
+
+**確認済み：** `execute_prewarm` は容量 pruning の前にも、次の既存 entry 除去を行う。
+
+1. smoothing が変わると `sync_smoothing_percent` が entries 全体を clear。
+2. 同一 source ID の entry のうち、texture ID または generation が異なるものを除去。
+3. 生成・挿入後、同一 source 系列の target 数、全体件数、拡大 pixels 合計を pruning。
+
+根拠：`src/gpu_lanczos.rs:1427`、`:1429`、`:1760`、`:1779`、`:1792`、`:1807`。
+
+**設計案：Previous の「退去なし」は文字どおり既存 entry の除去ゼロとする。旧 texture／generation の失効除去も例外にしない。**
+
+理由は、低優先補完のために既存 entry の不要性を別途証明する仕組みを作らず、当初の「前の補完で既存完成物を追い出さない」契約をそのまま検査できるためである。旧世代除去を許す案より conservative だが、通常 draw／Next の失効・生成は従来どおり進む。
+
+Previous の Native miss は、以下を**全て満たす場合だけ**実行する。
+
+| 判定対象 | 条件 |
+|---|---|
+| smoothing 同期 | 同期による既存 entry の除去がゼロ |
+| 旧 source 除去 | 同一 source ID の旧 texture／generation entry の除去がゼロ |
+| 系列内 target 数 | 新 entry を含め2以下 |
+| 全体件数 | 新 entry を含め64以下 |
+| 拡大 pixels 合計 | 新 entry を含め既存上限以下 |
+
+smoothing 不一致でも entries が空なら、同期による entry 除去はゼロなので許可できる。entries が1件でも残る場合は見送る。同じ source ID の旧 texture／generation が残る場合も、たとえ旧世代に見えても Previous からは除去しない。
+
+**実装境界：**
+
+- 判定は cache metadata と plan だけを読む純粋処理とする。
+- 通常 `query_prewarm` の hit／不要を先に扱い、miss に対して判定する。
+- 最新需要・backing・VRAM と合わせて再照合し、**claim、smoothing 同期、use clock 更新、retain、allocation より前**に拒否する。
+- 実行入口でも同じ条件を確認する。呼出し側の事前判定だけを根拠に破壊的処理を通さない。
+- Previous にだけ適用する呼出し時 policy とし、通常 draw／Next の既存削除・pruning 挙動は変えない。永続 bool や別 cache は追加しない。
+
+保留理由は、少なくとも `cache_smoothing_clear`、`cache_source_replacement`、`cache_capacity` を区別する。拒否時に cache を先に整理したり、枠を取得してから返したりしない。拒否だけを理由とする repaint loop も作らない。
+
+Native key、通常 geometry、戻る curl の素材、D2 handoff、VRAM admission に関する他の記述は維持する。
+
+**推測・限界：** この規則では、古い entry が通常経路で整理されるまで Previous の Native 補完が進まない場合がある。best-effort の見送りとして扱い、通常 draw／Next の失効処理を追加起動して迂回しない。性能効果は未計測である。
+
+##### 27.17.20.7 状態の組合せを減らす判断と multi-context〔置換：通常 producer 側を採らない理由〕
+
+検討表の該当行を次へ置き換える。
+
+| 検討案 | 判断 |
+|---|---|
+| Previous の CPU も通常 producer で先に始める | 本案では不採用。通常 producer は最新 callback 観測より前に走るため、その位置には最新 view と全 live context の同時点の優先判定をそのまま置けない。ROOT 最終 hook なら全 retry 後の callback 観測と現在需要を再照合できる |
+
+Native cache は既に準備済み出力の事実を保持する。「Next Native 完了を示す永続状態が別途必要」という説明は撤回する。問題は cache の存否そのものではなく、**その出力が最新 view に一致するか、兄弟を含む Next 優先をどの時点で判定するか**である。
+
+根拠：`src/app/update_phases.rs:1988`、`src/ui_fullscreen.rs:27803`、`src/app/final_prepare_budget.rs:513`。
+
+Next の CPU 予約不足時の回収は、最新 view に基づく Previous 開始判定とは別である。既存位置で確定した Next CPU 需要と予約不足を根拠に、前記の限定回収を行ってよい。
+
+multi-context の契約には次を加える。
+
+- 低優先予約の回収対象は live route に限定しない。既存 budget が示す予約 owner を、parked を含めて訪問する。
+- 回収訪問は資源処理だけであり、parked viewer の再開、描画、通常 service、次段 producer の開始を伴わない。
+- `Unknown` の兄弟がある場合、全 Previous を保留する方針は維持する。ただし、その blocker を診断へ残す。
+
+detached の構造修正については、独立 reviewer が合意済みであり、設計担当も今回の指摘を妥当と判断している。「合意未了」という旧記述は更新する。§11 には、parked を含む予約 owner 訪問と保護対象、pressure 時だけの回収、Native の除去ゼロ規則を今回の範囲として追記する。改訂案の再レビューと完成差分の承認は別に扱う。
+
+##### 27.17.20.9 perf event、解析器、隔離計測〔置換：追加する診断〕
+
+既存 D3 event の拡張方針を維持し、次を追加する。
+
+| 診断 | 記録内容 |
+|---|---|
+| 予約回収 | 要求元 Next の context／unit、予約不足理由、訪問先 context／unit、結果保持場所、回収／保護理由、実際の予約解放前後 |
+| 実行中の保持 | 未受信結果と実際に計算中の区別。Computing の取消を即時予約解放として数えない |
+| 兄弟による Previous 保留 | 保留される Previous の context、blocker の Next context、`Pending / Unknown`、Unknown の具体理由 |
+| Native 除去回避 | smoothing clear、旧 texture／generation 除去、容量制限の別 |
+
+兄弟の Unknown も、例えば `next_unknown` と `blocker_context`、`blocker_reason` の組で残す。「自 context の素材不足」と誤読できる記録にしない。
+
+診断は perf 専用の有限理由値として既存の重複抑制へ組み込み、採用・回収・wake 判定に使わない。予約回収 event のために予約 Arc を保持しない。解析器はこれらを理由別に表示し、近い時刻の操作へ推定帰属しない。
+
+##### 27.17.20.10 回帰、chunk、見積り〔置換：追加回帰と checkpoint 2〕
+
+既存回帰表へ次を追加する。
+
+| 回帰 | 必須条件 |
+|---|---|
+| A／B の parked 結果→C の Next | A、B の Previous を登録前に park。worker を順次完了させ、2 unit の結果予約だけを残す。C の Next が予約不足を検出し、live 外の A／B を回収して開始できる。A／B の再開や追加入力を要しない |
+| 結果保持場所 | 上記を CpuReady、未受信 channel、両者混在で検査。未受信結果を回収対象から漏らさない |
+| bytes 圧力 | unit 数には余裕があっても、合計 bytes 不足で同じ回収が働く。要求単体が上限超過なら訪問しない |
+| 保護対象 | parked の Current／Next、DisplayPrepared、legacy、素材を共有する補助表紙は破棄しない。held／receipt／batch lease は不変 |
+| 実際に計算中 | receiver が Empty の間、permit／worker 側予約は保持。実終了前に C の投機実走行を重ねない。完了後は既存 wake で再評価 |
+| 探索範囲 | 無関係な context を多数置いても予約 owner 最大2 unitだけを訪問。Next 需要なし・予約不足なし・permit 不足のみでは回収訪問ゼロ |
+| 回収訪問の副作用 | parked で採用・登録・Native 生成・新 job・表示再開が起きない。元 mounted owner へ戻る |
+| 兄弟 Unknown | A の Next Unknown により B の Previous も保留され、blocker=A と具体理由が診断される |
+| smoothing 不一致 | 既存 entry ありでは Previous を拒否。entries、active smoothing、use clock、登録枠、allocation は不変。空 cache では除去ゼロの同期を許可 |
+| 旧 texture／generation | 同一 source ID の texture 不一致・generation 不一致をそれぞれ作り、Previous を拒否。別 source ID だけの entry はこの理由では拒否しない |
+| 通常経路の維持 | 通常 draw／Next では従来どおり smoothing clear・旧 source 除去が働く |
+| 一時変異 | 回収を live-only／CpuReady-only に限定する変異、smoothing／旧 source の除去判定を外す変異で対応回帰が失敗する |
+
+parked 結果保持の既存 fixture を拡張し、enum 名だけで「計算中」と判断しない回帰を作る。
+
+根拠：`src/app/final_prepare/tests/lifecycle_tests.rs:91`、`:121`、`src/app/final_prepare_cpu.rs:372`、`src/gpu_lanczos.rs:4829`。
+
+1 chunk・3 checkpoint は維持し、checkpoint 2 を次へ置き換える。
+
+> **Next 全段優先、Previous 開始・採用・取消、Next CPU の予約拒否を起点とする parked 込みの限定回収、全削除規則を含む Native 除去ゼロ admission。**
+
+実装3〜5日＋レビュー修正1〜2日という条件付き予算は据え置く。追加回収・純粋判定の共通化がこの範囲を超えると判明した場合に再見積りする。自動回帰・隔離計測・正式性能 gate は未実施である。
+
+##### 未確定・要レビュー点〔置換〕
+
+- 予約拒否の typed outcome と最大2 unit の metadata snapshot が、既存 waiter 登録・解放通知の順序を壊さないこと。
+- parked owner の Current／Next／Previous と素材共有を、採用済み topology／exact key だけで照合できること。不明なものを低優先と推定しないこと。
+- 回収対象の一時値まで drop してから予約を再判定し、未受信 channel と実際の Computing を区別できること。
+- Native の純粋判定と実行入口の再検査が、smoothing clear・旧 source 除去・容量 pruning を全て覆うこと。
+- detached の構造修正への合意は得られている。今回改訂への再レビュー、§11 の記録、完成 source／実行証拠の確認は残る。
+- 取消残時間、将来の VRAM 圧力、静止中の配送負担、F12 後退の改善量は引き続き未計測。2500msで必ず準備が完了するとは扱わない。
+
+##### 利用者の判断が要る点〔置換〕
+
+**本改訂による新しい判断依頼はない。** 上限値、通常操作、既存 Next／通常 draw、source／AI の範囲は変更しない。Previous の Native は既存 entry を一つでも除去する場合に見送る。上限増加や通常利用の待ち増が必要と判明した場合だけ、元の方針どおり実装前に判断へ返す。
