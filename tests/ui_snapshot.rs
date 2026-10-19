@@ -34,6 +34,52 @@ mod test_ui;
 #[path = "support/logical_bounds.rs"]
 mod logical_bounds;
 
+#[test]
+fn global_search_short_term_reject_light() {
+    global_search_short_term_reject_snapshot(
+        "global_search_short_term_reject_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        &["r5"],
+    );
+}
+
+#[test]
+fn global_search_short_term_reject_dark() {
+    global_search_short_term_reject_snapshot(
+        "global_search_short_term_reject_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        &["sd", "ai"],
+    );
+}
+
+fn global_search_short_term_reject_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    terms: &'static [&'static str],
+) {
+    let message = mimageviewer::global_search::RejectReason::TooShort(
+        terms.iter().map(|term| (*term).into()).collect(),
+    )
+    .as_user_message();
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(480.0, 220.0),
+        move |ui| {
+            ui.ctx()
+                .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            mimageviewer::draw_global_search_reject_snapshot_fixture(ui, terms);
+        },
+        |harness| {
+            let badge = harness.get_by_label(&message);
+            assert!(harness.ctx.content_rect().contains_rect(badge.rect()));
+            badge.hover();
+            harness.run();
+        },
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn effetune_show_only_active_tooltip_dark() {

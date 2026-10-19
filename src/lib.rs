@@ -190,6 +190,7 @@ mod global_search_ui;
 pub use global_search_ui::{
     draw_everything_progress_snapshot_fixture,
     draw_everything_search_disabled_menu_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_global_search_reject_snapshot_fixture,
 };
 pub mod gpu_info;
 #[cfg(any(test, feature = "dev-tools"))]

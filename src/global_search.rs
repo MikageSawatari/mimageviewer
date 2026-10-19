@@ -29,7 +29,7 @@ use crossbeam_channel::Sender;
 use uuid::Uuid;
 
 use crate::fts_index::{self, FtsIndex, IndexKind, QueryFilters, SearchTarget};
-use crate::search_query::{self, Token};
+use crate::search_query::{self, MatchMode, Token};
 
 /// §9.1 ステップ 4 確定方針 (プロトタイプ計測で PASS、§15.1.9)
 pub const HARD_MAX: usize = 10_000;
@@ -77,7 +77,7 @@ fn send_event(
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoneReason {
     /// Tantivy が候補を使い切った
     Complete,
@@ -89,12 +89,12 @@ pub enum DoneReason {
     RejectedQuery(RejectReason),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectReason {
     /// クエリが空
     Empty,
-    /// 1 文字クエリ (CJK) / ASCII 2 文字以下
-    TooShort,
+    /// 最小長ポリシーで拒否した include 語 (パース済みの小文字表記)。
+    TooShort(Vec<String>),
     /// NOT-only クエリ (Ctrl+G では禁止)
     NotOnly,
 }
@@ -192,7 +192,7 @@ fn run_with_hit_limit(
     let tokens = search_query::parse(query_text);
 
     // 2. 早期 return ポリシー
-    if let Err(reason) = validate_query(query_text, &tokens) {
+    if let Err(reason) = validate_query(query_text, &tokens, scope.mode) {
         let _ = send_event(
             tx,
             wake,
@@ -246,14 +246,12 @@ fn run_with_hit_limit(
     };
     let Some(query) = fts_index::build_bigram_and_query(fts.fields(), &include_tokens, &filters)
     else {
-        // bigram が作れない (どこかのトークンが 1 文字等) → early return
+        // 1 文字語は validate_query で拒否済み。空の対象フィルタ等による構築失敗を
+        // 語の長さの問題と誤表示しない。
         let _ = send_event(
             tx,
             wake,
-            SearchStreamEvent::Done {
-                truncated: false,
-                reason: DoneReason::RejectedQuery(RejectReason::TooShort),
-            },
+            SearchStreamEvent::Error("検索条件から索引クエリを作成できません".into()),
         );
         return;
     };
@@ -401,12 +399,10 @@ fn is_epub_search_path(path: &str) -> bool {
 // 内部ヘルパー
 // -----------------------------------------------------------------------
 
-/// 最小長ポリシー + NOT-only 拒否の判定 (§9.1 ステップ 2-3)。
-/// 最小長は **各 include トークン単位** で確認する (Codex 6 回目指摘 #2)。
-///
-/// 旧実装は `join(" ")` した連結文字列の長さで判定していたため、`a b c` や
-/// `夕 海` のような短すぎるトークン群が合計長で通過してしまう問題があった。
-fn validate_query(query_text: &str, tokens: &[Token]) -> Result<(), RejectReason> {
+/// Ctrl+G 専用の最小長ポリシー + NOT-only 拒否 (§1.229)。
+/// 1 文字語の索引照会可否と、単独では候補を広げすぎる 2 文字語を区別する。
+/// AND では十分な長さの include 語が候補を絞るため、後者も Must として照会できる。
+fn validate_query(query_text: &str, tokens: &[Token], mode: MatchMode) -> Result<(), RejectReason> {
     if query_text.trim().is_empty() || tokens.is_empty() {
         return Err(RejectReason::Empty);
     }
@@ -414,32 +410,56 @@ fn validate_query(query_text: &str, tokens: &[Token]) -> Result<(), RejectReason
     if !tokens.iter().any(|t| t.include) {
         return Err(RejectReason::NotOnly);
     }
-    // タグトークンは最小長チェックの対象外 — `#a` のような 1 文字タグ名でも
-    // bigram (`#a` 自体) が 1 つだけ生成されて Tantivy で引け、post-filter も
-    // substring 一致で通る。`#` プレフィックス込みなので最低 2 文字は確保される。
-    // 通常キーワードの include トークンのみ §4.3 の最小長 (CJK: 2 / ASCII: 3) を確認。
-    for t in tokens.iter().filter(|t| t.include && !t.is_tag) {
-        if !has_sufficient_length(&t.needle) {
-            return Err(RejectReason::TooShort);
-        }
+    let lengths: Vec<_> = tokens
+        .iter()
+        .filter(|t| t.include)
+        .map(|t| (t, query_term_length(&t.needle)))
+        .collect();
+    let has_anchor = lengths
+        .iter()
+        .any(|(_, length)| *length == QueryTermLength::Sufficient);
+    let short_terms: Vec<String> = lengths
+        .into_iter()
+        // タグ候補への橋渡し: #a 等は従来どおり免除。# 込みで 2 文字以上。
+        .filter(|(t, length)| {
+            !t.is_tag
+                && match length {
+                    QueryTermLength::Unindexable => true,
+                    QueryTermLength::NeedsAnchor => mode == MatchMode::Or || !has_anchor,
+                    QueryTermLength::Sufficient => false,
+                }
+        })
+        .map(|(t, _)| t.needle.clone())
+        .collect();
+    if !short_terms.is_empty() {
+        return Err(RejectReason::TooShort(short_terms));
     }
     Ok(())
 }
 
-/// §4.3 最小クエリ長ポリシー。
-/// - CJK を 1 文字でも含む → 2 文字以上で OK
-/// - それ以外 (ASCII / 数字 / 記号のみ) → 3 文字以上
-fn has_sufficient_length(text: &str) -> bool {
-    let trimmed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    let char_count = trimmed.chars().count();
-    if char_count == 0 {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryTermLength {
+    /// 1 文字以下。AND の他語が十分長くても拒否する (2026-10-19 利用者決定)。
+    Unindexable,
+    /// 非 CJK 2 文字。AND で十分な長さの include 語があるときだけ許可する。
+    NeedsAnchor,
+    /// 従来の最小長 (CJK を含む 2 文字以上 / その他 3 文字以上) を満たす。
+    Sufficient,
+}
+
+fn query_term_length(text: &str) -> QueryTermLength {
+    let mut char_count = 0;
+    let mut contains_cjk = false;
+    for c in text.chars().filter(|c| !c.is_whitespace()) {
+        char_count += 1;
+        contains_cjk |= is_cjk(c);
     }
-    let contains_cjk = trimmed.chars().any(is_cjk);
-    if contains_cjk {
-        char_count >= 2
+    if char_count < 2 {
+        QueryTermLength::Unindexable
+    } else if char_count == 2 && !contains_cjk {
+        QueryTermLength::NeedsAnchor
     } else {
-        char_count >= 3
+        QueryTermLength::Sufficient
     }
 }
 
@@ -463,13 +483,22 @@ fn is_cjk(c: char) -> bool {
 
 // Just for external consumers who want to know the reason value.
 impl RejectReason {
-    pub fn as_user_message(self) -> &'static str {
+    pub fn as_user_message(&self) -> String {
         match self {
-            RejectReason::Empty => "検索キーワードを入力してください",
-            RejectReason::TooShort => {
-                "検索キーワードが短すぎます (日本語は 2 文字以上、英数字は 3 文字以上)"
+            RejectReason::Empty => "検索キーワードを入力してください".into(),
+            RejectReason::TooShort(terms) => {
+                let terms = terms
+                    .iter()
+                    .map(|term| format!("\"{term}\""))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!(
+                    "{terms} が短すぎます (1 文字語は不可。英数字 2 文字語は AND で長い語と併用してください)"
+                )
             }
-            RejectReason::NotOnly => "含める語を 1 つ以上入力してください (除外だけの検索は不可)",
+            RejectReason::NotOnly => {
+                "含める語を 1 つ以上入力してください (除外だけの検索は不可)".into()
+            }
         }
     }
 }
@@ -708,17 +737,35 @@ mod tests {
         favs: &[Uuid],
         fts: &FtsIndex,
     ) -> (Vec<GlobalHit>, DoneReason, bool) {
+        let (hits, reason, truncated, _) =
+            collect_scoped_events(query, favs, &SearchScope::default(), fts);
+        (hits, reason, truncated)
+    }
+
+    fn collect_scoped_events(
+        query: &str,
+        favs: &[Uuid],
+        scope: &SearchScope,
+        fts: &FtsIndex,
+    ) -> (Vec<GlobalHit>, DoneReason, bool, usize) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(false);
-        let scope = SearchScope::default();
-        run(query, favs, &scope, fts, &cancel, &tx, None);
+        run(query, favs, scope, fts, &cancel, &tx, None);
         drop(tx);
         let mut all_hits = Vec::new();
         let mut reason = DoneReason::Complete;
         let mut truncated = false;
+        let mut scanned = 0;
         while let Ok(ev) = rx.recv() {
             match ev {
-                SearchStreamEvent::Batch { hits, .. } => all_hits.extend(hits),
+                SearchStreamEvent::Batch {
+                    hits,
+                    scanned_candidates,
+                    ..
+                } => {
+                    all_hits.extend(hits);
+                    scanned = scanned_candidates;
+                }
                 SearchStreamEvent::Done {
                     truncated: t,
                     reason: r,
@@ -729,7 +776,173 @@ mod tests {
                 SearchStreamEvent::Error(e) => panic!("unexpected error: {e}"),
             }
         }
-        (all_hits, reason, truncated)
+        (all_hits, reason, truncated, scanned)
+    }
+
+    fn rejected_short_terms(terms: &[&str]) -> DoneReason {
+        DoneReason::RejectedQuery(RejectReason::TooShort(
+            terms.iter().map(|term| (*term).into()).collect(),
+        ))
+    }
+
+    #[test]
+    fn short_term_validation_distinguishes_indexability_and_candidate_breadth() {
+        assert_eq!(query_term_length("r"), QueryTermLength::Unindexable);
+        assert_eq!(query_term_length("夕"), QueryTermLength::Unindexable);
+        assert_eq!(query_term_length("r5"), QueryTermLength::NeedsAnchor);
+        assert_eq!(query_term_length("夕焼"), QueryTermLength::Sufficient);
+        assert_eq!(query_term_length("EOS"), QueryTermLength::Sufficient);
+
+        for mode in [MatchMode::And, MatchMode::Or] {
+            for (query, short) in [
+                ("r5", vec!["r5"]),
+                ("sd ai", vec!["sd", "ai"]),
+                ("夕 海", vec!["夕", "海"]),
+                ("EOS x", vec!["x"]),
+                ("EOS 夕", vec!["夕"]),
+                ("夕焼 海", vec!["海"]),
+                ("r5 -longword", vec!["r5"]),
+                ("#a r5", vec!["r5"]),
+            ] {
+                let expected =
+                    RejectReason::TooShort(short.iter().map(|term| (*term).into()).collect());
+                assert_eq!(
+                    validate_query(query, &search_query::parse(query), mode),
+                    Err(expected.clone()),
+                    "{query:?} / {mode:?}"
+                );
+                let message = expected.as_user_message();
+                for term in short {
+                    assert!(message.contains(&format!("\"{term}\"")), "{message}");
+                }
+            }
+            // 除外語は最小長の対象外。タグ候補への橋渡しとフレーズの単位も維持する。
+            for query in ["EOS -r5 -x -夕", "#a", "夕焼", r#""EOS R5""#] {
+                assert_eq!(
+                    validate_query(query, &search_query::parse(query), mode),
+                    Ok(())
+                );
+            }
+        }
+        for query in ["EOS R5", "r5 EOS", "EOS sd ai", "夕焼 r5", "#long r5"] {
+            assert_eq!(
+                validate_query(query, &search_query::parse(query), MatchMode::And),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_query("EOS R5", &search_query::parse("EOS R5"), MatchMode::Or),
+            Err(RejectReason::TooShort(vec!["r5".into()]))
+        );
+        assert!(
+            RejectReason::TooShort(vec!["sd".into(), "ai".into()])
+                .as_user_message()
+                .starts_with("\"sd\"、\"ai\" が短すぎます")
+        );
+    }
+
+    #[test]
+    fn single_char_terms_are_rejected_before_index_query_construction() {
+        let (_tmp, _meta, fts) = setup();
+        for mode in [MatchMode::And, MatchMode::Or] {
+            let scope = SearchScope {
+                mode,
+                ..Default::default()
+            };
+            for (query, short) in [
+                ("EOS a", vec!["a"]),
+                ("EOS 夕", vec!["夕"]),
+                ("夕 海", vec!["夕", "海"]),
+            ] {
+                // 空 favorite の早期 Complete より前に拒否するので、build の None での拒否ではない。
+                let (hits, reason, _, scanned) = collect_scoped_events(query, &[], &scope, &fts);
+                assert_eq!(reason, rejected_short_terms(&short));
+                assert!(hits.is_empty());
+                assert_eq!(scanned, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn and_short_terms_are_must_candidates_and_all_terms_are_post_filtered() {
+        let (_tmp, _meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        {
+            let mut writer = fts.writer().unwrap();
+            for (id, name, exif) in [
+                ("a", "a.jpg", "Canon EOS R5"),
+                ("b", "b.jpg", "R5 body from EOS series"),
+                ("c", "EOS.jpg", "R5"),
+                ("d", "d.jpg", "EOS"),
+                ("e", "e.jpg", "R5"),
+                // eo / os は存在するが eos は存在しない bigram 偽陽性。
+                ("f", "f.jpg", "eox os R5"),
+            ] {
+                upsert_doc(
+                    &writer,
+                    fts.fields(),
+                    &IndexDoc {
+                        path: format!("c:/{id}.jpg"),
+                        container: Container::Fs,
+                        zip_entry: String::new(),
+                        favorite_id: fav,
+                        kind: IndexKind::Image,
+                        mtime: 0,
+                        file_size: 0,
+                        norms: PerSourceText {
+                            name: name.to_lowercase(),
+                            exif: exif.to_lowercase(),
+                            ..Default::default()
+                        },
+                    },
+                )
+                .unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        fts.reload_reader().unwrap();
+        let scope = SearchScope::default();
+        let (_, reason, _, long_scanned) = collect_scoped_events("EOS", &[fav], &scope, &fts);
+        assert_eq!(reason, DoneReason::Complete);
+        assert_eq!(long_scanned, 5);
+        let (hits, reason, _, scanned) = collect_scoped_events("EOS R5", &[fav], &scope, &fts);
+        assert_eq!(reason, DoneReason::Complete);
+        assert_eq!(scanned, 4, "r5 自体も Must なので EOS のみの d は候補外");
+        let mut paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["c:/a.jpg", "c:/b.jpg", "c:/c.jpg"],
+            "非隣接・逆順・別ソースを許可し、片語だけと偽陽性を除外"
+        );
+        let (hits, reason, _) = collect_events(r#""EOS R5""#, &[fav], &fts);
+        assert_eq!(reason, DoneReason::Complete);
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            ["c:/a.jpg"]
+        );
+        let (hits, _, _) = collect_events("EOS -r5", &[fav], &fts);
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            ["c:/d.jpg"]
+        );
+
+        let or_scope = SearchScope {
+            mode: MatchMode::Or,
+            ..Default::default()
+        };
+        let (_, reason, _, scanned) = collect_scoped_events("EOS Canon", &[fav], &or_scope, &fts);
+        assert_eq!(reason, DoneReason::Complete);
+        assert_eq!(scanned, long_scanned, "既存の OR 候補集合を維持する");
+        for query in ["EOS R5", "EOS Canon R5"] {
+            let (hits, reason, _, scanned) = collect_scoped_events(query, &[fav], &or_scope, &fts);
+            assert_eq!(reason, rejected_short_terms(&["r5"]));
+            assert!(hits.is_empty());
+            assert_eq!(scanned, 0, "OR に短い語を足しても候補走査を増やさない");
+        }
+        let (hits, reason, _) = collect_events("r5", &[fav], &fts);
+        assert!(hits.is_empty());
+        assert_eq!(reason, rejected_short_terms(&["r5"]));
     }
 
     fn ingest_many_for_progress(fts: &FtsIndex, fav: Uuid, count: usize, text: &str) {
@@ -932,7 +1145,7 @@ mod tests {
         ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け");
         let (hits, reason, _) = collect_events("夕", &[fav], &fts);
         assert!(hits.is_empty());
-        assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
+        assert_eq!(reason, rejected_short_terms(&["夕"]));
     }
 
     #[test]
@@ -957,7 +1170,7 @@ mod tests {
         ingest(&meta, &fts, fav, "c:/a.jpg", "sd photo");
         let (hits, reason, _) = collect_events("sd", &[fav], &fts);
         assert!(hits.is_empty());
-        assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
+        assert_eq!(reason, rejected_short_terms(&["sd"]));
     }
 
     #[test]
@@ -1088,18 +1301,18 @@ mod tests {
         ingest(&meta, &fts, fav, "c:/a.jpg", "夕焼け 海辺");
         let (hits, reason, _) = collect_events("夕 海", &[fav], &fts);
         assert!(hits.is_empty());
-        assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
+        assert_eq!(reason, rejected_short_terms(&["夕", "海"]));
     }
 
     #[test]
     fn ascii_multi_short_tokens_rejected() {
-        // 英字 2 文字トークンの複数組 (`sd ai`) は各 token が ASCII 3 未満なので TooShort。
+        // 英字 2 文字語だけでは AND の候補を十分絞る語が無い。
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         ingest(&meta, &fts, fav, "c:/a.jpg", "sd ai photo");
         let (hits, reason, _) = collect_events("sd ai", &[fav], &fts);
         assert!(hits.is_empty());
-        assert_eq!(reason, DoneReason::RejectedQuery(RejectReason::TooShort));
+        assert_eq!(reason, rejected_short_terms(&["sd", "ai"]));
     }
 
     #[test]
@@ -1146,9 +1359,9 @@ mod tests {
 
         // Codex P2 回帰: 旧実装は #a を ASCII 2 文字として TooShort 拒否していた
         let (hits, reason, _) = collect_events("#a", &[fav], &fts);
-        assert_ne!(
+        assert_eq!(
             reason,
-            DoneReason::RejectedQuery(RejectReason::TooShort),
+            DoneReason::Complete,
             "短いタグ名は最小長で弾かないこと"
         );
         assert!(
