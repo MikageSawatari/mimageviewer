@@ -6210,3 +6210,9 @@ workspaceの9 slowは失敗ではない。今回は全lib/full gateとも失敗0
 各コマンド・件数・終了コード・ログ・変異復元SHA-256の正本は`target/back-fix-handoff.md`と`target/back-fix-*.json/log`。
 最後の`build-dev.ps1 -TestScript -PreserveRuntime`も終了0（161.099秒）、3実行ファイルとVCRT PE検査が成功した。起動はしていない。
 限定独立追認はP3/P2とも解消としてACCEPT、残存指摘なし。実機・計測script・正式性能gateは引き続き未実施。
+
+##### 27.17.21.x 独立完成レビュー（2026-10-20）
+
+- 独立レビュー (SID `01a15462`、xhigh) の 1 回目は CHANGES REQUESTED (P2: test-full 未実施 / P3: Pair で予約回収・再試行が頁ごと)。`99bda8cfe` で対応し、再レビューで **ACCEPT・master 取り込み可**、残存指摘なし。
+- detached に触れる範囲が症状パッチではなく構造的修正であることに、完成差分でも設計担当 (ClaudeCode) と独立レビュー担当の双方が合意。
+- 未確認: 実アプリ操作・計測 script の実駆動・F12 直後 / 2500ms 後の改善量・正式性能 gate。
