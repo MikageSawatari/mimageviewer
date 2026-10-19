@@ -6869,7 +6869,7 @@ fn housekeeping_gate_remains_fts_only() {
 /// Esc that closes it - and made a right-click stop closing the image with nothing on screen to
 /// explain why. Its siblings in the same bar have never blocked anything (2026-08-15, before
 /// v3.0.0 went out).
-fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
+fn fullscreen_overflow_panel_holds_no_input_and_survives_file_boundary() {
     let mut app = setup_app_for_test();
     app.fs_overflow_panel_state = FsOverflowPanelState::Root;
     assert!(!app.common_modal_dialog_open());
@@ -6881,7 +6881,41 @@ fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
     );
 
     app.reset_fs_side_panel_runtime_for_file_change();
-    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+}
+
+#[cfg(windows)]
+#[test]
+fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
+    use crate::ui_fullscreen::FullscreenPrimarySuppression;
+
+    for state in [
+        FsOverflowPanelState::Root,
+        FsOverflowPanelState::NavigatorPosition,
+        FsOverflowPanelState::SpreadAdjustment,
+        FsOverflowPanelState::Slideshow,
+        FsOverflowPanelState::MusicNoteColor,
+    ] {
+        for pause in [true, false] {
+            let mut app = setup_app_for_test();
+            app.items = vec![GridItem::Image(app.tmp.path().join("overflow-owner.jpg"))];
+            app.fullscreen_idx = Some(0);
+            app.fs_overflow_panel_state = state;
+            app.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
+
+            if pause {
+                app.reset_detached_pause_foreground_modes(0);
+            } else {
+                app.close_fullscreen();
+            }
+
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert!(
+                !app.fs_primary_suppression.is_active(),
+                "{state:?}, pause={pause}: foreground ownership must end with the panel"
+            );
+        }
+    }
 }
 
 #[test]
@@ -13588,7 +13622,14 @@ mod paused_similar_feature_tests {
             ctx.run_pass(input, |ctx| {
                 ctx.root_ui(|root_ui| {
                     egui::CentralPanel::default().show(root_ui, |ui| {
-                        assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+                        assert!(app.draw_metadata_panel(
+                            ui,
+                            ctx,
+                            full_rect,
+                            true,
+                            0.0,
+                            Default::default()
+                        ));
                     })
                 });
             })

@@ -5864,3 +5864,10 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
   独立設計レビューも既存合意範囲の構造的修正としてACCEPT。完成差分・実行gateの判定は `target/d3-5-*` に分けて記録する。
 - D3-3は利用者決定で次の版の後へ延期（backlog §1.401）。既存編集／comic表示経路を維持する。
   実機操作・motion、正式3run×30機会gateは未確認。page-turn計画 §27.17.17 に実装済み範囲・計測推移・残作業をまとめた。
+
+### §11 追補: §1.396 スライドショー設定の「…」移動と前面入力状態の解放（2026-10-19、実装・独立レビュー済み・実機未確認）
+
+- 対象: ブランチ `slideshow-1396` (`3db6e24c6` / `d01fcc111` / `5e9e7a5c3` ほか)。HUD のスライドショーボタンを即時開始・停止にし、設定を上部バーの「…」(`FsOverflowPanelState::Slideshow`) へ移した。
+- 触れた detached 経路: `App::reset_detached_pause_foreground_modes` だけ。(1) 廃止した `slideshow_popup_open` のリセット行を削除、(2) overflow パネルを閉じる行の隣に `fs_primary_suppression` のリセットを追加 (直下の `fs_secondary_press.cancel()` と左右をそろえる)。detached の述語・viewport・geometry・placement・focus・window lifecycle は変更しない。
+- 所有の判断: `fs_overflow_panel_state` と `fs_primary_suppression` はどちらも前面の fullscreen viewer の一時状態として App 全体に 1 つ置かれ、open / close / 新規窓 / passive 採用 / 前面 pause の同じ境界で解放される。パネル内で始まった押下の所有 (`OverflowStream`) はこの既存モデルに載せ、ViewerContextBundle への移設はしない (移設は detached 所有境界の変更で別作業)。
+- 合意: 独立 reviewer (Sol / xhigh、2026-10-19 再レビュー) と ClaudeCode の双方が、上の 2 点は「前面を手放す既存境界で同種の一時入力状態を解放する構造的修正であり、症状パッチではない」ことに合意した。reviewer は bundle へ移さない判断にも異議なし。

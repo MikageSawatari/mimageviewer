@@ -15442,12 +15442,20 @@ pub(crate) enum FsOverflowPanelState {
     Root,
     NavigatorPosition,
     SpreadAdjustment,
+    Slideshow,
     MusicNoteColor,
 }
 
 impl FsOverflowPanelState {
     pub(crate) fn is_open(self) -> bool {
         self != Self::Closed
+    }
+
+    pub(crate) fn closes_on_file_change(self) -> bool {
+        // Only file/book-dependent contents close here. The spread adjustment's
+        // anchor and reset belong to the current book; the other panels expose
+        // global settings and must remain usable while pages advance.
+        matches!(self, Self::SpreadAdjustment)
     }
 }
 
@@ -17201,8 +17209,6 @@ pub struct App {
     pub(crate) spread_popup_open: bool,
     /// ズーム/フィット切替ポップアップ表示中
     pub(crate) fit_popup_open: bool,
-    /// スライドショー設定ポップアップ表示中
-    pub(crate) slideshow_popup_open: bool,
     /// 360 度ビューの投影方式ポップアップ表示中。360 表示中しか開けない。
     pub(crate) panorama_projection_popup_open: bool,
     /// 上バーの「…」から開く右上パネル。root / navigator submenu を単一状態で所有する。
@@ -20683,7 +20689,6 @@ impl App {
             spread_popup_open: false,
             panorama_projection_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             fs_overflow_panel_state: FsOverflowPanelState::Closed,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
@@ -22741,7 +22746,7 @@ impl App {
             self.fullscreen_tag_picker_open => "fullscreen_tag_picker",
             // The top bar's overflow panel is deliberately absent. It is a menu, not a dialog:
             // it asks nothing and has nothing to confirm, and its siblings in the same bar - the
-            // spread, fit and slideshow popups - have never blocked anything. Classifying it with
+            // spread and fit popups - have never blocked anything. Classifying it with
             // dialogs made it hold every key while open, including the Esc that closes it, and
             // made a right-click stop closing the image for no visible reason. It dismisses
             // itself on the next input instead (v3.0.0, before release).
@@ -41304,7 +41309,6 @@ impl App {
         self.apply_view_trim_for_key(&source_path);
         self.spread_popup_open = false;
         self.fit_popup_open = false;
-        self.slideshow_popup_open = false;
         self.panorama_projection_popup_open = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
@@ -61208,11 +61212,11 @@ impl App {
     fn reset_detached_pause_foreground_modes(&mut self, fs_idx: usize) {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
-        self.slideshow_popup_open = false;
         self.panorama_projection_popup_open = false;
         // The same reason as in `close_fullscreen`: this is the other place that gives up the
         // fullscreen foreground, and a panel that only draws there must not outlive it.
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        self.fs_primary_suppression = Default::default();
         self.cancel_mouse_ring_flick();
         self.fs_secondary_press.cancel();
         self.capture_region_selection = None;
@@ -78164,7 +78168,6 @@ impl App {
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
         self.spread_popup_open = false;
         self.fit_popup_open = false;
-        self.slideshow_popup_open = false;
         self.panorama_projection_popup_open = false;
         // The top bar's overflow panel belongs to this list for the same reason and was missing
         // from it: it is drawn only in fullscreen, and it holds the keyboard while it is open -
@@ -87765,7 +87768,9 @@ impl App {
         self.invalidate_similar_preview();
         self.fullscreen_navigator_interaction.invalidate();
         self.close_fs_side_panel_runtime();
-        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        if self.fs_overflow_panel_state.closes_on_file_change() {
+            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        }
     }
 
     fn close_fs_side_panel_runtime(&mut self) {

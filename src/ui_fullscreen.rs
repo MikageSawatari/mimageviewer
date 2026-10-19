@@ -20,12 +20,20 @@
 
 pub(crate) mod canonical_demand;
 #[cfg(test)]
+mod front_popup_input_tests;
+#[cfg(test)]
 mod native_focus_tests;
+#[cfg(test)]
+mod overflow_input_tests;
 mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
 #[cfg(test)]
 mod retained_material_entry_tests;
+#[cfg(test)]
+mod slideshow_settings_tests;
+#[cfg(test)]
+mod slideshow_tests;
 #[cfg(test)]
 mod wheel_frame_tests;
 #[cfg(test)]
@@ -105,6 +113,107 @@ pub(crate) struct FullscreenSecondaryPressOwner {
     context: crate::ring_shortcut::RightDragContext,
 }
 
+/// Resolved before front UI actions, shared by all backing input consumers in this pass.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FsOverflowPointerFrameInput {
+    primary_owned: bool,
+    secondary_owned: bool,
+    secondary_owner: Option<FullscreenSecondaryPressOwner>,
+}
+
+impl FsOverflowPointerFrameInput {
+    pub(crate) fn owns(self, button: egui::PointerButton) -> bool {
+        match button {
+            egui::PointerButton::Primary => self.primary_owned,
+            egui::PointerButton::Secondary => self.secondary_owned,
+            _ => false,
+        }
+    }
+}
+
+/// Project the current overflow surface through egui's layer hit-test once per pass.
+/// The same surface is used by both buttons and by the touch classifier.
+fn fs_overflow_pointer_surface(ctx: &egui::Context, panel: Option<egui::Rect>) -> Vec<egui::Rect> {
+    let Some(panel) = panel else {
+        return Vec::new();
+    };
+    let overflow = egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("fs_overflow_panel_foreground"),
+    );
+    let (allowed, layers) = ctx.memory(|memory| {
+        (
+            memory.is_above_modal_layer(overflow),
+            memory
+                .layer_ids()
+                .filter(|layer| {
+                    layer.order >= egui::Order::Foreground && memory.areas().is_visible(layer)
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    if !allowed {
+        return Vec::new();
+    }
+
+    // Split at interactive Area boundaries, so the top layer is constant inside
+    // each piece. Do not register/move an Area here: that would reorder open menus.
+    let mut pieces = vec![panel];
+    for layer in layers {
+        let Some(state) = egui::AreaState::load(ctx, layer.id).filter(|state| state.interactable)
+        else {
+            continue;
+        };
+        let rect = ctx
+            .layer_transform_to_global(layer)
+            .map_or(state.rect(), |transform| transform * state.rect());
+        pieces = pieces
+            .into_iter()
+            .flat_map(|piece| {
+                let intersection = piece.intersect(rect);
+                if intersection.min.x <= intersection.max.x
+                    && intersection.min.y <= intersection.max.y
+                {
+                    // Rect::contains includes both edges. Partition representable coordinates
+                    // without shared edges, including single-coordinate lines at Area borders.
+                    [
+                        egui::Rect::from_min_max(
+                            piece.min,
+                            egui::pos2(piece.max.x, intersection.min.y.next_down()),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(piece.min.x, intersection.max.y.next_up()),
+                            piece.max,
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(piece.min.x, intersection.min.y),
+                            egui::pos2(intersection.min.x.next_down(), intersection.max.y),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(intersection.max.x.next_up(), intersection.min.y),
+                            egui::pos2(piece.max.x, intersection.max.y),
+                        ),
+                        intersection,
+                    ]
+                    .into_iter()
+                    .filter(|rect| rect.min.x <= rect.max.x && rect.min.y <= rect.max.y)
+                    .collect::<Vec<_>>()
+                } else {
+                    vec![piece]
+                }
+            })
+            .collect();
+    }
+    pieces.retain(|piece| {
+        ctx.layer_id_at(piece.center()).is_none_or(|top| {
+            // A newly opened/sizing Area has no interactive hit yet. Its current
+            // rectangle may cover backing layers, but never another foreground UI.
+            top == overflow || top.order < egui::Order::Foreground
+        })
+    });
+    pieces
+}
+
 impl FullscreenSecondaryPressOwner {
     fn new(
         viewer_context: crate::app::ViewerContextId,
@@ -124,6 +233,9 @@ impl FullscreenSecondaryPressOwner {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FullscreenSecondaryPress {
     Idle,
+    Overflow {
+        owner: FullscreenSecondaryPressOwner,
+    },
     Armed {
         owner: FullscreenSecondaryPressOwner,
         started_at: std::time::Instant,
@@ -169,7 +281,7 @@ impl FullscreenSecondaryPress {
         new_generation: u64,
         new_idx: usize,
     ) {
-        if let Self::Armed { owner, .. } = self
+        if let Self::Armed { owner, .. } | Self::Overflow { owner } = self
             && owner.viewer_context == viewer_context
             && owner.items_generation == old_generation
             && owner.fs_idx == old_idx
@@ -181,9 +293,53 @@ impl FullscreenSecondaryPress {
 
     fn start_pos(self) -> Option<egui::Pos2> {
         match self {
-            Self::Idle => None,
+            Self::Idle | Self::Overflow { .. } => None,
             Self::Armed { start_pos, .. } => Some(start_pos),
         }
+    }
+
+    /// A press begun in overflow belongs to it through release, even after leaving its rect.
+    /// Reuse the secondary sequence owner instead of creating a separate pending latch.
+    fn overflow_owns_input(
+        &mut self,
+        owner: Option<FullscreenSecondaryPressOwner>,
+        visible_panel: &[egui::Rect],
+        input: &egui::InputState,
+    ) -> bool {
+        if matches!(self, Self::Overflow { owner: captured } if Some(*captured) != owner) {
+            self.cancel();
+        }
+        let mut owned = matches!(self, Self::Overflow { .. });
+        for event in &input.events {
+            if let egui::Event::PointerButton {
+                button: egui::PointerButton::Secondary,
+                pressed,
+                pos,
+                ..
+            } = event
+            {
+                if *pressed {
+                    if let Some(owner) =
+                        owner.filter(|_| visible_panel.iter().any(|r| r.contains(*pos)))
+                    {
+                        *self = Self::Overflow { owner };
+                        owned = true;
+                    } else if matches!(self, Self::Overflow { .. }) {
+                        self.cancel();
+                    }
+                } else if matches!(self, Self::Overflow { .. }) {
+                    owned = true;
+                    self.cancel();
+                }
+            }
+        }
+        // Retire lost terminal edges, but keep this terminal frame owned.
+        if matches!(self, Self::Overflow { .. })
+            && (!input.focused || !input.pointer.secondary_down())
+        {
+            self.cancel();
+        }
+        owned
     }
 
     fn advance(
@@ -1970,6 +2126,7 @@ pub(crate) enum FullscreenPrimarySuppression {
     #[default]
     Idle,
     PointerStream,
+    OverflowStream,
     TouchStream,
 }
 
@@ -2022,7 +2179,9 @@ impl FullscreenPrimarySuppression {
     ) -> FullscreenPrimarySuppressionDecision {
         match event {
             FullscreenPrimarySuppressionEvent::PointerStreamStarted => {
-                *self = Self::PointerStream;
+                if *self != Self::OverflowStream {
+                    *self = Self::PointerStream;
+                }
                 FullscreenPrimarySuppressionDecision::Suppress
             }
             FullscreenPrimarySuppressionEvent::PointerFrame { released } => {
@@ -2031,7 +2190,7 @@ impl FullscreenPrimarySuppression {
                 } else {
                     FullscreenPrimarySuppressionDecision::Allow
                 };
-                if released && *self == Self::PointerStream {
+                if released && matches!(self, Self::PointerStream | Self::OverflowStream) {
                     *self = Self::Idle;
                 }
                 decision
@@ -2042,6 +2201,15 @@ impl FullscreenPrimarySuppression {
                 completed,
                 cancelled,
             } => {
+                // Front widgets retain their promoted primary stream even when the backing
+                // touch driver is disabled. Physical release/liveness or a touch terminal
+                // retires this owner.
+                if *self == Self::OverflowStream {
+                    if cancelled || completed {
+                        *self = Self::Idle;
+                    }
+                    return FullscreenPrimarySuppressionDecision::Suppress;
+                }
                 // PointerStream is provisional until raw-touch correlation has
                 // identified the source. From that point the touch frame is
                 // authoritative for this pass: canvas gestures are allowed,
@@ -2544,6 +2712,25 @@ struct FsNavigatorFrameInputSnapshots {
 }
 
 impl FsNavigatorFrameInput {
+    fn without_overflow_buttons(mut self, front: FsOverflowPointerFrameInput) -> Self {
+        for event in &mut self.events {
+            if let FsNavigatorInputEvent::PointerButton { button, pos, .. } = event
+                && front.owns(*button)
+            {
+                // The position belongs to wheel targeting and any non-owned gesture too.
+                *event = FsNavigatorInputEvent::PointerMoved(*pos);
+            }
+        }
+        if front.primary_owned {
+            self.primary_down = false;
+        }
+        if front.secondary_owned {
+            self.secondary_down = false;
+        }
+        // Positions, focus, wheel, and the other button retain their original event order.
+        self
+    }
+
     fn record_current_pass(ctx: &egui::Context) {
         let viewport = ctx.viewport_id();
         let pass_nr = ctx.cumulative_pass_nr();
@@ -5573,6 +5760,35 @@ struct FsOverflowPanelView {
     music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     composition_available: bool,
     composition_managed: bool,
+    slideshow: FsSlideshowSettings,
+}
+
+/// Copy-only projection of the existing global settings. No playback clock is owned here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FsSlideshowSettings {
+    interval_secs: f32,
+    wait_secs: f32,
+    scroll_secs: f32,
+    scroll_percent: u32,
+    end_action: SlideshowEndAction,
+}
+
+impl FsSlideshowSettings {
+    fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            interval_secs: settings.slideshow_interval_secs,
+            wait_secs: settings.slideshow_continuous_wait_secs,
+            scroll_secs: settings.slideshow_continuous_scroll_secs,
+            scroll_percent: settings.slideshow_continuous_scroll_percent,
+            end_action: settings.slideshow_end_action,
+        }
+    }
+}
+
+impl Default for FsSlideshowSettings {
+    fn default() -> Self {
+        Self::from_settings(&crate::settings::Settings::default())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5605,7 +5821,7 @@ fn draw_spread_shift_marker(ui: &mut egui::Ui, rect: egui::Rect, view: &SpreadSh
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FsOverflowPanelAction {
     Close,
     Back,
@@ -5616,6 +5832,10 @@ enum FsOverflowPanelAction {
     SetShiftMemory(bool),
     SetMusicNoteColor(crate::music_note_color::MusicNoteColorScheme),
     EditComposition,
+    SetSlideshow {
+        values: FsSlideshowSettings,
+        persist: bool,
+    },
 }
 
 /// One frame's root-menu input boundary. An editor adoption retires the
@@ -5639,6 +5859,8 @@ fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
         FsOverflowPanelState::SpreadAdjustment => 6,
         FsOverflowPanelState::MusicNoteColor => 2,
+        // Fixed back row + four 48pt sliders + two 24pt headings + three end rows.
+        FsOverflowPanelState::Slideshow => 9,
     }
 }
 
@@ -5937,6 +6159,46 @@ fn draw_fs_overflow_panel_row(
     }
 }
 
+fn draw_fs_slideshow_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    slider: egui::Slider<'_>,
+) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let mut row =
+        ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(12.0, 2.0))));
+    row.spacing_mut().slider_width = (row.available_width() - 85.0).max(60.0);
+    let label_response = row.label(label);
+    let response = row.add(slider).labelled_by(label_response.id);
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::unique(("fs_slideshow_slider_test_rect", label)),
+            response.rect,
+        );
+        data.insert_temp(
+            egui::Id::unique(("fs_slideshow_slider_test_id", label)),
+            response.id,
+        );
+    });
+    response
+}
+
+fn draw_fs_slideshow_heading(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(13.0),
+        ui.visuals().weak_text_color(),
+    );
+}
+
 fn draw_fs_overflow_panel_surface(
     ui: &mut egui::Ui,
     panel_rect: egui::Rect,
@@ -5976,6 +6238,7 @@ fn draw_fs_overflow_panel_surface(
         FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
         FsOverflowPanelState::SpreadAdjustment => "見開きの調整",
         FsOverflowPanelState::MusicNoteColor => "音名の色",
+        FsOverflowPanelState::Slideshow => "スライドショー",
         FsOverflowPanelState::Closed => return None,
     };
     child.painter().text(
@@ -6016,7 +6279,7 @@ fn draw_fs_overflow_panel_surface(
         .clicked()
         .then_some(FsOverflowPanelAction::Close);
 
-    let body_rect = egui::Rect::from_min_max(
+    let mut body_rect = egui::Rect::from_min_max(
         egui::pos2(
             panel_rect.left() + FS_OVERFLOW_PANEL_PADDING,
             header_rect.bottom() + FS_OVERFLOW_PANEL_PADDING,
@@ -6026,6 +6289,35 @@ fn draw_fs_overflow_panel_surface(
             panel_rect.bottom() - FS_OVERFLOW_PANEL_PADDING,
         ),
     );
+    // Slideshow settings remain usable while pages advance. Keep Back with the header
+    // so only the settings body scrolls, even in a short viewport.
+    if view.state == FsOverflowPanelState::Slideshow && body_rect.is_positive() {
+        let back_rect = egui::Rect::from_min_size(
+            body_rect.min,
+            egui::vec2(body_rect.width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
+        );
+        let mut back = child.new_child(egui::UiBuilder::new().max_rect(back_rect));
+        let response = draw_fs_overflow_panel_row(
+            &mut back,
+            "slideshow_back",
+            "<  戻る",
+            "",
+            false,
+            true,
+            None,
+        );
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("fs_slideshow_back_test_rect"),
+                response.rect,
+            )
+        });
+        if response.clicked() {
+            action = Some(FsOverflowPanelAction::Back);
+        }
+        body_rect.min.y += FS_OVERFLOW_PANEL_ROW_HEIGHT;
+    }
     if body_rect.is_positive() {
         let mut body = child.new_child(egui::UiBuilder::new().max_rect(body_rect));
         body.set_clip_rect(body_rect);
@@ -6127,6 +6419,33 @@ fn draw_fs_overflow_panel_surface(
                         if ui.add_enabled(view.shift.enabled, egui::Checkbox::new(&mut memory, "見開きの調整を本ごとに記憶する"))
                             .on_hover_text("全冊に効く設定です。OFFでも保存済み調整は保持し、次回ONの再入場で使います").changed() {
                             action = Some(FsOverflowPanelAction::SetShiftMemory(memory));
+                        }
+                    }
+                    FsOverflowPanelState::Slideshow => {
+                        let mut values = view.slideshow;
+                        let mut changed = false;
+                        let mut persist = false;
+                        let mut record = |response: egui::Response| {
+                            changed |= response.changed();
+                            persist |= response.drag_stopped() || (response.changed() && !response.dragged());
+                        };
+                        record(draw_fs_slideshow_slider(ui, "ページ送り間隔:", egui::Slider::new(&mut values.interval_secs, 0.5..=30.0).suffix(" 秒").fixed_decimals(1)));
+                        draw_fs_slideshow_heading(ui, "連結読みスライドショー:");
+                        record(draw_fs_slideshow_slider(ui, "待機時間:", egui::Slider::new(&mut values.wait_secs, 0.1..=30.0).suffix(" 秒").fixed_decimals(1)));
+                        record(draw_fs_slideshow_slider(ui, "スクロール時間:", egui::Slider::new(&mut values.scroll_secs, 0.0..=5.0).suffix(" 秒").fixed_decimals(1)));
+                        record(draw_fs_slideshow_slider(ui, "1回のスクロール量:", egui::Slider::new(&mut values.scroll_percent, 1..=100).suffix(" %")));
+                        draw_fs_slideshow_heading(ui, "フォルダの最後まで進んだら:");
+                        for end_action in [SlideshowEndAction::LoopFolder, SlideshowEndAction::NextFolder, SlideshowEndAction::Stop] {
+                            let selected = values.end_action == end_action;
+                            if draw_fs_overflow_panel_row(ui, ("slideshow_end", end_action as u8), end_action.label(),
+                                if selected { "選択中" } else { "" }, selected, true, None).clicked() {
+                                values.end_action = end_action;
+                                changed = true;
+                                persist = true;
+                            }
+                        }
+                        if changed || persist {
+                            action = Some(FsOverflowPanelAction::SetSlideshow { values, persist });
                         }
                     }
                     FsOverflowPanelState::MusicNoteColor => {
@@ -6477,7 +6796,6 @@ struct StillTopBarVisibilityInputs {
     side_panel_visible: bool,
     spread_popup_open: bool,
     fit_popup_open: bool,
-    slideshow_popup_open: bool,
     rotation_popup_open: bool,
     panorama_projection_popup_open: bool,
     overflow_panel_open: bool,
@@ -6491,7 +6809,6 @@ fn still_top_bar_visible_from_inputs(input: StillTopBarVisibilityInputs) -> bool
         || input.side_panel_visible
         || input.spread_popup_open
         || input.fit_popup_open
-        || input.slideshow_popup_open
         || input.rotation_popup_open
         || input.panorama_projection_popup_open
         || input.overflow_panel_open
@@ -6535,7 +6852,6 @@ struct StillTouchInputEnabledInputs {
     context_menu_open: bool,
     spread_popup_open: bool,
     fit_popup_open: bool,
-    slideshow_popup_open: bool,
     rotation_popup_open: bool,
     panorama_projection_popup_open: bool,
     compare_wipe_active: bool,
@@ -6559,7 +6875,6 @@ fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
         && !input.context_menu_open
         && !input.spread_popup_open
         && !input.fit_popup_open
-        && !input.slideshow_popup_open
         && !input.rotation_popup_open
         && !input.panorama_projection_popup_open
         && !input.compare_wipe_active
@@ -7593,7 +7908,7 @@ fn should_handle_fullscreen_wheel(
     in_video_tile: bool,
     ctrl_held: bool,
     modal_for_keys: bool,
-    // 表示モード / フィット / スライドショーのポップアップメニュー表示中は、メニュー上でも画像上でも
+    // 表示モード / フィットのポップアップや「…」パネル表示中は、メニュー上でも画像上でも
     // ホイールを背後のページ送り・連結スクロール・ズームへ流さない (modal と同様に全抑制)。
     popup_open: bool,
 ) -> bool {
@@ -18906,6 +19221,7 @@ pub fn draw_spread_shift_hud_snapshot_fixture(ui: &mut egui::Ui, unresolved: boo
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
         shift,
         music_note_color_scheme: Default::default(),
+        slideshow: Default::default(),
         composition_available: false,
         composition_managed: false,
     };
@@ -18929,6 +19245,7 @@ pub fn draw_composition_editor_hud_snapshot_fixture(
         composition_available: available,
         composition_managed: managed,
         music_note_color_scheme: Default::default(),
+        slideshow: Default::default(),
     };
     let rect = egui::Rect::from_min_size(
         ui.max_rect().min,
@@ -24444,6 +24761,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn draw_fullscreen_seek_overlay(
         &mut self,
         ui: &mut egui::Ui,
@@ -24462,6 +24780,7 @@ impl App {
             seek_geometry,
             side_panel_visible,
             touch_chrome_latched,
+            FsOverflowPointerFrameInput::default(),
         )
     }
 
@@ -24518,6 +24837,7 @@ impl App {
         seek_geometry: StillSeekGeometry,
         side_panel_visible: bool,
         touch_chrome_latched: bool,
+        overflow_pointer_input: FsOverflowPointerFrameInput,
     ) -> Option<usize> {
         self.fs_seek_overlay_visible = false;
         self.poll_still_seek_rotations();
@@ -24529,7 +24849,8 @@ impl App {
             return None;
         }
 
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
+        let primary_allowed = !overflow_pointer_input.primary_owned;
+        let primary_down = primary_allowed && ctx.input(|i| i.pointer.primary_down());
         let bottom_lock = self.settings.still_bottom_lock();
         let locked = self.resolved_still_chrome().bottom_lock.bar_locked();
         let raw_locked = bottom_lock.bar_locked();
@@ -24626,7 +24947,7 @@ impl App {
                 },
                 raw_locked && !locked,
             ));
-            if lock_resp.clicked() {
+            if primary_allowed && lock_resp.clicked() {
                 self.settings.set_still_seek_bar_locked(!raw_locked);
                 self.settings.save();
                 ctx.request_repaint();
@@ -24839,22 +25160,29 @@ impl App {
             // The response handler owns the immutable press origin, live center, and release
             // commit. The page-position sync above is the only non-close path that discards a
             // committed center.
-            let strip_interaction = handle_still_seek_strip_response(
-                &strip_response,
-                strip_layout_center,
-                info.current_pos,
-                total,
-                geometry.drag_step_width,
-                // Rect::bottom is exclusive at the monitor edge. Keep the shared close
-                // predicate unchanged, but cap its boundary at the last physical pixel.
-                strip_rect
-                    .bottom()
-                    .min((full_rect.bottom() - 1.0 / ctx.pixels_per_point()).max(full_rect.top())),
-                strip_lock_rect,
-                strip_toggle_rect,
-                strip_is_rtl,
-                &mut self.fs_seek_gesture,
-            );
+            let strip_interaction = if primary_allowed {
+                handle_still_seek_strip_response(
+                    &strip_response,
+                    strip_layout_center,
+                    info.current_pos,
+                    total,
+                    geometry.drag_step_width,
+                    // Rect::bottom is exclusive at the monitor edge. Keep the shared close
+                    // predicate unchanged, but cap its boundary at the last physical pixel.
+                    strip_rect.bottom().min(
+                        (full_rect.bottom() - 1.0 / ctx.pixels_per_point()).max(full_rect.top()),
+                    ),
+                    strip_lock_rect,
+                    strip_toggle_rect,
+                    strip_is_rtl,
+                    &mut self.fs_seek_gesture,
+                )
+            } else {
+                StillSeekStripInteraction {
+                    closed_by_drag: false,
+                    note_seek_activity: false,
+                }
+            };
             let strip_closed_by_drag = strip_interaction.closed_by_drag;
             #[cfg(all(windows, feature = "test-script"))]
             {
@@ -24903,6 +25231,7 @@ impl App {
                 self.note_fullscreen_seek_activity();
             }
             if !strip_closed_by_drag
+                && primary_allowed
                 && strip_response.clicked()
                 && let Some(source_pos) = pointed_source_pos
                 && let Some(resolved) = resolve_still_seek_target(
@@ -24992,7 +25321,7 @@ impl App {
                     },
                     strip_locked && !self.resolved_still_chrome().bottom_lock.strip_locked(),
                 ));
-            if strip_lock_response.clicked() {
+            if primary_allowed && strip_lock_response.clicked() {
                 self.settings.set_still_seek_strip_locked(!strip_locked);
                 self.settings.save();
                 ctx.request_repaint();
@@ -25120,8 +25449,14 @@ impl App {
                     }
                 }
 
-                let interaction =
-                    handle_still_seek_track_response(&response, &mut self.fs_seek_gesture);
+                let interaction = if primary_allowed {
+                    handle_still_seek_track_response(&response, &mut self.fs_seek_gesture)
+                } else {
+                    StillSeekTrackInteraction {
+                        action: StillSeekTrackAction::None,
+                        note_seek_activity: false,
+                    }
+                };
                 if interaction.note_seek_activity {
                     self.fs_seek_drag_active = true;
                     self.note_fullscreen_seek_activity();
@@ -26853,6 +27188,7 @@ impl App {
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
+                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_overflow_pointer_input(ctx, full_rect);
                         let music_overflow_input = self.begin_music_overflow_frame_input(ctx, full_rect, fs_idx);
                         let mut hud_popup_wheel = self
                             .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx, music_overflow_input)
@@ -27142,6 +27478,8 @@ impl App {
                                 || ctrl_nav.is_some() || sibling_nav.is_some()
                                 || mouse_nav.is_some() || jump_to.is_some(),
                             true,
+                            overflow_pointer_input,
+                            &overflow_touch_excluded,
                         );
                         if let Some(mut proposal) = wheel_result.deferred.take() {
                             proposal.frame_navigation_allowed = !continuation_committed;
@@ -27605,7 +27943,7 @@ impl App {
                         // 単一ページ表示で消しゴムを描画する。
                         if self.erase_mode && !is_spread_double && !state.original_preview_active {
                             if let Some(transform) = single_transform.as_ref() {
-                                self.handle_erase_paint(ctx, transform);
+                                self.handle_erase_paint(ctx, transform, overflow_pointer_input);
                                 self.draw_erase_overlay(ui, ctx, transform);
                             }
                             ctx.request_repaint();
@@ -27621,7 +27959,7 @@ impl App {
                         if self.conceal_mode && !is_spread_double && !state.original_preview_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
-                                self.handle_conceal_paint(ctx, transform);
+                                self.handle_conceal_paint(ctx, transform, overflow_pointer_input);
                                 self.draw_conceal_overlay(ui, ctx, transform);
                             }
                             ctx.request_repaint();
@@ -27637,7 +27975,7 @@ impl App {
                                 // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
                                 // 漏れるのを防ぐ)。ダイアログ自体の描画は draw_text_overlay で行う。
                                 if !self.text_subdialog_open() {
-                                    self.handle_text_canvas_input(ctx, transform);
+                                    self.handle_text_canvas_input(ctx, transform, overflow_pointer_input);
                                 }
                                 self.draw_text_overlay(ui, ctx, transform);
                             }
@@ -27652,7 +27990,7 @@ impl App {
                         {
                             if let Some(transform) = single_transform.as_ref() {
                                 let la_input_t0 = std::time::Instant::now();
-                                self.handle_local_adjust_canvas_input(ctx, full_rect, transform);
+                                self.handle_local_adjust_canvas_input(ctx, full_rect, transform, overflow_pointer_input);
                                 fs_la_canvas_input_ms =
                                     la_input_t0.elapsed().as_secs_f64() * 1000.0;
                                 let la_overlay_t0 = std::time::Instant::now();
@@ -27682,6 +28020,7 @@ impl App {
                                     transform,
                                     image_size,
                                     pointer_allowed,
+                                    overflow_pointer_input,
                                 );
                                 ctx.request_repaint();
                             } else if self.sns_split.is_some() {
@@ -27922,6 +28261,7 @@ impl App {
                                 full_rect,
                                 image_rect,
                                 pixels.as_deref(),
+                                overflow_pointer_input,
                             );
                             if close_analysis {
                                 // × も Z / ホバーボタンと同じ経路 (ズーム/パン引き継ぎ込み) に
@@ -28015,7 +28355,7 @@ impl App {
                                 full_rect,
                                 still_seek_height,
                             );
-                            self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
+                            self.draw_adjustment_panel(ui, panel_rect, state.image_dims, overflow_pointer_input);
                             metadata_panel_demand_checked = true;
                             right_panel_visible = self.draw_metadata_panel(
                                 ui,
@@ -28023,7 +28363,7 @@ impl App {
                                 full_rect,
                                 info_panel_lock_effective,
                                 still_seek_height,
-                            );
+                             overflow_pointer_input, );
                             side_panel_visible |= right_panel_visible;
                         } else if panorama_mode_active_now {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
@@ -28048,7 +28388,7 @@ impl App {
                                 full_rect,
                                 info_panel_lock_effective,
                                 still_seek_height,
-                            );
+                             overflow_pointer_input, );
                             side_panel_visible = right_panel_visible;
                         }
                         if !metadata_panel_demand_checked {
@@ -28091,6 +28431,7 @@ impl App {
                                 still_seek_geometry,
                                 side_panel_visible,
                                 touch_chrome_latched,
+                                overflow_pointer_input,
                             )
                         {
                             if !continuation_committed {
@@ -28163,7 +28504,7 @@ impl App {
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
                             // 専用トグルがある。
                             let show_window_toggle = cfg!(windows) && !is_video_mode && !detached;
-                            let slideshow_was_playing = self.slideshow_playing;
+                            let mut slideshow_pressed = false;
                             // 360 度パノラマビュー: 検出 + アクティブ状態を計算
                             // (docs/panorama-360-view-plan.md §5.3)。is_panorama_mode_active
                             // は state Some + detect Some を要求するが、ボタン表示は
@@ -28229,7 +28570,6 @@ impl App {
                                     side_panel_visible,
                                     spread_popup_open: self.spread_popup_open,
                                     fit_popup_open: self.fit_popup_open,
-                                    slideshow_popup_open: self.slideshow_popup_open,
                                     rotation_popup_open: fs_rotation_popup_open(ctx),
                                     panorama_projection_popup_open: self
                                         .panorama_projection_popup_open,
@@ -28284,9 +28624,8 @@ impl App {
                                 side_panel_visible,
                                 self.fs_overflow_panel_state.is_open(),
                                 &mut overflow_request,
-                                &mut self.slideshow_playing,
-                                &mut self.settings.slideshow_interval_secs,
-                                &mut self.settings.slideshow_end_action,
+                                self.slideshow_playing,
+                                &mut slideshow_pressed,
                                 current_rotation,
                                 &mut rotation_choice,
                                 panorama_trigger,
@@ -28314,10 +28653,6 @@ impl App {
                                 fit_no_upscale,
                                 fit_no_downscale,
                                 &mut self.fit_popup_open,
-                                &mut self.slideshow_popup_open,
-                                &mut self.settings.slideshow_continuous_wait_secs,
-                                &mut self.settings.slideshow_continuous_scroll_secs,
-                                &mut self.settings.slideshow_continuous_scroll_percent,
                                 &mut specified_scale_edit,
                                 &mut specified_scale_max_edit,
                                 specified_scale_favorite,
@@ -28424,12 +28759,8 @@ impl App {
                                 // モード切替が次の入力まで反映されない (Codex P2)。
                                 ctx.request_repaint_of(egui::ViewportId::ROOT);
                             }
-                            if !slideshow_was_playing && self.slideshow_playing {
-                                self.schedule_next_slideshow_from_now();
-                            } else if slideshow_was_playing && !self.slideshow_playing {
-                                self.slideshow_anchor_idx = None;
-                                self.continuous_reading_scroll_transition = None;
-                                self.slideshow_scroll_range_cache = None;
+                            if slideshow_pressed {
+                                self.toggle_fullscreen_slideshow(fs_idx);
                             }
                             // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
                             #[cfg(windows)]
@@ -32870,7 +33201,6 @@ impl App {
             context_menu_open: self.fs_context_menu_idx.is_some(),
             popup_open: self.spread_popup_open
                 || self.fit_popup_open
-                || self.slideshow_popup_open
                 || self.panorama_projection_popup_open
                 || fs_still_seek_strip_popup_open(ctx),
             ime_active: target
@@ -33160,7 +33490,6 @@ impl App {
             side_panel_visible,
             spread_popup_open: self.spread_popup_open,
             fit_popup_open: self.fit_popup_open,
-            slideshow_popup_open: self.slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
             panorama_projection_popup_open: self.panorama_projection_popup_open,
             overflow_panel_open: self.fs_overflow_panel_state.is_open(),
@@ -33456,7 +33785,6 @@ impl App {
             ) || self.test_script_pending_text_input_focus(),
             self.spread_popup_open
                 || self.fit_popup_open
-                || self.slideshow_popup_open
                 || self.panorama_projection_popup_open
                 || fs_rotation_popup_open(ctx)
                 || fs_still_seek_strip_popup_open(ctx),
@@ -33498,6 +33826,15 @@ impl App {
 
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::mark_action_pass_eligible(ctx);
+
+        // Slideshow is a settings surface: focused sliders and their numeric editors own
+        // arrows/text/IME, rather than dismissing the panel and navigating the page behind it.
+        if self.fs_overflow_panel_state == FsOverflowPanelState::Slideshow
+            && ctx.memory(|memory| memory.focused().is_some())
+        {
+            self.fs_zoom_reset_transient();
+            return action;
+        }
 
         // The overflow panel is a menu, so the next keystroke closes it - and then goes on to do
         // whatever it was going to do. It does not swallow the key: a menu that eats the input
@@ -35509,18 +35846,7 @@ impl App {
         // 開始時のみ、現在ページが画像系アイテム (Image/ZipImage/PdfPage) かを確認する。
         // 非画像アイテム上では開始させない (停止操作は常に許可)。
         if key_s {
-            self.slideshow_popup_open = false;
-            if self.slideshow_playing {
-                self.stop_slideshow_playback();
-            } else if matches!(
-                self.items.get(fs_idx),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            ) {
-                self.slideshow_playing = true;
-                self.schedule_next_slideshow_from_now();
-            }
+            self.toggle_fullscreen_slideshow(fs_idx);
         }
 
         if key_seek_strip_toggle {
@@ -36131,6 +36457,12 @@ impl App {
                     true,
                     None,
                 ),
+                FullscreenOverflowItemId::SlideshowSettings => (
+                    item.label().into(),
+                    format!("{:.1} 秒  >", self.settings.slideshow_interval_secs),
+                    true,
+                    None,
+                ),
                 FullscreenOverflowItemId::ImageAnalysis => {
                     let enabled =
                         self.analysis_mode || (!is_spread_double && self.reading_flow.is_paged());
@@ -36193,6 +36525,7 @@ impl App {
             composition_available: self.composition_editor_available(),
             composition_managed: self.pairing_edit_availability()
                 == crate::spread_shift::PairingEditAvailability::Composed,
+            slideshow: FsSlideshowSettings::from_settings(&self.settings),
         }
     }
 
@@ -36341,11 +36674,7 @@ impl App {
         }) {
             return Some(FsHudPopupWheelTarget::Overflow);
         }
-        if self.fit_popup_open
-            || self.spread_popup_open
-            || self.slideshow_popup_open
-            || self.panorama_projection_popup_open
-        {
+        if self.fit_popup_open || self.spread_popup_open || self.panorama_projection_popup_open {
             return Some(FsHudPopupWheelTarget::TopBar);
         }
         None
@@ -36361,7 +36690,6 @@ impl App {
             FsHudPopupWheelTarget::TopBar => {
                 self.fit_popup_open
                     || self.spread_popup_open
-                    || self.slideshow_popup_open
                     || self.panorama_projection_popup_open
                     || fs_rotation_popup_open(ctx)
             }
@@ -36395,6 +36723,7 @@ impl App {
             navigator_corner: FullscreenNavigatorCorner::BottomRight,
             shift: Default::default(),
             music_note_color_scheme: self.settings.music_note_color_scheme,
+            slideshow: FsSlideshowSettings::from_settings(&self.settings),
             composition_available: false,
             composition_managed: false,
         };
@@ -36489,6 +36818,9 @@ impl App {
                 FullscreenOverflowItemId::PageTurnAnimationToggle => {
                     self.toggle_page_turn_animation()
                 }
+                FullscreenOverflowItemId::SlideshowSettings => {
+                    self.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+                }
                 FullscreenOverflowItemId::ImageAnalysis => {
                     let available =
                         self.analysis_mode || (!is_spread_double && self.reading_flow.is_paged());
@@ -36532,6 +36864,17 @@ impl App {
             }
             FsOverflowPanelAction::SetMusicNoteColor(scheme) => {
                 self.set_music_note_color_scheme(scheme);
+            }
+            FsOverflowPanelAction::SetSlideshow { values, persist } => {
+                self.settings.slideshow_interval_secs = values.interval_secs;
+                self.settings.slideshow_continuous_wait_secs = values.wait_secs;
+                self.settings.slideshow_continuous_scroll_secs = values.scroll_secs;
+                self.settings.slideshow_continuous_scroll_percent = values.scroll_percent;
+                self.settings.slideshow_end_action = values.end_action;
+                // Do not reschedule the current page. The next transition reads these values.
+                if persist {
+                    self.settings.save();
+                }
             }
             FsOverflowPanelAction::SetShiftMemory(enabled) => {
                 if view.shift.enabled {
@@ -38005,6 +38348,8 @@ impl App {
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
+        let (overflow_pointer_input, overflow_touch_excluded) =
+            self.capture_fs_overflow_pointer_input(ctx, full_rect);
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
@@ -38019,6 +38364,8 @@ impl App {
             navigation_operation,
             false,
             false,
+            overflow_pointer_input,
+            &overflow_touch_excluded,
         );
         (result.page_nav, result.close)
     }
@@ -38038,9 +38385,12 @@ impl App {
         navigation_operation: &mut Option<ViewerOperationId>,
         suppress_wheel_navigation: bool,
         merge_at_frame_tail: bool,
+        overflow_pointer_input: FsOverflowPointerFrameInput,
+        overflow_touch_excluded: &[egui::Rect],
     ) -> FsWheelFrameResult {
         *navigator_reservation = None;
-        let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx);
+        let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx)
+            .without_overflow_buttons(overflow_pointer_input);
         if front_wheel_owner.is_some() {
             // The begin-pass capture remains intact. Both immediate and reserved consumers
             // receive the same projection, retaining pointer/focus/release gesture ownership.
@@ -38063,7 +38413,7 @@ impl App {
         });
         if self.cancel_mouse_right_drag_on_primary_press(
             crate::ring_shortcut::RightDragOwner::Root,
-            primary_pressed,
+            primary_pressed && !overflow_pointer_input.primary_owned,
         ) {
             self.fs_primary_suppression.arm_pointer_stream();
         }
@@ -38271,12 +38621,22 @@ impl App {
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_primary_suppression.arm_pointer_stream();
+                let touch_scope = self.fullscreen_idx.map(|fs_idx| StillTouchChromeLatch {
+                    fs_idx,
+                    session_started_at: self.fullscreen_opened_at(),
+                });
+                let help_phase =
+                    touch_scope.and_then(|scope| still_touch_first_run_help_phase(ctx, scope));
                 let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                     ctx,
                     crate::touch_correlation::TouchSurface::StillFullscreen,
                     crate::touch_input::TapZoneGeometry {
                         surface: full_rect,
-                        excluded: Vec::new(),
+                        excluded: if help_phase.is_none() {
+                            overflow_touch_excluded.to_vec()
+                        } else {
+                            Vec::new()
+                        },
                         behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                             accepts_pinch: true,
                             tap_zones: touch_tap_zones,
@@ -38294,19 +38654,27 @@ impl App {
                         cancelled: touch_frame.touch_cancelled(),
                     },
                 );
-                if let Some(idx) = self.fullscreen_idx {
-                    let scope = StillTouchChromeLatch {
-                        fs_idx: idx,
-                        session_started_at: self.fullscreen_opened_at(),
-                    };
-                    let help_phase = still_touch_first_run_help_phase(ctx, scope);
+                if let Some(scope) = touch_scope.filter(|_| !overflow_pointer_input.primary_owned) {
+                    if help_phase.is_none()
+                        && touch_frame
+                            .commands()
+                            .iter()
+                            .copied()
+                            .any(|command| self.dismiss_fs_overflow_on_touch_tap(command))
+                    {
+                        return FsWheelFrameResult::default();
+                    }
                     match still_touch_foreground_reclaim_action(
                         help_phase,
                         touch_frame.is_active(),
                         touch_frame.commands(),
                     ) {
                         StillTouchForegroundReclaimAction::ToggleChrome => {
-                            toggle_still_touch_chrome_latch(ctx, idx, self.fullscreen_opened_at());
+                            toggle_still_touch_chrome_latch(
+                                ctx,
+                                scope.fs_idx,
+                                self.fullscreen_opened_at(),
+                            );
                         }
                         StillTouchForegroundReclaimAction::LearnAndShowChrome => {
                             set_still_touch_chrome_latch(ctx, scope, true);
@@ -38628,7 +38996,6 @@ impl App {
                     side_panel_visible,
                     spread_popup_open: self.spread_popup_open,
                     fit_popup_open: self.fit_popup_open,
-                    slideshow_popup_open: self.slideshow_popup_open,
                     rotation_popup_open: fs_rotation_popup_open(ctx),
                     panorama_projection_popup_open: self.panorama_projection_popup_open,
                     overflow_panel_open: self.fs_overflow_panel_state.is_open(),
@@ -38641,7 +39008,6 @@ impl App {
         // 筆以外、各パネル上、popup / modal 中は input に触れず、下流の従来経路へ残す。
         let edit_popup_open = self.spread_popup_open
             || self.fit_popup_open
-            || self.slideshow_popup_open
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
             || fs_still_seek_strip_popup_open(ctx)
@@ -38669,7 +39035,6 @@ impl App {
             context_menu_open: self.fs_context_menu_idx.is_some(),
             spread_popup_open: self.spread_popup_open,
             fit_popup_open: self.fit_popup_open,
-            slideshow_popup_open: self.slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx) || fs_still_seek_strip_popup_open(ctx),
             panorama_projection_popup_open: self.panorama_projection_popup_open,
             compare_wipe_active,
@@ -38710,11 +39075,9 @@ impl App {
         if top_bar_visible {
             touch_excluded.push(fullscreen_top_bar_rect(full_rect));
         }
-        // 右上の overflow panel はページ送り面ではない。panel state と同じ純粋な矩形計算を
-        // touch classifier に渡し、行・戻る・閉じる操作を PageSide へ再分類させない。
-        if let Some(rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state) {
-            touch_excluded.push(rect);
-        }
+        // Use the same frontmost surface captured for both pointer buttons. A popup
+        // above overflow keeps its pre-existing touch handling instead of becoming overflow.
+        touch_excluded.extend_from_slice(overflow_touch_excluded);
         // ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
         // 除外しないと、隅ボタンも閉じるボタンも押せないまま、触れた指がページを送る。
         if let Some(navigator_rect) = self.fullscreen_navigator_panel_rect(ctx, full_rect) {
@@ -38790,6 +39153,11 @@ impl App {
         let mut touch_help_learned_this_frame = false;
         if touch_input_enabled {
             for command in touch_frame.clone().into_commands() {
+                // Drive the recognizer through its terminal frame above, but never reuse a
+                // front-owned promoted pointer after an early UI action closed the panel.
+                if overflow_pointer_input.primary_owned {
+                    continue;
+                }
                 if let Some(help_phase) = touch_help_phase_for_commands {
                     if still_touch_first_run_help_tap_action(help_phase, command)
                         == StillTouchFirstRunHelpTapAction::LearnAndShowChrome
@@ -38805,6 +39173,9 @@ impl App {
                     }
                     // Every command belongs to the modal guide while it is
                     // visible. In particular, PageSide never reaches page_nav.
+                    continue;
+                }
+                if self.dismiss_fs_overflow_on_touch_tap(command) {
                     continue;
                 }
                 if touch_panel_tap_command_dismisses_before_dispatch(
@@ -38939,7 +39310,8 @@ impl App {
                 )
             })
             .unwrap_or(compare_base_rect);
-        if !cursor_in_panel
+        if !overflow_pointer_input.primary_owned
+            && !cursor_in_panel
             && self.handle_compare_wipe_drag(ctx, compare_drag_rect, compare_base_rect)
         {
             return FsWheelFrameResult::default();
@@ -39005,6 +39377,10 @@ impl App {
             // evidence, not a new cross-frame owner.
             primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
         }
+        if overflow_pointer_input.primary_owned {
+            // A terminal TouchFrame::Allow must not reuse the front widget's release.
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
+        }
         // ── フォーカス復帰クリック / touch replacement の抑制 ──
         let wheel_options = ctx.options(|o| o.input_options);
         let wheel_segments =
@@ -39058,7 +39434,6 @@ impl App {
                 modal_for_keys,
                 self.spread_popup_open
                     || self.fit_popup_open
-                    || self.slideshow_popup_open
                     || self.panorama_projection_popup_open
                     || fs_rotation_popup_open(ctx)
                     || fs_still_seek_strip_popup_open(ctx)
@@ -39119,7 +39494,6 @@ impl App {
                         modal_for_keys,
                         self.spread_popup_open
                             || self.fit_popup_open
-                            || self.slideshow_popup_open
                             || self.panorama_projection_popup_open,
                         suppress_egui_wheel,
                         handle_wheel_here,
@@ -39155,6 +39529,7 @@ impl App {
             seek_panel_rect,
             seek_panel_interactive,
             prev_foreground_hwnd,
+            overflow_pointer_input,
         );
         // Preserve the released wheel-before-click classification without mutating
         // a page which an intermediate navigation has already left.
@@ -39811,7 +40186,6 @@ impl App {
         }
         if self.spread_popup_open
             || self.fit_popup_open
-            || self.slideshow_popup_open
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(_ctx)
             || fs_still_seek_strip_popup_open(_ctx)
@@ -39848,6 +40222,72 @@ impl App {
         }
     }
 
+    fn capture_fs_overflow_pointer_input(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> (FsOverflowPointerFrameInput, Vec<egui::Rect>) {
+        let visible_panel = fs_overflow_pointer_surface(
+            ctx,
+            fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state),
+        );
+        let secondary_owner = self.fullscreen_idx.map(|fs_idx| {
+            FullscreenSecondaryPressOwner::new(
+                self.edit_request_owner_context(),
+                self.items_generation,
+                fs_idx,
+                self.current_right_drag_context(),
+            )
+        });
+        let pointer = ctx.input(|input| {
+            if input.events.iter().any(|event| {
+                matches!(event, egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary, pressed: true, pos, ..
+                } if visible_panel.iter().any(|rect| rect.contains(*pos)))
+            }) {
+                self.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
+            }
+            let primary_owned =
+                self.fs_primary_suppression == FullscreenPrimarySuppression::OverflowStream;
+            if primary_owned
+                && (!input.focused
+                    || (!input.pointer.primary_down() && !input.pointer.primary_released()))
+            {
+                self.fs_primary_suppression = FullscreenPrimarySuppression::Idle;
+            }
+            FsOverflowPointerFrameInput {
+                primary_owned,
+                secondary_owned: self.fs_secondary_press.overflow_owns_input(
+                    secondary_owner,
+                    &visible_panel,
+                    input,
+                ),
+                secondary_owner,
+            }
+        });
+        (pointer, visible_panel)
+    }
+
+    fn dismiss_fs_overflow_on_touch_tap(
+        &mut self,
+        command: crate::touch_input::TouchCommand,
+    ) -> bool {
+        if self.fs_overflow_panel_state.is_open()
+            && matches!(
+                command,
+                crate::touch_input::TouchCommand::ToggleChrome
+                    | crate::touch_input::TouchCommand::PageSide { .. }
+            )
+        {
+            // Frontmost panel contacts are excluded by the shared surface. Only spend outside taps;
+            // the caller still drives recognizer ownership through its terminal frame.
+            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            true
+        } else {
+            false
+        }
+    }
+
     fn recognize_fs_secondary_input(
         &mut self,
         ctx: &egui::Context,
@@ -39857,6 +40297,7 @@ impl App {
         seek_panel_rect: egui::Rect,
         seek_panel_interactive: bool,
         prev_foreground_hwnd: usize,
+        overflow_pointer_input: FsOverflowPointerFrameInput,
     ) -> FsSecondaryAction {
         let dialog_open_for_right_drag = self.any_dialog_open();
         if dialog_open_for_right_drag {
@@ -39876,6 +40317,12 @@ impl App {
         let secondary_down = ctx.input(|i| i.pointer.secondary_down());
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let secondary_released = ctx.input(|i| i.pointer.secondary_released());
+        let press_owner = overflow_pointer_input.secondary_owner;
+        if overflow_pointer_input.secondary_owned {
+            self.cancel_mouse_ring_flick();
+            self.cancel_mouse_gesture();
+            return FsSecondaryAction::None;
+        }
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
         let passive_secondary_pos = fullscreen_pointer_pos_or(
             ctx,
@@ -39895,7 +40342,6 @@ impl App {
         // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
         let popup_open = self.spread_popup_open
             || self.fit_popup_open
-            || self.slideshow_popup_open
             || self.panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
             || fs_still_seek_strip_popup_open(ctx);
@@ -39913,16 +40359,7 @@ impl App {
             None
         };
         let passive_press_owner = fullscreen_secondary_press_owner_for_frame(
-            self.fullscreen_idx.map(|fs_idx| {
-                FullscreenSecondaryPressOwner::new(
-                    // This existing helper is the cross-platform current projection owner;
-                    // edit requests and physical pointer sequences need the same exact scope.
-                    self.edit_request_owner_context(),
-                    self.items_generation,
-                    fs_idx,
-                    right_drag_context,
-                )
-            }),
+            press_owner,
             &right_drag_mode,
             right_drag_context,
             right_drag_gate_reject.is_some(),
@@ -40030,7 +40467,6 @@ impl App {
             && self.fs_context_menu_idx.is_none()
             && !self.spread_popup_open
             && !self.fit_popup_open
-            && !self.slideshow_popup_open
             && !self.panorama_projection_popup_open
             && !fs_rotation_popup_open(ctx)
             && !fs_still_seek_strip_popup_open(ctx)
@@ -40310,12 +40746,25 @@ impl App {
         was_playing
     }
 
+    /// HUD・キー/マウス割当・リング/ジェスチャで共有する、active viewer のトグル出口。
+    pub(crate) fn toggle_fullscreen_slideshow(&mut self, fs_idx: usize) {
+        if self.slideshow_playing {
+            self.stop_slideshow_playback();
+        } else if matches!(
+            self.items.get(fs_idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        ) {
+            self.slideshow_playing = true;
+            self.schedule_next_slideshow_from_now();
+        }
+    }
+
     /// 既存の手動停止と remote session lock が共有する停止入口。
-    /// 表示位置と fullscreen/window 構成は保持し、popup も閉じる。
+    /// 表示位置と fullscreen/window 構成、全体設定パネルは保持する。
     pub(crate) fn stop_slideshow_playback(&mut self) -> bool {
-        let was_playing = self.stop_projected_slideshow_playback();
-        self.slideshow_popup_open = false;
-        was_playing
+        self.stop_projected_slideshow_playback()
     }
 
     /// フォルダ内の先頭の静止画系アイテム (Video 除外) へ折り返す。
@@ -43878,7 +44327,6 @@ impl App {
         self.reset_live_spread_shift(false);
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
-        self.slideshow_popup_open = false;
         self.panorama_projection_popup_open = false;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         if !self.reading_flow.is_paged() {
@@ -44175,7 +44623,6 @@ impl App {
         self.spread_mode = mode;
         self.reading_direction = direction;
         self.spread_popup_open = false;
-        self.slideshow_popup_open = false;
         self.panorama_projection_popup_open = false;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         if !self.reading_flow.is_paged() {
@@ -49641,9 +50088,9 @@ impl App {
             && !music_view_frame_ui.blocks_cursor_auto_hide()
             && !self.spread_popup_open
             && !self.fit_popup_open
-            && !self.slideshow_popup_open
             && !self.panorama_projection_popup_open
             && !fs_still_seek_strip_popup_open(ctx)
+            && !self.fs_overflow_panel_state.is_open()
             && self.fs_context_menu_idx.is_none()
             && !self.any_dialog_open()
     }
@@ -49666,9 +50113,8 @@ impl App {
         side_panel_visible: bool,
         overflow_panel_open: bool,
         overflow_request: &mut Option<FsOverflowOpenRequest>,
-        slideshow_playing: &mut bool,
-        slideshow_interval: &mut f32,
-        slideshow_end_action: &mut SlideshowEndAction,
+        slideshow_playing: bool,
+        slideshow_pressed: &mut bool,
         current_rotation: crate::rotation_db::Rotation,
         rotation_choice: &mut Option<crate::rotation_db::Rotation>,
         // 360 度パノラマビュー (docs/panorama-360-view-plan.md §5.3):
@@ -49711,10 +50157,6 @@ impl App {
         fit_no_upscale: bool,
         fit_no_downscale: bool,
         fit_popup_open: &mut bool,
-        slideshow_popup_open: &mut bool,
-        slideshow_continuous_wait_secs: &mut f32,
-        slideshow_continuous_scroll_secs: &mut f32,
-        slideshow_continuous_scroll_percent: &mut u32,
         specified_scale_edit: &mut crate::settings::FullscreenSpecifiedScale,
         specified_scale_max_edit: &mut u32,
         specified_scale_favorite: bool,
@@ -49768,7 +50210,6 @@ impl App {
 
         let popup_wheel_owned = *fit_popup_open
             || *spread_popup_open
-            || *slideshow_popup_open
             || *panorama_projection_popup_open
             || fs_rotation_popup_open(ctx);
         let hover_in_top = ctx.input(|i| {
@@ -49787,7 +50228,6 @@ impl App {
             side_panel_visible,
             spread_popup_open: *spread_popup_open,
             fit_popup_open: *fit_popup_open,
-            slideshow_popup_open: *slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
             panorama_projection_popup_open: *panorama_projection_popup_open,
             overflow_panel_open,
@@ -50015,14 +50455,8 @@ impl App {
         // ▶/⏸ スライドショーボタン (画像モード) または ▦ タイルボタン (動画モード)
         // 360 モード中は非表示。
         if panorama_mode_active {
-            if *slideshow_popup_open {
-                *slideshow_popup_open = false;
-            }
             // skip
         } else if is_video {
-            if *slideshow_popup_open {
-                *slideshow_popup_open = false;
-            }
             let tile_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -50044,14 +50478,13 @@ impl App {
                 *page_nav = FsPageNav::None;
             }
         } else {
-            let play_btn_x = next_x;
             let play_resp = draw_bar_button(
                 ui,
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
                 "fs_play_btn",
                 |hovered| {
-                    if *slideshow_playing {
+                    if slideshow_playing {
                         egui::Color32::from_rgba_unmultiplied(60, 180, 60, 200)
                     } else if hovered {
                         egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
@@ -50061,14 +50494,14 @@ impl App {
                 },
                 false,
                 |p, c, r| {
-                    if *slideshow_playing {
+                    if slideshow_playing {
                         draw_pause_icon(p, c, r);
                     } else {
                         draw_play_triangle(p, c, r);
                     }
                 },
             );
-            let play_resp = if *slideshow_playing {
+            let play_resp = if slideshow_playing {
                 play_resp.hover_tip_dark(
                     keymap.first_chord_bracket_label("スライドショー停止", KeyAction::FsSlideshow),
                 )
@@ -50077,178 +50510,13 @@ impl App {
                     keymap.first_chord_bracket_label("スライドショー", KeyAction::FsSlideshow),
                 )
             };
-            let slideshow_resp_rect = play_resp.rect;
             if play_resp.clicked() {
-                if *slideshow_playing {
-                    *slideshow_playing = false;
-                    *slideshow_popup_open = false;
-                } else {
-                    *slideshow_popup_open = !*slideshow_popup_open;
-                    *spread_popup_open = false;
-                    *fit_popup_open = false;
-                }
+                *slideshow_pressed = true;
             }
             if play_resp.hovered() {
                 *page_nav = FsPageNav::None;
             }
 
-            if *slideshow_popup_open {
-                let popup_w = 330.0_f32;
-                let popup_h = 350.0_f32;
-                let popup_x_min = bar_rect.min.x + 8.0;
-                let popup_x_max = (bar_rect.max.x - popup_w - 8.0).max(popup_x_min);
-                let popup_x =
-                    (play_btn_x - popup_w + BAR_BUTTON_SIZE).clamp(popup_x_min, popup_x_max);
-                let popup_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_x, bar_rect.max.y + 4.0),
-                    egui::vec2(popup_w, popup_h),
-                );
-                ui.painter().rect_filled(
-                    popup_rect,
-                    6.0,
-                    egui::Color32::from_rgba_unmultiplied(30, 30, 30, 244),
-                );
-                ui.painter().rect_stroke(
-                    popup_rect,
-                    6.0,
-                    egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
-                    ),
-                    egui::StrokeKind::Outside,
-                );
-
-                let mut toggle_slideshow = false;
-                let shortcut = keymap.first_chord_label(KeyAction::FsSlideshow);
-                let button_label = match (*slideshow_playing, shortcut.as_deref()) {
-                    (true, Some(label)) => format!("停止 [{label}]"),
-                    (true, None) => "停止".to_owned(),
-                    (false, Some(label)) => format!("開始 [{label}]"),
-                    (false, None) => "開始".to_owned(),
-                };
-                let inner = popup_rect.shrink2(egui::vec2(12.0, 10.0));
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(inner)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                    |child_ui| {
-                        child_ui.set_width(inner.width());
-                        child_ui.spacing_mut().item_spacing.y = 7.0;
-                        child_ui.label(
-                            egui::RichText::new("スライドショー")
-                                .strong()
-                                .color(egui::Color32::from_gray(230)),
-                        );
-
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("ページ送り")
-                                    .color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_interval, 0.5..=30.0)
-                                    .suffix(" 秒")
-                                    .fixed_decimals(1),
-                            )
-                            .labelled_by(label.id);
-                        });
-
-                        child_ui.add_space(2.0);
-                        child_ui.label(
-                            egui::RichText::new("連結読み")
-                                .size(11.0)
-                                .color(egui::Color32::from_gray(150)),
-                        );
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("待機").color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_continuous_wait_secs, 0.1..=30.0)
-                                    .suffix(" 秒")
-                                    .fixed_decimals(1),
-                            )
-                            .labelled_by(label.id);
-                        });
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("移動時間")
-                                    .color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_continuous_scroll_secs, 0.0..=5.0)
-                                    .suffix(" 秒")
-                                    .fixed_decimals(1),
-                            )
-                            .labelled_by(label.id);
-                        });
-                        child_ui.horizontal(|ui| {
-                            let label = ui.label(
-                                egui::RichText::new("移動量").color(egui::Color32::from_gray(210)),
-                            );
-                            ui.add(
-                                egui::Slider::new(slideshow_continuous_scroll_percent, 1..=100)
-                                    .suffix(" %"),
-                            )
-                            .labelled_by(label.id);
-                        });
-
-                        child_ui.add_space(2.0);
-                        child_ui.label(
-                            egui::RichText::new("最後まで進んだら")
-                                .size(11.0)
-                                .color(egui::Color32::from_gray(150)),
-                        );
-                        for action in [
-                            SlideshowEndAction::LoopFolder,
-                            SlideshowEndAction::NextFolder,
-                            SlideshowEndAction::Stop,
-                        ] {
-                            child_ui.radio_value(
-                                slideshow_end_action,
-                                action,
-                                egui::RichText::new(action.label())
-                                    .color(egui::Color32::from_gray(220)),
-                            );
-                        }
-
-                        child_ui.add_space(4.0);
-                        let fill = if *slideshow_playing {
-                            egui::Color32::from_rgb(96, 96, 96)
-                        } else {
-                            egui::Color32::from_rgb(70, 130, 210)
-                        };
-                        if child_ui
-                            .add_sized(
-                                egui::vec2(inner.width(), 30.0),
-                                egui::Button::new(
-                                    egui::RichText::new(button_label)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(fill),
-                            )
-                            .clicked()
-                        {
-                            toggle_slideshow = true;
-                        }
-                    },
-                );
-
-                if toggle_slideshow {
-                    *slideshow_playing = !*slideshow_playing;
-                    *slideshow_popup_open = false;
-                }
-
-                if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
-                    if !popup_rect.contains(pos)
-                        && !slideshow_resp_rect.contains(pos)
-                        && ctx.input(|i| i.pointer.any_pressed())
-                    {
-                        *slideshow_popup_open = false;
-                    }
-                }
-            }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
@@ -50612,7 +50880,6 @@ impl App {
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
                 *fit_popup_open = false;
-                *slideshow_popup_open = false;
             }
             if spread_resp.hovered() {
                 *page_nav = FsPageNav::None;
@@ -50989,7 +51256,6 @@ impl App {
             if mf_resp.clicked() {
                 *fit_popup_open = !*fit_popup_open;
                 *spread_popup_open = false;
-                *slideshow_popup_open = false;
             }
             if mf_resp.hovered() {
                 *page_nav = FsPageNav::None;
@@ -51055,7 +51321,6 @@ impl App {
         if popup_wheel_owned
             || *fit_popup_open
             || *spread_popup_open
-            || *slideshow_popup_open
             || *panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
         {
@@ -57870,7 +58135,14 @@ mod tests {
                                         app.draw_fs_music_right_panel(ui, ctx, panel, 0);
                                     } else {
                                         let lock = app.resolved_still_chrome().info_locked;
-                                        app.draw_metadata_panel(ui, ctx, rect, lock, 0.0);
+                                        app.draw_metadata_panel(
+                                            ui,
+                                            ctx,
+                                            rect,
+                                            lock,
+                                            0.0,
+                                            Default::default(),
+                                        );
                                     }
                                 })
                             });
@@ -63012,9 +63284,7 @@ mod tests {
                             let mut page_nav = FsPageNav::None;
                             let mut side_panel_mode_pressed = false;
                             let mut overflow_request = None;
-                            let mut slideshow_playing = false;
-                            let mut slideshow_interval = 5.0;
-                            let mut slideshow_end_action = SlideshowEndAction::default();
+                            let slideshow_playing = false;
                             let mut rotation_choice = None;
                             let mut panorama_pressed = false;
                             let mut panorama_projection_popup_open = panorama_projection_list_open;
@@ -63031,10 +63301,6 @@ mod tests {
                             let mut spread_popup_open = false;
                             let mut local_adjust_mode = false;
                             let mut fit_popup_open = false;
-                            let mut slideshow_popup_open = false;
-                            let mut slideshow_wait = 1.0;
-                            let mut slideshow_scroll = 1.0;
-                            let mut slideshow_percent = 100;
                             let mut fit_mode_choice = None;
                             let mut fit_no_upscale_choice = None;
                             let mut fit_no_downscale_choice = None;
@@ -63058,9 +63324,8 @@ mod tests {
                                 false,
                                 false,
                                 &mut overflow_request,
-                                &mut slideshow_playing,
-                                &mut slideshow_interval,
-                                &mut slideshow_end_action,
+                                slideshow_playing,
+                                &mut false,
                                 crate::rotation_db::Rotation::None,
                                 &mut rotation_choice,
                                 // 投影一覧を出すシナリオでは 360 表示中として描く
@@ -63091,10 +63356,6 @@ mod tests {
                                 false,
                                 false,
                                 &mut fit_popup_open,
-                                &mut slideshow_popup_open,
-                                &mut slideshow_wait,
-                                &mut slideshow_scroll,
-                                &mut slideshow_percent,
                                 &mut crate::settings::FullscreenSpecifiedScale::default(),
                                 &mut {
                                     crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
@@ -63271,19 +63532,13 @@ mod tests {
                             let mut page_nav = FsPageNav::None;
                             let mut side_panel_mode_pressed = false;
                             let mut overflow_request = None;
-                            let mut slideshow_playing = false;
-                            let mut slideshow_interval = 5.0;
-                            let mut slideshow_end_action = SlideshowEndAction::default();
+                            let slideshow_playing = false;
                             let mut rotation_choice = None;
                             let mut panorama_pressed = false;
                             let mut panorama_projection_popup_open = false;
                             let mut panorama_projection_choice = None;
                             let mut local_adjust_mode = false;
                             let mut fit_popup_open = false;
-                            let mut slideshow_popup_open = false;
-                            let mut slideshow_wait = 1.0;
-                            let mut slideshow_scroll = 1.0;
-                            let mut slideshow_percent = 100;
                             let mut fit_mode_choice = None;
                             let mut fit_no_upscale_choice = None;
                             let mut fit_no_downscale_choice = None;
@@ -63307,9 +63562,8 @@ mod tests {
                                 false,
                                 false,
                                 &mut overflow_request,
-                                &mut slideshow_playing,
-                                &mut slideshow_interval,
-                                &mut slideshow_end_action,
+                                slideshow_playing,
+                                &mut false,
                                 crate::rotation_db::Rotation::None,
                                 &mut rotation_choice,
                                 None,
@@ -63341,10 +63595,6 @@ mod tests {
                                 false,
                                 false,
                                 &mut fit_popup_open,
-                                &mut slideshow_popup_open,
-                                &mut slideshow_wait,
-                                &mut slideshow_scroll,
-                                &mut slideshow_percent,
                                 &mut crate::settings::FullscreenSpecifiedScale::default(),
                                 &mut {
                                     crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
@@ -63830,12 +64080,15 @@ mod tests {
         assert_eq!(root.right(), full_rect.right() - FS_OVERFLOW_PANEL_MARGIN);
         assert_eq!(submenu.min, root.min);
         assert_eq!(submenu.width(), root.width());
-        assert_eq!(
-            root.height() - submenu.height(),
-            FS_OVERFLOW_PANEL_ROW_HEIGHT * 3.0
-        );
-        assert_eq!(root.height(), 444.0);
-        assert_eq!(submenu.height(), 300.0);
+        for (state, rect) in [
+            (FsOverflowPanelState::Root, root),
+            (FsOverflowPanelState::NavigatorPosition, submenu),
+        ] {
+            assert_eq!(
+                rect.height() - FS_OVERFLOW_PANEL_HEADER_HEIGHT - FS_OVERFLOW_PANEL_PADDING * 2.0,
+                fs_overflow_panel_body_row_count(state) as f32 * FS_OVERFLOW_PANEL_ROW_HEIGHT
+            );
+        }
         assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
 
         let narrow = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(300.0, 180.0));
@@ -63884,9 +64137,11 @@ mod tests {
             FsOverflowPanelState::NavigatorPosition,
             FsOverflowPanelState::SpreadAdjustment,
             FsOverflowPanelState::MusicNoteColor,
+            FsOverflowPanelState::Slideshow,
         ] {
             for size in [
                 egui::vec2(1200.0, 800.0),
+                egui::vec2(1093.0, 614.0),
                 egui::vec2(320.0, 200.0),
                 egui::vec2(320.0, 180.0),
             ] {
@@ -63920,6 +64175,7 @@ mod tests {
                         composition_available: true,
                         composition_managed: true,
                         music_note_color_scheme: Default::default(),
+                        slideshow: Default::default(),
                     };
                     let draw = |events| {
                         let _ = ctx
@@ -63980,7 +64236,13 @@ mod tests {
                         // content as well as viewport height: Fits alone would also accept
                         // a budget that accidentally counts the ambient spacing twice.
                         let expected_body = fs_overflow_panel_body_row_count(state) as f32
-                            * FS_OVERFLOW_PANEL_ROW_HEIGHT;
+                            * FS_OVERFLOW_PANEL_ROW_HEIGHT
+                            - if state == FsOverflowPanelState::Slideshow {
+                                // Back is fixed above the scrolling body.
+                                FS_OVERFLOW_PANEL_ROW_HEIGHT
+                            } else {
+                                0.0
+                            };
                         let tolerance = 1.0 / ctx.pixels_per_point();
                         assert!(
                             (before.content.y - expected_body).abs() <= tolerance,
@@ -64104,6 +64366,16 @@ mod tests {
                             ];
                             let mut root_rows = root_rows;
                             root_rows.insert(3, animation_row.clone());
+                            root_rows.insert(
+                                4,
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::SlideshowSettings,
+                                    label: "スライドショー".into(),
+                                    status: "3.0 秒  >".into(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                            );
                             let view = FsOverflowPanelView {
                                 state,
                                 root_rows,
@@ -64112,6 +64384,7 @@ mod tests {
                                 composition_available: true,
                                 composition_managed: false,
                                 music_note_color_scheme: Default::default(),
+                                slideshow: Default::default(),
                             };
                             let panel_rect =
                                 fs_overflow_panel_rect(ctx.content_rect(), state).unwrap();
@@ -64120,7 +64393,7 @@ mod tests {
                 });
             });
         harness.run();
-        if size.y >= 520.0 {
+        if size.y >= 600.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
                 data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                     .unwrap()
@@ -64150,7 +64423,7 @@ mod tests {
 
     #[test]
     fn fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height() {
-        for size in [egui::vec2(720.0, 520.0), egui::vec2(720.0, 720.0)] {
+        for size in [egui::vec2(720.0, 600.0), egui::vec2(720.0, 720.0)] {
             // The shared fixture retains its original Fits assertion; no PNG is
             // needed to detect the 8pt viewport shrink from build_ui's outer frame.
             let _ = fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
@@ -64182,7 +64455,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root_tall",
             FsOverflowPanelState::Root,
-            egui::vec2(720.0, 520.0),
+            egui::vec2(720.0, 600.0),
             false,
         );
     }
@@ -64194,6 +64467,16 @@ mod tests {
             FsOverflowPanelState::Root,
             egui::vec2(720.0, 440.0),
             true,
+        );
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_snapshot_slideshow() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_slideshow",
+            FsOverflowPanelState::Slideshow,
+            egui::vec2(1093.0, 614.0),
+            false,
         );
     }
 
@@ -70633,7 +70916,14 @@ mod tests {
             .run_pass(navigator_ordered_input(Vec::new(), 0.6), |ctx| {
                 ctx.root_ui(|root_ui| {
                     egui::CentralPanel::default().show(root_ui, |ui| {
-                        assert!(app.draw_metadata_panel(ui, ctx, full_rect, true, 0.0));
+                        assert!(app.draw_metadata_panel(
+                            ui,
+                            ctx,
+                            full_rect,
+                            true,
+                            0.0,
+                            Default::default()
+                        ));
                     })
                 });
             })
@@ -76483,7 +76773,6 @@ mod tests {
             side_panel_visible: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             overflow_panel_open: false,
@@ -76513,7 +76802,6 @@ mod tests {
             context_menu_open: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             compare_wipe_active: false,
@@ -76536,7 +76824,6 @@ mod tests {
             side_panel_visible: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             overflow_panel_open: false,
@@ -76738,10 +77025,6 @@ mod tests {
                 ..enabled
             },
             StillTouchInputEnabledInputs {
-                slideshow_popup_open: true,
-                ..enabled
-            },
-            StillTouchInputEnabledInputs {
                 rotation_popup_open: true,
                 ..enabled
             },
@@ -76783,7 +77066,6 @@ mod tests {
             context_menu_open: false,
             spread_popup_open: false,
             fit_popup_open: false,
-            slideshow_popup_open: false,
             rotation_popup_open: false,
             panorama_projection_popup_open: false,
             compare_wipe_active: false,
@@ -88463,9 +88745,7 @@ mod specified_scale_consumer_tests {
                         let mut page_nav = FsPageNav::None;
                         let mut side_panel_mode_pressed = false;
                         let mut overflow_request = None;
-                        let mut slideshow_playing = false;
-                        let mut slideshow_interval = 5.0;
-                        let mut slideshow_end_action = SlideshowEndAction::default();
+                        let slideshow_playing = false;
                         let mut rotation_choice = None;
                         let mut panorama_pressed = false;
                         let mut panorama_projection_popup_open = false;
@@ -88479,10 +88759,6 @@ mod specified_scale_consumer_tests {
                             crate::settings::PageAlonePreferences::default();
                         let mut local_adjust_mode = false;
                         let mut fit_popup_open = *open;
-                        let mut slideshow_popup_open = false;
-                        let mut slideshow_wait = 1.0;
-                        let mut slideshow_scroll = 1.0;
-                        let mut slideshow_percent = 100;
                         let mut fit_mode_choice = None;
                         let mut fit_no_upscale_choice = None;
                         let mut fit_no_downscale_choice = None;
@@ -88506,9 +88782,8 @@ mod specified_scale_consumer_tests {
                             false,
                             false,
                             &mut overflow_request,
-                            &mut slideshow_playing,
-                            &mut slideshow_interval,
-                            &mut slideshow_end_action,
+                            slideshow_playing,
+                            &mut false,
                             crate::rotation_db::Rotation::None,
                             &mut rotation_choice,
                             None,
@@ -88536,10 +88811,6 @@ mod specified_scale_consumer_tests {
                             false,
                             false,
                             &mut fit_popup_open,
-                            &mut slideshow_popup_open,
-                            &mut slideshow_wait,
-                            &mut slideshow_scroll,
-                            &mut slideshow_percent,
                             value,
                             &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
                             false,
@@ -89728,7 +89999,11 @@ mod specified_scale_consumer_tests {
         for popup in 0..5 {
             app.fit_popup_open = popup == 0;
             app.spread_popup_open = popup == 1;
-            app.slideshow_popup_open = popup == 2;
+            app.fs_overflow_panel_state = if popup == 2 {
+                FsOverflowPanelState::Slideshow
+            } else {
+                FsOverflowPanelState::Closed
+            };
             let menu_id = match popup {
                 3 => Some(egui::Id::unique("fs_rotation_btn").with("popup")),
                 4 => Some(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")),
@@ -89852,7 +90127,15 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_overflow_wheel_reaches_real_front_panel_only_inside_its_rect() {
-        for size in [egui::vec2(820.0, 240.0), egui::vec2(820.0, 600.0)] {
+        // Keep an exposed metadata body beneath the root menu as its row count changes.
+        let tall_height = TOP_BAR_HEIGHT
+            + FS_OVERFLOW_PANEL_MARGIN * 2.0
+            + FS_OVERFLOW_PANEL_PADDING * 2.0
+            + FS_OVERFLOW_PANEL_HEADER_HEIGHT
+            + fs_overflow_panel_body_row_count(FsOverflowPanelState::Root) as f32
+                * FS_OVERFLOW_PANEL_ROW_HEIGHT
+            + 200.0;
+        for size in [egui::vec2(820.0, 240.0), egui::vec2(820.0, tall_height)] {
             let (ctx, mut app, viewport) = specified_popup_metadata_fixture(size);
             let mut frame = 0;
             let mut draw = |app: &mut App, events| {
@@ -89906,7 +90189,15 @@ mod specified_scale_consumer_tests {
                     "the front overflow ScrollArea receives the wheel"
                 );
             } else {
-                let outside = egui::pos2(panel.center().x, panel.bottom() - 20.0);
+                let overflow_rect =
+                    fs_overflow_panel_rect(viewport, app.fs_overflow_panel_state).unwrap();
+                // Use the metadata body below the front panel, however many root rows exist.
+                let outside_body = egui::Rect::from_min_max(
+                    egui::pos2(panel.left(), panel.top().max(overflow_rect.bottom())),
+                    panel.max,
+                );
+                assert!(outside_body.is_positive());
+                let outside = outside_body.center();
                 assert!(
                     !fs_overflow_panel_rect(viewport, app.fs_overflow_panel_state)
                         .unwrap()
@@ -92749,6 +93040,7 @@ mod music_overflow_tests {
                 navigator_corner: FullscreenNavigatorCorner::BottomRight,
                 shift: Default::default(),
                 music_note_color_scheme: MusicNoteColorScheme::Fifths,
+                slideshow: Default::default(),
                 composition_available: false,
                 composition_managed: false,
             };
@@ -93490,8 +93782,8 @@ mod music_overflow_tests {
         app.reset_fs_side_panel_runtime_for_file_change();
         assert_eq!(
             app.fs_overflow_panel_state,
-            FsOverflowPanelState::Closed,
-            "the existing file-change ownership boundary closes the music menu"
+            FsOverflowPanelState::MusicNoteColor,
+            "global settings survive file changes; the music lifecycle still closes its own menu"
         );
     }
 

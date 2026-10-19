@@ -1321,15 +1321,21 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
     ) {
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
-        if self.fs_primary_suppression.is_active() {
+        if self.fs_primary_suppression.is_active()
+            && self.fs_primary_suppression
+                != crate::ui_fullscreen::FullscreenPrimarySuppression::OverflowStream
+        {
             return;
         }
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
-        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| i.pointer.primary_released());
-        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed())
+        let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
+        let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
+        let primary_released = ctx.input(|i| primary_allowed && i.pointer.primary_released());
+        let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
             && self
                 .settings
                 .ring_shortcuts
@@ -1958,12 +1964,25 @@ impl App {
         viewport_id: egui::ViewportId,
     ) {
         let (pointer_pos, primary_down) = conceal_preview_pointer_state(ctx, viewport_id);
+        // This pipeline read precedes the target viewport's per-pass input capture. A held
+        // press already has its canonical owner from the previous pass; do not reinterpret
+        // that overflow press as an eye-button hold after entering conceal mode by key.
+        let primary_down = primary_down
+            && self.fs_primary_suppression
+                != crate::ui_fullscreen::FullscreenPrimarySuppression::OverflowStream;
         self.conceal_preview_active = conceal_preview_pointer_active(
             self.conceal_mode,
             self.conceal_preview_button_rect,
             pointer_pos,
             primary_down,
         );
+        #[cfg(test)]
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("conceal_pipeline_preview_test_active"),
+                self.conceal_preview_active,
+            )
+        });
     }
 
     /// マスクオーバーレイ + ハンドル + ツールプレビュー + パネルを描画する。

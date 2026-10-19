@@ -1745,14 +1745,77 @@ active CentralPanelの `ui.max_rect()` から一度解決した `StillSeekGeomet
 （見開き単ページ / 見開き 2 ページ × ページ単位 / 連結読み）で走らせ、登録済み button rect の
 個数と全 x 座標が一致することを回帰テストで固定する。
 
-「その他の機能」パネルは `FsOverflowPanelState` が閉 / root / ナビゲータ位置を排他的に所有し、
-上部バーの下へ 12pt、画面右端から 12pt 離して配置する。項目はナビゲータ ON / OFF →
-ナビゲータ位置 → 分析ツール → ピクセルグリッド → ルーペ固定の固定順にする。行高は 48pt、
+「その他の機能」パネルは `FsOverflowPanelState` が閉 / root / ナビゲータ位置 / 見開きの調整 / スライドショー / 音名の色を排他的に所有し、
+上部バーの下へ 12pt、画面右端から 12pt 離して配置する。項目は
+`FullscreenOverflowItemId::fixed_order()` と同じく、見開きの調整 → ナビゲータ ON / OFF →
+ナビゲータ位置 → ページめくりアニメーション → スライドショー → 分析ツール →
+ピクセルグリッド → ルーペ固定の固定順にする。行高は 48pt、
 ヘッダーと閉じる hit target は 44pt とし、短い viewport では本文だけをスクロールする。同じ純粋な
-panel rect resolver を描画と `touch_excluded` が共有する。表示中は
-`App::common_modal_dialog_open` に含めて wheel / key を止め、背面キャンバスの pointer / navigator
-操作も止める。touch recognizer 自体は terminal frame まで駆動して ownership を残さない。状態表示や
+panel rect resolver を描画と入力が共有する。入力は現在の矩形を egui の layer hit-test に
+通し、押下位置で最前面が overflow の Area となる領域だけを対象にする。
+同じ pass の領域を左右ボタンの開始判定と `touch_excluded` が共有する。
+シーク設定・回転等の popup が手前にあれば overflow は所有せず、それらの popup と背面の
+入力関係は従来どおりとする。シーク設定 popup 自体の描画・選択は省略しない。
+初回 / sizing で Area がまだ hit-test に現れない部分は、現在の矩形と既存の hit 情報で補う。
+既存の最前面が Foreground 以上なら補わず、Area の登録・順序変更はしない。
+閉じた状態では矩形を返さないので、前 pass の Area が残っても新しい押下を所有しない。
+パネル内の wheel はパネルが受け、パネル外の wheel は背面へ流れる。スライドショー設定中も
+外側の wheel でページ送り・ズームでき、パネルは維持する。外側の左クリック / タップは
+パネルを閉じるだけで消費し、その入力でページ送りやバー表示切替をしない。
+スワイプ・ドラッグ等の連続操作は既存の扱いを維持する。最前面が overflow パネルの位置で始まった左右ボタン入力は
+離すまでパネルが所有し、矩形外へ出てもナビゲータを含む背面へ渡さない。
+右ボタンは既存の `FullscreenSecondaryPress` の overflow 所有状態で保持し、
+右クリック終了・リング・ジェスチャにも渡さない。外側で始まった入力は従来どおり扱う。
+左右ボタンの所有は、root の早期描画が閉じる / 行選択で状態を変える前に一度確定する。
+左ボタンは既存の `FullscreenPrimarySuppression::OverflowStream` で保持する。
+これはパネルと同じく App 全体の前面 viewer の一時状態であり、context bundle には移さない。
+fullscreen の open / close、新規 detached viewport / passive viewport 採用の既存リセットに加え、
+`reset_detached_pause_foreground_modes` でもパネルを閉じるのと同時に primary 抑止を解放する。
+同じ pass-local 所有結果を、ナビゲータの予約 / 直接処理に渡す raw 入力の projection と
+secondary action が共有する。projection は所有したボタンの edge / down だけを除き、
+位置・focus・wheel・非所有ボタンは残す。背面ナビゲータと重なる場所でも所有は変わらず、
+外側開始のパンや範囲選択、外側 wheel を止めない。終端フレームの primary 抑止は
+後続 touch 判定の Allow で上書きしない。
+最前面が overflow パネルの押下は、背面のすべての raw 入力処理が確定済みの所有結果を読む。
+対象はナビゲータ / 範囲ズーム、比較ワイプ、通常パン / 回転 / 連結読み、リング / ジェスチャ、
+分析のパン / ガイド / 色固定、ブックマーク行、metadata の長押しプレビュー、
+シークバー / サムネイル列、touch コマンド、
+編集 canvas（消しゴム・隠蔽・注釈・補正レイヤー・SNS 分割）。キーでパネルを閉じて
+編集へ入る同一 pass でも所有は維持し、ボタンごとに入力を除くので非所有ボタンの操作は残す。
+画像パイプラインより前の隠蔽プレビュー hold だけは、前 pass で確定した同じ `OverflowStream` を
+継続参照する。新しい矩形判定や viewport 経路は作らない。範囲コピーの排他条件、Response が
+所有する入力、hover 描画・保存終了判定等の区別は [raw 入力監査表](section396-overflow-input-audit.md) を参照。
+パネル表示中はカーソル自動非表示の clean 判定を false にする。モーダルダイアログ扱いにはせず、
+フォーカス中の設定部品へはキーを渡し、それ以外のキーはパネルを閉じて通常の操作へ進む。
+touch recognizer 自体は terminal frame まで駆動して ownership を残さない。状態表示や
 実効 shortcut label は既存 state / keymap の読み取りだけで組み立て、UI 描画のための同期 I/O は行わない。
+
+スライドショーの root 行には現在のページ送り間隔を表示する。
+サブパネルは環境設定と同じページ送り間隔、連結読みの待機時間・スクロール時間・スクロール量、
+末尾動作を編集し、開始 / 停止ボタンを置かない。旧 `slideshow_popup_open` と設定 popup は廃止する。
+root の先頭には既存の「本の構成を編集」行を置く。スライダーは操作中に設定値を更新し、
+ドラッグ終了またはキーボード等による変更時に一度だけ既存の `settings.save()` で保存する。
+末尾動作は選択時に保存する。ヘッダーと「戻る」は固定し、本文だけを `DragScroll::Always` で
+スクロールする。フォーカス中の設定部品へキーを渡し、背面のページ送りには流さない。
+HUD の再生 / 停止ボタンは 1 クリックで即時切り替え、`KeyAction::FsSlideshow`、マウス割当、
+リング、ジェスチャと同じ `App::toggle_fullscreen_slideshow` へ合流する。開始対象は `Image` / `ZipImage` / `PdfPage`
+だけとし、停止時の状態解放も共通化する。既存の表示完了待ち、ページめくり、連結読みの進行は維持する。
+
+再生中に設定を変えても現在の `slideshow_next_at` は変更せず、次回の切替・待機の予定から新しい値を使う。
+進捗リングは現在の設定間隔を分母にするため、変更直後から次の予定を作るまで一時的に進捗がずれる。
+これは既知の制約であり、設定変更で現在の表示時間を再計算しない。
+ファイル切替で閉じるのは、内容が表示中のファイル / 本に依存する `SpreadAdjustment` だけとする
+（調整の基点・解除がその本に依存する）。全体設定を扱う root / ナビゲータ位置 / 音名の色 /
+スライドショーは、自動送り・手動送りとも開いたままにする。判定は
+`FsOverflowPanelState::closes_on_file_change` に集約する。root の行・見開き調整の status・本の構成の可否は
+毎フレーム `fullscreen_overflow_panel_view` から作り直し、切替先の状態を表示する。
+`close_fullscreen` と viewer の前面所有権を手放す境界では、すべての状態を閉じる。
+音楽ビュー終了時の音名の色パネルの close、キー・外側クリック / タップによる close は従来どおりとする。
+通常の物理フォルダへ自動で進む経路は、`try_start_slideshow_next_folder` →
+`start_folder_nav(...SlideshowNext)` → `FolderNavMode::SlideshowNext` →
+`close_fullscreen_for_folder_nav_reopen()` で一度 fullscreen を閉じてから開き直し・再生再開するため、
+その境界で設定パネルも閉じる。ZIP 内 DFS / snapshot / collection 等は各既存経路の
+close 有無に従い、フォルダをまたぐすべての経路でパネルを維持する契約にはしない。
 
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して

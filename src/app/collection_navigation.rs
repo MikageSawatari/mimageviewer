@@ -4901,6 +4901,41 @@ mod tests {
     }
 
     #[test]
+    fn slideshow_ring_stop_cancels_collection_navigation_intent() {
+        let mut app = setup_app_for_test();
+        app.items = vec![crate::grid_item::GridItem::Image(PathBuf::from(
+            "C:/fixture/slideshow.png",
+        ))];
+        app.fullscreen_idx = Some(0);
+        app.slideshow_playing = true;
+        app.slideshow_anchor_idx = Some(0);
+        let request = cancellation_slideshow_request(&app, app.collection_grid_context_id());
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::RequestNeeded {
+                request,
+                watch: None,
+            }));
+        let sequence = app.top_level_grid_view.collection_navigation_sequence();
+        app.apply_ring_action(
+            &egui::Context::default(),
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            crate::ring_shortcut::RingActionId::ImageSlideshow,
+            "test",
+        );
+        assert!(!app.slideshow_playing);
+        assert!(app.slideshow_anchor_idx.is_none());
+        assert!(
+            app.top_level_grid_view
+                .take_collection_navigation_pending()
+                .is_none()
+        );
+        assert_ne!(
+            app.top_level_grid_view.collection_navigation_sequence(),
+            sequence
+        );
+    }
+
+    #[test]
     fn collection_slideshow_cancel_retires_same_context_archive_despite_stale_generation() {
         for slideshow_only in [false, true] {
             let mut app = setup_app_for_test();

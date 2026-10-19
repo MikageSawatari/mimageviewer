@@ -12668,7 +12668,10 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
     ) {
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         if !self.local_adjust_mode {
             return;
         }
@@ -12693,7 +12696,7 @@ impl App {
         };
         if !self.ensure_local_adjust_masks_match_source_dims(fs_idx) {
             let bucket_canvas_click = self.local_adjust_mask_tool == LocalAdjustMaskTool::Bucket
-                && ctx.input(|input| input.pointer.primary_pressed())
+                && ctx.input(|input| primary_allowed && input.pointer.primary_pressed())
                 && ctx
                     .input(|input| input.pointer.interact_pos())
                     .is_some_and(|pos| {
@@ -12718,10 +12721,10 @@ impl App {
             pointer_pos,
         ) = ctx.input(|i| {
             (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.pointer.secondary_pressed(),
+                primary_allowed && i.pointer.primary_pressed(),
+                primary_allowed && i.pointer.primary_down(),
+                primary_allowed && i.pointer.primary_released(),
+                secondary_allowed && i.pointer.secondary_pressed(),
                 i.modifiers,
                 i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
             )
@@ -15865,6 +15868,7 @@ impl App {
         fs_idx: usize,
         body_width: f32,
         body_height: f32,
+        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
     ) {
         if self.current_book_bookmark_draft(fs_idx).is_none() {
             ui.add_space(12.0);
@@ -16109,11 +16113,20 @@ impl App {
                         });
                         control_clicked
                     });
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::unique(("fs_bookmark_row_test_rect", bookmark.id)),
+                            inner.response.rect,
+                        )
+                    });
                     // 行全体の click widget を子ボタンの後から重ねると、後勝ちの
                     // interaction が「名前を編集」「削除」の click を奪う。Frame は
                     // hover のままにして、行内の生 click を読み、子 control が処理した
                     // click だけを除外する。
-                    let row_primary_clicked = ui.input(|input| input.pointer.primary_clicked());
+                    let row_primary_clicked = !overflow_pointer_input
+                        .owns(egui::PointerButton::Primary)
+                        && ui.input(|input| input.pointer.primary_clicked());
                     if bookmark_row_should_jump(
                         inner.response.contains_pointer(),
                         row_primary_clicked,
@@ -16311,6 +16324,7 @@ impl App {
         ui: &mut egui::Ui,
         panel_rect: egui::Rect,
         image_dims: Option<(u32, u32)>,
+        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
     ) {
         // フルスクリーン対象のページ idx
         let Some(fs_root_idx) = self.fullscreen_idx else {
@@ -16758,6 +16772,7 @@ impl App {
                         fs_root_idx,
                         content_width,
                         body_height,
+                        overflow_pointer_input,
                     );
                 },
             );

@@ -6963,20 +6963,7 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        if self.slideshow_playing {
-            self.slideshow_playing = false;
-            self.slideshow_anchor_idx = None;
-            self.continuous_reading_scroll_transition = None;
-            self.slideshow_scroll_range_cache = None;
-        } else if matches!(
-            self.items.get(fs_idx),
-            Some(GridItem::Image(_))
-                | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::PdfPage { .. })
-        ) {
-            self.slideshow_playing = true;
-            self.schedule_next_slideshow_from_now();
-        }
+        self.toggle_fullscreen_slideshow(fs_idx);
     }
 
     fn cycle_ring_transparent_background(&mut self, fs_idx: usize) {
