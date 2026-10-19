@@ -101,8 +101,8 @@ pub(crate) fn draw_fullscreen_specified_scale_axis_controls(
     ui: &mut egui::Ui,
     axis: &mut crate::settings::SpecifiedScaleAxisSetting,
     label: &str,
-) {
-    pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true);
+) -> Option<egui::Rect> {
+    pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true)
 }
 
 pub(crate) fn draw_fullscreen_specified_scale_max_controls(

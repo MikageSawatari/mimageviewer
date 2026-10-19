@@ -526,6 +526,7 @@ impl App {
         fs_idx: usize,
         image_size: [usize; 2],
         pointer_allowed: bool,
+        front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let current = self.export_crop_for_idx(fs_idx, image_size);
         if !self.export_crop_mode && current.is_none() {
@@ -571,7 +572,7 @@ impl App {
         let drag_in_progress =
             self.export_crop_drag.is_some() || self.export_crop_create_drag.is_some();
         if !crop_overlay_keeps_the_pointer(
-            pointer_allowed,
+            pointer_allowed && !front.owns(egui::PointerButton::Primary),
             drag_in_progress,
             ui.input(|i| i.pointer.primary_down()),
         ) {
@@ -580,7 +581,7 @@ impl App {
             return false;
         }
 
-        self.handle_export_crop_pointer(ui, transform, fs_idx, image_size, settings, handles)
+        self.handle_export_crop_pointer(ui, transform, fs_idx, image_size, settings, handles, front)
     }
 
     fn handle_export_crop_pointer(
@@ -591,6 +592,7 @@ impl App {
         image_size: [usize; 2],
         settings: CropSettings,
         handles: [(CropHandle, egui::Pos2); 8],
+        front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let (space_pan_held, force_create_held) = crate::keyboard_input::focused_key_state_permit(
             ui.ctx(),
@@ -602,7 +604,7 @@ impl App {
                     .modifier_held_action(ui.ctx(), permit, KeyAction::CropForceCreateHold),
             )
         });
-        self.handle_export_crop_pointer_with_holds(
+        self.handle_export_crop_pointer_with_holds_and_front(
             ui,
             transform,
             fs_idx,
@@ -611,10 +613,12 @@ impl App {
             handles,
             space_pan_held,
             force_create_held,
+            front,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn handle_export_crop_pointer_with_holds(
         &mut self,
         ui: &mut egui::Ui,
@@ -626,12 +630,39 @@ impl App {
         space_pan_held: bool,
         force_create_held: bool,
     ) -> bool {
+        self.handle_export_crop_pointer_with_holds_and_front(
+            ui,
+            transform,
+            fs_idx,
+            image_size,
+            settings,
+            handles,
+            space_pan_held,
+            force_create_held,
+            Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_export_crop_pointer_with_holds_and_front(
+        &mut self,
+        ui: &mut egui::Ui,
+        transform: &DisplayedImageTransform,
+        fs_idx: usize,
+        image_size: [usize; 2],
+        settings: CropSettings,
+        handles: [(CropHandle, egui::Pos2); 8],
+        space_pan_held: bool,
+        force_create_held: bool,
+        front: crate::ui_fullscreen::FsFrontPointerFrameInput,
+    ) -> bool {
         let (primary_pressed, primary_down, primary_released, press_origin, hover_pos, total_delta) =
             ui.input(|i| {
                 (
-                    i.pointer.primary_pressed(),
-                    i.pointer.primary_down(),
-                    i.pointer.primary_released(),
+                    !front.owns(egui::PointerButton::Primary) && i.pointer.primary_pressed(),
+                    !front.owns(egui::PointerButton::Primary) && i.pointer.primary_down(),
+                    !front.owns_release(egui::PointerButton::Primary)
+                        && i.pointer.primary_released(),
                     i.pointer.press_origin(),
                     i.pointer.hover_pos(),
                     i.pointer.total_drag_delta().unwrap_or(egui::Vec2::ZERO),

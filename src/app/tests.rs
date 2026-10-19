@@ -6887,8 +6887,6 @@ fn fullscreen_overflow_panel_holds_no_input_and_survives_file_boundary() {
 #[cfg(windows)]
 #[test]
 fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
-    use crate::ui_fullscreen::FullscreenPrimarySuppression;
-
     for state in [
         FsOverflowPanelState::Root,
         FsOverflowPanelState::NavigatorPosition,
@@ -6901,7 +6899,8 @@ fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
             app.items = vec![GridItem::Image(app.tmp.path().join("overflow-owner.jpg"))];
             app.fullscreen_idx = Some(0);
             app.fs_overflow_panel_state = state;
-            app.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
+            app.fs_front_pointer =
+                crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
 
             if pause {
                 app.reset_detached_pause_foreground_modes(0);
@@ -6911,7 +6910,7 @@ fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
 
             assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
             assert!(
-                !app.fs_primary_suppression.is_active(),
+                !app.fs_front_pointer.is_active(),
                 "{state:?}, pause={pause}: foreground ownership must end with the panel"
             );
         }
@@ -107329,3 +107328,60 @@ mod bookmark_build_adoption_tests;
 
 #[path = "tests/manual_nav_wrap.rs"]
 mod manual_nav_wrap;
+
+#[cfg(windows)]
+#[test]
+fn front_popup_f12_round_trip_and_passive_handoff_retire_the_foreground_owner() {
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\front-owner.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    for detached in [true, false] {
+        app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+        app.toggle_detached_viewer_mode();
+        assert_eq!(app.settings.detached_viewer_enabled, detached);
+        assert_eq!(
+            app.viewer_presentation == ViewerPresentation::DetachedWindow,
+            detached
+        );
+        assert!(
+            !app.fs_front_pointer.is_active(),
+            "F12 must retire the old viewport input owner"
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.handoff_active_detached_viewport_to_passive("front_popup_owner_test");
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "handoff retires front input even for live-media callers"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_changes() {
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\front-owner.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.settings.video_in_window_mode = false;
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.prepare_viewer_presentation_open(0, false);
+    assert!(
+        app.fs_front_pointer.is_active(),
+        "a same-viewer page open is not a display handoff"
+    );
+    app.settings.video_in_window_mode = true;
+    app.prepare_viewer_presentation_open(0, false);
+    assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+    assert!(!app.fs_front_pointer.is_active());
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.apply_video_presentation_switched(ViewerPresentation::Fullscreen);
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "native commit transfers the presentation owner too"
+    );
+}

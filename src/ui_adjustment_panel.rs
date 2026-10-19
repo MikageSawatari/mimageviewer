@@ -12668,7 +12668,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         transform: &DisplayedImageTransform,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
@@ -12723,7 +12723,9 @@ impl App {
             (
                 primary_allowed && i.pointer.primary_pressed(),
                 primary_allowed && i.pointer.primary_down(),
-                primary_allowed && i.pointer.primary_released(),
+                primary_allowed
+                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                    && i.pointer.primary_released(),
                 secondary_allowed && i.pointer.secondary_pressed(),
                 i.modifiers,
                 i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
@@ -15868,7 +15870,7 @@ impl App {
         fs_idx: usize,
         body_width: f32,
         body_height: f32,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         if self.current_book_bookmark_draft(fs_idx).is_none() {
             ui.add_space(12.0);
@@ -16126,6 +16128,7 @@ impl App {
                     // click だけを除外する。
                     let row_primary_clicked = !overflow_pointer_input
                         .owns(egui::PointerButton::Primary)
+                        && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
                         && ui.input(|input| input.pointer.primary_clicked());
                     if bookmark_row_should_jump(
                         inner.response.contains_pointer(),
@@ -16324,7 +16327,7 @@ impl App {
         ui: &mut egui::Ui,
         panel_rect: egui::Rect,
         image_dims: Option<(u32, u32)>,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         // フルスクリーン対象のページ idx
         let Some(fs_root_idx) = self.fullscreen_idx else {

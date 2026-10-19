@@ -97,13 +97,7 @@ fn overflow_secondary_sequences_are_owned_through_release_in_all_states() {
                         button(inside, egui::PointerButton::Secondary, true),
                     ],
                 );
-                assert!(
-                    matches!(
-                        app.fs_secondary_press,
-                        FullscreenSecondaryPress::Overflow { .. }
-                    ),
-                    "{state:?} {mode:?}"
-                );
+                assert!(app.fs_front_pointer.buttons[1], "{state:?} {mode:?}");
                 frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
                 assert!(app.mouse_ring_flick.is_none() && app.mouse_gesture.is_none());
                 assert_eq!(app.fullscreen_idx, Some(1));
@@ -231,7 +225,7 @@ fn overflow_outside_tap_dismisses_only_then_next_tap_acts_and_releases_owner() {
             assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
             assert_eq!(app.still_touch_chrome_is_latched(&ctx), chrome);
             assert!(
-                !app.fs_primary_suppression.is_active(),
+                !app.fs_front_pointer.is_active(),
                 "terminal touch ownership must retire"
             );
             tap(&mut app, &ctx, pos);
@@ -291,7 +285,7 @@ fn overflow_outside_touch_drag_retains_existing_pan_and_panel() {
         );
         assert_eq!(app.fs_overflow_panel_state, state);
         assert_eq!(app.fullscreen_idx, Some(1));
-        assert!(!app.fs_primary_suppression.is_active());
+        assert!(!app.fs_front_pointer.is_active());
     }
 }
 
@@ -357,7 +351,7 @@ fn overflow_focus_reclaim_touch_uses_the_same_outside_tap_dismissal() {
             assert_eq!(app.fullscreen_idx, Some(1));
             assert_eq!(app.still_touch_chrome_is_latched(&ctx), chrome);
             frame(&mut app, &ctx, vec![egui::Event::PointerGone]);
-            assert!(!app.fs_primary_suppression.is_active());
+            assert!(!app.fs_front_pointer.is_active());
         }
     }
     assert!(crate::test_native_focus::requests().is_empty());
@@ -435,10 +429,7 @@ fn overflow_outside_right_drag_can_continue_into_panel() {
                 RightDragMode::MouseGesture => assert!(app.mouse_gesture.is_some()),
                 _ => unreachable!(),
             }
-            assert!(!matches!(
-                app.fs_secondary_press,
-                FullscreenSecondaryPress::Overflow { .. }
-            ));
+            assert!(!app.fs_front_pointer.buttons[1]);
             frame(
                 &mut app,
                 &ctx,
@@ -697,7 +688,7 @@ fn overflow_captured_buttons_preserve_outside_navigator_wheel() {
             "the captured button must not pan/select or redirect the wheel to image zoom"
         );
         render_frame(&mut app, &ctx, vec![button(outside, button_kind, false)]);
-        assert!(!app.fs_primary_suppression.is_active());
+        assert!(!app.fs_front_pointer.is_active());
         assert_eq!(app.fs_secondary_press, FullscreenSecondaryPress::Idle);
     }
 }
@@ -765,38 +756,29 @@ fn overflow_secondary_capture_preserves_outside_primary_navigator_pan() {
 
 #[test]
 fn overflow_primary_stream_keeps_front_ownership_until_physical_terminal() {
-    use FullscreenPrimarySuppressionDecision::Suppress;
-    use FullscreenPrimarySuppressionEvent::{PointerFrame, PointerStreamStarted, TouchFrame};
-    let mut owner = FullscreenPrimarySuppression::OverflowStream;
-    assert_eq!(owner.apply(PointerStreamStarted), Suppress);
-    assert_eq!(owner, FullscreenPrimarySuppression::OverflowStream);
-    for (active, completed, cancelled) in [
-        (true, false, false),
-        (false, true, false),
-        (false, false, true),
-    ] {
-        owner = FullscreenPrimarySuppression::OverflowStream;
-        assert_eq!(
-            owner.apply(TouchFrame {
-                suppresses_current_frame: false,
-                active,
-                completed,
-                cancelled
-            }),
-            Suppress
-        );
-        assert_eq!(
-            owner,
-            if completed || cancelled {
-                FullscreenPrimarySuppression::Idle
-            } else {
-                FullscreenPrimarySuppression::OverflowStream
-            }
-        );
-    }
-    owner = FullscreenPrimarySuppression::OverflowStream;
-    assert_eq!(owner.apply(PointerFrame { released: true }), Suppress);
-    assert_eq!(owner, FullscreenPrimarySuppression::Idle);
+    let ctx = egui::Context::default();
+    let mut owner = FsFrontPointerOwnership::primary_for_test();
+    crate::test_ui::headless_paint_output(ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let frame = owner.capture(ctx, false, &[]);
+        assert!(frame.primary_owned);
+        assert!(owner.owns_primary());
+    }))
+    .drop_without_applying_deltas();
+    crate::test_ui::headless_paint_output(ctx.run_ui(
+        egui::RawInput {
+            events: vec![button(
+                egui::pos2(10.0, 10.0),
+                egui::PointerButton::Primary,
+                false,
+            )],
+            ..Default::default()
+        },
+        |ctx| {
+            assert!(owner.capture(ctx, false, &[]).primary_owned);
+            assert!(!owner.owns_primary());
+        },
+    ))
+    .drop_without_applying_deltas();
 }
 
 #[test]
@@ -865,10 +847,7 @@ fn overflow_touch_cancel_without_primary_release_allows_next_outside_navigator_d
             button(inside, egui::PointerButton::Primary, true),
         ],
     );
-    assert_eq!(
-        app.fs_primary_suppression,
-        FullscreenPrimarySuppression::OverflowStream
-    );
+    assert!(app.fs_front_pointer.owns_primary());
     render_frame(
         &mut app,
         &ctx,
@@ -878,7 +857,7 @@ fn overflow_touch_cancel_without_primary_release_allows_next_outside_navigator_d
         ],
     );
     assert!(
-        !app.fs_primary_suppression.is_active(),
+        !app.fs_front_pointer.is_active(),
         "egui-winit Cancel has no primary release edge"
     );
     let outside = egui::pos2(
@@ -913,7 +892,7 @@ fn overflow_touch_cancel_without_primary_release_allows_next_outside_navigator_d
             button(end, egui::PointerButton::Primary, false),
         ],
     );
-    assert!(!app.fs_primary_suppression.is_active());
+    assert!(!app.fs_front_pointer.is_active());
 }
 
 fn landscape_sources(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
@@ -1494,10 +1473,7 @@ fn overflow_held_press_cannot_become_conceal_pipeline_eye_preview_after_mode_ent
             button(start, egui::PointerButton::Primary, true),
         ],
     );
-    assert_eq!(
-        app.fs_primary_suppression,
-        FullscreenPrimarySuppression::OverflowStream
-    );
+    assert!(app.fs_front_pointer.owns_primary());
     render_frame(
         &mut app,
         &ctx,
@@ -1560,7 +1536,7 @@ fn overflow_held_press_cannot_become_conceal_pipeline_eye_preview_after_mode_ent
         &ctx,
         vec![button(eye, egui::PointerButton::Primary, false)],
     );
-    assert!(!app.fs_primary_suppression.is_active());
+    assert!(!app.fs_front_pointer.is_active());
     render_frame(
         &mut app,
         &ctx,
@@ -1844,7 +1820,7 @@ fn overflow_real_touch_menu_key_dismissal_keeps_the_physical_contact_owned() {
     render_frame(&mut app, &ctx, vec![egui::Event::PointerGone]);
     assert_eq!(app.fullscreen_idx, Some(1));
     assert_eq!((app.fs_zoom, app.fs_pan), before);
-    assert!(!app.fs_primary_suppression.is_active());
+    assert!(!app.fs_front_pointer.is_active());
     let end = outside + egui::vec2(50.0, 35.0);
     render_frame(
         &mut app,
@@ -1875,7 +1851,7 @@ fn overflow_real_touch_menu_key_dismissal_keeps_the_physical_contact_owned() {
             button(end, egui::PointerButton::Primary, false),
         ],
     );
-    assert!(!app.fs_primary_suppression.is_active());
+    assert!(!app.fs_front_pointer.is_active());
 }
 
 #[test]
@@ -2010,10 +1986,7 @@ fn overflow_real_metadata_hold_preview_requires_an_unowned_new_press() {
             button(pos, egui::PointerButton::Primary, true),
         ],
     );
-    assert_eq!(
-        app.fs_primary_suppression,
-        FullscreenPrimarySuppression::OverflowStream
-    );
+    assert!(app.fs_front_pointer.owns_primary());
     assert!(
         app.similar_panel
             .preview
@@ -2044,7 +2017,7 @@ fn overflow_real_metadata_hold_preview_requires_an_unowned_new_press() {
         &ctx,
         vec![button(pos, egui::PointerButton::Primary, false)],
     );
-    assert!(!app.fs_primary_suppression.is_active());
+    assert!(!app.fs_front_pointer.is_active());
     let _completion = app
         .similar_panel
         .preview
@@ -2186,11 +2159,11 @@ fn overflow_top_layer_seek_popup_accepts_real_mouse_and_touch_row_selection() {
             crate::settings::StillSeekStripHeight::Small
         );
         let exclusions = app
-            .capture_fs_overflow_pointer_input(&ctx, overlapping_popup_viewport())
+            .capture_fs_front_pointer_input(&ctx, overlapping_popup_viewport())
             .1;
         assert!(
-            !exclusions.iter().any(|rect| rect.contains(pos)),
-            "overflow touch exclusion must leave the higher seek row usable"
+            exclusions.iter().any(|rect| rect.contains(pos)),
+            "front touch exclusion blocks canvas, while the higher seek row remains selectable"
         );
         let mut press = vec![
             egui::Event::PointerMoved(pos),
@@ -2206,10 +2179,10 @@ fn overflow_top_layer_seek_popup_accepts_real_mouse_and_touch_row_selection() {
             egui::Modifiers::NONE,
             overlapping_popup_viewport(),
         );
-        assert_ne!(
-            app.fs_primary_suppression,
-            FullscreenPrimarySuppression::OverflowStream,
-            "higher popup press cannot belong to overflow"
+        assert_eq!(
+            app.fs_front_pointer.owns_primary(),
+            true,
+            "higher popup press belongs to the front menu"
         );
         let mut release = vec![button(pos, egui::PointerButton::Primary, false)];
         if promoted_touch {
@@ -2250,10 +2223,7 @@ fn overflow_top_layer_secondary_press_does_not_claim_the_higher_seek_popup() {
         overlapping_popup_viewport(),
     );
     assert!(
-        !matches!(
-            app.fs_secondary_press,
-            FullscreenSecondaryPress::Overflow { .. }
-        ),
+        app.fs_front_pointer.buttons[1],
         "secondary uses the same actual front layer as primary and touch"
     );
     // Releasing in another popup retains master behavior, including its existing
@@ -2326,7 +2296,7 @@ fn overflow_nonoverlapping_front_region_still_shields_the_real_wipe_with_seek_po
         });
     let fraction = (start.x - draw.left()) / draw.width();
     app.compare_view_mode = crate::app::CompareViewMode::wipe(fraction);
-    let exclusions = app.capture_fs_overflow_pointer_input(&ctx, rect).1;
+    let exclusions = app.capture_fs_front_pointer_input(&ctx, rect).1;
     assert!(exclusions.iter().any(|rect| rect.contains(start)));
     render_frame_in_rect(
         &mut app,
@@ -2338,10 +2308,7 @@ fn overflow_nonoverlapping_front_region_still_shields_the_real_wipe_with_seek_po
         egui::Modifiers::NONE,
         rect,
     );
-    assert_eq!(
-        app.fs_primary_suppression,
-        FullscreenPrimarySuppression::OverflowStream
-    );
+    assert!(app.fs_front_pointer.owns_primary());
     let end = start - egui::vec2(55.0, 0.0);
     render_frame_in_rect(
         &mut app,
@@ -2403,15 +2370,12 @@ fn overflow_first_open_and_sizing_pass_claim_each_button_before_the_area_can_int
             }
             if kind == egui::PointerButton::Primary {
                 assert_eq!(
-                    app.fs_primary_suppression,
-                    FullscreenPrimarySuppression::OverflowStream,
+                    app.fs_front_pointer.owns_primary(),
+                    true,
                     "first-open primary/touch ownership must not depend on last frame's area"
                 );
             } else {
-                assert!(matches!(
-                    app.fs_secondary_press,
-                    FullscreenSecondaryPress::Overflow { .. }
-                ));
+                assert!(app.fs_front_pointer.buttons[1]);
             }
             let end = inside - egui::vec2(70.0, 50.0);
             let mut movement = vec![egui::Event::PointerMoved(end)];
@@ -2429,7 +2393,7 @@ fn overflow_first_open_and_sizing_pass_claim_each_button_before_the_area_can_int
                 "sizing/open press must not pan the backing image: passes={passes}, button={kind:?}, touch={promoted_touch}"
             );
             assert_eq!(app.fullscreen_idx, Some(1));
-            assert!(!app.fs_primary_suppression.is_active());
+            assert!(!app.fs_front_pointer.is_active());
             assert_eq!(app.fs_secondary_press, FullscreenSecondaryPress::Idle);
         }
     }
@@ -2459,7 +2423,7 @@ fn overflow_closed_state_does_not_reclaim_buttons_or_touch_from_a_stale_area() {
         // Close through the state owner before the next pass. The previous frame's
         // Area still exists in egui memory; it must not resurrect a closed menu.
         app.fs_overflow_panel_state = FsOverflowPanelState::Closed;
-        let (closed_input, closed_surface) = app.capture_fs_overflow_pointer_input(&ctx, rect);
+        let (closed_input, closed_surface) = app.capture_fs_front_pointer_input(&ctx, rect);
         assert!(!closed_input.owns(kind));
         assert!(
             closed_surface.is_empty(),
@@ -2470,14 +2434,8 @@ fn overflow_closed_state_does_not_reclaim_buttons_or_touch_from_a_stale_area() {
             press.insert(0, touch(start, egui::TouchPhase::Start));
         }
         render_frame_in_rect(&mut app, &ctx, press, egui::Modifiers::NONE, rect);
-        assert_ne!(
-            app.fs_primary_suppression,
-            FullscreenPrimarySuppression::OverflowStream
-        );
-        assert!(!matches!(
-            app.fs_secondary_press,
-            FullscreenSecondaryPress::Overflow { .. }
-        ));
+        assert_ne!(app.fs_front_pointer.owns_primary(), true);
+        assert!(!app.fs_front_pointer.buttons[1]);
         let end = start - egui::vec2(70.0, 50.0);
         if kind == egui::PointerButton::Primary {
             let mut movement = vec![egui::Event::PointerMoved(end)];

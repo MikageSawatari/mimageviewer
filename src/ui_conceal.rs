@@ -1321,20 +1321,21 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
-        if self.fs_primary_suppression.is_active()
-            && self.fs_primary_suppression
-                != crate::ui_fullscreen::FullscreenPrimarySuppression::OverflowStream
-        {
+        if self.fs_primary_suppression.is_active() {
             return;
         }
         let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
         let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| primary_allowed && i.pointer.primary_released());
+        let primary_released = ctx.input(|i| {
+            primary_allowed
+                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                && i.pointer.primary_released()
+        });
         let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
             && self
                 .settings
@@ -1967,9 +1968,7 @@ impl App {
         // This pipeline read precedes the target viewport's per-pass input capture. A held
         // press already has its canonical owner from the previous pass; do not reinterpret
         // that overflow press as an eye-button hold after entering conceal mode by key.
-        let primary_down = primary_down
-            && self.fs_primary_suppression
-                != crate::ui_fullscreen::FullscreenPrimarySuppression::OverflowStream;
+        let primary_down = primary_down && !self.fs_front_pointer.owns_primary_in(viewport_id);
         self.conceal_preview_active = conceal_preview_pointer_active(
             self.conceal_mode,
             self.conceal_preview_button_rect,
