@@ -1776,6 +1776,8 @@ F11 / F12、native presentation の確定などで表示先が変わる境界と
 移譲する境界で所有を終了する。fullscreen の close、新規 detached viewport / passive viewport 採用、
 `reset_detached_pause_foreground_modes` でも既存の前面リセットと同時に解放する。
 他 viewport の描画や focus loss は所有を変更せず、同じ表示先の再確認でも終了させない。
+focus loss で物理所有を終了しても、その pass の確定イベント列は破棄しない。
+release が focus loss より前なら範囲コピーを確定し、逆順なら取消する。最終 focus level とイベント順序を区別する。
 同じ pass-local 所有結果を、ナビゲータの予約 / 直接処理に渡す raw 入力の projection と
 secondary action が共有する。所有結果には pass 最後の down / press と旧列の release mask に加え、
 元イベント順に対応する所有情報を保持する。ナビゲータ / 範囲キャプチャの raw event projection は

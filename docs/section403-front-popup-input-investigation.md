@@ -546,3 +546,62 @@ cargo nextest run -p mimageviewer --lib -E 'test(/front_popup|overflow|slideshow
 
 実装上の未解決事項はない。修正差分のlib全件・build-dev・独立再レビュー・検収・コミット、
 detached計画§11への前面境界記録はClaudeCodeへ引き継ぐ。実機確認は未実施。
+
+### 9.6 範囲キャプチャの focus loss と fixture の修正（2026-10-19）
+
+`4960cda74` の再レビューで前回4件の解消と前面境界9関数の構造的修正が合意された。
+その合意の記録は `916fddeb5`（detached計画§11）。一方、ClaudeCodeのlib全件で範囲captureの6件が失敗し、
+focus lossの早期returnとdefault確定結果を渡すfixtureの2件のP2を受領した。
+9.5までの関連filterに `capture_region` がなく、これらを検証から漏らしていた。以下はその修正記録。
+
+- `FsFrontPointerOwnership::capture` は、最終focus levelがfalseでも確定イベント列を返す。
+  `WindowFocused(false)` の位置で永続ownerを終了し、先行releaseの所属・イベント順序を保持する。
+  focusを失っている間の新規pressは所有せず、同passの再focus後の新しい列はそのviewportに結び直す。
+  focus levelだけが通知された場合も、イベント列を保持したままpass末尾で永続ownerを終了する。
+- `run_capture_region_input_frame` と toolbar armテストは、描画前に `capture_fs_front_pointer_input` を通す。
+  consumerは確定列だけを読み、raw入力へのfallbackは追加していない。
+- `FsFrontPointerFrameInput::default()` と型の構築箇所を `src` 全体で検索した。
+  追加で見つかったシークのtest-onlyラッパー `draw_fullscreen_seek_overlay` も実際の確定処理へ接続した。
+  残るdefault returnは別viewportを描くときの既存の非所有結果だけで、test consumerへのdefault注入はない。
+- 今回、9.2の前面境界9関数、detachedの述語・viewport routing・geometry・focus判定・lifecycleは変更しない。
+  変更した本体関数は `FsFrontPointerOwnership::capture`。他はテストと文書の更新。
+
+既存6件はfixtureを本番の入力契約へ合わせて検証する。
+
+- `capture_region_focus_and_escape_terminals_preserve_event_order`
+- `capture_region_release_before_focus_loss_copies`
+- `capture_region_release_then_panel_press_keeps_copy_and_reverse_order_cancels`
+- `capture_region_toolbar_arm_after_overlay_does_not_replay_old_focus_events`
+- `capture_region_wait_release_then_same_pass_drag_copies_once`
+- `capture_region_canvas_drag_releases_at_panel_with_clamped_copy_after_pointer_gone`
+
+先頭2件は `RawInput.focused=false` とviewportのfocus=falseを指定し、実際の `InputState.focused=false` もassertする。
+release→focus lossはコピー、focus loss→releaseは取消となる両方の順序を検査する。
+追加した所有境界テスト:
+
+- `front_popup_focus_loss_keeps_ordered_release_provenance_and_retires_the_owner`
+  （非フォーカスpassでもreleaseを保持し、loss前後の所属を区別、永続ownerは終了）
+- `front_popup_focus_round_trip_binds_a_new_stream_to_the_same_viewport`
+  （loss中のpressは所有せず、同passの再focus後のpressは元viewportの新列として所有）
+
+今回のlib全件は、利用者の明示指示どおり `MSBUILDDISABLENODEREUSE=1` で
+`cargo nextest run -p mimageviewer --lib` を直接実行した。関連filterで代替していない。
+
+| 検証 | 結果 / ログ |
+| --- | --- |
+| 範囲capture・front popup・overflow・navigator・seek | **689成功 / 0失敗**。`target/section403-capture-focused.log`。 |
+| 最終ソースのcapture / focus回帰 | **16成功 / 0失敗**。`target/section403-capture-focused-final.log`。 |
+| lib全件・初回 | **13,751成功 / 1失敗 / 既存ignored59件**、403.476秒。`target/section403-capture-lib-full.log`。JUnitは `target/section403-capture-lib-full-first.junit.xml`。報告された範囲capture6件はすべて成功したことをJUnitでも確認。 |
+| 初回失敗1件の単独確認 | **1成功 / 0失敗**。`target/section403-capture-unrelated-isolated.log`。 |
+| 同一ソースのlib全件・再確認 | **13,752成功 / 0失敗 / 既存ignored59件**、411.457秒。`target/section403-capture-lib-full-confirm.log`。JUnitは `target/section403-capture-lib-full-confirm.junit.xml`。 |
+| `cargo test --test ui_snapshot` | **186成功 / 0失敗**、PNG変更なし。`target/section403-capture-ui-snapshot.log`。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功。`target/section403-capture-check.log`。 |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 成功。`target/section403-capture-fmt.log`。 |
+
+初回の全件実行だけで `similar_index::tests::startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker`
+が `src/similar_index.rs:11083` の `db.scanned_once_matches(&fingerprint)` のassertで失敗した。
+類似索引のコード・テストは今回変更していない。単独実行では成功し、コードを変えずに実行した2回目の全件でも成功した。
+原因は未特定であり、今回の範囲capture修正で類似索引の問題も直ったとは扱わない。
+最初の失敗ログを保持し、テストのignore・retry設定・並列数の変更は行っていない。
+
+今回のP2 2件の実装・自動検証は完了。実アプリ起動は行わず、build-dev・独立再レビュー・検収・コミットはClaudeCodeへ渡す。

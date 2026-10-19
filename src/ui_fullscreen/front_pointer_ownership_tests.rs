@@ -129,3 +129,85 @@ fn front_popup_old_touch_terminal_and_new_group_in_one_pass_are_distinct() {
     ))
     .drop_without_applying_deltas();
 }
+
+#[test]
+fn front_popup_focus_loss_keeps_ordered_release_provenance_and_retires_the_owner() {
+    for release_before_loss in [true, false] {
+        let ctx = egui::Context::default();
+        let mut owner = FsFrontPointerOwnership::default();
+        crate::test_ui::headless_paint_output(ctx.run_ui(
+            egui::RawInput {
+                events: vec![button(true)],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(owner.capture(ctx, true, &[]).primary_owned);
+            },
+        ))
+        .drop_without_applying_deltas();
+        let events = if release_before_loss {
+            vec![button(false), egui::Event::WindowFocused(false)]
+        } else {
+            vec![egui::Event::WindowFocused(false), button(false)]
+        };
+        crate::test_ui::headless_paint_output(ctx.run_ui(
+            egui::RawInput {
+                focused: false,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(!ctx.input(|input| input.raw.focused || input.focused));
+                let frame = owner.capture(ctx, true, &[]);
+                assert!(!owner.is_active());
+                let releases: Vec<_> = frame
+                    .events
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.event,
+                            egui::Event::PointerButton { pressed: false, .. }
+                        )
+                    })
+                    .collect();
+                assert_eq!(releases.len(), 1, "focus loss must not discard the release");
+                assert_eq!(releases[0].owned, release_before_loss);
+                assert!(
+                    frame
+                        .events
+                        .iter()
+                        .any(|entry| matches!(entry.event, egui::Event::WindowFocused(false)))
+                );
+            },
+        ))
+        .drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn front_popup_focus_round_trip_binds_a_new_stream_to_the_same_viewport() {
+    let ctx = egui::Context::default();
+    let mut owner = FsFrontPointerOwnership::default();
+    crate::test_ui::headless_paint_output(ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::WindowFocused(false),
+                button(true),
+                button(false),
+                egui::Event::WindowFocused(true),
+                button(true),
+            ],
+            ..Default::default()
+        },
+        |ctx| {
+            let frame = owner.capture(ctx, true, &[]);
+            assert!(
+                !frame.events[1].owned,
+                "a press before focus gain cannot start ownership"
+            );
+            assert!(frame.events[4].owned);
+            assert!(owner.owns_primary_in(ctx.viewport_id()));
+        },
+    ))
+    .drop_without_applying_deltas();
+}

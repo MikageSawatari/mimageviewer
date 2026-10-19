@@ -24,6 +24,8 @@ egui に前 pass の Area が残っていても新規所有しない。
 物理 release、最後の touch End / Cancel、所有 viewport の focus loss、実際の表示先移譲 / close で解放する。
 F11 / F12、native presentation の確定等による表示先の変更と active → passive handoff でも解放する。
 他 viewport の描画・入力・focus loss はその所有を変更せず、表示先が変わらない再確認でも維持する。
+所有 viewport の focus loss で物理所有が終わっても、先行 release を含む確定イベント列と所属は保持する。
+範囲captureはこの列の順序でコピー / 取消を確定し、consumerでraw入力を読み直さない。
 同一 pass の旧 release → 新 press は新列として判定する。pass 最後の down / press、旧列の release mask、
 元イベント順の所有情報を分けて保持し、ナビゲータと範囲キャプチャへは各 event の所有で射影する。
 owned press → move → release → 新 press が一つの pass に入っても、前半の event を背面へ戻さない。

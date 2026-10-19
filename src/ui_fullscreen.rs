@@ -235,10 +235,9 @@ impl FsFrontPointerOwnership {
             let mut owned = self.buttons;
             let mut release_owned = [false; 3];
             let mut touch_owned = self.touch_owned;
-            if !input.focused || input.viewport().focused == Some(false) {
-                *self = Self::default();
-                return FsFrontPointerFrameInput::default();
-            }
+            // RawInput focus describes the end of the pass. Keep preceding edges,
+            // and retire the physical owner at the ordered loss instead of dropping input.
+            let mut accepts_presses = true;
             let mut events = Vec::with_capacity(input.events.len());
             for event in &input.events {
                 let mut event_owned = false;
@@ -265,9 +264,11 @@ impl FsFrontPointerOwnership {
                             if index == 0 && self.touches.is_empty() {
                                 touch_owned = self.touch_owned;
                             }
-                            self.buttons[index] = menu_presented
-                                || (index < 2 && overflow.iter().any(|rect| rect.contains(*pos)))
-                                || (index == 0 && self.touch_owned);
+                            self.buttons[index] = accepts_presses
+                                && (menu_presented
+                                    || (index < 2
+                                        && overflow.iter().any(|rect| rect.contains(*pos)))
+                                    || (index == 0 && self.touch_owned));
                             // A new sequence replaces the old terminal edge in this pass.
                             owned[index] = self.buttons[index];
                             event_owned = self.buttons[index];
@@ -291,7 +292,7 @@ impl FsFrontPointerOwnership {
                         event_owned = self.touch_owned;
                         let contact = (device_id.0, id.0);
                         match phase {
-                            egui::TouchPhase::Start => {
+                            egui::TouchPhase::Start if accepts_presses => {
                                 if self.touches.is_empty() {
                                     owned[0] = self.buttons[0];
                                     self.touch_owned = menu_presented
@@ -316,13 +317,21 @@ impl FsFrontPointerOwnership {
                                     self.touch_owned = false;
                                 }
                             }
-                            egui::TouchPhase::Move => {}
+                            egui::TouchPhase::Start | egui::TouchPhase::Move => {}
                         }
                     }
                     egui::Event::PointerMoved(_) | egui::Event::PointerGone => {
                         // Ordered primary consumers use moves only for their accepted primary
                         // stream; an independently owned secondary/middle must not block it.
                         event_owned = self.buttons[0] || self.touch_owned;
+                    }
+                    egui::Event::WindowFocused(focused) => {
+                        accepts_presses = *focused;
+                        if *focused {
+                            self.viewport = Some(frame.0);
+                        } else {
+                            *self = Self::default();
+                        }
                     }
                     _ => {}
                 }
@@ -331,7 +340,7 @@ impl FsFrontPointerOwnership {
                     owned: event_owned,
                 });
             }
-            FsFrontPointerFrameInput {
+            let resolved = FsFrontPointerFrameInput {
                 navigator_events: input
                     .events
                     .iter()
@@ -348,7 +357,13 @@ impl FsFrontPointerOwnership {
                 touch_owned,
                 release_owned,
                 secondary_owner: None,
+            };
+            // Some backends supply only the focus level. Even then, the event
+            // projection remains available while persistent ownership ends here.
+            if !input.focused || input.viewport().focused == Some(false) {
+                *self = Self::default();
             }
+            resolved
         })
     }
 
@@ -25114,6 +25129,7 @@ impl App {
         touch_chrome_latched: bool,
     ) -> Option<usize> {
         let seek_geometry = self.still_seek_geometry_for_idx(full_rect, fs_idx, false);
+        let (front, _) = self.capture_fs_front_pointer_input(ctx, full_rect);
         self.draw_fullscreen_seek_overlay_with_geometry(
             ui,
             ctx,
@@ -25122,7 +25138,7 @@ impl App {
             seek_geometry,
             side_panel_visible,
             touch_chrome_latched,
-            FsFrontPointerFrameInput::default(),
+            front,
         )
     }
 
@@ -85267,16 +85283,13 @@ mod tests {
         let mut remaining_events = Vec::new();
         let _ = ctx
             .run_pass(input, |ctx| {
+                let (front, _) = app.capture_fs_front_pointer_input(ctx, full_rect);
                 ctx.root_ui(|root_ui| {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(root_ui, |ui| {
                             effect = app.draw_capture_region_selection_overlay(
-                                ui,
-                                ctx,
-                                full_rect,
-                                fs_idx,
-                                FsFrontPointerFrameInput::default(),
+                                ui, ctx, full_rect, fs_idx, front,
                             );
                         })
                 });
@@ -85501,6 +85514,17 @@ mod tests {
         finish
     }
 
+    fn capture_region_focus_loss_input(events: Vec<egui::Event>, time: f64) -> egui::RawInput {
+        let mut input = navigator_ordered_input(events, time);
+        input.focused = false;
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(false);
+        input
+    }
+
     // One App per test keeps independent event-order scenarios off one large debug stack frame.
     #[test]
     fn capture_region_focus_and_escape_terminals_preserve_event_order() {
@@ -85517,7 +85541,7 @@ mod tests {
             &ctx,
             full_rect,
             fs_idx,
-            navigator_ordered_input(
+            capture_region_focus_loss_input(
                 vec![
                     egui::Event::WindowFocused(false),
                     navigator_button_event(finish, egui::PointerButton::Primary, false),
@@ -85526,6 +85550,7 @@ mod tests {
             ),
         );
         assert_eq!(effect, Some(CaptureRegionTerminalEffect::Cancel));
+        assert!(!ctx.input(|input| input.raw.focused || input.focused));
         drop(app);
     }
 
@@ -85544,7 +85569,7 @@ mod tests {
             &ctx,
             full_rect,
             fs_idx,
-            navigator_ordered_input(
+            capture_region_focus_loss_input(
                 vec![
                     navigator_button_event(finish, egui::PointerButton::Primary, false),
                     egui::Event::WindowFocused(false),
@@ -85553,6 +85578,7 @@ mod tests {
             ),
         );
         let _ = expect_capture_copy(effect, fs_idx);
+        assert!(!ctx.input(|input| input.raw.focused || input.focused));
         drop(app);
     }
 
@@ -85659,16 +85685,13 @@ mod tests {
                     0.0,
                 ),
                 |ctx| {
+                    let (front, _) = app.capture_fs_front_pointer_input(ctx, full_rect);
                     ctx.root_ui(|root_ui| {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE)
                             .show(root_ui, |ui| {
                                 effect = app.draw_capture_region_selection_overlay(
-                                    ui,
-                                    ctx,
-                                    full_rect,
-                                    fs_idx,
-                                    FsFrontPointerFrameInput::default(),
+                                    ui, ctx, full_rect, fs_idx, front,
                                 );
                             })
                     });
