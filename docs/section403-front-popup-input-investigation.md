@@ -619,3 +619,5 @@ release→focus lossはコピー、focus loss→releaseは取消となる両方�
 
 未確認 (実アプリ): ダブルクリックによる表示リセットの境界 (この表示モードではクリックがページ送りになるため。実描画テストと変異確認のみ)、
 シーク設定 × ナビゲータ / 比較ワイプ・分析 × 回転メニューの重なり (§5 の実描画テストのみ)、中ボタン、タッチ、F11 / F12 往復、パネル内ドロップダウン。
+
+最終確認 (ClaudeCode、`d5307c1ec`): `test-lib-full.ps1` の 1 回目は 13,751 成功 / 1 失敗で、§9.6 と同じ `similar_index::tests::startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` (`src/similar_index.rs:11083` の `scanned_once_matches` の assert) が落ちた。このブランチは `similar_index` を変更していない。単独実行は 8 回とも成功、2 回目の全件 (`-Force`) は 13,752 件すべて成功。全件実行の負荷下でだけ落ちる既存の不安定なテストと見ているが、原因は未特定 (別項目で扱う)。
