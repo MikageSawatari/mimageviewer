@@ -170,14 +170,14 @@ metadata 境界を持つ終了、live return を後段 dispatcher へ渡す終�
 | app: `terminate_active_detached_open_before_viewport` / `cancel_detached_initial_open_for_lease` / `cancel_detached_grid_archive_open_owner`、startup_ops: `cancel_bookmark_open_request` | T。初回準備の取消 / 失敗 | 既存 exact owner / lease の cancel → context 終端。別 lease の完了は採用しない |
 | app: `close_active_detached_session_exact`、native_video: `execute_video_presentation_host_effect` の TerminalSessionClose | T の effect の実行、または I の遅延 content teardown | T の発行元は通常終了 / close-to-completion。metadata / I は既存 typed effect を保持。session/output retirement だけで別の予約を消さない |
 | app: `load_zip_as_folder_with_prepared_enumeration` / `handle_grid_parent_folder_action` の preserve 後 close、`change_main_context_for_visible_grid_with_metadata_boundary`、smart_folder: `install_adopted_smart_root_payload` | I/H。一覧/世代の採用に使う共通 teardown。root の独立 navigation は既存 admission が旧 open owner を cancel し、folder-nav は新しい継続 owner を保持する | 低位 close を維持。ここから finish を呼ぶと新しい reopen を取り消すため、T と一括置換しない |
-| app: `commit_physical_history_transition` / `apply_folder_nav_result`、collection_navigation: `install` / `install_collection_outer_physical_adoption` / `commit_collection_navigation`、snapshot_ops: `prepare_required_fullscreen_navigation` | I。既存 typed navigation が次の閲覧を所有 | `close_fullscreen_for_folder_nav_reopen` → 低位 close。予約保持 |
+| app: `commit_physical_history_transition` / `apply_folder_nav_result`、collection_navigation: `install` / `install_collection_outer_physical_adoption` / `commit_collection_navigation`、snapshot_ops: `prepare_required_fullscreen_navigation` | I。既存 typed navigation が次の閲覧を所有 | `close_fullscreen_for_folder_nav_reopen` → `close_fullscreen_content`。予約・情報パネルのロック・類似本 query の所有を保持。描画資源のない `FolderNavigation(None)` も同じ分類。内部 reopen のテストもこの製品入口を通す（§2.3） |
 | snapshot_ops: `snapshot_load_and_open`、rating_membership_ops: `prepare_rating_membership_items_swap` / `adopt_rating_membership` の neighbor、app: `close_fullscreen_for_rating_membership` | I。exact target / metadata / rating landing を再採用 | 既存 content teardown と caller の再開を維持 |
 | app: `park_detached_session_for_stack_aggregation` / `park_current_viewer_context_as_live_media_inner` / `park_active_detached_context_as_live_media` / `promote_active_detached_video_for_main_context_change` | H。index=None は App 投影を空にするため。reader は移譲先で生存 | context ID / bundle / passive window を保持。予約を退役しない |
 | app: `handoff_active_detached_viewport_to_passive` / `finish_active_detached_session_handoff`、registry: `activate_mounted_as_independent_detached` / `become_mounted_independent_detached_viewer` | H。active designation / native in-window flag を外すが窓/reader は維持 | 既存の移譲。terminal と誤認しない |
 | app: `prepare_viewer_presentation_open` / `apply_egui_viewer_presentation_for_current_item`、native_video: `toggle_still_window_mode` / `apply_video_presentation_switched` | H / open。F12、全画面↔ウィンドウ内、メディア表示切替 | 同じ閲覧を保持。index-only 判定の変更なし |
 | app: `retire_terminal_detached_viewport_identity` / `begin_active_detached_session_close` / `finish_active_detached_session_close` / `finalize_closed_active_detached_viewport`、`update_active_viewer_context` の finalized cleanup | C。上流の T / context 終端、または H が所有判断済み | output / registration の破棄だけ。二重の別 context 取消を追加しない |
 | app: `reset_active_detached_viewport_runtime_for_new_window`、ui_fullscreen: `hide_native_video_black_backdrop_if_shown` / `hide_embedded_still_viewport_if_shown` / `hide_current_fullscreen_viewport_for_recreate` | H/C。backdrop を外す / root へ移す / viewport を再作成するだけ | viewer の予約を維持。fs_viewport_shown=false を終了述語にしない |
-| app: `prepare_viewer_presentation_close` / `close_fullscreen_now` / `close_fullscreen_now_with_metadata_boundary` | T/I/H 共通の最下位内容 teardown。index=None の実書込元 | 退役判断は上流。内部 reopen も通るため、ここには finish を足さない |
+| app: `prepare_viewer_presentation_close` / `close_fullscreen_now` / `close_fullscreen_now_with_metadata_boundary` | T/I/H 共通の最下位内容 teardown。index=None の実書込元 | 退役判断は上流。内部 reopen も通るため、ここには finish を足さない。T の `close_fullscreen` は先に継続 owner を退役し、I は owner を維持して到達する。holdover の存在だけで T を I に変えない（§2.3） |
 | startup_ops: `open_bookmark_media_in_detached_context` の target-not-opened | 初回 build の失敗 T | build abort が一時 bundle / 予約を drop。stable context の強制 mount はしない |
 | update_phases: `input_test_script_actions` の CloseFullscreen | T（test-script の明示操作） | 既存 close-to-completion。`prepare_test_script_run` は変更しない |
 | App の `on_exit` / `on_exit_inner` / Drop | プロセス寿命の T。通常の viewport close と異なり以後の UI poll がない | 既存の全 owner shutdown / Drop。揮発予約は次回へ保存されない。保存/flush/worker 停止の順序を変えないため、通常の content teardown へ寄せない |
@@ -276,6 +276,54 @@ viewer 不在の password 保持と既存の待機 viewer 終了回帰を併せ�
 ```powershell
 cargo nextest run -p mimageviewer --lib -E 'test(/stack|startup_notices|book_composition|archive_convert|epub_convert|close|retire|ui_scale|snapshot.*swap|rating_membership|remove_items|removed_path|fs_nav|folder_nav|sidecar_restore::tests|smart.*(fullscreen|navigation)|collection.*navigation|viewport_retirement|viewer_context_registry::tests|park/)'
 ```
+
+### 2.3 本体 lib 全件で見つかった内部 close テストの入口移行漏れ（2026-10-20）
+
+`268fc8dcb` で報告された `favorite_adjustment_defaults_tests` の2件を単独実行し、
+情報パネルのロック消失・類似本 query の Withdrawn を再現した。導入コミットは
+`e2f07fa87`。`close_fullscreen` に無条件の `finish_fullscreen_navigation_for_true_close`
+を追加し、従来共有していた内容 teardown を `close_fullscreen_content` へ分けた差分による。
+製品の folder navigation wrapper は同時に content 専用へ移行したが、この2件のテストは
+holdover を捕捉後、旧 API の `close_fullscreen` を内部 reopen として呼び続けていた。
+そのため真の終了を正しく実行して assertion が落ちており、製品の内部入口の誤分類ではない。
+`28e0aa575` はこの関数・テストを変更せず、後続 §1.402 の `a1b88e3e5` / `268fc8dcb` も
+この終了処理を変更していない（`src/app/tests.rs` の差分は通知テスト module の登録のみ）。
+
+テストの内部 reopen 部分を、製品が通る `close_fullscreen_for_folder_nav_reopen` へ移行する。
+既存 assertion はすべて維持し、index 不在の内容 teardown、再open後の query 保持も確認する。
+さらに同じ typed holdover がある状態からの `close_fullscreen` は必ず query / lock / holdover を
+退役する対照を足す。holdover の存在を条件に真の終了を内部 reopen へ戻すと、待機中の
+Esc・backend close の取消を再び取りこぼすため、製品の終了境界は変更しない。
+
+close 系 caller と typed holdover の生成からの経路を再抽出し、§2.1 の I/H 行と
+その隣接する T 行を照合した結果は以下。追加の製品 caller の移行漏れは見つからなかった。
+
+| 見直した分類表の行 / テスト入口 | 分類・確認結果 |
+| --- | --- |
+| `commit_physical_history_transition` / `apply_folder_nav_result`、Collection の3入口、`prepare_required_fullscreen_navigation` | I。全 caller が `close_fullscreen_for_folder_nav_reopen` → content 専用。上表にパネル・query と資源なしの typed owner の保持も明記した。今回の2件もこの入口に揃える |
+| ZIP採用 / grid parent、main context変更、Smart採用 | I/H。`close_fullscreen_content` を使用し、共通の真の終了へは入らない |
+| snapshot再open / rating neighbor | I。content 専用または既存 metadata 専用 teardown。Empty / snapshot一覧戻りは別の T であり、混同しない |
+| stack用park / live media park / F12、native `TerminalSessionClose` effect | H、または上流で分類済みの content teardown。予約所有者を終了しない。effect の元が T の場合は発行元で退役済み |
+| `zip_nav_dfs_fullscreen` の候補なし、製本 hidden / missing、park失敗fallback | T。近傍に holdover の生成や再openがあっても、該当 branch は継続先がなく実際に終了する。通常 close を維持 |
+| `close_fullscreen_now` / metadata teardown | T/I/H 共通。上流の API 選択で分類し、holdover だけから真の終了を推測しない。上表に明記 |
+| `section1335_snapshot_and_reading_history_direct_pages_keep_physical_restore_record` | T の後に別のopen。旧コメントの「Internal close」は不正確なので修正。viewer の終了自体は一覧選択の意思を記録しない、という既存の assertion は維持 |
+
+今回の変更はテストの入口・対照条件と分類記録だけで、detached の表示・開閉・所有移譲を含む
+製品コードは変更しない。マニュアル・UI snapshot PNG の変更もない。
+
+検証記録（2026-10-20）:
+
+- 修正前の2件は **2 failed**（run `e08d9d3f-baa6-4496-8bc4-cb0b6d8cdc92`）。
+  修正後は同じ2件が **2 passed**（run `00f26ce2-e63a-4b8c-9929-2843895064c8`）。
+- `test(/favorite_adjustment_defaults_tests|startup_restore/)` は **462 passed**
+  （run `3a54f706-b168-4b9a-9857-2125bfe1a552`、16.974秒）。
+  お気に入り設定 module 全体と、コメントを訂正した起動時一覧復元の回帰を含む。
+- §2.2 と同じ関連フィルターは **1,636 passed**
+  （run `a0b248c3-bd46-4e93-b849-d69ed3af71f5`、91.644秒）。
+  このフィルターは今回の2件の名前には一致しないため、今後も上の module フィルターを併走する。
+- workspace 全体の `cargo fmt` / `cargo fmt --check`、UI glyph 検査、`git diff --check` は通過。
+  本体 lib 全件は実行していない。テスト・文書だけの変更なので検証バイナリの再生成は行わず、
+  製品バイナリの起動・実機操作・commit も行っていない。新規ファイルはない。
 
 ## 3. データ (exe 埋め込み)
 
