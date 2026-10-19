@@ -345,3 +345,25 @@ mIV Remote の Web UI は端末側 (`crates/remote-web/web/app.js` の `changeIm
   `section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps`、
   `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`) が断続的に失敗・終了残留した。
   個別実行と以後の全件実行では成功。別 worktree の全件テストと同時に走っていた。
+
+## 16. 実アプリでの確認 (2026-10-19)
+
+観測者: ClaudeCode (利用者の依頼により、隔離 data-dir `target/wraptest/data` で起動した build-dev の
+`mimageviewer-core.exe` を画面操作)。素材は番号入りの生成画像 (通常 5 枚、1 枚、ZIP 6 ページ、横長 3 枚、
+画像 2 枚 + 動画 1 本)。
+
+- OFF: 末尾で ↓ → 「末尾です」で停止 (従来どおり)。
+- 環境設定: 検索「ループ」で 表示 → 閲覧表示 → 前後移動 の項目が出て、ON にできた。
+- ON・通常フォルダ: ↓/↑、ホイール、→/←、画面の左右クリックで 5 → 1、1 → 5 と折り返し、案内なし。
+  End は末尾で「末尾です」(対象外の操作は従来どおり)。
+- 1 枚のフォルダ: ↓ で「末尾です」、↑ で「先頭です」(折り返さない)。
+- ZIP 見開き (左→右): P1|P2 で ↑ → P5|P6、P5|P6 で ↓ → P1|P2。
+- 左右分割: 左→右で 1L ↑ → 3R、↓ → 1L。右→左で 1R ↑ → 3L、↓ → 1R (綴じ方向に合った側)。
+- 動画混在: 末尾の動画で ↓ → 画像 1、画像 1 で ↑ → 動画、動画でホイール ↓ → 画像 1。
+- F12 別ウィンドウ: 別ウィンドウで 5 → 1 と折り返し。メインの一覧カーソルは通常の前後移動と同じく追従
+  (連動している窓の既存の挙動)。折り返し固有の別の動きは観測されなかった。
+- ページめくりアニメーション ON (ZIP 見開き): 通常の送りはログ `[page-turn] start reason=curl_submitted`、
+  最後の見開きからの折り返しは `[page-turn] skip reason=navigation_wrap` (演出なし)。
+
+未確認: コレクション、非表示ページを含む本、音楽ビューの前後ボタン、ゲームパッド、独立した
+(連動しない) 別窓、mIV Remote (対象外)。
