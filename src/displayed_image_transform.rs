@@ -191,7 +191,7 @@ pub(crate) struct DisplayedImageGeometryInput {
     pub(crate) pixel_fit: RectPixelFit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct DisplayedImageGeometry {
     pub(crate) source_size: egui::Vec2,
@@ -226,7 +226,7 @@ pub(crate) struct DisplayedImageGeometry {
     pub(crate) pixel_fit: RectPixelFit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct DisplayedImageTransform {
     pub(crate) page_idx: usize,

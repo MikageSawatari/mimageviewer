@@ -23,6 +23,7 @@ pub mod atlas_diag;
 mod mipmap;
 mod renderer;
 mod startup_diagnostics;
+mod texture_delivery;
 
 mod setup;
 
@@ -37,6 +38,7 @@ pub use startup_diagnostics::{
 };
 #[cfg(feature = "capture")]
 pub use startup_diagnostics::{set_root_startup_frame_tag, take_root_startup_frame_tag};
+pub use texture_delivery::{TextureDeliverySubmitted, install_texture_delivery_observer};
 
 /// Helpers for capturing screenshots of the UI.
 #[cfg(feature = "capture")]

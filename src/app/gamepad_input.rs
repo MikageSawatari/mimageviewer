@@ -2379,6 +2379,9 @@ impl App {
             self.consume_gamepad_directional_neutral_gate(now);
             let analog_ordinal = events.len() as u32;
             for event in events {
+                if self.gamepad_targets_viewer() {
+                    self.service_final_prepare_before_lookup(ctx);
+                }
                 match event {
                     PadBatchEvent::SessionEnded => {
                         self.clear_gamepad_input_overlays(ctx);
@@ -12276,5 +12279,39 @@ mod physical_boundary_tests {
         assert!(resumed.dispatch_allowed);
         assert!(resumed.dispatched);
         assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3_forked_mounted_gamepad_adopts_its_own_result_before_first_lookup() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        let main_key = crate::app::final_prepare_tests::queued_final(&mut app, 0);
+        let fork = app.fork_materialized_still_context(std::path::Path::new("C:/page-turn"), 0);
+        app.with_viewer_context(fork, |owner| {
+            assert!(
+                owner.final_effect_pending.is_empty(),
+                "fork must not share receiver/cancel ownership"
+            );
+            owner.reading_direction = crate::settings::ReadingDirection::Ltr;
+            owner.settings.gamepad_enabled = true;
+            let key = crate::app::final_prepare_tests::queued_final(owner, 1);
+            owner
+                .gamepad
+                .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+            let batch = owner.sample_gamepad_input_with_logic_for_test(&ctx);
+            crate::app::final_prepare_tests::expect_adopted_before_lookup(key, || {
+                let outcome = owner.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+                assert!(outcome.dispatched);
+            });
+            assert_eq!(owner.fullscreen_idx, Some(1));
+        })
+        .unwrap();
+        assert!(app.final_effect_pending.contains_key(&main_key));
+        assert!(app.final_composite_cache.get(&main_key).is_none());
     }
 }

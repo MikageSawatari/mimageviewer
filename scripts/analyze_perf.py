@@ -16,6 +16,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     page-turn [--check] キーリピート中の通過/実体化ページ数を集計。
                         --check でページ送りの不変条件を検査
     page-turn-animation [--check] 紙めくりの開始率・完走率・可視提示・保持量を集計
+    page-turn-d3        操作別のcurlコマ数・間隔とD3準備/提出イベントを参考集計
     test-script-input [--check]
                         合成 hold の振動・repeat 蓄積の観測事実を検査
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
@@ -677,6 +678,146 @@ def cmd_page_turn_animation(events: list[dict], args, delivery: dict | None = No
     if args.json_out is not None:
         args.json_out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return (2 if report["status"] == "CannotJudge" else 1 if report["status"] == "fail" else 0) if args.check else 0
+
+
+def analyze_page_turn_d3(events: list[dict]) -> dict:
+    """Reference diagnostics, independent of the formal animation usability gate.
+
+    Submission is not GPU completion or OS presentation. Preparation observations
+    have no operation identity (and native lookups have no viewer context), so
+    never attribute them to the nearest navigation or count them as its readiness.
+    """
+    warnings = list(getattr(events, "evidence_errors", []))
+    grouped = defaultdict(list)
+    observations = []
+    stages = (
+        "cpu_ready", "registered", "texture_delivery_submitted",
+        "native_submitted", "native_lookup", "gpu_deferred",
+    )
+    counts = Counter({stage: 0 for stage in stages})
+    lookups = Counter({outcome: 0 for outcome in ("hit", "miss", "not_needed")})
+    deferred = Counter()
+    for event in events:
+        if event.get("cat") == "page_turn_animation":
+            identity = tuple(event.get(field) for field in ("context", "window", "operation_id"))
+            if any(not isinstance(value, str) or not value for value in identity):
+                warnings.append("Animation event without context/window/operation_id")
+            elif _animation_number(event.get("t")) is None:
+                warnings.append(f"{identity}: invalid animation timestamp")
+            else:
+                grouped[identity].append(event)
+        stage = None
+        if event.get("cat") == "fs":
+            kind = event.get("kind", "")
+            if isinstance(kind, str) and kind.startswith("final_prepare_"):
+                stage = kind.removeprefix("final_prepare_")
+        elif (event.get("cat"), event.get("kind")) == ("gpu", "texture_delivery_submitted"):
+            stage = "texture_delivery_submitted"
+        if stage not in stages:
+            continue
+        counts[stage] += 1
+        # Preserve exact key/renderer/texture/context fields for source correlation.
+        observations.append({key: value for key, value in event.items() if key not in ("_line", "tid")})
+        if stage == "native_lookup":
+            outcome = event.get("outcome")
+            lookups[outcome if isinstance(outcome, str) and outcome else "unknown"] += 1
+        elif stage == "gpu_deferred":
+            reason = event.get("reason")
+            route = event.get("stage", "final")
+            deferred[(route if isinstance(route, str) else "unknown",
+                      reason if isinstance(reason, str) and reason else "unknown")] += 1
+
+    operations = []
+    for identity, rows in sorted(grouped.items(), key=lambda pair: (min(e["t"] for e in pair[1]), pair[0])):
+        rows = sorted(rows, key=lambda event: event["t"])
+        phases = Counter(event.get("kind") for event in rows)
+        curls = {}
+        # start repeats the first frame, sometimes with a different logging t.
+        # Prefer frame receipts even in legacy traces without frame identities.
+        curl_rows = [event for event in rows if event.get("kind") == "frame"
+                     and event.get("reason") == "curl_submitted"]
+        if not curl_rows:
+            curl_rows = [event for event in rows if event.get("kind") == "start"
+                         and event.get("reason") == "curl_submitted"][:1]
+        for event in curl_rows:
+            frame_id = next((event[field] for field in ("frame_id", "frame", "n")
+                             if type(event.get(field)) in (str, int)), event["t"])
+            curls.setdefault(frame_id, event)
+        samples = sorted(curls.values(), key=lambda event: event["t"])
+        output_times = [_animation_number(event.get("output_motion_elapsed_ms")) for event in samples]
+        precise = bool(samples) and all(value is not None for value in output_times)
+        if precise and any(b < a for a, b in zip(output_times, output_times[1:])):
+            warnings.append(f"{identity}: nonmonotonic output motion clock; using event timestamps")
+            precise = False
+        sample_times = output_times if precise else [event["t"] * 1000 for event in samples]
+        intervals = [b - a for a, b in zip(sample_times, sample_times[1:])]
+        accepted = next((event for event in rows if event.get("kind") == "opportunity"), None)
+        latency = next((_animation_number(event.get("accept_to_first_curl_ms")) for event in samples
+                        if _animation_number(event.get("accept_to_first_curl_ms")) is not None), None)
+        latency_basis = "recorded_accept_to_first_curl_ms" if latency is not None else None
+        if latency is None and samples and accepted is not None:
+            accept_t = _animation_number(accepted.get("accepted_t", accepted["t"]))
+            if accept_t is not None and samples[0]["t"] >= accept_t:
+                latency = (samples[0]["t"] - accept_t) * 1000
+                latency_basis = "opportunity_to_first_curl_event_t"
+        terminal = [event for event in rows if event.get("kind") in ("finish", "cancel", "skip")]
+        reported_gaps = [_animation_number(event.get("motion_max_gap_ms")) for event in rows]
+        reported_gaps = [value for value in reported_gaps if value is not None]
+        operations.append({
+            "context": identity[0], "window": identity[1], "operation_id": identity[2],
+            "opportunity": bool(phases["opportunity"]), "started": bool(phases["start"]),
+            "finished": bool(phases["finish"]), "cancelled": bool(phases["cancel"]),
+            "skipped": bool(phases["skip"]),
+            "terminal_reasons": sorted({str(event.get("reason", "unknown")) for event in terminal}),
+            "curl_frames": len(samples), "accept_to_first_curl_ms": latency,
+            "accept_latency_basis": latency_basis,
+            "curl_interval_basis": "output_motion_elapsed_ms" if precise else "event_t_ms",
+            "curl_intervals_ms": intervals,
+            "curl_interval_max_ms": max(intervals) if intervals else None,
+            "curl_interval_p95_ms": percentile(intervals, .95),
+            "reported_motion_max_gap_ms": max(reported_gaps) if reported_gaps else None,
+        })
+    if not operations:
+        warnings.append("No correlated animation operations")
+    return {
+        "status": "reference", "delivery": validate_delivery(events),
+        "timing_boundary": "accepted_egui_output_submission_not_gpu_completion_or_os_present",
+        "interval_scope": "successive_unique_curl_submitted_frames_excludes_final_canonical",
+        "diagnostic_scope": "whole_log_observed_event_counts_not_operation_attribution",
+        "counts_are": "observed_records_absence_does_not_prove_zero_work_or_instrumentation",
+        "operations": operations, "d3_event_counts": dict(counts),
+        "native_lookup_outcomes": dict(sorted(lookups.items())),
+        "gpu_deferred_reasons": [{"stage": stage, "reason": reason, "count": count}
+                                 for (stage, reason), count in sorted(deferred.items())],
+        "d3_observations": observations, "warnings": list(dict.fromkeys(warnings)),
+    }
+
+
+def cmd_page_turn_d3(events: list[dict], args) -> int:
+    report = analyze_page_turn_d3(events)
+    print("page-turn-d3: reference (not a formal performance/usability verdict)")
+    print_delivery(report["delivery"])
+    print("  timing: accepted egui curl output submission; not GPU completion / OS present")
+    print("  intervals: unique curl frames only; final canonical output excluded")
+    def metric(value):
+        return "N/A" if value is None else f"{value:.3f}"
+    for operation in report["operations"]:
+        print(f"  context={operation['context']} window={operation['window']} operation={operation['operation_id']}")
+        print(f"    curl_frames={operation['curl_frames']} "
+              f"accept_to_first_curl_ms={metric(operation['accept_to_first_curl_ms'])} "
+              f"interval_max_ms={metric(operation['curl_interval_max_ms'])} "
+              f"interval_p95_ms={metric(operation['curl_interval_p95_ms'])} "
+              f"finished={operation['finished']} cancelled={operation['cancelled']} skipped={operation['skipped']} "
+              f"reasons={operation['terminal_reasons']}")
+    print(f"  D3 whole-log observed records: {report['d3_event_counts']}")
+    print(f"  native_lookup: {report['native_lookup_outcomes']}")
+    print(f"  gpu_deferred: {report['gpu_deferred_reasons']}")
+    print("  missing records do not prove zero work / instrumentation; preparation is not attributed to operations")
+    for warning in report["warnings"]:
+        print(f"  warning: {warning}")
+    if args.json_out is not None:
+        args.json_out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return 0
 
 
 def analyze_page_turn(events: list[dict]) -> dict:
@@ -4001,6 +4142,8 @@ def main() -> None:
     p_animation.add_argument("--required-profile", action="append", default=None,
                              help="明示する評価範囲（複数指定可）。省略時は全必須warm profile")
     p_animation.add_argument("--json-out", type=Path, default=None)
+    p_d3 = subs.add_parser("page-turn-d3", help="操作別curl/D3準備・提出の参考診断（正式gateではない）")
+    p_d3.add_argument("--json-out", type=Path, default=None)
     p_test_script_input = subs.add_parser("test-script-input")
     p_test_script_input.add_argument(
         "--check",
@@ -4167,6 +4310,8 @@ def main() -> None:
             sys.exit(cmd_page_turn_check(events))
     elif args.cmd == "page-turn-animation":
         sys.exit(cmd_page_turn_animation(events, args, delivery))
+    elif args.cmd == "page-turn-d3":
+        sys.exit(cmd_page_turn_d3(events, args))
     elif args.cmd == "display-integrity":
         sys.exit(cmd_display_integrity(events, args.check))
     elif args.cmd == "test-script-input":

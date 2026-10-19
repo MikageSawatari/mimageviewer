@@ -3,6 +3,35 @@
 use super::*;
 
 #[test]
+fn d3_permission_direct_landing_adopts_before_its_first_lookup() {
+    let ctx = egui::Context::default();
+    let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+        &ctx,
+        crate::settings::SpreadMode::Single,
+    );
+    let intent = OpenIntent {
+        context_id: app.spread_shift_context_id().serial(),
+        items_generation: app.items_generation,
+        idx: 1,
+        history_trigger: HistoryTrigger::UserChosen,
+        materialization: FsOpenMaterialization::Eager,
+        contract: FsPageLoadContract::Sequential,
+        purpose: BookTargetPurpose::Next,
+        route: BookTargetRoute::FullscreenNavigation,
+        navigation_origin: Vec::new(),
+    };
+    app.book_composition_permission.open = OpenPermission::Resuming {
+        intent: intent.clone(),
+        candidates: Vec::new(),
+    };
+    let key = crate::app::final_prepare_tests::queued_final(&mut app, 1);
+    crate::app::final_prepare_tests::expect_adopted_before_lookup(key, || {
+        app.resume_qualified_book_target(&ctx, &intent)
+    });
+    assert_eq!(app.fullscreen_idx, Some(1));
+}
+
+#[test]
 fn deferred_projection_wait_is_retired_by_close_source_replacement_and_fork() {
     for close in ["replace", "manual", "rating"] {
         let mut env = crate::app::setup_app_for_test();

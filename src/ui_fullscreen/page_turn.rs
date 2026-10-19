@@ -12,6 +12,8 @@ mod cover_tests;
 #[cfg(test)]
 mod draw_submit_tests;
 #[cfg(test)]
+mod final_prepare_tests;
+#[cfg(test)]
 mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
@@ -1424,6 +1426,126 @@ pub(crate) fn take_test_events() -> Vec<(ViewerOperationFact, &'static str, &'st
 }
 
 impl App {
+    #[cfg(test)]
+    pub(crate) fn page_turn_gpu_fingerprint_for_test(&self) -> String {
+        let unit = |unit: &Arc<PaintedUnit>| {
+            format!(
+                "{:p}:{}:{}",
+                Arc::as_ptr(unit),
+                unit.reserved_bytes.load(Ordering::Relaxed),
+                unit.material_diagnostics()
+            )
+        };
+        let state = match &self.page_turn_presentation.state {
+            PresentationState::Inactive => "inactive".to_owned(),
+            PresentationState::Flat(u) => format!("flat:{}", unit(u)),
+            PresentationState::Offered { outgoing, offer } => format!(
+                "offered:{}:{:p}:{:p}",
+                unit(outgoing),
+                Arc::as_ptr(&offer.ready_sources),
+                Arc::as_ptr(&offer.submission)
+            ),
+            PresentationState::Turning {
+                outgoing,
+                incoming,
+                offer,
+                ..
+            } => format!(
+                "turning:{}:{}:{:p}:{:p}",
+                unit(outgoing),
+                unit(incoming),
+                Arc::as_ptr(&offer.ready_sources),
+                Arc::as_ptr(&offer.submission)
+            ),
+            PresentationState::Completing {
+                incoming,
+                completion,
+                diagnostics,
+                ..
+            } => {
+                let receipt = match completion {
+                    FlatCompletion::NeedFlat => "need".to_owned(),
+                    FlatCompletion::Submitted(r) => format!(
+                        "{}:{}:{}:{:?}",
+                        r.frame,
+                        r.pass,
+                        r.was_accepted(),
+                        r.pages()
+                    ),
+                };
+                format!(
+                    "completing:{}:{}:{:p}",
+                    unit(incoming),
+                    receipt,
+                    Arc::as_ptr(&diagnostics.tracker)
+                )
+            }
+        };
+        format!(
+            "{}:leases={}",
+            state,
+            self.page_turn_leases.reserved_bytes()
+        )
+    }
+
+    /// Existing accepted output, never CPU readiness or a newly registered
+    /// texture, authorizes background work for the following unit.
+    pub(crate) fn page_turn_current_unit_presented(&self) -> bool {
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Flat(unit) if unit.evidence.was_accepted() => unit,
+            PresentationState::Turning {
+                incoming,
+                clock: MotionClock::Running { .. },
+                ..
+            } => incoming,
+            PresentationState::Completing { incoming, .. } if incoming.evidence.was_accepted() => {
+                incoming
+            }
+            _ => return false,
+        };
+        unit.destination == self.page_turn_destination()
+            && unit.items == self.items_generation
+            && unit.mode == self.spread_mode
+            && unit.slice == self.fullscreen_page_slice
+            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+            && self.fullscreen_idx.is_some_and(|idx| {
+                unit.pages
+                    .iter()
+                    .any(|page| page.occurrence.navigation_anchor_idx == idx)
+            })
+    }
+
+    /// Accepted output evidence is independent of current cache quality. Match
+    /// the exact held occurrence/source/paint and binding before final publication.
+    pub(super) fn page_turn_receipt_matches_held(&self, receipt: &SubmittedUnitReceipt) -> bool {
+        let unit = match &self.page_turn_presentation.state {
+            PresentationState::Turning { incoming: unit, .. }
+            | PresentationState::Completing { incoming: unit, .. } => unit,
+            _ => return false,
+        };
+        receipt.was_accepted()
+            && receipt.has_presentation_binding()
+            && receipt.content_matches(self)
+            && receipt.destination() == self.page_turn_destination()
+            && unit.destination == receipt.destination()
+            && unit.items == self.items_generation
+            && unit.mode == self.spread_mode
+            && unit.slice == self.fullscreen_page_slice
+            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+            && unit.pages.len() == receipt.pages().len()
+            && unit.pages.iter().all(|page| {
+                receipt
+                    .pages()
+                    .iter()
+                    .any(|(occurrence, source, paint, area)| {
+                        *occurrence == page.occurrence
+                            && *source == page.resource.source_texture_id()
+                            && *paint == page.resource.paint_texture_id()
+                            && *area > 0.0
+                    })
+            })
+    }
+
     /// Preferences and HUD adopt the same global setting before any next turn.
     pub(crate) fn adopt_page_turn_animation_settings(&mut self, enabled: bool, duration_ms: u32) {
         if self.settings.page_turn_animation_enabled != enabled
@@ -1437,6 +1559,7 @@ impl App {
     }
 
     pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
+        self.service_final_prepare_before_lookup(ctx);
         self.flush_submitted_page_turn_ready(ctx);
         if !self.settings.page_turn_animation_enabled && !self.page_turn_completion_active() {
             let enabled_id = egui::Id::unique("page_turn_input_enabled");
@@ -1729,6 +1852,8 @@ impl App {
     /// Resident-only counterpart of ordinary processed + fallback selection.
     /// Incomplete final output is displayable; this never invokes a producer.
     fn page_turn_resident_source(&self, idx: usize) -> Option<(egui::TextureHandle, &'static str)> {
+        #[cfg(test)]
+        crate::app::final_prepare_tests::observe_lookup(self);
         let edit_key = self.current_edit_result_key(idx);
         let final_entry = self
             .final_composite_cache
@@ -2221,6 +2346,7 @@ impl App {
                 ("incoming_inputs", ready_sources.diagnostics()),
             ],
         );
+        self.note_page_turn_gpu_activity();
         self.page_turn_presentation.state = PresentationState::Offered {
             outgoing,
             offer: AcceptedOffer {
@@ -2726,6 +2852,9 @@ impl App {
                 submission_event = self.page_turn_completion_event(&receipt);
             }
             self.record_page_turn_completion_flat(&receipt);
+        }
+        if curl {
+            self.note_page_turn_gpu_activity();
         }
         queue_submission(ctx, receipt.clone(), submission_event);
         Some(receipt)

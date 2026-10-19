@@ -52,6 +52,39 @@ output hookはoperation/destinationと既存終端を照合し、取消/close後
 準備待ち、専用tick/worker/queue、UI同期I/Oは追加しない。OFF・slideshow等の既存timerを維持する。
 素材所有は[page-turn計画 §27.11](page-turn-animation-plan.md)、時計と検証は同§27.12を正本とする。
 
+D3-1（2026-10-18）は既存 final-effect の receiver と context-local cache のまま、
+`collect_final_prepare_results` と `adopt_final_prepare_results_before_lookup` に分離する。
+採用可能な既存結果は呼出し内の一時 Vec で移譲し、未 admit の legacy rendition 仕事は元の receiver に残す。
+この段階では新しい CpuReady owner・permit・容量予約・投機 worker は作らなかった。
+
+D3-2 は同じ pending を `Computing | CpuReady` に拡張する。新 D3 の worker は App 共通の
+実行 permit（1件）と出力予約（context 1 unit／全体2 unit／1GiB）を同時に取得してから開始する。
+取消・receiver 除去・同期 takeover でも permit は実終了まで保持し、出力予約は channel と結果へ追随する。
+返却は同じ資源 owner に登録した既存 service 宛先を非 blocking repaint で起こす。新しい要求 queue や heartbeat はない。
+CPU-ready の採用は selector を呼ばず、要求時 identity と世代を照合して既存 final cache へ move する。
+既存 legacy 表示/先読みの要求範囲と通常登録は維持し、これらを含む全 CPU 仕事が1件になるとは主張しない。
+park は開始済み final-effect を保持し、新しい D3 開始を止める。詳細は [D3計画](page-turn-animation-plan.md) §27.17.13。
+入力・permission の再開・実表示復帰は selector 非依存の共通 service を通るが、単なる context mount は通さない。
+app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
+通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。
+
+D3-4(b) の Native 候補は既存 App 共通 frame owner に当該 pass の値だけを置く。
+最終 hook は通常の全 context final 登録を先に処理し、同じ canonical 入力を再照合してから
+非生成 query・全 pool の出力＋一時 allocation 会計・backing 再検査・直前 claim の順で進む。
+renderer lock を context 訪問／会計へ持ち越さず、通常 `fs_lanczos_cache`／submit／Native lease を使う。
+park／mount／fork の新しい非同期 owner は作らず、cold metadata 準備も追加しない。
+
+D3-5整理（2026-10-19）: Native canonical の完全性・位置検索は既存 installed topology の証拠／索引を使い、
+未採用なら skip する。slideshow の nav/unit 列も収集・再照合から再構築しない。最新 callback の値は
+既存 frame owner に置き、最終 hook の処理後に消費する。別 cache owner／queue／heartbeat は作らない。
+source／AI の既存先読み要求範囲と producer は維持する。D3-3 の編集入力・comic CPU-only 化は
+次の版の後の [backlog §1.401](next-release-backlog.md) へ延期し、通常表示要求の従来経路は保持する。
+横断監査と計測／未確認事項の正本は [page-turn 計画 §27.17.17](page-turn-animation-plan.md)。
+CPU 需要用の従来 resolver に残っていた全頁走査・mixed slideshow 列再構築も、D3-5 で同じ既存
+`SpreadDisplayUnitsCache` 内の派生 record へ移す。cold だけ導出し、warm は scalar／Arc identity と索引で読む。
+共通adoption／producer／keepのprefixで同pass採用し、ROOT直接採用も覆う。visible token／units／証拠は変更せず、
+同じ枝は既存索引を参照し、異なる枝だけ完全recordを持つ。forkのfresh owner、mount／park／promoteの移譲は維持する。
+
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 
 `run_music_analysis` はデコード成功と取消なしを確認し、必要な `TimelineComplete` の送信後に
@@ -1425,8 +1458,14 @@ mImageViewer は 2 つのリストを使い分ける:
 
 `app/vram_accounting.rs` は `fs_cache` から表示系の各派生 cache、連結 transition、
 `thumbnails` / `thumb_textures` / `thumb_adjust_tex` までを横断する。推定表示サイズではなく
-`TextureHandle::size()` と完全な mip chain を使い、同じ `TextureId` は cache をまたいでも
+`TextureHandle::size()` と登録時 options に対応する mip chain を使い、同じ `TextureId` は cache をまたいでも
 1 回だけ数える。チェック柄・スタンプ・font preview など小さく有界な texture は対象外とする。
+
+D3 の final は実登録 options の mip 有無を使い、Native 出力は RGBA8・mip なしで数える。
+mounted だけでなく registry の at-rest／parked の通常cacheも共通walkerで加算する。
+presentation の Native は出力だけをpinし、元sourceを重複pinしない。cache退去後も最後の実batch leaseが
+生存する間は既存weak inventoryから会計し、弱参照自体は寿命を延ばさない。Native admissionは出力に加え
+当該branchの実一時allocationも含める。offer前の専用pin予約・演出専用cacheは作らない。
 
 `--perf-log` が有効な場合だけ、約 1 秒に 1 回 `gpu.vram_accounting` を記録する。イベントには
 モード、全 texel/byte、共有 pool と両配分の上限、無制限フラグ、および subsystem ごとの
@@ -2110,3 +2149,12 @@ viewのページ名/状態/unitの投影はdraft変更時に更新し、静止�
 poll、context退避／復帰、変換終端は同じBoxを移し、owner、modal、receiver、lease、
 取消・Dropの境界は変更しない。新しいpending stateや受付の排他は追加しない。
 Appサイズ上限と通常stackでのcapture回帰を維持し、poll／context移譲のallocation保持も検査する。
+
+
+## 紙めくりD3-4(a)の配送観測（2026-10-18）
+
+CPU worker/pending/permit/予約の所有はD3-2のまま。早期serviceは受信・検証・通常採用を続け、
+非共有の新規投機GPU登録だけROOT最終outputへ移す。ON/pagedのLegacyPrefetchも同じ枠を使う。
+既存frame ownerのpass観測と単調活動を使い、待機queueを増やさない。
+TextureDelivery observerは既存queue提出後・renderer lock外・free前の診断だけを通知する。
+App/UI再入、追加submit、GPU完了ticketはない。詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.15を参照。

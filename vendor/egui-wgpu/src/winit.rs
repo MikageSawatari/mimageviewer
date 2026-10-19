@@ -1098,6 +1098,7 @@ struct TextureDelivery<'a> {
     textures_delta: &'a mut epaint::textures::TexturesDelta,
     queue_needs_submit: bool,
     startup_observer: Option<&'a WgpuConfiguration>,
+    observation: Option<crate::texture_delivery::DeliveryObservation>,
 }
 
 impl<'a> TextureDelivery<'a> {
@@ -1122,6 +1123,7 @@ impl<'a> TextureDelivery<'a> {
         };
         // Preserve upstream's fallback submission unless an upload actually submits the queue.
         let mut queue_needs_submit = true;
+        let mut observation = crate::texture_delivery::DeliveryObservation::begin();
         {
             let mut renderer = render_state.renderer.write();
             let diag_id = renderer.diag_id();
@@ -1130,15 +1132,27 @@ impl<'a> TextureDelivery<'a> {
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {
                     let before = renderer.texture_size(&id);
-                    match renderer.update_texture_with_submission(
+                    let submission = renderer.update_texture_with_submission(
                         &render_state.device,
                         &render_state.queue,
                         id,
                         &image_delta,
-                    ) {
+                    );
+                    match submission {
                         renderer::TextureUpdateSubmission::Unchanged => {}
                         renderer::TextureUpdateSubmission::Pending => queue_needs_submit = true,
                         renderer::TextureUpdateSubmission::Submitted => queue_needs_submit = false,
+                    }
+                    if !matches!(submission, renderer::TextureUpdateSubmission::Unchanged)
+                        && let Some(observation) = observation.as_mut()
+                    {
+                        observation.record(
+                            diag_id,
+                            id,
+                            &image_delta,
+                            matches!(submission, renderer::TextureUpdateSubmission::Submitted),
+                            site,
+                        );
                     }
                     let after = renderer.texture_size(&id);
                     crate::atlas_diag::record_applied(id, diag_id, &image_delta, before, after);
@@ -1156,6 +1170,7 @@ impl<'a> TextureDelivery<'a> {
             textures_delta,
             queue_needs_submit,
             startup_observer,
+            observation,
         })
     }
 
@@ -1168,6 +1183,9 @@ impl<'a> TextureDelivery<'a> {
             counts.set(next);
         });
         self.queue_needs_submit = false;
+        if let Some(observation) = self.observation.as_mut() {
+            observation.submitted();
+        }
     }
 }
 
@@ -1184,6 +1202,11 @@ impl Drop for TextureDelivery<'_> {
                 next.empty += 1;
                 counts.set(next);
             });
+        }
+        // Mip generation may already have submitted the entire batch. Otherwise
+        // the normal or fallback submit above has now completed the queue handoff.
+        if let Some(observation) = self.observation.as_mut() {
+            observation.submitted();
         }
         {
             let mut renderer = self.render_state.renderer.write();
