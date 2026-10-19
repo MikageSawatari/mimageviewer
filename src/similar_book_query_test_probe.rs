@@ -9,6 +9,7 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BookQueryTestPhase {
+    AfterMetadata,
     MihPostingScan,
     SqlProgress,
     AfterOriginDiscovery,
@@ -52,6 +53,7 @@ impl BookQueryTestPhaseProbe {
     /// point, while MIH and direct-loop probes are thereby guaranteed to observe body work.
     pub(crate) fn arm_after_metadata(&self) {
         self.armed.store(true, Ordering::Release);
+        self.checkpoint(BookQueryTestPhase::AfterMetadata);
     }
 
     pub(crate) fn checkpoint(&self, phase: BookQueryTestPhase) {

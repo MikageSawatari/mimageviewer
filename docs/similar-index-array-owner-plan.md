@@ -1,7 +1,7 @@
 # §1.404 類似索引の検索配列 owner 設計
 
-状態: 設計案 R2。2026-10-19、調査コミット `6b9189960` を基準とする。
-ClaudeCode の方向づけを実装可能な契約へ具体化した文書であり、製品コードの変更・実装承認ではない。
+状態: R2 の独立設計レビュー後、利用者が実装を承認（2026-10-19）。実装・検証記録は §16。
+設計本文の基点は調査コミット `6b9189960`。以下の未実装・承認前という記述は設計作成時の履歴。
 原因と再現証拠は [調査記録](similar-index-flaky-startup-marker-investigation.md) を参照。
 設計・採否・検収は ClaudeCode。以下の型名・ファイル分割は提案名。
 
@@ -523,3 +523,109 @@ configure の暗黙再読込を廃止する回復規則の採否は、ClaudeCode
 文書作成時の確認: UTF-8 読取、4個の fenced block の対応、相対リンクの存在、`git diff --check` は成功。
 差分は本書と `docs/README.md` の索引追加のみ。製品 source、既存 probe/witness、テスト条件は変更していない。
 文書のみの作業なので製品テスト・build・アプリ起動は行わず、コミットも行っていない。
+
+## 16. 実装記録
+
+設計・検収は ClaudeCode、実装・自動検証は Codex。利用者指示によりコミットせず、
+P1 → P2 → P3 の差分をこの作業ツリーへ残す。製品バイナリは起動しない。
+
+- P1: `similar_array_owner` と要求合流・公開済み stamp による ack・close を新設。
+  base helper は `BasePersistence::Reused / Written(cutoff)` を返し、製品の I/O authority は owner が保持する。
+  初期の旧呼出しとの互換 bridge は P2 で test / dev-tools 専用へ限定した。
+  P1 の lib 型チェック、owner の焦点 4 件は成功（`target/similar-array-owner/p1.log`）。
+- P2: configure / eager open / query fallback / refresh / through、item stamp、book readiness を一括接続。
+  `MemoryState`、`memory_epoch`、`ArrayUpdateState` の running/requested/required_through/last_error、
+  `compaction_running`、旧 loader/updater/compactor の spawn、snapshot CAS loop、ack の worker-stopped 推測を撤去。
+  `QueryScopeState` の revision / immutable roots / 6件cache と、公開 snapshot / revision を分離した。
+  旧配列を構成変更で失効しない。DB/base の schema・format と scan/watch/Full 印の契約は維持する。
+- P3: witness を成功契約の通常回帰へ反転し、擬似再オープンを scan cancel/join → owner Closed → drop へ収束。
+  後着要求・cutoff・failure・scope/sibling の回帰、恒久診断、文書と gate を完成した。
+
+独立設計レビュー P3 の反映: `SimilarDb::prune_array_history` は既存 `write_transaction`（IMMEDIATE）を
+開始し、store identity 照合と DELETE を同じ transaction で行う。通常の scan writer による commit と
+競合しても DEFERRED の read→write 昇格を行わない。異 store の cutoff では DELETE しない。
+
+調査専用の `MIV_SIMILAR_STARTUP_TRACE` / `trace_startup_investigation` / captured-current epoch と
+discarded の stderr、restarted-worker stderr は撤去。base の BeforeReplace/AfterReplace barrier は
+path ごとの guard を持つ cfg(test) として保持し、新 owner の phase barrier も instance-local とする。
+恒久ログは owner/operation ID、操作、公開/失敗/停止、観測/要求 store+seq、元エラーを記録する。
+Faulted は公開済み配列を保持し、再起動の案内と進捗投影を出す。config/watch/query/Full から再試行しない。
+
+追加した owner 14 件と製品経路 5 件では、要求合流、read/publish/idle をまたぐ後着要求、
+同 store/seq の ack、未到達/異 store の拒否、replace→adopt→prune、実 compaction と cutoff 後の commit、
+missing-history rebuild、read/replace/prune/worker panic、close/reopen、sibling 分離、旧 item 完了の拒否を確認する。
+DB には IMMEDIATE の writer 予約を確認する回帰と、別接続の scan writer が commit した後に prune が成功する回帰を追加した。
+旧 witness は `reconfigure_overlapping_requests_share_one_load_and_full_writes_marker` とし、ignore を外した。
+対象 startup marker 回帰は旧 scan と owner の Closed まで収束してから同じ data_dir を再オープンする。
+
+独立実装レビュー（GPT-6.1 Sol / xhigh）で、空 refresh の無条件 book soft refresh を指摘された。
+snapshot/初期 Missing が変わる場合と終端通知に限定し、空 refresh では revision/Arc/通知が不変となる回帰を追加した。
+Wait ticket 固定、実 rebuild/compact 中の close、sibling の query stamp/cache Arc、barrier timeout の assert も追加確認した。
+最終の静的差分確認では追加 P1/P2 なし。検収は ClaudeCode に引き継ぐ。
+
+負荷 gate 初回は新しい book readiness 回帰だけが 20 周中17周失敗した。
+一時診断で、失敗周も固定 Wait→Run→実 runtime→DB open→`query_with_timing` 呼出直前まで到達したことを確認した。
+失敗地点はその後の `AfterOriginDiscovery` の既存5秒上限であり、owner readiness の lost-wake ではない。
+内部読取/MIH/OS scheduling のどこで遅れたかは分離しておらず、CPU 原因や engine の負荷性能を確定したとは扱わない。
+この回帰の受入点を実 read transaction の `AfterMetadata` へ限定し、固定 Wait、追加 query なし、5秒上限を維持した。
+独立 reviewer とこの検証範囲で合意した。DB/MIH の結果は既存 book 回帰で検証する。
+一時 stage hook/catch/stderr は撤去し、typed `AfterMetadata` test phase だけを保持した。
+失敗証跡は `target/similar-startup-investigation/owner-cpu-load-20-before-readiness-fix.log` と
+`owner-cpu-load-10-terminal-diagnostic.log` / `owner-cpu-load-10-stage-diagnostic.log` に保存した。
+
+修正後の関連焦点テストは308件成功（`target/similar-array-owner/readiness-fixed-focus.log`、nextest 3.441秒）。
+owner の fixture 実測は compaction 中の新 ack 待ち2.602ms、小 Delta 1件の commit→query 10.819ms。
+小さい headless fixture の参考値であり、製品性能の保証ではない。初期 load は反転 witness で1操作/1replace、
+idle constructor はI/Oなし、空 refresh/repeated ensure は読者通知・公開 revision を増やさないことを assert した。
+通常小 Delta の worker コストは既存 `apply_change_batch_checked` と同じである。
+base 行数を N、既存 Delta を K、今回の変更を M とすると、Delta map の再構成は O(K log K)、
+superseded bitset の複製は O(N/64)、変更適用は O(M(log N + log(K+M)))。
+base の全 record 複製はせず Arc を共有する。owner の導入で K 依存を定数時間にしたとは扱わない。
+要求受付と snapshot/stamp の観測は短いメモリ操作だけで、DB read/配列適用/compaction は worker が行う。
+
+受入 gate の結果は以下のとおり。実装・自動検証は完了し、ClaudeCode の検収とコミットへ引き継ぐ。
+負荷 helper の正本は `scripts/stress-similar-index.py`。調査と同じ入口は次で生成する。
+
+```powershell
+Copy-Item -LiteralPath .\scripts\stress-similar-index.py -Destination .\target\similar-startup-investigation\stress-load.py
+python target/similar-startup-investigation/stress-load.py --stress-count 20
+```
+
+24 CPU 負荷 process、負荷上限180秒、子テスト上限1800秒、`-E 'test(/^similar_index::/)' -j 48 --no-fail-fast`。
+先に焦点テストを compile し、負荷中に test 本体が走る条件にする。
+本作業では利用者の最新指示に従い main-lib 専用の全件 gate を1回実行し、workspace/vendor/doc gate も別途記録する。
+
+2026-10-19 の検証（未コミット差分、`MSBUILDDISABLENODEREUSE=1`、CPU数24、製品起動なし）:
+
+| 対象 | コマンド | 結果 / 証跡 |
+| --- | --- | --- |
+| 関連焦点 | `cargo nextest run -p mimageviewer --lib -E 'test(/^similar_array_owner::/) \| test(/^similar_index::/) \| test(/^similar_search_array::/) \| test(/^similar_db::/) \| test(/^similar_book_/) \| test(/^indexer_manager::/) \| test(/^metadata_reconfiguration::/)'` | 308/308成功、3.441秒。`target/similar-array-owner/readiness-fixed-focus.log` |
+| CPU負荷受入 | `python target/similar-startup-investigation/stress-load.py --stress-count 20` | 24負荷process、`-E 'test(/^similar_index::/)' --stress-count 20 -j 48 --no-fail-fast`。106件×20周=2,120成功、失敗0。nextest 123.744秒、helper exit 0 / 140.656秒。`target/similar-startup-investigation/owner-cpu-load-20.log` |
+| main-lib専用全件（1回） | `.\scripts\test-lib-full.ps1 -Force`（`cargo nextest run -p mimageviewer --lib -E all()`） | 13,773成功、失敗0、既存ignore 59、412.911秒。`target/similar-array-owner/main-lib-full.log`。成功台帳: `target/test-lib-full/6b96f5618a08d8ac9e442db74cbc55118a8bff90fe8232cb48c15001e4ebcd9e.json` |
+| workspace / vendor / doc全体gate | `.\scripts\test-full.ps1 -SuppressCrashDialogs` | exit 0、全体1,026.99秒。workspace（`pack-build-tools`）15,085成功 / 63 ignore、482.214秒。vendor egui 117、egui-winit 43、egui-wgpu 37、eframe wgpu 55（live 1 ignore）、eframe glow 57、計309成功。doctestは12 crateの段階がexit 0、実行0 / 既存ignore 3。全段失敗0。`target/similar-array-owner/full-gate.log` |
+| 通常core型チェック | `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、37.55秒。`target/similar-array-owner/final-normal-check.log` |
+| portable core型チェック | `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | exit 0、55.14秒。`target/similar-array-owner/final-portable-check.log` |
+| fmt / UI glyph | `cargo fmt --all -- --check` / `python scripts/check_ui_glyphs.py` | 両方exit 0、危険グリフ0件 |
+| 通常profile確認用build | `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、170.71秒。core / remote / EPUB worker、VC runtime PE 3件の検査成功。`target/similar-array-owner/dev-build.log`。native依存は先に`cargo build --profile dev-runtime -p turbojpeg-sys -p libraw-sys -j 1`で準備し、script本体は`CARGO_BUILD_JOBS=8`。portable featureなし、起動なし |
+
+Rustソース7ファイルのSHA-256は `target/similar-array-owner/source-hashes.json` に保存した。
+以後は検証結果の文書更新だけを行い、同じRust差分の結果として再利用する。
+main-lib成功後に結果を文書へ追記したため、台帳の全追跡ファイル識別子と最終文書は一致しない。
+検証対象のRust/依存/実行条件には変更がない。最終照合でもRust 7ファイルの変更は0件だった。
+
+全体gateの前提準備: 最初の `test-full` は launcher の埋込入力である release core / remote / EPUB worker が
+このworktreeに無いためテスト開始前に101で停止した（`full-gate-missing-launcher-inputs.log`）。
+代用品や対象除外は使わず、同じソースから正規release入力を生成した。署名・配布・起動は行わない。
+turbojpegのCMake/MSBuildは`--parallel 24`で停止し、同じ生成済みprojectを`--parallel 1`・MSBuild `/nr:false`で実行すると成功した。
+release coreを`CARGO_BUILD_JOBS=1`で進めてnative依存を完成させた後も最適化を直列のまま続けたため時間を要した。
+このcompilerのみ意図的に中断し、環境`CARGO_INCREMENTAL=0` / `CARGO_BUILD_JOBS=24`で`cargo build --release --bin mimageviewer-core`
+で成功した（`release-core-input-parallel.log`、262.87秒）。中断は製品/テストの失敗には数えない。
+続く`cargo build --release -p mimageviewer-remote -p epub-pdf-worker --bin mimageviewer-remote --bin mimageviewer-epub-pdf --features mimageviewer-remote/embedded-web-assets`
+も成功した（`release-companion-inputs.log`、41.86秒）。これらの前提準備はproduct sourceを変えていない。
+
+残る範囲: 実アプリの起動・操作は利用者指示に従い未実施。上記book回帰の旧検証点での内部遅延要因は未分離。
+owner readinessの到達は一時診断と正式回帰で確認し、遅延自体の原因確定や実アプリの負荷性能保証とは区別する。
+通常profile確認用coreは準備済みだが、起動すると実際の`%APPDATA%\mimageviewer`の設定/データを更新し得る。
+利用者が確認する際はインストール版/トレイ常駐版を終了し、リポジトリルートから
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`で起動する。
+初期ロード中にお気に入り対象/除外の構成を変更し、Full完了と類似候補の表示を確認する。agentは起動しない。

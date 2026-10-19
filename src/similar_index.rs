@@ -9,6 +9,10 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::dupe::{self, Algo, Sig};
+use crate::similar_array_owner::{
+    ArrayAck, ArrayDemand, ArrayObservation, OwnerTerminal, PublishedArray, SimilarArrayHandle,
+    SimilarArrayOwner,
+};
 use crate::similar_book_engine::{
     BookQueryLimits, BookQueryStats, EngineError as BookEngineError, SimilarBookQueryEngine,
 };
@@ -481,11 +485,9 @@ impl SimilarBookQueryClient {
 pub struct SimilarIndexManager {
     data_dir: PathBuf,
     progress: Arc<Mutex<IndexProgress>>,
-    memory: Arc<Mutex<MemoryState>>,
+    array: SimilarArrayHandle,
     summary: Arc<Mutex<SummaryState>>,
-    memory_epoch: Arc<AtomicU64>,
-    item_query: Arc<Mutex<ItemQueryCache>>,
-    enabled_roots: Arc<RwLock<Vec<String>>>,
+    query_scope: Arc<Mutex<QueryScopeState>>,
     scheduler: Arc<SimilarIndexScheduler>,
     #[cfg(test)]
     item_query_test_hook: Mutex<Option<ItemQueryTestHook>>,
@@ -517,23 +519,24 @@ impl SimilarIndexManager {
     }
 
     /// DB を開かない軽量 constructor。起動時 I/O を増やさない。
-    pub fn new(data_dir: PathBuf) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(data_dir: PathBuf) -> Self {
         Self::new_with_book_query_notifier(data_dir, || {})
     }
 
-    pub(crate) fn new_with_book_query_notifier(
+    fn new_with_book_query_notifier(
         data_dir: PathBuf,
         notify_book_query_change: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         let progress = Arc::new(Mutex::new(IndexProgress::Idle));
-        let memory = Arc::new(Mutex::new(MemoryState::Unloaded));
         let summary = Arc::new(Mutex::new(SummaryState::Unloaded));
-        let memory_epoch = Arc::new(AtomicU64::new(0));
-        let item_query = Arc::new(Mutex::new(ItemQueryCache::default()));
-        let enabled_roots = Arc::new(RwLock::new(Vec::new()));
+        let query_scope = Arc::new(Mutex::new(QueryScopeState::default()));
+        let notify_book_query_change: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(notify_book_query_change);
         let scheduler = Arc::new_cyclic(|scheduler| {
             let runtime_scheduler = scheduler.clone();
             let probe_scheduler = scheduler.clone();
+            let notify_book = Arc::clone(&notify_book_query_change);
             let book_query = BookQueryExecutor::with_dispatch_gate(
                 move || {
                     // The old book scan pool lowered all query CPU work. The new executor owns
@@ -544,7 +547,7 @@ impl SimilarIndexManager {
                         engine: BookEngineSlot::Vacant,
                     }))
                 },
-                notify_book_query_change,
+                move || notify_book(),
                 move || {
                     probe_scheduler.upgrade().map_or_else(
                         || {
@@ -558,25 +561,27 @@ impl SimilarIndexManager {
                     )
                 },
             );
+            let array_scheduler: Weak<SimilarIndexScheduler> = scheduler.clone();
+            let array_owner = SimilarArrayOwner::new(data_dir.clone(), move || {
+                if let Some(scheduler) = array_scheduler.upgrade() {
+                    scheduler.book_query.soft_refresh();
+                    notify_book_query_change();
+                }
+            });
             SimilarIndexScheduler {
                 data_dir: data_dir.clone(),
                 progress: Arc::clone(&progress),
-                memory: Arc::clone(&memory),
+                array: array_owner.handle(),
+                _array_owner: array_owner,
                 summary: Arc::clone(&summary),
-                memory_epoch: Arc::clone(&memory_epoch),
-                memory_load_elapsed_us: AtomicU64::new(0),
-                item_query: Arc::clone(&item_query),
                 book_query,
                 #[cfg(test)]
                 book_query_phase_probe: Mutex::new(None),
                 known_book_store: Mutex::new(ObservedBookStore::Unobserved),
                 prefill_db: Arc::new(Mutex::new(None)),
-                enabled_roots: Arc::clone(&enabled_roots),
+                query_scope: Arc::clone(&query_scope),
                 raw_executor: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
-                array_update: Mutex::new(ArrayUpdateState::default()),
-                array_changed: Condvar::new(),
-                compaction_running: AtomicBool::new(false),
                 skip_offline_change_scan: AtomicBool::new(false),
                 #[cfg(test)]
                 startup_test_probe: Mutex::new(None),
@@ -591,11 +596,9 @@ impl SimilarIndexManager {
         Self {
             data_dir,
             progress,
-            memory,
+            array: scheduler.array.clone(),
             summary,
-            memory_epoch,
-            item_query,
-            enabled_roots,
+            query_scope,
             scheduler,
             #[cfg(test)]
             item_query_test_hook: Mutex::new(None),
@@ -651,10 +654,28 @@ impl SimilarIndexManager {
     }
 
     pub fn progress(&self) -> IndexProgress {
-        self.progress
+        let progress = self
+            .progress
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone();
+        if let Some(failure) = self.array.observe().failure() {
+            let report = match progress {
+                IndexProgress::Running(running) => running.report,
+                IndexProgress::AwaitingWatch(report)
+                | IndexProgress::AwaitingArray(report)
+                | IndexProgress::Complete(report)
+                | IndexProgress::Cancelled(report)
+                | IndexProgress::Degraded { report, .. } => report,
+                _ => IndexReport::default(),
+            };
+            IndexProgress::Degraded {
+                report,
+                reason: IndexDegradedReason::ArrayPublication(failure.to_string()),
+            }
+        } else {
+            progress
+        }
     }
 
     #[cfg(test)]
@@ -666,67 +687,118 @@ impl SimilarIndexManager {
     }
 
     #[cfg(test)]
+    fn install_snapshot_for_test(&self, snapshot: Arc<SearchSnapshot>) {
+        let revision = self
+            .array
+            .observe()
+            .published()
+            .map_or(1, |value| value.revision + 1);
+        self.array
+            .install_for_test(ArrayObservation::Published(PublishedArray {
+                snapshot,
+                revision,
+            }));
+    }
+
+    #[cfg(test)]
+    fn snapshot_for_test(&self) -> Arc<SearchSnapshot> {
+        Arc::clone(
+            &self
+                .array
+                .observe()
+                .published()
+                .expect("fixture has a published array")
+                .snapshot,
+        )
+    }
+
+    #[cfg(test)]
+    fn query_stamp_for_test(&self) -> ItemQueryStamp {
+        self.array.with_observation(|observation| ItemQueryStamp {
+            publication_revision: observation.published().expect("published fixture").revision,
+            scope_revision: self.query_scope.lock().unwrap().revision,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn force_progress_with_loaded_snapshot_for_test(&self, progress: IndexProgress) {
-        *self.memory.lock().unwrap_or_else(|e| e.into_inner()) = MemoryState::Ready(Arc::new(
-            SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
-                records: Box::new([]),
-                store_id: [1; 16],
-                applied_seq: 0,
-            }),
-        ));
+        self.array
+            .install_for_test(ArrayObservation::Published(PublishedArray {
+                snapshot: Arc::new(SearchSnapshot::from_base(
+                    crate::similar_search_array::BaseArray {
+                        records: Box::new([]),
+                        store_id: [1; 16],
+                        applied_seq: 0,
+                    },
+                )),
+                revision: 1,
+            }));
         *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = progress;
     }
 
     /// 同じ表示項目と同じメモリ snapshot への照会は Arc ごと再利用する。
     /// 線形走査と SQLite point lookup は worker 上だけで行う。
     pub fn query_item(&self, item_key: &str) -> Arc<ItemQuery> {
-        if !self.item_is_enabled(item_key) {
-            return Arc::new(ItemQuery::NotIndexed);
-        }
-        let running = matches!(
-            self.progress(),
-            IndexProgress::Running(_)
-                | IndexProgress::AwaitingWatch(_)
-                | IndexProgress::AwaitingArray(_)
-        );
-        let index = {
-            let state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-            match &*state {
-                MemoryState::Unloaded => {
-                    if running {
-                        return Arc::new(ItemQuery::Preparing);
-                    }
-                    drop(state);
-                    start_memory_load(
-                        &self.data_dir,
-                        &self.memory,
-                        &self.memory_epoch,
-                        &self.item_query,
-                        MemoryLoadTrigger::QueryFallback,
-                        Some(Arc::downgrade(&self.scheduler)),
-                    );
-                    return Arc::new(ItemQuery::Preparing);
-                }
-                MemoryState::Missing if running => return Arc::new(ItemQuery::Preparing),
-                MemoryState::Missing => return Arc::new(ItemQuery::NoIndex),
-                MemoryState::Loading => return Arc::new(ItemQuery::Preparing),
-                MemoryState::Failed(error) => return Arc::new(ItemQuery::Failed(error.clone())),
-                MemoryState::Ready(index) => Arc::clone(index),
+        let running = self.scheduler.worker_is_running();
+        let lookup = self.array.with_observation(|observation| {
+            let mut scope = self.query_scope.lock().unwrap_or_else(|e| e.into_inner());
+            if !key_is_under_any(item_key, &scope.roots) {
+                return ItemQueryLookup::Immediate(Arc::new(ItemQuery::NotIndexed));
             }
-        };
-        let epoch = self.memory_epoch.load(Ordering::Acquire);
-        if let Some(result) = cached_item_query(&self.item_query, item_key, epoch) {
-            if running && matches!(result.as_ref(), ItemQuery::NotIndexed) {
+            let Some(published) = observation.published() else {
+                return match observation {
+                    ArrayObservation::Uninitialized { busy: false } if !running => {
+                        ItemQueryLookup::Load
+                    }
+                    ArrayObservation::Missing if !running => {
+                        ItemQueryLookup::Immediate(Arc::new(ItemQuery::NoIndex))
+                    }
+                    _ if observation.failure().is_some() => ItemQueryLookup::Immediate(Arc::new(
+                        ItemQuery::Failed(observation.failure().unwrap().to_string()),
+                    )),
+                    _ => ItemQueryLookup::Immediate(Arc::new(ItemQuery::Preparing)),
+                };
+            };
+            let stamp = ItemQueryStamp {
+                scope_revision: scope.revision,
+                publication_revision: published.revision,
+            };
+            if let Some(result) = cached_item_query(&scope.cache, item_key, stamp) {
+                return ItemQueryLookup::Immediate(
+                    if running && matches!(result.as_ref(), ItemQuery::NotIndexed) {
+                        Arc::new(ItemQuery::Preparing)
+                    } else {
+                        result
+                    },
+                );
+            }
+            let preparing = Arc::new(ItemQuery::Preparing);
+            let retired =
+                store_cached_item_query(&mut scope.cache, item_key, stamp, Arc::clone(&preparing));
+            ItemQueryLookup::Start {
+                index: Arc::clone(&published.snapshot),
+                stamp,
+                roots: Arc::clone(&scope.roots),
+                preparing,
+                retired,
+            }
+        });
+        let (index, stamp, roots, preparing, retired) = match lookup {
+            ItemQueryLookup::Immediate(result) => return result,
+            ItemQueryLookup::Load => {
+                self.array.ensure(ArrayDemand::LoadIfPresent);
                 return Arc::new(ItemQuery::Preparing);
             }
-            return result;
-        }
-
-        let preparing = Arc::new(ItemQuery::Preparing);
-        store_cached_item_query(&self.item_query, item_key, epoch, Arc::clone(&preparing));
-        let cache = Arc::clone(&self.item_query);
-        let epoch_guard = Arc::clone(&self.memory_epoch);
-        let enabled_roots = Arc::clone(&self.enabled_roots);
+            ItemQueryLookup::Start {
+                index,
+                stamp,
+                roots,
+                preparing,
+                retired,
+            } => (index, stamp, roots, preparing, retired),
+        };
+        let query_scope = Arc::clone(&self.query_scope);
+        let array = self.array.clone();
         let db_path = SimilarDb::db_path_at(&self.data_dir);
         let query_key = item_key.to_owned();
         #[cfg(test)]
@@ -738,6 +810,7 @@ impl SimilarIndexManager {
         let spawn_result = std::thread::Builder::new()
             .name("similar-item-query".to_owned())
             .spawn(move || {
+                drop(retired);
                 let perf_started = crate::perf::is_enabled().then(std::time::Instant::now);
                 let cpu_started = perf_started.and_then(|_| current_thread_cpu_100ns());
                 let trace_id = perf_started.map_or(0, |_| next_similar_query_trace_id());
@@ -748,7 +821,14 @@ impl SimilarIndexManager {
                         Some(&query_key),
                         trace_id,
                         &[
-                            ("memory_epoch", serde_json::Value::from(epoch)),
+                            (
+                                "scope_revision",
+                                serde_json::Value::from(stamp.scope_revision),
+                            ),
+                            (
+                                "publication_revision",
+                                serde_json::Value::from(stamp.publication_revision),
+                            ),
                             (
                                 "snapshot_records",
                                 serde_json::Value::from(index.record_count() as u64),
@@ -771,7 +851,6 @@ impl SimilarIndexManager {
                         query_item_ready(&db, &index, &query_key)
                     });
                 if let ItemQuery::Ready(ItemMatches { hits, .. }) = &mut result {
-                    let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
                     hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
                 }
                 let terminal = item_query_terminal_label(&result);
@@ -779,16 +858,8 @@ impl SimilarIndexManager {
                     ItemQuery::Ready(matches) => matches.hits.len(),
                     _ => 0,
                 });
-                let active = if epoch_guard.load(Ordering::Acquire) == epoch {
-                    replace_cached_item_query_if_current(
-                        &cache,
-                        &query_key,
-                        epoch,
-                        Arc::new(result),
-                    )
-                } else {
-                    false
-                };
+                let active =
+                    complete_item_query(&array, &query_scope, &query_key, stamp, Arc::new(result));
                 if let Some(started) = perf_started {
                     let cpu_ms = cpu_started
                         .zip(current_thread_cpu_100ns())
@@ -799,7 +870,14 @@ impl SimilarIndexManager {
                         Some(&query_key),
                         trace_id,
                         &[
-                            ("memory_epoch", serde_json::Value::from(epoch)),
+                            (
+                                "scope_revision",
+                                serde_json::Value::from(stamp.scope_revision),
+                            ),
+                            (
+                                "publication_revision",
+                                serde_json::Value::from(stamp.publication_revision),
+                            ),
                             (
                                 "wall_ms",
                                 serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
@@ -828,7 +906,13 @@ impl SimilarIndexManager {
             let failed = Arc::new(ItemQuery::Failed(format!(
                 "similar item query worker start failed: {error}"
             )));
-            store_cached_item_query(&self.item_query, item_key, epoch, Arc::clone(&failed));
+            complete_item_query(
+                &self.array,
+                &self.query_scope,
+                item_key,
+                stamp,
+                Arc::clone(&failed),
+            );
             return failed;
         }
         preparing
@@ -912,7 +996,11 @@ impl SimilarIndexManager {
     fn item_is_enabled(&self, item_key: &str) -> bool {
         key_is_under_any(
             item_key,
-            &self.enabled_roots.read().unwrap_or_else(|e| e.into_inner()),
+            &self
+                .query_scope
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .roots,
         )
     }
 }
@@ -942,125 +1030,6 @@ fn repair_page_order_if_stale(db: &SimilarDb) {
             started.elapsed().as_secs_f64() * 1000.0
         )),
         Err(error) => crate::logger::log(format!("similar page order repair failed: {error}")),
-    }
-}
-
-fn start_memory_load(
-    data_dir: &Path,
-    memory: &Arc<Mutex<MemoryState>>,
-    memory_epoch: &Arc<AtomicU64>,
-    item_query: &Arc<Mutex<ItemQueryCache>>,
-    trigger: MemoryLoadTrigger,
-    scheduler: Option<Weak<SimilarIndexScheduler>>,
-) {
-    let epoch = memory_epoch.load(Ordering::Acquire);
-    {
-        let mut state = memory.lock().unwrap_or_else(|e| e.into_inner());
-        if !matches!(*state, MemoryState::Unloaded) {
-            return;
-        }
-        *state = MemoryState::Loading;
-    }
-    let db_path = SimilarDb::db_path_at(data_dir);
-    let base_path = similar_search_array::base_path(data_dir);
-    let legacy_sidecar_dir = data_dir.to_path_buf();
-    let state = Arc::clone(memory);
-    let epoch_guard = Arc::clone(memory_epoch);
-    let cache = Arc::clone(item_query);
-    let worker_scheduler = scheduler.clone();
-    let spawn_result = std::thread::Builder::new()
-        .name("similar-index-load".to_owned())
-        .spawn(move || {
-            let started = std::time::Instant::now();
-            if let Err(error) = similar_search_array::retire_legacy_sidecar(&legacy_sidecar_dir) {
-                crate::logger::log(error);
-            }
-            let loaded = (if !trigger.create_if_missing() && !db_path.is_file() {
-                Ok(None)
-            } else {
-                SimilarDb::open_at(&db_path)
-                    .map_err(db_error)
-                    .and_then(|db| similar_search_array::load_or_rebuild(&db, &base_path))
-                    .map(Some)
-            })
-            .map(|loaded| {
-                loaded.map(|loaded| {
-                    crate::logger::log(format!(
-                        "similar memory load: trigger={trigger:?} source={:?} rows={} elapsed_ms={:.1}",
-                        loaded.source,
-                        loaded.snapshot.record_count(),
-                        started.elapsed().as_secs_f64() * 1000.0
-                    ));
-                    if let Some(reason) = loaded.rejected {
-                        crate::logger::log(format!("similar base rebuilt: {reason}"));
-                    }
-                    Arc::new(loaded.snapshot)
-                })
-            })
-            .map_err(|error| format!("similar index load failed: {error}"));
-            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-            #[cfg(test)]
-            if std::env::var_os("MIV_SIMILAR_STARTUP_TRACE").is_some() {
-                eprintln!("SIMILAR_STARTUP load captured_epoch={epoch} current_epoch={} discarded={} result={:?}",
-                    epoch_guard.load(Ordering::Acquire), epoch_guard.load(Ordering::Acquire) != epoch,
-                    loaded.as_ref().map(|index| index.as_ref().map(|index| index.applied_seq)));
-            }
-            if epoch_guard.load(Ordering::Acquire) != epoch {
-                #[cfg(test)]
-                {
-                    drop(state);
-                    if let Some(scheduler) = worker_scheduler.as_ref().and_then(Weak::upgrade) {
-                        scheduler.probe_startup("memory_load_discarded");
-                    }
-                }
-                return;
-            }
-            // Diagnostic only: publish the actual load time with the matching memory epoch.
-            // Configure may start this load before the index worker's eager-load call.
-            if let Some(scheduler) = worker_scheduler.as_ref().and_then(Weak::upgrade) {
-                scheduler.memory_load_elapsed_us.store(
-                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-            }
-            *state = match loaded {
-                Ok(Some(index)) => MemoryState::Ready(index),
-                Ok(None) => MemoryState::Missing,
-                Err(error) => MemoryState::Failed(error),
-            };
-            drop(state);
-            cache.lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
-            epoch_guard.fetch_add(1, Ordering::AcqRel);
-            #[cfg(test)]
-            if let Some(scheduler) = worker_scheduler.as_ref().and_then(Weak::upgrade) {
-                scheduler.probe_startup("memory_load_published");
-            }
-            if let Some(scheduler) = worker_scheduler.and_then(|scheduler| scheduler.upgrade()) {
-                scheduler.request_array_refresh();
-                scheduler.book_query.soft_refresh();
-            }
-        });
-    if let Err(error) = spawn_result {
-        {
-            *memory.lock().unwrap_or_else(|e| e.into_inner()) =
-                MemoryState::Failed(format!("similar index load worker start failed: {error}"));
-        }
-        if let Some(scheduler) = scheduler.and_then(|scheduler| scheduler.upgrade()) {
-            scheduler.book_query.soft_refresh();
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryLoadTrigger {
-    Configure,
-    IndexRunOpen,
-    QueryFallback,
-}
-
-impl MemoryLoadTrigger {
-    fn create_if_missing(self) -> bool {
-        matches!(self, Self::Configure | Self::IndexRunOpen)
     }
 }
 
@@ -2077,35 +2046,21 @@ impl SchedulerState {
     }
 }
 
-#[derive(Default)]
-struct ArrayUpdateState {
-    requested: bool,
-    running: bool,
-    required_through: Option<crate::similar_db::StoreWatermark>,
-    last_error: Option<String>,
-}
-
 struct SimilarIndexScheduler {
     data_dir: PathBuf,
     progress: Arc<Mutex<IndexProgress>>,
-    memory: Arc<Mutex<MemoryState>>,
+    array: SimilarArrayHandle,
     summary: Arc<Mutex<SummaryState>>,
-    memory_epoch: Arc<AtomicU64>,
-    // Last current-epoch eager load duration; it never participates in scheduler decisions.
-    memory_load_elapsed_us: AtomicU64,
-    item_query: Arc<Mutex<ItemQueryCache>>,
+    _array_owner: SimilarArrayOwner,
     book_query: BookQueryExecutor<Arc<BookQuery>>,
     #[cfg(test)]
     book_query_phase_probe:
         Mutex<Option<Arc<crate::similar_book_query_test_probe::BookQueryTestPhaseProbe>>>,
     known_book_store: Mutex<ObservedBookStore>,
     prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
-    enabled_roots: Arc<RwLock<Vec<String>>>,
+    query_scope: Arc<Mutex<QueryScopeState>>,
     raw_executor: Mutex<Option<Arc<crate::raw::RawDevelopExecutor>>>,
     state: Mutex<SchedulerState>,
-    array_update: Mutex<ArrayUpdateState>,
-    array_changed: Condvar,
-    compaction_running: AtomicBool,
     skip_offline_change_scan: AtomicBool,
     #[cfg(test)]
     startup_test_probe: Mutex<Option<Arc<dyn Fn(&'static str) + Send + Sync>>>,
@@ -2261,21 +2216,18 @@ impl SchedulerBookQueryRuntime {
                 "similar book query scheduler is unavailable".to_owned(),
             ));
         };
-        let shared_snapshot = {
-            let memory = scheduler.memory.lock().unwrap_or_else(|e| e.into_inner());
-            match &*memory {
-                MemoryState::Ready(snapshot) => Some(Arc::clone(snapshot)),
-                MemoryState::Unloaded
-                | MemoryState::Loading
-                | MemoryState::Missing
-                | MemoryState::Failed(_) => None,
-            }
-        };
-        let roots = scheduler
-            .enabled_roots
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let shared_snapshot = scheduler
+            .array
+            .observe()
+            .published()
+            .map(|value| Arc::clone(&value.snapshot));
+        let roots = Arc::clone(
+            &scheduler
+                .query_scope
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .roots,
+        );
         let db_path = SimilarDb::db_path_at(&scheduler.data_dir);
 
         if matches!(self.engine, BookEngineSlot::Vacant) {
@@ -2462,14 +2414,7 @@ impl SimilarIndexNotifier {
         let should_load = !roots.is_empty();
         scheduler.configure(roots, pdf_passwords, activity_gate, excluded_roots);
         if should_load {
-            start_memory_load(
-                &scheduler.data_dir,
-                &scheduler.memory,
-                &scheduler.memory_epoch,
-                &scheduler.item_query,
-                MemoryLoadTrigger::Configure,
-                Some(Arc::downgrade(&scheduler)),
-            );
+            scheduler.array.ensure(ArrayDemand::LoadOrCreate);
         }
     }
 
@@ -2571,14 +2516,18 @@ impl SimilarIndexScheduler {
                 "similar book query scheduler stopped".to_owned(),
             ));
         }
-        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-        match &*memory {
-            MemoryState::Loading => BookQueryDispatchDecision::Wait,
-            MemoryState::Unloaded if worker_running => BookQueryDispatchDecision::Wait,
-            MemoryState::Unloaded
-            | MemoryState::Missing
-            | MemoryState::Failed(_)
-            | MemoryState::Ready(_) => BookQueryDispatchDecision::Run,
+        match self.array.observe() {
+            ArrayObservation::Closing | ArrayObservation::Closed(OwnerTerminal::Stopped) => {
+                BookQueryDispatchDecision::Complete(BookQueryTerminal::Failed(
+                    "similar book query scheduler stopped".into(),
+                ))
+            }
+            ArrayObservation::Uninitialized { busy } if busy || worker_running => {
+                #[cfg(test)]
+                self.probe_startup("book_dispatch_wait");
+                BookQueryDispatchDecision::Wait
+            }
+            _ => BookQueryDispatchDecision::Run,
         }
     }
 
@@ -2640,11 +2589,6 @@ impl SimilarIndexScheduler {
             .collect::<Vec<_>>();
         excluded_root_keys.sort();
         excluded_root_keys.dedup();
-        *self
-            .enabled_roots
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = normalized;
-
         let password_revision = pdf_passwords.configuration_revision();
         let should_start = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2682,6 +2626,11 @@ impl SimilarIndexScheduler {
             });
             if !roots_changed && !password_changed {
                 return;
+            }
+            {
+                let mut scope = self.query_scope.lock().unwrap_or_else(|e| e.into_inner());
+                scope.revision = scope.revision.wrapping_add(1).max(1);
+                scope.roots = Arc::new(normalized);
             }
             state.config_epoch = state.config_epoch.wrapping_add(1).max(1);
             let config_epoch = state.config_epoch;
@@ -2732,7 +2681,6 @@ impl SimilarIndexScheduler {
             state.phase.cancel();
             state.reserve_worker_if_runnable()
         };
-        self.retain_loaded_snapshot_during_run();
         self.book_query.hard_invalidate();
         if should_start {
             self.spawn_worker();
@@ -3152,14 +3100,7 @@ impl SimilarIndexScheduler {
         let page_order_elapsed = page_order_started.elapsed();
         // configure と DB 作成が競合しても、実行中の worker が必ず eager load を開始する。
         // この呼び出しは既に Loading / Ready なら no-op で、パネル照会には依存しない。
-        start_memory_load(
-            &self.data_dir,
-            &self.memory,
-            &self.memory_epoch,
-            &self.item_query,
-            MemoryLoadTrigger::IndexRunOpen,
-            Some(Arc::downgrade(&self)),
-        );
+        self.array.ensure(ArrayDemand::LoadOrCreate);
 
         loop {
             let Some(plan) = self
@@ -3432,10 +3373,7 @@ impl SimilarIndexScheduler {
             #[cfg(test)]
             self.probe_startup("before_array_request");
             let ack_started = std::time::Instant::now();
-            self.request_array_refresh_through(watermark);
             if let Err(error) = self.wait_for_array_ack(watermark, &plan.running.cancel) {
-                #[cfg(test)]
-                self.trace_startup_investigation(&format!("array_ack={error:?}"));
                 match error {
                     ArrayAckWaitError::Cancelled => {
                         telemetry.log_terminal("cancelled", &outcome.report);
@@ -3484,7 +3422,7 @@ impl SimilarIndexScheduler {
             if reused_initial {
                 crate::logger::log(telemetry.reused_initial_log(
                     page_order_elapsed,
-                    self.memory_load_elapsed_us.load(Ordering::Relaxed),
+                    self.array.load_elapsed_us(),
                     ack_elapsed,
                 ));
                 if crate::perf::is_enabled() {
@@ -3549,42 +3487,10 @@ impl SimilarIndexScheduler {
 
     #[cfg(test)]
     fn probe_startup(&self, phase: &'static str) {
-        self.trace_startup_investigation(phase);
         let probe = self.startup_test_probe.lock().unwrap().clone();
         if let Some(probe) = probe {
             probe(phase);
         }
-    }
-
-    // Temporary investigation only; no production logging or scheduling changes.
-    #[cfg(test)]
-    fn trace_startup_investigation(&self, event: &str) {
-        if std::env::var_os("MIV_SIMILAR_STARTUP_TRACE").is_none() {
-            return;
-        }
-        let memory = {
-            let memory = self.memory.lock().unwrap();
-            match &*memory {
-                MemoryState::Unloaded => "Unloaded".to_owned(),
-                MemoryState::Loading => "Loading".to_owned(),
-                MemoryState::Missing => "Missing".to_owned(),
-                MemoryState::Failed(error) => format!("Failed({error})"),
-                MemoryState::Ready(snapshot) => format!("Ready(seq={})", snapshot.applied_seq),
-            }
-        };
-        let epoch = self.memory_epoch.load(Ordering::Acquire);
-        let array = {
-            let array = self.array_update.lock().unwrap();
-            format!(
-                "running={} requested={} required={:?} error={:?}",
-                array.running, array.requested, array.required_through, array.last_error
-            )
-        };
-        let progress = self.progress.lock().unwrap().clone();
-        eprintln!(
-            "SIMILAR_STARTUP scheduler={:p} event={event} memory={memory} epoch={epoch} array=[{array}] progress={progress:?}",
-            self
-        );
     }
 
     fn settle_interrupted_plan(
@@ -3638,76 +3544,12 @@ impl SimilarIndexScheduler {
         };
         drop(owner);
         // The global decode callback registration always carries the matching DB/scope pair.
-        register_prefill_db(&db, &self.enabled_roots);
+        register_prefill_db(&db, &self.query_scope);
         Ok(db)
     }
 
-    fn retain_loaded_snapshot_during_run(&self) {
-        self.memory_epoch.fetch_add(1, Ordering::AcqRel);
-        retain_ready_memory_or_unload(&mut self.memory.lock().unwrap_or_else(|e| e.into_inner()));
-    }
-
-    fn request_array_refresh(self: &Arc<Self>) {
-        self.start_array_refresh(None);
-    }
-
-    fn request_array_refresh_through(
-        self: &Arc<Self>,
-        watermark: crate::similar_db::StoreWatermark,
-    ) {
-        self.start_array_refresh(Some(watermark));
-    }
-
-    fn start_array_refresh(self: &Arc<Self>, watermark: Option<crate::similar_db::StoreWatermark>) {
-        let should_start = {
-            let mut state = self.array_update.lock().unwrap_or_else(|e| e.into_inner());
-            state.requested = true;
-            state.last_error = None;
-            if let Some(watermark) = watermark {
-                state.required_through = Some(match state.required_through {
-                    Some(current) if current.store_id == watermark.store_id => {
-                        crate::similar_db::StoreWatermark {
-                            store_id: current.store_id,
-                            through_change_seq: current
-                                .through_change_seq
-                                .max(watermark.through_change_seq),
-                        }
-                    }
-                    _ => watermark,
-                });
-            }
-            if state.running {
-                false
-            } else {
-                state.running = true;
-                true
-            }
-        };
-        if should_start {
-            let scheduler = Arc::clone(self);
-            if let Err(error) = std::thread::Builder::new()
-                .name("similar-array-update".to_owned())
-                .spawn(move || scheduler.array_update_loop())
-            {
-                {
-                    let mut state = self.array_update.lock().unwrap_or_else(|e| e.into_inner());
-                    state.running = false;
-                    state.last_error =
-                        Some(format!("similar array update worker start failed: {error}"));
-                }
-                crate::logger::log(format!("similar array update worker start failed: {error}"));
-                self.array_changed.notify_all();
-                self.book_query.soft_refresh();
-            }
-        }
-    }
-
-    fn snapshot_reaches(
-        snapshot: &SearchSnapshot,
-        watermark: crate::similar_db::StoreWatermark,
-    ) -> bool {
-        snapshot.base.store_id == watermark.store_id
-            && snapshot.applied_seq >= watermark.through_change_seq
+    fn request_array_refresh(&self) {
+        self.array.refresh();
     }
 
     fn wait_for_array_ack(
@@ -3715,271 +3557,48 @@ impl SimilarIndexScheduler {
         watermark: crate::similar_db::StoreWatermark,
         cancel: &AtomicBool,
     ) -> Result<(), ArrayAckWaitError> {
+        if self.array_ack_cancelled(cancel) {
+            return Err(ArrayAckWaitError::Cancelled);
+        }
+        let reply = self.array.request_through(watermark);
         loop {
-            if cancel.load(Ordering::Acquire)
-                || self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .shutdown
-            {
+            if self.array_ack_cancelled(cancel) {
                 return Err(ArrayAckWaitError::Cancelled);
             }
-            let awaiting_initial_load = {
-                let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-                match &*memory {
-                    MemoryState::Ready(snapshot) if Self::snapshot_reaches(snapshot, watermark) => {
-                        return Ok(());
-                    }
-                    MemoryState::Failed(error) => {
-                        return Err(ArrayAckWaitError::Failed(error.clone()));
-                    }
-                    MemoryState::Missing => {
-                        return Err(ArrayAckWaitError::Failed(
-                            "similar array publication source is missing".to_owned(),
-                        ));
-                    }
-                    MemoryState::Loading => true,
-                    MemoryState::Unloaded | MemoryState::Ready(_) => false,
+            match reply.recv_timeout(Duration::from_millis(100)) {
+                Ok(ArrayAck::Published(_)) => {
+                    return if self.array_ack_cancelled(cancel) {
+                        Err(ArrayAckWaitError::Cancelled)
+                    } else {
+                        Ok(())
+                    };
                 }
-            };
-            let state = self.array_update.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(error) = state.last_error.clone() {
-                return Err(ArrayAckWaitError::Failed(error));
+                Ok(ArrayAck::Stopped) => return Err(ArrayAckWaitError::Cancelled),
+                Ok(ArrayAck::Failed(failure)) => {
+                    return Err(ArrayAckWaitError::Failed(failure.to_string()));
+                }
+                Ok(ArrayAck::StoreChanged { expected, observed }) => {
+                    return Err(ArrayAckWaitError::Failed(format!(
+                        "StoreChanged: required={expected:?} observed={observed:?}"
+                    )));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ArrayAckWaitError::Failed(
+                        "array owner reply disconnected; mImageViewer を再起動してください。"
+                            .into(),
+                    ));
+                }
             }
-            if !awaiting_initial_load && !state.running && !state.requested {
-                return Err(ArrayAckWaitError::Failed(
-                    "similar array publication worker stopped before the requested watermark"
-                        .to_owned(),
-                ));
-            }
-            let _ = self
-                .array_changed
-                .wait_timeout(state, Duration::from_millis(100))
-                .unwrap_or_else(|e| e.into_inner());
         }
     }
-
-    fn array_update_loop(self: Arc<Self>) {
-        let db_path = SimilarDb::db_path_at(&self.data_dir);
-        let base_path = similar_search_array::base_path(&self.data_dir);
-        loop {
-            self.array_update
+    fn array_ack_cancelled(&self, cancel: &AtomicBool) -> bool {
+        cancel.load(Ordering::Acquire)
+            || self
+                .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .requested = false;
-            let snapshot = {
-                let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-                match &*memory {
-                    MemoryState::Ready(snapshot) => Some(Arc::clone(snapshot)),
-                    _ => None,
-                }
-            };
-            if let Some(snapshot) = snapshot {
-                let started = std::time::Instant::now();
-                let result = SimilarDb::open_at(&db_path)
-                    .map_err(db_error)
-                    .and_then(|db| {
-                        let batch = db
-                            .load_item_changes_after(snapshot.applied_seq)
-                            .map_err(db_error)?;
-                        match similar_search_array::apply_change_batch(&snapshot, batch) {
-                            Ok(Some(next)) => Ok((db, next, false)),
-                            Ok(None) => Ok((
-                                db,
-                                SearchSnapshot {
-                                    base: Arc::clone(&snapshot.base),
-                                    delta: Arc::clone(&snapshot.delta),
-                                    superseded: Arc::clone(&snapshot.superseded),
-                                    applied_seq: snapshot.applied_seq,
-                                },
-                                false,
-                            )),
-                            Err(_) => similar_search_array::rebuild_from_sqlite(&db, &base_path)
-                                .map(|next| (db, next, true)),
-                        }
-                    });
-                match result {
-                    Ok((db, next, rebuilt)) => {
-                        let changed = next.applied_seq != snapshot.applied_seq || rebuilt;
-                        let next = Arc::new(next);
-                        let active = if changed {
-                            if self.publish_snapshot_if_current(&snapshot, Arc::clone(&next)) {
-                                if rebuilt
-                                    && let Err(error) = db
-                                        .prune_item_changes_through(next.base.applied_seq)
-                                        .map_err(db_error)
-                                {
-                                    crate::logger::log(format!(
-                                        "similar array rebuilt history prune failed: {error}"
-                                    ));
-                                }
-                                Some(Arc::clone(&next))
-                            } else {
-                                self.array_update
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .requested = true;
-                                None
-                            }
-                        } else {
-                            Some(Arc::clone(&snapshot))
-                        };
-                        if changed && active.is_some() {
-                            crate::logger::log(format!(
-                                "similar array update: changes={} rebuilt={} elapsed_ms={:.1}",
-                                next.applied_seq.saturating_sub(snapshot.applied_seq),
-                                rebuilt,
-                                started.elapsed().as_secs_f64() * 1000.0
-                            ));
-                        }
-                        if active
-                            .as_ref()
-                            .is_some_and(|active| active.should_compact())
-                        {
-                            self.start_compaction(
-                                db,
-                                Arc::clone(active.as_ref().expect("checked active snapshot")),
-                            );
-                        }
-                        if let Some(active) = active {
-                            let mut state =
-                                self.array_update.lock().unwrap_or_else(|e| e.into_inner());
-                            if state
-                                .required_through
-                                .is_some_and(|required| Self::snapshot_reaches(&active, required))
-                            {
-                                state.required_through = None;
-                            }
-                            state.last_error = None;
-                            drop(state);
-                            self.array_changed.notify_all();
-                        }
-                    }
-                    Err(error) => {
-                        crate::logger::log(format!("similar array update failed: {error}"));
-                        self.array_update
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .last_error = Some(error);
-                        self.array_changed.notify_all();
-                    }
-                }
-            }
-            let mut state = self.array_update.lock().unwrap_or_else(|e| e.into_inner());
-            if state.requested {
-                continue;
-            }
-            state.running = false;
-            drop(state);
-            self.array_changed.notify_all();
-            return;
-        }
-    }
-
-    fn publish_snapshot_if_current(
-        &self,
-        expected: &Arc<SearchSnapshot>,
-        next: Arc<SearchSnapshot>,
-    ) -> bool {
-        let published = {
-            let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-            match &*memory {
-                MemoryState::Ready(current) if Arc::ptr_eq(current, expected) => {
-                    *memory = MemoryState::Ready(next);
-                    true
-                }
-                _ => false,
-            }
-        };
-        if published {
-            self.memory_epoch.fetch_add(1, Ordering::AcqRel);
-            self.item_query
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entries
-                .clear();
-            self.book_query.soft_refresh();
-        }
-        published
-    }
-
-    fn start_compaction(self: &Arc<Self>, db: SimilarDb, snapshot: Arc<SearchSnapshot>) {
-        if self
-            .compaction_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let scheduler = Arc::clone(self);
-        let base_path = similar_search_array::base_path(&self.data_dir);
-        let spawn = std::thread::Builder::new()
-            .name("similar-array-compact".to_owned())
-            .spawn(move || {
-                let started = std::time::Instant::now();
-                let base = Arc::new(similar_search_array::compacted_base(&snapshot));
-                let result = similar_search_array::write_compacted_base(&base_path, &base);
-                match result {
-                    Ok(()) => {
-                        // DB 更新が同時に進んでいても cutoff より新しい delta を残して公開する。
-                        // CAS に負けたら最新 snapshot でもう一度組み直す。公開できるまでは、
-                        // 新 base の復旧に必要な item_change を削除しない。
-                        let mut published = false;
-                        loop {
-                            let current = {
-                                let memory = scheduler
-                                    .memory
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                match &*memory {
-                                    MemoryState::Ready(current) => Some(Arc::clone(current)),
-                                    _ => None,
-                                }
-                            };
-                            let Some(current) = current else { break };
-                            let Ok(next) = similar_search_array::snapshot_on_new_base(
-                                &current,
-                                Arc::clone(&base),
-                            ) else {
-                                break;
-                            };
-                            if scheduler.publish_snapshot_if_current(&current, Arc::new(next)) {
-                                published = true;
-                                break;
-                            }
-                            std::thread::yield_now();
-                        }
-                        if published {
-                            match db.prune_item_changes_through(base.applied_seq) {
-                                Ok(_) => crate::logger::log(format!(
-                                    "similar array compaction: rows={} through_seq={} elapsed_ms={:.1}",
-                                    snapshot.record_count(),
-                                    snapshot.applied_seq,
-                                    started.elapsed().as_secs_f64() * 1000.0
-                                )),
-                                Err(error) => crate::logger::log(format!(
-                                    "similar array compaction history prune failed: {}",
-                                    db_error(error)
-                                )),
-                            }
-                        } else {
-                            crate::logger::log(
-                                "similar array compaction deferred publication; history retained",
-                            );
-                        }
-                    }
-                    Err(error) => crate::logger::log(format!("similar array compaction failed: {error}")),
-                }
-                scheduler.compaction_running.store(false, Ordering::Release);
-                scheduler.request_array_refresh();
-            });
-        if let Err(error) = spawn {
-            self.compaction_running.store(false, Ordering::Release);
-            crate::logger::log(format!(
-                "similar array compaction worker start failed: {error}"
-            ));
-        }
+                .shutdown
     }
 
     fn finish_worker(&self, progress: IndexProgress) {
@@ -3994,8 +3613,8 @@ impl SimilarIndexScheduler {
             state.shutdown = true;
             state.phase.cancel();
         }
-        self.array_changed.notify_all();
         self.book_query.shutdown();
+        self.array.close();
     }
 }
 
@@ -4007,14 +3626,6 @@ fn normalized_parent(key: &str) -> Option<&str> {
     let trimmed = key.trim_end_matches('/');
     let separator = trimmed.rfind('/')?;
     (separator > 2).then_some(&trimmed[..separator])
-}
-
-enum MemoryState {
-    Unloaded,
-    Loading,
-    Missing,
-    Ready(Arc<SearchSnapshot>),
-    Failed(String),
 }
 
 enum SummaryState {
@@ -4040,65 +3651,106 @@ const ITEM_QUERY_CACHE_LIMIT: usize = 6;
 
 struct CachedItemQuery {
     item_key: String,
-    memory_epoch: u64,
+    stamp: ItemQueryStamp,
     result: Arc<ItemQuery>,
 }
 
 fn cached_item_query(
-    cache: &Mutex<ItemQueryCache>,
+    cache: &ItemQueryCache,
     item_key: &str,
-    memory_epoch: u64,
+    stamp: ItemQueryStamp,
 ) -> Option<Arc<ItemQuery>> {
     cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .entries
         .iter()
-        .find(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
+        .find(|entry| entry.item_key == item_key && entry.stamp == stamp)
         .map(|entry| Arc::clone(&entry.result))
 }
 
 fn store_cached_item_query(
-    cache: &Mutex<ItemQueryCache>,
+    cache: &mut ItemQueryCache,
     item_key: &str,
-    memory_epoch: u64,
+    stamp: ItemQueryStamp,
     result: Arc<ItemQuery>,
-) {
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    cache
-        .entries
-        .retain(|entry| entry.item_key != item_key && entry.memory_epoch == memory_epoch);
+) -> Vec<CachedItemQuery> {
+    let mut retired = Vec::new();
+    for entry in std::mem::take(&mut cache.entries) {
+        if entry.item_key != item_key && entry.stamp == stamp {
+            cache.entries.push(entry);
+        } else {
+            retired.push(entry);
+        }
+    }
     cache.entries.push(CachedItemQuery {
         item_key: item_key.to_owned(),
-        memory_epoch,
+        stamp,
         result,
     });
     let overflow = cache.entries.len().saturating_sub(ITEM_QUERY_CACHE_LIMIT);
-    cache.entries.drain(..overflow);
+    retired.extend(cache.entries.drain(..overflow));
+    retired
 }
 
 fn replace_cached_item_query_if_current(
-    cache: &Mutex<ItemQueryCache>,
+    cache: &mut ItemQueryCache,
     item_key: &str,
-    memory_epoch: u64,
+    stamp: ItemQueryStamp,
     result: Arc<ItemQuery>,
-) -> bool {
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+) -> Option<Arc<ItemQuery>> {
     let Some(entry) = cache
         .entries
         .iter_mut()
-        .find(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
+        .find(|entry| entry.item_key == item_key && entry.stamp == stamp)
     else {
-        return false;
+        return None;
     };
-    entry.result = result;
-    true
+    Some(std::mem::replace(&mut entry.result, result))
 }
 
-fn retain_ready_memory_or_unload(state: &mut MemoryState) {
-    if !matches!(state, MemoryState::Ready(_)) {
-        *state = MemoryState::Unloaded;
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ItemQueryStamp {
+    scope_revision: u64,
+    publication_revision: u64,
+}
+#[derive(Default)]
+struct QueryScopeState {
+    revision: u64,
+    roots: Arc<Vec<String>>,
+    cache: ItemQueryCache,
+}
+enum ItemQueryLookup {
+    Immediate(Arc<ItemQuery>),
+    Load,
+    Start {
+        index: Arc<SearchSnapshot>,
+        stamp: ItemQueryStamp,
+        roots: Arc<Vec<String>>,
+        preparing: Arc<ItemQuery>,
+        retired: Vec<CachedItemQuery>,
+    },
+}
+fn complete_item_query(
+    array: &SimilarArrayHandle,
+    scope: &Mutex<QueryScopeState>,
+    key: &str,
+    stamp: ItemQueryStamp,
+    result: Arc<ItemQuery>,
+) -> bool {
+    let retired = array.with_observation(|observation| {
+        if observation
+            .published()
+            .is_none_or(|value| value.revision != stamp.publication_revision)
+        {
+            return None;
+        }
+        let mut scope = scope.lock().unwrap_or_else(|e| e.into_inner());
+        if scope.revision != stamp.scope_revision {
+            return None;
+        }
+        replace_cached_item_query_if_current(&mut scope.cache, key, stamp, Arc::clone(&result))
+    });
+    // Both rejected results and replaced payloads are released after the owner/scope guards.
+    retired.is_some()
 }
 
 fn query_item_ready(db: &SimilarDb, snapshot: &SearchSnapshot, item_key: &str) -> ItemQuery {
@@ -7002,40 +6654,40 @@ fn pdf_page_key(normalized_pdf_path: &str, page_num: u32) -> String {
 
 struct PrefillRegistration {
     db: Weak<SimilarDb>,
-    enabled_roots: Weak<RwLock<Vec<String>>>,
+    query_scope: Weak<Mutex<QueryScopeState>>,
 }
 
 static PREFILL_DB: OnceLock<RwLock<Option<PrefillRegistration>>> = OnceLock::new();
 
-fn register_prefill_db(db: &Arc<SimilarDb>, enabled_roots: &Arc<RwLock<Vec<String>>>) {
+fn register_prefill_db(db: &Arc<SimilarDb>, query_scope: &Arc<Mutex<QueryScopeState>>) {
     *PREFILL_DB
         .get_or_init(|| RwLock::new(None))
         .write()
         .unwrap_or_else(|e| e.into_inner()) = Some(PrefillRegistration {
         db: Arc::downgrade(db),
-        enabled_roots: Arc::downgrade(enabled_roots),
+        query_scope: Arc::downgrade(query_scope),
     });
 }
 
 #[cfg(test)]
 pub(crate) fn register_prefill_db_for_test(db: &Arc<SimilarDb>) {
     // decode target 不変条件のテスト用。scope owner を保持しないため prefill 自体は無効。
-    register_prefill_db(db, &Arc::new(RwLock::new(Vec::new())));
+    register_prefill_db(db, &Arc::new(Mutex::new(QueryScopeState::default())));
 }
 
-fn prefill_target() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)> {
+fn prefill_target() -> Option<(Arc<SimilarDb>, Arc<Mutex<QueryScopeState>>)> {
     let registration = PREFILL_DB.get()?.read().unwrap_or_else(|e| e.into_inner());
     let registration = registration.as_ref()?;
-    let enabled_roots = registration.enabled_roots.upgrade()?;
-    Some((registration.db.upgrade()?, enabled_roots))
+    let query_scope = registration.query_scope.upgrade()?;
+    Some((registration.db.upgrade()?, query_scope))
 }
 
 fn thumbnail_prefill_scope_allows(
-    enabled_roots: &RwLock<Vec<String>>,
+    query_scope: &Mutex<QueryScopeState>,
     normalized_path: &str,
 ) -> bool {
-    let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
-    key_is_under_any(normalized_path, &roots)
+    let scope = query_scope.lock().unwrap_or_else(|e| e.into_inner());
+    key_is_under_any(normalized_path, &scope.roots)
 }
 
 struct PreparedThumbnailPrefill {
@@ -7052,7 +6704,7 @@ struct ThumbnailPrefillPrepareError {
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_thumbnail_prefill(
-    enabled_roots: &RwLock<Vec<String>>,
+    query_scope: &Mutex<QueryScopeState>,
     path: &Path,
     zip_entry: Option<&str>,
     pdf_page: Option<u32>,
@@ -7064,7 +6716,7 @@ fn prepare_thumbnail_prefill(
     let normalized_path = crate::search_index_db::normalize_path(path);
     // Fast rejection only. This helper returns an owned value, so its scope guard cannot survive
     // the decode/signature work or the later DB wait.
-    if !thumbnail_prefill_scope_allows(enabled_roots, &normalized_path) {
+    if !thumbnail_prefill_scope_allows(query_scope, &normalized_path) {
         return Ok(None);
     }
     let (item_key, kind, format) = if let Some(entry) = zip_entry {
@@ -7122,11 +6774,11 @@ fn prepare_thumbnail_prefill(
 
 fn store_offered_thumbnail_prefill(
     db: &SimilarDb,
-    enabled_roots: &RwLock<Vec<String>>,
+    query_scope: &Mutex<QueryScopeState>,
     prepared: &PreparedThumbnailPrefill,
 ) -> rusqlite::Result<bool> {
     db.put_prefill_if(&prepared.item, || {
-        thumbnail_prefill_scope_allows(enabled_roots, &prepared.normalized_path)
+        thumbnail_prefill_scope_allows(query_scope, &prepared.normalized_path)
     })
 }
 
@@ -7186,7 +6838,7 @@ fn offer_thumbnail_raster_with_target_resolver(
     file_size: i64,
     image: &image::DynamicImage,
     source_dims: (u32, u32),
-    resolve_target: impl FnOnce() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)>,
+    resolve_target: impl FnOnce() -> Option<(Arc<SimilarDb>, Arc<Mutex<QueryScopeState>>)>,
 ) -> crate::perf::stall::Timing {
     // This direct capability gate is intentional.  A stale process-global test registration (or
     // a future accidental manager construction) must not turn ordinary thumbnail decoding into
@@ -7194,11 +6846,11 @@ fn offer_thumbnail_raster_with_target_resolver(
     if !capability.is_enabled() {
         return crate::perf::stall::Timing::default();
     }
-    let Some((db, enabled_roots)) = resolve_target() else {
+    let Some((db, query_scope)) = resolve_target() else {
         return crate::perf::stall::Timing::default();
     };
     let prepared = match prepare_thumbnail_prefill(
-        &enabled_roots,
+        &query_scope,
         path,
         zip_entry,
         pdf_page,
@@ -7218,7 +6870,7 @@ fn offer_thumbnail_raster_with_target_resolver(
         }
     };
     let db_started = crate::perf::stall::Span::start();
-    let result = store_offered_thumbnail_prefill(&db, &enabled_roots, &prepared);
+    let result = store_offered_thumbnail_prefill(&db, &query_scope, &prepared);
     let db_timing = db_started.map(|at| at.finish()).unwrap_or_default();
     if let Err(error) = result {
         crate::logger::log(format!(
@@ -7250,8 +6902,8 @@ fn raster_is_large_enough_for_canonical_proxy(
 }
 
 #[cfg(test)]
-#[path = "similar_startup_investigation.rs"]
-mod startup_investigation;
+#[path = "similar_array_owner_regression.rs"]
+mod array_owner_regression;
 
 #[cfg(test)]
 mod tests {
@@ -7697,16 +7349,32 @@ mod tests {
                 other => panic!("unexpected benchmark result: {other:?}"),
             };
         }
-        let cache = Mutex::new(ItemQueryCache::default());
+        let mut cache = ItemQueryCache::default();
         let cache_miss_started = std::time::Instant::now();
         let cached = Arc::new(query_item_ready(&db, &index, &origin_key));
-        store_cached_item_query(&cache, &origin_key, 7, Arc::clone(&cached));
+        store_cached_item_query(
+            &mut cache,
+            &origin_key,
+            ItemQueryStamp {
+                scope_revision: 0,
+                publication_revision: 7,
+            },
+            Arc::clone(&cached),
+        );
         let cache_miss_ms = cache_miss_started.elapsed().as_secs_f64() * 1000.0;
         let mut cache_hit_ms = Vec::new();
         for _ in 0..3 {
             let started = std::time::Instant::now();
             let again = std::hint::black_box(
-                cached_item_query(&cache, &origin_key, 7).expect("cache hit missing"),
+                cached_item_query(
+                    &cache,
+                    &origin_key,
+                    ItemQueryStamp {
+                        scope_revision: 0,
+                        publication_revision: 7,
+                    },
+                )
+                .expect("cache hit missing"),
             );
             cache_hit_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             assert!(Arc::ptr_eq(&cached, &again));
@@ -7766,8 +7434,8 @@ mod tests {
         assert_eq!(existing.source, similar_search_array::LoadSource::BaseFile);
 
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.memory.lock().unwrap() = MemoryState::Ready(Arc::new(existing.snapshot));
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.install_snapshot_for_test(Arc::new(existing.snapshot));
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
         let origin = db
             .load_item("c:/library/item-1.png", current_hash_version())
             .unwrap()
@@ -7791,13 +7459,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let add_to_query_ms = add_to_query_ms.expect("incremental add did not reach query");
-        let current = {
-            let memory = manager.memory.lock().unwrap();
-            let MemoryState::Ready(current) = &*memory else {
-                panic!("snapshot disappeared");
-            };
-            Arc::clone(current)
-        };
+        let current = { manager.snapshot_for_test() };
         assert_eq!(current.delta.len(), 1);
 
         let compact_started = std::time::Instant::now();
@@ -8510,52 +8172,119 @@ mod tests {
     }
 
     #[test]
-    fn item_query_cache_changes_only_with_origin_or_memory_epoch() {
-        let cache = Mutex::new(ItemQueryCache::default());
+    fn item_query_cache_changes_only_with_origin_or_query_stamp() {
+        let mut cache = ItemQueryCache::default();
         let first = Arc::new(ItemQuery::Ready(empty_matches()));
-        store_cached_item_query(&cache, "origin-a", 4, Arc::clone(&first));
-        let same = cached_item_query(&cache, "origin-a", 4).unwrap();
+        store_cached_item_query(
+            &mut cache,
+            "origin-a",
+            ItemQueryStamp {
+                scope_revision: 0,
+                publication_revision: 4,
+            },
+            Arc::clone(&first),
+        );
+        let same = cached_item_query(
+            &cache,
+            "origin-a",
+            ItemQueryStamp {
+                scope_revision: 0,
+                publication_revision: 4,
+            },
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&first, &same));
-        assert!(cached_item_query(&cache, "origin-b", 4).is_none());
-        assert!(cached_item_query(&cache, "origin-a", 5).is_none());
+        assert!(
+            cached_item_query(
+                &cache,
+                "origin-b",
+                ItemQueryStamp {
+                    scope_revision: 0,
+                    publication_revision: 4
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            cached_item_query(
+                &cache,
+                "origin-a",
+                ItemQueryStamp {
+                    scope_revision: 0,
+                    publication_revision: 5
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn stale_item_query_worker_cannot_replace_a_newer_origin() {
-        let cache = Mutex::new(ItemQueryCache::default());
+        let mut cache = ItemQueryCache::default();
         store_cached_item_query(
-            &cache,
+            &mut cache,
             "origin-b",
-            7,
+            ItemQueryStamp {
+                scope_revision: 0,
+                publication_revision: 7,
+            },
             Arc::new(ItemQuery::Ready(empty_matches())),
         );
-        assert!(!replace_cached_item_query_if_current(
-            &cache,
-            "origin-a",
-            7,
-            Arc::new(ItemQuery::Featureless),
-        ));
+        assert!(
+            replace_cached_item_query_if_current(
+                &mut cache,
+                "origin-a",
+                ItemQueryStamp {
+                    scope_revision: 0,
+                    publication_revision: 7
+                },
+                Arc::new(ItemQuery::Featureless),
+            )
+            .is_none()
+        );
 
         assert!(matches!(
-            cached_item_query(&cache, "origin-b", 7).as_deref(),
+            cached_item_query(
+                &cache,
+                "origin-b",
+                ItemQueryStamp {
+                    scope_revision: 0,
+                    publication_revision: 7
+                }
+            )
+            .as_deref(),
             Some(ItemQuery::Ready(_))
         ));
-        assert!(cached_item_query(&cache, "origin-a", 7).is_none());
+        assert!(
+            cached_item_query(
+                &cache,
+                "origin-a",
+                ItemQueryStamp {
+                    scope_revision: 0,
+                    publication_revision: 7
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
-    fn active_run_keeps_only_a_complete_loaded_snapshot() {
-        let ready = Arc::new(snapshot_from_rows(&[row(1, "origin", [0; 32], 1)]));
-        let mut state = MemoryState::Ready(Arc::clone(&ready));
-        retain_ready_memory_or_unload(&mut state);
-        let MemoryState::Ready(retained) = state else {
-            panic!("complete snapshot was dropped");
-        };
-        assert!(Arc::ptr_eq(&ready, &retained));
-
-        let mut loading = MemoryState::Loading;
-        retain_ready_memory_or_unload(&mut loading);
-        assert!(matches!(loading, MemoryState::Unloaded));
+    fn configuration_retains_the_store_publication_and_invalidates_query_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let snapshot = Arc::new(snapshot_from_rows(&[row(1, "origin", [0; 32], 1)]));
+        manager.install_snapshot_for_test(Arc::clone(&snapshot));
+        let before = manager.query_stamp_for_test();
+        manager.configure(
+            &[],
+            crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            None,
+            Vec::new(),
+        );
+        let after = manager.query_stamp_for_test();
+        assert_eq!(before.publication_revision, after.publication_revision);
+        assert_ne!(before.scope_revision, after.scope_revision);
+        assert!(Arc::ptr_eq(&snapshot, &manager.snapshot_for_test()));
     }
 
     #[test]
@@ -8663,10 +8392,11 @@ mod tests {
             applied_seq: base.applied_seq,
         });
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.memory.lock().unwrap() = MemoryState::Ready(Arc::new(snapshot));
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
-        let epoch = manager.memory_epoch.load(Ordering::Acquire);
+        manager.install_snapshot_for_test(Arc::new(snapshot));
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
+        let stamp = manager.query_stamp_for_test();
         let run_query = |key: &str, terminal_before_completion: Option<IndexProgress>| {
+            manager.scheduler.state.lock().unwrap().phase = SchedulerPhase::Starting;
             *manager.progress.lock().unwrap() = IndexProgress::Running(RunningProgress {
                 stage: IndexStage::Scanning,
                 current_path: None,
@@ -8687,18 +8417,20 @@ mod tests {
                 .expect("query worker reached the deterministic barrier");
             if let Some(terminal) = terminal_before_completion.clone() {
                 *manager.progress.lock().unwrap() = terminal;
+                manager.scheduler.state.lock().unwrap().phase = SchedulerPhase::Idle;
             }
             resume_tx.send(()).unwrap();
             completed_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("query worker published its terminal cache entry");
-            let cached = cached_item_query(&manager.item_query, key, epoch)
+            let cached = cached_item_query(&manager.query_scope.lock().unwrap().cache, key, stamp)
                 .expect("terminal query result is cached");
             assert_eq!(cached.as_ref(), &ItemQuery::NotIndexed);
 
             if terminal_before_completion.is_none() {
                 assert_eq!(manager.query_item(key).as_ref(), &ItemQuery::Preparing);
                 *manager.progress.lock().unwrap() = IndexProgress::Idle;
+                manager.scheduler.state.lock().unwrap().phase = SchedulerPhase::Idle;
             }
             let projected = manager.query_item(key);
             assert_eq!(projected.as_ref(), &ItemQuery::NotIndexed);
@@ -8753,10 +8485,10 @@ mod tests {
     fn off_scope_update_completes_while_prefill_holds_db_then_rejects_insert() {
         let temp = tempfile::tempdir().unwrap();
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
         let db = manager.scheduler.db_for_worker().unwrap();
         let prepared = prepare_thumbnail_prefill(
-            &manager.enabled_roots,
+            &manager.query_scope,
             Path::new("c:/library/racing.png"),
             None,
             None,
@@ -8785,7 +8517,7 @@ mod tests {
             db_owned_rx.recv().unwrap();
 
             let offer_db = Arc::clone(&db);
-            let roots = Arc::clone(&manager.enabled_roots);
+            let roots = Arc::clone(&manager.query_scope);
             let offered = &prepared;
             let offer_thread =
                 scope.spawn(move || store_offered_thumbnail_prefill(&offer_db, &roots, offered));
@@ -8825,7 +8557,7 @@ mod tests {
     fn old_scope_insert_finishes_before_the_already_completed_off_purge() {
         let temp = tempfile::tempdir().unwrap();
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
         let db = manager.scheduler.db_for_worker().unwrap();
         let prefill = row(1, "c:/library/racing.png", [9; 32], 10).item;
         let (scope_released_tx, scope_released_rx) = std::sync::mpsc::channel();
@@ -8836,12 +8568,13 @@ mod tests {
 
         std::thread::scope(|scope| {
             let prefill_db = Arc::clone(&db);
-            let roots = Arc::clone(&manager.enabled_roots);
+            let roots = Arc::clone(&manager.query_scope);
             let candidate = prefill.clone();
             let writer = scope.spawn(move || {
                 prefill_db.put_prefill_if(&candidate, || {
                     let allowed = {
-                        let roots = roots.read().unwrap_or_else(|e| e.into_inner());
+                        let scope = roots.lock().unwrap_or_else(|e| e.into_inner());
+                        let roots = &scope.roots;
                         key_is_under_any(&candidate.item_key, &roots)
                     };
                     scope_released_tx.send(()).unwrap();
@@ -8991,8 +8724,8 @@ mod tests {
         ));
 
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.memory.lock().unwrap() = MemoryState::Ready(index);
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.install_snapshot_for_test(index);
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
         assert_eq!(*manager.query_item(&origin.item_key), ItemQuery::Preparing);
 
         for _ in 0..100 {
@@ -9033,8 +8766,8 @@ mod tests {
             },
         ));
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.memory.lock().unwrap() = MemoryState::Ready(index);
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.install_snapshot_for_test(index);
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
 
         // 描画のたびに両方を引く、という UI と同じ順で回す。
         let mut settled = [None, None];
@@ -9116,8 +8849,8 @@ mod tests {
         let original_base = Arc::clone(&loaded.snapshot.base);
 
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.memory.lock().unwrap() = MemoryState::Ready(Arc::new(loaded.snapshot));
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.install_snapshot_for_test(Arc::new(loaded.snapshot));
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
 
         let mut near_signature = [0u8; 32];
         near_signature[0] = 1;
@@ -9132,10 +8865,7 @@ mod tests {
                 && hits.iter().any(|hit| hit.item_key == near.item_key)
             {
                 let elapsed = started.elapsed();
-                let current = manager.memory.lock().unwrap();
-                let MemoryState::Ready(current) = &*current else {
-                    panic!("snapshot disappeared");
-                };
+                let current = manager.snapshot_for_test();
                 assert!(Arc::ptr_eq(&original_base, &current.base));
                 assert_eq!(current.delta.len(), 1);
                 eprintln!(
@@ -9173,21 +8903,17 @@ mod tests {
         let latest_seq = db.load_item_changes_after(0).unwrap().latest_seq;
 
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.memory.lock().unwrap() = MemoryState::Ready(Arc::new(loaded.snapshot));
+        manager.install_snapshot_for_test(Arc::new(loaded.snapshot));
         manager.scheduler.request_array_refresh();
 
         for _ in 0..500 {
-            let state = manager.memory.lock().unwrap();
-            let MemoryState::Ready(current) = &*state else {
-                panic!("history recovery must retain a usable snapshot");
-            };
+            let current = manager.snapshot_for_test();
             if current.applied_seq == latest_seq {
                 assert!(!Arc::ptr_eq(&old_base, &current.base));
                 assert_eq!(current.base.records.len(), 3);
                 return;
             }
             assert!(Arc::ptr_eq(&old_base, &current.base));
-            drop(state);
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("missing history did not rebuild and publish a current base");
@@ -9210,8 +8936,8 @@ mod tests {
         );
 
         assert!(!matches!(
-            *manager.memory.lock().unwrap(),
-            MemoryState::Unloaded
+            manager.array.observe(),
+            ArrayObservation::Uninitialized { busy: false }
         ));
     }
 
@@ -9244,7 +8970,10 @@ mod tests {
             .set_watch_health(&registration, WatchHealth::Ready, None);
 
         for _ in 0..100 {
-            if !matches!(*manager.memory.lock().unwrap(), MemoryState::Unloaded) {
+            if !matches!(
+                manager.array.observe(),
+                ArrayObservation::Uninitialized { busy: false }
+            ) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -9255,7 +8984,8 @@ mod tests {
     #[test]
     fn panel_query_during_a_run_does_not_start_the_eager_load() {
         let manager = SimilarIndexManager::new(PathBuf::from("unused-test-data-dir"));
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
+        manager.scheduler.state.lock().unwrap().phase = SchedulerPhase::Starting;
         *manager.progress.lock().unwrap() = IndexProgress::Running(RunningProgress {
             stage: IndexStage::Scanning,
             current_path: None,
@@ -9267,8 +8997,8 @@ mod tests {
             &ItemQuery::Preparing
         );
         assert!(matches!(
-            *manager.memory.lock().unwrap(),
-            MemoryState::Unloaded
+            manager.array.observe(),
+            ArrayObservation::Uninitialized { busy: false }
         ));
     }
 
@@ -9276,7 +9006,7 @@ mod tests {
     fn missing_store_remains_a_distinct_no_index_result() {
         let temp = tempfile::tempdir().unwrap();
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
         assert_eq!(
             manager.query_item("c:/library/page.jpg").as_ref(),
             &ItemQuery::Preparing
@@ -9482,7 +9212,7 @@ mod tests {
                 let _ = notify_tx.send(());
             },
         );
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
         let client = SimilarBookQueryClient::new();
 
         assert_eq!(
@@ -9521,7 +9251,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(SimilarDb::db_path_at(temp.path())).unwrap();
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
         let first = SimilarBookQueryClient::new();
         let second = SimilarBookQueryClient::new();
 
@@ -9548,8 +9278,10 @@ mod tests {
             &[book_page("c:/library/book", 0, 9)],
         );
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
-        *manager.memory.lock().unwrap() = MemoryState::Loading;
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
+        manager
+            .array
+            .install_for_test(ArrayObservation::Uninitialized { busy: true });
         let client = SimilarBookQueryClient::new();
 
         assert_eq!(
@@ -9562,7 +9294,7 @@ mod tests {
             &BookQuery::Preparing
         );
 
-        *manager.memory.lock().unwrap() = MemoryState::Missing;
+        manager.array.install_for_test(ArrayObservation::Missing);
         manager.scheduler.book_query.soft_refresh();
         assert!(matches!(
             wait_for_book_terminal(&manager, &client, "c:/library/book").as_ref(),
@@ -9581,8 +9313,8 @@ mod tests {
             &[book_page("c:/library/book", 0, 11)],
         );
         let manager = SimilarIndexManager::new(temp.path().to_path_buf());
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
-        *manager.memory.lock().unwrap() = MemoryState::Missing;
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
+        manager.array.install_for_test(ArrayObservation::Missing);
         let retained = SimilarBookQueryClient::new();
         let active = SimilarBookQueryClient::new();
 
@@ -9660,13 +9392,15 @@ mod tests {
                 let _ = notify_tx.send(());
             },
         );
-        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
-        *manager.memory.lock().unwrap() = MemoryState::Missing;
+        manager.query_scope.lock().unwrap().roots = Arc::new(vec!["c:/library".to_owned()]);
+        manager.array.install_for_test(ArrayObservation::Missing);
         let (probe, mut phase_control) =
             crate::similar_book_query_test_probe::BookQueryTestPhaseProbe::new(
                 crate::similar_book_query_test_probe::BookQueryTestPhase::SqlProgress,
             );
         manager.set_book_query_test_phase_probe(probe);
+        // Separate the fixture's readiness wake from subsequent query-result notifications.
+        while notify_rx.try_recv().is_ok() {}
         let client_a = SimilarBookQueryClient::new();
         let client_b = SimilarBookQueryClient::new();
 
@@ -10783,6 +10517,8 @@ mod tests {
         )
         .item;
         db.put_prefill(&prefill).unwrap();
+        manager.scheduler.shutdown();
+        manager.array.wait_closed_for_test();
         drop(manager);
         drop(db);
 
@@ -10838,6 +10574,8 @@ mod tests {
             assert_eq!(db.cleanup_incomplete_call_count(), 1);
             assert_eq!(manager.reconcile_job_counts_for_test(), (0, 0));
             assert!(db.scanned_once_matches(&fingerprint).unwrap());
+            manager.scheduler.shutdown();
+            manager.array.wait_closed_for_test();
         }
     }
 
@@ -11109,6 +10847,7 @@ mod tests {
             let cancelled_loader_calls = usize::from(!off_purge);
             assert_eq!(db.full_inventory_load_count(), cancelled_loader_calls);
             assert!(!db.scanned_once_matches(&fingerprint).unwrap());
+            manager.array.wait_closed_for_test();
             drop(manager);
             drop(db);
 
@@ -11132,9 +10871,6 @@ mod tests {
                     }
                 }));
             Arc::clone(&restarted.scheduler).worker_loop();
-            restarted
-                .scheduler
-                .trace_startup_investigation("restarted_worker_returned");
             assert!(!reused.load(Ordering::Acquire));
             assert_eq!(restarted.reconcile_job_counts_for_test(), (1, 0));
             assert_eq!(db.full_inventory_load_count(), 1);
@@ -12051,27 +11787,22 @@ mod tests {
             store_id: [3; 16],
             applied_seq: 8,
         });
-        assert!(SimilarIndexScheduler::snapshot_reaches(
-            &snapshot,
-            crate::similar_db::StoreWatermark {
-                store_id: [3; 16],
-                through_change_seq: 8,
-            }
-        ));
-        assert!(!SimilarIndexScheduler::snapshot_reaches(
-            &snapshot,
-            crate::similar_db::StoreWatermark {
-                store_id: [3; 16],
-                through_change_seq: 9,
-            }
-        ));
-        assert!(!SimilarIndexScheduler::snapshot_reaches(
-            &snapshot,
-            crate::similar_db::StoreWatermark {
-                store_id: [4; 16],
-                through_change_seq: 1,
-            }
-        ));
+        let published = PublishedArray {
+            snapshot: Arc::new(snapshot),
+            revision: 1,
+        };
+        assert!(published.reaches(crate::similar_db::StoreWatermark {
+            store_id: [3; 16],
+            through_change_seq: 8,
+        }));
+        assert!(!published.reaches(crate::similar_db::StoreWatermark {
+            store_id: [3; 16],
+            through_change_seq: 9,
+        }));
+        assert!(!published.reaches(crate::similar_db::StoreWatermark {
+            store_id: [4; 16],
+            through_change_seq: 1,
+        }));
     }
 
     #[test]

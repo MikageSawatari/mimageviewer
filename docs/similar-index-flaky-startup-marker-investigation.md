@@ -285,3 +285,15 @@ C62BEBFAE8AF2BCF883BEB2CB618A4E56002CEAC8659B0E97D29B410CB333D30  controlled-rec
 アプリの実行時挙動を修正していないので dev verification binary は作成しない。
 全件・workspace/vendor gate も修正完了の証拠としては実行していない。今回の全件失敗の調査に必要な
 負荷 stress と headless witness を優先した。
+
+## 9. 後継実装への引き継ぎ（2026-10-19）
+
+利用者承認後の修正は [単一配列 owner 計画 §16](similar-index-array-owner-plan.md#16-実装記録)
+に記録する。本書 §1〜§8 とその失敗ログは調査時点の証拠であり、修正後の結果へ書き換えない。
+旧 ignored witness は `src/similar_array_owner_regression.rs` の
+`reconfigure_overlapping_requests_share_one_load_and_full_writes_marker` へ反転し、通常回帰とした。
+二つ目の loader を待つ barrier と epoch/discard の stderr、`MIV_SIMILAR_STARTUP_TRACE` の製品/test仕組みは撤去した。
+
+負荷 helper の再生成手順は後継計画 §16、正本は `scripts/stress-similar-index.py`。
+既存の `target/similar-startup-investigation/stress-load.py` をこの正本からコピーし、同じ負荷条件で
+`--stress-count 20` を指定する。修正後のログ名は `owner-cpu-load-20.log` とし、調査時の失敗証跡を上書きしない。
