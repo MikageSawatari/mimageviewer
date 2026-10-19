@@ -5101,6 +5101,8 @@ impl App {
     /// モード」設定で、動画 HUD のトグルと同じ値を切り替える。
     #[cfg(windows)]
     pub(crate) fn toggle_still_window_mode(&mut self) {
+        // The physical input owner belongs to the old rendering viewport, not the new one.
+        self.fs_front_pointer = Default::default();
         let in_window = !self.settings.video_in_window_mode;
         let now = std::time::Instant::now();
         crate::dwm_transitions::disable_transitions_for_thread_windows();
@@ -5176,6 +5178,9 @@ impl App {
     /// 「ユーザーが見ていない未確定モード」が次回起動時に持ち越される。
     #[cfg(windows)]
     pub(crate) fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
+        if self.viewer_presentation != presentation {
+            self.fs_front_pointer = Default::default();
+        }
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;

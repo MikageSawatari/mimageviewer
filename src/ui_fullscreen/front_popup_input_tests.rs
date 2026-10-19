@@ -59,20 +59,30 @@ fn output(
     rect: egui::Rect,
     events: Vec<egui::Event>,
 ) -> egui::FullOutput {
+    output_in_viewport(app, ctx, rect, egui::ViewportId::ROOT, events)
+}
+
+fn output_in_viewport(
+    app: &mut App,
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    viewport_id: egui::ViewportId,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
     app.frame_counter += 1;
+    let mut input = egui::RawInput {
+        viewport_id,
+        screen_rect: Some(rect),
+        time: Some(app.frame_counter as f64 / 60.0),
+        focused: true,
+        events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::NONE))
+            .chain(events)
+            .collect(),
+        ..Default::default()
+    };
+    input.viewports.entry(viewport_id).or_default().focused = Some(true);
     let output = crate::test_ui::headless_paint_output(
-        ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(rect),
-                time: Some(app.frame_counter as f64 / 60.0),
-                focused: true,
-                events: std::iter::once(egui::Event::ModifiersChanged(egui::Modifiers::NONE))
-                    .chain(events)
-                    .collect(),
-                ..Default::default()
-            },
-            |ui| app.render_fullscreen_viewport(ui),
-        ),
+        ctx.run_ui(input, |ui| app.render_fullscreen_viewport(ui)),
     );
     output
 }
@@ -747,6 +757,11 @@ fn front_popup_and_overflow_hold_survive_real_arrow_page_navigation() {
             egui::PointerButton::Secondary,
             egui::PointerButton::Middle,
         ] {
+            if overflow && which == egui::PointerButton::Middle {
+                // Overflow preserves the released middle-button canvas behavior;
+                // only menus own middle input until its physical release.
+                continue;
+            }
             let ctx = egui::Context::default();
             let rect = viewport(1093.0);
             let mut app = sources(&ctx, [320, 160]);
@@ -1480,5 +1495,476 @@ fn front_popup_owned_release_and_new_canvas_press_in_one_pass_keep_their_own_edg
             frame(&mut app, &ctx, rect, vec![button(end, false)]);
         }
         assert!(!app.fs_front_pointer.is_active());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn front_popup_actual_f11_round_trip_retires_the_old_viewport_pointer_owner() {
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    app.settings.video_in_window_mode = false;
+    app.native_video_in_window_active = false;
+    app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+    app.fs_zoom = 2.0;
+    let full = app.fullscreen_viewport_id();
+    assert_ne!(full, egui::ViewportId::ROOT);
+    // Supply actual nested immediate viewport passes, rather than egui's
+    // embedded Window fallback, with input local to the destination viewport.
+    let child_input = std::rc::Rc::new(std::cell::RefCell::new((0.0, Vec::<egui::Event>::new())));
+    let child_launcher = std::rc::Rc::new(std::cell::Cell::new(None));
+    let input = child_input.clone();
+    let launcher = child_launcher.clone();
+    ctx.set_embed_viewports(false);
+    egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+        let (time, events) = input.borrow().clone();
+        let mut raw = egui::RawInput {
+            viewport_id: viewport.ids.this,
+            screen_rect: Some(rect),
+            time: Some(time),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        raw.viewports.insert(
+            viewport.ids.this,
+            egui::ViewportInfo {
+                parent: Some(viewport.ids.parent),
+                focused: Some(true),
+                ..Default::default()
+            },
+        );
+        crate::test_ui::headless_paint_output(ctx.run_ui(raw, |ui| {
+            (viewport.viewport_ui_cb)(ui);
+            launcher.set(
+                ctx.read_response(egui::Id::unique("fs_margin_fit_btn"))
+                    .map(|response| response.rect.center()),
+            );
+        }))
+        .drop_without_applying_deltas();
+    });
+    let paint = |app: &mut App, viewport_id, events: Vec<egui::Event>| {
+        assert_eq!(
+            viewport_id == egui::ViewportId::ROOT,
+            app.native_video_in_window_active
+        );
+        let root_events = if viewport_id == egui::ViewportId::ROOT {
+            *child_input.borrow_mut() = ((app.frame_counter + 1) as f64 / 60.0, Vec::new());
+            events
+        } else {
+            assert_eq!(viewport_id, app.fullscreen_viewport_id());
+            *child_input.borrow_mut() = ((app.frame_counter + 1) as f64 / 60.0, events);
+            Vec::new()
+        };
+        frame(app, &ctx, rect, root_events);
+    };
+    for _ in 0..4 {
+        paint(&mut app, full, vec![]);
+    }
+    assert_page(&app);
+    let launcher = child_launcher
+        .get()
+        .expect("actual fullscreen child must draw its fit launcher");
+    for events in [
+        vec![egui::Event::PointerMoved(launcher)],
+        vec![button(launcher, true)],
+        vec![button(launcher, false)],
+    ] {
+        paint(&mut app, full, events);
+    }
+    for _ in 0..4 {
+        paint(&mut app, full, vec![]);
+    }
+    assert!(app.fit_popup_open);
+    let old = outside_image_point(&app);
+    paint(
+        &mut app,
+        full,
+        vec![egui::Event::PointerMoved(old), button(old, true)],
+    );
+    assert!(app.fs_front_pointer.is_active());
+    // Dispatch the actual F11 binding, and intentionally never send the old
+    // fullscreen viewport a release while the renderer transfers to ROOT.
+    paint(&mut app, full, vec![key(egui::Key::F11, true)]);
+    assert!(app.settings.video_in_window_mode);
+    assert_eq!(
+        app.viewer_presentation,
+        crate::app::ViewerPresentation::MainWindow
+    );
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "F11 must retire the old viewport owner"
+    );
+    settle(&mut app, &ctx, rect);
+    let start = egui::pos2(280.0, 340.0);
+    let end = start + egui::vec2(45.0, 30.0);
+    let before = app.fs_pan;
+    for events in [
+        vec![egui::Event::PointerMoved(start), button(start, true)],
+        vec![egui::Event::PointerMoved(end)],
+        vec![button(end, false)],
+    ] {
+        frame(&mut app, &ctx, rect, events);
+    }
+    assert_ne!(
+        app.fs_pan, before,
+        "the new ROOT viewport must accept a fresh drag"
+    );
+    Menu::Fit.open(&mut app, &ctx, rect);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(old), button(old, true)],
+    );
+    assert!(app.fs_front_pointer.is_active());
+    frame(&mut app, &ctx, rect, vec![key(egui::Key::F11, true)]);
+    assert!(!app.settings.video_in_window_mode);
+    assert_eq!(
+        app.viewer_presentation,
+        crate::app::ViewerPresentation::Fullscreen
+    );
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "return transfer must retire ROOT ownership too"
+    );
+    paint(&mut app, full, vec![key(egui::Key::F11, false)]);
+    let before = app.fs_pan;
+    paint(
+        &mut app,
+        full,
+        vec![egui::Event::PointerMoved(start), button(start, true)],
+    );
+    paint(&mut app, full, vec![egui::Event::PointerMoved(end)]);
+    assert_ne!(
+        app.fs_pan, before,
+        "fullscreen to ROOT to fullscreen must leave the canvas usable"
+    );
+    paint(&mut app, full, vec![button(end, false)]);
+    let before = (app.fs_zoom, app.fs_pan);
+    for click_number in 1..=2 {
+        for events in [
+            vec![egui::Event::PointerMoved(start)],
+            vec![button(start, true)],
+            vec![button(start, false)],
+        ] {
+            paint(&mut app, full, events);
+        }
+        if click_number == 1 {
+            assert_eq!(
+                (app.fs_zoom, app.fs_pan),
+                before,
+                "the first new fullscreen canvas click must not reset"
+            );
+        }
+    }
+    assert_eq!(
+        app.fs_zoom, 1.0,
+        "the second fullscreen canvas click must reset after the actual F11 round trip"
+    );
+    assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+}
+
+fn navigator_sources(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    panorama: bool,
+) -> crate::app::AppTestEnvForTest {
+    let mut app = sources(ctx, [320, 160]);
+    app.settings.fullscreen_navigator_visible = true;
+    app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::TopRight;
+    app.settings.fullscreen_navigator_size = 520.0;
+    app.fs_zoom = 2.0;
+    if panorama {
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.3,
+            0.1,
+            crate::panorama::PanoProjection::Perspective,
+        ));
+    }
+    settle(&mut app, ctx, rect);
+    if panorama {
+        assert!(app.is_panorama_mode_active(1));
+    } else {
+        assert_page(&app);
+    }
+    app
+}
+
+fn navigator_content(app: &mut App, rect: egui::Rect, panorama: bool) -> egui::Rect {
+    let media = app.fullscreen_media_rect(rect, 1, false);
+    let content = if panorama {
+        app.panorama_navigator_layout(media, 1)
+            .unwrap()
+            .content_rect
+    } else {
+        app.fs_navigator_layout(media).unwrap().content_rect
+    };
+    assert!(content.is_positive());
+    content
+}
+
+#[test]
+fn front_popup_navigator_double_click_counts_only_backing_clicks_for_flat_and_panorama() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for (panorama, expire_launcher_click) in
+        [(false, true), (false, false), (true, true), (true, false)]
+    {
+        let ctx = egui::Context::default();
+        let rect = viewport(1093.0);
+        let mut app = navigator_sources(&ctx, rect, panorama);
+        app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::BottomLeft;
+        settle(&mut app, &ctx, rect);
+        let menu = if panorama {
+            Menu::Projection
+        } else {
+            Menu::Fit
+        };
+        menu.open(&mut app, &ctx, rect);
+        if expire_launcher_click {
+            // Let egui's launcher click expire without a wall-clock wait so
+            // closing click + backing click 1 is definitely a raw double-click.
+            for _ in 0..40 {
+                frame(&mut app, &ctx, rect, vec![]);
+            }
+        }
+        let content = navigator_content(&mut app, rect, panorama);
+        let popup = if panorama {
+            ctx.read_response(egui::Id::unique((
+                "fs_panorama_projection_item",
+                crate::panorama::PanoProjection::Perspective.shader_code(),
+            )))
+            .unwrap()
+            .rect
+            .expand(16.0)
+        } else {
+            ctx.data(|data| {
+                data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
+                    "fs_fit_popup_scroll_layout",
+                ))
+            })
+            .unwrap()
+            .0
+        };
+        let exposed = egui::Rect::from_min_max(
+            content.min,
+            egui::pos2(content.right().min(popup.left() - 20.0), content.bottom()),
+        )
+        .shrink(4.0);
+        assert!(
+            exposed.width() > 8.0 && exposed.height() > 30.0,
+            "panorama={panorama}, content={content:?}, popup={popup:?}, exposed={exposed:?}"
+        );
+        let pos = exposed.lerp_inside(egui::vec2(0.35, 0.7));
+        menu.assert_outside(&ctx, pos);
+        let before = view_state(&app);
+        click(&mut app, &ctx, rect, pos);
+        assert!(!menu.is_open(&app, &ctx));
+        assert_eq!(
+            view_state(&app),
+            before,
+            "the closing click belongs to the menu"
+        );
+        click(&mut app, &ctx, rect, pos);
+        if expire_launcher_click {
+            let raw_count = ctx.input(|input| {
+                input
+                    .pointer
+                    .released_buttons_with_click_counts()
+                    .find(|(button, _)| *button == egui::PointerButton::Primary)
+                    .and_then(|(_, click)| click)
+                    .map(|(_, count)| count)
+            });
+            assert_eq!(
+                raw_count,
+                Some(2),
+                "first backing click must be egui's raw second click (panorama={panorama})"
+            );
+        }
+        assert_eq!(
+            view_state(&app),
+            before,
+            "backing click 1 must not center with the closing click (panorama={panorama}, expired={expire_launcher_click})"
+        );
+        click(&mut app, &ctx, rect, pos);
+        if panorama {
+            assert_ne!(
+                view_state(&app).4,
+                before.4,
+                "backing click 2 must center the real panorama navigator"
+            );
+        } else {
+            assert_ne!(
+                app.fs_pan, before.2,
+                "backing click 2 must center the real flat navigator"
+            );
+        }
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn front_popup_and_overflow_same_pass_complete_owned_stream_cannot_leak_before_a_fresh_press() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for overflow in [false, true] {
+        let ctx = egui::Context::default();
+        let rect = viewport(1093.0);
+        let mut app = navigator_sources(&ctx, rect, false);
+        if !overflow {
+            app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::BottomLeft;
+            settle(&mut app, &ctx, rect);
+        }
+        let content = navigator_content(&mut app, rect, false);
+        let boundary = if overflow {
+            app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+            settle(&mut app, &ctx, rect);
+            fs_overflow_panel_rect(rect, app.fs_overflow_panel_state)
+                .unwrap()
+                .left()
+        } else {
+            Menu::Fit.open(&mut app, &ctx, rect);
+            ctx.data(|data| {
+                data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
+                    "fs_fit_popup_scroll_layout",
+                ))
+            })
+            .unwrap()
+            .0
+            .left()
+                - 20.0
+        };
+        let exposed = egui::Rect::from_min_max(
+            content.min,
+            egui::pos2(boundary.min(content.right()), content.bottom()),
+        )
+        .shrink(5.0);
+        assert!(
+            exposed.width() > 24.0 && exposed.height() > 100.0,
+            "overflow={overflow}, content={content:?}, boundary={boundary}, exposed={exposed:?}"
+        );
+        let fresh = exposed.lerp_inside(egui::vec2(0.5, 0.65));
+        let owned = if overflow {
+            let overlap = content
+                .intersect(fs_overflow_panel_rect(rect, app.fs_overflow_panel_state).unwrap())
+                .shrink(5.0);
+            assert!(overlap.width() > 25.0 && overlap.height() > 60.0);
+            overlap.center()
+        } else {
+            exposed.lerp_inside(egui::vec2(0.5, 0.2))
+        };
+        let before = view_state(&app);
+        // No previous pass owns this stream. Ownership must be projected at
+        // each event, not inferred from the final button level of this pass.
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![
+                egui::Event::PointerMoved(owned),
+                button(owned, true),
+                egui::Event::PointerMoved(fresh),
+                button(fresh, false),
+                button(fresh, true),
+            ],
+        );
+        assert_eq!(
+            view_state(&app),
+            before,
+            "earlier owned motion/release must stay hidden (overflow={overflow})"
+        );
+        assert_eq!(app.fs_front_pointer.is_active(), !overflow);
+        if !overflow {
+            // Menus use the pass-entry presentation snapshot: another press
+            // in that same pass still belongs to the just-dismissed menu.
+            frame(&mut app, &ctx, rect, vec![button(fresh, false)]);
+            assert_eq!(view_state(&app), before);
+            assert!(!app.fs_front_pointer.is_active());
+            frame(&mut app, &ctx, rect, vec![button(fresh, true)]);
+        }
+        let end = fresh + egui::vec2(0.0, 30.0);
+        assert!(content.contains(end));
+        frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(end)]);
+        assert_ne!(
+            app.fs_pan, before.2,
+            "the new backing press must start navigator pan"
+        );
+        frame(&mut app, &ctx, rect, vec![button(end, false)]);
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn front_popup_overflow_middle_short_click_and_drag_zoom_preserve_released_canvas_behavior() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for overflow in [false, true] {
+        for drag in [false, true] {
+            let ctx = egui::Context::default();
+            let rect = viewport(1093.0);
+            let mut app = sources(&ctx, [320, 160]);
+            app.fs_zoom = 2.0;
+            app.settings.ring_shortcuts.mouse_buttons_image.middle =
+                crate::ring_shortcut::RingActionId::ImageRotateRight;
+            settle(&mut app, &ctx, rect);
+            let panel = fs_overflow_panel_rect(rect, FsOverflowPanelState::Slideshow).unwrap();
+            let start = panel.min + egui::vec2(3.0, 3.0);
+            assert!(assert_page(&app).contains(start));
+            if overflow {
+                app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+                settle(&mut app, &ctx, rect);
+            }
+            let before = view_state(&app);
+            let rotation = app.get_rotation(1);
+            frame(
+                &mut app,
+                &ctx,
+                rect,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    pointer_button(start, egui::PointerButton::Middle, true),
+                ],
+            );
+            assert!(
+                !app.fs_front_pointer.is_active(),
+                "overflow must not capture Middle"
+            );
+            let end = if drag {
+                start + egui::vec2(-45.0, 55.0)
+            } else {
+                start
+            };
+            if drag {
+                frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(end)]);
+                assert_ne!(
+                    app.fs_zoom, before.1,
+                    "middle drag must zoom through overflow"
+                );
+            }
+            frame(
+                &mut app,
+                &ctx,
+                rect,
+                vec![pointer_button(end, egui::PointerButton::Middle, false)],
+            );
+            if drag {
+                assert_eq!(
+                    app.get_rotation(1),
+                    rotation,
+                    "middle drag is not a short click"
+                );
+            } else {
+                assert_eq!(
+                    app.get_rotation(1),
+                    crate::rotation_db::Rotation::Cw90,
+                    "the assigned middle short-click action must run through overflow"
+                );
+            }
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(!app.fs_front_pointer.is_active());
+        }
     }
 }

@@ -3,12 +3,14 @@
 対象は `render_fullscreen_viewport` の静止画描画と、その前後で実行する入力処理。
 `pointer.*`（`primary_clicked` / `any_click` 等を含む）、`PointerButton`、
 `Response::interact_pointer_pos` と呼出先を検索し、テスト用入力生成と描画だけの参照を分けた。
-§1.403 で左・右・中・touch の前面所有へ一般化した。Extra ボタン・wheel は従来の契約を保つ。
+§1.403 で前面メニューの左・右・中・touch の所有へ一般化した。
+overflow 単独の位置による所有は左・右・touch に限る。Extra ボタン・wheel は従来の契約を保つ。
 
 `capture_fs_front_pointer_input` が root の早期描画とキー処理・navigator 予約より前に一度だけ所有を確定する。
 現在のパネル矩形を egui の layer hit-test に通し、押下位置の最前面が overflow の Area のときだけ
-左・右・中・touch の押下を解放までパネルが所有する。提示中の F / S / R / P / Q / fullscreen context menu と
-対象 viewport の egui memory popup は、位置によらず新規押下を所有する。パネルを閉じるフレームや、キーで
+左・右・touch の押下を解放までパネルが所有する。overflow 単独では中ボタンの短クリック割り当てと
+drag zoom を維持する。提示中の F / S / R / P / Q / fullscreen context menu と対象 viewport の
+egui memory popup は、中ボタンを含む新規押下を位置によらず所有する。パネルを閉じるフレームや、キーで
 別モードへ入るフレームでも同じ `FsFrontPointerFrameInput` を各 consumer へ渡す。
 矩形・layer を各 consumer で判定し直さない。外側開始の入力は従来どおり扱う。
 overflow だけなら touch 除外も同じ pass の最前面領域を使う。メニュー提示中 / touch 所有中は全 canvas を
@@ -19,20 +21,28 @@ egui に前 pass の Area が残っていても新規所有しない。
 シーク設定 popup は毎 pass 描画し、選択は従来の Response に任せる。
 物理列は App 全体の前面一時状態 `FsFrontPointerOwnership` が保持し、context bundle には移さない。
 旧 `OverflowStream` / `FullscreenSecondaryPress::Overflow` は廃止した。同 viewer のページ移動では終わらず、
-物理 release、最後の touch End / Cancel、所有 viewport の focus loss、既存の前面 handoff / close だけで解放する。
-他 viewport の入力・focus loss はその所有を変更しない。同一 pass の旧 release → 新 press は新列として判定する。
+物理 release、最後の touch End / Cancel、所有 viewport の focus loss、実際の表示先移譲 / close で解放する。
+F11 / F12、native presentation の確定等による表示先の変更と active → passive handoff でも解放する。
+他 viewport の描画・入力・focus loss はその所有を変更せず、表示先が変わらない再確認でも維持する。
+同一 pass の旧 release → 新 press は新列として判定する。pass 最後の down / press、旧列の release mask、
+元イベント順の所有情報を分けて保持し、ナビゲータと範囲キャプチャへは各 event の所有で射影する。
+owned press → move → release → 新 press が一つの pass に入っても、前半の event を背面へ戻さない。
+メニュー提示は pass 入口で一度判定するため同じ pass 内の後続 press も所有し、overflow 単独では
+後続 press の位置によって判定する。
 double-click は前面所有境界以降の背面受理 click と egui の click count の両方で成立させる。
+通常 canvas と flat / panorama ナビゲータで共有し、閉じた click → 背面 click 1 では中央移動せず、
+続く背面 click 2 で中央移動する。
 
 以下の consumer 表の所有結果は一般化後の `FsFrontPointerFrameInput` を指す。追加接続は
 中ボタン短押し / drag zoom と範囲 capture。隠蔽のパイプライン前 hold は同じ owner を viewport 一致で参照する。
 
 | 背面処理 | overflow との到達（§1.396 の棚卸し） | 一般化後の所有結果・変更 / 除外根拠（関数が参照点） |
 | --- | --- | --- |
-| ナビゲータの予約・直接処理・予約後処理、右範囲選択ズーム | 可 | `ui_fullscreen.rs::handle_fs_wheel_and_click_frame` から `without_front_buttons` 済み raw snapshot を全入口へ渡す。ボタン edge / down だけを除き位置・focus・wheel・非所有ボタンは保つ（既存修正）。 |
+| ナビゲータの予約・直接処理・予約後処理、右範囲選択ズーム | 可 | `ui_fullscreen.rs::handle_fs_wheel_and_click_frame` から `without_front_buttons` 済み raw snapshot を全入口へ渡す。元イベント順の所有情報で owned button edge を除き、位置・focus・wheel・非所有ボタンを保つ。flat / panorama の中央移動にも共通の背面 click 対境界を適用する。 |
 | 比較ワイプ境界 | 可 | `handle_compare_wipe_drag` の呼出前に確定済み primary 所有を参照。 |
 | 通常パン・Ctrl 回転・連結読みスクロール・panorama drag・double click / ページクリック | 可 | `apply_fs_wheel_frame_proposal` の `primary_suppression` 分岐が全 primary 操作より前。確定済み primary 所有は touch 終端でも上書きしない（既存修正）。 |
 | 右クリック・リング・ジェスチャ | 可 | `recognize_fs_secondary_input` が確定済み secondary 所有を参照。既存右操作を primary press で中断する入口も、前面所有の primary は配送しない。 |
-| 中ボタン短押し / drag zoom | 可 | `update_mouse_middle_short_click` の開始と `handle_middle_drag_zoom` を確定済み middle 所有で除く。ページ移動で保持を失わず、終端後の新規列を受理する。 |
+| 中ボタン短押し / drag zoom | 所有対象外（従来どおり通る） | overflow 単独では従来の短クリック割り当てと drag zoom を維持する。前面メニューが所有した middle だけ `update_mouse_middle_short_click` の開始と `handle_middle_drag_zoom` から除く。ページ移動で保持を失わず、終端後の新規列を受理する。 |
 | 分析のパン・ガイド作成・右クリックの filter / 色固定 | 可 | `draw_analysis_panel` へ同じ結果を渡し、primary 各 edge / down と secondary press をボタン別に除く。分析は `fullscreen_top_bar_chrome_allowed` の除外対象ではない。 |
 | 補正パネルのブックマーク行 | 可 | `draw_adjustment_panel` → `draw_bookmark_panel_body` へ同じ結果を渡して raw `primary_clicked` を除く。現在位置の `contains_pointer` だけでは press 所有にならず、狭い窓の重なりで行へ漏れ得た。 |
 | 消しゴム | モード中は不可、キー入場の同一 pass は可 | `handle_erase_paint` へ同じ結果を渡し primary / secondary を個別に除く。従来の `fs_primary_suppression.is_active` だけでは終端 pass と secondary 所有を扱えない。 |
@@ -44,7 +54,7 @@ double-click は前面所有境界以降の背面受理 click と egui の click
 | 隠蔽の先行 preview hold | 前面 press を保持して隠蔽へ入った後に可 | `sync_conceal_preview_before_pipeline` は子 viewport の per-pass capture より前に必要なため、前 pass で確定した同じ `FsFrontPointerOwnership` を参照して raw down を除く。`enter_conceal_mode` は eye rect を消し、隠蔽中は overflow を開けないので、新規 press の再判定は不要。 |
 | シークバー・サムネイル列・固定 / 表示部品 | 可 | `draw_fullscreen_seek_overlay_with_geometry` へ同じ結果を渡し raw down・gesture 更新・クリック確定を除く。もともと操作開始は Response 所有だが、確定結果へも接続する。 |
 | touch ページ送り・chrome・pan / pinch コマンド | 可 | recognizer は左右ボタンと共有する最前面の overflow 領域で終端まで駆動（`handle_fs_wheel_and_click_frame` の通常 / 前面復帰経路）。コマンド配送も確定済み primary 所有を参照し、早期 close 後に再利用しない。外側開始の連続操作は維持。 |
-| 範囲キャプチャ | overflow 上からの通常開始はなし。Q と共存可能 | `draw_capture_region_selection_overlay` へ同じ結果を渡し、所有中は primary の event / move を配送しない。focus / キーの取消は維持する。開始時の `wait_for_release` と通常の新規選択は維持する。 |
+| 範囲キャプチャ | overflow 上からの通常開始はなし。Q と共存可能 | `draw_capture_region_selection_overlay` へ同じ結果を渡し、元イベント順の所有情報で primary の owned event / move だけを除く。同一 pass の後続新規列を前半の所有と混同しない。focus / キーの取消、開始時の `wait_for_release` と通常の新規選択は維持する。 |
 | metadata の類似画像 / 本の対応帯 hold preview | 可 | `ui_metadata_panel.rs::draw_page_strip` / `draw_similar_hit_buttons` は `is_pointer_button_down_on` と Response の位置を要求する。それに加え `draw_metadata_panel` → `draw_metadata_panel_inner` の共通適用境界へ同じ結果を渡し、primary 所有中は両 producer の `peek_press` を開始しない。raw 位置による fallback は診断用 observation だけで、hover・診断・既存 preview の終端監視は維持する。 |
 | ルーペ・ZipPla 照準・分析 hover 色・各筆カーソル・ナビゲータのカーソル | 可、押下による背面操作ではない | hover 位置 / 表示用 down を読むだけ（例 `src/ui_fullscreen.rs:47721` のルーペ）。画像・選択・編集の入力を発生させないため、既存の描画を維持する。 |
 | 表示トリム | 可、raw 単独の操作開始なし | `src/ui_view_trim.rs:1312` / `1810` の raw down は保存バッチ終了時期の判定のみ。値操作は Response が所有する。 |

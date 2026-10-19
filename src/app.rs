@@ -61163,6 +61163,7 @@ impl App {
 
     #[cfg(windows)]
     fn handoff_active_detached_viewport_to_passive(&mut self, reason: &'static str) {
+        self.fs_front_pointer = Default::default();
         let session_before = self.active_detached_session;
         let shown_before = self.fs_viewport_shown;
         let presentation_before = self.fs_viewport_presentation;
@@ -67999,6 +68000,9 @@ impl App {
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
+        if self.viewer_presentation != presentation {
+            self.fs_front_pointer = Default::default();
+        }
         self.viewer_presentation = presentation;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
@@ -87904,6 +87908,9 @@ impl App {
                 "remote_ipc: rejected detached presentation open outside Local phase",
             );
             return;
+        }
+        if self.viewer_presentation != target_presentation {
+            self.fs_front_pointer = Default::default();
         }
         self.viewer_presentation = target_presentation;
         #[cfg(windows)]

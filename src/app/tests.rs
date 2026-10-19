@@ -107328,3 +107328,60 @@ mod bookmark_build_adoption_tests;
 
 #[path = "tests/manual_nav_wrap.rs"]
 mod manual_nav_wrap;
+
+#[cfg(windows)]
+#[test]
+fn front_popup_f12_round_trip_and_passive_handoff_retire_the_foreground_owner() {
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\front-owner.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    for detached in [true, false] {
+        app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+        app.toggle_detached_viewer_mode();
+        assert_eq!(app.settings.detached_viewer_enabled, detached);
+        assert_eq!(
+            app.viewer_presentation == ViewerPresentation::DetachedWindow,
+            detached
+        );
+        assert!(
+            !app.fs_front_pointer.is_active(),
+            "F12 must retire the old viewport input owner"
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.handoff_active_detached_viewport_to_passive("front_popup_owner_test");
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "handoff retires front input even for live-media callers"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_changes() {
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\front-owner.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.settings.video_in_window_mode = false;
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.prepare_viewer_presentation_open(0, false);
+    assert!(
+        app.fs_front_pointer.is_active(),
+        "a same-viewer page open is not a display handoff"
+    );
+    app.settings.video_in_window_mode = true;
+    app.prepare_viewer_presentation_open(0, false);
+    assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+    assert!(!app.fs_front_pointer.is_active());
+    app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
+    app.apply_video_presentation_switched(ViewerPresentation::Fullscreen);
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "native commit transfers the presentation owner too"
+    );
+}

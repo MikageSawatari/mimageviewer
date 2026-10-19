@@ -116,8 +116,10 @@ pub(crate) struct FullscreenSecondaryPressOwner {
 }
 
 /// Resolved before front UI actions, shared by all backing input consumers in this pass.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FsFrontPointerFrameInput {
+    events: std::sync::Arc<[FsFrontPointerEventOwnership]>,
+    navigator_events: std::sync::Arc<[bool]>,
     primary_owned: bool,
     secondary_owned: bool,
     middle_owned: bool,
@@ -126,8 +128,15 @@ pub(crate) struct FsFrontPointerFrameInput {
     secondary_owner: Option<FullscreenSecondaryPressOwner>,
 }
 
+/// Event provenance is resolved in raw event order, before any front menu can close.
+#[derive(Clone)]
+struct FsFrontPointerEventOwnership {
+    event: egui::Event,
+    owned: bool,
+}
+
 impl FsFrontPointerFrameInput {
-    pub(crate) fn owns(self, button: egui::PointerButton) -> bool {
+    pub(crate) fn owns(&self, button: egui::PointerButton) -> bool {
         match button {
             egui::PointerButton::Primary => self.primary_owned,
             egui::PointerButton::Secondary => self.secondary_owned,
@@ -136,7 +145,7 @@ impl FsFrontPointerFrameInput {
         }
     }
 
-    pub(crate) fn owns_release(self, button: egui::PointerButton) -> bool {
+    pub(crate) fn owns_release(&self, button: egui::PointerButton) -> bool {
         let index = match button {
             egui::PointerButton::Primary => 0,
             egui::PointerButton::Secondary => 1,
@@ -146,7 +155,7 @@ impl FsFrontPointerFrameInput {
         self.release_owned[index]
     }
 
-    fn backing_response(self, mut response: egui::Response) -> egui::Response {
+    fn backing_response(&self, mut response: egui::Response) -> egui::Response {
         use egui::response::Flags;
         if self.primary_owned {
             response
@@ -230,7 +239,9 @@ impl FsFrontPointerOwnership {
                 *self = Self::default();
                 return FsFrontPointerFrameInput::default();
             }
+            let mut events = Vec::with_capacity(input.events.len());
             for event in &input.events {
+                let mut event_owned = false;
                 match event {
                     egui::Event::PointerButton {
                         button,
@@ -242,21 +253,29 @@ impl FsFrontPointerOwnership {
                             egui::PointerButton::Primary => 0,
                             egui::PointerButton::Secondary => 1,
                             egui::PointerButton::Middle => 2,
-                            _ => continue,
+                            _ => {
+                                events.push(FsFrontPointerEventOwnership {
+                                    event: event.clone(),
+                                    owned: false,
+                                });
+                                continue;
+                            }
                         };
                         if *pressed {
                             if index == 0 && self.touches.is_empty() {
                                 touch_owned = self.touch_owned;
                             }
                             self.buttons[index] = menu_presented
-                                || overflow.iter().any(|rect| rect.contains(*pos))
+                                || (index < 2 && overflow.iter().any(|rect| rect.contains(*pos)))
                                 || (index == 0 && self.touch_owned);
                             // A new sequence replaces the old terminal edge in this pass.
                             owned[index] = self.buttons[index];
+                            event_owned = self.buttons[index];
                             if owned[index] {
                                 self.clicks = FsBackingClickBoundary::default();
                             }
                         } else {
+                            event_owned = self.buttons[index];
                             release_owned[index] = self.buttons[index];
                             owned[index] |= self.buttons[index];
                             self.buttons[index] = false;
@@ -269,6 +288,7 @@ impl FsFrontPointerOwnership {
                         pos,
                         ..
                     } => {
+                        event_owned = self.touch_owned;
                         let contact = (device_id.0, id.0);
                         match phase {
                             egui::TouchPhase::Start => {
@@ -278,6 +298,7 @@ impl FsFrontPointerOwnership {
                                         || overflow.iter().any(|rect| rect.contains(*pos));
                                     touch_owned = self.touch_owned;
                                 }
+                                event_owned = self.touch_owned;
                                 self.touches.insert(contact);
                                 if self.touch_owned {
                                     self.clicks = FsBackingClickBoundary::default();
@@ -298,10 +319,29 @@ impl FsFrontPointerOwnership {
                             egui::TouchPhase::Move => {}
                         }
                     }
+                    egui::Event::PointerMoved(_) | egui::Event::PointerGone => {
+                        // Ordered primary consumers use moves only for their accepted primary
+                        // stream; an independently owned secondary/middle must not block it.
+                        event_owned = self.buttons[0] || self.touch_owned;
+                    }
                     _ => {}
                 }
+                events.push(FsFrontPointerEventOwnership {
+                    event: event.clone(),
+                    owned: event_owned,
+                });
             }
             FsFrontPointerFrameInput {
+                navigator_events: input
+                    .events
+                    .iter()
+                    .zip(&events)
+                    .filter_map(|(event, ownership)| {
+                        fs_navigator_tracks_event(event).then_some(ownership.owned)
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                events: events.into(),
                 primary_owned: owned[0] || touch_owned,
                 secondary_owned: owned[1],
                 middle_owned: owned[2],
@@ -318,8 +358,41 @@ impl FsFrontPointerOwnership {
             && response.clicked()
             && response.ctx.input(|input| input.pointer.primary_clicked())
         {
-            self.clicks.current_accepted = (self.clicks.previous_accepted + 1).min(3);
+            if self.clicks.current_accepted == 0 {
+                self.clicks.current_accepted = (self.clicks.previous_accepted + 1).min(3);
+            }
         }
+    }
+
+    fn accept_navigator_click(
+        &mut self,
+        ctx: &egui::Context,
+        click: Option<(egui::Pos2, u32)>,
+    ) -> Option<(egui::Pos2, u32)> {
+        if self
+            .viewport
+            .is_some_and(|owner| owner != ctx.viewport_id())
+        {
+            return None;
+        }
+        let (pos, raw_count) = click?;
+        let frame = (ctx.viewport_id(), ctx.cumulative_frame_nr());
+        if self.clicks.frame != Some(frame) {
+            self.clicks = FsBackingClickBoundary {
+                frame: Some(frame),
+                previous_accepted: self.clicks.current_accepted,
+                current_accepted: 0,
+            };
+        }
+        // A navigator folds every accepted release in event order, including multiple
+        // clicks in one pass. The canvas Response path runs only if it did not consume.
+        self.clicks.current_accepted = if self.clicks.current_accepted == 0 {
+            self.clicks.previous_accepted + 1
+        } else {
+            self.clicks.current_accepted + 1
+        }
+        .min(3);
+        Some((pos, raw_count.min(self.clicks.current_accepted)))
     }
 
     fn backing_double_clicked(&self, response: &egui::Response) -> bool {
@@ -2911,24 +2984,35 @@ struct FsNavigatorFrameInputSnapshots {
     by_viewport: HashMap<egui::ViewportId, FsNavigatorFrameInputSnapshot>,
 }
 
+fn fs_navigator_tracks_event(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::PointerMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::PointerGone
+            | egui::Event::WindowFocused(_)
+    )
+}
+
 impl FsNavigatorFrameInput {
-    fn without_front_buttons(mut self, front: FsFrontPointerFrameInput) -> Self {
-        for event in &mut self.events {
-            if let FsNavigatorInputEvent::PointerButton {
-                button,
-                pos,
-                pressed,
-                ..
-            } = event
-                && (if *pressed {
-                    front.owns(*button)
-                } else {
-                    front.owns_release(*button)
+    fn without_front_buttons(mut self, front: &FsFrontPointerFrameInput) -> Self {
+        // The snapshot omits unrelated raw events; project the same indices without reclassifying
+        // any pointer position. In particular, a later backing press cannot re-own earlier moves.
+        let ownership = &front.navigator_events;
+        if !ownership.is_empty() {
+            debug_assert_eq!(self.events.len(), ownership.len());
+            self.events = self
+                .events
+                .into_iter()
+                .zip(ownership.iter())
+                .map(|(event, owned)| match (event, owned) {
+                    (FsNavigatorInputEvent::PointerButton { pos, .. }, true) => {
+                        FsNavigatorInputEvent::PointerMoved(pos)
+                    }
+                    (event, _) => event,
                 })
-            {
-                // The position belongs to wheel targeting and any non-owned gesture too.
-                *event = FsNavigatorInputEvent::PointerMoved(*pos);
-            }
+                .collect();
         }
         if front.primary_owned {
             self.primary_down = false;
@@ -2936,7 +3020,6 @@ impl FsNavigatorFrameInput {
         if front.secondary_owned {
             self.secondary_down = false;
         }
-        // Positions, focus, wheel, and the other button retain their original event order.
         self
     }
 
@@ -27746,7 +27829,7 @@ impl App {
                                 || ctrl_nav.is_some() || sibling_nav.is_some()
                                 || mouse_nav.is_some() || jump_to.is_some(),
                             true,
-                            overflow_pointer_input,
+                            overflow_pointer_input.clone(),
                             &overflow_touch_excluded,
                         );
                         if let Some(mut proposal) = wheel_result.deferred.take() {
@@ -28211,7 +28294,7 @@ impl App {
                         // 単一ページ表示で消しゴムを描画する。
                         if self.erase_mode && !is_spread_double && !state.original_preview_active {
                             if let Some(transform) = single_transform.as_ref() {
-                                self.handle_erase_paint(ctx, transform, overflow_pointer_input);
+                                self.handle_erase_paint(ctx, transform, overflow_pointer_input.clone());
                                 self.draw_erase_overlay(ui, ctx, transform);
                             }
                             ctx.request_repaint();
@@ -28227,7 +28310,7 @@ impl App {
                         if self.conceal_mode && !is_spread_double && !state.original_preview_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
-                                self.handle_conceal_paint(ctx, transform, overflow_pointer_input);
+                                self.handle_conceal_paint(ctx, transform, overflow_pointer_input.clone());
                                 self.draw_conceal_overlay(ui, ctx, transform);
                             }
                             ctx.request_repaint();
@@ -28243,7 +28326,7 @@ impl App {
                                 // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
                                 // 漏れるのを防ぐ)。ダイアログ自体の描画は draw_text_overlay で行う。
                                 if !self.text_subdialog_open() {
-                                    self.handle_text_canvas_input(ctx, transform, overflow_pointer_input);
+                                    self.handle_text_canvas_input(ctx, transform, overflow_pointer_input.clone());
                                 }
                                 self.draw_text_overlay(ui, ctx, transform);
                             }
@@ -28258,7 +28341,7 @@ impl App {
                         {
                             if let Some(transform) = single_transform.as_ref() {
                                 let la_input_t0 = std::time::Instant::now();
-                                self.handle_local_adjust_canvas_input(ctx, full_rect, transform, overflow_pointer_input);
+                                self.handle_local_adjust_canvas_input(ctx, full_rect, transform, overflow_pointer_input.clone());
                                 fs_la_canvas_input_ms =
                                     la_input_t0.elapsed().as_secs_f64() * 1000.0;
                                 let la_overlay_t0 = std::time::Instant::now();
@@ -28288,7 +28371,7 @@ impl App {
                                     transform,
                                     image_size,
                                     pointer_allowed,
-                                    overflow_pointer_input,
+                                    overflow_pointer_input.clone(),
                                 );
                                 ctx.request_repaint();
                             } else if self.sns_split.is_some() {
@@ -28323,7 +28406,7 @@ impl App {
                                     paint_idx,
                                     image_size,
                                     pointer_allowed,
-                                    overflow_pointer_input,
+                                    overflow_pointer_input.clone(),
                                 );
                                 if self.export_crop_mode || used {
                                     ctx.request_repaint();
@@ -28349,7 +28432,7 @@ impl App {
                             );
                         } else {
                         if let Some(effect) =
-                            self.draw_capture_region_selection_overlay(ui, ctx, full_rect, paint_idx, overflow_pointer_input)
+                            self.draw_capture_region_selection_overlay(ui, ctx, full_rect, paint_idx, overflow_pointer_input.clone())
                         {
                             match effect {
                                 CaptureRegionTerminalEffect::Copy { idx, crop } => {
@@ -28530,7 +28613,7 @@ impl App {
                                 full_rect,
                                 image_rect,
                                 pixels.as_deref(),
-                                overflow_pointer_input,
+                                overflow_pointer_input.clone(),
                             );
                             if close_analysis {
                                 // × も Z / ホバーボタンと同じ経路 (ズーム/パン引き継ぎ込み) に
@@ -28624,7 +28707,7 @@ impl App {
                                 full_rect,
                                 still_seek_height,
                             );
-                            self.draw_adjustment_panel(ui, panel_rect, state.image_dims, overflow_pointer_input);
+                            self.draw_adjustment_panel(ui, panel_rect, state.image_dims, overflow_pointer_input.clone());
                             metadata_panel_demand_checked = true;
                             right_panel_visible = self.draw_metadata_panel(
                                 ui,
@@ -28632,7 +28715,7 @@ impl App {
                                 full_rect,
                                 info_panel_lock_effective,
                                 still_seek_height,
-                             overflow_pointer_input, );
+                             overflow_pointer_input.clone(), );
                             side_panel_visible |= right_panel_visible;
                         } else if panorama_mode_active_now {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
@@ -28657,7 +28740,7 @@ impl App {
                                 full_rect,
                                 info_panel_lock_effective,
                                 still_seek_height,
-                             overflow_pointer_input, );
+                             overflow_pointer_input.clone(), );
                             side_panel_visible = right_panel_visible;
                         }
                         if !metadata_panel_demand_checked {
@@ -28700,7 +28783,7 @@ impl App {
                                 still_seek_geometry,
                                 side_panel_visible,
                                 touch_chrome_latched,
-                                overflow_pointer_input,
+                                overflow_pointer_input.clone(),
                             )
                         {
                             if !continuation_committed {
@@ -37621,7 +37704,9 @@ impl App {
                     if focused
                         && accept_panel_events
                         && matches!(interaction, Some(PanoramaNavigatorInteraction::Pan { .. }))
-                        && let Some((click_pos, 2)) = *adjudicated_click
+                        && let Some((click_pos, 2)) = self
+                            .fs_front_pointer
+                            .accept_navigator_click(ctx, *adjudicated_click)
                         && layout.canvas_rect.contains(click_pos)
                     {
                         let uv = panorama_navigator_screen_to_uv(layout.content_rect, click_pos);
@@ -37987,7 +38072,9 @@ impl App {
                             FsNavigatorPointerGesture::AwaitingPan { .. }
                                 | FsNavigatorPointerGesture::Pan { .. }
                         )
-                        && let Some((click_pos, 2)) = *adjudicated_click
+                        && let Some((click_pos, 2)) = self
+                            .fs_front_pointer
+                            .accept_navigator_click(ctx, *adjudicated_click)
                         && layout.canvas_rect.contains(click_pos)
                         && let Some((page, source_pos)) = layout.nearest_page_at(click_pos)
                     {
@@ -38635,7 +38722,7 @@ impl App {
             navigation_operation,
             false,
             false,
-            overflow_pointer_input,
+            overflow_pointer_input.clone(),
             &overflow_touch_excluded,
         );
         (result.page_nav, result.close)
@@ -38661,7 +38748,7 @@ impl App {
     ) -> FsWheelFrameResult {
         *navigator_reservation = None;
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx)
-            .without_front_buttons(overflow_pointer_input);
+            .without_front_buttons(&overflow_pointer_input);
         if front_wheel_owner.is_some() {
             // The begin-pass capture remains intact. Both immediate and reserved consumers
             // receive the same projection, retaining pointer/focus/release gesture ownership.
@@ -39587,7 +39674,7 @@ impl App {
                 ctx,
                 compare_drag_rect,
                 compare_base_rect,
-                overflow_pointer_input,
+                overflow_pointer_input.clone(),
             )
         {
             return FsWheelFrameResult::default();
@@ -39607,7 +39694,7 @@ impl App {
         if !overflow_pointer_input.middle_owned
             && (!cursor_in_panel || self.fs_middle_zoom_drag.is_some())
         {
-            self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input);
+            self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input.clone());
         }
         if middle_short_click {
             if let Some(nav) = self.apply_mouse_button(
@@ -39810,7 +39897,7 @@ impl App {
             seek_panel_rect,
             seek_panel_interactive,
             prev_foreground_hwnd,
-            overflow_pointer_input,
+            overflow_pointer_input.clone(),
         );
         // Preserve the released wheel-before-click classification without mutating
         // a page which an intermediate navigation has already left.
@@ -53861,34 +53948,14 @@ impl App {
             self.capture_region_selection = None;
             return Some(CaptureRegionTerminalEffect::Cancel);
         }
-        let events = ctx.input(|input| input.events.clone());
         let mut focused = initial_focused;
         let mut primary_down = selection.target.is_some();
-        for event in events {
-            if front.owns_release(egui::PointerButton::Primary)
-                && matches!(
-                    event,
-                    egui::Event::PointerButton {
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        ..
-                    }
-                )
-            {
-                continue;
-            }
-            if front.primary_owned
-                && matches!(
-                    event,
-                    egui::Event::PointerMoved(_)
-                        | egui::Event::PointerButton {
-                            button: egui::PointerButton::Primary,
-                            ..
-                        }
-                )
-            {
-                continue;
-            }
+        for event in front
+            .events
+            .iter()
+            .filter(|event| !event.owned)
+            .map(|event| event.event.clone())
+        {
             match event {
                 egui::Event::PointerMoved(pos) if focused && primary_down => {
                     if let Some(target) = selection.target {

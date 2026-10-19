@@ -361,8 +361,8 @@ F / S / P や Area を持たない toast は layer 判定で拾えず、各メ�
   `FullscreenPrimarySuppression::OverflowStream` / `FullscreenSecondaryPress::Overflow` を除去し、
   ページ操作の取消と物理入力列の寿命を分けた。bundle へ移さず、同 viewer のページ移動で保持する。
 - `capture_fs_front_pointer_input` がキー・root overflow 描画・navigator 予約より前に一度だけ
-  `FsFrontPointerFrameInput` を確定する。overflow は最前面の現在矩形上だけ、提示中のメニューは位置によらず
-  左・右・中・touch を所有する。touch は device/contact の組を保持して最後の End / Cancel で終える。
+  `FsFrontPointerFrameInput` を確定する。overflow は最前面の現在矩形上で左・右・touch だけ、
+  提示中のメニューは位置によらず左・右・中・touch を所有する。touch は最後の End / Cancel で終える。
   同 pass の release → 新 press は新列として判定し、他 viewport の非フォーカスでは解放しない。
 - 上部メニューは描画と `FsTopMenuEligibility` / `fullscreen_top_bar_chrome_allowed` を共有。
   Q は `fullscreen_seek_menu_eligible`、X は `fs_context_menu_presented` を共有する。
@@ -383,13 +383,23 @@ F / S / P や Area を持たない toast は layer 判定で拾えず、各メ�
 
 ### 9.2 触れた前面境界
 
-以下は既存リセットで新しい同種の一時入力状態も解放する追加のみ。detached の述語・viewport routing・
-geometry・focus 判定・lifecycle は変更しない。§1.396 と同じ構造的修正として、ClaudeCode の記録・レビュー合意へ渡す。
+以下は既存の前面切替・リセット境界で、同種の一時入力状態も解放する追加のみ。
+detached の述語・viewport routing・geometry・focus 判定・lifecycle は変更しない。
+初回の4関数は§1.396と同じ構造的修正として独立レビューでも合意済み。追加5関数も同じ規則に従い、
+ClaudeCodeの記録・レビューへ渡す。
 
 - `App::reset_detached_pause_foreground_modes`
 - `App::reset_active_detached_viewport_runtime_for_new_window`
 - `App::adopt_active_detached_viewport_runtime_from_passive`
 - `App::close_fullscreen_now_with_metadata_boundary`
+
+独立レビュー後の修正で追加した境界（同じ終了規則、詳細は9.5）:
+
+- `App::toggle_still_window_mode`（F11）
+- `App::apply_egui_viewer_presentation_for_current_item`（F12等）
+- `App::prepare_viewer_presentation_open`（解決した表示先が変わる場合のみ）
+- `App::apply_video_presentation_switched`（native presentation確定、表示先が変わる場合のみ）
+- `App::handoff_active_detached_viewport_to_passive`（live mediaを含む前面引渡し）
 
 ### 9.3 テストと検証
 
@@ -457,3 +467,82 @@ lib 全件、build-dev、独立完了レビュー、コミットは ClaudeCode �
 上表は強化後の再確認である。
 
 変異した2ファイルは SHA-256 一致で復元を確認した。復元後の関連一式は619件すべて成功した。
+
+
+### 9.5 独立レビューの P2 4件への対応（2026-10-19）
+
+初回実装 `8051885d8` の lib 全件13,744件成功は ClaudeCode から受領した検証記録。
+以下はその後の差分であり、上記9.3の初回検証とは区別する。
+
+1. **表示先変更後の owner**: 入力のない pass でも保持する viewport identity はそのままにし、
+   F11 / F12 / 表示先open解決 / native presentation確定 / active→passive引渡しの実境界で
+   旧 `FsFrontPointerOwnership` を終了する。同じ表示先の再確認や同 viewer のページ移動では終了しない。
+   無関係な viewport の描画・非フォーカスでの解除は追加していない。触れた前面境界は9.2の全9関数。
+2. **ナビゲータの double-click**: flat / panorama とも `accept_navigator_click` を通し、
+   前面境界以降の背面受理 click 数と egui の adjudicated count の小さい方を読む。
+   一つの pass に複数の release がある場合も受理順に進める。canvas と同じ境界であり、独自タイマーはない。
+   `src` 全体を `double_clicked` / `click_count` / count=2 の直接参照で検索し、fullscreen背面の直接参照は
+   この2経路だった。main windowのresizeとnative media overlayの音量・速度は今回の背面canvasの対象外。
+3. **同じ pass の複数物理列**: 確定結果を共有する `Arc` に、元のeventと各eventの所属を記録する。
+   ナビゲータのprojectionはその所属でボタンedgeを除く一方、位置は後続wheelや非所有ボタンのため残す。
+   範囲captureも同じ確定event列から所有event/moveを除いて読む。最終down/pressとrelease maskは別に維持し、
+   後半の背面pressから前半の所属を再計算しない。menu提示述語はpass入口で一度評価するので、
+   同pass内の後続pressもmenu所有。overflow単独の後続pressは、その押下時に確定した位置所属に従う。
+4. **overflowの中ボタン**: 位置による所有は§1.396の左右/touchに戻した。
+   中ボタンは提示中の前面menuだけが所有する。overflow上の短クリック割り当てとdrag zoomは維持する。
+
+追加した実描画テスト（`src/ui_fullscreen/front_popup_input_tests.rs`）:
+
+- `front_popup_actual_f11_round_trip_retires_the_old_viewport_pointer_owner`
+  （実F11配送、fullscreen→ROOT→fullscreen、旧列を離さず移譲、新表示先のdrag）
+- `front_popup_navigator_double_click_counts_only_backing_clicks_for_flat_and_panorama`
+  （閉じるclick→背面1打目は不変、背面2打目は中央移動、flat/panorama両方。
+  起動clickの時間窓が残る/切れた4ケースで、後者は背面1打目のegui生count=2も検査）
+- `front_popup_and_overflow_same_pass_complete_owned_stream_cannot_leak_before_a_fresh_press`
+  （owned press→move→release→新press、menu/overflow両方、後続背面dragの対照）
+- `front_popup_overflow_middle_short_click_and_drag_zoom_preserve_released_canvas_behavior`
+  （overflow閉/開の対照、中短クリックの回転割り当て、中drag zoom）
+
+追加した境界テスト（`src/app/tests.rs`）:
+
+- `front_popup_f12_round_trip_and_passive_handoff_retire_the_foreground_owner`
+- `front_popup_presentation_open_keeps_page_owner_until_the_display_target_changes`
+
+既存 `front_popup_and_overflow_hold_survive_real_arrow_page_navigation` はmenuの左右中、overflowの左右を検査する。
+overflowの中まで所有する誤った期待だけを除き、menuの中ボタンとtouch、他viewportの既存回帰は維持した。
+
+修正後の検証（すべて `MSBUILDDISABLENODEREUSE=1`、実アプリ起動なし）:
+
+| 検証 | 結果 / ログ |
+| --- | --- |
+| 関連 nextest | **635成功 / 0失敗**。`target/section403-p2-related-final.log`。9.3のfilterに、F11 / F12 round trip / native presentation確定 / detached pauseの既存回帰を追加した。新規6件、実描画20件・所有境界3件を含む。 |
+| `cargo test --test ui_snapshot` | **186成功 / 0失敗**、PNG変更なし。`target/section403-p2-ui-snapshot.log`。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功。`target/section403-p2-check-final.log`。 |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 成功。`target/section403-p2-fmt.log`。 |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ0件。`target/section403-p2-glyphs.log`。 |
+
+最終nextestコマンド:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run -p mimageviewer --lib -E 'test(/front_popup|overflow|slideshow_|fullscreen_secondary|fullscreen_primary|touch_panel|foreground_reclaim|wheel_frame|navigator|compare|analysis|page_edit_release|export_crop|sns_split|erase|conceal|text_canvas|local_adjust_canvas|still_image_root_f11|still_image_window_mode|f12_round_trip|apply_video_presentation_switched|video_presentation_switch_updates|detached_pause/)'
+```
+
+変異確認:
+
+| 変異 | 対応するテストの検出結果 |
+| --- | --- |
+| F11の旧owner終了を除く | F11実経路テストが `F11 must retire the old viewport owner` で失敗。 |
+| `open_fullscreen_with_metadata_boundary` で物理ownerもリセットする | 押下保持→ArrowRightテストが `page navigation must preserve the Primary physical owner` で失敗。 |
+| ナビゲータprojectionでeventごとの所属を無視する | 同pass複数列テストが、前面motionで背面pan `[0,0]` → `[0,-458.9]` となり失敗。 |
+| overflow位置所有を中ボタンにも広げる | 中ボタン対照テストが `overflow must not capture Middle` で失敗。 |
+| ナビゲータで背面受理数の制限を外しegui生countを読む | 単独変異で生count=2を確認した背面1打目が中央移動し、pan `[0,0]` → `[313.4,-205.7]` となり失敗。 |
+
+最初の5変異同時確認は **0成功 / 5失敗**（`target/section403-p2-mutation.log`）。
+この時ナビゲータはtripleを境界後のdoubleとして読めない対照側で落ちたため、起動clickを失効させるケースを追加し、
+ナビゲータの単独変異を再確認した。上表最後の誤成立を検出し **0成功 / 1失敗**
+（`target/section403-p2-navigator-mutation.log`）。両回とも変異3ファイルのSHA-256一致で復元し、
+復元後の最終ソースで上記635件とsnapshotを成功させた。
+
+実装上の未解決事項はない。修正差分のlib全件・build-dev・独立再レビュー・検収・コミット、
+detached計画§11への前面境界記録はClaudeCodeへ引き継ぐ。実機確認は未実施。
