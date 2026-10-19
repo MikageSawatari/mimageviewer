@@ -605,6 +605,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | 旧 runtime / EffeTune 世代清掃 | `std::thread` (`runtime-cleanup`、短命) | 起動ごとに最大1本、portable／App単体testでは生成しない | core のstartup完了かつ初回egui frame後、UIはdata-dirと固定bundle pathを渡すだけ。workerが他SemVer版／inactive世代をcanonical confinement・全tree reparse検査後にbest-effort削除する。workerでprocess画像を一度だけ列挙し、候補内の実行中画像／同版別coreによる旧世代を保守的に保持する。全cooperative lockを削除しないruntime/.locksの永久fileに置く。候補の使用中lockをexclusiveで一度だけ非blocking取得し、版の抽出／公開lockも削除完了まで保持する。coreはexe所属版のshared leaseをrun入口から保持し、世代解決とpinはegui構築前／既存retry workerで実行。旧publisher互換lockも外側publisherの後で併用する。launcherは版directory作成前にshared leaseを取り、保持したままcoreの引き渡しeventまたは終了をOS waitし、core側は待たない。未確定reader／未知layout／current異常／busyは清掃を見送る。失敗はlogのみ、次回起動へ回す。清掃のtimer・retry loop・UI通知・終了joinは無い。詳細は[配布計画§10.2](effetune-integration-plan.md#102-v430-の配布同梱-2026-10-01) |
 | 合成ビューの pin 資産更新 (§1.313) | `std::thread` + 既存 `metadata_import_refresh::run` | viewer context ごとに最新要求 1 件 | `CurrentViewRefresh::Pins` が変更コンテナ／動画集合を所有。同一 items generation の先行範囲を統合し、FS metadata・cascade DB・catalog DELETE・video pin read／seed write を既存 metadata worker 内で完了し、live cache を変更せず private map を準備する。完了は egui を起こし、mounted context／generation と cache／catalog／policy identity が一致する結果だけを既存 metadata-pin 適用へ渡す。UI terminal は DB handle を持たず準備済みメモリだけを採用する。無関係な Loaded 資産を保持し、token 交換時は変更／未完了動画の producer を再開する。置換・世代切替・retired context・App drop で cancel。同世代の metadata import が pin materialization を置き換える場合も、準備済み対象要求を確定して旧 context owner を取消してから successor worker を開始する。取消する unpin の可視 container keys は既存の無効化対象集合へ引き継ぐ。pin 以外の import や対象外 context は退役させない。詳細は [pin-reload-audit.md](pin-reload-audit.md) |
 | Windows file clipboard cut 観測 | message-only window STA (`cut-clipboard-listener`) + OLE reader STA (`cut-clipboard-reader`) | process ごとに各 1 | production install は UI を待たず `Starting` を返し、同じ backend generation の reader / listener `Ready` が揃った時だけ `Running` にする。起動中の通知・読取結果は順序を保って後から適用し、失敗時は `Disabled` へ収束する。listener は `WM_CLIPBOARDUPDATE` を sequence と単調 request serialで latest slotへ発行するだけで、OLE/clipboard I/Oを行わない。readerが `IDataObject` を自thread内で読み、path正規化と不変集合構築を完了してApp-global reducerへ返す。sequence変更時は旧表示をPendingへ失効し、競合中だけ上限付きbackoffで再取得する。SetData完了もprivate tokenで同じreducerへ入りrepaintを要求する。終了時はlistenerを解除・joinし、起動中または外部COM内で停止不能なthreadは無条件joinしない。testの既定backendはinertで、実clipboard/HWNDを作らない |
+| 類似索引の検索配列 | `std::thread` (`similar-array-owner`) + 一つの state mutex / Condvar、要求ごとの ack channel | 有効 manager の固定 data_dir ごとに1本、未要求時はI/Oなしで休眠 | base load/rebuild/compaction/replace・snapshot/revision採用・history pruneを直列実行。後着refreshをpendingへ保持し、公開→到達ack→永続base cutoffまでprune。root/除外/passwordの変更でloadを捨てない。UIはensure/状態読取/close通知のみ。Faultedは公開済み配列を保持し再起動を案内、closeはUIでjoinしない。詳しくは[所有計画・検証記録](similar-index-array-owner-plan.md#16-実装記録) |
 | 類似候補の長押し画像準備 | `std::thread` (`similar-preview`) + request専用mpsc/cancel | viewer ownerごとに実行中1件（取消drainを含む）＋最新待機1件 | `SimilarPanelState.preview` が要求・表示gesture・assetを所有し、既存viewer bundleと交換する。workerは毎pressのsource stamp確認と必要時の通常画像/ZIP/PDF decodeを行う。release/focus lossは表示だけを終了し、同じ要求の有効な遅延完了は隠れたcacheとして受ける。source/page/session変更やcloseは当該ownerを失効し、取消中に次workerを重ねない。ROOT updateがmounted/AtRest双方の終端をpollし、worker完了がROOTを一度起こす。UIはDB/ファイル待ちやdecodeを行わない。R4段階検証の現況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
 | サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。起動時に設定された PDFium pool の並列度を活かすためここに置く) |
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile の全体走査 (本物の同期 I/O。`fs::read_dir` 再帰探索 / ZIP セントラルディレクトリ読み込みなどメインプロセス内ブロッキング) |
@@ -840,7 +841,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | Ctrl+G `SearchStreamEvent` | Ctrl+G ワーカー → UI | `Batch { hits, scanned_candidates, valid_hits }` / `Done { truncated, reason }` / `Error`。毎フレーム `try_recv` を MAX_EVENTS_PER_FRAME=8 までループ消費 |
 | `DebouncedChange` (notify-rs) | FsWatcher → supervisor | 500ms ウィンドウで集約した変更イベント (`favorite_id`, `path`, `ChangeKind`) |
 | `SupervisorCommand` | UI (`IndexerManager`) → supervisor | 一時停止 / 再開 / フル再スキャン要求 |
-| `SimilarIndexNotifier` | 既存 favorite supervisor → 別バージョン索引 scheduler | 同じ `FsWatcher` の追加・変更・削除通知を軽量な再照合要求へ変換する。進行中なら revision だけ進め、終了後の 1 回へ coalesce するため watcher を追加しない。coalesce された中間 pass では Complete 済みの検索 snapshot を保持し、最終 pass の全 in-flight 回収後だけ再読込する。検索用メモリ表は起動時 configure と索引 worker の DB open 時に専用 `similar-index-load` worker で先行ロードし、パネルは実行中に未ロードでも新たなロードを開始しない。`similar.compact` が DB store ID・内容世代・行数・hash/proxy version・SHA-256 と一致すれば順次読込し、不一致なら SQLite snapshot へ戻して sidecar を作り直す。更新中の右パネルは変更が完了後に反映されることを明示する |
+| `SimilarIndexNotifier` | 既存 favorite supervisor → 別バージョン索引 scheduler | 同じ `FsWatcher` の通知を event sequence 付き dirty scope / Full へ合流する。scan / prefill commit 後の配列更新は同じ store の `SimilarArrayHandle` へ要求し、scheduler は公開済み store/seq の ack と job-current 確認後に Full 完了印を書く。構成変更は query scope を失効するが、store の初期ロードを再起動しない。更新中も公開済み snapshot で検索できる |
 | `similar_index` bounded work queue | 別バージョン索引 coordinator → 16 scan worker | ルーズ画像 1 枚または本 1 冊を単位に、全体 16・ドライブ文字または UNC server/share ごと 8 まで実行する。操作中は既存 `ActivityGate` で 1 / 1 へ縮退し、cancel 時は未開始を捨てても in-flight 全件の終了を待ってから Cancelled を返す。本のページ処理と generation publish は 1 worker 内に閉じる |
 | `local_adjust_write_handle` の job / result | UI ↔ 補正レイヤー書き込みワーカー | job = `LocalAdjustWriteJob { key, generation, layers }` (`layers` は `Arc` 共有なので積んでも複製しない)。result = `LocalAdjustWriteCompletion`: `Settled { key, generation, layers, outcome }` / `Superseded { key, generation }`。**`layers` を結果にも載せる**のは、UI がミラーする文書を「worker が実際に書いたもの」に固定するため (メモリから取り直すと、積んでから完了までの間に入った編集を写す)。`Superseded` は成功でも失敗でもないので、ミラーもトーストも出さない |
 | `IndexerManager.writer` | 全 FTS 書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。ingest と purge/cleanup は dispatcher に job を `submit` し、writer に直接触らない (§5.5)。通常の tag_write_worker は tags.db のみを更新し、この writer を使わない。 |
@@ -1369,6 +1370,31 @@ transaction で消す。起動設定は最初の構成でだけ採用し、実�
   cleanup と実行由来の自動 merge failure は共通 reporter の log+通知+durable pending へ進む。
   writer kill による未実行 merge task は実 I/O failure と区別する。detach/abrupt termination が
   全整合や marker 完了を保証するとはしない。runtime wipe/reopen、自動 Full retry は追加しない。
+
+### 類似索引の配列と query の寿命（§1.404）
+
+`SimilarArrayOwner` の生成権限は固定 data_dir の manager 初期化に限り、notifier / query / scan は
+clone可能な handle だけを使う。旧 `similar-index-load` / `similar-array-update` / `similar-array-compact`
+とその bool / memory epoch / CAS 公開は撤去した。scan writer / scheduler の config epoch・cancel・
+ActivityGate・watch・purge・Full/Delta は従来の所有を維持する。
+
+owner の一つの mutex が Published（snapshotとrevision）、要求合流、ack、Faulted / Closing / Closedを所有する。
+ack は同 store / 到達 seq の公開事実だけで成功し、worker停止を複数lockから推測しない。
+refresh は identity / batch を同一read TXで得る。pruneは既存IMMEDIATE write transactionでidentityを
+照合し、置換と採用の完了後に永続baseのcutoffだけを削除する。後着commitは後続refreshへ残る。
+空refreshは公開revisionを進めず、bookのsoft refreshも送らない。
+UIのprogress読取はowner lock内でfailureだけを複製し、snapshotの参照を持ち出さない。
+closeは公開snapshotをClosingへ移し、呼出元の旧状態に参照を残さずowner workerで退役する。
+
+itemは `QueryScopeState` のimmutable roots / scope revision / 6件cacheとpublication revisionを照合する。
+lock順は owner → query scope、query workerは受付時rootsを使い、遅い旧完了でcacheを再充填しない。
+bookは共有snapshotの取得元とreadinessだけをownerへ替え、同一TXの私有fallback・MIH・limitsを維持する。
+Missing / Faulted / worker異常終了もdispatchを通知し、Waitを追加UI入力なしで再評価する。
+
+shutdownはscan cancel・book停止・owner close通知までで、UIからI/O / join / Condvar待機を行わない。
+workerは実処理の帰還後に採用/未開始pruneを見送り、資源解放後にClosedを公開する。
+同じdata_dirの擬似再オープンだけ、headless fixtureでscan joinとowner Closed receiptを待つ。
+まれな実I/O障害はログ＋既存「更新未完了」への投影と再起動案内で止め、稼働中の自動再試行を行わない。
 
 ### 3.5 新ワーカー追加時のテンプレ
 

@@ -32,6 +32,15 @@
 
 ## 1. 優先候補
 
+### 1.404 類似索引の初期ロード中に設定を変えると、索引が「更新未完了」で止まることがある — 全件テストの不安定さから判明 (2026-10-19)
+
+- 状態: **修正済み・独立レビュー受入可 (`7d4767093`)・実アプリ確認済み (ClaudeCode、2026-10-19、[所有計画](similar-index-array-owner-plan.md) §17)。master 未取込**。調査記録: [similar-index-flaky-startup-marker-investigation.md](similar-index-flaky-startup-marker-investigation.md)。
+- きっかけ: `similar_index::tests::startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` が lib 全件実行のときだけ時々落ちた (§1.403 の作業中、3 回中 2 回)。
+- 原因 (headless の負荷再現と順序固定の再現で確認、実アプリでは未確認): 構成変更 (お気に入りの類似索引対象・共通除外・PDF パスワード) がメモリの初期ロード中に起きると、旧ロードを失効させて新ロードを始めるが、旧ロードの検索配列ファイル (`similar.base`) への書き込み・置換は止まらない。旧・新が同じファイルを置換し、Windows ではハンドルの重なりでアクセス拒否 (0x80070005) になる。新ロードが Failed を公開し、Full が終わっても配列の反映確認 (ack) が Failed → Degraded(ArrayPublication) で止まり、完了印も書かれない。
+- 利用者から見た症状 (コード上の到達経路): お気に入り編集画面に「更新未完了: 検索用一覧への反映を確認できませんでした」。類似画像の検索が使えない状態が、構成を変えるか次回起動まで続き得る。
+- 対応: store ごとの一つの worker が load/rebuild/refresh/compaction/replace・公開・history prune を直列所有する。構成変更は query scope だけを失効し、初期ロードを破棄・再起動しない。ack は同 store/seq の公開済み事実から確定する。旧 three-thread の起動点、bool/epoch、CAS 公開と worker-stopped 推測を撤去。まれな実 I/O 失敗はデータを保持して「更新未完了」と再起動案内を表示し、次回起動で読み込み直す。sleep / retry / assert 緩和は追加しない。
+- 規模 / 優先度: Medium / P2 (通常の操作で到達し得る)。
+
 ### 1.403 フルスクリーンでメニューを開いたまま押すと、背面のナビゲータ・比較ワイプ・分析表示も動く — §1.396 のレビューで判明 (2026-10-19)
 
 - 状態: **実装済み・独立レビュー受入可 (`0a089b1c8`)・実アプリ確認済み (ClaudeCode、2026-10-19、主要経路。詳細と未確認項目は [調査記録](section403-front-popup-input-investigation.md) §10)。master 未取込**。経緯: D1 改訂 2 を実装し、レビュー P2 4 件と範囲キャプチャの P2 2 件を修正。lib 全件 13,752 件・ui_snapshot 186 件成功。

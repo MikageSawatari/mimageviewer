@@ -22,6 +22,38 @@ use crate::similar_db::{
 };
 
 const BASE_FILE: &str = "similar.base";
+
+// Path-scoped replacement barrier. Never compiled into the product.
+#[cfg(test)]
+pub(crate) mod startup_investigation_probe {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Phase {
+        BeforeReplace,
+        AfterReplace,
+    }
+    type Probe = Arc<dyn Fn(Phase) + Send + Sync>;
+    static PROBE: Mutex<BTreeMap<PathBuf, Probe>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PROBE.lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(crate) fn install(path: PathBuf, probe: Probe) -> Guard {
+        assert!(PROBE.lock().unwrap().insert(path.clone(), probe).is_none());
+        Guard(path)
+    }
+    pub(super) fn hit(path: &Path, phase: Phase) {
+        let probe = PROBE.lock().unwrap().get(path).map(Arc::clone);
+        if let Some(probe) = probe {
+            probe(phase);
+        }
+    }
+}
 const LEGACY_SIDECAR_FILE: &str = "similar.compact";
 const BASE_MAGIC: [u8; 8] = *b"MIVSIMB1";
 const BASE_FORMAT_VERSION: u32 = 1;
@@ -54,6 +86,54 @@ pub(crate) struct SearchSnapshot {
     pub(crate) delta: Arc<[DeltaEntry]>,
     pub(crate) superseded: Arc<[u64]>,
     pub(crate) applied_seq: u64,
+}
+
+// Observe the actual final Arc drop, without adding ownership to the tested snapshot.
+#[cfg(test)]
+pub(crate) mod snapshot_drop_probe {
+    use super::*;
+    use std::sync::{Mutex, Weak, mpsc};
+    use std::thread::Thread;
+
+    static PROBES: Mutex<BTreeMap<usize, mpsc::Sender<Thread>>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) struct Guard(Weak<SearchSnapshot>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PROBES.lock().unwrap().remove(&(self.0.as_ptr() as usize));
+        }
+    }
+
+    pub(crate) fn observe(snapshot: &Arc<SearchSnapshot>) -> (Guard, mpsc::Receiver<Thread>) {
+        let (sender, receiver) = mpsc::channel();
+        assert!(
+            PROBES
+                .lock()
+                .unwrap()
+                .insert(Arc::as_ptr(snapshot) as usize, sender)
+                .is_none()
+        );
+        // Keep the allocation address unique until this registration is removed.
+        (Guard(Arc::downgrade(snapshot)), receiver)
+    }
+
+    pub(super) fn hit(snapshot: &SearchSnapshot) {
+        let sender = PROBES
+            .lock()
+            .unwrap()
+            .remove(&(std::ptr::from_ref(snapshot) as usize));
+        if let Some(sender) = sender {
+            let _ = sender.send(std::thread::current());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SearchSnapshot {
+    fn drop(&mut self) {
+        snapshot_drop_probe::hit(self);
+    }
 }
 
 impl SearchSnapshot {
@@ -105,6 +185,13 @@ pub(crate) struct LoadedSnapshot {
     pub(crate) snapshot: SearchSnapshot,
     pub(crate) source: LoadSource,
     pub(crate) rejected: Option<BaseRejectReason>,
+    pub(crate) persistence: BasePersistence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BasePersistence {
+    Reused,
+    Written(crate::similar_db::StoreWatermark),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,13 +250,28 @@ pub(crate) fn retire_legacy_sidecar(data_dir: &Path) -> Result<bool, String> {
     }
 }
 
+/// Disposable fixture / standalone benchmark only; product callers must use the store owner.
+#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) fn load_or_rebuild(db: &SimilarDb, path: &Path) -> Result<LoadedSnapshot, String> {
+    let loaded = load_for_owner(&crate::similar_array_owner::BaseAccess::fixture(), db, path)?;
+    if let BasePersistence::Written(cutoff) = loaded.persistence {
+        db.prune_array_history(cutoff).map_err(db_error)?;
+    }
+    Ok(loaded)
+}
+
+pub(crate) fn load_for_owner(
+    _access: &crate::similar_array_owner::BaseAccess,
+    db: &SimilarDb,
+    path: &Path,
+) -> Result<LoadedSnapshot, String> {
     let store_id = db.search_store_id().map_err(db_error)?;
     match read_base(path, store_id) {
         Ok(base) => Ok(LoadedSnapshot {
             snapshot: SearchSnapshot::from_base(base),
             source: LoadSource::BaseFile,
             rejected: None,
+            persistence: BasePersistence::Reused,
         }),
         Err(reason) => {
             let rows = db
@@ -181,18 +283,30 @@ pub(crate) fn load_or_rebuild(db: &SimilarDb, path: &Path) -> Result<LoadedSnaps
                 applied_seq: rows.applied_seq,
             };
             write_base(path, &base)?;
-            db.prune_item_changes_through(base.applied_seq)
-                .map_err(db_error)?;
+            let cutoff = crate::similar_db::StoreWatermark {
+                store_id: base.store_id,
+                through_change_seq: base.applied_seq,
+            };
             Ok(LoadedSnapshot {
                 snapshot: SearchSnapshot::from_base(base),
                 source: LoadSource::Sqlite,
                 rejected: Some(reason),
+                persistence: BasePersistence::Written(cutoff),
             })
         }
     }
 }
 
+#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) fn rebuild_from_sqlite(db: &SimilarDb, path: &Path) -> Result<SearchSnapshot, String> {
+    rebuild_for_owner(&crate::similar_array_owner::BaseAccess::fixture(), db, path)
+}
+
+pub(crate) fn rebuild_for_owner(
+    _access: &crate::similar_array_owner::BaseAccess,
+    db: &SimilarDb,
+    path: &Path,
+) -> Result<SearchSnapshot, String> {
     let rows = db
         .load_base_search_rows(current_hash_version())
         .map_err(db_error)?;
@@ -414,7 +528,20 @@ pub(crate) fn compacted_base(snapshot: &SearchSnapshot) -> BaseArray {
     }
 }
 
+#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) fn write_compacted_base(path: &Path, base: &BaseArray) -> Result<(), String> {
+    write_compacted_for_owner(
+        &crate::similar_array_owner::BaseAccess::fixture(),
+        path,
+        base,
+    )
+}
+
+pub(crate) fn write_compacted_for_owner(
+    _access: &crate::similar_array_owner::BaseAccess,
+    path: &Path,
+    base: &BaseArray,
+) -> Result<(), String> {
     write_base(path, base)
 }
 
@@ -633,7 +760,15 @@ fn write_base(path: &Path, base: &BaseArray) -> Result<(), String> {
             .get_ref()
             .sync_all()
             .map_err(|error| format!("base sync failed: {error}"))?;
-        replace_file_atomic(&temp, path).map_err(|error| format!("base publish failed: {error}"))
+        // No reader/writer handle may survive replacement or escape to the next owner operation.
+        drop(writer);
+        #[cfg(test)]
+        startup_investigation_probe::hit(path, startup_investigation_probe::Phase::BeforeReplace);
+        let result = replace_file_atomic(&temp, path)
+            .map_err(|error| format!("base publish failed: {error}"));
+        #[cfg(test)]
+        startup_investigation_probe::hit(path, startup_investigation_probe::Phase::AfterReplace);
+        result
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);

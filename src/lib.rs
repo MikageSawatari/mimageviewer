@@ -300,6 +300,7 @@ pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
 pub mod sidecar_import;
+mod similar_array_owner;
 mod similar_book_engine;
 mod similar_book_mih;
 mod similar_book_query;
