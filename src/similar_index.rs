@@ -659,7 +659,10 @@ impl SimilarIndexManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Some(failure) = self.array.observe().failure() {
+        if let Some(failure) = self
+            .array
+            .with_observation(|observation| observation.failure().cloned())
+        {
             let report = match progress {
                 IndexProgress::Running(running) => running.report,
                 IndexProgress::AwaitingWatch(report)
@@ -8285,6 +8288,184 @@ mod tests {
         assert_eq!(before.publication_revision, after.publication_revision);
         assert_ne!(before.scope_revision, after.scope_revision);
         assert!(Arc::ptr_eq(&snapshot, &manager.snapshot_for_test()));
+    }
+
+    fn array_drop_barrier() -> (
+        impl Fn() + Send + Sync,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        (
+            move || {
+                entered.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("release array retirement barrier");
+            },
+            entered_rx,
+            release,
+        )
+    }
+
+    fn progress_does_not_retain_snapshot(faulted: bool) {
+        use crate::similar_array_owner::{ArrayFailure, ArrayOperation, OwnerPhase};
+        use crate::similar_search_array::{DeltaEntry, snapshot_drop_probe};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let mut snapshot = snapshot_from_rows(&[row(1, "c:/old.jpg", [0; 32], 1)]);
+        snapshot.delta = vec![DeltaEntry {
+            item_id: 2,
+            seq: 1,
+            record: Some(SearchRecord {
+                item_id: 2,
+                signature: [1; 32],
+                quality: 1,
+                revision: 1,
+            }),
+        }]
+        .into();
+        snapshot.applied_seq = 1;
+        let snapshot = Arc::new(snapshot);
+        let (_drop_guard, dropped) = snapshot_drop_probe::observe(&snapshot);
+        let published = PublishedArray {
+            snapshot,
+            revision: 1,
+        };
+        manager.array.install_for_test(if faulted {
+            ArrayObservation::Faulted {
+                published: Some(published),
+                failure: ArrayFailure {
+                    operation: ArrayOperation::Worker,
+                    detail: "progress retirement fixture".into(),
+                },
+            }
+        } else {
+            ArrayObservation::Published(published)
+        });
+        let (pause_ui, entered, release_ui) = array_drop_barrier();
+        manager.array.set_probe(Arc::new(move |phase| {
+            if phase == OwnerPhase::AfterObservation {
+                pause_ui();
+            }
+        }));
+
+        std::thread::scope(|threads| {
+            let ui = std::thread::Builder::new()
+                .name("test-ui-progress".into())
+                .spawn_scoped(threads, || manager.progress())
+                .unwrap();
+            entered.recv_timeout(Duration::from_secs(20)).unwrap();
+            manager.array.set_probe(Arc::new(|_| {}));
+            if faulted {
+                manager.array.close();
+                manager.array.wait_closed_for_test();
+            } else {
+                // The old store differs: a real rebuild publishes a new base and retires delta.
+                manager.array.ensure(ArrayDemand::RefreshOrCreate);
+                manager.array.wait_idle_for_test();
+                assert!(manager.query_stamp_for_test().publication_revision > 1);
+            }
+            let drop_thread = dropped.try_recv();
+            release_ui.send(()).unwrap();
+            let ui_id = ui.thread().id();
+            let progress = ui.join().unwrap();
+            assert_eq!(matches!(progress, IndexProgress::Degraded { .. }), faulted);
+            let drop_thread = drop_thread.expect("snapshot retired before the UI returns");
+            assert_eq!(drop_thread.name(), Some("similar-array-owner"));
+            assert_ne!(drop_thread.id(), ui_id);
+        });
+        manager.array.close();
+        manager.array.wait_closed_for_test();
+    }
+
+    #[test]
+    fn progress_published_snapshot_is_retired_by_owner_during_publication() {
+        progress_does_not_retain_snapshot(false);
+    }
+
+    #[test]
+    fn progress_faulted_snapshot_is_retired_by_owner_during_close() {
+        progress_does_not_retain_snapshot(true);
+    }
+
+    fn close_transfers_snapshot_to_worker(faulted: bool) {
+        use crate::similar_array_owner::OwnerPhase;
+        use crate::similar_search_array::snapshot_drop_probe;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        db.upsert_loose_item(&row(1, "c:/published.jpg", [0; 32], 1).item)
+            .unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        let goal = db.change_watermark().unwrap();
+        assert_eq!(
+            manager
+                .array
+                .request_through(goal)
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap(),
+            ArrayAck::Published(goal)
+        );
+        manager.array.wait_idle_for_test();
+        let snapshot = manager.snapshot_for_test();
+        let (_drop_guard, dropped) = snapshot_drop_probe::observe(&snapshot);
+        drop(snapshot);
+        let (pause_worker, worker_entered, release_worker) = array_drop_barrier();
+        let (pause_ui, ui_entered, release_ui) = array_drop_barrier();
+        if faulted {
+            manager.array.fail_at_for_test(OwnerPhase::BeforeRead);
+        }
+        manager.array.set_probe(Arc::new(move |phase| {
+            if phase
+                == if faulted {
+                    OwnerPhase::AfterFault
+                } else {
+                    OwnerPhase::BeforeIdle
+                }
+            {
+                pause_worker();
+            } else if phase == OwnerPhase::AfterCloseTransition {
+                pause_ui();
+            }
+        }));
+        manager.array.ensure(ArrayDemand::RefreshOrCreate);
+        worker_entered
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap();
+
+        std::thread::scope(|threads| {
+            let ui = std::thread::Builder::new()
+                .name("test-ui-close".into())
+                .spawn_scoped(threads, || manager.array.close())
+                .unwrap();
+            ui_entered.recv_timeout(Duration::from_secs(20)).unwrap();
+            release_worker.send(()).unwrap();
+            manager.array.wait_closed_for_test();
+            let drop_thread = dropped.try_recv();
+            release_ui.send(()).unwrap();
+            let ui_id = ui.thread().id();
+            ui.join().unwrap();
+            let drop_thread = drop_thread.expect("snapshot retired before close caller cleanup");
+            assert_eq!(drop_thread.name(), Some("similar-array-owner"));
+            assert_ne!(drop_thread.id(), ui_id);
+        });
+    }
+
+    #[test]
+    fn close_open_snapshot_is_moved_to_owner_before_caller_cleanup() {
+        close_transfers_snapshot_to_worker(false);
+    }
+
+    #[test]
+    fn close_faulted_snapshot_is_moved_to_owner_before_caller_cleanup() {
+        close_transfers_snapshot_to_worker(true);
     }
 
     #[test]

@@ -1383,6 +1383,8 @@ ack は同 store / 到達 seq の公開事実だけで成功し、worker停止�
 refresh は identity / batch を同一read TXで得る。pruneは既存IMMEDIATE write transactionでidentityを
 照合し、置換と採用の完了後に永続baseのcutoffだけを削除する。後着commitは後続refreshへ残る。
 空refreshは公開revisionを進めず、bookのsoft refreshも送らない。
+UIのprogress読取はowner lock内でfailureだけを複製し、snapshotの参照を持ち出さない。
+closeは公開snapshotをClosingへ移し、呼出元の旧状態に参照を残さずowner workerで退役する。
 
 itemは `QueryScopeState` のimmutable roots / scope revision / 6件cacheとpublication revisionを照合する。
 lock順は owner → query scope、query workerは受付時rootsを使い、遅い旧完了でcacheを再充填しない。

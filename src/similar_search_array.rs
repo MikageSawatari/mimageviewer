@@ -88,6 +88,54 @@ pub(crate) struct SearchSnapshot {
     pub(crate) applied_seq: u64,
 }
 
+// Observe the actual final Arc drop, without adding ownership to the tested snapshot.
+#[cfg(test)]
+pub(crate) mod snapshot_drop_probe {
+    use super::*;
+    use std::sync::{Mutex, Weak, mpsc};
+    use std::thread::Thread;
+
+    static PROBES: Mutex<BTreeMap<usize, mpsc::Sender<Thread>>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) struct Guard(Weak<SearchSnapshot>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PROBES.lock().unwrap().remove(&(self.0.as_ptr() as usize));
+        }
+    }
+
+    pub(crate) fn observe(snapshot: &Arc<SearchSnapshot>) -> (Guard, mpsc::Receiver<Thread>) {
+        let (sender, receiver) = mpsc::channel();
+        assert!(
+            PROBES
+                .lock()
+                .unwrap()
+                .insert(Arc::as_ptr(snapshot) as usize, sender)
+                .is_none()
+        );
+        // Keep the allocation address unique until this registration is removed.
+        (Guard(Arc::downgrade(snapshot)), receiver)
+    }
+
+    pub(super) fn hit(snapshot: &SearchSnapshot) {
+        let sender = PROBES
+            .lock()
+            .unwrap()
+            .remove(&(std::ptr::from_ref(snapshot) as usize));
+        if let Some(sender) = sender {
+            let _ = sender.send(std::thread::current());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SearchSnapshot {
+    fn drop(&mut self) {
+        snapshot_drop_probe::hit(self);
+    }
+}
+
 impl SearchSnapshot {
     pub(crate) fn from_base(base: BaseArray) -> Self {
         let words = base.records.len().div_ceil(64);

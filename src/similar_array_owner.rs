@@ -295,23 +295,28 @@ impl SimilarArrayHandle {
     }
     /// The closure may take the query-scope lock, in this order. It must do only short memory work.
     pub(crate) fn with_observation<T>(&self, read: impl FnOnce(&ArrayObservation) -> T) -> T {
-        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let observation = match &*state {
-            ArrayOwnerState::Open(open) => match &open.view {
-                ArrayView::Uninitialized => ArrayObservation::Uninitialized {
-                    busy: !matches!(open.work, ArrayWork::Idle),
+        let result = {
+            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let observation = match &*state {
+                ArrayOwnerState::Open(open) => match &open.view {
+                    ArrayView::Uninitialized => ArrayObservation::Uninitialized {
+                        busy: !matches!(open.work, ArrayWork::Idle),
+                    },
+                    ArrayView::Missing => ArrayObservation::Missing,
+                    ArrayView::Published(value) => ArrayObservation::Published(value.clone()),
                 },
-                ArrayView::Missing => ArrayObservation::Missing,
-                ArrayView::Published(value) => ArrayObservation::Published(value.clone()),
-            },
-            ArrayOwnerState::Faulted { published, failure } => ArrayObservation::Faulted {
-                published: published.clone(),
-                failure: failure.clone(),
-            },
-            ArrayOwnerState::Closing { .. } => ArrayObservation::Closing,
-            ArrayOwnerState::Closed(terminal) => ArrayObservation::Closed(terminal.clone()),
+                ArrayOwnerState::Faulted { published, failure } => ArrayObservation::Faulted {
+                    published: published.clone(),
+                    failure: failure.clone(),
+                },
+                ArrayOwnerState::Closing { .. } => ArrayObservation::Closing,
+                ArrayOwnerState::Closed(terminal) => ArrayObservation::Closed(terminal.clone()),
+            };
+            read(&observation)
         };
-        read(&observation)
+        #[cfg(test)]
+        self.shared.probe(OwnerPhase::AfterObservation);
+        result
     }
     pub(crate) fn ensure(&self, demand: ArrayDemand) {
         self.shared.enqueue(demand);
@@ -366,11 +371,25 @@ impl SimilarArrayHandle {
             ) {
                 return;
             }
-            let published = state.published().cloned();
-            let mut old = std::mem::replace(&mut *state, ArrayOwnerState::Closing { published });
+            let mut old =
+                std::mem::replace(&mut *state, ArrayOwnerState::Closing { published: None });
+            // Transfer the owner's reference; the caller must not retire a published array.
+            let published = match &mut old {
+                ArrayOwnerState::Open(open) => {
+                    match std::mem::replace(&mut open.view, ArrayView::Uninitialized) {
+                        ArrayView::Published(published) => Some(published),
+                        _ => None,
+                    }
+                }
+                ArrayOwnerState::Faulted { published, .. } => published.take(),
+                _ => unreachable!("closing and closed states returned above"),
+            };
+            *state = ArrayOwnerState::Closing { published };
             let replies = take_waiters(&mut old);
             (old, replies)
         };
+        #[cfg(test)]
+        self.shared.probe(OwnerPhase::AfterCloseTransition);
         self.shared.send_all(replies, ArrayAck::Stopped);
         drop(old);
         self.shared.wake.notify_all();
@@ -910,6 +929,8 @@ impl Shared {
         drop(old);
         self.send_all(requests, ArrayAck::Failed(failure));
         (self.notify)();
+        #[cfg(test)]
+        self.probe(OwnerPhase::AfterFault);
     }
     fn close_worker(&self, terminal: OwnerTerminal) {
         crate::logger::log(format!(
@@ -954,12 +975,15 @@ impl Shared {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnerPhase {
+    AfterObservation,
     BeforeRead,
     AfterRead,
     BeforePublish,
     AfterPublish,
     BeforePrune,
     BeforeIdle,
+    AfterFault,
+    AfterCloseTransition,
 }
 
 #[cfg(test)]

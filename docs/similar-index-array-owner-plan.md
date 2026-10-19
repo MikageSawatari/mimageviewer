@@ -238,6 +238,7 @@ compaction の終了後は必ず最新差分確認を一件要求する。cutoff
 3. base を書いた場合、write/sync/replace と File / BufWriter / reader handle の破棄まで終える。
 4. owner lock 下で snapshot と revision を一回で採用し、到達した ack の結果を確定する。
    callback、reply 送信、大きい旧 Arc の最終破棄は lock 外で行う。
+   UIの進捗読取は同じlock内でfailureだけを複製し、snapshotのArcを持ち出さない。
 5. 書いた **その base の store / base.applied_seq** を cutoff として history を prune する。
 6. 初期ロード後も最新差分確認を一件行う。読んだ base が古くても、既存の読み取り可能な配列を先に使える。
 
@@ -382,6 +383,7 @@ owner の終端時に既存の UI wake と §7.3 の book dispatch 通知を行�
 
 manager shutdown は従来どおり scan を cancel し book executor を shutdown したうえで、owner に close を通知する。
 owner lock 内で Closing にし、未開始の要求を破棄し、保留 ack の Stopped を確定する。
+公開snapshotはClosingへ移動し、呼出元へ返す旧状態には参照を残さない。
 reply 送信や大きな payload 解放は lock 外。UI thread は join / DB close 待ち / Condvar wait をしない。
 初期 loader / compactor の個別 JoinHandle はなくなり、owner worker が自分の実処理終了を所有する。
 
@@ -629,3 +631,56 @@ owner readinessの到達は一時診断と正式回帰で確認し、遅延自�
 利用者が確認する際はインストール版/トレイ常駐版を終了し、リポジトリルートから
 `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`で起動する。
 初期ロード中にお気に入り対象/除外の構成を変更し、Full完了と類似候補の表示を確認する。agentは起動しない。
+
+### 16.1 完成レビュー P2: UIへの最終破棄の移動を防ぐ
+
+2026-10-19、`9faa4c3bb` の独立完成レビューで指摘された2経路を修正した。
+以下は同commitに対する未コミット差分の記録であり、上記の初回実装gateとは区別する。
+コミットと検収はClaudeCodeが担当し、agentは製品を起動しない。
+
+- `progress()`は`with_observation`のlock内でfailureだけを複製する。
+  観測用snapshotのArcをUIへ持ち出す一時値を撤去し、公開更新/closeと重なってもUIを最終所有者にしない。
+- `close()`はOpenのviewまたはFaultedのOptionから公開snapshotをClosingへ移す。
+  呼出元がlock外で片付ける旧状態にはsnapshotを残さず、workerの終了が先でもUIで大きな配列を解放しない。
+  ownerの状態型、ack、revision、query stamp、通常のquery workerへの参照移譲は維持する。
+- `observe` / `with_observation` / snapshotのArc複製をgrepし、同型のUI経路を確認した。
+  `query_item()`のStartは検索workerへmoveし、即時返却値はsnapshotを含まない。
+  `complete_item_query()`はcache結果だけを返す。book runtimeの取得とdispatch gateはbook worker上で実行される。
+  他の同型UI経路は見つからなかった。まれなthread spawn失敗に新たな退役/再試行機構は追加しない。
+- 回帰はPublished/FaultedのprogressとOpen/Faultedのcloseの計4件。
+  UIの観測後/Closing遷移後をbarrierで止め、実際のowner公開更新またはClosedまで先行させる。
+  UIを解放する前に`SearchSnapshot::drop`の通知を検査し、破棄threadが`similar-array-owner`でUIとは異なることをassertする。
+  Drop observerはsnapshotのアドレスごとの登録とWeak guardで識別し、強参照を増やさない。
+  observerとbarrierは`cfg(test)`限定で、製品の追加状態/ログ/調査用環境変数はない。
+
+独立した差分レビュー（GPT-6.1 Sol / xhigh）は追加P1/P2/P3なし。
+観測barrierはowner mutexと内部observationの解放後、返却値を保持する位置に置いた。
+これによりRust 2024でif-letの一時値がelse前に解放される場合も、旧実装の参照持出しを確実に固定する。
+`progress()`と`close()`だけを旧実装へ戻したmutationでは、新規4件がすべて意図どおり失敗した
+（`target/similar-array-owner/p2-drop-old-mutation.log`、nextest 0/4成功、exit 100）。
+対照確認後は正実装をbyte単位で復元した。以降のgateは正実装を対象とする。
+
+今回の検証（`MSBUILDDISABLENODEREUSE=1`、通常feature、製品起動なし）:
+
+| 対象 | コマンド | 結果 / 証跡 |
+| --- | --- | --- |
+| 関連nextest | `cargo nextest run -p mimageviewer --lib -E 'test(/^similar_array_owner::/) \| test(/^similar_index::/) \| test(/^similar_search_array::/) \| test(/^similar_db::/) \| test(/^similar_book_/) \| test(/^indexer_manager::/) \| test(/^metadata_reconfiguration::/)'` | 312/312成功、失敗0、3.494秒。`target/similar-array-owner/p2-drop-focused.log` |
+| CPU負荷gate | `python scripts/stress-similar-index.py --stress-count 20` | 24負荷process、`-E 'test(/^similar_index::/)' --stress-count 20 -j 48 --no-fail-fast`。110件×20周=2,200成功、失敗0。nextest 115.307秒、helper exit 0 / 131.822秒。`target/similar-startup-investigation/owner-cpu-load-20.log` |
+| fmt | `cargo fmt --all -- --check` | exit 0 |
+| 通常profile確認用build | `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、96.52秒。`CARGO_BUILD_JOBS=8`、portable featureなし。core / remote / EPUB workerとVC runtimeのPE 3件の検査成功。`target/similar-array-owner/p2-drop-dev-build.log`。起動なし |
+
+元commitの負荷gateログは`target/similar-startup-investigation/owner-cpu-load-20-before-p2-drop-fix.log`へ保存した。
+今回のgate本体はexit 0。外側の一時runnerだけが末尾表示時にcp932変換の例外を出したため、
+runnerの標準出力と子Pythonの出力をUTF-8へ統一した。正規nextestログとテスト結果には影響しない。
+表示修正は`p2-drop-log-encoding.log`でexit 0を確認した。
+
+今回の追補では関連nextestと負荷gateを再実行した。lib全件/workspace/vendor/doctestの結果は
+§16の修正前の記録であり、新しい差分の全件成功結果とは扱わない。
+Rust 3ファイルのSHA-256は`target/similar-array-owner/p2-drop-source-hashes.json`へ保存し、
+関連nextestから負荷gate・確認用buildまで変更がないことを照合した。UI文言は変更していない。
+新規の恒久診断はなく、既存の型付き終端ログを維持した。今回のP2に未解決事項はない。
+
+確認用coreの起動コマンドは`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+既定では実際の`%APPDATA%\mimageviewer`の設定/データを更新し得るため、利用者が起動前に
+インストール版/トレイ常駐版を終了する（同じsingle-instance mutex）。
+類似索引の初期ロード/更新中に進捗表示を開き、通常の候補表示と終了操作を確認できる。agentは起動しない。
