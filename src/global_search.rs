@@ -945,6 +945,35 @@ mod tests {
         assert_eq!(reason, rejected_short_terms(&["r5"]));
     }
 
+    #[test]
+    fn and_short_phrase_post_filter_rejects_noncontiguous_bigram_candidates() {
+        let (_tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        for (path, text) in [
+            ("c:/contiguous.jpg", "EOS r 5"),
+            ("c:/noncontiguous.jpg", "EOS r x 5"),
+            ("c:/no_spaces.jpg", "EOS r5"),
+            ("c:/no_anchor.jpg", "r 5"),
+            ("c:/anchor_only.jpg", "EOS only"),
+        ] {
+            ingest(&meta, &fts, fav, path, text);
+        }
+
+        // 空白を除くと 2 文字の短語。r5 の 1 bigram とは異なり、"r " / " 5" が
+        // 同じ doc にあっても隣接は保証されないため、短語の post-filter 省略を検出できる。
+        assert_eq!(query_term_length("r 5"), QueryTermLength::NeedsAnchor);
+        let (hits, reason, truncated, scanned) =
+            collect_scoped_events(r#"EOS "r 5""#, &[fav], &SearchScope::default(), &fts);
+        assert_eq!(reason, DoneReason::Complete);
+        assert!(!truncated);
+        assert_eq!(scanned, 2, "連続・非連続の両方が索引候補になること");
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            ["c:/contiguous.jpg"],
+            "短いフレーズも post-filter で連続部分一致を要求すること"
+        );
+    }
+
     fn ingest_many_for_progress(fts: &FtsIndex, fav: Uuid, count: usize, text: &str) {
         retry_tantivy_permission_denied(|| {
             let mut writer = fts.writer()?;
