@@ -22,6 +22,43 @@ use crate::similar_db::{
 };
 
 const BASE_FILE: &str = "similar.base";
+
+// Temporary, path-scoped investigation probe. Never compiled into the product.
+#[cfg(test)]
+pub(crate) mod startup_investigation_probe {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Phase {
+        BeforeReplace,
+        AfterReplace,
+    }
+    type Probe = Arc<dyn Fn(Phase) + Send + Sync>;
+    static PROBE: Mutex<Option<(PathBuf, Probe)>> = Mutex::new(None);
+
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *PROBE.lock().unwrap() = None;
+        }
+    }
+    pub(crate) fn install(path: PathBuf, probe: Probe) -> Guard {
+        *PROBE.lock().unwrap() = Some((path, probe));
+        Guard
+    }
+    pub(super) fn hit(path: &Path, phase: Phase) {
+        let probe = PROBE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(target, _)| target == path)
+            .map(|(_, probe)| Arc::clone(probe));
+        if let Some(probe) = probe {
+            probe(phase);
+        }
+    }
+}
 const LEGACY_SIDECAR_FILE: &str = "similar.compact";
 const BASE_MAGIC: [u8; 8] = *b"MIVSIMB1";
 const BASE_FORMAT_VERSION: u32 = 1;
@@ -633,7 +670,13 @@ fn write_base(path: &Path, base: &BaseArray) -> Result<(), String> {
             .get_ref()
             .sync_all()
             .map_err(|error| format!("base sync failed: {error}"))?;
-        replace_file_atomic(&temp, path).map_err(|error| format!("base publish failed: {error}"))
+        #[cfg(test)]
+        startup_investigation_probe::hit(path, startup_investigation_probe::Phase::BeforeReplace);
+        let result = replace_file_atomic(&temp, path)
+            .map_err(|error| format!("base publish failed: {error}"));
+        #[cfg(test)]
+        startup_investigation_probe::hit(path, startup_investigation_probe::Phase::AfterReplace);
+        result
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);

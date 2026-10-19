@@ -999,7 +999,20 @@ fn start_memory_load(
             })
             .map_err(|error| format!("similar index load failed: {error}"));
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            if std::env::var_os("MIV_SIMILAR_STARTUP_TRACE").is_some() {
+                eprintln!("SIMILAR_STARTUP load captured_epoch={epoch} current_epoch={} discarded={} result={:?}",
+                    epoch_guard.load(Ordering::Acquire), epoch_guard.load(Ordering::Acquire) != epoch,
+                    loaded.as_ref().map(|index| index.as_ref().map(|index| index.applied_seq)));
+            }
             if epoch_guard.load(Ordering::Acquire) != epoch {
+                #[cfg(test)]
+                {
+                    drop(state);
+                    if let Some(scheduler) = worker_scheduler.as_ref().and_then(Weak::upgrade) {
+                        scheduler.probe_startup("memory_load_discarded");
+                    }
+                }
                 return;
             }
             // Diagnostic only: publish the actual load time with the matching memory epoch.
@@ -1018,6 +1031,10 @@ fn start_memory_load(
             drop(state);
             cache.lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
             epoch_guard.fetch_add(1, Ordering::AcqRel);
+            #[cfg(test)]
+            if let Some(scheduler) = worker_scheduler.as_ref().and_then(Weak::upgrade) {
+                scheduler.probe_startup("memory_load_published");
+            }
             if let Some(scheduler) = worker_scheduler.and_then(|scheduler| scheduler.upgrade()) {
                 scheduler.request_array_refresh();
                 scheduler.book_query.soft_refresh();
@@ -3417,6 +3434,8 @@ impl SimilarIndexScheduler {
             let ack_started = std::time::Instant::now();
             self.request_array_refresh_through(watermark);
             if let Err(error) = self.wait_for_array_ack(watermark, &plan.running.cancel) {
+                #[cfg(test)]
+                self.trace_startup_investigation(&format!("array_ack={error:?}"));
                 match error {
                     ArrayAckWaitError::Cancelled => {
                         telemetry.log_terminal("cancelled", &outcome.report);
@@ -3530,10 +3549,42 @@ impl SimilarIndexScheduler {
 
     #[cfg(test)]
     fn probe_startup(&self, phase: &'static str) {
+        self.trace_startup_investigation(phase);
         let probe = self.startup_test_probe.lock().unwrap().clone();
         if let Some(probe) = probe {
             probe(phase);
         }
+    }
+
+    // Temporary investigation only; no production logging or scheduling changes.
+    #[cfg(test)]
+    fn trace_startup_investigation(&self, event: &str) {
+        if std::env::var_os("MIV_SIMILAR_STARTUP_TRACE").is_none() {
+            return;
+        }
+        let memory = {
+            let memory = self.memory.lock().unwrap();
+            match &*memory {
+                MemoryState::Unloaded => "Unloaded".to_owned(),
+                MemoryState::Loading => "Loading".to_owned(),
+                MemoryState::Missing => "Missing".to_owned(),
+                MemoryState::Failed(error) => format!("Failed({error})"),
+                MemoryState::Ready(snapshot) => format!("Ready(seq={})", snapshot.applied_seq),
+            }
+        };
+        let epoch = self.memory_epoch.load(Ordering::Acquire);
+        let array = {
+            let array = self.array_update.lock().unwrap();
+            format!(
+                "running={} requested={} required={:?} error={:?}",
+                array.running, array.requested, array.required_through, array.last_error
+            )
+        };
+        let progress = self.progress.lock().unwrap().clone();
+        eprintln!(
+            "SIMILAR_STARTUP scheduler={:p} event={event} memory={memory} epoch={epoch} array=[{array}] progress={progress:?}",
+            self
+        );
     }
 
     fn settle_interrupted_plan(
@@ -7197,6 +7248,10 @@ fn raster_is_large_enough_for_canonical_proxy(
     };
     decoded_long_edge >= required_long_edge
 }
+
+#[cfg(test)]
+#[path = "similar_startup_investigation.rs"]
+mod startup_investigation;
 
 #[cfg(test)]
 mod tests {
@@ -11077,6 +11132,9 @@ mod tests {
                     }
                 }));
             Arc::clone(&restarted.scheduler).worker_loop();
+            restarted
+                .scheduler
+                .trace_startup_investigation("restarted_worker_returned");
             assert!(!reused.load(Ordering::Acquire));
             assert_eq!(restarted.reconcile_job_counts_for_test(), (1, 0));
             assert_eq!(db.full_inventory_load_count(), 1);
