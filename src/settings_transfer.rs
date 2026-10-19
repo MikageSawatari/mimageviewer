@@ -725,6 +725,7 @@ preferences_policy! {
         audio_normalize_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         audio_normalize_target_lufs_milli => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         last_seen_version => "初回/学習/通知/保存版の内部記録";
+        whats_new_acknowledged_version => "初回/学習/通知/保存版の内部記録";
     }
 }
 
@@ -1913,7 +1914,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 462);
+        assert_eq!(entries.len(), 463);
         assert_eq!(
             entries
                 .iter()
@@ -1926,7 +1927,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            315
+            316
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());

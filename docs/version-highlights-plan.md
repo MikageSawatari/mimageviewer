@@ -10,9 +10,9 @@
   `latest_not_newer_than` + 描画 `render(ui, entries)` (App 非依存 → snapshot から呼べる)。
 - ダイアログ: [src/ui_dialogs/whats_new.rs](../src/ui_dialogs/whats_new.rs)。⚠ 必読 → ・ 新機能 →
   「すべての変更を見る」(changelog.html) / 閉じる。display-only。
-- トリガ: `App` 構築時に `meta.previous_last_seen_version` と現行版で `highlights_to_show` を
-  評価し、非空なら表示。`last_seen_version` は `Settings::load` で更新・保存済みなので一度きり
-  (閉じなくても次回は出ない)。新規インストール (previous=None) は出さない。
+- トリガ: `App` 構築時に `settings.whats_new_acknowledged_version` と現行版で
+  `highlights_to_show` を評価し、非空なら表示要求を保持する。利用者が閉じるまで未読を持ち越す。
+  `last_seen_version` は起動時の移行・snapshot用の記録として独立に維持する。
 - 開発用 `--whatsnew-from <ver>` で任意の前バージョンから強制表示 (`cli_flag_takes_value` 登録済)。
   ヘルプメニュー「重要な変更点を表示」で再表示。
 - テスト: `highlights_to_show` の unit test + egui_kittest snapshot `whats_new_multi_version_dark`。
@@ -25,7 +25,8 @@
 - **v2.9.0 entry** は、一覧の通常クリックをエクスプローラー方式へ切り替えることを
   `must_read` で告知する。既存設定の一度きりの切替は新しい永続フラグを持たず、
   `highlights_to_show(previous_last_seen_version, current, table())` が返した集合にこの entry が
-  含まれるかから直接導出する。したがって告知と切替の範囲は常に一致し、v2.9.0 以後に
+  含まれるかから直接導出する。初回移行時の告知と切替の範囲は一致し、未読告知の再表示では
+  設定を再移行しない。v2.9.0 以後に
   ユーザーがチェック方式へ戻しても次回起動では上書きしない。
 
 ## 0. 背景と目的
@@ -66,14 +67,33 @@
       ④ の highlight テーブルに **v1.8.0 のマウス変更を重複して載せない** (対話プロンプトが担当)。
   - 利点: 画面が純粋な情報表示になり、§5 のテスト容易性がさらに高まる。
 
-## 2. トリガ (既存資産を流用、新規検出ロジック不要)
+## 2. トリガと既読記録 (§1.232、2026-10-19)
 
-- 既存の `settings.last_seen_version` ([src/settings.rs](../src/settings.rs)) /
-  `SettingsLoadMeta.previous_last_seen_version` / `version_changed` 判定をそのまま使う。
-- `previous == None` (新規インストール) → **何も出さない** (新規ユーザーを「変更点」で迎えない)。
-- `previous == current` → 出さない。
-- `previous < current` → previous より新しく current 以下の**全バージョンの highlight を累積**して
+- `settings.whats_new_acknowledged_version` から現行版までを `highlights_to_show` で選ぶ。
+  `acknowledged == current` → 出さない。
+- `acknowledged < current` → acknowledged より新しく current 以下の**全バージョンの highlight を累積**して
   1 画面に表示する (バージョンを飛ばした人も、途中で入った重要変更を見逃さない)。
+- リリース済み設定に項目がない場合、`Settings::load` で
+  `previous_last_seen_version.unwrap_or(current)` へ初期化し、起動版と同じ bootstrap save で
+  その起動中に保存する。同じ版からの移行でも保存する。clean install は current となり表示しない。
+- `whats_new_visible` を描画の早期 return と共通モーダル判定の両方で使う。
+  表示要求があり、ビューアを開いていない場合だけ true (要求を作る入口でエントリの非空を保証する)。毎回既存状態を参照し、
+  全画面・ウィンドウ内・別ウィンドウ (active が App 外に退避中の場合、他の still/media 窓も含む)
+  の間は保留する。表示中だけ Esc / × / 閉じるを検出する。
+  閉じるEscは消費し、同じpassで次に表示されるネットワーク通知へ渡さない。
+- `startup_notice_viewer_open` が通知用の単一述語。detached の開閉・表示先・input routing は変えない。
+  マウス操作の移行案内と初回設定も main だけに描き共通モーダルに入る同型なので、
+  それぞれの visible helper で同じ保留条件を使う。ネットワーク data_dir 通知にも適用し、
+  先行の設定・移行・重要な変更点の要求が完了するまで待つ順序を維持する。
+- 設定の保護起動案内は復元・終了を選ぶ別の契約なので変更しない。worker の通知は非モーダル、
+  トレイ案内は起動要求ではなく利用者操作起点なので今回の起動通知保留には加えない。
+  新版の自動更新確認はバッジだけで、結果ダイアログを開くのは手動確認/バッジクリック時だけ。
+  改名ジャーナル復旧は lazy load の破損時の回復操作であり、隔離worker実行中もCASの排他を
+  保つモーダルなので、起動時の情報通知と同じ保留条件へは変更しない。
+- 簡素化: 通知を3表示先へ移さず、main に戻るまで表示と入力停止を一緒に保留する。
+  latch・新しい非同期owner・detached遷移は不要。既読保存は既存の Settings 保存経路を使い、
+  まれな保存失敗はログと通知で割り切り、再試行・復旧状態は追加しない。環境設定の古い draft から既読を巻き戻さず、
+  環境設定の持ち運びからは内部記録として除外する。
 
 ## 3. データ (exe 埋め込み)
 
@@ -96,8 +116,12 @@
 - `egui::Window` + スクロール可能リスト (既存ダイアログの idiom)。
 - 2 段構成: **⚠ 操作・既定の変更 (必読)** → **主な新機能 (任意)** → 「すべての変更を見る」リンク。
 - バージョンをまたぐ場合はバージョン見出しごとに項目を並べる。
-- 閉じる/OK の 1 ボタン。閉じたら `last_seen_version` 更新済みなので次回は出ない
-  (既存のバージョン記録更新に乗る)。
+- 閉じるボタン / タイトル × / Esc のいずれかで利用者が閉じたときだけ
+  `whats_new_acknowledged_version = current` にして保存する。「すべての変更を見る」は閉じず既読にしない。
+  `--whatsnew-from` は表示範囲だけを強制し、閉じたときは同じく current を記録する。
+  `prepare_test_script_run` は要求をメモリで落とすだけで、既読を保存しない。
+- ヘルプからの再表示は既存の現行版/最新entryへのfallbackを維持する。保留中の要求があれば
+  その累積/強制表示範囲を保持し、最新版だけへの置換で未読を取りこぼさない。
 
 ### 4.1 小画面での本文幅と操作行（2026-10-09 修正）
 
@@ -133,7 +157,9 @@
   [tests/ui_snapshot.rs](../tests/ui_snapshot.rs) に 1 本追加。レイアウト崩れを**実機なし**で検知。
 - **開発用の強制表示フラグ** `--whatsnew-from <version>` (または env): 任意の「前バージョン」から
   画面を即表示。**ダウングレード/再インストール不要**で、どのまたぎ組合せも目視できる。
-- **残る実機 smoke は 1 点だけ**: バージョンを上げた初回に 1 回出て閉じれること。マトリクス不要。
+- 状態遷移・実DBテスト: 3モードの表示/入力停止保留、同じイベント列のEsc消費、閉じたときの保存、
+  閉じずに再起動/版飛ばし、項目なしの移行と即時保存、clean install、通知順序を固定する。
+  実機では引数起動の3モードでキー・右クリックが使え、ビューアを閉じると通知が出ることを確認する。
 - **本文幅の回帰**: 実フォントで複数の本文幅とUI倍率100%/200%を通し、描画内容が親の横幅を
   広げないことを検査する。現行の全告知に加え、さらに長い必読・新機能の見出しと本文を表示し、
   1093×614 / 1366×728の往復リサイズ後も、連続フレームでウィンドウとタイトル ×・固定操作行の
@@ -146,7 +172,7 @@
 
 | 必要な処理 | 流用元 |
 | --- | --- |
-| バージョン変更検出 / 前バージョン取得 | `last_seen_version` / `previous_last_seen_version` / `version_changed` ([src/settings.rs](../src/settings.rs)) |
+| 未読範囲 / 起動時移行 | `whats_new_acknowledged_version` / 初回だけ `previous_last_seen_version` ([src/settings.rs](../src/settings.rs)) |
 | ダイアログ (Window + ScrollArea) | 既存ダイアログ ([src/ui_dialogs/update_notice.rs](../src/ui_dialogs/update_notice.rs) ほか) の idiom |
 | ヘルプメニューからの再表示 | 既存メニュー構造 |
 | 「すべての変更を見る」リンク | マニュアル changelog.html ([src/external_links.rs](../src/external_links.rs)) |
@@ -159,8 +185,8 @@
 - 今後の標準動作変更は全部この器に集約 (個別ダイアログを増やさない)。
 
 ## 8. 永続データへの影響
-- **追加ストアなし** (`last_seen_version` は既存)。highlight はコード埋め込み。
-  マイグレーション不要。
+- 追加ストアなし。既存 `settings.db` の汎用KVに `whats_new_acknowledged_version` を追加する。
+  欠落項目の初期化・即時保存は §2。highlight は引き続きコード埋め込み。
 
 ## 9. リリース手順への追加
 - [CLAUDE.md] のリリースチェックリスト (Phase 1 付近) に「version highlight テーブルに
@@ -169,3 +195,20 @@
 ## 10. ドキュメント同時更新 (実装時)
 - [spec.md](spec.md) / [architecture-overview.md](architecture-overview.md) /
   htdocs マニュアル (ヘルプから再表示できる旨。内部用語を出さない方針)。
+
+## 11. §1.232 の実装・検証記録 (2026-10-19)
+
+- `next6-notice`、起点 `be318299f` の未コミット差分。App状態/実入力handler/Settings実DBの
+  回帰15件を追加し、既存回帰と合わせた焦点テスト82件、設定backup関連9件がすべて成功。
+- `ui_snapshot` の変更点・ネットワーク通知・小画面・画面サイズ変更の4件が成功。
+  描画本文/レイアウトは変更せず、期待PNGの追加・更新はない。
+- 初回のリンク操作テストは日本語フォント未設定で失敗し、製品のfont helperを設定して修正した。
+  上記82件は修正後の結果。本体lib全件は今回の実装担当では実行せず、ClaudeCodeの最終gateへ引き継ぐ。
+- ソースhash、command、nextest run ID、件数、環境条件は `target/notice-verification.json` に記録。
+  native依存物の並列CMakeが失敗する環境のため、ビルドは
+  `MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1` を使用する。
+- `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` が成功し、通常featureの
+  core / Remote / EPUB変換器と依存DLLを配置済み。VC runtime/PE検査も `runtime=4 pe=3` で成功。
+  `cargo fmt` / `cargo fmt --check` / UIグリフ検査 / `git diff --check` も成功。
+  製品exeの起動・実機入力検証・独立レビューは未実施。
+  引数起動の3モードでキー/右クリックが使え、ビューアを閉じると通知が出る実機確認を残す。

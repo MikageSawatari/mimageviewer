@@ -6044,6 +6044,10 @@ pub struct Settings {
     /// 新規 (= 過去に保存履歴なし) や旧コードで保存された JSON では None。
     #[serde(default)]
     pub last_seen_version: Option<String>,
+    /// 最後に利用者が「重要な変更点」を閉じた版。起動しただけでは進めない。
+    /// 旧設定の欠落値は load 時に前回起動版 (新規なら現行版) へ移行・保存する。
+    #[serde(default)]
+    pub whats_new_acknowledged_version: Option<String>,
 }
 
 /// VST3 プラグインチェーンの 1 エントリ。
@@ -7981,6 +7985,7 @@ impl Default for Settings {
             audio_normalize_enabled: false,
             audio_normalize_target_lufs_milli: default_audio_normalize_target_lufs_milli(),
             last_seen_version: None,
+            whats_new_acknowledged_version: None,
             // ── 隠蔽加工 (Phase 1) ────────────────────────────
             conceal_type: crate::conceal::ConcealType::default(),
             conceal_mosaic_tile_mode: crate::conceal::TileSizeMode::default(),
@@ -9404,6 +9409,15 @@ impl Settings {
                 }
             }
         }
+        let whats_new_acknowledgement_migrated = settings.whats_new_acknowledged_version.is_none();
+        if whats_new_acknowledgement_migrated && db_loaded {
+            settings.whats_new_acknowledged_version = Some(
+                previous_last_seen_version
+                    .as_deref()
+                    .unwrap_or(current_version)
+                    .to_owned(),
+            );
+        }
         if version_marker_changed && db_loaded {
             // Clean install has no previous version to snapshot. Record the current marker through
             // the bootstrap save so later launches can distinguish a real version transition.
@@ -9443,7 +9457,8 @@ impl Settings {
             || toolbar_sort_rating_options_migrated
             || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
-            || version_marker_changed;
+            || version_marker_changed
+            || whats_new_acknowledgement_migrated;
         let bootstrap_saved = if bootstrap_save_needed {
             settings.save_internal_no_rotation()
         } else {
@@ -10264,6 +10279,9 @@ impl Settings {
     /// `src` 側は Vec / String など大きいフィールドは `std::mem::take` で奪うので、
     /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
+        // 通知を閉じる前の環境設定 draft で既読を巻き戻さない。
+        self.whats_new_acknowledged_version
+            .clone_from(&src.whats_new_acknowledged_version);
         // ── グリッド / ツールバー runtime 状態 ──
         self.grid_cols = src.grid_cols;
         self.grid_view_mode = src.grid_view_mode;
@@ -12284,6 +12302,125 @@ mod tests {
         );
         assert_eq!(reloaded.settings.ai_upscale_prefetch_forward, 2);
         assert_eq!(reloaded.settings.ai_upscale_prefetch_back, 7);
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_migrates_missing_released_field_and_persists_before_dismissal() {
+        for current in ["3.9.0", "3.10.0"] {
+            let env = setup_backup_env();
+            let mut old = Settings::load_with_meta_for_version("3.9.0").settings;
+            old.whats_new_acknowledged_version = None;
+            old.save();
+            // Model a released DB that has no key, rather than just a JSON null value.
+            let conn = rusqlite::Connection::open(env._tmp.path().join("settings.db")).unwrap();
+            conn.execute(
+                "DELETE FROM settings_kv WHERE key = 'whats_new_acknowledged_version'",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            assert_eq!(loaded.settings.last_seen_version.as_deref(), Some(current));
+            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            assert_eq!(
+                stored.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            // No dialog dismissal/save: a second launch must retain the original range even
+            // though the startup/version marker has already advanced. Also covers same-version
+            // migration, where the acknowledgement alone must cause bootstrap writeback.
+            reset_backup_state_for_test();
+            let next = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                next.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            let versions = |previous| {
+                crate::version_highlights::highlights_to_show(
+                    previous,
+                    current,
+                    crate::version_highlights::table(),
+                )
+                .iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                versions(next.settings.whats_new_acknowledged_version.as_deref()),
+                versions(Some("3.9.0"))
+            );
+        }
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_clean_install_is_current_and_has_no_highlights() {
+        let _env = setup_backup_env();
+        let loaded = Settings::load_with_meta_for_version("3.10.0");
+        assert_eq!(loaded.meta.previous_last_seen_version, None);
+        assert_eq!(
+            loaded.settings.whats_new_acknowledged_version.as_deref(),
+            Some("3.10.0")
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.whats_new_acknowledged_version,
+            loaded.settings.whats_new_acknowledged_version
+        );
+        assert!(
+            crate::version_highlights::highlights_to_show(
+                stored.whats_new_acknowledged_version.as_deref(),
+                "3.10.0",
+                crate::version_highlights::table(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_stale_preferences_draft() {
+        let mut live = Settings::default();
+        live.whats_new_acknowledged_version = Some("3.9.0".to_owned());
+        let mut draft = live.clone();
+        live.whats_new_acknowledged_version = Some("3.11.0".to_owned());
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.whats_new_acknowledged_version.as_deref(),
+            Some("3.11.0")
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_undismissed_relaunch_and_skipped_upgrades() {
+        let _env = setup_backup_env();
+        let mut old = Settings::load_with_meta_for_version("3.8.0").settings;
+        old.whats_new_acknowledged_version = Some("3.8.0".to_owned());
+        old.save();
+        for current in ["3.9.0", "3.9.0", "3.10.0"] {
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.8.0")
+            );
+            let versions: Vec<_> = crate::version_highlights::highlights_to_show(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                current,
+                crate::version_highlights::table(),
+            )
+            .iter()
+            .map(|entry| entry.version)
+            .collect();
+            if current == "3.9.0" {
+                assert_eq!(versions, ["3.9.0"]);
+            } else {
+                assert_eq!(versions, ["3.9.0", "3.10.0"]);
+            }
+        }
     }
 
     #[test]

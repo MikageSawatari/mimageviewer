@@ -8,6 +8,9 @@ mod thumbnail_request_lifecycle;
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
 
+#[path = "tests/startup_notices.rs"]
+mod startup_notices;
+
 #[cfg(windows)]
 #[test]
 fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record() {

@@ -119,6 +119,10 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 
 ### 2.2 実装時の唯一の policy と強制テスト
 
+§1.232 (2026-10-19): `whats_new_acknowledged_version` は通知の既読に関する内部記録として
+除外する。取り込み先の既読を変更せず、古い環境設定 draft の OK でも live の値を保持する。
+この追加時点は全463 / 対象147 / 除外316フィールド。転送形式・項目は変更しない。
+
 §1.365 (2026-10-10): `preferences_restore_position` を plain / plain の bool として追加。
 環境設定の前回位置を復元するかどうかの選択だけを転送し、ページ・スクロール座標は
 Settings に持たず転送しない。既定 ON、欠落は現在の draft 値を保持する。形式 v1 のまま、

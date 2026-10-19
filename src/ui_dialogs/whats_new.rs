@@ -3,19 +3,63 @@
 //! - 表示判定 (どのバージョンの変更点を出すか) は `App` 構築時に
 //!   [`crate::version_highlights::highlights_to_show`] (純関数) で決め、`whats_new_entries` に入る。
 //! - ここはその描画だけを担当する (display-only。移行の二択 UI は持たない)。
-//! - `last_seen_version` の更新は `Settings::load` 側で済んでいるので、閉じる際に永続化は不要
-//!   (次回起動では previous == current となり再表示されない)。
+//! - ビューア表示中は保留し、描画・モーダル判定・閉じる入力は同じ visible helper に従う。
+//! - 利用者が閉じたときだけ既読版を保存する。保留したまま終了しても次回へ持ち越す。
 
-use crate::app::App;
+use crate::app::{ActionSurface, App};
 use eframe::egui;
 
 impl App {
+    pub(crate) fn whats_new_visible(&self) -> bool {
+        self.show_whats_new && !self.startup_notice_viewer_open()
+    }
+
+    pub(crate) fn request_whats_new_from_help(&mut self) {
+        // A pending cumulative/forced request must not lose unread entries when help is
+        // selected from main while a detached viewer still owns another window.
+        if self.show_whats_new {
+            return;
+        }
+        let mut entries = crate::version_highlights::for_version(
+            env!("CARGO_PKG_VERSION"),
+            crate::version_highlights::table(),
+        );
+        if entries.is_empty()
+            && let Some(latest) = crate::version_highlights::latest_not_newer_than(
+                env!("CARGO_PKG_VERSION"),
+                crate::version_highlights::table(),
+            )
+        {
+            entries = vec![latest];
+        }
+        if !entries.is_empty() {
+            self.whats_new_entries = entries;
+            self.show_whats_new = true;
+        }
+    }
+
     pub(crate) fn show_whats_new_dialog(&mut self, ctx: &egui::Context) {
-        if !self.show_whats_new || self.whats_new_entries.is_empty() {
+        if !self.whats_new_visible() {
             return;
         }
         let mut open = true;
+        // The next startup notice can become visible later in this same pass. Escape belongs
+        // to this visible dialog and must not dismiss that previously hidden notice as well.
         let escape_pressed = self.dialog_escape_pressed(ctx);
+        if escape_pressed {
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+            });
+        }
         let close;
         let open_changelog;
         // &'static 参照の Vec なので clone は安価 (借用衝突回避のためローカルへ)。
@@ -32,6 +76,15 @@ impl App {
         }
         if close || !open || escape_pressed {
             self.show_whats_new = false;
+            self.settings.whats_new_acknowledged_version =
+                Some(env!("CARGO_PKG_VERSION").to_owned());
+            if !self.settings.save_checked() {
+                self.show_feedback_toast_on(
+                    "重要な変更点の既読状態を保存できませんでした。次回起動時に再表示されることがあります"
+                        .to_owned(),
+                    ActionSurface::MainWindow,
+                );
+            }
         }
     }
 }
@@ -91,6 +144,28 @@ pub(super) fn draw_whats_new_dialog(
 mod tests {
     use super::*;
     use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn whats_new_changelog_action_does_not_request_dismissal() {
+        let response = std::rc::Rc::new(std::cell::Cell::new((false, false, true)));
+        let observed = response.clone();
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder().build_ui(move |ui| {
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ui.ctx());
+                fonts_ready = true;
+                return;
+            }
+            let mut open = true;
+            let entries: Vec<_> = crate::version_highlights::table().iter().rev().collect();
+            let (close, changelog) = draw_whats_new_dialog(ui.ctx(), &mut open, &entries);
+            observed.set((close, changelog, open));
+        });
+        harness.run_steps(5);
+        harness.get_by_label("すべての変更を見る").click_accesskit();
+        harness.run_steps(1);
+        assert_eq!(response.get(), (false, true, true));
+    }
 
     #[test]
     fn version_highlights_initial_width_respects_037_window_budget() {

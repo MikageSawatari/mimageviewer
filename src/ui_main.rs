@@ -8636,30 +8636,7 @@ impl App {
                                                 )
                                                 .clicked()
                                             {
-                                                // 現行版のエントリ。無ければ現行版以下の最新エントリに
-                                                // フォールバック (次版エントリを先に埋め込んでも未来の
-                                                // 変更点を表示しない)。
-                                                let mut entries =
-                                                    crate::version_highlights::for_version(
-                                                        env!("CARGO_PKG_VERSION"),
-                                                        crate::version_highlights::table(),
-                                                    );
-                                                if entries.is_empty() {
-                                                    if let Some(latest) =
-                                                        crate::version_highlights::latest_not_newer_than(
-                                                            env!("CARGO_PKG_VERSION"),
-                                                            crate::version_highlights::table(),
-                                                        )
-                                                    {
-                                                        entries = vec![latest];
-                                                    }
-                                                }
-                                                // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
-                                                // ショートカットを塞がないよう、開かない (Codex P3)。
-                                                if !entries.is_empty() {
-                                                    self.whats_new_entries = entries;
-                                                    self.show_whats_new = true;
-                                                }
+                                                self.request_whats_new_from_help();
                                                 ui.close();
                                             }
                                         }

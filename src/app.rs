@@ -19550,7 +19550,7 @@ impl App {
         }
         let whats_new_prev = whatsnew_from_override
             .as_deref()
-            .or(load_meta.previous_last_seen_version.as_deref());
+            .or(settings.whats_new_acknowledged_version.as_deref());
         let whats_new_entries = crate::version_highlights::highlights_to_show(
             whats_new_prev,
             env!("CARGO_PKG_VERSION"),
@@ -22782,8 +22782,8 @@ impl App {
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
             self.show_operation_customize_discard_confirm => "operation_customize_discard_confirm",
-            self.show_mouse_nav_migration_prompt => "mouse_nav_migration_prompt",
-            self.show_whats_new => "whats_new",
+            self.mouse_nav_migration_prompt_visible() => "mouse_nav_migration_prompt",
+            self.whats_new_visible() => "whats_new",
             self.network_data_dir_notice_visible() => "network_data_dir_notice",
             self.show_context_shortcuts_help => "context_shortcuts_help",
             self.show_toolbar_reset_confirm => "toolbar_reset_confirm",
@@ -22798,8 +22798,7 @@ impl App {
             self.epub_convert_pending_in_any_context() => "epub_convert",
             self.video_upscale.is_some() => "video_upscale",
             self.tq.show => "thumb_quality",
-            self.settings_boot_problem_source.is_none() && !self.settings.first_setup_completed
-                => "first_setup",
+            self.first_setup_visible() => "first_setup",
             self.show_delete_confirm => "delete_confirm",
             self.edit_bundle_paste_pending.is_some() => "edit_bundle_paste_pending",
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
@@ -22906,8 +22905,23 @@ impl App {
         self.fullscreen_tag_panel_sticky_tags.clear();
     }
 
+    /// Startup notices live only on main. Read existing viewer ownership each time, including
+    /// the active detached context parked off App and the other still/media windows. This does
+    /// not change detached lifecycle, presentation, or main-window input ownership.
+    pub(crate) fn startup_notice_viewer_open(&self) -> bool {
+        #[cfg(windows)]
+        if self.active_detached_context_is_at_rest() || !self.detached_image_windows.is_empty() {
+            return true;
+        }
+        self.fullscreen_idx.is_some()
+    }
+
+    pub(crate) fn mouse_nav_migration_prompt_visible(&self) -> bool {
+        self.show_mouse_nav_migration_prompt && !self.startup_notice_viewer_open()
+    }
+
     pub(crate) fn show_mouse_nav_migration_prompt_dialog(&mut self, ctx: &egui::Context) {
-        if !self.show_mouse_nav_migration_prompt {
+        if !self.mouse_nav_migration_prompt_visible() {
             return;
         }
 
