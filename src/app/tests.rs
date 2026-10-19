@@ -6869,7 +6869,7 @@ fn housekeeping_gate_remains_fts_only() {
 /// Esc that closes it - and made a right-click stop closing the image with nothing on screen to
 /// explain why. Its siblings in the same bar have never blocked anything (2026-08-15, before
 /// v3.0.0 went out).
-fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
+fn fullscreen_overflow_panel_holds_no_input_and_survives_file_boundary() {
     let mut app = setup_app_for_test();
     app.fs_overflow_panel_state = FsOverflowPanelState::Root;
     assert!(!app.common_modal_dialog_open());
@@ -6881,7 +6881,7 @@ fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
     );
 
     app.reset_fs_side_panel_runtime_for_file_change();
-    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
 }
 
 #[cfg(windows)]

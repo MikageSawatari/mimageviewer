@@ -15452,7 +15452,10 @@ impl FsOverflowPanelState {
     }
 
     pub(crate) fn closes_on_file_change(self) -> bool {
-        self != Self::Slideshow
+        // Only file/book-dependent contents close here. The spread adjustment's
+        // anchor and reset belong to the current book; the other panels expose
+        // global settings and must remain usable while pages advance.
+        matches!(self, Self::SpreadAdjustment)
     }
 }
 

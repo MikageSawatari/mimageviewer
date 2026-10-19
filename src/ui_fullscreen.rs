@@ -93782,8 +93782,8 @@ mod music_overflow_tests {
         app.reset_fs_side_panel_runtime_for_file_change();
         assert_eq!(
             app.fs_overflow_panel_state,
-            FsOverflowPanelState::Closed,
-            "the existing file-change ownership boundary closes the music menu"
+            FsOverflowPanelState::MusicNoteColor,
+            "global settings survive file changes; the music lifecycle still closes its own menu"
         );
     }
 

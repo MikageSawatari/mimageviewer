@@ -11,18 +11,20 @@ enum Entry {
 }
 
 fn render(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
-    ctx.run_ui(
+    app.frame_counter += 1;
+    crate::test_ui::headless_paint_output(ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1000.0, 700.0),
             )),
             focused: true,
+            time: Some(app.frame_counter as f64 / 60.0),
             events,
             ..Default::default()
         },
         |ui| app.render_fullscreen_viewport(ui),
-    )
+    ))
     .drop_without_applying_deltas();
 }
 
@@ -201,15 +203,17 @@ fn slideshow_start_accepts_only_displayed_still_pages_and_stop_always_cleans_up(
 }
 
 #[test]
-fn slideshow_subpanel_survives_file_change_but_closes_at_fullscreen_exit() {
+fn slideshow_overflow_file_change_policy_covers_all_states_and_fullscreen_exit() {
     let mut app = crate::app::setup_app_for_test();
-    for state in [
-        FsOverflowPanelState::Root,
-        FsOverflowPanelState::NavigatorPosition,
-        FsOverflowPanelState::SpreadAdjustment,
-        FsOverflowPanelState::MusicNoteColor,
-        FsOverflowPanelState::Slideshow,
+    for (state, closes) in [
+        (FsOverflowPanelState::Closed, false),
+        (FsOverflowPanelState::Root, false),
+        (FsOverflowPanelState::NavigatorPosition, false),
+        (FsOverflowPanelState::SpreadAdjustment, true),
+        (FsOverflowPanelState::MusicNoteColor, false),
+        (FsOverflowPanelState::Slideshow, false),
     ] {
+        assert_eq!(state.closes_on_file_change(), closes, "{state:?}");
         app.fs_overflow_panel_state = state;
         app.slideshow_playing = true;
         app.slideshow_anchor_idx = Some(1);
@@ -217,20 +221,20 @@ fn slideshow_subpanel_survives_file_change_but_closes_at_fullscreen_exit() {
         app.reset_fs_side_panel_runtime_for_file_change();
         assert_eq!(
             app.fs_overflow_panel_state,
-            if state == FsOverflowPanelState::Slideshow {
-                state
-            } else {
+            if closes {
                 FsOverflowPanelState::Closed
-            }
+            } else {
+                state
+            },
+            "{state:?}"
         );
         assert!(app.slideshow_playing);
         assert_eq!(app.slideshow_anchor_idx, Some(1));
         assert_eq!(app.slideshow_next_at, clock);
+        app.close_fullscreen();
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_stopped(&app);
     }
-    app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
-    app.close_fullscreen();
-    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
-    assert_stopped(&app);
 }
 
 #[cfg(windows)]
@@ -288,4 +292,86 @@ fn slideshow_automatic_page_advance_keeps_the_settings_subpanel() {
     assert!(app.slideshow_playing);
     assert_eq!(app.slideshow_anchor_idx, Some(1));
     assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Slideshow);
+}
+
+#[test]
+fn slideshow_real_timer_advance_keeps_the_overflow_root_open() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    page_turn::install(&ctx);
+    install_fs_navigator_input_tracking(&ctx);
+    let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
+    app.settings.fullscreen_top_bar_locked = true;
+    app.settings.page_turn_animation_enabled = false;
+    app.settings.slideshow_interval_secs = 30.0;
+    #[cfg(windows)]
+    {
+        app.native_video_in_window_active = true;
+    }
+    for _ in 0..3 {
+        render(&mut app, &ctx, vec![]);
+    }
+    assert!(app.fullscreen_page_layout.single_page().is_some());
+    app.toggle_fullscreen_slideshow(0);
+    let pos = ctx
+        .read_response(egui::Id::unique("fs_overflow_btn"))
+        .expect("the actual HUD must expose the overflow button")
+        .rect
+        .center();
+    render(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    render(&mut app, &ctx, click(pos));
+    render(&mut app, &ctx, vec![]);
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+    assert_eq!(app.fullscreen_idx, Some(0));
+
+    // Expire the deadline without calling advance_slideshow directly: the next
+    // production fullscreen pass must execute its timer and file-change reset.
+    app.slideshow_next_at = Instant::now() - Duration::from_millis(1);
+    render(&mut app, &ctx, vec![]);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+    render(&mut app, &ctx, vec![]);
+    assert!(app.fullscreen_page_layout.single_page().is_some());
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(app.slideshow_playing);
+    assert_eq!(app.slideshow_anchor_idx, Some(1));
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+    assert!(app.slideshow_next_at > Instant::now());
+}
+
+#[test]
+fn slideshow_retained_overflow_root_rebuilds_file_dependent_view() {
+    use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+    use crate::app::spread_shift_owner::ViewerShift;
+
+    let mut app = crate::app::setup_app_for_test();
+    app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+    app.projection_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(
+        "c:/slideshow/first-book",
+    )));
+    app.spread_shift.state = ViewerShift::Ordinary(1);
+    let first = app.fullscreen_overflow_panel_view(false);
+    let shift_status = |view: &FsOverflowPanelView| {
+        view.root_rows
+            .iter()
+            .find(|row| row.item == FullscreenOverflowItemId::SpreadAdjustment)
+            .unwrap()
+            .status
+            .clone()
+    };
+    assert_eq!(shift_status(&first), "調整あり  >");
+    assert!(first.composition_available);
+
+    // Model the accepted source/shift state at the shared file-change boundary.
+    // Root survives, but neither its row status nor composition eligibility may
+    // retain a view from the old file/book.
+    app.projection_recipe = ProjectionRecipe::OrdinaryList;
+    app.spread_shift.state = ViewerShift::None;
+    app.reset_fs_side_panel_runtime_for_file_change();
+    let next = app.fullscreen_overflow_panel_view(false);
+    assert_eq!(next.state, FsOverflowPanelState::Root);
+    assert_eq!(shift_status(&next), "確認  >");
+    assert!(!next.composition_available);
 }

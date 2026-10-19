@@ -1804,8 +1804,13 @@ HUD の再生 / 停止ボタンは 1 クリックで即時切り替え、`KeyAct
 再生中に設定を変えても現在の `slideshow_next_at` は変更せず、次回の切替・待機の予定から新しい値を使う。
 進捗リングは現在の設定間隔を分母にするため、変更直後から次の予定を作るまで一時的に進捗がずれる。
 これは既知の制約であり、設定変更で現在の表示時間を再計算しない。
-ファイル切替時に維持するのはスライドショーサブパネルだけで、root / ナビゲータ位置は従来どおり閉じる。
-`close_fullscreen` と viewer の前面所有権を手放す境界では、スライドショーサブパネルも閉じる。
+ファイル切替で閉じるのは、内容が表示中のファイル / 本に依存する `SpreadAdjustment` だけとする
+（調整の基点・解除がその本に依存する）。全体設定を扱う root / ナビゲータ位置 / 音名の色 /
+スライドショーは、自動送り・手動送りとも開いたままにする。判定は
+`FsOverflowPanelState::closes_on_file_change` に集約する。root の行・見開き調整の status・本の構成の可否は
+毎フレーム `fullscreen_overflow_panel_view` から作り直し、切替先の状態を表示する。
+`close_fullscreen` と viewer の前面所有権を手放す境界では、すべての状態を閉じる。
+音楽ビュー終了時の音名の色パネルの close、キー・外側クリック / タップによる close は従来どおりとする。
 通常の物理フォルダへ自動で進む経路は、`try_start_slideshow_next_folder` →
 `start_folder_nav(...SlideshowNext)` → `FolderNavMode::SlideshowNext` →
 `close_fullscreen_for_folder_nav_reopen()` で一度 fullscreen を閉じてから開き直し・再生再開するため、
