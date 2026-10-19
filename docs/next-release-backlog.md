@@ -32,24 +32,6 @@
 
 ## 1. 優先候補
 
-### 1.404 類似索引の初期ロード中に設定を変えると、索引が「更新未完了」で止まることがある — 全件テストの不安定さから判明 (2026-10-19)
-
-- 状態: **修正済み・独立レビュー受入可 (`7d4767093`)・実アプリ確認済み (ClaudeCode、2026-10-19、[所有計画](similar-index-array-owner-plan.md) §17)。master 未取込**。調査記録: [similar-index-flaky-startup-marker-investigation.md](similar-index-flaky-startup-marker-investigation.md)。
-- きっかけ: `similar_index::tests::startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` が lib 全件実行のときだけ時々落ちた (§1.403 の作業中、3 回中 2 回)。
-- 原因 (headless の負荷再現と順序固定の再現で確認、実アプリでは未確認): 構成変更 (お気に入りの類似索引対象・共通除外・PDF パスワード) がメモリの初期ロード中に起きると、旧ロードを失効させて新ロードを始めるが、旧ロードの検索配列ファイル (`similar.base`) への書き込み・置換は止まらない。旧・新が同じファイルを置換し、Windows ではハンドルの重なりでアクセス拒否 (0x80070005) になる。新ロードが Failed を公開し、Full が終わっても配列の反映確認 (ack) が Failed → Degraded(ArrayPublication) で止まり、完了印も書かれない。
-- 利用者から見た症状 (コード上の到達経路): お気に入り編集画面に「更新未完了: 検索用一覧への反映を確認できませんでした」。類似画像の検索が使えない状態が、構成を変えるか次回起動まで続き得る。
-- 対応: store ごとの一つの worker が load/rebuild/refresh/compaction/replace・公開・history prune を直列所有する。構成変更は query scope だけを失効し、初期ロードを破棄・再起動しない。ack は同 store/seq の公開済み事実から確定する。旧 three-thread の起動点、bool/epoch、CAS 公開と worker-stopped 推測を撤去。まれな実 I/O 失敗はデータを保持して「更新未完了」と再起動案内を表示し、次回起動で読み込み直す。sleep / retry / assert 緩和は追加しない。
-- 規模 / 優先度: Medium / P2 (通常の操作で到達し得る)。
-
-### 1.403 フルスクリーンでメニューを開いたまま押すと、背面のナビゲータ・比較ワイプ・分析表示も動く — §1.396 のレビューで判明 (2026-10-19)
-
-- 状態: **実装済み・独立レビュー受入可 (`0a089b1c8`)・実アプリ確認済み (ClaudeCode、2026-10-19、主要経路。詳細と未確認項目は [調査記録](section403-front-popup-input-investigation.md) §10)。master 未取込**。経緯: D1 改訂 2 を実装し、レビュー P2 4 件と範囲キャプチャの P2 2 件を修正。lib 全件 13,752 件・ui_snapshot 186 件成功。
-- 症状 (headless 実描画テストで再現、実機は未確認): シーク設定メニューの項目の上でドラッグすると、重なっている背面のナビゲータの表示位置や比較ワイプの境界も動く。分析表示で上部の回転メニューの項目の上をドラッグすると、背面の分析画像もパンする。編集ツールの筆・範囲キャプチャ・中ボタン操作にも同じ型の候補がある (ソース調査)。
-- 原因: 背面の raw 入力処理 (ナビゲータ・比較ワイプ・分析ほか) がポップアップの有無を見ない。ページクリック・右クリック・touch は既知の 5 種のポップアップでだけ止まり、パネル内の context menu・ComboBox 等は対象外。
-- 対応: [調査記録](section403-front-popup-input-investigation.md) §8 の D1 改訂2に従い、提示述語と描画条件を共有し、前面所有を全背面 consumer へ配る。物理列はページ取消と別の App 一時状態へ移し、「…」も同じ寿命で保持する。外側 press close と memory popup の既定 click close を分け、前面のクリックを背面 double-click の対へ含めない。
-- 再現テスト: `src/ui_fullscreen/front_popup_input_tests.rs` の既存3件の ignore を解除。6種メニューの外側ドラッグ、非提示bool、押下保持中のページ移動、double-click境界、memory popup、viewport局所性、複数touch・子メニューの実描画回帰を追加。
-- 着手時期: §1.396 を master へ取り込んだ後 (同じ所有の仕組みと consumer を触る)。 番号: ブランチでは当初 §1.402 として起票し、master の §1.402 (成功通知) と衝突したため §1.403 へ振り直した (2026-10-19、同日のコミットメッセージの 1.402 はこの項目)。規模 / 優先度: Medium / P3。
-
 ### 1.402 成功通知を簡潔にし、通知時間を「短い・標準・長い」で選べるようにする — 5ch >>588 (2026-10-19)
 
 - 報告: ファイル名変更後などのメッセージ表示時間が長く感じる。利用者方針 (2026-10-19): 成功通知の文章を短くし、通知の表示時間を「短い・標準・長い」から選べる全体設定を追加する方向で進める。未実装、収録版は未定。
@@ -83,45 +65,6 @@
 - **見つからなかった結果も記憶する**: 同じ場所を idle のたびに探し続けない。現在の一覧内では `ThumbnailState::Failed` により再試行を止めているが、候補なしの選定 proof は保存されない。再訪時も含む再利用範囲を設計し、候補・キャッシュ・固定代表・設定の変更や明示更新で再探索できるようにする。未探索・既存キャッシュなしを「画像なし」と確定せず、取消や一時的な読取失敗も恒久的な対象外にしない。
 - 検証: 成功・空書庫・画像なし・未キャッシュ・取消、同じ idle/再訪での無駄な反復、追加・削除・代表固定変更後の再探索、操作再開時の応答性と複数窓の分離。既存 catalog/proof の無効化を再利用し、深い階層の変更を親 mtime だけで検知できるとは扱わない。
 - 関連: [folder-representative-plan.md](folder-representative-plan.md)、[thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md)。規模 / 優先度: Medium / P3。
-
-### 1.396 スライドショーボタンを即時開始・停止にし、設定を上 HUD の「…」へ移す — 5ch >>579〜580 (2026-10-18)
-
-- 実機確認の追補 (2026-10-19、ClaudeCode 観測): 再生中に「…」の一覧が自動送りで閉じ、設定へ進めない問題に対応。ファイル切替で閉じるのを本に依存する「見開きの調整」だけとし、一覧・ナビゲータ位置・音名の色・スライドショーは維持する（fullscreen 終了・前面を手放す境界・音楽ビュー固有の close は維持）。
-
-- 状態: **実装済み・実アプリ確認済み (ClaudeCode、2026-10-19、下記)**。 ブランチ `slideshow-1396` (`81b1bd1a5` まで、master 未取込)。独立レビュー (Sol / xhigh) は 4 往復の指摘対応後 `81b1bd1a5` で受入可。本体 lib 全件 `test-lib-full.ps1` 13,547 成功 / 0 失敗 (`81b1bd1a5`、2026-10-19)。実機確認用 `build-dev.ps1` 作成済み (エージェントは起動していない)。
-- 要望: 再生ボタンを押したら設定画面を挟まず開始したい。キー・リング・ジェスチャでは既に即時開始・停止できるとの補足あり。利用者方針: 表示間隔などは閲覧中にも変更したいため、環境設定に残しつつ上 HUD の「…」から開けるようにする。
-- 対応: HUD の再生ボタンを 1 クリック即時開始 / 停止へ変更し、`KeyAction::FsSlideshow`・マウス割当・リング・ジェスチャと単一出口へ接続する。開始は `Image` / `ZipImage` / `PdfPage` に限定し、停止時の解放も共通化する。旧設定 popup を削除し、既存 `FsOverflowPanelState` のスライドショーサブパネルへ設定を移す。
-- パネル: root のページめくりアニメーション直後に追加し、ページ送り間隔を表示する。環境設定と同じ表示間隔・連結読みの待機時間 / スクロール時間 / スクロール量・末尾動作を編集し、開始 / 停止ボタンは置かない。ファイル切替で閉じるのは本に依存する「見開きの調整」だけで、ルート・ナビゲータ位置・音名の色・このサブパネルは維持する (実機確認後の 2e307407b)。fullscreen close / 前面所有権の解放ではすべて閉じる。
-- 反映時点: 再生中の変更は次の切替から適用し、現在の `slideshow_next_at` は変更しない。進捗リングは現設定の間隔を使うため、変更後に一時的にずれる既知制約を明記する。表示完了待ち・ページめくり・連結読みの仕組み、環境設定側の変更・保存は維持する。
-- 調査: 通常の閲覧入口で「再生ボタンが出るが開始できない」項目は見つからない。動画・音声は別 HUD、フォルダ・書庫・スタック等は既存の一覧移動 / 展開 / 変換 / 拒否へ分岐する。通常の次フォルダ移動では既存の fullscreen close → reopen 境界で設定パネルも閉じる。ZIP 内 DFS 等は既存経路の close 有無に従う。
-- 自動検証 (2026-10-19、`slideshow-1396` / `fb14a73a1` からの未コミット差分): core の `cargo check` 成功、関連 nextest **42 成功 / 0 失敗**、`cargo test --test ui_snapshot` **186 成功 / 0 失敗**。`cargo fmt --check`、UI グリフ 0 件、製品ページ 49 カードの文字数検査も成功。独立レビューは別担当で実施 (結果は下に追記)。lib 全件は検収側の担当とし、実アプリは起動していない。
-- 関連 filter: `cargo nextest run --no-fail-fast -p mimageviewer --lib -E 'test(/slideshow_|overflow_panel|popup_wheel|wheel_frame_true_close|still_touch_input_availability|still_top_bar.*visibility/)'`。`MSBUILDDISABLENODEREUSE=1` で実行。最終ログは `target/slideshow-tests-final.log` / `target/slideshow-ui-snapshot.log` / `target/slideshow-check-final.log`。新規回帰は 3 入口・非静止画拒否・停止 cleanup / collection intent 取消・自動送り・context 分離・mouse / touch slider の所有と確定保存・数値欄入力・時計維持・固定ヘッダー / 戻るを検査する。
-- スナップショット: `UPDATE_SNAPSHOTS=1` で `fullscreen_overflow_panel_root.png` / `fullscreen_overflow_panel_root_tall.png` / `fullscreen_overflow_panel_page_turn_on.png` を更新し、`fullscreen_overflow_panel_slideshow.png` を追加（4 枚計 153,594 bytes、`tests/snapshots/`）。通常比較でも成功。最終目視は ClaudeCode の検収へ引き継ぐ。
-- 確認用ビルド: `MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1` で `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` 成功。通常プロファイルの core / Remote / EPUB 変換ワーカーを生成し、付属 DLL の依存関係検査も `runtime=4 pe=3` で成功した。ログは `target/slideshow-build-dev.log`。起動は行っていない。
-- 追補 (2026-10-19、`3db6e24c6` 後のレビュー修正): 全 overflow 状態でパネル内開始の右入力を移動・解放まで所有する。外側タップは通常入力 / フォーカス復帰の両経路で閉じるだけに揃え、パネル表示中はカーソルを自動非表示にしない。外側 wheel と連続 touch 操作は従来どおり。root 行数増加で落ちた既存 2 テストは、行数由来の高さと実際の前面 / 背面矩形から検査するよう修正した。
-- 追補の自動検証: `MSBUILDDISABLENODEREUSE=1` で core `cargo check` 成功、`cargo nextest run --no-fail-fast -p mimageviewer --lib -E 'test(/slideshow_|overflow|fullscreen_secondary|touch_panel|foreground_reclaim|wheel_frame/)'` **137 成功 / 0 失敗**、`cargo test --test ui_snapshot` **186 成功 / 0 失敗**（PNG 更新なし）。`cargo fmt` / `cargo fmt --check`、UI グリフ 0 件、`git diff --check` も成功。ログは `target/slideshow-followup-check-final.log` / `target/slideshow-followup-tests-final.log` / `target/slideshow-followup-ui-snapshot.log`。限定独立レビューの未解決指摘なし。lib 全件と実機確認は検収側へ引き継ぐ。
-- 追補の確認用ビルド: `CARGO_BUILD_JOBS=16` で `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` 成功（`MSBUILDDISABLENODEREUSE=1`）。core / Remote / EPUB ワーカーと付属 DLL の検査は `runtime=4 pe=3` で合格。ログは `target/slideshow-followup-build-dev.log`。製品アプリの起動・実画面操作は行っていない。
-- 再確認 P2 の追加修正（`d01fcc111` 後）: root の早期描画前に左右入力の所有を一度確定し、ナビゲータの予約 / 直接処理と secondary action が同じ結果を使う。パネル内で始まった左右ボタン入力は離すまでパネルが所有し、ナビゲータを含む背面へ渡さない。raw 入力は所有ボタンの edge / down だけを除き、位置・focus・wheel・非所有ボタンを保つため、外側開始の操作は維持する。描画済み layout と右上ナビゲータの重なりからのドラッグ、外側操作、root 同フレーム close、終端・touch cancel の回帰テストを追加した。
-- 所有モデルの設計確定: ClaudeCode 判断に従い、左入力の所有は既存 App 全体の `fs_primary_suppression` に `OverflowStream` を追加して保持する。パネルと同じ前面 viewer の一時状態であり、context bundle / detached 述語 / viewport 経路は変更しない。既存 open / close / 新規窓 / passive 窓採用のリセットを維持し、前面を手放す `reset_detached_pause_foreground_modes` ではパネル close と同時に primary 抑止を解放する。全 5 状態 × pause / close の回帰も追加。変更以前からの App 全体の primary 抑止について、具体的な操作手順を伴う複数窓の実害は今回の source 調査では特定していない。限定独立レビューの未解決指摘なし。確認用 build-dev は検収側が担当する。
-- 再確認 P2 の関連検証: `MSBUILDDISABLENODEREUSE=1` で `cargo nextest run --no-fail-fast -p mimageviewer --lib -E 'test(/slideshow_|overflow|fullscreen_secondary|fullscreen_primary|touch_panel|foreground_reclaim|wheel_frame|navigator/)'` **211 成功 / 0 失敗**、`cargo test --test ui_snapshot` **186 成功 / 0 失敗**（PNG 変更なし）、`cargo check -p mimageviewer --bin mimageviewer-core` 成功。`cargo fmt` / `cargo fmt --check` / `git diff --check` も成功。ログは `target/slideshow-navigator-tests-final.log` / `target/slideshow-navigator-ui-snapshot.log` / `target/slideshow-navigator-check-final.log`。実アプリは起動していない。lib 全件・build-dev・実機確認は検収側へ引き継ぐ。
-- raw 入力の横断監査（`5e9e7a5c3` 後）: 比較ワイプ、分析、ブックマーク行、キーから入る編集 canvas、隠蔽の先行 preview hold にも所有結果を接続し、シーク / touch / metadata 長押しの適用境界を揃える。ボタンごとに配送を除き、外側開始の操作、wheel、hover、中ボタンを維持する。[監査表](section396-overflow-input-audit.md) に検索対象・到達性・保護箇所と、切り取り / 範囲コピーの除外根拠を記録した。実描画経路の回帰 13 件を追加。限定独立レビューの未解決指摘なし。実アプリは起動していない。
-- 横断監査の nextest 最終結果: `MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=16`。`cargo nextest run --no-fail-fast -p mimageviewer --lib -E 'test(overflow_input_tests)'` **29 成功 / 0 失敗**（既存 16 + 追加 13）。広い関連 filter `test(/slideshow_|overflow|fullscreen_secondary|fullscreen_primary|touch_panel|foreground_reclaim|wheel_frame|navigator|compare|wipe|loupe|pan|text_|local_adjust|conceal|erase|crop|sns_split|seek|bookmark|similar/)` は **2,725 成功 / 0 失敗**（既存シーク検査 1 件が約 91 秒で正常終了）。ログは `target/slideshow-raw-audit-focused-agent4.log` / `target/slideshow-raw-audit-tests-final.log`。lib 全件と build-dev は検収側が担当する。
-- 横断監査の残りの最終検証: 同じ環境で `cargo test --test ui_snapshot` **186 成功 / 0 失敗**（PNG 変更なし）、`cargo check -p mimageviewer --bin mimageviewer-core` 成功。`cargo fmt` / `cargo fmt --check` / `git diff --check` 成功、UI グリフ検査も 0 件。ログは `target/slideshow-raw-audit-ui-snapshot-final.log` / `target/slideshow-raw-audit-check-final.log`。製品アプリの起動・実機確認・コミットは行っていない。
-- 最前面 layer の追加修正（`15b352628` / `9b7761e13` 後）: overflow の矩形内でも、押下位置で最前面が別 popup なら所有しない。左右ボタン・通常 / 前面復帰の touch 除外は同じ pass の hit-test 領域を共有する。初回 / sizing は現在の矩形と既存 hit 情報で補い、閉鎖後の stale Area からは新規所有しない。Area の登録順序は変更しない。シーク設定 popup の描画を毎 pass 継続する。所有型の3分割は行わず、別 popup と背面の関係は基点 `fb14a73a1` の扱いを維持する。ソース比較で確認した既存の navigator / 比較ワイプ / 分析への到達手順は [監査表](section396-overflow-input-audit.md#範囲外として維持した別-popup-と背面の関係) へ記録した（今回の修正対象外、実アプリ未確認）。
-- 最前面 layer 修正の nextest: `MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=16`。`cargo nextest run --no-fail-fast -p mimageviewer --lib -E 'test(overflow_input_tests)'` は **35 成功 / 0 失敗**（既存 29 + 追加 6）。横断監査と同じ広い関連 filter は **2,731 成功 / 0 失敗**（74.8 秒、シークの実レイアウト検査 1 件が 72.0 秒で正常終了）。ログは `target/section396-layer-focused-final.log` / `target/section396-layer-related-final.log`。core `cargo check`、`cargo fmt` / `cargo fmt --check` / `git diff --check`、UI グリフ 0 件も成功。ログは `target/section396-layer-check-final.log`。新規テストの初回失敗 4 件は fixture の重なり座標と egui の旧 widget 所有に関する前提を修正後、全件成功した。lib 全件・build-dev・実機確認・コミットは検収側へ引き継ぐ。
-- 最前面 layer 修正の UI snapshot: `cargo test --test ui_snapshot` **186 成功 / 0 失敗**、PNG 変更なし。ログは `target/section396-layer-ui-snapshot-final.log`。限定レビューでは inclusive な矩形の共有辺を除く修正と境界テストを追加後、未解決の製品指摘はない。製品アプリは起動していない。
-- 実アプリでの確認 (2026-10-19): 観測者 ClaudeCode (利用者の依頼により、隔離 data-dir `target/sstest/data` で起動した build-dev の `mimageviewer-core.exe` を画面操作、master 取り込み後の 030b0a160 と修正後の 2e307407b)。素材は番号入りの生成画像 (フォルダ A 6 枚・B 3 枚・縦長 C 3 枚)。
-  - ▶ 1 クリックで設定画面なしに再生開始 (一時停止アイコンが緑)、約 3 秒後に次へ。▶ / S キーで停止。
-  - 「… → スライドショー」を開いたまま ▶ で再生してもパネルは残り、ページが進む。再生中に間隔を 3 → 9.7 秒へ変えると、表示中のページは元の予定で切り替わり、次のページは 9.7 秒表示された。
-  - パネル内の右クリックでフルスクリーンは閉じない。パネル外の左クリック 1 回目は閉じるだけでページは変わらず、2 回目で次へ。
-  - 末尾動作「次のフォルダへ進む」: A6 → B → C と再生が続き、フォルダをまたいだ時点でパネルは閉じた (設計どおり)。終了して起動し直しても間隔 0.5 秒・次のフォルダへ進むが残っていた。
-  - 縦連結 (6 キー) で再生すると約 1.7 秒ごとに半画面ずつ進み、再生中にスクロール量を 100% にすると送り幅が大きくなった。画像をまたいでもパネルは残った。
-  - F12 の別ウィンドウ: S と上部バーのボタンで、その窓だけが再生・停止。「…」も開く。窓を小さくすると見出しと「戻る」は固定のまま本文だけがホイールでスクロールし、背面のページは動かない。
-  - 見つかった問題 (030b0a160): 再生中に「…」の一覧は開くが次の自動送りで閉じ、3 秒間隔では設定へ辿り着きにくい。2e307407b で修正 (見開きの調整以外はファイル切替で閉じない) し、修正版で再生中に「… → スライドショー」と辿れ、ページ送りをまたいでも開いたままなのを確認した。
-  - 未確認: タッチ操作、リング / ジェスチャ・マウスボタン割当からの開始停止 (ハンドラ単体テストのみ)、ZIP / PDF、横連結、コレクション、mIV Remote。
-- 関連: [display-pipeline.md](display-pipeline.md)、マニュアルのフルスクリーン / スライドショー設定説明を更新。規模 / 優先度: Small〜Medium / P3。
-- 既知の残りの対応 (2026-10-19、§1.403): 「…」パネル上で押したまま矢印キーでページを移ると所有が終わる問題は、新しい前面物理 owner をページ取消と分離して解消。前面メニューの左右中・overflowの左右の押下保持→実ArrowRight→背面不変とrelease解放の実描画回帰を追加した。overflow単独は従来どおり中ボタンを所有しない。実機確認は未実施。
-- §1.396 の範囲外だった前面 popup 問題は **§1.403 で実装対応**。シーク設定 × ナビゲータ / 比較ワイプ、回転 popup × 分析の既存3件の実描画再現テストは ignore を解除した。修正前の調査・再現証跡と実装後の検証は [調査・実装記録](section403-front-popup-input-investigation.md) に分けて記録する。実機確認は未実施。
 
 ### 1.387 サブモニターの動画全画面で HUD の点滅が残る — 5ch >>557〜570 (2026-10-16)
 
