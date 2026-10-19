@@ -1991,6 +1991,9 @@ impl App {
     }
 
     fn poll_sidecar_restore_projected(&mut self, ctx: &egui::Context) {
+        // Read session ownership before taking its sidecar continuation out of App.
+        // This is a fact for this poll, not a persistent viewer/viewport latch.
+        let viewer_session_open = self.projected_viewer_session_open();
         let Some(mut state) = self.sidecar_restore.take() else {
             return;
         };
@@ -2023,7 +2026,9 @@ impl App {
                         let had_deferred_fullscreen = state.common.deferred_fullscreen.is_some();
                         state.common.discard_target();
                         self.finish_visible_container_fs_nav_failed();
-                        self.close_fullscreen();
+                        if viewer_session_open {
+                            self.close_fullscreen();
+                        }
                         #[cfg(windows)]
                         if had_deferred_fullscreen {
                             self.terminate_active_detached_open_before_viewport(
@@ -3825,6 +3830,61 @@ mod tests {
                 }),
             super::super::file_type_resume::PositionResolution::Restored(0)
         );
+    }
+
+    #[test]
+    fn visibility_index_disconnect_ends_only_an_existing_viewer_session() {
+        for viewer in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().to_path_buf();
+            let image = folder.join("page.png");
+            image::RgbImage::new(1, 1).save(&image).unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(image)];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Failed];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            if viewer {
+                app.fullscreen_idx = Some(0);
+                app.capture_fs_nav_holdover(0);
+                app.fullscreen_idx = None;
+                app.items_generation += 1;
+            }
+            app.prepare_current_listing_page_identity_index(Default::default(), None);
+            let (tx, rx) = mpsc::channel();
+            drop(tx);
+            app.sidecar_restore.as_mut().unwrap().phase =
+                Phase::PreparingPageIndex(PreparingPageIndex {
+                    rx,
+                    next: PageIndexContinuation::PrepareOnly(PageIndexPublication::CurrentListing),
+                });
+            let pdf = folder.join("list-only.pdf");
+            if viewer {
+                assert!(app.defer_sidecar_restore_fullscreen(
+                    0,
+                    HistoryTrigger::UserChosen,
+                    FsOpenMaterialization::Eager,
+                    FsPageLoadContract::Sequential,
+                ));
+            } else {
+                app.pdf_password_request =
+                    Some(super::super::PdfPasswordRequest::legacy(pdf.clone()));
+                app.pdf_password_input = "typed password".into();
+            }
+            assert_eq!(app.projected_viewer_session_open(), viewer);
+            app.spread_popup_open = true;
+            app.poll_sidecar_restore(&egui::Context::default());
+            assert!(!app.sidecar_restore_active());
+            assert!(!app.projected_viewer_session_open());
+            if viewer {
+                assert!(!app.spread_popup_open, "waiting reader content must close");
+                assert!(app.fs_holdover_tex.is_none());
+                assert!(!app.fs_nav_is_locked());
+            } else {
+                assert_eq!(app.pdf_password_dialog_path(), Some(pdf));
+                assert_eq!(app.pdf_password_input, "typed password");
+            }
+        }
     }
 
     #[test]

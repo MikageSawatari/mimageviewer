@@ -19418,7 +19418,9 @@ impl App {
         }
         #[cfg(not(windows))]
         {
-            self.close_fullscreen();
+            if self.projected_viewer_session_open() {
+                self.close_fullscreen();
+            }
             ctx.request_repaint();
         }
     }
@@ -22693,7 +22695,9 @@ impl App {
 
     pub(crate) fn finish_everything_edit_boundary(&mut self) {
         self.finish_rating_membership_edit_boundary();
-        self.finish_fullscreen_navigation_for_true_close();
+        if self.projected_viewer_session_open() {
+            self.finish_fullscreen_navigation_for_true_close();
+        }
         if self.fullscreen_idx.is_some() {
             self.close_fullscreen_for_rating_membership();
         }
@@ -32085,7 +32089,9 @@ impl App {
         if query.is_empty() {
             return;
         }
-        if !self.current_viewer_session_is_detached_or_switching() {
+        if !self.current_viewer_session_is_detached_or_switching()
+            && self.projected_viewer_session_open()
+        {
             self.close_fullscreen();
         }
         self.open_tag_view_with_query(Some(query), false);

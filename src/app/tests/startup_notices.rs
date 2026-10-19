@@ -344,6 +344,47 @@ fn startup_notices_bulk_settings_close_preserves_list_only_password_request() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn startup_notices_non_viewer_boundaries_preserve_list_password_request() {
+    for close in [
+        "everything",
+        "location_favorite",
+        "ring_location",
+        "snapshot_list",
+        "tag",
+    ] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        if close == "snapshot_list" {
+            let folder = app.tmp.path().to_path_buf();
+            let image = folder.join("snapshot.png");
+            image::RgbImage::new(1, 1).save(&image).unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(image)];
+            app.thumbnails = vec![ThumbnailState::Failed];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            app.finish_page_identity_preparation_for_test();
+            assert!(app.snapshot.is_some());
+            app.current_folder = Some(folder.join("child"));
+        }
+        let pdf = app.tmp.path().join("list-only.pdf");
+        app.pdf_password_request = Some(PdfPasswordRequest::legacy(pdf.clone()));
+        app.pdf_password_input = "typed password".into();
+        assert!(!app.projected_viewer_session_open());
+        match close {
+            "snapshot_list" => assert!(app.snapshot_return_to_list_view()),
+            "tag" => app.open_tag_view_for_tag("notice"),
+            _ => end_waiting_viewer(&mut app, &ctx, close),
+        }
+        assert!(app.pdf_password_request.is_some(), "{close}");
+        assert_eq!(app.pdf_password_dialog_path(), Some(pdf), "{close}");
+        assert_eq!(app.pdf_password_input, "typed password", "{close}");
+    }
+}
+
 #[test]
 fn startup_notices_defer_through_enumeration_reopen_and_show_after_cancel() {
     let mut app = setup_app();

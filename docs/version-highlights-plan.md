@@ -145,20 +145,21 @@ metadata 境界を持つ終了、live return を後段 dispatcher へ渡す終�
 
 | ファイル・抽出された入口 / 状態を書き換える関数 | 分類・判定理由 | 終点 / 保持する経路 |
 | --- | --- | --- |
-| app: `set_ui_scale_factor`、preferences: `apply_preferences_dialog` のフォント変更、remote: `service_remote_session_requests` | T。一括終了。index は None でも viewer の待機がある | `close_all_viewer_sessions_with_cause` → detached 一括終了 + main の `close_fullscreen_to_completion` |
+| app: `set_ui_scale_factor`、preferences: `apply_preferences_dialog` のフォント変更、remote: `service_remote_session_requests` | 条件付き T（対象 session 単位）。一括終了には index 不在の待機も含む | Windows は `close_all_viewer_sessions_with_cause` → detached 一括終了 + 所有述語で対象と判定した main の `close_fullscreen_to_completion`。非 Windows の前回無条件化した倍率/Remote も同じ所有述語で判定 |
 | app: `close_all_detached_viewers_for_mode_change` / `close_all_detached_viewers_with_cause` | T。detached 設定の変更は従来どおり対象窓だけ。専用全画面 main の待機も閉じる | 投影中の session 所有者（index 不在の待機も含む）を同じ述語で判定し `close_fullscreen_to_completion`、他 context は `close_and_retire_context`。App 共通 viewport flag の cleanup だけでは main の別要求を終了させない |
 | app: `handle_fullscreen_close_request` / immediate dispatcher / `on_viewport_close_requested`、viewport_retirement: `accept_viewport_close_request` / `accept_active_detached_window_close` | T。Esc / Enter / HUD / OS close | 既存の finish / close-to-completion → 共通所有者。live return は finish 後に通常 navigation へ渡す |
 | startup_list_restore: `close_fullscreen_to_page_list` / `close_main_still_fullscreen_for_tray`、ui_fullscreen: `handle_fs_navigation_with_render_perf` / `handle_video_input` | T。ページ一覧 / トレイへの退出 | 通常終了、または既存 finish → parent restore。waiting Esc は次行 |
 | ui_fullscreen: `keep_fullscreen_viewport_alive` の待機 Esc / close、`render_embedded_fs_nav_holdover` | T。index 不在の待機を明示取消 | 既存 finish。Preparing lease は既存の exact-lease cancel を維持 |
 | gamepad_input: `apply_ring_close_fullscreen`、native_video: `drain_native_video_source_swap_pending_events` / `dispatch_native_video_key_event` | T。ring / native のページ一覧戻り | `close_fullscreen_to_page_list` → 通常終了 |
-| app: `close_detached_viewer_for_virtual_page_list_parent_nav`、`open_tag_view_for_tag`、`update_active_viewer_context` の Live return | T。閲覧ではなく一覧へ戻る | 通常終了。タグ遷移は main の待機も閉じ、detached sibling は閉じない |
-| gamepad_input: `confirm_gamepad_favorite_picker`、`apply_ring_favorite_slot` / `apply_ring_drive_letter` / `apply_current_drive_root` / `apply_switch_drive_letter` / `apply_ring_location_action` | T。有効な新しい場所を受理済み。index がなくても旧閲覧は終了 | 通常終了。旧 index-only guard を外す |
-| snapshot_ops: `snapshot_return_to_list_view`、filename_stack_ui: `poll_stack_grouping` | T。固定一覧 / 集約一覧へ戻す | 通常終了。旧 index-only guard を外す。park した sibling は保持 |
-| app: `finish_everything_edit_boundary` | T。新しい Everything 一覧の受付。metadata Undo の扱いを維持 | finish → 必要な場合だけ既存 rating metadata teardown |
+| app: `close_detached_viewer_for_virtual_page_list_parent_nav`、`update_active_viewer_context` の Live return | T。既存 reader の一覧復帰 | 通常終了。Live return の所有者・routing は維持 |
+| app: `open_tag_view_for_tag` | 条件付き T。main に viewer が実在する場合だけ終了 | `projected_viewer_session_open` を使い待機も含める。タグ一覧の受付だけでは一覧用 PDF 要求を viewer 終了として扱わず、detached sibling も閉じない |
+| gamepad_input: `confirm_gamepad_favorite_picker`、`apply_ring_favorite_slot` / `apply_ring_drive_letter` / `apply_current_drive_root` / `apply_switch_drive_letter` / `apply_ring_location_action` | 条件付き T。有効な場所アクションでも、viewer 実在時だけ旧閲覧を終了 | index-only 判定を `projected_viewer_session_open` へ置換。返却 navigation と通常の open admission は維持し、一覧用要求を真の終了で先取り取消しない |
+| snapshot_ops: `snapshot_return_to_list_view`、filename_stack_ui: `poll_stack_grouping` | 条件付き T。固定一覧 / 集約一覧の採用時に viewer が実在する場合だけ終了 | `projected_viewer_session_open` で判定。stack は park 後の投影先を読む。viewer がなければ一覧採用だけを続け、cold PDF の password 要求・入力は保持。park した sibling は保持 |
+| app: `finish_everything_edit_boundary` | 条件付き T。metadata 編集境界と viewer の寿命は別 | 編集境界は従来どおり適用し、`projected_viewer_session_open` の場合だけ finish。実ページがある場合の rating metadata teardown / Undo 方針は維持 |
 | app: `reconcile_fullscreen_after_main_focus` | 条件成立時だけ T。自動 focus close は実ページに対する既存 policy | 通常終了。待機中は自動 close 対象ではなく viewport を維持するため、index guard は残す |
 | app: `zip_nav_dfs_fullscreen`、book_composition_permission: `remap_after_book_projection` / `poll_book_presentation_permission`、book_composition_runtime: `adopt_book_projection` | T。hidden / missing / 空の本で有限探索が尽きた | 通常終了。DFS の次の候補がある場合は I として継続 |
 | app: `poll_video`、native_video: `poll_native_video_open_pending_with_readiness` / `poll_native_video_source_swap_pending_after_owner_gate` | T。native の close / host 消滅 / timeout | mounted は通常終了。parked は既存 window-id close → context 退役 |
-| sidecar_restore: `poll_sidecar_restore_projected` の page-index worker 切断 | T。準備失敗で閲覧を終了 | 通常終了。index-only guard を外し、list/discard の処理は維持 |
+| sidecar_restore: `poll_sidecar_restore_projected` の page-index worker 切断 | 条件付き T。終了対象の viewer があれば終了し、一覧だけの index 準備失敗は要求を discard するだけ | sidecar owner を App から take する前に共有述語を評価し、この poll の終了判断に使う。待機の再開予約を退役し、viewer がない一覧用 password は保持。永続 latch は設けない |
 | snapshot_ops: `prepare_viewer_index_swap` の key なし / member 不在 | T。新しい一覧で reader を解決できない | 通常終了。membership policy は既存 caller が判断 |
 | app: `remove_items_batch` | 残存ページへ隣接移動するなら I、旧実ページが None になった場合だけ T | None の分岐は finish。index shift / cache の再整合は既存処理を維持 |
 | app: `release_viewer_surfaces_for_removed_paths_with_metadata_boundary` | Manual は T。静止画 main は隣接再整合を維持し、表示/再生していない row の削除だけでは終了しない。BookAppend は handle 解放後に再採用する I | Manual は通常終了、BookAppend は既存 metadata teardown。detached は context 退役 |
@@ -232,6 +233,49 @@ cargo nextest run -p mimageviewer --lib -E 'test(/startup_notices|book_compositi
 表示内容/レイアウトは変更せず snapshot PNG の更新はない。マニュアルの既存 changelog にある
 「ビューア中は保留し、閉じてから表示」は今回の挙動と一致するため変更しない。
 Windows 実機での表示・OS close の最終確認は未実施。
+
+### 2.2 第5回レビュー: 一覧採用と viewer 終了の区別（2026-10-20）
+
+第4回の `poll_stack_grouping` の一律 T 分類は広すぎた。cold PDF の一覧 open は
+元 folder / items / generation を保持し、password dialog 中も背景の stack poll が継続する。
+この完了で viewer がないまま真の終了へ入り、一覧用 PDF 要求・入力を消す退行を確認した。
+上表の stack / snapshot、場所アクション、タグ、Everything、page-index 失敗を
+「viewer 実在時のみ T」に修正する。終了の対象は通知・一括終了と同じ
+`projected_viewer_session_open` で読み、index がなくても再開待ちなら終了対象に含める。
+非 Windows の倍率/Remote の前回無条件化箇所も同じ条件に揃える。
+明示的な context 退役は context 全体の終了、backend close は登録済み viewer の終了であり、
+一覧採用だけの入口と混同しない。共通の退役点・内部 reopen / park / F12 の分離は変更しない。
+
+sidecar の失敗 poll は、自身の continuation を take する前に同じ所有述語を読み取る。
+local へ移した待機 owner を「存在しない」と誤認しないための同一 poll 内の事実であり、
+新しい App 状態や一回限りの latch ではない。
+背景の stack 採用全体を password 中に停止する案は、viewer を終了する必要のない
+一覧準備も止めるため採らず、採用と viewer 終了の責務を区別する。
+
+回帰は実 worker の stack candidate を保留し、通常の cold PDF open → typed password 結果 →
+password 入力の後で完了を配送する。採用・hydration 後も要求と入力が残ることを確認する。
+viewer 待機の対照では3表示モードで再開予約を持たせ、採用時の終了・通知復帰・遅着 PDF 成功で
+再オープンしないことを確認する。場所・Everything・タグ・固定一覧と page-index 失敗も、
+viewer 不在の password 保持と既存の待機 viewer 終了回帰を併せて確認する。
+
+検証（第5回差分、2026-10-20）:
+
+- 新規4件は **4 passed**（run `364b9823-15f8-45f3-ad30-0e97ccdfbaed`）。
+  `stack_grouping_completion_preserves_cold_list_pdf_password_request_and_input`、
+  `stack_grouping_completion_ends_waiting_viewer_before_late_pdf_success`、
+  `startup_notices_non_viewer_boundaries_preserve_list_password_request`、
+  `visibility_index_disconnect_ends_only_an_existing_viewer_session`。
+- 下記の関連範囲は **1,636 passed**（run `4fe70ad3-977f-4abe-a147-4c0eb42c546d`、90.527秒）。
+  本体 lib 全件は ClaudeCode の最終 gate に残す。
+- `cargo fmt`（workspace 全体）、`cargo fmt --check`、UI glyph 検査、`git diff --check` は通過。
+  表示内容/レイアウトの変更はなく snapshot PNG / マニュアルの更新はない。
+- `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は core / remote / EPUB worker と
+  VCRT/PE 検査まで成功（runtime=4、pe=3）。バイナリ起動・実機操作は行っていない。
+  非 Windows 分岐の実行確認はこの Windows 環境では行っていない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/stack|startup_notices|book_composition|archive_convert|epub_convert|close|retire|ui_scale|snapshot.*swap|rating_membership|remove_items|removed_path|fs_nav|folder_nav|sidecar_restore::tests|smart.*(fullscreen|navigation)|collection.*navigation|viewport_retirement|viewer_context_registry::tests|park/)'
+```
 
 ## 3. データ (exe 埋め込み)
 

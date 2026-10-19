@@ -1218,7 +1218,9 @@ impl crate::app::App {
             };
             #[cfg(not(windows))]
             let close_failure = {
-                self.close_fullscreen();
+                if self.projected_viewer_session_open() {
+                    self.close_fullscreen();
+                }
                 None
             };
             let close_state = self.local_viewer_close_state(ctx, close_failure);

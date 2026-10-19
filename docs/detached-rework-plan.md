@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-20 §1.232 第5回レビュー: viewer 不在の一覧採用
+
+- 利用者が提示した独立レビューは、一括終了の合流と内部 reopen / park / F12 の
+  内容 teardown 分離を構造修正として妥当と判断し、未合流入口は他に発見されていない。
+  今回は第4回で広げすぎた「一覧採用も常に viewer の終了」という分類を修正する。
+- stack は既存 park の後に共有セッション所有述語を読み、viewer 実在時だけ終了する。
+  他の前回無条件化箇所も、一覧操作・metadata 境界と viewer 終了を区別する。
+  [入口表と理由](version-highlights-plan.md#22-第5回レビュー-一覧採用と-viewer-終了の区別2026-10-20) に記録する。
+- detached の述語・open / close / mount / park / F12 / viewport / registry / HWND 経路は変更しない。
+  既存述語による入口の適格性判定のみを修正し、新規状態・遅延・repaint は加えない。
+  今回差分の独立レビュー承認を取得済みとは扱わない。
+
 ### 2026-10-20 §1.232 第4回レビュー: 終了入口の監査と設定変更時の予約退役
 
 - 変更前 `48e2ddff4` の close 全呼出しと index / presentation / viewport / session の
