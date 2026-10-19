@@ -44,7 +44,7 @@
 
 ### 1.401 ページめくり D3-3: 編集済み・注釈付きの頁でも final を先回り準備する — D3 の残り (2026-10-19)
 
-- 状態: **次の版の後に回す (利用者 2026-10-19)**。D3-1 / D3-2 / D3-4(a)(b) はブランチ `pageturn-d3` で実装・独立レビュー済み (次の版に入れる予定)。
+- 状態: **次の版の後に回す (利用者 2026-10-19)**。D3-1 / D3-2 / D3-4(a)(b) / D3-5 は master に取り込み済み (`656af0431`)。
   設計の正本は [page-turn 計画 §27.17](page-turn-animation-plan.md) (D3-3 行、§27.17.6 の編集入力・comic、改訂 1 の P2-5)。
 - 現状: 先回り準備は、CPU 入力が揃っている頁 (補正・AI 完了済み・カラー化・LUT・sharpen・post) と、既に exact な edit pixels がある頁だけが対象。
   未実体化の編集 (erase / local / conceal の materialization、mask の DB 読み・black flatten) と comic (注釈) の頁は、従来どおり表示時に同期で作るので、
