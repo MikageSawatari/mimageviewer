@@ -2023,9 +2023,7 @@ impl App {
                         let had_deferred_fullscreen = state.common.deferred_fullscreen.is_some();
                         state.common.discard_target();
                         self.finish_visible_container_fs_nav_failed();
-                        if self.fullscreen_idx.is_some() {
-                            self.close_fullscreen();
-                        }
+                        self.close_fullscreen();
                         #[cfg(windows)]
                         if had_deferred_fullscreen {
                             self.terminate_active_detached_open_before_viewport(

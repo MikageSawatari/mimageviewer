@@ -475,6 +475,7 @@ impl App {
                 }
             }
             Some(RatingNeighborDecision::Empty) => {
+                self.finish_fullscreen_navigation_for_true_close();
                 self.close_fullscreen_for_rating_membership();
             }
             None => {}

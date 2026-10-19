@@ -19410,28 +19410,14 @@ impl App {
 
         #[cfg(windows)]
         {
-            let mounted_source_swap_presenter = self
-                .native_video_source_swap_pending
-                .as_ref()
-                .is_some_and(|pending| pending.parked_live_window_id.is_none());
-            // Viewer-mode settings use this path to close mounted + passive detached sessions.
-            // It is a no-op when no such window/session exists.
-            if self
-                .close_all_detached_viewers_for_mode_change(ctx)
-                .unwrap_or(true)
+            if let Err(error) =
+                self.close_all_viewer_sessions_with_cause(ctx, ViewerCloseCause::Replaced)
             {
-                return;
-            }
-            if mounted_source_swap_presenter {
-                self.close_fullscreen();
-                ctx.request_repaint();
-                return;
+                crate::logger::log(format!("ui_scale_viewer_close_failed: {error:?}"));
             }
         }
-
-        // Native fullscreen has no egui detached host, so the detached teardown can be a no-op.
-        // `close_fullscreen` also drops mounted source-swap/native-output pending state.
-        if self.fullscreen_idx.is_some() {
+        #[cfg(not(windows))]
+        {
             self.close_fullscreen();
             ctx.request_repaint();
         }
@@ -22707,6 +22693,7 @@ impl App {
 
     pub(crate) fn finish_everything_edit_boundary(&mut self) {
         self.finish_rating_membership_edit_boundary();
+        self.finish_fullscreen_navigation_for_true_close();
         if self.fullscreen_idx.is_some() {
             self.close_fullscreen_for_rating_membership();
         }
@@ -22919,7 +22906,46 @@ impl App {
         {
             return true;
         }
-        self.fullscreen_idx.is_some() || self.fs_nav_deferred_reopen_wait_active()
+        self.projected_viewer_session_open()
+    }
+
+    /// One current-context fact for notice visibility and terminal admission. Empty child
+    /// viewport registrations and list-only document preparation are not viewer sessions.
+    pub(crate) fn projected_viewer_session_open(&self) -> bool {
+        if self.fullscreen_idx.is_some()
+            || self.fs_nav_deferred_reopen_wait_active()
+            || self
+                .epub_convert
+                .as_ref()
+                .is_some_and(|state| state.deferred_fullscreen.is_some())
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            self.vst3_deferred_media_open.is_some()
+                || self
+                    .native_video_open_pending
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.owner_context_id == self.projected_viewer_context_id()
+                    })
+                || self
+                    .native_video_source_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.parked_live_window_id.is_none())
+                || self.video_presentation_transition.is_transitioning()
+                || self.video_presentation_transition.has_pending_effects()
+        }
+        #[cfg(not(windows))]
+        false
+    }
+
+    pub(crate) fn archive_convert_deferred_fullscreen_active(&self) -> bool {
+        self.archive_convert
+            .as_ref()
+            .and_then(|state| state.deferred_fullscreen.as_ref())
+            .is_some_and(|deferred| deferred.owner_context == self.projected_viewer_context_id())
     }
 
     pub(crate) fn mouse_nav_migration_prompt_visible(&self) -> bool {
@@ -32059,7 +32085,7 @@ impl App {
         if query.is_empty() {
             return;
         }
-        if self.viewer_session_blocks_main_window() {
+        if !self.current_viewer_session_is_detached_or_switching() {
             self.close_fullscreen();
         }
         self.open_tag_view_with_query(Some(query), false);
@@ -36971,7 +36997,7 @@ impl App {
             {
                 self.preserve_active_detached_image_window_for_main_context_change();
                 self.retire_direct_media_reader_for_source_adoption();
-                self.close_fullscreen();
+                self.close_fullscreen_content();
             }
         }
 
@@ -45530,6 +45556,9 @@ impl App {
                 }
             } else {
                 self.fullscreen_epub_source = None;
+            }
+            if self.fullscreen_idx.is_none() {
+                self.finish_fullscreen_navigation_for_true_close();
             }
         }
         // 音声モード系の idx-keyed 状態は対象アイテムが残存したときだけ追随し、消えたら畳む
@@ -55541,7 +55570,7 @@ impl App {
         if close_detached_after_zip_back {
             self.preserve_active_detached_image_window_for_main_context_change();
             self.retire_direct_media_reader_for_source_adoption();
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         if self.zip_nav_back() {
             return None;
@@ -61408,6 +61437,24 @@ impl App {
         self.close_all_detached_viewers_with_cause(ctx, ViewerCloseCause::Replaced)
     }
 
+    /// Root-dispatcher terminal for settings changes and Remote acquisition.
+    /// Main survives context retirement, so always finish its session, even while its
+    /// content index / child viewport is absent. Do not infer session lifetime from idx.
+    #[cfg(windows)]
+    pub(crate) fn close_all_viewer_sessions_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        cause: ViewerCloseCause,
+    ) -> Result<(), LocalViewerCloseFailure> {
+        let detached = self.close_all_detached_viewers_with_cause(ctx, cause);
+        let main = if self.projected_viewer_session_open() {
+            self.close_fullscreen_to_completion(ctx)
+        } else {
+            Ok(())
+        };
+        detached.and(main)
+    }
+
     #[cfg(windows)]
     pub(crate) fn close_all_detached_viewers_with_cause(
         &mut self,
@@ -61436,9 +61483,9 @@ impl App {
         let mut close_failure = None;
 
         if self.video_presentation_transition.is_transitioning() {
-            self.video_presentation_transition
-                .dispatch(PresentationTransitionEvent::TerminalClose);
-            self.execute_video_presentation_transition_effects(ctx);
+            if let Err(error) = self.close_fullscreen_to_completion(ctx) {
+                close_failure = Some(error);
+            }
         }
 
         self.log_detached_image_window_debug(format!(
@@ -61488,8 +61535,13 @@ impl App {
             }
             self.begin_active_detached_session_close("mode_change_close_all_active");
             self.finish_active_detached_session_close("mode_change_close_all_active");
-            if self.fullscreen_idx.is_some() {
-                self.close_fullscreen();
+            // Viewport flags are App-global and can still describe the detached
+            // context retired above. End only the projected reader, including its
+            // index-less waits; do not cancel main's unrelated list-only request.
+            if self.projected_viewer_session_open()
+                && let Err(error) = self.close_fullscreen_to_completion(ctx)
+            {
+                close_failure.get_or_insert(error);
             }
         }
 
@@ -65718,7 +65770,7 @@ impl App {
             return;
         }
         self.preserve_active_detached_image_window_for_main_context_change();
-        self.close_fullscreen();
+        self.close_fullscreen_content();
     }
 
     #[cfg(windows)]
@@ -66142,7 +66194,7 @@ impl App {
                 if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
                     self.close_fullscreen_now_with_metadata_boundary(boundary);
                 } else {
-                    self.close_fullscreen();
+                    self.close_fullscreen_content();
                 }
             }
         }
@@ -66153,7 +66205,7 @@ impl App {
             if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
                 self.close_fullscreen_now_with_metadata_boundary(boundary);
             } else {
-                self.close_fullscreen();
+                self.close_fullscreen_content();
             }
         }
         self.retire_direct_media_reader_for_source_adoption();
@@ -77924,7 +77976,7 @@ impl App {
                 let detached_viewer_open_next_still_detached_once =
                     self.detached_viewer_open_next_still_detached_once;
                 let fs_viewport_generation = self.fs_viewport_generation;
-                self.close_fullscreen();
+                self.close_fullscreen_content();
                 // Ctrl+↑↓ is an internal viewer-to-viewer reopen. If a stale
                 // grid-open intent survives here, always-new detached mode can
                 // allocate a fresh window_id and briefly show the default-sized
@@ -77961,7 +78013,7 @@ impl App {
                 return;
             }
         }
-        self.close_fullscreen();
+        self.close_fullscreen_content();
         // Folder navigation is never a grid-originated open; prevent a stale
         // intent from changing detached window allocation on the next reopen.
         self.fs_open_intent_from_grid = false;
@@ -77973,6 +78025,16 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        if self.book_append_undo_in_progress() {
+            return;
+        }
+        self.finish_fullscreen_navigation_for_true_close();
+        self.close_fullscreen_content();
+    }
+
+    /// Content-only teardown for an owner that will reopen or transfer this reader.
+    /// True session exits must use close_fullscreen / close_fullscreen_to_completion.
+    pub(super) fn close_fullscreen_content(&mut self) {
         if self.book_append_undo_in_progress() {
             return;
         }
@@ -78015,13 +78077,13 @@ impl App {
             self.video_presentation_transition
                 .dispatch(PresentationTransitionEvent::TerminalClose);
         }
-        // `TerminalSessionClose` の実行は、その中で `close_fullscreen` まで走る。
+        // `TerminalSessionClose` は予約退役済みの content teardown まで実行する。
         // **走ったなら二度目を呼ばない** — 初回 close が整えた状態を巻き戻す
         // (Codex Q1)。走っていない場合だけ、ここで閉じる。
         if self.execute_video_presentation_transition_effects(ctx)
             == PresentationEffectsOutcome::DidNotClose
         {
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         if self.fullscreen_idx.is_some()
             && !self.video_presentation_transition.is_transitioning()

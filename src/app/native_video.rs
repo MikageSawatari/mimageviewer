@@ -3045,7 +3045,7 @@ impl App {
                 // ここで通常の teardown まで走る。呼び出し側が「まだ閉じていない」と
                 // 判断して二度目を呼ぶと、初回 close が整えた状態を巻き戻す。
                 match metadata_boundary {
-                    super::FsMetadataBoundary::Manual => self.close_fullscreen(),
+                    super::FsMetadataBoundary::Manual => self.close_fullscreen_content(),
                     boundary @ super::FsMetadataBoundary::BookAppend(_) => {
                         self.close_fullscreen_now_with_metadata_boundary(boundary)
                     }

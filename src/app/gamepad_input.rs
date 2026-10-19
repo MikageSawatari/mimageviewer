@@ -3592,9 +3592,7 @@ impl App {
         self.gamepad_favorite_picker = None;
         self.clear_native_video_picker_overlay(ctx);
         self.gamepad.state.require_directional_neutral();
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         if let Some(target) = favorite_target {
             self.bump_input_seq(
                 "gamepad_favorite_nav",
@@ -5775,9 +5773,7 @@ impl App {
             self.show_feedback_toast(format!("お気に入り {slot} は未登録です"));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
         ctx.request_repaint();
         Some(AddressBarNav::Direct(
@@ -5799,9 +5795,7 @@ impl App {
             self.show_feedback_toast(format!("ドライブが見つかりません: {}", path.display()));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
         Some(AddressBarNav::Direct(
             resolved,
@@ -5824,9 +5818,7 @@ impl App {
             ));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         self.bump_input_seq(
             source,
             Some(&format!("current_drive_root={}", path.display())),
@@ -5869,9 +5861,7 @@ impl App {
             };
             resolved_root
         };
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         self.bump_input_seq(
             source,
             Some(&format!(
@@ -5915,9 +5905,7 @@ impl App {
             }
             _ => return None,
         };
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         self.bump_input_seq(source, Some(&format!("{nav:?}")));
         ctx.request_repaint();
         Some(nav)

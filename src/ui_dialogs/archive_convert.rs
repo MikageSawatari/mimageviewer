@@ -787,13 +787,6 @@ impl App {
         true
     }
 
-    pub(crate) fn archive_convert_deferred_fullscreen_active(&self) -> bool {
-        self.archive_convert
-            .as_ref()
-            .and_then(|state| state.deferred_fullscreen.as_ref())
-            .is_some()
-    }
-
     /// 背面入力を止める実ダイアログが現在表示されるか。
     ///
     /// 確認なし変換の走査中は state 自体は存在するが Window は描画しないため、

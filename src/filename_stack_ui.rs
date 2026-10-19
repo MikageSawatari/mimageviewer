@@ -1410,9 +1410,7 @@ impl crate::app::App {
         if self.fullscreen_idx.is_some() {
             self.park_detached_session_for_stack_aggregation(ctx);
         }
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         self.apply_stack_group_ready(
             pending.source.folder.clone(),
             match &pending.source.listing {

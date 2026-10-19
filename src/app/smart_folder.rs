@@ -8396,7 +8396,7 @@ impl App {
         self.cancel_media_navigation_pending_for_current_context(
             "restore_prepared_smart_folder_session",
         );
-        self.close_fullscreen();
+        self.close_fullscreen_content();
         self.bump_full_context_for_load();
         self.cancel_pending_folder_nav();
         self.pdf_enumerate_pending = None;

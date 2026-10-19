@@ -39,12 +39,8 @@ fn deferred_navigation_reopen() -> DeferredFsReopen {
 }
 
 #[cfg(windows)]
-pub(in crate::app) fn close_waiting_viewer_through_backend(
-    app: &mut App,
-    ctx: &egui::Context,
-    detached: bool,
-    mounted: bool,
-) {
+fn register_waiting_viewer(app: &mut App, ctx: &egui::Context, detached: bool) -> egui::ViewportId {
+    app.native_video_in_window_active = false;
     app.fs_viewport_shown = true;
     app.fs_viewport_presentation = Some(if detached {
         ViewerPresentation::DetachedWindow
@@ -73,6 +69,17 @@ pub(in crate::app) fn close_waiting_viewer_through_backend(
     })
     .drop_without_applying_deltas();
     assert!(ctx.viewport_registration(viewport_id).is_some());
+    viewport_id
+}
+
+#[cfg(windows)]
+pub(in crate::app) fn close_waiting_viewer_through_backend(
+    app: &mut App,
+    ctx: &egui::Context,
+    detached: bool,
+    mounted: bool,
+) {
+    let viewport_id = register_waiting_viewer(app, ctx, detached);
     let accept = |app: &mut App| {
         assert!(matches!(
             eframe::App::on_viewport_close_requested(app, ctx, viewport_id),
@@ -84,6 +91,90 @@ pub(in crate::app) fn close_waiting_viewer_through_backend(
             .expect("mounted detached close");
     } else {
         accept(app);
+    }
+}
+
+/// The same real session-ending entry points are exercised with enumeration, book
+/// projection / permission, and archive completion owners (not a test-only retire).
+#[cfg(windows)]
+pub(in crate::app) const WAITING_SESSION_END_ROUTES: &[&str] = &[
+    "scale_fullscreen",
+    "scale_embedded",
+    "scale_detached",
+    "bulk_mode_fullscreen",
+    "bulk_mode_transition",
+    "bulk_font_embedded",
+    "direct_close",
+    "page_list",
+    "everything",
+    "tray_close",
+    "location_favorite",
+    "ring_location",
+];
+
+#[cfg(windows)]
+pub(in crate::app) fn end_waiting_viewer(app: &mut App, ctx: &egui::Context, close: &str) {
+    if matches!(
+        close,
+        "scale_fullscreen" | "bulk_mode_fullscreen" | "bulk_mode_transition" | "scale_detached"
+    ) {
+        register_waiting_viewer(app, ctx, close == "scale_detached");
+    } else {
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.native_video_in_window_active = true;
+        app.fs_viewport_shown = false;
+        app.fs_viewport_presentation = None;
+    }
+    match close {
+        "scale_fullscreen" | "scale_embedded" | "scale_detached" => {
+            app.set_ui_scale_factor(ctx, app.settings.ui_scale_factor + 0.25);
+        }
+        "bulk_mode_transition" => {
+            begin_test_video_presentation_transition(
+                app,
+                ViewerPresentation::DetachedWindow,
+                false,
+            );
+            assert!(app.video_presentation_transition.is_transitioning());
+            app.close_all_detached_viewers_for_mode_change(ctx).unwrap();
+        }
+        "bulk_mode_fullscreen" => {
+            app.close_all_detached_viewers_for_mode_change(ctx).unwrap();
+        }
+        "bulk_font_embedded" => {
+            app.close_all_viewer_sessions_with_cause(ctx, ViewerCloseCause::Replaced)
+                .unwrap();
+        }
+        "direct_close" => app.close_fullscreen(),
+        "page_list" => app.close_fullscreen_to_page_list(),
+        "everything" => app.finish_everything_edit_boundary(),
+        "tray_close" => app.close_main_still_fullscreen_for_tray(),
+        "location_favorite" => {
+            app.settings.favorites = vec![crate::settings::FavoriteEntry::new(
+                "notice destination".into(),
+                PathBuf::from("notice-destination"),
+            )];
+            assert!(
+                app.apply_location_navigation_key_action(
+                    ctx,
+                    KeyAction::GridOpenFavorite1,
+                    "notice_test",
+                )
+                .is_some()
+            );
+        }
+        "ring_location" => {
+            assert!(
+                app.apply_ring_action(
+                    ctx,
+                    crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+                    crate::ring_shortcut::RingActionId::OpenLocationDriveList,
+                    "notice_test",
+                )
+                .is_some()
+            );
+        }
+        _ => panic!("unknown session end: {close}"),
     }
 }
 
@@ -120,6 +211,137 @@ fn assert_startup_notices_deferred(app: &mut App) {
     assert!(!app.common_modal_dialog_open());
     app.settings.first_setup_completed = true;
     app.show_whats_new = true;
+}
+
+#[cfg(windows)]
+#[test]
+fn startup_notices_settings_and_list_exits_retire_enumeration_before_late_success() {
+    for pdf in [false, true] {
+        for &close in WAITING_SESSION_END_ROUTES {
+            let mut app = setup_app();
+            request_whats_new(&mut app);
+            let path = app
+                .tmp
+                .path()
+                .join(if pdf { "late.pdf" } else { "late.zip" });
+            let ctx = egui::Context::default();
+            let mut pdf_complete = None;
+            let mut zip_complete = None;
+            let cancel = if pdf {
+                let (handle, complete) =
+                    crate::pdf_loader::pending_enumerate_handle_for_test(&path);
+                let cancel = Arc::clone(&handle.cancel);
+                pdf_complete = Some(complete);
+                app.pdf_enumerate_pending = Some((
+                    path.clone(),
+                    None,
+                    handle,
+                    Box::new(OpenRequestOwner::Navigation),
+                    None,
+                    PdfOpenPhase::ColdCandidate {
+                        retained_source: None,
+                        restore_intent: StartupListIntent::PageContinuation,
+                    },
+                    crate::pdf_loader::LeasedEpubPath::try_new(path.clone()).unwrap(),
+                ));
+                cancel
+            } else {
+                let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+                zip.start_file("page.jpg", zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, b"page").unwrap();
+                zip.finish().unwrap();
+                let prepared = crate::zip_loader::PreparedZipEnumeration::prepare(
+                    path.clone(),
+                    crate::zip_loader::enumerate_image_entries_detailed(&path).unwrap(),
+                    Default::default(),
+                );
+                let (deliver, rx) = mpsc::channel();
+                zip_complete = Some((deliver, prepared));
+                let cancel = Arc::new(AtomicBool::new(false));
+                app.zip_enumerate_pending = Some(ZipEnumeratePending {
+                    zip_path: path.clone(),
+                    input_seq: 1,
+                    cancel: Arc::clone(&cancel),
+                    rx,
+                    restore_intent: StartupListIntent::PageContinuation,
+                });
+                cancel
+            };
+            app.fs_nav_after_pdf_enumerate = Some(deferred_navigation_reopen());
+            app.fs_nav_locked_gen = Some(app.items_generation);
+            app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+            assert!(app.projected_viewer_session_open());
+            assert!(!app.whats_new_visible());
+            end_waiting_viewer(&mut app, &ctx, close);
+            assert!(app.pdf_enumerate_pending.is_none(), "pdf={pdf}, {close}");
+            assert!(app.zip_enumerate_pending.is_none(), "pdf={pdf}, {close}");
+            assert!(cancel.load(Ordering::Relaxed), "pdf={pdf}, {close}");
+            assert!(app.fs_nav_after_pdf_enumerate.is_none());
+            assert!(!app.projected_viewer_session_open(), "pdf={pdf}, {close}");
+            assert!(app.whats_new_visible(), "pdf={pdf}, {close}");
+            let generation = app.items_generation;
+            if let Some(complete) = pdf_complete {
+                complete(Ok(vec![crate::pdf_loader::PdfPageEntry {
+                    page_num: 0,
+                    mtime: 1,
+                    file_size: 4,
+                }]));
+            }
+            if let Some((deliver, prepared)) = zip_complete {
+                assert!(
+                    deliver.send(Ok(prepared)).is_err(),
+                    "retired receiver: {close}"
+                );
+            }
+            app.poll_pdf_enumerate();
+            app.poll_zip_enumerate();
+            app.poll_sidecar_restore(&ctx);
+            assert_eq!(app.items_generation, generation);
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.whats_new_visible());
+            assert_eq!(
+                app.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn startup_notices_bulk_settings_close_preserves_list_only_password_request() {
+    for detached in [false, true] {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("list-only.pdf");
+        app.pdf_password_request = Some(PdfPasswordRequest::legacy(path.clone()));
+        app.pdf_password_input = "list password".into();
+        if detached {
+            app.build_active_context_for_test(Some(1237), DetachedSource::Image, |owner| {
+                owner.items = vec![GridItem::Image(PathBuf::from("sibling.jpg"))];
+                owner.fullscreen_idx = Some(0);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+            });
+            app.with_active_viewer_context(|owner| {
+                owner.fs_viewport_shown = true;
+                owner.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+            })
+            .unwrap();
+            // These flags outlive projection changes; they are not main's viewer.
+            assert!(app.fs_viewport_shown);
+            assert!(app.active_detached_context_is_at_rest());
+        }
+        assert!(!app.projected_viewer_session_open());
+        let ctx = egui::Context::default();
+        let scale = app.settings.ui_scale_factor + 0.25;
+        app.set_ui_scale_factor(&ctx, scale);
+        assert!(!app.active_detached_context_is_at_rest());
+        assert!(app.pdf_password_request.is_some(), "detached={detached}");
+        assert_eq!(
+            app.pdf_password_input, "list password",
+            "detached={detached}"
+        );
+    }
 }
 
 #[test]
@@ -201,7 +423,10 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
             "context_retire",
             "retired_owner_at_completion",
             "internal_reopen_then_backend_fullscreen",
-        ] {
+        ]
+        .into_iter()
+        .chain(WAITING_SESSION_END_ROUTES.iter().copied())
+        {
             let escape = close == "escape";
             let mut app = setup_app();
             request_whats_new(&mut app);
@@ -268,10 +493,25 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
                     owner.viewer_presentation = ViewerPresentation::DetachedWindow;
                 });
                 let sibling_ctx = egui::Context::default();
-                sibling_ctx.begin_pass(escape_input());
+                // This edge belongs to the sibling's viewport. A root edge must
+                // not borrow main's archive continuation to become a viewer key.
+                let viewport_id = App::detached_image_window_viewport_id(1235);
+                let mut sibling_input = escape_input();
+                sibling_input.viewport_id = viewport_id;
+                sibling_input
+                    .viewports
+                    .insert(viewport_id, Default::default());
+                sibling_ctx.begin_pass(sibling_input);
                 app.with_active_viewer_context(|owner| {
+                    assert!(!owner.archive_convert_deferred_fullscreen_active());
                     let action = owner.handle_fs_key_input(&sibling_ctx, 0, false);
-                    assert!(action.close, "sibling Escape must be accepted");
+                    assert!(
+                        action.close,
+                        "sibling Escape must be accepted: close={close}, modal={:?}, owner={:?}, events={:?}",
+                        owner.modal_dialog_block_reason(),
+                        owner.keyboard_owner_for_pass(&sibling_ctx),
+                        sibling_ctx.input(|input| input.events.clone()),
+                    );
                     owner.handle_fullscreen_close_request();
                 })
                 .expect("sibling viewer must mount");
@@ -316,7 +556,9 @@ fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reope
                 );
                 assert!(!app.whats_new_visible());
             }
-            if close.starts_with("backend_") || close.starts_with("internal_reopen_") {
+            if WAITING_SESSION_END_ROUTES.contains(&close) {
+                end_waiting_viewer(&mut app, &ctx, close);
+            } else if close.starts_with("backend_") || close.starts_with("internal_reopen_") {
                 close_waiting_viewer_through_backend(
                     &mut app,
                     &ctx,

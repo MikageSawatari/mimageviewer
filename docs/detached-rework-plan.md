@@ -1455,6 +1455,32 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-20 §1.232 第4回レビュー: 終了入口の監査と設定変更時の予約退役
+
+- 変更前 `48e2ddff4` の close 全呼出しと index / presentation / viewport / session の
+  状態解除箇所を抽出し、真の終了・内部差替え・所有移譲・表示 cleanup に分類した。
+  全入口・index-only 判定の採否と例外は
+  [version-highlights-plan §2.1](version-highlights-plan.md#21-終了入口の監査1232-第4回レビュー2026-10-20) に記録する。
+- 今回は読むだけでなく、**設定変更による終了を既存の予約退役点へ接続する**。
+  main は列挙/製本待ちで index がなくても session が生き、context は一括終了後も生存するため、
+  viewport flag の解除や detached context の退役だけでは再開予約が終わらなかった。
+  倍率・フォント・Remote の全 viewer 終了を一つの API に寄せ、専用全画面の一括終了も
+  `close_fullscreen_to_completion` へ通す。main の対象判定と通知は同じ既存 owner 由来の述語を使う。
+  App 共通 viewport flag は別窓の退役後も残り得るため、表示 cleanup と投影中 session の
+  終了を区別する。一覧だけの main PDF password と active detached の併存も回帰で固定し、
+  窓だけの表示状態を根拠に兄弟の要求を取り消さない。
+- 通常 `close_fullscreen` も真の終了処理へ合流させ、内部 folder-nav・snapshot 再開・park 後の
+  内容解除などは明示的な `close_fullscreen_content` に分ける。予約の退役は引き続き
+  `retire_viewer_reopen_requests(context)` に集約し、兄弟の書庫予約は owner ID が一致するときだけ扱う。
+  metadata の特殊終了は既存方針を維持したまま同じ終了処理へ接続する。
+- detached の open / mount / park / promote、viewport 登録/生成/placement、HWND・focus、
+  registry の所有遷移、内部 reopen の保持条件は変更しない。変更するのは終了入口から
+  既存終端への接続と内容 teardown の呼分けであり、guard / delay / repaint による症状抑制ではない。
+  一覧だけの準備を終了対象へ広げず、変換・projection の成功後の一覧採用も維持する。
+- 判断の根拠は利用者が提示した第4回レビューの対応方針と、そのコード上の確認。
+  backend close / context 退役・内部 reopen / holdover / PDF password・EPUB・registry は
+  前回レビューで妥当とされた部分を維持する。今回差分の独立レビュー承認を取得済みとは扱わない。
+
 ### 2026-10-20 §1.232: 起動通知の保留と内部遷移中のビューア所有
 
 - 対象は `App::startup_notice_viewer_open` と通知側の visible / modal 判定。

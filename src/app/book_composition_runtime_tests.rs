@@ -1281,6 +1281,7 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
 #[cfg(windows)]
 #[test]
 fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completion() {
+    use super::tests::startup_notices::{WAITING_SESSION_END_ROUTES, end_waiting_viewer};
     for projection in [true, false] {
         for close in [
             "escape",
@@ -1288,7 +1289,10 @@ fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completi
             "backend_fullscreen",
             "backend_detached",
             "context_retire",
-        ] {
+        ]
+        .into_iter()
+        .chain(WAITING_SESSION_END_ROUTES.iter().copied())
+        {
             let escape = close == "escape";
             let mut env = setup_app();
             let root = env.tmp.path().join("cancelled-entry.pdf");
@@ -1348,7 +1352,9 @@ fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completi
                     .push(egui::ViewportEvent::Close);
             }
             let ctx = egui::Context::default();
-            if close.starts_with("backend_") {
+            if WAITING_SESSION_END_ROUTES.contains(&close) {
+                end_waiting_viewer(&mut env, &ctx, close);
+            } else if close.starts_with("backend_") {
                 super::tests::startup_notices::close_waiting_viewer_through_backend(
                     &mut env,
                     &ctx,
@@ -1381,7 +1387,10 @@ fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completi
             // lose their original receiver when the qualified open retires.
             if let Some(prepared) = prepared {
                 let delivered = late_projection.send(prepared.recv_timeout(WAIT).unwrap());
-                if matches!(close, "backend_detached" | "context_retire") {
+                if matches!(
+                    close,
+                    "backend_detached" | "context_retire" | "scale_detached"
+                ) {
                     assert!(delivered.is_err(), "retired context must drop its receiver");
                 } else {
                     delivered.unwrap();

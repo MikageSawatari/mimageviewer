@@ -1211,6 +1211,58 @@ mod tests {
         assert!(app.whats_new_visible());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn startup_notices_epub_settings_close_keeps_conversion_but_retires_late_reopen() {
+        for embedded in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let (mut state, tx, cancel) = fake_state(EpubConvertPhase::Converting(None));
+            state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: crate::app::DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+            app.epub_convert = Some(state);
+            app.show_whats_new = true;
+            app.show_mouse_nav_migration_prompt = false;
+            app.native_video_in_window_active = embedded;
+            app.viewer_presentation = if embedded {
+                crate::app::ViewerPresentation::MainWindow
+            } else {
+                crate::app::ViewerPresentation::Fullscreen
+            };
+            app.fs_viewport_shown = !embedded;
+            app.fs_viewport_presentation = (!embedded).then_some(app.viewer_presentation);
+            assert!(!app.whats_new_visible());
+            let scale = app.settings.ui_scale_factor + 0.25;
+            app.set_ui_scale_factor(&ctx, scale);
+            assert!(
+                app.epub_convert
+                    .as_ref()
+                    .unwrap()
+                    .deferred_fullscreen
+                    .is_none()
+            );
+            assert!(!cancel.is_cancelled());
+            assert!(app.whats_new_visible());
+            tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Published)))
+                .unwrap();
+            ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+                .drop_without_applying_deltas();
+            assert!(
+                app.pdf_enumerate_pending.is_some(),
+                "list adoption continues"
+            );
+            assert!(app.fs_nav_after_pdf_enumerate.is_none());
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.whats_new_visible());
+        }
+    }
+
     #[test]
     fn inspect_same_name_pdf_shows_disabled_save_reason() {
         let mut app = crate::app::setup_app_for_test();

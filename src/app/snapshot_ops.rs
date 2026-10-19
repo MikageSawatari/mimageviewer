@@ -1581,9 +1581,7 @@ impl App {
         // filter suppress 解除 (= snapshot list view は filter 通常適用)
         let _ = self.restore_rating_filter_suppression();
         // fullscreen 中なら閉じる
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
-        }
+        self.close_fullscreen();
         // snapshot 内から ZipFile を開いていた場合、その子 ZIP の zip_nav が残っている。
         // list view は start_loading_items を通さず items を差し替えるので、ここで明示的に
         // 破棄しないと stale zip_nav が list view 上の BS で旧 ZIP 階層を復活させる
@@ -2087,7 +2085,7 @@ impl App {
         let was_fs = self.fullscreen_idx.is_some();
         // 現在 fullscreen を閉じる (= items が入れ替わるので)
         if was_fs {
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         // guard bypass
         self.snapshot_internal_nav = true;
