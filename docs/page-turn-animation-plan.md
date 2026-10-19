@@ -5300,3 +5300,20 @@ detachedの変更は、既存runtime・session／context binding・実描画disp
 - 実 Single／Pair painter の clip／ROI から通常 resolve が生成した Native key を test-only observer で取得し、prewarm の key／hit と比較する。
   PDF layout と raster の相違、SpecifiedScale、ROOT と異なる子 viewport ppp、実 callback の resize／DPI／clip 更新と旧候補失効、warm 時の全頁走査ゼロを回帰で確認する。
   検証・prewarm 側だけの ROI 一時変異と SHA-256 復元の記録は `target/d3-4b-fix-*`。実機性能・正式八条件／motion は今回も未計測。
+
+#### 27.17.16 D3-4(b) 後の実アプリ計測（2026-10-19、ClaudeCode が隔離 data-dir で実行）
+
+ブランチ `pageturn-d3` (`6e688ee55`) の `build-dev.ps1 -TestScript` で同じ 8 条件を測った。利用者の実機での見え方の確認ではない。計測中、利用者の
+インストール版 v4.7.1 (常駐) が起動していた (操作はなし)。証跡は作業ツリーの `target/page-turn-smoke/d34b-*/logs/`。
+
+| 条件 | D3-4(a) 後 (§27.17.15) コマ数 / 受理→初回 curl / 最大間隔 | D3-4(b) 後 |
+| --- | --- | --- |
+| 補正あり・単ページ (03 / 04) | 30〜34 / 4〜18ms / 8〜27ms | 30〜34 / 4〜9ms / 7〜28ms |
+| 補正あり・見開き RtlCover (03 / 04) | 29〜33 / 5〜63ms / 8〜19ms | 21〜34 / 5〜44ms / 7〜50ms |
+| 補正なし (03 / 04、単・見開き) | 28〜34 / 4〜41ms / 7〜35ms | 28〜34 / 4〜8ms / 7〜41ms (1 回だけ 9 コマ、下記) |
+
+- 見開きの Native lookup はほぼ hit になった (04: hit 165 / miss 5、03: hit 171 / miss 2)。単ページの初回 curl は全条件 4〜9ms。
+- 補正ありの見開きで、後半の 4 回 (受理前に約 1.5 秒 frame が無い静止) の初回 curl が 21〜46ms 残る。この間、Native は hit し、投機の準備は約 2 秒前に完了しており、
+  アプリのログに重い仕事は記録されていない (受理の frame の次の frame が約 42ms)。GPU 側 (大きい texture の residency・driver) が原因の可能性があるが**未確認**。
+  原因を決めるには PresentMon / ETW 等の GPU 側の記録が要る。D3 の範囲内で直せるとは扱わない。
+- 補正なし 04 単ページの 1 回 (9 コマ) は `cancel reason=focus_lost` (計測中にフォーカスが一瞬外れた、環境要因) で、欠陥ではない。
