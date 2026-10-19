@@ -2424,7 +2424,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         if self.book_append_undo_in_progress() {
@@ -2446,7 +2446,9 @@ impl App {
             (
                 primary_allowed && i.pointer.primary_pressed(),
                 primary_allowed && i.pointer.primary_down(),
-                primary_allowed && i.pointer.primary_released(),
+                primary_allowed
+                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                    && i.pointer.primary_released(),
                 i.pointer.interact_pos(),
             )
         });

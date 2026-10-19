@@ -1617,22 +1617,23 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
         // フォーカス復帰クリック中は塗り・選択操作を一切発生させない
         // (handle_fs_wheel_and_click で検出・セットされる)
-        if self.fs_primary_suppression.is_active()
-            && self.fs_primary_suppression
-                != crate::ui_fullscreen::FullscreenPrimarySuppression::OverflowStream
-        {
+        if self.fs_primary_suppression.is_active() {
             return;
         }
         let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
         let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| primary_allowed && i.pointer.primary_released());
+        let primary_released = ctx.input(|i| {
+            primary_allowed
+                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                && i.pointer.primary_released()
+        });
         let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
             && self
                 .settings

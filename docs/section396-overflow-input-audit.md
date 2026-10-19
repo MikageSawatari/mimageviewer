@@ -3,47 +3,57 @@
 対象は `render_fullscreen_viewport` の静止画描画と、その前後で実行する入力処理。
 `pointer.*`（`primary_clicked` / `any_click` 等を含む）、`PointerButton`、
 `Response::interact_pointer_pos` と呼出先を検索し、テスト用入力生成と描画だけの参照を分けた。
-中ボタン・Extra ボタン・wheel の既存操作は今回の左右ボタン所有へ巻き込まない。
+§1.403 で左・右・中・touch の前面所有へ一般化した。Extra ボタン・wheel は従来の契約を保つ。
 
-`capture_fs_overflow_pointer_input` が root の早期描画より前に一度だけ所有を確定する。
+`capture_fs_front_pointer_input` が root の早期描画とキー処理・navigator 予約より前に一度だけ所有を確定する。
 現在のパネル矩形を egui の layer hit-test に通し、押下位置の最前面が overflow の Area のときだけ
-左右の押下を解放までパネルが所有する。パネルを閉じるフレームや、キーで
-別モードへ入るフレームでも同じ `FsOverflowPointerFrameInput` を各 consumer へ渡す。
+左・右・中・touch の押下を解放までパネルが所有する。提示中の F / S / R / P / Q / fullscreen context menu と
+対象 viewport の egui memory popup は、位置によらず新規押下を所有する。パネルを閉じるフレームや、キーで
+別モードへ入るフレームでも同じ `FsFrontPointerFrameInput` を各 consumer へ渡す。
 矩形・layer を各 consumer で判定し直さない。外側開始の入力は従来どおり扱う。
-touch 除外も同じ pass の最前面領域を使い、別 popup が手前にある部分を overflow として除外しない。
+overflow だけなら touch 除外も同じ pass の最前面領域を使う。メニュー提示中 / touch 所有中は全 canvas を
+touch recognizer の除外へ渡す（メニュー項目の Response は維持）。
 初回 / sizing の未登録・非 interactive な Area は現在の矩形で補うが、既存の Foreground 以上の
 hit を上書きしない。Area の登録順序は変更しない。閉じた直後は現在の矩形がないため、
 egui に前 pass の Area が残っていても新規所有しない。
 シーク設定 popup は毎 pass 描画し、選択は従来の Response に任せる。
-別 popup と背面の関係を一般化する所有型は導入しない。
+物理列は App 全体の前面一時状態 `FsFrontPointerOwnership` が保持し、context bundle には移さない。
+旧 `OverflowStream` / `FullscreenSecondaryPress::Overflow` は廃止した。同 viewer のページ移動では終わらず、
+物理 release、最後の touch End / Cancel、所有 viewport の focus loss、既存の前面 handoff / close だけで解放する。
+他 viewport の入力・focus loss はその所有を変更しない。同一 pass の旧 release → 新 press は新列として判定する。
+double-click は前面所有境界以降の背面受理 click と egui の click count の両方で成立させる。
 
-| 背面処理 | overflow 所有と同時到達 | 所有結果・変更 / 除外根拠（関数が参照点） |
+以下の consumer 表の所有結果は一般化後の `FsFrontPointerFrameInput` を指す。追加接続は
+中ボタン短押し / drag zoom と範囲 capture。隠蔽のパイプライン前 hold は同じ owner を viewport 一致で参照する。
+
+| 背面処理 | overflow との到達（§1.396 の棚卸し） | 一般化後の所有結果・変更 / 除外根拠（関数が参照点） |
 | --- | --- | --- |
-| ナビゲータの予約・直接処理・予約後処理、右範囲選択ズーム | 可 | `ui_fullscreen.rs::handle_fs_wheel_and_click_frame` (`src/ui_fullscreen.rs:37600`) から `without_overflow_buttons` (`src/ui_fullscreen.rs:2623`) 済み raw snapshot を全入口へ渡す。ボタン edge / down だけを除き位置・focus・wheel・非所有ボタンは保つ（既存修正）。 |
-| 比較ワイプ境界 | 可 | `handle_compare_wipe_drag` (`src/ui_fullscreen.rs:35396`) の呼出前に確定済み primary 所有を参照。 |
-| 通常パン・Ctrl 回転・連結読みスクロール・panorama drag・double click / ページクリック | 可 | `apply_fs_wheel_frame_proposal` (`src/ui_fullscreen.rs:38918`) の `primary_suppression` 分岐が全 primary 操作より前。確定済み primary 所有は touch 終端でも上書きしない（既存修正）。 |
-| 右クリック・リング・ジェスチャ | 可 | `recognize_fs_secondary_input` (`src/ui_fullscreen.rs:39517`) が確定済み secondary 所有を参照。既存右操作を primary press で中断する入口も、前面所有の primary は配送しない。 |
-| 分析のパン・ガイド作成・右クリックの filter / 色固定 | 可 | `draw_analysis_panel` (`src/ui_analysis_panel.rs:839`) へ同じ結果を渡し、primary 各 edge / down と secondary press をボタン別に除く。分析は `fullscreen_top_bar_chrome_allowed` (`src/ui_fullscreen.rs:23505`) の除外対象ではない。 |
-| 補正パネルのブックマーク行 | 可 | `draw_adjustment_panel` (`src/ui_adjustment_panel.rs:16322`) → `draw_bookmark_panel_body` (`src/ui_adjustment_panel.rs:15864`) へ同じ結果を渡して raw `primary_clicked` を除く。現在位置の `contains_pointer` だけでは press 所有にならず、狭い窓の重なりで行へ漏れ得た。 |
-| 消しゴム | モード中は不可、キー入場の同一 pass は可 | `handle_erase_paint` (`src/ui_erase.rs:1616`) へ同じ結果を渡し primary / secondary を個別に除く。従来の `fs_primary_suppression.is_active` だけでは終端 pass と secondary 所有を扱えない。 |
-| 隠蔽 canvas | 同上 | `handle_conceal_paint` (`src/ui_conceal.rs:1320`) へ同じ結果を渡し primary / secondary を個別に除く。 |
-| テキスト注釈 | 同上 | `handle_text_canvas_input` (`src/ui_text.rs:2423`) へ同じ結果を渡し primary 操作を除く。 |
-| 補正レイヤー canvas | 同上 | `handle_local_adjust_canvas_input` (`src/ui_adjustment_panel.rs:12666`) へ同じ結果を渡す。準備中の bucket click を含め primary / secondary を個別に除く。 |
-| 切り取り | パネル内 primary 開始との通常同時到達なし | 製品入口は補正パネルの「切り取り」Button の Response click のみ（`src/ui_adjustment_panel.rs:16698`、キー / ring 入口なし）。モード中は topbar / overflow を描かない。通常表示で残った crop 枠は `draw_export_crop_overlay` (`src/ui_crop.rs:522`) の `!export_crop_mode` で描画だけ。ボタン入場は crop 描画より後で、次 pass では press edge が終了済み、drag も入場時に空となる。既存 drag の継続条件を変えない。 |
-| SNS 分割 | モード中は不可、キー入場の同一 pass は可 | `draw_sns_split_overlay` (`src/ui_sns_split.rs:1115`) へ同じ結果を渡し primary 所有中は raw 操作を実行しない。 |
-| 隠蔽の先行 preview hold | 前面 press を保持して隠蔽へ入った後に可 | `sync_conceal_preview_before_pipeline` (`src/ui_conceal.rs:1961`) は子 viewport の per-pass capture より前に必要なため、前 pass で確定した同じ `OverflowStream` を参照して raw down を除く。`enter_conceal_mode` は eye rect を消し、隠蔽中は overflow を開けないので、新規 press の再判定は不要。 |
-| シークバー・サムネイル列・固定 / 表示部品 | 可 | `draw_fullscreen_seek_overlay_with_geometry` (`src/ui_fullscreen.rs:24132`) へ同じ結果を渡し raw down・gesture 更新・クリック確定を除く。もともと操作開始は Response 所有だが、確定結果へも接続する。 |
+| ナビゲータの予約・直接処理・予約後処理、右範囲選択ズーム | 可 | `ui_fullscreen.rs::handle_fs_wheel_and_click_frame` から `without_front_buttons` 済み raw snapshot を全入口へ渡す。ボタン edge / down だけを除き位置・focus・wheel・非所有ボタンは保つ（既存修正）。 |
+| 比較ワイプ境界 | 可 | `handle_compare_wipe_drag` の呼出前に確定済み primary 所有を参照。 |
+| 通常パン・Ctrl 回転・連結読みスクロール・panorama drag・double click / ページクリック | 可 | `apply_fs_wheel_frame_proposal` の `primary_suppression` 分岐が全 primary 操作より前。確定済み primary 所有は touch 終端でも上書きしない（既存修正）。 |
+| 右クリック・リング・ジェスチャ | 可 | `recognize_fs_secondary_input` が確定済み secondary 所有を参照。既存右操作を primary press で中断する入口も、前面所有の primary は配送しない。 |
+| 中ボタン短押し / drag zoom | 可 | `update_mouse_middle_short_click` の開始と `handle_middle_drag_zoom` を確定済み middle 所有で除く。ページ移動で保持を失わず、終端後の新規列を受理する。 |
+| 分析のパン・ガイド作成・右クリックの filter / 色固定 | 可 | `draw_analysis_panel` へ同じ結果を渡し、primary 各 edge / down と secondary press をボタン別に除く。分析は `fullscreen_top_bar_chrome_allowed` の除外対象ではない。 |
+| 補正パネルのブックマーク行 | 可 | `draw_adjustment_panel` → `draw_bookmark_panel_body` へ同じ結果を渡して raw `primary_clicked` を除く。現在位置の `contains_pointer` だけでは press 所有にならず、狭い窓の重なりで行へ漏れ得た。 |
+| 消しゴム | モード中は不可、キー入場の同一 pass は可 | `handle_erase_paint` へ同じ結果を渡し primary / secondary を個別に除く。従来の `fs_primary_suppression.is_active` だけでは終端 pass と secondary 所有を扱えない。 |
+| 隠蔽 canvas | 同上 | `handle_conceal_paint` へ同じ結果を渡し primary / secondary を個別に除く。 |
+| テキスト注釈 | 同上 | `handle_text_canvas_input` へ同じ結果を渡し primary 操作を除く。 |
+| 補正レイヤー canvas | 同上 | `handle_local_adjust_canvas_input` へ同じ結果を渡す。準備中の bucket click を含め primary / secondary を個別に除く。 |
+| 切り取り | overflow とは通常同時到達なし。編集パネルの memory popup とは共存 | `draw_export_crop_overlay` → `handle_export_crop_pointer_with_holds_and_front` へ同じ結果を渡し、所有した primary press / down / release を除く。通常表示で残った crop 枠は描画だけ。非所有の既存 drag の継続条件は維持する。 |
+| SNS 分割 | モード中は不可、キー入場の同一 pass は可 | `draw_sns_split_overlay` へ同じ結果を渡し primary 所有中は raw 操作を実行しない。 |
+| 隠蔽の先行 preview hold | 前面 press を保持して隠蔽へ入った後に可 | `sync_conceal_preview_before_pipeline` は子 viewport の per-pass capture より前に必要なため、前 pass で確定した同じ `FsFrontPointerOwnership` を参照して raw down を除く。`enter_conceal_mode` は eye rect を消し、隠蔽中は overflow を開けないので、新規 press の再判定は不要。 |
+| シークバー・サムネイル列・固定 / 表示部品 | 可 | `draw_fullscreen_seek_overlay_with_geometry` へ同じ結果を渡し raw down・gesture 更新・クリック確定を除く。もともと操作開始は Response 所有だが、確定結果へも接続する。 |
 | touch ページ送り・chrome・pan / pinch コマンド | 可 | recognizer は左右ボタンと共有する最前面の overflow 領域で終端まで駆動（`handle_fs_wheel_and_click_frame` の通常 / 前面復帰経路）。コマンド配送も確定済み primary 所有を参照し、早期 close 後に再利用しない。外側開始の連続操作は維持。 |
-| 範囲キャプチャ | パネル内 primary 開始との通常同時到達なし | 製品入口は Ctrl + 上部カメラの Response click だけ（`src/ui_fullscreen.rs:49520` → `28021`）。カメラと overflow は上部バー下の 12pt margin で離れ、capture 中は `fullscreen_top_bar_chrome_allowed` (`src/ui_fullscreen.rs:23505`) が false。開始時の押下は `src/ui_fullscreen.rs:52488` の `wait_for_release` で消費する。外側 primary による開始まで遮断しない。 |
-| metadata の類似画像 / 本の対応帯 hold preview | 可 | `ui_metadata_panel.rs::draw_page_strip` (`src/ui_metadata_panel.rs:4650`) / `draw_similar_hit_buttons` (`src/ui_metadata_panel.rs:4920`) は `is_pointer_button_down_on` と Response の位置を要求する。それに加え `draw_metadata_panel` (`src/ui_metadata_panel.rs:2046`) → `draw_metadata_panel_inner` (`src/ui_metadata_panel.rs:2293`) の共通適用境界へ同じ結果を渡し、primary 所有中は両 producer の `peek_press` を開始しない。raw 位置による fallback は診断用 observation だけで、hover・診断・既存 preview の終端監視は維持する。 |
+| 範囲キャプチャ | overflow 上からの通常開始はなし。Q と共存可能 | `draw_capture_region_selection_overlay` へ同じ結果を渡し、所有中は primary の event / move を配送しない。focus / キーの取消は維持する。開始時の `wait_for_release` と通常の新規選択は維持する。 |
+| metadata の類似画像 / 本の対応帯 hold preview | 可 | `ui_metadata_panel.rs::draw_page_strip` / `draw_similar_hit_buttons` は `is_pointer_button_down_on` と Response の位置を要求する。それに加え `draw_metadata_panel` → `draw_metadata_panel_inner` の共通適用境界へ同じ結果を渡し、primary 所有中は両 producer の `peek_press` を開始しない。raw 位置による fallback は診断用 observation だけで、hover・診断・既存 preview の終端監視は維持する。 |
 | ルーペ・ZipPla 照準・分析 hover 色・各筆カーソル・ナビゲータのカーソル | 可、押下による背面操作ではない | hover 位置 / 表示用 down を読むだけ（例 `src/ui_fullscreen.rs:47721` のルーペ）。画像・選択・編集の入力を発生させないため、既存の描画を維持する。 |
 | 表示トリム | 可、raw 単独の操作開始なし | `src/ui_view_trim.rs:1312` / `1810` の raw down は保存バッチ終了時期の判定のみ。値操作は Response が所有する。 |
-| filename stack | 独立 consumer なし | `filename_stack_ui.rs` に fullscreen 用 raw pointer handler はない。キーの `stack_jump`（`src/ui_fullscreen.rs:35243`）と、通常の fullscreen ナビゲーション / マウス割当 / リング経路へ合流する。 |
+| filename stack | 独立 consumer なし | `filename_stack_ui.rs` に fullscreen 用 raw pointer handler はない。キーの `stack_jump`と、通常の fullscreen ナビゲーション / マウス割当 / リング経路へ合流する。 |
 | HUD popup、カーソル activity、フォーカス復帰 | 可、画像操作とは別 | popup の raw click は自分の outside-dismiss（例 `src/ui_fullscreen.rs:49854`）、activity はカーソル復帰（`26436`）、focus は前面 widget を使うための復帰（`37767`）。後段の画像操作には上の所有結果を適用する。 |
 
-編集6モードは `ui_conceal.rs::is_overlay_edit_mode_active` (`src/ui_conceal.rs:73`) に含まれるため、通常は
-`fullscreen_top_bar_chrome_allowed` (`src/ui_fullscreen.rs:23505`) が false となり overflow を開けない。ただし
-`handle_fs_key_input_with_operation` (`src/ui_fullscreen.rs:32985`) はメニューを閉じたキーを通常処理へ渡すため、モード排他だけでは
+編集6モードは `ui_conceal.rs::is_overlay_edit_mode_active` に含まれるため、通常は
+`fullscreen_top_bar_chrome_allowed` が false となり overflow を開けない。ただし
+`handle_fs_key_input_with_operation` はメニューを閉じたキーを通常処理へ渡すため、モード排他だけでは
 同一 pass の保護にならない。キーから入れる上表の編集入口にも確定済み所有を渡す理由はこの遷移である。
 
 検証は headless の実 `render_fullscreen_viewport` を用いる。実アプリは起動しない。
@@ -90,11 +100,13 @@ popup の辺上を含め、ボタンと touch で同じ最前面判定を保つ�
 閉鎖テストは新規 overflow 所有なし / touch 除外領域が空であることを直接検査し、
 その押下の解放後に新しい canvas 操作が有効であることを対照にする。
 
-### 範囲外として維持した別 popup と背面の関係
+### §1.396 時点で範囲外だった別 popup と背面の関係（履歴）
 
 以下はソース比較による到達経路で、実アプリでの再現確認は行っていない。
 overflow を閉じた状態でも存在し、`fb14a73a1` の同じ呼出条件 / raw 入力処理を確認した。
-別 popup 全般の入力所有を変更せず、設計担当のバックログ判断へ引き継ぐ。
+§1.396 では別 popup 全般の入力所有を変更せず、設計担当へ引き継いだ。下表の3経路は
+§1.403 で前面所有へ統合し、実描画テストの ignore を解除した。共通 modal Window / VST manager / gamepad picker /
+上部バー・360品質ボタンの余白 / AI status・toast は引き続き対象外。
 
 | 操作手順 | 根拠 |
 | --- | --- |

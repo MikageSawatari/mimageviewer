@@ -6887,8 +6887,6 @@ fn fullscreen_overflow_panel_holds_no_input_and_survives_file_boundary() {
 #[cfg(windows)]
 #[test]
 fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
-    use crate::ui_fullscreen::FullscreenPrimarySuppression;
-
     for state in [
         FsOverflowPanelState::Root,
         FsOverflowPanelState::NavigatorPosition,
@@ -6901,7 +6899,8 @@ fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
             app.items = vec![GridItem::Image(app.tmp.path().join("overflow-owner.jpg"))];
             app.fullscreen_idx = Some(0);
             app.fs_overflow_panel_state = state;
-            app.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
+            app.fs_front_pointer =
+                crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
 
             if pause {
                 app.reset_detached_pause_foreground_modes(0);
@@ -6911,7 +6910,7 @@ fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
 
             assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
             assert!(
-                !app.fs_primary_suppression.is_active(),
+                !app.fs_front_pointer.is_active(),
                 "{state:?}, pause={pause}: foreground ownership must end with the panel"
             );
         }

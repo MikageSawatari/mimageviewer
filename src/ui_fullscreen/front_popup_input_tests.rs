@@ -1,5 +1,5 @@
 //! Backlog 1.403: non-overflow foreground menus through the actual fullscreen renderer.
-//! These tests express the intended input boundary; the released raw handlers may violate it.
+//! These tests keep the physical foreground stream separate from the painted canvas.
 use super::*;
 
 fn viewport(width: f32) -> egui::Rect {
@@ -74,7 +74,6 @@ fn output(
             |ui| app.render_fullscreen_viewport(ui),
         ),
     );
-    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
     output
 }
 
@@ -225,7 +224,6 @@ fn drag_in_popup(
 }
 
 #[test]
-#[ignore = "backlog 1.403: 前面 popup の押下が背面へ届く (再現テスト)"]
 fn front_popup_seek_row_does_not_pan_the_actual_top_right_navigator() {
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();
@@ -297,7 +295,6 @@ fn prepare_wipe(app: &mut App) {
 }
 
 #[test]
-#[ignore = "backlog 1.403: 前面 popup の押下が背面へ届く (再現テスト)"]
 fn front_popup_seek_row_does_not_move_the_actual_comparison_wipe() {
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();
@@ -349,7 +346,6 @@ fn front_popup_seek_row_does_not_move_the_actual_comparison_wipe() {
 }
 
 #[test]
-#[ignore = "backlog 1.403: 前面 popup の押下が背面へ届く (再現テスト)"]
 fn front_popup_rotation_row_does_not_pan_the_actual_analysis_canvas() {
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();
@@ -392,4 +388,1097 @@ fn front_popup_rotation_row_does_not_pan_the_actual_analysis_canvas() {
         app.analysis_pan, before,
         "dragging the front rotation menu must not pan its overlapping raw-input analysis canvas"
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Menu {
+    Fit,
+    Spread,
+    Projection,
+    Seek,
+    Rotation,
+    Context,
+}
+
+impl Menu {
+    fn button_id(self) -> Option<&'static str> {
+        match self {
+            Self::Fit => Some("fs_margin_fit_btn"),
+            Self::Spread => Some("fs_spread_btn"),
+            Self::Projection => Some("fs_panorama_projection_btn"),
+            Self::Seek => Some(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID),
+            Self::Rotation => Some("fs_rotation_btn"),
+            Self::Context => None,
+        }
+    }
+
+    fn is_open(self, app: &App, ctx: &egui::Context) -> bool {
+        match self {
+            Self::Fit => app.fit_popup_open,
+            Self::Spread => app.spread_popup_open,
+            Self::Projection => app.panorama_projection_popup_open,
+            Self::Seek => fs_still_seek_strip_popup_open(ctx),
+            Self::Rotation => fs_rotation_popup_open(ctx),
+            Self::Context => app.fs_context_menu_idx.is_some(),
+        }
+    }
+
+    fn assert_outside(self, ctx: &egui::Context, pos: egui::Pos2) {
+        let popup = match self {
+            Self::Fit => ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
+                        "fs_fit_popup_scroll_layout",
+                    ))
+                })
+                .expect("the real fit popup must publish its laid-out body")
+                .0
+                .expand(16.0),
+            Self::Spread => ctx
+                .read_response(egui::Id::unique(format!(
+                    "spread_popup_{}",
+                    SpreadMode::Single.to_int(),
+                )))
+                .expect("the real spread popup must lay out its first row")
+                .rect
+                .expand(16.0),
+            Self::Projection => ctx
+                .read_response(egui::Id::unique((
+                    "fs_panorama_projection_item",
+                    crate::panorama::PanoProjection::Perspective.shader_code(),
+                )))
+                .expect("the real projection popup must lay out its first row")
+                .rect
+                .expand(16.0),
+            Self::Seek | Self::Rotation => egui::AreaState::load(
+                ctx,
+                egui::Id::unique(self.button_id().unwrap()).with("popup"),
+            )
+            .unwrap()
+            .rect(),
+            Self::Context => egui::AreaState::load(ctx, egui::Id::unique("fs_ctx_menu"))
+                .unwrap()
+                .rect(),
+        };
+        assert!(popup.is_positive());
+        // S/P have many rows below the first one; requiring the point to lie
+        // strictly to the left proves it is outside every row and the header.
+        assert!(
+            pos.x < popup.left(),
+            "{self:?}: outside point {pos:?}, real popup {popup:?}"
+        );
+    }
+
+    fn open(self, app: &mut App, ctx: &egui::Context, rect: egui::Rect) {
+        if let Some(id) = self.button_id() {
+            let button = ctx
+                .read_response(egui::Id::unique(id))
+                .unwrap_or_else(|| panic!("production toolbar must draw {id}"))
+                .rect;
+            assert!(button.is_positive());
+            click(app, ctx, rect, button.center());
+        } else {
+            // No HWND is supplied by setup_app_for_test, so this draws the real
+            // egui fallback and never invokes the native Shell menu.
+            assert!(app.main_hwnd.is_none());
+            app.fs_context_menu_idx = app.fullscreen_idx;
+            app.fs_context_menu_pos = egui::pos2(650.0, 100.0);
+        }
+        settle(app, ctx, rect);
+        assert!(self.is_open(app, ctx), "{self:?} must really open");
+        let paint = output(app, ctx, rect, vec![]);
+        let label = match self {
+            Self::Fit => FullscreenFitMode::Page.label(),
+            Self::Spread => SpreadMode::Single.label(),
+            Self::Projection => crate::panorama::PanoProjection::Perspective.label(),
+            Self::Seek => {
+                paint.drop_without_applying_deltas();
+                seek_row(app, ctx, rect);
+                return;
+            }
+            Self::Rotation => "180°",
+            Self::Context => {
+                paint.drop_without_applying_deltas();
+                let area = egui::AreaState::load(ctx, egui::Id::unique("fs_ctx_menu"))
+                    .expect("the actual context menu Window must be laid out");
+                assert!(area.rect().is_positive() && area.interactable);
+                return;
+            }
+        };
+        let painted_row = text_center(&paint, label);
+        assert!(rect.contains(painted_row));
+        paint.drop_without_applying_deltas();
+    }
+}
+
+fn pointer_button(pos: egui::Pos2, which: egui::PointerButton, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: which,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn key(key: egui::Key, pressed: bool) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn outside_image_point(app: &App) -> egui::Pos2 {
+    let page = app.fullscreen_page_layout.single_page().unwrap();
+    let pos = egui::pos2(260.0, 330.0);
+    assert!(
+        page.transform.paint_rect.contains(pos),
+        "the outside press must hit the actual painted page"
+    );
+    pos
+}
+
+fn view_state(app: &App) -> (Option<usize>, f32, egui::Vec2, f32, Option<(f32, f32, f32)>) {
+    (
+        app.fullscreen_idx,
+        app.fs_zoom,
+        app.fs_pan,
+        app.fs_free_rotation,
+        app.panorama_state
+            .as_ref()
+            .map(|p| (p.yaw, p.pitch, p.fov_y)),
+    )
+}
+
+#[test]
+fn front_popup_all_six_menus_close_on_outside_press_and_own_the_entire_drag() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for menu in [
+        Menu::Fit,
+        Menu::Spread,
+        Menu::Projection,
+        Menu::Seek,
+        Menu::Rotation,
+        Menu::Context,
+    ] {
+        for which in [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Secondary,
+            egui::PointerButton::Middle,
+        ] {
+            let ctx = egui::Context::default();
+            let rect = viewport(1093.0);
+            let mut app = sources(&ctx, [320, 160]);
+            app.fs_zoom = 2.0;
+            if matches!(menu, Menu::Projection) {
+                app.panorama_state = Some(crate::panorama::PanoramaState::new(
+                    0.3,
+                    0.1,
+                    crate::panorama::PanoProjection::Perspective,
+                ));
+            }
+            settle(&mut app, &ctx, rect);
+            if matches!(menu, Menu::Projection) {
+                assert!(app.is_panorama_mode_active(1));
+            } else {
+                assert_page(&app);
+            }
+            menu.open(&mut app, &ctx, rect);
+            let start = if matches!(menu, Menu::Projection) {
+                egui::pos2(260.0, 330.0)
+            } else {
+                outside_image_point(&app)
+            };
+            // All toolbar popups are anchored on the right at this viewport;
+            // verify the chosen outside point cannot be the launch button.
+            if let Some(id) = menu.button_id() {
+                assert!(
+                    !ctx.read_response(egui::Id::unique(id))
+                        .unwrap()
+                        .rect
+                        .contains(start)
+                );
+            }
+            menu.assert_outside(&ctx, start);
+            let before = view_state(&app);
+            frame(
+                &mut app,
+                &ctx,
+                rect,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    pointer_button(start, which, true),
+                ],
+            );
+            assert!(
+                !menu.is_open(&app, &ctx),
+                "{menu:?} must close on {which:?} press, before release"
+            );
+            for delta in [egui::vec2(35.0, 20.0), egui::vec2(70.0, 45.0)] {
+                frame(
+                    &mut app,
+                    &ctx,
+                    rect,
+                    vec![egui::Event::PointerMoved(start + delta)],
+                );
+                assert_eq!(
+                    view_state(&app),
+                    before,
+                    "{menu:?} {which:?}: held foreground input reached the real canvas"
+                );
+            }
+            frame(
+                &mut app,
+                &ctx,
+                rect,
+                vec![pointer_button(start + egui::vec2(70.0, 45.0), which, false)],
+            );
+            assert_eq!(
+                view_state(&app),
+                before,
+                "{menu:?} {which:?}: foreground release reached the canvas"
+            );
+            assert!(app.mouse_ring_flick.is_none() && app.mouse_gesture.is_none());
+        }
+    }
+}
+
+#[test]
+fn front_popup_launch_button_closes_once_without_reopening_on_release() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for menu in [
+        Menu::Fit,
+        Menu::Spread,
+        Menu::Projection,
+        Menu::Seek,
+        Menu::Rotation,
+    ] {
+        let ctx = egui::Context::default();
+        let rect = viewport(1093.0);
+        let mut app = sources(&ctx, [320, 160]);
+        if matches!(menu, Menu::Projection) {
+            app.panorama_state = Some(crate::panorama::PanoramaState::new(
+                0.0,
+                0.0,
+                crate::panorama::PanoProjection::Perspective,
+            ));
+        }
+        settle(&mut app, &ctx, rect);
+        menu.open(&mut app, &ctx, rect);
+        let pos = ctx
+            .read_response(egui::Id::unique(menu.button_id().unwrap()))
+            .unwrap()
+            .rect
+            .center();
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![egui::Event::PointerMoved(pos), button(pos, true)],
+        );
+        frame(&mut app, &ctx, rect, vec![button(pos, false)]);
+        settle(&mut app, &ctx, rect);
+        assert!(
+            !menu.is_open(&app, &ctx),
+            "{menu:?}: launch button must toggle once"
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+}
+
+#[test]
+fn front_popup_nonpresented_toolbar_bools_do_not_block_the_real_erase_brush() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    settle(&mut app, &ctx, rect);
+    Menu::Fit.open(&mut app, &ctx, rect);
+    // Use the production E shortcut; it leaves the toolbar bool behind while
+    // removing the toolbar from the rendered edit canvas.
+    frame(&mut app, &ctx, rect, vec![key(egui::Key::E, true)]);
+    frame(&mut app, &ctx, rect, vec![key(egui::Key::E, false)]);
+    settle(&mut app, &ctx, rect);
+    assert!(app.erase_mode, "the real E entry must reach erase mode");
+    assert!(
+        app.fit_popup_open,
+        "fixture must retain the nonpresented open bool"
+    );
+    let page = assert_page(&app);
+    let start = page.center();
+    assert!(!app.erase_panel_rect(rect).contains(start));
+    let before = app.erase_mask.clone();
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(start), button(start, true)],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(start + egui::vec2(20.0, 0.0))],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![button(start + egui::vec2(20.0, 0.0), false)],
+    );
+    assert_ne!(
+        app.erase_mask, before,
+        "a hidden toolbar bool must not own a new edit stroke"
+    );
+}
+
+#[test]
+fn front_popup_and_overflow_hold_survive_real_arrow_page_navigation() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for overflow in [false, true] {
+        for which in [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Secondary,
+            egui::PointerButton::Middle,
+        ] {
+            let ctx = egui::Context::default();
+            let rect = viewport(1093.0);
+            let mut app = sources(&ctx, [320, 160]);
+            app.fs_zoom = 2.0;
+            settle(&mut app, &ctx, rect);
+            let start = if overflow {
+                app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
+                settle(&mut app, &ctx, rect);
+                let panel = fs_overflow_panel_rect(rect, app.fs_overflow_panel_state).unwrap();
+                // The frame margin owns input without focusing a Slider whose
+                // ArrowRight handling would replace the page-navigation control.
+                panel.min + egui::vec2(3.0, 3.0)
+            } else {
+                Menu::Fit.open(&mut app, &ctx, rect);
+                outside_image_point(&app)
+            };
+            frame(
+                &mut app,
+                &ctx,
+                rect,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    pointer_button(start, which, true),
+                ],
+            );
+            assert!(app.fs_front_pointer.is_active());
+            frame(&mut app, &ctx, rect, vec![key(egui::Key::ArrowRight, true)]);
+            frame(
+                &mut app,
+                &ctx,
+                rect,
+                vec![key(egui::Key::ArrowRight, false)],
+            );
+            assert_ne!(
+                app.fullscreen_idx,
+                Some(1),
+                "fixture must really navigate while held (overflow={overflow}, {which:?})"
+            );
+            let page = app
+                .fullscreen_page_layout
+                .single_page()
+                .expect("the next page must actually paint");
+            assert_eq!(Some(page.page_idx()), app.fullscreen_idx);
+            assert!(
+                app.fs_front_pointer.is_active(),
+                "page navigation must preserve the {which:?} physical owner"
+            );
+            // Navigation normally resets the transform. Give the newly painted
+            // page a usable pan range to expose a leaked held primary button.
+            app.fs_zoom = 2.0;
+            frame(&mut app, &ctx, rect, vec![]);
+            let before = view_state(&app);
+            let end = egui::pos2(360.0, 370.0);
+            frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(end)]);
+            assert_eq!(
+                view_state(&app),
+                before,
+                "page replacement must not release physical ownership (overflow={overflow}, {which:?})"
+            );
+            assert!(app.mouse_ring_flick.is_none() && app.mouse_gesture.is_none());
+            frame(
+                &mut app,
+                &ctx,
+                rect,
+                vec![pointer_button(end, which, false)],
+            );
+            assert_eq!(view_state(&app), before);
+            assert!(
+                !app.fs_front_pointer.is_active(),
+                "the real {which:?} release must finish the physical stream"
+            );
+        }
+    }
+}
+
+#[test]
+fn front_popup_dismissal_click_cannot_be_the_first_click_of_a_canvas_reset() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for expire_launcher_click in [false, true] {
+        let ctx = egui::Context::default();
+        let rect = viewport(1093.0);
+        let mut app = sources(&ctx, [320, 160]);
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::vec2(30.0, 15.0);
+        settle(&mut app, &ctx, rect);
+        Menu::Fit.open(&mut app, &ctx, rect);
+        if expire_launcher_click {
+            for _ in 0..40 {
+                frame(&mut app, &ctx, rect, vec![]);
+            }
+        }
+        let pos = outside_image_point(&app);
+        let before = (app.fs_zoom, app.fs_pan);
+        click(&mut app, &ctx, rect, pos);
+        assert!(!app.fit_popup_open);
+        click(&mut app, &ctx, rect, pos);
+        assert_eq!(
+            (app.fs_zoom, app.fs_pan),
+            before,
+            "egui's second click straddles the foreground/canvas boundary"
+        );
+        assert!(
+            ctx.input(|input| input
+                .pointer
+                .released_buttons_with_click_counts()
+                .any(|(button, click)| button == egui::PointerButton::Primary
+                    && click.is_some_and(|(_, count)| count >= 2))),
+            "the boundary test must exercise egui's actual multi-click count"
+        );
+        if expire_launcher_click {
+            assert!(ctx.input(|input| {
+                input
+                    .pointer
+                    .button_double_clicked(egui::PointerButton::Primary)
+            }));
+        }
+        // The next click completes the first pair accepted by the canvas, even
+        // when egui counts the earlier menu click and reports a triple click.
+        click(&mut app, &ctx, rect, pos);
+        assert_eq!(
+            app.fs_zoom, 1.0,
+            "two canvas clicks immediately after dismissal must reset"
+        );
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+        // Keep the normal, unbroken canvas double-click behavior as a second control.
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::vec2(30.0, 15.0);
+        for _ in 0..40 {
+            frame(&mut app, &ctx, rect, vec![]);
+        }
+        click(&mut app, &ctx, rect, pos);
+        click(&mut app, &ctx, rect, pos);
+        assert_eq!(app.fs_zoom, 1.0);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+    }
+}
+
+fn combo_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    viewport_id: egui::ViewportId,
+    events: Vec<egui::Event>,
+) -> egui::Id {
+    app.frame_counter += 1;
+    let mut input = egui::RawInput {
+        viewport_id,
+        screen_rect: Some(rect),
+        time: Some(app.frame_counter as f64 / 60.0),
+        focused: true,
+        events,
+        ..Default::default()
+    };
+    input.viewports.entry(viewport_id).or_default().focused = Some(true);
+    let mut widget_id = None;
+    crate::test_ui::headless_paint_output(ctx.run_ui(input, |ui| {
+        app.render_fullscreen_viewport(ui);
+        // Exercise egui's real panel-style ComboBox owner, including its
+        // Response and Popup Area, alongside the actual fullscreen renderer.
+        egui::Area::new(egui::Id::unique("front_popup_combo_panel"))
+            .fixed_pos(egui::pos2(780.0, 180.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                let combo = egui::ComboBox::from_id_salt("front_popup_combo")
+                    .selected_text("test panel choice")
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(false, "panel memory popup row")
+                            .clicked()
+                        {
+                            ui.close();
+                        }
+                    });
+                widget_id = Some(combo.response.id);
+            });
+    }))
+    .drop_without_applying_deltas();
+    widget_id.unwrap()
+}
+
+fn open_combo(
+    app: &mut App,
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    viewport_id: egui::ViewportId,
+) -> egui::Id {
+    let mut widget = combo_frame(app, ctx, rect, viewport_id, vec![]);
+    for _ in 0..3 {
+        widget = combo_frame(app, ctx, rect, viewport_id, vec![]);
+    }
+    let pos = ctx.read_response(widget).unwrap().rect.center();
+    combo_frame(
+        app,
+        ctx,
+        rect,
+        viewport_id,
+        vec![egui::Event::PointerMoved(pos)],
+    );
+    combo_frame(app, ctx, rect, viewport_id, vec![button(pos, true)]);
+    combo_frame(app, ctx, rect, viewport_id, vec![button(pos, false)]);
+    for _ in 0..3 {
+        combo_frame(app, ctx, rect, viewport_id, vec![]);
+    }
+    let popup = widget.with("popup");
+    assert!(egui::Popup::is_id_open(ctx, popup));
+    let area =
+        egui::AreaState::load(ctx, popup).expect("ComboBox must lay out its actual memory popup");
+    assert!(area.rect().is_positive() && area.interactable);
+    assert_eq!(
+        ctx.layer_id_at(area.rect().center()),
+        Some(egui::LayerId::new(egui::Order::Foreground, popup))
+    );
+    popup
+}
+
+#[test]
+fn front_popup_memory_combo_preserves_outside_drag_then_closes_on_outside_click() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    app.fs_zoom = 2.0;
+    settle(&mut app, &ctx, rect);
+    assert_page(&app);
+    let popup = open_combo(&mut app, &ctx, rect, egui::ViewportId::ROOT);
+    let start = outside_image_point(&app);
+    assert!(
+        !egui::AreaState::load(&ctx, popup)
+            .unwrap()
+            .rect()
+            .contains(start)
+    );
+    let end = start + egui::vec2(70.0, 40.0);
+    let before = view_state(&app);
+    for events in [
+        vec![egui::Event::PointerMoved(start), button(start, true)],
+        vec![egui::Event::PointerMoved(end)],
+        vec![button(end, false)],
+    ] {
+        combo_frame(&mut app, &ctx, rect, egui::ViewportId::ROOT, events);
+        assert!(
+            egui::Popup::is_id_open(&ctx, popup),
+            "egui's memory popup must preserve its click-based outside-close contract"
+        );
+        assert_eq!(
+            view_state(&app),
+            before,
+            "outside drag belongs to the memory popup through release"
+        );
+    }
+    for events in [
+        vec![egui::Event::PointerMoved(start)],
+        vec![button(start, true)],
+        vec![button(start, false)],
+    ] {
+        combo_frame(&mut app, &ctx, rect, egui::ViewportId::ROOT, events);
+        assert_eq!(view_state(&app), before);
+    }
+    assert!(!egui::Popup::is_id_open(&ctx, popup));
+    // Closing the popup must not leave a permanent canvas suppression.
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(start), button(start, true)],
+    );
+    frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(end)]);
+    assert_ne!(
+        app.fs_pan, before.2,
+        "a fresh canvas drag must still work after popup release"
+    );
+    frame(&mut app, &ctx, rect, vec![button(end, false)]);
+}
+
+#[test]
+fn front_popup_memory_close_is_local_to_the_rendered_viewport() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut root = sources(&ctx, [320, 160]);
+    let root_popup = open_combo(&mut root, &ctx, rect, egui::ViewportId::ROOT);
+    let child_id = egui::ViewportId::from_hash_of("front-popup-child");
+    // Model the existing foreground handoff with one guarded App environment.
+    // A second setup_app_for_test would recursively acquire its process-global DB lock.
+    root.fs_front_pointer = Default::default();
+    let child_popup = open_combo(&mut root, &ctx, rect, child_id);
+    let outside = egui::pos2(260.0, 330.0);
+    for events in [
+        vec![egui::Event::PointerMoved(outside)],
+        vec![button(outside, true)],
+        vec![button(outside, false)],
+    ] {
+        combo_frame(&mut root, &ctx, rect, child_id, events);
+    }
+    assert!(!egui::Popup::is_id_open(&ctx, child_popup));
+    root.fs_front_pointer = Default::default();
+    combo_frame(&mut root, &ctx, rect, egui::ViewportId::ROOT, vec![]);
+    assert!(
+        egui::Popup::is_id_open(&ctx, root_popup),
+        "closing a child viewport's menu must not call global Popup::close_all"
+    );
+    assert_eq!(root.fullscreen_idx, Some(1));
+}
+
+#[test]
+fn front_popup_actual_seek_press_close_keeps_the_other_viewports_menu_open() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    settle(&mut app, &ctx, rect);
+    Menu::Seek.open(&mut app, &ctx, rect);
+    let child = egui::ViewportId::from_hash_of("front-seek-menu-child");
+    app.fs_front_pointer = Default::default();
+    for _ in 0..4 {
+        combo_frame(&mut app, &ctx, rect, child, vec![]);
+    }
+    let launcher = ctx
+        .read_response(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID))
+        .expect("the child viewer must draw its real seek launcher")
+        .rect
+        .center();
+    for events in [
+        vec![egui::Event::PointerMoved(launcher)],
+        vec![button(launcher, true)],
+        vec![button(launcher, false)],
+    ] {
+        combo_frame(&mut app, &ctx, rect, child, events);
+    }
+    for _ in 0..3 {
+        combo_frame(&mut app, &ctx, rect, child, vec![]);
+    }
+    assert!(fs_still_seek_strip_popup_open(&ctx));
+    let outside = egui::pos2(260.0, 330.0);
+    combo_frame(
+        &mut app,
+        &ctx,
+        rect,
+        child,
+        vec![egui::Event::PointerMoved(outside), button(outside, true)],
+    );
+    assert!(
+        !fs_still_seek_strip_popup_open(&ctx),
+        "the child menu must close on press"
+    );
+    assert!(app.fs_front_pointer.is_active());
+    combo_frame(&mut app, &ctx, rect, child, vec![button(outside, false)]);
+    app.fs_front_pointer = Default::default();
+    combo_frame(&mut app, &ctx, rect, egui::ViewportId::ROOT, vec![]);
+    assert!(
+        fs_still_seek_strip_popup_open(&ctx),
+        "the real child seek close must preserve the root menu"
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+}
+
+fn contact(id: u64, phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+    egui::Event::Touch {
+        device_id: egui::TouchDeviceId(84),
+        id: egui::TouchId(id),
+        phase,
+        pos,
+        force: None,
+    }
+}
+
+#[test]
+fn front_popup_touch_ownership_lasts_until_the_last_contact_end_or_cancel() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for last_phase in [egui::TouchPhase::End, egui::TouchPhase::Cancel] {
+        let ctx = egui::Context::default();
+        let rect = viewport(1093.0);
+        let mut app = sources(&ctx, [320, 160]);
+        app.fs_zoom = 2.0;
+        settle(&mut app, &ctx, rect);
+        Menu::Fit.open(&mut app, &ctx, rect);
+        let start = outside_image_point(&app);
+        let second = start + egui::vec2(25.0, 0.0);
+        let before = view_state(&app);
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![
+                contact(1, egui::TouchPhase::Start, start),
+                egui::Event::PointerMoved(start),
+                button(start, true),
+            ],
+        );
+        assert!(!app.fit_popup_open);
+        assert!(app.fs_front_pointer.is_active());
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![contact(2, egui::TouchPhase::Start, second)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![
+                contact(1, egui::TouchPhase::End, start),
+                button(start, false),
+            ],
+        );
+        assert!(
+            app.fs_front_pointer.is_active(),
+            "ending the first/promoted finger cannot release the remaining contact"
+        );
+        let end = second + egui::vec2(65.0, 35.0);
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![
+                contact(2, egui::TouchPhase::Move, end),
+                egui::Event::PointerMoved(end),
+            ],
+        );
+        assert_eq!(view_state(&app), before);
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![contact(2, last_phase, end), egui::Event::PointerGone],
+        );
+        frame(&mut app, &ctx, rect, vec![]);
+        assert!(
+            !app.fs_front_pointer.is_active(),
+            "the final {last_phase:?} must end the physical stream"
+        );
+        assert_eq!(view_state(&app), before);
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![egui::Event::PointerMoved(start + egui::vec2(40.0, 30.0))],
+        );
+        assert_ne!(
+            app.fs_pan, before.2,
+            "a new pointer stream must reach the real canvas after the last finger ends"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![button(start + egui::vec2(40.0, 30.0), false)],
+        );
+    }
+}
+
+#[test]
+fn front_popup_touch_cancel_then_new_contact_in_one_pass_starts_a_new_canvas_stream() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    app.fs_zoom = 2.0;
+    settle(&mut app, &ctx, rect);
+    Menu::Fit.open(&mut app, &ctx, rect);
+    let start = outside_image_point(&app);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![
+            contact(1, egui::TouchPhase::Start, start),
+            egui::Event::PointerMoved(start),
+            button(start, true),
+        ],
+    );
+    assert!(!app.fit_popup_open);
+    assert!(app.fs_front_pointer.is_active());
+    let before = view_state(&app);
+    let next = start + egui::vec2(10.0, 10.0);
+    // Match winit's cancellation contract: there is no promoted primary
+    // release. The following Start belongs to a new physical contact group.
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![
+            contact(1, egui::TouchPhase::Cancel, start),
+            egui::Event::PointerGone,
+            contact(2, egui::TouchPhase::Start, next),
+            egui::Event::PointerMoved(next),
+            button(next, true),
+        ],
+    );
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "the canceled foreground group must not own the following canvas contact"
+    );
+    assert_eq!(view_state(&app), before);
+    let end = next + egui::vec2(60.0, 35.0);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![
+            contact(2, egui::TouchPhase::Move, end),
+            egui::Event::PointerMoved(end),
+        ],
+    );
+    assert_ne!(
+        app.fs_pan, before.2,
+        "the new contact must pan the actual painted page"
+    );
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![
+            contact(2, egui::TouchPhase::End, end),
+            button(end, false),
+            egui::Event::PointerGone,
+        ],
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(!app.fs_front_pointer.is_active());
+}
+
+#[test]
+fn front_popup_actual_context_submenu_child_press_keeps_its_parent_open() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    // The fallback is a Window with inline CollapsingHeader children. A tall
+    // viewport keeps the genuine OpenWith header and its child fully visible.
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 1600.0));
+    let mut app = sources(&ctx, [320, 160]);
+    app.fs_zoom = 2.0;
+    settle(&mut app, &ctx, rect);
+    assert_page(&app);
+    Menu::Context.open(&mut app, &ctx, rect);
+    let paint = output(&mut app, &ctx, rect, vec![]);
+    let header = text_center(&paint, "アプリケーションで開く…");
+    paint.drop_without_applying_deltas();
+    click(&mut app, &ctx, rect, header);
+    for _ in 0..20 {
+        frame(&mut app, &ctx, rect, vec![]);
+    }
+    assert!(Menu::Context.is_open(&app, &ctx));
+    let paint = output(&mut app, &ctx, rect, vec![]);
+    let child = text_center(&paint, "外部ツールの設定…");
+    paint.drop_without_applying_deltas();
+    let parent = egui::AreaState::load(&ctx, egui::Id::unique("fs_ctx_menu")).unwrap();
+    assert!(parent.rect().is_positive() && parent.rect().contains(child));
+    assert_eq!(
+        ctx.layer_id_at(child),
+        Some(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::unique("fs_ctx_menu")
+        ))
+    );
+    let before = view_state(&app);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(child), button(child, true)],
+    );
+    assert!(
+        Menu::Context.is_open(&app, &ctx),
+        "an actual child row press is inside the parent menu"
+    );
+    assert_eq!(view_state(&app), before);
+    // Move before release so the child command is not dispatched. This also
+    // verifies the parent's inside-start stream stays owned outside its rect.
+    let outside = egui::pos2(260.0, 330.0);
+    assert!(!parent.rect().contains(outside));
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(outside)],
+    );
+    frame(&mut app, &ctx, rect, vec![button(outside, false)]);
+    assert!(Menu::Context.is_open(&app, &ctx));
+    assert_eq!(view_state(&app), before);
+    assert!(!app.fs_front_pointer.is_active());
+}
+
+#[test]
+fn front_popup_actual_fit_unit_combo_child_press_keeps_its_parent_open() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 1200.0));
+    let mut app = sources(&ctx, [320, 160]);
+    app.settings.fullscreen_specified_scale = Default::default();
+    settle(&mut app, &ctx, rect);
+    assert_page(&app);
+    Menu::Fit.open(&mut app, &ctx, rect);
+    assert!(
+        app.settings
+            .common_fullscreen_specified_scale()
+            .width
+            .enabled
+    );
+    let unit = ctx
+        .data(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::unique(("specified_scale_unit_response", "幅")))
+        })
+        .expect("the actual fit editor must expose its unit ComboBox response");
+    assert!(unit.is_positive() && rect.contains_rect(unit));
+    click(&mut app, &ctx, rect, unit.center());
+    settle(&mut app, &ctx, rect);
+    assert!(app.fit_popup_open && egui::Popup::is_any_open(&ctx));
+    let paint = output(&mut app, &ctx, rect, vec![]);
+    let choice = text_center(&paint, "px");
+    paint.drop_without_applying_deltas();
+    let layer = ctx
+        .layer_id_at(choice)
+        .expect("the actual unit popup must own the selected row");
+    assert_eq!(layer.order, egui::Order::Foreground);
+    let area = egui::AreaState::load(&ctx, layer.id)
+        .expect("the unit ComboBox must draw a real Popup Area");
+    assert!(area.interactable && area.rect().is_positive() && area.rect().contains(choice));
+    let before = view_state(&app);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(choice), button(choice, true)],
+    );
+    assert!(
+        app.fit_popup_open,
+        "a real child popup row press must not dismiss the fit parent"
+    );
+    assert_eq!(view_state(&app), before);
+    frame(&mut app, &ctx, rect, vec![button(choice, false)]);
+    assert!(
+        app.fit_popup_open,
+        "selecting a unit keeps the fit editor open"
+    );
+    assert!(!egui::Popup::is_id_open(&ctx, layer.id));
+    assert!(
+        matches!(
+            app.settings
+                .common_fullscreen_specified_scale()
+                .width
+                .active(),
+            Some(crate::settings::SpecifiedScaleAxis::LogicalPixels(_)),
+        ),
+        "the actual child row must still change the width unit"
+    );
+    assert_eq!(view_state(&app), before);
+}
+
+#[test]
+fn front_popup_owned_release_and_new_canvas_press_in_one_pass_keep_their_own_edges() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for drag_new_stream in [false, true] {
+        let ctx = egui::Context::default();
+        let rect = viewport(1093.0);
+        let mut app = sources(&ctx, [320, 160]);
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::vec2(30.0, 15.0);
+        settle(&mut app, &ctx, rect);
+        assert_page(&app);
+        Menu::Fit.open(&mut app, &ctx, rect);
+        let pos = outside_image_point(&app);
+        Menu::Fit.assert_outside(&ctx, pos);
+        let before = view_state(&app);
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![egui::Event::PointerMoved(pos), button(pos, true)],
+        );
+        assert!(!app.fit_popup_open);
+        assert!(app.fs_front_pointer.is_active());
+        assert_eq!(view_state(&app), before);
+        // egui exposes the old release/click and the new held press together.
+        // Ownership must switch for the new stream without making the old
+        // foreground terminal edge into a click accepted by the canvas.
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            vec![button(pos, false), button(pos, true)],
+        );
+        assert!(!app.fs_front_pointer.is_active());
+        assert_eq!(
+            view_state(&app),
+            before,
+            "the old owned release cannot reset the canvas"
+        );
+        let release = if drag_new_stream {
+            let end = pos + egui::vec2(60.0, 35.0);
+            frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(end)]);
+            assert_ne!(
+                app.fs_pan, before.2,
+                "the new press in the mixed pass must start a real canvas drag"
+            );
+            assert_eq!(app.fs_zoom, before.1);
+            end
+        } else {
+            pos
+        };
+        frame(&mut app, &ctx, rect, vec![button(release, false)]);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(
+            app.fs_zoom, before.1,
+            "the new click cannot double-click with the old owned release"
+        );
+        if !drag_new_stream {
+            assert_eq!(view_state(&app), before);
+            let end = pos + egui::vec2(60.0, 35.0);
+            frame(&mut app, &ctx, rect, vec![button(pos, true)]);
+            frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(end)]);
+            assert_ne!(
+                app.fs_pan, before.2,
+                "a following fresh canvas drag must also remain usable"
+            );
+            frame(&mut app, &ctx, rect, vec![button(end, false)]);
+        }
+        assert!(!app.fs_front_pointer.is_active());
+    }
 }

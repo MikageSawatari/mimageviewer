@@ -10008,7 +10008,7 @@ pub(super) fn draw_fullscreen_specified_scale_axis_controls(
     axis: &mut crate::settings::SpecifiedScaleAxisSetting,
     label: &str,
     dark_popup: bool,
-) {
+) -> Option<egui::Rect> {
     use crate::settings::SpecifiedScaleAxis;
     let current = axis.value;
     let (mut number, mut pixels) = match current {
@@ -10098,6 +10098,10 @@ pub(super) fn draw_fullscreen_specified_scale_axis_controls(
     if pixels != matches!(current, SpecifiedScaleAxis::LogicalPixels(_)) {
         axis.value = axis.value.with_pixel_unit(pixels);
     }
+    let popup_id = _unit_response.response.id.with("popup");
+    egui::Popup::is_id_open(ui.ctx(), popup_id)
+        .then(|| egui::AreaState::load(ui.ctx(), popup_id).map(|area| area.rect()))
+        .flatten()
 }
 
 pub(super) fn draw_fullscreen_specified_scale_max_controls(
@@ -10158,7 +10162,7 @@ pub(super) fn draw_fullscreen_specified_scale_settings(
                 if !axis.enabled {
                     ui.disable();
                 }
-                draw_fullscreen_specified_scale_axis_controls(ui, axis, label, false);
+                let _ = draw_fullscreen_specified_scale_axis_controls(ui, axis, label, false);
             });
         });
     }

@@ -20,6 +20,8 @@
 
 pub(crate) mod canonical_demand;
 #[cfg(test)]
+mod front_pointer_ownership_tests;
+#[cfg(test)]
 mod front_popup_input_tests;
 #[cfg(test)]
 mod native_focus_tests;
@@ -115,19 +117,276 @@ pub(crate) struct FullscreenSecondaryPressOwner {
 
 /// Resolved before front UI actions, shared by all backing input consumers in this pass.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct FsOverflowPointerFrameInput {
+pub(crate) struct FsFrontPointerFrameInput {
     primary_owned: bool,
     secondary_owned: bool,
+    middle_owned: bool,
+    touch_owned: bool,
+    release_owned: [bool; 3],
     secondary_owner: Option<FullscreenSecondaryPressOwner>,
 }
 
-impl FsOverflowPointerFrameInput {
+impl FsFrontPointerFrameInput {
     pub(crate) fn owns(self, button: egui::PointerButton) -> bool {
         match button {
             egui::PointerButton::Primary => self.primary_owned,
             egui::PointerButton::Secondary => self.secondary_owned,
+            egui::PointerButton::Middle => self.middle_owned,
             _ => false,
         }
+    }
+
+    pub(crate) fn owns_release(self, button: egui::PointerButton) -> bool {
+        let index = match button {
+            egui::PointerButton::Primary => 0,
+            egui::PointerButton::Secondary => 1,
+            egui::PointerButton::Middle => 2,
+            _ => return false,
+        };
+        self.release_owned[index]
+    }
+
+    fn backing_response(self, mut response: egui::Response) -> egui::Response {
+        use egui::response::Flags;
+        if self.primary_owned {
+            response
+                .flags
+                .remove(Flags::DRAG_STARTED | Flags::DRAGGED | Flags::IS_POINTER_BUTTON_DOWN_ON);
+        }
+        if self.primary_owned || self.owns_release(egui::PointerButton::Primary) {
+            response.flags.remove(Flags::CLICKED | Flags::DRAG_STOPPED);
+        }
+        response
+    }
+}
+
+/// Physical front input belongs to the foreground viewer, not to its current page.
+/// Only the owning viewport may retire it; foreground handoffs explicitly clear it.
+#[derive(Default)]
+pub(crate) struct FsFrontPointerOwnership {
+    viewport: Option<egui::ViewportId>,
+    buttons: [bool; 3],
+    touches: HashSet<(u64, u64)>,
+    touch_owned: bool,
+    clicks: FsBackingClickBoundary,
+}
+
+#[derive(Default)]
+struct FsBackingClickBoundary {
+    frame: Option<(egui::ViewportId, u64)>,
+    previous_accepted: u32,
+    current_accepted: u32,
+}
+
+impl FsFrontPointerOwnership {
+    #[cfg(test)]
+    pub(crate) fn primary_for_test() -> Self {
+        Self {
+            buttons: [true, false, false],
+            ..Self::default()
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn is_active(&self) -> bool {
+        self.buttons.iter().any(|owned| *owned) || self.touch_owned
+    }
+    pub(crate) fn owns_primary(&self) -> bool {
+        self.buttons[0] || self.touch_owned
+    }
+
+    pub(crate) fn owns_primary_in(&self, viewport: egui::ViewportId) -> bool {
+        self.viewport == Some(viewport) && self.owns_primary()
+    }
+
+    fn capture(
+        &mut self,
+        ctx: &egui::Context,
+        menu_presented: bool,
+        overflow: &[egui::Rect],
+    ) -> FsFrontPointerFrameInput {
+        if self
+            .viewport
+            .is_some_and(|owner| owner != ctx.viewport_id())
+        {
+            return FsFrontPointerFrameInput::default();
+        }
+        self.viewport = Some(ctx.viewport_id());
+        let frame = (ctx.viewport_id(), ctx.cumulative_frame_nr());
+        ctx.input(|input| {
+            if input.pointer.any_click() && !input.pointer.primary_clicked() {
+                self.clicks = FsBackingClickBoundary::default();
+            }
+            if input.pointer.primary_clicked() && self.clicks.frame != Some(frame) {
+                self.clicks = FsBackingClickBoundary {
+                    frame: Some(frame),
+                    previous_accepted: self.clicks.current_accepted,
+                    current_accepted: 0,
+                };
+            }
+            let mut owned = self.buttons;
+            let mut release_owned = [false; 3];
+            let mut touch_owned = self.touch_owned;
+            if !input.focused || input.viewport().focused == Some(false) {
+                *self = Self::default();
+                return FsFrontPointerFrameInput::default();
+            }
+            for event in &input.events {
+                match event {
+                    egui::Event::PointerButton {
+                        button,
+                        pressed,
+                        pos,
+                        ..
+                    } => {
+                        let index = match button {
+                            egui::PointerButton::Primary => 0,
+                            egui::PointerButton::Secondary => 1,
+                            egui::PointerButton::Middle => 2,
+                            _ => continue,
+                        };
+                        if *pressed {
+                            if index == 0 && self.touches.is_empty() {
+                                touch_owned = self.touch_owned;
+                            }
+                            self.buttons[index] = menu_presented
+                                || overflow.iter().any(|rect| rect.contains(*pos))
+                                || (index == 0 && self.touch_owned);
+                            // A new sequence replaces the old terminal edge in this pass.
+                            owned[index] = self.buttons[index];
+                            if owned[index] {
+                                self.clicks = FsBackingClickBoundary::default();
+                            }
+                        } else {
+                            release_owned[index] = self.buttons[index];
+                            owned[index] |= self.buttons[index];
+                            self.buttons[index] = false;
+                        }
+                    }
+                    egui::Event::Touch {
+                        device_id,
+                        id,
+                        phase,
+                        pos,
+                        ..
+                    } => {
+                        let contact = (device_id.0, id.0);
+                        match phase {
+                            egui::TouchPhase::Start => {
+                                if self.touches.is_empty() {
+                                    owned[0] = self.buttons[0];
+                                    self.touch_owned = menu_presented
+                                        || overflow.iter().any(|rect| rect.contains(*pos));
+                                    touch_owned = self.touch_owned;
+                                }
+                                self.touches.insert(contact);
+                                if self.touch_owned {
+                                    self.clicks = FsBackingClickBoundary::default();
+                                }
+                            }
+                            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                                touch_owned |= self.touch_owned;
+                                self.touches.remove(&contact);
+                                if self.touches.is_empty() {
+                                    if self.touch_owned {
+                                        // winit emits no promoted primary release for TouchCancel.
+                                        owned[0] |= self.buttons[0];
+                                        self.buttons[0] = false;
+                                    }
+                                    self.touch_owned = false;
+                                }
+                            }
+                            egui::TouchPhase::Move => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            FsFrontPointerFrameInput {
+                primary_owned: owned[0] || touch_owned,
+                secondary_owned: owned[1],
+                middle_owned: owned[2],
+                touch_owned,
+                release_owned,
+                secondary_owner: None,
+            }
+        })
+    }
+
+    fn accept_backing_click(&mut self, response: &egui::Response, suppressed: bool) {
+        if self.viewport == Some(response.ctx.viewport_id())
+            && !suppressed
+            && response.clicked()
+            && response.ctx.input(|input| input.pointer.primary_clicked())
+        {
+            self.clicks.current_accepted = (self.clicks.previous_accepted + 1).min(3);
+        }
+    }
+
+    fn backing_double_clicked(&self, response: &egui::Response) -> bool {
+        self.viewport == Some(response.ctx.viewport_id())
+            && response.clicked()
+            && response.ctx.input(|input| {
+                input
+                    .pointer
+                    .released_buttons_with_click_counts()
+                    .any(|(button, click)| {
+                        button == egui::PointerButton::Primary
+                            && click.is_some_and(|(_, count)| {
+                                count.min(self.clicks.current_accepted) == 2
+                            })
+                    })
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FsTopMenuEligibility {
+    image: bool,
+    panorama: bool,
+}
+
+impl FsTopMenuEligibility {
+    fn new(is_video: bool, panorama_active: bool, panorama_mode_active: bool) -> Self {
+        Self {
+            image: !is_video && !panorama_mode_active,
+            panorama: !is_video && panorama_active,
+        }
+    }
+}
+
+/// Keep launchers and child menus inside their parent's outside-press boundary.
+pub(crate) fn fs_menu_outside_press(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    launcher: egui::Rect,
+    children: &[egui::Rect],
+) -> bool {
+    let events = ctx.input(|input| input.events.clone());
+    events.iter().any(|event| {
+        let pos = match event {
+            egui::Event::PointerButton {
+                pressed: true, pos, ..
+            }
+            | egui::Event::Touch {
+                phase: egui::TouchPhase::Start,
+                pos,
+                ..
+            } => *pos,
+            _ => return false,
+        };
+        !rect.contains(pos)
+            && !launcher.contains(pos)
+            && !children.iter().any(|child| child.contains(pos))
+    })
+}
+
+fn fs_close_menu_on_outside_press(popup: &egui::Popup<'_>, response: &egui::Response) {
+    if popup.is_open()
+        && popup
+            .get_popup_rect()
+            .is_some_and(|rect| fs_menu_outside_press(&response.ctx, rect, response.rect, &[]))
+    {
+        egui::Popup::close_id(&response.ctx, popup.get_id());
     }
 }
 
@@ -233,9 +492,6 @@ impl FullscreenSecondaryPressOwner {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FullscreenSecondaryPress {
     Idle,
-    Overflow {
-        owner: FullscreenSecondaryPressOwner,
-    },
     Armed {
         owner: FullscreenSecondaryPressOwner,
         started_at: std::time::Instant,
@@ -281,7 +537,7 @@ impl FullscreenSecondaryPress {
         new_generation: u64,
         new_idx: usize,
     ) {
-        if let Self::Armed { owner, .. } | Self::Overflow { owner } = self
+        if let Self::Armed { owner, .. } = self
             && owner.viewer_context == viewer_context
             && owner.items_generation == old_generation
             && owner.fs_idx == old_idx
@@ -293,53 +549,9 @@ impl FullscreenSecondaryPress {
 
     fn start_pos(self) -> Option<egui::Pos2> {
         match self {
-            Self::Idle | Self::Overflow { .. } => None,
+            Self::Idle => None,
             Self::Armed { start_pos, .. } => Some(start_pos),
         }
-    }
-
-    /// A press begun in overflow belongs to it through release, even after leaving its rect.
-    /// Reuse the secondary sequence owner instead of creating a separate pending latch.
-    fn overflow_owns_input(
-        &mut self,
-        owner: Option<FullscreenSecondaryPressOwner>,
-        visible_panel: &[egui::Rect],
-        input: &egui::InputState,
-    ) -> bool {
-        if matches!(self, Self::Overflow { owner: captured } if Some(*captured) != owner) {
-            self.cancel();
-        }
-        let mut owned = matches!(self, Self::Overflow { .. });
-        for event in &input.events {
-            if let egui::Event::PointerButton {
-                button: egui::PointerButton::Secondary,
-                pressed,
-                pos,
-                ..
-            } = event
-            {
-                if *pressed {
-                    if let Some(owner) =
-                        owner.filter(|_| visible_panel.iter().any(|r| r.contains(*pos)))
-                    {
-                        *self = Self::Overflow { owner };
-                        owned = true;
-                    } else if matches!(self, Self::Overflow { .. }) {
-                        self.cancel();
-                    }
-                } else if matches!(self, Self::Overflow { .. }) {
-                    owned = true;
-                    self.cancel();
-                }
-            }
-        }
-        // Retire lost terminal edges, but keep this terminal frame owned.
-        if matches!(self, Self::Overflow { .. })
-            && (!input.focused || !input.pointer.secondary_down())
-        {
-            self.cancel();
-        }
-        owned
     }
 
     fn advance(
@@ -2126,7 +2338,6 @@ pub(crate) enum FullscreenPrimarySuppression {
     #[default]
     Idle,
     PointerStream,
-    OverflowStream,
     TouchStream,
 }
 
@@ -2179,9 +2390,7 @@ impl FullscreenPrimarySuppression {
     ) -> FullscreenPrimarySuppressionDecision {
         match event {
             FullscreenPrimarySuppressionEvent::PointerStreamStarted => {
-                if *self != Self::OverflowStream {
-                    *self = Self::PointerStream;
-                }
+                *self = Self::PointerStream;
                 FullscreenPrimarySuppressionDecision::Suppress
             }
             FullscreenPrimarySuppressionEvent::PointerFrame { released } => {
@@ -2190,7 +2399,7 @@ impl FullscreenPrimarySuppression {
                 } else {
                     FullscreenPrimarySuppressionDecision::Allow
                 };
-                if released && matches!(self, Self::PointerStream | Self::OverflowStream) {
+                if released && matches!(self, Self::PointerStream) {
                     *self = Self::Idle;
                 }
                 decision
@@ -2201,15 +2410,6 @@ impl FullscreenPrimarySuppression {
                 completed,
                 cancelled,
             } => {
-                // Front widgets retain their promoted primary stream even when the backing
-                // touch driver is disabled. Physical release/liveness or a touch terminal
-                // retires this owner.
-                if *self == Self::OverflowStream {
-                    if cancelled || completed {
-                        *self = Self::Idle;
-                    }
-                    return FullscreenPrimarySuppressionDecision::Suppress;
-                }
                 // PointerStream is provisional until raw-touch correlation has
                 // identified the source. From that point the touch frame is
                 // authoritative for this pass: canvas gestures are allowed,
@@ -2712,10 +2912,19 @@ struct FsNavigatorFrameInputSnapshots {
 }
 
 impl FsNavigatorFrameInput {
-    fn without_overflow_buttons(mut self, front: FsOverflowPointerFrameInput) -> Self {
+    fn without_front_buttons(mut self, front: FsFrontPointerFrameInput) -> Self {
         for event in &mut self.events {
-            if let FsNavigatorInputEvent::PointerButton { button, pos, .. } = event
-                && front.owns(*button)
+            if let FsNavigatorInputEvent::PointerButton {
+                button,
+                pos,
+                pressed,
+                ..
+            } = event
+                && (if *pressed {
+                    front.owns(*button)
+                } else {
+                    front.owns_release(*button)
+                })
             {
                 // The position belongs to wheel targeting and any non-owned gesture too.
                 *event = FsNavigatorInputEvent::PointerMoved(*pos);
@@ -7141,21 +7350,22 @@ fn draw_still_seek_strip_popup(
         .open_memory(response.clicked().then_some(egui::SetOpenCommand::Toggle))
         .align(egui::RectAlign::TOP_END)
         .gap(6.0)
-        .frame(crate::os_theme::dark_popup_frame(&response.ctx).inner_margin(0.0))
-        .show(|ui| {
-            crate::os_theme::apply_dark_ui(ui);
-            selected = draw_still_seek_strip_menu(
-                ui,
-                visible,
-                current_height,
-                height_values,
-                current_preview_size,
-                preview_size_values,
-            );
-            if selected.is_some() {
-                ui.close();
-            }
-        });
+        .frame(crate::os_theme::dark_popup_frame(&response.ctx).inner_margin(0.0));
+    fs_close_menu_on_outside_press(&popup, response);
+    let popup = popup.show(|ui| {
+        crate::os_theme::apply_dark_ui(ui);
+        selected = draw_still_seek_strip_menu(
+            ui,
+            visible,
+            current_height,
+            height_values,
+            current_preview_size,
+            preview_size_values,
+        );
+        if selected.is_some() {
+            ui.close();
+        }
+    });
     if popup.is_some() {
         // Let the popup scroll first, then consume even unused wheel input at an edge.
         response.ctx.input_mut(|input| {
@@ -14692,11 +14902,16 @@ impl App {
     /// (どちらに書き込むかはドラッグ開始時点の `analysis_mode` で決まる)。
     /// 戻り値は「このフレームで中ボタンがアクティブに使われていた」か。true なら
     /// 呼び出し側はこの後の左クリック/右クリックの解釈をスキップしてよい。
-    fn handle_middle_drag_zoom(&mut self, ctx: &egui::Context, full_rect: egui::Rect) -> bool {
+    fn handle_middle_drag_zoom(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        front: FsFrontPointerFrameInput,
+    ) -> bool {
         // ZipPla 風ズーム (照準中 / 確定中) は専用描画経路で fs_zoom/fs_pan を使わない。
         // 中ボタンドラッグで不可視の fs_zoom を書き換えず、専用の fs_zoom_factor を動かす。
         if self.fs_zoom_mode_engaged() {
-            return self.handle_zoom_mode_middle_drag(ctx);
+            return self.handle_zoom_mode_middle_drag(ctx, front);
         }
         // 360 度ビューも自前の視点を持つ。ここを塞がないと、中ボタンドラッグが
         // 画面に何も起こさないまま fs_zoom を動かす (ピンチと同じ取りこぼし)。
@@ -14709,7 +14924,8 @@ impl App {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
                 i.pointer.button_pressed(egui::PointerButton::Middle),
-                i.pointer.button_released(egui::PointerButton::Middle),
+                !front.owns_release(egui::PointerButton::Middle)
+                    && i.pointer.button_released(egui::PointerButton::Middle),
                 i.pointer.interact_pos(),
             )
         });
@@ -14791,12 +15007,17 @@ impl App {
         false
     }
 
-    fn handle_zoom_mode_middle_drag(&mut self, ctx: &egui::Context) -> bool {
+    fn handle_zoom_mode_middle_drag(
+        &mut self,
+        ctx: &egui::Context,
+        front: FsFrontPointerFrameInput,
+    ) -> bool {
         let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
                 i.pointer.button_pressed(egui::PointerButton::Middle),
-                i.pointer.button_released(egui::PointerButton::Middle),
+                !front.owns_release(egui::PointerButton::Middle)
+                    && i.pointer.button_released(egui::PointerButton::Middle),
                 i.pointer.interact_pos(),
             )
         });
@@ -18735,7 +18956,7 @@ impl FsWheelFrameSemanticInput {
             primary_stopped: response.drag_stopped_by(egui::PointerButton::Primary),
             total_drag_delta: fullscreen_drag_pan_proposal(response, egui::Vec2::ZERO),
             drag_delta: response.drag_delta(),
-            double_clicked: response.double_clicked(),
+            double_clicked: app.fs_front_pointer.backing_double_clicked(response),
             music_context_allowed: app.music_timeline_ctrl_wheel_context_allowed(ctx),
         }
     }
@@ -24210,6 +24431,44 @@ impl App {
             && !self.fs_music_view_active(fs_idx)
     }
 
+    pub(crate) fn fs_context_menu_presented(&self) -> bool {
+        self.fs_context_menu_idx
+            .is_some_and(|idx| self.items.get(idx).is_some())
+    }
+
+    fn fullscreen_seek_menu_eligible(&mut self, full_rect: egui::Rect, idx: usize) -> bool {
+        if !self.fullscreen_seek_overlay_allowed(idx, false) {
+            return false;
+        }
+        let geometry = self.still_seek_geometry_for_idx(full_rect, idx, false);
+        geometry.total_height > 0.0
+            && geometry.panel_rect(full_rect).width() >= 160.0
+            && self.fullscreen_seek_info_cached(idx).is_some()
+    }
+
+    fn fs_front_menu_presented(&mut self, ctx: &egui::Context, full_rect: egui::Rect) -> bool {
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        let eligible = FsTopMenuEligibility::new(
+            matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            ),
+            self.panorama_state.is_some(),
+            self.is_panorama_mode_active(idx),
+        );
+        let rotation = fs_rotation_popup_open(ctx);
+        let seek = fs_still_seek_strip_popup_open(ctx);
+        (self.fullscreen_top_bar_chrome_allowed(idx)
+            && ((eligible.image && (self.fit_popup_open || self.spread_popup_open || rotation))
+                || (eligible.panorama && self.panorama_projection_popup_open)))
+            || (seek && self.fullscreen_seek_menu_eligible(full_rect, idx))
+            || self.fs_context_menu_presented()
+            // egui memory is viewport scoped. Known menus above also need their draw gate.
+            || (egui::Popup::is_any_open(ctx) && !rotation && !seek)
+    }
+
     fn fullscreen_top_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
         self.resolved_still_chrome().top_locked
             && !is_video
@@ -24780,7 +25039,7 @@ impl App {
             seek_geometry,
             side_panel_visible,
             touch_chrome_latched,
-            FsOverflowPointerFrameInput::default(),
+            FsFrontPointerFrameInput::default(),
         )
     }
 
@@ -24837,14 +25096,17 @@ impl App {
         seek_geometry: StillSeekGeometry,
         side_panel_visible: bool,
         touch_chrome_latched: bool,
-        overflow_pointer_input: FsOverflowPointerFrameInput,
+        overflow_pointer_input: FsFrontPointerFrameInput,
     ) -> Option<usize> {
         self.fs_seek_overlay_visible = false;
         self.poll_still_seek_rotations();
         // 分析モード中は対象画像に集中するため、下端のページシークバーを出さない
         // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
         // 問題も併せて解消される)。
-        if !self.fullscreen_seek_overlay_allowed(fs_idx, false) {
+        if !self.fullscreen_seek_overlay_allowed(fs_idx, false)
+            || (fs_still_seek_strip_popup_open(ctx)
+                && !self.fullscreen_seek_menu_eligible(full_rect, fs_idx))
+        {
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
@@ -24947,7 +25209,10 @@ impl App {
                 },
                 raw_locked && !locked,
             ));
-            if primary_allowed && lock_resp.clicked() {
+            if primary_allowed
+                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                && lock_resp.clicked()
+            {
                 self.settings.set_still_seek_bar_locked(!raw_locked);
                 self.settings.save();
                 ctx.request_repaint();
@@ -25133,11 +25398,11 @@ impl App {
                         egui::vec2(0.0, strip_content.height()),
                     )
                 });
-            let strip_response = ui.interact(
+            let strip_response = overflow_pointer_input.backing_response(ui.interact(
                 row_rect,
                 ui.make_persistent_id("fullscreen_still_seek_strip_row"),
                 egui::Sense::click_and_drag(),
-            );
+            ));
             #[cfg(all(windows, feature = "test-script"))]
             crate::test_script::pointer_input::record_region(
                 crate::test_script::pointer_input::RegionId::StillSeekStripRow,
@@ -25321,7 +25586,10 @@ impl App {
                     },
                     strip_locked && !self.resolved_still_chrome().bottom_lock.strip_locked(),
                 ));
-            if primary_allowed && strip_lock_response.clicked() {
+            if primary_allowed
+                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                && strip_lock_response.clicked()
+            {
                 self.settings.set_still_seek_strip_locked(!strip_locked);
                 self.settings.save();
                 ctx.request_repaint();
@@ -25404,11 +25672,11 @@ impl App {
                 let hit_rect = track_rect
                     .expand2(egui::vec2(0.0, 14.0 * bar_scale))
                     .intersect(bar_rect);
-                let response = ui.interact(
+                let response = overflow_pointer_input.backing_response(ui.interact(
                     hit_rect,
                     ui.make_persistent_id("fullscreen_seek_track"),
                     egui::Sense::click_and_drag(),
-                );
+                ));
                 #[cfg(all(windows, feature = "test-script"))]
                 crate::test_script::pointer_input::record_region(
                     crate::test_script::pointer_input::RegionId::StillSeekTrack,
@@ -27188,7 +27456,7 @@ impl App {
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
-                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_overflow_pointer_input(ctx, full_rect);
+                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_front_pointer_input(ctx, full_rect);
                         let music_overflow_input = self.begin_music_overflow_frame_input(ctx, full_rect, fs_idx);
                         let mut hud_popup_wheel = self
                             .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx, music_overflow_input)
@@ -28055,6 +28323,7 @@ impl App {
                                     paint_idx,
                                     image_size,
                                     pointer_allowed,
+                                    overflow_pointer_input,
                                 );
                                 if self.export_crop_mode || used {
                                     ctx.request_repaint();
@@ -28080,7 +28349,7 @@ impl App {
                             );
                         } else {
                         if let Some(effect) =
-                            self.draw_capture_region_selection_overlay(ui, ctx, full_rect, paint_idx)
+                            self.draw_capture_region_selection_overlay(ui, ctx, full_rect, paint_idx, overflow_pointer_input)
                         {
                             match effect {
                                 CaptureRegionTerminalEffect::Copy { idx, crop } => {
@@ -36169,6 +36438,7 @@ impl App {
         ctx: &egui::Context,
         draw_rect: egui::Rect,
         viewport_rect: egui::Rect,
+        front: FsFrontPointerFrameInput,
     ) -> bool {
         let crate::app::CompareViewMode::Wipe {
             fraction,
@@ -36186,7 +36456,8 @@ impl App {
                 (
                     i.pointer.primary_pressed(),
                     i.pointer.primary_down(),
-                    i.pointer.primary_released(),
+                    !front.owns_release(egui::PointerButton::Primary)
+                        && i.pointer.primary_released(),
                     i.pointer.interact_pos(),
                     i.pointer.hover_pos(),
                 )
@@ -38349,7 +38620,7 @@ impl App {
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
         let (overflow_pointer_input, overflow_touch_excluded) =
-            self.capture_fs_overflow_pointer_input(ctx, full_rect);
+            self.capture_fs_front_pointer_input(ctx, full_rect);
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
@@ -38385,12 +38656,12 @@ impl App {
         navigation_operation: &mut Option<ViewerOperationId>,
         suppress_wheel_navigation: bool,
         merge_at_frame_tail: bool,
-        overflow_pointer_input: FsOverflowPointerFrameInput,
+        overflow_pointer_input: FsFrontPointerFrameInput,
         overflow_touch_excluded: &[egui::Rect],
     ) -> FsWheelFrameResult {
         *navigator_reservation = None;
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx)
-            .without_overflow_buttons(overflow_pointer_input);
+            .without_front_buttons(overflow_pointer_input);
         if front_wheel_owner.is_some() {
             // The begin-pass capture remains intact. Both immediate and reserved consumers
             // receive the same projection, retaining pointer/focus/release gesture ownership.
@@ -39312,7 +39583,12 @@ impl App {
             .unwrap_or(compare_base_rect);
         if !overflow_pointer_input.primary_owned
             && !cursor_in_panel
-            && self.handle_compare_wipe_drag(ctx, compare_drag_rect, compare_base_rect)
+            && self.handle_compare_wipe_drag(
+                ctx,
+                compare_drag_rect,
+                compare_base_rect,
+                overflow_pointer_input,
+            )
         {
             return FsWheelFrameResult::default();
         }
@@ -39322,13 +39598,16 @@ impl App {
         // 分析モード中でも同じ操作感で動かす (書き戻し先はドラッグ開始時の mode で固定)。
         // パネル上で「開始」された中ボタンは無視して下流に流すが、既にドラッグが
         // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
-        let middle_short_click = self.update_mouse_middle_short_click(
+        let middle_short_click = self.update_mouse_middle_short_click_with_release(
             ctx,
-            !cursor_in_panel,
+            !cursor_in_panel && !overflow_pointer_input.middle_owned,
             crate::app::ActionSurface::Viewer,
+            !overflow_pointer_input.owns_release(egui::PointerButton::Middle),
         );
-        if !cursor_in_panel || self.fs_middle_zoom_drag.is_some() {
-            self.handle_middle_drag_zoom(ctx, default_image_rect);
+        if !overflow_pointer_input.middle_owned
+            && (!cursor_in_panel || self.fs_middle_zoom_drag.is_some())
+        {
+            self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input);
         }
         if middle_short_click {
             if let Some(nav) = self.apply_mouse_button(
@@ -39347,11 +39626,11 @@ impl App {
         let in_video_tile = self.video_tile_mode_active;
         #[cfg(not(windows))]
         let in_video_tile = false;
-        let fs_response = ui.interact(
+        let fs_response = overflow_pointer_input.backing_response(ui.interact(
             full_rect,
             egui::Id::unique("fs_click"),
             egui::Sense::click_and_drag(),
-        );
+        ));
         let continuous_touch_delta = continuous_reading_response_drag_delta(
             ctx,
             &fs_response,
@@ -39382,6 +39661,8 @@ impl App {
             primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
         }
         // ── フォーカス復帰クリック / touch replacement の抑制 ──
+        self.fs_front_pointer
+            .accept_backing_click(&fs_response, primary_suppression.suppresses_current_frame());
         let wheel_options = ctx.options(|o| o.input_options);
         let wheel_segments =
             ctx.input(|input| crate::wheel_input::remaining_wheel_segments(input, wheel_options));
@@ -40153,7 +40434,7 @@ impl App {
         let has_transform = zoom > ZOOM_NEAR_ONE
             || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
-        if response.double_clicked() && has_transform {
+        if self.fs_front_pointer.backing_double_clicked(response) && has_transform {
             return FsCanvasClickAction::ResetTransform;
         }
         if fullscreen_click_belongs_to_view(zoom, self.fs_free_rotation)
@@ -40222,11 +40503,11 @@ impl App {
         }
     }
 
-    fn capture_fs_overflow_pointer_input(
+    fn capture_fs_front_pointer_input(
         &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
-    ) -> (FsOverflowPointerFrameInput, Vec<egui::Rect>) {
+    ) -> (FsFrontPointerFrameInput, Vec<egui::Rect>) {
         let visible_panel = fs_overflow_pointer_surface(
             ctx,
             fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state),
@@ -40239,33 +40520,26 @@ impl App {
                 self.current_right_drag_context(),
             )
         });
-        let pointer = ctx.input(|input| {
-            if input.events.iter().any(|event| {
-                matches!(event, egui::Event::PointerButton {
-                    button: egui::PointerButton::Primary, pressed: true, pos, ..
-                } if visible_panel.iter().any(|rect| rect.contains(*pos)))
-            }) {
-                self.fs_primary_suppression = FullscreenPrimarySuppression::OverflowStream;
-            }
-            let primary_owned =
-                self.fs_primary_suppression == FullscreenPrimarySuppression::OverflowStream;
-            if primary_owned
-                && (!input.focused
-                    || (!input.pointer.primary_down() && !input.pointer.primary_released()))
-            {
-                self.fs_primary_suppression = FullscreenPrimarySuppression::Idle;
-            }
-            FsOverflowPointerFrameInput {
-                primary_owned,
-                secondary_owned: self.fs_secondary_press.overflow_owns_input(
-                    secondary_owner,
-                    &visible_panel,
-                    input,
-                ),
-                secondary_owner,
-            }
-        });
-        (pointer, visible_panel)
+        let menu_presented = self.fs_front_menu_presented(ctx, full_rect);
+        let mut pointer = self
+            .fs_front_pointer
+            .capture(ctx, menu_presented, &visible_panel);
+        pointer.secondary_owner = secondary_owner;
+        // Front admission retires the backing gesture for that same button. The
+        // physical owner above is independent and survives these cancellations.
+        if pointer.secondary_owned {
+            self.fs_secondary_press.cancel();
+        }
+        if pointer.middle_owned {
+            self.fs_middle_zoom_drag = None;
+            self.cancel_mouse_middle_short_click();
+        }
+        let touch_excluded = if menu_presented || pointer.touch_owned {
+            vec![full_rect]
+        } else {
+            visible_panel
+        };
+        (pointer, touch_excluded)
     }
 
     fn dismiss_fs_overflow_on_touch_tap(
@@ -40297,7 +40571,7 @@ impl App {
         seek_panel_rect: egui::Rect,
         seek_panel_interactive: bool,
         prev_foreground_hwnd: usize,
-        overflow_pointer_input: FsOverflowPointerFrameInput,
+        overflow_pointer_input: FsFrontPointerFrameInput,
     ) -> FsSecondaryAction {
         let dialog_open_for_right_drag = self.any_dialog_open();
         if dialog_open_for_right_drag {
@@ -40316,7 +40590,9 @@ impl App {
             .right_drag_mode(right_drag_context);
         let secondary_down = ctx.input(|i| i.pointer.secondary_down());
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
-        let secondary_released = ctx.input(|i| i.pointer.secondary_released());
+        let secondary_released = !overflow_pointer_input
+            .owns_release(egui::PointerButton::Secondary)
+            && ctx.input(|i| i.pointer.secondary_released());
         let press_owner = overflow_pointer_input.secondary_owner;
         if overflow_pointer_input.secondary_owned {
             self.cancel_mouse_ring_flick();
@@ -50197,6 +50473,8 @@ impl App {
         shift_view: Option<&SpreadShiftHudView>,
         pre_resolved_close: Option<BarButtonResponse>,
     ) {
+        let menu_eligibility =
+            FsTopMenuEligibility::new(is_video, panorama_active, panorama_mode_active);
         let composition_owned = matches!(
             pairing_availability,
             crate::spread_shift::PairingEditAvailability::Composed
@@ -50523,7 +50801,7 @@ impl App {
         // 回転角度メニュー (画像のみ — 動画では意味を持たないため非表示)。
         // 左右回転の2ボタンを1個にまとめ、現在角度を含む絶対角度を選べるようにする。
         // 360 モード中は非表示 (360 ビューは独自の yaw を持つため rotation_db は適用しない)。
-        if !is_video && !panorama_mode_active {
+        if menu_eligibility.image {
             let rotate_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -50542,7 +50820,9 @@ impl App {
             if rotate_resp.hovered() {
                 *page_nav = FsPageNav::None;
             }
-            let _ = crate::os_theme::dark_menu_popup(&rotate_resp).show(|ui| {
+            let popup = crate::os_theme::dark_menu_popup(&rotate_resp);
+            fs_close_menu_on_outside_press(&popup, &rotate_resp);
+            let _ = popup.show(|ui| {
                 crate::os_theme::apply_dark_ui(ui);
                 ui.set_min_width(132.0);
                 for (rotation, label) in [
@@ -50604,7 +50884,7 @@ impl App {
         // 押すたびに順送りする形はやめた: 4 方式あり、今どれを見ているかが押す前に
         // 分からないため (2026-08 利用者フィードバック)。順送りはキーだけに残す。
         let mut projection_resp_rect = egui::Rect::NOTHING;
-        if !is_video && panorama_active {
+        if menu_eligibility.panorama {
             let tooltip = keymap.chord_list_bracket_label(
                 &format!(
                     "投影方式: {}\nクリックで一覧から選択",
@@ -50635,7 +50915,7 @@ impl App {
             *panorama_projection_popup_open = false;
         }
 
-        if *panorama_projection_popup_open && !is_video && panorama_active {
+        if *panorama_projection_popup_open && menu_eligibility.panorama {
             let row_h = 40.0_f32;
             let label_font = egui::FontId::proportional(13.0);
             let desc_font = egui::FontId::proportional(10.0);
@@ -50744,11 +51024,7 @@ impl App {
             }
 
             // ポップアップ外クリックで閉じる (見開きの一覧と同じ作法)。
-            if let Some(pos) = ctx.input(|i| i.pointer.press_origin())
-                && !popup_rect.contains(pos)
-                && !projection_resp_rect.contains(pos)
-                && ctx.input(|i| i.pointer.any_pressed())
-            {
+            if fs_menu_outside_press(ctx, popup_rect, projection_resp_rect, &[]) {
                 *panorama_projection_popup_open = false;
             }
         }
@@ -50820,7 +51096,7 @@ impl App {
         let spread_active = spread_mode.is_spread() || !reading_flow.is_paged();
         let sm = *spread_mode;
         let mut spread_resp_rect = egui::Rect::NOTHING;
-        if !is_video && !panorama_mode_active {
+        if menu_eligibility.image {
             let spread_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -50890,7 +51166,7 @@ impl App {
         }
 
         // 表示モードポップアップ (画像のみ)
-        if *spread_popup_open && !is_video {
+        if *spread_popup_open && menu_eligibility.image {
             let popup_x = next_x;
             let popup_y = bar_rect.max.y + 4.0;
             let popup_w = 230.0_f32;
@@ -51203,13 +51479,8 @@ impl App {
             );
 
             // ポップアップ外クリックで閉じる
-            let pointer_pos = ctx.input(|i| i.pointer.press_origin());
-            if let Some(pos) = pointer_pos {
-                if !popup_rect.contains(pos) && !spread_resp_rect.contains(pos) {
-                    if ctx.input(|i| i.pointer.any_pressed()) {
-                        *spread_popup_open = false;
-                    }
-                }
+            if fs_menu_outside_press(ctx, popup_rect, spread_resp_rect, &[]) {
+                *spread_popup_open = false;
             }
         }
 
@@ -51220,7 +51491,7 @@ impl App {
         // ズーム/フィットボタン (画像のみ、見開きボタンの左)。クリックでメニューを開く。
         let fit_btn_x = next_x;
         let mut fit_resp_rect = egui::Rect::NOTHING;
-        if !is_video && !panorama_mode_active {
+        if menu_eligibility.image {
             let fit_active =
                 !matches!(fit_mode, FullscreenFitMode::Page) || fit_no_upscale || fit_no_downscale;
             let mf_resp = draw_bar_button(
@@ -51267,7 +51538,7 @@ impl App {
         }
 
         // ズーム/フィットポップアップ (画像のみ)。現在モードを青でハイライト。
-        if *fit_popup_open && !is_video && !panorama_mode_active {
+        if *fit_popup_open && menu_eligibility.image {
             let bounds = ui.ctx().content_rect().shrink(4.0);
             let width = 320.0_f32.min(bounds.width());
             let origin = egui::pos2(
@@ -51309,11 +51580,12 @@ impl App {
                 *fit_no_downscale_choice = Some(value);
             }
             *specified_scale_changed |= popup.inner.specified_changed;
-            if ui.input(|i| i.pointer.any_click())
-                && ui.input(|i| i.pointer.interact_pos()).is_some_and(|pos| {
-                    !popup_response.rect.contains(pos) && !fit_resp_rect.contains(pos)
-                })
-            {
+            if fs_menu_outside_press(
+                ctx,
+                popup_response.rect,
+                fit_resp_rect,
+                &popup.inner.child_popups,
+            ) {
                 *fit_popup_open = false;
             }
         }
@@ -51754,7 +52026,7 @@ fn fs_fit_popup_axis(
     ui: &mut egui::Ui,
     label: &str,
     axis: &mut crate::settings::SpecifiedScaleAxisSetting,
-) {
+) -> Option<egui::Rect> {
     ui.push_id(label, |ui| {
         let row = fs_fit_popup_row(ui, "enabled", label, axis.enabled, true);
         if row.clicked() {
@@ -51768,7 +52040,7 @@ fn fs_fit_popup_axis(
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
             crate::ui_dialogs::preferences::draw_fullscreen_specified_scale_axis_controls(
                 ui, axis, label,
-            );
+            )
         };
         if row.rect.width() >= 240.0 {
             // Leave the right-aligned ON/OFF target outside the widget rect.
@@ -51784,16 +52056,18 @@ fn fs_fit_popup_axis(
                     .max_rect(rect)
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
-            controls(&mut child);
+            controls(&mut child)
         } else {
             // A genuinely narrow viewport wraps the same controls below the
             // toggle; their actual child height remains in the scroll layout.
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(16.0);
-                controls(ui);
-            });
+                controls(ui)
+            })
+            .inner
         }
-    });
+    })
+    .inner
 }
 
 fn fs_fit_popup_max_scale(ui: &mut egui::Ui, max_tenths: &mut u32) {
@@ -51831,6 +52105,7 @@ fn fs_fit_popup_specified_editor(
     value: &mut crate::settings::FullscreenSpecifiedScale,
     max_tenths: &mut u32,
     favorite: bool,
+    child_popups: &mut Vec<egui::Rect>,
 ) -> bool {
     let before = (*value, *max_tenths);
     fs_fit_popup_header(
@@ -51841,8 +52116,8 @@ fn fs_fit_popup_specified_editor(
             "指定サイズ（共通）"
         },
     );
-    fs_fit_popup_axis(ui, "幅", &mut value.width);
-    fs_fit_popup_axis(ui, "高さ", &mut value.height);
+    child_popups.extend(fs_fit_popup_axis(ui, "幅", &mut value.width));
+    child_popups.extend(fs_fit_popup_axis(ui, "高さ", &mut value.height));
     fs_fit_popup_max_scale(ui, max_tenths);
     ui.add(egui::Label::new(egui::RichText::new(
         "％は画像表示領域が基準。pxは画面の表示倍率に追従。幅・高さの枠に収めます。\n「縮小しない」は枠より優先。最大倍率は共通設定。AI拡大前の元画像サイズが基準。手動ズーム・Zは上限の対象外。",
@@ -51859,7 +52134,7 @@ pub(crate) fn draw_fs_specified_scale_live_editor(
     fs_fit_popup_frame()
         .show(ui, |ui| {
             crate::os_theme::apply_dark_ui(ui);
-            fs_fit_popup_specified_editor(ui, value, max_tenths, favorite)
+            fs_fit_popup_specified_editor(ui, value, max_tenths, favorite, &mut Vec::new())
         })
         .inner
 }
@@ -51870,6 +52145,7 @@ struct FsFitPopupChoice {
     no_upscale: Option<bool>,
     no_downscale: Option<bool>,
     specified_changed: bool,
+    child_popups: Vec<egui::Rect>,
 }
 
 fn draw_fs_fit_popup(
@@ -51954,8 +52230,13 @@ fn draw_fs_fit_popup(
                                 choice.no_downscale = Some(!no_downscale);
                             }
                             fs_fit_popup_separator(ui);
-                            choice.specified_changed =
-                                fs_fit_popup_specified_editor(ui, value, max_tenths, favorite);
+                            choice.specified_changed = fs_fit_popup_specified_editor(
+                                ui,
+                                value,
+                                max_tenths,
+                                favorite,
+                                &mut choice.child_popups,
+                            );
                             choice
                         })
                 },
@@ -53540,6 +53821,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         fs_idx: usize,
+        front: FsFrontPointerFrameInput,
     ) -> Option<CaptureRegionTerminalEffect> {
         let Some(mut selection) = self.capture_region_selection else {
             return None;
@@ -53583,6 +53865,30 @@ impl App {
         let mut focused = initial_focused;
         let mut primary_down = selection.target.is_some();
         for event in events {
+            if front.owns_release(egui::PointerButton::Primary)
+                && matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            if front.primary_owned
+                && matches!(
+                    event,
+                    egui::Event::PointerMoved(_)
+                        | egui::Event::PointerButton {
+                            button: egui::PointerButton::Primary,
+                            ..
+                        }
+                )
+            {
+                continue;
+            }
             match event {
                 egui::Event::PointerMoved(pos) if focused && primary_down => {
                     if let Some(target) = selection.target {
@@ -84898,8 +85204,13 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(root_ui, |ui| {
-                            effect = app
-                                .draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
+                            effect = app.draw_capture_region_selection_overlay(
+                                ui,
+                                ctx,
+                                full_rect,
+                                fs_idx,
+                                FsFrontPointerFrameInput::default(),
+                            );
                         })
                 });
                 remaining_events = ctx.input(|input| input.events.clone());
@@ -85286,7 +85597,11 @@ mod tests {
                             .frame(egui::Frame::NONE)
                             .show(root_ui, |ui| {
                                 effect = app.draw_capture_region_selection_overlay(
-                                    ui, ctx, full_rect, fs_idx,
+                                    ui,
+                                    ctx,
+                                    full_rect,
+                                    fs_idx,
+                                    FsFrontPointerFrameInput::default(),
                                 );
                             })
                     });

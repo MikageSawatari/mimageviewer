@@ -349,3 +349,111 @@ F / S / P や Area を持たない toast は layer 判定で拾えず、各メ�
 §5 の 3 件の `#[ignore]` を外して成功させ、8.1 の 1〜4 それぞれに実描画テストを足す (非提示の bool で編集 canvas を
 止めない / F・S・P・Q・R・X は外側ドラッグ 1 回で閉じ、パネル内 popup は外側ドラッグで開いたまま背面不変・その後の外側クリックで閉じる / 押したままキーでページ移動しても背面へ戻らない / 閉じるクリック直後の
 同位置クリックで reset しない)。「…」の `OverflowStream` を新しい寿命へ移したことの回帰も確認する。
+
+## 9. 実装記録
+
+2026-10-19、`front-popup-1403`。設計・検収は ClaudeCode、実装・関連自動検証は Codex。
+§1〜§7 は修正前の調査・再現記録として残す。本節が実装後の記録である。
+
+### 9.1 変更点
+
+- `FsFrontPointerOwnership` を App 全体の前面 viewer 一時状態として追加。旧
+  `FullscreenPrimarySuppression::OverflowStream` / `FullscreenSecondaryPress::Overflow` を除去し、
+  ページ操作の取消と物理入力列の寿命を分けた。bundle へ移さず、同 viewer のページ移動で保持する。
+- `capture_fs_front_pointer_input` がキー・root overflow 描画・navigator 予約より前に一度だけ
+  `FsFrontPointerFrameInput` を確定する。overflow は最前面の現在矩形上だけ、提示中のメニューは位置によらず
+  左・右・中・touch を所有する。touch は device/contact の組を保持して最後の End / Cancel で終える。
+  同 pass の release → 新 press は新列として判定し、他 viewport の非フォーカスでは解放しない。
+- 上部メニューは描画と `FsTopMenuEligibility` / `fullscreen_top_bar_chrome_allowed` を共有。
+  Q は `fullscreen_seek_menu_eligible`、X は `fs_context_menu_presented` を共有する。
+  egui の `Memory::any_popup_open` / `close_popup` は `viewport_id` をキーとしていることを vendored source で確認した。
+- 既存監査表の全 consumer に同じ結果を配り、中ボタン短押し / drag zoom と範囲 capture も接続。
+  隠蔽のパイプライン前 hold は前 pass の同じ物理 owner を viewport 一致で読む。
+  memory popup と共存する切り取り canvas の raw 入力も同じ結果へ接続した。
+  同 pass に旧所有列の release と新しい背面 press がある場合は、確定結果の release mask に旧終端を残し、
+  新しい down / press と分ける。navigator の ordered event、編集の raw release、中ボタンの完了、
+  背面 Response の click / drag-stop に旧終端を再利用しない。
+- F / S / P / Q / R / X は各描画境界で外側 press close。起動ボタンと開いた子メニューを除外する。
+  egui memory popup は既定 click close を維持し、`Popup::close_all` は追加していない。native menu loop は変更しない。
+- `FsBackingClickBoundary` は連続して背面が受理した primary click 数（3で飽和）を記録し、
+  egui の `released_buttons_with_click_counts` が返す count と小さい方を読む。2のときだけ double-click とする。
+  前面所有開始・未受理 click は境界を切る。閉じる click を含む egui の3打目も、背面での2打目なら reset できる。
+  通常の背面3打目では重ねて reset しない。独自タイマーはない。
+- 共通 modal Window、VST manager、gamepad picker、Bar / Pb の余白、AI status / toast は対象外のまま。
+
+### 9.2 触れた前面境界
+
+以下は既存リセットで新しい同種の一時入力状態も解放する追加のみ。detached の述語・viewport routing・
+geometry・focus 判定・lifecycle は変更しない。§1.396 と同じ構造的修正として、ClaudeCode の記録・レビュー合意へ渡す。
+
+- `App::reset_detached_pause_foreground_modes`
+- `App::reset_active_detached_viewport_runtime_for_new_window`
+- `App::adopt_active_detached_viewport_runtime_from_passive`
+- `App::close_fullscreen_now_with_metadata_boundary`
+
+### 9.3 テストと検証
+
+`front_popup_input_tests.rs` の既存3件の ignore を解除した。追加テスト:
+
+- `front_popup_all_six_menus_close_on_outside_press_and_own_the_entire_drag`（6種 × 左右中）
+- `front_popup_launch_button_closes_once_without_reopening_on_release`
+- `front_popup_nonpresented_toolbar_bools_do_not_block_the_real_erase_brush`
+- `front_popup_and_overflow_hold_survive_real_arrow_page_navigation`
+- `front_popup_dismissal_click_cannot_be_the_first_click_of_a_canvas_reset`
+- `front_popup_memory_combo_preserves_outside_drag_then_closes_on_outside_click`
+- `front_popup_memory_close_is_local_to_the_rendered_viewport`
+- `front_popup_actual_seek_press_close_keeps_the_other_viewports_menu_open`
+- `front_popup_touch_ownership_lasts_until_the_last_contact_end_or_cancel`
+- `front_popup_touch_cancel_then_new_contact_in_one_pass_starts_a_new_canvas_stream`
+- `front_popup_actual_context_submenu_child_press_keeps_its_parent_open`
+- `front_popup_actual_fit_unit_combo_child_press_keeps_its_parent_open`
+- `front_popup_owned_release_and_new_canvas_press_in_one_pass_keep_their_own_edges`
+
+X の子メニューは親 Window 内のインライン展開なので、実 min rect へ含まれる。F の単位 ComboBox は
+実描画から返した開いている子 popup rect を外側 close 判定へ渡す。中央の所有判定で内側を再判定しない。
+
+`front_pointer_ownership_tests.rs` には他 viewport の非フォーカス、同一 pass の旧 release → 新 press、
+旧 touch Cancel → 新 contact group の回帰を追加。
+名前は `front_popup_owner_ignores_another_viewports_focus_loss`、
+`front_popup_old_release_and_fresh_press_in_one_pass_have_distinct_owners`、
+`front_popup_old_touch_terminal_and_new_group_in_one_pass_are_distinct`。
+既存 overflow テストは旧 variant の直接検査を新 owner の検査へ移し、上位 Q の押下も前面所有する仕様に更新した。
+項目の選択・外側開始の通常動作を維持する対照は残す。
+
+すべて `MSBUILDDISABLENODEREUSE=1`。実アプリ起動やデスクトップ入力は行わない。
+
+| 検証 | 結果 / ログ |
+| --- | --- |
+| 関連 nextest（下記 filter） | **619成功 / 0失敗**。`target/section403-related-final.log`。実描画16件・所有境界3件、既存 overflow35件、スライドショー・navigator・比較・分析・編集系を含む。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功。`target/section403-check-final.log`。 |
+| `cargo test --test ui_snapshot` | **186成功 / 0失敗**。PNG変更なし。`target/section403-ui-snapshot.log`。 |
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 成功。 |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ0件。 |
+
+関連 nextest の再実行コマンド:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run -p mimageviewer --lib -E 'test(/front_popup|overflow|slideshow_|fullscreen_secondary|fullscreen_primary|touch_panel|foreground_reclaim|wheel_frame|navigator|compare|analysis|page_edit_release|export_crop|sns_split|erase|conceal|text_canvas|local_adjust_canvas/)'
+```
+
+対象範囲の実装上の未解決事項はない。範囲外の入力問題は §8.1 の5に残す。
+lib 全件、build-dev、独立完了レビュー、コミットは ClaudeCode 担当。実機確認は未実施。
+
+### 9.4 変異確認
+
+`target/section403-mutation-final.log`。次の2変異を同一ビルドへ入れ、対応する2テストを実行して
+**0成功 / 2失敗**を確認した。寿命テストの保持中にはクリック終端がなく、double-click テストにはページ移動がないので、
+それぞれ別の不変条件違反を検出している。
+
+| 変異 | 検出したテスト / 失敗 |
+| --- | --- |
+| `open_fullscreen_with_metadata_boundary` で `fs_front_pointer` もリセットする | `front_popup_and_overflow_hold_survive_real_arrow_page_navigation`。`page navigation must preserve the Primary physical owner` で失敗。 |
+| count=2を前面境界で制限せず採用する（正常な境界後のtriple→double対照は維持） | `front_popup_dismissal_click_cannot_be_the_first_click_of_a_canvas_reset`。閉じた直後のクリックで zoom / pan が `(2.0, [30,15])` から `(1.0, [0,0])` へ変わり、不変 assert で失敗。 |
+
+初回の double-click 変異は、メニュー起動クリックが egui の triple-click count に残るためテストを通過した。
+起動クリックの時間窓が残る / 切れた両方の実描画ケースを加え、実際の multi-click count を assert してから、
+閉じた直後の最初の背面 click は reset せず、その次の背面 click で正しく reset する対照まで強化した。
+上表は強化後の再確認である。
+
+変異した2ファイルは SHA-256 一致で復元を確認した。復元後の関連一式は619件すべて成功した。

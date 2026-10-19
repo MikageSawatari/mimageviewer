@@ -2055,6 +2055,10 @@ impl crate::app::App {
     /// 移動なし右クリックでトリガーされる。
     /// アプリケーション起動によりフルスクリーンを閉じるべき場合は true を返す。
     pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> bool {
+        if !self.fs_context_menu_presented() {
+            self.fs_context_menu_idx = None;
+            return false;
+        }
         let idx = match self.fs_context_menu_idx {
             Some(i) => i,
             None => return false,
@@ -2118,7 +2122,12 @@ impl crate::app::App {
                 ui.set_min_width(200.0);
                 selected_command = render_egui_menu_nodes(ui, &nodes);
 
-                if ui.input(|i| i.pointer.primary_clicked()) && !ui.ui_contains_pointer() {
+                if crate::ui_fullscreen::fs_menu_outside_press(
+                    ctx,
+                    ui.min_rect(),
+                    egui::Rect::NOTHING,
+                    &[],
+                ) {
                     close = true;
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {

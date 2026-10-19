@@ -1118,7 +1118,7 @@ impl App {
         transform: &DisplayedImageTransform,
         image_size: [usize; 2],
         pointer_allowed: bool,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let Some(layout) = self.sns_split else {
             return false;
@@ -1182,7 +1182,14 @@ impl App {
             return false;
         }
 
-        self.handle_sns_split_pointer(ui, transform, image_size, layout, handles)
+        self.handle_sns_split_pointer(
+            ui,
+            transform,
+            image_size,
+            layout,
+            handles,
+            overflow_pointer_input,
+        )
     }
 
     fn handle_sns_split_pointer(
@@ -1192,6 +1199,7 @@ impl App {
         image_size: [usize; 2],
         layout: SnsSplitLayout,
         handles: [(CropHandle, egui::Pos2); 8],
+        front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let frame_ratio = sns_frame_ratio_from_key(self.settings.sns_split_frame_ratio.as_deref());
         let (primary_pressed, primary_down, primary_released, press_origin, hover_pos, total_delta) =
@@ -1199,7 +1207,8 @@ impl App {
                 (
                     input.pointer.primary_pressed(),
                     input.pointer.primary_down(),
-                    input.pointer.primary_released(),
+                    !front.owns_release(egui::PointerButton::Primary)
+                        && input.pointer.primary_released(),
                     input.pointer.press_origin(),
                     input.pointer.hover_pos(),
                     input.pointer.total_drag_delta().unwrap_or(egui::Vec2::ZERO),
