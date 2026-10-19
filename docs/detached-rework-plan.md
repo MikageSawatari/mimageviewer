@@ -1485,6 +1485,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - 合意: ClaudeCode と独立レビュー Codex（2026-10-19/20）は、既存 detached 所有状態を読む
   この通知述語の変更を「開閉・viewport 遷移を変える症状パッチではない」と判断・合意済み。
   P2 は内部遷移中の判定漏れ、P3 は本節への記録漏れとして指摘され、今回それぞれを補う。
+- 再レビュー P2 への追補: 真の取消出口 `finish_fullscreen_navigation_for_true_close()` に
+  `retire_book_deferred_open()` と `clear_archive_convert_deferred_fullscreen()` を接続する。
+  既存の列挙・sidecar・folder navigation 取消と同じ境界で再開予約の寿命を終える修正。
+  製本 projection と変換本体・一覧更新は継続し、遅着の完了が元の予約で閲覧を再開しない。
+  変換の既存 clear helper は holdover も解放するため、navigation sequence の終了処理後に呼ぶ。
+  待機画面の Esc / ×、通常の閉じる操作、Backspace のページ一覧戻りはこの出口を共有する。
+  detached 初回 Preparing の lease 専用取消は既に製本 permission と該当 lease の変換を
+  退役させているので変更しない。detached session/runtime・viewport の遷移経路も変更しない。
+  製本の context / generation / scope・candidate correlation と、変換 state が所有する受信口・
+  現在の復帰予約を使い、新しい世代・待機フラグは追加しない。
+  変換 state は App 共通なので、既存 `ViewerContextId` を発行元として復帰予約に捕捉する。
+  共通取消出口はその context が一致するときだけ既存 clear helper を呼び、別 viewer の
+  Esc で元の予約を消費しない。捕捉する constructor を App 側（snapshot_ops）へ移し、
+  registry の projected identity API の private 境界は広げない。永続データの追加はない。
+  同名予約を持つ EPUB 変換は全 phase が可視モーダルで、Esc / × は既存の
+  `finish_epub_convert(Abort)` が state・予約・受信口ごと退役させる別の取消契約なので変更しない。
+  書庫の `auto_fullscreen` は明示 open 用で、復帰予約を付けるナビ入口は false を渡す。
+  今回はその独立した明示 open の契約へ広げず、待機中の復帰予約を退役させる。
 
 ### 2026-10-18 §1.395: 全viewportのsurface窓寸法制約
 

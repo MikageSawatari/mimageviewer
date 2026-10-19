@@ -168,6 +168,8 @@ pub(crate) enum ArchivePasswordResume {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ArchiveConvertDeferredFullscreen {
+    /// Conversion is App-global; only this viewer's close retires its reopen intent.
+    pub owner_context: crate::app::ViewerContextId,
     pub reopen: crate::app::DeferredFsReopen,
     pub restore_video_tile: bool,
 }
@@ -804,33 +806,6 @@ impl App {
                 state.allow_direct_read,
             )
         })
-    }
-
-    pub(crate) fn attach_archive_convert_deferred_fullscreen(
-        &mut self,
-        restore_video_tile: bool,
-        resume_slideshow: bool,
-        history_trigger: crate::app::HistoryTrigger,
-    ) -> bool {
-        let resume_to_last_page = self.settings.book_nav_resume.resumes();
-        let Some(state) = self.archive_convert.as_mut() else {
-            return false;
-        };
-        if !state.suppress_confirm && !state.allow_direct_read {
-            return false;
-        }
-        state.deferred_fullscreen = Some(ArchiveConvertDeferredFullscreen {
-            restore_video_tile,
-            reopen: crate::app::DeferredFsReopen {
-                history_trigger,
-                resume_slideshow,
-                target: crate::app::DeferredFsTarget::None,
-                resume_to_last_page,
-                from_explicit_open: false,
-                preserve_after_password_prompt: false,
-            },
-        });
-        true
     }
 
     pub(crate) fn clear_archive_convert_deferred_fullscreen(&mut self) {

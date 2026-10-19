@@ -2230,6 +2230,7 @@ impl App {
         // A live return can defer content teardown until the main UI dispatcher.
         // Its accepted Close already ends this viewer's automatic navigation owner.
         self.stop_projected_slideshow_playback();
+        self.retire_book_deferred_open();
         self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
         self.cancel_inflight_order_dependent_folder_nav();
@@ -2244,6 +2245,49 @@ impl App {
             self.fs_nav_after_pdf_enumerate = None;
         }
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
+        // Keep conversion/list adoption running, but remove its viewer continuation. This
+        // helper also releases the holdover, so run it after the sequence's exit bookkeeping.
+        // The conversion is App-global: a sibling viewer's close must not consume this intent.
+        if self
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.deferred_fullscreen.as_ref())
+            .is_some_and(|deferred| deferred.owner_context == self.projected_viewer_context_id())
+        {
+            self.clear_archive_convert_deferred_fullscreen();
+        }
+    }
+
+    /// Capture the requesting viewer here, inside App's context ownership boundary.
+    pub(crate) fn attach_archive_convert_deferred_fullscreen(
+        &mut self,
+        restore_video_tile: bool,
+        resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
+    ) -> bool {
+        let owner_context = self.projected_viewer_context_id();
+        let resume_to_last_page = self.settings.book_nav_resume.resumes();
+        let Some(state) = self.archive_convert.as_mut() else {
+            return false;
+        };
+        if !state.suppress_confirm && !state.allow_direct_read {
+            return false;
+        }
+        state.deferred_fullscreen = Some(
+            crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                owner_context,
+                restore_video_tile,
+                reopen: crate::app::DeferredFsReopen {
+                    history_trigger,
+                    resume_slideshow,
+                    target: crate::app::DeferredFsTarget::None,
+                    resume_to_last_page,
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                },
+            },
+        );
+        true
     }
 
     pub(super) fn prepare_required_fullscreen_navigation(

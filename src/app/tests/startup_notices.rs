@@ -135,6 +135,193 @@ fn startup_notices_defer_during_mounted_detached_preparation_without_an_index() 
     assert!(app.whats_new_visible());
 }
 
+#[cfg(windows)]
+#[test]
+fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reopen() {
+    use crate::ui_dialogs::archive_convert::{
+        ArchiveConvertCompletionPolicy, ArchiveConvertMsg, ArchiveConvertPhase,
+        ArchiveConvertProgressShared, ArchiveConvertState, ArchiveScanOutcome,
+    };
+    for direct in [false, true] {
+        for escape in [true, false] {
+            let mut app = setup_app();
+            request_whats_new(&mut app);
+            let source = app.tmp.path().join("source.7z");
+            std::fs::write(&source, b"source").unwrap();
+            let backing = app.tmp.path().join("readable.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&backing).unwrap());
+            zip.start_file("page-001.jpg", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+            zip.finish().unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (deliver, rx) = mpsc::channel();
+            app.archive_convert = Some(Box::new(ArchiveConvertState {
+                src_path: source.clone(),
+                input_seq: 1232,
+                format: if direct {
+                    ArchiveFormat::Rar
+                } else {
+                    ArchiveFormat::SevenZ
+                },
+                password: None,
+                password_input: String::new(),
+                phase: if direct {
+                    ArchiveConvertPhase::Scanning
+                } else {
+                    ArchiveConvertPhase::Converting {
+                        progress: Arc::new(ArchiveConvertProgressShared::new()),
+                    }
+                },
+                cancel: Arc::clone(&cancel),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: direct,
+                completion: ArchiveConvertCompletionPolicy::Navigation,
+                restore_intent: StartupListIntent::PageContinuation,
+                pending_sibling_output: None,
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: true,
+                suppress_confirm_next_time: false,
+            }));
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.fs_nav_locked_gen = Some(app.items_generation);
+            app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+            assert!(app.attach_archive_convert_deferred_fullscreen(
+                false,
+                false,
+                HistoryTrigger::UserChosen
+            ));
+            if direct {
+                // Suppressed scanning is not modal. A sibling viewer may close while
+                // main's archive request is still pending; that is not its cancellation.
+                app.build_active_context_for_test(Some(1235), DetachedSource::Image, |owner| {
+                    owner.items = vec![GridItem::Image(PathBuf::from("sibling.jpg"))];
+                    owner.fullscreen_idx = Some(0);
+                    owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                });
+                let sibling_ctx = egui::Context::default();
+                sibling_ctx.begin_pass(escape_input());
+                app.with_active_viewer_context(|owner| {
+                    let action = owner.handle_fs_key_input(&sibling_ctx, 0, false);
+                    assert!(action.close, "sibling Escape must be accepted");
+                    owner.handle_fullscreen_close_request();
+                })
+                .expect("sibling viewer must mount");
+                sibling_ctx.end_pass().drop_without_applying_deltas();
+                app.remove_active_context_for_test();
+                assert!(
+                    app.archive_convert_deferred_fullscreen_active(),
+                    "sibling close must preserve main's reopen"
+                );
+                assert!(!cancel.load(Ordering::Relaxed));
+            }
+            app.viewer_presentation = ViewerPresentation::MainWindow;
+            app.native_video_in_window_active = true;
+            assert!(!app.whats_new_visible());
+            let mut input = if escape {
+                escape_input()
+            } else {
+                egui::RawInput::default()
+            };
+            if !escape {
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+            }
+            let ctx = egui::Context::default();
+            ctx.run_pass(input, |ctx| {
+                ctx.root_ui(|ui| app.render_fullscreen_viewport(ui));
+                assert!(!app.archive_convert_deferred_fullscreen_active());
+                assert!(app.whats_new_visible());
+                if escape {
+                    assert!(!app.dialog_escape_pressed(ctx));
+                    app.show_whats_new_dialog(ctx);
+                    assert!(
+                        app.show_whats_new,
+                        "viewer Escape must not acknowledge the notice"
+                    );
+                }
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                !cancel.load(Ordering::Relaxed),
+                "closing the viewer must keep conversion running"
+            );
+            assert!(app.archive_convert.is_some());
+            assert!(app.fs_holdover_tex.is_none());
+            assert!(!app.fs_nav_is_locked());
+
+            // Deliver the original lifecycle's success only AFTER the real close.
+            // Its list adoption remains useful, but it no longer owns a viewer open.
+            let message = if direct {
+                ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::Direct {
+                    source: backing.clone(),
+                }))
+            } else {
+                ArchiveConvertMsg::ConvertDone(Ok((
+                    crate::archive_converter::ArchiveImageSummary {
+                        image_count: 1,
+                        total_uncompressed_bytes: 4,
+                        nested_archive_count: 0,
+                    },
+                    backing.clone(),
+                    std::fs::metadata(&backing).unwrap().len() as i64,
+                )))
+            };
+            deliver.send(message).unwrap();
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.show_archive_convert_dialog(ctx)
+            })
+            .drop_without_applying_deltas();
+            assert!(app.archive_convert.is_none());
+            // Cached conversion may classify the path and use prepared history adoption;
+            // direct reads enter the ordinary ZIP receiver. Drive both existing owners.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                app.poll_rar_archive_navigation_for_test(&ctx);
+                app.poll_zip_enumerate();
+                app.poll_sidecar_restore(&ctx);
+                if app.current_folder.as_ref() == Some(&backing)
+                    && app.zip_enumerate_pending.is_none()
+                    && app.top_level_grid_view.open_path_classification().is_none()
+                    && app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_none()
+                    && !app.sidecar_restore_active()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "late archive list adoption did not settle"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::ZipImage { .. }))
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&backing));
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.fs_nav_after_pdf_enumerate.is_none());
+            assert!(!app.pending_auto_fs_open);
+            assert!(app.whats_new_visible());
+            assert_eq!(
+                app.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+        }
+    }
+}
+
 #[test]
 fn startup_notices_defer_drawing_modal_and_escape_in_every_viewer_mode() {
     let mut app = setup_app();

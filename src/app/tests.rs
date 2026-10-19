@@ -93770,6 +93770,7 @@ mod smart_folder_transition_tests {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let deferred_fullscreen = with_deferred_fullscreen.then(|| {
             crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                owner_context: app.projected_viewer_context_id(),
                 restore_video_tile: false,
                 reopen: DeferredFsReopen {
                     history_trigger: crate::app::HistoryTrigger::UserChosen,
