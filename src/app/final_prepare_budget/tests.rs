@@ -183,7 +183,10 @@ fn d3_4_legacy_ready_deferral_has_no_poll_loop_but_computing_keeps_its_wake() {
                 app.adopt_final_prepare_results(
                     &ctx,
                     vec![key],
-                    FinalPrepareAdoption::RootFinalized(Some(reason)),
+                    FinalPrepareAdoption::RootFinalized(
+                        Some(reason),
+                        crate::ui_fullscreen::FinalUnitPosition::Next,
+                    ),
                 );
                 assert_pending(&app, key);
                 assert!(

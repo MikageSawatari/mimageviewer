@@ -69,7 +69,8 @@ app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/conte
 通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。
 
 D3-4(b) の Native 候補は既存 App 共通 frame owner に当該 pass の値だけを置く。
-最終 hook は通常の全 context final 登録を先に処理し、同じ canonical 入力を再照合してから
+最終 hook は全 live Next final登録→Next Native→全Next成立を再照合し、成立後だけPreviousの登録/Native/
+resident-only CPU開始へ進む（§1.405の限定拡張）。同じ canonical 入力を再照合してから
 非生成 query・全 pool の出力＋一時 allocation 会計・backing 再検査・直前 claim の順で進む。
 renderer lock を context 訪問／会計へ持ち越さず、通常 `fs_lanczos_cache`／submit／Native lease を使う。
 park／mount／fork の新しい非同期 owner は作らず、cold metadata 準備も追加しない。
@@ -2183,4 +2184,11 @@ CPU worker/pending/permit/予約の所有はD3-2のまま。早期serviceは受�
 非共有の新規投機GPU登録だけROOT最終outputへ移す。ON/pagedのLegacyPrefetchも同じ枠を使う。
 既存frame ownerのpass観測と単調活動を使い、待機queueを増やさない。
 TextureDelivery observerは既存queue提出後・renderer lock外・free前の診断だけを通知する。
-App/UI再入、追加submit、GPU完了ticketはない。詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.15を参照。
+通常UI/入力/permissionへの再入、追加submit、GPU完了ticketはない。詳細は[紙めくり計画](page-turn-animation-plan.md) §27.17.15を参照。
+
+§1.405ではNext CPUの実予約拒否時だけ、BudgetState.units最大2 unitのmetadata snapshotからownerを特定する。
+mutex外で`with_viewer_context_ref`/`with_viewer_context_state`によりparkedも訪問し、未昇格PreviousのCpuReady/
+未受信channelを破棄する。一時値までdrop後、元Next/keyを再照合して一度だけ再試行する。
+Current/Next共有素材・DisplayPrepared・legacy・Unknown・held/receipt/batchは保護し、実計算中のpermit/予約は終了まで保持する。
+park単独では取消しない。最新callbackは位置別結果を一体で置換し、Previous Nativeは全削除規則の除去ゼロを検査する。
+新しいqueue/ready latch/全頁・全registry走査や同期I/Oは追加しない。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。

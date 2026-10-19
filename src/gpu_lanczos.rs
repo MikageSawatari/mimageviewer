@@ -976,6 +976,9 @@ pub(crate) enum NativePrewarmUnavailable {
     InvalidPlan,
     SourceChanged,
     ClaimDenied,
+    CacheSmoothingClear,
+    CacheSourceReplacement,
+    CacheCapacity,
 }
 
 impl NativePrewarmUnavailable {
@@ -987,8 +990,17 @@ impl NativePrewarmUnavailable {
             Self::InvalidPlan => "invalid_plan",
             Self::SourceChanged => "source_changed",
             Self::ClaimDenied => "claim_denied",
+            Self::CacheSmoothingClear => "cache_smoothing_clear",
+            Self::CacheSourceReplacement => "cache_source_replacement",
+            Self::CacheCapacity => "cache_capacity",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativePrewarmPolicy {
+    Ordinary,
+    NoRemoval,
 }
 
 /// A call-local calculation, never a pending owner and never a source lease.
@@ -1395,6 +1407,62 @@ impl GpuLanczosCache {
         plan: NativePrewarmPlan,
         claim: impl FnOnce(NativeAllocationBytes) -> bool,
     ) -> NativePrewarmExecution {
+        self.execute_prewarm_with_policy(
+            render_state,
+            resource,
+            plan,
+            NativePrewarmPolicy::Ordinary,
+            claim,
+        )
+    }
+
+    /// Pure metadata admission shared by the caller and the execution boundary.
+    /// Includes invalidation removals as well as post-insertion pruning.
+    pub(crate) fn prewarm_no_removal_admission(
+        &self,
+        plan: NativePrewarmPlan,
+    ) -> Result<(), NativePrewarmUnavailable> {
+        if self.active_smoothing_percent != plan.smoothing_percent && !self.entries.is_empty() {
+            return Err(NativePrewarmUnavailable::CacheSmoothingClear);
+        }
+        if self.entries.keys().any(|key| {
+            key.source_id == plan.key.source_id
+                && (key.source_texture_id != plan.key.source_texture_id
+                    || key.generation != plan.key.generation)
+        }) {
+            return Err(NativePrewarmUnavailable::CacheSourceReplacement);
+        }
+        let increment = usize::from(!self.entries.contains_key(&plan.key));
+        if self.entries.len() + increment > MAX_CACHE_ENTRIES
+            || self
+                .entries
+                .keys()
+                .filter(|key| same_source_target_family(**key, plan.key))
+                .count()
+                + increment
+                > MAX_TARGETS_PER_SOURCE
+            || self
+                .entries
+                .keys()
+                .copied()
+                .chain((increment != 0).then_some(plan.key))
+                .map(cached_upscale_pixels)
+                .fold(0_u64, u64::saturating_add)
+                > MAX_CACHED_UPSCALE_PIXELS
+        {
+            return Err(NativePrewarmUnavailable::CacheCapacity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute_prewarm_with_policy(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        resource: &FullscreenPaintResource,
+        plan: NativePrewarmPlan,
+        policy: NativePrewarmPolicy,
+        claim: impl FnOnce(NativeAllocationBytes) -> bool,
+    ) -> NativePrewarmExecution {
         let Some((source_id, _, generation)) = resource.resampleable_parts() else {
             return NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::SourceChanged);
         };
@@ -1412,6 +1480,11 @@ impl GpuLanczosCache {
                 .is_some_and(|output| output.key == plan.key)
         {
             return NativePrewarmExecution::Hit;
+        }
+        if policy == NativePrewarmPolicy::NoRemoval
+            && let Err(reason) = self.prewarm_no_removal_admission(plan)
+        {
+            return NativePrewarmExecution::Unavailable(reason);
         }
         let source = match prewarm_source_backing(
             render_state,
@@ -1807,34 +1880,17 @@ impl GpuLanczosCache {
         loop {
             let total = self
                 .entries
-                .iter()
-                .filter(|(key, _)| {
-                    matches!(
-                        key.scale_branch,
-                        FullscreenPaintScaleBranch::UpscaleLanczos
-                            | FullscreenPaintScaleBranch::UpscaleNis
-                            | FullscreenPaintScaleBranch::UpscaleAnime
-                            | FullscreenPaintScaleBranch::UpscalePixelArt
-                    )
-                })
-                .fold(0_u64, |pixels, (key, _)| {
-                    pixels.saturating_add(target_pixels(key.target_size))
-                });
+                .keys()
+                .copied()
+                .map(cached_upscale_pixels)
+                .fold(0_u64, u64::saturating_add);
             if total <= MAX_CACHED_UPSCALE_PIXELS {
                 break;
             }
             let Some(oldest) = self
                 .entries
                 .iter()
-                .filter(|(key, _)| {
-                    matches!(
-                        key.scale_branch,
-                        FullscreenPaintScaleBranch::UpscaleLanczos
-                            | FullscreenPaintScaleBranch::UpscaleNis
-                            | FullscreenPaintScaleBranch::UpscaleAnime
-                            | FullscreenPaintScaleBranch::UpscalePixelArt
-                    )
-                })
+                .filter(|(key, _)| cached_upscale_pixels(**key) != 0)
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key)
             else {
@@ -1851,6 +1907,16 @@ fn same_source_target_family(left: LanczosCacheKey, right: LanczosCacheKey) -> b
         && left.generation == right.generation
         && left.smoothing_percent == right.smoothing_percent
         && left.scale_branch == right.scale_branch
+}
+
+fn cached_upscale_pixels(key: LanczosCacheKey) -> u64 {
+    match key.scale_branch {
+        FullscreenPaintScaleBranch::UpscaleLanczos
+        | FullscreenPaintScaleBranch::UpscaleNis
+        | FullscreenPaintScaleBranch::UpscaleAnime
+        | FullscreenPaintScaleBranch::UpscalePixelArt => target_pixels(key.target_size),
+        _ => 0,
+    }
 }
 
 pub(crate) struct LanczosOutput {
@@ -4823,6 +4889,245 @@ mod tests {
         assert!(plan.intermediate_x_start + plan.intermediate_x_width >= 2003);
         assert!(plan.intermediate_x_width < 4000);
         assert!(plan.texture_fetches > 0);
+    }
+
+    fn back_fake_entry(cache: &mut GpuLanczosCache, key: LanczosCacheKey) {
+        cache.entries.insert(
+            key,
+            LanczosCacheEntry {
+                output: Arc::new(LanczosOutput {
+                    texture_id_lease: NativeTextureIdLease {
+                        texture_id: egui::TextureId::User(9900),
+                        releaser: Arc::new(CountingReleaser(AtomicUsize::new(0))),
+                    },
+                    key,
+                    _texture: None,
+                }),
+                last_used: 17,
+            },
+        );
+    }
+
+    fn back_plan(key: LanczosCacheKey, smoothing_percent: u32) -> NativePrewarmPlan {
+        NativePrewarmPlan {
+            key,
+            work: work_plan_for_key([16, 24], key).unwrap(),
+            smoothing_percent,
+        }
+    }
+
+    #[test]
+    fn back_native_no_removal_covers_all_invalidation_and_pruning_rules_purely() {
+        let base = LanczosCacheKey {
+            source_id: FullscreenPaintSourceId::Page(3),
+            source_texture_id: egui::TextureId::Managed(7),
+            generation: FullscreenPaintSourceGeneration { items: 4, input: 8 },
+            target_size: [32, 48],
+            smoothing_percent: 0,
+            scale_branch: FullscreenPaintScaleBranch::UpscaleLanczos,
+            source_region: LanczosSourceRegionKey::Full,
+        };
+        let plan = back_plan(base, 50);
+        let mut cache = GpuLanczosCache::default();
+        assert!(
+            cache.prewarm_no_removal_admission(plan).is_ok(),
+            "empty cache can synchronize smoothing"
+        );
+        back_fake_entry(
+            &mut cache,
+            LanczosCacheKey {
+                source_id: FullscreenPaintSourceId::Page(99),
+                ..base
+            },
+        );
+        cache.use_clock = 29;
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheSmoothingClear)
+        );
+        assert_eq!(
+            (
+                cache.entries.len(),
+                cache.active_smoothing_percent,
+                cache.use_clock
+            ),
+            (1, 0, 29)
+        );
+        cache.active_smoothing_percent = 50;
+        assert!(
+            cache.prewarm_no_removal_admission(plan).is_ok(),
+            "other sources do not trigger source replacement"
+        );
+        for old in [
+            LanczosCacheKey {
+                source_texture_id: egui::TextureId::Managed(8),
+                ..base
+            },
+            LanczosCacheKey {
+                generation: FullscreenPaintSourceGeneration { items: 4, input: 7 },
+                ..base
+            },
+        ] {
+            cache.entries.clear();
+            back_fake_entry(&mut cache, old);
+            assert_eq!(
+                cache.prewarm_no_removal_admission(plan),
+                Err(NativePrewarmUnavailable::CacheSourceReplacement)
+            );
+            assert_eq!(cache.entries.len(), 1);
+        }
+        cache.entries.clear();
+        for target_size in [[34, 50], [36, 52]] {
+            back_fake_entry(
+                &mut cache,
+                LanczosCacheKey {
+                    target_size,
+                    ..base
+                },
+            );
+        }
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheCapacity)
+        );
+        cache.entries.clear();
+        for idx in 0..MAX_CACHE_ENTRIES {
+            back_fake_entry(
+                &mut cache,
+                LanczosCacheKey {
+                    source_id: FullscreenPaintSourceId::Page(idx + 100),
+                    ..base
+                },
+            );
+        }
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheCapacity)
+        );
+        cache.entries.clear();
+        for idx in 0..2 {
+            back_fake_entry(
+                &mut cache,
+                LanczosCacheKey {
+                    source_id: FullscreenPaintSourceId::Page(idx + 100),
+                    target_size: [4096, 4096],
+                    ..base
+                },
+            );
+        }
+        assert_eq!(
+            cache.prewarm_no_removal_admission(plan),
+            Err(NativePrewarmUnavailable::CacheCapacity)
+        );
+    }
+
+    #[test]
+    fn back_native_execution_rechecks_no_removal_before_backing_claim_or_mutation() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let renderer = egui_wgpu::Renderer::new(&device, target_format, Default::default());
+        let rs = egui_wgpu::RenderState {
+            instance,
+            adapter,
+            available_adapters: Vec::new(),
+            device,
+            queue,
+            target_format,
+            renderer: Arc::new(egui::epaint::mutex::RwLock::new(renderer)),
+        };
+        let ctx = egui::Context::default();
+        let tex = metadata_only_texture(&ctx, [16, 24], egui::TextureOptions::LINEAR);
+        let resource = FullscreenPaintResource::resampleable(
+            3,
+            tex,
+            FullscreenPaintSourceGeneration { items: 4, input: 8 },
+        );
+        let key = resource_lanczos_key(
+            &resource,
+            0.5,
+            1.0,
+            None,
+            PostFilter::None,
+            0,
+            AnimeUpscaleSourceLimit::Px4096,
+        )
+        .unwrap();
+        let plan = back_plan(key, 0);
+        let mut cache = GpuLanczosCache::default();
+        assert!(cache.prewarm_no_removal_admission(plan).is_ok());
+        let old = LanczosCacheKey {
+            source_texture_id: egui::TextureId::Managed(9999),
+            ..key
+        };
+        back_fake_entry(&mut cache, old); // changes after caller's pure preflight
+        let claimed = std::cell::Cell::new(false);
+        assert!(matches!(
+            cache.execute_prewarm_with_policy(
+                &rs,
+                &resource,
+                plan,
+                NativePrewarmPolicy::NoRemoval,
+                |_| {
+                    claimed.set(true);
+                    true
+                }
+            ),
+            NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::CacheSourceReplacement)
+        ));
+        assert!(!claimed.get());
+        assert_eq!(cache.use_clock, 0);
+        assert_eq!(cache.entries.len(), 1);
+        cache.active_smoothing_percent = 50;
+        assert!(matches!(
+            cache.execute_prewarm_with_policy(
+                &rs,
+                &resource,
+                plan,
+                NativePrewarmPolicy::NoRemoval,
+                |_| {
+                    claimed.set(true);
+                    true
+                }
+            ),
+            NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::CacheSmoothingClear)
+        ));
+        assert!(!claimed.get());
+        assert_eq!(cache.active_smoothing_percent, 50);
+        assert_eq!(cache.use_clock, 0);
+        assert!(cache.entries.contains_key(&old));
+        cache.active_smoothing_percent = 0;
+        rs.renderer.write().update_texture(
+            &rs.device,
+            &rs.queue,
+            resource.source_texture_id(),
+            &egui::epaint::ImageDelta::full(
+                egui::ColorImage::filled([16, 24], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        assert!(matches!(
+            cache.execute_prewarm(&rs, &resource, plan, |_| true),
+            NativePrewarmExecution::Submitted { .. }
+        ));
+        assert!(!cache.entries.contains_key(&old));
+        assert!(cache.entries.contains_key(&key));
+        let mut empty = GpuLanczosCache::default();
+        empty.active_smoothing_percent = 50;
+        assert!(matches!(
+            empty.execute_prewarm_with_policy(
+                &rs,
+                &resource,
+                plan,
+                NativePrewarmPolicy::NoRemoval,
+                |_| true
+            ),
+            NativePrewarmExecution::Submitted { .. }
+        ));
+        assert_eq!(empty.active_smoothing_percent, 0);
+        assert!(empty.entries.contains_key(&key));
     }
 
     #[test]

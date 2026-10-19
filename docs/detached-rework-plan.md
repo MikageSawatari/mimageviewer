@@ -5878,3 +5878,27 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
 - 触れた前面境界 (9 関数): `reset_detached_pause_foreground_modes`、`reset_active_detached_viewport_runtime_for_new_window`、`adopt_active_detached_viewport_runtime_from_passive`、`close_fullscreen_now_with_metadata_boundary`、`toggle_still_window_mode`、`apply_egui_viewer_presentation_for_current_item`、`prepare_viewer_presentation_open`、`apply_video_presentation_switched`、`handoff_active_detached_viewport_to_passive`。いずれも前面の押下所有をその境界で解放する追加で、detached の述語・viewport 生成・geometry・placement・focus・window lifecycle は変更しない。presentation 系は表示先が変わる場合だけ解放し、同じ viewer・表示先のページ移動では所有を保つ (表示先の比較、app.rs `prepare_viewer_presentation_open` 付近)。
 - 所有の判断: §1.396 と同じく前面 viewer の一時状態として App 全体に置き、ViewerContextBundle へは移さない。
 - 合意: 独立 reviewer (Sol / xhigh、2026-10-19 の完成レビューと再レビュー) と ClaudeCode の双方が、9 関数すべてについて「既存の前面境界で同種の一時入力状態を解放する構造的修正であり、症状パッチではない」ことに合意した。
+
+### §11 追補: §1.405 Previous需要と共通資源の優先順（2026-10-19、実装・自動検証済み、実機未確認）
+
+正本は[page-turn計画 §27.17.20/.12/.13/.21](page-turn-animation-plan.md)。今回の範囲が症状パッチではなく
+context所有の需要と共通admissionの構造修正であることは、設計担当ClaudeCodeと事前独立reviewer双方が合意済み（.13）。
+完成差分の承認は別であり、中間sourceレビューの確定P1〜P3指摘なしを完成承認の代用にしない。
+完成sourceの独立レビューもACCEPT（2026-10-20、残存P1〜P3なし）。今回の範囲が構造修正であるとの合意を維持する。
+focused・全lib・snapshot・解析器回帰と計測用buildは成功。途中失敗を含む件数・終了コードと未実施範囲は`target/back-handoff.md`に記録する。
+
+- `FinalUnitPosition`のPreviousは通常ordinal−1。既存後方keep内の全occurrenceだけを補完し、方向履歴やbackward slotを増やさない。
+- `CanonicalCallbackObservation`は既存frame ownerに最新callbackのroute/viewと両位置の収集結果を一体で保持。
+  `finalize_speculative_gpu_output`は既存live dispatch/runtime/bindingを再照合し、全live Nextのfinal/Native成立後だけPreviousを進める。
+- ROOT hookからのresident-only Previous CPU開始を限定拡張する。Next通常producer位置を維持し、UI/input/permission/metadata producerへ再入しない。
+- `reclaim_previous_final_results`は実Next CPU予約拒否時だけBudgetState.units最大2 unitからownerを特定し、mutexを解放後に
+  `with_viewer_context_ref`/`with_viewer_context_state`でparkedも訪問する。元mountへ復帰し、parkedの描画/再開/採用/登録/新producerは行わない。
+  未昇格PreviousのCpuReadyと未受信channelだけが結果回収対象。Current/Next共有素材、DisplayPrepared、legacy、Unknown、held/receipt/batchは保護する。
+  Emptyの実計算中は保持し、高優先化の取消でもworkerのpermit/予約は実終了まで残す。park自体で一括取消しない。
+- Previous Nativeはsmoothing clear・旧source除去・容量pruningによる既存entry除去が文字どおりゼロのときだけ。
+  `prewarm_no_removal_admission`と実行入口の再検査をclaim等より前に置き、通常draw/Nextは維持する。
+- HWND/生成identity/placementや新しいdetached flagは変更しない。fresh fork、mount/deposit/promoteの既存payload移譲、
+  parked presentation/receipt/material/lease保持を維持する。回帰と検証結果は上記.21と`target/back-*`へ記録する。
+- 完成前確認（2026-10-20）で、先頭の診断blockerがUnknownの場合に後続兄弟のPendingを取消条件から漏らす実装を修正。
+  診断と取消を分け、同じ呼出内の全Next状態から`any(Pending)`で導出する。実装担当と独立reviewer双方が設計への整合修正と確認し、
+  両訪問順と取消後の実permit/worker予約保持の回帰を追加した。新しい永続stateやparked回収範囲の拡張はない。

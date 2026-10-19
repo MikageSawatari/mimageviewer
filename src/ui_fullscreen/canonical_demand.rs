@@ -64,6 +64,7 @@ pub(crate) struct CanonicalPageDemand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CanonicalUnitDemand {
+    pub(crate) position: FinalUnitPosition,
     pub(crate) destination: PresentationDestination,
     pub(crate) pages: Vec<CanonicalPageDemand>,
     view: CanonicalViewInputs,
@@ -71,6 +72,18 @@ pub(crate) struct CanonicalUnitDemand {
     items_generation: u64,
     composition: SpreadDisplayComposition,
     media_rect: egui::Rect,
+}
+
+/// One atomic observation per callback, including failures. An incomplete final
+/// must not erase the latest view or the other adjacent position's evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CanonicalCallbackObservation {
+    pub(crate) destination: PresentationDestination,
+    view: CanonicalViewInputs,
+    current_anchor: Option<usize>,
+    items_generation: u64,
+    pub(crate) next: Result<CanonicalUnitDemand, CanonicalDemandUnavailable>,
+    pub(crate) previous: Result<CanonicalUnitDemand, CanonicalDemandUnavailable>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +97,7 @@ pub(crate) enum CanonicalDemandUnavailable {
     Material,
     FitBasis,
     Geometry,
+    OutsideBackwardKeep,
 }
 
 impl CanonicalDemandUnavailable {
@@ -98,6 +112,7 @@ impl CanonicalDemandUnavailable {
             Self::Material => "material_unavailable",
             Self::FitBasis => "fit_basis_unavailable",
             Self::Geometry => "geometry_unavailable",
+            Self::OutsideBackwardKeep => "outside_backward_keep",
         }
     }
 }
@@ -195,6 +210,27 @@ pub(super) fn spread_page_transform(
 }
 
 impl App {
+    #[cfg(test)]
+    fn collect_next_canonical_demand(
+        &self,
+        ctx: &egui::Context,
+        view: CanonicalViewInputs,
+    ) -> Result<CanonicalUnitDemand, CanonicalDemandUnavailable> {
+        self.collect_canonical_demand(ctx, view, FinalUnitPosition::Next)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_canonical_native_demand(&mut self, demand: CanonicalUnitDemand) {
+        self.observe_canonical_callback(CanonicalCallbackObservation {
+            destination: demand.destination,
+            view: demand.view,
+            current_anchor: Some(demand.current_anchor),
+            items_generation: demand.items_generation,
+            next: Ok(demand),
+            previous: Err(CanonicalDemandUnavailable::Ineligible),
+        });
+    }
+
     pub(crate) fn record_next_canonical_native_demand(&mut self, ui: &egui::Ui) {
         if !self.settings.page_turn_animation_enabled
             || !self.reading_flow.is_paged()
@@ -207,10 +243,15 @@ impl App {
             base_clip: ui.painter().clip_rect(),
             pixels_per_point: ui.ctx().pixels_per_point(),
         };
-        match self.collect_next_canonical_demand(ui.ctx(), view) {
-            Ok(demand) => self.observe_canonical_native_demand(demand),
-            Err(reason) => self.observe_canonical_native_unavailable(reason.as_str()),
-        }
+        let observation = CanonicalCallbackObservation {
+            destination: self.page_turn_destination(),
+            view,
+            current_anchor: self.fullscreen_idx,
+            items_generation: self.items_generation,
+            next: self.collect_canonical_demand(ui.ctx(), view, FinalUnitPosition::Next),
+            previous: self.collect_canonical_demand(ui.ctx(), view, FinalUnitPosition::Previous),
+        };
+        self.observe_canonical_callback(observation);
     }
 
     /// Replay uses the owning callback's view, never ROOT's ambient ppp. A resize
@@ -223,8 +264,34 @@ impl App {
         if !self.canonical_native_demand_was_observed(demand) {
             return false;
         }
-        self.collect_next_canonical_demand(ctx, demand.view)
+        self.collect_canonical_demand(ctx, demand.view, demand.position)
             .is_ok_and(|current| current == *demand)
+    }
+
+    pub(crate) fn refresh_canonical_callback_demand(
+        &self,
+        ctx: &egui::Context,
+        observation: &CanonicalCallbackObservation,
+        position: FinalUnitPosition,
+    ) -> Result<CanonicalUnitDemand, CanonicalDemandUnavailable> {
+        if observation.destination != self.page_turn_destination()
+            || observation.current_anchor != self.fullscreen_idx
+            || observation.items_generation != self.items_generation
+            || !self.canonical_callback_was_observed(observation)
+        {
+            return Err(CanonicalDemandUnavailable::Ineligible);
+        }
+        self.collect_canonical_demand(ctx, observation.view, position)
+    }
+
+    pub(crate) fn canonical_observation_matches_demand(
+        observation: &CanonicalCallbackObservation,
+        demand: &CanonicalUnitDemand,
+    ) -> bool {
+        observation.destination == demand.destination
+            && observation.view == demand.view
+            && observation.current_anchor == Some(demand.current_anchor)
+            && observation.items_generation == demand.items_generation
     }
 
     pub(crate) fn canonical_demand_resource_if_current(
@@ -308,16 +375,19 @@ impl App {
             .ok_or(CanonicalDemandUnavailable::AutoTrim)
     }
 
-    fn collect_next_canonical_demand(
+    fn collect_canonical_demand(
         &self,
         ctx: &egui::Context,
         view: CanonicalViewInputs,
+        position: FinalUnitPosition,
     ) -> Result<CanonicalUnitDemand, CanonicalDemandUnavailable> {
         #[cfg(test)]
         let _resident_only = ResidentCollectionGuard::enter();
         use CanonicalDemandUnavailable as Missing;
         let anchor = self.fullscreen_idx.ok_or(Missing::Ineligible)?;
-        if self.remote_session_blocks_local_control()
+        if !self.settings.page_turn_animation_enabled
+            || (position == FinalUnitPosition::Previous && self.slideshow_playing)
+            || self.remote_session_blocks_local_control()
             || !self.page_turn_current_unit_presented()
             || !self.page_turn_view_eligible(anchor)
             || self.spread_mode.is_split()
@@ -334,9 +404,14 @@ impl App {
             return Err(Missing::Ineligible);
         }
         let composition = self
-            .resident_final_unit_composition_from_snapshot(anchor, FinalUnitPosition::Next)
+            .resident_final_unit_composition_from_snapshot(anchor, position)
             .ok_or(Missing::Topology)?
             .ok_or(Missing::Boundary)?;
+        if position == FinalUnitPosition::Previous
+            && self.previous_final_prepare_occurrences(anchor).is_none()
+        {
+            return Err(Missing::OutsideBackwardKeep);
+        }
         let occurrences = composition.pages_in_screen_order(self.spread_mode);
         if occurrences.is_empty()
             || occurrences
@@ -616,6 +691,7 @@ impl App {
             })
             .collect::<Result<Vec<_>, Missing>>()?;
         Ok(CanonicalUnitDemand {
+            position,
             destination: self.page_turn_destination(),
             pages,
             view,

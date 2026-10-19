@@ -111,6 +111,72 @@ class PageTurnD3Tests(unittest.TestCase):
         self.assertEqual(report["status"], "reference")
         self.assertEqual(report["delivery"]["status"], "CannotJudge")
 
+    def test_back_direction_uses_resolved_flag_or_legacy_unit_never_physical_key(self):
+        report = analyze_page_turn_d3([
+            animation(1, "opportunity", resolved_forward=False, key="Right"),
+            animation(2, "opportunity", operation="two", unit={"incoming": {"forward": True}}),
+            animation(3, "opportunity", operation="three", key="Left"),
+        ])
+        self.assertEqual([row["direction"] for row in report["operations"]], ["backward", "forward", "unknown"])
+
+    def test_back_positions_pressure_blockers_and_exact_preparation_correlation(self):
+        def event(t, stage, **fields):
+            return dict(t=t, cat="fs", kind="final_prepare_"+stage, **fields)
+        rows = [event(1, "cpu_ready", request_id=7, requested_position="previous"),
+                event(2, "registered", request_id=7, demand_position="current", requested_position="previous", renderer=2, texture="Managed(1)"),
+                dict(t=3, cat="gpu", kind="texture_delivery_submitted", renderer=99, texture="Managed(1)"),
+                dict(t=4, cat="gpu", kind="texture_delivery_submitted", renderer=2, texture="Managed(1)"),
+                event(5, "native_submitted", renderer=2, source_texture_id="Managed(1)", native_key="key", demand_position="previous", requested_position="previous"),
+                event(6, "native_lookup", renderer=2, native_key="key", outcome="hit"),
+                event(7, "gpu_deferred", demand_position="previous", reason="next_unknown", blocker_context=42, blocker_reason="rotation_unavailable"),
+                event(8, "gpu_deferred", demand_position="previous", reason="cache_source_replacement"),
+                event(9, "cpu_pressure", demand_position="previous", request_id=8, reason="cancelled_for_next", location="computing"),
+                event(9.1, "worker_finished", request_id=8, requested_position="previous")]
+        report = analyze_page_turn_d3(rows)
+        self.assertEqual(report["events_by_demand_position"]["current"]["registered"], 1)
+        self.assertEqual(report["events_by_requested_position"]["previous"]["registered"], 1)
+        self.assertEqual(report["events_by_demand_position"]["unknown"]["cpu_ready"], 1)
+        self.assertEqual(report["previous_blockers"], [dict(context="42", reason="rotation_unavailable", count=1)])
+        chain = report["preparation_chains"][0]
+        self.assertEqual(len(chain["cpu_ready"]), 1)
+        self.assertEqual(len(chain["delivery"]), 1)
+        self.assertEqual(chain["delivery"][0]["renderer"], 2)
+        self.assertEqual(len(chain["native"]), 1)
+        self.assertEqual(len(chain["lookup"]), 1)
+        self.assertAlmostEqual(report["cancel_to_finish"][0]["cancel_to_finish_ms"], 100)
+        self.assertEqual(report["operations"], [])
+        self.assertEqual(report["status"], "reference")
+
+    def test_resource_correlation_infers_only_unique_requested_position(self):
+        for stage, submitted_kind, texture_field in (
+                ("native_lookup", "final_prepare_native_submitted", "native_key"),
+                ("texture_delivery_submitted", "final_prepare_registered", "texture")):
+            for origins, expected in (
+                    (["previous"], "previous"),
+                    (["previous", "previous"], "previous"),
+                    (["previous", "next"], "unknown"),
+                    (["previous", "unknown"], "unknown")):
+                for explicit_demand in (None, "current"):
+                    with self.subTest(stage=stage, origins=origins, demand=explicit_demand):
+                        rows = [dict(t=i, cat="fs", kind=submitted_kind, renderer=2,
+                                     **{texture_field: "exact"},
+                                     demand_position="previous" if i == 0 else "current",
+                                     requested_position=origin)
+                                for i, origin in enumerate(origins)]
+                        observation = dict(t=10, cat="fs" if stage == "native_lookup" else "gpu",
+                                           kind="final_prepare_native_lookup" if stage == "native_lookup"
+                                           else stage, renderer=2, **{texture_field: "exact"})
+                        if explicit_demand is not None:
+                            observation["demand_position"] = explicit_demand
+                        report = analyze_page_turn_d3(rows + [observation])
+                        self.assertEqual(report["events_by_demand_position"]
+                                         [explicit_demand or "unknown"][stage], 1)
+                        self.assertEqual(report["events_by_requested_position"][expected][stage], 1)
+                        # Explicit event evidence always takes precedence over origin.
+                        observation["requested_position"] = "next"
+                        report = analyze_page_turn_d3(rows + [observation])
+                        self.assertEqual(report["events_by_requested_position"]["next"][stage], 1)
+
     def test_bad_identity_time_and_absent_stages_do_not_create_success(self):
         report = analyze_page_turn_d3([animation(float("nan"), "opportunity"),
                                        animation(1, "frame", context=None)])

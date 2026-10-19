@@ -6112,3 +6112,76 @@ parked 結果保持の既存 fixture を拡張し、enum 名だけで「計算�
 - 独立レビュー (SID `01a15462`、xhigh) は改訂 1 (`c6d7f183b`) を **ACCEPT**。前回の P2 (parked の結果予約) と P3 (Native の除去ゼロ) は設計上解消し、新規指摘なし。
 - detached に触れる範囲が「症状パッチではなく構造的修正」であることに、設計担当 (ClaudeCode) と独立レビュー担当の双方が合意 (改訂後も維持)。完成差分での確認と `docs/detached-rework-plan.md` §11 への記録は実装 chunk で行う。
 - 次: 1 chunk・3 checkpoint で実装 (Codex)。
+
+#### 27.17.21 戻る方向の先回り準備 実装記録（2026-10-19、実装済・実機未確認）
+
+正本は§27.17.20と§27.17.20.12改訂1、事前再レビューは§27.17.20.13。
+`pageturn-back` / `b257c4de2`からの未コミット差分。Codexが実装し、commitはClaudeCodeが担当する。
+製品・portable smokeは起動していない。中間の独立sourceレビューはcheckpoint1/2の確定P1〜P3指摘なし。
+完成レビュー・自動検証のコマンド、件数、終了コード、途中失敗と修正、一時変異のSHA-256復元証拠は
+`target/back-handoff.md`、`target/back-*.json`/`.log`、全libの`target/test-lib-full/`台帳/JUnitを正本とする。
+生成物はGit管理外。検証途中の結果を最終成功として扱わない。
+
+完成sourceの独立レビューはACCEPT（2026-10-20、解析器診断の追認も完了、残存P1〜P3なし）。
+最終自動検証はfocused404、全lib13,796（59skip）、snapshot186、Python解析器114が成功。
+fmt/check通常・test-script/glyph検査、`build-dev.ps1 -TestScript -PreserveRuntime`も終了0。
+全libの初回1失敗と同条件再実行成功、native依存の並列build失敗と単一job再実行成功は引継ぎへ区別して記録した。
+release実行ファイル3本不在のためtest-fullは未実施。実機・計測script・正式性能gateは未実行のままである。
+
+| checkpoint | 実装の境界 |
+| --- | --- |
+| 1 | `FinalUnitPosition::resolve`、CPU/resident両composition resolverのCurrent/Next/Previous。Previousはchecked_sub、両端はBoundary、証拠不明はNone。`previous_final_prepare_occurrences`が既存後方keepへのoccurrence全体の包含を照合。`CanonicalCallbackObservation`は最新route/viewと両位置の成功/失敗を一体で置換する |
+| 2 | `finalize_speculative_gpu_output`で全live Next final→Next Native→全Next再照合→全成立時だけPrevious final→Previous Native→不足resident CPU jobを最大1件開始。`NextPreparationState`は呼出内のBoundary/Satisfied/Pending/Unknownで、永続ready latchはない。Next CPUの通常producer位置は維持 |
+| 2・予約 | `FinalPrepareCpuBudget::try_start`をtyped denialへ分け、実行中でも予約不足を優先識別。Nextの実resident plan/bytes確定後だけ最大2 unitのmetadata snapshotからownerを特定。mutex外で`with_viewer_context_ref`→`with_viewer_context_state`によりparkedも訪問。PreviousのCpuReady/未受信channelを破棄し、一時値までdrop後に元Next/keyを再照合して一度だけ再試行 |
+| 2・保護 | Current/Nextのunitだけでなくexact素材を共有するoccurrence、DisplayPrepared、legacy、Unknownを保護。held/receipt/presentation/batchと登録済cacheは触らない。Empty receiverは実計算中として保持。高優先化のlive取消でもpermit/worker側予約は実終了までRAII保持。park単独では取消しない |
+| 2・Native | `prewarm_no_removal_admission`がsmoothing clear、同source旧texture/generation、系列2 target、全体64件、拡大pixels合計を純粋照合。PreviousだけNoRemoval policyを渡し実行入口でも再検査。claim/同期/use clock/retain/allocationより前に拒否。通常draw/Nextのpruningは維持 |
+| 3 | perfの位置・request_id・CPU lifecycle/pressure・兄弟blocker・Native拒否理由、`analyze_perf.py page-turn-d3`、後退script/overlay、回帰と一時変異、関連文書 |
+
+**コード上の前提確認と実装判断:** BudgetState.unitsの上限は2 unit、Computingが未受信完成結果を含むこと、
+既存with_stateが元mountへ戻すこと、Nativeに容量pruning前のsmoothing/旧source除去があることを確認した。
+Previous keepの照合では既存source/AIのback+1が必ず直前image unitを丸ごと加える規則を利用し、
+installed索引で解決したcompositionに全occurrenceが含まれることを証明する。keep-set全体の再構築や全頁走査は追加しない。
+非画像の直前unitを遠方画像で代用せず、slideshow/連結/Split/OFF/Remote等の開始範囲は維持する。
+設計に反する仕様変更はしていない。hookからの開始はresident pixels/既存planによるPreviousだけの限定拡張で、
+通常UI・入力・permission・decode/materialization・DB/font読取へ再入しない。
+
+**観測:** 既存eventを拡張する。CPUの`cpu_started`/`cpu_ready`/`worker_finished`、登録、Native提出、保留に
+`demand_position`/`requested_position`を付ける。workerは現在役割を観測できないのでdemandはunknown。
+`request_id`は診断専用でunit identity/採用判定には使わない。`cpu_pressure`は要求元と訪問owner、保持場所、
+保護/回収/実計算中/一度の再試行、予約bytes前後を記録する。兄弟保留は`blocker_context`/`blocker_reason`、
+Native除去回避は`cache_smoothing_clear`/`cache_source_replacement`/`cache_capacity`を分ける。
+解析器は実解決方向を使い、旧ログはunknown、operationへの時刻近接帰属はしない。他解析モードは変更しない。
+renderer/exact keyやTextureIdの一致で補完できるのは一意な準備起点のrequested_positionだけとし、
+lookup/配送時のdemand_position欠落はunknownのままとする。Previous準備が到着時にCurrentへ変わるため、
+資源の一致からイベント時の役割は推定しない。準備起点が複数位置ならrequested_positionもunknownとする。
+
+**計測支援:** [back-measurement.md](../scripts/page-turn/back-measurement.md)にscript/overlayと実行手順を記録。
+一覧途中open、本体/F12即時/F12 2500ms、反転と二context、OFF、Boundary/wrap、前進八条件を別profileで採る。
+未実行であり、F12直後の無条件改善・2500ms内の準備完了・正式性能gate達成は主張しない。
+
+**回帰の接続:** §27.17.20.10と改訂1の追加表を、既存D3/D2/D4回帰と次の追加回帰で検査する。
+
+| 対象 | 主な追加回帰（関数名の接頭辞`back_`） |
+| --- | --- |
+| Previous解決・keep・両端・Unknown・全頁走査なし | `resolvers_agree_on_previous_ordinal_keep_and_boundary_without_scans`（Single/LTR/RTL/表紙） |
+| 最新callbackで両位置を保持 | `callback_retains_next_when_previous_material_is_missing_and_replaces_latest_view` |
+| 全Next段階優先・兄弟の訪問順反転・Unknown | `next_native_pending_and_unknown_block_previous_cpu_and_registration`、`all_live_next_precede_previous_in_both_route_orders_and_unknown_sibling` |
+| resident Previous CPU→登録・反転・OFF | `root_waits_for_next_native_then_starts_and_registers_previous_resident_job`、`previous_ready_is_taken_by_display_on_direction_reversal_without_slot`、`early_service_discards_previous_after_animation_off` |
+| parked A/B→C・CpuReady/channel/混在・legacy保護・mount/held不変 | `next_pressure_reclaims_two_parked_ready_channel_and_mixed_without_resume` |
+| bytes圧力・要求単独上限超過 | `real_next_bytes_pressure_reclaims_parked_result_but_oversize_does_not` |
+| Current/Next/DisplayPrepared/Unknown・Empty worker・共有補助表紙 | `pressure_protects_parked_current_next_display_and_real_computing`、`pressure_protects_previous_unit_material_shared_with_current_cover` |
+| ROOTでの高優先取消・実permit保持・Unknownなら取消しない | `root_next_pending_cancels_previous_computing_without_releasing_real_permit` |
+| 兄弟Unknown/Pending混在の両訪問順・取消後の実permit保持 | `mixed_unknown_pending_siblings_cancel_previous_in_both_visit_orders` |
+| Native純粋判定と入口再検査・通常除去維持・空cache同期可 | `native_no_removal_covers_all_invalidation_and_pruning_rules_purely`、`native_execution_rechecks_no_removal_before_backing_claim_or_mutation` |
+| Previous ROI/keyと通常draw、実後退offer/Single/Pair/D2 | `previous_native_matches_real_single_arrival_and_pair_draw_roi_keys`、`root_native_reaches_real_backward_single_pair_offer_and_d2_handoff` |
+| 上限のtyped拒否・計測script構文 | `cpu_denial_distinguishes_reservation_before_busy_and_oversized`、`measurement_scripts_parse_without_running_any_ui` |
+| 解析器の資源相関・反転後の需要役割・曖昧な準備起点 | `test_resource_correlation_infers_only_unique_requested_position`（lookup/配送の両方） |
+
+既存のview変更・Remote・対象外・Pair片頁・park/F12/fork・discard retry・演出排他・wrap・held/canonical/flat-first回帰もfocused/全libで継続検査する。
+一時変異は指定10種類にNative実行入口の再検査省略と先頭診断blockerによる取消判定を加えた12種類を個別に注入し、対応回帰の失敗と元bytes/SHA-256一致を記録する。
+最早期skip等で実解決方向が記録されなかった操作は解析上unknownのままとし、物理キーから埋めない。
+
+**完成前の優先判定修正（2026-10-20）:** 最初の実装では診断用に選んだ先頭blockerのreasonで取消も決めていた。
+`[A Unknown, B Pending]`の訪問順ではBの確定したNext不足を見落とすため、実装担当と独立reviewer双方で修正が必要と確認した。
+取消は同じ呼出内の全statesから`any(Pending)`で都度導出し、診断用blockerと分離した。永続boolは追加せず、
+既存の取消helper・保護対象・実終了までのpermit/worker予約保持を維持する。設計変更ではなく§27.17.20.5への実装整合である。

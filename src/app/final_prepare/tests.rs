@@ -42,13 +42,13 @@ pub(crate) fn worker_checkpoint(cancel: &AtomicBool) {
     }
 }
 
-struct WorkerHold {
+pub(crate) struct WorkerHold {
     _gate: Arc<StageGate>,
     entered: mpsc::Receiver<()>,
     resume: mpsc::Sender<()>,
 }
 impl WorkerHold {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (entered_tx, entered) = mpsc::sync_channel(1);
         let (resume, resume_rx) = mpsc::channel();
         let gate = Arc::new(StageGate {
@@ -62,12 +62,12 @@ impl WorkerHold {
             resume,
         }
     }
-    fn entered(&self) {
+    pub(crate) fn entered(&self) {
         self.entered
             .recv_timeout(Duration::from_secs(10))
             .expect("worker paused after tone");
     }
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         let _ = self.resume.send(());
     }
 }
@@ -654,4 +654,22 @@ fn d3_2_upload_preserves_arc_within_limit_and_triangle_pixels_above_it() {
     let actual = final_upload_pixels(&pixels);
     assert!(!Arc::ptr_eq(&pixels, &actual));
     assert_eq!(*actual, expected);
+}
+
+#[test]
+fn back_measurement_scripts_parse_without_running_any_ui() {
+    let mut engine = rhai::Engine::new();
+    engine.set_max_expr_depths(64, 64);
+    for script in [
+        include_str!("../../../scripts/page-turn/back-main.rhai"),
+        include_str!("../../../scripts/page-turn/back-f12-immediate.rhai"),
+        include_str!("../../../scripts/page-turn/back-f12-idle.rhai"),
+        include_str!("../../../scripts/page-turn/back-two-context-reversal.rhai"),
+        include_str!("../../../scripts/page-turn/back-boundary-wrap.rhai"),
+        include_str!("../../../scripts/page-turn/back-forward-control.rhai"),
+    ] {
+        engine
+            .compile(script)
+            .expect("Rhai syntax only; never execute the measurement");
+    }
 }
