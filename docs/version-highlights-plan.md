@@ -82,6 +82,10 @@
   の間は保留する。表示中だけ Esc / × / 閉じるを検出する。
   閉じるEscは消費し、同じpassで次に表示されるネットワーク通知へ渡さない。
 - `startup_notice_viewer_open` が通知用の単一述語。detached の開閉・表示先・input routing は変えない。
+  `fullscreen_idx` が空でも、既存の `fs_nav_deferred_reopen_wait_active()` が所有する
+  PDF/ZIP 列挙、製本の projection/提示許可、アーカイブ変換、sidecar 復元の reopen 待ちは
+  ビューア継続として扱う。detached は既存の生存要求と退避済み context/窓も読む。
+  viewport の表示済みフラグ単独は閉じた後の cleanup まで残るので、保留条件にしない。
   マウス操作の移行案内と初回設定も main だけに描き共通モーダルに入る同型なので、
   それぞれの visible helper で同じ保留条件を使う。ネットワーク data_dir 通知にも適用し、
   先行の設定・移行・重要な変更点の要求が完了するまで待つ順序を維持する。

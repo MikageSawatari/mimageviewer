@@ -22908,12 +22908,18 @@ impl App {
     /// Startup notices live only on main. Read existing viewer ownership each time, including
     /// the active detached context parked off App and the other still/media windows. This does
     /// not change detached lifecycle, presentation, or main-window input ownership.
+    /// An empty index can be an internal reopen gap: use the existing navigation and detached
+    /// lifetime owners, not fs_viewport_shown (which can outlive a close and is false for embedded
+    /// holdovers).
     pub(crate) fn startup_notice_viewer_open(&self) -> bool {
         #[cfg(windows)]
-        if self.active_detached_context_is_at_rest() || !self.detached_image_windows.is_empty() {
+        if self.active_detached_context_is_at_rest()
+            || self.detached_active_window_alive_wanted()
+            || !self.detached_image_windows.is_empty()
+        {
             return true;
         }
-        self.fullscreen_idx.is_some()
+        self.fullscreen_idx.is_some() || self.fs_nav_deferred_reopen_wait_active()
     }
 
     pub(crate) fn mouse_nav_migration_prompt_visible(&self) -> bool {

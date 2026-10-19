@@ -27,6 +27,114 @@ fn escape_input() -> egui::RawInput {
     }
 }
 
+fn deferred_navigation_reopen() -> DeferredFsReopen {
+    DeferredFsReopen {
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: false,
+        from_explicit_open: false,
+        preserve_after_password_prompt: false,
+    }
+}
+
+fn assert_startup_notices_deferred(app: &mut App) {
+    assert!(!app.whats_new_visible());
+    assert!(!app.common_modal_dialog_open());
+    assert!(!app.any_modal_dialog_open_for_fullscreen_keys());
+    let ctx = egui::Context::default();
+    ctx.begin_pass(escape_input());
+    app.show_whats_new_dialog(&ctx);
+    assert!(app.dialog_escape_pressed(&ctx));
+    let output = ctx.end_pass();
+    assert!(output.shapes.is_empty());
+    output.drop_without_applying_deltas();
+    assert!(app.show_whats_new);
+    assert_eq!(
+        app.settings.whats_new_acknowledged_version.as_deref(),
+        Some("3.9.0")
+    );
+
+    // The same owner also defers the following network notice and the other
+    // main-only startup prompts, even if What's New is not requested.
+    app.show_whats_new = false;
+    app.network_data_dir_notice = Some(PathBuf::from(r"\\server\share\data"));
+    assert!(!app.network_data_dir_notice_visible());
+    assert!(!app.common_modal_dialog_open());
+    app.network_data_dir_notice = None;
+    app.show_mouse_nav_migration_prompt = true;
+    assert!(!app.mouse_nav_migration_prompt_visible());
+    assert!(!app.common_modal_dialog_open());
+    app.show_mouse_nav_migration_prompt = false;
+    app.settings.first_setup_completed = false;
+    assert!(!app.first_setup_visible());
+    assert!(!app.common_modal_dialog_open());
+    app.settings.first_setup_completed = true;
+    app.show_whats_new = true;
+}
+
+#[test]
+fn startup_notices_defer_through_enumeration_reopen_and_show_after_cancel() {
+    let mut app = setup_app();
+    request_whats_new(&mut app);
+    app.items = vec![GridItem::Image(PathBuf::from("notice-test.jpg"))];
+    for presentation in [
+        ViewerPresentation::Fullscreen,
+        ViewerPresentation::MainWindow,
+        ViewerPresentation::DetachedWindow,
+    ] {
+        app.viewer_presentation = presentation;
+        // Both PDF and ZIP navigation transfer the reopen to this owner while
+        // the index is absent. Embedded mode retains its main surface instead
+        // of an OS viewport, so fs_viewport_shown is deliberately false there.
+        app.fs_viewport_shown = presentation != ViewerPresentation::MainWindow;
+        #[cfg(windows)]
+        {
+            app.native_video_in_window_active = presentation == ViewerPresentation::MainWindow;
+        }
+        app.fullscreen_idx = None;
+        app.fs_nav_after_pdf_enumerate = Some(deferred_navigation_reopen());
+        assert_startup_notices_deferred(&mut app);
+
+        // Enumeration completes and the viewer adopts a page: the notice must
+        // stay deferred after the old pending owner is consumed.
+        app.fs_nav_after_pdf_enumerate = None;
+        app.fullscreen_idx = Some(0);
+        assert_startup_notices_deferred(&mut app);
+
+        // Another navigation is cancelled by the real waiting-surface close
+        // boundary. Viewport cleanup may still be pending; it is not a viewer.
+        app.fullscreen_idx = None;
+        app.fs_nav_after_pdf_enumerate = Some(deferred_navigation_reopen());
+        app.finish_fullscreen_navigation_for_true_close();
+        assert!(app.fs_nav_after_pdf_enumerate.is_none());
+        assert!(app.whats_new_visible(), "{presentation:?}");
+        assert_eq!(app.modal_dialog_block_reason(), Some("whats_new"));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn startup_notices_defer_during_mounted_detached_preparation_without_an_index() {
+    let mut app = setup_app();
+    request_whats_new(&mut app);
+    app.build_active_context_for_test(Some(1234), DetachedSource::Image, |owner| {
+        owner.fullscreen_idx = None;
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+    });
+    assert!(!app.whats_new_visible());
+    app.with_active_viewer_context(|owner| {
+        assert!(!owner.active_detached_context_is_at_rest());
+        assert!(owner.detached_active_window_alive_wanted());
+        assert!(owner.active_detached_transition_outstanding());
+        assert!(!owner.fs_nav_deferred_reopen_wait_active());
+        assert_startup_notices_deferred(owner);
+    })
+    .expect("preparing detached context must mount");
+    app.remove_active_context_for_test();
+    assert!(app.whats_new_visible());
+}
+
 #[test]
 fn startup_notices_defer_drawing_modal_and_escape_in_every_viewer_mode() {
     let mut app = setup_app();

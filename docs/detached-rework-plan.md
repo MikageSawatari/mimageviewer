@@ -1455,6 +1455,37 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-20 §1.232: 起動通知の保留と内部遷移中のビューア所有
+
+- 対象は `App::startup_notice_viewer_open` と通知側の visible / modal 判定。
+  main の `fullscreen_idx` だけでなく、既存の deferred reopen owner、active detached の
+  生存要求、App 外に退避中の active context、他の still/media 窓を読み取る。
+  重要な変更点・ネットワーク data_dir 通知・マウス操作の移行案内・初回設定で同じ述語を使う。
+- `fullscreen_idx == None` は内部 close→reopen でも発生し、閲覧終了を意味しない。
+  毎回既存所有者を読むことで、保留中は描画とモーダル入力停止の両方を無効にし、
+  真の取消・終了で所有が終われば通知を表示する。新しい bool / latch / 遅延 / repaint は加えない。
+  `fs_viewport_shown` 単独では、閉じた後の cleanup フレームも閲覧中と誤認するため使用しない。
+- 同型の継続経路は以下。通常の folder scan / staged Smart・履歴の準備は旧ページを
+  採用まで保持する経路もあり、index が残る場合は従来の `fullscreen_idx` 判定で保留する。
+
+  | index が空になる継続・退避経路 | 読み取る既存所有状態 |
+  | --- | --- |
+  | PDF/ZIP（EPUB の PDF 化後も含む）の列挙後 reopen、明示 leaf / snapshot からの再開 | `fs_nav_after_pdf_enumerate` |
+  | 製本 projection 完了・提示許可後の deferred open | `book_deferred_open_wait_active()` |
+  | 確認なし変換・直接読取り後の reopen | `archive_convert_deferred_fullscreen_active()` |
+  | 採用済み navigation の sidecar hydration 後 reopen | `sidecar_restore_navigation_fullscreen_wait_active()` |
+  | navigation holdover に属する従来の exact-page sidecar 復元待ち | `fs_nav_deferred_reopen_wait_active()` 内の context / generation / exact target 照合 |
+  | active detached の初回準備・scan / 分類 / 履歴 / 変換 / 列挙 / password / bookmark 待ち | `detached_active_window_alive_wanted()`（既存 session / runtime の生存要求） |
+  | active context の App 外への退避、別の still/media 窓への park / promote | `active_detached_context_is_at_rest()` / `detached_image_windows` |
+
+- 変更しない経路: detached の open / switch / close / cancel、context の mount / park / promote、
+  viewport の生成・維持・破棄、placement、HWND / focus / z-order、既存入力 routing。
+  通知の非表示時に入力を止めないという所有境界の修正であり、detached の症状を
+  guard / delay で抑える変更ではない。
+- 合意: ClaudeCode と独立レビュー Codex（2026-10-19/20）は、既存 detached 所有状態を読む
+  この通知述語の変更を「開閉・viewport 遷移を変える症状パッチではない」と判断・合意済み。
+  P2 は内部遷移中の判定漏れ、P3 は本節への記録漏れとして指摘され、今回それぞれを補う。
+
 ### 2026-10-18 §1.395: 全viewportのsurface窓寸法制約
 
 設計担当ClaudeCodeと独立設計レビュー（GPT-6.1 Sol / xhigh）の合意済み指示を受け、
