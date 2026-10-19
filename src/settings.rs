@@ -2817,6 +2817,28 @@ impl TextContrast {
     }
 }
 
+/// 通常の一時通知の表示時間。旧設定の項目欠落は Standard に移行する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDuration {
+    Short,
+    #[default]
+    Standard,
+    Long,
+    #[serde(other)]
+    Unknown,
+}
+
+impl NotificationDuration {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "短い",
+            Self::Long => "長い",
+            Self::Standard | Self::Unknown => "標準",
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // UiFontSettings (v2.7.0 UI フォント)
 // -----------------------------------------------------------------------
@@ -5371,6 +5393,10 @@ pub struct Settings {
     #[serde(default)]
     pub text_contrast: TextContrast,
 
+    /// 一時通知の全体設定。警告・エラーは短い設定でも標準時間を確保する。
+    #[serde(default)]
+    pub notification_duration: NotificationDuration,
+
     /// OS DPI とは独立したアプリ内 UI 表示倍率 (50%..=200%、10% 刻み)。
     #[serde(default = "default_ui_scale_factor")]
     pub ui_scale_factor: f32,
@@ -7780,6 +7806,7 @@ impl Default for Settings {
             ui_theme: UiTheme::default(),
             preferences_restore_position: true,
             text_contrast: TextContrast::default(),
+            notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),
             ui_font: UiFontSettings::default(),
             first_setup_completed: false,
@@ -9874,6 +9901,9 @@ impl Settings {
         self.restore_toolbar_name_filter_after_load();
         self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
         self.text_contrast = self.text_contrast.normalized();
+        if self.notification_duration == NotificationDuration::Unknown {
+            self.notification_duration = NotificationDuration::Standard;
+        }
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
         self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
@@ -10688,6 +10718,60 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_duration_defaults_and_sqlite_roundtrip() {
+        assert_eq!(
+            Settings::default().notification_duration,
+            NotificationDuration::Standard
+        );
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            missing.notification_duration,
+            NotificationDuration::Standard
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        for value in [
+            NotificationDuration::Short,
+            NotificationDuration::Standard,
+            NotificationDuration::Long,
+        ] {
+            let mut settings = Settings::default();
+            settings.notification_duration = value;
+            settings.grid_cols = 9;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().notification_duration,
+                value
+            );
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'notification_duration'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+        assert_eq!(
+            loaded.grid_cols, 9,
+            "old settings survive the additive migration"
+        );
+    }
+
+    #[test]
+    fn notification_duration_unknown_value_is_forward_compatible() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"notification_duration":"future"}"#).unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Unknown);
+        assert_eq!(loaded.notification_duration.label(), "標準");
+        loaded.sanitize();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+    }
+
     #[test]
     fn preferences_restore_position_defaults_on_and_sqlite_roundtrip() {
         assert!(Settings::default().preferences_restore_position);

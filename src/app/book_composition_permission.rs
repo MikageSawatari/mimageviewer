@@ -932,7 +932,7 @@ impl App {
                     BookIdentityPermission::Allowed
                 };
                 if result == BookIdentityPermission::Hidden {
-                    self.show_feedback_toast("本の構成で非表示に設定されています".into());
+                    self.show_feedback_warning("本の構成で非表示に設定されています".into());
                 }
                 (result, Some(permission))
             }
@@ -1059,7 +1059,7 @@ impl App {
                     self.close_fullscreen();
                 }
             }
-            _ => self.show_feedback_toast("開こうとしたページが見つかりません".into()),
+            _ => self.show_feedback_warning("開こうとしたページが見つかりません".into()),
         }
     }
 
@@ -1119,13 +1119,13 @@ impl App {
                 crate::logger::log(format!(
                     "book_composition: unsupported candidate source: {error}"
                 ));
-                self.show_feedback_toast(UNSUPPORTED_COMPOSITION_NOTICE.into());
+                self.show_feedback_warning(UNSUPPORTED_COMPOSITION_NOTICE.into());
             }
             CandidatePermissionError::Unavailable(error) => {
                 crate::logger::log(format!(
                     "book_composition: candidate permission unavailable: {error}"
                 ));
-                self.show_feedback_toast("本の構成を確認できませんでした".into());
+                self.show_feedback_warning("本の構成を確認できませんでした".into());
             }
         }
     }
@@ -1481,7 +1481,7 @@ impl App {
         let mut candidates = Vec::with_capacity(demand.len());
         for occurrence in demand {
             let Some(candidate) = self.presentation_candidate(occurrence.item_index) else {
-                self.show_feedback_toast("開こうとしたページが見つかりません".into());
+                self.show_feedback_warning("開こうとしたページが見つかりません".into());
                 self.book_composition_permission.open = OpenPermission::Idle;
                 return;
             };

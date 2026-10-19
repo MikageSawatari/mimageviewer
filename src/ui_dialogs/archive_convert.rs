@@ -1074,7 +1074,7 @@ impl App {
                             owner.request_id,
                             "archive_detached_direct_open_failed",
                         );
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
                         );
                     }
@@ -1179,7 +1179,7 @@ impl App {
                 .and_then(|name| name.to_str())
                 .unwrap_or("ZIP")
                 .to_string();
-            self.show_feedback_toast(format!("ZIP ファイルを作成しました: {output_name}"));
+            self.show_feedback_toast(format!("ZIP を作成: {output_name}"));
             let parent = output.parent().map(std::path::Path::to_path_buf);
             if let Some(parent) = parent
                 && self
@@ -1311,7 +1311,7 @@ impl App {
                                 owner.request_id,
                                 "archive_detached_converted_open_failed",
                             );
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
                             );
                         }

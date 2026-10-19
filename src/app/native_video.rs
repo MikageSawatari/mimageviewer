@@ -2235,7 +2235,7 @@ impl App {
 
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         let Some(slot) = self.settings.video_preset_slots.slots[slot_idx].clone() else {
-            self.show_feedback_toast(format!("[動画スロット{key_label} は空です]"));
+            self.show_feedback_warning(format!("[動画スロット{key_label} は空です]"));
             return;
         };
         self.settings.video_adjustments = slot.adjustments;
@@ -2552,7 +2552,7 @@ impl App {
                     "[native-video] detached host wait timeout: idx={idx} waited_ms={:.1}",
                     requested_at.elapsed().as_secs_f64() * 1000.0
                 ));
-                self.show_feedback_toast(
+                self.show_feedback_error(
                     "別ウィンドウの準備に失敗したため動画を開けませんでした".to_string(),
                 );
                 if let Some(window_id) = parked_live_window_id {
@@ -2643,7 +2643,7 @@ impl App {
                     ],
                 );
             }
-            self.show_feedback_toast("前の動画デコード終了待ちがタイムアウトしました".to_string());
+            self.show_feedback_error("前の動画デコード終了待ちがタイムアウトしました".to_string());
             if let Some(window_id) = parked_live_window_id {
                 self.request_parked_live_media_close_after_poll(
                     window_id,
@@ -3868,7 +3868,7 @@ impl App {
             crate::logger::log(format!(
                 "[native-video] deferred source swap aborted: presenter closed target_idx={target_idx}"
             ));
-            self.show_feedback_toast("動画プレゼンターが閉じられました".to_string());
+            self.show_feedback_warning("動画プレゼンターが閉じられました".to_string());
             if let Some(window_id) = parked_live_window_id {
                 crate::logger::log(format!(
                     "[native-video] parked deferred source swap aborted; closing owner after poll: \
@@ -3932,7 +3932,7 @@ impl App {
                         ],
                     );
                 }
-                self.show_feedback_toast(
+                self.show_feedback_error(
                     "前の動画デコード終了待ちがタイムアウトしました".to_string(),
                 );
                 if let Some(window_id) = parked_live_window_id {
@@ -6483,7 +6483,7 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {
                 if !self.vst3_playback_ui_context_is_main_fullscreen() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
                     );
                     self.mark_native_video_hud_activity(ctx);
@@ -6710,7 +6710,7 @@ impl App {
                     self.settings.save();
                 }
                 if let Some(toast) = toast {
-                    self.show_native_video_overlay_toast(toast, false);
+                    self.show_native_video_overlay_warning(toast, false);
                 }
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -7217,7 +7217,7 @@ impl App {
     /// 設定保存 → effective mode を再計算して player に反映 → トースト → HUD activity 更新。
     pub(crate) fn cycle_native_video_loop_common(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.video_continuous_mode.is_enabled() {
-            self.show_native_video_overlay_toast("連続再生中はループ無効".to_string(), false);
+            self.show_native_video_overlay_warning("連続再生中はループ無効".to_string(), false);
             self.mark_native_video_hud_activity(ctx);
             return;
         }
@@ -9300,6 +9300,7 @@ impl App {
                 info_open: self.fs_info_panel.open,
                 info_locked: self.fs_info_panel.locked,
                 suppression: self.settings.fullscreen_chrome_suppression,
+                notification_duration: self.settings.notification_duration,
             },
             detached,
         }
@@ -11518,7 +11519,19 @@ impl App {
                     crate::video::seek_strip::SeekStripMaterialAvailability::Unavailable(reason);
                 if player.seek_strip_material_availability() != unavailable {
                     player.set_seek_strip_material_availability(unavailable);
-                    player.show_native_overlay_toast(reason.user_notice().to_string(), true, None);
+                    let text = reason.user_notice().to_string();
+                    let seconds = crate::feedback::resolve_duration(
+                        self.settings.notification_duration,
+                        crate::feedback::FeedbackKind::Warning,
+                        &text,
+                        crate::feedback::FeedbackTiming::Seconds(2.5),
+                    );
+                    player.show_native_overlay_toast(
+                        text,
+                        true,
+                        crate::feedback::FeedbackKind::Warning,
+                        Some(std::time::Duration::from_secs_f32(seconds)),
+                    );
                 }
             }
             crate::logger::log(format!(
@@ -11983,7 +11996,12 @@ impl App {
             "video bookmark bulk add: {msg} ({})",
             path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
         ));
-        self.show_native_video_overlay_toast(msg, true);
+        self.show_native_video_feedback(
+            msg,
+            true,
+            crate::feedback::FeedbackKind::result(errors > 0),
+            crate::feedback::FeedbackTiming::Seconds(2.5),
+        );
         self.mark_native_video_hud_activity(ctx);
     }
 
@@ -12008,7 +12026,7 @@ impl App {
         let entries = db.list_marker_meta(&path);
         let count = entries.len();
         if count == 0 {
-            self.show_native_video_overlay_toast(
+            self.show_native_video_overlay_warning(
                 "コピーするブックマークがありません".to_string(),
                 true,
             );
@@ -12065,7 +12083,10 @@ impl App {
             }
             Err(e) => {
                 crate::logger::log(format!("video bookmark clear failed: {e}"));
-                self.show_native_video_overlay_toast(format!("ブックマーク削除に失敗: {e}"), true);
+                self.show_native_video_overlay_warning(
+                    format!("ブックマーク削除に失敗: {e}"),
+                    true,
+                );
             }
         }
         self.mark_native_video_hud_activity(ctx);
@@ -13536,7 +13557,7 @@ impl App {
         // VST owner/HUD 機構は OFF モードのメイン fullscreen 前提。detached / 複数
         // ウィンドウ mode ではチェーン処理だけを共有し、GUI は開かない。
         if !self.vst3_playback_ui_context_is_main_fullscreen() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
             );
             return;
@@ -13547,7 +13568,7 @@ impl App {
                 crate::video::dsp::DspState::Enabled
             )
         {
-            self.show_feedback_toast("VST3 が有効ではありません".to_string());
+            self.show_feedback_warning("VST3 が有効ではありません".to_string());
             return;
         }
         let Some((placement, rect, owner_hwnd)) =
@@ -13617,7 +13638,7 @@ impl App {
                 crate::logger::log(format!("[music-vst] entered VST shell for fs_idx={fs_idx}"));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("VST 画面を開けません: {err}"));
+                self.show_feedback_warning(format!("VST 画面を開けません: {err}"));
                 crate::logger::log(format!("[music-vst] attach failed: {err}"));
             }
         }
@@ -14053,7 +14074,7 @@ impl App {
         if let Some(reason) =
             video_audio_enter_gate_rejection(VideoAudioEnterGate::AudioTrackMissing(no_audio_track))
         {
-            self.show_feedback_toast("この動画には音声トラックがありません".to_string());
+            self.show_feedback_warning("この動画には音声トラックがありません".to_string());
             return VideoAudioEnterOutcome::Rejected(reason);
         }
         // exit で placement 復帰の判定に使う enter 時点の物理ターゲット (placement / rect /
@@ -14071,7 +14092,7 @@ impl App {
                 target_available: entry_target.is_some(),
             })
         {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "別ウィンドウの準備中です。少し待ってからもう一度お試しください".to_string(),
             );
             return VideoAudioEnterOutcome::Rejected(reason);
@@ -14478,7 +14499,7 @@ impl App {
                         crate::logger::log(format!(
                             "[video-audio] fallback exit re-attach failed fs_idx={fs_idx}: {err}"
                         ));
-                        self.show_feedback_toast(format!("動画表示に戻れませんでした: {err}"));
+                        self.show_feedback_warning(format!("動画表示に戻れませんでした: {err}"));
                     }
                 }
             } else {
@@ -14538,7 +14559,7 @@ impl App {
         // VST owner/HUD 機構は OFF モードのメイン fullscreen 前提。detached / 複数
         // ウィンドウ mode ではチェーン処理だけを共有し、GUI は開かない。
         if !self.vst3_playback_ui_context_is_main_fullscreen() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "VST はメインウィンドウのフルスクリーンでのみ使用できます".to_string(),
             );
             return;
@@ -14549,7 +14570,7 @@ impl App {
                 crate::video::dsp::DspState::Enabled
             )
         {
-            self.show_feedback_toast("VST3 が有効ではありません".to_string());
+            self.show_feedback_warning("VST3 が有効ではありません".to_string());
             return;
         }
         // presenter が上がっている (HWND publish 済み) こと。音声モードなら通常 hidden で存在する。
@@ -14754,25 +14775,59 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn show_native_video_overlay_toast(&self, text: String, centered: bool) {
-        self.show_native_video_overlay_toast_with_linger(text, centered, None);
+        self.show_native_video_feedback(
+            text,
+            centered,
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Seconds(if centered { 2.5 } else { 1.8 }),
+        );
     }
 
-    /// `show_native_video_overlay_toast` の linger 指定版。`linger` が `Some` のとき
-    /// その時間だけトーストを表示し続ける。←→ 押しっぱなしの境界トーストのように
-    /// 「キーを離したら早めに消したい」用途で短い値を渡す。`None` なら従来どおり
-    /// `centered` から既定値 (centered: 2.5s / それ以外: 1.8s) が使われる。
     #[cfg(windows)]
-    pub(crate) fn show_native_video_overlay_toast_with_linger(
+    pub(crate) fn show_native_video_overlay_warning(&self, text: String, centered: bool) {
+        self.show_native_video_feedback(
+            text,
+            centered,
+            crate::feedback::FeedbackKind::Warning,
+            crate::feedback::FeedbackTiming::Seconds(if centered { 2.5 } else { 1.8 }),
+        );
+    }
+
+    #[cfg(windows)]
+    fn show_native_video_feedback(
         &self,
         text: String,
         centered: bool,
-        linger: Option<std::time::Duration>,
+        kind: crate::feedback::FeedbackKind,
+        timing: crate::feedback::FeedbackTiming,
+    ) {
+        let seconds = crate::feedback::resolve_duration(
+            self.settings.notification_duration,
+            kind,
+            &text,
+            timing,
+        );
+        self.publish_native_video_overlay_toast(text, centered, seconds);
+    }
+
+    /// Transport only: the caller has already resolved the duration. Never apply policy here.
+    #[cfg(windows)]
+    pub(crate) fn publish_native_video_overlay_toast(
+        &self,
+        text: String,
+        centered: bool,
+        seconds: f32,
     ) {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.show_native_overlay_toast(text, centered, linger);
+            player.show_native_overlay_toast(
+                text,
+                centered,
+                crate::feedback::FeedbackKind::Info,
+                Some(std::time::Duration::from_secs_f32(seconds)),
+            );
         }
     }
 
@@ -14832,10 +14887,11 @@ impl App {
         // ←→ 押しっぱなしの間は repeat ごとに re-show されて表示が維持され、
         // キーを離すと linger 経過 (700ms) で早めに消える。通常トーストの
         // 既定値 (2.5s) のままだとキーを離した後も長く残り続けて煩わしい。
-        self.show_native_video_overlay_toast_with_linger(
+        self.show_native_video_feedback(
             hint.to_string(),
             true,
-            Some(std::time::Duration::from_millis(700)),
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Immediate(0.7),
         );
     }
 
@@ -14890,7 +14946,12 @@ impl App {
             self.settings.fullscreen_boundary_notice_visible,
             hint,
         ) {
-            self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
+            self.show_native_video_feedback(
+                Self::native_boundary_hint_text(hint),
+                true,
+                crate::feedback::FeedbackKind::Info,
+                crate::feedback::FeedbackTiming::Immediate(2.5),
+            );
         }
     }
 

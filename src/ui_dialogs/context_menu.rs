@@ -1701,14 +1701,16 @@ impl crate::app::App {
                 if let Some(paths) = target.shell_paths.as_deref() {
                     invoke_shell_clipboard(self, ctx, paths, verb);
                 } else if target.has_checked {
-                    self.show_feedback_toast(checked_virtual_selection_message("コピー / カット"));
+                    self.show_feedback_warning(checked_virtual_selection_message(
+                        "コピー / カット",
+                    ));
                 } else {
                     let message = target
                         .item
                         .file_operation_refusal()
                         .unwrap_or(crate::grid_item::FileOperationRefusal::VirtualPage)
                         .message("コピー / カット");
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                 }
                 None
             }
@@ -1717,7 +1719,7 @@ impl crate::app::App {
                     && target.checked_file_operation_selection
                         != CheckedFileOperationSelection::RealOnly
                 {
-                    self.show_feedback_toast(checked_virtual_selection_message(
+                    self.show_feedback_warning(checked_virtual_selection_message(
                         "ファイルのパスとしてコピー",
                     ));
                     return None;
@@ -1857,7 +1859,10 @@ impl crate::app::App {
                     .find(|tool| tool.id == id)
                     .cloned()
                 else {
-                    self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
+                    self.show_feedback_warning(format!(
+                        "外部ツールが見つかりません (ID: {})",
+                        id.0
+                    ));
                     return None;
                 };
                 self.queue_external_tool_launch_from_context_menu(
@@ -1883,7 +1888,7 @@ impl crate::app::App {
                         crate::external_tool::ExternalToolLaunch::Association { handler_id },
                         file.to_path_buf(),
                     ),
-                    Err(reason) => self.show_feedback_toast(reason),
+                    Err(reason) => self.show_feedback_warning(reason),
                 }
                 None
             }
@@ -1898,7 +1903,7 @@ impl crate::app::App {
                     && target.checked_file_operation_selection
                         != CheckedFileOperationSelection::RealOnly
                 {
-                    self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                    self.show_feedback_warning(checked_virtual_selection_message("削除"));
                     return None;
                 }
                 if !target.delete_targets.is_empty() {
@@ -1936,11 +1941,11 @@ impl crate::app::App {
                     Some(ContextMenuAction::JumpToFolder(request))
                 }
                 CollectionJumpRequestResolution::NoParent => {
-                    self.show_feedback_toast(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned());
+                    self.show_feedback_warning(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned());
                     None
                 }
                 CollectionJumpRequestResolution::Unavailable(reason) => {
-                    self.show_feedback_toast(reason);
+                    self.show_feedback_warning(reason);
                     None
                 }
             };
@@ -2336,7 +2341,7 @@ impl crate::app::App {
                 return;
             }
             crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(reason) => {
-                self.show_feedback_toast(reason.to_string());
+                self.show_feedback_warning(reason.to_string());
                 return;
             }
             crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot => {}
@@ -2348,7 +2353,7 @@ impl crate::app::App {
             if classify_checked_file_operation_selection(self.checked.len(), targets.len())
                 != CheckedFileOperationSelection::RealOnly
             {
-                self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                self.show_feedback_warning(checked_virtual_selection_message("削除"));
                 return;
             }
             self.request_delete_confirm(targets);
@@ -2361,7 +2366,7 @@ impl crate::app::App {
             };
             let Some(path) = item.drag_source_path().map(|p| p.to_path_buf()) else {
                 if let Some(reason) = item.file_operation_refusal() {
-                    self.show_feedback_toast(reason.message("削除"));
+                    self.show_feedback_warning(reason.message("削除"));
                 }
                 return;
             };
@@ -3260,7 +3265,16 @@ mod delete_confirm_tests {
         let message = checked_virtual_selection_message("削除");
         let chars = message.chars().count();
         assert!(chars >= 50, "文言が想定より短い: {chars} 文字");
-        let secs = crate::ui_fullscreen::feedback_toast_duration(&message);
+        let secs = crate::feedback::feedback_toast_duration(&message);
+        assert_eq!(
+            crate::feedback::resolve_duration(
+                crate::settings::NotificationDuration::Short,
+                crate::feedback::FeedbackKind::Warning,
+                &message,
+                crate::feedback::FeedbackTiming::Text
+            ),
+            secs
+        );
         // 日本語の読字速度 (毎秒 8 文字程度) で読み切れること。
         assert!(
             secs >= 5.0,

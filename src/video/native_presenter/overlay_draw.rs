@@ -3473,12 +3473,7 @@ pub(super) fn draw_native_toast(
     toast: &NativeOverlayToast,
 ) -> Option<egui::Rect> {
     let elapsed = toast.started_at.elapsed().as_secs_f32();
-    let duration = if toast.centered { 2.5 } else { 1.8 };
-    let alpha = if elapsed > duration - 0.35 {
-        ((duration - elapsed) / 0.35).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
+    let alpha = toast.opacity_at(elapsed);
     if alpha <= 0.0 {
         return None;
     }

@@ -921,7 +921,7 @@ impl App {
                     .and_then(snapshot_key_from_grid_item)
                     .is_some()
         }) {
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.normalize_direct_media_basis_for_snapshot();
@@ -936,7 +936,7 @@ impl App {
             .collect();
         if captured_entries.is_empty() {
             // 0 件の snapshot は意味がない (= scope なし)。toast で警告して早期 return。
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.capture_main_list_restore_cursor();
@@ -1838,7 +1838,7 @@ impl App {
         // The classification worker has proved this is not a subsequent RAR volume.
         // This route remains cache-only: a miss never opens a conversion dialog.
         let Some(cached) = self.try_archive_cache_lookup(&path) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)".into(),
             );
             return;
@@ -2036,7 +2036,7 @@ impl App {
                 };
                 let _ = format; // 変換 dialog は snapshot scope 外、cache hit 時のみ自動 open
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                     return false;
@@ -2058,7 +2058,7 @@ impl App {
                 } else {
                     // cache 無し: snapshot 中は変換 dialog を出さず skip (= 次 entry に進む
                     // 想定だが、ユーザーの代表 use case ではないので MVP として false)
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)"
                             .into(),
                     );
@@ -2386,12 +2386,12 @@ impl App {
                 );
             self.snapshot_internal_nav = false;
             if !started {
-                self.show_feedback_toast("画像の場所を開けません".to_string());
+                self.show_feedback_warning("画像の場所を開けません".to_string());
             }
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2439,7 +2439,7 @@ impl App {
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2781,7 +2781,7 @@ impl App {
                 SnapshotTarget::Fs(p) => p.clone(),
                 SnapshotTarget::ConvertibleArchive { path, .. } => {
                     if self.settings.archive_file_handling_ignores_convertible() {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                         );
                         return false;
@@ -2796,7 +2796,7 @@ impl App {
                     if let Some(cached) = self.try_archive_cache_lookup(path) {
                         cached
                     } else {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "変換対応アーカイブは★固定範囲内で開けません".into(),
                         );
                         return false;

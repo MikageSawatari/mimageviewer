@@ -879,3 +879,13 @@ PDFの仮想項目はruntime keyと同じ`page_<u32>`だけを許可し、評価
 5. **ドキュメント同時更新** — [public-wording-policies.md](public-wording-policies.md) の「コード修正時のドキュメント同時更新」セクションに従う
 
 §1.333の最後まで視聴した動画・音声は、Settingsの `video_watched_to_end` 集合とsettings.db同名の追加tableで記録する。既存再生位置表・再開動作は保持し、集合から本体一覧へ満タンを描く。詳細はbook-resume-meter-plan.md §11。
+
+
+### 一時通知の時間ポリシー（§1.402）
+
+`feedback.rs` が情報/警告/エラーの型と表示時間の倍率を所有する。
+App の発行境界で確定した秒数を既存 toast state と native transport へ渡す。
+動画内部の発行元は種類を明示し、既存 NativeChromeSnapshot から選択値を読む。
+設定は既存 settings.db KV の追加項目で、旧項目欠落時は標準へ移行する。
+新しい worker・channel・detached context state は持たない。
+[時間・例外・棚卸しの詳細](notification-duration-policy.md)。

@@ -260,7 +260,7 @@ impl App {
                 self.invalidate_tag_apply_suggestions();
                 self.show_feedback_toast(message);
             }
-            Err(e) => self.show_feedback_toast(format!("タグの改名/統合に失敗: {e}")),
+            Err(e) => self.show_feedback_error(format!("タグの改名/統合に失敗: {e}")),
         }
     }
 }

@@ -1253,7 +1253,7 @@ impl App {
         crate::logger::log(
             "reading position preparation unavailable; display continuation cancelled",
         );
-        self.show_feedback_toast(
+        self.show_feedback_warning(
             "読書位置を準備できませんでした。一覧を再読み込みしてください".into(),
         );
         if self
@@ -1487,7 +1487,7 @@ impl App {
         }
         if self.sidecar_restore.is_some() {
             crate::logger::log("snapshot page index preparation rejected: hydration owner is busy");
-            self.show_feedback_toast("一覧の準備が完了してから固定してください".into());
+            self.show_feedback_warning("一覧の準備が完了してから固定してください".into());
             return;
         }
         let source_path = self.current_folder.clone();
@@ -1563,7 +1563,7 @@ impl App {
 
     fn report_sidecar_restore_flush_failure(&mut self, error: String) {
         crate::logger::log(format!("sidecar restore flush failed: {error}"));
-        self.show_feedback_toast(format!("サイドカーの保存を完了できませんでした: {error}"));
+        self.show_feedback_warning(format!("サイドカーの保存を完了できませんでした: {error}"));
     }
 
     fn sidecar_restore_context_current(&self, common: &Common) -> bool {
@@ -2021,7 +2021,7 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     if matches!(preparing.next, PageIndexContinuation::PrepareOnly(_)) {
                         crate::logger::log("snapshot reading position worker disconnected");
-                        self.show_feedback_toast("読書位置の準備workerが停止しました".into());
+                        self.show_feedback_warning("読書位置の準備workerが停止しました".into());
                         #[cfg(windows)]
                         let had_deferred_fullscreen = state.common.deferred_fullscreen.is_some();
                         state.common.discard_target();
@@ -2041,7 +2041,7 @@ impl App {
                     crate::logger::log(
                         "reading position worker disconnected; display continuation cancelled",
                     );
-                    self.show_feedback_toast(
+                    self.show_feedback_error(
                         "読書位置の準備に失敗しました。一覧を再読み込みしてください".into(),
                     );
                     state.common.discard_target();
@@ -2526,7 +2526,9 @@ impl App {
                 Ok(true) => state.common.book_restore = None,
                 Err(error) => {
                     crate::logger::log(format!("book shift restore failed: {error}"));
-                    self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+                    self.show_feedback_warning(format!(
+                        "見開き調整を復元できませんでした: {error}"
+                    ));
                     state.common.book_restore = None;
                 }
             }
@@ -2548,7 +2550,7 @@ impl App {
         ) {
             if let Some(warning) = state.common.warning.take() {
                 crate::logger::log(format!("snapshot page index preparation: {warning}"));
-                self.show_feedback_toast(warning);
+                self.show_feedback_warning(warning);
             }
             if let Some(deferred) = state.common.deferred_fullscreen.take() {
                 if deferred.matches_item(&self.items) {
@@ -2579,7 +2581,7 @@ impl App {
         debug_assert!(self.install_sidecar_restore_result(None, effects).is_none());
         if let Some(warning) = state.common.warning.take() {
             crate::logger::log(format!("sidecar restore terminal warning: {warning}"));
-            self.show_feedback_toast(format!("サイドカー復元: {warning}"));
+            self.show_feedback_warning(format!("サイドカー復元: {warning}"));
         }
         let deferred = state.common.deferred_fullscreen.take();
         let favorite_failures = std::mem::take(&mut state.common.favorite_failures);

@@ -435,7 +435,7 @@ impl App {
             if self.apply_auto_export_crop_for_idx(fs_idx) {
                 self.show_feedback_toast("[自動クロップ]".to_string());
             } else if self.current_raw_source_pixels(fs_idx).is_some() {
-                self.show_feedback_toast("[余白を検出できません]".to_string());
+                self.show_feedback_warning("[余白を検出できません]".to_string());
             }
         }
         auto_resp.on_hover_text("四辺の単色余白を検出して切り取り範囲に設定します");

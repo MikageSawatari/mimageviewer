@@ -2205,7 +2205,7 @@ impl crate::app::App {
             }
             Err(error) => {
                 crate::logger::log(format!("remote_ipc: shift reset failed: {error}"));
-                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を保存できませんでした: {error}"));
                 write_error(
                     RemoteWriteErrorCode::PersistenceFailed,
                     "見開き調整の解除を保存できませんでした",

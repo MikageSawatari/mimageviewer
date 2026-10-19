@@ -300,7 +300,7 @@ impl App {
             self.last_book_resume = None;
         } else if let Some(surface) = surface {
             crate::logger::log("book-resume clear: writer unavailable");
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "読書位置をクリアできませんでした。再起動してください".into(),
                 surface,
             );
@@ -389,7 +389,7 @@ impl App {
         if let Some(result) = self.book_resume_meters.poll() {
             if let Err(error) = result {
                 crate::logger::log(format!("book-resume meter: {error}"));
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "読書位置のメーターを取得できませんでした。再起動してください".into(),
                 );
             }
@@ -412,6 +412,7 @@ impl App {
                 crate::logger::log(format!("book-resume clear: {error}"));
                 self.reload_book_resume_meters();
             }
+            let kind = crate::feedback::FeedbackKind::result(result.is_err());
             let message = match result {
                 Ok(0) => "保存済みの本の読書位置はありません".into(),
                 Ok(count) => format!("{count} 件の読書位置をクリアしました"),
@@ -426,7 +427,7 @@ impl App {
                 // Use its existing context owner to reach the correct native overlay.
                 if self
                     .with_viewer_context(context, |app| {
-                        app.show_feedback_toast_on(message, surface);
+                        app.show_feedback_result_on(message, surface, kind);
                     })
                     .is_err()
                 {
@@ -436,7 +437,7 @@ impl App {
                     ));
                 }
             } else if self.pref_state.is_none() {
-                self.show_feedback_toast(message);
+                self.show_feedback_result(message, kind);
             }
             ctx.request_repaint();
         }

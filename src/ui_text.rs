@@ -5117,7 +5117,7 @@ impl App {
                         );
                     }
                     None => {
-                        self.show_feedback_toast("画像を読み込めませんでした".to_string());
+                        self.show_feedback_warning("画像を読み込めませんでした".to_string());
                     }
                 }
                 false
@@ -5207,7 +5207,7 @@ impl App {
                 })
             })
         {
-            self.show_feedback_toast("差し替え対象のスタンプが見つかりませんでした".to_string());
+            self.show_feedback_warning("差し替え対象のスタンプが見つかりませんでした".to_string());
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -5234,7 +5234,7 @@ impl App {
                 // 未変更のまま dirty/save するのを避け、注釈を戻して中断する (Codex P2)。
                 let Some(obj) = objs.iter_mut().find(|o| o.id == id) else {
                     self.comic_docs.insert(key.to_string(), objs);
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "差し替え対象のスタンプが見つかりませんでした".to_string(),
                     );
                     return;

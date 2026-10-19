@@ -864,7 +864,7 @@ impl App {
             crate::logger::log(format!(
                 "local-adjust producer superseded by content change: key={key}"
             ));
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "LUT／マスク生成結果を破棄しました。レイヤーが変更されています".to_owned(),
             );
         }
@@ -2209,7 +2209,7 @@ impl ContextAsyncOwner {
             Self::SimilarPreview => {
                 let passwords = app.pdf_passwords.clone();
                 if let Some(notice) = app.similar_panel.preview.poll_background(ctx, &passwords) {
-                    app.show_feedback_toast(notice);
+                    app.show_feedback_warning(notice);
                 }
             }
             Self::FolderNavigation | Self::FolderPaneScan => {}

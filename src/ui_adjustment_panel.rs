@@ -11461,7 +11461,7 @@ impl App {
         // Reject UndoAppend before lending the document, then invalidate only
         // an Applied edit in this same call, before any render/save publication.
         if self.book_append_undo_in_progress() {
-            self.show_feedback_toast("本への追加を取り消しています".to_string());
+            self.show_feedback_warning("本への追加を取り消しています".to_string());
             return false;
         }
         if !self.begin_local_page_edit(fs_idx) {
@@ -11591,7 +11591,7 @@ impl App {
         norm: [f32; 2],
     ) {
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -11599,7 +11599,7 @@ impl App {
         };
         let image_dims = local_adjust_image_dims(self, fs_idx);
         if source.size != [image_dims.0, image_dims.1] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
@@ -11648,7 +11648,7 @@ impl App {
             });
         match outcome {
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
             }
@@ -11657,7 +11657,7 @@ impl App {
                 if let Some(message) = crate::ui_helpers::bucket_shape_fit_failed_message(
                     self.local_adjust_bucket_region,
                 ) {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
             }
             crate::mask_db::BucketFillOutcome::Filled
@@ -12705,7 +12705,7 @@ impl App {
                             && !self.local_adjust_tool_panel_rect(full_rect).contains(pos)
                     });
             if bucket_canvas_click {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                         .to_string(),
                 );
@@ -14420,7 +14420,7 @@ impl App {
                     self.show_feedback_toast(format!("加工パラメータをペースト: {}", kind.label()));
                 }
             } else {
-                self.show_feedback_toast("コピー済みの加工パラメータがありません".to_string());
+                self.show_feedback_warning("コピー済みの加工パラメータがありません".to_string());
             }
         }
         if let Some(layer_idx) = effect_requests.reset_effect
@@ -14492,7 +14492,7 @@ impl App {
             self.local_adjust_selective_color_pick_active = true;
             self.local_adjust_rgb_pick_active = None;
             self.local_adjust_repair_point_pick_active = None;
-            self.show_feedback_toast("画像上の色をクリックして対象色を選択します".to_string());
+            self.show_feedback_warning("画像上の色をクリックして対象色を選択します".to_string());
         }
         if effect_requests.cancel_rgb_pick {
             self.local_adjust_rgb_pick_active = None;
@@ -14510,7 +14510,7 @@ impl App {
             self.local_adjust_repair_point_pick_active = Some(target);
             self.local_adjust_selective_color_pick_active = false;
             self.local_adjust_rgb_pick_active = None;
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "画像上をクリックして{}を指定します",
                 target.label()
             ));
@@ -14533,7 +14533,7 @@ impl App {
 
     fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
         if self.local_adjust_lut_pending.is_some() {
-            self.show_feedback_toast("LUT読み込み中です".to_string());
+            self.show_feedback_warning("LUT読み込み中です".to_string());
             return;
         }
         if !self
@@ -14542,7 +14542,7 @@ impl App {
             .and_then(|layers| layers.get(layer_idx))
             .is_some_and(|layer| matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_)))
         {
-            self.show_feedback_toast("3D LUT レイヤーを選択してください".to_string());
+            self.show_feedback_warning("3D LUT レイヤーを選択してください".to_string());
             return;
         }
         let Some(path) = rfd::FileDialog::new()
@@ -14588,10 +14588,10 @@ impl App {
                     path: path.clone(),
                     rx,
                 });
-                self.show_feedback_toast(format!("LUT読み込み中: {}", path.display()));
+                self.show_feedback_warning(format!("LUT読み込み中: {}", path.display()));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("LUT読み込み worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("LUT読み込み worker 起動失敗: {err}"));
             }
         }
     }
@@ -14612,7 +14612,7 @@ impl App {
                     || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
                         != pending.document
                 {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "LUT読み込み結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
@@ -14623,7 +14623,7 @@ impl App {
                 if !layers.get(pending.layer_idx).is_some_and(|layer| {
                     matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_))
                 }) {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "LUT読み込み結果を破棄しました。対象レイヤーが変更されています".to_string(),
                     );
                     return;
@@ -14644,21 +14644,25 @@ impl App {
                     "補正レイヤーLUT読み込み".to_string(),
                 );
                 self.show_feedback_toast(format!(
-                    "LUT読み込み完了: {name} ({size}^3) / {}",
-                    pending.path.display()
+                    "LUT読み込み: {name} ({size}^3) / {}",
+                    pending
+                        .path
+                        .file_name()
+                        .unwrap_or(pending.path.as_os_str())
+                        .to_string_lossy()
                 ));
                 ctx.request_repaint();
             }
             Ok(Err(err)) => {
                 self.local_adjust_lut_pending = None;
-                self.show_feedback_toast(format!("LUT読み込み失敗: {err}"));
+                self.show_feedback_error(format!("LUT読み込み失敗: {err}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.local_adjust_lut_pending = None;
-                self.show_feedback_toast("LUT読み込み worker が停止しました".to_string());
+                self.show_feedback_warning("LUT読み込み worker が停止しました".to_string());
             }
         }
     }
@@ -14739,7 +14743,7 @@ impl App {
             return;
         }
         if self.local_adjust_segmentation_pending.is_some() {
-            self.show_feedback_toast("マスク生成中です".to_string());
+            self.show_feedback_warning("マスク生成中です".to_string());
             return;
         }
         if !self
@@ -14748,7 +14752,7 @@ impl App {
             .and_then(|layers| layers.get(layer_idx))
             .is_some_and(|layer| matches!(layer.mask, local_adjust_core::LocalMask::Subject(_)))
         {
-            self.show_feedback_toast("被写体マスクのレイヤーを選択してください".to_string());
+            self.show_feedback_warning("被写体マスクのレイヤーを選択してください".to_string());
             return;
         }
         self.ensure_ai_runtime();
@@ -14756,13 +14760,13 @@ impl App {
         // 被写体マットモデル (BiRefNet) は編集用追加パックから供給される。
         // App 構造体に毎フレーム I/O を避けてキャッシュしてあるパスを使う。
         let Some(model_path) = self.subject_matte_path.clone() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "被写体マットモデルが見つかりません (編集用追加ファイル未導入)".to_string(),
             );
             return;
         };
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast("被写体マスク生成用の画像を取得できません".to_string());
+            self.show_feedback_warning("被写体マスク生成用の画像を取得できません".to_string());
             return;
         };
         if !self.admit_book_append_followup_mutation() {
@@ -14811,10 +14815,10 @@ impl App {
                         cancel,
                         rx,
                     });
-                self.show_feedback_toast("被写体マスク生成中...".to_string());
+                self.show_feedback_warning("被写体マスク生成中...".to_string());
             }
             Err(err) => {
-                self.show_feedback_toast(format!("被写体マスク worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("被写体マスク worker 起動失敗: {err}"));
             }
         }
     }
@@ -14826,7 +14830,7 @@ impl App {
         scope: LocalAdjustRegionSegmentationScope,
     ) {
         if self.local_adjust_segmentation_pending.is_some() {
-            self.show_feedback_toast("マスク生成中です".to_string());
+            self.show_feedback_warning("マスク生成中です".to_string());
             return;
         }
         if !self
@@ -14837,11 +14841,11 @@ impl App {
                 matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_))
             })
         {
-            self.show_feedback_toast("領域分割マスクのレイヤーを選択してください".to_string());
+            self.show_feedback_warning("領域分割マスクのレイヤーを選択してください".to_string());
             return;
         }
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
-            self.show_feedback_toast("領域分割用の画像を取得できません".to_string());
+            self.show_feedback_warning("領域分割用の画像を取得できません".to_string());
             return;
         };
         let subject = if scope.requires_subject() {
@@ -14850,7 +14854,7 @@ impl App {
             None
         };
         if scope.requires_subject() && subject.is_none() {
-            self.show_feedback_toast("利用できる被写体マスクがありません".to_string());
+            self.show_feedback_warning("利用できる被写体マスクがありません".to_string());
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -14901,7 +14905,7 @@ impl App {
                 self.show_feedback_toast(scope.pending_label().to_string());
             }
             Err(err) => {
-                self.show_feedback_toast(format!("領域分割 worker 起動失敗: {err}"));
+                self.show_feedback_error(format!("領域分割 worker 起動失敗: {err}"));
             }
         }
     }
@@ -14922,7 +14926,7 @@ impl App {
                     || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
                         != pending.document
                 {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "マスク生成結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
@@ -14931,7 +14935,7 @@ impl App {
                     self.local_page_edit_document_for_producer(&pending.owner, &pending.document);
                 let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
                 let Some(layer) = Arc::make_mut(&mut layers).get_mut(pending.layer_idx) else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "マスク生成結果を破棄しました。対象レイヤーがありません".to_string(),
                     );
                     return;
@@ -14958,7 +14962,7 @@ impl App {
                         format!("領域分割完了: {label_count} 領域")
                     }
                     _ => {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "マスク生成結果を破棄しました。対象レイヤーが変更されています"
                                 .to_string(),
                         );
@@ -14981,14 +14985,14 @@ impl App {
             }
             Ok(Err(err)) => {
                 self.local_adjust_segmentation_pending = None;
-                self.show_feedback_toast(format!("マスク生成失敗: {err}"));
+                self.show_feedback_error(format!("マスク生成失敗: {err}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.local_adjust_segmentation_pending = None;
-                self.show_feedback_toast("マスク生成 worker が停止しました".to_string());
+                self.show_feedback_warning("マスク生成 worker が停止しました".to_string());
             }
         }
     }
@@ -16726,7 +16730,7 @@ impl App {
                         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                         return;
                     }
-                    Err(error) => self.show_feedback_toast(error.message().to_string()),
+                    Err(error) => self.show_feedback_error(error.message().to_string()),
                 }
             }
             if activate_export {

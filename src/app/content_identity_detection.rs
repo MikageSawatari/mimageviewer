@@ -390,7 +390,7 @@ impl App {
         self.content_identity_updates_before_load.clear();
         self.content_identity_ledger_state = ContentIdentityLedgerState::Unusable(detail.clone());
         crate::logger::log(format!("content_identity: ledger unusable: {detail}"));
-        self.show_feedback_toast(
+        self.show_feedback_warning(
             "コピー・移動したファイルの編集内容の復元を利用できません".to_string(),
         );
     }

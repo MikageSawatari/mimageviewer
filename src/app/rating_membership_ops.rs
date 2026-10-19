@@ -510,12 +510,12 @@ impl App {
                 }
                 preparing |= self.set_search_rating_adoption_intent(pending_intent);
                 if !preparing && restore_viewer {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "評価は戻しましたが、元のページは現在の一覧にありません".into(),
                     );
                 }
             } else if origin.viewer_key().is_some_and(|key| !reader.contains(key)) {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "評価は戻しましたが、元のページは現在の表示条件に含まれません".into(),
                 );
             }

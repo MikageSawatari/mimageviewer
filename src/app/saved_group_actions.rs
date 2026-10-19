@@ -327,19 +327,19 @@ impl App {
             _ => {}
         }
         if self.is_snapshot_active() {
-            self.show_feedback_toast("スナップショット中は他のフォルダに移動できません".into());
+            self.show_feedback_warning("スナップショット中は他のフォルダに移動できません".into());
             return None;
         }
         if self.sidecar_restore_active() {
-            self.show_feedback_toast("復元処理が進行中です".into());
+            self.show_feedback_warning("復元処理が進行中です".into());
             return None;
         }
         if self.saved_group_open.is_some() || self.saved_group_other_main_nav_pending() {
-            self.show_feedback_toast("別の場所を開く処理が進行中です".into());
+            self.show_feedback_warning("別の場所を開く処理が進行中です".into());
             return None;
         }
         let Some(source) = self.smart_folder_source_lease() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 saved_group_source_unavailable_message(
                     self.projected_viewer_context_id() == self.viewer_context_main(),
                 )
@@ -364,7 +364,7 @@ impl App {
             if self.book_op_pending.as_ref().is_some_and(|pending| {
                 !matches!(&pending.intent, crate::books::BookOpIntent::List { .. })
             }) {
-                self.show_feedback_toast("本棚の更新処理が進行中です".into());
+                self.show_feedback_warning("本棚の更新処理が進行中です".into());
                 return None;
             }
             let id = self.next_saved_group_open_id();
@@ -394,14 +394,14 @@ impl App {
                     *navigation = Some(id);
                     None
                 } else {
-                    self.show_feedback_toast("本棚の更新処理が進行中です".into());
+                    self.show_feedback_warning("本棚の更新処理が進行中です".into());
                     return None;
                 }
             } else if let Some(rows) = self.book_list_cache.as_ref() {
                 match book_action_target(rows, action, transition.current_book.as_ref()) {
                     Ok(path) => Some(path),
                     Err(message) => {
-                        self.show_feedback_toast(message);
+                        self.show_feedback_warning(message);
                         return None;
                     }
                 }
@@ -413,14 +413,14 @@ impl App {
                     *navigation = Some(id);
                     None
                 } else {
-                    self.show_feedback_toast("本棚一覧を読み込めませんでした".into());
+                    self.show_feedback_warning("本棚一覧を読み込めませんでした".into());
                     return None;
                 }
             };
             if let Some(path) = target
                 && let Err(message) = self.start_saved_book_scan(&mut transition, path)
             {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 return None;
             }
             self.saved_group_open = Some(transition);
@@ -452,7 +452,7 @@ impl App {
                         lease.finish(Instant::now(), "adopted");
                         return Some(AddressBarNav::CollectionOpen(id));
                     }
-                    Err(message) => self.show_feedback_toast(message),
+                    Err(message) => self.show_feedback_warning(message),
                 }
                 lease.finish(Instant::now(), "rejected");
                 return None;
@@ -524,17 +524,17 @@ impl App {
                     match book_action_target(rows, request.action, request.current_book.as_ref()) {
                         Ok(path) => {
                             if let Err(message) = self.start_saved_book_scan(&mut request, path) {
-                                self.show_feedback_toast(message);
+                                self.show_feedback_warning(message);
                                 return;
                             }
                         }
                         Err(message) => {
-                            self.show_feedback_toast(message);
+                            self.show_feedback_warning(message);
                             return;
                         }
                     }
                 } else {
-                    self.show_feedback_toast("本棚一覧を読み込めませんでした".into());
+                    self.show_feedback_warning("本棚一覧を読み込めませんでした".into());
                     return;
                 }
             }
@@ -551,11 +551,11 @@ impl App {
                     request.phase = SavedGroupOpenPhase::ReadyBook { path, scan };
                 }
                 Ok(Err(error)) => {
-                    self.show_feedback_toast(format!("本を読み込めませんでした: {error}"));
+                    self.show_feedback_warning(format!("本を読み込めませんでした: {error}"));
                     return;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("本の読み込みが中断されました".into());
+                    self.show_feedback_warning("本の読み込みが中断されました".into());
                     return;
                 }
                 Err(TryRecvError::Empty) => {
@@ -581,7 +581,7 @@ impl App {
                             request.phase = SavedGroupOpenPhase::ReadyCollection { id };
                         }
                         Err(message) => {
-                            self.show_feedback_toast(message);
+                            self.show_feedback_warning(message);
                             return;
                         }
                     },
@@ -591,7 +591,7 @@ impl App {
                         }
                     }
                     Err(message) => {
-                        self.show_feedback_toast(message.into());
+                        self.show_feedback_warning(message.into());
                         return;
                     }
                 }
@@ -645,7 +645,7 @@ impl App {
                     super::OpenRequestOwner::Navigation,
                     crate::app::StartupListIntent::ExplicitList,
                 ) {
-                    self.show_feedback_toast("本を開けませんでした".into());
+                    self.show_feedback_warning("本を開けませんでした".into());
                 }
             }
             SavedGroupOpenPhase::ReadyCollection { id } => {
@@ -666,7 +666,7 @@ impl App {
                     request.action,
                     request.current_collection,
                 ) else {
-                    self.show_feedback_toast("コレクションを開けませんでした".into());
+                    self.show_feedback_warning("コレクションを開けませんでした".into());
                     return;
                 };
                 if current_id != id {

@@ -8,6 +8,9 @@ mod thumbnail_request_lifecycle;
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
 
+#[path = "tests/notification_duration.rs"]
+mod notification_duration;
+
 #[path = "tests/startup_notices.rs"]
 pub(super) mod startup_notices;
 

@@ -125,7 +125,7 @@ impl App {
                 crate::logger::log(format!(
                     "composition editor: rejected {rejected} activation request(s)"
                 ));
-                self.show_feedback_toast("本の構成を編集中のため、別の本を開けません".into());
+                self.show_feedback_warning("本の構成を編集中のため、別の本を開けません".into());
             }
             return;
         }
@@ -192,7 +192,7 @@ impl App {
             crate::logger::log(format!(
                 "single_instance: rejected {rejected} activation open request(s) during Remote ownership"
             ));
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
             );
             ctx.request_repaint();
@@ -227,7 +227,7 @@ impl App {
                 requested.display()
             ));
             if matches!(source, StartupOpenPathSource::Activation) {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
                 );
             }
@@ -235,7 +235,7 @@ impl App {
         }
         if self.composition_editor_modal_active() {
             crate::logger::log("composition editor: rejected path open");
-            self.show_feedback_toast("本の構成を編集中のため、別の本を開けません".into());
+            self.show_feedback_warning("本の構成を編集中のため、別の本を開けません".into());
             return;
         }
         if self.document_open_modal_admission_blocked() {
@@ -560,7 +560,7 @@ impl App {
                     } else if matches!(source, StartupOpenPathSource::Activation) {
                         self.resume_activation_held_open(held, held_duration);
                     }
-                    self.show_feedback_toast("パスの確認を完了できませんでした".to_string());
+                    self.show_feedback_warning("パスの確認を完了できませんでした".to_string());
                 }
                 ctx.request_repaint();
             }
@@ -658,7 +658,7 @@ impl App {
             if matches!(source, StartupOpenPathSource::InitialStartup) {
                 self.open_default_startup_target();
             }
-            self.show_feedback_toast(message);
+            self.show_feedback_warning(message);
             return;
         }
         if matches!(source, StartupOpenPathSource::Activation) {
@@ -692,7 +692,7 @@ impl App {
                 bookmark_owner.request_id,
                 "relative_page_missing_or_unsafe",
             );
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
             return;
@@ -759,7 +759,7 @@ impl App {
             crate::logger::log(format!(
                 "startup open: activation open failed for {requested_display}"
             ));
-            self.show_feedback_toast("開けるパスが見つかりませんでした".to_string());
+            self.show_feedback_warning("開けるパスが見つかりませんでした".to_string());
         }
     }
 

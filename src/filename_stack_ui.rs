@@ -797,7 +797,7 @@ impl crate::app::App {
                         crate::logger::log(
                             "stack deletion: retained projection could not be prepared",
                         );
-                        self.show_feedback_toast("スタックの保存情報を読み取れませんでした。最新の情報に更新してください".into());
+                        self.show_feedback_warning("スタックの保存情報を読み取れませんでした。最新の情報に更新してください".into());
                         // There is no accepted aggregate to expose. Keep the survivor flat
                         // order until the ordinary deferred reload prepares a new list.
                         let previous = self.folder_observation.take();
@@ -1504,9 +1504,9 @@ impl crate::app::App {
                 notice.push('\n');
                 notice.push_str(&stack_notice);
             }
-            self.show_feedback_toast(notice);
+            self.show_feedback_warning(notice);
         } else if let Some(stack_notice) = stack_notice {
-            self.show_feedback_toast(stack_notice);
+            self.show_feedback_warning(stack_notice);
         }
     }
 
@@ -1790,7 +1790,7 @@ impl crate::app::App {
                     Some(StackReturnState::Refreshing { view: current }) if Arc::ptr_eq(current, &view))
             {
                 self.stack_return_state = Some(StackReturnState::Recovering { view });
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "編集情報を更新できませんでした。自動で再試行します。".into(),
                 );
             }
@@ -1959,7 +1959,7 @@ impl crate::app::App {
     /// (folder_changes=false なので `stack_mode_requested` は維持される)。
     pub(crate) fn toggle_stack_mode(&mut self) {
         if !self.stack_mode_available() {
-            self.show_feedback_toast("スタック表示は通常フォルダまたはサブ展開で使えます".into());
+            self.show_feedback_warning("スタック表示は通常フォルダまたはサブ展開で使えます".into());
             return;
         }
         if self.items_are_subfolder_expansion_view {
@@ -1993,7 +1993,7 @@ impl crate::app::App {
         if self.stack_mode_requested && self.stack_script_pending.is_none() {
             // スクリプトが失敗して既定ルールへフォールバックした場合は最優先で知らせる。
             if self.stack_script_error.is_some() {
-                self.show_feedback_toast(
+                self.show_feedback_error(
                     "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)"
                         .into(),
                 );
@@ -2002,7 +2002,7 @@ impl crate::app::App {
                 .as_ref()
                 .is_some_and(|sv| !sv.has_collapsible_stack())
             {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "まとめられるスタックがありませんでした (分類ルールはヘルプ参照)".into(),
                 );
             } else if let Some(rule) = self.stack_active_rule.clone() {
@@ -2052,7 +2052,7 @@ impl crate::app::App {
         }
 
         if self.subfolder_expansion_snapshot.is_none() {
-            self.show_feedback_toast("サブ展開のスナップショットがありません".into());
+            self.show_feedback_warning("サブ展開のスナップショットがありません".into());
             return;
         }
 

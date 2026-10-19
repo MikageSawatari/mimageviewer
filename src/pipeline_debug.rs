@@ -126,11 +126,11 @@ impl App {
 
     pub(crate) fn start_pipeline_debug_export(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.pipeline_debug_export_pending.is_some() {
-            self.show_feedback_toast("デバッグ出力中です".to_string());
+            self.show_feedback_warning("デバッグ出力中です".to_string());
             return;
         }
         if matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
-            self.show_feedback_toast("動画は画像パイプラインデバッグ対象外です".to_string());
+            self.show_feedback_warning("動画は画像パイプラインデバッグ対象外です".to_string());
             return;
         }
 
@@ -164,7 +164,7 @@ impl App {
             })
             .sum::<usize>();
         if pages.is_empty() || stage_count == 0 {
-            self.show_feedback_toast("出力できる画像段階がまだありません".to_string());
+            self.show_feedback_warning("出力できる画像段階がまだありません".to_string());
             return;
         }
 
@@ -198,7 +198,7 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("デバッグ出力 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("デバッグ出力 worker を開始できません: {err}"));
             }
         }
     }
@@ -230,22 +230,16 @@ impl App {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("debug-pipeline");
-                #[cfg(windows)]
-                self.show_native_video_overlay_toast(
+                self.show_feedback_toast_with_duration(
                     format!("デバッグ出力しました: {name}"),
-                    false,
+                    crate::feedback::FEEDBACK_TOAST_DURATION,
                 );
-                self.fs_feedback_toast = Some((
-                    format!("デバッグ出力しました: {name}"),
-                    std::time::Instant::now(),
-                    crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
-                ));
                 self.fs_feedback_toast_reveal_path = Some(done.manifest_path);
                 self.fs_feedback_toast_surface = None;
             }
             Err(err) => {
                 crate::logger::log(format!("pipeline-debug: export failed: {err}"));
-                self.show_feedback_toast(format!("デバッグ出力に失敗: {err}"));
+                self.show_feedback_error(format!("デバッグ出力に失敗: {err}"));
             }
         }
     }

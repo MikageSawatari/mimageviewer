@@ -413,14 +413,14 @@ impl App {
         match failure {
             PdfOpenFailure::NotConverted => {
                 if self.settings.epub_file_handling_ignores_epub() {
-                    self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
+                    self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
                     if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                         self.restore_address_after_epub_open_aborted(logical);
                     }
                     return PdfOpenFailureRoute::Handled;
                 }
                 let Ok(cancel) = CancelToken::new() else {
-                    self.show_feedback_toast("EPUB の変換を開始できませんでした".into());
+                    self.show_feedback_warning("EPUB の変換を開始できませんでした".into());
                     if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                         self.restore_address_after_epub_open_aborted(logical);
                     }
@@ -464,7 +464,7 @@ impl App {
                 PdfOpenFailureRoute::ConversionDialogOpened
             }
             PdfOpenFailure::EpubUnavailable(reason) => {
-                self.show_feedback_toast(format!("EPUB 変換が無効です: {reason}"));
+                self.show_feedback_warning(format!("EPUB 変換が無効です: {reason}"));
                 if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                     self.restore_address_after_epub_open_aborted(logical);
                 }
@@ -566,7 +566,7 @@ impl App {
         let _source_owner = state.src_owner.clone();
         drop(state);
         if !user_data_errors.is_empty() {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "PDF は保存されましたが、一部の設定を引き継げませんでした: {}",
                 user_data_errors.join("; ")
             ));

@@ -79,7 +79,7 @@ impl App {
             self.settings.whats_new_acknowledged_version =
                 Some(env!("CARGO_PKG_VERSION").to_owned());
             if !self.settings.save_checked() {
-                self.show_feedback_toast_on(
+                self.show_feedback_warning_on(
                     "重要な変更点の既読状態を保存できませんでした。次回起動時に再表示されることがあります"
                         .to_owned(),
                     ActionSurface::MainWindow,

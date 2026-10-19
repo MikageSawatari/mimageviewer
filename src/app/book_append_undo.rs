@@ -51,7 +51,7 @@ impl App {
 
     pub(crate) fn admit_book_append_followup_mutation(&mut self) -> bool {
         if self.book_append_undo_in_progress() {
-            self.show_feedback_toast("本への追加を取り消しています".into());
+            self.show_feedback_warning("本への追加を取り消しています".into());
             return false;
         }
         self.invalidate_book_append_undo();
@@ -125,7 +125,7 @@ impl App {
     /// falls through into a second, older metadata operation.
     pub(crate) fn try_undo_book_append(&mut self, ctx: &egui::Context) -> bool {
         if self.book_append_undo_in_progress() {
-            self.show_feedback_toast("本への追加を取り消しています".into());
+            self.show_feedback_warning("本への追加を取り消しています".into());
             return true;
         }
         let Some(receipt) = self.book_append_undo_receipt.as_ref().cloned() else {
@@ -139,7 +139,7 @@ impl App {
             return true;
         }
         if self.book_append_undo_writers_busy() {
-            self.show_feedback_toast("処理中のため本への追加を取り消せません".into());
+            self.show_feedback_warning("処理中のため本への追加を取り消せません".into());
             return true;
         }
         if !self.admit_rename_migration_source_change(ctx) {
@@ -164,7 +164,7 @@ impl App {
             || receipt.source_context != self.projected_viewer_context_id()
             || !self.book_append_operation_matches_receipt(receipt.operation())
         {
-            self.show_feedback_toast("処理中のため本への追加を取り消せません".into());
+            self.show_feedback_warning("処理中のため本への追加を取り消せません".into());
             return true;
         }
         self.cancel_book_append_readonly_refresh();
@@ -259,7 +259,7 @@ impl App {
             self.invalidate_rating_counts_cache();
         }
         if !report.errors.is_empty() {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "本ページの編集情報の引き継ぎに一部失敗しました ({} 件)",
                 report.errors.len()
             ));
@@ -310,7 +310,7 @@ impl App {
             for error in &result.purge_errors {
                 crate::logger::log(format!("[book-append-undo] metadata purge: {error}"));
             }
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "{} ページを取り消しました。{} 件を取り消せませんでした",
                 result.succeeded.len(),
                 result.failed.len() + result.purge_errors.len()

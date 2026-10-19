@@ -59,6 +59,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["文字色", "見やすさ", "contrast"]
     ),
     entry!(
+        "general/notification-duration",
+        General,
+        "通知の表示時間",
+        ["短い", "標準", "長い", "トースト", "メッセージ", "通知時間"]
+    ),
+    entry!(
         "general/restore-position",
         General,
         "環境設定を開き直したときに前回の位置を復元する",

@@ -604,7 +604,7 @@ impl App {
                 .take_audio_art_notice()
         {
             crate::logger::log(format!("audio art cache notice: {detail}"));
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "音声画像のキャッシュを保存・参照できませんでした。次回に再生成します".to_owned(),
             );
         }
@@ -813,7 +813,7 @@ impl App {
         self.poll_pdf_worker_notice();
         if crate::pdf_loader::take_render_epoch_maintenance_failure() {
             crate::logger::log("PDF render epoch maintenance worker disconnected".to_owned());
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "PDFサムネイルの旧要求を整理できませんでした。再起動してください".to_owned(),
                 ActionSurface::MainWindow,
             );
@@ -1429,7 +1429,9 @@ impl App {
                                 "folder open scan failed path={} error={error}",
                                 path.display()
                             ));
-                            self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                            self.show_feedback_warning(
+                                "フォルダを読み取れませんでした".to_string(),
+                            );
                             None
                         }
                     }

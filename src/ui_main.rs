@@ -8745,11 +8745,11 @@ impl App {
 
     pub(crate) fn open_book_reorder_from_current(&mut self) {
         let Some(folder) = self.current_folder.clone() else {
-            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            self.show_feedback_warning("本フォルダを開いてから並べ替えてください".to_string());
             return;
         };
         if !crate::books::is_direct_book_folder(&self.book_root_path(), &folder) {
-            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            self.show_feedback_warning("本フォルダを開いてから並べ替えてください".to_string());
             return;
         }
         let entries: Vec<crate::books::BookPageEntry> = self
@@ -8775,7 +8775,7 @@ impl App {
             })
             .collect();
         if entries.is_empty() {
-            self.show_feedback_toast("並べ替えできるページがありません".to_string());
+            self.show_feedback_warning("並べ替えできるページがありません".to_string());
             return;
         }
         let mut selected_keys = HashSet::new();
@@ -9151,7 +9151,7 @@ impl App {
                             if let Some(state) = self.book_reorder.as_mut() {
                                 state.error = Some(err.clone());
                             }
-                            self.show_feedback_toast(format!(
+                            self.show_feedback_error(format!(
                                 "ページ順の保存に失敗しました: {err}"
                             ));
                             ctx.request_repaint();
@@ -9234,7 +9234,7 @@ impl App {
                             if reload_current {
                                 self.pending_reload = true;
                             }
-                            self.show_feedback_toast(format!("ページ転送に失敗しました: {err}"));
+                            self.show_feedback_error(format!("ページ転送に失敗しました: {err}"));
                             ctx.request_repaint();
                             return;
                         }
@@ -11554,7 +11554,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 Ok(false) => {
                     // 合成ビュー等で実コンテナが無い場合。常に何らかのフィードバックを返す
                     // (グリッドからのコンテナ付与で無反応に見えないように)。
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "この画面ではこの場所に評価を付けられません".to_string(),
                     );
                 }
@@ -14929,7 +14929,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         {
                                             self.start_quick_folder_slot_switch(slot, resolved);
                                         } else {
-                                            self.show_feedback_toast(format!(
+                                            self.show_feedback_warning(format!(
                                                 "{label} の最後の場所が見つかりません。ドライブ一覧へ切り替えます: {}",
                                                 raw_target.to_string_lossy()
                                             ));
@@ -16975,7 +16975,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // しないので網羅性のため no-op。
                 Some(GridItem::Stack { .. }) => {}
                 Some(GridItem::CollectionPlaceholder { .. }) => {
-                    self.show_feedback_toast("この参照は現在見つからないため開けません".into());
+                    self.show_feedback_warning("この参照は現在見つからないため開けません".into());
                 }
                 None => {}
             }
@@ -17013,7 +17013,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         post_drag_toast,
                     });
                 }
-                DragDecision::ImmediateToast(msg) => self.show_feedback_toast(msg),
+                DragDecision::ImmediateToast(msg) => self.show_feedback_warning(msg),
                 DragDecision::None => {}
             }
         }

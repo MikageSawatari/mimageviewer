@@ -59,6 +59,13 @@ pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
 }
 
 #[doc(hidden)]
+pub fn draw_notification_duration_snapshot_fixture(
+    ui: &mut egui::Ui,
+    mut value: crate::settings::NotificationDuration,
+) {
+    pages::draw_notification_duration_setting(ui, &mut value);
+}
+
 pub fn draw_preferences_restore_position_snapshot_fixture(ui: &mut egui::Ui, enabled: bool) {
     let mut settings = Settings::default();
     settings.preferences_restore_position = enabled;
@@ -2445,7 +2452,7 @@ impl App {
                 .set_parallelism(requested_raw_parallelism as usize)
             {
                 settings.raw_develop_parallelism = self.settings.raw_develop_parallelism;
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "RAW の同時現像数を変更できませんでした: {error}"
                 ));
             } else {
@@ -2697,7 +2704,7 @@ impl App {
                 &mut live,
             );
             if preferences_change_book_append_write_settings(&self.settings, &edited) {
-                self.show_feedback_toast("本への追加を取り消しています".into());
+                self.show_feedback_warning("本への追加を取り消しています".into());
                 return;
             }
         }
@@ -2938,7 +2945,7 @@ impl App {
                     .close_all_detached_viewers_for_mode_change(ctx)
                     .unwrap_or(true)
             {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "別ウィンドウの表示モードを変更したため、開いていた別ウィンドウを閉じました"
                         .to_string(),
                 );
@@ -2958,7 +2965,7 @@ impl App {
                 }
             }
             if !self.settings.save_checked() {
-                self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
+                self.show_feedback_warning("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
             }
             creative_lut_transaction.commit();
 

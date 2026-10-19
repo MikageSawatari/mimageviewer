@@ -2955,7 +2955,7 @@ impl App {
                     visibility_notice,
                 }) => {
                     if let Some(notice) = visibility_notice {
-                        self.show_feedback_toast(notice.message().into());
+                        self.show_feedback_warning(notice.message().into());
                     }
                     // Accepted batches enter the worker FIFO in order. The worker does
                     // the rating lookup before returning each rated batch to this owner.
@@ -3306,7 +3306,7 @@ impl App {
                             continue;
                         }
                         if rating_sort_failed {
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "評価順を読み込めなかったため名前順で表示しました".into(),
                             );
                         }
@@ -3384,7 +3384,7 @@ impl App {
                                         .into(),
                                 );
                             }
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "[検索結果を準備できませんでした]".to_string(),
                             );
                         }
@@ -3795,7 +3795,7 @@ impl App {
             order_request,
             crate::rating_sort::ListingOrderRequest::Rating(_)
         ) {
-            self.show_feedback_toast("評価順を準備できなかったため名前順で表示しました".into());
+            self.show_feedback_warning("評価順を準備できなかったため名前順で表示しました".into());
         }
         // Badge counts and rows belong to one accepted projection, including the fallback path.
         let drilled_counts = match self.global_search.view() {

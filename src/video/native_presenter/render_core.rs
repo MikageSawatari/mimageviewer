@@ -3076,6 +3076,12 @@ pub(super) struct NativeOverlayToast {
     linger: Duration,
 }
 
+impl NativeOverlayToast {
+    pub(super) fn opacity_at(&self, elapsed: f32) -> f32 {
+        ((self.linger.as_secs_f32() - elapsed) / 0.35).clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 impl NativeOverlayToast {
     fn for_test(text: &str) -> Self {
@@ -8547,14 +8553,25 @@ impl NativeRenderCore {
         }
     }
 
-    pub fn show_overlay_toast(
+    pub(crate) fn show_overlay_toast(
         &mut self,
         text: String,
         centered: bool,
+        kind: crate::feedback::FeedbackKind,
         linger: Option<std::time::Duration>,
     ) {
+        // App notifications carry their resolved lifetime. Native-origin notifications
+        // read the preference from the existing chrome snapshot and resolve it here once.
+        let linger = linger.unwrap_or_else(|| {
+            Duration::from_secs_f32(crate::feedback::resolve_duration(
+                self.chrome.policy.notification_duration,
+                kind,
+                &text,
+                crate::feedback::FeedbackTiming::Seconds(if centered { 2.5 } else { 1.8 }),
+            ))
+        });
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.show_toast(text, centered, linger);
+            overlay.show_toast(text, centered, Some(linger));
         }
     }
 
@@ -14494,6 +14511,17 @@ fn native_ime_cursor_area_intent(
 #[cfg(test)]
 mod native_output_tests {
     use super::*;
+
+    #[test]
+    fn notification_duration_native_fade_uses_resolved_lifetime() {
+        let mut toast = NativeOverlayToast::for_test("通知");
+        for seconds in [0.7, 1.2, 1.8, 2.5, 5.5, 8.25] {
+            toast.linger = Duration::from_secs_f32(seconds);
+            assert_eq!(toast.opacity_at(seconds - 0.4), 1.0);
+            assert!((toast.opacity_at(seconds - 0.175) - 0.5).abs() < 0.00001);
+            assert_eq!(toast.opacity_at(seconds), 0.0);
+        }
+    }
 
     #[test]
     fn native_platform_intents_keep_focus_ime_and_cursor_order_without_presenting() {
