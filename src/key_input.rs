@@ -3639,6 +3639,14 @@ pub fn set_test_frame(edges: Vec<KeyEdge>) {
     set_test_frame_for_viewport(egui::ViewportId::ROOT, edges);
 }
 
+/// Queue through the same stamping/pending boundary as native ingress.
+#[cfg(test)]
+pub(crate) fn enqueue_test_pending_edge(edge: KeyEdge) {
+    if let Ok(mut guard) = state().lock() {
+        guard.enqueue_key_edge(edge);
+    }
+}
+
 #[cfg(test)]
 pub fn set_test_frame_for_viewport(viewport: egui::ViewportId, mut edges: Vec<KeyEdge>) {
     for edge in &mut edges {

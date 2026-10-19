@@ -1023,19 +1023,24 @@ fn show_offset_tooltip_with_observer(
         Some(rect) => tip.popup = tip.popup.anchor(rect),
         None => tip = tip.at_pointer(),
     }
+    let frame = if dark {
+        crate::os_theme::dark_popup_frame(ctx)
+    } else {
+        egui::Frame::popup(&ctx.global_style())
+    };
+    let content_width = (ctx.content_rect().width() - frame.total_margin().sum().x).max(1.0);
+    tip.popup = tip.popup.frame(frame);
     if dark {
-        tip.popup = tip
-            .popup
-            .style(crate::os_theme::dark_popup_style(ctx))
-            .frame(crate::os_theme::dark_popup_frame(ctx));
+        tip.popup = tip.popup.style(crate::os_theme::dark_popup_style(ctx));
     }
     tip.show(|ui| {
-        // 動的な内容で Area が縮まないよう最大幅を固定する（egui issue #5167）。
-        ui.set_max_width(ui.spacing().tooltip_width);
+        // Keep dynamic Area sizing stable, bounded by the actual viewport in
+        // UI points (including zoom), with room for the popup frame.
+        ui.set_max_width(ui.spacing().tooltip_width.min(content_width));
         if dark {
             crate::os_theme::apply_dark_ui(ui);
         }
-        let label = ui.add(egui::Label::new(text()));
+        let label = ui.add(egui::Label::new(text()).wrap());
         on_render(ui, &label);
     });
 }
@@ -1269,6 +1274,44 @@ mod accessibility_names_tests {
                     });
                 })
                 .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn tooltip_text_wraps_inside_zoomed_viewport_after_resize_in_both_themes() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_zoom_factor(2.0);
+            // Reuse one tooltip Area while the physical work area gets smaller.
+            for width in [960.0, 640.0, 480.0] {
+                for _ in 0..3 {
+                    crate::test_ui::headless_paint_output(ctx.run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width / 2.0, 290.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|ui| {
+                                let response = ui.button("Anchor");
+                                show_offset_tooltip_with_observer(
+                                    ctx,
+                                    egui::Tooltip::for_widget(&response),
+                                    dark,
+                                    Some(response.rect),
+                                    || "A long explanation must remain fully readable even when the UI is enlarged and the work area becomes smaller. ".repeat(3).into(),
+                                    |ui, label| {
+                                        assert!(label.rect.width() <= ctx.content_rect().width());
+                                        assert!(ui.clip_rect().contains_rect(label.rect), "viewport={:?}, label={:?}", ctx.content_rect(), label.rect);
+                                    },
+                                );
+                            });
+                        },
+                    ));
+                }
+            }
         }
     }
 

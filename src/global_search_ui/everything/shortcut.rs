@@ -43,9 +43,6 @@ impl App {
     }
 
     pub(crate) fn dispatch_everything_search_shortcut(&mut self, ctx: &egui::Context) -> bool {
-        if self.notify_everything_search_shortcut_refusal(ctx) {
-            return true;
-        }
         if ctx.viewport_id() != egui::ViewportId::ROOT || !self.everything_search_entry_allowed() {
             return false;
         }
@@ -419,7 +416,7 @@ mod tests {
             egui::Modifiers::CTRL,
             Some(main_owner()),
         );
-        assert!(app.dispatch_everything_search_shortcut(&ctx));
+        assert!(app.notify_everything_search_shortcut_refusal(&ctx));
         assert!(!app.dispatch_everything_search_shortcut(&ctx));
         assert!(
             app.fs_feedback_toast
@@ -463,7 +460,8 @@ mod tests {
             egui::Modifiers::CTRL,
             Some(main_owner()),
         );
-        assert!(app.dispatch_everything_search_shortcut(&ctx));
+        assert!(app.notify_everything_search_shortcut_refusal(&ctx));
+        assert!(!app.dispatch_everything_search_shortcut(&ctx));
         assert!(!app.global_search.active);
         assert!(app.fs_feedback_toast.is_some());
         let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
@@ -620,7 +618,10 @@ mod tests {
         ] {
             key_pass(&ctx, egui::Key::R, egui::Modifiers::CTRL, Some(owner));
             let before = ctx.input(|input| input.events.clone());
-            assert!(!app.dispatch_everything_search_shortcut(&ctx), "{owner:?}");
+            assert!(
+                !app.notify_everything_search_shortcut_refusal(&ctx),
+                "{owner:?}"
+            );
             assert_eq!(ctx.input(|input| input.events.clone()), before);
             assert!(app.fs_feedback_toast.is_none());
             let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
@@ -708,7 +709,7 @@ mod tests {
             }),
         );
         let before = ctx.input(|input| input.events.clone());
-        assert!(!app.dispatch_everything_search_shortcut(&ctx));
+        assert!(!app.notify_everything_search_shortcut_refusal(&ctx));
         assert!(app.fs_feedback_toast.is_none());
         assert_eq!(ctx.input(|input| input.events.clone()), before);
         // Grid's rebind must leave the fullscreen Ctrl+G editing action usable.

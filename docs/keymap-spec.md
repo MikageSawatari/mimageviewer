@@ -509,6 +509,8 @@ Enter では送信せず、確定後の Enter または「検索」で送信す�
 Modal／文字入力／IME／focus recovery／他viewportのキーは通知も消費もしない。Remoteは現状Modal所有なので
 hoverで理由を確認する。ROOT上でもFullscreen surfaceが所有するキーは既存viewer操作へ残す。
 fullscreen/native側からROOTへの新しい転送は加えない。
+通知はWin32 pendingを当該native frameへ取り込んだ直後の1か所で処理する。後段の実行dispatchでは
+再通知せず、同じ押下のegui/native両キューを既存keymap helperで同時に消費する。
 
 `GridColumnCount11..20` のリング・マウス割り当てを旧版から守るには、公開時にアプリ版番号を v4.1.0 より上げることが前提。`settings.db` は保存時の版番号が実行版より新しければ、旧版の起動時に読み込み前の `Incompatible` 判定で保存を止める。同じ v4.1.0 の開発ビルド間ではこの判定が働かず、旧版の `sanitize()` が未知のリング・マウス操作を `None` に置き換えて保存し得る。版番号の更新はリリース作業で行う。
 

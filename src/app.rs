@@ -95590,11 +95590,7 @@ impl App {
         self.apply_pending_main_font_update(ctx);
 
         self.service_capture_main_window(ctx, frame);
-        #[cfg(windows)]
-        crate::key_input::begin_frame_for_context_with_tracking(
-            ctx,
-            self.settings.page_turn_animation_enabled,
-        );
+        self.input_begin_key_frame(ctx);
 
         // タスクトレイ関連の毎フレーム処理は、設定 ON のときのみ走らせる。
         // 既定 OFF のユーザーには IsWindowVisible の syscall やイベント polling を

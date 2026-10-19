@@ -120,8 +120,8 @@ fn everything_search_disabled_menu_hover_snapshot(
         name,
         theme,
         mimageviewer::settings::TextContrast::Standard,
-        // The main window clamps both saved/initial and interactive widths to
-        // 640 points (lib.rs::MIN_INNER_SIZE). Exercise that supported minimum.
+        // Representative image size; actual logical width can be smaller at
+        // higher UI zoom or on a small work area. Cover those below.
         egui::vec2(640.0, 180.0),
         |ui| {
             ui.ctx()
@@ -142,6 +142,52 @@ fn everything_search_disabled_menu_hover_snapshot(
             );
         },
     );
+}
+
+#[test]
+fn everything_search_disabled_menu_hover_fits_small_viewports_and_ui_zoom() {
+    for theme in [
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    ] {
+        for (size, scale) in [
+            (egui::vec2(480.0, 360.0), 1.0),
+            (egui::vec2(640.0, 580.0), 2.0),
+            (egui::vec2(480.0, 580.0), 2.0),
+        ] {
+            let mut fonts_ready = false;
+            let mut harness = test_ui::builder().with_size(size).build_ui(move |ui| {
+                let ctx = &ui.ctx().clone();
+                mimageviewer::os_theme::apply_resolved(ctx, theme);
+                if !fonts_ready {
+                    install_app_fonts(ctx);
+                    mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+                test_ui::full_viewport_ui(ui, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(ui);
+                    });
+                });
+            });
+            harness.run();
+            let button = harness.get_by_label("Everything ファイル名検索…  Ctrl+R");
+            assert!(button.accesskit_node().is_disabled());
+            button.hover();
+            harness.run();
+            let viewport = harness.ctx.content_rect();
+            assert!((viewport.size() * scale - size).length() < 1.0);
+            let reason = harness.get_by_label("連動した別ウィンドウで閲覧している間は使えません。表示を閉じてから検索してください");
+            assert!(
+                viewport.contains_rect(reason.rect()),
+                "theme={theme:?}, scale={scale}, viewport={viewport:?}, reason={:?}",
+                reason.rect()
+            );
+        }
+    }
 }
 
 #[test]

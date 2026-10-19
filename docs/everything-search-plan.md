@@ -748,8 +748,8 @@ UI 同期 probe、最終エラーを使った入口の無効化、未確認の N
 既存例は sort lock の `reason.tooltip()` (`ui_main.rs:8351`) と
 `OpenAdmissionRefusal::message` → `show_open_admission_refusal` (`app.rs:1490,28423`)。
 
-拒否通知専用の `notify_everything_search_shortcut_refusal` を ROOT の `input_update_begin` に接続する。
-この phase は既存 keyboard owner の確定後、embedded/native fullscreen の描画 early return より前に通る。
+拒否通知専用の `notify_everything_search_shortcut_refusal` を ROOT の `input_begin_key_frame` に接続する。
+この phase は既存 keyboard owner の確定とWin32 native frameの確立後、embedded/native fullscreen の描画 early return より前に通る。
 通知入口は検索を開かず、IPC／context 移管も行わない。
 
 - ROOT、検索の main context 資格、ROOT/Main に一致する application shortcut permit を要求する。
@@ -757,7 +757,8 @@ UI 同期 probe、最終エラーを使った入口の無効化、未確認の N
   新しい dialog が同 pass で開いた場合も `any_dialog_open()` でそのキーを任せる。
 - 拒否の非 repeat press だけを既存 `keymap.consume_action_no_repeat(GlobalEverythingSearch)` で処理する。
   実効割当／none／exact modifiers／Win32 viewport ごとの edge 所有をそのまま使う。
-  early phase と後段 dispatch の二重到達は同じ event 消費で一回にし、repeat は通知を重ねない。
+  通知はnative frame確立直後の1か所だけで処理し、後段dispatchでは通知しない。
+  同じ押下のWin32/egui両キューを既存helperで同時に消費し、repeat は通知を重ねない。
   固定 Ctrl+R、OS current level、Modal 越えの diagnostic peek は使わない。
 - 本文に「Everything ファイル名検索: 」を付け、既存の本文長に応じた時間を使って
   `show_feedback_toast_on_with_duration(..., ActionSurface::MainWindow, ...)` へ出す。
@@ -827,7 +828,8 @@ fullscreen/Remote の非到達・非視認については、ホバーと manual 
 - 独立完成レビューは別担当。main lib 全件は ClaudeCode が最後に実施する。
   対象テスト、glyph lint、fmt、check、確認用 build の実施結果は以下へ記録する。
 
-検証対象は HEAD `be318299f` 上の未コミット差分。最終 Rust 差分
+以下は初回実装（`3306bf124` としてcommit済み）の検証記録であり、レビュー修正後の結果は§20.5に記録する。
+当時の検証対象は HEAD `be318299f` 上の未コミット差分。Rust 差分
 （`git diff --binary -- src tests/ui_snapshot.rs`）の SHA-256 は
 `3185f5ebca6da9c24be05198e1a471e4c9e9cce62535a50aaf4ecd8341252a9f`。
 
@@ -842,9 +844,10 @@ fullscreen/Remote の非到達・非視認については、ホバーと manual 
 | `scripts/vst3-host-identity.ps1 -ValidateRepo` | 現ソース一致を確認、hostの起動・変更なし |
 | `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | **exit 0**（2026-10-20）。通常featureのcore／Remote service／EPUB PDF worker、DLL配置、EffeTune bundle、VCRT検査（runtime=4 / pe=3）成功。`target/search6-build-dev-final.log` |
 
-UI検査の最初の480pt fixtureは本文が右へ16ptはみ出して失敗した。メインは保存／起動引数・対話resizeとも
-`lib.rs::MIN_INNER_SIZE` の幅640ptが下限なので、その実際の最小幅へ修正して収まり検査・PNG生成を通した。
-製品tooltipの仕様や文言をこの失敗のために変更していない。
+UI検査の最初の480pt fixtureは本文が右へ16ptはみ出して失敗した。その際「640ptが実際の最小幅」と誤認して
+fixtureを広げたが、これははみ出しを隠しただけだった。`MIN_INNER_SIZE` はUI倍率で割ってviewportへ渡し、
+小さい作業領域では最小寸法自体も縮むため、論理幅640ptは保証されない。§20.5で共通tooltipの幅を修正し、
+480pt・200%で320pt・小さい作業領域の200%で240ptを追加検査する。640×180の2枚は代表画像としてのみ保持する。
 
 前提復元: このworktreeで不足していた `vendor/libraw` を既存treeから実体コピーした。
 TurboJPEGの並列native buildは終了コード1となり、`MSBUILDDISABLENODEREUSE=1` とworkspace内TEMP、
@@ -864,3 +867,46 @@ portable featureは付けず、製品アプリ・実Everythingへの照会は実
 通常の `%APPDATA%\mimageviewer` を使用し、実設定／データを更新し得る（single-instance mutexも共有）。
 連動した別ウィンドウを開いてmainへ戻り、両メニューのhoverとCtrl+R一回の理由通知、
 操作カスタマイズの「押して入力」等でキーが奪われないこと、通常一覧では従来どおり開けることを確認する。
+
+### 20.5 独立コードレビューのP2対応（2026-10-20）
+
+独立レビューの2件をコードで確認して修正する。可否enum・文言・入力所有gateは維持する。
+
+- **入力frameの境界:** `input_update_begin` はWin32の `begin_frame_for_context_with_tracking` より前だった。
+  未取込pendingはkeymapの両キュー消費から漏れるため、eguiで通知した後に同じ押下を再取込できた。
+  前frameの未消費edgeを次frameのMain所有と読み替える経路もあった。
+  既存のnative begin位置を `input_begin_key_frame` として抽出し、その直後だけで通知する。
+  後段の実行dispatchから通知を外す。frame確立そのものの位置、入力所有、検索の受付条件は動かさず、
+  新しいlatch／guard／queueを増やさない。実phase順の回帰でegui+Win32 pendingの同時押下と
+  TextInputからMainへ移った時の旧edge失効を確認する。
+- **tooltipの表示可能幅:** 共通 `show_offset_tooltip_with_observer` がviewportを無視して
+  `tooltip_width` を再設定していた。popup枠の寸法を差し引いた現在の `content_rect().width()` と
+  tooltip幅の小さい方で折り返す。UI倍率・小さい作業領域・表示後resizeにも同じ計算を使う。
+  enabled／disabled／暗色固定のhoverは同じhelperを通るため、既存のtooltip回帰とUI snapshot全件を確認する。
+  文言を省略せず、既存の遅延変換・AccessKit名・配色・pointer回避を維持する。
+- main grid限定、Modal非消費、Fullscreen所有入力の非消費、Ctrl+Gおよびdetached経路は変更しない。
+
+検証対象は `3306bf124` 上の未コミット差分。初回実装の結果と今回の件数は合算しない。
+Rust差分（`git diff --binary -- src tests/ui_snapshot.rs`）のSHA-256:
+`2681f842f477ac1cad15cd3f06624832a3675e819ff1129251d4771de18bc2ab`。
+
+| 実施 | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/everything/) \| test(/phase_c_key_tests/) \| test(/global_search_ui/) \| test(/ui_helpers::accessibility_names_tests/)' --test-threads 4` | **182 passed / 0 failed**、21.275s。`target/search6-review-tests.log` |
+| `cargo test -p mimageviewer --test ui_snapshot -- --test-threads 4` | **189 passed / 0 failed**、94.95s。`target/search6-review-ui.log` |
+| UI差分 | 既存PNG全件の比較成功。代表のhover PNG2枚も変更不要。新規PNGなし |
+| 通常 core `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、34.72s。`target/search6-review-check.log` |
+| 同 `--features portable` | exit 0、53.48s。`target/search6-review-check-portable.log` |
+| `cargo fmt`（引数なし）／`cargo fmt --check`／glyph lint／`git diff --check` | exit 0、危険グリフ0 |
+
+最初のlib test compileは追加fixtureの `RawInput.modifiers` がegui 0.37に存在せず失敗した。
+既存と同じ `Event::ModifiersChanged` に直して再実行し、上表の成功を確認した。
+実行環境はworkspace内TEMP/TMP/MSBUILDDEBUGPATHと `MSBUILDDISABLENODEREUSE=1` を使用。
+tests/checkは `CARGO_BUILD_JOBS=1`、native依存が構築済みの確認用buildは4。
+`scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` もexit 0。
+core 5m47s、Remote service 0.54s、EPUB PDF worker 0.47s、VCRT検査runtime=4 / pe=3で成功した。
+ログは `target/search6-review-build-dev.log`。通常featureの `target/dev-runtime/mimageviewer-core.exe` は
+334,356,480 bytes、更新日時2026-10-20 00:59:04。製品の起動はしていない。
+利用者確認は前節の通常profile起動手順に従い、連動窓中のCtrl+R一回の通知、ダイアログの非消費、
+UI倍率200%／狭い窓でのホバー理由全文を確認する。
+製品アプリは起動せず、commitは行わない。本体lib全件・独立再レビュー・実機での確認は別途。
