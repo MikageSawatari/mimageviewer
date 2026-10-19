@@ -18,6 +18,7 @@ fn d3_permission_direct_landing_adopts_before_its_first_lookup() {
         contract: FsPageLoadContract::Sequential,
         purpose: BookTargetPurpose::Next,
         route: BookTargetRoute::FullscreenNavigation,
+        navigation_origin: Vec::new(),
     };
     app.book_composition_permission.open = OpenPermission::Resuming {
         intent: intent.clone(),

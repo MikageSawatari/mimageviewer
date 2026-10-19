@@ -156,6 +156,63 @@ pub(crate) fn app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
 }
 
 #[test]
+fn d3_5b_manual_wrap_retires_obsolete_computing_and_ready_without_late_publication() {
+    use crate::ui_fullscreen::page_turn_submission_tests::{
+        draw_current_without_sources, frame, install_presentation,
+    };
+
+    for computing in [false, true] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        app.settings.fullscreen_manual_nav_wrap = true;
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx);
+        });
+        assert!(app.page_turn_current_unit_presented());
+        let hold = computing.then(WorkerHold::new);
+        app.prefetch_next_final_unit(&ctx, 0);
+        let key = *app.final_effect_pending.keys().next().unwrap();
+        assert_eq!(key.edit_key.idx, 1);
+        let cancel = app.final_effect_pending[&key].cancel.clone();
+        if let Some(hold) = &hold {
+            hold.entered();
+        } else {
+            assert_eq!(wait_ready(&mut app, 1), key);
+        }
+        let nav = app.spread_page_nav(-1);
+        app.handle_fs_navigation(&ctx, false, false, None, None, None, nav, None, 0);
+        assert_eq!(app.fullscreen_idx, Some(3));
+        assert!(!app.page_turn_completion_active());
+        let landed = app.page_turn_gpu_fingerprint_for_test();
+        app.prefetch_next_final_unit(&ctx, 3);
+        assert!(app.final_effect_pending.is_empty());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!app.final_composite_cache.contains_key(&key));
+        assert_eq!(app.page_turn_gpu_fingerprint_for_test(), landed);
+        if let Some(hold) = &hold {
+            assert_eq!(app.final_prepare_cpu.snapshot().running, 1);
+            hold.release();
+            wait_idle(&app);
+        }
+        app.poll_final_effects(&ctx);
+        assert!(app.final_effect_pending.is_empty());
+        assert!(!app.final_composite_cache.contains_key(&key));
+        assert_eq!(app.page_turn_gpu_fingerprint_for_test(), landed);
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx);
+            let composition = app.spread_display_composition_for_anchor(3);
+            assert_eq!(
+                composition.pages_in_reading_order(),
+                vec![crate::ui_fullscreen::SpreadPageOccurrence::navigation(3, 3)]
+            );
+        });
+        assert!(app.page_turn_current_unit_presented());
+        assert!(!app.final_composite_cache.contains_key(&key));
+    }
+}
+
+#[test]
 fn d3_2_cancel_takeover_holds_real_worker_permit_and_release_wakes_without_input() {
     let ctx = egui::Context::default();
     let mut app = app(&ctx);

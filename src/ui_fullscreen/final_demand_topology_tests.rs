@@ -116,6 +116,86 @@ fn demand_pages(app: &App) -> Vec<usize> {
 }
 
 #[test]
+fn d3_5b_manual_wrap_keeps_cpu_and_resident_native_demand_nonwrapping() {
+    for mode in [
+        SpreadMode::Single,
+        SpreadMode::Ltr,
+        SpreadMode::Rtl,
+        SpreadMode::LtrCover,
+        SpreadMode::RtlCover,
+    ] {
+        for final_cover in [false, true] {
+            for wrap in [false, true] {
+                for slideshow in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut app = ready(&ctx, mode, false);
+                    app.settings.fullscreen_manual_nav_wrap = wrap;
+                    app.settings.final_cover_spread_enabled = final_cover;
+                    app.slideshow_playing = slideshow;
+                    let nav = app.get_nav_indices();
+                    let units = app.build_spread_display_units_for_nav(&nav);
+                    let first = units.first().unwrap().anchor_idx();
+                    let last = units.last().unwrap().anchor_idx();
+                    assert_ne!(first, last);
+                    app.fullscreen_idx = Some(last);
+                    frame(&ctx, |ui, ctx| {
+                        draw_current_without_sources(&mut app, ui, ctx);
+                    });
+                    assert!(app.page_turn_current_unit_presented());
+                    app.prepare_final_demand_topologies();
+                    let token = app.spread_display_units_cache.token.clone();
+                    let visible = app.spread_display_units_cache.units.clone();
+                    assert_eq!(
+                        app.final_unit_composition_from_snapshot(last, FinalUnitPosition::Next),
+                        Some(None)
+                    );
+                    assert_eq!(
+                        app.resident_final_unit_composition_from_snapshot(
+                            last,
+                            FinalUnitPosition::Next
+                        ),
+                        Some(None)
+                    );
+                    assert_eq!(
+                        app.next_final_unit_demand_from_snapshot(last),
+                        Some(NextFinalUnitDemand::Boundary)
+                    );
+                    app.prefetch_next_final_unit(&ctx, last);
+                    assert!(app.final_effect_pending.is_empty());
+                    assert!(Arc::ptr_eq(&visible, &app.spread_display_units_cache.units));
+                    assert_eq!(token, app.spread_display_units_cache.token);
+                    // Automatic/slideshow navigation stays nonwrapping even
+                    // when the separate manual-navigation setting is enabled.
+                    if mode.is_spread() {
+                        assert_eq!(
+                            app.spread_page_nav_for_indices(&nav, last, 1),
+                            FsPageNav::Boundary { at_end: true }
+                        );
+                    }
+                    if wrap {
+                        let step =
+                            crate::ui_helpers::adjacent_idx_in_order_wrapping(&nav, last, 1, true);
+                        // Single resolves Delta later; spreads expose Wrap.
+                        if mode.is_spread() {
+                            assert_eq!(
+                                app.spread_page_nav(1),
+                                FsPageNav::Wrap(FsWrapTarget {
+                                    idx: first,
+                                    slice: None,
+                                    forward: true,
+                                })
+                            );
+                        } else {
+                            assert!(step.is_some_and(|step| step.wrapped && step.idx == first));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn d3_5_cpu_producer_keep_and_ready_adoption_are_warm_without_book_work() {
     for mixed in [false, true] {
         for mode in [

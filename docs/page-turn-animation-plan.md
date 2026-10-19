@@ -5329,7 +5329,9 @@ detachedの変更は、既存runtime・session／context binding・実描画disp
 | D3-2 | `20742ad57`、CRT 寸法正本化 `2d0f5a440` | CPU-only 一般 final、実終了までの permit、結果予約、通知、takeover、park 保持 |
 | D3-4(a) | `b727d95c7`、Submitted receipt park 回帰 `6123fd830` | ROOT 最終 output の新規投機登録、演出排他、retry を跨ぐ活動、配送観測 |
 | D3-4(b) | `e92000b10`、installed topology／実 draw 回帰 `6e688ee55` | 共通 canonical geometry と Native prewarm、通常 cache／D2 handoff、allocation 会計 |
-| D3-5 | 作業開始 `479f7f65e`（master `2410719c7` merge 済み、競合なし）、今回差分は未commit | 横断監査、下記 F1 の同owner内修正、解析器・文書整理。実行検証と通常確認 build の結果は `target/d3-5-*` に分けて記録 |
+| D3-5 | `4af0d93ef`（作業開始 `479f7f65e`、master `2410719c7` merge 後） | 横断監査、下記 F1 の同owner内修正、解析器・文書整理。実行検証と通常確認 build の結果は `target/d3-5-*` に分けて記録 |
+
+**§1.400 merge 後の整合（D3-5b）:** D3-5 は `4af0d93ef` で commit 済み、master `4c8cbb974`（手動前後移動ループを含む）を `218ec2aa1` へ merge した状態で再確認した。手動ループ ON でも CPU／resident Native の次 unit 需要は最終 unit を `Boundary` とし、先頭 unit（逆方向の折り返し先も同様）を新たな投機対象には含めない。[手動ループ正本 §5・§6](manual-nav-wrap-plan.md) は折り返しを `navigation_wrap` として演出対象外の平らな切替にし、既存先読みを拡張しない。これは本節 §27.17.2 の Boundary を尊重する契約とも一致し、通常表示の同期 takeover／cache hit で着地できるため、折り返し先の先回りは今回不要と判断した。折り返しでも既存 barrier は held の canonical flat 受理後に continuation を着地させ、D3 pending は現在／次 unit・context・世代・key の照合から外れたものを取消／採用拒否する。実 resolver の末尾 Boundary、Computing／CpuReady を持った逆方向折り返し後の取消・遅着非公開・着地素材の回帰を追加し、検証と通常 build は `target/d3-5b-*` に記録する。continuation の許可判定 purpose を保持しない既存制約（同正本 §4.2・§5）は payload を変更しない今回の差分でも維持する。
 
 計測は ClaudeCode が採取した §27.15 → §27.17.13 → §27.17.15 → §27.17.16 を正本とし、この作業では製品を起動していない。
 
