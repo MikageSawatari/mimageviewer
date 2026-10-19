@@ -359,6 +359,7 @@ preferences_policy! {
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
         fullscreen_side_panel_mode: FsSidePanelMode => ("閲覧表示の左右パネル", |v, _raw| FsSidePanelMode::all().contains(v), plain, plain);
         fullscreen_chrome_suppression: FullscreenChromeSuppression => ("全画面中の固定表示の一時抑制", |_, _| true, plain, plain);
+        fullscreen_manual_nav_wrap: bool => ("閲覧表示の手動前後移動ループ", |_, _| true, plain, plain);
         fullscreen_boundary_notice_visible: bool => ("閲覧表示の境界通知", |_, _| true, plain, plain);
         fullscreen_processing_status_visible: bool => ("閲覧表示の処理状況", |_, _| true, plain, plain);
         fullscreen_prefetch_status_visible: bool => ("閲覧表示の先読み状況", |_, _| true, plain, plain);
@@ -1236,6 +1237,7 @@ mod tests {
             &[FsSidePanelMode::Hover, FsSidePanelMode::ClickToShow],
         );
         settings.fullscreen_boundary_notice_visible = !settings.fullscreen_boundary_notice_visible;
+        settings.fullscreen_manual_nav_wrap = !settings.fullscreen_manual_nav_wrap;
         settings.fullscreen_processing_status_visible =
             !settings.fullscreen_processing_status_visible;
         settings.fullscreen_prefetch_status_visible = !settings.fullscreen_prefetch_status_visible;
@@ -1911,13 +1913,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 461);
+        assert_eq!(entries.len(), 462);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            146
+            147
         );
         assert_eq!(
             entries
@@ -1934,7 +1936,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 144);
+        assert_eq!(wire.len(), 145);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2061,6 +2063,39 @@ mod tests {
             assert_eq!(parsed.issues.len(), 1);
             parsed.apply_to(&mut destination);
             assert_eq!(destination.preferences_restore_position, enabled);
+        }
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_transfer_roundtrip_missing_and_invalid_values() {
+        for enabled in [false, true] {
+            let source = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                fullscreen_manual_nav_wrap: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let parsed =
+                    parse_preferences(&document(json!({"fullscreen_manual_nav_wrap": invalid})))
+                        .unwrap();
+                assert_eq!(parsed.issues.len(), 1);
+                parsed.apply_to(&mut destination);
+                assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            }
         }
     }
 

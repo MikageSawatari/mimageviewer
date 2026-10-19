@@ -1,5 +1,20 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+## 手動の前後移動ループ（§1.400）
+
+`fullscreen_manual_nav_wrap`（既定OFF）がONなら、既存の手動前後移動Actionは現在の閲覧順・
+表示対象の端で折り返す。新しいKeyAction・既定キー・トグル操作は追加しない。
+`FsNextImage` / `FsPrevImage` / 縦方向版 / `FsPageNext` / `FsPagePrev` と、動画・音声の
+`VideoNextFile` / `VideoPrevFile`、同じ入口を通るホイール・クリック・HUD・マウス割り当て・
+ゲームパッドに適用する。連結読みでは項目をまたぐ静止画単位の明示移動だけが対象。
+単ページ / 分割の `FsSpreadShift*` と `ImageSpreadShift*` は既存のsource単位Delta移動として折り返す。
+見開きでの同操作は組み合わせ調整なので対象外。
+
+`FsJumpFirst` / `FsJumpLast`、`FsFixedJump*`、スタックジャンプ、シーク、Ctrl+↑↓ /
+Ctrl+PageUp/PageDown、連結方向のスクロール、自動送りは変更しない。再割り当てしたキーでも
+Actionの意味に従う。対象が1表示単位で動けなければ境界案内を保ち、折り返した場合は案内を出さない。
+Remoteの固定操作は対象外。設定と着地規則は [手動前後移動ループ設計](manual-nav-wrap-plan.md) を参照。
+
 ## 保存済み位置の全件クリア（§1.394）
 
 `ClearVideoMediaMemory` / `ClearBookResumePositions` は独立した Global / Press 操作で、
@@ -669,7 +684,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 |---|---|
 | <kbd>?</kbd> (既定) | 画像フルスクリーンで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーと、中央 / 左右タップ・2 本指ズーム / パンの「タッチ操作」は別枠で表示する |
 | <kbd>I</kbd> / <kbd>Tab</kbd> | 左右パネルの表示モード (通常ホバー / クリック表示) を切り替える。Action: `FsToggleMetadata`。画像フルスクリーン、native 動画、egui 音楽ビューで共通。native 動画では effective chord を presenter から App へ転送する |
-| <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次のファイル (見開き中は前 / 次の見開き = 2 ページ送り)。左右の方向は環境設定で「ページ表示 / 読み方向に合わせる」（既定）または「シークバー方向に合わせる」を選べる。最後 / 最初の見開きでは 1 回目の入力で境界案内を表示する |
+| <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次のファイル (見開き中は前 / 次の見開き = 2 ページ送り)。左右の方向は環境設定で「ページ表示 / 読み方向に合わせる」（既定）または「シークバー方向に合わせる」を選べる。最後 / 最初の見開きでは、手動の前後移動ループがOFF、または折り返せる別の表示単位がない場合、1 回目の入力で境界案内を表示する。ループONで折り返せる場合は反対側の端へ移る |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次のファイル (= 一般慣例で左右と同義)。見開きの境界判定も左右と共通。縦連結では縦スクロール、横連結では前 / 次ファイル。スライドショー中もフォルダ内移動は再生を止めない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 通常はプレーン <kbd>↑</kbd>/<kbd>↓</kbd> と同義 (前 / 次ファイル)。**ファイル名スタックのフラット読書中 (v2.0.0)** は「前 / 次のスタックの先頭画像へジャンプ」(= 今の投稿の残りをスキップ。`Shift+↑` はスタック途中なら現スタック先頭、先頭なら前スタック先頭)。端では no-op (次フォルダは <kbd>Ctrl</kbd>+<kbd>↓</kbd>)。スタックジャンプ部分の Action: `FsStackJumpPrev` / `FsStackJumpNext`。動画再生中は音量 (下表参照) |
 | 既定キーなし (`FsPagePrev` / `FsPageNext`) | コマンド設定でキーを割り当てると、前 / 次のページへ移動する。矢印ナビゲーションは固定扱いのまま残しつつ、明示的にページ送りへ割り当てたい場合の Action |

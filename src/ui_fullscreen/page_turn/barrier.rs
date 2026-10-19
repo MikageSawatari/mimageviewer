@@ -2,6 +2,10 @@
 //! has contributed a complete canonical flat to an adopted output.
 use super::*;
 
+#[cfg(test)]
+#[path = "manual_nav_wrap_tests.rs"]
+mod manual_nav_wrap_tests;
+
 pub(super) enum FlatCompletion {
     NeedFlat,
     Submitted(SubmittedUnitReceipt),

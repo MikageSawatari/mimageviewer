@@ -5221,6 +5221,9 @@ pub struct Settings {
     /// Targets whose fixed display becomes automatic only on the current F11 surface.
     #[serde(default)]
     pub fullscreen_chrome_suppression: FullscreenChromeSuppression,
+    /// 手動の前後移動を現在の閲覧順の先頭 / 末尾で折り返す。
+    #[serde(default)]
+    pub fullscreen_manual_nav_wrap: bool,
     /// フルスクリーンで先頭 / 末尾に達したときの案内を表示する。
     #[serde(default = "default_true")]
     pub fullscreen_boundary_notice_visible: bool,
@@ -7729,6 +7732,7 @@ impl Default for Settings {
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_chrome_suppression: FullscreenChromeSuppression::default(),
+            fullscreen_manual_nav_wrap: false,
             fullscreen_boundary_notice_visible: true,
             fullscreen_processing_status_visible: true,
             fullscreen_prefetch_status_visible: true,
@@ -12404,6 +12408,33 @@ mod tests {
         let mut loaded: Settings = serde_json::from_value(value).unwrap();
         loaded.sanitize();
         assert!(loaded.grid_cursor_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_defaults_off_and_survives_sanitize() {
+        assert!(!Settings::default().fullscreen_manual_nav_wrap);
+        let mut legacy: Settings = serde_json::from_str("{}").unwrap();
+        legacy.sanitize();
+        assert!(!legacy.fullscreen_manual_nav_wrap);
+        let mut enabled: Settings =
+            serde_json::from_str(r#"{"fullscreen_manual_nav_wrap":true}"#).unwrap();
+        enabled.sanitize();
+        assert!(enabled.fullscreen_manual_nav_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_roundtrips_json() {
+        for enabled in [false, true] {
+            let original = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&original).unwrap();
+            assert_eq!(value["fullscreen_manual_nav_wrap"], enabled);
+            let mut loaded: Settings = serde_json::from_value(value).unwrap();
+            loaded.sanitize();
+            assert_eq!(loaded.fullscreen_manual_nav_wrap, enabled);
+        }
     }
 
     #[test]
