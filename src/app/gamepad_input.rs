@@ -2379,6 +2379,9 @@ impl App {
             self.consume_gamepad_directional_neutral_gate(now);
             let analog_ordinal = events.len() as u32;
             for event in events {
+                if self.gamepad_targets_viewer() {
+                    self.service_final_prepare_before_lookup(ctx);
+                }
                 match event {
                     PadBatchEvent::SessionEnded => {
                         self.clear_gamepad_input_overlays(ctx);
@@ -8982,6 +8985,148 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 }
 
 #[cfg(test)]
+impl App {
+    /// Observe the actual media-handler request without spawning a resolver or player.
+    pub(crate) fn capture_manual_media_request_for_test(
+        &mut self,
+        action: impl FnOnce(&mut Self),
+    ) -> (Vec<usize>, u32, &'static str) {
+        assert!(self.media_navigation_resolver.is_none());
+        assert!(self.media_navigation_pending.is_none());
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (_result_tx, result_rx) = std::sync::mpsc::channel();
+        self.media_navigation_resolver = Some(super::MediaNavigationResolver {
+            request_tx,
+            result_rx,
+            next_request_id: 1,
+        });
+        action(self);
+        let request = request_rx
+            .try_recv()
+            .expect("the handler sends one media request");
+        assert!(request_rx.try_recv().is_err(), "one request per input");
+        self.media_navigation_pending = None;
+        self.media_navigation_resolver = None;
+        (
+            request
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.idx)
+                .collect(),
+            request.required_matches,
+            request.source,
+        )
+    }
+}
+
+#[cfg(test)]
+mod manual_nav_wrap_input_tests {
+    use super::*;
+    use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
+
+    #[test]
+    fn manual_nav_wrap_gamepad_and_assigned_mouse_page_steps_land_at_the_same_endpoint() {
+        for wrap in [false, true] {
+            for forward in [false, true] {
+                let current = if forward { 3 } else { 0 };
+                let expected = if wrap { 3 - current } else { current };
+                for mouse in [false, true] {
+                    let ctx = egui::Context::default();
+                    let mut app = ready_app(&ctx, SpreadMode::Single);
+                    app.settings.page_turn_animation_enabled = false;
+                    app.settings.fullscreen_manual_nav_wrap = wrap;
+                    app.fullscreen_idx = Some(current);
+                    app.selected = Some(current);
+                    frame(&ctx, |_, ctx| {
+                        if mouse {
+                            // The released mouse assignment is a source-page step
+                            // in Single/Split mode and a pairing nudge in Spread.
+                            let action = if forward {
+                                RingActionId::ImageSpreadShiftNext
+                            } else {
+                                RingActionId::ImageSpreadShiftPrev
+                            };
+                            let profile = app
+                                .settings
+                                .ring_shortcuts
+                                .mouse_button_profile_mut(RingShortcutContext::ImageFullscreen);
+                            profile.back = action.clone();
+                            let dispatched = app.dispatch_mouse_button(
+                                ctx,
+                                MouseButtonSlot::Back,
+                                crate::app::ActionSurface::Viewer,
+                                "manual-wrap-mouse-test",
+                            );
+                            assert_eq!(dispatched.dispatched_action, Some(action));
+                        } else {
+                            app.navigate_gamepad_still(ctx, current, if forward { 1 } else { -1 });
+                        }
+                    });
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(expected),
+                        "wrap={wrap} forward={forward} mouse={mouse}"
+                    );
+                    if wrap {
+                        assert!(app.fs_boundary_hint.is_none());
+                    } else {
+                        assert!(
+                            matches!(app.fs_boundary_hint, Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == forward)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_does_not_change_assigned_home_end_or_spread_nudge() {
+        for wrap in [false, true] {
+            for end in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = ready_app(&ctx, SpreadMode::Single);
+                app.settings.page_turn_animation_enabled = false;
+                app.settings.fullscreen_manual_nav_wrap = wrap;
+                app.fullscreen_idx = Some(1);
+                app.settings
+                    .ring_shortcuts
+                    .mouse_button_profile_mut(RingShortcutContext::ImageFullscreen)
+                    .back = if end {
+                    RingActionId::ImageEnd
+                } else {
+                    RingActionId::ImageHome
+                };
+                for _ in 0..2 {
+                    frame(&ctx, |_, ctx| {
+                        app.apply_mouse_button(
+                            ctx,
+                            MouseButtonSlot::Back,
+                            crate::app::ActionSurface::Viewer,
+                            "manual-wrap-jump-test",
+                        );
+                    });
+                    assert_eq!(app.fullscreen_idx, Some(if end { 3 } else { 0 }));
+                }
+                assert!(
+                    matches!(app.fs_boundary_hint, Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == end)
+                );
+            }
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, SpreadMode::Ltr);
+            app.settings.page_turn_animation_enabled = false;
+            app.settings.fullscreen_manual_nav_wrap = wrap;
+            app.fullscreen_idx = Some(0);
+            let before = app.spread_shift_anchor_idx();
+            frame(&ctx, |_, ctx| {
+                app.apply_ring_image_spread_shift(ctx, -1, "manual-wrap-nudge-test");
+            });
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.spread_shift_anchor_idx(), before);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
@@ -12121,5 +12266,39 @@ mod physical_boundary_tests {
         assert!(resumed.dispatch_allowed);
         assert!(resumed.dispatched);
         assert_eq!(app.gamepad.state.axis(PadAxis::LeftX), 0.9);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3_forked_mounted_gamepad_adopts_its_own_result_before_first_lookup() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        let main_key = crate::app::final_prepare_tests::queued_final(&mut app, 0);
+        let fork = app.fork_materialized_still_context(std::path::Path::new("C:/page-turn"), 0);
+        app.with_viewer_context(fork, |owner| {
+            assert!(
+                owner.final_effect_pending.is_empty(),
+                "fork must not share receiver/cancel ownership"
+            );
+            owner.reading_direction = crate::settings::ReadingDirection::Ltr;
+            owner.settings.gamepad_enabled = true;
+            let key = crate::app::final_prepare_tests::queued_final(owner, 1);
+            owner
+                .gamepad
+                .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+            let batch = owner.sample_gamepad_input_with_logic_for_test(&ctx);
+            crate::app::final_prepare_tests::expect_adopted_before_lookup(key, || {
+                let outcome = owner.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+                assert!(outcome.dispatched);
+            });
+            assert_eq!(owner.fullscreen_idx, Some(1));
+        })
+        .unwrap();
+        assert!(app.final_effect_pending.contains_key(&main_key));
+        assert!(app.final_composite_cache.get(&main_key).is_none());
     }
 }

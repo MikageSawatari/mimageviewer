@@ -18,6 +18,7 @@
 //! v0.9.0 で native presenter に移行済。新規追加 / 移植時に「ui_fullscreen.rs を見て
 //! しまう」誤認を避けるため明示。
 
+pub(crate) mod canonical_demand;
 #[cfg(test)]
 mod front_popup_input_tests;
 #[cfg(test)]
@@ -47,6 +48,10 @@ use eframe::egui;
 
 #[cfg(test)]
 mod book_composition_tests;
+#[cfg(test)]
+mod final_demand_topology_tests;
+#[cfg(test)]
+mod next_final_demand_tests;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11325,6 +11330,8 @@ impl App {
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        #[cfg(test)]
+        crate::app::final_prepare_tests::observe_lookup(self);
         let texture = self.resolve_fs_display_tex_from_caches(idx, include_thumb)?;
         self.display_texture_matches_page(&texture, idx)
             .then_some(texture)
@@ -13559,6 +13566,32 @@ impl App {
         }
     }
 
+    /// Read only the already-bound target. In particular this must not resolve
+    /// navigation readiness: that resolver selects textures and belongs after
+    /// final-result adoption. Existing rendition admission remains target-scoped.
+    pub(crate) fn final_prepare_work_admission(&self, fs_idx: usize) -> FsPageTurnDecision {
+        let (active, ready) = self.fs_navigation_sequence_rendition_state(fs_idx);
+        page_turn_decision_for_inputs(active, ready)
+    }
+
+    pub(crate) fn invalidate_final_prepare_decision(&self, ctx: &egui::Context) {
+        let viewport = self.page_turn_destination().viewport;
+        ctx.data_mut(|data| {
+            data.remove::<FsPageTurnFrameDecision>(egui::Id::unique((
+                "fs_page_turn_decision",
+                viewport,
+            )));
+        });
+    }
+
+    /// All mutations/invalidation belonging to this entry have already run.
+    /// Do not sample input, poll permission, start producers, or select a display
+    /// source here. Re-entry may receive a newly arrived result in the same frame.
+    pub(crate) fn service_final_prepare_before_lookup(&mut self, ctx: &egui::Context) {
+        self.reflect_held_page_turn_receipt_before_lookup(ctx);
+        self.poll_final_effects(ctx);
+    }
+
     pub(crate) fn fs_navigation_rendition_target_pages(&self, fs_idx: usize) -> Option<Vec<usize>> {
         self.fs_holdover_tex
             .as_ref()
@@ -14017,6 +14050,7 @@ impl App {
                 self.bind_fs_navigation_sequence_to_current_target();
             }
             if let Some(idx) = self.fullscreen_idx {
+                self.service_final_prepare_before_lookup(ctx);
                 let original_preview_active = self.original_preview_active_for_frame(ctx, idx);
                 self.resolve_fs_navigation_sequence_target(ctx, idx, original_preview_active);
             }
@@ -14054,6 +14088,7 @@ impl App {
             self.fs_holdover_tex = None;
             return;
         };
+        self.service_final_prepare_before_lookup(ctx);
         let has_full = matches!(
             self.fs_cache.get(&idx),
             Some(FsCacheEntry::Static { .. })
@@ -16113,6 +16148,39 @@ pub(crate) struct PagedPrefetchTargets {
     pub(crate) targets: Vec<(usize, usize)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NextFinalUnitDemand {
+    Boundary,
+    Unit(Vec<SpreadPageOccurrence>),
+}
+
+enum FinalUnitPosition {
+    Current,
+    Next,
+}
+
+/// The unit ordinal, never an image index or physical direction, advances.
+/// Composition owns blank/vacant paper and cover supplements; only real page
+/// occurrences become pixel demand. No source lookup or preparation occurs.
+fn next_final_unit_demand(
+    units: &[SpreadDisplayUnit],
+    current: usize,
+    mode: SpreadMode,
+    final_cover: bool,
+    placement: crate::settings::SingletonSpreadEndpointSettings,
+    eligible: bool,
+) -> NextFinalUnitDemand {
+    let Some(next) = current.checked_add(1).filter(|next| *next < units.len()) else {
+        return NextFinalUnitDemand::Boundary;
+    };
+    match resolve_spread_display_composition(units, next, mode, final_cover, placement, eligible) {
+        Some(composition) => {
+            NextFinalUnitDemand::Unit(composition.pages_in_reading_order().to_vec())
+        }
+        None => NextFinalUnitDemand::Boundary,
+    }
+}
+
 /// A page's role inside one visible reading unit. Navigation is projected only
 /// from `Navigation`; supplements participate in the complete presentation but
 /// never add a seek/history/page-count target.
@@ -16635,12 +16703,123 @@ pub(crate) struct SpreadDisplayUnitsCache {
     /// Derived once with the unit token. This proves that `nav` is a complete permutation of
     /// one all-page item list; transient surface/search/stack eligibility stays outside the cache.
     complete_page_permutation: Option<bool>,
+    /// CPU demand derives other reading topologies without replacing the visible
+    /// units allocation that submitted receipts still identify.
+    final_demand_topologies: Option<FinalDemandTopologies>,
     rotation_recheck_all: bool,
     rotation_recheck_indices: HashSet<usize>,
     /// Bounded source measurements outlive a viewport presentation permit.
     /// Entries carry no image permission and are never emitted as paint pages.
     continuous_measurements: std::collections::VecDeque<ContinuousUnitMeasurement>,
     continuous_admission: ContinuousAdmissionEpisode,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FinalDemandCompleteness {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalDemandBookContext {
+    Eligible,
+    Ineligible,
+}
+
+impl FinalDemandCompleteness {
+    fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FinalDemandDerivedTopology {
+    units: Vec<SpreadDisplayUnit>,
+    positions: HashMap<usize, usize>,
+    completeness: FinalDemandCompleteness,
+}
+
+#[derive(Clone, Debug)]
+enum FinalDemandTopology {
+    /// Reuse the owner's existing units and reverse index, rather than cloning
+    /// a book-sized map merely to look up Current/Next.
+    Visible(FinalDemandCompleteness),
+    Derived(Arc<FinalDemandDerivedTopology>),
+}
+
+#[derive(Clone, Debug)]
+struct FinalDemandTopologies {
+    visible: SpreadDisplayUnitsToken,
+    visible_units: Arc<Vec<SpreadDisplayUnit>>,
+    source: (u64, ReadingFlow),
+    reader_order: (usize, usize),
+    normal_nav: Arc<Vec<usize>>,
+    still_nav: Arc<Vec<usize>>,
+    requested_page_alone: crate::settings::PageAloneSettings,
+    book_context: FinalDemandBookContext,
+    normal: FinalDemandTopology,
+    still: FinalDemandTopology,
+}
+
+impl FinalDemandTopologies {
+    fn same_visible(
+        &self,
+        token: &SpreadDisplayUnitsToken,
+        units: &Arc<Vec<SpreadDisplayUnit>>,
+    ) -> bool {
+        // Arc's derived PartialEq would walk the navigation list on every poll.
+        Arc::ptr_eq(&self.visible.nav, &token.nav)
+            && Arc::ptr_eq(&self.visible_units, units)
+            && self.visible.items_generation == token.items_generation
+            && self.visible.spread_mode == token.spread_mode
+            && self.visible.shift_anchor_idx == token.shift_anchor_idx
+            && self.visible.landscape_epoch == token.landscape_epoch
+            && self.visible.page_alone == token.page_alone
+            && self.visible.composed == token.composed
+    }
+}
+
+fn build_display_unit_topology(
+    nav: &[usize],
+    mode: SpreadMode,
+    shift: Option<usize>,
+    page_alone: crate::settings::PageAloneSettings,
+    overrides: &HashMap<usize, crate::book_composition::PageOverride>,
+    landscape: impl Fn(usize, usize) -> bool,
+    pairable: impl Fn(usize) -> bool,
+) -> Vec<SpreadDisplayUnit> {
+    #[cfg(test)]
+    SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
+    if mode.is_spread() {
+        build_spread_display_units_with_overrides(
+            nav, mode, shift, page_alone, overrides, landscape, pairable,
+        )
+    } else {
+        nav.iter()
+            .enumerate()
+            .map(|(position, &idx)| {
+                SpreadDisplayUnit::singleton(
+                    position,
+                    idx,
+                    if pairable(idx) {
+                        SpreadDisplaySingletonCause::UnpairedSlot
+                    } else {
+                        SpreadDisplaySingletonCause::NonPairableBoundary
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+fn index_display_units(units: &[SpreadDisplayUnit]) -> HashMap<usize, usize> {
+    let mut positions = HashMap::new();
+    for (position, unit) in units.iter().enumerate() {
+        for &idx in &unit.pages {
+            positions.entry(idx).or_insert(position);
+        }
+    }
+    positions
 }
 
 #[derive(Clone, Debug)]
@@ -16866,12 +17045,10 @@ impl SpreadDisplayUnitsCache {
             nav: Arc::clone(&nav),
             composed: None,
         });
-        self.tracked_indices.clear();
+        self.final_demand_topologies = None;
+        self.tracked_indices = index_display_units(&units);
         self.image_unit_positions.clear();
         for (position, unit) in units.iter().enumerate() {
-            for &idx in &unit.pages {
-                self.tracked_indices.entry(idx).or_insert(position);
-            }
             if (0..unit.pages.len()).any(|offset| {
                 image_flags
                     .get(unit.nav_start + offset)
@@ -17076,6 +17253,26 @@ fn reset_final_cover_eligibility_scan_count_for_test() {
 #[cfg(test)]
 fn final_cover_eligibility_scan_count_for_test() -> usize {
     FINAL_COVER_ELIGIBILITY_SCAN_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_native_topology_work_counts_for_test() {
+    reset_final_cover_eligibility_scan_count_for_test();
+    reset_spread_display_units_build_count_for_test();
+    PREFETCH_NAV_COMPARISON_ELEMENTS.set(0);
+    PREFETCH_POSITION_SCANS.set(0);
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+}
+
+#[cfg(test)]
+pub(crate) fn native_topology_work_counts_for_test() -> [usize; 5] {
+    [
+        final_cover_eligibility_scan_count_for_test(),
+        spread_display_units_build_count_for_test(),
+        PREFETCH_NAV_COMPARISON_ELEMENTS.get(),
+        PREFETCH_POSITION_SCANS.get(),
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+    ]
 }
 #[cfg(test)]
 fn build_spread_display_units_with_landscape(
@@ -18443,6 +18640,13 @@ impl FsFrameState {
 }
 
 /// フルスクリーンのページ移動結果。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FsWrapTarget {
+    pub(crate) idx: usize,
+    pub(crate) slice: Option<crate::page_split::PageSlice>,
+    pub(crate) forward: bool,
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FsPageNav {
     #[default]
@@ -18451,6 +18655,8 @@ pub(crate) enum FsPageNav {
     Delta(i32),
     /// 見開き表示で解決済みの次の表示単位先頭。
     Target(usize),
+    /// Manual end-to-end jump, excluded from adjacent page-turn animation.
+    Wrap(FsWrapTarget),
     /// 見開き表示の先頭 / 末尾に、その入力 1 回で到達した。
     Boundary { at_end: bool },
     /// 横長分割での移動先。**同じページの反対側も、別ページも同じ変種で表す**
@@ -19616,40 +19822,21 @@ impl App {
             .iter()
             .map(|&idx| is_spread_pairable_item(self.items.get(idx)))
             .collect::<Vec<_>>();
-        let units = if self.spread_mode.is_spread() {
-            let automatic_overrides = HashMap::new();
-            let overrides = self
-                .composed_book_layout()
-                .map(|layout| &layout.page_overrides)
-                .unwrap_or(&automatic_overrides);
-            build_spread_display_units_with_overrides(
-                nav,
-                self.spread_mode,
-                self.spread_shift_anchor_idx(),
-                page_alone,
-                overrides,
-                |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
-                |idx| is_spread_pairable_item(self.items.get(idx)),
-            )
-        } else {
-            nav.iter()
-                .enumerate()
-                .map(|(position, &idx)| {
-                    SpreadDisplayUnit::singleton(
-                        position,
-                        idx,
-                        if image_flags[position] {
-                            SpreadDisplaySingletonCause::UnpairedSlot
-                        } else {
-                            SpreadDisplaySingletonCause::NonPairableBoundary
-                        },
-                    )
-                })
-                .collect()
-        };
+        let automatic_overrides = HashMap::new();
+        let overrides = self
+            .composed_book_layout()
+            .map(|layout| &layout.page_overrides)
+            .unwrap_or(&automatic_overrides);
+        let units = build_display_unit_topology(
+            nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx(),
+            page_alone,
+            overrides,
+            |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
+            |idx| is_spread_pairable_item(self.items.get(idx)),
+        );
         let nav_identity = nav_identity.unwrap_or_else(|| Arc::new(nav.to_vec()));
-        #[cfg(test)]
-        SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
         self.spread_display_units_cache.install(
             nav_identity,
             self.items_generation,
@@ -19999,6 +20186,412 @@ impl App {
         })
     }
 
+    fn final_demand_book_context(&self) -> FinalDemandBookContext {
+        if self.spread_complete_book_context_eligible() {
+            FinalDemandBookContext::Eligible
+        } else {
+            FinalDemandBookContext::Ineligible
+        }
+    }
+
+    fn final_demand_visible_inputs_are_current(&self) -> bool {
+        let cache = &self.spread_display_units_cache;
+        let Some(token) = &cache.token else {
+            return false;
+        };
+        let composed = self.composed_layout_token().and_then(|(scope, token)| {
+            self.composed_book_layout()
+                .map(|layout| (scope, token, composition_view_direction(layout.direction)))
+        });
+        token.items_generation == self.items_generation
+            && token.spread_mode == self.spread_mode
+            && token.shift_anchor_idx == self.spread_shift_anchor_idx()
+            && token.landscape_epoch == cache.landscape_epoch
+            && token.composed == composed
+            && !cache.rotation_recheck_all
+            && cache.rotation_recheck_indices.is_empty()
+    }
+
+    fn final_demand_topologies_are_current(&self, saved: &FinalDemandTopologies) -> bool {
+        let cache = &self.spread_display_units_cache;
+        self.final_demand_visible_inputs_are_current()
+            && cache
+                .token
+                .as_ref()
+                .is_some_and(|token| saved.same_visible(token, &cache.units))
+            && self.viewer_navigation_caches.source == Some(saved.source)
+            && saved.source == (self.items_generation, self.reading_flow)
+            && self
+                .viewer_navigation_caches
+                .nav_indices
+                .as_ref()
+                .is_some_and(|nav| Arc::ptr_eq(nav, &saved.normal_nav))
+            && self
+                .viewer_navigation_caches
+                .still_image_indices
+                .as_ref()
+                .is_some_and(|nav| Arc::ptr_eq(nav, &saved.still_nav))
+            && saved.reader_order
+                == (
+                    self.current_reader_order().as_ptr() as usize,
+                    self.current_reader_order().len(),
+                )
+            && saved.requested_page_alone == self.page_alone_enabled_for_current_book()
+            && saved.book_context == self.final_demand_book_context()
+    }
+
+    /// One cold pure derivation under the existing unit owner. Never resolve
+    /// shift, read metadata, select a display texture, or replace visible proof.
+    pub(crate) fn prepare_final_demand_topologies(&mut self) {
+        if !self.settings.page_turn_animation_enabled
+            || !self.reading_flow.is_paged()
+            || self.spread_mode.is_split()
+            || self.fullscreen_idx.is_none()
+            || self.remote_session_blocks_local_control()
+        {
+            return;
+        }
+        // A validated resume adopts results before the runtime changes from
+        // ParkedLive to Resuming. Pure demand derivation follows that existing
+        // service boundary; mount/park themselves never call this method.
+        if !self.final_demand_visible_inputs_are_current() {
+            return;
+        }
+        if self
+            .spread_display_units_cache
+            .final_demand_topologies
+            .as_ref()
+            .is_some_and(|saved| self.final_demand_topologies_are_current(saved))
+        {
+            return;
+        }
+        let token = self
+            .spread_display_units_cache
+            .token
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Both lists use the current accepted reader order. The cold comparison
+        // proves this visible baseline belongs to that order, even when an owner
+        // was replaced with a same-content Arc without changing items generation.
+        let normal = build_nav_indices(&self.items, self.current_reader_order());
+        let still = crate::ui_helpers::still_image_display_indices(
+            &self.items,
+            self.current_reader_order(),
+        );
+        if !token.matches_nav(&normal) && !token.matches_nav(&still) {
+            return;
+        }
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        let normal_nav = match self.viewer_navigation_caches.nav_indices.as_ref() {
+            Some(nav) if nav.as_slice() == normal.as_slice() => nav.clone(),
+            _ => self.viewer_navigation_caches.install_nav_indices(normal),
+        };
+        let same_nav = normal_nav.as_slice() == still.as_slice();
+        let still_nav = match self.viewer_navigation_caches.still_image_indices.as_ref() {
+            Some(nav) if nav.as_slice() == still.as_slice() => nav.clone(),
+            _ if same_nav => {
+                self.viewer_navigation_caches.still_image_indices = Some(normal_nav.clone());
+                normal_nav.clone()
+            }
+            _ => self
+                .viewer_navigation_caches
+                .install_still_image_indices(still),
+        };
+        let normal = self.derive_final_demand_topology(&normal_nav, &token);
+        let still = if same_nav {
+            normal.clone()
+        } else {
+            self.derive_final_demand_topology(&still_nav, &token)
+        };
+        self.spread_display_units_cache.final_demand_topologies = Some(FinalDemandTopologies {
+            visible: token,
+            visible_units: self.spread_display_units_cache.units.clone(),
+            source: (self.items_generation, self.reading_flow),
+            reader_order: (
+                self.current_reader_order().as_ptr() as usize,
+                self.current_reader_order().len(),
+            ),
+            normal_nav,
+            still_nav,
+            requested_page_alone: self.page_alone_enabled_for_current_book(),
+            book_context: self.final_demand_book_context(),
+            normal,
+            still,
+        });
+    }
+
+    fn derive_final_demand_topology(
+        &self,
+        nav: &[usize],
+        token: &SpreadDisplayUnitsToken,
+    ) -> FinalDemandTopology {
+        let visible_nav = token.matches_nav(nav);
+        let complete = self.spread_mode.is_spread()
+            && self.spread_complete_book_context_eligible()
+            && self.spread_complete_page_permutation(nav);
+        let completeness = if complete {
+            FinalDemandCompleteness::Complete
+        } else {
+            FinalDemandCompleteness::Incomplete
+        };
+        let page_alone = if complete && self.spread_mode.has_cover() {
+            self.page_alone_enabled_for_current_book()
+        } else {
+            Default::default()
+        };
+        if visible_nav && token.page_alone == page_alone {
+            return FinalDemandTopology::Visible(completeness);
+        }
+        let empty = HashMap::new();
+        let overrides = self
+            .composed_book_layout()
+            .map(|layout| &layout.page_overrides)
+            .unwrap_or(&empty);
+        let units = build_display_unit_topology(
+            nav,
+            self.spread_mode,
+            token.shift_anchor_idx,
+            page_alone,
+            overrides,
+            |_, idx| {
+                self.spread_display_units_cache
+                    .landscape_indices
+                    .contains(&idx)
+            },
+            |idx| is_spread_pairable_item(self.items.get(idx)),
+        );
+        let positions = index_display_units(&units);
+        FinalDemandTopology::Derived(Arc::new(FinalDemandDerivedTopology {
+            units,
+            positions,
+            completeness,
+        }))
+    }
+
+    /// Observation only in D3-1. Slideshow uses its actual installed still-image
+    /// navigation list; Collection's future snapshot is never guessed here.
+    pub(crate) fn observe_next_final_unit_demand(&mut self) {
+        if !crate::perf::is_enabled()
+            || !self.settings.page_turn_animation_enabled
+            || !self.reading_flow.is_paged()
+            || self.spread_mode.is_split()
+        {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        #[cfg(windows)]
+        if self.slideshow_playing
+            && matches!(
+                self.navigation_scope,
+                crate::app::ViewerNavigationScope::CollectionRoot
+            )
+        {
+            return;
+        }
+        self.prepare_final_demand_topologies();
+        let Some(demand) = self.next_final_unit_demand_from_snapshot(idx) else {
+            return;
+        };
+        let (boundary, pages) = match demand {
+            NextFinalUnitDemand::Boundary => (true, Vec::new()),
+            NextFinalUnitDemand::Unit(pages) => (false, pages),
+        };
+        crate::perf::event("fs", "next_final_unit_demand", None, self.input_seq, &[
+            ("items_generation", self.items_generation.into()),
+            ("viewport", format!("{:?}", self.page_turn_destination().viewport).into()),
+            ("anchor", idx.into()),
+            ("slideshow", self.slideshow_playing.into()),
+            ("boundary", boundary.into()),
+            ("pages", serde_json::Value::Array(pages.iter().map(|page| serde_json::json!({"idx": page.idx, "anchor": page.navigation_anchor_idx, "role": format!("{:?}", page.role)})).collect())),
+        ]);
+    }
+
+    /// The same pure installed topology as observation, including slideshow's
+    /// actual still-only destination. Never opens the next book or collection.
+    pub(crate) fn next_final_prepare_occurrences(
+        &self,
+        idx: usize,
+    ) -> Option<Vec<SpreadPageOccurrence>> {
+        #[cfg(windows)]
+        if self.slideshow_playing
+            && matches!(
+                self.navigation_scope,
+                crate::app::ViewerNavigationScope::CollectionRoot
+            )
+        {
+            return None;
+        }
+        match self.next_final_unit_demand_from_snapshot(idx)? {
+            NextFinalUnitDemand::Boundary => None,
+            NextFinalUnitDemand::Unit(pages) => Some(pages),
+        }
+    }
+
+    pub(crate) fn next_final_unit_demand_from_snapshot(
+        &self,
+        idx: usize,
+    ) -> Option<NextFinalUnitDemand> {
+        self.final_unit_demand_from_snapshot(idx, FinalUnitPosition::Next)
+    }
+
+    pub(crate) fn current_final_prepare_occurrences(
+        &self,
+        idx: usize,
+    ) -> Option<Vec<SpreadPageOccurrence>> {
+        match self.final_unit_demand_from_snapshot(idx, FinalUnitPosition::Current)? {
+            NextFinalUnitDemand::Boundary => None,
+            NextFinalUnitDemand::Unit(pages) => Some(pages),
+        }
+    }
+
+    fn final_unit_demand_from_snapshot(
+        &self,
+        idx: usize,
+        requested: FinalUnitPosition,
+    ) -> Option<NextFinalUnitDemand> {
+        Some(
+            match self.final_unit_composition_from_snapshot(idx, requested)? {
+                Some(composition) => NextFinalUnitDemand::Unit(
+                    composition
+                        .pages_in_reading_order()
+                        .iter()
+                        .copied()
+                        .filter(|page| is_spread_pairable_item(self.items.get(page.idx)))
+                        .collect(),
+                ),
+                None => NextFinalUnitDemand::Boundary,
+            },
+        )
+    }
+
+    /// Read only proofs already adopted by the ordinary navigation/unit owners.
+    /// Native observation must not rebuild either the book permutation proof or
+    /// slideshow's still-only navigation/units on each callback and replay.
+    fn resident_final_unit_composition_from_snapshot(
+        &self,
+        idx: usize,
+        requested: FinalUnitPosition,
+    ) -> Option<Option<SpreadDisplayComposition>> {
+        let cache = &self.spread_display_units_cache;
+        let token = cache.token.as_ref()?;
+        if token.items_generation != self.items_generation
+            || token.spread_mode != self.spread_mode
+            || token.landscape_epoch != cache.landscape_epoch
+            || token.shift_anchor_idx != self.spread_shift_anchor_idx()
+            || cache.rotation_recheck_all
+            || !cache.rotation_recheck_indices.is_empty()
+            || self.viewer_navigation_caches.source
+                != Some((self.items_generation, self.reading_flow))
+        {
+            return None;
+        }
+        let owns_nav = self
+            .viewer_navigation_caches
+            .nav_indices
+            .as_ref()
+            .is_some_and(|nav| Arc::ptr_eq(nav, &token.nav))
+            || (self.slideshow_playing
+                && self
+                    .viewer_navigation_caches
+                    .still_image_indices
+                    .as_ref()
+                    .is_some_and(|nav| Arc::ptr_eq(nav, &token.nav)));
+        let composed = self.composed_layout_token().and_then(|(scope, token)| {
+            self.composed_book_layout()
+                .map(|layout| (scope, token, composition_view_direction(layout.direction)))
+        });
+        if !owns_nav || token.composed != composed {
+            return None;
+        }
+        // Each non-pairable media item owns a non-image singleton unit. This
+        // token-derived index therefore proves the installed topology is also
+        // the slideshow topology without enumerating/filtering the book again.
+        if self.slideshow_playing && cache.image_unit_positions.len() != cache.units.len() {
+            return None;
+        }
+        // Single has no endpoint/cover composition policy. For spreads, absence
+        // of the installed complete-list proof is unknown, never assumed false.
+        let eligible =
+            if self.spread_mode.is_spread() && self.spread_complete_book_context_eligible() {
+                cache.complete_page_permutation?
+            } else {
+                false
+            };
+        let page_alone = if self.spread_mode.has_cover() && eligible {
+            self.page_alone_enabled_for_current_book()
+        } else {
+            Default::default()
+        };
+        if token.page_alone != page_alone {
+            return None;
+        }
+        let position = cache.unit_position(idx)?;
+        let position = match requested {
+            FinalUnitPosition::Current => position,
+            FinalUnitPosition::Next => match position.checked_add(1) {
+                Some(next) if next < cache.units.len() => next,
+                _ => return Some(None),
+            },
+        };
+        Some(resolve_spread_display_composition(
+            &cache.units,
+            position,
+            self.spread_mode,
+            self.final_cover_spread_enabled_for_current_book(),
+            self.spread_singleton_display_endpoint_settings(),
+            eligible,
+        ))
+    }
+
+    /// The installed topology's complete composition, including singleton slots
+    /// and cover roles. Observation and Native demand must not reconstruct it
+    /// from a flattened list of page indices.
+    fn final_unit_composition_from_snapshot(
+        &self,
+        idx: usize,
+        requested: FinalUnitPosition,
+    ) -> Option<Option<SpreadDisplayComposition>> {
+        let cache = &self.spread_display_units_cache;
+        let saved = cache.final_demand_topologies.as_ref()?;
+        if !self.final_demand_topologies_are_current(saved) {
+            return None;
+        }
+        let topology = if self.slideshow_playing {
+            &saved.still
+        } else {
+            &saved.normal
+        };
+        let (units, position, completeness) = match topology {
+            FinalDemandTopology::Visible(proof) => {
+                (cache.units.as_slice(), cache.unit_position(idx)?, *proof)
+            }
+            FinalDemandTopology::Derived(topology) => (
+                topology.units.as_slice(),
+                *topology.positions.get(&idx)?,
+                topology.completeness,
+            ),
+        };
+        let position = match requested {
+            FinalUnitPosition::Current => position,
+            FinalUnitPosition::Next => match position.checked_add(1) {
+                Some(next) if next < units.len() => next,
+                _ => return Some(None),
+            },
+        };
+        Some(resolve_spread_display_composition(
+            units,
+            position,
+            self.spread_mode,
+            self.final_cover_spread_enabled_for_current_book(),
+            self.spread_singleton_display_endpoint_settings(),
+            completeness.is_complete(),
+        ))
+    }
+
     pub(crate) fn book_target_presentation_demand(
         &mut self,
         idx: usize,
@@ -20204,6 +20797,7 @@ impl App {
         steps: &[crate::page_split::PresentationStep],
         fs_idx: usize,
         dir: i32,
+        wrap: bool,
     ) -> FsPageNav {
         let at = steps
             .iter()
@@ -20218,6 +20812,18 @@ impl App {
             crate::page_split::step_backward(steps, at)
         };
         match moved {
+            crate::page_split::StepMove::AtEnd if wrap && steps.len() > 1 => {
+                let step = if dir > 0 {
+                    steps[0]
+                } else {
+                    steps[steps.len() - 1]
+                };
+                FsPageNav::Wrap(FsWrapTarget {
+                    idx: step.source_idx,
+                    slice: Some(step.slice),
+                    forward: dir > 0,
+                })
+            }
             crate::page_split::StepMove::AtEnd => FsPageNav::Boundary { at_end: dir > 0 },
             crate::page_split::StepMove::WithinPage { to }
             | crate::page_split::StepMove::ToAnotherPage { to } => FsPageNav::Split(to),
@@ -21738,6 +22344,15 @@ impl App {
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::record_drawn_paint(&painter, &window.texture, "snapshot_direct".into());
         window.texture.retain_native_output_for_paint(&painter);
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn draw_detached_snapshot_for_gpu_test(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        window: &crate::app::DeferredDetachedImageWindowView,
+    ) {
+        Self::draw_detached_image_window_snapshot(ui, full_rect, window);
     }
 
     #[cfg(windows)]
@@ -26051,6 +26666,10 @@ impl App {
             detached_open_pending,
             detached_open_holdover_ready,
         ) = if detached && !embedded {
+            // Visibility/readiness probe only: this &self lookup neither captures
+            // a paint source nor accepts an offer/receipt. Actual viewport selection
+            // passes begin_page_turn_viewer_frame's service prefix. Existing close
+            // ordering is retained separately for barrier/no-barrier paths.
             let display_ready = self.resolve_fs_display_tex(fs_idx, true).is_some();
             let cache_state = match self.fs_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Static { .. }) => "static",
@@ -26814,6 +27433,7 @@ impl App {
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
                             full_rect, fs_idx, state.is_video, still_seek_geometry,
                         );
+                        self.record_next_canonical_native_demand(ui);
                         if key_action.close {
                             close_fs = true;
                         }
@@ -29435,6 +30055,9 @@ impl App {
         fs_idx: usize,
         perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
     ) -> FsPageTurnDecision {
+        #[cfg(test)]
+        crate::app::final_prepare_tests::assert_outside_receipt();
+        self.service_final_prepare_before_lookup(ctx);
         let demand = self.book_target_presentation_demand(fs_idx);
         if !matches!(
             self.book_presentation_allowed(&demand),
@@ -29969,22 +30592,23 @@ impl App {
     /// Emit readiness only after the final visible display-unit source has been
     /// selected (including holdovers). Spread pages are accepted only as a complete
     /// unit, so the trace cannot report a half-painted pair as ready.
-    pub(crate) fn flush_submitted_page_turn_ready(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending_fs_page_turn_ready.take() else {
-            return;
-        };
+    fn take_matching_submitted_page_turn_ready(&mut self) -> Option<PendingFsPageTurnReady> {
+        let pending = self.pending_fs_page_turn_ready.take()?;
         let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
-            return;
+            return None;
         };
-        if !receipt.was_accepted()
-            || pending.items_generation != self.items_generation
+        if !receipt.was_accepted() {
+            self.pending_fs_page_turn_ready = Some(pending);
+            return None;
+        }
+        if pending.items_generation != self.items_generation
             || pending.mode != self.spread_mode
             || pending.slice != self.fullscreen_page_slice
             || !Arc::ptr_eq(&pending.units, &self.spread_display_units_cache.units)
             || self.fullscreen_idx != Some(pending.composition.navigation_anchor_idx())
             || !receipt.matches_sources(self.page_turn_destination(), &pending.sources)
         {
-            return;
+            return None;
         }
         let current =
             self.spread_display_composition_for_anchor(pending.composition.navigation_anchor_idx());
@@ -30011,65 +30635,99 @@ impl App {
                         page.transform.uv_rect,
                     )
                 }))
-            || pending.sources.pages.iter().any(|page| {
-                let native_presentation = matches!(
-                    &page.resource,
-                    FullscreenPaintPayload::PresentationMaterial(_)
-                ) && page.resource.lanczos_output().is_some();
-                if native_presentation
-                    && (!receipt.has_presentation_binding() || !receipt.content_matches(self))
-                {
-                    return true;
-                }
-                let held = matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
-                    .then(|| self.page_turn_held_resource(page.idx()))
-                    .flatten()
-                    .filter(|resource| {
-                        resource.source_texture_id() == page.resource.source_texture_id()
-                            && resource.source_generation() == page.resource.source_generation()
-                    });
-                let generation_matches = held.is_some()
-                    || match page.resource.source_generation() {
-                        Some(generation) => {
-                            generation.items == self.items_generation
-                                && generation.input
-                                    == self.input_generation.get(&page.idx()).copied().unwrap_or(0)
-                        }
-                        // Legacy Direct thumbnails/animations have no producer generation.
-                        // Their owning source resolver below still checks the current identity.
-                        None => matches!(
-                            &page.resource,
-                            FullscreenPaintPayload::NormalResource(
-                                FullscreenPaintResource::Direct { .. }
-                            ) | FullscreenPaintPayload::PresentationMaterial(_)
-                        ),
-                    };
-                let presentation_matches = native_presentation
-                    && receipt.has_presentation_binding()
-                    && receipt.content_matches(self)
-                    && page.resource.source_generation().is_some()
-                    && held.as_ref().is_none_or(|resource| {
-                        resource.paint_texture_id() == page.resource.paint_texture_id()
-                    });
-                let current_source = match pending.source_policy {
-                    FsSubmittedSourcePolicy::Normal => held
-                        .and_then(|resource| resource.source_texture().cloned())
-                        .or_else(|| self.resolve_fs_display_tex(page.idx(), true)),
-                    FsSubmittedSourcePolicy::Original => self
-                        .resolve_original_preview_tex(page.idx())
-                        .or_else(|| self.fs_thumbnail_texture_for_display(page.idx())),
-                    FsSubmittedSourcePolicy::Passthrough => {
-                        self.cached_passthrough_rendition(page.idx())
-                    }
-                };
-                !generation_matches
-                    || (page.provenance == FsDisplayUnitPageProvenance::Live
-                        && !presentation_matches
-                        && !current_source.is_some_and(|texture| {
-                            texture.id() == page.resource.source_texture_id()
-                        }))
-            })
         {
+            return None;
+        }
+        Some(pending)
+    }
+
+    /// Before adoption, only held presentation proof may retire the observer.
+    /// Ordinary receipts retain their original selector validation after adoption.
+    pub(crate) fn reflect_held_page_turn_receipt_before_lookup(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.take_matching_submitted_page_turn_ready() else {
+            return;
+        };
+        let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
+            return;
+        };
+        if !matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
+            || !self.page_turn_receipt_matches_held(receipt)
+        {
+            self.pending_fs_page_turn_ready = Some(pending);
+            return;
+        }
+        self.emit_fs_page_turn_ready_for_submitted_display_unit(
+            ctx,
+            &pending.composition,
+            pending.decision,
+            &pending.sources,
+        );
+    }
+
+    pub(crate) fn flush_submitted_page_turn_ready(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.take_matching_submitted_page_turn_ready() else {
+            return;
+        };
+        let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
+            return;
+        };
+        if pending.sources.pages.iter().any(|page| {
+            let native_presentation = matches!(
+                &page.resource,
+                FullscreenPaintPayload::PresentationMaterial(_)
+            ) && page.resource.lanczos_output().is_some();
+            if native_presentation
+                && (!receipt.has_presentation_binding() || !receipt.content_matches(self))
+            {
+                return true;
+            }
+            let held = matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
+                .then(|| self.page_turn_held_resource(page.idx()))
+                .flatten()
+                .filter(|resource| {
+                    resource.source_texture_id() == page.resource.source_texture_id()
+                        && resource.source_generation() == page.resource.source_generation()
+                });
+            let generation_matches = held.is_some()
+                || match page.resource.source_generation() {
+                    Some(generation) => {
+                        generation.items == self.items_generation
+                            && generation.input
+                                == self.input_generation.get(&page.idx()).copied().unwrap_or(0)
+                    }
+                    // Legacy Direct thumbnails/animations have no producer generation.
+                    // Their owning source resolver below still checks the current identity.
+                    None => matches!(
+                        &page.resource,
+                        FullscreenPaintPayload::NormalResource(
+                            FullscreenPaintResource::Direct { .. }
+                        ) | FullscreenPaintPayload::PresentationMaterial(_)
+                    ),
+                };
+            let presentation_matches = native_presentation
+                && receipt.has_presentation_binding()
+                && receipt.content_matches(self)
+                && page.resource.source_generation().is_some()
+                && held.as_ref().is_none_or(|resource| {
+                    resource.paint_texture_id() == page.resource.paint_texture_id()
+                });
+            let current_source = match pending.source_policy {
+                FsSubmittedSourcePolicy::Normal => held
+                    .and_then(|resource| resource.source_texture().cloned())
+                    .or_else(|| self.resolve_fs_display_tex(page.idx(), true)),
+                FsSubmittedSourcePolicy::Original => self
+                    .resolve_original_preview_tex(page.idx())
+                    .or_else(|| self.fs_thumbnail_texture_for_display(page.idx())),
+                FsSubmittedSourcePolicy::Passthrough => {
+                    self.cached_passthrough_rendition(page.idx())
+                }
+            };
+            !generation_matches
+                || (page.provenance == FsDisplayUnitPageProvenance::Live
+                    && !presentation_matches
+                    && !current_source
+                        .is_some_and(|texture| texture.id() == page.resource.source_texture_id()))
+        }) {
             return;
         }
         self.emit_fs_page_turn_ready_for_submitted_display_unit(
@@ -31563,7 +32221,16 @@ impl App {
         } else {
             self.get_nav_indices()
         };
-        self.spread_page_nav_for_indices(&nav, fs_idx, base_delta)
+        self.spread_page_nav_for_indices_wrapping(
+            &nav,
+            fs_idx,
+            base_delta,
+            self.manual_nav_wrap_enabled(),
+        )
+    }
+
+    pub(crate) fn manual_nav_wrap_enabled(&self) -> bool {
+        self.settings.fullscreen_manual_nav_wrap
     }
 
     pub(crate) fn spread_page_nav_for_indices(
@@ -31572,12 +32239,22 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) -> FsPageNav {
+        self.spread_page_nav_for_indices_wrapping(nav, fs_idx, base_delta, false)
+    }
+
+    fn spread_page_nav_for_indices_wrapping(
+        &mut self,
+        nav: &[usize],
+        fs_idx: usize,
+        base_delta: i32,
+        wrap: bool,
+    ) -> FsPageNav {
         let dir = base_delta.signum();
         if dir == 0 {
             return FsPageNav::None;
         }
         if let Some(steps) = self.build_presentation_steps_for_nav(nav) {
-            return self.split_page_nav(&steps, fs_idx, dir);
+            return self.split_page_nav(&steps, fs_idx, dir, wrap);
         }
         if !self.spread_mode.is_spread() {
             return FsPageNav::Delta(base_delta);
@@ -31589,6 +32266,17 @@ impl App {
         let target_unit_pos = unit_pos as i32 + dir;
         if (0..units.len() as i32).contains(&target_unit_pos) {
             FsPageNav::Target(units[target_unit_pos as usize].anchor_idx())
+        } else if wrap && units.len() > 1 {
+            let unit = if dir > 0 {
+                &units[0]
+            } else {
+                &units[units.len() - 1]
+            };
+            FsPageNav::Wrap(FsWrapTarget {
+                idx: unit.anchor_idx(),
+                slice: None,
+                forward: dir > 0,
+            })
         } else {
             FsPageNav::Boundary { at_end: dir > 0 }
         }
@@ -31675,16 +32363,17 @@ impl App {
             if let Some((target, anchor)) = self.compute_spread_offset_nudge(fs_idx, dir) {
                 self.page_turn_defer_spread_shift(ctx, target, operation, anchor);
             }
-        } else if let Some(target) = crate::ui_helpers::adjacent_page_navigation_idx(
+        } else if let Some(target) = crate::ui_helpers::adjacent_page_navigation_idx_wrapping(
             &self.items,
             self.current_reader_order(),
             fs_idx,
             dir.signum(),
             false,
+            self.manual_nav_wrap_enabled(),
         ) {
             self.page_turn_defer_navigation(
                 ctx,
-                target,
+                target.idx,
                 None,
                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                 operation,
@@ -32856,8 +33545,10 @@ impl App {
         embedded: bool,
         root_input: Option<&FullscreenRootFrameInput>,
     ) -> PageTurnFrameEntry {
+        self.observe_live_paged_for_final_prepare();
         if !self.page_turn_barrier_active() {
             self.page_turn_pre_draw(ctx);
+            self.service_final_prepare_before_lookup(ctx);
             return PageTurnFrameEntry::Continue {
                 close_response: None,
                 committed: false,
@@ -32900,6 +33591,7 @@ impl App {
                 .blocks_legacy_keymap_shortcuts()
                 && !root_permitted);
         if owned_elsewhere {
+            self.service_final_prepare_before_lookup(ctx);
             return PageTurnFrameEntry::Continue {
                 close_response: None,
                 committed: false,
@@ -32985,6 +33677,7 @@ impl App {
             self.page_turn_pre_draw(&root.context);
         }
         self.page_turn_pre_draw(ctx);
+        self.service_final_prepare_before_lookup(ctx);
         // This is already accepted, recipient-bound navigation. Committing its
         // canonical flat receipt does not sample fresh keys or current levels;
         // a keyboard permit would strand unfocused wheel/slideshow continuations.
@@ -39992,7 +40685,7 @@ impl App {
             FsPageNav::Delta(delta) => {
                 crate::ui_helpers::adjacent_idx_in_order(&image_indices, cur, delta)
             }
-            FsPageNav::None | FsPageNav::Boundary { .. } => None,
+            FsPageNav::None | FsPageNav::Boundary { .. } | FsPageNav::Wrap(_) => None,
         };
         if let Some(idx) = next_idx {
             // フォルダ内の次の静止画系アイテムへ前進。
@@ -40358,10 +41051,30 @@ impl App {
     }
 
     fn admit_book_page_navigation(&mut self, ctx: &egui::Context, target: usize) -> Option<usize> {
+        self.admit_book_page_navigation_with_purpose(ctx, target, None)
+    }
+
+    fn admit_book_page_navigation_with_purpose(
+        &mut self,
+        ctx: &egui::Context,
+        target: usize,
+        purpose: Option<crate::app::book_composition_permission::BookTargetPurpose>,
+    ) -> Option<usize> {
+        // Capture before polling: adopting a new projection can remap pages and
+        // change their pairing while this request still owns its original unit.
+        let navigation_origin = purpose.map(|_| self.capture_book_navigation_origin());
         let target = self.poll_and_remap_book_target(ctx, target)?;
         let contract = crate::fs_page_load_scheduler::FsPageLoadContract::Sequential;
-        let purpose = self.book_target_navigation_purpose(target, contract);
-        let deferred = if self
+        let purpose =
+            purpose.unwrap_or_else(|| self.book_target_navigation_purpose(target, contract));
+        let deferred = if let Some(navigation_origin) = navigation_origin {
+            self.defer_book_composition_wrapped_navigation(
+                target,
+                contract,
+                purpose,
+                navigation_origin,
+            )
+        } else if self
             .fullscreen_idx
             .is_some_and(|current| self.continuous_reading_active_for_idx(current))
         {
@@ -41448,6 +42161,12 @@ impl App {
         if self.viewer_mutation_modal_active() {
             return;
         }
+        // Covers root forwarded keys and this viewport's own key handler after
+        // their settings/edit mutations, as well as mouse/gamepad navigation.
+        // Accepted close always keeps priority over adoption.
+        if !close_fs && !close_to_page_list {
+            self.service_final_prepare_before_lookup(ctx);
+        }
         // A manual navigation intent retires rating restoration even when the
         // page-turn barrier defers its dispatch until an adopted flat frame.
         if close_fs
@@ -41475,6 +42194,11 @@ impl App {
                 ))
             } else {
                 match page_nav {
+                    FsPageNav::Wrap(target) => Some((
+                        target.idx,
+                        target.slice,
+                        crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    )),
                     FsPageNav::Target(target) => Some((
                         target,
                         None,
@@ -41487,23 +42211,25 @@ impl App {
                     )),
                     FsPageNav::Delta(delta) if delta != 0 => {
                         let target = if self.continuous_reading_active_for_idx(fs_idx) {
-                            crate::ui_helpers::adjacent_idx_in_order(
+                            crate::ui_helpers::adjacent_idx_in_order_wrapping(
                                 &self.get_still_image_indices(),
                                 fs_idx,
                                 delta.signum(),
+                                self.manual_nav_wrap_enabled(),
                             )
                         } else {
-                            crate::ui_helpers::adjacent_page_navigation_idx(
+                            crate::ui_helpers::adjacent_page_navigation_idx_wrapping(
                                 &self.items,
                                 self.current_reader_order(),
                                 fs_idx,
                                 delta.signum(),
                                 false,
+                                self.manual_nav_wrap_enabled(),
                             )
                         };
                         target.map(|target| {
                             (
-                                target,
+                                target.idx,
                                 None,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                             )
@@ -41672,6 +42398,9 @@ impl App {
             // against the actor's latest prepared order. Movement to the other half of the same
             // split image remains an in-page operation and stays on the existing path below.
             let collection_delta = match page_nav {
+                FsPageNav::Wrap(target) if target.idx != fs_idx => {
+                    Some(if target.forward { 1 } else { -1 })
+                }
                 FsPageNav::Delta(delta) => Some(delta),
                 FsPageNav::Target(target) => navigable_delta_between(
                     &self.items,
@@ -41686,7 +42415,7 @@ impl App {
                     fs_idx,
                     step.source_idx,
                 ),
-                FsPageNav::None | FsPageNav::Split(_) => None,
+                FsPageNav::None | FsPageNav::Split(_) | FsPageNav::Wrap(_) => None,
             };
             if jump_to.is_none()
                 && let Some(delta) = collection_delta
@@ -41695,6 +42424,7 @@ impl App {
                     fs_idx,
                     delta,
                     crate::app::ManualMediaNavigationLanding::Fullscreen,
+                    self.manual_nav_wrap_enabled(),
                 )
             {
                 self.page_turn_excluded_navigation_with_operation(
@@ -41732,6 +42462,78 @@ impl App {
                         FsNavigationPerfSpan::LandTarget,
                         land_perf_t0,
                     );
+                }
+            } else if let FsPageNav::Wrap(target) = page_nav {
+                let current_is_media = matches!(
+                    self.items.get(fs_idx),
+                    Some(GridItem::Video(_) | GridItem::Audio(_))
+                );
+                if current_is_media {
+                    let display_order = self.current_reader_order().to_vec();
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "navigation_wrap",
+                        operation,
+                    );
+                    self.start_manual_media_navigation(
+                        ctx,
+                        &display_order,
+                        fs_idx,
+                        if target.forward { 1 } else { -1 },
+                        true,
+                        "media_window_manual",
+                        crate::app::ManualMediaNavigationLanding::Fullscreen,
+                    );
+                } else if target.idx == fs_idx {
+                    if let Some(slice) = target.slice {
+                        self.page_turn_excluded_navigation_with_operation(
+                            ctx,
+                            "navigation_wrap",
+                            operation,
+                        );
+                        self.set_fullscreen_page_slice_for_display_unit(slice);
+                        self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
+                        self.fs_boundary_hint = None;
+                        ctx.request_repaint();
+                    }
+                } else if !self.fs_navigation_sequence_blocks_new_target()
+                    && let Some(new_idx) = self.admit_book_page_navigation_with_purpose(
+                        ctx,
+                        target.idx,
+                        Some(if target.forward {
+                            crate::app::book_composition_permission::BookTargetPurpose::Next
+                        } else {
+                            crate::app::book_composition_permission::BookTargetPurpose::Previous
+                        }),
+                    )
+                {
+                    let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
+                    let accept_rendition =
+                        self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, Some(new_idx));
+                    if self.begin_fs_page_navigation_sequence(
+                        ctx,
+                        fs_idx,
+                        new_idx,
+                        accept_rendition,
+                    ) {
+                        self.page_turn_excluded_navigation_with_operation(
+                            ctx,
+                            "navigation_wrap",
+                            operation,
+                        );
+                        self.land_still_page_navigation_target(
+                            ctx,
+                            fs_idx,
+                            new_idx,
+                            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            &mut fs_navigation_perf,
+                        );
+                        if self.fullscreen_idx == Some(new_idx)
+                            && let Some(slice) = target.slice
+                        {
+                            self.set_fullscreen_page_slice_for_display_unit(slice);
+                        }
+                    }
                 }
             } else if let FsPageNav::Split(step) = page_nav {
                 if step.source_idx == fs_idx {
@@ -41817,6 +42619,7 @@ impl App {
                             &display_order,
                             fs_idx,
                             delta,
+                            self.manual_nav_wrap_enabled(),
                             "media_window_manual",
                             crate::app::ManualMediaNavigationLanding::Fullscreen,
                         );
@@ -41927,24 +42730,40 @@ impl App {
                         &display_order,
                         fs_idx,
                         nav_delta,
+                        self.manual_nav_wrap_enabled(),
                         "media_window_manual",
                         crate::app::ManualMediaNavigationLanding::Fullscreen,
                     );
-                } else if let Some(new_idx) = if self.continuous_reading_active_for_idx(fs_idx) {
+                } else if let Some(step) = if self.continuous_reading_active_for_idx(fs_idx) {
                     let nav = self.get_still_image_indices();
-                    crate::ui_helpers::adjacent_idx_in_order(&nav, fs_idx, nav_delta.signum())
+                    crate::ui_helpers::adjacent_idx_in_order_wrapping(
+                        &nav,
+                        fs_idx,
+                        nav_delta.signum(),
+                        self.manual_nav_wrap_enabled(),
+                    )
                 } else {
-                    crate::ui_helpers::adjacent_page_navigation_idx(
+                    crate::ui_helpers::adjacent_page_navigation_idx_wrapping(
                         &self.items,
                         &display_order,
                         fs_idx,
                         nav_delta.signum(),
                         false,
+                        self.manual_nav_wrap_enabled(),
                     )
                 } {
+                    let new_idx = step.idx;
                     let moved = new_idx != fs_idx;
                     if (!moved || !self.fs_navigation_sequence_blocks_new_target())
-                        && let Some(new_idx) = self.admit_book_page_navigation(ctx, new_idx)
+                        && let Some(new_idx) = self.admit_book_page_navigation_with_purpose(
+                            ctx,
+                            new_idx,
+                            step.wrapped.then_some(if nav_delta > 0 {
+                                crate::app::book_composition_permission::BookTargetPurpose::Next
+                            } else {
+                                crate::app::book_composition_permission::BookTargetPurpose::Previous
+                            }),
+                        )
                     {
                         let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
                         let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
@@ -41968,7 +42787,13 @@ impl App {
                             sequence_started
                         } {
                             if self.settings.page_turn_animation_enabled {
-                                if !moved {
+                                if step.wrapped {
+                                    self.page_turn_excluded_navigation_with_operation(
+                                        ctx,
+                                        "navigation_wrap",
+                                        operation,
+                                    );
+                                } else if !moved {
                                     self.page_turn_excluded_navigation_with_operation(
                                         ctx,
                                         "navigation_no_movement",
@@ -42166,6 +42991,8 @@ impl App {
     /// 余白カット用の中身 bbox を取得 (キャッシュ付き)。余白なし / pixels 未取得
     /// (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の pixels から検出する。
     pub(crate) fn cached_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
+        #[cfg(test)]
+        canonical_demand::assert_ordinary_metadata_allowed();
         if !self.is_raw_page(idx) {
             self.ensure_original_material_for_entry(
                 idx,
@@ -42558,16 +43385,17 @@ impl App {
             let Some(transform) = transform else {
                 return None;
             };
-            let needs_clip = zoom_pan.is_some()
-                || free_rotation_rad.abs() > TRANSFORM_EPSILON
-                || fit_bbox.is_some()
-                || !matches!(fit_mode, FullscreenFitMode::Page)
-                || fit_scale_limits.active();
-            let painter = if needs_clip {
-                ui.painter().with_clip_rect(full_rect)
-            } else {
-                ui.painter().clone()
-            };
+            let painter = ui
+                .painter()
+                .with_clip_rect(canonical_demand::single_clip_rect(
+                    ui.painter().clip_rect(),
+                    full_rect,
+                    zoom_pan,
+                    free_rotation_rad,
+                    content_bbox,
+                    fit_mode,
+                    fit_scale_limits,
+                ));
             let white = white_companion_override
                 .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
             let Some(paint_resource) = self.prepare_fs_paged_paint_payload(
@@ -48457,18 +49285,17 @@ impl App {
 
         // ズーム/パンが有効な場合は image_rect でクリップする
         // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
-        let painter = if zoom_pan.is_some()
-            || content_left.is_some()
-            || content_right.is_some()
-            || !matches!(fit_mode, FullscreenFitMode::Page)
-            || fit_scale_limits.active()
-            || self.fs_zoom_mode_engaged()
-        {
-            // ZipPla ズーム中は cover で image_rect 外へはみ出すので必ずクリップする。
-            ui.painter().with_clip_rect(image_rect)
-        } else {
-            ui.painter().clone()
-        };
+        let painter = ui
+            .painter()
+            .with_clip_rect(canonical_demand::spread_clip_rect(
+                ui.painter().clip_rect(),
+                image_rect,
+                zoom_pan,
+                [content_left, content_right],
+                fit_mode,
+                fit_scale_limits,
+                self.fs_zoom_mode_engaged(),
+            ));
         let left_allow_thumbnail = display_override.is_none()
             && !settling_with_renditions
             && (pass_through
@@ -48490,26 +49317,20 @@ impl App {
             let left_bbox = content_left.unwrap_or(full_bbox);
             let right_bbox = content_right.unwrap_or(full_bbox);
             let content_active = content_left.is_some() || content_right.is_some();
-            let geometry = spread_layout_geometry(
-                ls,
-                rs,
-                left_bbox,
-                right_bbox,
-                spread_should_match_page_heights(fit_mode),
-            );
             let specified = display_override
                 .and_then(|(left, _)| fit_input_specified_size(left.fit_input))
                 .unwrap_or(self.settings.fullscreen_specified_scale);
-            let Some(auto_fit) = resolve_paged_auto_fit(
+            let Some((geometry, auto_fit)) = canonical_demand::spread_auto_layout(
+                [ls, rs],
+                [content_left, content_right],
                 fit_mode,
                 specified,
-                image_rect,
-                geometry.fit_size,
-                spread_gap,
-                fit_scale_limits,
                 display_override
                     .and_then(|(left, _)| fit_input_specified_max_tenths(left.fit_input))
                     .unwrap_or(self.settings.fullscreen_specified_scale_max_tenths),
+                image_rect,
+                spread_gap,
+                fit_scale_limits,
             ) else {
                 return FsNavigatorTextureSources::default();
             };
@@ -48984,14 +49805,7 @@ impl App {
                     .unwrap_or(tex_size)
             }
         };
-        let display_size = match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(layout_size.y, layout_size.x)
-            }
-            _ => layout_size,
-        };
-        let page_rect = fit_display_size_in_rect(rect, display_size);
-        resolve_fs_transform_in_layout_rect(
+        canonical_demand::spread_page_transform(
             DisplayedImageTransformInput {
                 pixel_fit: RectPixelFit::Texels,
                 page_idx: idx,
@@ -49009,7 +49823,8 @@ impl App {
                 pixels_per_point,
                 placement,
             },
-            page_rect,
+            layout_size,
+            rect,
         )
     }
 
@@ -67619,6 +68434,7 @@ mod tests {
         app.final_composite_cache.insert(
             key,
             crate::app::FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: [8, 12],
                 pixels,
@@ -90744,6 +91560,10 @@ mod specified_scale_consumer_tests {
 pub(crate) mod page_turn_submission_tests {
     use super::*;
 
+    pub(crate) fn install_presentation(ctx: &egui::Context) {
+        page_turn::install(ctx);
+    }
+
     #[test]
     fn source_texture_sharing_actual_draw_preserves_single_spread_on_off_and_resize() {
         for enabled in [false, true] {
@@ -90844,6 +91664,14 @@ pub(crate) mod page_turn_submission_tests {
             app.record_page_dims_for_spread(idx, (80, 120));
         }
         app
+    }
+
+    pub(crate) fn draw_current_without_sources(
+        app: &mut App,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+    ) {
+        let _ = draw_current(app, ui, ctx);
     }
 
     pub(crate) fn draw_current(
@@ -93778,3 +94606,7 @@ mod music_overflow_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_fullscreen/manual_nav_wrap_tests.rs"]
+mod manual_nav_wrap_tests;

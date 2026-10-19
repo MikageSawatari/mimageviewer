@@ -2225,6 +2225,42 @@ pub(crate) fn still_image_display_indices_build_count_for_test() -> usize {
     STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.get()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdjacentStep {
+    pub(crate) idx: usize,
+    pub(crate) wrapped: bool,
+}
+
+/// Manual navigation alone may cross the ends of the owning context's order.
+/// Keep the non-wrapping helper unchanged for automatic navigation and prefetch.
+pub(crate) fn adjacent_idx_in_order_wrapping(
+    nav_indices: &[usize],
+    current: usize,
+    delta: i32,
+    wrap: bool,
+) -> Option<AdjacentStep> {
+    if let Some(idx) = adjacent_idx_in_order(nav_indices, current, delta) {
+        return Some(AdjacentStep {
+            idx,
+            wrapped: false,
+        });
+    }
+    if !wrap || delta == 0 || nav_indices.len() <= 1 {
+        return None;
+    }
+    // An absent current has no defined position in this order; preserve the
+    // existing fallback rather than inventing a wrap from a different context.
+    let position = nav_indices.iter().position(|&idx| idx == current)?;
+    let idx = if delta > 0 && position == nav_indices.len() - 1 {
+        *nav_indices.first()?
+    } else if delta < 0 && position == 0 {
+        *nav_indices.last()?
+    } else {
+        return None;
+    };
+    (idx != current).then_some(AdjacentStep { idx, wrapped: true })
+}
+
 pub(crate) fn adjacent_idx_in_order(
     nav_indices: &[usize],
     current: usize,
@@ -2299,6 +2335,37 @@ pub fn adjacent_page_navigation_idx(
     } else {
         adjacent_navigable_idx(items, display_order, current, delta)
     }
+}
+
+pub(crate) fn adjacent_page_navigation_idx_wrapping(
+    items: &[GridItem],
+    display_order: &[usize],
+    current: usize,
+    delta: i32,
+    continuous_reading: bool,
+    wrap: bool,
+) -> Option<AdjacentStep> {
+    let nav = if continuous_reading {
+        still_image_display_indices(items, display_order)
+    } else {
+        display_order
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                matches!(
+                    items.get(idx),
+                    Some(
+                        GridItem::Image(_)
+                            | GridItem::Video(_)
+                            | GridItem::Audio(_)
+                            | GridItem::ZipImage { .. }
+                            | GridItem::PdfPage { .. }
+                    )
+                )
+            })
+            .collect()
+    };
+    adjacent_idx_in_order_wrapping(&nav, current, delta, wrap)
 }
 
 fn page_jump_nav_indices(items: &[GridItem], display_order: &[usize]) -> Vec<usize> {
@@ -3584,6 +3651,209 @@ mod tests {
         ];
         let vi = vec![0, 1];
         assert_eq!(first_slideshow_still_idx(&items, &vi), Some(1));
+    }
+
+    #[test]
+    fn manual_nav_wrap_adjacent_order_off_matches_existing_resolution() {
+        for order in [&[][..], &[2][..], &[4, 0, 3, 1][..], &[3, 1][..]] {
+            for current in 0..7 {
+                for delta in [-9, -1, 0, 1, 9] {
+                    assert_eq!(
+                        adjacent_idx_in_order_wrapping(order, current, delta, false),
+                        adjacent_idx_in_order(order, current, delta).map(|idx| AdjacentStep {
+                            idx,
+                            wrapped: false
+                        }),
+                        "order={order:?}, current={current}, delta={delta}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_adjacent_order_wraps_only_at_endpoints() {
+        let order = [7, 3, 9];
+        for (current, delta, idx, wrapped) in [
+            (9, 1, 7, true),
+            (7, -1, 9, true),
+            (7, 1, 3, false),
+            (9, -1, 3, false),
+            (3, 1, 9, false),
+            (3, -1, 7, false),
+            // Preserve the old clamped multi-step move; crossing the end
+            // from inside the order is not a second, implicit wrap.
+            (3, 9, 9, false),
+            (3, -9, 7, false),
+        ] {
+            assert_eq!(
+                adjacent_idx_in_order_wrapping(&order, current, delta, true),
+                Some(AdjacentStep { idx, wrapped })
+            );
+        }
+        assert_eq!(adjacent_idx_in_order_wrapping(&order, 7, 0, true), None);
+    }
+
+    #[test]
+    fn manual_nav_wrap_adjacent_order_empty_and_singleton_have_no_self_target() {
+        for order in [&[][..], &[4][..]] {
+            for wrap in [false, true] {
+                for delta in [-1, 0, 1] {
+                    assert_eq!(adjacent_idx_in_order_wrapping(order, 4, delta, wrap), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_absent_current_keeps_numeric_fallback_without_wrapping() {
+        let order = [8, 2, 5];
+        for wrap in [false, true] {
+            for (delta, idx) in [(1, 5), (-1, 2)] {
+                assert_eq!(
+                    adjacent_idx_in_order_wrapping(&order, 4, delta, wrap),
+                    Some(AdjacentStep {
+                        idx,
+                        wrapped: false
+                    })
+                );
+            }
+            assert_eq!(adjacent_idx_in_order_wrapping(&order, 9, 1, wrap), None);
+            assert_eq!(adjacent_idx_in_order_wrapping(&order, 0, -1, wrap), None);
+            assert_eq!(adjacent_idx_in_order_wrapping(&order, 4, 0, wrap), None);
+        }
+    }
+
+    fn manual_nav_wrap_mixed_items() -> Vec<GridItem> {
+        use std::path::PathBuf;
+
+        vec![
+            GridItem::Folder(PathBuf::from("/a/folder")),
+            GridItem::Image(PathBuf::from("/a/one.jpg")),
+            GridItem::Video(PathBuf::from("/a/two.mp4")),
+            GridItem::Audio(PathBuf::from("/a/three.mp3")),
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("/a/book.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::Image(PathBuf::from("/a/five.jpg")),
+        ]
+    }
+
+    #[test]
+    fn manual_nav_wrap_page_navigation_off_matches_existing_target_sets() {
+        let items = manual_nav_wrap_mixed_items();
+        for order in [
+            &[][..],
+            &[3][..],
+            &[3, 0, 5, 4, 2, 1, 999][..],
+            &[0, 4, 2][..],
+        ] {
+            for continuous in [false, true] {
+                for current in 0..8 {
+                    for delta in [-9, -1, 0, 1, 9] {
+                        assert_eq!(
+                            adjacent_page_navigation_idx_wrapping(
+                                &items, order, current, delta, continuous, false
+                            ),
+                            adjacent_page_navigation_idx(&items, order, current, delta, continuous)
+                                .map(|idx| AdjacentStep {
+                                    idx,
+                                    wrapped: false
+                                }),
+                            "order={order:?}, continuous={continuous}, current={current}, delta={delta}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_page_navigation_uses_sorted_filtered_order_including_audio() {
+        let items = manual_nav_wrap_mixed_items();
+        // Detail-sort result: Audio is first, Image is last; folder is not
+        // navigable and source-index order must not replace the given order.
+        let sorted = [3, 0, 5, 4, 2, 1, 999];
+        for (current, delta, idx, wrapped) in [
+            (1, 1, 3, true),
+            (3, -1, 1, true),
+            (5, -1, 3, false),
+            (4, 1, 2, false),
+        ] {
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &sorted, current, delta, false, true),
+                Some(AdjacentStep { idx, wrapped })
+            );
+        }
+        // Filtering removes Audio and both Images. Wrap only within the
+        // remaining PDF / Video targets, without restoring hidden entries.
+        let filtered = [0, 4, 2];
+        for (current, delta, idx) in [(2, 1, 4), (4, -1, 2)] {
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(
+                    &items, &filtered, current, delta, false, true
+                ),
+                Some(AdjacentStep { idx, wrapped: true })
+            );
+        }
+    }
+
+    #[test]
+    fn manual_nav_wrap_continuous_navigation_wraps_in_still_image_order_only() {
+        let items = manual_nav_wrap_mixed_items();
+        let order = [3, 0, 5, 4, 2, 1];
+        assert_eq!(still_image_display_indices(&items, &order), vec![5, 4, 1]);
+        for (current, delta, idx, wrapped) in [
+            (1, 1, 5, true),
+            (5, -1, 1, true),
+            (5, 1, 4, false),
+            (1, -1, 4, false),
+        ] {
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &order, current, delta, true, true),
+                Some(AdjacentStep { idx, wrapped })
+            );
+        }
+        assert_eq!(
+            adjacent_page_navigation_idx_wrapping(&items, &[0, 3, 2, 4], 4, 1, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_nav_wrap_page_navigation_absent_current_and_empty_scopes_do_not_wrap() {
+        let items = manual_nav_wrap_mixed_items();
+        for continuous in [false, true] {
+            for delta in [-1, 1] {
+                assert_eq!(
+                    adjacent_page_navigation_idx_wrapping(&items, &[], 1, delta, continuous, true),
+                    None
+                );
+                assert_eq!(
+                    adjacent_page_navigation_idx_wrapping(&items, &[1], 1, delta, continuous, true),
+                    None
+                );
+            }
+            // Current source is excluded from this filtered scope. Its
+            // existing numeric neighbor is retained, but it cannot wrap.
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &[4, 1], 2, 1, continuous, true),
+                Some(AdjacentStep {
+                    idx: 4,
+                    wrapped: false
+                })
+            );
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &[4, 1], 5, 1, continuous, true),
+                None
+            );
+            assert_eq!(
+                adjacent_page_navigation_idx_wrapping(&items, &[4, 1], 0, -1, continuous, true),
+                None
+            );
+        }
     }
 
     #[test]

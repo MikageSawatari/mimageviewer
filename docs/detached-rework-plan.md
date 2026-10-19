@@ -5778,6 +5778,93 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
   既存の表示用カラー化 / LUT 要求は保持する (`viewer_context_registry.rs` の現行監査を維持)。
 - 実装後に記録するもの: 実際に触れた関数、park / resume 契約の実装、兄弟 context 不変の検証結果、完成レビューでの合意。
 
+#### D3-1 実装追補（2026-10-18、実機未確認）
+
+- `update_active_viewer_context` は retained-shift 採用後・gamepad 配送前に同じ context の service を行う。
+  `activate_detached_image_window_snapshot` と ParkedLive の実表示再開は、既存 mount/runtime/retained-shift 再開後に接続した。
+  `with_viewer_context` 等の汎用 mount/deposit には採用を追加していない。
+- `begin_page_turn_viewer_frame`、共通非 close navigation、decision/nav-lock、permission resume、既存 continuation に
+  `service_final_prepare_before_lookup` を接続。close/retire の既存優先、入力 edge の単一観測を維持する。
+  冒頭の detached visibility probe は paint source を捕捉しない非確定参照として明記した。
+- 既存 `final_effect_pending` の park 除外分類は変更しない。結果採用と decision cache 失効は mount された owner のみ。
+  新規投機、CpuReady、permit、予約は D3-1 では導入せず、fork は既存の非共有 receiver/cancel 契約を維持する。
+- 独立 Sol/xhigh の途中レビューでも、既存 context の service/receipt/採用境界へ限定した構造修正であり、症状パッチではないと確認。
+  観測による slideshow cache 置換と通常登録 marker の不足の2指摘は修正し、コード上の解消を再確認済み。
+  兄弟不変の実行結果と独立完成判定は、page-turn 計画 §27.17.12 と同じ `target/d3-1-handoff.md` に記録する。
+- 独立完成レビュー (ClaudeCode が別 session で依頼した Sol / xhigh、2026-10-18、`7388b3f2d`): ACCEPT、P1〜P3 なし。完成差分で
+  「症状パッチではなく構造的修正」に合意。root キー各経路と mounted update 全体の順序の一部は文字列検査で、全入口の端から端までの動的検証ではない (レビュー所見)。
+
+#### D3-2 実装追補（2026-10-18、完成 source レビュー ACCEPT・実機未確認）
+
+- 新しい一般 final の開始は root の `render_prepare_fullscreen_materials` と独立 viewer の
+  `update_active_viewer_context` の既存非 target work 境界に限る。単なる mount/deposit から開始しない。
+- 同じ context の `final_effect_pending` が Computing/CpuReady と要求種別を所有し、fork は新しい空 map、
+  park/promote は既存の資源移譲を使う。cancel/close/内容失効は当該 owner の公開権だけを外す。
+  worker の App 共通 permit は実終了まで、出力予約は登録/破棄まで保持する。
+- park は既存表示用カラー化/LUT と開始済み新 D3 worker を cancel せず保持する。park 中に次 job を開始しない。
+  復帰の D3-1 service で exact 再照合して採用し、host/window identity の変更から新しい detached 述語を推測しない。
+- 独立 Sol/xhigh の実装前構造レビューは ACCEPT WITH CHANGES。同じ context の service/pending/移譲の修正であり、
+  症状パッチではないことに合意。完成 source レビューも ACCEPT、P1/P2 残件なしで構造修正への合意を再確認した。
+  動的検証結果はこの source 判定と分け、`target/d3-2-handoff.md` へ記録する。
+
+
+#### D3-4(a) 実装追補（2026-10-18、実機未確認）
+
+- 正本は紙めくり計画 §27.17.14.10/.11。ClaudeCodeの設計記録と独立Sol/xhighの前提・完成sourceレビューで、
+  既存runtime/binding/dispatchの観測と資源移譲に限る構造修正であり、症状パッチではないことに合意した。
+- `begin_page_turn_viewer_frame` の通常paged描画入口でcontext/destinationを既存 `SpeculativeGpuFrame` に観測する。
+  候補のないownerも含む。ROOT `App::ui` の各pass開始で観測値だけを更新する。
+  mainは実dispatchを通った現在main context、active F12はactive sessionと `locate_window_context` のbinding、
+  runtime Opening/Resuming/Activeを `final_prepare_route_is_current` で再照合する。
+  `ContextResidence::AtRest` は保管位置でありpark判定に使わない。mount、backstopへの入場、
+  passive Parked/ParkedLiveのsnapshot描画だけでは通常live paged経路の証拠にしない。
+- actual offer/curl/mandatory canonical提出の活動は同じouter frameの全retryで単調に保持する。
+  Aをpark/cancelしても当該frameの活動を消さない。次frameは活動を持ち越さず、現在liveのBを再評価する。
+  Aのpresentation state、accepted materials、canonical receipt、leaseをBの登録のために変更しない。
+- `finalize_speculative_gpu_output` はnative wgpu ROOTの全retry後に既存ownerを `with_viewer_context_state` で訪ねる。
+  既存資源の一時移譲であり、publicationを採用するmountではない。hookから入力配送、permission再開、UI実行、
+  viewport生成・再生成、begin/end pass、discard要求は呼ばない。新しいHWND推測・placement・時間窓・detached flagはない。
+- 早期serviceは受信・失効照合・receipt反映・表示用/共有handle採用を維持し、非共有の新規投機登録だけを最終hookへ移す。
+  旧 `LegacyPrefetch` もON/pagedでは非表示GPU登録だけ同じ枠へ通す。park保持・LegacyDisplay・OFF/連結/Splitは従来どおり。
+  exact表示昇格は同passで採用し、incomplete AI publication後も通常品質producerを進める。
+- 通常upload/枠使用済みの既存wakeは最終境界へ移す。演出理由・VRAM不足の保留では追加wakeを発行しない。
+  Computingの既存worker pollは維持し、最終枠へ移したLegacy CpuReadyは16ms pollから除外する。別queue/heartbeatはない。
+- 回帰・完成レビューの結果は紙めくり計画の実装記録および `target/d3-4a-handoff.md` に記録する。
+
+#### D3-4(b) 実装追補（2026-10-19、実機未確認）
+
+- 紙めくり計画 §27.17.14.4/.5/.10/.11 の範囲で、通常 callback の所有 viewport／ppp／clip と次 composition の resident 値を読む。
+  通常 Single／Pair の geometry を共有し、frame 限りの候補を既存 App 共通 `SpeculativeGpuFrame` に移譲する。
+  detached の runtime／binding／live dispatch 判定と context 訪問は (a) の `final_prepare_route_is_current`／`with_viewer_context_state` をそのまま使う。
+- allocation は既存 ROOT 最終 output hook のみ。通常 UI、入力、permission、viewport 生成へ再入しない。
+  全 context の final 登録後に Native を判定する。renderer lock 中に context 訪問や会計 walker を実行しない。
+- Native cache は各 context の通常 `fs_lanczos_cache` 単独 owner、候補と一件枠は App owner。
+  fork／mount／park／promote の資源移譲や receiver 寿命を変更せず、単なる mount／passive snapshot から候補を作らない。
+  park した A の演出状態・receipt・material／lease を B の投機のために解除しない。同 frame の活動記録は (a) と同じく維持する。
+- 新しい HWND 推測・placement・時間窓・detached flag は追加しない。設計担当の既存合意範囲を使い、独立 Sol/xhigh の実装前確認でも症状パッチではない構造拡張と確認した。
+  完成 source 判定と ROOT／viewport／discard／park／兄弟不変／batch lifetime の実行結果は `target/d3-4b-handoff.md` に分けて記録する。
+
+##### D3-4(b) 独立完成レビュー対応（2026-10-19）
+
+- canonical の追加需要は既存 installed unit token の完全性証拠と索引を読み、未採用は見送る。新しい cache owner や context 世代の一括失効は追加しない。
+- 既存 App frame owner の最新 callback 値と再照合し、旧 viewport view を現行と扱わない。最終 hook 中も同じ値 owner を保持し、処理後に消費するだけで、mount／park／promote の意味は変えない。
+- 実 child callback の異なる ppp／clip と ROOT での再照合を headless テストに含める。runtime／binding／dispatch 述語、HWND、placement、viewport 生成、permission は変更しない。
+  設計担当が妥当と判断した P2 二件への修正であり、独立 source 再レビューも既存 owner 内の構造的修正として合意。検証記録は `target/d3-4b-fix-*`。
+
+##### D3-5 merge 後の横断監査（2026-10-19）
+
+- `479f7f65e`（最新master `2410719c7` merge後）で、通常producer、全contextの会計とbatch lease、park／fork／mount／promote の所有境界を再監査した。
+  静的根拠と実行gateの区別は `target/d3-5-audit.md`。runtime／binding／dispatch・HWND／placement・viewport生成は変更しない。
+- canonical Nativeとは別のCPU需要resolverに毎frameの全頁走査とmixed slideshowの列再構築が残るF1を検出した。
+  需要を減らさず、表示token／receiptを置換せず、既存SpreadDisplayUnitsCache内の派生recordへcold一回の証拠／索引を採用する。
+  同じ枝はvisible索引を参照し、異なる枝だけ完全recordを持つ。source／nav／composed／mode／shift／landscape／page-aloneを照合し、
+  warmはscalar／Arc identityだけで読む。共通adoption入口が通常serviceとROOT直接採用を覆い、producer／keep／perf観測も共有する。
+  forkはfresh owner、mount／park／promoteは既存値移譲のままで、新しいworker／pending／bool／世代／detachedフラグを足さない。
+  同owner内の再構築可能なcache field追加が必要な理由と失効契約は `target/d3-5-topology-design.md`。
+  独立設計レビューも既存合意範囲の構造的修正としてACCEPT。完成差分・実行gateの判定は `target/d3-5-*` に分けて記録する。
+- D3-3は利用者決定で次の版の後へ延期（backlog §1.401）。既存編集／comic表示経路を維持する。
+  実機操作・motion、正式3run×30機会gateは未確認。page-turn計画 §27.17.17 に実装済み範囲・計測推移・残作業をまとめた。
+
 ### §11 追補: §1.396 スライドショー設定の「…」移動と前面入力状態の解放（2026-10-19、実装・独立レビュー済み・実機未確認）
 
 - 対象: ブランチ `slideshow-1396` (`3db6e24c6` / `d01fcc111` / `5e9e7a5c3` ほか)。HUD のスライドショーボタンを即時開始・停止にし、設定を上部バーの「…」(`FsOverflowPanelState::Slideshow`) へ移した。

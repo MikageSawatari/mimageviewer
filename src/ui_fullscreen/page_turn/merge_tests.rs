@@ -205,18 +205,6 @@ fn page_turn_merge_rating_empty_retires_turning_and_completing_in_common_close()
     for completing in [false, true] {
         let ctx = egui::Context::default();
         let mut app = rated_book(&ctx, 4);
-        // A flat output awaiting renderer acceptance is owned by the same close
-        // boundary even if the following curl has already been accepted.
-        frame(&ctx, |ui, ctx| {
-            let (composition, sources) = draw_current(&mut app, ui, ctx);
-            app.emit_fs_page_turn_ready_for_display_unit(
-                ctx,
-                &composition,
-                FsPageTurnDecision::normal(),
-                &sources,
-            );
-        });
-        assert!(app.pending_fs_page_turn_ready.is_some());
         seed_leaf(&ctx, &mut app);
         let tracker = match &app.page_turn_presentation.state {
             PresentationState::Turning { offer, .. } => offer.submission.clone(),
@@ -238,7 +226,25 @@ fn page_turn_merge_rating_empty_retires_turning_and_completing_in_common_close()
             });
             assert!(app.page_turn_completion_active());
         }
-        assert!(app.pending_fs_page_turn_ready.is_some());
+        if completing {
+            // Capture the current canonical flat after navigation. Its service
+            // prefix invalidates the preceding unit's receipt before selection.
+            // Close must retire this fresh pending proof and the continuation.
+            frame(&ctx, |ui, ctx| {
+                let (composition, sources) = draw_current(&mut app, ui, ctx);
+                app.emit_fs_page_turn_ready_for_display_unit(
+                    ctx,
+                    &composition,
+                    FsPageTurnDecision::normal(),
+                    &sources,
+                );
+            });
+            assert!(app.pending_fs_page_turn_ready.is_some());
+        } else {
+            // Curl output is not a canonical-flat receipt. This branch verifies
+            // cancellation/Inactive; pending cleanup is covered by Completing.
+            assert!(app.pending_fs_page_turn_ready.is_none());
+        }
         for idx in [0, 2, 3] {
             let key = app.rating_path_key(idx).unwrap();
             app.rating_db.as_ref().unwrap().set(&key, 0).unwrap();

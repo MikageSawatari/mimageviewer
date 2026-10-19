@@ -45,7 +45,7 @@ Ctrl+↑↓ でフォルダ横断しない。
 | 操作 | 現状 |
 | --- | --- |
 | ホイール / ↑↓ / 画像の ←→ | `visible_indices` 内の前後アイテムへ移動。通常の←→によるページ移動は、環境設定でページ表示 / 読み方向（既定）またはページシークバーの実効方向に合わせられる。縦連結ではホイール / ↑↓ / PageUp/PageDown は縦スクロールし、←→はこの設定に従って前後の静止画へ移動する。横連結ではホイール / ←→ / PageUp/PageDown は横スクロールし、↑↓ で前後の静止画へ移動する。どちらも途中の動画・音声は飛ばす。ページ単位表示では従来どおり動画・音声も前後移動の対象。独立 detached 静止画窓は、仮想一覧から開いても同じ実親または同じ ZIP / PDF を非同期に完全列挙した物理順を使い、検索で欠落した同一フォルダ画像も含める |
-| 同一一覧の先頭 / 末尾 | `FsBoundaryHint::Edge` を中央表示し、「先頭です」/「末尾です」と Home / End、Ctrl+↑↓ を案内 |
+| 同一一覧の先頭 / 末尾 | 既定は `FsBoundaryHint::Edge` を中央表示し、「先頭です」/「末尾です」と Home / End、Ctrl+↑↓ を案内。`fullscreen_manual_nav_wrap` が ON の手動前後移動は反対の端へ折り返す。別の表示単位へ動けない場合だけ従来の案内 |
 | Ctrl+↑↓ | `FolderNavMode::Fullscreen` で DFS。現在は前後どちらの方向でも移動先フォルダの先頭 image-like に着地する。独立 detached 静止画窓では、その窓の `DetachedPhysical` bundle を起点に通常画像フォルダ / ZIP / CBZ / PDF だけを物理 DFS 順で移動し、main の検索・絞り込み・★固定を参照しない |
 | Ctrl+PageUp/PageDown | `FolderNavMode::SiblingFullscreen` で同じ親の前後兄弟へ移動する。独立 detached 静止画窓でも同じ物理兄弟順を使うが、静止画を持たない兄弟と RAR/7z/LZH は開かず境界案内を出す |
 | スライドショー「次のフォルダへ進む」 | 通常 linked viewer では `FolderNavMode::SlideshowNext` で次の静止画フォルダへ進む。切り離した detached / always-new 窓ではフォルダ横断せず、現一覧内ループ扱い |
@@ -55,6 +55,18 @@ Ctrl+↑↓ でフォルダ横断しない。
 | スマートフォルダ scoped drill 中の Ctrl+↑↓ | `FolderNavMode::SmartFolder { fullscreen: true }`。entry scope 内または前後 entryへ移動し、方向に関わらず先頭 image-likeへ着地 |
 
 注意: 以前の docs には「Ctrl+↑ は前フォルダの末尾画像へ」と書かれていたが、現在の実装は「方向に関わらず移動先の先頭」。
+
+手動前後移動のループ (§1.400) は既定 OFF。現在の閲覧順・表示対象内だけで折り返し、
+別フォルダ・別の本には移らない。単ページは既存の Audio を含む前後移動対象、連結読みの
+明示的な項目移動は静止画順、見開きは表示単位列、分割は読み順のステップ列の両端を使う。
+動画・音声の手動前後ファイル移動とコレクションの手動移動にも適用する。
+キー・ホイール・左右クリック・HUD・ゲームパッド・マウス割り当ての共通入口で設定を読む。
+Home/End、固定量ジャンプ、見開き nudge、Ctrl+↑↓ / Ctrl+PageUp/PageDown、シーク、
+ファイル名スタックジャンプ、連結スクロール、自動送り、Remote は対象外。
+一覧の `grid_cursor_wrap`、`slideshow_end_action`、動画・音声の連続再生のループとは独立する。
+折り返しはページめくり演出を除外し、先読み範囲は広げない。非同期経路・許可待ち経路での
+分割側、barrier continuation、媒体 resolver の窓間干渉の既存制約は変更しない。
+詳細は [手動前後移動ループ設計](manual-nav-wrap-plan.md) §3〜7。
 
 ### 2.3 native 動画フルスクリーン
 
@@ -156,7 +168,9 @@ Ctrl+F active 中に Ctrl+↑↓ を通常 DFS に流すと、「検索結果を
 | detached 動画 / 音声窓、bundle 化されていない旧経路の窓の Ctrl+↑↓ / Ctrl+PageUp/PageDown | 「切り離した別ウィンドウではフォルダ移動しません」などの no-op 案内。通常画像の新規 always-new open は active physical bundle へ昇格するため、この旧経路には残らない |
 
 見開きでは 2 ページを 1 つの表示単位として扱う。最後の見開きから次へ、または最初の見開きから
-前へ進む入力は、内部ページ index を同じ見開き内で動かさず、その 1 回目で境界ヒントを表示する。
+前へ進む入力は、内部ページ index を同じ見開き内で動かさず、ループ OFF または折り返せない場合は
+その 1 回目で境界ヒントを表示する。手動移動のループ ON で別の表示単位へ折り返した場合は
+`FsBoundaryHint::Edge` を生成しない。
 環境設定で境界案内を OFF にした場合も `FsBoundaryHint::Edge` の生成・期限切れ・境界判定は
 そのまま維持し、静止画 / detached / native 動画の描画だけを抑止する。他のフォルダ境界案内や
 検索スコープ案内はこの設定の対象外とする。

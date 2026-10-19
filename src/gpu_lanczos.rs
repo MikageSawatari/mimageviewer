@@ -922,7 +922,7 @@ impl FullscreenPaintPayload {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct LanczosCacheKey {
+pub(crate) struct LanczosCacheKey {
     source_id: FullscreenPaintSourceId,
     source_texture_id: egui::TextureId,
     generation: FullscreenPaintSourceGeneration,
@@ -930,6 +930,197 @@ struct LanczosCacheKey {
     smoothing_percent: u32,
     scale_branch: FullscreenPaintScaleBranch,
     source_region: LanczosSourceRegionKey,
+}
+
+impl LanczosCacheKey {
+    /// Exact diagnostic identity, including the bitwise ROI key. Construct only
+    /// while perf logging is enabled.
+    pub(crate) fn perf_key(self) -> String {
+        format!("{self:?}")
+    }
+
+    pub(crate) fn source_texture_id(self) -> egui::TextureId {
+        self.source_texture_id
+    }
+
+    pub(crate) fn target_size(self) -> [u32; 2] {
+        self.target_size
+    }
+
+    pub(crate) fn scale_branch(self) -> FullscreenPaintScaleBranch {
+        self.scale_branch
+    }
+
+    pub(crate) fn visible_source_uv_rect(self) -> Option<egui::Rect> {
+        self.source_region.visible_rect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeAllocationBytes {
+    pub(crate) output_bytes: u64,
+    pub(crate) temporary_bytes: u64,
+}
+
+impl NativeAllocationBytes {
+    pub(crate) fn total(self) -> u64 {
+        self.output_bytes.saturating_add(self.temporary_bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativePrewarmUnavailable {
+    NoRenderer,
+    MissingBacking,
+    BackingMismatch,
+    InvalidPlan,
+    SourceChanged,
+    ClaimDenied,
+}
+
+impl NativePrewarmUnavailable {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRenderer => "no_renderer",
+            Self::MissingBacking => "missing_backing",
+            Self::BackingMismatch => "backing_mismatch",
+            Self::InvalidPlan => "invalid_plan",
+            Self::SourceChanged => "source_changed",
+            Self::ClaimDenied => "claim_denied",
+        }
+    }
+}
+
+/// A call-local calculation, never a pending owner and never a source lease.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativePrewarmPlan {
+    key: LanczosCacheKey,
+    work: LanczosWorkPlan,
+    smoothing_percent: u32,
+}
+
+impl NativePrewarmPlan {
+    pub(crate) fn key(self) -> LanczosCacheKey {
+        self.key
+    }
+
+    pub(crate) fn allocation(self) -> NativeAllocationBytes {
+        self.work.allocation_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativePrewarmQuery {
+    NotNeeded,
+    Hit(LanczosCacheKey),
+    Unavailable(NativePrewarmUnavailable),
+    Miss(NativePrewarmPlan),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativePrewarmExecution {
+    Hit,
+    Unavailable(NativePrewarmUnavailable),
+    Submitted {
+        output_texture_id: egui::TextureId,
+        stats: LanczosGenerationStats,
+    },
+}
+
+/// Both normal resolve and speculative planning must use this exact request.
+#[allow(clippy::too_many_arguments)]
+fn resource_lanczos_key(
+    resource: &FullscreenPaintResource,
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    post_filter: PostFilter,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
+    let (source_id, source, generation) = resource.resampleable_parts()?;
+    requested_lanczos_key(
+        source_id,
+        source.id(),
+        generation,
+        [source.size()[0] as u32, source.size()[1] as u32],
+        logical_scale,
+        pixels_per_point,
+        visible_region,
+        post_filter,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NativeLookupForTest {
+    pub(crate) source_texture_id: egui::TextureId,
+    pub(crate) key: Option<LanczosCacheKey>,
+    pub(crate) outcome: &'static str,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NATIVE_LOOKUPS_FOR_TEST: std::cell::RefCell<Option<Vec<NativeLookupForTest>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn begin_native_lookup_observation_for_test() {
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| *lookups.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_native_lookups_for_test() -> Vec<NativeLookupForTest> {
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| lookups.borrow_mut().take().unwrap_or_default())
+}
+
+fn record_native_lookup(
+    render_state: Option<&egui_wgpu::RenderState>,
+    resource: &FullscreenPaintResource,
+    key: Option<LanczosCacheKey>,
+    outcome: &'static str,
+) {
+    #[cfg(test)]
+    NATIVE_LOOKUPS_FOR_TEST.with(|lookups| {
+        if let Some(lookups) = lookups.borrow_mut().as_mut() {
+            lookups.push(NativeLookupForTest {
+                source_texture_id: resource.source_texture_id(),
+                key,
+                outcome,
+            });
+        }
+    });
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    crate::perf::event(
+        "fs",
+        "final_prepare_native_lookup",
+        None,
+        0,
+        &[
+            (
+                "renderer",
+                render_state
+                    .map(|state| state.renderer.read().diag_id().into())
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "source_texture_id",
+                format!("{:?}", resource.source_texture_id()).into(),
+            ),
+            (
+                "native_key",
+                key.map(|key| key.perf_key().into())
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            ("outcome", outcome.into()),
+        ],
+    );
 }
 
 /// Pure request identity shared by ordinary preparation and held native reuse.
@@ -1134,6 +1325,123 @@ impl GpuLanczosCache {
         std::mem::take(&mut self.resolve_input_ids)
     }
 
+    /// Inspect the ordinary request/cache and renderer backing without changing
+    /// cache recency, allocating GPU resources, or claiming a frame slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn query_prewarm(
+        &self,
+        render_state: Option<&egui_wgpu::RenderState>,
+        resource: &FullscreenPaintResource,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_region: Option<VisibleRegionRequest>,
+        post_filter: PostFilter,
+        smoothing_percent: u32,
+        anime_source_limit: AnimeUpscaleSourceLimit,
+    ) -> NativePrewarmQuery {
+        let Some(key) = resource_lanczos_key(
+            resource,
+            logical_scale,
+            pixels_per_point,
+            visible_region,
+            post_filter,
+            smoothing_percent,
+            anime_source_limit,
+        ) else {
+            return NativePrewarmQuery::NotNeeded;
+        };
+        if lanczos_target_decision(key.scale_branch, key.target_size)
+            == LanczosTargetDecision::OriginalFallback
+        {
+            return NativePrewarmQuery::NotNeeded;
+        }
+        let smoothing_percent =
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        if (self.active_smoothing_percent == smoothing_percent && self.entries.contains_key(&key))
+            || resource
+                .lanczos_output()
+                .is_some_and(|output| output.key == key)
+        {
+            return NativePrewarmQuery::Hit(key);
+        }
+        let Ok(work) =
+            work_plan_for_key([resource.size()[0] as u32, resource.size()[1] as u32], key)
+        else {
+            return NativePrewarmQuery::Unavailable(NativePrewarmUnavailable::InvalidPlan);
+        };
+        let Some(render_state) = render_state else {
+            return NativePrewarmQuery::Unavailable(NativePrewarmUnavailable::NoRenderer);
+        };
+        if let Err(reason) =
+            prewarm_source_backing(render_state, key.source_texture_id, work.source_size())
+        {
+            return NativePrewarmQuery::Unavailable(reason);
+        }
+        NativePrewarmQuery::Miss(NativePrewarmPlan {
+            key,
+            work,
+            smoothing_percent,
+        })
+    }
+
+    /// The caller revalidates demand, live activity and global VRAM admission
+    /// before entering. `claim` only claims the app-wide frame slot: it runs
+    /// after backing validation, with no renderer lock, immediately before GPU
+    /// allocation. A cloned backing keeps that validated allocation alive.
+    pub(crate) fn execute_prewarm(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        resource: &FullscreenPaintResource,
+        plan: NativePrewarmPlan,
+        claim: impl FnOnce(NativeAllocationBytes) -> bool,
+    ) -> NativePrewarmExecution {
+        let Some((source_id, _, generation)) = resource.resampleable_parts() else {
+            return NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::SourceChanged);
+        };
+        if source_id != plan.key.source_id
+            || resource.source_texture_id() != plan.key.source_texture_id
+            || generation != plan.key.generation
+            || resource.size() != plan.work.source_size().map(|size| size as usize)
+        {
+            return NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::SourceChanged);
+        }
+        if (self.active_smoothing_percent == plan.smoothing_percent
+            && self.entries.contains_key(&plan.key))
+            || resource
+                .lanczos_output()
+                .is_some_and(|output| output.key == plan.key)
+        {
+            return NativePrewarmExecution::Hit;
+        }
+        let source = match prewarm_source_backing(
+            render_state,
+            plan.key.source_texture_id,
+            plan.work.source_size(),
+        ) {
+            Ok(source) => source,
+            Err(reason) => return NativePrewarmExecution::Unavailable(reason),
+        };
+        if !claim(plan.allocation()) {
+            return NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::ClaimDenied);
+        }
+        self.sync_smoothing_percent(plan.smoothing_percent);
+        self.use_clock = self.use_clock.wrapping_add(1);
+        self.entries.retain(|candidate, _| {
+            candidate.source_id != plan.key.source_id
+                || (candidate.source_texture_id == plan.key.source_texture_id
+                    && candidate.generation == plan.key.generation)
+        });
+        let (output, event) =
+            self.generate_with_source(render_state, resource, plan.key, plan.work, &source);
+        match event {
+            Some(LanczosPerfEvent::Generated(stats)) => NativePrewarmExecution::Submitted {
+                output_texture_id: output.paint_texture_id(),
+                stats,
+            },
+            _ => NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::InvalidPlan),
+        }
+    }
+
     pub(crate) fn resolve(
         &mut self,
         render_state: Option<&egui_wgpu::RenderState>,
@@ -1153,18 +1461,17 @@ impl GpuLanczosCache {
         let scale_branch =
             fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
         if resource.resampleable_parts().is_none() || !scale_branch.uses_resampler() {
+            record_native_lookup(render_state, resource, None, "not_needed");
             return (resource.original_resampleable(), None);
         }
         let Some(render_state) = render_state else {
+            record_native_lookup(None, resource, None, "no_renderer");
             return (resource.original_resampleable(), None);
         };
         let (source_id, source, generation) = resource.resampleable_parts().unwrap();
         let source_size = [source.size()[0] as u32, source.size()[1] as u32];
-        let Some(key) = requested_lanczos_key(
-            source_id,
-            source.id(),
-            generation,
-            source_size,
+        let Some(key) = resource_lanczos_key(
+            resource,
             logical_scale,
             pixels_per_point,
             visible_region,
@@ -1172,6 +1479,7 @@ impl GpuLanczosCache {
             smoothing_percent,
             anime_source_limit,
         ) else {
+            record_native_lookup(Some(render_state), resource, None, "not_needed");
             return (resource.original_resampleable(), None);
         };
         let fallback_source = LanczosFallbackSourceKey {
@@ -1183,6 +1491,7 @@ impl GpuLanczosCache {
         if lanczos_target_decision(key.scale_branch, key.target_size)
             == LanczosTargetDecision::OriginalFallback
         {
+            record_native_lookup(Some(render_state), resource, Some(key), "not_needed");
             let first_for_source = self.limit_fallback_sources.insert(fallback_source);
             let event = first_for_source.then_some(upscale_limit_fallback_event(
                 source_size,
@@ -1202,6 +1511,7 @@ impl GpuLanczosCache {
             && output.key.scale_branch == key.scale_branch
             && output.key.source_region == key.source_region
         {
+            record_native_lookup(Some(render_state), resource, Some(key), "hit");
             return (resource.clone(), None);
         }
         self.resolve_key(render_state, resource, key)
@@ -1215,12 +1525,14 @@ impl GpuLanczosCache {
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         self.use_clock = self.use_clock.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&key) {
+            record_native_lookup(Some(render_state), resource, Some(key), "hit");
             entry.last_used = self.use_clock;
             return (
                 resource.with_lanczos(entry.output.clone(), key.smoothing_percent),
                 None,
             );
         }
+        record_native_lookup(Some(render_state), resource, Some(key), "miss");
         self.entries.retain(|candidate, _| {
             candidate.source_id != key.source_id
                 || (candidate.source_texture_id == key.source_texture_id
@@ -1242,14 +1554,28 @@ impl GpuLanczosCache {
         key: LanczosCacheKey,
         plan: LanczosWorkPlan,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
-        let started = Instant::now();
-        let mut renderer = render_state.renderer.write();
-        let Some(source_texture) = renderer
-            .texture(&resource.source_texture_id())
-            .and_then(|texture| texture.texture.as_ref())
-        else {
-            return (resource.original_resampleable(), None);
+        let source_texture = {
+            let renderer = render_state.renderer.read();
+            let Some(source_texture) = renderer
+                .texture(&resource.source_texture_id())
+                .and_then(|texture| texture.texture.as_ref())
+            else {
+                return (resource.original_resampleable(), None);
+            };
+            source_texture.clone()
         };
+        self.generate_with_source(render_state, resource, key, plan, &source_texture)
+    }
+
+    fn generate_with_source(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        resource: &FullscreenPaintResource,
+        key: LanczosCacheKey,
+        plan: LanczosWorkPlan,
+        source_texture: &wgpu::Texture,
+    ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
+        let started = Instant::now();
         let job = match plan {
             LanczosWorkPlan::AnimeUpscale(plan) => self
                 .anime_resampler
@@ -1283,12 +1609,11 @@ impl GpuLanczosCache {
             Ok(job) => job,
             Err(_) => return (resource.original_resampleable(), None),
         };
-        let texture_id = renderer.register_native_texture(
+        let texture_id = render_state.renderer.write().register_native_texture(
             &render_state.device,
             job.output_view(),
             wgpu::FilterMode::Linear,
         );
-        drop(renderer);
         self.submit_job(render_state, resource, key, plan, job, texture_id, started)
     }
 
@@ -1809,6 +2134,30 @@ fn work_plan_for_key(source_size: [u32; 2], key: LanczosCacheKey) -> Result<Lanc
 }
 
 impl LanczosWorkPlan {
+    fn allocation_bytes(self) -> NativeAllocationBytes {
+        let rgba16_bytes = |size: [u32; 2]| {
+            u64::from(size[0])
+                .saturating_mul(u64::from(size[1]))
+                .saturating_mul(8)
+        };
+        let temporary_bytes = match self {
+            Self::Full(plan) => rgba16_bytes([plan.source_size[0], plan.target_size[1]]),
+            Self::VisibleUpscale(plan) => {
+                rgba16_bytes([plan.intermediate_x_width, plan.target_size[1]])
+            }
+            Self::AnimeUpscale(plan) => rgba16_bytes(plan.process_size)
+                .saturating_mul(STILL_IMAGE_ANIME4K_VARIANT.intermediate_count() as u64),
+            Self::NisUpscale(_) | Self::PixelArtUpscale(_) => 0,
+        };
+        let target = self.target_size();
+        NativeAllocationBytes {
+            output_bytes: u64::from(target[0])
+                .saturating_mul(u64::from(target[1]))
+                .saturating_mul(4),
+            temporary_bytes,
+        }
+    }
+
     fn source_size(self) -> [u32; 2] {
         match self {
             Self::Full(plan) => plan.source_size,
@@ -1868,6 +2217,34 @@ impl LanczosWorkPlan {
             Self::AnimeUpscale(plan) => Some(plan.source_region_px),
         }
     }
+}
+
+fn backing_matches_plan(
+    actual_size: [u32; 2],
+    format: wgpu::TextureFormat,
+    source_size: [u32; 2],
+) -> bool {
+    actual_size == source_size && format == wgpu::TextureFormat::Rgba8Unorm
+}
+
+fn prewarm_source_backing(
+    render_state: &egui_wgpu::RenderState,
+    texture_id: egui::TextureId,
+    source_size: [u32; 2],
+) -> Result<wgpu::Texture, NativePrewarmUnavailable> {
+    let renderer = render_state.renderer.read();
+    let source = renderer
+        .texture(&texture_id)
+        .and_then(|texture| texture.texture.as_ref())
+        .ok_or(NativePrewarmUnavailable::MissingBacking)?;
+    if !backing_matches_plan(
+        [source.width(), source.height()],
+        source.format(),
+        source_size,
+    ) {
+        return Err(NativePrewarmUnavailable::BackingMismatch);
+    }
+    Ok(source.clone())
 }
 
 fn quantized_target_size(source_size: [u32; 2], scale: f32, quantum: u32) -> [u32; 2] {
@@ -2641,6 +3018,10 @@ fn create_pipeline(
         cache: None,
     })
 }
+
+#[cfg(test)]
+#[path = "gpu_lanczos/prewarm_tests.rs"]
+mod prewarm_tests;
 
 #[cfg(test)]
 mod tests {

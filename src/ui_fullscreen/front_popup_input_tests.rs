@@ -1,4 +1,4 @@
-//! Backlog 1.402: non-overflow foreground menus through the actual fullscreen renderer.
+//! Backlog 1.403: non-overflow foreground menus through the actual fullscreen renderer.
 //! These tests express the intended input boundary; the released raw handlers may violate it.
 use super::*;
 
@@ -225,7 +225,7 @@ fn drag_in_popup(
 }
 
 #[test]
-#[ignore = "backlog 1.402: 前面 popup の押下が背面へ届く (再現テスト)"]
+#[ignore = "backlog 1.403: 前面 popup の押下が背面へ届く (再現テスト)"]
 fn front_popup_seek_row_does_not_pan_the_actual_top_right_navigator() {
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();
@@ -297,7 +297,7 @@ fn prepare_wipe(app: &mut App) {
 }
 
 #[test]
-#[ignore = "backlog 1.402: 前面 popup の押下が背面へ届く (再現テスト)"]
+#[ignore = "backlog 1.403: 前面 popup の押下が背面へ届く (再現テスト)"]
 fn front_popup_seek_row_does_not_move_the_actual_comparison_wipe() {
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();
@@ -349,7 +349,7 @@ fn front_popup_seek_row_does_not_move_the_actual_comparison_wipe() {
 }
 
 #[test]
-#[ignore = "backlog 1.402: 前面 popup の押下が背面へ届く (再現テスト)"]
+#[ignore = "backlog 1.403: 前面 popup の押下が背面へ届く (再現テスト)"]
 fn front_popup_rotation_row_does_not_pan_the_actual_analysis_canvas() {
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();

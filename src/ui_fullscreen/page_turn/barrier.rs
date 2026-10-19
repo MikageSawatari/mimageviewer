@@ -2,6 +2,10 @@
 //! has contributed a complete canonical flat to an adopted output.
 use super::*;
 
+#[cfg(test)]
+#[path = "manual_nav_wrap_tests.rs"]
+mod manual_nav_wrap_tests;
+
 pub(super) enum FlatCompletion {
     NeedFlat,
     Submitted(SubmittedUnitReceipt),
@@ -136,6 +140,7 @@ impl App {
             return;
         }
         *completion = FlatCompletion::Submitted(receipt.clone());
+        self.note_page_turn_gpu_activity();
     }
 
     pub(crate) fn page_turn_completion_active(&self) -> bool {
@@ -356,6 +361,7 @@ impl App {
         if !ready {
             return None;
         }
+        self.service_final_prepare_before_lookup(ctx);
         self.flush_submitted_page_turn_ready(ctx);
         // Presentation adoption precedes ordinary navigation completion. Keep
         // the same typed command if its matching observer has not retired yet.

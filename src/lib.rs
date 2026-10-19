@@ -544,6 +544,30 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
 /// docs/briefs/pdf-page-turn-and-stale-composite-plan.md の ③。
 fn install_texture_delta_ledger() {
     egui_wgpu::atlas_diag::set_sink(|message| logger::log(message));
+    egui_wgpu::install_texture_delivery_observer(perf::is_enabled, |delivery| {
+        let site = match delivery.site {
+            egui_wgpu::atlas_diag::Site::ProducedMain => "produced_main",
+            egui_wgpu::atlas_diag::Site::ProducedImmediate => "produced_immediate",
+            egui_wgpu::atlas_diag::Site::ProducedPresenter => "produced_presenter",
+            egui_wgpu::atlas_diag::Site::AppliedPaint => "applied_paint",
+            egui_wgpu::atlas_diag::Site::AppliedNoPaint => "applied_no_paint",
+            egui_wgpu::atlas_diag::Site::AppliedPresenter => "applied_presenter",
+        };
+        perf::event(
+            "gpu",
+            "texture_delivery_submitted",
+            None,
+            0,
+            &[
+                ("renderer", delivery.renderer.into()),
+                ("texture", format!("{:?}", delivery.texture_id).into()),
+                ("batch", delivery.batch.into()),
+                ("bytes", delivery.bytes.into()),
+                ("mipmap", delivery.mipmap.into()),
+                ("site", site.into()),
+            ],
+        );
+    });
 }
 
 fn install_panic_log_hook() {

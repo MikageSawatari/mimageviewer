@@ -195,9 +195,16 @@ fn page_turn_paged_prefetch_retained_cover_before_accept_starts_and_finishes() {
         assert!(!app.final_composite_cache.contains_key(&final_key));
         app.fullscreen_idx = Some(19);
         app.reconcile_paged_prefetch_window(19);
+        // Existing source prefetch visits partner 20, then the upcoming unit's
+        // page 21 and supplementary cover 0. Finish each CPU job at its static
+        // ROOT finalized-output opportunity, before accepting a presentation.
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        for _ in 0..3 {
             app.prefetch_final_ai(&ctx, 19);
+            assert!(!app.final_effect_pending.is_empty());
+            crate::app::paged_prefetch_tests::complete_pending_composites_before(
+                &mut app, &ctx, deadline,
+            );
             if app
                 .final_composite_cache
                 .get(&final_key)
@@ -205,12 +212,13 @@ fn page_turn_paged_prefetch_retained_cover_before_accept_starts_and_finishes() {
             {
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "existing prefetch worker must publish cover before navigation"
-            );
-            std::thread::yield_now();
         }
+        assert!(
+            app.final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete),
+            "existing prefetch must publish the upcoming cover before navigation"
+        );
         assert_eq!(app.fullscreen_idx, Some(19));
         install(&ctx);
         capture(&ctx, &mut app, 19);

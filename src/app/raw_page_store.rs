@@ -1108,6 +1108,7 @@ pub(crate) mod tests {
         app.final_composite_cache.insert(
             key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size,
                 pixels,
@@ -1859,6 +1860,7 @@ pub(crate) mod tests {
                     app.final_composite_cache.insert(
                         final_key,
                         FinalCompositeEntry {
+                            texture_options: egui::TextureOptions::LINEAR,
                             canonical_dims: None,
                             source_size: [2, 3],
                             pixels: processed,
@@ -2052,6 +2054,9 @@ impl App {
                 developed,
                 high_res,
             } => {
+                // apply_result has returned from its synchronous manager registration;
+                // no speculative admission can interleave inside that store call.
+                self.speculative_gpu_frame.note_ordinary_upload();
                 if self.items.get(tag.idx).is_some() {
                     if let Some(entry) = self.fs_cache.get(&tag.idx) {
                         let tex = match entry {

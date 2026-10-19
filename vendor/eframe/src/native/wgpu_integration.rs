@@ -38,6 +38,35 @@ use crate::{
 
 use super::{epi_integration, event_loop_context, winit_integration, winit_integration::WinitApp};
 
+/// The native wgpu Full boundary, after run_ui has exhausted all retries.
+/// Keep this free of backend locks so App can reconcile its existing resource owners.
+pub(super) fn finalize_native_wgpu_root_output(
+    app: &mut dyn App,
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+    producing_root_frame: u64,
+    output: &mut FullOutput,
+) {
+    if viewport_id != ViewportId::ROOT {
+        return;
+    }
+    app.on_native_wgpu_root_output_finalized(
+        ctx,
+        producing_root_frame,
+        output.platform_output.num_completed_passes,
+    );
+    // A hook may release the old cache entry after that entry was updated/drawn
+    // in the final pass. Preserve its update until paint, then free afterwards.
+    super::viewport_lifecycle::append_texture_delta(
+        &mut output.textures_delta,
+        ctx.tex_manager().write().take_delta(),
+    );
+}
+
+#[cfg(test)]
+#[path = "wgpu_root_output_tests.rs"]
+mod root_output_tests;
+
 #[cfg(all(test, target_os = "windows"))]
 pub(super) mod render_phase_test_gate {
     use std::{
@@ -950,6 +979,9 @@ impl WgpuWinitRunning<'_> {
             .get(&viewport_id)
             .and_then(|viewport| viewport.window.clone());
         let _discard_texture_scope = enter_discard_texture_delivery(&integration.egui_ctx, shared);
+        let producing_root_frame = integration
+            .egui_ctx
+            .cumulative_frame_nr_for(ViewportId::ROOT);
         let mut full_output = {
             #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
             let _window_witness_scope = crate::miv_test_script_window_witness::enter_native_window(
@@ -965,6 +997,13 @@ impl WgpuWinitRunning<'_> {
                 raw_input.expect("a Full UI pass takes its viewport's input"),
             )
         };
+        finalize_native_wgpu_root_output(
+            app.as_mut(),
+            &integration.egui_ctx,
+            viewport_id,
+            producing_root_frame,
+            &mut full_output,
+        );
         egui_wgpu::atlas_diag::record_produced(
             egui_wgpu::atlas_diag::Site::ProducedMain,
             &full_output.textures_delta,

@@ -321,7 +321,7 @@ fn composite_pixels_revision_readers_consume_only_their_own_live_pixels() {
             Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::BLUE)),
         ));
         owner.prefetch_retained_paged_composites(&ctx, 19);
-        complete_pending_composites(owner, &ctx);
+        super::paged_prefetch_tests::complete_pending_composites_for_display(owner, &ctx);
         evict_pair_cpu(owner);
     });
     app.with_window_context_for_test(sibling, |owner| {

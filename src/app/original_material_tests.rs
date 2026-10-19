@@ -519,6 +519,7 @@ fn original_material_backlog_merges_entry_and_preserves_sibling_context() {
             owner.final_composite_cache.insert(
                 sibling_key,
                 FinalCompositeEntry {
+                    texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     canonical_dims,
                     source_size,
                     pixels: Arc::clone(&sibling_pixels),

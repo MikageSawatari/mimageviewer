@@ -779,6 +779,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/manual-nav-wrap",
+        SpreadMode,
+        "先頭 / 末尾で反対側の端へ移る (ループ)",
+        [
+            "前後移動",
+            "手動",
+            "折り返し",
+            "画像",
+            "動画",
+            "音声",
+            "wrap"
+        ]
+    ),
+    entry!(
         "spread/boundary-notice",
         SpreadMode,
         "先頭 / 末尾の案内を表示",
@@ -1887,6 +1901,17 @@ mod tests {
             .find(|entry| entry.anchor == "spread/seek-strip")
             .expect("静止画サムネイル列の最大高さが検索できる");
         assert_eq!(still_height.page, PreferencesPage::SpreadMode);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_is_searchable() {
+        for query in ["手動 ループ", "前後移動 折り返し", "動画 wrap"] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/manual-nav-wrap")
+                .expect("手動の前後移動ループ設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
     }
 
     #[test]

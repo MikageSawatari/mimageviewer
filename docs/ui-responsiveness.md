@@ -471,6 +471,21 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+紙めくり D3（2026-10-19）は一般 final の CPU 処理と表示 clamp を既存 final-effect worker へ置く。
+投機 CPU permit は実終了まで1件、結果予約は context 1 unit／全体2 unit／1GiB。表示要求は投機枠を
+待たず、検証済み CpuReady の引取りまたは同期 takeover を行う。未実体化の編集・comic は従来経路を維持する。
+非共有 final 登録と Native prewarm は native wgpu ROOT の全 retry 後の最終 output hook に限定し、
+演出の live dispatch／当該 frame の演出活動と排他、App 共通で新規投機 allocation は outer frame 当たり1件。
+通常 producer や source／AI 先読みを止めてこの枠へ合わせない。
+Native canonical 収集・再照合は既存 installed topology の証拠／索引と resident metadata だけを読み、
+cold DB 回転 read・余白検出・全頁走査／slideshow 列の再構築を追加しない。証拠不足なら投機を見送る。
+CPU需要用resolverに残っていた全頁走査・mixed slideshow列再構築は、D3-5で既存unit owner内の派生cacheへ移す。
+coldだけ現reader order／visible基準との整合と索引を作り、warmはscalar／Arc identity／逆索引で読む。
+需要縮小、visible token／receipt置換、別owner追加で解消せず、共通adoptionでROOT直接経路も覆う。
+準備・登録・配送 submit・Native submit は GPU 実完了とは区別する。解析は
+`python scripts/analyze_perf.py <perf.jsonl> page-turn-d3`、完了範囲・残る停止と正式 gate 未実施は
+[page-turn 計画 §27.17.17](page-turn-animation-plan.md) を参照。
+
 本の構成editor（§1.242 G4、next-book）はsource列挙/保存前fingerprint/保存待ち/thumbnail decodeを
 workerへ置く。純粋UIは元ページ・unit・変更previewをvirtualizedで描き、可視thumbnail要求は最大24件。
 全ページの名前・参照map・hidden状態をframeごとに作り直さず、draft変更時のviewを再利用する。

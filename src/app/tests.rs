@@ -52709,6 +52709,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: pixels.size,
                 pixels: Arc::clone(&pixels),
@@ -52846,6 +52847,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: pixels.size,
                 pixels,
@@ -53676,6 +53678,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: edit_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
@@ -53753,11 +53756,12 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: edit_pixels.size,
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: final_effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -53828,6 +53832,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: cached_pixels.size,
                 pixels: cached_pixels,
@@ -53860,11 +53865,12 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: source.size,
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: prefetch_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(prefetch_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: true,
+                origin: FinalEffectOrigin::LegacyPrefetch,
+                gpu_diagnostics: Default::default(),
             },
         );
         let reused = app.start_final_effect_worker(
@@ -53883,7 +53889,7 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.final_effect_pending
                 .get(&final_key)
-                .is_some_and(|pending| !pending.prefetch),
+                .is_some_and(|pending| !pending.origin.is_prefetch()),
             "the matching prefetch must still be promoted instead of restarted"
         );
         drop(prefetch_tx);
@@ -53918,6 +53924,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: provisional_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
@@ -53939,11 +53946,12 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx: final_effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         let old_holdover = ctx.load_texture(
@@ -53989,6 +53997,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: complete_pixels.size,
                 pixels: complete_pixels,
@@ -54069,11 +54078,12 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: false,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -54115,11 +54125,12 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -57449,11 +57460,12 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: [1, 1],
                 cancel: Arc::clone(&effect_cancel),
-                rx: effect_rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(effect_rx)),
                 items_generation,
                 output_complete: true,
                 nearest_sampler: false,
-                prefetch: false,
+                origin: FinalEffectOrigin::LegacyDisplay,
+                gpu_diagnostics: Default::default(),
             },
         );
 
@@ -57506,11 +57518,16 @@ mod pipeline_cache_refactor_tests {
                     canonical_dims: None,
                     source_size: [1, 1],
                     cancel: Arc::new(AtomicBool::new(false)),
-                    rx,
+                    state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                     items_generation,
                     output_complete: true,
                     nearest_sampler: false,
-                    prefetch: idx != target_idx,
+                    origin: if idx != target_idx {
+                        FinalEffectOrigin::LegacyPrefetch
+                    } else {
+                        FinalEffectOrigin::LegacyDisplay
+                    },
+                    gpu_diagnostics: Default::default(),
                 },
             );
         }
@@ -58007,6 +58024,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: monochrome.size,
                 pixels: Arc::clone(&monochrome),
@@ -59587,6 +59605,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
@@ -59691,8 +59710,11 @@ mod pipeline_cache_refactor_tests {
             .final_effect_pending
             .remove(&final_key)
             .expect("neighbor colorize prefetch must start");
-        let result = pending
-            .rx
+        let FinalEffectState::Computing(FinalEffectReceiver::Legacy(ref effect_rx)) = pending.state
+        else {
+            panic!("legacy prefetch receiver");
+        };
+        let result = effect_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("colorize prefetch result");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -59703,11 +59725,12 @@ mod pipeline_cache_refactor_tests {
                 canonical_dims: None,
                 source_size: pending.source_size,
                 cancel: pending.cancel,
-                rx,
+                state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation: pending.items_generation,
                 output_complete: pending.output_complete,
                 nearest_sampler: pending.nearest_sampler,
-                prefetch: pending.prefetch,
+                origin: pending.origin,
+                gpu_diagnostics: Default::default(),
             },
         );
         app.poll_final_effects(&ctx);
@@ -59774,7 +59797,7 @@ mod pipeline_cache_refactor_tests {
             .get(&final_key)
             .expect("same pending must remain");
         assert!(Arc::ptr_eq(&original_cancel, &promoted.cancel));
-        assert!(!promoted.prefetch);
+        assert!(!promoted.origin.is_prefetch());
         assert!(!original_cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert!(
             displayed.is_none(),
@@ -59815,6 +59838,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             current_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: current_pixels.size,
                 pixels: current_pixels,
@@ -59864,6 +59888,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             target_final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: prefetched_pixels.size,
                 pixels: prefetched_pixels,
@@ -60929,6 +60954,7 @@ mod pipeline_display_edit_split_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                texture_options: egui::TextureOptions::LINEAR,
                 canonical_dims: None,
                 source_size: image.size,
                 pixels: Arc::new(image),
@@ -63029,6 +63055,7 @@ mod still_window_mode_key_tests {
             &[old_idx, old_idx + 1],
             old_idx,
             1,
+            false,
             "test_missing",
             ManualMediaNavigationLanding::NativeVideo,
         );
@@ -63083,6 +63110,7 @@ mod still_window_mode_key_tests {
             &[old_idx, next_idx],
             old_idx,
             1,
+            false,
             "test_provisional",
             ManualMediaNavigationLanding::NativeVideo,
         );
@@ -63289,6 +63317,7 @@ mod still_window_mode_key_tests {
                 &display_order,
                 old_idx,
                 1,
+                false,
                 source,
                 ManualMediaNavigationLanding::NativeVideo,
             );
@@ -86466,7 +86495,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(eof_result.missing, vec![(missing, missing_path.clone())]);
 
         let manual_candidates =
-            App::collect_manual_media_navigation_candidates(&app.items, &order, current, 1);
+            App::collect_manual_media_navigation_candidates(&app.items, &order, current, 1, false);
         let manual_result = App::resolve_media_navigation_candidates(
             &manual_candidates,
             1,
@@ -107297,3 +107326,6 @@ mod merge_adoption_tests;
 
 #[path = "tests/bookmark_build_adoption.rs"]
 mod bookmark_build_adoption_tests;
+
+#[path = "tests/manual_nav_wrap.rs"]
+mod manual_nav_wrap;

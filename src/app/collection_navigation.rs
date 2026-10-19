@@ -46,6 +46,7 @@ enum CollectionNavigationAction {
         display_unit_step: bool,
         landing: ManualMediaNavigationLanding,
         still_only: bool,
+        wrap: bool,
     },
     Slideshow {
         fs_idx: usize,
@@ -145,9 +146,10 @@ impl CollectionNavigationAction {
                     CollectionNavigationTail::Stop
                 }
             }
-            Self::Manual { .. } | Self::OuterGrid { .. } | Self::OuterFullscreen { .. } => {
-                CollectionNavigationTail::Stop
-            }
+            Self::Manual { wrap: true, .. } => CollectionNavigationTail::WrapExcludingCurrent,
+            Self::Manual { wrap: false, .. }
+            | Self::OuterGrid { .. }
+            | Self::OuterFullscreen { .. } => CollectionNavigationTail::Stop,
         }
     }
 
@@ -597,6 +599,7 @@ pub(in crate::app) enum CollectionNavigationPending {
         landing: ManualMediaNavigationLanding,
         display_unit_step: bool,
         still_only: bool,
+        wrap: bool,
         stamp: CollectionNavigationContinuationStamp,
     },
 }
@@ -714,18 +717,21 @@ impl CollectionNavigationPending {
         landing: ManualMediaNavigationLanding,
         still_only: bool,
         display_unit_step: bool,
+        wrap: bool,
     ) -> bool {
         if let Self::AwaitingManualContinuation {
             steps,
             landing: active_landing,
             display_unit_step: active_display_unit_step,
             still_only: active_still_only,
+            wrap: active_wrap,
             ..
         } = self
         {
             if *active_landing != landing
                 || *active_still_only != still_only
                 || *active_display_unit_step != display_unit_step
+                || *active_wrap != wrap
                 || (*steps != 0 && steps.signum() != delta.signum())
             {
                 return false;
@@ -748,6 +754,7 @@ impl CollectionNavigationPending {
             landing: active_landing,
             still_only: active_still_only,
             display_unit_step: active_display_unit_step,
+            wrap: active_wrap,
             ..
         } = action
         else {
@@ -756,6 +763,7 @@ impl CollectionNavigationPending {
         if *active_landing != landing
             || *active_still_only != still_only
             || *active_display_unit_step != display_unit_step
+            || *active_wrap != wrap
             || active.signum() != delta.signum()
         {
             return false;
@@ -1757,8 +1765,9 @@ impl App {
         fs_idx: usize,
         delta: i32,
         landing: ManualMediaNavigationLanding,
+        wrap: bool,
     ) -> bool {
-        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, false)
+        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, false, wrap)
     }
 
     pub(crate) fn start_collection_manual_display_unit_navigation(
@@ -1767,8 +1776,9 @@ impl App {
         fs_idx: usize,
         delta: i32,
         landing: ManualMediaNavigationLanding,
+        wrap: bool,
     ) -> bool {
-        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, true)
+        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, true, wrap)
     }
 
     fn start_collection_manual_navigation_inner(
@@ -1778,6 +1788,7 @@ impl App {
         delta: i32,
         landing: ManualMediaNavigationLanding,
         display_unit_step: bool,
+        wrap: bool,
     ) -> bool {
         if delta == 0 {
             return false;
@@ -1800,16 +1811,41 @@ impl App {
                 } if *active_landing == landing
                     && self.collection_navigation_manual_continuation_is_current(stamp, landing)
             );
-            if continuation_is_current
-                && pending.accumulate_manual(delta, landing, still_only, display_unit_step)
-            {
-                let sequence = self
-                    .top_level_grid_view
-                    .advance_collection_navigation_sequence();
-                pending.set_intent_sequence(sequence);
-                self.top_level_grid_view
-                    .set_collection_navigation_pending(Some(pending));
-                return true;
+            if continuation_is_current {
+                let accepted = match &mut pending {
+                    CollectionNavigationPending::AwaitingManualContinuation {
+                        steps,
+                        display_unit_step: active_display_unit_step,
+                        still_only: active_still_only,
+                        wrap: active_wrap,
+                        ..
+                    } if *active_wrap != wrap => {
+                        // A changed wrap policy starts a new intent, discarding the old queued
+                        // inputs. Keep the landing owner until its native swap completes: the
+                        // caller's presenter index may still belong to the previous root order.
+                        *steps = delta.clamp(-32, 32);
+                        *active_display_unit_step = display_unit_step;
+                        *active_still_only = still_only;
+                        *active_wrap = wrap;
+                        true
+                    }
+                    _ => pending.accumulate_manual(
+                        delta,
+                        landing,
+                        still_only,
+                        display_unit_step,
+                        wrap,
+                    ),
+                };
+                if accepted {
+                    let sequence = self
+                        .top_level_grid_view
+                        .advance_collection_navigation_sequence();
+                    pending.set_intent_sequence(sequence);
+                    self.top_level_grid_view
+                        .set_collection_navigation_pending(Some(pending));
+                    return true;
+                }
             }
             self.top_level_grid_view
                 .set_collection_navigation_pending(Some(pending));
@@ -1832,7 +1868,13 @@ impl App {
             .advance_collection_navigation_sequence();
         if self
             .top_level_grid_view
-            .accumulate_collection_manual_navigation(delta, landing, still_only, display_unit_step)
+            .accumulate_collection_manual_navigation(
+                delta,
+                landing,
+                still_only,
+                display_unit_step,
+                wrap,
+            )
         {
             if let Some(pending) = self
                 .top_level_grid_view
@@ -1856,6 +1898,7 @@ impl App {
                 display_unit_step,
                 landing,
                 still_only,
+                wrap,
             },
         )
     }
@@ -2913,6 +2956,7 @@ impl App {
                 landing,
                 display_unit_step,
                 still_only,
+                wrap,
                 stamp,
             } => {
                 if !self.collection_navigation_manual_continuation_is_current(&stamp, landing) {
@@ -2934,6 +2978,7 @@ impl App {
                                 landing,
                                 display_unit_step,
                                 still_only,
+                                wrap,
                                 stamp,
                             },
                         ));
@@ -2946,6 +2991,7 @@ impl App {
                             fs_idx,
                             if forward { 1 } else { -1 },
                             landing,
+                            wrap,
                         )
                     } else {
                         self.start_collection_manual_navigation(
@@ -2953,6 +2999,7 @@ impl App {
                             fs_idx,
                             if forward { 1 } else { -1 },
                             landing,
+                            wrap,
                         )
                     };
                     if started
@@ -4343,6 +4390,7 @@ impl App {
                 queued_steps,
                 display_unit_step,
                 still_only,
+                wrap,
                 ..
             } => {
                 match landing {
@@ -4380,6 +4428,7 @@ impl App {
                                     landing,
                                     display_unit_step,
                                     still_only,
+                                    wrap,
                                     stamp,
                                 },
                             ));
@@ -6672,6 +6721,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: Some(Arc::new(owner)),
             perf_started_at: None,
@@ -7120,6 +7170,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
@@ -7311,6 +7362,7 @@ mod tests {
             &[], // Collection root owns reader order; a caller's list display order is irrelevant.
             0,
             1,
+            false,
             "collection_manual_route_test",
             ManualMediaNavigationLanding::Fullscreen,
         );
@@ -8661,6 +8713,336 @@ mod tests {
     }
 
     #[test]
+    fn manual_collection_wrap_handler_lands_at_the_latest_actor_order_endpoints() {
+        use crate::ui_fullscreen::FsPageNav;
+
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for forward in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(|name| temp.path().join(name));
+            for path in &paths {
+                image::RgbImage::new(90, 160).save(path).unwrap();
+            }
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let created = recv(
+                client
+                    .create_collection("latest wrap order".into())
+                    .unwrap(),
+            );
+            let registrations = paths
+                .iter()
+                .map(|path| {
+                    crate::collection_store::CollectionRegistration::from_trusted_path(
+                        path,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let added = recv(
+                client
+                    .add_batch(created.collection_id(), created.revision(), registrations)
+                    .unwrap(),
+            );
+            let prepared = prepare_snapshot(&added.snapshot);
+            app.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: prepared.collection_id,
+                }),
+                None,
+            );
+            app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+            app.spread_mode = crate::settings::SpreadMode::Single;
+            app.settings.fullscreen_manual_nav_wrap = true;
+            app.settings.page_turn_animation_enabled = false;
+            let current_idx = if forward { 3 } else { 0 };
+            app.fullscreen_idx = Some(current_idx);
+            // Keep the current endpoint but change the opposite endpoint in the actor only.
+            // The handler must not land at the opposite end of the stale installed order.
+            let latest_order = if forward { [1, 0, 2, 3] } else { [0, 3, 1, 2] };
+            let entry_ids = latest_order.map(|index| prepared.entries[index].entry_id);
+            let latest = recv(
+                client
+                    .reorder_manual(
+                        prepared.collection_id,
+                        prepared.collection_revision,
+                        entry_ids.to_vec(),
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .prepared()
+                    .unwrap()
+                    .collection_revision,
+                prepared.collection_revision
+            );
+            let ctx = egui::Context::default();
+            let delta = if forward { 1 } else { -1 };
+            let nav = app.spread_page_nav(delta);
+            assert_eq!(nav, FsPageNav::Delta(delta));
+            app.handle_fs_navigation(&ctx, false, false, None, None, None, nav, None, current_idx);
+            assert!(app.top_level_grid_view.collection_navigation_pending());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.top_level_grid_view.collection_navigation_pending() {
+                assert!(Instant::now() < deadline, "latest-order wrap did not land");
+                app.poll_collection_navigation(&ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let target_idx = if forward { 0 } else { 3 };
+            let expected_original = if forward { 1 } else { 2 };
+            assert_eq!(app.fullscreen_idx, Some(target_idx));
+            assert!(
+                matches!(&app.items[target_idx], crate::grid_item::GridItem::Image(path)
+                if path == &paths[expected_original])
+            );
+            let installed = app
+                .top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .prepared()
+                .unwrap();
+            assert_eq!(installed.collection_revision, latest.revision());
+            assert_eq!(
+                installed
+                    .entries
+                    .iter()
+                    .map(|entry| entry.entry_id)
+                    .collect::<Vec<_>>(),
+                entry_ids
+            );
+            assert!(app.fs_boundary_hint.is_none());
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    fn manual_collection_wrap_with_one_split_image_changes_slice_without_a_collection_request() {
+        use crate::page_split::{PresentationStep, SplitDirection};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::{FsPageNav, FsWrapTarget};
+
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("landscape.jpg");
+        image::RgbImage::new(160, 90).save(&image).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("split image".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &image,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(prepared, None);
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_manual_nav_wrap = true;
+        app.settings.page_turn_animation_enabled = false;
+        app.record_page_dims_for_spread(0, (160, 90));
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::None);
+        let ctx = egui::Context::default();
+        for mode in [SpreadMode::SplitLtr, SpreadMode::SplitRtl] {
+            app.spread_mode = mode;
+            app.viewer_navigation_caches.invalidate();
+            let direction = SplitDirection::from_spread_mode(mode).unwrap();
+            let steps = [
+                PresentationStep {
+                    source_idx: 0,
+                    slice: direction.first(),
+                },
+                PresentationStep {
+                    source_idx: 0,
+                    slice: direction.second(),
+                },
+            ];
+            for forward in [false, true] {
+                let current = if forward { steps[1] } else { steps[0] };
+                let target = if forward { steps[0] } else { steps[1] };
+                app.fullscreen_page_slice = current.slice;
+                assert!(
+                    app.collection_root_navigation_origin(0, true).is_some(),
+                    "the fixture must be eligible for collection-root navigation"
+                );
+                let sequence = app.top_level_grid_view.collection_navigation_sequence();
+                let nav = app.spread_page_nav(if forward { 1 } else { -1 });
+                assert_eq!(
+                    nav,
+                    FsPageNav::Wrap(FsWrapTarget {
+                        idx: 0,
+                        slice: Some(target.slice),
+                        forward,
+                    })
+                );
+                app.handle_fs_navigation(&ctx, false, false, None, None, None, nav, None, 0);
+                assert_eq!(app.fullscreen_idx, Some(0));
+                assert_eq!(app.fullscreen_page_slice, target.slice);
+                assert!(app.fs_boundary_hint.is_none());
+                assert!(!app.top_level_grid_view.collection_navigation_pending());
+                assert_eq!(
+                    app.top_level_grid_view.collection_navigation_sequence(),
+                    sequence,
+                    "same-source wrapping must not issue a collection request"
+                );
+            }
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn manual_collection_wrap_without_another_display_unit_finishes_at_the_boundary() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for case in ["image", "video", "audio", "spread", "missing"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let (extension, kind) = match case {
+                "video" => ("mp4", CollectionResolvedKind::Video),
+                "audio" => ("mp3", CollectionResolvedKind::Audio),
+                _ => ("jpg", CollectionResolvedKind::Image),
+            };
+            let current = temp.path().join(format!("current.{extension}"));
+            let other = temp.path().join("other.jpg");
+            std::fs::write(&current, b"current fixture").unwrap();
+            std::fs::write(&other, b"other fixture").unwrap();
+            let mut registrations = vec![
+                crate::collection_store::CollectionRegistration::from_trusted_path(&current, kind)
+                    .unwrap(),
+            ];
+            if matches!(case, "spread" | "missing") {
+                registrations.push(
+                    crate::collection_store::CollectionRegistration::from_trusted_path(
+                        &other,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                );
+            }
+            let created = recv(client.create_collection(case.into()).unwrap());
+            let added = recv(
+                client
+                    .add_batch(created.collection_id(), created.revision(), registrations)
+                    .unwrap(),
+            );
+            let prepared = prepare_snapshot(&added.snapshot);
+            app.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: prepared.collection_id,
+                }),
+                None,
+            );
+            app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+            app.fullscreen_idx = Some(0);
+            if case == "missing" {
+                std::fs::remove_file(&other).unwrap();
+            }
+            let ctx = egui::Context::default();
+            for delta in [-1, 1] {
+                app.fs_boundary_hint = None;
+                let mut origin = app.collection_root_navigation_origin(0, false).unwrap();
+                if case == "spread" {
+                    origin.anchor.as_mut().unwrap().partner =
+                        Some(App::collection_navigation_identity_at(&prepared, 1).unwrap());
+                }
+                origin.intent_sequence = app
+                    .top_level_grid_view
+                    .advance_collection_navigation_sequence();
+                assert!(app.enqueue_collection_navigation(
+                    &ctx,
+                    origin,
+                    CollectionNavigationAction::Manual {
+                        fs_idx: 0,
+                        delta,
+                        queued_steps: 0,
+                        display_unit_step: true,
+                        landing: ManualMediaNavigationLanding::Fullscreen,
+                        still_only: false,
+                        wrap: true,
+                    }
+                ));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.top_level_grid_view.collection_navigation_pending() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{case}, {delta}: navigation did not finish"
+                    );
+                    app.poll_collection_navigation(&ctx);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(app.fullscreen_idx, Some(0), "{case}, {delta}");
+                assert!(
+                    matches!(app.fs_boundary_hint,
+                        Some(crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. }) if at_end == (delta > 0)
+                    ),
+                    "{case}, {delta}: an exhausted manual wrap must emit its boundary hint"
+                );
+            }
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    fn manual_request_repeats_merge_only_when_wrap_matches() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        for wrap in [false, true] {
+            let mut request =
+                cancellation_slideshow_request(&app, app.collection_grid_context_id());
+            request.action = CollectionNavigationAction::Manual {
+                fs_idx: 0,
+                delta: 1,
+                queued_steps: 0,
+                display_unit_step: true,
+                landing: ManualMediaNavigationLanding::Fullscreen,
+                still_only: true,
+                wrap,
+            };
+            let mut pending = CollectionNavigationPending::RequestNeeded {
+                request,
+                watch: Some(client.subscribe().unwrap()),
+            };
+            assert!(!pending.accumulate_manual(
+                1,
+                ManualMediaNavigationLanding::Fullscreen,
+                true,
+                true,
+                !wrap,
+            ));
+            assert!(pending.accumulate_manual(
+                1,
+                ManualMediaNavigationLanding::Fullscreen,
+                true,
+                true,
+                wrap,
+            ));
+            assert!(
+                matches!(pending.action(), Some(CollectionNavigationAction::Manual {
+                queued_steps: 1, wrap: active_wrap, ..
+            }) if *active_wrap == wrap)
+            );
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn manual_repeats_queue_while_the_previous_landing_is_pending() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let target_path = PathBuf::from(r"C:\collection\target.jpg");
@@ -8671,6 +9053,7 @@ mod tests {
             landing: ManualMediaNavigationLanding::Fullscreen,
             display_unit_step: true,
             still_only: true,
+            wrap: false,
             stamp: CollectionNavigationContinuationStamp {
                 context_id: super::super::viewer_context_registry::ViewerContextId::for_test(7),
                 collection_id: CollectionId::new(),
@@ -8685,18 +9068,34 @@ mod tests {
             },
         };
 
-        assert!(
-            pending.accumulate_manual(1, ManualMediaNavigationLanding::Fullscreen, true, true,)
-        );
-        assert!(
-            pending.accumulate_manual(1, ManualMediaNavigationLanding::Fullscreen, true, true,)
-        );
+        assert!(pending.accumulate_manual(
+            1,
+            ManualMediaNavigationLanding::Fullscreen,
+            true,
+            true,
+            false
+        ));
+        assert!(!pending.accumulate_manual(
+            1,
+            ManualMediaNavigationLanding::Fullscreen,
+            true,
+            true,
+            true,
+        ));
+        assert!(pending.accumulate_manual(
+            1,
+            ManualMediaNavigationLanding::Fullscreen,
+            true,
+            true,
+            false
+        ));
         pending.set_intent_sequence(18);
         assert!(!pending.accumulate_manual(
             -1,
             ManualMediaNavigationLanding::Fullscreen,
             true,
             true,
+            false,
         ));
         assert!(matches!(
             pending,
@@ -8760,6 +9159,7 @@ mod tests {
                     landing: ManualMediaNavigationLanding::Fullscreen,
                     display_unit_step: false,
                     still_only: false,
+                    wrap: true,
                     stamp: CollectionNavigationContinuationStamp {
                         context_id,
                         collection_id: prepared.collection_id,
@@ -8777,15 +9177,160 @@ mod tests {
             1,
             1,
             ManualMediaNavigationLanding::Fullscreen,
+            true,
         ));
+        let pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap();
         assert!(matches!(
-            app.top_level_grid_view.take_collection_navigation_pending(),
-            Some(CollectionNavigationPending::AwaitingManualContinuation {
+            &pending,
+            CollectionNavigationPending::AwaitingManualContinuation {
                 steps: 1,
+                wrap: true,
                 stamp: CollectionNavigationContinuationStamp { target_idx: 0, .. },
                 ..
-            })
+            }
         ));
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(pending));
+        app.settings.fullscreen_manual_nav_wrap = false;
+        app.poll_collection_navigation(&egui::Context::default());
+        let pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap();
+        assert!(
+            matches!(
+                pending.action(),
+                Some(CollectionNavigationAction::Manual { wrap: true, .. })
+            ),
+            "queued input must retain its captured wrap after the setting changes"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn changed_manual_wrap_replaces_queued_input_from_the_pending_native_landing() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let paths = [temp.path().join("old.mp4"), temp.path().join("target.mp4")];
+        for path in &paths {
+            std::fs::write(path, b"video fixture").unwrap();
+        }
+        let registrations = paths
+            .iter()
+            .map(|path| {
+                crate::collection_store::CollectionRegistration::from_trusted_path(
+                    path,
+                    CollectionResolvedKind::Video,
+                )
+                .unwrap()
+            })
+            .collect();
+        let created = recv(client.create_collection("native landing".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(created.collection_id(), created.revision(), registrations)
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        let ctx = egui::Context::default();
+        for previous_wrap in [false, true] {
+            for caller_idx in [0, 2] {
+                // Index 0 is the old presenter and now identifies a different prepared entry;
+                // index 2 represents an old order that was longer than the latest root.
+                app.fullscreen_idx = Some(0);
+                let sequence = app
+                    .top_level_grid_view
+                    .advance_collection_navigation_sequence();
+                let now = Instant::now();
+                app.native_video_fast_swap_pending =
+                    Some(super::super::NativeVideoFastSwapPending {
+                        target_idx: 1,
+                        target_path: paths[1].clone(),
+                        source_epoch: 1,
+                        started_at: now,
+                        deadline: now + Duration::from_secs(5),
+                        parked_live_window_id: None,
+                    });
+                let stamp = CollectionNavigationContinuationStamp {
+                    context_id: app.collection_grid_context_id(),
+                    collection_id: prepared.collection_id,
+                    surface_generation: app.top_level_grid_view.generation(),
+                    items_generation: app.items_generation,
+                    intent_sequence: sequence,
+                    target_idx: 1,
+                    target: App::collection_navigation_identity_at(&prepared, 1).unwrap(),
+                };
+                app.top_level_grid_view
+                    .set_collection_navigation_pending(Some(
+                        CollectionNavigationPending::AwaitingManualContinuation {
+                            steps: 3,
+                            landing: ManualMediaNavigationLanding::NativeVideo,
+                            display_unit_step: false,
+                            still_only: false,
+                            wrap: previous_wrap,
+                            stamp,
+                        },
+                    ));
+                let wrap = !previous_wrap;
+                assert!(
+                    app.start_collection_manual_navigation(
+                        &ctx,
+                        caller_idx,
+                        1,
+                        ManualMediaNavigationLanding::NativeVideo,
+                        wrap,
+                    ),
+                    "a changed wrap policy must remain owned by the collection landing"
+                );
+                // Polling during the swap must keep the new intent without issuing a request
+                // against either the transient presenter index or the unfinished target.
+                app.poll_collection_navigation(&ctx);
+                let pending = app
+                    .top_level_grid_view
+                    .take_collection_navigation_pending()
+                    .unwrap();
+                assert!(
+                    matches!(&pending,
+                        CollectionNavigationPending::AwaitingManualContinuation {
+                            steps: 1, wrap: active_wrap,
+                            stamp: CollectionNavigationContinuationStamp { target_idx: 1, intent_sequence, .. },
+                            ..
+                        } if *active_wrap == wrap && *intent_sequence != sequence
+                    ),
+                    "the new input replaces the three old queued steps"
+                );
+                app.top_level_grid_view
+                    .set_collection_navigation_pending(Some(pending));
+                app.native_video_fast_swap_pending = None;
+                app.fullscreen_idx = Some(1);
+                app.poll_collection_navigation(&ctx);
+                let pending = app
+                    .top_level_grid_view
+                    .take_collection_navigation_pending()
+                    .unwrap();
+                let request = pending.request().unwrap();
+                assert!(matches!(&request.action,
+                    CollectionNavigationAction::Manual { fs_idx: 1, delta: 1, queued_steps: 0, wrap: active_wrap, .. }
+                    if *active_wrap == wrap
+                ));
+                assert_eq!(
+                    request.origin.anchor.as_ref().unwrap().primary.entry_id,
+                    prepared.entries[1].entry_id
+                );
+            }
+        }
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -9201,6 +9746,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
@@ -9339,6 +9885,7 @@ mod tests {
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
                 still_only: false,
+                wrap: false,
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
@@ -9839,6 +10386,7 @@ mod tests {
             display_unit_step: false,
             landing: ManualMediaNavigationLanding::Fullscreen,
             still_only: true,
+            wrap: false,
         };
         assert_eq!(manual.direction(), CollectionNavigationDirection::Backward);
         assert_eq!(
@@ -9848,6 +10396,14 @@ mod tests {
         assert_eq!(manual.tail(), CollectionNavigationTail::Stop);
         assert!(!manual.is_media_eof());
         assert_eq!(manual.history_trigger(), HistoryTrigger::UserChosen);
+        let mut wrapping_manual = manual.clone();
+        if let CollectionNavigationAction::Manual { wrap, .. } = &mut wrapping_manual {
+            *wrap = true;
+        }
+        assert_eq!(
+            wrapping_manual.tail(),
+            CollectionNavigationTail::WrapExcludingCurrent
+        );
 
         let eof = CollectionNavigationAction::MusicContinuousEof {
             fs_idx: 4,

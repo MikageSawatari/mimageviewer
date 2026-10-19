@@ -2380,6 +2380,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `fullscreen_navigator_corner` | FullscreenNavigatorCorner | BottomRight | ナビゲータの配置。TopLeft / TopRight / BottomLeft / BottomRight。未知値は BottomRight へ正規化 |
 | `fullscreen_navigator_size` | f32 | 260.0 | ナビゲータの縮小画像領域の一辺（logical point）。160〜520 に正規化し、画面内へ収まる大きさに描画する |
 | `fullscreen_boundary_notice_visible` | bool | true | 静止画 / 本 / native 動画で一覧の先頭または末尾へ進もうとしたとき、「先頭です」「末尾です」と次の移動操作を案内する。OFF は案内の描画だけを止め、境界判定と案内状態の寿命は変えない |
+| `fullscreen_manual_nav_wrap` | bool | false | 閲覧表示の手動前後移動を現在の閲覧順・表示対象の先頭 / 末尾で折り返す。画像・本・動画・音声・コレクションに適用し、別フォルダ / 別の本へは移らない。見開きは表示単位、分割は読み順のステップ、連結読みの明示移動は静止画単位。移動先が現在と同じなら境界案内。Home/End・固定量ジャンプ・見開きnudge・フォルダ横断・seek・スタックジャンプ・連結スクロール・自動送り・Remoteは対象外。一覧カーソル / スライドショー / 連続再生のループ、境界案内の表示設定とは独立。設定転送対象。旧設定は項目なしでOFF。詳細は `manual-nav-wrap-plan.md` |
 | `fullscreen_processing_status_visible` | bool | true | 現在ページの高解像度読み込み、PDF 再描画、AI 処理中 / 完了、消去補完済みの表示を切り替える。まだ表示できる画像がないページ中央の「読込中...」は対象外。OFF にしても各処理は続ける |
 | `fullscreen_prefetch_status_visible` | bool | true | AI 先読み中の行と前後ページ別の点表示を切り替える。点は前のページを遠い→近い、次のページを近い→遠い順に現在位置の区切りを挟んで並べ、取得済みは緑、取得中は黄、未取得は灰色の輪郭で示す。片側 4 ページを超える場合は現在に近い 4 ページを点で残し、遠方分を状態別件数へまとめる。
 先読み枚数の設定上限が前後とも 10 枚なので、上限まで増やしても行が伸び続けない。ホバー時は全対象の状態別件数を表示する。OFF にしても先読み処理は続ける。処理状況も OFF のとき、表示する行も点表示もなければ左下の枠自体を描画しない |

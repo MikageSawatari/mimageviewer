@@ -14,7 +14,7 @@ fn resolved(book: &BookComposition, count: u32) -> ResolvedComposition {
     .unwrap()
 }
 
-fn composed_app(book: &BookComposition) -> crate::app::AppTestEnvForTest {
+pub(super) fn composed_app(book: &BookComposition) -> crate::app::AppTestEnvForTest {
     let scope = crate::book_scope::BookScopeKey::document("c:/g3-display.pdf").unwrap();
     let count = 4;
     let raw = (0..count)
