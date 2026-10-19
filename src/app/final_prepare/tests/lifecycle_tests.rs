@@ -801,6 +801,91 @@ fn back_pressure_protects_parked_current_next_display_and_real_computing() {
 }
 
 #[test]
+fn back_pair_pressure_recovers_once_per_producer_and_keeps_second_page_admission() {
+    for small_second_page in [false, true] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        app.final_prepare_cpu = final_prepare_cpu::FinalPrepareCpuBudget::with_limits(2, 60_000);
+        let (owner, protected_key, fingerprint) = parked_previous(&mut app, &ctx, 94124, true);
+        let reservation = app
+            .with_viewer_context_state(owner, |parked| {
+                // This result is now Current, so pressure must visit but retain it.
+                parked.fullscreen_idx = Some(1);
+                reservation_ptr(&parked.final_effect_pending[&protected_key])
+            })
+            .unwrap();
+        let before = app.final_prepare_cpu.snapshot();
+        assert_eq!(before.bytes, 38_400);
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        if small_second_page {
+            let pixels = Arc::new(egui::ColorImage::filled([40, 60], egui::Color32::WHITE));
+            let tex = ctx.load_texture(
+                "small-pair-second",
+                pixels.clone(),
+                DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            );
+            app.fs_cache.insert(
+                2,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: Some([40, 60]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            app.record_page_dims_for_spread(2, (40, 60));
+        }
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx)
+        });
+        app.prepare_final_demand_topologies();
+        let next = app.d3_final_prepare_unit(0).unwrap();
+        assert_eq!(
+            next.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for page in &next.pages {
+            assert!(app.final_prepare_plan_from_resident(page.idx).is_some());
+        }
+        let mounted = app.projected_viewer_context_id();
+        PRESSURE_TRACE
+            .with_borrow_mut(|trace| assert!(trace.replace(PressureTrace::default()).is_none()));
+        app.prefetch_next_final_unit(&ctx, 0);
+        let trace = PRESSURE_TRACE.with_borrow_mut(|trace| trace.take().unwrap());
+        assert_eq!(
+            trace.owner_visits,
+            vec![owner],
+            "one recovery across both Pair pages"
+        );
+        assert_eq!(
+            trace.admission_pages,
+            vec![1, 1, 2],
+            "first page retries once; second still tries ordinary admission"
+        );
+        assert_eq!(app.projected_viewer_context_id(), mounted);
+        assert_eq!(
+            app.final_effect_pending.len(),
+            usize::from(small_second_page)
+        );
+        if small_second_page {
+            wait_ready(&mut app, 2);
+        } else {
+            assert_eq!(app.final_prepare_cpu.snapshot(), before);
+        }
+        app.with_viewer_context_state(owner, |parked| {
+            assert_eq!(
+                reservation_ptr(&parked.final_effect_pending[&protected_key]),
+                reservation
+            );
+            assert_eq!(parked.page_turn_gpu_fingerprint_for_test(), fingerprint);
+        })
+        .unwrap();
+    }
+}
+
+#[test]
 fn back_real_next_bytes_pressure_reclaims_parked_result_but_oversize_does_not() {
     for oversized in [false, true] {
         let ctx = egui::Context::default();
@@ -869,7 +954,15 @@ fn back_pressure_protects_previous_unit_material_shared_with_current_cover() {
     assert_eq!(previous.pages.len(), 1);
     assert_eq!(previous.pages[0].idx, 0);
     let (key, pixels, size, plan) = app.final_prepare_plan_from_resident(0).unwrap();
-    assert!(app.spawn_prepared_final_job(&ctx, key, pixels, size, plan, previous.clone()));
+    assert!(app.spawn_prepared_final_job(
+        &ctx,
+        key,
+        pixels,
+        size,
+        plan,
+        previous.clone(),
+        &mut false
+    ));
     wait_ready(&mut app, 0);
     assert_eq!(
         app.final_prepare_unit_position(&previous),

@@ -289,6 +289,7 @@ impl App {
         if !self.page_turn_current_unit_presented() {
             return;
         }
+        let mut reclaim_attempted = false;
         for page in &unit.pages {
             let idx = page.idx;
             if self.exact_complete_final_composite_entry(idx).is_some() {
@@ -301,7 +302,15 @@ impl App {
             if self.final_effect_pending.contains_key(&key) {
                 continue;
             }
-            if self.spawn_prepared_final_job(ctx, key, source, source_size, plan, unit.clone()) {
+            if self.spawn_prepared_final_job(
+                ctx,
+                key,
+                source,
+                source_size,
+                plan,
+                unit.clone(),
+                &mut reclaim_attempted,
+            ) {
                 return;
             }
         }
@@ -428,6 +437,8 @@ impl App {
             if self.with_viewer_context_ref(owner, |_| ()).is_none() {
                 continue;
             }
+            #[cfg(test)]
+            tests::record_pressure_owner_visit(owner);
             if crate::perf::is_enabled() {
                 crate::perf::event(
                     "fs",
@@ -579,6 +590,7 @@ impl App {
         let Some(unit) = self.d3_final_prepare_unit_at(idx, FinalUnitPosition::Previous) else {
             return false;
         };
+        let mut reclaim_attempted = false;
         for page in &unit.pages {
             if self.resident_final_prepare_texture(ctx, page.idx).is_some() {
                 continue;
@@ -590,7 +602,15 @@ impl App {
             if self.final_effect_pending.contains_key(&key) {
                 continue;
             }
-            if self.spawn_prepared_final_job(ctx, key, pixels, size, plan, unit.clone()) {
+            if self.spawn_prepared_final_job(
+                ctx,
+                key,
+                pixels,
+                size,
+                plan,
+                unit.clone(),
+                &mut reclaim_attempted,
+            ) {
                 return true;
             }
         }
@@ -641,22 +661,29 @@ impl App {
         source_size: [usize; 2],
         plan: FinalCompositePlan,
         unit: FinalPrepareUnit,
+        reclaim_attempted: &mut bool,
     ) -> bool {
         let wake = self.final_prepare_wake(ctx);
         let Some(bytes) = prepared_output_bytes(source.size, plan.post_filter) else {
             return false;
         };
         let requested_position = self.final_prepare_unit_position(&unit);
+        #[cfg(test)]
+        tests::record_pressure_admission(key.edit_key.idx);
         let mut admission = self
             .final_prepare_cpu
             .try_start(unit.clone(), bytes, wake.clone());
-        if requested_position == Some(FinalUnitPosition::Next)
+        if !*reclaim_attempted
+            && requested_position == Some(FinalUnitPosition::Next)
             && let Err(final_prepare_cpu::FinalPrepareStartDenied::Reservation {
                 units,
                 bytes: reserved,
                 reason,
             }) = &admission
         {
+            // One recovery belongs to the whole unit producer invocation,
+            // including both Pair pages. Later pages still try normal admission.
+            *reclaim_attempted = true;
             let reserved = *reserved;
             let reason = *reason;
             self.reclaim_previous_final_results(units, &unit);
@@ -674,6 +701,8 @@ impl App {
             {
                 return false;
             }
+            #[cfg(test)]
+            tests::record_pressure_admission(key.edit_key.idx);
             admission = self.final_prepare_cpu.try_start(unit.clone(), bytes, wake);
             if crate::perf::is_enabled() {
                 crate::perf::event(

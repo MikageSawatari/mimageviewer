@@ -6185,3 +6185,28 @@ lookup/配送時のdemand_position欠落はunknownのままとする。Previous�
 `[A Unknown, B Pending]`の訪問順ではBの確定したNext不足を見落とすため、実装担当と独立reviewer双方で修正が必要と確認した。
 取消は同じ呼出内の全statesから`any(Pending)`で都度導出し、診断用blockerと分離した。永続boolは追加せず、
 既存の取消helper・保護対象・実終了までのpermit/worker予約保持を維持する。設計変更ではなく§27.17.20.5への実装整合である。
+
+**独立完成レビューへの対応（2026-10-20、P3/P2）:** `d0f40d22f`への完成レビューはCHANGES REQUESTED。
+P1はなく、detachedの完成差分が構造修正であるとの合意は維持された。前記の内部レビューACCEPTと区別する。
+
+- P3: `spawn_prepared_final_job`の頁ごとに回収・再試行できたため、Next Pairの両頁が予約拒否されるとownerを再訪していた。
+  `prefetch_next_final_unit`の頁ループ外で生成した呼出しローカルの`reclaim_attempted`を共有し、回収・再試行はunit producer全体で一度に限定する。
+  後続頁の通常admissionは維持する。永続state、待機、追加timer/repaint、上限変更はない。
+  `back_pair_pressure_recovers_once_per_producer_and_keeps_second_page_admission`で、parkedの保護Currentが枠を占有する実経路を検査する。
+  両頁拒否時はowner訪問1回・admission頁列`[1,1,2]`、小さい2頁目なら通常admissionで開始することと、保護lease/mount/held不変を確認する。
+- P2: release core、embedded-web-assets付きremote、epub-pdfを指定順の直接cargo buildで用意し、必須`test-full.ps1`を実行する。
+  以前のrelease不在による未実施記録は成功の代用にしない。P3変更後はfocused/全lib/fmt/check通常・test-scriptを再検証し、最後に計測用buildを作り直す。
+  実行結果、途中失敗、単独再実行、一時変異のSHA-256復元、最終buildは`target/back-fix-*`へ記録する。製品・portable smoke・計測scriptは起動しない。
+
+P3追加回帰の初回実行は1/1成功・終了0。頁単位へ戻す一時変異は同回帰のowner訪問回数assertionで失敗（終了100）し、
+元bytes/復元後SHA-256一致を確認した。限定独立sourceレビューはACCEPT、実行結果は実装担当が記録する。
+
+P3修正後のfocusedは405/405成功、全libは13,797成功・59skip、fmt --checkとcheck通常/test-scriptはいずれも終了0。
+P2のrelease3本は指定順の直接cargo buildで全て終了0（core 2833.319秒、remote 227.616秒、epub-pdf 113.671秒）。
+`build-release.ps1`は使用せず、この実行でTurboJPEG失敗・再試行は発生していない。
+必須`test-full.ps1`も初回成功・終了0（1117.233秒）。workspaceは15,109成功・63skip、doctestは実行対象0/ignore3、
+vendor egui 117、egui-winit 43、egui-wgpu 37、eframe/wgpu 55（1skip）、eframe/glow 57が全件成功した。
+workspaceの9 slowは失敗ではない。今回は全lib/full gateとも失敗0のため、単独再実行は発生していない。
+各コマンド・件数・終了コード・ログ・変異復元SHA-256の正本は`target/back-fix-handoff.md`と`target/back-fix-*.json/log`。
+最後の`build-dev.ps1 -TestScript -PreserveRuntime`も終了0（161.099秒）、3実行ファイルとVCRT PE検査が成功した。起動はしていない。
+限定独立追認はP3/P2とも解消としてACCEPT、残存指摘なし。実機・計測script・正式性能gateは引き続き未実施。

@@ -9,6 +9,29 @@ struct StageGate {
 }
 thread_local! {
     static NEXT_GATE: std::cell::RefCell<Option<Arc<StageGate>>> = const { std::cell::RefCell::new(None) };
+    static PRESSURE_TRACE: std::cell::RefCell<Option<PressureTrace>> = const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct PressureTrace {
+    admission_pages: Vec<usize>,
+    owner_visits: Vec<ViewerContextId>,
+}
+
+pub(super) fn record_pressure_admission(idx: usize) {
+    PRESSURE_TRACE.with_borrow_mut(|trace| {
+        if let Some(trace) = trace {
+            trace.admission_pages.push(idx);
+        }
+    });
+}
+
+pub(super) fn record_pressure_owner_visit(owner: ViewerContextId) {
+    PRESSURE_TRACE.with_borrow_mut(|trace| {
+        if let Some(trace) = trace {
+            trace.owner_visits.push(owner);
+        }
+    });
 }
 static GATES: Mutex<Vec<(usize, std::sync::Weak<StageGate>)>> = Mutex::new(Vec::new());
 
@@ -137,7 +160,7 @@ pub(crate) fn start(app: &mut App, ctx: &egui::Context, idx: usize) -> bool {
     let Some((key, pixels, size, plan)) = app.final_prepare_plan_from_resident(idx) else {
         return false;
     };
-    app.spawn_prepared_final_job(ctx, key, pixels, size, plan, unit(app, idx))
+    app.spawn_prepared_final_job(ctx, key, pixels, size, plan, unit(app, idx), &mut false)
 }
 
 pub(crate) fn app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
