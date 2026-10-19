@@ -19,6 +19,8 @@
 //! しまう」誤認を避けるため明示。
 
 #[cfg(test)]
+mod front_popup_input_tests;
+#[cfg(test)]
 mod native_focus_tests;
 #[cfg(test)]
 mod overflow_input_tests;
