@@ -174,8 +174,11 @@ unsafe extern "system" fn set(
         .probe
         .record("set", vec![f as usize, m as usize, take.0 as usize]);
     if hr.is_ok() && take.as_bool() {
+        // fRelease transfers the existing ownership, not the input structure's storage.
+        // Bit-copy without AddRef, then let ReleaseStgMedium mutate only our local copy.
+        let mut owned = unsafe { m.read() };
         unsafe {
-            ReleaseStgMedium(m.cast_mut());
+            ReleaseStgMedium(&mut owned);
         }
     }
     hr
@@ -566,10 +569,21 @@ fn medium_ownership_and_frelease_belong_to_inner_and_caller() {
 
     for (status, take, expected) in [(S_OK, false, 0), (S_OK, true, 1), (E_NOTIMPL, true, 0)] {
         p.status.set(status);
-        let (mut medium, released, _) = owned_medium();
+        let (mut medium, released, address) = owned_medium();
+        // Keep the COM object alive while inspecting the unchanged input after transfer.
+        let observer = medium.pUnkForRelease.as_ref().unwrap().clone();
+        let original_tymed = medium.tymed;
+        let original_hglobal = unsafe { medium.u.hGlobal };
         let result = unsafe { drag.data.SetData(&format(), &medium, take) };
         assert_eq!(result.is_ok(), status.is_ok());
-        assert_eq!(released.drops.load(Ordering::SeqCst), expected);
+        assert_eq!(medium.tymed, original_tymed);
+        assert_eq!(unsafe { medium.u.hGlobal }, original_hglobal);
+        assert_eq!(
+            medium.pUnkForRelease.as_ref().unwrap().as_raw() as usize,
+            address
+        );
+        assert_eq!(unsafe { inner(observer.as_raw()) }.refs.get(), 2 - expected);
+        assert_eq!(released.drops.load(Ordering::SeqCst), 0);
         let call = p.calls.borrow().last().unwrap().0;
         assert_eq!(call, "set");
         assert_eq!(p.calls.borrow().last().unwrap().1[2], usize::from(take));
@@ -578,6 +592,8 @@ fn medium_ownership_and_frelease_belong_to_inner_and_caller() {
                 ReleaseStgMedium(&mut medium);
             }
         }
+        assert_eq!(unsafe { inner(observer.as_raw()) }.refs.get(), 1);
+        drop(observer);
         assert_eq!(released.drops.load(Ordering::SeqCst), 1);
     }
     drag.finish_modal().unwrap();
