@@ -684,3 +684,17 @@ Rust 3ファイルのSHA-256は`target/similar-array-owner/p2-drop-source-hashes
 既定では実際の`%APPDATA%\mimageviewer`の設定/データを更新し得るため、利用者が起動前に
 インストール版/トレイ常駐版を終了する（同じsingle-instance mutex）。
 類似索引の初期ロード/更新中に進捗表示を開き、通常の候補表示と終了操作を確認できる。agentは起動しない。
+
+## 17. 実アプリでの確認 (2026-10-19)
+
+観測者: ClaudeCode (利用者の依頼により、隔離 data-dir `target/sstest/data` で起動した build-dev の `mimageviewer-core.exe` (`7d4767093`) を画面操作)。
+素材は番号入りの生成画像と、A1 / B1 を縮小した JPEG (`media/D_versions`)。
+
+- 「お気に入り → このフォルダを追加」で `media` を別バージョン索引 ON で登録: 数秒で「別バージョン (前回完了): 14 件」、インデクサはアイドル、「監視中」。
+- 別バージョン索引のチェックを 0.2 秒間隔で外して付け直す (構成変更の連続): 「前回完了 14 件」(最終更新が更新) でアイドルに戻り、「更新未完了」は出なかった。
+- A1 をフルスクリーンで開き右パネル「類似」: 「ほぼ同一」に `A01_small.jpg` (700×500 JPEG、D_versions) が出た。
+
+未確認 (実アプリ): 初期ロード中の構成変更そのもの (タイミングを狙えないため。負荷下の stress 2,200 回と順序固定の回帰で確認)、大きなライブラリでの所要時間、
+実 I/O 障害時の「更新未完了」と再起動案内、トレイ常駐からの再起動。
+
+最終の自動検証 (ClaudeCode): `test-lib-full.ps1` 13,777 成功 / 0 失敗 (`7d4767093`)、`python scripts/stress-similar-index.py --stress-count 20` 106 件 × 20 周成功 (`9faa4c3bb`)。

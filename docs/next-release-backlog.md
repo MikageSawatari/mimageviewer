@@ -34,7 +34,7 @@
 
 ### 1.404 類似索引の初期ロード中に設定を変えると、索引が「更新未完了」で止まることがある — 全件テストの不安定さから判明 (2026-10-19)
 
-- 状態: **単一配列 owner へ実装・独立実装レビュー・自動 gate 完了、ClaudeCode 検収待ち・未コミット**。CPU 24 process負荷は106件×20周=2,120成功、main-lib全件13,773成功、workspace全件15,085成功、vendor 309成功、全段失敗0。通常/portable core check・fmt・UI glyph・通常profile確認buildも成功。採択設計と実装・検証記録: [similar-index-array-owner-plan.md](similar-index-array-owner-plan.md) §16。調査時点の証跡: [similar-index-flaky-startup-marker-investigation.md](similar-index-flaky-startup-marker-investigation.md)。製品バイナリは起動しておらず、実アプリの確認は未実施。
+- 状態: **修正済み・独立レビュー受入可 (`7d4767093`)・実アプリ確認済み (ClaudeCode、2026-10-19、[所有計画](similar-index-array-owner-plan.md) §17)。master 未取込**。調査記録: [similar-index-flaky-startup-marker-investigation.md](similar-index-flaky-startup-marker-investigation.md)。
 - きっかけ: `similar_index::tests::startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` が lib 全件実行のときだけ時々落ちた (§1.403 の作業中、3 回中 2 回)。
 - 原因 (headless の負荷再現と順序固定の再現で確認、実アプリでは未確認): 構成変更 (お気に入りの類似索引対象・共通除外・PDF パスワード) がメモリの初期ロード中に起きると、旧ロードを失効させて新ロードを始めるが、旧ロードの検索配列ファイル (`similar.base`) への書き込み・置換は止まらない。旧・新が同じファイルを置換し、Windows ではハンドルの重なりでアクセス拒否 (0x80070005) になる。新ロードが Failed を公開し、Full が終わっても配列の反映確認 (ack) が Failed → Degraded(ArrayPublication) で止まり、完了印も書かれない。
 - 利用者から見た症状 (コード上の到達経路): お気に入り編集画面に「更新未完了: 検索用一覧への反映を確認できませんでした」。類似画像の検索が使えない状態が、構成を変えるか次回起動まで続き得る。
