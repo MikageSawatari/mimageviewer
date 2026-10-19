@@ -5388,3 +5388,18 @@ python scripts/analyze_perf.py target/page-turn-smoke/d34b-04-rtl-adj/logs/perf_
 master 取り込み前の独立最終レビュー (Sol / xhigh、`200bd9530`、`git diff master...HEAD`) は **ACCEPT、P1〜P3 なし、master 取り込み可**。
 D3-5 の派生 topology、§1.400 の手動ループとの整合 (末尾 Boundary 維持)、§1.395 / EffeTune v0.14.0 との接点、通常表示の不変、`page-turn-d3` 解析モード、文書の整合を確認。
 detached の完成差分は「症状パッチではなく構造的修正」と合意。正式性能 gate (3run×30 機会) と利用者の実機受入は未完了。
+
+#### 27.17.19 ClaudeCode による実アプリ操作の確認（2026-10-19、隔離 data-dir、利用者の許可による PC 操作）
+
+`build-dev.ps1` の通常ビルド (`8a8737ef5` の製品コード) を隔離 data-dir (`target/manual-d3/data`、`--perf-log`) で起動し、computer-use で操作した。
+`global_preset` (明るさ +15・コントラスト +10) と演出 ON 200ms は隔離 profile の settings.db に設定。対象は 04 (8000×8192)。利用者の目視確認ではない。
+
+- 表示の正しさ (画面): 単ページで 1→5→4→5、右開き表紙単独の見開きで 4|5 から 12|13 (→10|11→12|13)、F12 の別ウィンドウで 12|13→10|11→8|9→10|11、
+  演出 OFF の別ウィンドウで 10|11→12|13→14|15→12|13。いずれも期待どおりの頁・左右配置に着地した。ログに panic・error なし。
+- 演出 ON・本体窓 (`analyze_perf.py page-turn-d3`): 単ページ 6 回は curl 31〜34 コマ・受理→初回 curl 4〜7ms・最大間隔 7〜22ms。見開き 7 回は 33〜34 コマ・最大間隔 7〜9ms、
+  初回 curl は 4〜56ms (§27.17.16 の後半の遅れと同じ傾向)。
+- **別ウィンドウで、開いた直後に前の見開きへ戻る 2 回は curl 1 コマ・受理→初回 curl 164〜176ms (演出がほぼ出ない)。** 前の unit の final を同期で作っていた
+  (`fs.final_composite_build` 1 頁 65〜89ms × 2、Native miss で再生成)。D3 は次 unit だけを先回りし、§27.17.2 の「前 unit は既存 cache を優先し、不足は低優先で補う」は
+  未実装。D3 前と同じ挙動で退行ではないが、戻る方向の先回りは残り (backlog §1.401 に追記)。本体窓の単ページの戻りは直前頁が cache に残っていて滑らか。
+- 演出 OFF: D3 の投機は動かない (`cpu_ready` / `registered` 0)。頁送りの final は従来どおり表示時に同期で作る (1 頁 60〜97ms) が、登録の `upload_ms` は 0
+  (Arc 登録で全画素の複製をやめた D3 の共通改善。§27.15 では 67〜77ms)。
