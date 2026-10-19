@@ -17342,6 +17342,8 @@ pub struct App {
     /// 相関済み canvas gesture は TouchStream が寿命だけを所有して通し、terminal touch
     /// replacement は current frame だけ抑制して cross-frame state にはしない。
     pub(crate) fs_primary_suppression: crate::ui_fullscreen::FullscreenPrimarySuppression,
+    /// Foreground physical sequences outlive page-operation cancellation. Never bundled.
+    pub(crate) fs_front_pointer: crate::ui_fullscreen::FsFrontPointerOwnership,
 
     // ── 通常フルスクリーン ズーム/パン/任意回転 ──────────────
     /// 通常フルスクリーンのズーム倍率（1.0 = フィット）
@@ -20743,6 +20745,7 @@ impl App {
             fs_prev_foreground_hwnd: 0,
             fs_last_native_focus_claim_at: None,
             fs_last_main_focus_restore_at: None,
+            fs_front_pointer: Default::default(),
             fs_primary_suppression: Default::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
@@ -61160,6 +61163,7 @@ impl App {
 
     #[cfg(windows)]
     fn handoff_active_detached_viewport_to_passive(&mut self, reason: &'static str) {
+        self.fs_front_pointer = Default::default();
         let session_before = self.active_detached_session;
         let shown_before = self.fs_viewport_shown;
         let presentation_before = self.fs_viewport_presentation;
@@ -61216,6 +61220,7 @@ impl App {
         // The same reason as in `close_fullscreen`: this is the other place that gives up the
         // fullscreen foreground, and a panel that only draws there must not outlive it.
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        self.fs_front_pointer = Default::default();
         self.fs_primary_suppression = Default::default();
         self.cancel_mouse_ring_flick();
         self.fs_secondary_press.cancel();
@@ -63304,6 +63309,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
+        self.fs_front_pointer = Default::default();
         self.fs_primary_suppression = Default::default();
     }
 
@@ -63342,6 +63348,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
+        self.fs_front_pointer = Default::default();
         self.fs_primary_suppression = Default::default();
     }
 
@@ -67993,6 +68000,9 @@ impl App {
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
+        if self.viewer_presentation != presentation {
+            self.fs_front_pointer = Default::default();
+        }
         self.viewer_presentation = presentation;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
@@ -78486,6 +78496,7 @@ impl App {
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
+        self.fs_front_pointer = Default::default();
         self.fs_primary_suppression = Default::default();
         self.fs_secondary_press.cancel();
         #[cfg(windows)]
@@ -87897,6 +87908,9 @@ impl App {
                 "remote_ipc: rejected detached presentation open outside Local phase",
             );
             return;
+        }
+        if self.viewer_presentation != target_presentation {
+            self.fs_front_pointer = Default::default();
         }
         self.viewer_presentation = target_presentation;
         #[cfg(windows)]

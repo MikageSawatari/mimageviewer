@@ -43,7 +43,7 @@ fn collect_actual_merge(
     let state = app.prepare_fullscreen_state(&ctx, idx, FsPageTurnDecision::normal());
     let mut operation = None;
     let (overflow_pointer_input, overflow_touch_excluded) =
-        app.capture_fs_overflow_pointer_input(&ctx, ui.max_rect());
+        app.capture_fs_front_pointer_input(&ctx, ui.max_rect());
     let result = app.handle_fs_wheel_and_click_frame(
         ui,
         &ctx,

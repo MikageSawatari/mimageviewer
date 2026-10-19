@@ -5624,10 +5624,24 @@ impl App {
         allow_start: bool,
         surface: crate::app::ActionSurface,
     ) -> bool {
+        self.update_mouse_middle_short_click_with_release(ctx, allow_start, surface, true)
+    }
+
+    pub(crate) fn cancel_mouse_middle_short_click(&mut self) {
+        self.mouse_middle_click_start = None;
+    }
+
+    pub(crate) fn update_mouse_middle_short_click_with_release(
+        &mut self,
+        ctx: &egui::Context,
+        allow_start: bool,
+        surface: crate::app::ActionSurface,
+        allow_release: bool,
+    ) -> bool {
         let sample = ctx.input(|i| MouseMiddleInputSample {
             is_down: i.pointer.button_down(egui::PointerButton::Middle),
             is_pressed: i.pointer.button_pressed(egui::PointerButton::Middle),
-            is_released: i.pointer.button_released(egui::PointerButton::Middle),
+            is_released: allow_release && i.pointer.button_released(egui::PointerButton::Middle),
             current_pos: i.pointer.interact_pos(),
         });
         update_mouse_middle_click_state(

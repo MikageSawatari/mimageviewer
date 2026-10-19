@@ -2050,7 +2050,7 @@ impl App {
         full_rect: egui::Rect,
         lock_effective: bool,
         seek_height: f32,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         self.draw_metadata_panel_inner(
             ui,
@@ -2297,7 +2297,7 @@ impl App {
         full_rect: egui::Rect,
         lock_effective: bool,
         seek_height: f32,
-        overflow_pointer_input: crate::ui_fullscreen::FsOverflowPointerFrameInput,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         let tag_picker_open = self.fullscreen_tag_picker_open;

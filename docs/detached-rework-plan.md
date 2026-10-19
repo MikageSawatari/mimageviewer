@@ -5871,3 +5871,10 @@ Context/nativeの対象限定退役はcollectorより先に進め、公開済み
 - 触れた detached 経路: `App::reset_detached_pause_foreground_modes` だけ。(1) 廃止した `slideshow_popup_open` のリセット行を削除、(2) overflow パネルを閉じる行の隣に `fs_primary_suppression` のリセットを追加 (直下の `fs_secondary_press.cancel()` と左右をそろえる)。detached の述語・viewport・geometry・placement・focus・window lifecycle は変更しない。
 - 所有の判断: `fs_overflow_panel_state` と `fs_primary_suppression` はどちらも前面の fullscreen viewer の一時状態として App 全体に 1 つ置かれ、open / close / 新規窓 / passive 採用 / 前面 pause の同じ境界で解放される。パネル内で始まった押下の所有 (`OverflowStream`) はこの既存モデルに載せ、ViewerContextBundle への移設はしない (移設は detached 所有境界の変更で別作業)。
 - 合意: 独立 reviewer (Sol / xhigh、2026-10-19 再レビュー) と ClaudeCode の双方が、上の 2 点は「前面を手放す既存境界で同種の一時入力状態を解放する構造的修正であり、症状パッチではない」ことに合意した。reviewer は bundle へ移さない判断にも異議なし。
+
+### §11 追補: §1.403 前面メニューの押下所有と前面境界での解放（2026-10-19、実装・独立レビュー中・実機未確認）
+
+- 対象: ブランチ `front-popup-1403` (`8051885d8` / `4960cda74` ほか)。前面メニュー (上部 / シークのメニュー、右クリックメニュー、egui memory popup) を提示している間に始まった押下を、終端まで前面の所有として背面へ渡さない。§1.396 の overflow 所有と 1 つの確定結果にまとめた。設計は [section403 調査記録](section403-front-popup-input-investigation.md) §8、実装記録は §9。
+- 触れた前面境界 (9 関数): `reset_detached_pause_foreground_modes`、`reset_active_detached_viewport_runtime_for_new_window`、`adopt_active_detached_viewport_runtime_from_passive`、`close_fullscreen_now_with_metadata_boundary`、`toggle_still_window_mode`、`apply_egui_viewer_presentation_for_current_item`、`prepare_viewer_presentation_open`、`apply_video_presentation_switched`、`handoff_active_detached_viewport_to_passive`。いずれも前面の押下所有をその境界で解放する追加で、detached の述語・viewport 生成・geometry・placement・focus・window lifecycle は変更しない。presentation 系は表示先が変わる場合だけ解放し、同じ viewer・表示先のページ移動では所有を保つ (表示先の比較、app.rs `prepare_viewer_presentation_open` 付近)。
+- 所有の判断: §1.396 と同じく前面 viewer の一時状態として App 全体に置き、ViewerContextBundle へは移さない。
+- 合意: 独立 reviewer (Sol / xhigh、2026-10-19 の完成レビューと再レビュー) と ClaudeCode の双方が、9 関数すべてについて「既存の前面境界で同種の一時入力状態を解放する構造的修正であり、症状パッチではない」ことに合意した。
