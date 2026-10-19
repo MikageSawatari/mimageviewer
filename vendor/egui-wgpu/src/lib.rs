@@ -48,6 +48,9 @@ pub mod capture;
 #[cfg(feature = "winit")]
 pub mod winit;
 
+#[cfg(all(windows, feature = "winit"))]
+mod window_size_limit;
+
 use std::sync::Arc;
 
 use epaint::mutex::RwLock;
@@ -55,6 +58,10 @@ use epaint::mutex::RwLock;
 /// An error produced by egui-wgpu.
 #[derive(thiserror::Error, Debug)]
 pub enum WgpuError {
+    #[cfg(all(windows, feature = "winit"))]
+    #[error("Failed to constrain the surface window: {0}")]
+    WindowSizeLimit(#[from] std::io::Error),
+
     #[error(transparent)]
     RequestAdapterError(#[from] wgpu::RequestAdapterError),
 

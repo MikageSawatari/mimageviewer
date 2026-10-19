@@ -183,21 +183,7 @@ impl ExternalToolMenuTarget {
     }
 
     fn add_grid_item(&mut self, item: &crate::grid_item::GridItem) {
-        use crate::grid_item::GridItem;
-        match item {
-            GridItem::Image(_)
-            | GridItem::Video(_)
-            | GridItem::Audio(_)
-            | GridItem::ZipFile(_)
-            | GridItem::PdfFile(_)
-            | GridItem::ConvertibleArchive { .. }
-            | GridItem::Stack { .. } => self.has_target = true,
-            GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
-                self.has_target = true;
-                self.has_virtual_page = true;
-            }
-            _ => self.has_unsupported = true,
-        }
+        self.add_target(&LaunchTarget::from_grid_item(Some(item)));
     }
     /// 解決済み集合からメニューの capability を決める。
     ///
@@ -262,7 +248,8 @@ impl LaunchTarget {
         match item {
             Some(GridItem::Image(path)) => Self::ImagePage(path.clone()),
             Some(
-                GridItem::Video(path)
+                GridItem::Folder(path)
+                | GridItem::Video(path)
                 | GridItem::Audio(path)
                 | GridItem::ZipFile(path)
                 | GridItem::PdfFile(path),
@@ -5415,6 +5402,226 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn folder_target_selected_path_and_settings_preview_agree() {
+        let folder = PathBuf::from(r"C:\Pictures\選択したフォルダ");
+        let item = crate::grid_item::GridItem::Folder(folder.clone());
+        let targets = resolve_external_targets(
+            std::slice::from_ref(&item),
+            &[0],
+            &HashSet::new(),
+            ExternalTargetSource::GridKey { selected: Some(0) },
+        );
+        assert_eq!(targets, vec![LaunchTarget::RealFile(folder.clone())]);
+        // Preferences captures this same resolver's value before building its preview.
+        let preview_target = LaunchTarget::from_grid_item(Some(&item));
+        assert_eq!(preview_target, targets[0]);
+        for payload in [
+            PayloadPolicy::TempEdited,
+            PayloadPolicy::TempOriginal,
+            PayloadPolicy::OriginalFile,
+        ] {
+            let mut tool = file_list_test_tool(SelectionPolicy::Single);
+            tool.arguments = "{files}".to_string();
+            tool.payload = payload;
+            let preview = build_launch_request_for_preview(&tool, &preview_target).unwrap();
+            assert_eq!(preview.files, vec![folder.clone()]);
+            assert_eq!(
+                preview.files,
+                build_launch_request(&tool, &targets[0]).unwrap().files
+            );
+        }
+    }
+
+    #[test]
+    fn folder_target_checked_order_limits_and_virtual_refusal_are_preserved() {
+        use crate::grid_item::GridItem;
+        let items = vec![
+            GridItem::Folder("first".into()),
+            GridItem::Image("page.jpg".into()),
+            GridItem::Folder("last".into()),
+        ];
+        let checked = HashSet::from([0, 1, 2]);
+        let targets = resolve_external_targets(
+            &items,
+            &[2, 1, 0],
+            &checked,
+            ExternalTargetSource::GridKey { selected: Some(0) },
+        );
+        assert_eq!(
+            targets,
+            vec![
+                LaunchTarget::RealFile("last".into()),
+                LaunchTarget::ImagePage("page.jpg".into()),
+                LaunchTarget::RealFile("first".into())
+            ]
+        );
+        let mut tool = file_list_test_tool(SelectionPolicy::Single);
+        tool.arguments = "{files}".to_string();
+        assert!(
+            build_launch_operation(&tool, &targets)
+                .unwrap_err()
+                .contains("3 件")
+        );
+        for selection in [SelectionPolicy::Each, SelectionPolicy::Batch] {
+            tool.selection = selection;
+            let operation = build_launch_operation(&tool, &targets).unwrap();
+            let files: Vec<_> = operation
+                .requests
+                .into_iter()
+                .flat_map(|request| request.files)
+                .collect();
+            assert_eq!(
+                files,
+                vec![
+                    PathBuf::from("last"),
+                    PathBuf::from("page.jpg"),
+                    PathBuf::from("first")
+                ]
+            );
+        }
+        tool.max_targets = 2;
+        assert!(build_launch_operation(&tool, &targets).is_err());
+        // Context-menu container routing still ignores checked items and sends exactly one path.
+        assert_eq!(
+            resolve_external_targets(
+                &items,
+                &[2, 1, 0],
+                &checked,
+                ExternalTargetSource::Container {
+                    path: Some("first".into())
+                }
+            ),
+            vec![LaunchTarget::RealFile("first".into())]
+        );
+
+        let mixed = [
+            items[0].clone(),
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: None,
+            },
+        ];
+        for checked in [HashSet::from([1]), HashSet::from([0, 1])] {
+            let targets = resolve_external_targets(
+                &mixed,
+                &[0, 1],
+                &checked,
+                ExternalTargetSource::GridKey { selected: Some(0) },
+            );
+            assert!(targets.iter().any(|target| matches!(
+                target,
+                LaunchTarget::Virtual(crate::grid_item::FileOperationRefusal::ArchiveDirectory)
+            )));
+            assert!(
+                validate_materializable_targets(&targets)
+                    .unwrap_err()
+                    .contains("圧縮ファイル内のフォルダ")
+            );
+            assert!(build_launch_operation(&tool, &targets).is_err());
+        }
+    }
+
+    #[test]
+    fn folder_target_menu_capability_matches_the_shared_resolver() {
+        use crate::grid_item::GridItem;
+        for item in [
+            GridItem::Folder("folder".into()),
+            GridItem::Image("page.jpg".into()),
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: None,
+            },
+            GridItem::ZipImage {
+                zip_path: "book.zip".into(),
+                entry_name: "page.jpg".into(),
+            },
+            GridItem::PdfPage {
+                pdf_path: "book.pdf".into(),
+                page_num: 2,
+                content_type: None,
+            },
+            GridItem::Stack {
+                key: "pages".into(),
+                representative: "page.jpg".into(),
+                count: 2,
+            },
+        ] {
+            let target = LaunchTarget::from_grid_item(Some(&item));
+            let mut menu = ExternalToolMenuTarget::default();
+            menu.add_grid_item(&item);
+            assert_eq!(
+                menu,
+                ExternalToolMenuTarget::from_launch_targets(&[target]),
+                "{item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_target_picker_and_slot_prepare_directory_without_image_output() {
+        use crate::materializer::{MaterializeSource, Materializer};
+        let mut app = crate::app::setup_app_for_test();
+        // An image-looking directory name must still follow the non-image path.
+        let folder = app.tmp.path().join("folder.jpg");
+        std::fs::create_dir(&folder).unwrap();
+        app.items = vec![crate::grid_item::GridItem::Folder(folder.clone())];
+        app.visible_indices = vec![0];
+        app.checked.clear();
+        app.selected = Some(0);
+        app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Single)];
+        app.request_grid_external_tool_picker();
+        finish_picker_preparation(&mut app);
+        let ExternalOperation::Picker(picker) = &app.external_tool_operation else {
+            panic!("folder picker was refused")
+        };
+        assert_eq!(picker.locators.len(), 1);
+        assert_eq!(
+            picker.locators[0].target(),
+            &LaunchTarget::RealFile(folder.clone())
+        );
+        assert_eq!(
+            external_tool_capability(&app.settings.external_tools[0], picker.capability),
+            Some((true, None))
+        );
+        app.external_tool_operation = ExternalOperation::Idle;
+
+        let artifacts = app.tmp.path().join("materialized");
+        let manager = Materializer::new_at_for_test(artifacts.clone(), 1397);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for payload in [
+            PayloadPolicy::TempEdited,
+            PayloadPolicy::TempOriginal,
+            PayloadPolicy::OriginalFile,
+        ] {
+            app.settings.external_tools[0].payload = payload;
+            app.launch_grid_external_tool_slot(&egui::Context::default(), 1);
+            // Stop at request preparation; never reach the external-process launch boundary.
+            let mut preparing = take_preparing(&mut app);
+            finish_snapshot_for_test(&mut app, &mut preparing);
+            assert_eq!(preparing.requests.len(), 1);
+            let request = &preparing.requests[0];
+            assert!(
+                matches!(&request.source, MaterializeSource::File { path, image_page: false } if path == &folder)
+            );
+            assert!(request.page_edits.is_none());
+            let prepared = manager
+                .session()
+                .materialize(request, &cancel, generation)
+                .unwrap();
+            assert_eq!(prepared.path(), folder.as_path());
+            assert!(
+                !artifacts.exists(),
+                "a directory must not create image output"
+            );
+        }
     }
 
     #[test]

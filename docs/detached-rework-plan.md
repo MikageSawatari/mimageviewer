@@ -1455,6 +1455,35 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-18 §1.395: 全viewportのsurface窓寸法制約
+
+設計担当ClaudeCodeと独立設計レビュー（GPT-6.1 Sol / xhigh）の合意済み指示を受け、
+実装担当もPainterの初回safe／unsafe取り付け、共通resize、status再configure、Lost再作成をsourceで確認した。
+Windowsの全viewportで、renderer所有者である`vendor/egui-wgpu::Painter`がHWNDへ固定device上限を登録し、
+窓の外寸とconfigure寸法を`max_texture_dimension_2d`以下に保つ。
+panicの境界はconfigureへ渡す物理client寸法のdevice上限超過であり、外寸も同じ上限以下にするのは
+その不変条件を保証するための保守的な設計である。
+取り付け時はdevice確立後にsubclass登録・実窓補正を済ませ、再取得した実client寸法だけをinstallへ渡す。
+subclass迂回のresizeも同じ補正へ通し、surfaceだけをclampしない。解除はWM_NCDESTROYに集約する。
+実Painter回帰で判明したDXGIの同一HWND制約にも従い、WindowsのLost再作成では旧surfaceを先にdropし、
+検証済みの寸法・HWND値だけを新surfaceへ引き継ぐ（従来はconfigure完了まで旧surfaceを保持していた）。
+窓とrendererの所有境界で寸法契約を成立させる構造的修正であり、detached固有の症状guard・遅延・retry・
+追加repaintではない。既存Painterを単一所有者とし、新pending／placement同期経路を作らない方法で簡素化した。
+device要求上限8192、非Windows、`src/`の窓制御・detached述語・rect一致捕捉は変更しない。
+純関数・非表示HWND・実Painterの自動回帰を追加する。実装担当による製品起動・画面操作は行わず、
+設計担当の最終受入・利用者による実機確認とは区別する。
+
+同日、設計担当の実機確認で製品loggerが寸法制約のlog facade警告を転送しないことが判明したため、
+固定target `egui_wgpu::surface_window_limit`のWarn以上だけを既存の非同期sinkへ接続した。
+全viewport共通の診断境界の修正であり、窓制御・detached状態は変更しない。
+LimitingはDefSubclassProc前の要求が上限超過、または処理後の寸法を実際にclampした
+各WM_WINDOWPOSCHANGINGにつき1件記録する。winitが要求を大きくした場合も記録する。
+ログ抑制状態とWM_ENTERSIZEMOVE／WM_EXITSIZEMOVE追跡は撤去し、Correcting・失敗も毎回残す。
+通常の対話リサイズはWM_GETMINMAXINFOのptMaxTrackSizeで上限に止まる。
+従来のWM_ENTERSIZEMOVE後のSetWindowPos100回試験は合成された超過要求であり、通常ドラッグの証拠とはしない。
+実Painterのzero-client取り付け・描画でconfigure／acquireを行わず、非ゼロresize後は描画できることも
+非対話回帰の対象とし、製品の実機受入とは区別する。
+
 ### 2026-10-15 C1採択: 独立readerの受動更新停止
 
 **現在の利用者採択はC1だけ。案Aは不採用の履歴として保持し、source／main-owner境界の考え方だけを参照する。**

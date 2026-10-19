@@ -215,7 +215,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
-│   ├── effetune/EffeTune Mixwright.vst3/ (全448ファイル、v0.13.0。入力は別の VERSION と計449ファイル)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全462ファイル、v0.14.0。入力は別の VERSION と計463ファイル)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
@@ -266,6 +266,7 @@ release link 時に未解決になることがあるため、配布ビルドは�
 ランチャー側 build.rs が `target/release` の core / remote / EPUB worker の存在をチェックし、
 無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
 `EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
+承認済み入力は `third_party/effetune-mixwright/v0.14.0/manifest.sha256` の全463エントリと照合する。
 配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
 (vendor 原本は変更しない)。
 

@@ -201,6 +201,8 @@ bookmark title plateも実描画の矩形を返す。右クリック／右ドラ
 押下のCell／Background所属は既存pairing ownerの型で持ち、永続hit cacheや別の背景ownerを作らない。
 native D&Dはその押下時の所属を使い、読込み完了後の矩形で押下点を再判定しない。
 小さいセルでplateからはみ出すcaption・理由・アイコンも、描いた領域のセル／一覧clip内を項目として返す。
+代表画像のないフォルダ・ドライブ・ZIP内directoryは、アイコン周囲も描画ownerの`inner`全体を項目にする。
+代表画像ありのletterbox、セル外周4pt、実際の空き領域の背景判定は維持する（§1.399）。
 媒体別の境界・実描画順の検証は[決定仕様](grid-background-double-click-plan.md#描画領域とセル種類)を参照。
 
 ### 1.2 2 フェーズ優先ロード

@@ -55603,22 +55603,28 @@ impl App {
             }
             // Phase 7.H シーク粒度は Small / Medium / Large の共通設定を使う。
             if left || medium_left {
-                seek_outcome = Some(player.seek_relative(-medium_seek_secs));
+                seek_outcome =
+                    Some(player.seek_relative(-medium_seek_secs, crate::video::SeekOrigin::User));
             }
             if right || medium_right {
-                seek_outcome = Some(player.seek_relative(medium_seek_secs));
+                seek_outcome =
+                    Some(player.seek_relative(medium_seek_secs, crate::video::SeekOrigin::User));
             }
             if shift_left {
-                seek_outcome = Some(player.seek_relative(-small_seek_secs));
+                seek_outcome =
+                    Some(player.seek_relative(-small_seek_secs, crate::video::SeekOrigin::User));
             }
             if shift_right {
-                seek_outcome = Some(player.seek_relative(small_seek_secs));
+                seek_outcome =
+                    Some(player.seek_relative(small_seek_secs, crate::video::SeekOrigin::User));
             }
             if ctrl_left {
-                seek_outcome = Some(player.seek_relative(-large_seek_secs));
+                seek_outcome =
+                    Some(player.seek_relative(-large_seek_secs, crate::video::SeekOrigin::User));
             }
             if ctrl_right {
-                seek_outcome = Some(player.seek_relative(large_seek_secs));
+                seek_outcome =
+                    Some(player.seek_relative(large_seek_secs, crate::video::SeekOrigin::User));
             }
             if let Some(v) = new_vol {
                 player.set_volume(v);
@@ -55697,7 +55703,7 @@ impl App {
         if rewind_key && let Some(p) = self.fs_video_player(fs_idx) {
             // `seek(0.0)` は内部で `apply_command(Play)` を発行し autoplay intent を
             // 立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
-            p.seek(0.0);
+            p.seek(0.0, crate::video::SeekOrigin::User);
         }
 
         // 何らかの動画ショートカット入力があれば HUD のフェードタイマをリセット
@@ -55728,7 +55734,7 @@ impl App {
             match target {
                 Some(m) => {
                     if let Some(p) = self.fs_video_player(fs_idx) {
-                        p.seek(m.pts);
+                        p.seek(m.pts, crate::video::SeekOrigin::User);
                     }
                     // CH/BM ループ中ならマーカージャンプ後に loop_target を更新
                     #[cfg(windows)]
@@ -55764,7 +55770,7 @@ impl App {
                     // J キーで前のマーカーが見つからない (= 最初のマーカー手前または空) かつ
                     // 既に先頭に居なければ動画先頭へ seek。
                     if let Some(p) = self.fs_video_player(fs_idx) {
-                        p.seek(0.0);
+                        p.seek(0.0, crate::video::SeekOrigin::User);
                     }
                     #[cfg(windows)]
                     self.apply_loop_mode_to_player(fs_idx);
