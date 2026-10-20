@@ -284,13 +284,23 @@ fn saved_position_book_clear_rejects_duplicate_command_and_preferences_requests(
         app.persist_book_resume(later.clone(), 2, meter(3, 5));
         let last_record = app.last_book_resume.clone();
         let revision = app.book_append_undo_revision;
-        if preferences {
-            app.clear_book_resume_async();
-        } else {
-            app.execute_saved_position_clear(
-                crate::keymap::KeyAction::ClearBookResumePositions,
-                super::ActionSurface::Viewer,
-            );
+        for (setting, factor) in [
+            (crate::settings::NotificationDuration::Short, 1.0),
+            (crate::settings::NotificationDuration::Standard, 1.0),
+            (crate::settings::NotificationDuration::Long, 1.5),
+        ] {
+            app.settings.notification_duration = setting;
+            if preferences {
+                app.clear_book_resume_async();
+            } else {
+                app.execute_saved_position_clear(
+                    crate::keymap::KeyAction::ClearBookResumePositions,
+                    super::ActionSurface::Viewer,
+                );
+            }
+            let (text, _, seconds) = app.fs_feedback_toast.as_ref().unwrap();
+            assert_eq!(text, "本の読書位置をクリア中です");
+            assert_eq!(*seconds, 1.2 * factor);
         }
         assert_eq!(app.last_book_resume, last_record);
         assert_eq!(app.book_append_undo_revision, revision);

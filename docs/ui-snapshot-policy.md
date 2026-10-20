@@ -304,3 +304,9 @@ UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 
 実例: `src/ui_adjustment_panel.rs::local_adjust_segmentation_tests::local_adjust_panel_snapshot_*`
 (5 件、補正レイヤーパネル + レイヤーリスト UI)。
+
+
+§1.402 の通知時間設定は `notification_duration_preferences_light_standard`（480×115）と
+`notification_duration_preferences_dark_short_narrow`（260×145）で、本体と共通の全体設定helperを描く。
+3択の選択状態・狭幅の補足文の折り返しを確認する。App・実製品の起動は含めない。
+2枚は計35,683 bytes。生成画像を目視確認し、更新モードを外した通常比較も2件成功した。

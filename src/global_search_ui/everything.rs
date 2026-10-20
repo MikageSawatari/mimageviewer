@@ -256,7 +256,7 @@ impl App {
             Some(handle) => match handle.try_local_modal_lease() {
                 Some(lease) => Some(lease),
                 None => {
-                    self.show_feedback_toast("Remote が操作中のため検索できません".into());
+                    self.show_feedback_warning("Remote が操作中のため検索できません".into());
                     return;
                 }
             },
@@ -503,7 +503,7 @@ impl App {
         let cancel = match crate::everything_ipc::CancelHandle::new() {
             Ok(cancel) => cancel,
             Err(error) => {
-                self.show_feedback_toast(error.user_message().into());
+                self.show_feedback_error(error.user_message().into());
                 return true;
             }
         };

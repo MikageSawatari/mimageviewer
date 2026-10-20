@@ -10849,26 +10849,16 @@ fn format_duration_mm_ss(secs: f64) -> String {
 
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
-/// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
-pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
+#[cfg(test)]
+use crate::feedback::FEEDBACK_TOAST_DURATION;
+#[cfg(test)]
+use crate::feedback::feedback_toast_duration;
+#[cfg(test)]
 const FEEDBACK_TOAST_BASE_CHARS: usize = 20;
-/// 1 文字あたりの加算秒。**日本語の読字速度は毎秒 8 文字程度**なので、その逆数を取る。
-/// 0.06 (= 毎秒 17 文字) では読み切る前に消えた (2026-08-30、混在選択の拒否文で実測報告)。
+#[cfg(test)]
 const FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR: f32 = 0.12;
-/// 上限。長すぎるトーストは邪魔になるが、拒否理由と対処を書いた長文案内にも
-/// 5 秒以上を確保する。既存の長文ヒント (`NO_IMAGE_FOLDER_HINT_DURATION` = 4.0) より長い。
+#[cfg(test)]
 const FEEDBACK_TOAST_MAX_DURATION: f32 = 5.5;
-
-/// 短文は従来の 1.2 秒を維持し、20 文字を超えた分だけ表示時間を延ばす。
-/// 日本語を 1 文字として扱うため、byte 長ではなく Unicode scalar value 数で計算する。
-pub(crate) fn feedback_toast_duration(text: &str) -> f32 {
-    let extra_chars = text
-        .chars()
-        .count()
-        .saturating_sub(FEEDBACK_TOAST_BASE_CHARS);
-    (FEEDBACK_TOAST_DURATION + extra_chars as f32 * FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR)
-        .min(FEEDBACK_TOAST_MAX_DURATION)
-}
 
 fn feedback_toast_layer_id(drawing_surface: crate::app::ActionSurface) -> egui::LayerId {
     let id = match drawing_surface {
@@ -14489,7 +14479,9 @@ impl App {
                 true,
                 FsContinuousReadingUnavailableFeature::Zoom,
             ) {
-                self.show_feedback_toast("この表示では全画面ズームモードを使えません".to_string());
+                self.show_feedback_warning(
+                    "この表示では全画面ズームモードを使えません".to_string(),
+                );
             }
             ctx.request_repaint();
             return;
@@ -21710,7 +21702,7 @@ impl App {
             .preview
             .poll_background(ctx, &self.pdf_passwords)
         {
-            self.show_feedback_toast(notice);
+            self.show_feedback_warning(notice);
         }
         let asset = self.similar_panel.preview.presentation_for_frame(
             ctx,
@@ -32724,7 +32716,7 @@ impl App {
                 crate::spread_shift::PairingAction::Nudge,
             )
         {
-            self.show_feedback_toast(reason.into());
+            self.show_feedback_warning(reason.into());
             return;
         }
         if self.spread_mode.is_spread() {
@@ -32778,7 +32770,7 @@ impl App {
                 crate::spread_shift::PairingAction::Nudge,
             )
         {
-            self.show_feedback_toast(reason.into());
+            self.show_feedback_warning(reason.into());
             return;
         }
         if self.spread_mode.is_spread() {
@@ -33198,7 +33190,7 @@ impl App {
                 .is_some_and(|kind| self.settings.ai_feature_mode.allows_upscale_model(kind)),
         };
         if !allowed {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "[{shortcut_label}:アップスケール]\nこの AI モード ({}) では {} を使いません",
                 self.settings.ai_feature_mode.label(),
                 label
@@ -33242,7 +33234,7 @@ impl App {
                 ));
             }
         }
-        self.show_feedback_toast(toast);
+        self.show_feedback_warning(toast);
         self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
             app.write_params_for_scope(fs_idx, scope, params);
             app.clear_all_adjustment_and_ai_caches(fs_idx);
@@ -33299,12 +33291,12 @@ impl App {
             ));
         }
         if old_params.post_filter == next {
-            self.show_feedback_toast(toast);
+            self.show_feedback_warning(toast);
             return;
         }
         let mut params = old_params.clone();
         params.post_filter = next;
-        self.show_feedback_toast(toast);
+        self.show_feedback_warning(toast);
         self.capture_adjust_full(
             format!("ポストフィルタ: {}", next.display_label()),
             |app| {
@@ -35834,7 +35826,7 @@ impl App {
             //     そのモデルは隠れて保持されているだけ。U で None / 別モデルに上書きすると
             //     full モードへ戻したときに選択が失われるため、変更せず維持する。
             if items.len() <= 1 || cur.is_none() {
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "[U:アップスケール]\nこの AI モード ({}) では変更しません (保存済み選択を維持)",
                     self.settings.ai_feature_mode.label()
                 ));
@@ -35855,7 +35847,7 @@ impl App {
         // N キー: AI デノイズをトグル
         if key_n {
             if !self.settings.ai_feature_mode.allows_denoise() {
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "[N:デノイズ無効]\nAI 機能: {}",
                     self.settings.ai_feature_mode.label()
                 ));
@@ -35941,7 +35933,7 @@ impl App {
                 });
                 self.show_feedback_toast("[個別設定を解除]".to_string());
             } else {
-                self.show_feedback_toast("[個別設定なし]".to_string());
+                self.show_feedback_warning("[個別設定なし]".to_string());
             }
         }
 
@@ -36050,7 +36042,7 @@ impl App {
                 SpreadPair::Single => vec![fs_idx],
             };
             if !idxs.iter().any(|&i| self.fs_image_has_alpha(i)) {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "透過画像ではないため背景は切り替えできません".to_string(),
                 );
             } else {
@@ -36185,7 +36177,7 @@ impl App {
             ) && self.fullscreen_edit_mode_entry_allowed(fs_idx)
             {
                 if let Err(error) = self.enter_sns_split_mode(fs_idx) {
-                    self.show_feedback_toast(error.message().to_string());
+                    self.show_feedback_error(error.message().to_string());
                 }
             }
         }
@@ -42364,7 +42356,7 @@ impl App {
         self.note_fullscreen_nav_noop(reason, native_toast);
         #[cfg(windows)]
         if native_toast {
-            self.show_native_video_overlay_toast(Self::nav_noop_title(reason).to_string(), true);
+            self.show_native_video_overlay_warning(Self::nav_noop_title(reason).to_string(), true);
             self.request_native_video_hud_repaint(ctx);
             return;
         }
@@ -44671,7 +44663,7 @@ impl App {
                     || "表示モードの「見開き」".to_owned(),
                     |key| format!("[{key}]"),
                 );
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "この本の見開きは{entry}で表示できます。読む方向と表紙を変えるには本の構成を編集してください"
                 ));
                 return false;
@@ -44745,7 +44737,7 @@ impl App {
         {
             return false;
         }
-        self.show_feedback_toast("本の構成を読み込めないため見開き設定を変更できません".into());
+        self.show_feedback_warning("本の構成を読み込めないため見開き設定を変更できません".into());
         true
     }
 
@@ -44759,7 +44751,7 @@ impl App {
             }
             _ => return false,
         };
-        self.show_feedback_toast(reason.into());
+        self.show_feedback_warning(reason.into());
         true
     }
 
@@ -47540,14 +47532,14 @@ impl App {
                             crate::app::ComparePreparationState::WaitingForSource(request);
                         self.clear_compare_gpu_pair();
                         self.compare_view_mode.cancel_wipe_drag();
-                        self.show_feedback_toast("比較表示を準備中".to_string());
+                        self.show_feedback_warning("比較表示を準備中".to_string());
                     }
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     return false;
                 }
                 Err(err) => {
                     self.deactivate_compare_view();
-                    self.show_feedback_toast(err);
+                    self.show_feedback_error(err);
                     return false;
                 }
             };
@@ -47555,7 +47547,7 @@ impl App {
             Ok(size) => size,
             Err(err) => {
                 self.deactivate_compare_view();
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 return false;
             }
         };
@@ -47564,7 +47556,7 @@ impl App {
                 Ok(size) => size,
                 Err(err) => {
                     self.deactivate_compare_view();
-                    self.show_feedback_toast(err);
+                    self.show_feedback_error(err);
                     return false;
                 }
             };
@@ -47699,11 +47691,11 @@ impl App {
                         rx,
                     },
                 );
-                self.show_feedback_toast("比較表示を準備中".to_string());
+                self.show_feedback_warning("比較表示を準備中".to_string());
             }
             Err(err) => {
                 self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
-                self.show_feedback_toast(format!("比較 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("比較 worker を開始できません: {err}"));
             }
         }
         false
@@ -53271,11 +53263,11 @@ impl App {
                 Some((player.path().clone(), player.screenshot_target_secs()))
             }
         }) else {
-            self.show_feedback_toast("動画フレームをコピーできません".to_string());
+            self.show_feedback_warning("動画フレームをコピーできません".to_string());
             return;
         };
 
-        self.show_feedback_toast("動画フレームをクリップボードへコピー中".to_string());
+        self.show_feedback_warning("動画フレームをクリップボードへコピー中".to_string());
         let clipboard_seq = crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
         std::thread::Builder::new()
             .name("video-frame-copy".into())
@@ -53308,7 +53300,7 @@ impl App {
 
     pub(crate) fn save_video_frame_to_file(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.capture_pending.is_some() {
-            self.show_feedback_toast("キャプチャ保存中です".to_string());
+            self.show_feedback_warning("キャプチャ保存中です".to_string());
             return;
         }
 
@@ -53319,7 +53311,7 @@ impl App {
                 Some((player.path().clone(), player.screenshot_target_secs()))
             }
         }) else {
-            self.show_feedback_toast("動画フレームを保存できません".to_string());
+            self.show_feedback_warning("動画フレームを保存できません".to_string());
             return;
         };
 
@@ -53359,11 +53351,11 @@ impl App {
         match thread {
             Ok(_) => {
                 self.capture_pending = Some(crate::app::CapturePending { rx });
-                self.show_feedback_toast(format!("動画フレームを保存中 ({})", format.label()));
+                self.show_feedback_warning(format!("動画フレームを保存中 ({})", format.label()));
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("保存 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("保存 worker を開始できません: {err}"));
             }
         }
     }
@@ -53374,7 +53366,7 @@ impl App {
         {
             return false;
         }
-        self.show_feedback_toast(COMPARE_SPREAD_UNAVAILABLE_MESSAGE.to_string());
+        self.show_feedback_warning(COMPARE_SPREAD_UNAVAILABLE_MESSAGE.to_string());
         true
     }
 
@@ -53400,7 +53392,7 @@ impl App {
             return;
         }
         if self.compare_pin_pending.is_some() {
-            self.show_feedback_toast("比較画像を準備中です".to_string());
+            self.show_feedback_warning("比較画像を準備中です".to_string());
             return;
         }
 
@@ -53416,7 +53408,7 @@ impl App {
         let job = match self.prepare_capture_pixel_job(ctx, fs_idx) {
             Ok(job) => job,
             Err(err) => {
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 return;
             }
         };
@@ -53427,7 +53419,7 @@ impl App {
         let job = match self.prepare_capture_pixel_job(ctx, idx) {
             Ok(job) => job,
             Err(err) => {
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 return;
             }
         };
@@ -53458,11 +53450,11 @@ impl App {
                     external_item_key: None,
                     rx,
                 });
-                self.show_feedback_toast("比較画像を準備中".to_string());
+                self.show_feedback_warning("比較画像を準備中".to_string());
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("比較 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("比較 worker を開始できません: {err}"));
             }
         }
     }
@@ -53479,7 +53471,7 @@ impl App {
         const EXTERNAL_COMPARE_SOURCE_IDX: usize = usize::MAX;
 
         if self.compare_pin_pending.is_some() {
-            self.show_feedback_toast("比較画像を準備中です".to_string());
+            self.show_feedback_warning("比較画像を準備中です".to_string());
             return;
         }
         if self
@@ -53508,18 +53500,18 @@ impl App {
                     external_item_key: Some(item_key),
                     rx,
                 });
-                self.show_feedback_toast("比較画像を準備中".to_string());
+                self.show_feedback_warning("比較画像を準備中".to_string());
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(error) => {
-                self.show_feedback_toast(format!("比較 worker を開始できません: {error}"));
+                self.show_feedback_warning(format!("比較 worker を開始できません: {error}"));
             }
         }
     }
 
     pub(crate) fn toggle_compare_pin_from_grid_selection(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.selected else {
-            self.show_feedback_toast("比較画像にする画像を選択してください".to_string());
+            self.show_feedback_warning("比較画像にする画像を選択してください".to_string());
             return;
         };
         if !matches!(
@@ -53528,12 +53520,12 @@ impl App {
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::PdfPage { .. })
         ) {
-            self.show_feedback_toast("このアイテムは比較画像に設定できません".to_string());
+            self.show_feedback_warning("このアイテムは比較画像に設定できません".to_string());
             return;
         }
 
         if self.compare_pin_pending.is_some() {
-            self.show_feedback_toast("比較画像を準備中です".to_string());
+            self.show_feedback_warning("比較画像を準備中です".to_string());
             return;
         }
 
@@ -53547,12 +53539,12 @@ impl App {
         }
 
         let Some(source_key) = self.metadata_cache_key(idx) else {
-            self.show_feedback_toast("このアイテムは比較画像に設定できません".to_string());
+            self.show_feedback_warning("このアイテムは比較画像に設定できません".to_string());
             return;
         };
 
         if self.raw_development_unavailable(idx) {
-            self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+            self.show_feedback_warning("比較画像を読み込めませんでした".to_string());
             return;
         }
 
@@ -53561,11 +53553,11 @@ impl App {
                 self.start_compare_pin_single(ctx, idx);
             }
             Some(FsCacheEntry::Failed) => {
-                self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+                self.show_feedback_warning("比較画像を読み込めませんでした".to_string());
             }
             _ => {
                 if self.compare_pin_pending.is_some() {
-                    self.show_feedback_toast("比較画像を準備中です".to_string());
+                    self.show_feedback_warning("比較画像を準備中です".to_string());
                     return;
                 }
                 self.compare_pin_load_pending = Some(crate::app::ComparePinLoadPending {
@@ -53575,7 +53567,7 @@ impl App {
                 if !self.fs_pending.contains_key(&idx) {
                     self.start_fs_load(idx);
                 }
-                self.show_feedback_toast("比較画像を読み込み中".to_string());
+                self.show_feedback_warning("比較画像を読み込み中".to_string());
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
@@ -53587,7 +53579,7 @@ impl App {
             return;
         }
         if self.pinned_compare_slot.is_none() {
-            self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
+            self.show_feedback_warning("比較画像が未設定です。X で設定してください".to_string());
             return;
         }
         let next_mode = match self.compare_view_mode {
@@ -53641,7 +53633,7 @@ impl App {
             return;
         }
         if self.pinned_compare_slot.is_none() {
-            self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
+            self.show_feedback_warning("比較画像が未設定です。X で設定してください".to_string());
             return;
         }
         self.cancel_original_material_entry_intents(None);
@@ -53667,7 +53659,7 @@ impl App {
             return;
         }
         if self.pinned_compare_slot.is_none() {
-            self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
+            self.show_feedback_warning("比較画像が未設定です。X で設定してください".to_string());
             return;
         }
         self.cancel_original_material_entry_intents(None);
@@ -53690,14 +53682,14 @@ impl App {
 
     pub(crate) fn save_image_capture_to_file(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.capture_pending.is_some() {
-            self.show_feedback_toast("キャプチャ保存中です".to_string());
+            self.show_feedback_warning("キャプチャ保存中です".to_string());
             return;
         }
 
         let work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
             Ok(work) => work,
             Err(err) => {
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 return;
             }
         };
@@ -53732,14 +53724,14 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(err) => {
-                self.show_feedback_toast(format!("保存 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("保存 worker を開始できません: {err}"));
             }
         }
     }
 
     pub(crate) fn begin_capture_region_selection(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.is_overlay_edit_mode_active() || self.analysis_mode {
-            self.show_feedback_toast("通常表示で範囲コピーしてください".to_string());
+            self.show_feedback_warning("通常表示で範囲コピーしてください".to_string());
             return;
         }
         if self.continuous_reading_active_for_idx(fs_idx) {
@@ -53753,15 +53745,15 @@ impl App {
             return;
         }
         if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
-            self.show_feedback_toast("比較表示中は範囲コピーを使用できません".to_string());
+            self.show_feedback_warning("比較表示中は範囲コピーを使用できません".to_string());
             return;
         }
         if self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
-            self.show_feedback_toast("自由回転中は範囲コピーを使用できません".to_string());
+            self.show_feedback_warning("自由回転中は範囲コピーを使用できません".to_string());
             return;
         }
         if let Err(err) = self.capture_region_source_size_for_idx(ctx, fs_idx) {
-            self.show_feedback_toast(err);
+            self.show_feedback_error(err);
             return;
         }
 
@@ -53769,7 +53761,7 @@ impl App {
         self.capture_region_selection = Some(CaptureRegionSelection::new(fs_idx, wait_for_release));
         self.fs_pan_drag_start = None;
         self.fs_rotation_drag_start = None;
-        self.show_feedback_toast("ドラッグでコピー範囲を選択".to_string());
+        self.show_feedback_warning("ドラッグでコピー範囲を選択".to_string());
         ctx.request_repaint();
     }
 
@@ -54008,7 +54000,7 @@ impl App {
                                 selection.start_pos = Some(clamped);
                                 selection.current_pos = Some(clamped);
                             }
-                            Err(err) => self.show_feedback_toast(err),
+                            Err(err) => self.show_feedback_error(err),
                         }
                     }
                 }
@@ -54103,7 +54095,7 @@ impl App {
         let work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
             Ok(work) => work,
             Err(err) => {
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 return;
             }
         };
@@ -54145,7 +54137,7 @@ impl App {
         {
             Ok(job) => job,
             Err(err) => {
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 return;
             }
         };
@@ -54278,12 +54270,12 @@ impl App {
         book_name: String,
     ) {
         if self.book_op_pending.is_some() {
-            self.show_feedback_toast("製本処理中です".to_string());
+            self.show_feedback_warning("製本処理中です".to_string());
             return;
         }
         let indices = self.grid_selection_indices();
         if indices.is_empty() {
-            self.show_feedback_toast("追加する画像・ページを選択してください".to_string());
+            self.show_feedback_warning("追加する画像・ページを選択してください".to_string());
             return;
         }
 
@@ -54319,17 +54311,17 @@ impl App {
             }
         }
         if !errors.is_empty() {
-            self.show_feedback_toast(grid_book_add_rejection_message(&errors, sources.len()));
+            self.show_feedback_warning(grid_book_add_rejection_message(&errors, sources.len()));
             return;
         }
         let count = sources.len();
         self.start_book_append_to_named(ctx, book_name.clone(), sources);
-        self.show_feedback_toast(format!("「{book_name}」へ追加中: {count} ページ"));
+        self.show_feedback_warning(format!("「{book_name}」へ追加中: {count} ページ"));
     }
 
     pub(crate) fn add_clipboard_image_to_active_book(&mut self, ctx: &egui::Context) {
         if self.book_op_pending.is_some() {
-            self.show_feedback_toast("製本処理中です".to_string());
+            self.show_feedback_warning("製本処理中です".to_string());
             return;
         }
         let source = crate::books::BookPageSource::ClipboardImage {
@@ -54340,7 +54332,7 @@ impl App {
             ),
         };
         self.start_book_append(ctx, vec![source]);
-        self.show_feedback_toast("クリップボードの画像を追加先の本へ追加中".to_string());
+        self.show_feedback_warning("クリップボードの画像を追加先の本へ追加中".to_string());
     }
 
     pub(crate) fn add_fullscreen_image_to_active_book(
@@ -54349,7 +54341,7 @@ impl App {
         fs_idx: usize,
     ) {
         if self.book_op_pending.is_some() {
-            self.show_feedback_toast("製本処理中です".to_string());
+            self.show_feedback_warning("製本処理中です".to_string());
             return;
         }
         let active_folder = self.active_book_folder_path();
@@ -54361,13 +54353,13 @@ impl App {
         ) {
             Ok(source) => source,
             Err(err) => {
-                self.show_feedback_toast(friendly_book_add_error(err));
+                self.show_feedback_warning(friendly_book_add_error(err));
                 return;
             }
         };
         let book_name = self.active_book_name();
         self.start_book_append_to_named(ctx, book_name, vec![source]);
-        self.show_feedback_toast("追加先の本へ追加中".to_string());
+        self.show_feedback_warning("追加先の本へ追加中".to_string());
     }
 
     pub(crate) fn add_current_video_frame_to_active_book(
@@ -54376,7 +54368,7 @@ impl App {
         fs_idx: usize,
     ) {
         if self.book_op_pending.is_some() {
-            self.show_feedback_toast("製本処理中です".to_string());
+            self.show_feedback_warning("製本処理中です".to_string());
             return;
         }
         let Some((path, target_secs)) = self.fs_video_player(fs_idx).and_then(|player| {
@@ -54386,7 +54378,7 @@ impl App {
                 Some((player.path().clone(), player.screenshot_target_secs()))
             }
         }) else {
-            self.show_feedback_toast("動画フレームを追加できません".to_string());
+            self.show_feedback_warning("動画フレームを追加できません".to_string());
             return;
         };
         let format = self.settings.capture_format;
@@ -54401,7 +54393,7 @@ impl App {
             jpeg_matte,
         };
         self.start_book_append(ctx, vec![source]);
-        self.show_feedback_toast("動画フレームを追加先の本へ追加中".to_string());
+        self.show_feedback_warning("動画フレームを追加先の本へ追加中".to_string());
     }
 
     /// 集約グリッドの `GridItem::Stack` セルが指すスタックのメンバー画像 (実ファイル) のパス列を返す。
@@ -55159,7 +55151,7 @@ impl App {
     ) -> bool {
         let sns_split_export = sns_split.is_some();
         if self.export_pending.is_some() {
-            self.show_feedback_toast("エクスポート中です".to_string());
+            self.show_feedback_warning("エクスポート中です".to_string());
             return false;
         }
         // SNS 自身は合成要求の準備が成功するまで active のままにする。編集モードは
@@ -55173,7 +55165,7 @@ impl App {
             } else {
                 "編集モードを閉じてからエクスポートしてください"
             };
-            self.show_feedback_toast(message.to_string());
+            self.show_feedback_warning(message.to_string());
             return false;
         }
         self.cancel_original_material_entry_intents(None);
@@ -55186,7 +55178,7 @@ impl App {
         } {
             Ok(target) => target,
             Err(err) => {
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 return false;
             }
         };
@@ -55197,13 +55189,13 @@ impl App {
                     source_size,
                     page.predicted_size,
                 ) {
-                    self.show_feedback_toast(err);
+                    self.show_feedback_error(err);
                     return false;
                 }
                 (frames, Some(source_size))
             }
             (Some(_), crate::export_dialog::ExportComposite::Spread { .. }) => {
-                self.show_feedback_toast("SNS 分割の単ページを準備できませんでした".to_string());
+                self.show_feedback_warning("SNS 分割の単ページを準備できませんでした".to_string());
                 return false;
             }
             (None, _) => (Vec::new(), None),
@@ -55781,7 +55773,7 @@ impl App {
                         state.error = Some(err);
                         self.export_dialog = Some(state);
                     } else {
-                        self.show_feedback_toast(err);
+                        self.show_feedback_error(err);
                     }
                     return;
                 }
@@ -55965,7 +55957,7 @@ impl App {
             self.show_capture_saved_toast(path);
         }
         if let Some(message) = toast {
-            self.show_feedback_toast(message);
+            self.show_feedback_warning(message);
         }
     }
 

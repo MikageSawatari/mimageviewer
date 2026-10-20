@@ -191,6 +191,19 @@ impl Clone for ViewerPresentationPermission {
         }
     }
 }
+impl ViewerPresentationPermission {
+    pub(super) fn retire_deferred_open(&mut self) {
+        if matches!(&self.open, OpenPermission::AwaitingProjection { .. })
+            || matches!(&self.open,
+                OpenPermission::Checking { intent, .. }
+                    | OpenPermission::Ready { intent, .. }
+                    | OpenPermission::Resuming { intent, .. }
+                    if matches!(intent.route, BookTargetRoute::DeferredBook(_)))
+        {
+            self.open = OpenPermission::Idle;
+        }
+    }
+}
 impl std::fmt::Debug for ViewerPresentationPermission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ViewerPresentationPermission")
@@ -408,17 +421,7 @@ impl App {
     }
 
     pub(crate) fn retire_book_deferred_open(&mut self) {
-        if matches!(
-            &self.book_composition_permission.open,
-            OpenPermission::AwaitingProjection { .. }
-        ) || matches!(&self.book_composition_permission.open,
-            OpenPermission::Checking { intent, .. }
-                | OpenPermission::Ready { intent, .. }
-                | OpenPermission::Resuming { intent, .. }
-                if matches!(intent.route, BookTargetRoute::DeferredBook(_))
-        ) {
-            self.book_composition_permission.open = OpenPermission::Idle;
-        }
+        self.book_composition_permission.retire_deferred_open();
     }
 
     /// Row replacement retires old presentation proofs but carries the source's
@@ -929,7 +932,7 @@ impl App {
                     BookIdentityPermission::Allowed
                 };
                 if result == BookIdentityPermission::Hidden {
-                    self.show_feedback_toast("本の構成で非表示に設定されています".into());
+                    self.show_feedback_warning("本の構成で非表示に設定されています".into());
                 }
                 (result, Some(permission))
             }
@@ -1056,7 +1059,7 @@ impl App {
                     self.close_fullscreen();
                 }
             }
-            _ => self.show_feedback_toast("開こうとしたページが見つかりません".into()),
+            _ => self.show_feedback_warning("開こうとしたページが見つかりません".into()),
         }
     }
 
@@ -1116,13 +1119,13 @@ impl App {
                 crate::logger::log(format!(
                     "book_composition: unsupported candidate source: {error}"
                 ));
-                self.show_feedback_toast(UNSUPPORTED_COMPOSITION_NOTICE.into());
+                self.show_feedback_warning(UNSUPPORTED_COMPOSITION_NOTICE.into());
             }
             CandidatePermissionError::Unavailable(error) => {
                 crate::logger::log(format!(
                     "book_composition: candidate permission unavailable: {error}"
                 ));
-                self.show_feedback_toast("本の構成を確認できませんでした".into());
+                self.show_feedback_warning("本の構成を確認できませんでした".into());
             }
         }
     }
@@ -1478,7 +1481,7 @@ impl App {
         let mut candidates = Vec::with_capacity(demand.len());
         for occurrence in demand {
             let Some(candidate) = self.presentation_candidate(occurrence.item_index) else {
-                self.show_feedback_toast("開こうとしたページが見つかりません".into());
+                self.show_feedback_warning("開こうとしたページが見つかりません".into());
                 self.book_composition_permission.open = OpenPermission::Idle;
                 return;
             };

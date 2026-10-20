@@ -37,6 +37,7 @@ pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+pub(crate) mod feedback;
 #[cfg(feature = "dev-tools")]
 pub mod raw;
 #[cfg(not(feature = "dev-tools"))]
@@ -54,6 +55,8 @@ pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapsh
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_notification_duration_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_restore_position_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
@@ -1868,7 +1871,7 @@ pub fn run() -> eframe::Result {
                 }
                 Err(error) => {
                     logger::log(format!("spread_shift: worker startup failed: {error}"));
-                    app.show_feedback_toast(format!(
+                    app.show_feedback_warning(format!(
                         "見開き調整の保存を開始できませんでした: {error}"
                     ));
                 }
@@ -1885,7 +1888,7 @@ pub fn run() -> eframe::Result {
                 }
                 Err(error) => {
                     logger::log(format!("book_composition: worker startup failed: {error}"));
-                    app.show_feedback_toast(format!(
+                    app.show_feedback_warning(format!(
                         "本の構成の保存を開始できませんでした: {error}"
                     ));
                 }

@@ -213,7 +213,7 @@ impl App {
         let destination = match zip::destination_for(&source) {
             Ok(path) => path,
             Err(error) => {
-                self.show_feedback_toast(error);
+                self.show_feedback_error(error);
                 return false;
             }
         };
@@ -700,7 +700,7 @@ impl App {
         if matches!(op.phase, Phase::Result { .. }) && !matches!(op.exit, Exit::None) {
             self.resume_metadata_transfer_context_readers();
             if let Phase::Result { message, .. } = &op.phase {
-                self.show_feedback_toast(message.clone());
+                self.show_feedback_warning(message.clone());
             }
             if matches!(op.exit, Exit::Root) {
                 self.resume_root_lifecycle_close(

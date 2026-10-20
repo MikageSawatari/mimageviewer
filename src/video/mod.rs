@@ -558,6 +558,7 @@ pub struct NativeChromePolicy {
     pub(crate) info_open: crate::ui_helpers::MetadataPanelOpenState,
     pub info_locked: bool,
     pub suppression: crate::settings::FullscreenChromeSuppression,
+    pub notification_duration: crate::settings::NotificationDuration,
 }
 
 /// Exact existing window lease/host incarnation, carried across the prepare boundary.
@@ -654,6 +655,7 @@ mod chrome_suppression_transport_tests {
                 ..Default::default()
             },
             info_locked: true,
+            notification_duration: crate::settings::NotificationDuration::Long,
             suppression: FullscreenChromeSuppression {
                 top: true,
                 bottom: true,
@@ -1637,11 +1639,11 @@ enum NativeVideoOutputCommand {
     },
     ShowToast {
         text: String,
+        kind: crate::feedback::FeedbackKind,
         centered: bool,
-        /// 表示維持時間。`None` のとき presenter 側が `centered` から既定値
-        /// (centered: 2.5s / それ以外: 1.8s) を導く。←→ ホットキーの境界トーストの
-        /// ように「キーを離したら早めに消したい」用途では `Some(短い値)` を渡す。
-        linger: Option<std::time::Duration>,
+        /// App-resolved lifetime/fade, or None for native-origin default timing.
+        /// Immediate seek feedback carries resolved timing without preference scaling.
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
     },
     SetTileOverlay {
         tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
@@ -2158,6 +2160,15 @@ pub(crate) enum NativeUiCommandForTest {
 #[cfg(all(windows, test))]
 impl NativeUiProbeForTest {
     pub(crate) fn drain_toasts(&self) -> Vec<(String, Option<std::time::Duration>)> {
+        self.drain_toast_timings()
+            .into_iter()
+            .map(|(text, timing)| (text, timing.map(|timing| timing.native_linger())))
+            .collect()
+    }
+
+    pub(crate) fn drain_toast_timings(
+        &self,
+    ) -> Vec<(String, Option<crate::feedback::ResolvedFeedbackTiming>)> {
         self.command_rx
             .drain()
             .into_iter()
@@ -3128,7 +3139,7 @@ impl NativeVideoOutput {
         if let Some(toast) =
             video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Requested)
         {
-            self.show_toast(toast, false, None);
+            self.show_toast(toast, false, crate::feedback::FeedbackKind::Info, None);
         }
         let revision = self
             .video_scale_request_revision
@@ -3382,9 +3393,16 @@ impl NativeVideoOutput {
             });
     }
 
-    fn show_toast(&self, text: String, centered: bool, linger: Option<std::time::Duration>) {
+    fn show_toast(
+        &self,
+        text: String,
+        centered: bool,
+        kind: crate::feedback::FeedbackKind,
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
+    ) {
         let _ = self.command_tx.send(NativeVideoOutputCommand::ShowToast {
             text,
+            kind,
             centered,
             linger,
         });
@@ -4372,7 +4390,7 @@ fn show_rejected_video_scale_toast(
 ) {
     if let Some(toast) = video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Rejected)
     {
-        presenter.show_overlay_toast(toast, false, None);
+        presenter.show_overlay_toast(toast, false, crate::feedback::FeedbackKind::Warning, None);
     }
 }
 
@@ -6005,10 +6023,11 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::ShowToast {
                     text,
+                    kind,
                     centered,
                     linger,
                 } => {
-                    presenter.show_overlay_toast(text, centered, linger);
+                    presenter.show_overlay_toast(text, centered, kind, linger);
                 }
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
@@ -11997,17 +12016,18 @@ impl VideoPlayer {
         }
     }
 
-    /// native overlay にトーストを表示する。`linger` が `Some` のときその時間だけ
-    /// 表示を維持し、`None` のとき presenter が `centered` から既定値を導く。
+    /// Send resolved native lifetime/fade, or let native-origin notices resolve the default.
+    /// A resolved payload is never scaled again by the presenter.
     #[cfg(windows)]
-    pub fn show_native_overlay_toast(
+    pub(crate) fn show_native_overlay_toast(
         &self,
         text: String,
         centered: bool,
-        linger: Option<std::time::Duration>,
+        kind: crate::feedback::FeedbackKind,
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.show_toast(text, centered, linger);
+            output.show_toast(text, centered, kind, linger);
         }
     }
 
@@ -12097,7 +12117,12 @@ impl VideoPlayer {
                         ) {
                             // info_rx は動画を開くごとに 1 回だけ取り込まれる。ここを通知の
                             // 所有境界にして、毎 frame やストリップ操作では繰り返さない。
-                            self.show_native_overlay_toast(notice.to_string(), true, None);
+                            self.show_native_overlay_toast(
+                                notice.to_string(),
+                                true,
+                                crate::feedback::FeedbackKind::Warning,
+                                None,
+                            );
                         }
                         // SAR (= sample aspect ratio) を native presenter に伝える。
                         // anamorphic 動画 (NTSC DVD など) で表示比を補正するために
@@ -16151,6 +16176,7 @@ mod tests {
             .unwrap();
         tx.send(super::NativeVideoOutputCommand::ShowToast {
             text: "first".to_string(),
+            kind: crate::feedback::FeedbackKind::Info,
             centered: false,
             linger: None,
         })
@@ -16159,6 +16185,7 @@ mod tests {
             .unwrap();
         tx.send(super::NativeVideoOutputCommand::ShowToast {
             text: "second".to_string(),
+            kind: crate::feedback::FeedbackKind::Info,
             centered: false,
             linger: None,
         })

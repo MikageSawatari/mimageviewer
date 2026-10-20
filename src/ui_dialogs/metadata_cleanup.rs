@@ -114,7 +114,7 @@ impl App {
 
     fn start_metadata_cleanup_scan(&mut self) {
         if !self.metadata_cleanup_can_start() {
-            self.show_feedback_toast("ファイル操作の完了後にもう一度実行してください".into());
+            self.show_feedback_warning("ファイル操作の完了後にもう一度実行してください".into());
             return;
         }
         self.metadata_cleanup_scan = None;
@@ -127,7 +127,9 @@ impl App {
 
     fn start_metadata_cleanup_delete(&mut self) {
         if !self.metadata_cleanup_can_start() {
-            self.show_feedback_toast("メタデータ書き込みの完了後にもう一度実行してください".into());
+            self.show_feedback_warning(
+                "メタデータ書き込みの完了後にもう一度実行してください".into(),
+            );
             return;
         }
         let Some(scan) = self.metadata_cleanup_scan.clone() else {

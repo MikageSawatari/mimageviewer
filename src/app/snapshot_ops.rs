@@ -921,7 +921,7 @@ impl App {
                     .and_then(snapshot_key_from_grid_item)
                     .is_some()
         }) {
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.normalize_direct_media_basis_for_snapshot();
@@ -936,7 +936,7 @@ impl App {
             .collect();
         if captured_entries.is_empty() {
             // 0 件の snapshot は意味がない (= scope なし)。toast で警告して早期 return。
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.capture_main_list_restore_cursor();
@@ -1580,8 +1580,8 @@ impl App {
         let n = list_items.len();
         // filter suppress 解除 (= snapshot list view は filter 通常適用)
         let _ = self.restore_rating_filter_suppression();
-        // fullscreen 中なら閉じる
-        if self.fullscreen_idx.is_some() {
+        // A pending reader also ends here; list-only preparation is not a reader.
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         // snapshot 内から ZipFile を開いていた場合、その子 ZIP の zip_nav が残っている。
@@ -1838,7 +1838,7 @@ impl App {
         // The classification worker has proved this is not a subsequent RAR volume.
         // This route remains cache-only: a miss never opens a conversion dialog.
         let Some(cached) = self.try_archive_cache_lookup(&path) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)".into(),
             );
             return;
@@ -2036,7 +2036,7 @@ impl App {
                 };
                 let _ = format; // 変換 dialog は snapshot scope 外、cache hit 時のみ自動 open
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                     return false;
@@ -2058,7 +2058,7 @@ impl App {
                 } else {
                     // cache 無し: snapshot 中は変換 dialog を出さず skip (= 次 entry に進む
                     // 想定だが、ユーザーの代表 use case ではないので MVP として false)
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)"
                             .into(),
                     );
@@ -2087,7 +2087,7 @@ impl App {
         let was_fs = self.fullscreen_idx.is_some();
         // 現在 fullscreen を閉じる (= items が入れ替わるので)
         if was_fs {
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         // guard bypass
         self.snapshot_internal_nav = true;
@@ -2238,12 +2238,73 @@ impl App {
             self.zip_enumerate_pending = None;
             self.pdf_password_request = None;
             self.pdf_password_pending_save = None;
-            self.pdf_password_input.clear();
-            self.pdf_password_error = None;
-            self.pdf_password_save = false;
+            // The request is bundle-owned, but the dialog editor is App-global.
+            // A sibling's surviving prompt still owns its current input/error.
+            if self.pdf_password_dialog_path().is_none() {
+                self.pdf_password_input.clear();
+                self.pdf_password_error = None;
+                self.pdf_password_save = false;
+            }
             self.fs_nav_after_pdf_enumerate = None;
         }
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
+        self.retire_viewer_reopen_requests(self.projected_viewer_context_id());
+    }
+
+    /// Check the owner after list adoption, immediately before either completion reopens.
+    /// Adoption itself may retire a context; an earlier take/check is not sufficient.
+    pub(crate) fn resume_archive_convert_viewer_after_load(
+        &mut self,
+        ctx: &egui::Context,
+        deferred: crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen,
+    ) {
+        if !matches!(
+            self.viewer_context_residence(deferred.owner_context),
+            crate::app::ContextResidence::Mounted | crate::app::ContextResidence::AtRest
+        ) {
+            return;
+        }
+        let reason = self.reopen_fullscreen_after_folder_nav_load(
+            ctx,
+            deferred.restore_video_tile,
+            deferred.reopen.resume_slideshow,
+            deferred.reopen.history_trigger,
+        );
+        if reason == "enumerate_defer" {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Capture the requesting viewer here, inside App's context ownership boundary.
+    pub(crate) fn attach_archive_convert_deferred_fullscreen(
+        &mut self,
+        restore_video_tile: bool,
+        resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
+    ) -> bool {
+        let owner_context = self.projected_viewer_context_id();
+        let resume_to_last_page = self.settings.book_nav_resume.resumes();
+        let Some(state) = self.archive_convert.as_mut() else {
+            return false;
+        };
+        if !state.suppress_confirm && !state.allow_direct_read {
+            return false;
+        }
+        state.deferred_fullscreen = Some(
+            crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                owner_context,
+                restore_video_tile,
+                reopen: crate::app::DeferredFsReopen {
+                    history_trigger,
+                    resume_slideshow,
+                    target: crate::app::DeferredFsTarget::None,
+                    resume_to_last_page,
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                },
+            },
+        );
+        true
     }
 
     pub(super) fn prepare_required_fullscreen_navigation(
@@ -2325,12 +2386,12 @@ impl App {
                 );
             self.snapshot_internal_nav = false;
             if !started {
-                self.show_feedback_toast("画像の場所を開けません".to_string());
+                self.show_feedback_warning("画像の場所を開けません".to_string());
             }
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2378,7 +2439,7 @@ impl App {
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2720,7 +2781,7 @@ impl App {
                 SnapshotTarget::Fs(p) => p.clone(),
                 SnapshotTarget::ConvertibleArchive { path, .. } => {
                     if self.settings.archive_file_handling_ignores_convertible() {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                         );
                         return false;
@@ -2735,7 +2796,7 @@ impl App {
                     if let Some(cached) = self.try_archive_cache_lookup(path) {
                         cached
                     } else {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "変換対応アーカイブは★固定範囲内で開けません".into(),
                         );
                         return false;

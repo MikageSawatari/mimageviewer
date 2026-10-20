@@ -23,7 +23,7 @@ impl App {
     pub(crate) fn open_tag_apply_dialog(&mut self) {
         let paths = self.tag_target_paths(crate::app::ActionSurface::MainWindow);
         if paths.is_empty() {
-            self.show_feedback_toast("[タグ対象なし]".to_string());
+            self.show_feedback_warning("[タグ対象なし]".to_string());
             return;
         }
         self.hydrate_tags_cache_for_paths(&paths);

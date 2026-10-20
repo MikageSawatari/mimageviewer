@@ -413,11 +413,11 @@ impl App {
 
     pub(crate) fn request_file_organize_dialog(&mut self, clicked: Option<usize>) {
         if !matches!(self.file_organize_request, FileOrganizeRequest::Hidden) {
-            self.show_feedback_toast("整理操作が完了するまでお待ちください".to_owned());
+            self.show_feedback_warning("整理操作が完了するまでお待ちください".to_owned());
             return;
         }
         if self.remote_session_blocks_local_control() {
-            self.show_feedback_toast("リモート接続中は整理操作を開始できません".to_owned());
+            self.show_feedback_warning("リモート接続中は整理操作を開始できません".to_owned());
             return;
         }
         match resolve_sources(
@@ -434,7 +434,7 @@ impl App {
                         focus: None,
                     }))
             }
-            Err(message) => self.show_feedback_toast(message),
+            Err(message) => self.show_feedback_warning(message),
         }
     }
 
@@ -477,14 +477,14 @@ impl App {
                     FileOrganizeRequest::Running(Box::new(FileOrganizeRunning { request, rx }));
             }
             Ok(None) => {}
-            Err(message) => self.show_feedback_toast(message.to_owned()),
+            Err(message) => self.show_feedback_warning(message.to_owned()),
         }
     }
 
     pub(crate) fn poll_file_organize(&mut self, ctx: &egui::Context) {
         if self.file_organize_dialog_visible() && self.remote_session_blocks_local_control() {
             self.file_organize_request = FileOrganizeRequest::Hidden;
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "リモート接続されたため整理先の選択画面を閉じました".to_owned(),
             );
             return;
@@ -505,13 +505,13 @@ impl App {
         };
         let request = running.request;
         match result {
-            Ok(outcome) if outcome.aborted => self.show_feedback_toast(
+            Ok(outcome) if outcome.aborted => self.show_feedback_warning(
                 "操作が中断されました。処理済みの項目は元に戻りません".to_owned(),
             ),
             Ok(_) => {}
             Err(message) => {
                 crate::logger::log(format!("file_organize: {message}"));
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "操作を完了できませんでした。フォルダの内容を確認してください\n{message}"
                 ));
             }

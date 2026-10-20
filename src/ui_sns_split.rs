@@ -738,7 +738,7 @@ impl App {
         };
         if let Some(error) = self.sns_split_rotation_error(fs_idx) {
             self.reset_sns_split_mode();
-            self.show_feedback_toast(error.message().to_string());
+            self.show_feedback_error(error.message().to_string());
             return action;
         }
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
@@ -766,13 +766,13 @@ impl App {
         };
         if let Some(error) = self.sns_split_rotation_error(fs_idx) {
             self.reset_sns_split_mode();
-            self.show_feedback_toast(error.message().to_string());
+            self.show_feedback_error(error.message().to_string());
             return false;
         }
         let Some(source_size) = self.fs_page_coordinate_source_size(fs_idx) else {
             // キー入力に対して何も起きないと、利用者は原因を知る手段が無い。
             // open_export_dialog 側の失敗経路と同じく理由を出す。
-            self.show_feedback_toast("ページの寸法をまだ取得できていません".to_string());
+            self.show_feedback_warning("ページの寸法をまだ取得できていません".to_string());
             return false;
         };
         let image_size = [
@@ -781,7 +781,7 @@ impl App {
         ];
         if let Some(reason) = sns_split_export_disabled_reason(layout, image_size) {
             // パネルにも理由は出ているが、キーを押して無反応にはしない。
-            self.show_feedback_toast(reason.to_string());
+            self.show_feedback_warning(reason.to_string());
             return false;
         }
 

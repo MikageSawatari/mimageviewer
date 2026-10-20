@@ -1455,6 +1455,137 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-20 §1.232 第5回レビュー: viewer 不在の一覧採用
+
+- 利用者が提示した独立レビューは、一括終了の合流と内部 reopen / park / F12 の
+  内容 teardown 分離を構造修正として妥当と判断し、未合流入口は他に発見されていない。
+  今回は第4回で広げすぎた「一覧採用も常に viewer の終了」という分類を修正する。
+- stack は既存 park の後に共有セッション所有述語を読み、viewer 実在時だけ終了する。
+  他の前回無条件化箇所も、一覧操作・metadata 境界と viewer 終了を区別する。
+  [入口表と理由](version-highlights-plan.md#22-第5回レビュー-一覧採用と-viewer-終了の区別2026-10-20) に記録する。
+- detached の述語・open / close / mount / park / F12 / viewport / registry / HWND 経路は変更しない。
+  既存述語による入口の適格性判定のみを修正し、新規状態・遅延・repaint は加えない。
+  今回差分の独立レビュー承認を取得済みとは扱わない。
+
+### 2026-10-20 §1.232 第4回レビュー: 終了入口の監査と設定変更時の予約退役
+
+- 変更前 `48e2ddff4` の close 全呼出しと index / presentation / viewport / session の
+  状態解除箇所を抽出し、真の終了・内部差替え・所有移譲・表示 cleanup に分類した。
+  全入口・index-only 判定の採否と例外は
+  [version-highlights-plan §2.1](version-highlights-plan.md#21-終了入口の監査1232-第4回レビュー2026-10-20) に記録する。
+- 今回は読むだけでなく、**設定変更による終了を既存の予約退役点へ接続する**。
+  main は列挙/製本待ちで index がなくても session が生き、context は一括終了後も生存するため、
+  viewport flag の解除や detached context の退役だけでは再開予約が終わらなかった。
+  倍率・フォント・Remote の全 viewer 終了を一つの API に寄せ、専用全画面の一括終了も
+  `close_fullscreen_to_completion` へ通す。main の対象判定と通知は同じ既存 owner 由来の述語を使う。
+  App 共通 viewport flag は別窓の退役後も残り得るため、表示 cleanup と投影中 session の
+  終了を区別する。一覧だけの main PDF password と active detached の併存も回帰で固定し、
+  窓だけの表示状態を根拠に兄弟の要求を取り消さない。
+- 通常 `close_fullscreen` も真の終了処理へ合流させ、内部 folder-nav・snapshot 再開・park 後の
+  内容解除などは明示的な `close_fullscreen_content` に分ける。予約の退役は引き続き
+  `retire_viewer_reopen_requests(context)` に集約し、兄弟の書庫予約は owner ID が一致するときだけ扱う。
+  metadata の特殊終了は既存方針を維持したまま同じ終了処理へ接続する。
+- detached の open / mount / park / promote、viewport 登録/生成/placement、HWND・focus、
+  registry の所有遷移、内部 reopen の保持条件は変更しない。変更するのは終了入口から
+  既存終端への接続と内容 teardown の呼分けであり、guard / delay / repaint による症状抑制ではない。
+  一覧だけの準備を終了対象へ広げず、変換・projection の成功後の一覧採用も維持する。
+- 判断の根拠は利用者が提示した第4回レビューの対応方針と、そのコード上の確認。
+  backend close / context 退役・内部 reopen / holdover / PDF password・EPUB・registry は
+  前回レビューで妥当とされた部分を維持する。今回差分の独立レビュー承認を取得済みとは扱わない。
+
+### 2026-10-20 §1.232: 起動通知の保留と内部遷移中のビューア所有
+
+- 対象は `App::startup_notice_viewer_open` と通知側の visible / modal 判定。
+  main の `fullscreen_idx` だけでなく、既存の deferred reopen owner、active detached の
+  生存要求、App 外に退避中の active context、他の still/media 窓を読み取る。
+  重要な変更点・ネットワーク data_dir 通知・マウス操作の移行案内・初回設定で同じ述語を使う。
+- `fullscreen_idx == None` は内部 close→reopen でも発生し、閲覧終了を意味しない。
+  毎回既存所有者を読むことで、保留中は描画とモーダル入力停止の両方を無効にし、
+  真の取消・終了で所有が終われば通知を表示する。新しい bool / latch / 遅延 / repaint は加えない。
+  `fs_viewport_shown` 単独では、閉じた後の cleanup フレームも閲覧中と誤認するため使用しない。
+- 同型の継続経路は以下。通常の folder scan / staged Smart・履歴の準備は旧ページを
+  採用まで保持する経路もあり、index が残る場合は従来の `fullscreen_idx` 判定で保留する。
+
+  | index が空になる継続・退避経路 | 読み取る既存所有状態 |
+  | --- | --- |
+  | PDF/ZIP（EPUB の PDF 化後も含む）の列挙後 reopen、明示 leaf / snapshot からの再開 | `fs_nav_after_pdf_enumerate` |
+  | 製本 projection 完了・提示許可後の deferred open | `book_deferred_open_wait_active()` |
+  | 確認なし変換・直接読取り後の reopen | `archive_convert_deferred_fullscreen_active()` |
+  | 採用済み navigation の sidecar hydration 後 reopen | `sidecar_restore_navigation_fullscreen_wait_active()` |
+  | navigation holdover に属する従来の exact-page sidecar 復元待ち | `fs_nav_deferred_reopen_wait_active()` 内の context / generation / exact target 照合 |
+  | active detached の初回準備・scan / 分類 / 履歴 / 変換 / 列挙 / password / bookmark 待ち | `detached_active_window_alive_wanted()`（既存 session / runtime の生存要求） |
+  | active context の App 外への退避、別の still/media 窓への park / promote | `active_detached_context_is_at_rest()` / `detached_image_windows` |
+
+- 変更しない経路: detached の open / switch / close / cancel、context の mount / park / promote、
+  viewport の生成・維持・破棄、placement、HWND / focus / z-order、既存入力 routing。
+  通知の非表示時に入力を止めないという所有境界の修正であり、detached の症状を
+  guard / delay で抑える変更ではない。
+- 合意: ClaudeCode と独立レビュー Codex（2026-10-19/20）は、既存 detached 所有状態を読む
+  この通知述語の変更を「開閉・viewport 遷移を変える症状パッチではない」と判断・合意済み。
+  P2 は内部遷移中の判定漏れ、P3 は本節への記録漏れとして指摘され、今回それぞれを補う。
+- 再レビュー P2 への追補: 真の取消出口 `finish_fullscreen_navigation_for_true_close()` に
+  `retire_book_deferred_open()` と `clear_archive_convert_deferred_fullscreen()` を接続する。
+  既存の列挙・sidecar・folder navigation 取消と同じ境界で再開予約の寿命を終える修正。
+  製本 projection と変換本体・一覧更新は継続し、遅着の完了が元の予約で閲覧を再開しない。
+  変換の既存 clear helper は holdover も解放するため、navigation sequence の終了処理後に呼ぶ。
+  待機画面の Esc / ×、通常の閉じる操作、Backspace のページ一覧戻りはこの出口を共有する。
+  detached 初回 Preparing の lease 専用取消は既に製本 permission と該当 lease の変換を
+  退役させているので変更しない。detached session/runtime・viewport の遷移経路も変更しない。
+  製本の context / generation / scope・candidate correlation と、変換 state が所有する受信口・
+  現在の復帰予約を使い、新しい世代・待機フラグは追加しない。
+  変換 state は App 共通なので、既存 `ViewerContextId` を発行元として復帰予約に捕捉する。
+  共通取消出口はその context が一致するときだけ既存 clear helper を呼び、別 viewer の
+  Esc で元の予約を消費しない。捕捉する constructor を App 側（snapshot_ops）へ移し、
+  registry の projected identity API の private 境界は広げない。永続データの追加はない。
+  同名予約を持つ EPUB 変換は全 phase が可視モーダルで、Esc / × は既存の
+  `finish_epub_convert(Abort)` が state・予約・受信口ごと退役させる別の取消契約なので変更しない。
+  書庫の `auto_fullscreen` は明示 open 用で、復帰予約を付けるナビ入口は false を渡す。
+  今回はその独立した明示 open の契約へ広げず、待機中の復帰予約を退役させる。
+
+- 再々レビュー P2 への追補（2026-10-20）: 上記の「経路を変更しない」は当初の通知述語の
+  読取り範囲についての記録。今回の明示指示により、**再開予約の退役境界も変更する**。
+  backend の close は UI の待機画面を描画せず `accept_viewport_close_request` から入るため、
+  Esc 用の終了処理だけでは全入口が合流していなかった。全呼出し元を追い、
+  `close_fullscreen_to_completion` は終端 teardown 用、`retire_context` は at-rest bundle の
+  退役用であり、どちらも内部 folder-nav close の共通関数ではないことを確認した。
+  既存コードには両者すべてが通る一点がないため、予約所有者の共通終点
+  `retire_viewer_reopen_requests(context)` を registry 内に置く。
+
+  | 終了入口 | 共通終点までの経路 |
+  | --- | --- |
+  | 待機画面 Esc / UI close、通常 close、Backspace のページ一覧戻り | `finish_fullscreen_navigation_for_true_close` → 共通終点 |
+  | backend の全画面 close | `accept_viewport_close_request` → `close_fullscreen_to_completion` → 上記終了処理 |
+  | backend の active detached close（mounted / at-rest） | `accept_active_detached_window_close` → `close_fullscreen_to_completion`（at-rest は `close_and_retire_context` 経由） |
+  | passive detached close、発行元 context の単独退役 | `retire_context` → 共通終点（`begin_retire` 成功後） |
+  | 内部 folder-nav close→reopen | `close_fullscreen_for_folder_nav_reopen` → `close_fullscreen`。共通終点を通さず予約を保持 |
+
+  前回 snapshot_ops に置いた製本・書庫の予約退役は共通終点へ移し、context ID が一致する
+  所有者だけ退役させる。製本 permission の既存退役を bundle 自体でも使えるようにし、
+  Retiring bundle を無理に mount しない。書庫は App 共通予約だけを外し、現在投影中の
+  兄弟の lock / holdover は解放しない。close 完遂後の context 退役で同じ終点を通っても冪等。
+  context 消滅時の規則は「context 退役時に予約も退役」に統一し、完了を待って残さない。
+  直接読取りと変換キャッシュの両完了は一覧採用後の共通再開 helper で既存 `owner_context` の
+  Mounted / AtRest を照合する。一覧採用自体で退役する可能性があるため、予約を取り出す時点ではなく
+  再オープンの直前に照合する。生存中の退避 owner は認め、退役済み ID は再開を許可しない。
+  変換本体・キャッシュ生成・通常の一覧採用は従来どおり。新しい bool / generation はない。
+  同型の再点検で、EPUB も backend close はダイアログ自身の Abort を通らないことを確認した。
+  前回の「EPUB は変更しない」はダイアログ自身の Esc / × の契約については維持するが、
+  今回は mounted / Retiring bundle の EPUB `deferred_fullscreen` も同じ共通終点で退役させる。
+  viewer close では変換を継続し、遅着完了は PDF の一覧準備だけを行う回帰を追加する。
+  context 自体を捨てる場合の worker Drop / cancel は従来どおり。
+  PDF/ZIP 列挙・folder scan の予約は既存 bundle とともに退役する。App 共通 sidecar 復元は
+  既に target context の生存照合・消滅時の discard があり、別 context へ再開を渡さない。
+  backend hook を実際に呼ぶ全画面 / detached 回帰、context 単独退役、遅着完了、
+  内部 reopen の保持、兄弟 holdover の非干渉を追加した。RawInput の Close 回帰とは区別する。
+  `close_fullscreen_to_completion` から既存終了処理へ合流することで、PDF password request
+  （bundle 所有）を外した際の共通 editor（App 所有）の扱いも対象になる。共通入力欄の初期化は
+  `pdf_password_dialog_path` で所有者が残らない場合だけ行い、既存の兄弟 prompt 非干渉テストを維持する。
+  §2 の BA-7（所有者と資源寿命）の境界を揃える修正であり、viewport の生成・配置・
+  開閉判断・mount / park / promote の変更や症状 guard は加えない。
+  当初の通知述語が症状パッチでないという ClaudeCode・独立レビューの合意
+  （2026-10-19/20）は上記のとおり保持する。今回の退役境界変更は再々レビュー指摘への
+  利用者の明示対応方針に沿ったもので、追加差分の独立検収済みを意味しない。
+
 ### 2026-10-18 §1.395: 全viewportのsurface窓寸法制約
 
 設計担当ClaudeCodeと独立設計レビュー（GPT-6.1 Sol / xhigh）の合意済み指示を受け、

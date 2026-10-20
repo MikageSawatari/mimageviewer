@@ -37,6 +37,29 @@ pub(super) fn draw_preferences_restore_position_setting(
     );
 }
 
+pub(super) fn draw_notification_duration_setting(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::NotificationDuration,
+) {
+    use crate::settings::NotificationDuration;
+    ui.label(egui::RichText::new("通知の表示時間").strong());
+    ui.horizontal_wrapped(|ui| {
+        for choice in [
+            NotificationDuration::Short,
+            NotificationDuration::Standard,
+            NotificationDuration::Long,
+        ] {
+            ui.radio_value(value, choice, choice.label());
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "警告・エラーは「短い」でも標準の時間を確保します。進捗表示には適用しません。",
+        )
+        .weak(),
+    );
+}
+
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if state.transfer_feedback.is_some() {
         super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
@@ -87,6 +110,10 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
             )
             .weak(),
         );
+    });
+    ui.add_space(12.0);
+    anchored(ui, state, "general/notification-duration", |ui, state| {
+        draw_notification_duration_setting(ui, &mut state.settings.notification_duration);
     });
     ui.add_space(12.0);
     anchored(ui, state, "general/restore-position", |ui, state| {

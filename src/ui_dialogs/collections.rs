@@ -2267,22 +2267,22 @@ impl App {
     /// add uses the target collection's latest revision rather than a possibly stale manager copy.
     pub(crate) fn add_grid_selection_to_collection(&mut self, collection_id: CollectionId) {
         if !self.collection_ui.can_edit() {
-            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            self.show_feedback_warning("コレクションを現在編集できません。".into());
             return;
         }
         if !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         let indices = self.grid_selection_indices();
         if indices.is_empty() {
-            self.show_feedback_toast("コレクションに追加する項目を選択してください。".into());
+            self.show_feedback_warning("コレクションに追加する項目を選択してください。".into());
             return;
         }
         let mut paths = Vec::with_capacity(indices.len());
         for index in indices {
             let Some(item) = self.items.get(index) else {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "選択内容が更新されたため、コレクションに追加できません。".into(),
                 );
                 return;
@@ -2292,7 +2292,7 @@ impl App {
                     || "この項目はコレクションに追加できません".to_owned(),
                     |reason| reason.message("コレクションに追加"),
                 );
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 return;
             };
             paths.push(path.to_path_buf());
@@ -2323,11 +2323,11 @@ impl App {
             return;
         };
         if self.fullscreen_idx != Some(fs_idx) {
-            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            self.show_feedback_warning("表示中の項目が変わったため、追加できません。".into());
             return;
         }
         let Some(item) = self.items.get(fs_idx) else {
-            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            self.show_feedback_warning("表示中の項目が変わったため、追加できません。".into());
             return;
         };
         let path = match item {
@@ -2337,7 +2337,7 @@ impl App {
                     || "現在の実画像だけをコレクションに追加できます。".to_owned(),
                     |refusal| refusal.message("コレクションに追加"),
                 );
-                self.show_feedback_toast(reason);
+                self.show_feedback_warning(reason);
                 return;
             }
         };
@@ -2349,7 +2349,7 @@ impl App {
             return;
         };
         if self.fullscreen_idx != Some(fs_idx) {
-            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            self.show_feedback_warning("表示中の項目が変わったため、追加できません。".into());
             return;
         }
         let path = match self.items.get(fs_idx) {
@@ -2357,7 +2357,7 @@ impl App {
                 crate::grid_item::GridItem::Video(path) | crate::grid_item::GridItem::Audio(path),
             ) => path.clone(),
             _ => {
-                self.show_feedback_toast("現在の動画・音声ファイルを追加できません。".into());
+                self.show_feedback_warning("現在の動画・音声ファイルを追加できません。".into());
                 return;
             }
         };
@@ -2370,7 +2370,7 @@ impl App {
             .toolbar_collection_target_id
             .map(CollectionId::from_uuid);
         if target.is_none() {
-            self.show_feedback_toast("追加先のコレクションを選択してください。".into());
+            self.show_feedback_warning("追加先のコレクションを選択してください。".into());
         }
         target
     }
@@ -2382,11 +2382,11 @@ impl App {
         paths: Vec<std::path::PathBuf>,
     ) {
         if !self.collection_ui.can_edit() {
-            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            self.show_feedback_warning("コレクションを現在編集できません。".into());
             return;
         }
         if !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         let Some(collection_name) = self
@@ -2403,12 +2403,12 @@ impl App {
         else {
             self.collection_ui
                 .request_catalog(self.collection_ui.wanted_catalog_revision);
-            self.show_feedback_toast("追加先のコレクションが見つかりません。".into());
+            self.show_feedback_warning("追加先のコレクションが見つかりません。".into());
             return;
         };
 
         let Some(client) = self.collection_ui.client.clone() else {
-            self.show_feedback_toast("コレクションを利用できません。".into());
+            self.show_feedback_warning("コレクションを利用できません。".into());
             return;
         };
         match client.load_collection(collection_id) {
@@ -2428,7 +2428,7 @@ impl App {
             Err(error) => {
                 let message = collection_error_message(&error);
                 self.collection_ui.message = Some((true, message.clone()));
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "「{collection_name}」へ追加できませんでした: {message}"
                 ));
             }
@@ -2905,7 +2905,7 @@ impl App {
                     Ok(Ok(_)) => {
                         let message = "追加先のコレクション応答が一致しませんでした。".to_owned();
                         self.collection_ui.message = Some((true, message.clone()));
-                        self.show_feedback_toast(format!(
+                        self.show_feedback_warning(format!(
                             "「{}」へ追加できませんでした: {message}",
                             request.collection_name
                         ));
@@ -2914,7 +2914,7 @@ impl App {
                     Ok(Err(error)) => {
                         let message = collection_error_message(&error);
                         self.collection_ui.message = Some((true, message.clone()));
-                        self.show_feedback_toast(format!(
+                        self.show_feedback_warning(format!(
                             "「{}」へ追加できませんでした: {message}",
                             request.collection_name
                         ));
@@ -2926,7 +2926,7 @@ impl App {
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         let message = "追加先のコレクション応答が失われました。".to_owned();
                         self.collection_ui.message = Some((true, message.clone()));
-                        self.show_feedback_toast(format!(
+                        self.show_feedback_warning(format!(
                             "「{}」へ追加できませんでした: {message}",
                             request.collection_name
                         ));
@@ -2948,14 +2948,14 @@ impl App {
                     self.continue_collection_grid_snapshot(request.target, request.action, snapshot)
                 }
                 Ok(Ok(_)) => {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "表示が切り替わったため、コレクション操作を取り消しました。".into(),
                     );
                     CollectionDialogOperation::Idle
                 }
                 Ok(Err(error)) => {
                     let message = collection_error_message(&error);
-                    self.show_feedback_toast(message.clone());
+                    self.show_feedback_warning(message.clone());
                     self.collection_ui.message = Some((true, message));
                     CollectionDialogOperation::Idle
                 }
@@ -2963,7 +2963,7 @@ impl App {
                     CollectionDialogOperation::GridSnapshot(request)
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("コレクション内容の応答が失われました。".into());
+                    self.show_feedback_warning("コレクション内容の応答が失われました。".into());
                     CollectionDialogOperation::Idle
                 }
             },
@@ -3074,7 +3074,7 @@ impl App {
                         Ok(task) => CollectionDialogOperation::ExportAllWriting { progress, task },
                         Err(error) => {
                             self.collection_ui.message = Some((true, error.clone()));
-                            self.show_feedback_toast(error);
+                            self.show_feedback_error(error);
                             CollectionDialogOperation::Idle
                         }
                     }
@@ -3088,7 +3088,7 @@ impl App {
                 Ok(Err(error)) => {
                     let message = collection_error_message(&error);
                     self.collection_ui.message = Some((true, message.clone()));
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     CollectionDialogOperation::Idle
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -3103,7 +3103,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     let message = "一括書き出し用一覧の応答が失われました。".to_owned();
                     self.collection_ui.message = Some((true, message.clone()));
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     CollectionDialogOperation::Idle
                 }
             },
@@ -3124,12 +3124,12 @@ impl App {
                     let cancelled = matches!(error, CollectionAllExportFailure::Cancelled { .. });
                     let message = error.message();
                     self.collection_ui.message = Some((!cancelled, message.clone()));
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     CollectionDialogOperation::Idle
                 }
                 Some(Err(error)) => {
                     self.collection_ui.message = Some((true, error.clone()));
-                    self.show_feedback_toast(error);
+                    self.show_feedback_error(error);
                     CollectionDialogOperation::Idle
                 }
             },
@@ -3143,15 +3143,15 @@ impl App {
         action: CollectionGridSnapshotAction,
     ) {
         if !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         if action.requires_edit_admission() && !self.collection_ui.can_edit() {
-            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            self.show_feedback_warning("コレクションを現在編集できません。".into());
             return;
         }
         if !self.collection_grid_request_stamp_is_current(target.stamp) {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "現在のコレクション一覧を更新してから操作してください。".into(),
             );
             return;
@@ -3159,11 +3159,11 @@ impl App {
         let client = match self.collection_store_client_for_read() {
             Ok(Some(client)) => client,
             Ok(None) => {
-                self.show_feedback_toast("コレクションを利用できません。".into());
+                self.show_feedback_warning("コレクションを利用できません。".into());
                 return;
             }
             Err(error) => {
-                self.show_feedback_toast(collection_error_message(&error));
+                self.show_feedback_warning(collection_error_message(&error));
                 return;
             }
         };
@@ -3176,7 +3176,7 @@ impl App {
                         receiver,
                     });
             }
-            Err(error) => self.show_feedback_toast(collection_error_message(&error)),
+            Err(error) => self.show_feedback_warning(collection_error_message(&error)),
         }
     }
 
@@ -3201,7 +3201,7 @@ impl App {
             }
             CollectionGridSnapshotAction::SetOrder(intent) => {
                 if intent.content != target {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "表示が切り替わったため、並び順の変更を取り消しました。".into(),
                     );
                     return CollectionDialogOperation::Idle;
@@ -3220,18 +3220,20 @@ impl App {
                         receiver,
                     }),
                     Err(error) => {
-                        self.show_feedback_toast(collection_error_message(&error));
+                        self.show_feedback_warning(collection_error_message(&error));
                         CollectionDialogOperation::Idle
                     }
                 }
             }
             CollectionGridSnapshotAction::OpenReorder => {
                 if snapshot.definition.order_mode != CollectionOrderMode::Manual {
-                    self.show_feedback_toast("手動順のコレクションだけを並べ替えられます。".into());
+                    self.show_feedback_warning(
+                        "手動順のコレクションだけを並べ替えられます。".into(),
+                    );
                     return CollectionDialogOperation::Idle;
                 }
                 if snapshot.entries.is_empty() {
-                    self.show_feedback_toast("並べ替える参照がありません。".into());
+                    self.show_feedback_warning("並べ替える参照がありません。".into());
                     return CollectionDialogOperation::Idle;
                 }
                 self.open_collection_reorder(snapshot, target.selected_entry_id);
@@ -3407,7 +3409,7 @@ impl App {
                 }
                 Ok(Err(error)) => {
                     if matches!(origin, CollectionOperationOrigin::Grid(_)) {
-                        self.show_feedback_toast(collection_error_message(&error));
+                        self.show_feedback_warning(collection_error_message(&error));
                     }
                     self.finish_actor_error(error)
                 }
@@ -3420,7 +3422,7 @@ impl App {
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     if matches!(origin, CollectionOperationOrigin::Grid(_)) {
-                        self.show_feedback_toast("コレクション保存の応答が失われました。".into());
+                        self.show_feedback_warning("コレクション保存の応答が失われました。".into());
                     }
                     self.finish_actor_disconnect()
                 }
@@ -3439,14 +3441,14 @@ impl App {
                     CollectionDialogOperation::Idle
                 }
                 Ok(Err(error)) => {
-                    self.show_feedback_toast(collection_error_message(&error));
+                    self.show_feedback_warning(collection_error_message(&error));
                     self.finish_actor_error(error)
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     CollectionDialogOperation::Submitting(ActorTask::SetOrder { intent, receiver })
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("コレクション保存の応答が失われました。".into());
+                    self.show_feedback_warning("コレクション保存の応答が失われました。".into());
                     self.finish_actor_disconnect()
                 }
             },
@@ -3480,7 +3482,7 @@ impl App {
                 }
                 Ok(Err(error)) => {
                     let message = collection_error_message(&error);
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     self.finish_actor_error(error)
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -3492,7 +3494,7 @@ impl App {
                     })
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("コレクション保存の応答が失われました。".into());
+                    self.show_feedback_warning("コレクション保存の応答が失われました。".into());
                     self.finish_actor_disconnect()
                 }
             },
@@ -3599,9 +3601,12 @@ impl App {
             } else {
                 format!("「{collection_name}」")
             };
-            self.show_feedback_toast(format!("{prefix}: {message}"));
+            self.show_feedback_result(
+                format!("{prefix}: {message}"),
+                crate::feedback::FeedbackKind::result(is_error),
+            );
         } else if matches!(origin, CollectionAddOrigin::Grid(_)) {
-            self.show_feedback_toast(message);
+            self.show_feedback_result(message, crate::feedback::FeedbackKind::result(is_error));
         }
     }
 
@@ -3613,7 +3618,7 @@ impl App {
     ) {
         self.collection_ui.message = Some((is_error, message.clone()));
         if origin.grid_stamp().is_some() {
-            self.show_feedback_toast(message);
+            self.show_feedback_result(message, crate::feedback::FeedbackKind::result(is_error));
         }
     }
 
@@ -3754,17 +3759,17 @@ impl App {
 
     pub(crate) fn start_collection_export_all(&mut self, parent: PathBuf) {
         if !self.collection_export_all_available() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         let client = match self.collection_store_client_for_read() {
             Ok(Some(client)) => client,
             Ok(None) => {
-                self.show_feedback_toast("コレクションを利用できません。".into());
+                self.show_feedback_warning("コレクションを利用できません。".into());
                 return;
             }
             Err(error) => {
-                self.show_feedback_toast(collection_error_message(&error));
+                self.show_feedback_warning(collection_error_message(&error));
                 return;
             }
         };
@@ -3780,7 +3785,7 @@ impl App {
                     receiver,
                 };
             }
-            Err(error) => self.show_feedback_toast(collection_error_message(&error)),
+            Err(error) => self.show_feedback_warning(collection_error_message(&error)),
         }
     }
 
@@ -4102,7 +4107,7 @@ impl App {
             if let Some(origin) = add_origin {
                 self.report_collection_add_result(&origin, false, "追加を取り消しました。".into());
             } else {
-                self.show_feedback_toast("コレクション処理を取り消しました。".into());
+                self.show_feedback_warning("コレクション処理を取り消しました。".into());
             }
         }
     }
@@ -5101,7 +5106,7 @@ impl App {
         request: crate::app::collection_grid::CollectionGridRemoveTarget,
     ) {
         if !self.collection_ui.can_edit() || !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("コレクションを現在編集できません。".to_string());
+            self.show_feedback_warning("コレクションを現在編集できません。".to_string());
             return;
         }
         self.collection_ui.operation = CollectionDialogOperation::ConfirmRemove {
@@ -8855,7 +8860,17 @@ mod tests {
         assert!(app.collection_export_all_available());
         app.start_collection_export_all(temp.path().to_path_buf());
         assert!(!app.collection_export_all_available());
-        app.start_collection_export_all(temp.path().join("must-not-start"));
+        for (setting, factor) in [
+            (crate::settings::NotificationDuration::Short, 1.0),
+            (crate::settings::NotificationDuration::Standard, 1.0),
+            (crate::settings::NotificationDuration::Long, 1.5),
+        ] {
+            app.settings.notification_duration = setting;
+            app.start_collection_export_all(temp.path().join("must-not-start"));
+            let (text, _, seconds) = app.fs_feedback_toast.as_ref().unwrap();
+            assert_eq!(text, "別のコレクション処理が進行中です。");
+            assert_eq!(*seconds, 1.2 * factor);
+        }
         assert!(matches!(
             app.collection_ui.operation,
             CollectionDialogOperation::ExportAllSnapshot { .. }

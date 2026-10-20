@@ -74,6 +74,7 @@ pub fn render_network_data_dir_notice_content(
 impl App {
     pub(crate) fn network_data_dir_notice_visible(&self) -> bool {
         self.network_data_dir_notice.is_some()
+            && !self.startup_notice_viewer_open()
             && self.settings_boot_problem_source.is_none()
             && self.settings.first_setup_completed
             && !self.show_mouse_nav_migration_prompt

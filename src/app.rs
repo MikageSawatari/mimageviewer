@@ -19206,7 +19206,7 @@ impl App {
             };
             // Save completion never moves a page, rebuilds units, or updates a sibling's live shift.
             if let Err(error) = &result.status {
-                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を保存できませんでした: {error}"));
             } else if let Some(clear) = accepted {
                 self.show_feedback_toast(
                     if clear {
@@ -19230,13 +19230,13 @@ impl App {
             }
         }
         for error in errors {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "見開き調整の保存データを処理できませんでした: {error}"
             ));
         }
         for result in clear_results {
             if let Err(error) = result.status {
-                self.show_feedback_toast(format!("見開き調整を削除できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を削除できませんでした: {error}"));
             }
         }
     }
@@ -19303,14 +19303,15 @@ impl App {
                     self.handle_capture_selection(snapshot, ctx, &mut activate);
                 }
                 SelectionEvent::ManualSaved { metadata_error, .. } => {
+                    let kind = crate::feedback::FeedbackKind::result(metadata_error.is_some());
                     let text = metadata_error.map_or_else(
                         || "1 枚保存しました".to_owned(),
                         |error| format!("1 枚保存しました: {error}"),
                     );
-                    self.show_feedback_toast_on(text, ActionSurface::MainWindow);
+                    self.show_feedback_result_on(text, ActionSurface::MainWindow, kind);
                 }
                 SelectionEvent::ManualFailed(error) => {
-                    self.show_feedback_toast_on(error, ActionSurface::MainWindow)
+                    self.show_feedback_warning_on(error, ActionSurface::MainWindow)
                 }
             }
         }
@@ -19410,29 +19411,17 @@ impl App {
 
         #[cfg(windows)]
         {
-            let mounted_source_swap_presenter = self
-                .native_video_source_swap_pending
-                .as_ref()
-                .is_some_and(|pending| pending.parked_live_window_id.is_none());
-            // Viewer-mode settings use this path to close mounted + passive detached sessions.
-            // It is a no-op when no such window/session exists.
-            if self
-                .close_all_detached_viewers_for_mode_change(ctx)
-                .unwrap_or(true)
+            if let Err(error) =
+                self.close_all_viewer_sessions_with_cause(ctx, ViewerCloseCause::Replaced)
             {
-                return;
-            }
-            if mounted_source_swap_presenter {
-                self.close_fullscreen();
-                ctx.request_repaint();
-                return;
+                crate::logger::log(format!("ui_scale_viewer_close_failed: {error:?}"));
             }
         }
-
-        // Native fullscreen has no egui detached host, so the detached teardown can be a no-op.
-        // `close_fullscreen` also drops mounted source-swap/native-output pending state.
-        if self.fullscreen_idx.is_some() {
-            self.close_fullscreen();
+        #[cfg(not(windows))]
+        {
+            if self.projected_viewer_session_open() {
+                self.close_fullscreen();
+            }
             ctx.request_repaint();
         }
     }
@@ -19550,7 +19539,7 @@ impl App {
         }
         let whats_new_prev = whatsnew_from_override
             .as_deref()
-            .or(load_meta.previous_last_seen_version.as_deref());
+            .or(settings.whats_new_acknowledged_version.as_deref());
         let whats_new_entries = crate::version_highlights::highlights_to_show(
             whats_new_prev,
             env!("CARGO_PKG_VERSION"),
@@ -21411,7 +21400,7 @@ impl App {
             .unusable_detail()
             .is_some()
         {
-            app.show_feedback_toast(
+            app.show_feedback_warning(
                 "コピー・移動したファイルの編集内容の復元を利用できません".to_string(),
             );
         }
@@ -22707,6 +22696,9 @@ impl App {
 
     pub(crate) fn finish_everything_edit_boundary(&mut self) {
         self.finish_rating_membership_edit_boundary();
+        if self.projected_viewer_session_open() {
+            self.finish_fullscreen_navigation_for_true_close();
+        }
         if self.fullscreen_idx.is_some() {
             self.close_fullscreen_for_rating_membership();
         }
@@ -22782,8 +22774,8 @@ impl App {
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
             self.show_operation_customize_discard_confirm => "operation_customize_discard_confirm",
-            self.show_mouse_nav_migration_prompt => "mouse_nav_migration_prompt",
-            self.show_whats_new => "whats_new",
+            self.mouse_nav_migration_prompt_visible() => "mouse_nav_migration_prompt",
+            self.whats_new_visible() => "whats_new",
             self.network_data_dir_notice_visible() => "network_data_dir_notice",
             self.show_context_shortcuts_help => "context_shortcuts_help",
             self.show_toolbar_reset_confirm => "toolbar_reset_confirm",
@@ -22798,8 +22790,7 @@ impl App {
             self.epub_convert_pending_in_any_context() => "epub_convert",
             self.video_upscale.is_some() => "video_upscale",
             self.tq.show => "thumb_quality",
-            self.settings_boot_problem_source.is_none() && !self.settings.first_setup_completed
-                => "first_setup",
+            self.first_setup_visible() => "first_setup",
             self.show_delete_confirm => "delete_confirm",
             self.edit_bundle_paste_pending.is_some() => "edit_bundle_paste_pending",
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
@@ -22906,8 +22897,68 @@ impl App {
         self.fullscreen_tag_panel_sticky_tags.clear();
     }
 
+    /// Startup notices live only on main. Read existing viewer ownership each time, including
+    /// the active detached context parked off App and the other still/media windows. This does
+    /// not change detached lifecycle, presentation, or main-window input ownership.
+    /// An empty index can be an internal reopen gap: use the existing navigation and detached
+    /// lifetime owners, not fs_viewport_shown (which can outlive a close and is false for embedded
+    /// holdovers).
+    pub(crate) fn startup_notice_viewer_open(&self) -> bool {
+        #[cfg(windows)]
+        if self.active_detached_context_is_at_rest()
+            || self.detached_active_window_alive_wanted()
+            || !self.detached_image_windows.is_empty()
+        {
+            return true;
+        }
+        self.projected_viewer_session_open()
+    }
+
+    /// One current-context fact for notice visibility and terminal admission. Empty child
+    /// viewport registrations and list-only document preparation are not viewer sessions.
+    pub(crate) fn projected_viewer_session_open(&self) -> bool {
+        if self.fullscreen_idx.is_some()
+            || self.fs_nav_deferred_reopen_wait_active()
+            || self
+                .epub_convert
+                .as_ref()
+                .is_some_and(|state| state.deferred_fullscreen.is_some())
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            self.vst3_deferred_media_open.is_some()
+                || self
+                    .native_video_open_pending
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.owner_context_id == self.projected_viewer_context_id()
+                    })
+                || self
+                    .native_video_source_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.parked_live_window_id.is_none())
+                || self.video_presentation_transition.is_transitioning()
+                || self.video_presentation_transition.has_pending_effects()
+        }
+        #[cfg(not(windows))]
+        false
+    }
+
+    pub(crate) fn archive_convert_deferred_fullscreen_active(&self) -> bool {
+        self.archive_convert
+            .as_ref()
+            .and_then(|state| state.deferred_fullscreen.as_ref())
+            .is_some_and(|deferred| deferred.owner_context == self.projected_viewer_context_id())
+    }
+
+    pub(crate) fn mouse_nav_migration_prompt_visible(&self) -> bool {
+        self.show_mouse_nav_migration_prompt && !self.startup_notice_viewer_open()
+    }
+
     pub(crate) fn show_mouse_nav_migration_prompt_dialog(&mut self, ctx: &egui::Context) {
-        if !self.show_mouse_nav_migration_prompt {
+        if !self.mouse_nav_migration_prompt_visible() {
             return;
         }
 
@@ -23179,14 +23230,14 @@ impl App {
         match reading_history_open_path_status(&path) {
             ReadingHistoryOpenPathStatus::Available => true,
             ReadingHistoryOpenPathStatus::Missing => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "ファイルが見つかりません。閲覧履歴は保持されています".to_string(),
                 );
                 let _ = key;
                 false
             }
             ReadingHistoryOpenPathStatus::Unavailable => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "ファイルにアクセスできません。外付けドライブが未接続の可能性があります"
                         .to_string(),
                 );
@@ -25778,7 +25829,7 @@ impl App {
         if failed {
             self.current_folder_watch_failed =
                 self.current_folder_watch.take().map(|watch| watch.folder);
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "フォルダーの変更監視を開始できませんでした。最新の情報に更新してください".into(),
             );
         }
@@ -26274,7 +26325,7 @@ impl App {
                 folder.display()
             ));
             if reason == "scan_failed" {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "フォルダーの変更を確認できませんでした。最新の情報に更新してください".into(),
                 );
             }
@@ -26711,7 +26762,7 @@ impl App {
                 .is_err()
             {
                 self.select_after_load = previous_hint;
-                self.show_feedback_toast("一覧の更新を開始できませんでした".into());
+                self.show_feedback_warning("一覧の更新を開始できませんでした".into());
             } else if kind == smart_folder::SmartChildKind::ConvertibleArchive
                 && saved_override.is_none()
                 && self.zip_nav.is_none()
@@ -28082,7 +28133,7 @@ impl App {
         }) = result
         else {
             self.finish_rejected_open_path_classification(&candidate);
-            self.show_feedback_toast("移動先を確認できません".into());
+            self.show_feedback_warning("移動先を確認できません".into());
             return;
         };
         if matches!(
@@ -28097,7 +28148,7 @@ impl App {
                 candidate.path.display()
             ));
             self.finish_rejected_open_path_classification(&candidate);
-            self.show_feedback_toast(message);
+            self.show_feedback_warning(message);
             return;
         }
         if kind == OpenPathKind::Other {
@@ -28113,7 +28164,7 @@ impl App {
             match refusal {
                 FolderOpenOutcome::Refused(reason) => self.show_pdf_open_refusal(reason),
                 FolderOpenOutcome::Ignored => {
-                    self.show_feedback_toast("設定により変換が必要な本を無視しています".into())
+                    self.show_feedback_warning("設定により変換が必要な本を無視しています".into())
                 }
                 _ => unreachable!("only typed refusal outcomes are returned"),
             }
@@ -28414,14 +28465,14 @@ impl App {
     fn show_pdf_open_refusal(&mut self, reason: FolderOpenRefusal) {
         match reason {
             FolderOpenRefusal::EpubIgnoredBySetting => {
-                self.show_feedback_toast("設定により EPUB を無視しています".into());
+                self.show_feedback_warning("設定により EPUB を無視しています".into());
             }
             FolderOpenRefusal::Admission(reason) => self.show_open_admission_refusal(reason),
         }
     }
 
     pub(crate) fn show_open_admission_refusal(&mut self, reason: OpenAdmissionRefusal) {
-        self.show_feedback_toast(reason.message().into());
+        self.show_feedback_warning(reason.message().into());
     }
 
     fn report_pdf_open_refusal(
@@ -28884,7 +28935,7 @@ impl App {
         {
             if self.settings.archive_file_handling_ignores_convertible() {
                 self.pending_auto_fs_open = false;
-                self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
+                self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
                 return FolderOpenOutcome::Ignored;
             }
             if format == crate::archive_converter::ArchiveFormat::Rar {
@@ -29222,7 +29273,7 @@ impl App {
     /// Activation performs its scope check before creating an auto-fullscreen reservation.
     /// Its refusal must therefore leave a reservation owned by the request it temporarily held.
     fn show_snapshot_out_of_scope_open_feedback(&mut self) {
-        self.show_feedback_toast(
+        self.show_feedback_warning(
             "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)".into(),
         );
     }
@@ -29777,7 +29828,7 @@ impl App {
                     self.pending_auto_fs_open = false;
                     self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
                     self.release_fs_nav_lock();
-                    self.show_feedback_toast("フォルダを読み取れませんでした".into());
+                    self.show_feedback_warning("フォルダを読み取れませんでした".into());
                     return FolderOpenOutcome::Ignored;
                 }
             },
@@ -30336,7 +30387,7 @@ impl App {
             });
         }
         if rating_order_failed {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "評価順を読み取れなかったため、名前順で表示しました".to_owned(),
             );
         }
@@ -30478,7 +30529,7 @@ impl App {
             } else {
                 "コンテナ索引も初期化できなかったため、確認を行えません。"
             };
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "アイテム索引を初期化できなかったため、アイテム索引と別バージョン索引の確認は行えません。{name_status}"
             ));
         }
@@ -30892,7 +30943,7 @@ impl App {
         // Host snapshots are already complete; draining never waits for IPC.
         let changes = bridge.pump_gui_signals();
         if !changes.warnings.is_empty() {
-            self.show_feedback_toast("音響調整の窓の表示・配置を更新できませんでした。".into());
+            self.show_feedback_warning("音響調整の窓の表示・配置を更新できませんでした。".into());
         }
         if !changes.user_hidden_paths.is_empty() {
             self.effetune.capture_on_hide();
@@ -31283,7 +31334,7 @@ impl App {
                 self.effetune.runtime,
                 crate::effetune::EffetuneRuntime::Failed(_)
             ) {
-                self.show_feedback_toast(warning);
+                self.show_feedback_warning(warning);
             }
         }
     }
@@ -31651,7 +31702,7 @@ impl App {
         // UI can draw it. Starting a toast clock under the overlay loses the notice.
         if !self.indexer_init.overlay_active() && self.window_visible && !minimized && take_notice()
         {
-            self.show_feedback_toast("起動記録を保存できませんでした".to_string());
+            self.show_feedback_warning("起動記録を保存できませんでした".to_string());
         }
     }
 
@@ -31664,7 +31715,7 @@ impl App {
         // Reporting this failure must not enqueue another log into the failed sink.
         if !self.indexer_init.overlay_active() && self.window_visible && !minimized {
             if take_error().is_some() {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "診断ログを保存できません。次回起動時に再試行します".to_string(),
                 );
             }
@@ -31734,11 +31785,11 @@ impl App {
                 IndexerInit::Ready(manager)
             }
             crate::indexer_manager::StartupInitOutcome::Unavailable => {
-                self.show_feedback_toast("全文検索を準備できませんでした".to_string());
+                self.show_feedback_warning("全文検索を準備できませんでした".to_string());
                 IndexerInit::Unavailable
             }
             crate::indexer_manager::StartupInitOutcome::Failed { user_message } => {
-                self.show_feedback_toast(user_message);
+                self.show_feedback_warning(user_message);
                 IndexerInit::Unavailable
             }
         };
@@ -32006,7 +32057,7 @@ impl App {
             }
         }
         if !notifications.is_empty() {
-            self.show_feedback_toast_with_duration(notifications.join("\n"), 5.0);
+            self.show_feedback_warning_with_duration(notifications.join("\n"), 5.0);
         }
     }
 
@@ -32039,7 +32090,9 @@ impl App {
         if query.is_empty() {
             return;
         }
-        if self.viewer_session_blocks_main_window() {
+        if !self.current_viewer_session_is_detached_or_switching()
+            && self.projected_viewer_session_open()
+        {
             self.close_fullscreen();
         }
         self.open_tag_view_with_query(Some(query), false);
@@ -32998,11 +33051,11 @@ impl App {
             Some(Ok(entries)) => entries,
             Some(Err(e)) => {
                 crate::logger::log(format!("reading-history: list failed: {e}"));
-                self.show_feedback_toast("[閲覧履歴を読み込めませんでした]".to_string());
+                self.show_feedback_warning("[閲覧履歴を読み込めませんでした]".to_string());
                 Vec::new()
             }
             None => {
-                self.show_feedback_toast("[閲覧履歴 DB を開けません]".to_string());
+                self.show_feedback_warning("[閲覧履歴 DB を開けません]".to_string());
                 Vec::new()
             }
         };
@@ -33061,7 +33114,7 @@ impl App {
             }
             Err(error) => {
                 crate::logger::log(format!("reading history preparation: {error}"));
-                self.show_feedback_toast("閲覧履歴を準備できませんでした".to_owned());
+                self.show_feedback_warning("閲覧履歴を準備できませんでした".to_owned());
             }
         }
         hydration
@@ -33118,7 +33171,7 @@ impl App {
                 self.reading_history_sources_pending
                     .remove(&owner.context_id);
                 self.address = "閲覧履歴".to_owned();
-                self.show_feedback_toast("閲覧履歴の準備が中断されました".to_owned());
+                self.show_feedback_warning("閲覧履歴の準備が中断されました".to_owned());
             }
         }
     }
@@ -34298,7 +34351,7 @@ impl App {
                     }
                     collection_grid::CollectionHistoryPreparePoll::Failed(error) => {
                         crate::logger::log(format!("collection history prepare failed: {error}"));
-                        self.show_feedback_toast("[コレクションを読み込めませんでした]".into());
+                        self.show_feedback_warning("[コレクションを読み込めませんでした]".into());
                     }
                     collection_grid::CollectionHistoryPreparePoll::Ready(prepared) => {
                         if !self.collection_history_source_is_current(&request) {
@@ -34390,7 +34443,7 @@ impl App {
                     }
                     collection_navigation::PhysicalHistoryPreflightPoll::Failed(error) => {
                         crate::logger::log(format!("collection child preflight failed: {error}"));
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "[コレクションの項目を読み込めませんでした]".into(),
                         );
                     }
@@ -34539,7 +34592,7 @@ impl App {
                         crate::logger::log(format!(
                             "collection archive backing preflight failed: {error}"
                         ));
-                        self.show_feedback_toast("[書庫を読み込めませんでした]".into());
+                        self.show_feedback_warning("[書庫を読み込めませんでした]".into());
                     }
                     collection_navigation::PhysicalHistoryPreflightPoll::Ready(payload) => {
                         let (payload, cached_backing) = Self::split_cached_zip_preflight(payload);
@@ -34677,7 +34730,7 @@ impl App {
                     crate::logger::log(format!(
                         "converted history backing preflight failed: {error}"
                     ));
-                    self.show_feedback_toast("[書庫を読み込めませんでした]".into());
+                    self.show_feedback_warning("[書庫を読み込めませんでした]".into());
                     if request.dfs_continuation.is_some() {
                         self.clear_pending_folder_nav_steps();
                         self.release_fs_nav_lock();
@@ -34716,7 +34769,7 @@ impl App {
             }
             collection_navigation::PhysicalHistoryPreflightPoll::Failed(error) => {
                 crate::logger::log(format!("physical history preflight failed: {error}"));
-                self.show_feedback_toast("[フォルダを読み込めませんでした]".into());
+                self.show_feedback_warning("[フォルダを読み込めませんでした]".into());
                 if request.dfs_continuation.is_some() {
                     self.clear_pending_folder_nav_steps();
                     self.release_fs_nav_lock();
@@ -34878,7 +34931,9 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible() {
-            self.show_feedback_toast("設定により RAR / 7z / LZH アーカイブを無視しています".into());
+            self.show_feedback_warning(
+                "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+            );
             return false;
         }
         let format = path
@@ -34971,7 +35026,7 @@ impl App {
                 crate::logger::log(format!(
                     "converted history backing preflight could not start: {error}"
                 ));
-                self.show_feedback_toast("[書庫を読み込めませんでした]".into());
+                self.show_feedback_warning("[書庫を読み込めませんでした]".into());
                 if matches!(&transition,
                     HistoryNavigationTransition::Physical(request)
                         if request.dfs_continuation.is_some())
@@ -35036,7 +35091,7 @@ impl App {
                         self.clear_pending_folder_nav_steps();
                         self.release_fs_nav_lock();
                     }
-                    self.show_feedback_toast("[PDF を読み込めませんでした]".into());
+                    self.show_feedback_warning("[PDF を読み込めませんでした]".into());
                     return true;
                 };
                 request.phase = PhysicalHistoryPhase::Preflighting {
@@ -35069,7 +35124,7 @@ impl App {
                             Some(password.clone()),
                         )
                     else {
-                        self.show_feedback_toast("[PDF を読み込めませんでした]".into());
+                        self.show_feedback_warning("[PDF を読み込めませんでした]".into());
                         return true;
                     };
                     request.phase = CollectionHistoryPhase::ChildPreflighting {
@@ -36036,7 +36091,7 @@ impl App {
                     );
                 } else if msg != "cancelled" {
                     crate::logger::log(format!("rating-view: staged build failed: {msg}"));
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "[レーティング一覧を読み込めませんでした]".to_string(),
                     );
                 }
@@ -36044,7 +36099,7 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.rating_view_pending = None;
-                self.show_feedback_toast("[レーティング一覧を読み込めませんでした]".to_string());
+                self.show_feedback_warning("[レーティング一覧を読み込めませんでした]".to_string());
             }
         }
     }
@@ -36124,7 +36179,7 @@ impl App {
             app.reset_details_sort_to_toolbar();
             app.persist_pending_view_trim_state();
             if let Some(notice) = result.visibility_notice {
-                app.show_feedback_toast(notice.message().into());
+                app.show_feedback_warning(notice.message().into());
             }
             app.rating_view_rows = result.rows;
             app.rating_view_skipped = result.skipped;
@@ -36320,7 +36375,7 @@ impl App {
                     self.rating_view_accepted_write_generation =
                         crate::rating_db::RATING_WRITES.sample().completed_writes;
                     crate::logger::log(format!("rating-view: build failed: {msg}"));
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "[レーティング一覧を読み込めませんでした]".to_string(),
                     );
                 }
@@ -36330,7 +36385,7 @@ impl App {
                 self.rating_view_pending = None;
                 self.rating_view_accepted_write_generation =
                     crate::rating_db::RATING_WRITES.sample().completed_writes;
-                self.show_feedback_toast("[レーティング一覧を読み込めませんでした]".to_string());
+                self.show_feedback_warning("[レーティング一覧を読み込めませんでした]".to_string());
             }
         }
     }
@@ -36489,7 +36544,7 @@ impl App {
 
     fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
         if let Some(notice) = result.visibility_notice {
-            self.show_feedback_toast(notice.message().into());
+            self.show_feedback_warning(notice.message().into());
         }
         self.rating_view_rows = result.rows;
         self.rating_view_skipped = result.skipped;
@@ -36499,7 +36554,7 @@ impl App {
             self.install_rating_view_rows();
         }
         if self.rating_view_skipped > 0 {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "見つからない項目を {} 件除外しました",
                 self.rating_view_skipped
             ));
@@ -36803,7 +36858,7 @@ impl App {
             }
             Err(err) => {
                 crate::logger::log(format!("reading-history: remove failed: {err}"));
-                self.show_feedback_toast("[閲覧履歴の削除に失敗しました]".to_string());
+                self.show_feedback_error("[閲覧履歴の削除に失敗しました]".to_string());
             }
         }
     }
@@ -36951,7 +37006,7 @@ impl App {
             {
                 self.preserve_active_detached_image_window_for_main_context_change();
                 self.retire_direct_media_reader_for_source_adoption();
-                self.close_fullscreen();
+                self.close_fullscreen_content();
             }
         }
 
@@ -38430,7 +38485,7 @@ impl App {
                 self.clear_pending_folder_nav_steps();
                 self.release_fs_nav_lock();
             }
-            self.show_feedback_toast("[PDF を読み込めませんでした]".into());
+            self.show_feedback_warning("[PDF を読み込めませんでした]".into());
             return;
         };
         let next = match transition {
@@ -39220,7 +39275,7 @@ impl App {
             }
             DeferredFsOpenOutcome::RequiredTargetMissing => {
                 self.finish_visible_container_fs_nav_failed();
-                self.show_feedback_toast("移動先の画像が見つかりません".to_string());
+                self.show_feedback_warning("移動先の画像が見つかりません".to_string());
                 #[cfg(windows)]
                 self.terminate_active_detached_open_before_viewport(
                     "deferred_open_required_target_missing",
@@ -39228,7 +39283,7 @@ impl App {
             }
             DeferredFsOpenOutcome::RequiredTargetHidden => {
                 self.finish_visible_container_fs_nav_failed();
-                self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+                self.show_feedback_warning("このページは本の構成で非表示になっています".into());
                 #[cfg(windows)]
                 self.terminate_active_detached_open_before_viewport(
                     "deferred_open_required_target_hidden",
@@ -43952,7 +44007,7 @@ impl App {
                 .unwrap_or(false);
             if !has_webp {
                 // 2 行の操作ガイドなので既定 1.2 秒では読み切れない。長め (5 秒) で表示。
-                self.show_feedback_toast_with_duration(
+                self.show_feedback_warning_with_duration(
                     "動画内でピン留めされた画像がないため、設定できません\n\
                      先にフルスクリーンで動画を開き、HUD のピンボタン (または P キー) で\
                      フレームを保存してください"
@@ -43994,7 +44049,7 @@ impl App {
                         && load_path.try_exists().unwrap_or(false)
                 });
             if !has_cached_zip && !has_direct_rar {
-                self.show_feedback_toast_with_duration(
+                self.show_feedback_warning_with_duration(
                     "まだ変換されていないため代表サムネに固定できません\n\
                      一度開くか、選択してバッチ変換してください"
                         .to_string(),
@@ -44520,7 +44575,7 @@ impl App {
                 let index = build.builder.len();
                 if let Err(error) = build.builder.push(&self.items[index]) {
                     crate::logger::log(format!("virtual page-edit key order failed: {error}"));
-                    self.show_feedback_toast("ページ編集の読込に失敗しました".to_owned());
+                    self.show_feedback_error("ページ編集の読込に失敗しました".to_owned());
                     return;
                 }
                 if index % 64 == 63 && started.elapsed() >= KEY_ORDER_FRAME_BUDGET {
@@ -45294,7 +45349,7 @@ impl App {
             Ok(prepared) => prepared,
             Err(error) => {
                 crate::logger::log(format!("book_composition: item removal refused: {error}"));
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "ページの削除に合わせて本の構成を更新できませんでした".into(),
                 );
                 return;
@@ -45510,6 +45565,9 @@ impl App {
                 }
             } else {
                 self.fullscreen_epub_source = None;
+            }
+            if self.fullscreen_idx.is_none() {
+                self.finish_fullscreen_navigation_for_true_close();
             }
         }
         // 音声モード系の idx-keyed 状態は対象アイテムが残存したときだけ追随し、消えたら畳む
@@ -47311,7 +47369,7 @@ impl App {
                 crate::logger::log(format!(
                     "[RENAME-MIG] migration held because journal is not durable revision={revision:?}: {message}"
                 ));
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "名前変更に伴う設定の引き継ぎを保存できませんでした。移行は開始していません"
                         .into(),
                 );
@@ -47491,7 +47549,7 @@ impl App {
                 if local_work {
                     self.persist_rename_migration_journal();
                 }
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "復旧記録を読み取れました。操作をもう一度実行してください".into(),
                 );
             }
@@ -47510,7 +47568,7 @@ impl App {
                         prompt,
                         deferred_removed,
                     };
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "復旧記録をまだ読み取れません。元の記録を保護し、変更は実行していません".into(),
                 );
             }
@@ -47530,7 +47588,7 @@ impl App {
                         prompt: RenameMigrationRecoveryPrompt::Dismissed,
                         deferred_removed,
                     };
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "復旧記録の再確認が中断されました。元の記録を保護し、変更は実行していません"
                         .into(),
                 );
@@ -47579,7 +47637,7 @@ impl App {
                         prompt,
                         deferred_removed,
                     };
-                self.show_feedback_toast("復旧記録の再確認を開始できませんでした".into());
+                self.show_feedback_warning("復旧記録の再確認を開始できませんでした".into());
             }
         }
     }
@@ -47631,7 +47689,7 @@ impl App {
                         prompt,
                         deferred_removed,
                     };
-                self.show_feedback_toast("壊れた復旧記録の退避を開始できませんでした".into());
+                self.show_feedback_warning("壊れた復旧記録の退避を開始できませんでした".into());
             }
         }
     }
@@ -47702,7 +47760,7 @@ impl App {
                     self.invalidate_rename_migrations_for_removed_paths(&deferred_removed);
                 }
                 self.persist_rename_migration_journal();
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "壊れた復旧記録を退避しました。名前変更などの操作をもう一度実行してください"
                         .into(),
                 );
@@ -47717,7 +47775,7 @@ impl App {
                         prompt: RenameMigrationRecoveryPrompt::Shown,
                         deferred_removed,
                     };
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "復旧記録が変わったため退避しませんでした。「再読み込み」で内容を確認してください"
                         .into(),
                 );
@@ -47738,7 +47796,7 @@ impl App {
                         prompt,
                         deferred_removed,
                     };
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "壊れた復旧記録を退避できませんでした。元の記録は変更していません".into(),
                 );
             }
@@ -47783,7 +47841,7 @@ impl App {
             {
                 *prompt = RenameMigrationRecoveryPrompt::Shown;
             }
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "名前変更の復旧記録を確認してから、操作をもう一度実行してください".into(),
             );
         } else if matches!(
@@ -47792,7 +47850,7 @@ impl App {
         ) {
             self.retry_rename_migration_recovery(ctx);
         } else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "復旧記録を処理中です。完了後に操作をもう一度実行してください".into(),
             );
         }
@@ -48145,7 +48203,7 @@ impl App {
                             crate::logger::log(
                                 "[RENAME-MIG] worker panicked (boot retry)".to_string(),
                             );
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                             "名前変更に伴う設定の引き継ぎが中断されました (次回起動時に再実行します)"
                                 .to_string(),
                         );
@@ -48165,7 +48223,7 @@ impl App {
                             crate::logger::log(format!("[RENAME-MIG] error: {e}"));
                         }
                         if !report.errors.is_empty() {
-                            self.show_feedback_toast(format!(
+                            self.show_feedback_warning(format!(
                                 "名前変更に伴う設定の引き継ぎに一部失敗しました ({} 件)",
                                 report.errors.len()
                             ));
@@ -48253,7 +48311,7 @@ impl App {
                         crate::logger::log(format!(
                             "[RENAME-MIG] collection failed (boot retry): {error}"
                         ));
-                        self.show_feedback_toast(
+                        self.show_feedback_error(
                             "名前変更後のコレクション参照更新に失敗しました (次回起動時に再実行します)"
                                 .to_string(),
                         );
@@ -48704,7 +48762,7 @@ impl App {
                 "[delete] first failed = {}",
                 first.unwrap_or_default()
             ));
-            self.show_feedback_toast(format!("{} 件の削除に失敗しました", failed_count));
+            self.show_feedback_warning(format!("{} 件の削除に失敗しました", failed_count));
         }
 
         if succeeded.is_empty() {
@@ -48833,7 +48891,7 @@ impl App {
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
         if self.viewer_mutation_modal_active() {
             crate::logger::log("viewer mutation modal: rejected external file drop");
-            self.show_feedback_toast(if self.image_folder_zip_operation.is_some() {
+            self.show_feedback_warning(if self.image_folder_zip_operation.is_some() {
                 "ZIP を作成中のため、ファイルを操作できません".into()
             } else {
                 "本の構成を編集中のため、ファイルを操作できません".into()
@@ -48866,7 +48924,7 @@ impl App {
             } else {
                 "コピー先のフォルダがありません"
             };
-            self.show_feedback_toast(msg.to_string());
+            self.show_feedback_warning(msg.to_string());
             return;
         };
         // **review #7 対応**: ドロップ先との自己再帰判定 (per-path `Path::is_dir` +
@@ -48942,7 +49000,7 @@ impl App {
             });
         if let Err(e) = spawn_result {
             crate::logger::log(format!("file_drop: failed to spawn validate worker: {e}"));
-            self.show_feedback_toast("コピー処理の起動に失敗しました".to_string());
+            self.show_feedback_error("コピー処理の起動に失敗しました".to_string());
             return;
         }
         self.drop_copy_pending.push(rx);
@@ -48980,12 +49038,12 @@ impl App {
                     } else {
                         format!("ファイルコピー: 成功 {succeeded} / 失敗 {failed} — 例: {summary}")
                     };
-                    self.show_feedback_toast(toast);
+                    self.show_feedback_warning(toast);
                 } else if let Some(notice) = outcome.notice {
                     // **Codex P2-2 対応**: 失敗ではないが通知が必要なケース
                     // (= 全件除外で実コピー未実行 等)。
                     crate::logger::log(format!("file_drop: notice: {notice}"));
-                    self.show_feedback_toast(notice);
+                    self.show_feedback_warning(notice);
                 }
             }
         }
@@ -49013,7 +49071,7 @@ impl App {
             }
             Err(err) => {
                 crate::logger::log(format!("capture save failed: {err}"));
-                self.show_feedback_toast(format!("保存できません: {err}"));
+                self.show_feedback_warning(format!("保存できません: {err}"));
             }
         }
     }
@@ -49046,7 +49104,7 @@ impl App {
                     || result.indicator_width == 0
                     || result.indicator_height == 0
                 {
-                    self.show_feedback_toast("比較画像のサイズが不正です".to_string());
+                    self.show_feedback_warning("比較画像のサイズが不正です".to_string());
                     return;
                 }
                 let pixels = egui::ColorImage::from_rgba_unmultiplied(
@@ -49076,7 +49134,7 @@ impl App {
             }
             Err(err) => {
                 crate::logger::log(format!("compare pin failed: {err}"));
-                self.show_feedback_toast(format!("比較画像を設定できません: {err}"));
+                self.show_feedback_warning(format!("比較画像を設定できません: {err}"));
             }
         }
     }
@@ -49107,7 +49165,7 @@ impl App {
         if self.is_raw_page(source_idx) && !self.raw_edit_target_gate(source_idx) {
             if self.raw_development_unavailable(source_idx) {
                 self.compare_pin_load_pending = None;
-                self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+                self.show_feedback_warning("比較画像を読み込めませんでした".to_string());
             } else {
                 self.ensure_fs_page_load(source_idx);
                 self.start_raw_develop_for_compare(ctx, source_idx);
@@ -49127,11 +49185,11 @@ impl App {
             }
             Some(FsCacheEntry::Failed) => {
                 self.compare_pin_load_pending = None;
-                self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+                self.show_feedback_warning("比較画像を読み込めませんでした".to_string());
             }
             Some(FsCacheEntry::Video { .. }) => {
                 self.compare_pin_load_pending = None;
-                self.show_feedback_toast("動画は比較画像に設定できません".to_string());
+                self.show_feedback_warning("動画は比較画像に設定できません".to_string());
             }
             None => {
                 if !self.fs_pending.contains_key(&source_idx) {
@@ -49274,7 +49332,7 @@ impl App {
             }
             Err(err) => {
                 crate::logger::log(format!("compare prepare failed: {err}"));
-                self.show_feedback_toast(format!("比較表示を準備できません: {err}"));
+                self.show_feedback_warning(format!("比較表示を準備できません: {err}"));
             }
         }
     }
@@ -49471,7 +49529,7 @@ impl App {
 
     pub(crate) fn add_current_book_bookmark(&mut self, idx: usize) {
         let Some(entry) = self.current_book_bookmark_draft(idx) else {
-            self.show_feedback_toast("この画像は本のブックマーク対象ではありません".to_string());
+            self.show_feedback_warning("この画像は本のブックマーク対象ではありません".to_string());
             return;
         };
         if self.book_bookmark_service.is_some() && !self.admit_book_append_followup_mutation() {
@@ -49479,7 +49537,7 @@ impl App {
         }
         let request_id = self.next_book_bookmark_request_id();
         let Some(service) = self.book_bookmark_service.as_ref() else {
-            self.show_feedback_toast("ブックマークDBを利用できません".to_string());
+            self.show_feedback_warning("ブックマークDBを利用できません".to_string());
             return;
         };
         service.add(request_id, entry);
@@ -49565,7 +49623,7 @@ impl App {
     pub(crate) fn set_book_bookmark_title(&mut self, id: i64, title: String) {
         let request_id = self.next_book_bookmark_request_id();
         if self.book_bookmark_service.is_none() {
-            self.show_feedback_toast("ブックマークDBを利用できません".to_string());
+            self.show_feedback_warning("ブックマークDBを利用できません".to_string());
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -49608,7 +49666,7 @@ impl App {
                             });
                         }
                     }
-                    self.show_feedback_toast("ブックマークDBとの接続が終了しました".to_string());
+                    self.show_feedback_warning("ブックマークDBとの接続が終了しました".to_string());
                     break;
                 }
             };
@@ -49633,7 +49691,7 @@ impl App {
                             }
                         }
                         Err(err) => self
-                            .show_feedback_toast(format!("ブックマーク追加に失敗しました: {err}")),
+                            .show_feedback_error(format!("ブックマーク追加に失敗しました: {err}")),
                     }
                 }
                 crate::book_bookmarks::BookBookmarkEvent::Removed { request_id, result } => {
@@ -49645,7 +49703,7 @@ impl App {
                             self.show_feedback_toast("ブックマークを削除しました".to_string());
                         }
                         Err(err) => self
-                            .show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}")),
+                            .show_feedback_error(format!("ブックマーク削除に失敗しました: {err}")),
                     }
                 }
                 crate::book_bookmarks::BookBookmarkEvent::TitleUpdated { request_id, result } => {
@@ -49658,7 +49716,7 @@ impl App {
                             }
                             self.show_feedback_toast("ブックマーク名を更新しました".to_string());
                         }
-                        Err(err) => self.show_feedback_toast(format!(
+                        Err(err) => self.show_feedback_error(format!(
                             "ブックマーク名の更新に失敗しました: {err}"
                         )),
                     }
@@ -49702,7 +49760,7 @@ impl App {
                             crate::logger::log(format!(
                                 "book bookmark path migration failed: {error}"
                             ));
-                            self.show_feedback_toast(
+                            self.show_feedback_error(
                                 "本ブックマークの引き継ぎに失敗しました".to_string(),
                             );
                         }
@@ -49766,14 +49824,14 @@ impl App {
                         self.current_book_bookmarks_request = Some(pending);
                     } else {
                         self.current_book_bookmarks_key = Some(pending.key.clone());
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "ブックマーク一覧ワーカーを開始できませんでした".into(),
                         );
                     }
                 }
                 Err(err) => {
                     self.current_book_bookmarks_key = Some(pending.key.clone());
-                    self.show_feedback_toast(format!(
+                    self.show_feedback_warning(format!(
                         "ブックマーク一覧を読み込めませんでした: {err}"
                     ));
                 }
@@ -49921,14 +49979,14 @@ impl App {
                 self.current_book_bookmarks = projected.bookmarks;
                 self.current_book_bookmarks_key = Some(pending.key.clone());
                 if let Some(notice) = projected.notice {
-                    self.show_feedback_toast(notice.message().into());
+                    self.show_feedback_warning(notice.message().into());
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 let pending = self.current_book_bookmarks_request.take().unwrap();
                 self.current_book_bookmarks_key = Some(pending.key.clone());
-                self.show_feedback_toast("ブックマーク一覧ワーカーが終了しました".into());
+                self.show_feedback_warning("ブックマーク一覧ワーカーが終了しました".into());
             }
         }
     }
@@ -50073,7 +50131,7 @@ impl App {
     ) {
         self.poll_book_composition_read(ctx);
         if self.composition_hides_bookmark(bookmark) {
-            self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+            self.show_feedback_warning("このページは本の構成で非表示になっています".into());
             return;
         }
         let mut item_idx = self.book_bookmark_item_idx(bookmark);
@@ -50089,7 +50147,7 @@ impl App {
                             relative,
                         )
                     else {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "ブックマーク先のページが不正です（記録は保持されます）".to_string(),
                         );
                         return;
@@ -50100,7 +50158,7 @@ impl App {
             };
             self.open_bookmark_item_with_provenance(ctx, idx, provenance);
         } else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
         }
@@ -50292,7 +50350,7 @@ impl App {
                     if self.settings.facet_filter.uses_bookmark_state() {
                         self.rebuild_all_viewer_context_visible_indices();
                     }
-                    self.show_feedback_toast(format!(
+                    self.show_feedback_warning(format!(
                         "ブックマーク状態を読み込めませんでした: {error}"
                     ));
                 }
@@ -50763,7 +50821,7 @@ impl App {
         row: &crate::bookmark_browser::BookmarkBrowserRow,
     ) {
         if row.missing {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "ブックマーク先が見つかりません（記録は保持されます）".to_string(),
             );
             return;
@@ -51027,7 +51085,7 @@ impl App {
             match result {
                 Ok(prepared) => {
                     if let Some(notice) = prepared.visibility_notice {
-                        self.show_feedback_toast(notice.message().into());
+                        self.show_feedback_warning(notice.message().into());
                     }
                     let mut rows = prepared.rows;
                     let source_map_unchanged =
@@ -51071,7 +51129,7 @@ impl App {
                     ) {
                         self.bookmark_view_state = None;
                     }
-                    self.show_feedback_toast(format!(
+                    self.show_feedback_warning(format!(
                         "ブックマーク一覧を読み込めませんでした: {err}"
                     ));
                 }
@@ -51132,7 +51190,7 @@ impl App {
                     ));
                 }
                 Err(err) => {
-                    self.show_feedback_toast(format!("ブックマーク削除に失敗しました: {err}"))
+                    self.show_feedback_error(format!("ブックマーク削除に失敗しました: {err}"))
                 }
             }
         }
@@ -51227,7 +51285,7 @@ impl App {
             if cancelled {
                 self.terminate_active_detached_open_before_viewport("media_timeout");
             }
-            self.show_feedback_toast("ブックマーク位置を開けませんでした".to_string());
+            self.show_feedback_warning("ブックマーク位置を開けませんでした".to_string());
             return;
         }
         let Some(idx) = self.fullscreen_idx else {
@@ -51393,7 +51451,7 @@ impl App {
                     if cancelled {
                         self.terminate_active_detached_open_before_viewport("book_resolve_timeout");
                     }
-                    self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
+                    self.show_feedback_warning("ブックマーク先の本を開けませんでした".to_string());
                 }
                 return;
             }
@@ -51405,7 +51463,7 @@ impl App {
             if cancelled {
                 self.terminate_active_detached_open_before_viewport("book_page_timeout");
             }
-            self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
+            self.show_feedback_warning("ブックマーク先の本を開けませんでした".to_string());
             return;
         }
         let same_container = self.effective_folder().is_some_and(|path| {
@@ -51420,7 +51478,7 @@ impl App {
         }
         if self.composition_hides_bookmark(&pending.bookmark) {
             self.cancel_bookmark_open_request(pending.request_id, "book_page_composition_hidden");
-            self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+            self.show_feedback_warning("このページは本の構成で非表示になっています".into());
             return;
         }
         if let Some(idx) = self.book_bookmark_item_idx(&pending.bookmark) {
@@ -51468,7 +51526,7 @@ impl App {
             if cancelled {
                 self.terminate_active_detached_open_before_viewport("book_page_missing");
             }
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
         }
@@ -51525,7 +51583,7 @@ impl App {
     pub(crate) fn open_books_root(&mut self) {
         let root = self.book_root_path();
         if let Err(err) = std::fs::create_dir_all(&root) {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "本棚フォルダを作成できません: {}: {err}",
                 root.display()
             ));
@@ -51553,7 +51611,7 @@ impl App {
                 });
             }
             Err(err) => {
-                self.show_feedback_toast(format!("本棚一覧 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("本棚一覧 worker を開始できません: {err}"));
             }
         }
     }
@@ -51617,11 +51675,11 @@ impl App {
         sources: Vec<crate::books::BookPageSource>,
     ) {
         if sources.is_empty() {
-            self.show_feedback_toast("追加するページがありません".to_string());
+            self.show_feedback_warning("追加するページがありません".to_string());
             return;
         }
         if self.book_op_pending.is_some() {
-            self.show_feedback_toast("製本処理中です".into());
+            self.show_feedback_warning("製本処理中です".into());
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -51705,7 +51763,7 @@ impl App {
                 })
             }
             Err(err) => {
-                self.show_feedback_toast(format!("並べ替え worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("並べ替え worker を開始できません: {err}"));
                 None
             }
         }
@@ -51749,7 +51807,7 @@ impl App {
                 })
             }
             Err(err) => {
-                self.show_feedback_toast(format!("ページ転送 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("ページ転送 worker を開始できません: {err}"));
                 None
             }
         }
@@ -51817,7 +51875,7 @@ impl App {
                 crate::logger::log(format!(
                     "spread_shift: page mapping admission failed: {error}"
                 ));
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "見開き調整のページ移動を反映できませんでした: {error}"
                 ));
             }
@@ -51837,7 +51895,7 @@ impl App {
                 crate::logger::log(format!(
                     "book_composition: page mapping admission failed: {error}"
                 ));
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "本の構成のページ移動を反映できませんでした: {error}"
                 ));
             }
@@ -51912,7 +51970,7 @@ impl App {
         }
         let request_id = self.next_book_bookmark_request_id();
         let Some(service) = self.book_bookmark_service.as_ref() else {
-            self.show_feedback_toast("ブックマークDBを利用できません".to_string());
+            self.show_feedback_warning("ブックマークDBを利用できません".to_string());
             return;
         };
         service.migrate_paths_with_journal(request_id, mappings, journal_id.map(str::to_string));
@@ -52060,7 +52118,7 @@ impl App {
             "book page semantic metadata copy partially failed ({}): {preview}",
             errors.len()
         ));
-        self.show_feedback_toast(format!(
+        self.show_feedback_warning(format!(
             "本ページの評価・タグの引き継ぎに一部失敗しました ({} 件)",
             errors.len()
         ));
@@ -52091,7 +52149,7 @@ impl App {
             "book page edit metadata {op} partially failed ({}): {preview}",
             errors.len()
         ));
-        self.show_feedback_toast(format!(
+        self.show_feedback_warning(format!(
             "本ページの編集情報の引き継ぎに一部失敗しました ({} 件)",
             errors.len()
         ));
@@ -52108,7 +52166,7 @@ impl App {
         F: FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
     {
         if self.book_op_pending.is_some() {
-            self.show_feedback_toast("製本処理中です".to_string());
+            self.show_feedback_warning("製本処理中です".to_string());
             return false;
         }
         if !matches!(
@@ -52133,7 +52191,7 @@ impl App {
             }
             Err(err) => {
                 self.book_op_pending = None;
-                self.show_feedback_toast(format!("製本 worker を開始できません: {err}"));
+                self.show_feedback_warning(format!("製本 worker を開始できません: {err}"));
                 false
             }
         }
@@ -52265,7 +52323,7 @@ impl App {
                     }
                     Err(error) => {
                         crate::logger::log(format!("book append metadata read: {error}"));
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "本ページの編集情報を再読込できませんでした".into(),
                         );
                         summary.undo_files = None;
@@ -52387,7 +52445,7 @@ impl App {
                     crate::logger::log(format!(
                         "spread_shift: book purge admission failed: {error}"
                     ));
-                    self.show_feedback_toast(format!(
+                    self.show_feedback_warning(format!(
                         "削除した本の見開き調整を消去できませんでした: {error}"
                     ));
                 }
@@ -52397,7 +52455,7 @@ impl App {
                     crate::logger::log(format!(
                         "book_composition: book purge admission failed: {error}"
                     ));
-                    self.show_feedback_toast(format!(
+                    self.show_feedback_warning(format!(
                         "削除した本の構成を消去できませんでした: {error}"
                     ));
                 }
@@ -52440,7 +52498,7 @@ impl App {
             }
             Err(err) => {
                 crate::logger::log(format!("book op failed: {err}"));
-                self.show_feedback_toast(format!("製本処理に失敗しました: {err}"));
+                self.show_feedback_error(format!("製本処理に失敗しました: {err}"));
             }
         }
         false
@@ -55521,7 +55579,7 @@ impl App {
         if close_detached_after_zip_back {
             self.preserve_active_detached_image_window_for_main_context_change();
             self.retire_direct_media_reader_for_source_adoption();
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         if self.zip_nav_back() {
             return None;
@@ -56311,7 +56369,7 @@ impl App {
                         // 非スタックモードでは Stack セルは存在しないので網羅性のため no-op。
                         Some(GridItem::Stack { .. }) => {}
                         Some(GridItem::CollectionPlaceholder { .. }) => {
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "この参照は現在見つからないため開けません".into(),
                             );
                         }
@@ -56987,7 +57045,7 @@ impl App {
                 return None;
             };
             if !self.collection_jump_origin_is_current(path, &request.selection, origin) {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "コレクション一覧が更新されたため、もう一度選択してください".to_owned(),
                 );
                 return None;
@@ -57110,7 +57168,7 @@ impl App {
         if let Some(origin) = origin.as_ref() {
             if !self.collection_jump_origin_is_current(&path, &selection, origin) {
                 if self.collection_grid_context_id() == origin.stamp.context_id {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "コレクション一覧が更新されたため、もう一度選択してください".to_owned(),
                     );
                 }
@@ -57182,7 +57240,7 @@ impl App {
             item.drag_source_path()
                 .is_some_and(|candidate| crate::folder_tree::path_eq(candidate, &target))
         }) else {
-            self.show_feedback_toast("移動先の項目が見つかりませんでした".to_string());
+            self.show_feedback_warning("移動先の項目が見つかりませんでした".to_string());
             return;
         };
         self.select_item_after_load(index);
@@ -57634,7 +57692,7 @@ impl App {
                         }
                     }
                 ));
-                self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                self.show_feedback_warning("フォルダを読み取れませんでした".to_string());
                 if matches!(
                     &ready.purpose,
                     FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
@@ -58044,7 +58102,7 @@ impl App {
         source: &'static str,
     ) -> Option<crate::ui_main::AddressBarNav> {
         let Some(idx) = self.selected else {
-            self.show_feedback_toast("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
+            self.show_feedback_warning("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
             return None;
         };
         self.open_grid_container_with_mode(ctx, idx, mode, source)
@@ -58070,18 +58128,18 @@ impl App {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored explicit container open mode={mode:?} in multi-window mode"
             ));
-            self.show_feedback_toast_on(reason.to_string(), ActionSurface::MainWindow);
+            self.show_feedback_warning_on(reason.to_string(), ActionSurface::MainWindow);
             return None;
         }
         let Some(item) = self.items.get(idx).cloned() else {
-            self.show_feedback_toast("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
+            self.show_feedback_warning("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
             return None;
         };
         if !matches!(
             item,
             GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. }
         ) {
-            self.show_feedback_toast("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
+            self.show_feedback_warning("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
             return None;
         }
         if !self.guard_reading_history_open(idx) {
@@ -58383,7 +58441,7 @@ impl App {
                     self.finish_unbound_smart_folder_navigation_sequence();
                     self.release_fs_nav_lock();
                 }
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "スマートフォルダの並びが変わりました。もう一度操作してください".into(),
                 );
                 emit_end(apply_t0, apply_seq, apply_mode_tag, "smart_order_stale");
@@ -58394,7 +58452,7 @@ impl App {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
                 FolderNavMode::SiblingGrid => {
-                    self.show_feedback_toast(if result.forward {
+                    self.show_feedback_warning(if result.forward {
                         "次の兄弟フォルダはありません".to_string()
                     } else {
                         "前の兄弟フォルダはありません".to_string()
@@ -58482,7 +58540,7 @@ impl App {
                         }
                         self.release_fs_nav_lock();
                     } else {
-                        self.show_feedback_toast(if result.forward {
+                        self.show_feedback_warning(if result.forward {
                             "スマートフォルダ内の次のフォルダはありません".to_string()
                         } else {
                             "スマートフォルダ内の前のフォルダはありません".to_string()
@@ -58592,7 +58650,7 @@ impl App {
                 ));
                 self.clear_pending_folder_nav_steps();
                 self.release_fs_nav_lock();
-                self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                self.show_feedback_warning("フォルダを読み取れませんでした".to_string());
                 emit_end(apply_t0, apply_seq, apply_mode_tag, "scan_failed");
                 return;
             }
@@ -58644,7 +58702,7 @@ impl App {
             if !staged {
                 self.clear_pending_folder_nav_steps();
                 self.release_fs_nav_lock();
-                self.show_feedback_toast("フォルダを読み取れませんでした".into());
+                self.show_feedback_warning("フォルダを読み取れませんでした".into());
             }
             emit_end(apply_t0, apply_seq, apply_mode_tag, "physical_staged");
             return;
@@ -58669,7 +58727,7 @@ impl App {
                     self.clear_pending_folder_nav_steps();
                     self.finish_unbound_smart_folder_navigation_sequence();
                     self.release_fs_nav_lock();
-                    self.show_feedback_toast("移動先を確認できませんでした".into());
+                    self.show_feedback_warning("移動先を確認できませんでした".into());
                     emit_end(apply_t0, apply_seq, apply_mode_tag, "smart_kind_missing");
                     return;
                 };
@@ -59489,7 +59547,7 @@ impl App {
                         crate::grid_item::FileOperationRefusal::VirtualPage
                             .message("コピー / カット")
                     });
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 return;
             }
         };
@@ -59512,7 +59570,7 @@ impl App {
             crate::logger::log(format!(
                 "shell_clipboard: {verb:?} skipped; main HWND unavailable"
             ));
-            self.show_feedback_toast("OSクリップボード操作を開始できませんでした".to_string());
+            self.show_feedback_warning("OSクリップボード操作を開始できませんでした".to_string());
             return;
         };
 
@@ -59546,7 +59604,7 @@ impl App {
             }
             Err(err) => {
                 crate::logger::log(format!("shell_clipboard: {verb:?} failed: {err}"));
-                self.show_feedback_toast("OSクリップボード操作に失敗しました".to_string());
+                self.show_feedback_error("OSクリップボード操作に失敗しました".to_string());
             }
         }
     }
@@ -59706,7 +59764,7 @@ impl App {
                         crate::clipboard_capture::data::ClipboardKind::Image
                         | crate::clipboard_capture::data::ClipboardKind::Html => {
                             if !app.clipboard_capture_admission_allowed() {
-                                app.show_feedback_toast_on(
+                                app.show_feedback_warning_on(
                                     "一覧画面で Ctrl+V を押すと開けます".into(),
                                     ActionSurface::MainWindow,
                                 );
@@ -59716,7 +59774,7 @@ impl App {
                                 .clipboard_capture_service
                                 .manual_capture(kind, folder, ctx)
                             {
-                                app.show_feedback_toast_on(error, ActionSurface::MainWindow);
+                                app.show_feedback_warning_on(error, ActionSurface::MainWindow);
                             }
                         }
                         _ => {
@@ -59779,7 +59837,7 @@ impl App {
         crate::clipboard_capture::diagnostics::paste_dispatched();
         match query() {
             Ok(kind) => execute(self, ctx, kind, hwnd, folder),
-            Err(error) => self.show_feedback_toast_on(error, ActionSurface::MainWindow),
+            Err(error) => self.show_feedback_warning_on(error, ActionSurface::MainWindow),
         }
     }
 
@@ -60082,11 +60140,11 @@ impl App {
                 Some(index)
             }
             file_type_resume::PositionResolution::HiddenIdentity => {
-                self.show_feedback_toast("保存した読書位置のページは非表示になっています".into());
+                self.show_feedback_warning("保存した読書位置のページは非表示になっています".into());
                 None
             }
             file_type_resume::PositionResolution::LegacyWithExclusions => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "以前の読書位置はファイル種類の絞り込み中に復元できません".into(),
                 );
                 None
@@ -61388,6 +61446,24 @@ impl App {
         self.close_all_detached_viewers_with_cause(ctx, ViewerCloseCause::Replaced)
     }
 
+    /// Root-dispatcher terminal for settings changes and Remote acquisition.
+    /// Main survives context retirement, so always finish its session, even while its
+    /// content index / child viewport is absent. Do not infer session lifetime from idx.
+    #[cfg(windows)]
+    pub(crate) fn close_all_viewer_sessions_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        cause: ViewerCloseCause,
+    ) -> Result<(), LocalViewerCloseFailure> {
+        let detached = self.close_all_detached_viewers_with_cause(ctx, cause);
+        let main = if self.projected_viewer_session_open() {
+            self.close_fullscreen_to_completion(ctx)
+        } else {
+            Ok(())
+        };
+        detached.and(main)
+    }
+
     #[cfg(windows)]
     pub(crate) fn close_all_detached_viewers_with_cause(
         &mut self,
@@ -61416,9 +61492,9 @@ impl App {
         let mut close_failure = None;
 
         if self.video_presentation_transition.is_transitioning() {
-            self.video_presentation_transition
-                .dispatch(PresentationTransitionEvent::TerminalClose);
-            self.execute_video_presentation_transition_effects(ctx);
+            if let Err(error) = self.close_fullscreen_to_completion(ctx) {
+                close_failure = Some(error);
+            }
         }
 
         self.log_detached_image_window_debug(format!(
@@ -61468,8 +61544,13 @@ impl App {
             }
             self.begin_active_detached_session_close("mode_change_close_all_active");
             self.finish_active_detached_session_close("mode_change_close_all_active");
-            if self.fullscreen_idx.is_some() {
-                self.close_fullscreen();
+            // Viewport flags are App-global and can still describe the detached
+            // context retired above. End only the projected reader, including its
+            // index-less waits; do not cancel main's unrelated list-only request.
+            if self.projected_viewer_session_open()
+                && let Err(error) = self.close_fullscreen_to_completion(ctx)
+            {
+                close_failure.get_or_insert(error);
             }
         }
 
@@ -64294,7 +64375,7 @@ impl App {
         reason: &'static str,
     ) {
         self.cancel_detached_grid_archive_open_owner(owner, reason);
-        self.show_feedback_toast(
+        self.show_feedback_warning(
             "アーカイブを別ウィンドウで開けませんでした。もう一度お試しください".to_string(),
         );
     }
@@ -64419,7 +64500,7 @@ impl App {
 
         let descriptor = match plan {
             DetachedGridItemOpenPlan::CollectionRootUnavailable => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "コレクションの画像を開けませんでした。一覧を更新してください".to_string(),
                 );
                 return true;
@@ -64431,7 +64512,7 @@ impl App {
                 let base_placement = self.active_detached_viewer_current_placement();
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "別ウィンドウの切り替えを完了できませんでした".to_string(),
                     );
                     return true;
@@ -64444,7 +64525,7 @@ impl App {
                     placement_seed,
                     None,
                 ) {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "コレクションの画像を別ウィンドウで開けませんでした".to_string(),
                     );
                 }
@@ -64513,7 +64594,7 @@ impl App {
                 collection_restore,
             } => {
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
+                    self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
                     return true;
                 }
                 let base_placement = self.active_detached_viewer_current_placement();
@@ -65698,7 +65779,7 @@ impl App {
             return;
         }
         self.preserve_active_detached_image_window_for_main_context_change();
-        self.close_fullscreen();
+        self.close_fullscreen_content();
     }
 
     #[cfg(windows)]
@@ -66122,7 +66203,7 @@ impl App {
                 if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
                     self.close_fullscreen_now_with_metadata_boundary(boundary);
                 } else {
-                    self.close_fullscreen();
+                    self.close_fullscreen_content();
                 }
             }
         }
@@ -66133,7 +66214,7 @@ impl App {
             if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
                 self.close_fullscreen_now_with_metadata_boundary(boundary);
             } else {
-                self.close_fullscreen();
+                self.close_fullscreen_content();
             }
         }
         self.retire_direct_media_reader_for_source_adoption();
@@ -72972,7 +73053,7 @@ impl App {
     /// 指定 idx の画像を時計回りに 90° 回転する。
     pub(crate) fn rotate_image_cw(&mut self, idx: usize) {
         if self.idx_is_compiled_book_page(idx) {
-            self.show_feedback_toast("本のページは回転できません".to_string());
+            self.show_feedback_warning("本のページは回転できません".to_string());
             return;
         }
         let current = self.get_rotation(idx);
@@ -72984,7 +73065,7 @@ impl App {
     /// 指定 idx の画像を反時計回りに 90° 回転する。
     pub(crate) fn rotate_image_ccw(&mut self, idx: usize) {
         if self.idx_is_compiled_book_page(idx) {
-            self.show_feedback_toast("本のページは回転できません".to_string());
+            self.show_feedback_warning("本のページは回転できません".to_string());
             return;
         }
         let current = self.get_rotation(idx);
@@ -73000,7 +73081,7 @@ impl App {
         rotation: crate::rotation_db::Rotation,
     ) -> Result<(), String> {
         if self.idx_is_compiled_book_page(idx) {
-            self.show_feedback_toast("本のページは回転できません".to_string());
+            self.show_feedback_warning("本のページは回転できません".to_string());
             return Err("本のページは回転できません".to_string());
         }
         self.apply_rotation(idx, rotation)
@@ -73040,7 +73121,7 @@ impl App {
         );
         if exit_sns_split {
             self.reset_sns_split_mode();
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON.to_string(),
             );
         }
@@ -73433,13 +73514,13 @@ impl App {
             EditStoreOutcome::Failed(error) => error,
         };
         crate::logger::log(format!("[edit-store] {what}: write failed: {reason}"));
-        self.show_feedback_toast(format!("{what}を保存できませんでした: {reason}"));
+        self.show_feedback_warning(format!("{what}を保存できませんでした: {reason}"));
         false
     }
 
     pub(crate) fn report_rating_write_error(&mut self, error: &str) {
         crate::logger::log(format!("[RATING] user write failed: {error}"));
-        self.show_feedback_toast(format!("レーティングを保存できませんでした: {error}"));
+        self.show_feedback_warning(format!("レーティングを保存できませんでした: {error}"));
     }
 
     /// App-global path rating 更新を、現在 mount 中 context の idx cache へ反映する。
@@ -73742,7 +73823,7 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join(" / ");
-            self.show_feedback_toast(format!(
+            self.show_feedback_error(format!(
                 "レーティング書き込み失敗 {} 件: {}",
                 errors.len(),
                 preview
@@ -74859,7 +74940,7 @@ impl App {
         let targets = self.ratable_page_targets();
 
         if targets.is_empty() {
-            self.show_feedback_toast("[適用対象なし]".to_string());
+            self.show_feedback_warning("[適用対象なし]".to_string());
             return;
         }
 
@@ -74869,21 +74950,21 @@ impl App {
         let (slot_bitmap, slot_vectors, sw, sh) = match self.mask_db.as_ref() {
             Some(db) => {
                 let Some((sw, sh)) = db.slot_size(slot) else {
-                    self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
+                    self.show_feedback_warning(format!("[消しゴムスロット{slot}は空です]"));
                     return;
                 };
                 let Some((mask, vectors)) = db.get_slot_full(slot, sw, sh) else {
-                    self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
+                    self.show_feedback_warning(format!("[消しゴムスロット{slot}は空です]"));
                     return;
                 };
                 if !mask.iter().any(|&m| m) && vectors.is_empty() {
-                    self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
+                    self.show_feedback_warning(format!("[消しゴムスロット{slot}は空です]"));
                     return;
                 }
                 (mask, vectors, sw, sh)
             }
             None => {
-                self.show_feedback_toast("[マスクDB未初期化]".to_string());
+                self.show_feedback_warning("[マスクDB未初期化]".to_string());
                 return;
             }
         };
@@ -74923,21 +75004,21 @@ impl App {
         match self.conceal_db.as_ref() {
             Some(db) => {
                 let Some((sw, sh)) = db.slot_size(slot) else {
-                    self.show_feedback_toast(format!("[隠蔽スロット{slot}は空です]"));
+                    self.show_feedback_warning(format!("[隠蔽スロット{slot}は空です]"));
                     return None;
                 };
                 let Some((mask, shapes)) = db.get_slot_full(slot, sw, sh) else {
-                    self.show_feedback_toast(format!("[隠蔽スロット{slot}は空です]"));
+                    self.show_feedback_warning(format!("[隠蔽スロット{slot}は空です]"));
                     return None;
                 };
                 if !mask.iter().any(|&m| m) && shapes.is_empty() {
-                    self.show_feedback_toast(format!("[隠蔽スロット{slot}は空です]"));
+                    self.show_feedback_warning(format!("[隠蔽スロット{slot}は空です]"));
                     return None;
                 }
                 Some((mask, shapes, sw, sh))
             }
             None => {
-                self.show_feedback_toast("[隠蔽DB未初期化]".to_string());
+                self.show_feedback_warning("[隠蔽DB未初期化]".to_string());
                 None
             }
         }
@@ -74950,7 +75031,7 @@ impl App {
         let targets = self.ratable_page_targets();
 
         if targets.is_empty() {
-            self.show_feedback_toast("[適用対象なし]".to_string());
+            self.show_feedback_warning("[適用対象なし]".to_string());
             return;
         }
 
@@ -74990,7 +75071,7 @@ impl App {
             return;
         };
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
-            self.show_feedback_toast("[適用対象なし]".to_string());
+            self.show_feedback_warning("[適用対象なし]".to_string());
             return;
         }
 
@@ -75026,7 +75107,7 @@ impl App {
             return;
         };
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
-            self.show_feedback_toast("[削除対象なし]".to_string());
+            self.show_feedback_warning("[削除対象なし]".to_string());
             return;
         }
 
@@ -75041,7 +75122,7 @@ impl App {
         if had_mask {
             self.show_feedback_toast("[消しゴムマスク削除]".to_string());
         } else {
-            self.show_feedback_toast("[消しゴムマスクなし]".to_string());
+            self.show_feedback_warning("[消しゴムマスクなし]".to_string());
         }
     }
 
@@ -75055,7 +75136,7 @@ impl App {
             return;
         };
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
-            self.show_feedback_toast("[削除対象なし]".to_string());
+            self.show_feedback_warning("[削除対象なし]".to_string());
             return;
         }
 
@@ -75067,7 +75148,7 @@ impl App {
         if had_mask {
             self.show_feedback_toast("[隠蔽マスク削除]".to_string());
         } else {
-            self.show_feedback_toast("[隠蔽マスクなし]".to_string());
+            self.show_feedback_warning("[隠蔽マスクなし]".to_string());
         }
     }
 
@@ -75075,7 +75156,7 @@ impl App {
     pub(crate) fn delete_erase_masks_from_selection(&mut self) {
         let targets = self.ratable_page_targets();
         if targets.is_empty() {
-            self.show_feedback_toast("[削除対象なし]".to_string());
+            self.show_feedback_warning("[削除対象なし]".to_string());
             return;
         }
 
@@ -75094,7 +75175,7 @@ impl App {
 
         self.checked.clear();
         if removed == 0 {
-            self.show_feedback_toast("[消しゴムマスクなし]".to_string());
+            self.show_feedback_warning("[消しゴムマスクなし]".to_string());
         } else {
             crate::logger::log(format!("[ERASE] Bulk delete masks from {removed} items"));
             self.show_feedback_toast(format!("[消しゴムマスクを{removed}枚から削除]"));
@@ -75105,7 +75186,7 @@ impl App {
     pub(crate) fn delete_conceal_masks_from_selection(&mut self) {
         let targets = self.ratable_page_targets();
         if targets.is_empty() {
-            self.show_feedback_toast("[削除対象なし]".to_string());
+            self.show_feedback_warning("[削除対象なし]".to_string());
             return;
         }
 
@@ -75121,7 +75202,7 @@ impl App {
 
         self.checked.clear();
         if removed == 0 {
-            self.show_feedback_toast("[隠蔽マスクなし]".to_string());
+            self.show_feedback_warning("[隠蔽マスクなし]".to_string());
         } else {
             crate::logger::log(format!("[CONCEAL] Bulk delete masks from {removed} items"));
             self.show_feedback_toast(format!("[隠蔽マスクを{removed}枚から削除]"));
@@ -76171,12 +76252,16 @@ impl App {
                 }
             }
             OriginalMaterialEntry::AutoCrop if self.fullscreen_idx == Some(idx) => {
-                let message = if self.apply_auto_export_crop_for_idx(idx) {
+                let applied = self.apply_auto_export_crop_for_idx(idx);
+                let message = if applied {
                     "自動クロップ"
                 } else {
                     "余白を検出できません"
                 };
-                self.show_feedback_toast(message.to_owned());
+                self.show_feedback_result(
+                    message.to_owned(),
+                    crate::feedback::FeedbackKind::result(!applied),
+                );
             }
             OriginalMaterialEntry::ApplyEraseSlot { .. } => unreachable!(),
             OriginalMaterialEntry::ViewTrim { .. } => unreachable!(),
@@ -77904,7 +77989,7 @@ impl App {
                 let detached_viewer_open_next_still_detached_once =
                     self.detached_viewer_open_next_still_detached_once;
                 let fs_viewport_generation = self.fs_viewport_generation;
-                self.close_fullscreen();
+                self.close_fullscreen_content();
                 // Ctrl+↑↓ is an internal viewer-to-viewer reopen. If a stale
                 // grid-open intent survives here, always-new detached mode can
                 // allocate a fresh window_id and briefly show the default-sized
@@ -77941,7 +78026,7 @@ impl App {
                 return;
             }
         }
-        self.close_fullscreen();
+        self.close_fullscreen_content();
         // Folder navigation is never a grid-originated open; prevent a stale
         // intent from changing detached window allocation on the next reopen.
         self.fs_open_intent_from_grid = false;
@@ -77953,6 +78038,16 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        if self.book_append_undo_in_progress() {
+            return;
+        }
+        self.finish_fullscreen_navigation_for_true_close();
+        self.close_fullscreen_content();
+    }
+
+    /// Content-only teardown for an owner that will reopen or transfer this reader.
+    /// True session exits must use close_fullscreen / close_fullscreen_to_completion.
+    pub(super) fn close_fullscreen_content(&mut self) {
         if self.book_append_undo_in_progress() {
             return;
         }
@@ -77986,6 +78081,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> Result<(), LocalViewerCloseFailure> {
+        self.finish_fullscreen_navigation_for_true_close();
         // 守る不変条件は「この呼び出しを抜けたとき、未実行の effect が残っていない」。
         // 「遷移中なら」で条件を付けない — `close_fullscreen` が既に `TerminalClose` を
         // 出していると state は `Stable` なのに effect だけが積まれた状態になり、
@@ -77994,13 +78090,13 @@ impl App {
             self.video_presentation_transition
                 .dispatch(PresentationTransitionEvent::TerminalClose);
         }
-        // `TerminalSessionClose` の実行は、その中で `close_fullscreen` まで走る。
+        // `TerminalSessionClose` は予約退役済みの content teardown まで実行する。
         // **走ったなら二度目を呼ばない** — 初回 close が整えた状態を巻き戻す
         // (Codex Q1)。走っていない場合だけ、ここで閉じる。
         if self.execute_video_presentation_transition_effects(ctx)
             == PresentationEffectsOutcome::DidNotClose
         {
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         if self.fullscreen_idx.is_some()
             && !self.video_presentation_transition.is_transitioning()
@@ -82239,7 +82335,7 @@ impl App {
             if let Some(pending) = self.local_adjust_pending.remove(&idx) {
                 if !pending.cancel.load(Ordering::Relaxed) {
                     crate::logger::log(format!("edit_materialize: worker disconnected idx={idx}"));
-                    self.show_feedback_toast("画像素材の準備に失敗しました".to_owned());
+                    self.show_feedback_error("画像素材の準備に失敗しました".to_owned());
                 }
             }
         }
@@ -82508,7 +82604,7 @@ impl App {
                 crate::logger::log(format!(
                     "edit_materialize: worker failed idx={idx} error={error}"
                 ));
-                self.show_feedback_toast("画像素材の準備に失敗しました".to_owned());
+                self.show_feedback_error("画像素材の準備に失敗しました".to_owned());
                 false
             }
         };
@@ -87745,8 +87841,12 @@ impl App {
 
     /// 右上フィードバック表示を設定する (本文の文字数に応じた表示時間)。
     pub(crate) fn show_feedback_toast(&mut self, text: String) {
-        let duration_secs = crate::ui_fullscreen::feedback_toast_duration(&text);
-        self.show_feedback_toast_with_duration(text, duration_secs);
+        self.publish_feedback_toast(
+            text,
+            None,
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Text,
+        );
     }
 
     pub(crate) fn metadata_panel_click_shown(&self) -> bool {
@@ -88009,7 +88109,7 @@ impl App {
         // (fs_music_view_active は VST 中 false なので入口側の判定では VST サブモードを取りこぼす、
         // Codex 7e P2)。音声モードを抜けてから切り替える運用にする。
         if self.video_audio_mode.is_some() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "音声モードを終了してから別ウィンドウ表示に切り替えてください".to_string(),
             );
             return;
@@ -88029,7 +88129,7 @@ impl App {
         #[cfg(windows)]
         {
             if self.detached_toggle_disabled_by_always_new_images() {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "毎回新しいウィンドウで開く設定ではF12切替は無効です".to_string(),
                 );
                 return;
@@ -88125,61 +88225,141 @@ impl App {
         });
     }
 
-    /// 右上フィードバック表示を設定する (表示時間を明示指定)。
-    /// 本文長による自動計算を使わず、一定時間を保証したい案内向け。
-    pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, duration_secs: f32) {
-        #[cfg(windows)]
-        self.show_native_video_overlay_toast_with_linger(
-            text.clone(),
-            false,
-            Some(std::time::Duration::from_secs_f32(duration_secs)),
-        );
-        self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
-        self.fs_feedback_toast_reveal_path = None;
-        // 発火面不明の従来経路: 全面に描く (単面表示は show_feedback_toast_on を使う)。
-        self.fs_feedback_toast_surface = None;
-    }
-
-    /// 発火面を明示したフィードバックトースト。指定面にだけ表示する
-    /// (detached 窓とメイングリッドが同時に見える構成での二重表示防止)。
-    ///
-    /// `Viewer` 面で現在アイテムが native presenter 表示中の動画なら、egui トーストの
-    /// 代わりに native overlay トーストへ送る (egui ビューアは presenter の下で不可視)。
-    /// 音声モード (`fs_music_view_active`) 中は presenter が hidden なので egui 側を使う。
-    pub(crate) fn show_feedback_toast_on(&mut self, text: String, surface: ActionSurface) {
-        self.show_feedback_toast_on_with_duration(
+    /// Explicit seconds are standard-time bases; the publisher applies the preference once.
+    pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, seconds: f32) {
+        self.publish_feedback_toast(
             text,
-            surface,
-            crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
+            None,
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Seconds(seconds),
         );
     }
 
-    /// `show_feedback_toast_on` の表示秒数指定版。長めの案内文向け
-    /// (native overlay へ送る場合は linger として同じ秒数を渡す)。
+    pub(crate) fn show_feedback_result(
+        &mut self,
+        text: String,
+        kind: crate::feedback::FeedbackKind,
+    ) {
+        self.publish_feedback_toast(text, None, kind, crate::feedback::FeedbackTiming::Text);
+    }
+
+    pub(crate) fn show_feedback_result_on(
+        &mut self,
+        text: String,
+        surface: ActionSurface,
+        kind: crate::feedback::FeedbackKind,
+    ) {
+        self.publish_feedback_toast(
+            text,
+            Some(surface),
+            kind,
+            crate::feedback::FeedbackTiming::Seconds(crate::feedback::FEEDBACK_TOAST_DURATION),
+        );
+    }
+
+    pub(crate) fn show_feedback_warning(&mut self, text: String) {
+        self.publish_feedback_toast(
+            text,
+            None,
+            crate::feedback::FeedbackKind::Warning,
+            crate::feedback::FeedbackTiming::Text,
+        );
+    }
+
+    pub(crate) fn show_feedback_error(&mut self, text: String) {
+        self.publish_feedback_toast(
+            text,
+            None,
+            crate::feedback::FeedbackKind::Error,
+            crate::feedback::FeedbackTiming::Text,
+        );
+    }
+
+    pub(crate) fn show_feedback_warning_with_duration(&mut self, text: String, seconds: f32) {
+        self.publish_feedback_toast(
+            text,
+            None,
+            crate::feedback::FeedbackKind::Warning,
+            crate::feedback::FeedbackTiming::Seconds(seconds),
+        );
+    }
+
+    pub(crate) fn show_feedback_toast_on(&mut self, text: String, surface: ActionSurface) {
+        self.publish_feedback_toast(
+            text,
+            Some(surface),
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Seconds(crate::feedback::FEEDBACK_TOAST_DURATION),
+        );
+    }
+
+    pub(crate) fn show_feedback_warning_on(&mut self, text: String, surface: ActionSurface) {
+        self.publish_feedback_toast(
+            text,
+            Some(surface),
+            crate::feedback::FeedbackKind::Warning,
+            crate::feedback::FeedbackTiming::Seconds(crate::feedback::FEEDBACK_TOAST_DURATION),
+        );
+    }
+
     pub(crate) fn show_feedback_toast_on_with_duration(
         &mut self,
         text: String,
         surface: ActionSurface,
-        duration_secs: f32,
+        seconds: f32,
     ) {
+        self.publish_feedback_toast(
+            text,
+            Some(surface),
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::Seconds(seconds),
+        );
+    }
+
+    pub(crate) fn show_feedback_warning_on_with_duration(
+        &mut self,
+        text: String,
+        surface: ActionSurface,
+        seconds: f32,
+    ) {
+        self.publish_feedback_toast(
+            text,
+            Some(surface),
+            crate::feedback::FeedbackKind::Warning,
+            crate::feedback::FeedbackTiming::Seconds(seconds),
+        );
+    }
+
+    fn publish_feedback_toast(
+        &mut self,
+        text: String,
+        surface: Option<ActionSurface>,
+        kind: crate::feedback::FeedbackKind,
+        timing: crate::feedback::FeedbackTiming,
+    ) {
+        let resolved = crate::feedback::resolve_timing(
+            self.settings.notification_duration,
+            kind,
+            &text,
+            timing,
+        );
         #[cfg(windows)]
-        if matches!(surface, ActionSurface::Viewer) {
-            let native_overlay_visible = self.fullscreen_idx.is_some_and(|fs_idx| {
-                matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }))
-                    && !self.fs_music_view_active(fs_idx)
-            });
-            if native_overlay_visible {
-                self.show_native_video_overlay_toast_with_linger(
-                    text,
-                    false,
-                    Some(std::time::Duration::from_secs_f32(duration_secs)),
-                );
+        if surface != Some(ActionSurface::MainWindow) {
+            let native_only = surface == Some(ActionSurface::Viewer)
+                && self.fullscreen_idx.is_some_and(|idx| {
+                    matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. }))
+                        && !self.fs_music_view_active(idx)
+                });
+            if surface.is_none() || native_only {
+                self.publish_native_video_overlay_toast(text.clone(), false, resolved);
+            }
+            if native_only {
                 return;
             }
         }
-        self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
+        self.fs_feedback_toast = Some((text, std::time::Instant::now(), resolved.seconds));
         self.fs_feedback_toast_reveal_path = None;
-        self.fs_feedback_toast_surface = Some(surface);
+        self.fs_feedback_toast_surface = surface;
     }
 
     pub(crate) fn clear_fullscreen_feedback_for_viewer_switch(&mut self) {
@@ -88193,7 +88373,7 @@ impl App {
     /// egui 経路は切替と同期に、native 動画経路は `PlacementSwitched` 確定時に呼ばれる。
     #[cfg(windows)]
     pub(crate) fn show_media_window_main_hint_toast(&mut self) {
-        self.show_feedback_toast_on_with_duration(
+        self.show_feedback_warning_on_with_duration(
             "メインウィンドウ表示に切り替えました。グリッドから開き直すと別ウィンドウで再生されます"
                 .to_string(),
             ActionSurface::Viewer,
@@ -88221,7 +88401,7 @@ impl App {
     ) {
         let Some(o) = outcome else {
             // main HWND 未取得などでドラッグが走らなかった。
-            self.show_feedback_toast("ファイルのドラッグを開始できませんでした".to_string());
+            self.show_feedback_warning("ファイルのドラッグを開始できませんでした".to_string());
             return;
         };
 
@@ -88232,7 +88412,7 @@ impl App {
             } else {
                 "ファイルのドラッグを開始できませんでした"
             };
-            self.show_feedback_toast(msg.to_string());
+            self.show_feedback_warning(msg.to_string());
             return;
         }
 
@@ -88246,8 +88426,20 @@ impl App {
             (None, None) => None,
         };
         if let Some(msg) = combined {
-            self.show_feedback_toast(msg);
+            self.show_feedback_warning(msg);
         }
+    }
+
+    pub(crate) fn show_saved_output_feedback(&mut self, text: String) {
+        self.publish_feedback_toast(
+            text,
+            None,
+            crate::feedback::FeedbackKind::Info,
+            crate::feedback::FeedbackTiming::SurfaceSeconds {
+                egui: crate::feedback::FEEDBACK_TOAST_DURATION,
+                native: 1.8,
+            },
+        );
     }
 
     pub(crate) fn show_capture_saved_toast(&mut self, path: PathBuf) {
@@ -88256,13 +88448,7 @@ impl App {
             .and_then(|n| n.to_str())
             .unwrap_or("capture")
             .to_string();
-        #[cfg(windows)]
-        self.show_native_video_overlay_toast(format!("保存しました: {name}"), false);
-        self.fs_feedback_toast = Some((
-            format!("保存しました: {name}"),
-            std::time::Instant::now(),
-            crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
-        ));
+        self.show_saved_output_feedback(format!("保存しました: {name}"));
         self.fs_feedback_toast_reveal_path = Some(path);
         self.fs_feedback_toast_surface = None;
     }
@@ -89658,12 +89844,12 @@ impl App {
                     }
                 }
                 crate::favorite_view_state::FavoriteViewStoreCommand::Remove { .. } => {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "お気に入りの表示状態を保存データから削除できませんでした".to_owned(),
                     );
                 }
                 crate::favorite_view_state::FavoriteViewStoreCommand::Clear => {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "お気に入りの表示状態を保存データからクリアできませんでした".to_owned(),
                     );
                     if let Some(state) = self.pref_state.as_mut() {
@@ -89710,7 +89896,7 @@ impl App {
             crate::logger::log(format!(
                 "favorite view state remove submit failed id={favorite_id}: {error}"
             ));
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "お気に入りの表示状態を保存データから削除できませんでした".to_owned(),
             );
         }
@@ -89737,7 +89923,7 @@ impl App {
             .submit_favorite_view_store(crate::favorite_view_state::FavoriteViewStoreCommand::Clear)
         {
             crate::logger::log(format!("favorite view state clear submit failed: {error}"));
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "お気に入りの表示状態を保存データからクリアできませんでした".to_owned(),
             );
             if let Some(state) = self.pref_state.as_mut() {
@@ -89777,7 +89963,7 @@ impl App {
         };
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
-            self.show_feedback_toast(format!("[スロット{key_label} は空です]"));
+            self.show_feedback_warning(format!("[スロット{key_label} は空です]"));
             return;
         };
 
@@ -89873,13 +90059,13 @@ impl App {
     pub(crate) fn apply_slot_to_grid_selection(&mut self, slot_idx: usize) {
         let targets = self.ratable_page_targets();
         if targets.is_empty() {
-            self.show_feedback_toast("[適用対象なし]".to_string());
+            self.show_feedback_warning("[適用対象なし]".to_string());
             return;
         }
 
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
-            self.show_feedback_toast(format!("[スロット{key_label}は空です]"));
+            self.show_feedback_warning(format!("[スロット{key_label}は空です]"));
             return;
         };
 
@@ -89926,7 +90112,7 @@ impl App {
     pub(crate) fn clear_page_params_for_selection(&mut self) {
         let targets = self.ratable_page_targets();
         if targets.is_empty() {
-            self.show_feedback_toast("[対象なし]".to_string());
+            self.show_feedback_warning("[対象なし]".to_string());
             return;
         }
         let to_clear: Vec<usize> = targets
@@ -89935,7 +90121,7 @@ impl App {
             .filter(|idx| self.adjustment_page_params.contains_key(idx))
             .collect();
         if to_clear.is_empty() {
-            self.show_feedback_toast("[個別設定なし]".to_string());
+            self.show_feedback_warning("[個別設定なし]".to_string());
             return;
         }
         self.clear_page_params_for_indices(&to_clear);
@@ -91417,7 +91603,7 @@ impl App {
             }
             crate::panorama::PanoramaTrigger::Hint => "V キーで 360° ビューワー".to_string(),
         };
-        self.show_feedback_toast(msg);
+        self.show_feedback_warning(msg);
         self.pano_toast_shown_for_current_fs = true;
         true
     }
@@ -92816,7 +93002,7 @@ impl App {
                         "[fs] original material worker disconnected idx={key}"
                     ));
                     self.fs_cache.insert(key, FsCacheEntry::Failed);
-                    self.show_feedback_toast("元画像を読み込めませんでした".to_owned());
+                    self.show_feedback_warning("元画像を読み込めませんでした".to_owned());
                 }
                 pending.disarm_ticket();
             }
@@ -92977,7 +93163,7 @@ impl App {
             if preserve_completed && matches!(result, FsLoadResult::Failed) {
                 self.fs_cache
                     .insert_for_generation(key, items_generation, FsCacheEntry::Failed);
-                self.show_feedback_toast("元画像を読み込めませんでした".to_owned());
+                self.show_feedback_warning("元画像を読み込めませんでした".to_owned());
                 continue;
             }
             let result = match result {
@@ -94675,7 +94861,7 @@ impl App {
             return;
         }
         if self.video_continuous_mode.is_enabled() {
-            self.show_feedback_toast("連続再生中はループ無効".to_string());
+            self.show_feedback_warning("連続再生中はループ無効".to_string());
             return;
         }
         let has_bm = !self.music_bookmark_starts_for(fs_idx).is_empty();
@@ -95330,17 +95516,7 @@ impl App {
             // wheel / 前-次項目ボタンが pending 中に押されたケースで「反応しない」
             // 体感バグを防ぐ (実機 fb 2026-05-26)。
             self.maybe_apply_deferred_native_video_nav(ctx);
-            if let Some(message) = self
-                .take_audio_track_open_notice_toast(fs_idx)
-                .or_else(|| self.take_audio_track_failure_toast(fs_idx))
-            {
-                let message = message.to_string();
-                if self.fs_music_view_active(fs_idx) {
-                    self.show_feedback_toast(message);
-                } else {
-                    self.show_native_video_overlay_toast(message, false);
-                }
-            }
+            self.poll_audio_track_notice_toast(fs_idx);
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
@@ -95378,7 +95554,7 @@ impl App {
             // toast / 偶発 repaint に頼らず明示的に次フレームを起こす。
             ctx.request_repaint();
             if let Some(err) = native_close_error {
-                self.show_feedback_toast(format!("動画を再生できません: {err}"));
+                self.show_feedback_warning(format!("動画を再生できません: {err}"));
             }
             return;
         }
@@ -96786,7 +96962,7 @@ impl eframe::App for App {
             // worker so cancellation/late completion retains the Windows lifecycle.
             let passwords = self.pdf_passwords.clone();
             if let Some(notice) = self.similar_panel.preview.poll_background(ctx, &passwords) {
-                self.show_feedback_toast(notice);
+                self.show_feedback_warning(notice);
             }
         }
         self.poll_image_folder_zip(ctx);

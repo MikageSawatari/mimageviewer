@@ -1253,7 +1253,7 @@ impl App {
         crate::logger::log(
             "reading position preparation unavailable; display continuation cancelled",
         );
-        self.show_feedback_toast(
+        self.show_feedback_warning(
             "読書位置を準備できませんでした。一覧を再読み込みしてください".into(),
         );
         if self
@@ -1487,7 +1487,7 @@ impl App {
         }
         if self.sidecar_restore.is_some() {
             crate::logger::log("snapshot page index preparation rejected: hydration owner is busy");
-            self.show_feedback_toast("一覧の準備が完了してから固定してください".into());
+            self.show_feedback_warning("一覧の準備が完了してから固定してください".into());
             return;
         }
         let source_path = self.current_folder.clone();
@@ -1563,7 +1563,7 @@ impl App {
 
     fn report_sidecar_restore_flush_failure(&mut self, error: String) {
         crate::logger::log(format!("sidecar restore flush failed: {error}"));
-        self.show_feedback_toast(format!("サイドカーの保存を完了できませんでした: {error}"));
+        self.show_feedback_warning(format!("サイドカーの保存を完了できませんでした: {error}"));
     }
 
     fn sidecar_restore_context_current(&self, common: &Common) -> bool {
@@ -1991,6 +1991,9 @@ impl App {
     }
 
     fn poll_sidecar_restore_projected(&mut self, ctx: &egui::Context) {
+        // Read session ownership before taking its sidecar continuation out of App.
+        // This is a fact for this poll, not a persistent viewer/viewport latch.
+        let viewer_session_open = self.projected_viewer_session_open();
         let Some(mut state) = self.sidecar_restore.take() else {
             return;
         };
@@ -2018,12 +2021,12 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     if matches!(preparing.next, PageIndexContinuation::PrepareOnly(_)) {
                         crate::logger::log("snapshot reading position worker disconnected");
-                        self.show_feedback_toast("読書位置の準備workerが停止しました".into());
+                        self.show_feedback_warning("読書位置の準備workerが停止しました".into());
                         #[cfg(windows)]
                         let had_deferred_fullscreen = state.common.deferred_fullscreen.is_some();
                         state.common.discard_target();
                         self.finish_visible_container_fs_nav_failed();
-                        if self.fullscreen_idx.is_some() {
+                        if viewer_session_open {
                             self.close_fullscreen();
                         }
                         #[cfg(windows)]
@@ -2038,7 +2041,7 @@ impl App {
                     crate::logger::log(
                         "reading position worker disconnected; display continuation cancelled",
                     );
-                    self.show_feedback_toast(
+                    self.show_feedback_error(
                         "読書位置の準備に失敗しました。一覧を再読み込みしてください".into(),
                     );
                     state.common.discard_target();
@@ -2523,7 +2526,9 @@ impl App {
                 Ok(true) => state.common.book_restore = None,
                 Err(error) => {
                     crate::logger::log(format!("book shift restore failed: {error}"));
-                    self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+                    self.show_feedback_warning(format!(
+                        "見開き調整を復元できませんでした: {error}"
+                    ));
                     state.common.book_restore = None;
                 }
             }
@@ -2545,7 +2550,7 @@ impl App {
         ) {
             if let Some(warning) = state.common.warning.take() {
                 crate::logger::log(format!("snapshot page index preparation: {warning}"));
-                self.show_feedback_toast(warning);
+                self.show_feedback_warning(warning);
             }
             if let Some(deferred) = state.common.deferred_fullscreen.take() {
                 if deferred.matches_item(&self.items) {
@@ -2576,7 +2581,7 @@ impl App {
         debug_assert!(self.install_sidecar_restore_result(None, effects).is_none());
         if let Some(warning) = state.common.warning.take() {
             crate::logger::log(format!("sidecar restore terminal warning: {warning}"));
-            self.show_feedback_toast(format!("サイドカー復元: {warning}"));
+            self.show_feedback_warning(format!("サイドカー復元: {warning}"));
         }
         let deferred = state.common.deferred_fullscreen.take();
         let favorite_failures = std::mem::take(&mut state.common.favorite_failures);
@@ -3827,6 +3832,61 @@ mod tests {
                 }),
             super::super::file_type_resume::PositionResolution::Restored(0)
         );
+    }
+
+    #[test]
+    fn visibility_index_disconnect_ends_only_an_existing_viewer_session() {
+        for viewer in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().to_path_buf();
+            let image = folder.join("page.png");
+            image::RgbImage::new(1, 1).save(&image).unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(image)];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Failed];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            if viewer {
+                app.fullscreen_idx = Some(0);
+                app.capture_fs_nav_holdover(0);
+                app.fullscreen_idx = None;
+                app.items_generation += 1;
+            }
+            app.prepare_current_listing_page_identity_index(Default::default(), None);
+            let (tx, rx) = mpsc::channel();
+            drop(tx);
+            app.sidecar_restore.as_mut().unwrap().phase =
+                Phase::PreparingPageIndex(PreparingPageIndex {
+                    rx,
+                    next: PageIndexContinuation::PrepareOnly(PageIndexPublication::CurrentListing),
+                });
+            let pdf = folder.join("list-only.pdf");
+            if viewer {
+                assert!(app.defer_sidecar_restore_fullscreen(
+                    0,
+                    HistoryTrigger::UserChosen,
+                    FsOpenMaterialization::Eager,
+                    FsPageLoadContract::Sequential,
+                ));
+            } else {
+                app.pdf_password_request =
+                    Some(super::super::PdfPasswordRequest::legacy(pdf.clone()));
+                app.pdf_password_input = "typed password".into();
+            }
+            assert_eq!(app.projected_viewer_session_open(), viewer);
+            app.spread_popup_open = true;
+            app.poll_sidecar_restore(&egui::Context::default());
+            assert!(!app.sidecar_restore_active());
+            assert!(!app.projected_viewer_session_open());
+            if viewer {
+                assert!(!app.spread_popup_open, "waiting reader content must close");
+                assert!(app.fs_holdover_tex.is_none());
+                assert!(!app.fs_nav_is_locked());
+            } else {
+                assert_eq!(app.pdf_password_dialog_path(), Some(pdf));
+                assert_eq!(app.pdf_password_input, "typed password");
+            }
+        }
     }
 
     #[test]

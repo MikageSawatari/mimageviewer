@@ -2478,6 +2478,38 @@ fn preferences_favorite_view_state_dark() {
 }
 
 #[test]
+fn notification_duration_preferences_light_standard() {
+    snapshot_with_theme_at_size(
+        "notification_duration_preferences_light_standard",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 115.0),
+        None,
+        |ui| {
+            mimageviewer::draw_notification_duration_snapshot_fixture(
+                ui,
+                mimageviewer::settings::NotificationDuration::Standard,
+            );
+        },
+    );
+}
+
+#[test]
+fn notification_duration_preferences_dark_short_narrow() {
+    snapshot_with_theme_at_size(
+        "notification_duration_preferences_dark_short_narrow",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(260.0, 145.0),
+        None,
+        |ui| {
+            mimageviewer::draw_notification_duration_snapshot_fixture(
+                ui,
+                mimageviewer::settings::NotificationDuration::Short,
+            );
+        },
+    );
+}
+
+#[test]
 fn preferences_restore_position_light_on() {
     snapshot_with_theme_at_size(
         "preferences_restore_position_light_on",

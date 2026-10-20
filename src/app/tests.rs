@@ -8,6 +8,12 @@ mod thumbnail_request_lifecycle;
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
 
+#[path = "tests/notification_duration.rs"]
+mod notification_duration;
+
+#[path = "tests/startup_notices.rs"]
+pub(super) mod startup_notices;
+
 #[cfg(windows)]
 #[test]
 fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record() {
@@ -48993,13 +48999,19 @@ mod favorite_adjustment_defaults_tests {
         let _ = app.query_similar_book(&item);
 
         app.capture_fs_nav_holdover(0);
-        app.close_fullscreen();
+        app.close_fullscreen_for_folder_nav_reopen();
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.fs_holdover_tex.is_some());
         assert!(matches!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Active(_)
         ));
 
         app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        assert!(matches!(
+            app.similar_panel.book_query_demand_for_test(),
+            BookQueryDemandSnapshot::Active(_)
+        ));
         app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
         assert_eq!(
             app.similar_panel.book_query_demand_for_test(),
@@ -49007,7 +49019,10 @@ mod favorite_adjustment_defaults_tests {
         );
 
         let _ = app.query_similar_book(&item);
+        // The same continuation owner must not turn an explicit session exit into a reopen.
+        app.capture_fs_nav_holdover(0);
         app.close_fullscreen();
+        assert!(app.fs_holdover_tex.is_none());
         assert_eq!(
             app.similar_panel.book_query_demand_for_test(),
             BookQueryDemandSnapshot::Withdrawn
@@ -49039,8 +49054,8 @@ mod favorite_adjustment_defaults_tests {
 
     /// ロック中は前後移動でパネルを閉じないが、**フルスクリーンを出たら解除する**。
     ///
-    /// `close_fullscreen` はフォルダ移動の再オープンでも呼ばれるので、「ロック中は reset を
-    /// 飛ばす」だけにすると終了時も残ってしまう (backlog §1.158)。
+    /// 内部 reopen と真の終了は専用の入口で区別する。「ロック中は reset を飛ばす」だけに
+    /// すると真の終了時も残ってしまう (backlog §1.158)。
     #[test]
     fn the_lock_survives_moving_between_files_but_not_leaving_fullscreen() {
         let mut app = setup_app();
@@ -49094,7 +49109,8 @@ mod favorite_adjustment_defaults_tests {
             Some(FsHoldover::FolderNavigation(None))
         ));
 
-        app.close_fullscreen();
+        app.close_fullscreen_for_folder_nav_reopen();
+        assert!(app.fullscreen_idx.is_none());
         assert!(
             app.fs_info_panel.locked,
             "resource-less folder navigation must survive its internal close"
@@ -49110,6 +49126,20 @@ mod favorite_adjustment_defaults_tests {
         app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::ViewerExited);
         assert!(app.fs_holdover_tex.is_none());
         assert!(!app.fs_info_panel.locked);
+
+        // An explicit true close must release the lock even with a navigation owner present.
+        app.fs_info_panel.locked = true;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+        app.capture_fs_nav_holdover(0);
+        assert!(app.fs_holdover_tex.is_some());
+        app.close_fullscreen();
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(!app.fs_info_panel.locked);
+        assert_eq!(
+            app.fs_info_panel.open,
+            crate::ui_helpers::MetadataPanelOpenState::Closed
+        );
     }
 
     #[test]
@@ -93767,6 +93797,7 @@ mod smart_folder_transition_tests {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let deferred_fullscreen = with_deferred_fullscreen.then(|| {
             crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                owner_context: app.projected_viewer_context_id(),
                 restore_video_tile: false,
                 reopen: DeferredFsReopen {
                     history_trigger: crate::app::HistoryTrigger::UserChosen,

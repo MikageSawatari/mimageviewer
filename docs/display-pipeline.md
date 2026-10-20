@@ -3337,3 +3337,13 @@ topology の採用を必要とする。最新 callback の viewport／clip／ppp
 CPU 需要用 resolver に残っていた全頁走査・mixed slideshow 列再構築は、D3-5 で同owner内の派生 record に移す。
 visible と同じ枝は既存索引を読み、異なる枝だけcoldに導出する。CPU需要は縮小せず、adoption／producer／keepの
 共有prefixで同pass採用する。通常表示token／units／receiptを準備用に置換しない。詳細は同節F1を参照。
+
+
+## 一時通知の表示時間（§1.402）
+
+通知の種類、文字数・指定秒数・動画の既定時間、設定の倍率と例外は
+[通知時間ポリシーと棚卸し](notification-duration-policy.md) を正本とする。
+App で寿命とnative fadeを確定して渡し、描画側は倍率を再適用しない。
+標準ではnativeの既存linger/fadeの不一致、保存完了のegui1.2秒/native1.8秒も維持する。
+動画内部で発行する通知だけは、既存 chrome snapshot の選択値から同じ関数で一度確定する。
+処理の寿命に連動する進捗表示、ナビゲーション境界の専用ヒントは独立した表示を維持する。

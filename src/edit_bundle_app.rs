@@ -67,21 +67,21 @@ impl App {
 
     pub(crate) fn copy_page_edit_bundle(&mut self, idx: usize) {
         if self.edit_bundle_bulk_pending.is_some() {
-            self.show_feedback_toast("複数ページの編集内容を処理しています".to_string());
+            self.show_feedback_warning("複数ページの編集内容を処理しています".to_string());
             return;
         }
         if !self.is_page_edit_bundle_target(idx) {
             return;
         }
         if !self.edit_bundle_databases_available() {
-            self.show_feedback_toast("編集データベースを利用できません".to_string());
+            self.show_feedback_warning("編集データベースを利用できません".to_string());
             return;
         }
         let Some(key) = self.page_path_key(idx) else {
             return;
         };
         let Some(source_size) = self.known_page_source_size(idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "画像サイズを取得できません。画像を一度フルスクリーンで表示してから再実行してください"
                     .to_string(),
             );
@@ -123,28 +123,29 @@ impl App {
                 });
                 self.show_feedback_toast(format!("編集内容を読み込んでいます: {source_label}"));
             }
-            Err(error) => self
-                .show_feedback_toast(format!("編集内容の読み込みを開始できませんでした: {error}")),
+            Err(error) => self.show_feedback_warning(format!(
+                "編集内容の読み込みを開始できませんでした: {error}"
+            )),
         }
     }
 
     pub(crate) fn request_paste_page_edit_bundle(&mut self, idx: usize) {
         if self.edit_bundle_bulk_pending.is_some() {
-            self.show_feedback_toast("複数ページの編集内容を処理しています".to_string());
+            self.show_feedback_warning("複数ページの編集内容を処理しています".to_string());
             return;
         }
         if !self.is_page_edit_bundle_target(idx) || self.edit_bundle_clipboard.is_none() {
             return;
         }
         if !self.edit_bundle_databases_available() {
-            self.show_feedback_toast("編集データベースを利用できません".to_string());
+            self.show_feedback_warning("編集データベースを利用できません".to_string());
             return;
         }
         let Some(target_key) = self.page_path_key(idx) else {
             return;
         };
         let Some(target_size) = self.known_page_source_size(idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "画像サイズを取得できません。画像を一度フルスクリーンで表示してから再実行してください"
                     .to_string(),
             );
@@ -183,17 +184,17 @@ impl App {
 
     pub(crate) fn start_apply_page_edit_bundle(&mut self, request: EditBundlePasteRequest) {
         if self.edit_bundle_bulk_pending.is_some() {
-            self.show_feedback_toast("複数ページの編集内容を処理しています".to_string());
+            self.show_feedback_warning("複数ページの編集内容を処理しています".to_string());
             return;
         }
         if self.edit_bundle_apply_pending.is_some() {
-            self.show_feedback_toast("別の編集内容を貼り付けています".to_string());
+            self.show_feedback_warning("別の編集内容を貼り付けています".to_string());
             return;
         }
         let still_same_target = request.items_generation == self.items_generation
             && self.page_path_key(request.target_idx).as_deref() == Some(&request.target_key);
         if !still_same_target {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "一覧が更新されたため、編集内容の貼り付けをキャンセルしました".to_string(),
             );
             return;
@@ -229,8 +230,9 @@ impl App {
                     rx,
                 });
             }
-            Err(error) => self
-                .show_feedback_toast(format!("編集内容の貼り付けを開始できませんでした: {error}")),
+            Err(error) => self.show_feedback_warning(format!(
+                "編集内容の貼り付けを開始できませんでした: {error}"
+            )),
         }
     }
 
@@ -457,12 +459,12 @@ impl App {
                 }
                 Ok(_) => {
                     self.edit_bundle_clipboard = None;
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "この画像にはコピーできる編集内容がありません".to_string(),
                     );
                 }
                 Err(error) => {
-                    self.show_feedback_toast(format!("編集内容をコピーできませんでした: {error}"))
+                    self.show_feedback_warning(format!("編集内容をコピーできませんでした: {error}"))
                 }
             }
         }
@@ -513,7 +515,7 @@ impl App {
                         "edit_bundle: atomic paste failed key={} error={error}",
                         pending.request.target_key
                     ));
-                    self.show_feedback_toast(format!(
+                    self.show_feedback_warning(format!(
                         "編集内容を貼り付けできませんでした: {error}"
                     ));
                 }

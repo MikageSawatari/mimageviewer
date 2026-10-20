@@ -711,11 +711,11 @@ impl App {
     ) {
         let origin_context = origin.stamp.context_id;
         if self.collection_grid_context_id() == origin_context {
-            self.show_feedback_toast(message);
+            self.show_feedback_warning(message);
             return;
         }
         if self
-            .with_viewer_context(origin_context, |app| app.show_feedback_toast(message))
+            .with_viewer_context(origin_context, |app| app.show_feedback_warning(message))
             .is_err()
         {
             crate::logger::log(format!(

@@ -416,7 +416,7 @@ impl App {
         if summary.undo_files.is_none() {
             message.push_str("\nこの追加は取り消せません");
         }
-        self.show_feedback_toast_with_duration(message, 4.5);
+        self.show_feedback_warning_with_duration(message, 4.5);
         false
     }
 
@@ -511,7 +511,7 @@ impl App {
                     cause: FolderRefreshCause::BookAppendExternal,
                 });
                 self.release_book_append_observations(ctx, &intent);
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "追加後の一覧を更新できませんでした。追加の取り消しは利用できません".into(),
                 );
             }

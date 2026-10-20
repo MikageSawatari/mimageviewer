@@ -3070,10 +3070,15 @@ pub(super) struct NativeOverlayToast {
     pub(super) text: String,
     pub(super) started_at: Instant,
     pub(super) centered: bool,
-    /// このトーストを表示し続ける時間。`started_at` からこれを過ぎたら消す。
-    /// `show_toast` で `linger` 指定があればその値、無ければ `centered` から導いた
-    /// 既定値 (centered: 2.5s / それ以外: 1.8s) が入る。
-    linger: Duration,
+    /// Resolved lifetime and fade preserve the legacy independent clocks.
+    /// Expiry uses native_linger; drawing uses the resolved 1.8/2.5-second fade baseline.
+    timing: crate::feedback::ResolvedFeedbackTiming,
+}
+
+impl NativeOverlayToast {
+    pub(super) fn opacity_at(&self, elapsed: f32) -> f32 {
+        self.timing.native_opacity_at(elapsed, self.centered)
+    }
 }
 
 #[cfg(test)]
@@ -3083,7 +3088,12 @@ impl NativeOverlayToast {
             text: text.to_string(),
             started_at: Instant::now(),
             centered: false,
-            linger: Duration::from_secs_f32(1.8),
+            timing: crate::feedback::resolve_timing(
+                crate::settings::NotificationDuration::Standard,
+                crate::feedback::FeedbackKind::Info,
+                text,
+                crate::feedback::FeedbackTiming::Seconds(1.8),
+            ),
         }
     }
 }
@@ -8547,12 +8557,23 @@ impl NativeRenderCore {
         }
     }
 
-    pub fn show_overlay_toast(
+    pub(crate) fn show_overlay_toast(
         &mut self,
         text: String,
         centered: bool,
-        linger: Option<std::time::Duration>,
+        kind: crate::feedback::FeedbackKind,
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
     ) {
+        // App notifications carry their resolved lifetime. Native-origin notifications
+        // read the preference from the existing chrome snapshot and resolve it here once.
+        let linger = linger.unwrap_or_else(|| {
+            crate::feedback::resolve_timing(
+                self.chrome.policy.notification_duration,
+                kind,
+                &text,
+                crate::feedback::FeedbackTiming::Seconds(if centered { 2.5 } else { 1.8 }),
+            )
+        });
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.show_toast(text, centered, linger);
         }
@@ -11200,17 +11221,20 @@ impl NativeEguiOverlayState {
         self.dirty = true;
     }
 
-    fn show_toast(&mut self, text: String, centered: bool, linger: Option<Duration>) {
+    fn show_toast(
+        &mut self,
+        text: String,
+        centered: bool,
+        timing: crate::feedback::ResolvedFeedbackTiming,
+    ) {
         if text.trim().is_empty() {
             return;
         }
-        let linger =
-            linger.unwrap_or_else(|| Duration::from_millis(if centered { 2500 } else { 1800 }));
         self.toast = Some(NativeOverlayToast {
             text,
             started_at: Instant::now(),
             centered,
-            linger,
+            timing,
         });
         self.dirty = true;
     }
@@ -12591,7 +12615,7 @@ impl NativeEguiOverlay {
         if self
             .toast
             .as_ref()
-            .is_some_and(|toast| toast.started_at.elapsed() > toast.linger)
+            .is_some_and(|toast| toast.started_at.elapsed() > toast.timing.native_linger())
         {
             self.toast = None;
         }
@@ -14494,6 +14518,93 @@ fn native_ime_cursor_area_intent(
 #[cfg(test)]
 mod native_output_tests {
     use super::*;
+
+    #[test]
+    fn notification_duration_native_standard_preserves_legacy_linger_and_fade() {
+        use crate::feedback::{FeedbackKind, FeedbackTiming, resolve_timing};
+        use crate::settings::NotificationDuration;
+        let mut toast = NativeOverlayToast::for_test("通知");
+        for centered in [false, true] {
+            toast.centered = centered;
+            let fade_end = if centered { 2.5 } else { 1.8 };
+            for seconds in [0.7, 1.2, 1.8, 2.5, 3.5, 5.5] {
+                toast.timing = resolve_timing(
+                    NotificationDuration::Standard,
+                    FeedbackKind::Info,
+                    "通知",
+                    FeedbackTiming::Seconds(seconds),
+                );
+                assert_eq!(
+                    toast.timing.native_linger(),
+                    Duration::from_secs_f32(seconds)
+                );
+                // Compare with the pre-§1.402 formula, including long invisible linger.
+                for elapsed in [
+                    0.0, 0.69, 1.19, 1.45, 1.625, 1.8, 2.15, 2.325, 2.5, 3.49, 5.49,
+                ] {
+                    let legacy = if elapsed > fade_end - 0.35 {
+                        ((fade_end - elapsed) / 0.35_f32).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    assert_eq!(
+                        toast.opacity_at(elapsed),
+                        legacy,
+                        "centered={centered}, linger={seconds}, elapsed={elapsed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn notification_duration_native_scales_visible_fade_once_and_keeps_seek_boundary_unchanged() {
+        use crate::feedback::{FeedbackKind, FeedbackTiming, resolve_timing};
+        use crate::settings::NotificationDuration;
+        let mut toast = NativeOverlayToast::for_test("通知");
+        for (setting, factor) in [
+            (NotificationDuration::Short, 0.6),
+            (NotificationDuration::Standard, 1.0),
+            (NotificationDuration::Long, 1.5),
+        ] {
+            for centered in [false, true] {
+                toast.centered = centered;
+                let fade_end = if centered { 2.5 } else { 1.8 };
+                for kind in [
+                    FeedbackKind::Info,
+                    FeedbackKind::Warning,
+                    FeedbackKind::Error,
+                ] {
+                    let factor =
+                        if kind != FeedbackKind::Info && setting == NotificationDuration::Short {
+                            1.0
+                        } else {
+                            factor
+                        };
+                    toast.timing =
+                        resolve_timing(setting, kind, "通知", FeedbackTiming::Seconds(5.5));
+                    assert_eq!(
+                        toast.timing.native_linger(),
+                        Duration::from_secs_f32(5.5 * factor)
+                    );
+                    assert_eq!(toast.opacity_at((fade_end - 0.4) * factor), 1.0);
+                    assert!((toast.opacity_at((fade_end - 0.175) * factor) - 0.5).abs() < 0.00001);
+                    assert_eq!(toast.opacity_at(fade_end * factor), 0.0);
+                }
+            }
+            toast.centered = true;
+            toast.timing = resolve_timing(
+                setting,
+                FeedbackKind::Info,
+                "動画先頭です",
+                FeedbackTiming::Immediate(0.7),
+            );
+            assert_eq!(toast.timing.native_linger(), Duration::from_secs_f32(0.7));
+            for elapsed in [0.0, 0.35, 0.525, 0.699, 0.7] {
+                assert_eq!(toast.opacity_at(elapsed), 1.0);
+            }
+        }
+    }
 
     #[test]
     fn native_platform_intents_keep_focus_ime_and_cursor_order_without_presenting() {

@@ -1800,11 +1800,11 @@ impl App {
             return;
         }
         let Some(root) = self.current_folder.clone() else {
-            self.show_feedback_toast("サブ展開は通常フォルダでのみ使えます".into());
+            self.show_feedback_warning("サブ展開は通常フォルダでのみ使えます".into());
             return;
         };
         if !self.subfolder_expansion_available() {
-            self.show_feedback_toast("サブ展開は通常フォルダでのみ使えます".into());
+            self.show_feedback_warning("サブ展開は通常フォルダでのみ使えます".into());
             return;
         }
         let selected_roots = self.selected_subfolder_expansion_roots();
@@ -1886,7 +1886,7 @@ impl App {
             }
             Err(message) => {
                 self.subfolder_expansion_progress = None;
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
             }
         }
     }
@@ -2027,7 +2027,7 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.subfolder_expansion_pending = None;
                     self.subfolder_expansion_progress = None;
-                    self.show_feedback_toast("サブ展開の走査が中断されました".into());
+                    self.show_feedback_warning("サブ展開の走査が中断されました".into());
                     return;
                 }
             }
@@ -2072,14 +2072,14 @@ impl App {
                 Ok(SubfolderExpansionPrepareEvent::Error(message)) => {
                     self.subfolder_expansion_install_pending = None;
                     self.subfolder_expansion_progress = None;
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     return true;
                 }
                 Err(mpsc::TryRecvError::Empty) => return true,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.subfolder_expansion_install_pending = None;
                     self.subfolder_expansion_progress = None;
-                    self.show_feedback_toast("サブ展開の表示準備が中断されました".into());
+                    self.show_feedback_warning("サブ展開の表示準備が中断されました".into());
                     return true;
                 }
             }
@@ -2267,7 +2267,7 @@ impl App {
             }
             Err(message) => {
                 self.subfolder_expansion_progress = None;
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
             }
         }
     }
@@ -2518,7 +2518,7 @@ impl App {
             self.start_subfolder_expansion_scan_roots_owned(root, roots, navigation);
             return true;
         }
-        self.show_feedback_toast("サブ展開ビューを復元できませんでした".into());
+        self.show_feedback_warning("サブ展開ビューを復元できませんでした".into());
         true
     }
 
@@ -2677,7 +2677,7 @@ impl App {
             snapshot.stack_rating_source,
             crate::filename_stack_ui::StackRatingSource::ReadFailed
         ) {
-            self.show_feedback_toast("評価順を読み込めなかったため名前順で表示しました".into());
+            self.show_feedback_warning("評価順を読み込めなかったため名前順で表示しました".into());
         }
         if perf_on {
             crate::perf::event(
@@ -2752,7 +2752,7 @@ impl App {
             return hydration;
         }
         if skipped > 0 {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "サブ展開: {item_count}件 (読めなかった項目 {skipped}件)"
             ));
         } else if roots.len() > 1 {
@@ -2909,7 +2909,7 @@ impl App {
                     .book_address_label_for_path(&current)
                     .unwrap_or_else(|| current.to_string_lossy().to_string());
             }
-            self.show_feedback_toast("サブ展開の表示準備を中止しました".into());
+            self.show_feedback_warning("サブ展開の表示準備を中止しました".into());
         }
         ctx.request_repaint_after(Duration::from_millis(50));
     }
