@@ -28,6 +28,9 @@
 use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
+// Physical pixels above/below the hotspot. Never sample the desktop cursor in a fixture.
+const SNAPSHOT_CURSOR_EXTENT_PHYSICAL: (f32, f32) = (0.0, 34.0);
+
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 
@@ -172,7 +175,10 @@ fn everything_search_disabled_menu_hover_snapshot(
         |ui| {
             ui.ctx()
                 .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
-            mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(ui);
+            mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(
+                ui,
+                SNAPSHOT_CURSOR_EXTENT_PHYSICAL,
+            );
         },
         |harness| {
             let button = harness.get_by_label("Everything ファイル名検索…  Ctrl+R");
@@ -215,7 +221,10 @@ fn everything_search_disabled_menu_hover_fits_small_viewports_and_ui_zoom() {
                 ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
                 test_ui::full_viewport_ui(ui, |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(ui);
+                        mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(
+                            ui,
+                            SNAPSHOT_CURSOR_EXTENT_PHYSICAL,
+                        );
                     });
                 });
             });
