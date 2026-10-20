@@ -1,6 +1,6 @@
 # 別ウィンドウの配置を物理座標で 1 か所が持つ (backlog §1.384)
 
-状態: 設計第 4 版 (2026-10-20、設計担当 ClaudeCode Opus 5.5)。第 1 版 (241dadb75)・第 2 版 (331f717f7)・第 3 版 (733624656) は
+状態: 設計第 5 版 (2026-10-20、設計担当 ClaudeCode Opus 5.5)。第 4 版 (72eed920c) は ACCEPT WITH CHANGES。第 5 版は、第 4 版で足した「初回表示を後の pass へ移す」仕組みを、扱う組み合わせを減らす方向で置き換えた (§4)。第 1 版 (241dadb75)・第 2 版 (331f717f7)・第 3 版 (733624656) は
 独立設計レビュー (GPT-6.1 Sol / xhigh) で REJECT。方針 (物理外枠矩形を正本にし、単一の Win32 適用境界へ
 集約する) が症状パッチではなく構造的修正であることには、両版とも同意を得ている。差し戻し理由
 (初期化・描画・可視化の順序、対象モニターの選び方、DPI 境界をまたぐ適用、host の同一性、main 全画面の HWND)
@@ -42,15 +42,17 @@ BA との対応: BA-6 / R2c (placement の正本は runtime。今回はその**�
 
 1. **デスクトップ上の位置・大きさは物理ピクセル (仮想スクリーン座標) で持つ**。detached 窓の runtime placement、
    F11 の restore、保存値、全画面の対象矩形はすべて物理値。論理値 (egui points) は窓の中の描画にだけ使う。
-2. **detached 窓の top-level の位置・大きさを窓へ適用するのは 1 つの境界だけ** (`detached_window_geometry`、§3.3)。
-   egui の `with_position` / `with_inner_size` / `OuterPosition` / `InnerSize` では送らない
-   (egui-winit が窓のそのときの DPI で物理化するため)。
+2. **detached 窓の top-level の位置・大きさを確定させるのは 1 つの境界だけ** (`detached_window_geometry`、§3.3)。
+   egui の `OuterPosition` / `InnerSize` は送らない (egui-winit が窓のそのときの DPI で物理化するため)。
+   builder の `with_position` / `with_inner_size` は、OS 窓を作る前の **仮の配置** (§3.4) としてだけ渡し、
+   正しさは境界の適用で決まる。
 3. **全画面の対象は対象モニターの物理 `rcMonitor` をそのまま使う**。DPI で割らない・掛けない。
 4. **対象モニターは、配置の意図を表す物理矩形から決める**。新しく作った (まだ配置していない) HWND の位置は
    使わない (§3.5)。
-5. **OS 窓は、その HWND に最終の物理配置を適用し終えるまで見せない** (BA-2 のあるべき前提を、builder ではなく
-   「最初の Visible commit の前に物理配置を適用する」として満たす)。判定は「この HWND に適用した」という
-   事実 (runtime が持つ HWND 値と registry の現 HWND の一致) で行い、時間で判定しない。
+5. **OS 窓は、その host に最終の物理配置を適用した後で見せる**。active の immediate 窓では、作成と HWND の登録が
+   同じ root frame で済み、Visible の command は root frame の最後に処理される (§3.4) ので、登録時に適用すれば
+   順序が成り立つ。passive (deferred) 窓と root 側からの表示要求は、runtime の「配置済み」の事実で確かめる。
+   時間では判定しない。
 6. 時間窓・リトライ・画面外を後から戻す補正を主修正にしない (憲法 §2-5、backlog の指示)。
 7. Win32 の `SetWindowPos` は、同期の wndproc (winit・egui-winit・vendor の Painter subclass) が取り直す
    lock / `RefCell` borrow / egui の lock を保持したまま呼ばない (`WM_DPICHANGED` などが同期で wndproc に入るため)。
@@ -78,14 +80,13 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 - **runtime placement** (`DetachedWindowRuntime.placement`): `PhysicalWindowPlacement` にする。
   window_id ごとの正本であることは R2c のまま (新しい保存先・同期経路は作らない。憲法 §2-4)。
 - **runtime の適用記録** (`DetachedWindowRuntime.host_placement`、新設の型付き状態):
-  - `Unplaced`
-  - `Placed { incarnation, applied: AppliedGeometry, outcome: Exact | Mismatch, show_request: Option<ShowRequest> }`
-    — 配置を適用したが、まだ一度も見せていない。`applied` は適用後に読んだ実際の client の物理寸法と DPI
-    (§3.4 の描画機会の判定に使う)。`show_request` は root 側から来た初回表示の要求 (§3.4) を捨てずに保持する。
-  - `Shown { incarnation, outcome }` — 適用後の描画を済ませて Visible commit した。
+  - `Unplaced { show_request: Option<ShowRequest> }` — 現 host にまだ配置を適用していない。`show_request` は
+    root 側から来た表示要求 (§3.4 の 4) を捨てずに保持する。
+  - `Placed { incarnation, outcome: Exact | Mismatch }` — 現 host に配置を適用した。
   `incarnation` は既存の `host_incarnation` (`DetachedHostClaim` と同じ同一性。数値の同じ HWND を clear → 再登録しても
-  新しい値になる)。現 host の incarnation と一致するときだけ有効。host が作り直されれば一致しなくなる (別に失効させる
-  処理は要らない)。同じ incarnation の再登録では再配置しない。生の HWND 値では比べない (レビュー第 2 版 P2-4)。
+  新しい値になる)。`Placed` の incarnation が現 host と違えば `Unplaced` と同じに扱う (host が作り直されれば一致しなく
+  なり、別に失効させる処理は要らない。ただし保持中の `show_request` は host の交代で捨てる。§3.4 の 4)。
+  同じ incarnation の再登録では再配置しない。生の HWND 値では比べない (レビュー第 2 版 P2-4)。
 - **F11 の意図と restore** (`App.detached_viewer_borderless_fullscreen` / `detached_viewer_restore_placement`、
   唯一の書き手 `write_detached_viewer_borderless_state`): 場所はそのまま、restore の型を物理にする
   (独立レビュー同意)。runtime へ移さない理由: F12 往復では旧 runtime を終端退役させてから新しい window_id を作り、
@@ -93,9 +94,9 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
   runtime へ移すと退役時の受け渡し経路が新たに要る。
 - **F11 遷移の対象** (`DetachedViewerBorderlessTransition`): F11 を押した時点 (状態 command を送る前) の窓から決めた
   物理の対象矩形 (入るときは `rc_monitor`、出るときは restore の外枠) を遷移の値として持つ。遷移中に読み直さない。
-- **builder placement latch** (`DetachedWindowRuntime.builder_placement_latch`): 全 builder が位置・大きさを持たなく
-  なるので撤去する (独立レビューで他用途なしを確認。`ViewportBuilder::patch` は新値が `None` なら位置・大きさの
-  command を出さない。ただし過去の `Some` を消さないので、位置を持つ builder の入口を 1 つも残さないことが条件)。
+- **builder placement latch** (`DetachedWindowRuntime.builder_placement_latch`): 残す。builder は今までどおり、
+  host が生きていない間 (`detached_viewer_should_seed_placement`) だけ仮の配置を持ち、latch が frame 間で値を固定する。
+  latch に入れる値は物理 placement で、builder を作る所で §3.4 の 1 の換算をする。
 
 ### 3.3 変換・適用の境界 `src/detached_window_geometry.rs` (新設)
 
@@ -110,14 +111,17 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
   2. **staging** (DPI を m に移す。winit の `WM_DPICHANGED` 処理が読むのは要求した矩形ではなく **その時点の client 寸法**
      であり (winit `event_loop.rs`)、作り直し後の大きさは `client × r` になる。レビュー第 3 版 P2-1):
      2a. **今の DPI のまま小さくする**: k の `rc_work` の中心に、client が小さい既定寸法 (`S0`、例: 320×240 物理) に
-        なる外枠を、今の DPI の装飾 (`AdjustWindowRectExForDpi(style, 今の DPI)`) で求めて `SetWindowPos`。
+        なる外枠を `SetWindowPos`。外枠と client の差は **今の窓で実測した値** (`GetWindowRect` − `GetClientRect`) を使う
+        (Win32 style からは求めない。winit は装飾なしでも `WS_CAPTION` を残し `WM_NCCALCSIZE` で装飾を消すので、
+        `AdjustWindowRectExForDpi(style)` は装飾なしの窓で合わない。レビュー第 4 版 P2-2)。
         窓全体が k の中なので DPI は変わらない。`GetDpiForWindow` が変わっていないこと・`GetClientRect == S0` を確かめる
         (以後 winit が読む client 寸法が確定する)。
      2b. **m へ移す**: 外枠の大きさを保ったまま (`SWP_NOSIZE`)、m の `rc_work` の中心へ移す。窓全体が m の中なので
         窓は m に属し、Windows が `WM_DPICHANGED` を同期で送る。winit は client を `S0 × r` に作り直し、推奨矩形の
-        左上に新しい DPI の装飾込みで置く。`S0 × r` と新しい装飾の外枠が m の `rc_work` の半分以下になるよう `S0` を選ぶ
-        (r は高々 Windows の倍率の比。足りない小さなモニターでは `S0` をさらに小さくする)。推奨矩形の左上は、移動先の
-        左上 (m の中心付近) から大きく動かない前提で、その前提は 2c の確認と §5 の実モニター試験で固定する。
+        左上に新しい DPI の装飾込みで置く。`S0` は、移動前の外枠 (`S0` + 今の装飾) と作り直し後の外枠 (`S0 × r` +
+        新しい装飾。新しい装飾は今の装飾 × r で見積もる) の **両方** が m の `rc_work` の半分以下になるよう選ぶ
+        (r < 1 のときは移動前の外枠のほうが大きい。レビュー第 4 版 P2-2)。推奨矩形の左上は、移動先の左上
+        (m の中心付近) から大きく動かない前提で、**この前提は §5 の実モニター試験が通るまで未検証として扱う**。
      2c. `GetDpiForWindow(hwnd) == m.dpi` かつ `MonitorFromWindow(hwnd) == m` を確かめる。満たさなければ 4 の失敗
         として扱う (3 へ進まない)。
   3. `SetWindowPos(target)`。target は m との交差が最大なので、この段では DPI が変わらない。
@@ -139,60 +143,45 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 
 ### 3.4 配置して見せる順序 (作成・作り直し・adopt)
 
-1 つの host incarnation について、順序は次の 1 本に揃える。**初回の Visible commit は、配置後の大きさと DPI が
-egui の入力に届いた描画機会の callback の中でだけ送る**。immediate / deferred とも、callback の後に描画し、その後に
-native command を処理する (`vendor/eframe/src/native/frame_output.rs`、`wgpu_integration.rs`。独立レビューで確認。
-nested immediate で明示的に送った command は egui が親の出力まで保留する: `vendor/egui/src/context.rs`)。
-したがってその callback で送った Visible は、同じ pass の最終配置での描画の後に処理される。
-
-1. **作成**: builder は位置・大きさを持たず `Hidden` (`with_visible(false)`) で作る。Windows では Hidden の窓でも
-   callback と描画は走る (egui-winit は OS の可視状態を `ViewportInfo` に反映せず、`visible()` は minimized /
-   occluded から求める。レビュー第 2 版で第 1 版 P1-2 の前提を訂正)。
-2. **登録と適用**: HWND を registry に登録する所で、その incarnation が `Unplaced` なら §3.5 の意図から target を決めて
-   `apply_outer_rect` し、`Placed` を記録する (`applied` = 適用後に読んだ client の物理寸法と DPI)。続けて、HWND が
-   既にある viewport へ `ViewportCommand::RequestPaintWhileHidden` を送り、次の pass を起こす (HWND 生成前の command は
-   eframe が保留し、生成処理だけでは flush しない。要求は描画完了の確認ではないので、順序の判定には使わない)。
-3. **描画機会の判定と初回 commit**: callback の中で、egui の入力 (`ViewportInfo` の `inner_rect` × その viewport の
-   `pixels_per_point`、`native_pixels_per_point`) が `applied` の client 寸法 (物理、±1px) と DPI に一致したら、その pass は
-   配置後に native 側で取り直した入力で描かれる。その callback で、既存の Visible commit の位置から commit し
-   (最大化は従来どおり commit の中)、`Shown` にする。pass 番号では判定しない (`cumulative_pass_nr_for` は完了した
-   pass 数で、適用が callback の外か中かで境界がずれる。レビュー第 3 版 P3-3)。一致しない callback では commit しない。
-4. **一回限りの表示指定の消費**: 前面化しない指定 (`take_detached_viewer_activate_on_show` の `no_activate_once`) や
-   `fs_viewport_shown` などの「初回表示済み」は、実際に Visible commit を送ったときだけ消費・記録する。
-   commit を見送った pass では消費しない (レビュー第 2 版 P2-3、第 1 版 P1-3)。新しい bool は足さない
-   (既存の値の消費位置を commit へ移す)。
-5. **位置の記録**: `Unplaced` の間、その host の位置の観測を runtime placement へ書かない。配置済みの host の
+1. **作成 (今のまま + 仮の配置)**: active の窓は今も `Hidden` で作り、その frame の描画の後に callback 内で
+   Visible commit を送っている (`ui_fullscreen.rs` の初回可視化。白い client を見せないための既存の仕組み)。
+   これは変えない。builder に渡す仮の配置は、target (§3.5) の物理矩形を **target のモニターの DPI** で論理化した値:
+   `位置 = target 外枠の左上 / s_m`、`client の大きさ = (target 外枠 − m の DPI の装飾) / s_m` (UI 倍率の換算は従来どおり)。
+   winit は作成直後の窓の DPI で物理化するので、作成直後の窓の DPI が m の DPI と同じとき (単一 DPI の環境はすべて)
+   は **今と同じく最初から正しい位置・大きさで作られ、その大きさで描かれる**。違うときだけ位置・大きさがずれた
+   非表示の窓になり、2 で直る。
+2. **登録と適用**: HWND を registry に登録する所 (created / unclaimed adopted / skipped-snapshot recovered /
+   deferred adopted / watcher repair / ParkedLive の登録。入口の一覧は独立レビューの監査表 §7 を正とし、実装担当は
+   コードで漏れを確かめて報告する) で、現 host が未配置なら §3.5 の意図から target を決めて `apply_outer_rect` し、
+   `Placed` を記録する。作成直後の窓の DPI と m の DPI が同じなら、1 で既に target にあるので
+   `apply_outer_rect` は確認だけで終わる (`SetWindowPos` は要らない)。
+3. **可視化の順序**: egui は nested immediate viewport が送った command を root (primary) の pass の出力まで
+   保留し、まとめて処理する (`vendor/egui/src/context.rs` の viewport 出力。「子の command も primary が扱う」)。
+   active の通常経路では、作成 → callback (描画・Visible commit の送信) → `show_viewport_immediate` から戻る →
+   登録・適用 → root frame の最後に Visible を処理、の順になる。**Visible commit の位置・一回限りの表示指定の
+   消費・`fs_viewport_shown` は今のまま変えない**。loading shell / holdover / keepalive backstop も、登録が commit の
+   前にある (独立レビューの監査) ので同じ。
+   - 倍率の違う作成 (1 で仮の配置がずれた場合) だけは、最初に見える frame の中身が適用前の大きさで描いたものになる
+     (次の frame で描き直される)。画面外に出る今の不具合に比べて許容する。単一 DPI では起きない。
+   - 登録が作成の frame で済まない回復経路 (HWND の差分が取れず後の frame で採用する場合) では、Visible が先に処理され、
+     仮の配置で見えてから登録時に正しい位置へ動く。単一 DPI では仮の配置が正しいので動かない。まれな内部経路として
+     許容し、ログで分かるようにする (`apply_outer_rect` が実際に動かしたかを記録する)。
+4. **root 側からの表示要求** (トレイ復帰 `tray_integration.rs`、native 遷移の `SetHostVisible` と付随する `FocusHost`
+   `native_video.rs`、既存窓の再アクティブ化 `app.rs`、その他 callback の外から Visible を送る所。レビュー第 3 版 P2-2):
+   1 つの helper に通す。helper は現 host が `Placed` なら今までどおり送る。`Unplaced` なら送らず、要求 (表示・最大化・
+   前面化をまとめた 1 つの `ShowRequest`) を `show_request` に保持し、2 の適用の直後に送る。要求を捨てない。
+   保持中に非表示の要求が来たら `show_request` を消す (古い要求で再表示しない)。host が交代したら保持中の要求は捨てる
+   (新しい host へ漏らさない)。runtime が無い窓は従来の経路のまま (新しい保留を作らない)。
+5. **passive (deferred) 窓**: 今は builder の `with_visible(true)` と位置で可視化・配置している。deferred の command は
+   その viewport 自身の pass の出力で処理され、root の採用より先に処理されうるので、1 の順序は使えない。そこで
+   builder は `Hidden` + 仮の配置で作り、採用 (2) で適用し、callback に「`Placed` なら Visible commit」(最大化は commit の中)
+   を新設する。トレイ常駐中に作る窓 (今 `visible=false`) は commit せず、トレイ復帰の要求 (4) に任せる。
+   Windows では Hidden の窓でも callback は走る (レビュー第 2 版で確認)。
+6. **位置の記録**: `Unplaced` の間、その host の位置の観測を runtime placement へ書かない。`Placed` の host の
    位置の記録は、egui の観測 (callback の `outer_rect` / 送られてくる Frame) を「変わったかもしれない」という通知として
-   扱い、root が現 incarnation の HWND から `GetWindowRect` で読む (レビュー第 2 版 P2-5。初回 callback の観測は
-   配置前の窓の値なので使わない)。
-6. **root 側からの表示要求** (トレイ復帰 `tray_integration.rs`、native 遷移の `SetHostVisible` `native_video.rs`、
-   既存窓の再アクティブ化 `app.rs`、その他 callback の外から Visible を送る所。レビュー第 3 版 P2-2):
-   全部を 1 つの helper に通す。helper は現 incarnation の `host_placement` を見て:
-   - `Shown`: 今までどおり送ってよい (配置後の描画を済ませた host の再表示。トレイ中も外枠は変わらない)。
-   - `Placed`: 送らない。要求 (最大化・前面化の方針を含む) を `show_request` に保持し、その viewport の repaint を
-     要求する。3 の commit がその要求を使って送り、消費する (要求を捨てない)。callback 自身の初回表示の判断と
-     `show_request` は同じ commit で 1 回にまとめる。
-   - `Unplaced` (HWND 未登録など): 要求を runtime に保持できるなら `Placed` と同じく保持し、登録・適用の後に 3 で送る。
-     保持先が無い (runtime が無い) 場合は既存の挙動 (その経路の既存の保留・再試行の仕組み) に従い、新しい保留を作らない。
-   - 非表示にする要求 (`Visible(false)`) は状態にかかわらず今までどおり送る。
-
-経路ごとの当てはめ (入口の一覧は独立レビューの監査表 §7 を正とし、実装担当はコードで漏れを確かめて報告する):
-
-- **active の通常描画** (Visible commit が子 callback 内、登録が `show_viewport_immediate` から戻った後):
-  作成の pass では未登録なので commit しない。戻った後に登録・適用・描画要求。入力が届いた後の callback で commit。
-  初回表示が 1〜2 pass 遅れる。
-- **loading shell / holdover / keepalive backstop** (callback で描画 → 戻って登録 → 同じ関数で commit): 適用した pass では
-  commit しない。commit を 3 の条件を満たす callback へ移す (レビュー第 2 版 P2-2)。
-- **ParkedLive の immediate 作り直し** (今は commit が無く builder の可視化に頼る): 登録 (`ui_fullscreen.rs` の
-  ParkedLive 登録) で適用し、3 の条件を満たす callback に commit を新設する。
-- **passive (deferred) 窓**: Hidden で作る。最初の callback (`push_first_callback_once`) で root が採用し、採用で 2 を行う。
-  3 の条件を満たす callback に passive の Visible commit を新設する (今は builder の `with_visible(true)` が可視化を担う)。
-  トレイ常駐中に作る passive 窓 (今 `visible=false`) は 3 で commit せず `Placed` のまま待ち、トレイ復帰の要求は 6 の
-  helper が `show_request` に保持して 3 で送る。
-- **created / unclaimed adopted / skipped-snapshot recovered / deferred adopted / watcher repair**: すべて 2 を通す。
-- **既存窓の再表示**: 6 の helper。生きている同じ窓 (folder-nav の再利用、park / promote、active 再入場) は
-  再配置しない。
-- **非表示の keepalive・cleanup**: 作り直した host には 2 を行う。可視化は要求しない。
+   扱い、root が現 host の HWND から `GetWindowRect` で読む (レビュー第 2 版 P2-5)。
+7. 生きている同じ窓 (folder-nav の再利用、park / promote、active 再入場) は再配置しない。非表示の keepalive・cleanup で
+   作り直した host には 2 を行い、可視化は要求しない。
 
 ### 3.5 target の決め方 (意図から決める)
 
@@ -261,11 +250,28 @@ nested immediate で明示的に送った command は egui が親の出力まで
 
 ## 4. 状態の組み合わせを減らす検討 (CLAUDE.md の設計方針)
 
-- 採用: builder が位置を持たないことで、builder latch と「egui の patch が送る位置 command」と
-  「mIV が送る位置 command」の競合が無くなる。
+第 1〜4 版は「OS 窓を作ってから、最終配置で描いた後に見せる」を全経路で新たに保証しようとし、初回表示を後の pass へ
+移す・描画の機会を判定する・一回限りの表示指定の消費位置を動かす・`Placed` と `Shown` を分ける、と経路ごとに
+扱う組み合わせが増え続けた (第 4 版でも、入力は新しい寸法なのに描画面が古い寸法の瞬間が残ると指摘された)。
+親セッションの提案 (2026-10-20) を受け、組み合わせそのものを減らせないかを検討した。
+
+- **採用 (第 5 版): 仮の配置 + 登録時の適用 + 既存の可視化の順序に乗る**。builder に target のモニターの DPI で
+  論理化した仮の配置を渡すと、単一 DPI の環境・作成直後の DPI が同じ場合は今とまったく同じ動きになる
+  (退行が無い)。違う場合だけ登録時の適用で直し、active の可視化は「子の command は root frame の最後に処理される」
+  既存の順序に乗るので、可視化・表示指定・初回表示済みの扱いを変えない。新しい判定 (描画の機会) と経路ごとの
+  commit の移動がすべて不要になる。代償は、倍率の違う作成で最初の 1 frame の中身が適用前の大きさになりうること
+  (§3.4 の 3)。今の不具合 (画面外で見えない) に比べ許容する。
+- **不採用: モニターをまたぐ配置の変更では窓を閉じて作り直す**。原因は作り直しそのもの (作成直後の DPI が対象と
+  無関係) にあるので、作り直しに寄せても直らない。F11 の出入りで窓を作り直すと動画の host 移動 (presenter の付け替え)
+  まで巻き込み、今より重くなる。
+- **不採用: 第 4 版の「初回表示を後の pass へ移す」**。上のとおり、経路ごとの順序の組み合わせが増え、描画面の寸法の
+  同期という新しい前提が要る。
+
+- 採用: mIV は生きている窓へ位置の command (`OuterPosition` / `InnerSize`) を送らず、builder の仮の配置は
+  窓を作る前だけ (既存の latch のまま)。egui の patch が送る位置 command と mIV の適用が競合しない。
 - 採用: 位置の単位を 1 つ (物理) にし、変換・適用を 1 か所に集める。DPI の組み合わせ (窓の DPI × 対象の DPI ×
   UI 倍率) を各入口で扱わない。
-- 採用: 配置と初回表示の進み具合は、runtime の `host_placement` (incarnation 付きの `Unplaced` / `Placed` / `Shown`)
+- 採用: 配置の進み具合は、runtime の `host_placement` (`Unplaced { show_request }` / incarnation 付きの `Placed`)
   1 つで表す。host の作り直し・終了で別に失効させる処理を持たない。root 側からの表示要求も同じ状態に保持し、
   別の pending を作らない。
 - 不採用: F11 の意図・restore を runtime へ移す案 (§3.2 の理由)。
@@ -286,18 +292,20 @@ nested immediate で明示的に送った command は egui が親の出力まで
 - 実モニター: 倍率の違うモニターが 2 台以上ある機械でだけ走る試験 (それ以外では skip し、skip したことを出力する)。
   非表示の winit 窓を作り、倍率の違う各モニターの中央・境界をまたぐ位置・モニターより大きい矩形へ `apply_outer_rect`
   して、`Exact` になることと実際の矩形・DPI を確かめる。開発機 (150% と 100% の構成) で実行する。
-  2b の推奨矩形の左上の前提はこの試験で固定する。
+  2b の推奨矩形の左上の前提はこの試験で固定する。装飾あり・なし (仮想全画面)、150%→100% と 100%→150% の両方向を含め、
+  すべて `Exact` になることを実装報告に含める。
   境界をまたぐ target、現在の大きさと target の大きさが違う場合、モニターより大きい target、上下に並んだモニター、
   同じ DPI の場合 (staging しない) を含め、適用後の矩形 = target を確かめる。
 - 実 HWND (単一 DPI の範囲): winit (eframe と同じ backend) で非表示の窓を作り `apply_outer_rect` → `GetWindowRect` が
   target と一致すること。
-- App: 初回表示の順序 (適用した pass では commit しない・入力が適用後の寸法と DPI に一致した callback で commit・
-  適用が callback の外の場合と中の場合・shown と
-  `no_activate_once` は commit 時だけ消費)、loading shell / holdover / backstop / ParkedLive / passive の各経路の順序、
+- App: builder の仮の配置が target のモニターの DPI で論理化されること (単一 DPI では従来と同じ値になること)、
+  登録時に適用されること (作成直後の窓の DPI が同じなら `SetWindowPos` しないこと)、passive の commit が `Placed` まで
+  送られないこと、ParkedLive / loading shell / holdover / backstop の登録で適用されること、
   数値の同じ HWND を clear → 再登録したら新しい host として再配置されること、配置前の観測が runtime placement を
   上書きしないこと、最大化中の窓の F11 が `IsZoomed == false` まで幾何を適用しないこと、root 側の表示要求
-  (トレイ復帰・native 遷移・再アクティブ化) が `Placed` の host では保持されて初回 commit で送られ、`Shown` の host
-  では即送られること、Hidden deferred の進行 (passive が採用まで進み可視化される)、
+  (トレイ復帰・native 遷移の Visible と FocusHost・再アクティブ化) が `Unplaced` では 1 つの `ShowRequest` に保持されて
+  適用の直後に送られ、`Placed` では即送られること、保持中の非表示要求で古い要求が消えること、host の交代で
+  保持中の要求が新しい host へ漏れないこと、Hidden deferred の進行 (passive が採用まで進み可視化される)、
   新 HWND の位置と seed のモニターが違う場合、同じ HWND の再登録で再配置しないこと、HWND の作り直しで配置済みが
   外れること、F12 往復・promote 後の新しい窓・always-new・複数 passive 窓・F11 入る/解除 (最大化 → F11 → 解除を含む)・
   トレイ中の作り直し → 復帰・always-on-top の保持。
@@ -313,7 +321,12 @@ nested immediate で明示的に送った command は egui が親の出力まで
 - キー入力 subclass の rect 探索 (R1 の対象外のまま)。
 - detached の状態遷移・HWND registry・park / promote の所有境界そのもの、F11 遷移の `Settle` 時間待ち。
 
-## 7. 第 1 版のレビュー指摘との対応
+## 7. レビュー指摘との対応 (履歴)
+
+第 1〜3 版の表の「後の pass で commit」「`Shown`」などは当時の版の対応で、第 5 版の §3.4・§4 で置き換えた。
+各指摘が第 5 版でどう扱われるかは、第 4 版の表と §3.4 を正とする。
+
+### 第 1 版のレビュー指摘との対応
 
 | 指摘 | 対応 |
 | --- | --- |
@@ -350,3 +363,11 @@ nested immediate で明示的に送った command は egui が親の出力まで
 | P3-3 pass 番号の境界がずれる | §3.4 の 3: pass 番号ではなく、egui の入力が適用後の client 寸法と DPI に一致した callback で commit |
 | P3-4 §4 に旧 HWND 比較が残っている | §4 を `host_placement` に更新 |
 | Mismatch の扱い | §3.3 の 4: 成功に数えず、メイン窓のトーストで通知、「必ず回収できる」とは扱わない、通常操作での発生は不具合 |
+
+### 第 4 版のレビュー指摘との対応 (判定 ACCEPT WITH CHANGES)
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2-1 入力の寸法の一致は描画面の更新の十分条件でない | 第 5 版で描画の機会の判定そのものを廃止 (§3.4、§4)。既存の可視化の順序に乗る |
+| P2-2 staging の外枠を style から求めると装飾なしで合わない、`S0` の制約が片側だけ | §3.3 2a: 実測の外枠と client の差、2b: 移動前と作り直し後の両方を制約。推奨矩形の左上の前提は実モニター試験まで未検証 |
+| P3-3 `Unplaced` の要求の保持先が未定義、FocusHost が先に処理される | §3.2 `Unplaced { show_request }`、§3.4 の 4: 表示・最大化・前面化を 1 つの要求にまとめる。非表示で消す、host 交代で捨てる |
