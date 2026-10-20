@@ -910,3 +910,35 @@ core 5m47s、Remote service 0.54s、EPUB PDF worker 0.47s、VCRT検査runtime=4 
 利用者確認は前節の通常profile起動手順に従い、連動窓中のCtrl+R一回の通知、ダイアログの非消費、
 UI倍率200%／狭い窓でのホバー理由全文を確認する。
 製品アプリは起動せず、commitは行わない。本体lib全件・独立再レビュー・実機での確認は別途。
+
+### 20.6 ホバーsnapshotのOSカーソル依存を除去（2026-10-20）
+
+`389371880` 時点の代表2枚がsearch6単独／master統合後とも縦1～2px揺れる利用者報告。
+コード確認でも、fixtureが製品の `anchor_for` → `cursor_anchor_rect` → `GetCursorInfo` / `GetIconInfo` を
+通り、headlessの擬似ポインタとは別にデスクトップの現在のカーソル画像を計測していた。
+
+公開fixtureへ上下の物理px寸法を引数で渡し、2 PNGと倍率geometryは `(0, 34)` で固定する。
+メニューbutton／可否／理由と、tooltipの遅延変換・AccessKit名・幅制限・配色・gapは製品と共有する。
+寸法からアンカーへの変換をpure helperに分け、製品は従来のOS計測値（取得不可時は既存の論理34pt fallback）、
+fixtureは明示寸法を渡す。製品のOS計測gateや実カーソル回避を変更せず、テスト判定用の環境変数・状態を追加しない。
+
+他のhover撮影も確認した。Ctrl+G拒否バッジ、EffeTune、動画タグはegui標準 `on_hover_text` /
+`on_disabled_hover_text` でOS計測へ入らない。詳細アイコンはhover色だけ、整理先／見開き調整／toolbar等は
+撮影前にpointerを外している。libのstill seek hover撮影は独自previewで、lock button外を指す。
+確認範囲で同じ実カーソル依存の修正対象はEverythingの2枚のみ。
+
+物理寸法の100%／200%変換と、OS計測不可時の既存fallbackをlib回帰で検査する。
+検証対象は `389371880` 上の未コミット差分。Rust差分
+（`git diff --binary -- src tests/ui_snapshot.rs`）のSHA-256は
+`40b5ab7c5b01731d8ad9da7443bba9d6ba13ccab9b2edb431e8ea72b87bc93d7`。
+
+| 実施 | 結果 |
+| --- | --- |
+| `UPDATE_SNAPSHOTS=1` でEverything hover明暗2件をnextest実行 | 2 passed。`target/search6-cursor-update.log` |
+| PNG目視／比較 | 明暗とも640×180、理由全文・disabled状態・枠・位置を目視確認。固定寸法で再生成した2枚はHEADとbyte単位で一致（19,847 / 19,833 bytes）、PNG差分なし |
+| `cargo nextest run -p mimageviewer --test ui_snapshot --test-threads 4`（更新指定なし） | **191 passed / 0 failed / 0 skipped**、64.816s。`target/search6-cursor-ui.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ui_helpers::accessibility_names_tests/) \| test(/everything/)' --test-threads 4` | **82 passed / 0 failed**、7.440s。`target/search6-cursor-lib.log` |
+| 全体 `cargo fmt`／`cargo fmt --check`／glyph lint／`git diff --check` | 成功、危険グリフ0 |
+
+workspace内TEMP/TMP/MSBUILDDEBUGPATH、`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`を使用。
+fixtureの再現性だけの変更なので確認用製品buildは行わず、製品起動・commitも行わない。

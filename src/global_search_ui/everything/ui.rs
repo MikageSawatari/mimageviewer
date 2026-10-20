@@ -6,19 +6,41 @@ pub(crate) fn everything_search_menu_button(
     entry: super::EverythingSearchEntryAvailability,
 ) -> egui::Response {
     use crate::ui_helpers::HoverTipExt;
+    everything_search_menu_button_with_hover(ui, label, entry, |response, reason| {
+        response.hover_tip_disabled(reason)
+    })
+}
+
+fn everything_search_menu_button_with_hover(
+    ui: &mut egui::Ui,
+    label: &str,
+    entry: super::EverythingSearchEntryAvailability,
+    hover: impl FnOnce(egui::Response, &'static str) -> egui::Response,
+) -> egui::Response {
     let response = ui.add_enabled(entry.is_allowed(), egui::Button::new(label));
     match entry.reason_text() {
-        Some(reason) => response.hover_tip_disabled(reason),
+        Some(reason) => hover(response, reason),
         None => response,
     }
 }
 
 #[doc(hidden)]
-pub fn draw_everything_search_disabled_menu_snapshot_fixture(ui: &mut egui::Ui) {
-    everything_search_menu_button(
+/// `cursor_extent_physical` is the cursor's physical-pixel extent above/below its hotspot.
+pub fn draw_everything_search_disabled_menu_snapshot_fixture(
+    ui: &mut egui::Ui,
+    cursor_extent_physical: (f32, f32),
+) {
+    everything_search_menu_button_with_hover(
         ui,
         "Everything ファイル名検索…  Ctrl+R",
         super::EverythingSearchEntryAvailability::LinkedViewer,
+        |response, reason| {
+            crate::ui_helpers::hover_tip_disabled_with_cursor_extent(
+                response,
+                reason,
+                cursor_extent_physical,
+            )
+        },
     );
 }
 
