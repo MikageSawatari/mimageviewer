@@ -5,6 +5,9 @@ use eframe::egui;
 
 const EGUI_LICENSE_MIT: &str = include_str!("../../vendor/egui-wgpu/LICENSE-MIT");
 const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-APACHE");
+const LIBAVIF_LICENSE: &str = include_str!("../../LIBAVIF-LICENSE.txt");
+const DAV1D_LICENSE: &str = include_str!("../../DAV1D-LICENSE.txt");
+const LIBYUV_LICENSE: &str = include_str!("../../LIBYUV-LICENSE.txt");
 const LIBRAW_LICENSE: &str = include_str!("../../LIBRAW-LICENSE.txt");
 const ZLIB_LICENSE: &str = include_str!("../../ZLIB-LICENSE.txt");
 const RUST_DEFLATE_NOTICES: &str = include_str!("../../RUST-DEFLATE-NOTICES.txt");
@@ -66,6 +69,33 @@ pub fn draw_raw_license_snapshot_fixture(ui: &mut egui::Ui) {
         "libjpeg-turbo ライセンス・著作権表記 全文",
         "about_libjpeg_turbo_license",
         LIBJPEG_TURBO_LICENSE,
+    );
+}
+
+/// Bundled AVIF versions and full notices, shared by the dialog and headless UI tests.
+#[doc(hidden)]
+pub fn draw_avif_license_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.label(format!(
+        "AVIF 同梱版: {}",
+        crate::avif_decoder::BUILD_ID.trim()
+    ));
+    draw_license_text(
+        ui,
+        "libavif ライセンス・著作権表記 全文",
+        "about_libavif_license",
+        LIBAVIF_LICENSE,
+    );
+    draw_license_text(
+        ui,
+        "dav1d ライセンス・著作権表記 全文",
+        "about_dav1d_license",
+        DAV1D_LICENSE,
+    );
+    draw_license_text(
+        ui,
+        "libyuv ライセンス・著作権表記 全文",
+        "about_libyuv_license",
+        LIBYUV_LICENSE,
     );
 }
 
@@ -150,6 +180,9 @@ impl App {
                         ui.label("LGPLv3-or-later — FFmpeg project");
                         ui.end_row();
 
+                        ui.label("AVIF (libavif / dav1d / libyuv)");
+                        ui.label("BSD ? AOMedia / VideoLAN / libyuv authors");
+                        ui.end_row();
                         ui.label("LibRaw");
                         ui.label("CDDL-1.0 — LibRaw LLC");
                         ui.end_row();
@@ -246,6 +279,9 @@ impl App {
 
                 ui.add_space(8.0);
                 draw_raw_license_snapshot_fixture(ui);
+                ui.separator();
+                draw_avif_license_snapshot_fixture(ui);
+
                 draw_license_text(
                     ui,
                     "Everything IPC 定義 (MIT) 全文",
@@ -413,14 +449,17 @@ mod tests {
     }
 
     use super::{
-        EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, IJG_ATTRIBUTION, LIBJPEG_TURBO_LICENSE,
-        LIBRAW_LICENSE, ZLIB_LICENSE,
+        DAV1D_LICENSE, EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, IJG_ATTRIBUTION, LIBAVIF_LICENSE,
+        LIBJPEG_TURBO_LICENSE, LIBRAW_LICENSE, LIBYUV_LICENSE, ZLIB_LICENSE,
     };
 
     #[test]
     fn embedded_raw_notices_equal_tracked_files_with_bsd_and_ijg_attribution() {
         for (file, embedded) in [
             ("LIBRAW-LICENSE.txt", LIBRAW_LICENSE),
+            ("LIBAVIF-LICENSE.txt", LIBAVIF_LICENSE),
+            ("DAV1D-LICENSE.txt", DAV1D_LICENSE),
+            ("LIBYUV-LICENSE.txt", LIBYUV_LICENSE),
             ("ZLIB-LICENSE.txt", ZLIB_LICENSE),
             ("LIBJPEG-TURBO-LICENSE.txt", LIBJPEG_TURBO_LICENSE),
         ] {

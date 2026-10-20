@@ -391,65 +391,61 @@ fn normalize(bytes: &[u8], extension: &str, cancel: &AtomicBool) -> Result<Encod
     } else {
         bytes
     };
-    let mut wic_orientation_applied = false;
-    let decoded = if let Some(format) = format {
-        let mut reader = image::ImageReader::with_format(Cursor::new(input), format);
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(metadata::DECODE_BUDGET);
-        reader.limits(limits.clone());
-        match reader.into_decoder() {
-            Ok(mut decoder) => {
-                let (w, h) = decoder.dimensions();
-                if !raster_within_budget(w, h, decoder.total_bytes()) {
-                    return Err("raster exceeds decode budget".into());
-                }
-                limits
-                    .reserve(decoder.total_bytes())
-                    .map_err(|e| e.to_string())?;
-                decoder.set_limits(limits).map_err(|e| e.to_string())?;
-                check(cancel)?;
-                match DynamicImage::from_decoder(decoder) {
-                    Ok(decoded) => decoded,
-                    Err(error @ image::ImageError::Unsupported(_)) => {
-                        // Some TIFF compression modes are recognized at construction
-                        // but unsupported by the pixel decoder. Preserve the prior
-                        // raster admission and delegate once to the bounded WIC path.
-                        check(cancel)?;
-                        wic_orientation_applied = true;
-                        crate::wic_decoder::decode_to_dynamic_image_from_bytes_bounded(
-                            input,
-                            extension,
-                            metadata::DECODE_BUDGET,
-                        )
-                        .ok_or_else(|| error.to_string())?
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            Err(error) => {
-                wic_orientation_applied = true;
-                crate::wic_decoder::decode_to_dynamic_image_from_bytes_bounded(
-                    input,
-                    extension,
-                    metadata::DECODE_BUDGET,
-                )
-                .ok_or_else(|| error.to_string())?
-            }
-        }
-    } else {
-        wic_orientation_applied = true;
-        crate::wic_decoder::decode_to_dynamic_image_from_bytes_bounded(
-            input,
-            extension,
-            metadata::DECODE_BUDGET,
-        )
-        .ok_or("image decoder unavailable")?
+    let hint = format!("artwork.{extension}");
+    let source = crate::image_decode::Source::Bytes {
+        bytes: input,
+        hint: &hint,
     };
+    let decoded = crate::image_decode::primary(
+        source,
+        crate::avif_decoder::Workload::Background,
+        Some(metadata::DECODE_BUDGET),
+        Some(cancel),
+        || {
+            let Some(format) = format else {
+                return Err(image::ImageError::IoError(std::io::Error::other(
+                    "image decoder unavailable",
+                )));
+            };
+            let mut reader = image::ImageReader::with_format(Cursor::new(input), format);
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(metadata::DECODE_BUDGET);
+            reader.limits(limits.clone());
+            // Construction failures used to delegate to WIC, including malformed
+            // headers. Pixel failures other than Unsupported remain terminal.
+            let mut decoder = reader
+                .into_decoder()
+                .map_err(|error| image::ImageError::IoError(std::io::Error::other(error)))?;
+            let (w, h) = decoder.dimensions();
+            if !raster_within_budget(w, h, decoder.total_bytes()) {
+                return Err(image::ImageError::Limits(
+                    image::error::LimitError::from_kind(
+                        image::error::LimitErrorKind::InsufficientMemory,
+                    ),
+                ));
+            }
+            limits.reserve(decoder.total_bytes())?;
+            decoder.set_limits(limits)?;
+            DynamicImage::from_decoder(decoder).map_err(|error| match error {
+                error @ image::ImageError::Unsupported(_) => error,
+                error => image::ImageError::Decoding(image::error::DecodingError::new(
+                    format.into(),
+                    error,
+                )),
+            })
+        },
+    )
+    .map_err(|e| match e {
+        image::ImageError::Limits(_) => "raster exceeds decode budget".to_owned(),
+        error => error.to_string(),
+    })?;
     check(cancel)?;
-    let decoded = if wic_orientation_applied {
-        decoded
+    let display_orientation_applied =
+        decoded.orientation == crate::image_decode::Orientation::Applied;
+    let decoded = if display_orientation_applied {
+        decoded.image
     } else {
-        crate::thumb_loader::apply_orientation(decoded, orientation)
+        crate::thumb_loader::apply_orientation(decoded.image, orientation)
     };
     // Static, bounded square PNG/JPEG/WebP can retain their original bytes.
     // An animation marker conservatively selects reencoding of the first frame.
@@ -462,7 +458,7 @@ fn normalize(bytes: &[u8], extension: &str, cancel: &AtomicBool) -> Result<Encod
     let animated = (format == Some(ImageFormat::Png) && bytes.windows(4).any(|s| s == b"acTL"))
         || (format == Some(ImageFormat::WebP) && bytes.windows(4).any(|s| s == b"ANIM"));
     if let Some(mime) = mime
-        && !wic_orientation_applied
+        && !display_orientation_applied
         && !animated
         && orientation == 1
         && decoded.width() == decoded.height()
@@ -526,6 +522,29 @@ fn finish(bytes: Vec<u8>, mime: &'static str, cancel: &AtomicBool) -> Result<Enc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn avif_now_playing_bounded_artwork_preserves_rotation_and_alpha() {
+        for name in ["quadrant_irot90cw", "quadrant_alpha_444"] {
+            let bytes = std::fs::read(crate::avif_decoder::tests::fixture(name)).unwrap();
+            for hint in ["AVIF", ""] {
+                let art = normalize(&bytes, hint, &AtomicBool::new(false)).unwrap();
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .decode(&*art.base64)
+                    .unwrap();
+                let image = image::load_from_memory(&encoded).unwrap();
+                assert_eq!((image.width(), image.height()), (64, 64));
+                if name == "quadrant_irot90cw" {
+                    crate::avif_decoder::tests::assert_quadrants(&image, [2, 0, 3, 1]);
+                } else {
+                    let rgba = image.to_rgba8();
+                    assert_eq!(rgba.get_pixel(16, 16)[3], 0);
+                    assert_eq!(rgba.get_pixel(48, 16)[3], 255);
+                }
+            }
+        }
+    }
 
     #[cfg(windows)]
     fn ccitt3_tiff_fixture() -> Vec<u8> {

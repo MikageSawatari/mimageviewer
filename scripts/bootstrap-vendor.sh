@@ -55,6 +55,9 @@ run_step "PDFium" "vendor/pdfium/bin/pdfium.dll" \
 run_step "LibRaw 0.22.2 and zlib" "vendor/libraw/VERSION" \
     "bash scripts/setup-libraw.sh"
 
+run_step "libavif + dav1d + libyuv" "vendor/libavif/VERSION" \
+    "bash scripts/setup-libavif.sh"
+
 run_step "ONNX Runtime" "vendor/ort/onnxruntime.dll" \
     "bash scripts/setup-ort.sh"
 

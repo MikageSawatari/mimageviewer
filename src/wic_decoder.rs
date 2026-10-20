@@ -1,12 +1,12 @@
 //! Windows Imaging Component (WIC) を使った汎用画像デコーダ。
 //!
-//! `image` クレートが対応していない HEIC/HEIF, AVIF, JPEG XL
+//! `image` クレートが対応していない HEIC/HEIF, JPEG XL と内蔵 AVIF の fallback
 //! などのフォーマットを Windows のネイティブコーデック経由でデコードする。
 //! RAW はこの境界で拒否し、上位から LibRaw に送る。
 //!
 //! 必要なコーデックは Microsoft Store から無料インストールできる:
 //! - HEIC/HEIF: HEIF Image Extensions
-//! - AVIF:      AV1 Video Extensions
+//! - AVIF fallback: AV1 Video Extensions (通常は内蔵で読み、追加インストール不要)
 //! - JPEG XL:   JPEG XL Image Extensions
 //!
 //! インストールされていないフォーマットは `decode_to_dynamic_image` が `None` を返す。

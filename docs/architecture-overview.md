@@ -890,3 +890,10 @@ App の発行境界で寿命とnative fadeを確定して、既存 toast state �
 設定は既存 settings.db KV の追加項目で、旧項目欠落時は標準へ移行する。
 新しい worker・channel・detached context state は持たない。
 [時間・例外・棚卸しの詳細](notification-duration-policy.md)。
+
+## AVIF 内蔵デコード（§1.407）
+
+`crates/libavif-sys` の C shim が libavif の構造体 ABI を閉じ込め、既存の静的
+libavif / dav1d / libyuv をリンクする。`avif_decoder` は予算検査・RGBA8 確保・
+表示変換を所有する。`image_decode` は形式選択と WIC 接続、使用デコーダと向き状態を共有する。
+worker・queue・context owner・永続 schema は追加しない。

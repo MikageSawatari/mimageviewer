@@ -31,7 +31,15 @@ if [[ "${1:-}" == check ]]; then
     echo "Latest libavif release: $latest_avif (check its cmake/Modules/LocalDav1d.cmake and LocalLibyuv.cmake pins)"
     exit 0
 fi
-if [[ "${1:-}" != --force && -f "$VENDOR/VERSION" && "$(cat "$VENDOR/VERSION")" == "$STAMP" ]]; then
+installed() {
+    [[ -f "$VENDOR/VERSION" && "$(cat "$VENDOR/VERSION")" == "$STAMP" ]] || return 1
+    local file
+    for file in include/avif/avif.h lib/avif.lib lib/dav1d.lib lib/yuv.lib \
+        licenses/libavif-LICENSE.txt licenses/dav1d-COPYING.txt licenses/libyuv-LICENSE.txt; do
+        [[ -f "$VENDOR/$file" ]] || return 1
+    done
+}
+if [[ "${1:-}" != --force ]] && installed; then
     echo "vendor/libavif is up to date ($STAMP)"
     exit 0
 fi

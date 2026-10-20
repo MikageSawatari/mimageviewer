@@ -69,4 +69,55 @@
 
 ## 5. 未決・記録
 
-- (実装後に記入) スレッド数の具体値、サムネイルキャッシュ済みの AVIF の扱い、exe サイズの増分、速度の比較。
+### 実装判断（2026-10-20、avif-1407）
+
+- dav1d は需要のフルサイズ表示・clipboard・Remote AI で **4 threads**、サムネイル・
+  類似索引・一括変換・製本 editor thumbnail・fullscreen 先読み・ベンチで **1 thread**。
+  開発機の `NUMBER_OF_PROCESSORS=24`、fullscreen admission は process 共通で6件
+  （`FS_PAGE_LOAD_TOTAL_PERMITS`）、thumbnail/batch は設定 Auto で logical CPU / 2
+  （この環境では12 workers）。背景 worker にさらに内部並列を掛けない。
+  需要側も6×4=24を目安に内部並列を4に固定し、空き状況による切替や新しい worker は追加しない。
+- `libavif-sys` は既成の avif/dav1d/yuv static libraries と `/MT` の C shim のみをリンク。
+  `VERSION` の全内容を検証し、同梱版を `BUILD_ID` として about へ出す。
+- Rust の `avif_decoder` が割当前の寸法・RGBA予算検査と clap→irot→imir を一か所で所有。
+  `image_decode::Decoded` の `Orientation::Applied` を後段へ運び、拡張子で EXIF を抑止しない。
+  不正 clap だけは無視し、他の変換は続ける。native失敗は stage/result/diag をログへ記録して委譲。
+- libavif 1.4.2 は `imageSizeLimit > 16384*16384` 自体を拒否する（`read.c`）。
+  各辺32768と、このnative総画素上限・呼出元RGBA予算を併用する。超過は型付き
+  Dimensions/Budget とし、通常経路は既存WIC/Susieへ進む。bounded経路のWICにも同じ予算を渡す。
+- now-playing artwork の既存 bounded 経路はWICまでで、Susie呼出しは元からない。
+  Susieには割当前RGBA予算を渡すAPIがないため、ここへ非boundedのSusieを新設しない。
+  内蔵→bounded WICの既存終端を維持する。この例外は設計担当の確認事項。
+- 既存cancelをnative呼出し前後・fallback前後で照合する。実行中の1回のlibavif decodeは中断しない。
+- thumbnail catalog はmtime/sizeと全体schema version、PDF専用meta移行を持つが、
+  画像形式/decoder versionで無効化する共通機構はない。代表キー `zipthumb:` / `folderthumb:`
+  には元画像形式を特定できない旧行もあり、AVIFだけを漏れなく選べない。
+  利用者指示に従い新しい無効化/スキーマ変更は行わない。既存WIC製AVIFサムネイルは再生成まで残る。
+- 今回は長期処理の新しい状態/並行ownerを作らず、既存worker内のデコード境界だけを差し替える。
+  modal化や専用live-rebuildは不要。既存同期UIから今回のデコード呼出しへ至る経路は
+  棚卸しの範囲では見つからず、worker配置は変更しない。
+- exeサイズ増分・実画像での速度比較は、同じprofileの変更前ビルドがこのworktreeにないため未測定。
+  tiny synthetic fixtureの測定を実画像での性能根拠にはしない。
+
+### 接続先
+
+| 呼出元 | 接続と向き |
+| --- | --- |
+| canonical_image_loader | path / verified bytes / archive bytes、FallbackDecoder seamにnative追加、型付き向き |
+| thumb_loader | decode_image_for_thumb、decode_zip_chain（ZIPとverified source）、load_one_cachedの通常path、batch path/ZIP |
+| app | panorama source、fullscreen需要/先読みのworkload指定 |
+| books | 通常file / ZIP bytesのcomposite source decode |
+| similar_image | file/bytesのproxy、既存file WIC→bytes WICとSusie source選択を維持 |
+| ui_dialogs/context_menu | file / ZIP clipboard worker |
+| effetune/now_playing/artwork | bounded bytes decode（既存終端はWIC） |
+| bin/bench_dupe | full decodeとsynthesis、二重EXIFを撤去 |
+| bin/bench_ai / bench_zip_seek / bench_raw | file入力 / ZIP decodeと並列ZIP計測 / DNG限定WIC対照（同じhelper経由） |
+| remote_ipc/container / thumbnail | canonical / thumb_loaderを共用、独立デコード経路なし |
+
+直接WIC呼出しを残したもの: canonicalのproduction seam、共有helperの実装、artworkの
+WIC対照unit tests。`bench_raw` のDNG専用対照もshared helper経由へ接続。
+
+### 自動検証
+
+実行コマンド・件数・変更ファイル・制限は [実装・検証記録](avif-1407-implementation-results.md) を参照。
+AVIF＋ライセンスの最終focused 22/22、関連69/69、UI通常比較11/11成功。fmt clean、Clippy最終exit0（既存警告あり）。確認buildも成功（通常profile、core / Remote / EPUB）。製品バイナリは起動していない。

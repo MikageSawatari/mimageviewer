@@ -257,6 +257,10 @@
     リリース前に [docs/libraw-source-distribution.md](libraw-source-distribution.md) の SHA-256 と
     同梱版を照合し、LibRaw の対応ソースを mikage.to に配置する。installer / portable に
     `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` / `LIBJPEG-TURBO-LICENSE.txt` が入ることも確認する。
+10.2. AVIF 依存更新確認（エージェント用 `bash scripts/setup-libavif.sh check`）。
+    `vendor/libavif/VERSION` と静的ライブラリの組合せを照合し、AVIF fixture gate を確認する。
+    installer / portable に `LIBAVIF-LICENSE.txt` / `DAV1D-LICENSE.txt` /
+    `LIBYUV-LICENSE.txt` の全文が入ることを確認する。
 11. VST3 host bridge の確認 (v0.9.0+):
     - `vendor/vst3sdk/` が配置済み (`bash scripts/setup-vst3-sdk.sh`)
     - `vendor/vst3-host/mimageviewer-vst3-host.exe` が最新の C++ ソースでビルド済み

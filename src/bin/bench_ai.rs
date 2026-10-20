@@ -337,7 +337,19 @@ fn main() {
     let mut records: Vec<BenchRecord> = Vec::new();
 
     for img_path in &args.images {
-        let img = match image::open(img_path) {
+        let source = mimageviewer::image_decode::Source::Path(img_path);
+        let result = if mimageviewer::raw_format::is_raw_path(img_path) {
+            image::open(img_path)
+        } else {
+            mimageviewer::image_decode::decode(
+                source,
+                mimageviewer::avif_decoder::Workload::Background,
+                false,
+                None,
+            )
+            .map(|decoded| decoded.image)
+        };
+        let img = match result {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("  skip {}: {e}", img_path.display());

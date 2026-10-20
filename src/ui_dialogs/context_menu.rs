@@ -2450,32 +2450,16 @@ fn copy_image_to_clipboard(
                     }
                 }
             } else {
-                match image::open(&path) {
-                    Ok(i) => i,
-                    Err(_) => {
-                        #[cfg(windows)]
-                        {
-                            match crate::wic_decoder::decode_to_dynamic_image(&path).or_else(|| {
-                                crate::susie_loader::decode_file(&path, true, None).ok()
-                            }) {
-                                Some(i) => i,
-                                None => return,
-                            }
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            match crate::susie_loader::decode_file(&path, true, None) {
-                                Ok(i) => i,
-                                Err(_) => return,
-                            }
-                        }
-                    }
+                let source = crate::image_decode::Source::Path(&path);
+                match crate::image_decode::decode(
+                    source,
+                    crate::avif_decoder::Workload::Display,
+                    true,
+                    None,
+                ) {
+                    Ok(decoded) => decoded.oriented(source),
+                    Err(_) => return,
                 }
-            };
-            let img = if crate::raw_format::is_raw_path(&path) {
-                img
-            } else {
-                crate::thumb_loader::apply_exif_orientation(img, &path)
             };
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // ここの pre-check は DIB 構築を省くだけの best-effort 短絡。
@@ -2525,24 +2509,19 @@ fn copy_zip_image_to_clipboard(
                     }
                 }
             } else {
-                let Some(img) = image::load_from_memory(&bytes)
-                    .ok()
-                    .or_else(|| {
-                        crate::wic_decoder::decode_to_dynamic_image_from_bytes(
-                            &bytes,
-                            std::path::Path::new(&entry_name)
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .unwrap_or(""),
-                        )
-                    })
-                    .or_else(|| {
-                        crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
-                    })
-                else {
-                    return;
+                let source = crate::image_decode::Source::Bytes {
+                    bytes: &bytes,
+                    hint: &entry_name,
                 };
-                crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes)
+                match crate::image_decode::decode(
+                    source,
+                    crate::avif_decoder::Workload::Display,
+                    true,
+                    None,
+                ) {
+                    Ok(decoded) => decoded.oriented(source),
+                    Err(_) => return,
+                }
             };
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // pre-check は best-effort 短絡 (DIB 構築省略)。正式な stale 判定は

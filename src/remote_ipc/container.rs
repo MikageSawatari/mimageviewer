@@ -8724,6 +8724,7 @@ fn decode_remote_ai_canonical(
     let decoded = crate::canonical_image_loader::decode_canonical_image(
         source,
         crate::canonical_image_loader::CanonicalDecodeOptions {
+            avif_workload: crate::avif_decoder::Workload::Display,
             susie_priority: true,
             susie_cancel: Some(cancel),
             cancel: Some(cancel),

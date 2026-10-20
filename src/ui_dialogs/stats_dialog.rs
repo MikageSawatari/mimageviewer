@@ -122,19 +122,22 @@ impl App {
                             ui.heading("デコーダ経路");
                             ui.add_space(4.0);
                             let total_imgs = snapshot.total_images();
-                            let count_native = total_imgs
-                                .saturating_sub(snapshot.count_wic + snapshot.count_susie);
+                            let count_native = total_imgs.saturating_sub(
+                                snapshot.count_wic + snapshot.count_susie + snapshot.count_libavif,
+                            );
                             let time_native = (snapshot.time_jpg
                                 + snapshot.time_png
                                 + snapshot.time_webp
                                 + snapshot.time_gif
                                 + snapshot.time_bmp
                                 + snapshot.time_other
+                                - snapshot.time_libavif
                                 - snapshot.time_wic
                                 - snapshot.time_susie)
                                 .max(0.0);
-                            let decoder_rows: [(&str, u64, f64); 3] = [
+                            let decoder_rows: [(&str, u64, f64); 4] = [
                                 ("Native", count_native, time_native),
+                                ("libavif", snapshot.count_libavif, snapshot.time_libavif),
                                 ("WIC   ", snapshot.count_wic, snapshot.time_wic),
                                 ("Susie ", snapshot.count_susie, snapshot.time_susie),
                             ];

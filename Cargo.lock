@@ -3765,6 +3765,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libavif-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libbz2-rs-sys"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4163,6 +4170,7 @@ dependencies = [
  "gilrs",
  "image",
  "kamadak-exif",
+ "libavif-sys",
  "libraw-sys",
  "local-adjust-core",
  "log",

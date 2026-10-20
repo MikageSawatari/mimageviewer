@@ -1059,7 +1059,7 @@
       <div class="feature-card">
         <div class="icon">📷</div>
         <h3>RAW・HEIC・AVIF・レトロ形式対応</h3>
-        <p>各社 RAW の表示・現像を内蔵し、まず埋め込みプレビューを表示します。HEIC・AVIF・JPEG XL・TIFF は Windows の表示機能で、PI / MAG / PIC など PC-98 / X68000 時代の形式も Susie プラグイン（.spi）で閲覧できます。</p>
+        <p>各社 RAW の表示・現像と AVIF の表示を内蔵しています。HEIC・JPEG XL・TIFF は Windows の表示機能で、PI / MAG / PIC など PC-98 / X68000 時代の形式も Susie プラグイン（.spi）で閲覧できます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🎬</div>
@@ -1182,7 +1182,7 @@
 
   <section id="formats">
     <h2>対応フォーマット</h2>
-    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP、各社 RAW（内蔵）／ HEIC・AVIF・JPEG XL・TIFF（Windows の表示機能）。<a href="manual/formats.html#raw">RAW の対応形式と制限</a></p>
+    <p><strong>静止画：</strong>JPEG、PNG、GIF、WebP、BMP、各社 RAW・AVIF（追加インストール不要）／ HEIC・JPEG XL・TIFF（Windows の表示機能）。<a href="manual/formats.html#raw">RAW の対応形式と制限</a></p>
     <p><strong>アニメーション：</strong>アニメーション GIF、APNG、Animated WebP</p>
     <p><strong>動画：</strong>MP4、AVI、MOV、MKV、WMV、MPEG（サムネイル表示 + フルスクリーン再生）</p>
     <p><strong>ドキュメント：</strong>PDF（ページごとに表示、パスワード付き対応）</p>
@@ -1453,6 +1453,7 @@
     </p>
     <ul style="font-size:0.82rem; color:#888; line-height:1.5;">
       <li>libopenh264（BSD-2-Clause + 特許条項） — <a href="https://github.com/cisco/openh264">github.com/cisco/openh264</a></li>
+      <li>AVIF 表示: libavif（BSD-2-Clause）・dav1d（BSD-2-Clause）・libyuv（BSD-3-Clause）。ライセンス全文と著作権表記はアプリの「バージョン情報」から確認でき、配布物には LIBAVIF-LICENSE.txt・DAV1D-LICENSE.txt・LIBYUV-LICENSE.txt も同梱しています</li>
       <li>libdav1d（BSD-2-Clause） — <a href="https://code.videolan.org/videolan/dav1d">code.videolan.org/videolan/dav1d</a></li>
       <li>libsvtav1（BSD-3-Clause + 特許条項） — <a href="https://gitlab.com/AOMediaCodec/SVT-AV1">gitlab.com/AOMediaCodec/SVT-AV1</a></li>
       <li>libaom（BSD-2-Clause + AOM 特許ライセンス） — <a href="https://aomedia.googlesource.com/aom/">aomedia.googlesource.com/aom</a></li>

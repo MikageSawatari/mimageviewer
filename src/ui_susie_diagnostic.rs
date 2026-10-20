@@ -19,15 +19,22 @@ pub fn render_diagnostic(ui: &mut egui::Ui, status: &PoolStatus, plugins: &[Plug
         PoolStatus::ReadyWithPlugins { health, .. } => {
             let mut any_shadowed = false;
             for pi in plugins {
-                // プラグインが名乗る拡張子のうち、本体がネイティブ対応している
-                // ものは実際には本体が優先されるので "(本体優先)" マークを付ける。
-                // デコードパスは image → WIC → Susie の順なので、
-                // SUPPORTED_EXTENSIONS に含まれる拡張子は Susie に回ってこない。
+                // Primary decoders can fail; Susie remains the final fallback.
                 let mut parts: Vec<String> = Vec::with_capacity(pi.extensions.len());
                 let mut plugin_has_shadow = false;
                 for e in &pi.extensions {
-                    if crate::folder_tree::SUPPORTED_EXTENSIONS.contains(&e.as_str()) {
-                        parts.push(format!("{e} (本体優先)"));
+                    let lower = e.to_ascii_lowercase();
+                    if crate::folder_tree::SUPPORTED_EXTENSIONS.contains(&lower.as_str()) {
+                        let order = if crate::raw_format::is_raw_ext(&lower) {
+                            "内蔵RAW専用"
+                        } else if lower == "avif" {
+                            "内蔵→WIC→Susie"
+                        } else if crate::wic_decoder::is_wic_supported_extension(&lower) {
+                            "WIC→Susie"
+                        } else {
+                            "内蔵→WIC→Susie"
+                        };
+                        parts.push(format!("{e} ({order})"));
                         plugin_has_shadow = true;
                         any_shadowed = true;
                     } else {
@@ -49,8 +56,9 @@ pub fn render_diagnostic(ui: &mut egui::Ui, status: &PoolStatus, plugins: &[Plug
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "(本体優先) の拡張子は mImageViewer 本体の内蔵デコーダが\n\
-                         使われるため、このプラグインは呼ばれません。",
+                        "RAW 以外は、先に試すデコーダで読めない場合に Susie プラグインを試します。\n\
+                         AVIF は内蔵→WIC→Susie、HEIC / HEIF / JPEG XL / TIFF は WIC→Susie の順です。\n\
+                         RAW は内蔵の現像機能を使います。",
                     )
                     .size(11.0)
                     .weak(),

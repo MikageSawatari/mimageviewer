@@ -91,7 +91,7 @@ AI アップスケールや消しゴムなどの AI 処理はすべて PC の GP
 - 非ソリッド・入れ子なし・パスワードなしの RAR / CBR はそのまま直接ブラウズ。ソリッド RAR / 7z / CB7 / LZH と、パスワード付き・入れ子ありの RAR はクリックで ZIP 変換して閲覧（変換分は 2 回目以降キャッシュから即座に開ける）
 - Susie 画像プラグイン対応（.spi、32bit）— PC-98 / X68000 時代の PI / MAG / PIC / PIC2 / XLD4 等のレトロ画像形式
 - PDF 表示（ページごとレンダリング、パスワード付き対応、PDFium 内蔵）
-- RAW / HEIC / AVIF / JPEG XL 対応（Windows WIC 経由）
+- RAW の表示・現像と AVIF 表示を内蔵。HEIC / JPEG XL は Windows の表示機能で対応
 - 動画 インライン再生（MP4 / MKV / MOV / AVI / WMV / MPG / HEVC / AV1 等、FFmpeg LGPL DLL バックエンド）
   - フルスクリーンで Space / Enter 再生、Shift+Enter で外部プレイヤー、シーク / 音量 / ループ操作
   - チャプター / ブックマーク ジャンプ、ピン留めしたフレームをグリッドサムネに固定、タイル モード一覧
@@ -122,8 +122,8 @@ AI アップスケールや消しゴムなどの AI 処理はすべて PC の GP
 
 | 種類 | フォーマット |
 |------|-----------|
-| 静止画（内蔵） | JPEG, PNG, GIF, WebP, BMP |
-| 静止画（WIC） | HEIC, AVIF, JPEG XL, TIFF, 各社 RAW |
+| 静止画（内蔵） | JPEG, PNG, GIF, WebP, BMP, AVIF, 各社 RAW |
+| 静止画（Windows の表示機能） | HEIC, JPEG XL, TIFF |
 | 静止画（Susie 経由） | PI, MAG, PIC, PIC2, XLD4 などレトロ形式（.spi プラグインを導入した場合） |
 | アニメーション | GIF, APNG, Animated WebP |
 | ドキュメント | PDF |

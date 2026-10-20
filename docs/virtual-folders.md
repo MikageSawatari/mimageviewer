@@ -1051,7 +1051,7 @@ fullscreen viewport、detached window、in-window がそれぞれの実 inner si
 - ZIP 内 WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
 
 WIC デコードは `wic_decoder::decode_to_dynamic_image_from_bytes` でバイト列から
-直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF も開ける
+直接デコードできるため、ZIP 内の HEIC/JXL/TIFF も開ける（AVIF は内蔵を先に試す）
 (対応コーデックがインストールされていれば)。サムネイル・フルスクリーン両方の
 非 RAW ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
 ZIP 内 RAW は拡張子で先に LibRaw へ分岐し、entry bytes から preview または現像結果と
@@ -1159,3 +1159,10 @@ ZIP/PDF 用の相対キーは **ZIP/PDF ファイルの親フォルダ** に置�
 bufferは初回small readでのみ確保し、miss時は領域を再利用する。request/templateのcloneは空のbufferで開始し、可変bufferや取消tokenを兄弟request間で共有しない。cache hit前にも取消を確認し、大きなreadは直接読み、EOF/short read/seekの位置契約を維持する。書庫のfreshness判定、entry列挙、CP932/UTF-8正規化、legacy rename、入れ子ZIP、復号や失敗の扱いを省略しない。
 
 局所比較と検証結果は [類似索引の増分照合と収束](similar-index-incremental-reconcile-plan.md) の起動Full短縮節に記録する。small readのOS呼出しは減るがread-aheadによる読み取りbytesは増え得るため、局所fixtureの速度を実機全体の起動時間に読み替えない。
+
+### ZIP 内 AVIF（§1.407）
+
+entry bytes は通常ファイルと同じ `image_decode` 境界を通し、内蔵 libavif → WIC → Susie。
+canonical・thumbnail・本への追加・clipboard・類似検索・Remote で共有する。
+内蔵 AVIF の clap/irot/imir 適用済み情報は `Orientation::Applied` で運び、ZIP の
+EXIF bytes 補正を重ねない。native source_dims も表示変換後の寸法とする。
