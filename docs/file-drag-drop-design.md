@@ -1397,7 +1397,8 @@ ClaudeCode / 利用者指示に基づいて上記の最小修正を採用した�
 | 全体 `cargo fmt` / `cargo fmt --check` / `git diff --check` | exit 0。最終 Rust source の SHA-256 は `target/dragcache-completion-source-hashes.json` |
 | `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0。`target/dragcache-completion-glyphs.log` |
 | build-dev | exit 0、core / remote / EPUB worker を通常 feature・非 portable で生成。core は 3m39s、VCRT/PE 検査も成功。`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`、`-PreserveRuntime -WaitForOtherBuildsMinutes 0`。`target/dragcache-completion-build-dev.log`。製品は起動していない |
-| 修正後の実 Shell 2件 / Explorer 製品実機 | 未実施。前回同環境で確定した Start 前の拡張 DLL 例外の制約を再利用し、修正後 probe は ClaudeCode のサンドボックス外実行へ残す。修正前の外部 probe 成功を修正後の成功とは扱わない |
+| 修正後の実 Shell 2件 | 2件成功 (ClaudeCode がサンドボックス外で実行、2026-10-20、`744ff24cb`)。同一・別プロセスとも `Logical Performed DropEffect` では完了せず、コピー一致後の `Performed DropEffect` → `end` → `running=false source_refs=2`、ソース側ローカル破棄で `released`。cleanup End は使っていない。`target/dragcache-shell-probe-after-fix.log` |
+| Explorer 製品実機 (修正後) | 利用者確認待ち。製品ログの同じ drag_id で `async StartOperation`・`SHDoDragDrop done`・`async completed ... via=performed_drop_effect`・`object released` がそろうことを見る |
 | 本体lib全件 / commit / 製品起動 | 本体lib全件は ClaudeCode の最終 gate。利用者指示どおり commit と製品起動は行わない |
 
 #### 修正後の最小確認
