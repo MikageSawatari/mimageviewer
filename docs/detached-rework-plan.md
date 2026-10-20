@@ -6050,3 +6050,4 @@ dispatcher を通らないため、開始を受理した frontend で test-scrip
 受理結果を局所変数へ受けて既存と同じ値を返すだけで、detached の述語・状態遷移・配置は不変。
 同じ逆引きで見つかった Collection outer の準備済み owner と、画像フォルダ ZIP 化後の
 親一覧 owner も operation が scan を引き取る受理点（`ParentScan`）で計数し、install や水和では加算しない。
+`ff5af1f53` 再レビュー後、detached DFS の DirectRar／ConversionCacheHit も proven backing の受理点で test-script 限定計数を補い、loader 全呼び出し元と FolderNavRoute 全分岐を照合した（述語・挙動は不変）。

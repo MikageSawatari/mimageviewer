@@ -16007,6 +16007,7 @@ pub struct App {
     /// and Smart transition handoffs retain an existing owner and never count a second start.
     /// Prepared Collection outer loads count at owner admission; image-ZIP parent loads at
     /// scan handoff. Fresh detached document frontends count accepted descriptor starts.
+    /// Detached DFS admits proven RAR/cache backing in load_folder_nav_target before loading.
     #[cfg(all(windows, feature = "test-script"))]
     pub(crate) test_script_folder_load_requests: u64,
 
@@ -28632,6 +28633,8 @@ impl App {
                 }
                 match landing.kind {
                     FolderNavLandingKind::DirectRar | FolderNavLandingKind::ConversionCacheHit => {
+                        #[cfg(all(windows, feature = "test-script"))]
+                        self.test_script_record_folder_load_owner(&restore_intent);
                         self.load_zip_as_folder_proven_navigation_backing(
                             landing.backing_path,
                             restore_intent.clone(),

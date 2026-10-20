@@ -2554,6 +2554,78 @@ fn test_script_counts_superseded_refresh_starts_before_completion() {
 
 #[cfg(all(windows, feature = "test-script"))]
 #[test]
+fn test_script_counts_detached_proven_folder_nav_start_once_through_completion() {
+    use crate::folder_tree::{FolderNavLanding, FolderNavLandingKind};
+    for kind in [
+        FolderNavLandingKind::DirectRar,
+        FolderNavLandingKind::ConversionCacheHit,
+    ] {
+        let mut app = setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/archives/multiwindow-rar-nav");
+        let (source, backing) = if kind == FolderNavLandingKind::DirectRar {
+            let source = app.tmp.path().join("direct.rar");
+            std::fs::copy(fixtures.join("01-direct.rar"), &source).unwrap();
+            (source.clone(), source)
+        } else {
+            let source = app.tmp.path().join("cached.7z");
+            let backing = app.tmp.path().join("cached.zip");
+            std::fs::write(&source, b"source").unwrap();
+            std::fs::copy(fixtures.join("06-control.zip"), &backing).unwrap();
+            (source, backing)
+        };
+        // The DFS worker delivers this proven source/backing pair. Drive its UI admission,
+        // then the actual RAR/ZIP enumeration, without involving a viewport or input event.
+        let landing = FolderNavLanding {
+            logical_source: source.clone(),
+            backing_path: backing.clone(),
+            kind,
+        };
+        let before = app.test_script_folder_load_requests;
+        assert_eq!(
+            app.load_folder_nav_target(
+                FolderNavRoute::Detached(landing.clone()),
+                None,
+                StartupListIntent::PageContinuation,
+            ),
+            FolderOpenOutcome::Ignored
+        );
+        assert_eq!(app.test_script_folder_load_requests, before);
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        assert_eq!(
+            app.load_folder_nav_target(
+                FolderNavRoute::Detached(landing),
+                None,
+                StartupListIntent::PageContinuation,
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        assert!(app.zip_enumerate_pending.is_some());
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ctx = egui::Context::default();
+        while app.zip_enumerate_pending.is_some() || app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "proven archive load must settle"
+            );
+            app.poll_zip_enumerate();
+            app.poll_sidecar_restore(&ctx);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&backing));
+        assert_eq!(app.archive_source_override.as_ref(), Some(&source));
+        assert!(app.items.iter().any(
+            |item| matches!(item, GridItem::ZipImage { zip_path, .. } if zip_path == &backing)
+        ));
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
 fn test_script_counts_delegated_zip_start_once_through_adoption() {
     for convert_dispatch in [false, true] {
         let mut app = setup_app_for_test();
