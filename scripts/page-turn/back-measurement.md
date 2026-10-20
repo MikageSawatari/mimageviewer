@@ -43,3 +43,10 @@ CPU→登録はrequest_id、登録→配送はrenderer/TextureId、Nativeはrend
 一致から補完するのは一意な準備起点のrequested_positionだけで、lookup/配送時のdemand_position欠落はunknownのままにする。
 準備起点が複数位置にまたがる場合と相関できないlookup、旧ログはunknown。時刻が近い操作へ準備を推定帰属しない。
 背景配送・静止中入力応答・Next到達時間、D2/D4/flat-first、正式3run×30機会は別途計測する。
+
+## 2026-10-20 の実行で分かった制約
+
+- ページ送りはキー入力 (`turn(prev_key(rtl))`) で行う。`run_action("FsPage*")` は演出なしで移動する。
+- 読む向きは本体フルスクリーンの spread mode から、最初のページが落ち着いた後に読む (開いた直後は Single と報告されることがある)。
+- F12 の連動別ウィンドウでは前面が本体のままで、合成キーは本体の一覧が受ける (別ウィンドウは選択に追従する)。test-script に別ウィンドウを前面にする手段が無いため、
+  `back-f12-*.rhai` と `back-two-context-reversal.rhai` の戻るめくりは現状駆動できない (前面待ちで 10 秒 timeout する)。結果は page-turn 計画 §27.17.22。

@@ -1,5 +1,11 @@
 // Reference measurement only. Run on an explicitly approved disposable portable.
 // No D3 readiness wait: missing preparations remain in the measured denominator.
+// Page turns go through key input: run_action("FsPage*") moves without the page-turn animation.
+// The reading direction is read from the main fullscreen before F12; the root snapshot no longer
+// reports the detached context's spread mode afterwards.
+fn prev_key(rtl) { if rtl { "Right" } else { "Left" } }
+fn next_key(rtl) { if rtl { "Left" } else { "Right" } }
+fn turn(key) { wait_until(|s| s.target_registered, 10000); tap_key(key); }
 fn middle_grid(index) {
     wait_until(|s| s.target_registered && s.target_rendered
         && !s.is_fullscreen && s.items_len >= 16 && s.pending_thumbs == 0
@@ -22,7 +28,8 @@ fn detached(s) {
     result
 }
 fn normal_painted(window) {
-    window.page_ready && window.viewport_rendered && window.paint_matches_current_page
+    // paint evidence is recorded only for single-image draws, so spreads wait on page/viewport readiness.
+    window.page_ready && window.viewport_rendered
 }
 fn open_main() {
     run_action("GridOpenSelected");
@@ -46,11 +53,13 @@ fn open_f12() {
 middle_grid(0);
 open_main();
 sleep(2500);
+// Read after the first page settles; right after open the snapshot can still report Single.
+let rtl = snapshot().spread_mode.starts_with("Rtl");
 // Both profiles (wrap false / true) keep speculative endpoints Boundary.
-run_action("FsPagePrev");
+turn(prev_key(rtl));
 sleep(2500);
 tap_key("End");
 sleep(2500);
-run_action("FsPageNext");
+turn(next_key(rtl));
 sleep(2500);
 log("back-boundary-wrap: done");
