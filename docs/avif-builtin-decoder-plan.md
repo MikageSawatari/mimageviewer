@@ -216,3 +216,37 @@ server側の認証・最新の種類設定とsource資格の確認は変更し�
 - 文書: `docs/architecture-overview.md`, `docs/avif-1407-implementation-results.md`, `docs/avif-builtin-decoder-plan.md`, `docs/display-pipeline.md`, `docs/native-dependencies.md`, `docs/web-remote-plan.md`。
 
 `docs/avif-1407-implementation-results.md`は本節へ統合して削除。その他は変更。
+
+
+### 第3ラウンド: ZIP一括生成のEXIF重複解析（2026-10-20）
+
+- 第2ラウンドの全件/代表1枚の呼出元と共通helperが各1回解析し、JPEG DCT成功時も2回になっていた。
+  呼出元はDCT画像と`ScaleStats`を対で渡すだけにし、共通helperで向きを1回解析して
+  画素回転と`source_dims_after_exif`の両方へ使う。非DCTの既存向き規則も同じ境界で維持する。
+- 内蔵AVIFの`Orientation::Applied`はEXIFを解析せず、変換済み画素/寸法を使う。
+  RAWは従来のLibRaw分岐を維持。取消済み・decode失敗では新しい解析を始めない。
+- `FnOnce`のreader seamで、DCT成功・JPEGフルdecodeへのfallback・PNGについて向き1〜8の各1回を固定する。
+  同じ解析値でDCT元寸法が入れ替わること、適用済みAVIFと取消時は0回であることも検査する。
+
+他入口の再確認（基点`a929143ef`、AVIF導入前の`797dbf905`とも比較）:
+
+| 入口 | 結果 |
+| --- | --- |
+| thumb_loader: 通常path / verified bytes / ZIP / batch path・ZIP | 1回の解析値を画素とDCT寸法で再利用。decode_zip_chainは向き状態を返すだけで再解析しない |
+| canonical / books / context_menu / panorama | `Decoded::oriented`を1回呼ぶだけ。共有decode内部に重ねたEXIF解析なし |
+| metadata_ops / fast_resize / 製本prepare / core Remote寸法 | メタデータ取得の各段で最大1回。AVIFはsafe metadata APIの変換後寸法、EXIF再解析なし |
+| now-playing artwork | 取得済みorientation値で回転。共通decodeからorientedを呼び直さない。bounded WIC自身のorientation処理は従来どおり |
+| similar_imageのJPEG DCT / bench_dupeのJPEG DCT | 元寸法用read後にapply_exif_orientation_from_bytesが読む同型の2回あり。ただし両方とも797dbf905から存在し、今回のAVIF接続で追加したものではない。本P3修正には含めない |
+| 旧Remote画像API | 非AVIFはprobeとdecodeの別段で各1回（元から）。内蔵AVIFは両段ともEXIFを読まない |
+
+第3ラウンドの変更は`src/app/cache_ops.rs`と本節のみ。
+`MSBUILDDISABLENODEREUSE=1`、`CMAKE_GENERATOR=NMake Makefiles`で検証した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功（既存警告あり） |
+| `cargo nextest run -p mimageviewer --lib -E 'test(~app::cache_ops::) \| test(/avif/)'` | 33成功。新しい回数固定テストは3経路×向き8種、AVIF/取消時0回を含む |
+| `cargo fmt` / `cargo fmt --check` | 成功 |
+
+ログは`target/avif-r3-{check,focused,fmt,fmt-check}.log`（gitignore）。
+コミット・製品起動・全件ゲート・build-devは行わない。
