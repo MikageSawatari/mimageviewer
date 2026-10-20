@@ -775,6 +775,16 @@ impl DetachedWindowManager {
         pending
     }
 
+    /// A native lifecycle delivery follows backend output processing without
+    /// necessarily passing through another root input. Retire only its host.
+    pub(super) fn retire_mode_command_after_output(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id)
+            && runtime.host_placement.pending_mode_mut().take().is_some()
+        {
+            runtime.last_geometry_notification = None;
+        }
+    }
+
     /// Called once by the root raw-input hook after previous output has reached
     /// the backend, before any full/logic-only or repeated/discard logic pass.
     pub(super) fn retire_mode_commands_before_root_pass(&mut self) {
@@ -1678,6 +1688,37 @@ mod tests {
         manager.record_geometry_notification(7, notification);
         manager.retire_mode_commands_before_root_pass();
         assert!(!manager.geometry_notification_changed(7, notification));
+    }
+
+    #[test]
+    fn native_lifecycle_boundary_retires_only_its_host_and_invalidates_observation() {
+        let mut manager = DetachedWindowManager::new();
+        let notification = GeometryNotification::from_viewport(&egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+        for id in [7, 8, 9] {
+            manager.set_hwnd(id, id * 0x1000, false);
+            manager.note_mode_command(id, id != 8);
+            manager.record_geometry_notification(id, notification);
+        }
+        let sibling = manager.host_placement(8);
+        manager.retire_mode_command_after_output(7);
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(!manager.resolve_host_mode(7, false));
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert_eq!(manager.host_placement(8), sibling);
+        assert!(!manager.geometry_notification_changed(8, notification));
+        assert_eq!(manager.pending_mode(9), Some(true));
+        manager.record_geometry_notification(7, notification);
+        manager.retire_mode_command_after_output(7);
+        assert!(!manager.geometry_notification_changed(7, notification));
+        manager.retire_mode_command_after_output(10);
+        assert!(manager.runtime(10).is_none());
     }
 
     #[test]

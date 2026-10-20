@@ -87,6 +87,12 @@ impl App {
             .into_iter()
             .find(|id| Self::detached_image_window_viewport_id(*id) == viewport_id)
         {
+            // This backend lifecycle hook runs after output commands were
+            // processed, including native Close before the next root input.
+            // App-originated closes inside an output use the shared close owner
+            // directly and must retain their still-undelivered mode command.
+            self.detached_window_manager
+                .retire_mode_command_after_output(window_id);
             // A real backend request may be the first callback for this existing
             // owner. Capture its existing registration before the owner is removed.
             self.capture_detached_viewport_registration(ctx, window_id);
