@@ -16000,7 +16000,10 @@ pub struct App {
     /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
     pub(crate) items_generation: u64,
 
-    /// Counts top-level load requests before cancellation or install can hide a duplicate.
+    /// Counts accepted folder/list load starts, including requests cancelled before completion.
+    /// Direct dispatcher entries count after delegation, at load_folder_with_scan_claimed or
+    /// the Smart child owner's admission. Staged physical Preflighting entries count at
+    /// admit_physical_history_phase. Dispatchers and completion/install paths never add again.
     #[cfg(all(windows, feature = "test-script"))]
     pub(crate) test_script_folder_load_requests: u64,
 
@@ -28858,11 +28861,6 @@ impl App {
         {
             return self.report_pdf_open_refusal(&path, reason);
         }
-        #[cfg(all(windows, feature = "test-script"))]
-        {
-            self.test_script_folder_load_requests =
-                self.test_script_folder_load_requests.saturating_add(1);
-        }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
             && let Some(kind) = self.smart_physical_target_kind(&path)
@@ -29210,11 +29208,6 @@ impl App {
         {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return self.report_pdf_open_refusal(&path, reason);
-        }
-        #[cfg(all(windows, feature = "test-script"))]
-        {
-            self.test_script_folder_load_requests =
-                self.test_script_folder_load_requests.saturating_add(1);
         }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
@@ -29808,6 +29801,17 @@ impl App {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
+        }
+        #[cfg(all(windows, feature = "test-script"))]
+        if self.open_request_owner_is_current(&path, &owner)
+            && navigation
+                .as_ref()
+                .is_none_or(|navigation| self.main_list_navigation_is_current(navigation))
+        {
+            // A staged physical request has already returned above. Only this owner starts
+            // the direct load; callers rejected before admission do not count.
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
         }
         if pre_scan.is_none()
             && crate::folder_tree::is_paged_document_path(&path)
@@ -33999,6 +34003,15 @@ impl App {
 
             restore_intent: restore_intent.clone(),
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        if matches!(request.phase, PhysicalHistoryPhase::Preflighting { .. })
+            && self.main_list_navigation_is_current(&request.navigation)
+        {
+            // Count admission, including requests superseded before their worker completes.
+            // Completion and password/conversion continuations retain this request owner.
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
+        }
         self.replace_history_navigation_transition(Some(HistoryNavigationTransition::Physical(
             request,
         )));

@@ -2491,13 +2491,166 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
 #[test]
 fn test_script_counts_the_actual_refresh_folder_request() {
     let mut app = setup_app_for_test();
+    app.settings.sidecar_backup_enabled = false;
     let folder = app.tmp.path().join("rating-sort-refresh-request");
     std::fs::create_dir(&folder).unwrap();
     std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+    let initial = app.test_script_folder_load_requests;
     app.load_folder(folder);
+    assert_eq!(app.test_script_folder_load_requests, initial + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
     let before = app.test_script_folder_load_requests;
+    let generation = app.items_generation;
     app.reload_current_folder_preserving_override();
     assert_eq!(app.test_script_folder_load_requests, before + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert!(app.items_generation > generation);
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_history_back_once_through_adoption() {
+    let mut app = setup_app_for_test();
+    app.active_quick_folder_slot = None;
+    app.settings.sidecar_backup_enabled = false;
+    let first = app.tmp.path().join("count-history-first");
+    let second = app.tmp.path().join("count-history-second");
+    for folder in [&first, &second] {
+        std::fs::create_dir(folder).unwrap();
+        std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+        app.load_folder(folder.clone());
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    }
+    assert_eq!(
+        app.folder_history_back_target(),
+        Some(&FolderNavHistoryTarget::Path(first.clone()))
+    );
+    let before = app.test_script_folder_load_requests;
+    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+    app.settle_open_path_classification_for_test();
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert_eq!(app.current_folder.as_ref(), Some(&first));
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_superseded_refresh_starts_before_completion() {
+    let mut app = setup_app_for_test();
+    app.settings.sidecar_backup_enabled = false;
+    let folder = app.tmp.path().join("count-superseded-refresh");
+    std::fs::create_dir(&folder).unwrap();
+    app.load_folder(folder);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    let before = app.test_script_folder_load_requests;
+    app.reload_current_folder_preserving_override();
+    app.reload_current_folder_preserving_override();
+    assert_eq!(app.test_script_folder_load_requests, before + 2);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert_eq!(app.test_script_folder_load_requests, before + 2);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_delegated_zip_start_once_through_adoption() {
+    for convert_dispatch in [false, true] {
+        let mut app = setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        let path = app.tmp.path().join("count-delegated.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+        let before = app.test_script_folder_load_requests;
+        if convert_dispatch {
+            assert_eq!(
+                app.load_folder_or_convert_archive(path.clone()),
+                FolderOpenOutcome::Loaded
+            );
+        } else {
+            app.load_folder(path.clone());
+        }
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&path));
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_does_not_count_rejected_folder_starts() {
+    for convert_dispatch in [false, true] {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("count-rejected-owner");
+        std::fs::create_dir(&folder).unwrap();
+        let owner = OpenRequestOwner::QuickFolderSwitch(QuickFolderSwitchLoadOwner {
+            source_context: app.projected_viewer_context_id(),
+            source_surface_generation: app.top_level_grid_view.generation(),
+            source_slot: app.active_quick_folder_slot,
+            source_slot_switch_sequence: app.quick_folder_switch_sequence.wrapping_add(1),
+            target_slot: QuickFolderSlotId::B,
+            target_path: folder.clone(),
+        });
+        let before = app.test_script_folder_load_requests;
+        let outcome = if convert_dispatch {
+            app.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                folder,
+                false,
+                owner,
+                Some(OpenPathKind::Directory),
+                None,
+                StartupListIntent::ExplicitList,
+                None,
+            )
+        } else {
+            app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                folder,
+                None,
+                owner,
+                None,
+                Some(OpenPathKind::Directory),
+                StartupListIntent::ExplicitList,
+                None,
+            )
+        };
+        assert_eq!(outcome, FolderOpenOutcome::Ignored);
+        assert_eq!(app.test_script_folder_load_requests, before);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_does_not_count_stale_preflight_navigation() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("count-stale-navigation");
+    std::fs::create_dir(&folder).unwrap();
+    let navigation = app
+        .capture_physical_open_navigation(&OpenRequestOwner::Navigation, &folder)
+        .unwrap();
+    app.quick_folder_switch_sequence = app.quick_folder_switch_sequence.wrapping_add(1);
+    let before = app.test_script_folder_load_requests;
+    assert!(!app.start_physical_history_transition_classified(
+        PhysicalHistoryIntent::Navigation {
+            replay: None,
+            auto_fullscreen: false
+        },
+        folder,
+        None,
+        Some(OpenPathKind::Directory),
+        StartupListIntent::ExplicitList,
+        navigation,
+        None,
+    ));
+    assert_eq!(app.test_script_folder_load_requests, before);
+    assert!(
+        app.top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
+    );
 }
 
 #[test]
@@ -95750,6 +95903,39 @@ mod smart_folder_transition_tests {
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         wait_for_smart_folder_scope(&mut app, &ctx, &child);
         assert!(app.top_level_grid_view.smart_folder_session().is_some());
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_delegated_smart_start_once_through_adoption() {
+        for convert_dispatch in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            let source = app.tmp.path().join("count-smart-source");
+            let entry = source.join("child");
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), b"page").unwrap();
+            let definition = definition("Count Smart", source);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+            let before = app.test_script_folder_load_requests;
+            if convert_dispatch {
+                assert_eq!(
+                    app.load_folder_or_convert_archive(entry.clone()),
+                    FolderOpenOutcome::Loaded
+                );
+            } else {
+                app.load_folder(entry.clone());
+            }
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            assert_eq!(app.current_folder.as_ref(), Some(&entry));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
     }
 
     #[test]

@@ -6903,12 +6903,18 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
-    fn phase_3b_tray_projection_absence_is_an_environment_failure() {
-        let (bridge, _, _) = runner_bridge(ready_snapshot());
+    fn release_check_close_requires_an_active_release_check_session() {
+        // Phase 3b is connected. Without release_check_begin this call now fails
+        // at the session precondition, before observing any tray projection.
+        let (bridge, commands, wakes) = runner_bridge(ready_snapshot());
+        let interrupt = Arc::clone(&bridge.interrupt);
         let outcome = evaluate_source("release_check_close(\"after-loading\");", bridge);
-        assert_eq!(outcome.kind, ScriptOutcomeKind::EnvironmentFailure);
-        assert_eq!(outcome.kind.exit_code(), 2);
-        assert!(outcome.message.contains("Phase 3b"));
+        assert_eq!(outcome.kind, ScriptOutcomeKind::ScriptFailure);
+        assert_eq!(outcome.kind.exit_code(), 1);
+        assert!(outcome.message.contains("begin release checks first"));
+        assert!(interrupt.failure_message().is_none());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(wakes.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[cfg(feature = "test-script")]
@@ -9020,7 +9026,7 @@ mod tests {
                 ctx.begin_pass(input);
                 if guard == "text" {
                     draw_field(&ctx, &mut text, &mut request_focus);
-                    assert!(ctx.wants_keyboard_input());
+                    assert!(ctx.egui_wants_keyboard_input());
                 }
                 let mut active = local_runtime();
                 active
