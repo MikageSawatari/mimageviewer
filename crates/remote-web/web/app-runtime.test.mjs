@@ -5861,3 +5861,39 @@ test("G1 Remote return adoption restores the book response after temporary A2 sp
   assert.deepEqual(after.container,before.container);
   assert.deepEqual(after.pageGroups,before.pageGroups);
 });
+
+test("horizontal button labels follow configured mode across container and collection updates", () => {
+  const originalHistory = globalThis.history;
+  globalThis.history = { state: {}, replaceState() {} };
+  const address = { path: testPath("horizontal-input"), subresource: { kind: "file" } };
+  const entries = [1, 2].map((index) => ({ kind: "image", name: `${index}.jpg`,
+    address: { path: testPath(`horizontal-input/${index}.jpg`), subresource: { kind: "file" } } }));
+  const labels = {};
+  const viewer = {
+    destroy() {},
+    syncPagePositionFeedback() { ImageViewer.prototype.syncPagePositionFeedback.call(this); },
+    previous: { setAttribute: (name, value) => { labels.left = [name, value]; } },
+    next: { setAttribute: (name, value) => { labels.right = [name, value]; } },
+  };
+  try {
+    for (const kind of ["container", "collection"]) {
+      for (const [configuredMode, expectedRtl] of [["rtl", true], ["single", false], ["rtl_cover", true]]) {
+        const data = {
+          entries, image_count: entries.length,
+          configured_spread_mode: configuredMode, effective_spread_mode: "single", reading_direction: "rtl",
+          page_groups: entries.map((entry) => ({ anchor: entry.address, pages: [entry.address], slice: "full" })),
+        };
+        if (kind === "container") applyContainerData(address, data, true);
+        else applyCollectionData({ collectionKind: "rating", value: "4" }, data, true);
+        assert.equal(openViewerPagePositionForTest(viewer, 0), true);
+        viewer.syncPagePositionFeedback();
+        assert.deepEqual(labels.left, ["aria-label", expectedRtl ? "次の画像" : "前の画像"], kind);
+        assert.deepEqual(labels.right, ["aria-label", expectedRtl ? "前の画像" : "次の画像"], kind);
+        assert.equal(viewerPagePresentationForTest().seekState.direction, "rtl", kind);
+      }
+    }
+  } finally {
+    cleanupVideoViewerForTest(viewer);
+    globalThis.history = originalHistory;
+  }
+});

@@ -1187,7 +1187,8 @@ CSS page gap へ反映する。viewport は `height > width` を縦持ちとし�
 change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
-LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+LTR / RTL の見開き・横長分割モードは本体と同じく方向をそのモードへ揃え、Single の応答も
+保存済み方向を維持する。シークバーはこの `readingDirection` から向きを決め、入力の左右とは独立する。
 変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
 `PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
 案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
@@ -1195,9 +1196,20 @@ LTR / RTL の見開きモードは本体と同じく方向をそのモードへ�
 「文書の綴じ方向に従う」が有効なときに固定世代の方向を採用する。通常 PDF の `/Direction` は
 Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
-RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
-右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
-前後という意味を維持する。見開きの2画像は両方を別 DOM で fetch / decode し、最終寸法から
+横方向入力の反転は `command-core.mjs::inputAdvancesRightToLeft` だけで判定する。本体の
+`SpreadMode::advances_right_to_left` と同じく、Rtl / RtlCover / SplitRtl では反転し、
+Single / Ltr / LtrCover / SplitLtr では反転しない。入力は保存由来の `configured_spread_mode`
+（Web 共通 state の `spreadMode`）を見るため、Single は保存済み方向が RTL でも右 tap zone /
+`ArrowRight` / `›` が次グループになる。縦持ちの表示限定 Single は構成モードを変えないため、
+構成が RTL なら綴じ方向に従って反転を続ける。コンテナ・各コレクションも同じ state 値を使う。
+反転時は左 tap zone / `ArrowLeft` / `‹` が次、右 tap zone / `ArrowRight` / `›` が前になる。
+swipe は指でページを送る向きを維持し、反転時は右 swipe が次・左 swipe が前、Single と LTR は
+左 swipe が次・右 swipe が前になる。ボタンの aria-label と端ページのタップ案内も同じ判定から
+動作に合わせ、ラベルはモード変更時に更新する。
+上下矢印と PageUp / PageDown は前後という意味を維持する。本体の
+`fullscreen_horizontal_cursor_direction` 設定は持ち込まず、既定の FollowPage 相当とする。
+§1.259 で入力の左右を本体に揃えた。応答・IPC 型・protocol 版は変更しない。
+見開きの2画像は両方を別 DOM で fetch / decode し、最終寸法から
 共通高さの layout を確定してから page layer を1回で差し替えるため、片側だけの表示や暫定倍率を
 見せない。
 

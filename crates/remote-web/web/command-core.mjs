@@ -1010,6 +1010,22 @@ export function isRtlReadingDirection(direction) {
   return direction === ReadingDirection.RTL;
 }
 
+// Counterpart of SpreadMode::advances_right_to_left. Use the configured mode,
+// not the portrait-only effective Single or the saved seek reading direction.
+export function inputAdvancesRightToLeft(configuredSpreadMode) {
+  return configuredSpreadMode === SpreadMode.RTL ||
+    configuredSpreadMode === SpreadMode.RTL_COVER ||
+    configuredSpreadMode === SpreadMode.SPLIT_RTL;
+}
+
+export function viewerPageButtonState(side, rtl = false) {
+  const advances = side === "left" ? rtl : !rtl;
+  return {
+    commandName: advances ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE,
+    label: advances ? "次の画像" : "前の画像",
+  };
+}
+
 export function readingDirectionForSpreadMode(mode, currentDirection) {
   if (
     mode === SpreadMode.RTL ||
@@ -1362,7 +1378,7 @@ export function viewerBoundaryMessage({
   currentIndex,
   count,
   delta,
-  readingDirection = ReadingDirection.LTR,
+  rtl = false,
 }) {
   const index = Math.floor(Number(currentIndex));
   const length = Math.max(0, Math.floor(Number(count) || 0));
@@ -1371,7 +1387,7 @@ export function viewerBoundaryMessage({
   const atStart = step < 0 && index === 0;
   const atEnd = step > 0 && index === length - 1;
   if (!atStart && !atEnd) return null;
-  if (readingDirection === ReadingDirection.RTL) {
+  if (rtl) {
     return atStart
       ? "先頭ページです（右→左綴じ：次は左をタップ）"
       : "最終ページです（右→左綴じ：前は右をタップ）";
@@ -1384,6 +1400,11 @@ export function viewerTapCommand(clientX, width, rtl = false) {
   if (zone === "left") return command(rtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
   if (zone === "right") return command(rtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
   return command(CommandName.TOGGLE_VIEWER_BARS);
+}
+
+export function viewerSwipeCommand(gesture, rtl = false) {
+  const advances = gesture === ViewerGesture.SWIPE_LEFT ? !rtl : rtl;
+  return command(advances ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE);
 }
 
 export function videoTapCommand(clientX, width) {
