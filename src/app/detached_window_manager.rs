@@ -66,6 +66,31 @@ pub(crate) enum PlacementOutcome {
     Mismatch,
 }
 
+/// Backend geometry is a change notification, never the persisted placement.
+/// Focus/title changes deliberately do not cause an HWND sample.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct GeometryNotification {
+    outer: Option<egui::Rect>,
+    inner: Option<egui::Rect>,
+    native_pixels_per_point: Option<f32>,
+    pub(super) minimized: bool,
+    maximized: bool,
+}
+
+#[cfg(windows)]
+impl GeometryNotification {
+    pub(super) fn from_viewport(viewport: &egui::ViewportInfo) -> Option<Self> {
+        (viewport.outer_rect.is_some() || viewport.minimized == Some(true)).then_some(Self {
+            outer: viewport.outer_rect,
+            inner: viewport.inner_rect,
+            native_pixels_per_point: viewport.native_pixels_per_point,
+            minimized: viewport.minimized.unwrap_or(false),
+            maximized: viewport.maximized.unwrap_or(false),
+        })
+    }
+}
+
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostPlacement {
@@ -509,6 +534,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) builder_placement_latch:
         Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
     pub(crate) host_placement: HostPlacement,
+    last_geometry_notification: Option<GeometryNotification>,
     pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
     pub(crate) linked: bool,
     pub(crate) activation_intent: Option<DetachedActivationIntent>,
@@ -526,6 +552,7 @@ impl DetachedWindowRuntime {
             placement: None,
             builder_placement_latch: None,
             host_placement: HostPlacement::default(),
+            last_geometry_notification: None,
             trim_bboxes: std::collections::HashMap::new(),
             linked,
             activation_intent: None,
@@ -690,6 +717,31 @@ impl DetachedWindowManager {
         })
     }
 
+    pub(super) fn geometry_notification_changed(
+        &self,
+        window_id: u64,
+        notification: GeometryNotification,
+    ) -> bool {
+        self.runtime(window_id)
+            .is_some_and(|runtime| runtime.last_geometry_notification != Some(notification))
+    }
+
+    pub(super) fn record_geometry_notification(
+        &mut self,
+        window_id: u64,
+        notification: GeometryNotification,
+    ) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.last_geometry_notification = Some(notification);
+        }
+    }
+
+    pub(super) fn invalidate_geometry_notification(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.last_geometry_notification = None;
+        }
+    }
+
     /// Returns a request only when it can be dispatched immediately. Missing
     /// runtimes retain their existing caller-owned dispatch path.
     pub(super) fn request_show(
@@ -736,6 +788,7 @@ impl DetachedWindowManager {
     /// transition, preserving a root-side request already waiting on this host.
     pub(super) fn mark_host_unplaced(&mut self, window_id: u64, awaiting_unzoom: bool) {
         if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.last_geometry_notification = None;
             let show_request = match runtime.host_placement {
                 HostPlacement::Unplaced { show_request, .. } => show_request,
                 HostPlacement::Placed { .. } => None,
@@ -814,6 +867,7 @@ impl DetachedWindowManager {
         let runtime = self.runtimes.get_mut(&window_id)?;
         let hwnd = std::mem::take(&mut runtime.hwnd);
         runtime.host_placement = HostPlacement::default();
+        runtime.last_geometry_notification = None;
         (hwnd != 0).then_some(hwnd)
     }
 
@@ -846,6 +900,7 @@ impl DetachedWindowManager {
         let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
         runtime.hwnd = hwnd;
         if let Some(incarnation) = new_incarnation {
+            runtime.last_geometry_notification = None;
             if runtime.host_incarnation != 0 {
                 runtime.host_placement = HostPlacement::default();
             }
@@ -1377,6 +1432,36 @@ mod tests {
             manager.runtime(999).is_none(),
             "missing runtime must not create a pending owner"
         );
+    }
+
+    #[test]
+    fn geometry_notifications_are_scoped_to_host_incarnation_and_leave_siblings_unchanged() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000, 0x8000]);
+        manager.set_hwnd(7, 0x7000, false);
+        manager.set_hwnd(8, 0x8000, false);
+        let info = egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let notification = GeometryNotification::from_viewport(&info).unwrap();
+        for id in [7, 8] {
+            assert!(manager.geometry_notification_changed(id, notification));
+            manager.record_geometry_notification(id, notification);
+        }
+        manager.set_hwnd(7, 0x7000, false);
+        assert!(!manager.geometry_notification_changed(7, notification));
+        manager.invalidate_geometry_notification(7);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(!manager.geometry_notification_changed(8, notification));
+        manager.record_geometry_notification(7, notification);
+        manager.clear_hwnd(7);
+        manager.set_hwnd(7, 0x7000, false);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(!manager.geometry_notification_changed(8, notification));
     }
 
     #[test]

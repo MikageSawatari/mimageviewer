@@ -3002,7 +3002,7 @@ impl App {
                             false,
                         );
                     } else {
-                        Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+                        self.send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
                     }
                 } else {
                     ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));

@@ -2365,6 +2365,7 @@ impl App {
     }
 
     fn detached_window_hwnd_clear(&mut self, window_id: u64) -> Option<u64> {
+        let _ = self.capture_detached_window_placement_at_decision(window_id, "hwnd_clear");
         let cleared = self.detached_window_manager.clear_hwnd(window_id);
         if let Some(hwnd) = cleared {
             crate::presentation_observer::unregister(
@@ -2648,6 +2649,11 @@ impl App {
         new_state: DetachedWindowState,
         reason: &'static str,
     ) {
+        if new_state == DetachedWindowState::Closing
+            && self.detached_window_state(window_id) != Some(DetachedWindowState::Closing)
+        {
+            let _ = self.capture_detached_window_placement_at_decision(window_id, reason);
+        }
         // A passive snapshot that still owns a media player must remain ParkedLive until
         // activation or terminal close. Log only an actual lifecycle transition that violates
         // that invariant; unlike MIV_DETACHED_WINDOW_DEBUG this is intentionally always on so a
@@ -3794,6 +3800,7 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
+        let _ = self.capture_detached_window_placement_at_decision(window_id, reason);
         self.detached_window_manager
             .transfer_viewport_retirement(window_id);
         self.discard_parked_native_video_pending_for_window(window_id, reason);
@@ -50799,7 +50806,8 @@ impl App {
         source: DetachedSource,
         requested: PathBuf,
     ) -> bool {
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement =
+            self.capture_active_detached_placement_at_decision("bookmark_loading_seed");
         let had_active_detached = self.active_detached_context_exists();
         let parked = if matches!(source, DetachedSource::Video | DetachedSource::Audio) {
             self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx)
@@ -64538,7 +64546,8 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_collection_image",
                 );
-                let base_placement = self.active_detached_viewer_current_placement();
+                let base_placement =
+                    self.capture_active_detached_placement_at_decision("collection_image_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     self.show_feedback_warning(
@@ -64584,7 +64593,8 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_folder_candidate",
                 );
-                let base_placement = self.active_detached_viewer_current_placement();
+                let base_placement =
+                    self.capture_active_detached_placement_at_decision("folder_candidate_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     return false;
@@ -64626,7 +64636,8 @@ impl App {
                     self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
                     return true;
                 }
-                let base_placement = self.active_detached_viewer_current_placement();
+                let base_placement =
+                    self.capture_active_detached_placement_at_decision("archive_candidate_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     return false;
@@ -64728,7 +64739,7 @@ impl App {
         };
 
         let (descriptor, collection_restore) = descriptor;
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement = self.capture_active_detached_placement_at_decision("descriptor_seed");
         let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             return false;
@@ -64859,7 +64870,8 @@ impl App {
                 return None;
             }
         };
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement =
+            self.capture_active_detached_placement_at_decision("converted_bookmark_seed");
         let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.bookmark_open_pending =
@@ -65602,6 +65614,7 @@ impl App {
         let zoom_pan = self.fs_zoom_pan();
         let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
+        let _ = self.capture_detached_window_placement_at_decision(id, "build_active_snapshot");
         let placement = self.ensure_detached_window_runtime_placement(id, "build_active_snapshot");
         let pixels_per_point = ctx
             .map(egui::Context::pixels_per_point)
@@ -65751,6 +65764,8 @@ impl App {
             return None;
         }
         let id = self.ensure_detached_viewer_window_id();
+        let _ = self
+            .capture_detached_window_placement_at_decision(id, "build_parked_live_media_snapshot");
         let placement =
             self.ensure_detached_window_runtime_placement(id, "build_parked_live_media_snapshot");
         let texture = ctx.load_texture(
@@ -66350,7 +66365,8 @@ impl App {
             && self.viewer_session_is_detached()
             && current_idx.is_some_and(|current| self.viewer_item_supports_detached_still(current))
             && always_new;
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement =
+            self.capture_active_detached_placement_at_decision("always_new_still_seed");
         let parked_window_id = self
             .active_detached_session
             .map(|session| session.window_id)
@@ -67084,6 +67100,16 @@ impl App {
             return;
         }
         let target_borderless = !self.detached_viewer_borderless_fullscreen;
+        let entry_outer = target_borderless
+            .then(|| {
+                self.active_detached_hwnd_window_id().and_then(|window_id| {
+                    self.capture_detached_window_placement_at_decision(
+                        window_id,
+                        "f11_enter_requested",
+                    )
+                })
+            })
+            .flatten();
         if target_borderless {
             self.write_detached_viewer_borderless_state(
                 false,
@@ -67093,9 +67119,7 @@ impl App {
             );
         }
         let target_outer = if target_borderless {
-            let intent = self
-                .detached_viewer_host_hwnd_alive()
-                .and_then(|hwnd| crate::detached_window_geometry::read_outer_rect(hwnd as isize))
+            let intent = entry_outer
                 .unwrap_or_else(|| self.active_detached_viewer_current_placement().outer);
             crate::detached_window_geometry::borderless_target_for(intent).unwrap_or(intent)
         } else {
@@ -96635,7 +96659,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(windows)]
         if ctx.current_pass_index() == 0 {
-            self.record_detached_host_placements_before_commands();
+            self.record_detached_host_placements_before_commands(ctx);
         }
         self.speculative_gpu_frame
             .begin(ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT));

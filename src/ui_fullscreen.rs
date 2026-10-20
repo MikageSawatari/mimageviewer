@@ -23640,7 +23640,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) {
-        self.record_detached_host_placements_before_commands();
+        self.record_detached_host_placements_before_commands(ctx);
         self.service_deferred_detached_window_events(ctx);
     }
 
@@ -26174,7 +26174,7 @@ impl App {
                         false,
                     );
                 } else {
-                    Self::send_detached_viewport_visible_commit(ctx, fs_id, maximized);
+                    self.send_detached_viewport_visible_commit(ctx, fs_id, maximized);
                 }
                 self.observe_viewport_presentation_command(
                     fs_id,
@@ -26566,7 +26566,7 @@ impl App {
                     false,
                 );
             } else {
-                Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+                self.send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
             }
             self.observe_viewport_presentation_command(
                 viewport_id,
@@ -27327,15 +27327,19 @@ impl App {
                         .video_presentation_transition
                         .z_order_recovery_permitted()
                 {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    if let Some(window_id) = self.active_detached_hwnd_window_id() {
+                        self.request_detached_window_visibility(ctx, window_id, true, None, true);
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        self.send_detached_viewport_visible_commit(ctx, ctx.viewport_id(), false);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     self.observe_viewport_presentation_command(
                         ctx.viewport_id(),
                         crate::presentation_observer::WindowAction::Visible,
                         "ui_fullscreen::restore_current_viewport",
                         "value=true",
                     );
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.observe_viewport_presentation_command(
                         ctx.viewport_id(),
                         crate::presentation_observer::WindowAction::Focus,
@@ -29308,7 +29312,7 @@ impl App {
                         if detached {
                             let maximized =
                                 self.active_detached_viewport_maximized_on_visible_commit();
-                            Self::send_detached_viewport_visible_commit(
+                            self.send_detached_viewport_visible_commit(
                                 ctx,
                                 ctx.viewport_id(),
                                 maximized,
@@ -31903,6 +31907,9 @@ impl App {
         if !self.fs_viewport_shown {
             return;
         }
+        if self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow) {
+            self.capture_active_detached_placement_at_decision("fullscreen_viewport_recreate");
+        }
         let fs_id = self.fullscreen_viewport_id();
         let builder = match self.fs_viewport_presentation {
             Some(ViewerPresentation::DetachedWindow) => self
@@ -32209,10 +32216,15 @@ impl App {
     /// window. Both commands are queued only after the caller has painted/published content.
     #[cfg(windows)]
     pub(crate) fn send_detached_viewport_visible_commit(
+        &mut self,
         ctx: &egui::Context,
         viewport_id: egui::ViewportId,
         maximized: bool,
     ) {
+        // Hidden observations are consumed without polling. Every existing show
+        // owner comes through this commit, so the next root sample sees the host
+        // after visibility/maximization commands have actually been processed.
+        self.invalidate_detached_geometry_on_visible_commit(viewport_id);
         if maximized {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
         }

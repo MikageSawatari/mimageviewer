@@ -1455,6 +1455,28 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-20 §1.384: 別ウィンドウの配置を物理座標で 1 か所が持つ
+
+- 発端: 倍率の違うモニター (150% / 100%) で、別ウィンドウの動画が 1.5 倍の座標 (画面外) に作られた (利用者の実機報告 2026-10-15)。
+  placement は R2c どおり window_id ごとの runtime が正本だったが、値がその窓の DPI で割った論理値で、egui-winit が窓の
+  **そのときの** DPI で物理化していた。作成直後の窓の DPI は対象モニターと無関係なので、正本が 1 つでも変換境界が複数あった。
+  BA-6 / R2c (主)、BA-2、BA-7。
+- 構造: runtime placement・F11 の restore・保存値を物理外枠矩形にし、窓への適用を `src/detached_window_geometry.rs` の
+  1 つの境界 (`apply_outer_rect`、DPI をまたぐときは対象モニターの DPI へ移す staging を経る) に集めた。HWND 登録の全入口で
+  適用し、runtime の型付き状態 `HostPlacement` (incarnation 付き) が適用と root 側の表示要求の保持を持つ。builder は host を
+  作る前の仮の配置だけを持つ (既存 latch のまま)。active の可視化は既存の順序 (nested immediate の明示 command は primary の
+  出力で処理される) に乗せ、可視化の owner・一回限りの表示指定は変えない。passive は可視化を変えず採用時に適用する。
+  最大化中の窓への適用は F11 と passive で共通の 1 規則 (`IsZoomed == false` を確かめてから適用)。
+- 合意: 設計第 6 版 (docs/detached-dpi-placement-plan.md) で、設計担当 ClaudeCode と独立設計レビュー (GPT-6.1 Sol / xhigh) の双方が
+  「症状パッチではなく構造的修正である」ことに合意 (第 1〜6 版すべてで同意を維持、第 6 版で ACCEPT WITH CHANGES)。
+  独立実装レビューも同じ主張に同意。画面外を見つけて戻す補正・時間待ち・再試行は入れていない。
+- 触れた範囲: detached の HWND 登録入口 (created / unclaimed adopted / skipped-snapshot recovered / deferred adopted / watcher repair /
+  ParkedLive)、builder の配置、F11 の入る / 出る、root 側の表示要求 (トレイ復帰・native 遷移・再アクティブ化) の共通 helper、
+  ParkedLive の新規 host の Hidden 作成、位置の記録、設定 (新 field と旧 field の移行)。rect 一致探索・キー入力 subclass・
+  状態遷移・park / promote の所有境界・F11 遷移の Settle 時間待ちは変えていない。既定サイズ拒否の防波堤は単位だけ物理にした。
+- 残す検証条件: DPI をまたぐ staging の推奨矩形の前提は、倍率の違うモニターでの実 HWND 試験が通るまで未検証として扱う。
+  メインから開く全画面 viewport は同型だが範囲外 (backlog §1.407)。
+
 ### 2026-10-20 §1.232 第5回レビュー: viewer 不在の一覧採用
 
 - 利用者が提示した独立レビューは、一括終了の合流と内部 reopen / park / F12 の

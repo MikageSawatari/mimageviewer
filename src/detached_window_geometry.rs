@@ -248,16 +248,24 @@ pub struct PlacementApplied {
     pub moved: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OuterRectChange {
+    MoveAndResize(PhysicalRect),
+    MoveOnly { left: i32, top: i32 },
+    SizeOnly { width: i32, height: i32 },
+}
+
 /// Small synchronous Win32 surface, also used by the winit-behavior fake.
 pub trait WindowGeometry {
+    fn monitors(&self) -> Vec<MonitorFacts>;
     fn monitor_for_rect(&self, rect: PhysicalRect) -> Option<MonitorFacts>;
     fn outer_rect(&self, hwnd: isize) -> Option<PhysicalRect>;
     fn client_size(&self, hwnd: isize) -> Option<[i32; 2]>;
     fn dpi(&self, hwnd: isize) -> Option<u32>;
     fn monitor_for_window(&self, hwnd: isize) -> Option<MonitorFacts>;
     fn zoomed(&self, hwnd: isize) -> bool;
-    /// `move_only` uses SWP_NOSIZE; resizing before a DPI change is a separate step.
-    fn set_outer_rect(&mut self, hwnd: isize, rect: PhysicalRect, move_only: bool) -> bool;
+    /// Moving and resizing at the current DPI are separate from crossing DPI.
+    fn set_outer_rect(&mut self, hwnd: isize, change: OuterRectChange) -> bool;
 }
 
 fn mismatch(
@@ -354,26 +362,45 @@ pub fn apply_outer_rect_with(
         return Ok(PlacementApplied { moved: false });
     }
     if dpi != m.dpi {
-        let (Some(k), Some(client)) = (api.monitor_for_rect(initial), api.client_size(hwnd)) else {
+        let Some(client) = api.client_size(hwnd) else {
             return Err(fail(
                 api,
                 PlacementStage::ShrinkAtCurrentDpi,
-                "source monitor or client unavailable",
+                "source client unavailable",
             ));
         };
+        // An offscreen HWND can retain a DPI different from its nearest monitor.
+        // The shrink must not cross DPI before winit has read the small client.
+        let at_current_dpi = |k: &MonitorFacts| k.dpi == dpi && k.rc_work.is_valid();
+        let source = api
+            .monitor_for_window(hwnd)
+            .filter(at_current_dpi)
+            .or_else(|| api.monitors().into_iter().find(at_current_dpi));
         let frame = FrameInsets {
             width: initial.width() - client[0],
             height: initial.height() - client[1],
         };
-        let Some(small) = staging_client(k, m, frame, f64::from(m.dpi) / f64::from(dpi)) else {
+        // With no current-DPI monitor, only the target constrains the size:
+        // SWP_NOMOVE keeps the offscreen position during this first shrink.
+        let Some(small) = staging_client(
+            source.unwrap_or(m),
+            m,
+            frame,
+            f64::from(m.dpi) / f64::from(dpi),
+        ) else {
             return Err(fail(
                 api,
                 PlacementStage::ShrinkAtCurrentDpi,
                 "no staging size fits work area",
             ));
         };
-        let at_source = centered(k.rc_work, small[0] + frame.width, small[1] + frame.height);
-        if !api.set_outer_rect(hwnd, at_source, false)
+        let width = small[0] + frame.width;
+        let height = small[1] + frame.height;
+        let shrink = match source {
+            Some(k) => OuterRectChange::MoveAndResize(centered(k.rc_work, width, height)),
+            None => OuterRectChange::SizeOnly { width, height },
+        };
+        if !api.set_outer_rect(hwnd, shrink)
             || api.dpi(hwnd) != Some(dpi)
             || api.client_size(hwnd) != Some(small)
         {
@@ -383,9 +410,14 @@ pub fn apply_outer_rect_with(
                 "source DPI or small client did not settle synchronously",
             ));
         }
-        let at_target = centered(m.rc_work, at_source.width(), at_source.height());
-        if !api.set_outer_rect(hwnd, at_target, true)
-            || api.dpi(hwnd) != Some(m.dpi)
+        let at_target = centered(m.rc_work, width, height);
+        if !api.set_outer_rect(
+            hwnd,
+            OuterRectChange::MoveOnly {
+                left: at_target.left,
+                top: at_target.top,
+            },
+        ) || api.dpi(hwnd) != Some(m.dpi)
             || api.monitor_for_window(hwnd).map(|k| k.id) != Some(m.id)
         {
             return Err(fail(
@@ -395,7 +427,7 @@ pub fn apply_outer_rect_with(
             ));
         }
     }
-    if !api.set_outer_rect(hwnd, target, false)
+    if !api.set_outer_rect(hwnd, OuterRectChange::MoveAndResize(target))
         || api.outer_rect(hwnd) != Some(target)
         || api.dpi(hwnd) != Some(m.dpi)
     {
@@ -484,8 +516,8 @@ mod native {
         AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, GetWindowRect, IsZoomed, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-        SetWindowPos, WS_EX_WINDOWEDGE, WS_OVERLAPPEDWINDOW,
+        GetClientRect, GetWindowRect, IsZoomed, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SetWindowPos, WS_EX_WINDOWEDGE, WS_OVERLAPPEDWINDOW,
     };
     use windows::core::BOOL;
 
@@ -588,6 +620,9 @@ mod native {
     }
     pub(super) struct Native;
     impl WindowGeometry for Native {
+        fn monitors(&self) -> Vec<MonitorFacts> {
+            monitors()
+        }
         fn monitor_for_rect(&self, r: PhysicalRect) -> Option<MonitorFacts> {
             monitor_for_rect(r, true)
         }
@@ -611,23 +646,20 @@ mod native {
         fn zoomed(&self, hwnd: isize) -> bool {
             unsafe { IsZoomed(HWND(hwnd as *mut _)) }.as_bool()
         }
-        fn set_outer_rect(&mut self, hwnd: isize, r: PhysicalRect, move_only: bool) -> bool {
+        fn set_outer_rect(&mut self, hwnd: isize, change: OuterRectChange) -> bool {
             let mut flags = SWP_NOACTIVATE | SWP_NOZORDER;
-            if move_only {
-                flags |= SWP_NOSIZE;
-            }
-            unsafe {
-                SetWindowPos(
-                    HWND(hwnd as *mut _),
-                    None,
-                    r.left,
-                    r.top,
-                    r.width(),
-                    r.height(),
-                    flags,
-                )
-            }
-            .is_ok()
+            let (x, y, width, height) = match change {
+                OuterRectChange::MoveAndResize(r) => (r.left, r.top, r.width(), r.height()),
+                OuterRectChange::MoveOnly { left, top } => {
+                    flags |= SWP_NOSIZE;
+                    (left, top, 0, 0)
+                }
+                OuterRectChange::SizeOnly { width, height } => {
+                    flags |= SWP_NOMOVE;
+                    (0, 0, width, height)
+                }
+            };
+            unsafe { SetWindowPos(HWND(hwnd as *mut _), None, x, y, width, height, flags) }.is_ok()
         }
     }
 }
@@ -649,6 +681,9 @@ mod native {
     }
     pub(super) struct Native;
     impl WindowGeometry for Native {
+        fn monitors(&self) -> Vec<MonitorFacts> {
+            Vec::new()
+        }
         fn monitor_for_rect(&self, _: PhysicalRect) -> Option<MonitorFacts> {
             None
         }
@@ -667,7 +702,7 @@ mod native {
         fn zoomed(&self, _: isize) -> bool {
             false
         }
-        fn set_outer_rect(&mut self, _: isize, _: PhysicalRect, _: bool) -> bool {
+        fn set_outer_rect(&mut self, _: isize, _: OuterRectChange) -> bool {
             false
         }
     }
@@ -745,7 +780,8 @@ mod tests {
         client: [i32; 2],
         dpi: u32,
         decorated: bool,
-        calls: Vec<(PhysicalRect, bool)>,
+        calls: Vec<OuterRectChange>,
+        after_calls: Vec<(PhysicalRect, [i32; 2], u32)>,
         zoomed: bool,
         fail_on: Option<usize>,
         wrong_dpi: bool,
@@ -753,6 +789,14 @@ mod tests {
     impl Fake {
         fn new(monitors: Vec<MonitorFacts>, outer: PhysicalRect, decorated: bool) -> Self {
             let dpi = select(&monitors, outer, true).unwrap().dpi;
+            Self::new_at_dpi(monitors, outer, decorated, dpi)
+        }
+        fn new_at_dpi(
+            monitors: Vec<MonitorFacts>,
+            outer: PhysicalRect,
+            decorated: bool,
+            dpi: u32,
+        ) -> Self {
             let f = frame(dpi, decorated);
             Self {
                 monitors,
@@ -761,6 +805,7 @@ mod tests {
                 dpi,
                 decorated,
                 calls: vec![],
+                after_calls: vec![],
                 zoomed: false,
                 fail_on: None,
                 wrong_dpi: false,
@@ -817,6 +862,9 @@ mod tests {
         }
     }
     impl WindowGeometry for Fake {
+        fn monitors(&self) -> Vec<MonitorFacts> {
+            self.monitors.clone()
+        }
         fn monitor_for_rect(&self, r: PhysicalRect) -> Option<MonitorFacts> {
             select(&self.monitors, r, true)
         }
@@ -835,23 +883,28 @@ mod tests {
         fn zoomed(&self, _: isize) -> bool {
             self.zoomed
         }
-        fn set_outer_rect(&mut self, _: isize, requested: PhysicalRect, move_only: bool) -> bool {
-            self.calls.push((requested, move_only));
+        fn set_outer_rect(&mut self, _: isize, change: OuterRectChange) -> bool {
+            self.calls.push(change);
             if self.fail_on == Some(self.calls.len()) {
                 return false;
             }
-            let requested = if move_only {
-                rect(
-                    requested.left,
-                    requested.top,
-                    self.outer.width(),
-                    self.outer.height(),
-                )
-            } else {
-                requested
+            let requested = match change {
+                OuterRectChange::MoveAndResize(r) => r,
+                OuterRectChange::MoveOnly { left, top } => {
+                    rect(left, top, self.outer.width(), self.outer.height())
+                }
+                OuterRectChange::SizeOnly { width, height } => {
+                    rect(self.outer.left, self.outer.top, width, height)
+                }
             };
-            let monitor = self.monitor_for_rect(requested).unwrap();
-            if monitor.dpi != self.dpi {
+            // A wholly offscreen size-only change retains the HWND's current
+            // DPI; nearest-monitor facts do not replace that retained value.
+            let monitor = if matches!(change, OuterRectChange::SizeOnly { .. }) {
+                select(&self.monitors, requested, false)
+            } else {
+                self.monitor_for_rect(requested)
+            };
+            if let Some(monitor) = monitor.filter(|m| m.dpi != self.dpi) {
                 (self.outer, self.client) = self.rebuild_for_dpi(requested, monitor);
                 if !self.wrong_dpi {
                     self.dpi = monitor.dpi;
@@ -861,6 +914,7 @@ mod tests {
                 let f = frame(self.dpi, self.decorated);
                 self.client = [requested.width() - f.width, requested.height() - f.height];
             }
+            self.after_calls.push((self.outer, self.client, self.dpi));
             true
         }
     }
@@ -1015,7 +1069,7 @@ mod tests {
         assert!(fake.calls.is_empty());
         let target = rect(-300, 200, 3000, 1700);
         assert!(apply_outer_rect_with(&mut fake, 1, target).is_ok());
-        assert_eq!(fake.calls, vec![(target, false)]);
+        assert_eq!(fake.calls, vec![OuterRectChange::MoveAndResize(target)]);
     }
 
     #[test]
@@ -1058,10 +1112,11 @@ mod tests {
                         assert_eq!(fake.outer, target);
                         assert_eq!(fake.dpi, select(&ms, target, true).unwrap().dpi);
                         assert_eq!(fake.calls.len(), 3);
-                        assert!(!fake.calls[0].1);
-                        assert!(fake.calls[1].1);
-                        assert!(!fake.calls[2].1);
-                        let stage = fake.calls[0].0;
+                        let OuterRectChange::MoveAndResize(stage) = fake.calls[0] else {
+                            panic!("source shrink must move and resize")
+                        };
+                        assert!(matches!(fake.calls[1], OuterRectChange::MoveOnly { .. }));
+                        assert_eq!(fake.calls[2], OuterRectChange::MoveAndResize(target));
                         let f = frame(source.dpi, decorated);
                         assert!(stage.width() - f.width <= 320 && stage.height() - f.height <= 240);
                     }
@@ -1071,10 +1126,94 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_retained_dpi_uses_a_matching_monitor_before_cross_dpi_move() {
+        let ms = vec![
+            monitor(1, rect(0, 0, 3840, 2160), 144),
+            monitor(2, rect(3840, -1124, 2160, 3840), 144),
+            monitor(3, rect(6000, 1513, 1920, 1200), 96),
+        ];
+        for decorated in [false, true] {
+            for (initial, dpi, source, dest) in [
+                (rect(9000, 2270, 2880, 1800), 144, ms[0], ms[2]),
+                (rect(-9000, -5000, 2880, 1800), 96, ms[2], ms[0]),
+            ] {
+                assert_ne!(select(&ms, initial, true).unwrap().dpi, dpi);
+                let target = centered(dest.rc_work, 1000, 700);
+                let mut fake = Fake::new_at_dpi(ms.clone(), initial, decorated, dpi);
+                assert_eq!(
+                    apply_outer_rect_with(&mut fake, 1, target),
+                    Ok(PlacementApplied { moved: true }),
+                    "decorated={decorated} initial={initial:?} retained_dpi={dpi}"
+                );
+                let (shrunk, client, shrunk_dpi) = fake.after_calls[0];
+                assert_eq!(shrunk_dpi, dpi, "shrinking must keep the retained HWND DPI");
+                assert_eq!(client, [320, 240]);
+                assert_eq!(select(&ms, shrunk, false).unwrap().id, source.id);
+                assert!(matches!(fake.calls[0], OuterRectChange::MoveAndResize(_)));
+                assert!(matches!(fake.calls[1], OuterRectChange::MoveOnly { .. }));
+                assert_eq!(fake.calls[2], OuterRectChange::MoveAndResize(target));
+                assert_eq!(fake.outer, target);
+                assert_eq!(fake.dpi, dest.dpi);
+            }
+        }
+    }
+
+    #[test]
+    fn current_hwnd_monitor_is_preferred_among_matching_dpi_monitors() {
+        let ms = vec![
+            monitor(1, rect(0, 0, 3840, 2160), 144),
+            monitor(2, rect(3840, -1124, 2160, 3840), 144),
+            monitor(3, rect(6000, 1513, 1920, 1200), 96),
+        ];
+        let initial = centered(ms[1].rc_work, 1200, 900);
+        let target = centered(ms[2].rc_work, 1000, 700);
+        let mut fake = Fake::new(ms.clone(), initial, true);
+        apply_outer_rect_with(&mut fake, 1, target).unwrap();
+        assert_eq!(
+            select(&ms, fake.after_calls[0].0, false).unwrap().id,
+            ms[1].id
+        );
+    }
+
+    #[test]
+    fn offscreen_without_a_matching_dpi_monitor_shrinks_without_moving() {
+        for decorated in [false, true] {
+            for (dpi, target_dpi) in [(144, 96), (96, 144)] {
+                let ms = vec![monitor(1, rect(6000, 1513, 1920, 1200), target_dpi)];
+                let initial = rect(9000, 2270, 2880, 1800);
+                let target = centered(ms[0].rc_work, 1000, 700);
+                let mut fake = Fake::new_at_dpi(ms, initial, decorated, dpi);
+                assert_eq!(
+                    apply_outer_rect_with(&mut fake, 1, target),
+                    Ok(PlacementApplied { moved: true })
+                );
+                let f = frame(dpi, decorated);
+                assert_eq!(
+                    fake.calls[0],
+                    OuterRectChange::SizeOnly {
+                        width: 320 + f.width,
+                        height: 240 + f.height,
+                    }
+                );
+                assert_eq!(
+                    fake.after_calls[0],
+                    (
+                        rect(initial.left, initial.top, 320 + f.width, 240 + f.height),
+                        [320, 240],
+                        dpi,
+                    )
+                );
+                assert_eq!(fake.outer, target);
+                assert_eq!(fake.dpi, target_dpi);
+            }
+        }
+    }
+
+    #[test]
     fn fake_rebuild_uses_current_client_and_does_not_clamp_disconnected_monitors() {
         let mut fake = Fake::new(desktop(), rect(0, 0, 3000, 1800), false);
         let requested = rect(6100, 1600, 20, 20);
-        fake.set_outer_rect(1, requested, false);
+        fake.set_outer_rect(1, OuterRectChange::MoveAndResize(requested));
         assert_eq!(fake.client, [2000, 1200]);
         assert_eq!(fake.outer.width(), 2000);
         // Without staging, a very large current client need not stay on the new
@@ -1198,6 +1337,14 @@ mod tests {
         eprintln!("hidden winit monitor facts under per-monitor awareness: {ms:?}");
         let mixed = ms.iter().any(|m| ms.iter().any(|other| other.dpi != m.dpi));
         let mut observed_dpis = std::collections::BTreeSet::new();
+        let mut offscreen_exact_cases = 0;
+        let mut offscreen_retained_dpi_cases = 0;
+        let desktop_bounds = PhysicalRect {
+            left: ms.iter().map(|m| m.rc_monitor.left).min().unwrap(),
+            top: ms.iter().map(|m| m.rc_monitor.top).min().unwrap(),
+            right: ms.iter().map(|m| m.rc_monitor.right).max().unwrap(),
+            bottom: ms.iter().map(|m| m.rc_monitor.bottom).max().unwrap(),
+        };
         for decorated in [true, false] {
             #[allow(deprecated)]
             let window = event_loop
@@ -1302,6 +1449,76 @@ mod tests {
                         assert!(!unsafe { IsWindowVisible(HWND(hwnd as *mut _)) }.as_bool());
                     }
                 }
+                if mixed {
+                    // Move a hidden HWND completely outside the desktop. Unlike
+                    // apply_outer_rect this setup does not establish nearest DPI:
+                    // it can retain the source DPI despite a different nearest
+                    // monitor, just like a newly created offscreen detached host.
+                    let offscreen = ms
+                        .iter()
+                        .flat_map(|m| {
+                            let x = m.rc_work.left + (m.rc_work.width() - start.width()) / 2;
+                            let y = m.rc_work.top + (m.rc_work.height() - start.height()) / 2;
+                            [
+                                rect(
+                                    desktop_bounds.right + 9000,
+                                    y,
+                                    start.width(),
+                                    start.height(),
+                                ),
+                                rect(
+                                    desktop_bounds.left - 9000 - start.width(),
+                                    y,
+                                    start.width(),
+                                    start.height(),
+                                ),
+                                rect(
+                                    x,
+                                    desktop_bounds.bottom + 9000,
+                                    start.width(),
+                                    start.height(),
+                                ),
+                                rect(
+                                    x,
+                                    desktop_bounds.top - 9000 - start.height(),
+                                    start.width(),
+                                    start.height(),
+                                ),
+                            ]
+                        })
+                        .find(|r| monitor_for_rect(*r).is_some_and(|m| m.dpi != source.dpi));
+                    if let Some(offscreen) = offscreen {
+                        apply_outer_rect(hwnd, start).expect("reset before offscreen setup");
+                        assert!(native::Native.set_outer_rect(
+                            hwnd,
+                            OuterRectChange::MoveOnly {
+                                left: offscreen.left,
+                                top: offscreen.top,
+                            }
+                        ));
+                        let actual = read_outer_rect(hwnd).expect("offscreen HWND outer rect");
+                        assert!(
+                            ms.iter()
+                                .all(|m| actual.intersection_area(m.rc_monitor) == 0)
+                        );
+                        let retained_dpi = native::Native.dpi(hwnd).unwrap();
+                        let nearest = monitor_for_window(hwnd).unwrap();
+                        let target = centered(nearest.rc_work, start.width(), start.height());
+                        let result = apply_outer_rect(hwnd, target);
+                        eprintln!(
+                            "hidden winit offscreen decorated={decorated} source_dpi={} retained_dpi={retained_dpi} nearest_dpi={} initial={actual:?} target={target:?} result={result:?}",
+                            source.dpi, nearest.dpi
+                        );
+                        result.expect("offscreen real HWND placement must be Exact");
+                        assert_eq!(read_outer_rect(hwnd), Some(target));
+                        assert_eq!(native::Native.dpi(hwnd), Some(nearest.dpi));
+                        assert!(!unsafe { IsWindowVisible(HWND(hwnd as *mut _)) }.as_bool());
+                        offscreen_exact_cases += 1;
+                        if retained_dpi != nearest.dpi {
+                            offscreen_retained_dpi_cases += 1;
+                        }
+                    }
+                }
             }
         }
         assert_eq!(
@@ -1314,6 +1531,15 @@ mod tests {
                 "SKIP mixed-DPI real-monitor coverage: validated per-monitor-aware process/thread/HWNDs observed only {observed_dpis:?} on {} monitors; single-DPI HWND coverage passed",
                 ms.len()
             );
+        } else {
+            eprintln!(
+                "hidden winit offscreen coverage: Exact cases={offscreen_exact_cases}, verified retained-DPI/nearest-DPI mismatch cases={offscreen_retained_dpi_cases}"
+            );
+            if offscreen_retained_dpi_cases == 0 {
+                eprintln!(
+                    "SKIP retained-DPI/nearest-DPI mismatch real-monitor coverage: the offscreen setup did not establish an HWND retaining a DPI different from its nearest monitor; offscreen Exact checks still ran, retained-DPI regression remains covered by the fake only"
+                );
+            }
         }
     }
 }

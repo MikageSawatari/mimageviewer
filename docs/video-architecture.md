@@ -258,6 +258,9 @@ user seek coalesce (250ms)、open 進捗 HUD (50ms) の最短 one-shot だけを
 native presenter の表示先は `NativeVideoPlacement` を正本にする。
 detached host の通常配置・F11 restore は runtime が物理外枠座標で所有し、HWND 登録時に
 `detached_window_geometry` で適用する。builder の位置・寸法は生成前の仮配置に限る。
+配置の適用だけでは Hidden host を見せず、最大化を含む可視化は既存の表示 commit が行う。
+F11・終了・再作成や park の判断時は HWND を読み直し、通常 frame の egui 観測は変更通知として扱う。
+判断時は通常の外枠だけを更新し、最大化の意図は root の最初の pass の通常観測だけで更新する。
 
 - `MainWindowChild`: main HWND の child window。メインウィンドウ内に表示する。
 - `FullscreenBorderless`: monitor rect 全体の borderless presenter。fullscreen 専用 HUD overlay HWND、
