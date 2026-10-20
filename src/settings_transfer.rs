@@ -713,6 +713,7 @@ preferences_policy! {
         video_in_window_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_window_placement => "runtime overlay / PC のウィンドウ配置";
+        detached_viewer_window_physical_placement => "runtime overlay / PC のウィンドウ配置";
         vst3_enabled => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugins => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugin_path => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
@@ -1916,7 +1917,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 464);
+        assert_eq!(entries.len(), 465);
         assert_eq!(
             entries
                 .iter()
@@ -1929,7 +1930,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            316
+            317
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2398,6 +2399,67 @@ mod tests {
         let report = parsed.apply_to(&mut destination);
         assert_eq!(report.issues.len(), 1);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
+        assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn detached_placement_transfer_excludes_both_formats_and_keeps_destination() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+        use crate::settings::DetachedViewerWindowPlacement;
+
+        let source = Settings {
+            detached_viewer_window_placement: Some(DetachedViewerWindowPlacement {
+                x: 4000.0,
+                y: 100.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            }),
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: 6000,
+                    top: 150,
+                    right: 7440,
+                    bottom: 1230,
+                },
+                maximized: true,
+            }),
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+        for key in [
+            "detached_viewer_window_placement",
+            "detached_viewer_window_physical_placement",
+        ] {
+            assert!(document["preferences"].get(key).is_none(), "{key}");
+            document["preferences"][key] = serde_json::to_value(&source).unwrap()[key].clone();
+        }
+        let mut destination = Settings {
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: -1920,
+                    top: 0,
+                    right: -960,
+                    bottom: 720,
+                },
+                maximized: false,
+            }),
+            ..Settings::default()
+        };
+        let before = destination.clone();
+        let report = parse_preferences(&document.to_string())
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(report.unknown_count, 2);
+        assert_eq!(
+            destination.detached_viewer_window_placement,
+            before.detached_viewer_window_placement
+        );
+        assert_eq!(
+            destination.detached_viewer_window_physical_placement,
+            before.detached_viewer_window_physical_placement
+        );
         assert_excluded_unchanged(&before, &destination);
     }
 

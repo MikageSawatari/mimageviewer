@@ -50,6 +50,45 @@ pub(crate) struct DetachedHostClaim {
     pub(crate) hwnd: u64,
 }
 
+/// Root-side visibility, maximization and focus are committed together only after
+/// this host has received its physical placement.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ShowRequest {
+    pub(crate) maximized: Option<bool>,
+    pub(crate) focus: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementOutcome {
+    Exact,
+    Mismatch,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostPlacement {
+    Unplaced {
+        show_request: Option<ShowRequest>,
+        awaiting_unzoom: bool,
+    },
+    Placed {
+        incarnation: u64,
+        outcome: PlacementOutcome,
+    },
+}
+
+#[cfg(windows)]
+impl Default for HostPlacement {
+    fn default() -> Self {
+        Self::Unplaced {
+            show_request: None,
+            awaiting_unzoom: false,
+        }
+    }
+}
+
 /// Progress of a right-drag command recognized by a passive detached window.
 /// The command remains owned by that window until its viewer bundle is mounted.
 #[cfg(windows)]
@@ -466,8 +505,10 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) hwnd: u64,
     pub(crate) host_incarnation: u64,
     viewport_binding: Option<super::viewport_retirement::ViewportCommandBinding>,
-    pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
-    pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
+    pub(crate) placement: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
+    pub(crate) builder_placement_latch:
+        Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
+    pub(crate) host_placement: HostPlacement,
     pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
     pub(crate) linked: bool,
     pub(crate) activation_intent: Option<DetachedActivationIntent>,
@@ -484,6 +525,7 @@ impl DetachedWindowRuntime {
             viewport_binding: None,
             placement: None,
             builder_placement_latch: None,
+            host_placement: HostPlacement::default(),
             trim_bboxes: std::collections::HashMap::new(),
             linked,
             activation_intent: None,
@@ -568,7 +610,7 @@ impl DetachedWindowManager {
     pub(super) fn placement(
         &self,
         window_id: u64,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         self.runtime(window_id)
             .and_then(|runtime| runtime.placement)
     }
@@ -576,9 +618,9 @@ impl DetachedWindowManager {
     pub(super) fn set_placement(
         &mut self,
         window_id: u64,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         default_linked: bool,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         let runtime = self.entry_mut(window_id, default_linked);
         let previous = runtime.placement;
         runtime.placement = Some(placement);
@@ -613,7 +655,7 @@ impl DetachedWindowManager {
     pub(super) fn builder_placement_latch(
         &self,
         window_id: u64,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         self.runtime(window_id)
             .and_then(|runtime| runtime.builder_placement_latch)
     }
@@ -621,9 +663,9 @@ impl DetachedWindowManager {
     pub(super) fn set_builder_placement_latch(
         &mut self,
         window_id: u64,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         default_linked: bool,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         let runtime = self.entry_mut(window_id, default_linked);
         let previous = runtime.builder_placement_latch;
         runtime.builder_placement_latch = Some(placement);
@@ -634,6 +676,101 @@ impl DetachedWindowManager {
         self.runtime(window_id)
             .map(|runtime| runtime.hwnd)
             .filter(|hwnd| *hwnd != 0)
+    }
+
+    pub(super) fn host_placement(&self, window_id: u64) -> Option<HostPlacement> {
+        let runtime = self.runtime(window_id)?;
+        Some(match runtime.host_placement {
+            HostPlacement::Placed { incarnation, .. }
+                if runtime.hwnd == 0 || incarnation != runtime.host_incarnation =>
+            {
+                HostPlacement::default()
+            }
+            placement => placement,
+        })
+    }
+
+    /// Returns a request only when it can be dispatched immediately. Missing
+    /// runtimes retain their existing caller-owned dispatch path.
+    pub(super) fn request_show(
+        &mut self,
+        window_id: u64,
+        request: ShowRequest,
+    ) -> Option<ShowRequest> {
+        let Some(placement) = self.host_placement(window_id) else {
+            return Some(request);
+        };
+        match placement {
+            HostPlacement::Placed { .. } => Some(request),
+            HostPlacement::Unplaced {
+                show_request,
+                awaiting_unzoom,
+            } => {
+                // A later focus-only request must not erase an earlier maximize
+                // intent while placement is waiting for the host to unzoom.
+                let combined = ShowRequest {
+                    maximized: request
+                        .maximized
+                        .or(show_request.and_then(|old| old.maximized)),
+                    focus: request.focus || show_request.is_some_and(|old| old.focus),
+                };
+                self.runtimes.get_mut(&window_id).unwrap().host_placement =
+                    HostPlacement::Unplaced {
+                        show_request: Some(combined),
+                        awaiting_unzoom,
+                    };
+                None
+            }
+        }
+    }
+
+    pub(super) fn clear_show_request(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            if let HostPlacement::Unplaced { show_request, .. } = &mut runtime.host_placement {
+                *show_request = None;
+            }
+        }
+    }
+
+    /// Re-enter the same typed placement owner for an intentional geometry
+    /// transition, preserving a root-side request already waiting on this host.
+    pub(super) fn mark_host_unplaced(&mut self, window_id: u64, awaiting_unzoom: bool) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            let show_request = match runtime.host_placement {
+                HostPlacement::Unplaced { show_request, .. } => show_request,
+                HostPlacement::Placed { .. } => None,
+            };
+            runtime.host_placement = HostPlacement::Unplaced {
+                show_request,
+                awaiting_unzoom,
+            };
+        }
+    }
+
+    pub(super) fn set_host_awaiting_unzoom(&mut self, window_id: u64, awaiting_unzoom: bool) {
+        self.mark_host_unplaced(window_id, awaiting_unzoom);
+    }
+
+    /// A stale apply completion cannot mark a replacement host placed or take
+    /// its pending visibility request. Mismatch still permits visibility.
+    pub(super) fn mark_host_placed(
+        &mut self,
+        claim: DetachedHostClaim,
+        outcome: PlacementOutcome,
+    ) -> Option<ShowRequest> {
+        if !self.host_claim_is_alive(claim) {
+            return None;
+        }
+        let runtime = self.runtimes.get_mut(&claim.lease.window_id)?;
+        let show_request = match runtime.host_placement {
+            HostPlacement::Unplaced { show_request, .. } => show_request,
+            HostPlacement::Placed { .. } => None,
+        };
+        runtime.host_placement = HostPlacement::Placed {
+            incarnation: claim.incarnation,
+            outcome,
+        };
+        show_request
     }
 
     pub(super) fn hwnd_is_alive(&self, hwnd: u64) -> bool {
@@ -676,6 +813,7 @@ impl DetachedWindowManager {
     pub(super) fn clear_hwnd(&mut self, window_id: u64) -> Option<u64> {
         let runtime = self.runtimes.get_mut(&window_id)?;
         let hwnd = std::mem::take(&mut runtime.hwnd);
+        runtime.host_placement = HostPlacement::default();
         (hwnd != 0).then_some(hwnd)
     }
 
@@ -708,6 +846,9 @@ impl DetachedWindowManager {
         let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
         runtime.hwnd = hwnd;
         if let Some(incarnation) = new_incarnation {
+            if runtime.host_incarnation != 0 {
+                runtime.host_placement = HostPlacement::default();
+            }
             runtime.host_incarnation = incarnation;
         }
         previous
@@ -1184,6 +1325,183 @@ mod tests {
 
         manager.remove(WINDOW_ID);
         assert!(!manager.reusable_session_lease(WINDOW_ID));
+    }
+
+    #[test]
+    fn unplaced_host_retains_and_merges_show_until_physical_placement() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(7, DetachedWindowState::Opening, false);
+        let maximize = ShowRequest {
+            maximized: Some(true),
+            focus: false,
+        };
+        let focus = ShowRequest {
+            maximized: None,
+            focus: true,
+        };
+        assert_eq!(manager.request_show(7, maximize), None);
+        assert_eq!(manager.request_show(7, focus), None);
+        let combined = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: Some(combined),
+                awaiting_unzoom: false,
+            })
+        );
+
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let claim = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            Some(combined)
+        );
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Placed {
+                incarnation: claim.incarnation,
+                outcome: PlacementOutcome::Exact,
+            })
+        );
+        assert_eq!(manager.request_show(7, focus), Some(focus));
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            None
+        );
+        assert_eq!(manager.request_show(999, focus), Some(focus));
+        assert!(
+            manager.runtime(999).is_none(),
+            "missing runtime must not create a pending owner"
+        );
+    }
+
+    #[test]
+    fn hide_cancels_pending_show_without_losing_unzoom_wait() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        manager.mark_host_unplaced(7, true);
+        manager.request_show(
+            7,
+            ShowRequest {
+                maximized: Some(true),
+                focus: true,
+            },
+        );
+        manager.clear_show_request(7);
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: None,
+                awaiting_unzoom: true,
+            })
+        );
+        let claim = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            None
+        );
+    }
+
+    #[test]
+    fn host_replacement_discards_old_show_and_rejects_old_placement_completion() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000, 0x8000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let old = manager.host_claim_alive(7).unwrap();
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        manager.request_show(7, request);
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+        manager.request_show(7, request);
+        assert_eq!(manager.mark_host_placed(old, PlacementOutcome::Exact), None);
+        let current = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(current, PlacementOutcome::Mismatch),
+            Some(request)
+        );
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Placed {
+                incarnation: current.incarnation,
+                outcome: PlacementOutcome::Mismatch,
+            })
+        );
+        assert_eq!(
+            manager.request_show(7, request),
+            Some(request),
+            "mismatch must still allow visibility"
+        );
+    }
+
+    #[test]
+    fn duplicate_registration_preserves_placement_and_clear_reuse_requires_new_apply() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let first = manager.host_claim_alive(7).unwrap();
+        manager.mark_host_placed(first, PlacementOutcome::Exact);
+        let placed = manager.host_placement(7);
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(manager.host_placement(7), placed);
+
+        manager.mark_host_unplaced(7, true);
+        let request = ShowRequest {
+            maximized: Some(false),
+            focus: true,
+        };
+        manager.request_show(7, request);
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: Some(request),
+                awaiting_unzoom: true,
+            })
+        );
+        manager.clear_hwnd(7);
+        manager.set_hwnd(7, 0x7000, false);
+        let second = manager.host_claim_alive(7).unwrap();
+        assert_ne!(first.incarnation, second.incarnation);
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+        assert_eq!(
+            manager.mark_host_placed(first, PlacementOutcome::Exact),
+            None
+        );
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+    }
+
+    #[test]
+    fn placement_requests_and_completion_do_not_change_sibling_runtime() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000, 0x8000]);
+        manager.set_hwnd(7, 0x7000, false);
+        manager.set_hwnd(8, 0x8000, false);
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        manager.request_show(8, request);
+        manager.mark_host_unplaced(8, true);
+        let sibling = manager.host_placement(8);
+        let first = manager.host_claim_alive(7).unwrap();
+        manager.mark_host_placed(first, PlacementOutcome::Exact);
+        manager.clear_hwnd(7);
+        assert_eq!(manager.host_placement(8), sibling);
+        assert_eq!(
+            manager.mark_host_placed(
+                manager.host_claim_alive(8).unwrap(),
+                PlacementOutcome::Exact
+            ),
+            Some(request)
+        );
     }
 
     #[test]

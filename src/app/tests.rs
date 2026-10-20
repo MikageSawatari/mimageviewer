@@ -2,6 +2,43 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+/// Preserve the headless renderer's logical client dimensions while fixtures
+/// use the same physical outer placement as a decorated native window.
+#[cfg(windows)]
+pub(crate) fn detached_placement_with_logical_client_for_test(
+    logical_client: egui::Vec2,
+) -> crate::detached_window_geometry::PhysicalWindowPlacement {
+    use crate::detached_window_geometry::{
+        self as geometry, PhysicalRect, PhysicalWindowPlacement,
+    };
+    let anchor = PhysicalRect {
+        left: 80,
+        top: 80,
+        right: 81,
+        bottom: 81,
+    };
+    let monitor = geometry::monitor_for_rect(anchor).expect("test desktop monitor");
+    let frame = geometry::decorated_frame(monitor.dpi).expect("decorated test frame");
+    let placement = PhysicalWindowPlacement {
+        outer: PhysicalRect {
+            left: anchor.left,
+            top: anchor.top,
+            right: anchor.left + (logical_client.x * monitor.scale()).round() as i32 + frame.width,
+            bottom: anchor.top + (logical_client.y * monitor.scale()).round() as i32 + frame.height,
+        },
+        maximized: false,
+    };
+    assert_eq!(
+        geometry::monitor_for_rect(placement.outer).unwrap().id,
+        monitor.id
+    );
+    let actual_client = App::detached_snapshot_client_size(placement);
+    let rounding = 0.5 / monitor.scale() + 0.0001;
+    assert!((actual_client.x - logical_client.x).abs() <= rounding);
+    assert!((actual_client.y - logical_client.y).abs() <= rounding);
+    placement
+}
+
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
 
@@ -5065,11 +5102,13 @@ fn hidden_detached_host_builder_does_not_request_maximize() {
     app.begin_active_detached_session(12, DetachedSource::Image);
     app.set_detached_window_runtime_placement(
         12,
-        crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 1600.0,
-            h: 1200.0,
+        crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1700,
+                bottom: 1320,
+            },
             maximized: true,
         },
         "test_hidden_builder",
@@ -5095,11 +5134,13 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
     app.begin_active_detached_session(12, DetachedSource::Video);
     app.set_detached_window_runtime_placement(
         12,
-        crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 1600.0,
-            h: 1200.0,
+        crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1700,
+                bottom: 1320,
+            },
             maximized: true,
         },
         "test_visible_commit",
@@ -5129,6 +5170,15 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
     assert_eq!(
         after_capture, before_capture,
         "a hidden recreate scaffold must not publish its temporary restored state or geometry as user placement"
+    );
+    app.set_detached_window_host_for_test(12, 0xD371);
+    let claim = app.detached_window_manager.host_claim_alive(12).unwrap();
+    assert_eq!(
+        app.detached_window_manager.mark_host_placed(
+            claim,
+            crate::app::detached_window_manager::PlacementOutcome::Exact,
+        ),
+        None
     );
     let viewport_id = app.fullscreen_viewport_id();
     let ctx = egui::Context::default();
@@ -5249,11 +5299,13 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
         r"C:\pics\borderless-observation.jpg",
     )));
     let idx = 0;
-    let restore = crate::settings::DetachedViewerWindowPlacement {
-        x: 140.0,
-        y: 160.0,
-        w: 1500.0,
-        h: 1000.0,
+    let restore = crate::detached_window_geometry::PhysicalWindowPlacement {
+        outer: crate::detached_window_geometry::PhysicalRect {
+            left: 140,
+            top: 160,
+            right: 1640,
+            bottom: 1160,
+        },
         maximized: true,
     };
     app.fullscreen_idx = Some(idx);
@@ -5320,7 +5372,24 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     );
 
     // F11 OFF still has the paired restore placement and publishes it to the new runtime.
-    app.apply_detached_viewer_borderless_target(&egui::Context::default(), false);
+    app.set_detached_window_host_for_test(recreated_window, 0xF120);
+    let transition = DetachedViewerBorderlessTransition {
+        target_borderless: false,
+        target_outer: restore.outer,
+        phase: DetachedViewerBorderlessTransitionPhase::ApplyWindowMode,
+    };
+    crate::app::detached_placement::with_host_geometry_for_test(
+        recreated_window,
+        app.detached_viewer_borderless_target_rect(),
+        false,
+        || {
+            assert!(app.apply_detached_viewer_borderless_target(
+                &egui::Context::default(),
+                transition,
+                true,
+            ))
+        },
+    );
     assert!(!app.detached_viewer_borderless_fullscreen);
     assert_eq!(app.detached_viewer_restore_placement, None);
     assert_eq!(
@@ -5425,6 +5494,7 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     );
     assert!(
         app.detached_window_hwnd_set_for_reusable_lease(
+            &ctx,
             OLD_WINDOW_H,
             LATE_HWND,
             "test_late_registration_closing",
@@ -5452,6 +5522,7 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     );
     assert!(
         app.detached_window_hwnd_set_for_reusable_lease(
+            &ctx,
             OLD_WINDOW_H,
             LATE_HWND,
             "test_late_registration_removed",
@@ -5522,11 +5593,13 @@ fn hwnd_registration_preserves_previewport_lifecycle_until_render_marker() {
 #[cfg(windows)]
 fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
     let mut media = phase_c_support::setup_app();
-    let restore = crate::settings::DetachedViewerWindowPlacement {
-        x: 140.0,
-        y: 160.0,
-        w: 1500.0,
-        h: 1000.0,
+    let restore = crate::detached_window_geometry::PhysicalWindowPlacement {
+        outer: crate::detached_window_geometry::PhysicalRect {
+            left: 140,
+            top: 160,
+            right: 1640,
+            bottom: 1160,
+        },
         maximized: false,
     };
     media.items.push(GridItem::Audio(PathBuf::from(
@@ -62649,8 +62722,8 @@ mod still_window_mode_key_tests {
         image_window_id: u64,
         media_window_id: u64,
     ) -> (
-        crate::settings::DetachedViewerWindowPlacement,
-        crate::settings::DetachedViewerWindowPlacement,
+        crate::detached_window_geometry::PhysicalWindowPlacement,
+        crate::detached_window_geometry::PhysicalWindowPlacement,
     ) {
         app.settings.detached_viewer_enabled = true;
         app.settings.detached_viewer_open_images_in_window = false;
@@ -62664,8 +62737,11 @@ mod still_window_mode_key_tests {
         app.update_detached_window_runtime_flags(image_window_id, true, "test_linked_still");
 
         let media_placement = app.detached_viewer_window_placement();
-        let image_placement = crate::settings::DetachedViewerWindowPlacement {
-            w: media_placement.w - 64.0,
+        let image_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                right: media_placement.outer.right - 64,
+                ..media_placement.outer
+            },
             ..media_placement
         };
         app.set_detached_window_runtime_placement(
@@ -64917,6 +64993,21 @@ mod still_window_mode_key_tests {
         app.detached_window_hwnd_set(window_id, hwnd);
         let live_hwnds = if live { vec![hwnd] } else { Vec::new() };
         app.set_detached_window_live_hwnds_for_test(live_hwnds);
+    }
+
+    fn mark_detached_host_placed_for_test(app: &mut App, window_id: u64) {
+        app.set_detached_window_host_for_test(window_id, 0xD000 + window_id);
+        let claim = app
+            .detached_window_manager
+            .host_claim_alive(window_id)
+            .unwrap();
+        assert_eq!(
+            app.detached_window_manager.mark_host_placed(
+                claim,
+                crate::app::detached_window_manager::PlacementOutcome::Exact,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -68743,6 +68834,11 @@ mod still_window_mode_key_tests {
 
         app.detached_viewer_borderless_transition = Some(DetachedViewerBorderlessTransition {
             target_borderless: true,
+            target_outer: app
+                .detached_viewer_borderless_transition
+                .as_ref()
+                .unwrap()
+                .target_outer,
             phase: DetachedViewerBorderlessTransitionPhase::Settle {
                 until: std::time::Instant::now() - std::time::Duration::from_millis(1),
             },
@@ -78936,11 +79032,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             pixels,
             egui::TextureOptions::LINEAR,
         );
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 170.0,
-            y: 190.0,
-            w: 1320.0,
-            h: 880.0,
+        let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 170,
+                top: 190,
+                right: 1490,
+                bottom: 1070,
+            },
             maximized: true,
         };
         let viewport_id_before = App::detached_image_window_viewport_id(WINDOW_ID);
@@ -79092,11 +79190,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             first_pixels,
             egui::TextureOptions::LINEAR,
         );
-        let first_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: second_placement.x + 120.0,
-            y: second_placement.y + 80.0,
-            w: second_placement.w,
-            h: second_placement.h,
+        let first_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: second_placement.outer.left + 120,
+                top: second_placement.outer.top + 80,
+                right: second_placement.outer.right + 120,
+                bottom: second_placement.outer.bottom + 80,
+            },
             maximized: false,
         };
         app.set_detached_window_runtime_placement(42, first_placement, "test_passive_book_first");
@@ -79524,12 +79624,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(10));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         let first = push_image(&mut app, r"C:\pics\a.jpg");
@@ -79564,12 +79666,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_binding_for_test(Some(20));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.fs_transparent_bg_mode = 1;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         let first = push_image(&mut app, r"C:\pics\continuous-bg-a.png");
@@ -79613,12 +79717,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_binding_for_test(Some(76));
         app.reading_flow = crate::settings::ReadingFlow::Vertical;
         app.spread_mode = crate::settings::SpreadMode::Single;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
@@ -79682,12 +79788,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(11));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         let left = push_image(&mut app, r"C:\pics\spread-left.jpg");
@@ -79786,12 +79894,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.detached_viewer_open_images_in_window = true;
             app.settings.singleton_spread_first_enabled = true;
             app.settings.singleton_spread_last_enabled = true;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: 960.0,
-                    h: 720.0,
+            app.settings.detached_viewer_window_physical_placement =
+                Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                    outer: crate::detached_window_geometry::PhysicalRect {
+                        left: 80,
+                        top: 80,
+                        right: 1040,
+                        bottom: 800,
+                    },
                     maximized: false,
                 });
 
@@ -80071,12 +80181,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.detached_viewer_open_images_in_window = true;
             app.settings.singleton_spread_first_enabled = global_enabled;
             app.settings.singleton_spread_last_enabled = global_enabled;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: 960.0,
-                    h: 720.0,
+            app.settings.detached_viewer_window_physical_placement =
+                Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                    outer: crate::detached_window_geometry::PhysicalRect {
+                        left: 80,
+                        top: 80,
+                        right: 1040,
+                        bottom: 800,
+                    },
                     maximized: false,
                 });
             configure_detached_endpoint_singleton(
@@ -80128,14 +80240,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.singleton_spread_last_enabled = true;
             app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
             app.settings.spread_page_gap_px = 0;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: 960.0,
-                    h: 720.0,
-                    maximized: false,
-                });
+            app.settings.detached_viewer_window_physical_placement = Some(
+                crate::app::tests::detached_placement_with_logical_client_for_test(egui::vec2(
+                    960.0, 720.0,
+                )),
+            );
             configure_detached_endpoint_singleton(
                 &mut app,
                 &ctx,
@@ -80196,14 +80305,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.settings.singleton_spread_first_enabled = true;
             app.settings.singleton_spread_last_enabled = true;
             app.settings.spread_page_gap_px = 18;
-            app.settings.detached_viewer_window_placement =
-                Some(crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: window_size.x,
-                    h: window_size.y,
-                    maximized: false,
-                });
+            app.settings.detached_viewer_window_physical_placement = Some(
+                crate::app::tests::detached_placement_with_logical_client_for_test(window_size),
+            );
 
             let placement = ResolvedDisplayPlacement::Z {
                 active,
@@ -80355,14 +80459,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 20;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: window_size.x,
-                h: window_size.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(window_size));
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(313));
@@ -80473,12 +80571,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         let old_texture_id = old_texture.id();
         app.settings.detached_viewer_open_images_in_window = true;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
         app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |mounted| {
@@ -80637,14 +80737,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 20;
         app.settings.global_preset.post_filter = crate::adjustment::PostFilter::Nearest;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: window_size.x,
-                h: window_size.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(window_size));
         configure_detached_endpoint_singleton(
             &mut app,
             &ctx,
@@ -80740,16 +80834,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_single_snapshot_rect_matches_live_fit_input() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
-            maximized: false,
-        };
+        let placement = crate::app::tests::detached_placement_with_logical_client_for_test(
+            egui::vec2(960.0, 720.0),
+        );
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(70));
@@ -80773,17 +80863,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_spread_snapshot_rects_match_live_fit_input() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
-            maximized: false,
-        };
+        let placement = crate::app::tests::detached_placement_with_logical_client_for_test(
+            egui::vec2(960.0, 720.0),
+        );
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 0;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(71));
@@ -80826,17 +80912,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_spread_snapshot_preserves_trim_uv_and_background() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
+        let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 80,
+                top: 80,
+                right: 1040,
+                bottom: 800,
+            },
             maximized: false,
         };
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 0;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(72));
@@ -80926,17 +81014,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             for (window_w, window_h) in [(960.0_f32, 720.0_f32), (953.0, 719.0)] {
                 let mut app = setup_app();
                 let ctx = egui::Context::default();
-                let placement = crate::settings::DetachedViewerWindowPlacement {
-                    x: 80.0,
-                    y: 80.0,
-                    w: window_w,
-                    h: window_h,
-                    maximized: false,
-                };
+                let placement = crate::app::tests::detached_placement_with_logical_client_for_test(
+                    egui::vec2(window_w, window_h),
+                );
                 app.settings.detached_viewer_open_images_in_window = true;
                 app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
                 app.settings.spread_page_gap_px = gap;
-                app.settings.detached_viewer_window_placement = Some(placement);
+                app.settings.detached_viewer_window_physical_placement = Some(placement);
                 app.viewer_presentation = ViewerPresentation::DetachedWindow;
                 app.detached_viewer_independent_active = true;
                 app.set_detached_window_binding_for_test(Some(74));
@@ -80973,7 +81057,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
                 let pixels_per_point = ctx.pixels_per_point();
                 // 正規化を実寸へ戻して測る。凍結ページはウィンドウ比で持ち出される。
-                let to_px = |value: f32| value * window_w * pixels_per_point;
+                let client_width = App::detached_snapshot_client_size(placement).x;
+                let to_px = |value: f32| value * client_width * pixels_per_point;
                 let seam = to_px(snapshot.frozen_continuous_pages[1].clip_rect_norm.left())
                     - to_px(snapshot.frozen_continuous_pages[0].clip_rect_norm.right());
                 let want = (gap as f32 * pixels_per_point).round();
@@ -80989,17 +81074,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     fn detached_auto_trim_snapshot_uses_baked_runtime_bbox_after_fs_cache_eviction() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: 960.0,
-            h: 720.0,
+        let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 80,
+                top: 80,
+                right: 1040,
+                bottom: 800,
+            },
             maximized: false,
         };
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 0;
-        app.settings.detached_viewer_window_placement = Some(placement);
+        app.settings.detached_viewer_window_physical_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.transition_detached_window_state(73, DetachedWindowState::Active, "test");
@@ -82087,11 +82174,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         set_detached_host_for_test(&mut app, 12, 0x1234, true);
         app.set_detached_window_runtime_placement(
             12,
-            crate::settings::DetachedViewerWindowPlacement {
-                x: 10.0,
-                y: 20.0,
-                w: 800.0,
-                h: 600.0,
+            crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 10,
+                    top: 20,
+                    right: 810,
+                    bottom: 620,
+                },
                 maximized: false,
             },
             "test_folder_nav_reopen",
@@ -82165,11 +82254,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.next_detached_image_window_id = 13;
         app.set_detached_window_runtime_placement(
             12,
-            crate::settings::DetachedViewerWindowPlacement {
-                x: 10.0,
-                y: 20.0,
-                w: 800.0,
-                h: 600.0,
+            crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 10,
+                    top: 20,
+                    right: 810,
+                    bottom: 620,
+                },
                 maximized: false,
             },
             "test_folder_nav_reuse",
@@ -82595,21 +82686,25 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_runtime_placement_seeds_from_settings_then_overrides_with_runtime() {
         let mut app = setup_app();
-        let seed = crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 960.0,
-            h: 720.0,
+        let seed = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1060,
+                bottom: 840,
+            },
             maximized: false,
         };
-        let runtime = crate::settings::DetachedViewerWindowPlacement {
-            x: 320.0,
-            y: 220.0,
-            w: 1180.0,
-            h: 760.0,
+        let runtime = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 320,
+                top: 220,
+                right: 1500,
+                bottom: 980,
+            },
             maximized: false,
         };
-        app.settings.detached_viewer_window_placement = Some(seed);
+        app.settings.detached_viewer_window_physical_placement = Some(seed);
 
         app.begin_active_detached_session(41, DetachedSource::Image);
         assert_eq!(app.detached_window_runtime_placement(41), Some(seed));
@@ -82618,7 +82713,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_runtime_placement(41, runtime, "test_runtime_override");
         assert_eq!(app.active_detached_viewer_current_placement(), runtime);
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(seed),
             "live placement updates must not rewrite settings before close"
         );
@@ -82628,18 +82723,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_builder_placement_latch_does_not_follow_live_drag_updates() {
         let mut app = setup_app();
-        let initial = crate::settings::DetachedViewerWindowPlacement {
-            x: 1564.0,
-            y: 240.66667,
-            w: 1167.0,
-            h: 765.0,
+        let initial = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 1564,
+                top: 241,
+                right: 2731,
+                bottom: 1006,
+            },
             maximized: false,
         };
-        let alternate = crate::settings::DetachedViewerWindowPlacement {
-            x: 1578.6666,
-            y: 244.0,
-            w: 1167.0,
-            h: 765.0,
+        let alternate = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 1579,
+                top: 244,
+                right: 2746,
+                bottom: 1009,
+            },
             maximized: false,
         };
 
@@ -82672,18 +82771,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_builder_placement_latch_refreshes_on_real_seed_frame() {
         let mut app = setup_app();
-        let first = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let first = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
-        let latest = crate::settings::DetachedViewerWindowPlacement {
-            x: 740.0,
-            y: 260.0,
-            w: 1340.0,
-            h: 900.0,
+        let latest = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 740,
+                top: 260,
+                right: 2080,
+                bottom: 1160,
+            },
             maximized: false,
         };
 
@@ -82711,18 +82814,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_builder_placement_latch_refreshes_on_active_reentry() {
         let mut app = setup_app();
-        let first = crate::settings::DetachedViewerWindowPlacement {
-            x: 87.3,
-            y: 71.3,
-            w: 1278.0,
-            h: 840.0,
+        let first = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 87,
+                top: 71,
+                right: 1365,
+                bottom: 911,
+            },
             maximized: false,
         };
-        let moved = crate::settings::DetachedViewerWindowPlacement {
-            x: 680.0,
-            y: 220.0,
-            w: 1278.0,
-            h: 840.0,
+        let moved = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 680,
+                top: 220,
+                right: 1958,
+                bottom: 1060,
+            },
             maximized: false,
         };
 
@@ -82755,21 +82862,25 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_runtime_placement_persists_to_settings_on_remove() {
         let mut app = setup_app();
-        let seed = crate::settings::DetachedViewerWindowPlacement {
-            x: 100.0,
-            y: 120.0,
-            w: 960.0,
-            h: 720.0,
+        let seed = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 100,
+                top: 120,
+                right: 1060,
+                bottom: 840,
+            },
             maximized: false,
         };
-        let final_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 400.0,
-            y: 240.0,
-            w: 1200.0,
-            h: 820.0,
+        let final_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 400,
+                top: 240,
+                right: 1600,
+                bottom: 1060,
+            },
             maximized: false,
         };
-        app.settings.detached_viewer_window_placement = Some(seed);
+        app.settings.detached_viewer_window_physical_placement = Some(seed);
         app.begin_active_detached_session(42, DetachedSource::Image);
         app.set_detached_window_runtime_placement(42, final_placement, "test_final");
         app.begin_active_detached_session_close("test_close");
@@ -82777,7 +82888,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert_eq!(app.detached_window_state(42), None);
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(final_placement),
             "closing/removing a detached runtime persists the final OS placement"
         );
@@ -82798,25 +82909,31 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        let first = crate::settings::DetachedViewerWindowPlacement {
-            x: 120.0,
-            y: 130.0,
-            w: 900.0,
-            h: 700.0,
+        let first = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 120,
+                top: 130,
+                right: 1020,
+                bottom: 830,
+            },
             maximized: false,
         };
-        let second = crate::settings::DetachedViewerWindowPlacement {
-            x: 260.0,
-            y: 180.0,
-            w: 1000.0,
-            h: 760.0,
+        let second = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 260,
+                top: 180,
+                right: 1260,
+                bottom: 940,
+            },
             maximized: false,
         };
-        let third = crate::settings::DetachedViewerWindowPlacement {
-            x: 340.0,
-            y: 220.0,
-            w: 1100.0,
-            h: 780.0,
+        let third = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 340,
+                top: 220,
+                right: 1440,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.set_detached_window_runtime_placement(43, first, "test_first");
@@ -87700,27 +87817,37 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
-    fn detached_viewer_placement_saves_outer_position_and_inner_size() {
+    fn detached_viewer_placement_saves_physical_host_outer_rect() {
         let mut app = setup_app();
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
         let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
 
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 1.0, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 120,
+                top: 140,
+                right: 1020,
+                bottom: 840,
+            },
+            false,
+            || app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 1.0, false),
+        );
         assert!(restore.is_none());
 
         let placement = app
             .detached_window_runtime_placement(12)
-            .expect("logical placement should be saved in the detached runtime");
-        assert_eq!(placement.x, 120.0);
-        assert_eq!(placement.y, 140.0);
-        assert_eq!(placement.w, 860.0);
-        assert_eq!(placement.h, 640.0);
+            .expect("physical HWND placement should be saved in the detached runtime");
+        assert_eq!(placement.outer.left, 120);
+        assert_eq!(placement.outer.top, 140);
+        assert_eq!(placement.outer.right, 1020);
+        assert_eq!(placement.outer.bottom, 840);
         assert!(!placement.maximized);
         assert_eq!(
-            app.settings.detached_viewer_window_placement, None,
+            app.settings.detached_viewer_window_physical_placement, None,
             "settings should not be updated until the detached runtime is removed"
         );
     }
@@ -87728,28 +87855,47 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn active_detached_default_viewport_geometry_update_is_rejected_after_open() {
         let mut app = setup_app();
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now());
-        app.settings.detached_viewer_window_placement = Some(previous);
+        app.settings.detached_viewer_window_physical_placement = Some(previous);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(420.0, 160.0), egui::vec2(533.0, 400.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1220,
+                bottom: 760,
+            },
+            false,
+            || {
+                app.save_detached_viewer_placement_from_logical_rect(
+                    default_outer,
+                    None,
+                    1.5,
+                    false,
+                )
+            },
+        );
 
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(previous)
         );
         assert_eq!(app.detached_window_runtime_placement(12), Some(previous));
@@ -87763,28 +87909,47 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn active_detached_default_viewport_geometry_update_is_rejected_after_grace() {
         let mut app = setup_app();
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.fullscreen_idx = Some(0);
         app.fs_opened_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
-        app.settings.detached_viewer_window_placement = Some(previous);
+        app.settings.detached_viewer_window_physical_placement = Some(previous);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, previous, "test_default_reject");
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(202.0, 202.0), egui::vec2(533.0, 400.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 202,
+                top: 202,
+                right: 1002,
+                bottom: 802,
+            },
+            false,
+            || {
+                app.save_detached_viewer_placement_from_logical_rect(
+                    default_outer,
+                    None,
+                    1.5,
+                    false,
+                )
+            },
+        );
 
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(previous),
             "egui's default detached viewport size must never become the saved placement just because the open grace elapsed"
         );
@@ -87801,11 +87966,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         // 保存せず OS-window restore を要求することを固定する (Codex P1)。
         let mut app = setup_app();
         let idx = push_video(&mut app, r"C:\clips\movie.mp4");
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1698,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.fullscreen_idx = Some(idx);
@@ -87816,7 +87983,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             ViewerPresentation::DetachedWindow,
             false,
         );
-        app.settings.detached_viewer_window_placement = Some(previous);
+        app.settings.detached_viewer_window_physical_placement = Some(previous);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Video);
         app.set_detached_window_runtime_placement(12, previous, "test_switch_default_reject");
@@ -87826,8 +87993,25 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         let default_outer =
             egui::Rect::from_min_size(egui::pos2(114.0, 114.0), egui::vec2(533.0, 400.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(default_outer, None, 1.5, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 114,
+                top: 114,
+                right: 914,
+                bottom: 714,
+            },
+            false,
+            || {
+                app.save_detached_viewer_placement_from_logical_rect(
+                    default_outer,
+                    None,
+                    1.5,
+                    false,
+                )
+            },
+        );
 
         assert_eq!(
             restore,
@@ -87835,7 +88019,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "default geometry during the detach switch must be rejected and request an OS-window restore"
         );
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(previous),
             "the transient default size must not overwrite the saved placement mid-switch"
         );
@@ -87843,27 +88027,37 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
-    fn detached_viewer_logical_rect_saves_outer_position_and_inner_size() {
+    fn detached_viewer_logical_notification_uses_physical_host_rect_without_ppp_conversion() {
         let mut app = setup_app();
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
 
         let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(700.0, 420.0));
         let inner = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(640.0, 360.0));
-        let restore =
-            app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 2.0, false);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 240,
+                top: 280,
+                right: 1640,
+                bottom: 1120,
+            },
+            false,
+            || app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), 2.0, false),
+        );
         assert!(restore.is_none());
 
         let placement = app
             .detached_window_runtime_placement(12)
-            .expect("logical placement should be saved in the detached runtime");
-        assert_eq!(placement.x, 120.0);
-        assert_eq!(placement.y, 140.0);
-        assert_eq!(placement.w, 640.0);
-        assert_eq!(placement.h, 360.0);
+            .expect("physical HWND placement should be saved in the detached runtime");
+        assert_eq!(placement.outer.left, 240);
+        assert_eq!(placement.outer.top, 280);
+        assert_eq!(placement.outer.right, 1640);
+        assert_eq!(placement.outer.bottom, 1120);
         assert!(!placement.maximized);
         assert_eq!(
-            app.settings.detached_viewer_window_placement, None,
+            app.settings.detached_viewer_window_physical_placement, None,
             "settings should not be updated until the detached runtime is removed"
         );
     }
@@ -87874,16 +88068,18 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_video(&mut app, r"C:\clips\a.mp4");
-        let host_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 240.0,
-            y: 180.0,
-            w: 1280.0,
-            h: 840.0,
+        let host_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 240,
+                top: 180,
+                right: 1520,
+                bottom: 1020,
+            },
             maximized: false,
         };
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.settings.detached_viewer_window_placement = Some(host_placement);
+        app.settings.detached_viewer_window_physical_placement = Some(host_placement);
 
         app.handle_native_video_window_event(
             &ctx,
@@ -87898,7 +88094,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
 
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.settings.detached_viewer_window_physical_placement,
             Some(host_placement),
             "detached video is a child HWND; its geometry must not replace the host window placement"
         );
@@ -88002,19 +88198,23 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.set_detached_window_binding_for_test(Some(9));
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: 960.0,
-                h: 720.0,
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 80,
+                    top: 80,
+                    right: 1040,
+                    bottom: 800,
+                },
                 maximized: false,
             });
-        let live_placement = crate::settings::DetachedViewerWindowPlacement {
-            x: 420.0,
-            y: 160.0,
-            w: 1280.0,
-            h: 840.0,
+        let live_placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 420,
+                top: 160,
+                right: 1700,
+                bottom: 1000,
+            },
             maximized: false,
         };
         app.begin_active_detached_session(9, DetachedSource::Image);
@@ -88033,24 +88233,33 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn passive_default_viewport_geometry_update_is_rejected() {
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 502.0,
-            y: 138.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 502,
+                top: 138,
+                right: 1780,
+                bottom: 978,
+            },
             maximized: false,
         };
-        let default_candidate = crate::settings::DetachedViewerWindowPlacement {
-            x: 152.0,
-            y: 152.0,
-            w: 533.3333,
-            h: 400.0,
+        let default_candidate = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 152,
+                top: 152,
+                right: 952,
+                bottom: 752,
+            },
             maximized: false,
         };
         assert!(
             App::detached_passive_placement_update_looks_like_default_viewport(
                 previous,
                 default_candidate,
+                [previous.outer.width(), previous.outer.height()],
+                [
+                    default_candidate.outer.width(),
+                    default_candidate.outer.height()
+                ],
                 1.5,
                 false,
             )
@@ -88059,21 +88268,33 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             !App::detached_passive_placement_update_looks_like_default_viewport(
                 previous,
                 default_candidate,
+                [previous.outer.width(), previous.outer.height()],
+                [
+                    default_candidate.outer.width(),
+                    default_candidate.outer.height()
+                ],
                 1.5,
                 true,
             )
         );
-        let moved_without_default_size = crate::settings::DetachedViewerWindowPlacement {
-            x: 152.0,
-            y: 152.0,
-            w: 900.0,
-            h: 700.0,
+        let moved_without_default_size = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 152,
+                top: 152,
+                right: 1052,
+                bottom: 852,
+            },
             maximized: false,
         };
         assert!(
             !App::detached_passive_placement_update_looks_like_default_viewport(
                 previous,
                 moved_without_default_size,
+                [previous.outer.width(), previous.outer.height()],
+                [
+                    moved_without_default_size.outer.width(),
+                    moved_without_default_size.outer.height()
+                ],
                 1.5,
                 false,
             )
@@ -88912,7 +89133,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             id: 7,
             bar_close_requested: false,
             focused: true,
-            placement_update: None,
+            geometry_observed: false,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
             right_drag: None,
@@ -88959,18 +89180,22 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        let previous = crate::settings::DetachedViewerWindowPlacement {
-            x: 502.0,
-            y: 138.0,
-            w: 1278.0,
-            h: 840.0,
+        let previous = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 502,
+                top: 138,
+                right: 1780,
+                bottom: 978,
+            },
             maximized: false,
         };
-        let default_candidate = crate::settings::DetachedViewerWindowPlacement {
-            x: 152.0,
-            y: 152.0,
-            w: 533.3333,
-            h: 400.0,
+        let default_candidate = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 152,
+                top: 152,
+                right: 952,
+                bottom: 752,
+            },
             maximized: false,
         };
         let snapshot = DetachedImageWindowSnapshot {
@@ -89009,53 +89234,101 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             id: 7,
             bar_close_requested: false,
             focused: false,
-            placement_update: Some(default_candidate),
+            geometry_observed: true,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
             right_drag: None,
         });
 
-        app.process_deferred_detached_image_window_events_for_test(&ctx);
+        mark_detached_host_placed_for_test(&mut app, 7);
+        crate::app::detached_placement::with_host_geometry_for_test(
+            7,
+            default_candidate.outer,
+            false,
+            || {
+                app.process_deferred_detached_image_window_events_for_test(&ctx);
+                assert!(
+                    matches!(
+                        app.detached_window_manager.host_placement(7),
+                        Some(
+                            crate::app::detached_window_manager::HostPlacement::Unplaced {
+                                awaiting_unzoom: false,
+                                ..
+                            }
+                        )
+                    ),
+                    "rejecting the default host observation must invalidate the host's placement"
+                );
+                assert_eq!(app.detached_window_runtime_placement(7), Some(previous));
+
+                app.apply_detached_window_host_placement(&ctx, 7);
+                let claim = app.detached_window_manager.host_claim_alive(7).unwrap();
+                assert_eq!(
+                    app.detached_window_manager.host_placement(7),
+                    Some(crate::app::detached_window_manager::HostPlacement::Placed {
+                        incarnation: claim.incarnation,
+                        outcome: crate::app::detached_window_manager::PlacementOutcome::Exact,
+                    })
+                );
+                assert_eq!(
+                    crate::app::detached_placement::host_geometry_for_test(7),
+                    Some((previous.outer, false)),
+                    "the next root placement pass must restore the physical host outer rect"
+                );
+            },
+        );
 
         assert_eq!(
             app.detached_window_runtime_placement(7),
             Some(previous),
             "deferred PlacementObserved must pass through the same default-geometry rejection as immediate passive windows"
         );
-        assert!(
-            !app.detached_image_windows[0].initial_placement_applied,
-            "rejecting a default geometry observation asks the next deferred registration to re-seed placement"
-        );
     }
 
     #[test]
     fn detached_viewer_maximized_save_preserves_restore_placement() {
         let mut app = setup_app();
-        let seed = crate::settings::DetachedViewerWindowPlacement {
-            x: 120.0,
-            y: 140.0,
-            w: 860.0,
-            h: 640.0,
+        let seed = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 120,
+                top: 140,
+                right: 980,
+                bottom: 780,
+            },
             maximized: false,
         };
-        app.settings.detached_viewer_window_placement = Some(seed);
+        app.settings.detached_viewer_window_physical_placement = Some(seed);
         app.set_detached_window_binding_for_test(Some(12));
         app.begin_active_detached_session(12, DetachedSource::Image);
         app.set_detached_window_runtime_placement(12, seed, "test_maximized");
 
         let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
-        let restore = app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true);
+        mark_detached_host_placed_for_test(&mut app, 12);
+        let restore = crate::app::detached_placement::with_host_geometry_for_test(
+            12,
+            crate::detached_window_geometry::PhysicalRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+            true,
+            || app.save_detached_viewer_placement_from_logical_rect(outer, None, 1.5, true),
+        );
         assert!(restore.is_none());
 
         let placement = app
             .detached_window_runtime_placement(12)
             .expect("maximized placement should be saved in runtime");
-        assert_eq!(placement.x, 120.0);
-        assert_eq!(placement.y, 140.0);
-        assert_eq!(placement.w, 860.0);
-        assert_eq!(placement.h, 640.0);
+        assert_eq!(placement.outer.left, 120);
+        assert_eq!(placement.outer.top, 140);
+        assert_eq!(placement.outer.right, 980);
+        assert_eq!(placement.outer.bottom, 780);
         assert!(placement.maximized);
-        assert_eq!(app.settings.detached_viewer_window_placement, Some(seed));
+        assert_eq!(
+            app.settings.detached_viewer_window_physical_placement,
+            Some(seed)
+        );
     }
 
     #[test]

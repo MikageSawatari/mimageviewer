@@ -4574,43 +4574,6 @@ fn fullscreen_viewport_geometry(
     )
 }
 
-#[cfg(windows)]
-fn viewport_rect_to_window_geometry(rect: egui::Rect, ui_scale: f32) -> egui::Rect {
-    egui::Rect::from_min_max(
-        egui::pos2(
-            crate::settings::viewport_points_to_window_geometry(rect.min.x, ui_scale),
-            crate::settings::viewport_points_to_window_geometry(rect.min.y, ui_scale),
-        ),
-        egui::pos2(
-            crate::settings::viewport_points_to_window_geometry(rect.max.x, ui_scale),
-            crate::settings::viewport_points_to_window_geometry(rect.max.y, ui_scale),
-        ),
-    )
-}
-
-#[cfg(windows)]
-fn detached_placement_from_viewport_rects(
-    mut placement: crate::settings::DetachedViewerWindowPlacement,
-    outer_rect: egui::Rect,
-    inner_rect: Option<egui::Rect>,
-    maximized: bool,
-    ui_scale: f32,
-) -> crate::settings::DetachedViewerWindowPlacement {
-    let outer = viewport_rect_to_window_geometry(outer_rect, ui_scale);
-    let inner = inner_rect.map(|rect| viewport_rect_to_window_geometry(rect, ui_scale));
-    placement.x = outer.min.x;
-    placement.y = outer.min.y;
-    if let Some(inner) = inner {
-        placement.w = inner.width();
-        placement.h = inner.height();
-    } else {
-        placement.w = outer.width();
-        placement.h = outer.height();
-    }
-    placement.maximized = maximized;
-    placement
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FsCursorHide {
     Idle,
@@ -8896,11 +8859,9 @@ pub(crate) fn detached_image_window_bar_close_button_rect(full_rect: egui::Rect)
 struct DetachedImageWindowEventBatch {
     close_ids: Vec<u64>,
     activate_ids: Vec<u64>,
-    placements: Vec<(u64, crate::settings::DetachedViewerWindowPlacement)>,
     focus_updates: Vec<(u64, bool)>,
     activation_armed_updates: Vec<(u64, bool)>,
     initial_placement_applied_ids: Vec<u64>,
-    placement_seed_reset_ids: Vec<u64>,
     right_drag_events: Vec<(u64, crate::app::DetachedRightDragEvent)>,
 }
 
@@ -21810,7 +21771,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn build_detached_image_window_builder(
         window: &crate::app::DetachedImageWindowSnapshot,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         apply_initial_placement: bool,
         visible: bool,
         ui_scale: f32,
@@ -21825,11 +21786,15 @@ impl App {
             .with_visible(visible);
 
         if apply_initial_placement {
-            let position =
-                window_geometry_pos_to_viewport(egui::pos2(placement.x, placement.y), ui_scale);
-            let inner_size =
-                window_geometry_size_to_viewport(egui::vec2(placement.w, placement.h), ui_scale);
-            let builder = builder.with_inner_size(inner_size).with_position(position);
+            let builder = if let Some((position, inner_size)) =
+                crate::detached_window_geometry::provisional_builder_geometry(placement, true)
+            {
+                builder
+                    .with_inner_size(window_geometry_size_to_viewport(inner_size, ui_scale))
+                    .with_position(window_geometry_pos_to_viewport(position, ui_scale))
+            } else {
+                builder
+            };
             if visible {
                 builder.with_maximized(placement.maximized)
             } else {
@@ -21841,6 +21806,21 @@ impl App {
         } else {
             builder
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_snapshot_client_size(
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
+    ) -> egui::Vec2 {
+        crate::detached_window_geometry::provisional_builder_geometry(placement, true)
+            .map(|(_, size)| size)
+            .unwrap_or_else(|| {
+                crate::logger::log("[detached-placement] snapshot monitor geometry unavailable");
+                egui::vec2(
+                    placement.outer.width().max(1) as f32,
+                    placement.outer.height().max(1) as f32,
+                )
+            })
     }
 
     #[cfg(windows)]
@@ -21909,7 +21889,7 @@ impl App {
         clip_rect_norm: egui::Rect,
         pixels_per_point: f32,
         content_bbox: Option<egui::Rect>,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
     ) {
         if !Self::detached_image_window_debug_enabled() {
             return;
@@ -21969,14 +21949,14 @@ impl App {
         ctx: &egui::Context,
         window_id: u64,
         idx: usize,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
         if !self.continuous_reading_active_for_idx(idx) {
             return Vec::new();
         }
         let full_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
-            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+            Self::detached_snapshot_client_size(placement),
         );
         let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
         let Some((units, current_pos)) = self.continuous_reading_units_and_pos(idx) else {
@@ -22102,7 +22082,7 @@ impl App {
         ctx: Option<&egui::Context>,
         window_id: u64,
         idx: usize,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         pixels_per_point: f32,
         paged_display_unit: Option<&CapturedPagedDisplayUnit>,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
@@ -22129,7 +22109,7 @@ impl App {
     pub(crate) fn detached_single_image_snapshot_layout(
         &mut self,
         idx: usize,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         pixels_per_point: f32,
         texture: &egui::TextureHandle,
         rotation: crate::rotation_db::Rotation,
@@ -22139,7 +22119,7 @@ impl App {
         let texture_size = texture.size_vec2();
         let full_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
-            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+            Self::detached_snapshot_client_size(placement),
         );
         let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
         // **凍結ウィンドウも分割を通す。**非アクティブなウィンドウはこの snapshot から描くので、
@@ -22179,14 +22159,14 @@ impl App {
         &mut self,
         window_id: u64,
         idx: usize,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         pixels_per_point: f32,
         captured: &CapturedPagedDisplayUnit,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
         let unit = &captured.unit;
         let full_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
-            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+            Self::detached_snapshot_client_size(placement),
         );
         let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
         let spread_gap = quantize_points_to_physical_pixels(
@@ -23235,8 +23215,8 @@ impl App {
                 id,
                 bar_close_requested,
                 focused,
-                placement_update,
-                pixels_per_point,
+                geometry_observed,
+                pixels_per_point: _,
                 apply_initial_placement,
                 right_drag,
             } => {
@@ -23300,41 +23280,9 @@ impl App {
                         window_placement
                     ));
                 }
-                if let Some(placement) = placement_update {
-                    let geometry_ppp = crate::settings::native_pixels_per_point_from_effective(
-                        pixels_per_point,
-                        self.settings.ui_scale_factor,
-                    );
-                    if Self::detached_passive_placement_update_looks_like_default_viewport(
-                        window_placement,
-                        placement,
-                        geometry_ppp,
-                        apply_initial_placement,
-                    ) {
-                        self.log_detached_image_window_debug(format!(
-                            "passive_placement_update_rejected_default id={} initial_apply={} \
-                             ppp={:.2} from={:?} to={:?} source=deferred",
-                            id,
-                            apply_initial_placement,
-                            pixels_per_point,
-                            window_placement,
-                            placement
-                        ));
-                        batch.placement_seed_reset_ids.push(id);
-                        ctx.request_repaint();
-                    } else if placement != window_placement {
-                        self.log_detached_image_window_debug(format!(
-                            "passive_placement_update id={} initial_apply={} ppp={:.2} \
-                             from={:?} to={:?} source=deferred",
-                            id,
-                            apply_initial_placement,
-                            pixels_per_point,
-                            window_placement,
-                            placement
-                        ));
-                        batch.placements.push((id, placement));
-                    }
-                }
+                // Geometry is sampled once at the beginning of the root pass, before
+                // any unzoom/placement/maximize commands. This event is only a wakeup.
+                let _ = geometry_observed;
                 if apply_initial_placement {
                     batch.initial_placement_applied_ids.push(id);
                 }
@@ -23513,9 +23461,6 @@ impl App {
                 ctx.request_repaint_of(Self::detached_image_window_viewport_id(id));
             }
         }
-        for (id, placement) in batch.placements.drain(..) {
-            self.set_detached_window_runtime_placement(id, placement, "passive_placement_update");
-        }
         for id in batch.initial_placement_applied_ids.drain(..) {
             if let Some(window) = self
                 .detached_image_windows
@@ -23523,15 +23468,6 @@ impl App {
                 .find(|window| window.id == id)
             {
                 window.initial_placement_applied = true;
-            }
-        }
-        for id in batch.placement_seed_reset_ids.drain(..) {
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                window.initial_placement_applied = false;
             }
         }
         batch.close_ids.sort_unstable();
@@ -23704,6 +23640,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) {
+        self.record_detached_host_placements_before_commands();
         self.service_deferred_detached_window_events(ctx);
     }
 
@@ -23867,7 +23804,9 @@ impl App {
                 continue;
             }
             self.request_detached_right_drag_guide_repaint(ctx, right_drag_owner, viewport_id);
-            let apply_initial_placement = !window.initial_placement_applied;
+            let apply_initial_placement = self
+                .detached_window_hwnd_alive_for_window_id(window.id)
+                .is_none();
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "deferred_passive_seed");
             if apply_initial_placement {
@@ -23895,7 +23834,6 @@ impl App {
                 apply_initial_placement,
             );
             let shared = self.deferred_detached_image_window_shared(view);
-            let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx_ui, _class| {
                 let vp_ctx = &vp_ctx_ui.ctx().clone();
                 #[cfg(feature = "test-script")]
@@ -23910,37 +23848,18 @@ impl App {
                 if first_callback {
                     vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
-                let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
-                    vp_ctx.input(|i| {
-                        let vp = i.viewport();
-                        (
-                            vp.outer_rect,
-                            vp.inner_rect,
-                            vp.minimized.unwrap_or(false),
-                            vp.maximized.unwrap_or(false),
-                            vp.focused.unwrap_or(false),
-                            i.pixels_per_point,
-                        )
-                    });
-                let mut placement_update = None;
-                if !minimized && let Some(outer) = outer_rect {
-                    let placement = detached_placement_from_viewport_rects(
-                        view.placement,
-                        outer,
-                        inner_rect,
-                        maximized,
-                        ui_scale,
-                    );
-                    if placement.is_sane()
-                        && crate::monitor::title_bar_on_some_monitor(
-                            placement.x,
-                            placement.y,
-                            placement.w,
-                        )
-                    {
-                        placement_update = Some(placement);
-                    }
-                }
+                let (outer_rect, minimized, focused, ppp) = vp_ctx.input(|i| {
+                    let vp = i.viewport();
+                    (
+                        vp.outer_rect,
+                        vp.minimized.unwrap_or(false),
+                        vp.focused.unwrap_or(false),
+                        i.pixels_per_point,
+                    )
+                });
+                // Viewport rectangles only signal an observation. The root reads the owning
+                // HWND after adoption/application; callback coordinates never become placement.
+                let geometry_observed = !minimized && outer_rect.is_some();
                 let viewport_close_requested = false;
                 let right_drag = sidecar_restore_presentation
                     .is_none()
@@ -24007,14 +23926,14 @@ impl App {
                     id: view.id,
                     bar_close_requested,
                     focused,
-                    placement_update,
+                    geometry_observed,
                     pixels_per_point: ppp,
                     apply_initial_placement: view.apply_initial_placement,
                     right_drag: right_drag.clone(),
                 });
                 if viewport_close_requested
                     || bar_close_requested
-                    || placement_update.is_some()
+                    || geometry_observed
                     || right_drag.is_some()
                 {
                     vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -24057,7 +23976,9 @@ impl App {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
             self.request_detached_right_drag_guide_repaint(ctx, right_drag_owner, viewport_id);
-            let apply_initial_placement = !window.initial_placement_applied;
+            let apply_initial_placement = self
+                .detached_window_hwnd_alive_for_window_id(window.id)
+                .is_none();
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "passive_render_seed");
             let parked_live_music_info =
@@ -24081,15 +24002,14 @@ impl App {
                 &window,
                 window_placement,
                 apply_initial_placement,
-                self.window_visible,
+                self.window_visible && !apply_initial_placement,
                 self.settings.ui_scale_factor,
                 self.settings.always_on_top,
             );
             let viewport_close_requested = false;
             let mut bar_close_requested = false;
-            let mut placement_update = None;
+            let mut geometry_observed = false;
             let mut focused_now = false;
-            let mut pixels_per_point = 1.0_f32;
             let mut primary_pressed = false;
             let mut primary_released = false;
             let mut secondary_pressed = false;
@@ -24120,7 +24040,6 @@ impl App {
                     )
                 })
                 .flatten();
-            let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx_ui, _class| {
                 let vp_ctx = &vp_ctx_ui.ctx().clone();
                 #[cfg(windows)]
@@ -24130,38 +24049,16 @@ impl App {
                 if sidecar_restore_presentation.is_some() {
                     Self::consume_sidecar_restore_viewport_input(vp_ctx);
                 }
-                let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
-                    vp_ctx.input(|i| {
-                        let vp = i.viewport();
-                        (
-                            vp.outer_rect,
-                            vp.inner_rect,
-                            vp.minimized.unwrap_or(false),
-                            vp.maximized.unwrap_or(false),
-                            vp.focused.unwrap_or(false),
-                            i.pixels_per_point,
-                        )
-                    });
+                let (outer_rect, minimized, focused) = vp_ctx.input(|i| {
+                    let vp = i.viewport();
+                    (
+                        vp.outer_rect,
+                        vp.minimized.unwrap_or(false),
+                        vp.focused.unwrap_or(false),
+                    )
+                });
                 focused_now = focused;
-                pixels_per_point = ppp;
-                if !minimized && let Some(outer) = outer_rect {
-                    let placement = detached_placement_from_viewport_rects(
-                        window_placement,
-                        outer,
-                        inner_rect,
-                        maximized,
-                        ui_scale,
-                    );
-                    if placement.is_sane()
-                        && crate::monitor::title_bar_on_some_monitor(
-                            placement.x,
-                            placement.y,
-                            placement.w,
-                        )
-                    {
-                        placement_update = Some(placement);
-                    }
-                }
+                geometry_observed = !minimized && outer_rect.is_some();
                 let wheel_options = ctx.options(|o| o.input_options);
                 (
                     primary_pressed,
@@ -24263,6 +24160,15 @@ impl App {
                 viewport_id,
                 hwnd_before.as_deref(),
             );
+            if apply_initial_placement && self.window_visible {
+                self.request_detached_window_visibility(
+                    ctx,
+                    window.id,
+                    true,
+                    Some(window_placement.maximized),
+                    false,
+                );
+            }
             #[cfg(feature = "test-script")]
             if let Some((witness, content)) = test_script_passive_frame {
                 self.test_script_publish_detached_frame(window.id, viewport_id, witness, content);
@@ -24385,41 +24291,7 @@ impl App {
             render_batch
                 .activation_armed_updates
                 .push((window.id, activation_armed));
-            if let Some(placement) = placement_update {
-                let geometry_ppp = crate::settings::native_pixels_per_point_from_effective(
-                    pixels_per_point,
-                    self.settings.ui_scale_factor,
-                );
-                if Self::detached_passive_placement_update_looks_like_default_viewport(
-                    window_placement,
-                    placement,
-                    geometry_ppp,
-                    apply_initial_placement,
-                ) {
-                    self.log_detached_image_window_debug(format!(
-                        "passive_placement_update_rejected_default id={} initial_apply={} \
-                         ppp={:.2} from={:?} to={:?}",
-                        window.id,
-                        apply_initial_placement,
-                        pixels_per_point,
-                        window_placement,
-                        placement
-                    ));
-                    render_batch.placement_seed_reset_ids.push(window.id);
-                    ctx.request_repaint();
-                } else if placement != window_placement {
-                    self.log_detached_image_window_debug(format!(
-                        "passive_placement_update id={} initial_apply={} ppp={:.2} \
-                         from={:?} to={:?}",
-                        window.id,
-                        apply_initial_placement,
-                        pixels_per_point,
-                        window_placement,
-                        placement
-                    ));
-                    render_batch.placements.push((window.id, placement));
-                }
-            }
+            let _ = geometry_observed; // Root owns the HWND observation phase.
             if apply_initial_placement {
                 render_batch.initial_placement_applied_ids.push(window.id);
             }
@@ -26164,7 +26036,13 @@ impl App {
                     && !self.video_presentation_transition.is_transitioning()
                 {
                     let maximized = self.active_detached_viewport_maximized_on_visible_commit();
-                    Self::send_detached_viewport_visible_commit(ctx, fs_id, maximized);
+                    self.request_detached_window_visibility(
+                        ctx,
+                        window_id,
+                        true,
+                        Some(maximized),
+                        activate_on_show,
+                    );
                     self.observe_viewport_presentation_command(
                         fs_id,
                         crate::presentation_observer::WindowAction::Visible,
@@ -26176,7 +26054,6 @@ impl App {
                         },
                     );
                     if activate_on_show {
-                        ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
                         self.observe_viewport_presentation_command(
                             fs_id,
                             crate::presentation_observer::WindowAction::Focus,
@@ -26288,7 +26165,17 @@ impl App {
                 && !self.video_presentation_transition.is_transitioning()
             {
                 let maximized = self.active_detached_viewport_maximized_on_visible_commit();
-                Self::send_detached_viewport_visible_commit(ctx, fs_id, maximized);
+                if let Some(window_id) = keep_alive_window_id {
+                    self.request_detached_window_visibility(
+                        ctx,
+                        window_id,
+                        true,
+                        Some(maximized),
+                        false,
+                    );
+                } else {
+                    Self::send_detached_viewport_visible_commit(ctx, fs_id, maximized);
+                }
                 self.observe_viewport_presentation_command(
                     fs_id,
                     crate::presentation_observer::WindowAction::Visible,
@@ -26670,7 +26557,17 @@ impl App {
             && !self.video_presentation_transition.is_transitioning()
         {
             let maximized = self.active_detached_viewport_maximized_on_visible_commit();
-            Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+            if let Some(window_id) = backstop_window_id {
+                self.request_detached_window_visibility(
+                    ctx,
+                    window_id,
+                    true,
+                    Some(maximized),
+                    false,
+                );
+            } else {
+                Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+            }
             self.observe_viewport_presentation_command(
                 viewport_id,
                 crate::presentation_observer::WindowAction::Visible,
@@ -27022,42 +26919,21 @@ impl App {
             && !embedded
             && !need_show
             && std::mem::take(&mut self.detached_viewer_focus_requested);
-        // egui は同じ ViewportId でも OS 窓を内部で teardown/再生成する。特に detached **動画**
-        // では、presenter child (WS_CHILD) を host に付け替える過程で egui が「別の既定位置 host 窓
-        // (822x656)」を一瞬作り直す挙動が既知 (src/app/native_video.rs の host-parent 同期を参照。
-        // 実機で『拡大された古いフレームの小窓が一瞬』= この再生成窓)。その再生成は最後に渡した
-        // builder を使うため、seed しないと既定サイズで作られてから保存配置へリサイズされフラッシュ
-        // する。旧 host が **生存したまま** 新既定サイズ窓が生えるので host 生存判定だけでは
-        // 取りこぼす (Codex 実機レビュー P1)。detached 動画が active/切替中の間は毎フレーム
-        // placement を seed し、再生成窓を最初から保存配置サイズで作らせてフラッシュを消す。
-        // ただし seed 値を live placement に毎フレーム追従させると、drag 終了直後の 2 フレーム
-        // 差分が builder position の遅延フィードバックになり、窓が A/B の 2 値を永続往復する。
-        // そのため、live placement を builder へ渡す値へコピーするのは need_show / host 未生存の
-        // 真の seed 契機だけにし、動画 active の毎フレーム seed はラッチ値を再利用する。
-        // 静止画の enumerate holdover は live placement を更新しないので従来どおり host 未生存時
-        // のみ seed する (Codex P2)。
+        // A live host owns physical placement. Seeding its builder would let egui's
+        // logical geometry patch overwrite the single Win32 placement boundary.
         #[cfg(windows)]
         let detached_host_needs_create =
             detached && !embedded && self.detached_viewer_should_seed_placement();
         #[cfg(windows)]
-        let detached_refresh_builder_placement = need_show || detached_host_needs_create;
+        let detached_seed_placement = detached_host_needs_create;
         #[cfg(windows)]
-        let detached_seed_placement = detached_refresh_builder_placement
-            || self.detached_video_presentation_active_or_targeted();
-        #[cfg(windows)]
-        let detached_builder_placement = if detached && !embedded && detached_seed_placement {
-            Some(self.active_detached_builder_placement_latch(
-                detached_refresh_builder_placement,
-                "active_render",
-            ))
-        } else {
-            None
-        };
+        let detached_builder_placement = detached_seed_placement
+            .then(|| self.active_detached_builder_placement_latch(true, "active_render"));
         #[cfg(not(windows))]
         let detached_seed_placement = need_show;
         #[cfg(not(windows))]
         let detached_builder_placement: Option<
-            crate::settings::DetachedViewerWindowPlacement,
+            crate::detached_window_geometry::PhysicalWindowPlacement,
         > = None;
         #[cfg(windows)]
         let (
@@ -27374,7 +27250,7 @@ impl App {
                 }
                 #[cfg(windows)]
                 if detached {
-                    let (outer_rect, inner_rect, pixels_per_point, minimized, maximized) = ctx
+                    let (outer_rect, _inner_rect, pixels_per_point, minimized, _maximized) = ctx
                         .input(|i| {
                             let vp = i.viewport();
                             (
@@ -27394,46 +27270,10 @@ impl App {
                                 rect,
                                 pixels_per_point,
                             );
-                            let restore_placement = self
-                                .save_detached_viewer_placement_from_logical_rect_with_source(
-                                    "active_render",
-                                    self.active_detached_placement_observation_authority(),
-                                    rect,
-                                    inner_rect,
-                                    pixels_per_point,
-                                    maximized,
-                                );
-                            // restore_placement=Some = 現ジオメトリが既定 (過渡) で、保存配置へ
-                            // リポジション中。None = 保存配置に確定。過渡の間は presenter child の
-                            // 再親付けを遅らせ、動画が一瞬小サイズに縮むちらつきを防ぐ。
                             self.detached_viewer_host_geometry_settled =
-                                restore_placement.is_none();
-                            if let Some(placement) = restore_placement {
-                                let viewport_position = window_geometry_pos_to_viewport(
-                                    egui::pos2(placement.x, placement.y),
-                                    self.settings.ui_scale_factor,
-                                );
-                                let viewport_inner_size = window_geometry_size_to_viewport(
-                                    egui::vec2(placement.w, placement.h),
-                                    self.settings.ui_scale_factor,
-                                );
-                                self.log_detached_viewport_placement_event(
-                                    "active_render_restore_default",
-                                    "viewport_cmd",
-                                    format!(
-                                        "viewport=current command=OuterPosition/InnerSize \
-                                         placement={placement:?}"
-                                    ),
-                                );
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                                    viewport_position,
-                                ));
-                                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                                    viewport_inner_size,
-                                ));
-                                ctx.request_repaint();
-                            }
+                                self.active_detached_session.is_some_and(|session| {
+                                    self.detached_window_host_is_placed(session.window_id)
+                                });
                         }
                     }
                 }
@@ -32087,7 +31927,11 @@ impl App {
             "fs_visible_false",
             format!("reason=fullscreen_viewport_recreate viewport={fs_id:?} fs_idx={fs_idx}"),
         );
-        ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        if let Some(session) = self.active_detached_session {
+            self.request_detached_window_visibility(ctx, session.window_id, false, None, false);
+        } else {
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        }
         self.observe_viewport_presentation_command(
             fs_id,
             crate::presentation_observer::WindowAction::Visible,
@@ -32282,7 +32126,7 @@ impl App {
         active: Option<bool>,
         visibility: DetachedViewportBuilderVisibility,
         apply_placement: bool,
-        builder_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
+        builder_placement: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         source: &'static str,
     ) -> egui::ViewportBuilder {
         let name = self
@@ -32309,63 +32153,41 @@ impl App {
             .with_decorations(!borderless)
             .with_transparent(false)
             .with_taskbar(true);
-        if apply_placement {
-            if borderless {
-                let rect = self.detached_viewer_borderless_target_rect();
-                let viewport_position =
-                    window_geometry_pos_to_viewport(rect.min, self.settings.ui_scale_factor);
-                let viewport_inner_size =
-                    window_geometry_size_to_viewport(rect.size(), self.settings.ui_scale_factor);
-                self.log_detached_viewport_placement_event(
-                    source,
-                    "builder_with_position",
-                    format!(
-                        "fs_idx={fs_idx} active={active:?} apply_placement={apply_placement} \
-                         borderless=true seed_now={} pos=({:.3},{:.3}) size={:.3}x{:.3}",
-                        self.detached_viewer_should_seed_placement(),
-                        rect.min.x,
-                        rect.min.y,
-                        rect.width(),
-                        rect.height()
-                    ),
-                );
-                builder = builder
-                    .with_inner_size(viewport_inner_size)
-                    .with_position(viewport_position);
+        if apply_placement && self.detached_viewer_should_seed_placement() {
+            let placement = if borderless {
+                crate::detached_window_geometry::PhysicalWindowPlacement {
+                    outer: self.detached_viewer_borderless_target_rect(),
+                    maximized: false,
+                }
             } else {
-                let placement = builder_placement
-                    .unwrap_or_else(|| self.active_detached_viewer_current_placement());
-                let viewport_position = window_geometry_pos_to_viewport(
-                    egui::pos2(placement.x, placement.y),
-                    self.settings.ui_scale_factor,
-                );
-                let viewport_inner_size = window_geometry_size_to_viewport(
-                    egui::vec2(placement.w, placement.h),
-                    self.settings.ui_scale_factor,
-                );
-                self.log_detached_viewport_placement_event(
-                    source,
-                    "builder_with_position",
-                    format!(
-                        "fs_idx={fs_idx} active={active:?} apply_placement={apply_placement} \
-                         borderless=false seed_now={} latched={} placement={placement:?}",
-                        self.detached_viewer_should_seed_placement(),
-                        builder_placement.is_some()
-                    ),
-                );
+                builder_placement.unwrap_or_else(|| self.active_detached_viewer_current_placement())
+            };
+            if let Some((position, inner_size)) =
+                crate::detached_window_geometry::provisional_builder_geometry(
+                    placement,
+                    !borderless,
+                )
+            {
                 builder = builder
-                    .with_inner_size(viewport_inner_size)
-                    .with_position(viewport_position);
+                    .with_inner_size(window_geometry_size_to_viewport(
+                        inner_size,
+                        self.settings.ui_scale_factor,
+                    ))
+                    .with_position(window_geometry_pos_to_viewport(
+                        position,
+                        self.settings.ui_scale_factor,
+                    ));
             }
+            self.log_detached_viewport_placement_event(
+                source,
+                "builder_with_position",
+                format!("fs_idx={fs_idx} active={active:?} borderless={borderless} placement={placement:?}"),
+            );
         } else {
             self.log_detached_viewport_placement_event(
                 source,
                 "builder_no_position",
-                format!(
-                    "fs_idx={fs_idx} active={active:?} apply_placement={apply_placement} \
-                     borderless={borderless} seed_now={}",
-                    self.detached_viewer_should_seed_placement()
-                ),
+                format!("fs_idx={fs_idx} active={active:?} borderless={borderless}"),
             );
         }
         if let Some(active) = active {
@@ -32399,22 +32221,13 @@ impl App {
 
     #[cfg(windows)]
     fn fullscreen_backdrop_physical_rect(&self) -> Option<windows::Win32::Foundation::RECT> {
-        // 背景の黒幕も「いま居るモニター」を覆うものなので現在位置を読む。
-        let center = self.last_window_rect.map(|r| r.center())?;
-        let effective_ppp = self.last_pixels_per_point;
-        let native_ppp = crate::settings::native_pixels_per_point_from_effective(
-            effective_ppp,
-            self.settings.ui_scale_factor,
-        );
-        let rect = crate::monitor::get_monitor_logical_rect_at(
-            center.x * effective_ppp,
-            center.y * effective_ppp,
-        )?;
+        let main_outer = crate::detached_window_geometry::read_outer_rect(self.main_hwnd?)?;
+        let rect = crate::detached_window_geometry::monitor_for_rect(main_outer)?.rc_monitor;
         Some(windows::Win32::Foundation::RECT {
-            left: (rect.min.x * native_ppp).round() as i32,
-            top: (rect.min.y * native_ppp).round() as i32,
-            right: (rect.max.x * native_ppp).round() as i32,
-            bottom: (rect.max.y * native_ppp).round() as i32,
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
         })
     }
 
@@ -59735,6 +59548,41 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn active_detached_builder_does_not_patch_a_live_host_with_its_latch() {
+        let mut app = crate::app::setup_app_for_test();
+        app.begin_active_detached_session(41, crate::app::DetachedSource::Video);
+        app.set_detached_window_host_for_test(41, 0x4100);
+        app.set_detached_window_live_hwnds_for_test([0x4100]);
+        let latched = crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 6000,
+                top: 1500,
+                right: 7920,
+                bottom: 2700,
+            },
+            maximized: false,
+        };
+        assert!(!app.detached_viewer_should_seed_placement());
+        for borderless in [false, true] {
+            app.detached_viewer_borderless_fullscreen = borderless;
+            // In particular, a stale active-video seed/latch must never become a live patch.
+            let builder = app.build_detached_viewer_viewport_builder(
+                0,
+                None,
+                DetachedViewportBuilderVisibility::Preserve,
+                true,
+                Some(latched),
+                "test_live_host_latch",
+            );
+            assert_eq!(builder.position, None);
+            assert_eq!(builder.inner_size, None);
+            assert_eq!(builder.visible, None);
+            assert_eq!(builder.decorations, Some(!borderless));
+        }
+    }
+
     #[cfg(all(windows, feature = "test-script"))]
     #[test]
     fn spread_thumbnail_fallback_carries_sibling_page_proof() {
@@ -60278,11 +60126,13 @@ mod tests {
             image_underlay: crate::app::DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
             frozen_continuous_pages: Vec::new(),
             margin_color: egui::Color32::from_gray(64),
-            placement: crate::settings::DetachedViewerWindowPlacement {
-                x: 0.0,
-                y: 0.0,
-                w: 640.0,
-                h: 480.0,
+            placement: crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 0,
+                    top: 0,
+                    right: 640,
+                    bottom: 480,
+                },
                 maximized: false,
             },
             apply_initial_placement: false,
@@ -91826,11 +91676,13 @@ mod specified_scale_consumer_tests {
         close(ordinary.layout_full_image_rect.height(), 12.0);
         #[cfg(windows)]
         {
-            let placement = crate::settings::DetachedViewerWindowPlacement {
-                x: 0.0,
-                y: 0.0,
-                w: 1200.0,
-                h: 800.0,
+            let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 0,
+                    top: 0,
+                    right: 1200,
+                    bottom: 800,
+                },
                 maximized: false,
             };
             let (snapshot, _, _) = app
@@ -91844,7 +91696,10 @@ mod specified_scale_consumer_tests {
                     0.0,
                 )
                 .unwrap();
-            close(snapshot.height() * placement.h, 12.0);
+            close(
+                snapshot.height() * App::detached_snapshot_client_size(placement).y,
+                12.0,
+            );
         }
         let passthrough = app.ensure_passthrough_rendition(&ctx, 0).unwrap();
         assert_ne!(passthrough.id(), thumb.id());
@@ -91853,11 +91708,13 @@ mod specified_scale_consumer_tests {
         close(rendered.layout_full_image_rect.height(), 15000.0);
         #[cfg(windows)]
         {
-            let placement = crate::settings::DetachedViewerWindowPlacement {
-                x: 0.0,
-                y: 0.0,
-                w: 1200.0,
-                h: 800.0,
+            let placement = crate::detached_window_geometry::PhysicalWindowPlacement {
+                outer: crate::detached_window_geometry::PhysicalRect {
+                    left: 0,
+                    top: 0,
+                    right: 1200,
+                    bottom: 800,
+                },
                 maximized: false,
             };
             let (snapshot, _, _) = app
@@ -91871,7 +91728,10 @@ mod specified_scale_consumer_tests {
                     0.0,
                 )
                 .unwrap();
-            close(snapshot.height() * placement.h, 15000.0);
+            close(
+                snapshot.height() * App::detached_snapshot_client_size(placement).y,
+                15000.0,
+            );
         }
         let captured = app
             .fs_fit_input_for_resource(
