@@ -96656,6 +96656,17 @@ impl eframe::App for App {
         self.accept_viewport_close_request(ctx, viewport_id)
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, _input: &mut egui::RawInput) {
+        #[cfg(windows)]
+        if _input.viewport_id == egui::ViewportId::ROOT {
+            // Eframe has delivered the previous output before preparing this
+            // root operation. This runs once for Full (all retries) or LogicOnly,
+            // unlike frame counters, which do not advance for LogicOnly.
+            self.detached_window_manager
+                .retire_mode_commands_before_root_pass();
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(windows)]
         if ctx.current_pass_index() == 0 {

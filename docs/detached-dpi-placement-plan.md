@@ -85,6 +85,12 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
     `show_request` は root 側から来た表示要求 (§3.4 の 4) を捨てずに保持する。`awaiting_unzoom` は §3.3 の
     最大化の規則で最大化の解除を待っていること。
   - `Placed { incarnation, outcome: Exact | Mismatch }` — 現 host に配置を適用した。
+  - (実装レビューで追加、2026-10-20) `pending_mode: Option<bool>` — アプリが送ってまだ処理されていない最大化 / 解除の command。
+    command を運んだ出力の処理後の root の最初の入力の境界、または `IsZoomed` が値に一致したときに消える。host の交代で捨てる。
+  - **判断の時点** (F11 開始・終了と保存・再作成前・park・新規窓の seed) は HWND を読み直す。通常の外枠は `IsZoomed` なら
+    `GetWindowPlacement` の通常の矩形 (screen 座標へ変換)、そうでなければ `GetWindowRect`。最大化かどうかは `pending_mode`
+    があればその値、無ければ `IsZoomed` (OS の事実)。それ以外の frame は egui の geometry 通知があったときだけ読む。
+  - 表示 commit の最大化は、適用の時点で確定した target の値を運ぶ (表示の時点で App の状態から導き直さない)。
   `incarnation` は既存の `host_incarnation` (`DetachedHostClaim` と同じ同一性。数値の同じ HWND を clear → 再登録しても
   新しい値になる)。`Placed` の incarnation が現 host と違えば `Unplaced` と同じに扱う (host が作り直されれば一致しなく
   なり、別に失効させる処理は要らない。ただし保持中の `show_request` は host の交代で捨てる。§3.4 の 4)。
@@ -284,7 +290,7 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 - メインから開く全画面 viewport (`fullscreen_viewport_geometry`) は同型だが、**今回は直さない**。
   その HWND は detached の registry ではなく command binding で扱っており (`app.rs` の capture)、Hidden で作ってから
   配置するには、viewport の生存世代と対応付けて HWND を得る境界の設計が別に要る (レビュー P2-6。rect 一致探索の
-  拡張は不可)。[backlog §1.407](next-release-backlog.md) に別項目として起票した (利用者の報告は無く、実機での発生は未確認)。
+  拡張は不可)。[backlog §1.408](next-release-backlog.md) に別項目として起票した (利用者の報告は無く、実機での発生は未確認)。
   背景の修正だけで main 全画面 viewport の配置問題が解消したとは扱わない。
 
 ## 4. 状態の組み合わせを減らす検討 (CLAUDE.md の設計方針)
@@ -400,7 +406,7 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 | P2-5 初回 callback の古い観測で seed を上書き | §3.4 の 5: 配置前の観測は書かない。配置後は通知として扱い HWND から読む |
 | P2-6 F11 の「次の pass」は証拠にならない | §3.5: 順序が要るのは最大化の解除だけ。`IsZoomed == false` の事実で進む |
 | P3-7 borrow の禁止が広すぎる | §2 の 7 を wndproc が取り直す lock / borrow に限定 |
-| main 全画面の起票 | §3.8: backlog §1.407 |
+| main 全画面の起票 | §3.8: backlog §1.408 |
 
 ### 第 3 版のレビュー指摘との対応
 

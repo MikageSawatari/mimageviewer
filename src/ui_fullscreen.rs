@@ -32226,7 +32226,7 @@ impl App {
         // after visibility/maximization commands have actually been processed.
         self.invalidate_detached_geometry_on_visible_commit(viewport_id);
         if maximized {
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
+            self.send_detached_viewport_mode_command(ctx, viewport_id, true);
         }
         ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
     }

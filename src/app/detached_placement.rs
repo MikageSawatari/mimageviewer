@@ -13,6 +13,26 @@ enum HostObservation {
 }
 
 impl App {
+    /// Track the last app-issued mode until its output has been delivered, or
+    /// the HWND already agrees. ROOT and other surfaces keep their own owners.
+    pub(crate) fn send_detached_viewport_mode_command(
+        &mut self,
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+        maximized: bool,
+    ) {
+        if let Some(window_id) = self
+            .detached_window_manager
+            .ids()
+            .into_iter()
+            .find(|window_id| Self::detached_image_window_viewport_id(*window_id) == viewport_id)
+        {
+            self.detached_window_manager
+                .note_mode_command(window_id, maximized);
+        }
+        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(maximized));
+    }
+
     pub(crate) fn invalidate_detached_geometry_on_visible_commit(
         &mut self,
         viewport_id: egui::ViewportId,
@@ -99,12 +119,7 @@ impl App {
         if request.focus {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
         }
-        let maximized = self
-            .detached_window_manager
-            .runtime(window_id)
-            .map(|_| self.detached_window_placement_target(window_id).maximized)
-            .or(request.maximized);
-        if let Some(maximized) = maximized {
+        if let Some(maximized) = request.maximized {
             self.send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
         } else {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
@@ -138,7 +153,7 @@ impl App {
                 .mark_host_unplaced(window_id, false);
         }
         let maximized = if self.detached_window_manager.runtime(window_id).is_some() {
-            maximized.map(|_| self.detached_window_placement_target(window_id).maximized)
+            Some(self.detached_window_placement_target(window_id).maximized)
         } else {
             maximized
         };
@@ -258,9 +273,10 @@ impl App {
             if !awaiting {
                 self.detached_window_manager
                     .mark_host_unplaced(window_id, true);
-                ctx.send_viewport_cmd_to(
+                self.send_detached_viewport_mode_command(
+                    ctx,
                     Self::detached_image_window_viewport_id(window_id),
-                    egui::ViewportCommand::Maximized(false),
+                    false,
                 );
             }
             return false;
@@ -292,7 +308,7 @@ impl App {
             .detached_window_manager
             .mark_host_placed(claim, outcome)
             .map(|request| ShowRequest {
-                maximized: request.maximized.map(|_| target.maximized),
+                maximized: Some(target.maximized),
                 ..request
             });
         if target.maximized
@@ -301,9 +317,10 @@ impl App {
             && host_visible
             && request.is_none_or(|request| request.maximized.is_none())
         {
-            ctx.send_viewport_cmd_to(
+            self.send_detached_viewport_mode_command(
+                ctx,
                 Self::detached_image_window_viewport_id(window_id),
-                egui::ViewportCommand::Maximized(true),
+                true,
             );
         }
         if let Some(request) = request {
@@ -421,8 +438,8 @@ impl App {
                     || self.detached_viewer_borderless_transition.is_some()))
     }
 
-    /// Decisions refresh only normal geometry, preserving the runtime mode intent.
-    /// Root's first-pass observation is the sole reader that updates maximization.
+    /// Decisions use the last undelivered app command, otherwise the HWND mode.
+    /// Normal geometry always comes from the actual mode, never the pending one.
     /// Closing has already captured its final placement before teardown can erase
     /// the borderless state. Unplaced hosts retain the intended runtime target.
     pub(crate) fn capture_detached_window_placement_at_decision(
@@ -439,22 +456,21 @@ impl App {
             #[cfg(test)]
             OBSERVATION_READS.with(|reads| *reads.borrow_mut().entry(window_id).or_default() += 1);
             let zoomed = self.detached_host_zoomed(window_id, hwnd);
+            let maximized = self
+                .detached_window_manager
+                .resolve_host_mode(window_id, zoomed);
             let normal_outer = if zoomed {
                 self.detached_host_normal_outer(window_id, hwnd)
             } else {
                 outer
             };
             if let Some(normal_outer) = normal_outer {
-                let previous = self
-                    .detached_window_manager
-                    .placement(window_id)
-                    .unwrap_or_else(|| self.detached_window_seed_placement(window_id));
                 self.record_detached_normal_placement(
                     window_id,
                     hwnd,
                     PhysicalWindowPlacement {
                         outer: normal_outer,
-                        ..previous
+                        maximized,
                     },
                     zoomed,
                     source,
@@ -516,14 +532,17 @@ impl App {
             .detached_window_manager
             .placement(window_id)
             .unwrap_or_else(|| self.detached_window_seed_placement(window_id));
+        let maximized = self
+            .detached_window_manager
+            .resolve_host_mode(window_id, matches!(observation, HostObservation::Maximized));
         if matches!(observation, HostObservation::Maximized) {
-            if previous.maximized {
+            if previous.maximized == maximized {
                 return None;
             }
             self.set_detached_window_runtime_placement(
                 window_id,
                 PhysicalWindowPlacement {
-                    maximized: true,
+                    maximized,
                     ..previous
                 },
                 source,
@@ -533,10 +552,7 @@ impl App {
         let HostObservation::Normal(outer) = observation else {
             unreachable!()
         };
-        let candidate = PhysicalWindowPlacement {
-            outer,
-            maximized: false,
-        };
+        let candidate = PhysicalWindowPlacement { outer, maximized };
         self.record_detached_normal_placement(window_id, hwnd, candidate, false, source)
     }
 
@@ -784,7 +800,7 @@ fn with_host_visibility_for_test<R>(window_id: u64, visible: bool, run: impl FnO
 }
 
 #[cfg(test)]
-fn with_host_normal_outer_for_test<R>(
+pub(crate) fn with_host_normal_outer_for_test<R>(
     window_id: u64,
     outer: PhysicalRect,
     run: impl FnOnce() -> R,
@@ -828,6 +844,7 @@ mod tests {
                 .viewports
                 .insert(App::detached_image_window_viewport_id(12), info);
         }
+        eframe::App::raw_input_hook(app, ctx, &mut input);
         ctx.begin_pass(input);
         app.record_detached_host_placements_before_commands(ctx);
         ctx.end_pass().drop_without_applying_deltas();
@@ -1031,7 +1048,7 @@ mod tests {
                     geometry::borderless_target_for(moved).unwrap()
                 );
                 let restore = app.detached_viewer_restore_placement.unwrap();
-                assert_eq!(restore.maximized, previous.maximized);
+                assert_eq!(restore.maximized, maximized);
                 assert_eq!(restore.outer, if maximized { normal_outer } else { moved });
                 ctx.end_pass().drop_without_applying_deltas();
             });
@@ -1083,14 +1100,14 @@ mod tests {
                 app.settings.detached_viewer_window_physical_placement,
                 Some(PhysicalWindowPlacement {
                     outer: moved,
-                    maximized: intended_maximized,
+                    maximized,
                 })
             );
         }
     }
 
     #[test]
-    fn next_root_observation_updates_os_restore_intent_after_decision_geometry_only() {
+    fn decision_reads_os_restore_before_next_root_notification() {
         let mut app = setup_app();
         app.window_visible = true;
         let previous = PhysicalWindowPlacement {
@@ -1125,7 +1142,7 @@ mod tests {
                 app.detached_window_manager.placement(12),
                 Some(PhysicalWindowPlacement {
                     outer: normal_outer,
-                    maximized: true,
+                    maximized: false,
                 })
             );
             info.maximized = Some(false);
@@ -1141,6 +1158,185 @@ mod tests {
                     maximized: false,
                 })
             );
+        });
+    }
+
+    #[test]
+    fn pending_mode_protects_root_observation_until_native_matches() {
+        for maximized in [false, true] {
+            let mut app = setup_app();
+            app.window_visible = true;
+            let target = PhysicalWindowPlacement {
+                maximized,
+                ..app.default_detached_viewer_window_placement()
+            };
+            app.set_detached_window_runtime_placement(
+                12,
+                PhysicalWindowPlacement {
+                    maximized: !maximized,
+                    ..target
+                },
+                "test",
+            );
+            app.set_detached_window_host_for_test(12, 0x1234);
+            let claim = app.detached_window_manager.host_claim_alive(12).unwrap();
+            app.detached_window_manager
+                .mark_host_placed(claim, PlacementOutcome::Exact);
+            let id = App::detached_image_window_viewport_id(12);
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            input.viewports.insert(
+                id,
+                egui::ViewportInfo {
+                    outer_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(960.0, 720.0),
+                    )),
+                    maximized: Some(!maximized),
+                    ..Default::default()
+                },
+            );
+            ctx.begin_pass(input);
+            let fullscreen = geometry::borderless_target_for(target.outer).unwrap();
+            let initial = if maximized { target.outer } else { fullscreen };
+            with_host_geometry_for_test(12, initial, !maximized, || {
+                with_host_normal_outer_for_test(12, target.outer, || {
+                    app.send_detached_viewport_mode_command(&ctx, id, maximized);
+                    app.record_detached_host_placements_before_commands(&ctx);
+                    assert_eq!(app.detached_window_manager.placement(12), Some(target));
+                    assert_eq!(
+                        app.detached_window_manager.pending_mode(12),
+                        Some(maximized)
+                    );
+                    set_host_geometry_for_test(
+                        12,
+                        if maximized { fullscreen } else { target.outer },
+                        maximized,
+                    );
+                    app.capture_detached_window_placement_at_decision(12, "native_mode_matched");
+                    assert_eq!(app.detached_window_manager.pending_mode(12), None);
+                    assert_eq!(app.detached_window_manager.placement(12), Some(target));
+                });
+            });
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn initial_callback_mode_survives_post_show_adoption_and_recreation() {
+        for recreate in [false, true] {
+            let mut app = setup_app();
+            app.window_visible = true;
+            let target = PhysicalWindowPlacement {
+                maximized: true,
+                ..app.default_detached_viewer_window_placement()
+            };
+            app.set_detached_window_runtime_placement(12, target, "test");
+            if recreate {
+                app.set_detached_window_host_for_test(12, 0x1234);
+                app.detached_window_manager.note_mode_command(12, false);
+                app.detached_window_hwnd_clear(12);
+                assert_eq!(app.detached_window_manager.pending_mode(12), None);
+            }
+            let id = App::detached_image_window_viewport_id(12);
+            let ctx = context(id);
+            // This is emitted from the initial immediate callback, before its
+            // HWND can be adopted after show_viewport_immediate returns.
+            app.send_detached_viewport_visible_commit(&ctx, id, true);
+            assert_eq!(app.detached_window_manager.pending_mode(12), Some(true));
+            with_host_geometry_for_test(12, target.outer, false, || {
+                with_host_visibility_for_test(12, false, || {
+                    app.set_detached_window_host_for_test(12, 0x5678);
+                    app.detached_window_hwnd_set_for_reusable_lease(
+                        &ctx,
+                        12,
+                        0x5678,
+                        "post_show_adopt",
+                    )
+                    .unwrap();
+                    assert!(app.detached_window_host_is_placed(12));
+                    assert_eq!(app.detached_window_manager.pending_mode(12), Some(true));
+                    app.capture_detached_window_placement_at_decision(12, "after_post_show_adopt");
+                    assert_eq!(app.detached_window_manager.placement(12), Some(target));
+                });
+            });
+            let output = ctx.end_pass();
+            assert_eq!(
+                output.viewport_output[&id]
+                    .commands
+                    .iter()
+                    .filter(|cmd| matches!(cmd, egui::ViewportCommand::Maximized(true)))
+                    .count(),
+                1
+            );
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn root_output_boundary_handles_discard_and_logic_only_without_mode_polling() {
+        let mut app = setup_app();
+        app.window_visible = true;
+        let target = PhysicalWindowPlacement {
+            maximized: true,
+            ..app.default_detached_viewer_window_placement()
+        };
+        app.set_detached_window_runtime_placement(12, target, "test");
+        app.set_detached_window_host_for_test(12, 0x1234);
+        let claim = app.detached_window_manager.host_claim_alive(12).unwrap();
+        app.detached_window_manager
+            .mark_host_placed(claim, PlacementOutcome::Exact);
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let id = App::detached_image_window_viewport_id(12);
+        with_host_geometry_for_test(12, target.outer, false, || {
+            let mut input = egui::RawInput::default();
+            eframe::App::raw_input_hook(&mut *app, &ctx, &mut input);
+            let mut passes = 0;
+            let output = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx();
+                ctx.show_viewport_deferred(id, Default::default(), |_, _| {});
+                passes += 1;
+                if passes == 1 {
+                    app.send_detached_viewport_mode_command(ctx, id, true);
+                    ctx.request_discard("pending mode spans the complete output");
+                } else {
+                    // The first pass's command has left Context::commands, but
+                    // the backend has not received this root output yet.
+                    assert_eq!(app.detached_window_manager.pending_mode(12), Some(true));
+                    app.capture_detached_window_placement_at_decision(12, "discard_retry");
+                    assert_eq!(app.detached_window_manager.placement(12), Some(target));
+                }
+            });
+            assert_eq!(passes, 2);
+            assert_eq!(app.detached_window_manager.pending_mode(12), Some(true));
+            output.drop_without_applying_deltas();
+
+            let frame = ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT);
+            let reads = observation_reads();
+            let mut child_input = egui::RawInput {
+                viewport_id: id,
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(&mut *app, &ctx, &mut child_input);
+            assert_eq!(app.detached_window_manager.pending_mode(12), Some(true));
+            let mut root_input = egui::RawInput::default();
+            eframe::App::raw_input_hook(&mut *app, &ctx, &mut root_input);
+            assert_eq!(app.detached_window_manager.pending_mode(12), None);
+            assert_eq!(observation_reads(), reads, "output boundary reads no HWND");
+            let _logic = ctx.run_logic(&root_input, |ctx| {
+                app.send_detached_viewport_mode_command(ctx, id, true);
+            });
+            assert_eq!(app.detached_window_manager.pending_mode(12), Some(true));
+            // LogicOnly does not advance egui's frame number. The next root
+            // output still retires its already-delivered mode command.
+            eframe::App::raw_input_hook(&mut *app, &ctx, &mut root_input);
+            assert_eq!(app.detached_window_manager.pending_mode(12), None);
+            let _logic = ctx.run_logic(&root_input, |_| {
+                app.capture_detached_window_placement_at_decision(12, "after_logic_delivery");
+            });
+            assert_eq!(ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT), frame);
+            assert!(!app.detached_window_manager.placement(12).unwrap().maximized);
         });
     }
 
@@ -1639,70 +1835,136 @@ mod tests {
     }
 
     #[test]
-    fn f11_tray_restore_never_replays_normal_maximize_over_the_captured_fullscreen_target() {
-        for replace_host in [false, true] {
-            let mut app = setup_app();
-            app.window_visible = true;
-            app.set_detached_window_binding_for_test(Some(12));
-            app.begin_active_detached_session(12, super::super::DetachedSource::Image);
-            let mut restore = app.default_detached_viewer_window_placement();
-            restore.maximized = true;
-            app.set_detached_window_runtime_placement(12, restore, "test");
-            app.write_detached_viewer_borderless_state(false, Some(restore), "test", "restore");
-            app.set_detached_window_host_for_test(12, 0x1234);
-            let target = geometry::borderless_target_for(restore.outer).unwrap();
-            let transition = super::super::DetachedViewerBorderlessTransition {
-                target_borderless: true,
-                target_outer: target,
-                phase: super::super::DetachedViewerBorderlessTransitionPhase::AwaitUnzoom,
-            };
-            app.detached_viewer_borderless_transition = Some(transition);
-            let ctx = context(App::detached_image_window_viewport_id(12));
-            with_host_geometry_for_test(12, restore.outer, true, || {
-                assert!(!app.apply_detached_viewer_borderless_target(&ctx, transition, true));
-                app.request_detached_window_visibility(&ctx, 12, false, None, false);
-                app.window_visible = false;
-                set_host_geometry_for_test(12, restore.outer, false);
-                if replace_host {
-                    app.detached_window_hwnd_clear(12);
-                    app.set_detached_window_host_for_test(12, 0x5678);
-                    app.detached_window_hwnd_set_for_reusable_lease(
+    fn f11_step_tray_restore_uses_applied_mode_in_both_directions() {
+        use super::super::{
+            DetachedViewerBorderlessTransition as Transition,
+            DetachedViewerBorderlessTransitionPhase as Phase,
+        };
+        for (target_borderless, initially_zoomed) in [false, true]
+            .into_iter()
+            .flat_map(|target| [false, true].map(|zoomed| (target, zoomed)))
+        {
+            for replace_host in [false, true] {
+                let mut app = setup_app();
+                app.window_visible = true;
+                app.set_detached_window_binding_for_test(Some(12));
+                app.begin_active_detached_session(12, super::super::DetachedSource::Image);
+                let restore = PhysicalWindowPlacement {
+                    maximized: true,
+                    ..app.default_detached_viewer_window_placement()
+                };
+                app.set_detached_window_runtime_placement(12, restore, "test");
+                app.write_detached_viewer_borderless_state(
+                    !target_borderless,
+                    Some(restore),
+                    "test",
+                    "restore",
+                );
+                app.set_detached_window_host_for_test(12, 0x1234);
+                let claim = app.detached_window_manager.host_claim_alive(12).unwrap();
+                app.detached_window_manager
+                    .mark_host_placed(claim, PlacementOutcome::Exact);
+                let fullscreen = geometry::borderless_target_for(restore.outer).unwrap();
+                let target = if target_borderless {
+                    fullscreen
+                } else {
+                    restore.outer
+                };
+                app.detached_viewer_borderless_transition = Some(Transition {
+                    target_borderless,
+                    target_outer: target,
+                    phase: Phase::PrimeBlackFrame,
+                });
+                let id = App::detached_image_window_viewport_id(12);
+                let ctx = context(id);
+                let initial = if target_borderless {
+                    restore.outer
+                } else {
+                    fullscreen
+                };
+                with_host_geometry_for_test(12, initial, initially_zoomed, || {
+                    assert!(app.step_detached_viewer_borderless_transition(&ctx));
+                    if initially_zoomed {
+                        assert!(app.step_detached_viewer_borderless_transition(&ctx));
+                        assert!(matches!(
+                            app.detached_viewer_borderless_transition.unwrap().phase,
+                            Phase::AwaitUnzoom
+                        ));
+                    }
+                    app.request_detached_window_visibility(&ctx, 12, false, None, false);
+                    app.window_visible = false;
+                    set_host_geometry_for_test(12, initial, false);
+                    assert!(app.step_detached_viewer_borderless_transition(&ctx));
+                    assert_eq!(host_geometry_for_test(12), Some((initial, false)));
+                    if replace_host {
+                        app.detached_window_hwnd_clear(12);
+                        app.set_detached_window_host_for_test(12, 0x5678);
+                        app.detached_window_hwnd_set_for_reusable_lease(
+                            &ctx,
+                            12,
+                            0x5678,
+                            "tray_rehost",
+                        )
+                        .unwrap();
+                    }
+                    // A visibility request while hidden stays with placement;
+                    // its receipt still carries the pre-transition mode.
+                    app.request_detached_window_visibility(
                         &ctx,
                         12,
-                        0x5678,
-                        "tray_rehost",
-                    )
-                    .unwrap();
-                    assert!(app.detached_window_host_is_placed(12));
-                }
-                app.window_visible = true;
-                // Tray restoration captured the old normal maximize intent.
-                app.request_detached_window_visibility(&ctx, 12, true, Some(true), true);
-                assert!(app.apply_detached_viewer_borderless_target(&ctx, transition, false));
-                assert_eq!(host_geometry_for_test(12), Some((target, false)));
-                assert!(app.detached_viewer_borderless_fullscreen);
-                assert_eq!(app.detached_viewer_restore_placement, Some(restore));
-            });
-            let output = ctx.end_pass();
-            let commands =
-                &output.viewport_output[&App::detached_image_window_viewport_id(12)].commands;
-            assert!(
-                !commands
+                        true,
+                        Some(target_borderless),
+                        true,
+                    );
+                    app.window_visible = true;
+                    assert!(app.step_detached_viewer_borderless_transition(&ctx));
+                    assert!(matches!(
+                        app.detached_viewer_borderless_transition.unwrap().phase,
+                        Phase::Settle { .. }
+                    ));
+                    assert_eq!(host_geometry_for_test(12), Some((target, false)));
+                    assert_eq!(app.detached_viewer_borderless_fullscreen, target_borderless);
+                    if target_borderless {
+                        assert_eq!(app.detached_viewer_restore_placement, Some(restore));
+                    } else {
+                        assert_eq!(app.detached_window_runtime_placement(12), Some(restore));
+                    }
+                });
+                let output = ctx.end_pass();
+                let commands = &output.viewport_output[&id].commands;
+                let modes: Vec<_> = commands
                     .iter()
-                    .any(|c| matches!(c, egui::ViewportCommand::Maximized(true))),
-                "normal maximize must never overwrite F11 target; replace_host={replace_host}"
-            );
-            assert!(
-                commands
-                    .iter()
-                    .any(|c| matches!(c, egui::ViewportCommand::Visible(true)))
-            );
-            assert!(
-                commands
-                    .iter()
-                    .any(|c| matches!(c, egui::ViewportCommand::Focus))
-            );
-            output.drop_without_applying_deltas();
+                    .filter_map(|cmd| match cmd {
+                        egui::ViewportCommand::Maximized(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect();
+                let expected_mode = if target_borderless {
+                    initially_zoomed.then_some(false)
+                } else {
+                    Some(true)
+                };
+                assert_eq!(
+                    modes.last().copied(),
+                    expected_mode,
+                    "target_borderless={target_borderless} replace_host={replace_host} initially_zoomed={initially_zoomed}"
+                );
+                assert_eq!(
+                    modes.iter().filter(|&&mode| mode).count(),
+                    usize::from(!target_borderless)
+                );
+                assert!(
+                    commands
+                        .iter()
+                        .any(|cmd| matches!(cmd, egui::ViewportCommand::Visible(true)))
+                );
+                assert!(
+                    commands
+                        .iter()
+                        .any(|cmd| matches!(cmd, egui::ViewportCommand::Focus))
+                );
+                output.drop_without_applying_deltas();
+            }
         }
     }
 }

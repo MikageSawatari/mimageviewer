@@ -97,11 +97,30 @@ pub(crate) enum HostPlacement {
     Unplaced {
         show_request: Option<ShowRequest>,
         awaiting_unzoom: bool,
+        pending_mode: Option<bool>,
     },
     Placed {
         incarnation: u64,
         outcome: PlacementOutcome,
+        pending_mode: Option<bool>,
     },
+}
+
+#[cfg(windows)]
+impl HostPlacement {
+    fn pending_mode(&self) -> Option<bool> {
+        match self {
+            Self::Unplaced { pending_mode, .. } | Self::Placed { pending_mode, .. } => {
+                *pending_mode
+            }
+        }
+    }
+
+    fn pending_mode_mut(&mut self) -> &mut Option<bool> {
+        match self {
+            Self::Unplaced { pending_mode, .. } | Self::Placed { pending_mode, .. } => pending_mode,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -110,6 +129,7 @@ impl Default for HostPlacement {
         Self::Unplaced {
             show_request: None,
             awaiting_unzoom: false,
+            pending_mode: None,
         }
     }
 }
@@ -717,6 +737,54 @@ impl DetachedWindowManager {
         })
     }
 
+    /// The last command in this root output transaction owns the mode until
+    /// native observation agrees or the backend has consumed the transaction.
+    /// This metadata boundary deliberately performs no native liveness query.
+    pub(super) fn note_mode_command(&mut self, window_id: u64, maximized: bool) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&window_id) else {
+            return false;
+        };
+        if runtime.state == DetachedWindowState::Closing {
+            return false;
+        }
+        *runtime.host_placement.pending_mode_mut() = Some(maximized);
+        runtime.last_geometry_notification = None;
+        true
+    }
+
+    pub(super) fn pending_mode(&self, window_id: u64) -> Option<bool> {
+        let runtime = self.runtime(window_id)?;
+        if runtime.state == DetachedWindowState::Closing {
+            return None;
+        }
+        self.host_placement(window_id)?.pending_mode()
+    }
+
+    pub(super) fn resolve_host_mode(&mut self, window_id: u64, zoomed: bool) -> bool {
+        let Some(pending) = self.pending_mode(window_id) else {
+            return zoomed;
+        };
+        if zoomed == pending {
+            *self
+                .runtimes
+                .get_mut(&window_id)
+                .unwrap()
+                .host_placement
+                .pending_mode_mut() = None;
+        }
+        pending
+    }
+
+    /// Called once by the root raw-input hook after previous output has reached
+    /// the backend, before any full/logic-only or repeated/discard logic pass.
+    pub(super) fn retire_mode_commands_before_root_pass(&mut self) {
+        for runtime in self.runtimes.values_mut() {
+            if runtime.host_placement.pending_mode_mut().take().is_some() {
+                runtime.last_geometry_notification = None;
+            }
+        }
+    }
+
     pub(super) fn geometry_notification_changed(
         &self,
         window_id: u64,
@@ -757,6 +825,7 @@ impl DetachedWindowManager {
             HostPlacement::Unplaced {
                 show_request,
                 awaiting_unzoom,
+                pending_mode,
             } => {
                 // A later focus-only request must not erase an earlier maximize
                 // intent while placement is waiting for the host to unzoom.
@@ -770,6 +839,7 @@ impl DetachedWindowManager {
                     HostPlacement::Unplaced {
                         show_request: Some(combined),
                         awaiting_unzoom,
+                        pending_mode,
                     };
                 None
             }
@@ -789,6 +859,7 @@ impl DetachedWindowManager {
     pub(super) fn mark_host_unplaced(&mut self, window_id: u64, awaiting_unzoom: bool) {
         if let Some(runtime) = self.runtimes.get_mut(&window_id) {
             runtime.last_geometry_notification = None;
+            let pending_mode = runtime.host_placement.pending_mode();
             let show_request = match runtime.host_placement {
                 HostPlacement::Unplaced { show_request, .. } => show_request,
                 HostPlacement::Placed { .. } => None,
@@ -796,6 +867,7 @@ impl DetachedWindowManager {
             runtime.host_placement = HostPlacement::Unplaced {
                 show_request,
                 awaiting_unzoom,
+                pending_mode,
             };
         }
     }
@@ -815,6 +887,7 @@ impl DetachedWindowManager {
             return None;
         }
         let runtime = self.runtimes.get_mut(&claim.lease.window_id)?;
+        let pending_mode = runtime.host_placement.pending_mode();
         let show_request = match runtime.host_placement {
             HostPlacement::Unplaced { show_request, .. } => show_request,
             HostPlacement::Placed { .. } => None,
@@ -822,6 +895,7 @@ impl DetachedWindowManager {
         runtime.host_placement = HostPlacement::Placed {
             incarnation: claim.incarnation,
             outcome,
+            pending_mode,
         };
         show_request
     }
@@ -902,7 +976,16 @@ impl DetachedWindowManager {
         if let Some(incarnation) = new_incarnation {
             runtime.last_geometry_notification = None;
             if runtime.host_incarnation != 0 {
+                // A callback can issue a new command after clear_hwnd and
+                // before its replacement host is adopted. Only that command
+                // survives adoption; direct host replacement discards it.
+                let pending_mode = if previous.is_none() {
+                    runtime.host_placement.pending_mode()
+                } else {
+                    None
+                };
                 runtime.host_placement = HostPlacement::default();
+                *runtime.host_placement.pending_mode_mut() = pending_mode;
             }
             runtime.host_incarnation = incarnation;
         }
@@ -1383,6 +1466,221 @@ mod tests {
     }
 
     #[test]
+    fn mode_commands_require_existing_non_closing_runtime() {
+        let mut manager = DetachedWindowManager::new();
+        assert!(!manager.note_mode_command(7, true));
+        assert!(manager.runtime(7).is_none());
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.resolve_host_mode(7, true));
+
+        manager.transition_state(7, DetachedWindowState::Opening, false);
+        assert!(manager.note_mode_command(7, true));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        manager.set_hwnd(7, 0x7000, false);
+        // No fake native liveness is registered: metadata tracking must not
+        // perform an IsWindow query on every root pass or command observation.
+        assert!(manager.note_mode_command(7, true));
+        assert!(manager.resolve_host_mode(7, false));
+        manager.transition_state(7, DetachedWindowState::Closing, false);
+        assert!(!manager.note_mode_command(7, false));
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(!manager.resolve_host_mode(7, false));
+    }
+
+    #[test]
+    fn pending_mode_survives_show_placement_and_unplacement() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let pending = true;
+        assert!(manager.note_mode_command(7, pending));
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        assert_eq!(manager.request_show(7, request), None);
+        assert_eq!(manager.pending_mode(7), Some(pending));
+        let claim = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            Some(request)
+        );
+        assert_eq!(manager.pending_mode(7), Some(pending));
+        assert_eq!(manager.request_show(7, request), Some(request));
+        manager.mark_host_unplaced(7, true);
+        assert_eq!(manager.request_show(7, request), None);
+        manager.clear_show_request(7);
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: None,
+                awaiting_unzoom: true,
+                pending_mode: Some(pending),
+            })
+        );
+        manager.mark_host_placed(claim, PlacementOutcome::Mismatch);
+        assert_eq!(manager.pending_mode(7), Some(pending));
+    }
+
+    #[test]
+    fn host_replacement_clear_and_runtime_removal_discard_pending_mode() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_hwnd(7, 0x7000, false);
+        assert!(manager.note_mode_command(7, true));
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.pending_mode(7), None);
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+
+        assert!(manager.note_mode_command(7, false));
+        manager.clear_hwnd(7);
+        assert_eq!(manager.pending_mode(7), None);
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.note_mode_command(7, true));
+        manager.remove(7);
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.pending_mode(7), None);
+    }
+
+    #[test]
+    fn mode_command_before_initial_host_adoption_survives_registration() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(7, DetachedWindowState::Opening, false);
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        manager.request_show(7, request);
+        assert!(manager.note_mode_command(7, true));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        assert!(manager.resolve_host_mode(7, false));
+
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(manager.pending_mode(7), Some(true));
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: Some(request),
+                awaiting_unzoom: false,
+                pending_mode: Some(true),
+            })
+        );
+        assert!(manager.resolve_host_mode(7, false));
+    }
+
+    #[test]
+    fn new_mode_command_after_clear_survives_recreated_host_adoption() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_hwnd(7, 0x7000, false);
+        let first_incarnation = manager.runtime(7).unwrap().host_incarnation;
+        assert!(manager.note_mode_command(7, false));
+        manager.clear_hwnd(7);
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.note_mode_command(7, true));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        manager.request_show(
+            7,
+            ShowRequest {
+                maximized: Some(true),
+                focus: true,
+            },
+        );
+        manager.mark_host_unplaced(7, true);
+
+        manager.set_hwnd(7, 0x8000, false);
+        assert_ne!(
+            manager.runtime(7).unwrap().host_incarnation,
+            first_incarnation
+        );
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: None,
+                awaiting_unzoom: false,
+                pending_mode: Some(true),
+            }),
+            "recreated adoption preserves only the new command, retaining existing placement reset semantics"
+        );
+        assert!(manager.resolve_host_mode(7, false));
+        manager.clear_hwnd(7);
+        assert_eq!(manager.pending_mode(7), None);
+    }
+
+    #[test]
+    fn latest_mode_command_wins_until_matching_native_fact() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_hwnd(7, 0x7000, false);
+        manager.set_hwnd(8, 0x8000, false);
+        manager.note_mode_command(8, true);
+        let sibling = manager.host_placement(8);
+        assert!(manager.note_mode_command(7, true));
+        assert!(manager.resolve_host_mode(7, false));
+        assert!(manager.note_mode_command(7, false));
+        assert!(!manager.resolve_host_mode(7, true));
+        assert_eq!(manager.pending_mode(7), Some(false));
+        assert!(!manager.resolve_host_mode(7, false));
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.resolve_host_mode(7, true));
+        assert_eq!(manager.host_placement(8), sibling);
+
+        manager.note_mode_command(7, true);
+        assert!(manager.resolve_host_mode(7, true));
+        assert_eq!(manager.pending_mode(7), None);
+    }
+
+    #[test]
+    fn mode_commands_retire_at_root_output_boundary_and_invalidate_geometry() {
+        let mut manager = DetachedWindowManager::new();
+        let notification = GeometryNotification::from_viewport(&egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+        for id in [7, 8, 9, 10] {
+            manager.set_hwnd(id, id * 0x1000, false);
+            manager.record_geometry_notification(id, notification);
+        }
+        manager.note_mode_command(7, true);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(!manager.geometry_notification_changed(8, notification));
+        manager.note_mode_command(8, false);
+        manager.note_mode_command(10, true);
+        manager.record_geometry_notification(7, notification);
+        manager.record_geometry_notification(8, notification);
+        manager.record_geometry_notification(10, notification);
+
+        // Logic and discard passes inside one output transaction retain the
+        // command until the next root raw-input hook calls the boundary.
+        assert!(manager.resolve_host_mode(7, false));
+        assert!(manager.resolve_host_mode(7, false));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        assert!(!manager.geometry_notification_changed(7, notification));
+        assert!(manager.pending_mode(8).is_some());
+        assert!(!manager.geometry_notification_changed(8, notification));
+        assert!(!manager.geometry_notification_changed(9, notification));
+        assert!(!manager.resolve_host_mode(8, false));
+        assert_eq!(manager.pending_mode(8), None);
+
+        // The next root output boundary retires even an unmatched command.
+        manager.retire_mode_commands_before_root_pass();
+        assert_eq!(manager.pending_mode(7), None);
+        assert_eq!(manager.pending_mode(10), None);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(manager.geometry_notification_changed(10, notification));
+        assert!(!manager.resolve_host_mode(7, false));
+        assert!(!manager.geometry_notification_changed(8, notification));
+        assert!(!manager.geometry_notification_changed(9, notification));
+
+        manager.record_geometry_notification(7, notification);
+        manager.retire_mode_commands_before_root_pass();
+        assert!(!manager.geometry_notification_changed(7, notification));
+    }
+
+    #[test]
     fn unplaced_host_retains_and_merges_show_until_physical_placement() {
         let mut manager = DetachedWindowManager::new();
         manager.transition_state(7, DetachedWindowState::Opening, false);
@@ -1405,6 +1703,7 @@ mod tests {
             Some(HostPlacement::Unplaced {
                 show_request: Some(combined),
                 awaiting_unzoom: false,
+                pending_mode: None,
             })
         );
 
@@ -1420,6 +1719,7 @@ mod tests {
             Some(HostPlacement::Placed {
                 incarnation: claim.incarnation,
                 outcome: PlacementOutcome::Exact,
+                pending_mode: None,
             })
         );
         assert_eq!(manager.request_show(7, focus), Some(focus));
@@ -1483,6 +1783,7 @@ mod tests {
             Some(HostPlacement::Unplaced {
                 show_request: None,
                 awaiting_unzoom: true,
+                pending_mode: None,
             })
         );
         let claim = manager.host_claim_alive(7).unwrap();
@@ -1517,6 +1818,7 @@ mod tests {
             Some(HostPlacement::Placed {
                 incarnation: current.incarnation,
                 outcome: PlacementOutcome::Mismatch,
+                pending_mode: None,
             })
         );
         assert_eq!(
@@ -1549,6 +1851,7 @@ mod tests {
             Some(HostPlacement::Unplaced {
                 show_request: Some(request),
                 awaiting_unzoom: true,
+                pending_mode: None,
             })
         );
         manager.clear_hwnd(7);

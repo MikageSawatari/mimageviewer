@@ -88190,67 +88190,104 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
-    fn queued_maximize_preserves_intent_in_same_root_f11_close_and_park() {
-        for action in ["f11", "close", "park"] {
-            let mut app = setup_app();
-            let ctx = egui::Context::default();
-            ctx.set_embed_viewports(false);
-            ctx.begin_pass(Default::default());
-            let viewport_id = App::detached_image_window_viewport_id(12);
-            ctx.show_viewport_deferred(viewport_id, Default::default(), |_, _| {});
-            let idx = push_image(&mut app, r"C:\pics\queued-maximize.jpg");
-            insert_static_fs_entry(&mut app, &ctx, idx, "queued_maximize");
-            app.fullscreen_idx = Some(idx);
-            app.viewer_presentation = ViewerPresentation::DetachedWindow;
-            app.window_visible = true;
-            app.set_detached_window_binding_for_test(Some(12));
-            app.begin_active_detached_session(12, DetachedSource::Image);
-            let target = crate::detached_window_geometry::PhysicalWindowPlacement {
-                maximized: true,
-                ..app.default_detached_viewer_window_placement()
-            };
-            app.set_detached_window_runtime_placement(12, target, "test");
-            app.set_detached_window_host_for_test(12, 0x1234);
-            crate::app::detached_placement::with_host_geometry_for_test(
-                12,
-                target.outer,
-                false,
-                || {
-                    // The real placement producer queues remaximization. No backend
-                    // command has run yet when the decision below reads the HWND.
-                    app.apply_detached_window_host_placement(&ctx, 12);
-                    assert!(app.detached_window_host_is_placed(12));
-                    assert!(ctx.viewport_for(viewport_id, |viewport| {
-                        viewport.commands.iter().any(|command| {
-                            matches!(command, egui::ViewportCommand::Maximized(true))
-                        })
-                    }));
-                    match action {
-                        "f11" => {
-                            app.toggle_detached_viewer_borderless_fullscreen(&ctx);
-                            assert_eq!(app.detached_viewer_restore_placement, Some(target));
-                        }
-                        "close" => {
-                            app.retire_terminal_detached_viewport_identity(12, "test_close");
-                            assert_eq!(
-                                app.settings.detached_viewer_window_physical_placement,
-                                Some(target)
-                            );
-                        }
-                        "park" => {
-                            assert!(app.park_active_detached_image_window());
-                            assert_eq!(app.detached_window_runtime_placement(12), Some(target));
-                            assert_eq!(
-                                app.detached_window_state(12),
-                                Some(DetachedWindowState::Parked)
-                            );
-                            assert_eq!(app.detached_image_windows.last().unwrap().id, 12);
-                        }
-                        _ => unreachable!(),
-                    }
-                },
-            );
-            ctx.end_pass().drop_without_applying_deltas();
+    fn pending_mode_owns_same_output_f11_close_and_park_until_delivered() {
+        for maximized in [false, true] {
+            for action in ["f11", "close", "park"] {
+                let mut app = setup_app();
+                let ctx = egui::Context::default();
+                ctx.set_embed_viewports(false);
+                ctx.begin_pass(Default::default());
+                let viewport_id = App::detached_image_window_viewport_id(12);
+                ctx.show_viewport_deferred(viewport_id, Default::default(), |_, _| {});
+                let idx = push_image(&mut app, r"C:\pics\queued-mode.jpg");
+                insert_static_fs_entry(&mut app, &ctx, idx, "queued_mode");
+                app.fullscreen_idx = Some(idx);
+                app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                app.window_visible = true;
+                app.set_detached_window_binding_for_test(Some(12));
+                app.begin_active_detached_session(12, DetachedSource::Image);
+                let target = crate::detached_window_geometry::PhysicalWindowPlacement {
+                    maximized,
+                    ..app.default_detached_viewer_window_placement()
+                };
+                app.set_detached_window_runtime_placement(12, target, "test");
+                app.set_detached_window_host_for_test(12, 0x1234);
+                let actual_outer = if maximized {
+                    target.outer
+                } else {
+                    crate::detached_window_geometry::borderless_target_for(target.outer).unwrap()
+                };
+                crate::app::detached_placement::with_host_geometry_for_test(
+                    12,
+                    actual_outer,
+                    !maximized,
+                    || {
+                        crate::app::detached_placement::with_host_normal_outer_for_test(
+                            12,
+                            target.outer,
+                            || {
+                                if maximized {
+                                    // The real placement producer queues remaximization.
+                                    app.apply_detached_window_host_placement(&ctx, 12);
+                                } else {
+                                    let claim =
+                                        app.detached_window_manager.host_claim_alive(12).unwrap();
+                                    app.detached_window_manager.mark_host_placed(claim, crate::app::detached_window_manager::PlacementOutcome::Exact);
+                                    app.send_detached_viewport_mode_command(
+                                        &ctx,
+                                        viewport_id,
+                                        false,
+                                    );
+                                }
+                                assert!(app.detached_window_host_is_placed(12));
+                                assert_eq!(
+                                    app.detached_window_manager.pending_mode(12),
+                                    Some(maximized)
+                                );
+                                assert!(ctx.viewport_for(viewport_id, |viewport| viewport.commands.iter().any(
+                            |command| matches!(command, egui::ViewportCommand::Maximized(value) if *value == maximized)
+                        )));
+                                match action {
+                                    "f11" => {
+                                        app.toggle_detached_viewer_borderless_fullscreen(&ctx);
+                                        assert_eq!(
+                                            app.detached_viewer_restore_placement,
+                                            Some(target)
+                                        );
+                                    }
+                                    "close" => {
+                                        app.retire_terminal_detached_viewport_identity(
+                                            12,
+                                            "test_close",
+                                        );
+                                        assert_eq!(
+                                            app.settings.detached_viewer_window_physical_placement,
+                                            Some(target)
+                                        );
+                                    }
+                                    "park" => {
+                                        assert!(app.park_active_detached_image_window());
+                                        assert_eq!(
+                                            app.detached_window_runtime_placement(12),
+                                            Some(target)
+                                        );
+                                        assert_eq!(
+                                            app.detached_window_state(12),
+                                            Some(DetachedWindowState::Parked)
+                                        );
+                                        assert_eq!(
+                                            app.detached_image_windows.last().unwrap().id,
+                                            12
+                                        );
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            },
+                        );
+                    },
+                );
+                ctx.end_pass().drop_without_applying_deltas();
+            }
         }
     }
 
@@ -89349,6 +89386,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     Some(crate::app::detached_window_manager::HostPlacement::Placed {
                         incarnation: claim.incarnation,
                         outcome: crate::app::detached_window_manager::PlacementOutcome::Exact,
+                        pending_mode: None,
                     })
                 );
                 assert_eq!(

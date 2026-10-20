@@ -1475,7 +1475,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   ParkedLive の新規 host の Hidden 作成、位置の記録、設定 (新 field と旧 field の移行)。rect 一致探索・キー入力 subclass・
   状態遷移・park / promote の所有境界・F11 遷移の Settle 時間待ちは変えていない。既定サイズ拒否の防波堤は単位だけ物理にした。
 - 残す検証条件: DPI をまたぐ staging の推奨矩形の前提は、倍率の違うモニターでの実 HWND 試験が通るまで未検証として扱う。
-  メインから開く全画面 viewport は同型だが範囲外 (backlog §1.407)。
+  メインから開く全画面 viewport は同型だが範囲外 (backlog §1.408)。
 
 ### 2026-10-20 §1.232 第5回レビュー: viewer 不在の一覧採用
 
