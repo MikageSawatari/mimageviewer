@@ -1044,13 +1044,15 @@ inner 呼び出しが STA を再入し得るため、状態の `RefCell` borrow 
 | `Disabled` | 初期 / 無効化済み。GetAsyncMode=FALSE、InOperation=FALSE、自己保持なし |
 | `Armed { keep_alive }` | SetAsyncMode(TRUE) 済み。Get=TRUE、In=FALSE、自己への強参照を1個保持 |
 | `Running { keep_alive }` | target が StartOperation 済み。Get=TRUE、In=TRUE、同じ保持参照を移譲 |
-| `Finished` | EndOperation 済み。Get=TRUE (設定値を維持)、In=FALSE、自己保持なし |
+| `Finished` | EndOperation または検証済み Performed DropEffect で完了。Get=TRUE (設定値を維持)、In=FALSE、自己保持なし |
 
 - 1ドラッグにつき1 object。`SetAsyncMode(TRUE)` は自己参照を1回だけ取得し、
   `Armed` にする。`StartOperation` は `Running` へ移し、追加 AddRef は不要。
-- `EndOperation(hr, NULL, effects)` は状態を `Finished` にしてから、保持参照を取り出して
+- `EndOperation(hr, NULL, effects)` または `SetData(CFSTR_PERFORMEDDROPEFFECT)` は、
+  Running の状態を `Finished` にしてから、保持参照を取り出して
   borrow の外で解放する。呼び出し中の object が先に破棄されないよう、呼び出し側の参照と
   ローカル強参照の順序を保証する。成功・コピー中止・失敗とも同じ寿命終端を使う。
+  Performed 通知では SDK に従い S_OK と入力 DWORD を診断値にする。Logical 通知は完了に使わない。
 - `SHDoDragDrop` が戻ったら、ローカル参照を手放す前に **InOperation** を確認する。
   TRUE なら `Running` の自己保持を残す。FALSE で `Armed` のままなら
   外側の専用後始末で `Disabled` へ解除し、自己保持を解放する。Esc / 無効 target / 非同期非対応の
@@ -1058,8 +1060,9 @@ inner 呼び出しが STA を再入し得るため、状態の `RefCell` borrow 
   `Finished` なら End 済みなので二重解放しない。SHDoDragDrop の HRESULT が失敗でも
   同じ後始末を行い、**Running を一律リセットしない**。
 - `SetAsyncMode(FALSE)` は実行前の解除に使う。Running の途中に解除して参照を切らない。
-  重複 TRUE / Start / End は保持数を増減させず、状態に不適合な呼び出しはエラーとして
-  診断する。実装で決める HRESULT をユニットテストに固定する。再利用・複数並行 operation を
+  重複 TRUE / Start / End は保持数を増減させず、Finished への End / Performed 重複は成功とする。
+  未開始 Armed / Disabled への Performed は委譲だけ行い状態を変えず、その他の不適合な
+  async 呼び出しはエラーとして診断する。HRESULT をユニットテストに固定する。再利用・複数並行 operation を
   同じ object に積む契約は作らない。
 - 別のドラッグを始めても前の object を置換・キャンセルしない。各ドラッグが独立した
   Shell snapshot と寿命を持つ。App に「現在の非同期ドラッグ」slot やコピー待ち一覧は不要。
@@ -1150,7 +1153,7 @@ Windows COM ユニット / headless integration で確認する:
 | シナリオ | 期待・観測点 |
 | --- | --- |
 | disposable な数千件を Explorer / desktop へ drop | コピー継続中に SHDoDragDrop が復帰し、mIV のスクロール・選択・フォルダ閲覧が動く。コピー件数・内容も照合 |
-| 同名ファイル確認 / Explorer でコピーをキャンセル | Explorer の標準 UI が動き、mIV が結果待ちにならず、End の成功 / 中止がログで区別できる |
+| 同名ファイル確認 / Explorer でコピーをキャンセル | Explorer の標準 UI が動き、mIV が結果待ちにならず、completed の via / effect と object released を確認できる。marker の S_OK をコピー成功・中止の判定に使わない |
 | コピー中に閲覧フォルダ変更、続けて別ドラッグ | 古い object の GetData / End が有効で、新しいドラッグや viewer の状態に干渉しない |
 | disposable 原本の改名・移動・削除 | Explorer / ファイルシステムの通常の競合処理となり、mIV が別ファイルを代用したり復元したりしない |
 | コピー中の mIV 終了 | mIV の終了が完了する (ハングしない)、Explorer が固まらない。コピー結果は問わない (§12.4 の利用者決定) |
@@ -1237,3 +1240,191 @@ MSBuild 段で exit 1 (Rust 製品コードの失敗ではない)。同じ出力
 原本変更、コピー中の終了、1件等、自己drop・Esc・非同期非対応target) は実機で残る。
 特に終了確認は「mIV の終了が完了し、Explorer が固まらない」、コピー結果は不問という
 利用者決定で確認する。自動 COM 試験成功を Explorer の応答改善の実測結果とはしない。
+
+### 12.11 EndOperation 未到着の調査と Performed DropEffect による完了 (2026-10-20)
+
+利用者の Windows 11 10.0.26300 / Explorer 実機では、コピー中の操作、同名確認、
+キャンセル、終了は成立した。一方、HEAD `3a8035830` のログでは非同期の drag_id
+1 / 2 / 4 / 5 に Start と modal 復帰時の InOperation=TRUE があり、End / object released
+がなかった。自己 drop の drag_id=3 は未開始解除後に解放された。**通常コピー終了後にも
+Running の自己保持が残る問題**があり、§12.10 の自動試験成功では否定できなかった。
+以下の初回調査では保留し、その後の ClaudeCode によるサンドボックス外観測で最小修正を採用した。
+
+#### 初回調査の通知経路候補
+
+Microsoft の [ShlDisp.idl の実装 checklist](https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/shldisp.idl#L984-L1003)
+には、`IDataObject::SetData(CFSTR_PERFORMEDDROPEFFECT)` を受けた object が、HGLOBAL の
+DWORD を effect として `EndOperation(S_OK, NULL, effect)` に接続する記載がある。
+ローカル Windows SDK 10.0.26100.0 `um/ShlDisp.idl` の1079–1080行でも照合した。
+調査時点の外側 SetData は inner へ委譲するだけなので、この通知が届いている場合は、
+**通知の受け取りと Running の所有者が分離している**ことが原因候補になる。
+初回の実機ログには SetData の記録がなく、下記の制約により完了通知の観測点に到達できず、
+この時点では因果を確定できなかった。SDK のコメントには現行シグネチャにない paocb の痕跡もあり、
+コメントだけを実 Explorer の動作の証拠にはしない。
+
+marker が実測できた場合の最小修正候補は、現在の自己保持を維持したまま、直接の End と
+validated Performed DropEffect を共通の Running → Finished 遷移に集めること。
+入力 DWORD は inner.SetData の**前**に検証・取得し、fRelease による解放後には読まない。
+呼び出し中の強参照を委譲前から完了処理後まで保持し、再入後の現在状態を確認する。
+inner の HRESULT / medium 所有権は保ち、inner の保存失敗と外側の通知受領を区別する。
+Finished への重複通知は冪等、未開始 Armed を marker だけで完了させない。
+ログでは実 End 受信と marker による完了を区別し、marker からコピー成功を宣言しない。
+この案への独立 Codex (`gpt-6.1-sol` / `xhigh`) の合意は **marker 到着の実測を条件とする**。
+
+自己保持の単純削除は SetAsyncMode の AddRef 契約を変える。最後の外部 Release を検出する
+別 owner は `#[implement]` の Release 境界を含む別設計になる。いずれも現時点では採用しない。
+timer 回収、modal 復帰時の Running 強制解除、終了時一括解放は追加しない。
+
+#### 追加した隔離プローブ
+
+`src/file_drag/async_data_object/tests/shell_drop_probe.rs` の ignored tests は、
+製品ではなく **lib test executable** の子プロセスを使う。通常の lib 全件には含まれない。
+temp に source / destination を作り、8件 × 128 bytes の重複しないファイルを使う。
+Shell target を取得し、DragEnter / DragOver / Drop を呼び、STA でメッセージを回す。
+コピー全件の内容一致を5秒以内で確認し、その後2秒の配送観測区間を置く。
+親は自分が生成した子だけを12秒目安で監視する。別プロセスの場合は親 STA に配送された
+callback 内でブロックすると期限の確認自体が延びるため、suite 全体の絶対上限ではない。
+同一プロセス試験の親は source を持たず、実 Drop の外側で子を監視する。
+これらは**試験の観測・待機期限**であり、製品の寿命管理・回収条件ではない。
+Explorer のウィンドウ・入力・実ファイルを操作しない。
+Shell が読み込む登録済み拡張まで独自実装へ置き換える試験ではない。
+
+- 同一プロセス: 実 Shell snapshot と実ラッパーを、同一 STA 内の Shell target に渡す。
+- 別プロセス: IDataObject を標準 COM marshal し、子で QI した async interface と target を使う。
+  親の STA は pump を継続し、子終了後に marshal-table の保持も対で解放する。
+- 配送 control: 別プロセスから明示的に Start / CF_HDROP GetData / End を呼ぶ。
+  Shell target の実通知とは区別して synthetic と記録し、実装 STA の thread ID、
+  InOperation=FALSE、marshal 解放後にローカル2参照だけが残ることを検査する。
+
+cfg(test) の観測 hook は有効化したプローブだけが記録する。Start / 実 End 入口 / End 処理 / GetData /
+最終 Release の thread、SetData の全 format 名・DWORD・fRelease、target の HRESULT / effect /
+時間、コピー内容一致、ローカル破棄前の参照数を stderr に残す。mIV の logger は初期化せず、
+通常プロファイルへログを書かない。修正前は Running が残った場合も、先に実観測とローカル破棄後の
+記録を出し、その後で **synthetic EndOperation と明示した試験終了処理**を行う。
+その End / Release を Shell 自身による完了の証拠に混ぜなかった。
+修正後のプローブではこの cleanup End 自体を削除し、通知による完了・解放を必須にした (下記)。
+
+#### 初回に実測できた範囲と停止理由
+
+`BHID_SFUIObject` (GetUIObjectOf) と `BHID_SFViewObject` (CreateViewObject) の両経路で、
+同一 / 別プロセスとも DragEnter / DragOver は S_OK、COPY を返した。しかし Drop 内で
+`PowerToys.ImageResizerExt.dll` からの C++ 例外が Rust test harness まで漏れ、子が abort した。
+**StartOperation 前、コピー内容一致前であり、End / Performed DropEffect の判定点には未到達**。
+左ボタン指定を Drop にも渡して再実行したが同じ結果だった。
+
+CDB の first-chance native stack と exception object のメモリから、型
+`std::filesystem::filesystem_error`、error code 5、メッセージ
+`create_directories: Access is denied.`、対象ディレクトリ
+`%LOCALAPPDATA%\Microsoft\PowerToys\ImageResizer` を確認した。
+これは本環境での試験制約であり、利用者の「Start 後に End がない」原因や PowerToys 自体の
+不具合とは断定しない。権限境界の迂回、拡張の無効化、レジストリ・PowerToys 設定の変更、
+製品側への例外抑止は行わない。証跡は `target/dragcache-shell-probe-sfui-failed.log`、
+`target/dragcache-shell-probe-sfview-failed.log`、`target/dragcache-probe-cdb*.log`。
+
+別プロセスからの synthetic control と通常の焦点テストの結果は下記に記録する。
+独立レビューも、上記の観測不能な状態から SDK bridge を先行実装する根拠は増えていないと判断した。
+初回は **製品の所有・完了処理の変更を保留**し、実 Shell の通知を観測できる環境での結果を次判断へ渡した。
+この時点では cfg(test) だけの診断追加だったため、製品の見た目・マニュアル・確認用製品バイナリは変更しなかった。
+
+| 初回調査差分の検証 (修正前) | 結果・証跡 |
+| --- | --- |
+| opt-in Shell probes + cross-process control | exit 100、control 1件成功 / 実 Shell 2件は上記例外で失敗。run ID `48191290-7565-42c5-ac50-f23c6c96e36a`、`target/dragcache-shell-probe-final.log` |
+| control の到達・解放 | client thread=88092、Start / GetData / End入口 / End処理はすべて owner STA=51196。marshal 解放後 In=FALSE / source_refs=2、ローカル破棄で released=1 を確認。cleanup End は使っていない。これは子が明示送信した通知であり、実 Shell の通知ではない |
+| 既存 COM / 送出の焦点テスト | 35件成功、失敗0。§12.10 と同じ filter。run ID `92493f6b-c861-49bb-b31f-a25c5548cee3`、`target/dragcache-investigation-focused.log` |
+| 全体 `cargo fmt` / `cargo fmt --check` / `git diff --check` | exit 0 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0。`target/dragcache-investigation-glyphs.log` |
+| 製品ビルド / 本体lib全件 / 製品起動 | cfg(test) と文書だけの調査差分なので build-dev は省略。本体lib全件は ClaudeCode の最終 gate。製品を起動していない |
+
+初回調査 Rust source の hash は `target/dragcache-investigation-source-hashes.json`。
+独立レビューの限定指摘 (親 STA callback 中は12秒監視が延びること、有限の End 観測区間と
+子終了による COM rundown の区別) は上記に反映した。unsafe / marshal の対 / cleanup には
+追加の重大指摘なし。デバッガ用 temp fixture 1件の削除はコマンドの自動承認レビューが
+`blocked by policy` として拒否したため残っている。場所は `target/dragcache-probe-root.txt`。
+通常の tempfile ベースのプローブは各親の終了時に一時フォルダを片付けている。
+
+#### サンドボックス外での実 Shell 観測と採用した修正
+
+ClaudeCode が通常の PowerShell から下記の調査コマンドを実行し、
+`target/dragcache-shell-probe-user.log` に2件 PASS を記録した。
+修正前の記録は `target/dragcache-shell-probe-user-baseline.log` にも保全した。
+**同一 / 別プロセスとも Start 後の完了通知は Performed DropEffect で、直接の End はなかった**。
+
+| 順序 | 両プローブの観測 |
+| --- | --- |
+| DragEnter / DragOver | DropDescription / TargetCLSID 等の SetData |
+| Start 直後 | Logical Performed DropEffect=1、fRelease=TRUE。コピー内容はまだ一致していない |
+| 約200ms | コピー全8件の内容一致 |
+| その後 | Logical Performed DropEffect=1、続けて Performed DropEffect=1、いずれも fRelease=TRUE |
+| 観測区間終了 | copies_equal=TRUE、Running=TRUE、source_refs=3、実 End / released なし |
+| 旧プローブの synthetic cleanup End | end_entered / end / released が初めて出る |
+
+これにより、Shell の実通知は作成元 STA に届いており、**外側が Performed 通知を inner に
+委譲するだけで Running の自己保持を解放していなかった**ことを確認した。
+標準 marshal の修正や自己保持契約の変更は不要。独立設計レビューの実測条件が成立し、
+ClaudeCode / 利用者指示に基づいて上記の最小修正を採用した。
+
+- `complete_running` が直接 End と検証済み Performed の唯一の Running → Finished 遷移を担う。
+  状態を置換して borrow を閉じてから自己保持を解放する。Finished の重複は追加処理せず、
+  Armed / Disabled は marker で変更しない。App への完了通知・終了待機は追加しない。
+- constructor で Performed format を登録する。SetData はその format、CONTENT、lindex=-1、
+  HGLOBAL を含む FORMATETC、実 HGLOBAL medium、DWORD 以上の GlobalSize と GlobalLock 成功を検証する。
+  Logical Performed / Paste Succeeded / 他形式は完了に使わない。
+- SetData の入口から強参照を保持し、DWORD を読み終えて unlock してから inner を呼ぶ。
+  委譲後の input / HGLOBAL は読まない。inner のエラーも含む HRESULT と fRelease の所有規則を維持し、
+  完了通知の受領は inner の保存成否と分離する。再入後の現在状態が Running の場合だけ完了させる。
+  windows-rs の成功 HRESULT 正規化は §12.3 の既存契約どおり。
+- 製品ログは実 End 受信を `async EndOperation received`、1回だけの完了処理を
+  `async completed ... via=end_operation` / `via=performed_drop_effect`、破棄を
+  `object released` と区別する。marker の result=S_OK は SDK の値で、コピー成功通知には使わない。
+- 通常の mock 単体を追加し、実 HGLOBAL が inner 内で解放される fRelease=TRUE、FALSE、
+  inner の S_OK / S_FALSE / E_NOTIMPL、effect=NONE / COPY / MOVE の全てで同じ寿命処理を確認する。
+  Logical 単独、未開始・無効状態、両順序の重複、inner からの End / marker / disable 再入、
+  不正入力、ドラッグ間分離も検査する。MOVE は診断値の単体試験だけで、製品の COPY 限定は維持する。
+- ignored probes は synthetic cleanup End を削除した。Start があり、完了が1回、InOperation=FALSE、
+  ソース側ローカル参照を手放して released=1 を要求する。別プロセスでは marshal-table 保持も
+  対で解除した後に検査する。control の明示 End は synthetic と表示する別の配送検査のまま。
+
+初回の残りデバッガ temp fixture は ClaudeCode が削除するという利用者指示に従い、今回は触らない。
+見た目・利用操作・公開マニュアルの記述範囲は変わらず、snapshot PNG は更新しない。
+
+#### 修正差分の検証記録
+
+| 検証 | 結果・証跡 |
+| --- | --- |
+| 独立 Codex (`gpt-6.1-sol` / `xhigh`) の限定レビュー | P1/P2 指摘なし。事前 DWORD 取得、call_ref、再入後の状態確認、一度だけの解放、HRESULT / medium 所有権、追加7単体、cleanup End を除いた probe の検査を確認。レビュー担当は Cargo / UI を再実行していない |
+| 最終整形後の焦点テスト | 42件成功、失敗0。§12.10 と同じ filter。run ID `91c5aaf9-502c-4505-af1f-b68f46128be4`、`target/dragcache-completion-focused.log` |
+| 別プロセス配送 control | 1件成功。client=83188 から Start / GetData / End が owner STA=67552 に配送、In=FALSE / source_refs=2、cleanup End なしで released=1。run ID `21a354b5-fd27-44c2-b35c-35196718d8de`、`target/dragcache-completion-control.log` |
+| 全体 `cargo fmt` / `cargo fmt --check` / `git diff --check` | exit 0。最終 Rust source の SHA-256 は `target/dragcache-completion-source-hashes.json` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0。`target/dragcache-completion-glyphs.log` |
+| build-dev | exit 0、core / remote / EPUB worker を通常 feature・非 portable で生成。core は 3m39s、VCRT/PE 検査も成功。`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`、`-PreserveRuntime -WaitForOtherBuildsMinutes 0`。`target/dragcache-completion-build-dev.log`。製品は起動していない |
+| 修正後の実 Shell 2件 / Explorer 製品実機 | 未実施。前回同環境で確定した Start 前の拡張 DLL 例外の制約を再利用し、修正後 probe は ClaudeCode のサンドボックス外実行へ残す。修正前の外部 probe 成功を修正後の成功とは扱わない |
+| 本体lib全件 / commit / 製品起動 | 本体lib全件は ClaudeCode の最終 gate。利用者指示どおり commit と製品起動は行わない |
+
+#### 修正後の最小確認
+
+通常の PowerShell で、同じ worktree から次の headless probe を1回実行する。
+製品の起動・Explorer の画面操作は不要で、コピー対象はプローブが作る temp だけ。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run -j 1 -p mimageviewer --lib --run-ignored only -E 'test(/shell_drop_probe_(same|cross)_process$/)' --success-output immediate --failure-output immediate *> target/dragcache-shell-probe-user.log
+```
+
+`probe byte comparison completed=true` / `copies_equal=true` を確認し、同じ drag_id の
+`start` → `SetData` (`Performed DropEffect`) → `end` → `released` を追う。
+marker による完了なら `end_entered` は不要で、実 End 受信とは区別する。
+`probe observation` が `running=false source_refs=2`、
+`after source locals dropped (no cleanup End)` に `released` が1回現れ、2件 PASS することが基準。
+synthetic cleanup End は実行しない。2秒は有限の観測区間で、Shell metadata 全体の完了は保証しない。
+別プロセスの参照数は子終了による COM rundown 後の値なので、稼働中の target が自然に
+最終参照を離した証拠とは区別する。
+この probe は実 Shell folder target の観測であり、Explorer の window / site / OLE loop と同一とは
+保証しない。製品では利用者の既存隔離データで数千件を1回コピーし、同じ drag_id の
+`async StartOperation`、`SHDoDragDrop done ... in_operation=Some(true)`、
+`async completed ... via=performed_drop_effect`、`object released` がそろうことを確認する。
+小さいコピーで完了が早ければ、completed が modal 復帰より前 / InOperation=FALSE でも正常。
+実 End を呼ぶ target では `async EndOperation received` と `completed ... via=end_operation` が対応する。
+コピー中の mIV 操作、同名確認、Explorer キャンセル、自己 drop / Esc / 1件の既存挙動も確認し、
+自己 drop / Esc の未開始終了には completed がなくても released があればよい。
+コピー中終了は従来の利用者決定どおり、終了完了と Explorer がハングしないことを確認し、
+プロセス終了までに未完了の drag_id の released がなくても転送完遂を保証する設計には変えない。

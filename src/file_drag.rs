@@ -11,7 +11,7 @@
 //! UI スレッド・マウス押下中に `SHDoDragDrop` を呼ぶ。ドラッグ操作の OLE モーダル
 //! 区間は残る。非同期を選択して Drop から早期復帰する target では、その後の転送完了を
 //! 待たない。非対応 target の同期処理と開始前の Shell 解決コストは残る。
-//! 復帰後の GetData / EndOperation は通常の winit message loop が UI STA へ配送する。
+//! 復帰後の GetData / SetData / EndOperation は通常の winit message loop が UI STA へ配送する。
 //! 1ドラッグ1 owner とし App を参照せず、終了時に転送完了を待つ機構も追加しない。
 
 use std::path::{Path, PathBuf};

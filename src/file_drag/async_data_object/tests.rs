@@ -16,6 +16,77 @@ use windows::Win32::System::Ole::{CF_HDROP, ReleaseStgMedium};
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, SHCreateStdEnumFmtEtc};
 use windows::core::{GUID, IUnknown, IUnknown_Vtbl};
 
+mod shell_drop_probe;
+
+static CAPTURE_LIFECYCLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LIFECYCLE_EVENTS: std::sync::Mutex<Vec<(&'static str, u64, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(super) fn observe_lifecycle_event(event: &'static str, id: u64) {
+    if CAPTURE_LIFECYCLE.load(Ordering::Relaxed) {
+        let thread = unsafe { GetCurrentThreadId() };
+        eprintln!("shell_drop_probe: {event} drag_id={id} thread={thread}");
+        LIFECYCLE_EVENTS.lock().unwrap().push((event, id, thread));
+    }
+}
+
+fn clear_lifecycle_events() {
+    LIFECYCLE_EVENTS.lock().unwrap().clear();
+    CAPTURE_LIFECYCLE.store(true, Ordering::Relaxed);
+}
+
+fn take_lifecycle_events() -> Vec<(&'static str, u64, u32)> {
+    std::mem::take(&mut *LIFECYCLE_EVENTS.lock().unwrap())
+}
+
+pub(super) fn observe_set_data(
+    id: u64,
+    format: *const FORMATETC,
+    medium: *const STGMEDIUM,
+    release: BOOL,
+) {
+    if !CAPTURE_LIFECYCLE.load(Ordering::Relaxed) {
+        return;
+    }
+    use windows::Win32::System::DataExchange::GetClipboardFormatNameW;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    let Some(format) = (unsafe { format.as_ref() }) else {
+        return;
+    };
+    let mut name = [0u16; 256];
+    let count = unsafe { GetClipboardFormatNameW(format.cfFormat as u32, &mut name) };
+    let name = String::from_utf16_lossy(&name[..count.max(0) as usize]);
+    let effect = unsafe { medium.as_ref() }
+        .filter(|m| m.tymed == TYMED_HGLOBAL.0 as u32)
+        .and_then(|m| unsafe {
+            let global = m.u.hGlobal;
+            if GlobalSize(global) < std::mem::size_of::<u32>() {
+                return None;
+            }
+            let ptr = GlobalLock(global);
+            if ptr.is_null() {
+                return None;
+            }
+            let value = ptr.cast::<u32>().read_unaligned();
+            let _ = GlobalUnlock(global);
+            Some(value)
+        });
+    eprintln!(
+        "shell_drop_probe: SetData drag_id={id} format={} name={name:?} effect={effect:?} release={}",
+        format.cfFormat,
+        release.as_bool()
+    );
+    observe_lifecycle_event(
+        match name.as_str() {
+            "Performed DropEffect" => "performed",
+            "Logical Performed DropEffect" => "logical_performed",
+            "Paste Succeeded" => "paste_succeeded",
+            _ => "set_data",
+        },
+        id,
+    );
+}
+
 struct Sta;
 impl Sta {
     fn new() -> Self {
@@ -75,9 +146,13 @@ struct RawInner {
     vtable: &'static IDataObject_Vtbl,
     refs: Cell<u32>,
     probe: Rc<Probe>,
+    owned_medium: Option<STGMEDIUM>,
 }
 impl Drop for RawInner {
     fn drop(&mut self) {
+        if let Some(mut medium) = self.owned_medium.take() {
+            unsafe { ReleaseStgMedium(&mut medium) };
+        }
         self.probe.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -170,9 +245,12 @@ unsafe extern "system" fn set(
     m: *const STGMEDIUM,
     take: BOOL,
 ) -> HRESULT {
-    let hr = unsafe { inner(this) }
-        .probe
-        .record("set", vec![f as usize, m as usize, take.0 as usize]);
+    let p = &unsafe { inner(this) }.probe;
+    let hr = p.record("set", vec![f as usize, m as usize, take.0 as usize]);
+    let callback = p.callback.borrow_mut().take();
+    if let Some(callback) = callback {
+        callback();
+    }
     if hr.is_ok() && take.as_bool() {
         // fRelease transfers the existing ownership, not the input structure's storage.
         // Bit-copy without AddRef, then let ReleaseStgMedium mutate only our local copy.
@@ -246,6 +324,10 @@ static INNER_VTABLE: IDataObject_Vtbl = IDataObject_Vtbl {
     EnumDAdvise: enum_advises,
 };
 fn mock() -> (IDataObject, Rc<Probe>) {
+    mock_owning_medium(None)
+}
+
+fn mock_owning_medium(owned_medium: Option<STGMEDIUM>) -> (IDataObject, Rc<Probe>) {
     let probe = Rc::new(Probe {
         calls: RefCell::new(vec![]),
         status: Cell::new(S_OK),
@@ -260,6 +342,7 @@ fn mock() -> (IDataObject, Rc<Probe>) {
         vtable: &INNER_VTABLE,
         refs: Cell::new(1),
         probe: probe.clone(),
+        owned_medium,
     }));
     (unsafe { IDataObject::from_raw(ptr.cast()) }, probe)
 }
@@ -326,7 +409,7 @@ fn state_contract_and_invalid_duplicates_are_stable() {
         a.EndOperation(E_NOTIMPL, None::<&IBindCtx>, 0).unwrap();
         assert!(!a.InOperation().unwrap().as_bool());
         assert!(a.GetAsyncMode().unwrap().as_bool());
-        invalid(a.EndOperation(S_OK, None::<&IBindCtx>, 1));
+        a.EndOperation(S_OK, None::<&IBindCtx>, 1).unwrap(); // Finished is idempotent.
         invalid(a.StartOperation(None::<&IBindCtx>));
         invalid(a.SetAsyncMode(true));
     }
@@ -597,6 +680,269 @@ fn medium_ownership_and_frelease_belong_to_inner_and_caller() {
         assert_eq!(released.drops.load(Ordering::SeqCst), 1);
     }
     drag.finish_modal().unwrap();
+}
+
+fn effect_format(name: windows::core::PCWSTR) -> FORMATETC {
+    let cf_format = unsafe { RegisterClipboardFormatW(name) } as u16;
+    assert_ne!(cf_format, 0);
+    FORMATETC {
+        cfFormat: cf_format,
+        ..format()
+    }
+}
+
+/// pUnkForRelease owns the real HGLOBAL and frees it at its final Release.
+/// The retained Probe observes destruction without retaining the COM owner.
+fn effect_medium(effect: u32) -> (STGMEDIUM, Rc<Probe>) {
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc};
+    let global = unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>()).unwrap() };
+    let ptr = unsafe { GlobalLock(global) };
+    assert!(!ptr.is_null());
+    unsafe { ptr.cast::<u32>().write_unaligned(effect) };
+    let _ = unsafe { GlobalUnlock(global) };
+    let (owner, probe) = mock_owning_medium(Some(STGMEDIUM {
+        tymed: TYMED_HGLOBAL.0 as u32,
+        u: STGMEDIUM_0 { hGlobal: global },
+        pUnkForRelease: ManuallyDrop::new(None),
+    }));
+    let unknown = owner.cast::<IUnknown>().unwrap();
+    drop(owner);
+    (
+        STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: global },
+            pUnkForRelease: ManuallyDrop::new(Some(unknown)),
+        },
+        probe,
+    )
+}
+
+#[test]
+fn performed_marker_finishes_running_preserving_hresult_and_medium_ownership() {
+    let _sta = Sta::new();
+    let f = effect_format(CFSTR_PERFORMEDDROPEFFECT);
+    for status in [S_OK, S_FALSE, E_NOTIMPL] {
+        for take in [false, true] {
+            for effect in [0, 1, 2] {
+                let (drag, p) = wrapped();
+                unsafe { drag.capability.StartOperation(None::<&IBindCtx>).unwrap() };
+                assert!(drag.finish_modal().unwrap());
+                let target = drag.data.clone();
+                drop(drag); // Only the target reference and Running self-hold remain.
+                p.status.set(status);
+                let (mut medium, owner) = effect_medium(effect);
+                let global = unsafe { medium.u.hGlobal };
+                let address = medium.pUnkForRelease.as_ref().unwrap().as_raw();
+                let hr =
+                    unsafe { (target.vtable().SetData)(target.as_raw(), &f, &medium, take.into()) };
+                assert_eq!(hr, if status.is_ok() { S_OK } else { status });
+                assert_eq!(
+                    p.calls.borrow().last(),
+                    Some(&Call(
+                        "set",
+                        vec![
+                            &f as *const _ as usize,
+                            &medium as *const _ as usize,
+                            usize::from(take),
+                        ]
+                    ))
+                );
+                // The input structure is borrowed storage, even when ownership transfers.
+                assert_eq!(medium.tymed, TYMED_HGLOBAL.0 as u32);
+                assert_eq!(unsafe { medium.u.hGlobal }, global);
+                assert_eq!(medium.pUnkForRelease.as_ref().unwrap().as_raw(), address);
+                let transferred = status.is_ok() && take;
+                assert_eq!(owner.drops.load(Ordering::SeqCst), usize::from(transferred));
+                if !transferred {
+                    unsafe { ReleaseStgMedium(&mut medium) };
+                }
+                assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+                let cap: IDataObjectAsyncCapability = target.cast().unwrap();
+                assert!(!unsafe { cap.InOperation().unwrap() }.as_bool());
+                assert!(unsafe { cap.GetAsyncMode().unwrap() }.as_bool());
+                assert_eq!(p.drops.load(Ordering::SeqCst), 0);
+                drop((target, cap));
+                assert_eq!(p.drops.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn logical_marker_does_not_finish_running() {
+    let _sta = Sta::new();
+    let (drag, p) = wrapped();
+    let f = effect_format(windows::Win32::UI::Shell::CFSTR_LOGICALPERFORMEDDROPEFFECT);
+    unsafe { drag.capability.StartOperation(None::<&IBindCtx>).unwrap() };
+    for effect in [1, 0] {
+        let (medium, owner) = effect_medium(effect);
+        unsafe { drag.data.SetData(&f, &medium, true).unwrap() };
+        assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+        assert!(drag.finish_modal().unwrap());
+    }
+    unsafe {
+        drag.capability
+            .EndOperation(S_OK, None::<&IBindCtx>, 1)
+            .unwrap()
+    };
+    drop(drag);
+    assert_eq!(p.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn performed_marker_does_not_complete_armed_or_disabled() {
+    let _sta = Sta::new();
+    let f = effect_format(CFSTR_PERFORMEDDROPEFFECT);
+    for disabled in [false, true] {
+        let (drag, p) = wrapped();
+        if disabled {
+            unsafe { drag.capability.SetAsyncMode(false).unwrap() };
+        }
+        let (medium, owner) = effect_medium(1);
+        unsafe { drag.data.SetData(&f, &medium, true).unwrap() };
+        assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            unsafe { drag.capability.GetAsyncMode().unwrap() }.as_bool(),
+            !disabled
+        );
+        // A synchronous/self drop must still disarm Armed rather than leave Finished.
+        assert!(!drag.finish_modal().unwrap());
+        assert!(!unsafe { drag.capability.GetAsyncMode().unwrap() }.as_bool());
+        drop(drag);
+        assert_eq!(p.drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn marker_and_direct_end_are_idempotent_in_both_orders() {
+    let _sta = Sta::new();
+    let f = effect_format(CFSTR_PERFORMEDDROPEFFECT);
+    for end_first in [false, true] {
+        let (drag, p) = wrapped();
+        unsafe {
+            drag.capability.StartOperation(None::<&IBindCtx>).unwrap();
+            if end_first {
+                drag.capability
+                    .EndOperation(E_NOTIMPL, None::<&IBindCtx>, 0)
+                    .unwrap();
+            }
+            for effect in [1, 0] {
+                let (medium, owner) = effect_medium(effect);
+                drag.data.SetData(&f, &medium, true).unwrap();
+                assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+                drag.capability
+                    .EndOperation(S_OK, None::<&IBindCtx>, 2)
+                    .unwrap();
+            }
+        }
+        assert!(!drag.finish_modal().unwrap());
+        drop(drag);
+        assert_eq!(p.drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn inner_setdata_can_reenter_completion_or_disable_without_double_release() {
+    let _sta = Sta::new();
+    let f = effect_format(CFSTR_PERFORMEDDROPEFFECT);
+    for mode in 0..3 {
+        let (drag, p) = wrapped();
+        unsafe { drag.capability.StartOperation(None::<&IBindCtx>).unwrap() };
+        let cap = drag.capability.clone();
+        let target = drag.data.clone();
+        let seen = Rc::new(Cell::new(false));
+        let observed = seen.clone();
+        *p.callback.borrow_mut() = Some(Box::new(move || unsafe {
+            observed.set(cap.InOperation().unwrap().as_bool());
+            if mode == 1 {
+                let (medium, owner) = effect_medium(0);
+                target.SetData(&f, &medium, true).unwrap();
+                assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+            } else {
+                cap.EndOperation(S_OK, None::<&IBindCtx>, 0).unwrap();
+                if mode == 2 {
+                    cap.SetAsyncMode(false).unwrap();
+                }
+            }
+        }));
+        let (medium, owner) = effect_medium(1);
+        unsafe { drag.data.SetData(&f, &medium, true).unwrap() };
+        assert!(seen.get());
+        assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+        assert!(!unsafe { drag.capability.InOperation().unwrap() }.as_bool());
+        assert_eq!(
+            unsafe { drag.capability.GetAsyncMode().unwrap() }.as_bool(),
+            mode != 2
+        );
+        drop(drag);
+        assert_eq!(p.drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn malformed_completion_keeps_running_and_preserves_delegate_error() {
+    let _sta = Sta::new();
+    let (drag, p) = wrapped();
+    p.status.set(E_NOTIMPL);
+    unsafe { drag.capability.StartOperation(None::<&IBindCtx>).unwrap() };
+    let f = effect_format(CFSTR_PERFORMEDDROPEFFECT);
+    let (mut medium, owner) = effect_medium(1);
+    let verify = |format, medium| {
+        let error = unsafe { drag.data.SetData(format, medium, false) }.unwrap_err();
+        assert_eq!(error.code(), E_NOTIMPL);
+        assert!(drag.finish_modal().unwrap());
+    };
+    for bad in [
+        format(),
+        FORMATETC { dwAspect: 0, ..f },
+        FORMATETC { lindex: 0, ..f },
+        FORMATETC { tymed: 0, ..f },
+    ] {
+        verify(&bad, &medium);
+    }
+    verify(std::ptr::null(), &medium);
+    verify(&f, std::ptr::null());
+    let mut empty = STGMEDIUM::default();
+    verify(&f, &empty); // Non-HGLOBAL.
+    empty.tymed = TYMED_HGLOBAL.0 as u32;
+    verify(&f, &empty); // Zero size / invalid HGLOBAL.
+    unsafe { ReleaseStgMedium(&mut medium) };
+    assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+    unsafe {
+        drag.capability
+            .EndOperation(S_OK, None::<&IBindCtx>, 0)
+            .unwrap()
+    };
+    drop(drag);
+    assert_eq!(p.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn performed_marker_completes_only_its_own_drag() {
+    let _sta = Sta::new();
+    let (a, pa) = wrapped();
+    let (b, pb) = wrapped();
+    unsafe {
+        a.capability.StartOperation(None::<&IBindCtx>).unwrap();
+        b.capability.StartOperation(None::<&IBindCtx>).unwrap();
+        let (medium, owner) = effect_medium(1);
+        a.data
+            .SetData(&effect_format(CFSTR_PERFORMEDDROPEFFECT), &medium, true)
+            .unwrap();
+        assert_eq!(owner.drops.load(Ordering::SeqCst), 1);
+    }
+    assert!(!a.finish_modal().unwrap());
+    drop(a);
+    assert_eq!(pa.drops.load(Ordering::SeqCst), 1);
+    assert!(b.finish_modal().unwrap());
+    assert_eq!(pb.drops.load(Ordering::SeqCst), 0);
+    unsafe {
+        b.capability
+            .EndOperation(S_OK, None::<&IBindCtx>, 0)
+            .unwrap()
+    };
+    drop(b);
+    assert_eq!(pb.drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
