@@ -16000,10 +16000,11 @@ pub struct App {
     /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
     pub(crate) items_generation: u64,
 
-    /// Counts accepted folder/list load starts, including requests cancelled before completion.
-    /// Direct dispatcher entries count after delegation, at load_folder_with_scan_claimed or
-    /// the Smart child owner's admission. Staged physical Preflighting entries count at
-    /// admit_physical_history_phase. Dispatchers and completion/install paths never add again.
+    /// Counts new folder-load owners, including those cancelled before completion. Direct
+    /// loads and Smart children count at admission; physical history counts every new request
+    /// regardless of its initial phase. Direct archive scans count at their completion-policy
+    /// owner's creation (direct cache hits at admission). InternalHydration, StagedHistory
+    /// and Smart transition handoffs retain an existing owner and never count a second start.
     #[cfg(all(windows, feature = "test-script"))]
     pub(crate) test_script_folder_load_requests: u64,
 
@@ -28975,6 +28976,8 @@ impl App {
                 }
                 // ★固定 ガード等でブロックされたら Ignored を返し、後続の drill 進行に
                 // 流さない (Codex P1)。
+                #[cfg(all(windows, feature = "test-script"))]
+                self.test_script_record_folder_load_owner(&restore_intent);
                 return if self.open_archive_via_cache_owned(
                     path,
                     cached,
@@ -29753,6 +29756,16 @@ impl App {
         }
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_record_folder_load_owner(&mut self, intent: &StartupListIntent) {
+        // This typed intent explicitly hydrates the SAME request accepted by its caller.
+        // In particular, direct archive completion may create a physical execution request.
+        if !matches!(intent, StartupListIntent::InternalHydration(_)) {
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
+        }
+    }
+
     fn load_folder_with_scan_claimed(
         &mut self,
         path: PathBuf,
@@ -29810,8 +29823,7 @@ impl App {
         {
             // A staged physical request has already returned above. Only this owner starts
             // the direct load; callers rejected before admission do not count.
-            self.test_script_folder_load_requests =
-                self.test_script_folder_load_requests.saturating_add(1);
+            self.test_script_record_folder_load_owner(&restore_intent);
         }
         if pre_scan.is_none()
             && crate::folder_tree::is_paged_document_path(&path)
@@ -33596,6 +33608,15 @@ impl App {
             return_to,
             phase: CollectionHistoryPhase::Preparing(prepare),
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        if matches!(
+            transition.target,
+            FolderNavHistoryTarget::CollectionPhysical(_)
+        ) && self.main_list_navigation_is_current(&transition.navigation)
+        {
+            // Root catalog preparation is not a physical folder load; a child owns one.
+            self.test_script_record_folder_load_owner(&StartupListIntent::ExplicitList);
+        }
         self.replace_history_navigation_transition(Some(HistoryNavigationTransition::Collection(
             transition,
         )));
@@ -34004,13 +34025,10 @@ impl App {
             restore_intent: restore_intent.clone(),
         };
         #[cfg(all(windows, feature = "test-script"))]
-        if matches!(request.phase, PhysicalHistoryPhase::Preflighting { .. })
-            && self.main_list_navigation_is_current(&request.navigation)
-        {
+        if self.main_list_navigation_is_current(&request.navigation) {
             // Count admission, including requests superseded before their worker completes.
             // Completion and password/conversion continuations retain this request owner.
-            self.test_script_folder_load_requests =
-                self.test_script_folder_load_requests.saturating_add(1);
+            self.test_script_record_folder_load_owner(&request.restore_intent);
         }
         self.replace_history_navigation_transition(Some(HistoryNavigationTransition::Physical(
             request,
@@ -34285,6 +34303,8 @@ impl App {
             global_search_origin: self.capture_search_open_origin(),
             grid_open_effects: None,
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        self.test_script_record_folder_load_owner(&request.restore_intent);
         self.replace_history_navigation_transition(None);
         self.poll_physical_history_transition(ctx, request);
         true
@@ -34982,29 +35002,16 @@ impl App {
         format: crate::archive_converter::ArchiveFormat,
         restore_intent: StartupListIntent,
     ) -> bool {
-        let started = if format == crate::archive_converter::ArchiveFormat::Rar {
-            self.request_rar_open_owned(
-                path.to_path_buf(),
-                false,
-                OpenRequestOwner::Navigation,
-                restore_intent.clone(),
-            )
-        } else {
-            self.request_archive_convert_owned(
-                path.to_path_buf(),
-                format,
-                false,
-                OpenRequestOwner::Navigation,
-                restore_intent.clone(),
-            )
-        };
-        if started {
-            if let Some(state) = self.archive_convert.as_mut() {
-                state.completion =
-                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(request_id);
-            }
-        }
-        started
+        // This is a continuation of the caller's open, not a new Navigation owner.
+        self.request_archive_open_with_completion(
+            path.to_path_buf(),
+            format,
+            false,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(
+                request_id,
+            ),
+            restore_intent,
+        )
     }
 
     pub(crate) fn complete_staged_history_archive_conversion(
@@ -64684,6 +64691,8 @@ impl App {
                         );
                         return true;
                     }
+                    #[cfg(all(windows, feature = "test-script"))]
+                    self.test_script_record_folder_load_owner(&StartupListIntent::ExplicitList);
                     let outcome = self
                         .open_converted_grid_archive_in_detached_context(ctx, cached_zip, &owner);
                     self.finish_detached_grid_archive_open(

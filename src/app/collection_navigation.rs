@@ -4135,6 +4135,12 @@ impl App {
                 self.finish_collection_navigation_without_target(ctx, &action);
                 return;
             };
+            #[cfg(all(windows, feature = "test-script"))]
+            if is_outer_target {
+                // Without a main history request, this adopted Collection lease owns the
+                // physical load. Its InternalHydration calls below only execute that owner.
+                self.test_script_record_folder_load_owner(&restore_intent);
+            }
             Some(landing)
         };
         let target_idx = landing.as_ref().map_or(0, |landing| landing.target_idx);

@@ -6033,3 +6033,12 @@ focused・全lib・snapshot・解析器回帰と計測用buildは成功。途中
 - 完成前確認（2026-10-20）で、先頭の診断blockerがUnknownの場合に後続兄弟のPendingを取消条件から漏らす実装を修正。
   診断と取消を分け、同じ呼出内の全Next状態から`any(Pending)`で導出する。実装担当と独立reviewer双方が設計への整合修正と確認し、
   両訪問順と取消後の実permit/worker予約保持の回帰を追加した。新しい永続stateやparked回収範囲の拡張はない。
+
+### §11 追補: §1.392 診断用 folder-load 計数の追補（2026-10-20）
+
+`568051638` の独立レビュー P2 を設計担当が採択し、新規の一覧読み込み owner の受理を
+test-script 限定で数える。detached の変換書庫は直接書庫要求の受理、非 RAR の即時 cache hit は
+既存 owner claim の成功後に計数する。Collection の物理一覧受理も含め、detached 経路への変更は
+cfg 限定の計数だけ。
+述語・viewport・placement・focus・表示動作は変更しない。既存 owner による descriptor の水和や
+変換完了を再計数しない所有境界の修正であり、症状パッチではない（設計担当の明示方針と Codex の判断）。

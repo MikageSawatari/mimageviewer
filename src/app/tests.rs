@@ -70648,6 +70648,70 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
+    #[cfg(all(windows, feature = "test-script"))]
+    fn test_script_counts_detached_archive_owner_once_through_completion() {
+        for (format, direct) in [
+            (ArchiveFormat::Rar, true),
+            (ArchiveFormat::Rar, false),
+            (ArchiveFormat::SevenZ, false),
+        ] {
+            let mut app = setup_app();
+            let source = app.tmp.path().join(if format == ArchiveFormat::Rar {
+                "count.rar"
+            } else {
+                "count.7z"
+            });
+            let backing = if direct {
+                source.clone()
+            } else {
+                app.tmp.path().join("count-converted.zip")
+            };
+            std::fs::write(&source, b"source").unwrap();
+            std::fs::write(&backing, b"cache").unwrap();
+            let (main_folder, generation) =
+                install_convertible_archive_main_grid(&mut app, source.clone(), format);
+            let before = app.test_script_folder_load_requests;
+            let ctx = egui::Context::default();
+            assert!(
+                app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, false)
+            );
+            app.settle_open_path_classification_for_test();
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            assert!(!app.request_archive_convert_owned(
+                source.clone(),
+                format,
+                false,
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+
+            // Keep the real accepted owner, substituting only its worker result transport.
+            let (_tx, rx) = mpsc::channel();
+            let state = app
+                .archive_convert
+                .as_mut()
+                .expect("accepted archive owner");
+            state.cancel.store(true, Ordering::Relaxed);
+            state.cancel = Arc::new(AtomicBool::new(false));
+            state.rx = rx;
+            if direct {
+                state.pending_direct_nav = Some(backing.clone());
+            } else {
+                state.pending_nav = Some(backing.clone());
+            }
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.show_archive_convert_dialog(ctx)
+            })
+            .drop_without_applying_deltas();
+            complete_detached_archive_page_enumeration(&mut app, &backing, &["page.jpg"]);
+            assert_detached_archive_backing(&mut app, &source, &backing);
+            assert_convertible_archive_main_grid_unchanged(&app, &main_folder, &source, generation);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
+    }
+
+    #[test]
     #[cfg(windows)]
     fn detached_grid_archive_direct_read_completion_opens_detached_without_main_navigation() {
         let mut app = setup_app();
@@ -70809,6 +70873,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_archive_non_rar_cache_hit_opens_detached_without_main_navigation() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source = app.tmp.path().join("cached.7z");
         let backing = app.tmp.path().join("cached.zip");
         std::fs::write(&source, b"source").unwrap();
@@ -70839,6 +70905,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
 
         let expected_pages = ["cached-cover.jpg", "cached-page-002.png"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -70852,6 +70920,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert_detached_archive_backing(&mut app, &source, &backing);
         assert_detached_archive_pages(&mut app, &backing, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -70931,6 +71001,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_rar_conversion_cache_hit_opens_detached_after_probe() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source = app.tmp.path().join("cached-solid.rar");
         let backing = app.tmp.path().join("cached-solid.zip");
         std::fs::write(&source, b"source").unwrap();
@@ -70961,6 +71033,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
 
         let (scan_tx, scan_rx) = mpsc::channel();
         let state = app
@@ -71003,6 +71077,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert_detached_archive_backing(&mut app, &source, &backing);
         assert_detached_archive_pages(&mut app, &backing, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -95323,6 +95399,107 @@ mod smart_folder_transition_tests {
         assert!(matches!(app.items.as_slice(), [GridItem::Image(path)] if path == &sentinel));
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_direct_archive_owner_without_recounting_cache_hydration() {
+        for format in [ArchiveFormat::Rar, ArchiveFormat::SevenZ] {
+            let mut app = setup_app();
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.settings.sidecar_backup_enabled = false;
+            let folder = app.tmp.path().join("direct-count");
+            std::fs::create_dir(&folder).unwrap();
+            let source = folder.join(if format == ArchiveFormat::Rar {
+                "book.rar"
+            } else {
+                "book.7z"
+            });
+            std::fs::write(&source, b"archive").unwrap();
+            let cached = app.tmp.path().join("direct-count-cache.zip");
+            write_convert_completion_zip(&cached);
+            app.load_folder(folder);
+            super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(
+                &mut app,
+            );
+            let before = app.test_script_folder_load_requests;
+            let started = if format == ArchiveFormat::Rar {
+                app.request_rar_open_owned(
+                    source,
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                )
+            } else {
+                app.request_archive_convert_owned(
+                    source,
+                    format,
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                )
+            };
+            assert!(started);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            publish_convert_done_and_open(&mut app, &cached);
+            wait_for_snapshot_archive_listing(&mut app, &cached);
+            assert_eq!(app.current_folder.as_ref(), Some(&cached));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_direct_cache_owner_without_history_once() {
+        let mut app = setup_app();
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        let source = app.tmp.path().join("direct-cached.7z");
+        let cached = app.tmp.path().join("direct-cached.zip");
+        std::fs::write(&source, b"archive").unwrap();
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        let before = app.test_script_folder_load_requests;
+        let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen(source, false);
+        assert!(matches!(
+            outcome,
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        app.settle_open_path_classification_for_test();
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_does_not_count_zip_foreign_conversion_continuation() {
+        for detached in [false, true] {
+            let mut app = setup_app();
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.settings.detached_viewer_open_images_in_window = false;
+            if detached {
+                app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            }
+            let source = app.tmp.path().join("outer-count.zip");
+            let cached = app.tmp.path().join("outer-count-converted.zip");
+            write_convert_completion_zip(&source);
+            write_convert_completion_zip(&cached);
+            app.load_folder(source.clone());
+            wait_for_snapshot_archive_listing(&mut app, &source);
+            let before = app.test_script_folder_load_requests;
+            app.offer_zip_foreign_archive_conversion(
+                &source,
+                false,
+                StartupListIntent::ExplicitList,
+            );
+            assert!(app.archive_convert.is_some());
+            assert_eq!(app.test_script_folder_load_requests, before);
+            publish_convert_done_and_open(&mut app, &cached);
+            wait_for_snapshot_archive_listing(&mut app, &cached);
+            assert_eq!(app.test_script_folder_load_requests, before);
+        }
+    }
+
     #[test]
     fn snapshot_convertible_archive_cache_hit_uses_owned_source_scope() {
         let mut app = setup_app();
@@ -95332,6 +95509,8 @@ mod smart_folder_transition_tests {
         record_convertible_archive_cache(&mut app, &source, &cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
@@ -95339,6 +95518,10 @@ mod smart_folder_transition_tests {
         );
         app.settle_open_path_classification_for_test();
 
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
         assert!(app.archive_convert.is_none());
         assert_eq!(
             app.current_folder, source_folder,
@@ -95351,6 +95534,8 @@ mod smart_folder_transition_tests {
             Some(source.as_path())
         );
         assert!(app.is_snapshot_active());
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
         // Mutation `scope_cache_zip_instead_of_owned_source`: resolve snapshot ownership from
         // `cached` instead of MainGridArchiveTransitionIntent::source_path. The current-folder and
         // listing assertions fail because the common snapshot guard refuses the implementation
@@ -95365,12 +95550,16 @@ mod smart_folder_transition_tests {
         write_convert_completion_zip(&cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
                 .is_none()
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
         let request_id = match app.top_level_grid_view.history_navigation_transition() {
             Some(super::HistoryNavigationTransition::Physical(request)) => request.request_id,
             _ => panic!("snapshot archive open must retain a typed physical owner"),
@@ -95416,6 +95605,8 @@ mod smart_folder_transition_tests {
         // The same `scope_cache_zip_instead_of_owned_source` mutation reaches this test through
         // ConvertDone -> pending_nav -> load_folder_with_scan_owned and leaves the source grid
         // mounted instead of opening the completed archive.
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
