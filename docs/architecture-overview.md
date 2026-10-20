@@ -521,7 +521,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `vram_budget.rs` | mImageViewer 全体の GPU メモリ予算の単一所有者。永続設定の割合から共有 pool を求め、一覧 / フルスクリーンの 80% / 20% 配分、RGBA8 bytes / texels 換算、HIGH / LOW 水位を導出する。0% は無制限として明示的に扱う |
 | `monitor.rs` | モニター情報取得 (DPI 等) |
 | `open_with.rs` | Windows の関連付けアプリ列挙と EXE 選択。列挙結果は実行パスではなく `IAssocHandler::GetName()` の handler ID として保持する。起動 worker 内で対象拡張子の handler を再列挙し、既存の Shell `IDataObject` 生成経路を介して `IAssocHandler::Invoke` を呼ぶ。利用者が明示選択した EXE だけを process spawn へ渡す |
-| `file_drag.rs` | グリッドからエクスプローラ等へのファイル D&D 送出 (シェル `IDataObject` + `SHDoDragDrop`)。`docs/file-drag-drop-design.md` |
+| `file_drag.rs` / `file_drag/async_data_object.rs` | グリッドから外部へのファイル D&D 送出。Shell `IDataObject` を送出専用 STA 委譲ラッパーで保持し、`IDataObjectAsyncCapability` で非同期を交渉する。1ドラッグ1 owner、App へ完了を戻さず、終了時に転送を待たない。共有 Shell helper / クリップボード経路は従来どおり。`docs/file-drag-drop-design.md` §12 |
 | `os_theme.rs` | Windows の「アプリ用の色」(レジストリ) を検出し、egui::Visuals へ適用。初回起動時に `Settings::ui_theme` の初期値を決める |
 
 GPU テクスチャの利用許容量は `vram_budget.rs` の共有 pool だけから導出する。サムネイル側と
