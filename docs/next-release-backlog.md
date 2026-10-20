@@ -41,17 +41,6 @@
 - 調査とレビュー申し送り: [Everything計画 §20.3](everything-search-plan.md#203-今回やらないこと後続-1406-への申し送り)。BA-7/BA-5の構造設計としてClaudeCodeと独立Codexの合意後に着手。Ctrl+G/Rのlinked動画／音声、切替途中、再投影、cancel/error/close/remountを回帰対象にする。
 - 規模 / 優先度: Medium / P2。
 
-### 1.405 ページめくり: 戻る方向でも前の unit の final を先回り準備する — §1.401 から切り出し (2026-10-19)
-
-- 状態: **実装済・実機未確認 (次の版、利用者 2026-10-19)**。改訂1の事前再レビューACCEPT後、1 chunk・3 checkpointで実装。記録は[page-turn計画 §27.17.21](page-turn-animation-plan.md)。自動検証・一時変異・独立完成レビューの結果は同節が示す引継ぎ記録を参照。実機の後退改善量・正式性能gateは未計測。D3-3 (編集済み・注釈付きの頁) は §1.401 に残し、次の版の後。
-- 観測 (ClaudeCode の隔離実アプリ操作、[page-turn 計画 §27.17.19](page-turn-animation-plan.md)): F12 の別ウィンドウを開いた直後に前の見開きへ戻ると、
-  前の unit の final を同期で作り (8000×8192 で 1 頁 65〜89ms × 2、Native miss で再生成)、受理→初回 curl 164〜176ms・curl 1 コマで演出がほぼ出ない。
-  本体窓の単ページで直前頁へ戻る場合は cache に残っていて滑らか。D3 前と同じ挙動で退行ではない。
-- 原因 (設計): D3 は次 unit だけを先回りする。§27.17.2 の「前 unit は既存完成 cache を優先し、次 unit の準備後に既存後方範囲内の不足だけを低優先で補う。専用 backward slot は不要」が未実装。
-- 対応: D3 の既存の仕組み (permit 1 件・CpuReady 上限・登録枠・VRAM admission・Native prewarm・canonical demand) を使い、前 unit の不足を低優先で補う。
-  上限の分け合い・演出排他・別ウィンドウ / park・§1.400 のループ折り返し・連結読み / Split の扱いは設計確認で決める。
-- 規模 / 優先度: Small〜Medium / P2。
-
 ### 1.401 ページめくり D3-3: 編集済み・注釈付きの頁でも final を先回り準備する — D3 の残り (2026-10-19)
 
 - 状態: **次の版の後に回す (利用者 2026-10-19)**。D3-1 / D3-2 / D3-4(a)(b) / D3-5 は master に取り込み済み (`656af0431`)。
@@ -61,7 +50,9 @@
   その頁のめくり始めは止まり得る。
 - 対応: 既存 materialization owner に CPU-only 消費の入口を設け、comic の metadata / font / stamp 準備と CPU 完成・登録を分離し、共通 permit・CPU 予約・
   登録枠・VRAM admission へ接続する (§27.17.6・§27.17.9 の D3-3 行)。cold 注釈・未読込 font・Pair 両頁同時完成を試験する。
-- 戻る方向の先回りは §1.405 へ切り出し、次の版で対応する (利用者 2026-10-19)。
+- 戻る方向の先回りは §1.405 として次の版に入れた (master `6cdeef1e4`、記録は計画 §27.17.20〜§27.17.23)。
+  残り: 開いた直後 (Next の CPU 準備が始まるのは開いて約 1.3 秒後) に準備の時間なく戻ると、前 unit は従来どおり同期で作る (04 見開きで 157〜340ms)。
+  F12 の連動別ウィンドウは test-script から前面にできず、`scripts/page-turn/back-f12-*.rhai` と `back-two-context-reversal.rhai` は駆動できない (計画 §27.17.22)。
 - 規模 / 優先度: Medium (2〜4 日) / P3。
 
 ### 1.398 操作のない間に、ZIP/PDF からフォルダの代表サムネイルを作成する — 5ch >>581 (2026-10-18)
