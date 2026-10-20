@@ -33679,6 +33679,8 @@ fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
 #[test]
 fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let pdf = app.tmp.path().join("bookmark.pdf");
     std::fs::write(&pdf, b"%PDF-1.4\n%%EOF\n").expect("create placeholder PDF");
     arm_detached_bookmark_book_open(
@@ -33697,6 +33699,8 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         DetachedBuild::Built(true)
     );
 
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     assert!(app.items_are_bookmark_view);
     assert_eq!(
         app.current_folder.as_deref(),
@@ -33731,12 +33735,16 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         ));
     })
     .expect("PDF bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
 }
 
 #[cfg(windows)]
 #[test]
 fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let zip = app.tmp.path().join("bookmark.zip");
     std::fs::write(&zip, []).expect("create placeholder ZIP");
     arm_detached_bookmark_book_open(
@@ -33754,6 +33762,8 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
         ),
         DetachedBuild::Built(true)
     );
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
         assert!(
@@ -33768,12 +33778,16 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
         ));
     })
     .expect("ZIP bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
 }
 
 #[cfg(windows)]
 #[test]
 fn converted_bookmark_archive_enters_the_same_detached_book_context() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let source = app.tmp.path().join("bookmark.rar");
     let backing = app.tmp.path().join("bookmark-cache.zip");
     std::fs::write(&source, []).expect("create source archive");
@@ -33798,6 +33812,8 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         ),
         Some(true)
     );
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
         assert_eq!(
@@ -33812,12 +33828,16 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         );
     })
     .expect("converted archive bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
 }
 
 #[cfg(windows)]
 #[test]
 fn converted_bookmark_archive_continues_the_existing_loading_session_lease() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let ctx = egui::Context::default();
     let source = app.tmp.path().join("slow-bookmark.rar");
     let backing = app.tmp.path().join("slow-bookmark-cache.zip");
@@ -33884,6 +33904,8 @@ fn converted_bookmark_archive_continues_the_existing_loading_session_lease() {
         ));
     })
     .expect("conversion completion must continue inside the existing loading shell");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
 }
 
 #[cfg(windows)]
@@ -78720,6 +78742,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn detached_book_pdf_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_zip_pdf = true;
@@ -78741,6 +78765,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
 
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert_eq!(app.address, r"C:\books");
         assert_eq!(app.items.len(), 2);
@@ -78789,11 +78815,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 137.0);
         assert_detached_pdf_pages(&mut app, &pdf_path, &[0, 1]);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     }
 
     #[test]
     fn detached_book_zip_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_zip_pdf = true;
@@ -78815,6 +78845,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
 
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert_eq!(app.address, r"C:\books");
         assert_eq!(app.items.len(), 2);
@@ -78865,6 +78897,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.scroll_offset_y, 173.0);
         assert_detached_archive_pages(&mut app, &zip_path, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     }
 
     #[test]

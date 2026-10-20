@@ -891,7 +891,15 @@ impl App {
                 // Move the accepted scan owner, including its navigation proof, into this
                 // operation. The normal navigation tail never sees or consumes its receiver.
                 return match self.folder_pane_open_pending.take() {
-                    Some(pending) => Phase::ParentScan(pending),
+                    Some(pending) => {
+                        // The operation admits its parent-list owner now, including starts
+                        // cancelled before the scan completes. The adopter only executes it.
+                        #[cfg(all(windows, feature = "test-script"))]
+                        self.test_script_record_folder_load_owner(
+                            &super::StartupListIntent::ExplicitList,
+                        );
+                        Phase::ParentScan(pending)
+                    }
                     None => op.failed("親のフォルダの読取を開始できませんでした。".into()),
                 };
             }
@@ -1410,12 +1418,20 @@ mod tests {
                 let (sent, receive) = mpsc::channel();
                 sent.send(result).unwrap();
                 pending.rx = receive;
+                #[cfg(all(windows, feature = "test-script"))]
+                let (before_parent_load, before_parent_generation) =
+                    (app.test_script_folder_load_requests, app.items_generation);
                 pump_until(&mut app, &ctx, |app| {
                     matches!(
                         app.image_folder_zip_operation.as_ref().unwrap().phase,
                         Phase::ParentScan(..)
                     )
                 });
+                #[cfg(all(windows, feature = "test-script"))]
+                {
+                    assert_eq!(app.test_script_folder_load_requests, before_parent_load + 1);
+                    assert_eq!(app.items_generation, before_parent_generation);
+                }
                 let op = app.image_folder_zip_operation.as_mut().unwrap();
                 let Phase::ParentScan(pending) = &mut op.phase else {
                     unreachable!()
@@ -1433,6 +1449,8 @@ mod tests {
                     app.poll_external_rescan(&ctx);
                 }
                 app.poll_image_folder_zip(&ctx);
+                #[cfg(all(windows, feature = "test-script"))]
+                assert_eq!(app.test_script_folder_load_requests, before_parent_load + 1);
                 assert!(matches!(
                     app.image_folder_zip_operation.as_ref().unwrap().phase,
                     Phase::ParentHydration(..)
@@ -1452,6 +1470,8 @@ mod tests {
                     Phase::Result { success: true, .. }
                 ));
                 let destination = source.with_extension("zip");
+                #[cfg(all(windows, feature = "test-script"))]
+                assert_eq!(app.test_script_folder_load_requests, before_parent_load + 1);
                 assert_eq!(
                     app.items[app.selected.unwrap()].container_path(),
                     Some(destination.as_path())

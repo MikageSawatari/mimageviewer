@@ -3646,6 +3646,8 @@ impl App {
         payload: PhysicalHistoryPreflightPayload,
         restore_intent: super::StartupListIntent,
     ) -> Option<PreparedCollectionOuterAdoption> {
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_intent = restore_intent.clone();
         // This immutable membership also proves every target lookup in the outer root installer.
         // Its preserved-player/EPUB admission branch is excluded by preserve_active_media=false.
         if !root
@@ -3713,6 +3715,8 @@ impl App {
             route.child(Self::facet_scope_for_location(&location)),
         );
         let adoption = self.prepare_main_list_adoption(navigation, destination)?;
+        #[cfg(all(windows, feature = "test-script"))]
+        self.test_script_record_folder_load_owner(&count_intent);
         Some(PreparedCollectionOuterAdoption {
             listing,
             token,
@@ -5608,6 +5612,8 @@ mod tests {
         app.adopt_main_facet_route(root_route.clone());
         app.settings.facet_filter.exts.insert("zip".into());
         let history = app.folder_nav_history_snapshot();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         assert!(app.start_collection_outer_grid_navigation(&ctx, true));
         assert!(
@@ -5636,6 +5642,13 @@ mod tests {
             app.poll_collection_navigation(&ctx);
             std::thread::sleep(Duration::from_millis(2));
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
+            app.finish_page_identity_preparation_for_test();
+            app.poll_collection_navigation(&ctx);
+            assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
+        }
         assert_eq!(app.current_folder.as_ref(), Some(&book));
         assert!(app.items.iter().any(|item| matches!(item, crate::grid_item::GridItem::ZipImage { entry_name, .. } if entry_name == "page.jpg")));
         assert!(!app.facet_filter_active());
@@ -5653,6 +5666,114 @@ mod tests {
                 .position,
             CollectionGridPosition::PhysicalSource { .. }
         ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_prepared_collection_outer_owner_before_install_once() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book.zip");
+        write_single_page_zip(&book, "page.jpg");
+        let (mut app, client) = start_ready_app(&temp.path().join("outer-count.db"));
+        app.active_quick_folder_slot = None;
+        let created = recv(client.create_collection("outer count".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &book,
+                            CollectionResolvedKind::Zip,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(added.snapshot.collection_id()) {
+            assert!(Instant::now() < deadline);
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let root = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: root.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(root, None);
+        app.selected = None;
+        assert!(app.start_collection_outer_grid_navigation(&ctx, true));
+        let (mut request, root, ready) = loop {
+            assert!(
+                Instant::now() < deadline,
+                "outer request must reach preflight"
+            );
+            let pending = app
+                .top_level_grid_view
+                .take_collection_navigation_pending()
+                .unwrap();
+            if let CollectionNavigationPending::Preflighting {
+                request,
+                prepared,
+                receiver,
+                ..
+            } = pending
+            {
+                let ready = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                break (request, prepared, ready);
+            }
+            app.top_level_grid_view
+                .set_collection_navigation_pending(Some(pending));
+            app.poll_collection_navigation(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(request.navigation.is_some());
+        let CollectionNavigationPreflightPayload::Zip(zip) = ready.payload else {
+            panic!("the real registered ZIP must yield its prepared listing");
+        };
+        let before_loads = app.test_script_folder_load_requests;
+        let before_generation = app.items_generation;
+        let before_items = app.items.clone();
+        let prepared = app
+            .prepare_collection_outer_physical_adoption(
+                &mut request,
+                &root,
+                &ready.target,
+                PhysicalHistoryPreflightPayload::Zip(zip),
+                super::super::StartupListIntent::ExplicitList,
+            )
+            .expect("the current physical owner is accepted");
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
+        assert_eq!(app.items_generation, before_generation);
+        assert_eq!(
+            app.items, before_items,
+            "admission has not installed the listing"
+        );
+        app.install_collection_outer_physical_adoption(
+            &mut request,
+            root,
+            &ready.target,
+            prepared,
+            super::super::StartupListIntent::ExplicitList,
+            None,
+        );
+        app.finish_page_identity_preparation_for_test();
+        app.poll_collection_navigation(&ctx);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(app.items_generation > before_generation);
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         app.shutdown_collection_runtime_for_exit();
     }
 

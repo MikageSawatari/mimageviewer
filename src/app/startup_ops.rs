@@ -1301,8 +1301,17 @@ impl App {
                 result.rar_volume_proof.as_ref(),
             ) {
                 DetachedBuild::Built(descriptor) => {
-                    return if self.continue_active_detached_book_context_from_descriptor(descriptor)
-                    {
+                    #[cfg(all(windows, feature = "test-script"))]
+                    let count_descriptor = descriptor.clone();
+                    let started =
+                        self.continue_active_detached_book_context_from_descriptor(descriptor);
+                    #[cfg(all(windows, feature = "test-script"))]
+                    if started {
+                        // The resolver admits this bookmark's first descriptor load. Converted
+                        // archive callbacks use a different continuation and retain their owner.
+                        self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+                    }
+                    return if started {
                         StartupOpenApplyOutcome::Opened
                     } else {
                         StartupOpenApplyOutcome::NotOpenable
@@ -1578,12 +1587,15 @@ impl App {
         }
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
-        DetachedBuild::Built(self.start_active_detached_book_context(
-            descriptor,
-            ctx,
-            placement_seed,
-            Some(pending),
-        ))
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_descriptor = descriptor.clone();
+        let started =
+            self.start_active_detached_book_context(descriptor, ctx, placement_seed, Some(pending));
+        #[cfg(all(windows, feature = "test-script"))]
+        if started {
+            self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+        }
+        DetachedBuild::Built(started)
     }
 
     /// Full-feature book opens continue through the mounted/main context so editing and linked

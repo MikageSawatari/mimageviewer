@@ -6042,3 +6042,11 @@ test-script 限定で数える。detached の変換書庫は直接書庫要求�
 cfg 限定の計数だけ。
 述語・viewport・placement・focus・表示動作は変更しない。既存 owner による descriptor の水和や
 変換完了を再計数しない所有境界の修正であり、症状パッチではない（設計担当の明示方針と Codex の判断）。
+
+`001d5662a` の再レビュー後、設計担当の方針に従って一覧採用点からも逆引きした。
+直接 ZIP/PDF descriptor の新規開始（グリッド・ブックマーク・descriptor による再構築）は
+dispatcher を通らないため、開始を受理した frontend で test-script 限定の計数を補う。
+既存 context のメモリ上の一覧復元・変換完了からの descriptor 水和には加算しない。通常コードの変更は
+受理結果を局所変数へ受けて既存と同じ値を返すだけで、detached の述語・状態遷移・配置は不変。
+同じ逆引きで見つかった Collection outer の準備済み owner と、画像フォルダ ZIP 化後の
+親一覧 owner も operation が scan を引き取る受理点（`ParentScan`）で計数し、install や水和では加算しない。

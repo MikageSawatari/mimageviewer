@@ -16005,6 +16005,8 @@ pub struct App {
     /// regardless of its initial phase. Direct archive scans count at their completion-policy
     /// owner's creation (direct cache hits at admission). InternalHydration, StagedHistory
     /// and Smart transition handoffs retain an existing owner and never count a second start.
+    /// Prepared Collection outer loads count at owner admission; image-ZIP parent loads at
+    /// scan handoff. Fresh detached document frontends count accepted descriptor starts.
     #[cfg(all(windows, feature = "test-script"))]
     pub(crate) test_script_folder_load_requests: u64,
 
@@ -29763,6 +29765,21 @@ impl App {
         if !matches!(intent, StartupListIntent::InternalHydration(_)) {
             self.test_script_folder_load_requests =
                 self.test_script_folder_load_requests.saturating_add(1);
+        }
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(super) fn test_script_record_new_detached_descriptor_owner(
+        &mut self,
+        descriptor: &ViewerContextDescriptor,
+    ) {
+        // Fresh document frontends bypass the folder dispatcher. Folder/image descriptors
+        // use its counted scan admission; archive completions never call this new-owner hook.
+        if matches!(
+            descriptor,
+            ViewerContextDescriptor::Zip { .. } | ViewerContextDescriptor::Pdf { .. }
+        ) {
+            self.test_script_record_folder_load_owner(&StartupListIntent::ExplicitList);
         }
     }
 
@@ -63764,14 +63781,21 @@ impl App {
         placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     ) -> bool {
-        self.start_active_detached_book_context_with_start(
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_descriptor = descriptor.clone();
+        let started = self.start_active_detached_book_context_with_start(
             DetachedBookContextStart::Descriptor(descriptor),
             ctx,
             placement_seed,
             None,
             None,
             collection_restore,
-        )
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        if started {
+            self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+        }
+        started
     }
 
     #[cfg(windows)]
@@ -63781,14 +63805,21 @@ impl App {
         descriptor: ViewerContextDescriptor,
         ctx: &egui::Context,
     ) -> bool {
-        self.start_active_detached_book_context_with_start(
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_descriptor = descriptor.clone();
+        let started = self.start_active_detached_book_context_with_start(
             DetachedBookContextStart::Descriptor(descriptor),
             ctx,
             None,
             None,
             Some(window_id),
             None,
-        )
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        if started {
+            self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+        }
+        started
     }
 
     /// Build a new owner for a directly registered collection image. The captured prepared
