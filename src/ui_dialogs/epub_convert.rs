@@ -80,6 +80,12 @@ pub(crate) struct EpubConvertState {
     rx: Receiver<EpubConvertMsg>,
 }
 
+impl EpubConvertState {
+    pub(crate) fn retire_fullscreen_reopen(&mut self) -> bool {
+        self.deferred_fullscreen.take().is_some()
+    }
+}
+
 fn apply_epub_suppress_confirm_choice(
     settings: &mut crate::settings::Settings,
     suppress_next_time: bool,
@@ -407,14 +413,14 @@ impl App {
         match failure {
             PdfOpenFailure::NotConverted => {
                 if self.settings.epub_file_handling_ignores_epub() {
-                    self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
+                    self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
                     if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                         self.restore_address_after_epub_open_aborted(logical);
                     }
                     return PdfOpenFailureRoute::Handled;
                 }
                 let Ok(cancel) = CancelToken::new() else {
-                    self.show_feedback_toast("EPUB の変換を開始できませんでした".into());
+                    self.show_feedback_warning("EPUB の変換を開始できませんでした".into());
                     if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                         self.restore_address_after_epub_open_aborted(logical);
                     }
@@ -458,7 +464,7 @@ impl App {
                 PdfOpenFailureRoute::ConversionDialogOpened
             }
             PdfOpenFailure::EpubUnavailable(reason) => {
-                self.show_feedback_toast(format!("EPUB 変換が無効です: {reason}"));
+                self.show_feedback_warning(format!("EPUB 変換が無効です: {reason}"));
                 if matches!(continuation, EpubOpenContinuation::Direct { .. }) {
                     self.restore_address_after_epub_open_aborted(logical);
                 }
@@ -487,7 +493,7 @@ impl App {
         let Some(mut state) = self.epub_convert.take() else {
             return;
         };
-        let had_deferred = state.deferred_fullscreen.take().is_some();
+        let had_deferred = state.retire_fullscreen_reopen();
         let continuation = state.continuation.clone();
         let restore = std::mem::replace(
             &mut state.open_restore,
@@ -560,7 +566,7 @@ impl App {
         let _source_owner = state.src_owner.clone();
         drop(state);
         if !user_data_errors.is_empty() {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "PDF は保存されましたが、一部の設定を引き継げませんでした: {}",
                 user_data_errors.join("; ")
             ));
@@ -1143,6 +1149,118 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_notices_epub_backend_close_retires_only_reopen_before_late_completion() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let (mut state, tx, cancel) = fake_state(EpubConvertPhase::Converting(None));
+        state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: crate::app::DeferredFsTarget::None,
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: false,
+        });
+        app.epub_convert = Some(state);
+        app.show_whats_new = true;
+        app.show_mouse_nav_migration_prompt = false;
+        app.fs_viewport_shown = true;
+        let viewport_id = app.fullscreen_viewport_id();
+        ctx.set_embed_viewports(false);
+        ctx.run_ui(Default::default(), |_| {
+            ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+        let mut input = egui::RawInput {
+            viewport_id,
+            ..Default::default()
+        };
+        input.viewports.insert(viewport_id, Default::default());
+        ctx.run_pass(input, |ctx| {
+            app.capture_current_detached_viewport_registration(ctx)
+        })
+        .drop_without_applying_deltas();
+        assert!(matches!(
+            eframe::App::on_viewport_close_requested(&mut *app, &ctx, viewport_id),
+            eframe::ViewportCloseResponse::RetirementTransferred
+        ));
+        assert!(
+            app.epub_convert
+                .as_ref()
+                .unwrap()
+                .deferred_fullscreen
+                .is_none()
+        );
+        assert!(!cancel.is_cancelled());
+        assert!(app.whats_new_visible());
+        tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Published)))
+            .unwrap();
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
+        assert!(app.epub_convert.is_none());
+        assert!(
+            app.pdf_enumerate_pending.is_some(),
+            "conversion still adopts its list"
+        );
+        assert!(app.fs_nav_after_pdf_enumerate.is_none());
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.whats_new_visible());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_notices_epub_settings_close_keeps_conversion_but_retires_late_reopen() {
+        for embedded in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let (mut state, tx, cancel) = fake_state(EpubConvertPhase::Converting(None));
+            state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: crate::app::DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+            app.epub_convert = Some(state);
+            app.show_whats_new = true;
+            app.show_mouse_nav_migration_prompt = false;
+            app.native_video_in_window_active = embedded;
+            app.viewer_presentation = if embedded {
+                crate::app::ViewerPresentation::MainWindow
+            } else {
+                crate::app::ViewerPresentation::Fullscreen
+            };
+            app.fs_viewport_shown = !embedded;
+            app.fs_viewport_presentation = (!embedded).then_some(app.viewer_presentation);
+            assert!(!app.whats_new_visible());
+            let scale = app.settings.ui_scale_factor + 0.25;
+            app.set_ui_scale_factor(&ctx, scale);
+            assert!(
+                app.epub_convert
+                    .as_ref()
+                    .unwrap()
+                    .deferred_fullscreen
+                    .is_none()
+            );
+            assert!(!cancel.is_cancelled());
+            assert!(app.whats_new_visible());
+            tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Published)))
+                .unwrap();
+            ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+                .drop_without_applying_deltas();
+            assert!(
+                app.pdf_enumerate_pending.is_some(),
+                "list adoption continues"
+            );
+            assert!(app.fs_nav_after_pdf_enumerate.is_none());
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.whats_new_visible());
+        }
     }
 
     #[test]

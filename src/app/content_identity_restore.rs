@@ -375,7 +375,7 @@ impl App {
                 crate::logger::log(format!(
                     "content_identity: restore thread spawn failed: {error}"
                 ));
-                self.show_feedback_toast("編集内容の復元を開始できませんでした".to_string());
+                self.show_feedback_warning("編集内容の復元を開始できませんでした".to_string());
             }
         }
     }
@@ -394,7 +394,7 @@ impl App {
                         for_content_identity_index_stale(),
                 );
                 crate::logger::log("content_identity: restore thread disconnected".to_string());
-                self.show_feedback_toast("編集内容の復元が中断されました".to_string());
+                self.show_feedback_warning("編集内容の復元が中断されました".to_string());
                 return;
             }
             Some(Err(mpsc::TryRecvError::Empty)) => {
@@ -437,7 +437,7 @@ impl App {
         if report.requested_restores > 0 {
             self.finish_content_identity_restore(report.errors);
         } else if !report.errors.is_empty() {
-            self.show_feedback_toast(format!(
+            self.show_feedback_error(format!(
                 "確認結果の保存に失敗しました ({} 件)",
                 report.errors.len()
             ));

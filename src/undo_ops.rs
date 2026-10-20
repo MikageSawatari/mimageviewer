@@ -242,10 +242,11 @@ impl App {
             }
         }
         let mut feedback = format!("元に戻す: {summary}");
+        let kind = crate::feedback::FeedbackKind::result(notice.is_some());
         if let Some(notice) = notice {
             feedback.push_str(&format!(" ({notice})"));
         }
-        self.show_feedback_toast(feedback);
+        self.show_feedback_result(feedback, kind);
         self.meta_undo.push_redo(entry);
     }
 
@@ -326,10 +327,11 @@ impl App {
             }
         }
         let mut feedback = format!("やり直し: {summary}");
+        let kind = crate::feedback::FeedbackKind::result(notice.is_some());
         if let Some(notice) = notice {
             feedback.push_str(&format!(" ({notice})"));
         }
-        self.show_feedback_toast(feedback);
+        self.show_feedback_result(feedback, kind);
         self.meta_undo.push_undo_from_redo(entry);
     }
 
@@ -845,7 +847,7 @@ impl App {
         // 専用文言に切り替えるので、ここではラベル不要。
         self.tag_toast_label = None;
         let Some(h) = self.tag_write_handle.as_ref() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "タグ書き込みが初期化されていないため Undo できません".to_string(),
             );
             return;

@@ -548,15 +548,16 @@ OS が諦めるまで UI をブロックし得る。この制約は利用者が�
 
 ### 4.2 意図的な例外: native ファイル D&D のモーダルブロック
 
-ファイル D&D 送出 (`src/file_drag.rs::start_file_drag`) は `SHDoDragDrop` を UI
-スレッドで呼び、ドロップ完了 / キャンセルまで戻らない。`App::update` がその間
-ブロックするが、これは **§1 の禁止対象ではない** — バックグラウンド I/O ではなく、
-ユーザーが明示的に開始したモーダル操作であり、エクスプローラ含め全アプリ共通の
-標準挙動 (ドラッグ元ウィンドウはドラッグ中固まって見えるのが正常)。`SHDoDragDrop`
-自体が独自メッセージループを回すため OS レベルの応答性は保たれる。worker 化は
-不可能 (`DoDragDrop` 系は呼び出しスレッドにマウスキャプチャを要求する)。
-詳細は `docs/file-drag-drop-design.md` §6.2。perf ログを汚さないよう、実行は
-`update` 末尾 (frame_total 計測の後) に置いている。
+ドラッグ操作の OLE モーダル区間は残る。非同期を選択して Drop から早期復帰する target では、
+その後の転送完了を待たない。非対応 target の同期処理と開始前の Shell 解決コストも残る。
+
+ファイル D&D 送出 (`src/file_drag.rs::start_file_drag`) は `SHDoDragDrop` を UI STA から
+呼び、実行中は `App::update` が戻らない。意図的な例外は OLE モーダル区間であり、
+ドロップ後の長いコピー待ち全体を不可避とはしない。送出 object の
+`IDataObjectAsyncCapability` で非同期を交渉し、復帰後は通常の winit message loop で
+STA 宛ての COM 呼び出しを配送する。source 側へ独自 pump・転送完了待ち・周期 repaint は足さない。
+詳細は `file-drag-drop-design.md` §6.2 / §12。実行は従来どおり `update` 末尾
+(frame_total 計測の後) に置き、通常の file_drag ログへ所要時間と InOperation を残す。
 
 ### 4.3 大量一覧の target 構築も分割し、scroll では再走査しない
 

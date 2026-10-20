@@ -890,7 +890,7 @@ impl App {
         }
         match added {
             Some(_) => self.show_feedback_toast(format!("ブックマークを追加: {}", format_hms(pos))),
-            None => self.show_feedback_toast("既存のブックマークと近すぎます".to_string()),
+            None => self.show_feedback_warning("既存のブックマークと近すぎます".to_string()),
         }
     }
 
@@ -935,7 +935,7 @@ impl App {
             return;
         };
         if entries.is_empty() {
-            self.show_feedback_toast("登録できる行がありません".to_string());
+            self.show_feedback_warning("登録できる行がありません".to_string());
             return;
         }
         let refs: Vec<(f64, Option<&str>)> = entries
@@ -944,7 +944,7 @@ impl App {
             .collect();
         // DB エラー / DB 未オープンは黙って捨てずに通知する (Codex P3、動画と同流儀)。
         if self.video_bookmark_db.is_none() {
-            self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string());
+            self.show_feedback_warning("ブックマーク DB を開けませんでした".to_string());
             return;
         }
         let Some(db) = self.user_video_bookmark_db() else {
@@ -958,13 +958,16 @@ impl App {
                 if s.added > 0 {
                     self.notify_bookmarks_changed();
                 }
-                self.show_feedback_toast(format!(
-                    "一括登録: {} 件追加 / 重複 {} / エラー {}",
-                    s.added, s.skipped_duplicates, s.errors
-                ));
+                self.show_feedback_result(
+                    format!(
+                        "一括登録: {} 件追加 / 重複 {} / エラー {}",
+                        s.added, s.skipped_duplicates, s.errors
+                    ),
+                    crate::feedback::FeedbackKind::result(s.errors > 0),
+                );
             }
             Err(e) => {
-                self.show_feedback_toast(format!("ブックマークの保存に失敗しました: {e}"));
+                self.show_feedback_error(format!("ブックマークの保存に失敗しました: {e}"));
             }
         }
     }
@@ -981,7 +984,7 @@ impl App {
             .map(|db| db.list_marker_meta(&path))
             .unwrap_or_default();
         if entries.is_empty() {
-            self.show_feedback_toast("ブックマークがありません".to_string());
+            self.show_feedback_warning("ブックマークがありません".to_string());
             return;
         }
         let text = crate::video_bookmarks_parser::format_chapter_lines(&entries, seconds_only);
@@ -998,7 +1001,7 @@ impl App {
             return;
         };
         if self.video_bookmark_db.is_none() {
-            self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string());
+            self.show_feedback_warning("ブックマーク DB を開けませんでした".to_string());
             return;
         }
         let Some(db) = self.user_video_bookmark_db() else {
@@ -1016,7 +1019,7 @@ impl App {
                 self.notify_bookmarks_changed();
                 self.show_feedback_toast("ブックマークをすべて削除しました".to_string())
             }
-            Err(e) => self.show_feedback_toast(format!("削除に失敗しました: {e}")),
+            Err(e) => self.show_feedback_error(format!("削除に失敗しました: {e}")),
         }
     }
 

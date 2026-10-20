@@ -2703,7 +2703,7 @@ impl crate::app::App {
         let tool = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
             Ok(tool) => tool.clone(),
             Err(error) => {
-                self.show_feedback_toast(error);
+                self.show_feedback_error(error);
                 return;
             }
         };
@@ -3104,7 +3104,7 @@ impl crate::app::App {
             Some(Ok(true)) => match preparing.purpose {
                 ExternalPreparationPurpose::ForPicker(target_kind) => {
                     if self.settings.external_tools.is_empty() {
-                        self.show_feedback_toast("外部ツールが登録されていません".to_string());
+                        self.show_feedback_warning("外部ツールが登録されていません".to_string());
                         return;
                     }
                     self.external_tool_operation =
@@ -3141,13 +3141,13 @@ impl crate::app::App {
                             }
                         }
                         Err(error) => {
-                            self.show_feedback_toast(format!("{}: {error}", tool.display_name()))
+                            self.show_feedback_warning(format!("{}: {error}", tool.display_name()))
                         }
                     }
                 }
             },
-            Some(Err(error)) => self.show_feedback_toast(error),
-            None => self.show_feedback_toast(
+            Some(Err(error)) => self.show_feedback_error(error),
+            None => self.show_feedback_warning(
                 "対象のウィンドウを閉じたため、外部ツールの準備をキャンセルしました".to_string(),
             ),
         }
@@ -3207,9 +3207,9 @@ impl crate::app::App {
                     ExternalOperation::Launching(ExternalLaunching::Ready(pending))
             }
             Err(error) if target_count == 1 => {
-                self.show_feedback_toast(format!("{tool_name}: {error}"))
+                self.show_feedback_warning(format!("{tool_name}: {error}"))
             }
-            Err(error) => self.show_feedback_toast(format!(
+            Err(error) => self.show_feedback_warning(format!(
                 "{tool_name}: {target_count} 件の起動を開始できませんでした ({error})"
             )),
         }
@@ -3237,9 +3237,9 @@ impl crate::app::App {
                         self.external_tool_operation = ExternalOperation::Materializing(pending)
                     }
                     Err(error) if target_count == 1 => {
-                        self.show_feedback_toast(format!("{tool_name}: {error}"))
+                        self.show_feedback_warning(format!("{tool_name}: {error}"))
                     }
-                    Err(error) => self.show_feedback_toast(format!(
+                    Err(error) => self.show_feedback_warning(format!(
                         "{tool_name}: {target_count} 件の準備を開始できませんでした ({error})"
                     )),
                 }
@@ -3327,7 +3327,12 @@ impl crate::app::App {
             }
         }
         if !finished.is_empty() {
-            self.show_feedback_toast(external_launch_completion_summary(&finished));
+            self.show_feedback_result(
+                external_launch_completion_summary(&finished),
+                crate::feedback::FeedbackKind::result(
+                    finished.iter().any(|item| !item.failures.is_empty()),
+                ),
+            );
         }
         if !matches!(self.external_tool_operation, ExternalOperation::Idle)
             || !self.external_tool_retired_launch.is_empty()
@@ -3628,12 +3633,12 @@ impl crate::app::App {
                             scanned_entries: 0,
                         });
                 } else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "対象が移動したため、外部ツールをもう一度選択してください".to_string(),
                     );
                 }
             } else {
-                self.show_feedback_toast("外部ツールを選択できませんでした".to_string());
+                self.show_feedback_warning("外部ツールを選択できませんでした".to_string());
             }
         } else if cancel {
             self.external_tool_operation = ExternalOperation::Idle;

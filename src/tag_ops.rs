@@ -172,7 +172,7 @@ impl App {
         // ツールバーのピンタグ専用 (= グリッド面固定)。
         let surface = crate::app::ActionSurface::MainWindow;
         let Some(folder) = self.current_folder.clone() else {
-            self.show_feedback_toast_on("タグを付けるコンテナがありません".to_string(), surface);
+            self.show_feedback_warning_on("タグを付けるコンテナがありません".to_string(), surface);
             return;
         };
         // 合成ビューでは実コンテナが無いので no-op + 通知。判定は経路ごとに異なる:
@@ -185,7 +185,7 @@ impl App {
             || self.items_are_tag_view
             || self.items_are_drive_list
         {
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "この画面ではコンテナにタグを付けられません".to_string(),
                 surface,
             );
@@ -463,7 +463,7 @@ impl App {
             crate::logger::log(format!(
                 "[TAG] '{op_label}' aborted: tag_write_handle unavailable"
             ));
-            self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
+            self.show_feedback_warning(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return false;
         }
         // Admission precedes optimistic cache changes and pending Undo capture,
@@ -501,7 +501,7 @@ impl App {
             crate::logger::log(format!(
                 "[TAG] submit '{op_label}' aborted: tag_write_handle unavailable"
             ));
-            self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
+            self.show_feedback_warning(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return;
         };
         crate::logger::log(format!(
@@ -699,8 +699,8 @@ impl App {
             let msg = format!("タグ書き込み失敗 {} 件: {}", errors.len(), preview);
             // 発火面が分かるバッチはその面に出す (undo 復元など面未記録は従来どおり全面)。
             match self.tag_toast_surface {
-                Some(surface) => self.show_feedback_toast_on(msg, surface),
-                None => self.show_feedback_toast(msg),
+                Some(surface) => self.show_feedback_warning_on(msg, surface),
+                None => self.show_feedback_warning(msg),
             }
         } else if just_completed && (added + removed + cleared + restored + noop) > 0 {
             let label = self.tag_toast_label.take();

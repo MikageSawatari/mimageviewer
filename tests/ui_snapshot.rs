@@ -25,13 +25,63 @@
 //! - [egui_kittest docs](https://docs.rs/egui_kittest/)
 //! - mimageviewer 側のポリシー: [docs/ui-snapshot-policy.md](../docs/ui-snapshot-policy.md)
 
+use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
+
+// Physical pixels above/below the hotspot. Never sample the desktop cursor in a fixture.
+const SNAPSHOT_CURSOR_EXTENT_PHYSICAL: (f32, f32) = (0.0, 34.0);
 
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 
 #[path = "support/logical_bounds.rs"]
 mod logical_bounds;
+
+#[test]
+fn global_search_short_term_reject_light() {
+    global_search_short_term_reject_snapshot(
+        "global_search_short_term_reject_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        &["r5"],
+    );
+}
+
+#[test]
+fn global_search_short_term_reject_dark() {
+    global_search_short_term_reject_snapshot(
+        "global_search_short_term_reject_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        &["sd", "ai"],
+    );
+}
+
+fn global_search_short_term_reject_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    terms: &'static [&'static str],
+) {
+    let message = mimageviewer::global_search::RejectReason::TooShort(
+        terms.iter().map(|term| (*term).into()).collect(),
+    )
+    .as_user_message();
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(480.0, 220.0),
+        move |ui| {
+            ui.ctx()
+                .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            mimageviewer::draw_global_search_reject_snapshot_fixture(ui, terms);
+        },
+        |harness| {
+            let badge = harness.get_by_label(&message);
+            assert!(harness.ctx.content_rect().contains_rect(badge.rect()));
+            badge.hover();
+            harness.run();
+        },
+    );
+}
 
 #[cfg(windows)]
 #[test]
@@ -93,6 +143,106 @@ fn everything_search_bar_light() {
         mimageviewer::os_theme::ResolvedTheme::Light,
         egui::vec2(720.0, 240.0),
     );
+}
+
+#[test]
+fn everything_search_disabled_menu_hover_light() {
+    everything_search_disabled_menu_hover_snapshot(
+        "everything_search_disabled_menu_hover_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn everything_search_disabled_menu_hover_dark() {
+    everything_search_disabled_menu_hover_snapshot(
+        "everything_search_disabled_menu_hover_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+fn everything_search_disabled_menu_hover_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        // Representative image size; actual logical width can be smaller at
+        // higher UI zoom or on a small work area. Cover those below.
+        egui::vec2(640.0, 180.0),
+        |ui| {
+            ui.ctx()
+                .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(
+                ui,
+                SNAPSHOT_CURSOR_EXTENT_PHYSICAL,
+            );
+        },
+        |harness| {
+            let button = harness.get_by_label("Everything ファイル名検索…  Ctrl+R");
+            assert!(button.accesskit_node().is_disabled());
+            button.hover();
+            harness.run();
+            let reason = harness.get_by_label("連動した別ウィンドウで閲覧している間は使えません。表示を閉じてから検索してください");
+            assert!(
+                harness.ctx.content_rect().contains_rect(reason.rect()),
+                "viewport={:?}, reason={:?}",
+                harness.ctx.content_rect(),
+                reason.rect()
+            );
+        },
+    );
+}
+
+#[test]
+fn everything_search_disabled_menu_hover_fits_small_viewports_and_ui_zoom() {
+    for theme in [
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    ] {
+        for (size, scale) in [
+            (egui::vec2(480.0, 360.0), 1.0),
+            (egui::vec2(640.0, 580.0), 2.0),
+            (egui::vec2(480.0, 580.0), 2.0),
+        ] {
+            let mut fonts_ready = false;
+            let mut harness = test_ui::builder().with_size(size).build_ui(move |ui| {
+                let ctx = &ui.ctx().clone();
+                mimageviewer::os_theme::apply_resolved(ctx, theme);
+                if !fonts_ready {
+                    install_app_fonts(ctx);
+                    mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+                test_ui::full_viewport_ui(ui, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        mimageviewer::draw_everything_search_disabled_menu_snapshot_fixture(
+                            ui,
+                            SNAPSHOT_CURSOR_EXTENT_PHYSICAL,
+                        );
+                    });
+                });
+            });
+            harness.run();
+            let button = harness.get_by_label("Everything ファイル名検索…  Ctrl+R");
+            assert!(button.accesskit_node().is_disabled());
+            button.hover();
+            harness.run();
+            let viewport = harness.ctx.content_rect();
+            assert!((viewport.size() * scale - size).length() < 1.0);
+            let reason = harness.get_by_label("連動した別ウィンドウで閲覧している間は使えません。表示を閉じてから検索してください");
+            assert!(
+                viewport.contains_rect(reason.rect()),
+                "theme={theme:?}, scale={scale}, viewport={viewport:?}, reason={:?}",
+                reason.rect()
+            );
+        }
+    }
 }
 
 #[test]
@@ -2473,6 +2623,38 @@ fn preferences_favorite_view_state_dark() {
                 ui.set_width(580.0);
                 mimageviewer::draw_favorite_view_state_settings_snapshot_fixture(ui);
             });
+        },
+    );
+}
+
+#[test]
+fn notification_duration_preferences_light_standard() {
+    snapshot_with_theme_at_size(
+        "notification_duration_preferences_light_standard",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 115.0),
+        None,
+        |ui| {
+            mimageviewer::draw_notification_duration_snapshot_fixture(
+                ui,
+                mimageviewer::settings::NotificationDuration::Standard,
+            );
+        },
+    );
+}
+
+#[test]
+fn notification_duration_preferences_dark_short_narrow() {
+    snapshot_with_theme_at_size(
+        "notification_duration_preferences_dark_short_narrow",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(260.0, 145.0),
+        None,
+        |ui| {
+            mimageviewer::draw_notification_duration_snapshot_fixture(
+                ui,
+                mimageviewer::settings::NotificationDuration::Short,
+            );
         },
     );
 }

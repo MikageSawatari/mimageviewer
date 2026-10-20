@@ -282,7 +282,7 @@ impl App {
 
     pub(crate) fn open_metadata_export_dialog(&mut self) {
         let Some(root) = self.metadata_transfer_target() else {
-            self.show_feedback_toast("実フォルダを表示しているときに使用できます".to_string());
+            self.show_feedback_warning("実フォルダを表示しているときに使用できます".to_string());
             return;
         };
         self.metadata_transfer = Some(MetadataTransferState::export(root, &self.settings));
@@ -290,7 +290,7 @@ impl App {
 
     pub(crate) fn open_metadata_import_dialog(&mut self) {
         let Some(root) = self.metadata_transfer_target() else {
-            self.show_feedback_toast("実フォルダを表示しているときに使用できます".to_string());
+            self.show_feedback_warning("実フォルダを表示しているときに使用できます".to_string());
             return;
         };
         self.metadata_transfer = Some(MetadataTransferState::import(root));

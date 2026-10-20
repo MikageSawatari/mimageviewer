@@ -490,7 +490,7 @@ fn section1335_snapshot_and_reading_history_direct_pages_keep_physical_restore_r
     for snapshot in [false, true] {
         let (mut env, parent, book) = book_env();
         open_zip(&mut env, &book, true);
-        env.close_fullscreen(); // Internal close is deliberately not a list action.
+        env.close_fullscreen(); // A true viewer exit alone is deliberately not a list action.
         let before = env.settings.startup_list_restore.clone();
         if snapshot {
             env.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);

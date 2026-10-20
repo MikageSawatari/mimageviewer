@@ -479,7 +479,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「ファイル処理 → Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
 | `changelog_markdown.rs` | 更新履歴 (GitHub release body) の Markdown サブセット描画。バージョン更新ダイアログ (`ui_dialogs/update_notice.rs`) から呼ばれ、見出し / 箇条書き / `**強調**` / `` `コード` `` / `<kbd>キー</kbd>` を整形。`egui_kittest` のスナップショットテスト対象 |
-| `version_highlights.rs` (v2.0.0) | 更新後初回起動の「重要な変更点」(④)。exe 埋め込みテーブル + 純関数 `highlights_to_show` (またぎ累積、unit test) + 描画 `render`。ダイアログは `ui_dialogs/whats_new.rs`。`update_check` (更新前・ネット・全文) と別物で、更新後・オフライン・操作/既定変更の主要部分のみ。トリガは `last_seen_version` / `previous_last_seen_version` |
+| `version_highlights.rs` (v2.0.0) | 更新後の「重要な変更点」(④)。exe 埋め込みテーブル + 純関数 `highlights_to_show` (またぎ累積、unit test) + 描画 `render`。ダイアログは `ui_dialogs/whats_new.rs`。`update_check` (更新前・ネット・全文) と別物で、更新後・オフライン・操作/既定変更の主要部分のみ。`whats_new_acknowledged_version` から未読を選び、利用者が閉じたときだけ保存。main の起動通知は `startup_notice_viewer_open` で3モードの閲覧中を保留し、描画とモーダル判定を同じ visible helper へ揃える。詳細は [変更点表示計画 §2](version-highlights-plan.md#2-トリガと既読記録-12322026-10-19) |
 
 ### 検索 / インデクサ / タグ
 
@@ -521,7 +521,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `vram_budget.rs` | mImageViewer 全体の GPU メモリ予算の単一所有者。永続設定の割合から共有 pool を求め、一覧 / フルスクリーンの 80% / 20% 配分、RGBA8 bytes / texels 換算、HIGH / LOW 水位を導出する。0% は無制限として明示的に扱う |
 | `monitor.rs` | モニター情報取得 (DPI 等) |
 | `open_with.rs` | Windows の関連付けアプリ列挙と EXE 選択。列挙結果は実行パスではなく `IAssocHandler::GetName()` の handler ID として保持する。起動 worker 内で対象拡張子の handler を再列挙し、既存の Shell `IDataObject` 生成経路を介して `IAssocHandler::Invoke` を呼ぶ。利用者が明示選択した EXE だけを process spawn へ渡す |
-| `file_drag.rs` | グリッドからエクスプローラ等へのファイル D&D 送出 (シェル `IDataObject` + `SHDoDragDrop`)。`docs/file-drag-drop-design.md` |
+| `file_drag.rs` / `file_drag/async_data_object.rs` | グリッドから外部へのファイル D&D 送出。Shell `IDataObject` を送出専用 STA 委譲ラッパーで保持し、`IDataObjectAsyncCapability` で非同期を交渉する。1ドラッグ1 owner、App へ完了を戻さず、終了時に転送を待たない。共有 Shell helper / クリップボード経路は従来どおり。`docs/file-drag-drop-design.md` §12 |
 | `os_theme.rs` | Windows の「アプリ用の色」(レジストリ) を検出し、egui::Visuals へ適用。初回起動時に `Settings::ui_theme` の初期値を決める |
 
 GPU テクスチャの利用許容量は `vram_budget.rs` の共有 pool だけから導出する。サムネイル側と
@@ -879,3 +879,14 @@ PDFの仮想項目はruntime keyと同じ`page_<u32>`だけを許可し、評価
 5. **ドキュメント同時更新** — [public-wording-policies.md](public-wording-policies.md) の「コード修正時のドキュメント同時更新」セクションに従う
 
 §1.333の最後まで視聴した動画・音声は、Settingsの `video_watched_to_end` 集合とsettings.db同名の追加tableで記録する。既存再生位置表・再開動作は保持し、集合から本体一覧へ満タンを描く。詳細はbook-resume-meter-plan.md §11。
+
+
+### 一時通知の時間ポリシー（§1.402）
+
+`feedback.rs` が情報/警告/エラーの型と表示時間の倍率を所有する。
+App の発行境界で寿命とnative fadeを確定して、既存 toast state と native transport へ渡す。
+標準は従来の面別の時間・fadeを維持し、nativeのlinger/fadeの既存不一致は今回修正しない。
+動画内部の発行元は種類を明示し、既存 NativeChromeSnapshot から選択値を読む。
+設定は既存 settings.db KV の追加項目で、旧項目欠落時は標準へ移行する。
+新しい worker・channel・detached context state は持たない。
+[時間・例外・棚卸しの詳細](notification-duration-policy.md)。

@@ -3225,7 +3225,7 @@ impl App {
         }
         self.settings.ring_shortcuts.x_picker_hint_shown = true;
         self.settings.save();
-        self.show_feedback_toast_with_duration(
+        self.show_feedback_warning_with_duration(
             "ピッカーを開きました。メタデータ表示は画像リングの右上スロットから使えます。"
                 .to_string(),
             X_PICKER_HINT_TOAST_SECS,
@@ -3592,7 +3592,7 @@ impl App {
         self.gamepad_favorite_picker = None;
         self.clear_native_video_picker_overlay(ctx);
         self.gamepad.state.require_directional_neutral();
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         if let Some(target) = favorite_target {
@@ -3715,7 +3715,7 @@ impl App {
             GamepadLocationNav::BooksRoot => AddressBarNav::BooksRoot,
             GamepadLocationNav::Direct(path) => {
                 let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-                    self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
+                    self.show_feedback_warning(format!("場所が見つかりません: {}", path.display()));
                     return None;
                 };
                 AddressBarNav::Direct(resolved, crate::app::StartupListIntent::ExplicitList)
@@ -5742,13 +5742,13 @@ impl App {
 
     fn location_navigation_blocked(&mut self) -> bool {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return true;
         }
         if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            self.show_feedback_toast("検索中は場所ジャンプを使用できません".to_string());
+            self.show_feedback_warning("検索中は場所ジャンプを使用できません".to_string());
             return true;
         }
         false
@@ -5761,7 +5761,7 @@ impl App {
         source: &'static str,
     ) -> Option<AddressBarNav> {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return None;
@@ -5772,10 +5772,10 @@ impl App {
             .get(slot.saturating_sub(1))
             .map(|favorite| favorite.path.clone())
         else {
-            self.show_feedback_toast(format!("お気に入り {slot} は未登録です"));
+            self.show_feedback_warning(format!("お気に入り {slot} は未登録です"));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
@@ -5796,10 +5796,10 @@ impl App {
         }
         let path = super::drive_root_path_for_letter(letter)?;
         let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_toast(format!("ドライブが見つかりません: {}", path.display()));
+            self.show_feedback_warning(format!("ドライブが見つかりません: {}", path.display()));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
@@ -5814,17 +5814,17 @@ impl App {
             return None;
         }
         let Some(path) = self.current_location_root() else {
-            self.show_feedback_toast("現在位置のルートディレクトリが見つかりません".to_string());
+            self.show_feedback_warning("現在位置のルートディレクトリが見つかりません".to_string());
             return None;
         };
         let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "ルートディレクトリが見つかりません: {}",
                 path.display()
             ));
             return None;
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(
@@ -5857,19 +5857,19 @@ impl App {
             path
         } else {
             if let Some(path) = remembered.as_ref() {
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "{} の最後の場所が見つかりません。ルートへ移動します: {}",
                     drive_key,
                     path.display()
                 ));
             }
             let Some(resolved_root) = crate::folder_tree::resolve_openable_path(&root) else {
-                self.show_feedback_toast(format!("ドライブが見つかりません: {}", root.display()));
+                self.show_feedback_warning(format!("ドライブが見つかりません: {}", root.display()));
                 return None;
             };
             resolved_root
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(
@@ -5915,7 +5915,7 @@ impl App {
             }
             _ => return None,
         };
-        if self.fullscreen_idx.is_some() {
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("{nav:?}")));
@@ -5963,7 +5963,7 @@ impl App {
             .nth(slot.saturating_sub(1))
             .map(|tag| tag.name.clone())
         else {
-            self.show_feedback_toast(format!("ピン留めタグ {slot} は未登録です"));
+            self.show_feedback_warning(format!("ピン留めタグ {slot} は未登録です"));
             return;
         };
         self.bump_input_seq(source, Some(&format!("pinned_tag_slot={slot}")));
@@ -5978,7 +5978,7 @@ impl App {
             .tag_target_paths(crate::app::ActionSurface::MainWindow)
             .is_empty()
         {
-            self.show_feedback_toast("[タグ対象なし]".to_string());
+            self.show_feedback_warning("[タグ対象なし]".to_string());
             return;
         }
         self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
@@ -6003,14 +6003,14 @@ impl App {
         source: &'static str,
     ) -> Option<AddressBarNav> {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return None;
         }
         let len = self.settings.favorites.len();
         if len == 0 {
-            self.show_feedback_toast("お気に入りが登録されていません".to_string());
+            self.show_feedback_warning("お気に入りが登録されていません".to_string());
             return None;
         }
         let current = self.current_gamepad_favorite_index();
@@ -6029,11 +6029,11 @@ impl App {
         label: &'static str,
     ) -> Option<AddressBarNav> {
         let Some(path) = path else {
-            self.show_feedback_toast(format!("{label} が見つかりません"));
+            self.show_feedback_warning(format!("{label} が見つかりません"));
             return None;
         };
         let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
+            self.show_feedback_warning(format!("場所が見つかりません: {}", path.display()));
             return None;
         };
         Some(AddressBarNav::Direct(
@@ -6151,7 +6151,7 @@ impl App {
         if self.active_detached_viewer_has_foreground() {
             self.bump_input_seq(source, Some(detail));
             self.cancel_pending_folder_nav();
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 Self::nav_noop_title(crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent)
                     .to_string(),
             );
@@ -6269,7 +6269,7 @@ impl App {
             }
             RingActionId::GridToggleSnapshotLock if context == RingShortcutContext::Grid => {
                 if let Some(reason) = self.snapshot_button_disabled_reason() {
-                    self.show_feedback_toast(reason.to_string());
+                    self.show_feedback_warning(reason.to_string());
                 } else {
                     let label = self.infer_snapshot_source_label();
                     self.toggle_snapshot(label);
@@ -6458,7 +6458,7 @@ impl App {
             RingActionId::ImageRotateLeft if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     if self.current_fullscreen_spread_is_double(fs_idx) {
-                        self.show_feedback_toast("見開き表示中は回転できません".to_string());
+                        self.show_feedback_warning("見開き表示中は回転できません".to_string());
                     } else {
                         self.rotate_image_ccw(fs_idx);
                     }
@@ -6468,7 +6468,7 @@ impl App {
             RingActionId::ImageRotateRight if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     if self.current_fullscreen_spread_is_double(fs_idx) {
-                        self.show_feedback_toast("見開き表示中は回転できません".to_string());
+                        self.show_feedback_warning("見開き表示中は回転できません".to_string());
                     } else {
                         self.rotate_image_cw(fs_idx);
                     }
@@ -6534,7 +6534,9 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.copy_item_image_to_clipboard(fs_idx)
                 {
-                    self.show_feedback_toast("この項目は画像コピーに対応していません".to_string());
+                    self.show_feedback_warning(
+                        "この項目は画像コピーに対応していません".to_string(),
+                    );
                 }
                 None
             }
@@ -6542,7 +6544,7 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.open_item_folder_in_explorer(fs_idx)
                 {
-                    self.show_feedback_toast("フォルダを開けません".to_string());
+                    self.show_feedback_warning("フォルダを開けません".to_string());
                 }
                 None
             }
@@ -6550,7 +6552,7 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.copy_item_path_to_clipboard(ctx, fs_idx)
                 {
-                    self.show_feedback_toast("パスをコピーできません".to_string());
+                    self.show_feedback_warning("パスをコピーできません".to_string());
                 }
                 None
             }
@@ -6558,7 +6560,7 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx
                     && !self.copy_item_file_name_to_clipboard(ctx, fs_idx)
                 {
-                    self.show_feedback_toast("ファイル名をコピーできません".to_string());
+                    self.show_feedback_warning("ファイル名をコピーできません".to_string());
                 }
                 None
             }
@@ -6660,7 +6662,7 @@ impl App {
                     .fullscreen_idx
                     .is_some_and(|i| self.fs_music_view_active(i))
                 {
-                    self.show_feedback_toast("タイル表示は動画のみ対応です".to_string());
+                    self.show_feedback_warning("タイル表示は動画のみ対応です".to_string());
                 } else {
                     self.toggle_ring_video_tile_mode(ctx);
                 }
@@ -6703,7 +6705,7 @@ impl App {
                 #[cfg(not(windows))]
                 {
                     let _ = ctx;
-                    self.show_feedback_toast("この操作は Windows でのみ利用できます".to_string());
+                    self.show_feedback_warning("この操作は Windows でのみ利用できます".to_string());
                 }
             }
             RingShortcutContext::VideoFullscreen => {
@@ -6919,7 +6921,7 @@ impl App {
             RingShortcutContext::Grid => {
                 // A stale/misrouted Grid ring action must never reinterpret the fullscreen
                 // item as a grid selection or silently register a different source.
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "フルスクリーン表示中はグリッドの項目をコレクションに追加できません"
                         .to_string(),
                 );
@@ -6947,7 +6949,9 @@ impl App {
                     .fullscreen_idx
                     .is_some_and(|i| self.fs_music_view_active(i))
                 {
-                    self.show_feedback_toast("代表サムネのピン留めは動画のみ対応です".to_string());
+                    self.show_feedback_warning(
+                        "代表サムネのピン留めは動画のみ対応です".to_string(),
+                    );
                 } else {
                     self.pin_ring_video_frame(ctx);
                 }
@@ -6986,7 +6990,7 @@ impl App {
             crate::ui_fullscreen::SpreadPair::Single => vec![fs_idx],
         };
         if !idxs.iter().any(|&i| self.fs_image_has_alpha(i)) {
-            self.show_feedback_toast("透過画像ではないため背景は切り替えできません".to_string());
+            self.show_feedback_warning("透過画像ではないため背景は切り替えできません".to_string());
             return;
         }
         let modulo: u8 = if self.ai_upscale_enabled { 2 } else { 3 };
@@ -7079,7 +7083,7 @@ impl App {
             // グリッド面: Y でツリーをトグル。detached viewer が同時表示中でも
             // foreground / last-touched がメインならこちらを操作する。
             if self.folder_pane_disabled() && !self.settings.folder_tree_pane_visible {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "スナップショット中は他のフォルダに移動できません".to_string(),
                 );
                 return;
@@ -7351,13 +7355,13 @@ impl App {
 
     fn handle_gamepad_start(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return None;
         }
         if self.settings.favorites.is_empty() && self.settings.smart_folders.is_empty() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "お気に入り／スマートフォルダが登録されていません".to_string(),
             );
             return None;
@@ -7396,7 +7400,7 @@ impl App {
     fn open_gamepad_video_marker_picker(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let markers = self.collect_video_nav_markers(fs_idx);
         if markers.is_empty() {
-            self.show_feedback_toast("ブックマーク / チャプターがありません".to_string());
+            self.show_feedback_warning("ブックマーク / チャプターがありません".to_string());
             return;
         }
         let current = self
@@ -7422,19 +7426,19 @@ impl App {
 
     fn open_gamepad_location_picker(&mut self, ctx: &egui::Context) {
         if self.is_snapshot_active() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スナップショット中は他のフォルダに移動できません".to_string(),
             );
             return;
         }
         if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            self.show_feedback_toast("検索中は場所リストを開けません".to_string());
+            self.show_feedback_warning("検索中は場所リストを開けません".to_string());
             return;
         }
         let rating_counts = self.rating_counts();
         let entries = self.build_gamepad_location_entries(rating_counts);
         if entries.is_empty() {
-            self.show_feedback_toast("移動できる場所がありません".to_string());
+            self.show_feedback_warning("移動できる場所がありません".to_string());
             return;
         }
         let selected = self.current_gamepad_location_index(&entries).unwrap_or(0);
@@ -7682,7 +7686,7 @@ impl App {
             Some(GridItem::ConvertibleArchive { path, .. }) => {
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                 } else if self.begin_smart_grid_container_navigation(

@@ -797,7 +797,7 @@ impl crate::app::App {
                         crate::logger::log(
                             "stack deletion: retained projection could not be prepared",
                         );
-                        self.show_feedback_toast("スタックの保存情報を読み取れませんでした。最新の情報に更新してください".into());
+                        self.show_feedback_warning("スタックの保存情報を読み取れませんでした。最新の情報に更新してください".into());
                         // There is no accepted aggregate to expose. Keep the survivor flat
                         // order until the ordinary deferred reload prepares a new list.
                         let previous = self.folder_observation.take();
@@ -1410,7 +1410,9 @@ impl crate::app::App {
         if self.fullscreen_idx.is_some() {
             self.park_detached_session_for_stack_aggregation(ctx);
         }
-        if self.fullscreen_idx.is_some() {
+        // Accepting a background aggregate is a viewer end only when this
+        // context owns a session; a cold list-only PDF keeps its prompt.
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         self.apply_stack_group_ready(
@@ -1502,9 +1504,9 @@ impl crate::app::App {
                 notice.push('\n');
                 notice.push_str(&stack_notice);
             }
-            self.show_feedback_toast(notice);
+            self.show_feedback_warning(notice);
         } else if let Some(stack_notice) = stack_notice {
-            self.show_feedback_toast(stack_notice);
+            self.show_feedback_warning(stack_notice);
         }
     }
 
@@ -1788,7 +1790,7 @@ impl crate::app::App {
                     Some(StackReturnState::Refreshing { view: current }) if Arc::ptr_eq(current, &view))
             {
                 self.stack_return_state = Some(StackReturnState::Recovering { view });
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "編集情報を更新できませんでした。自動で再試行します。".into(),
                 );
             }
@@ -1957,7 +1959,7 @@ impl crate::app::App {
     /// (folder_changes=false なので `stack_mode_requested` は維持される)。
     pub(crate) fn toggle_stack_mode(&mut self) {
         if !self.stack_mode_available() {
-            self.show_feedback_toast("スタック表示は通常フォルダまたはサブ展開で使えます".into());
+            self.show_feedback_warning("スタック表示は通常フォルダまたはサブ展開で使えます".into());
             return;
         }
         if self.items_are_subfolder_expansion_view {
@@ -1991,7 +1993,7 @@ impl crate::app::App {
         if self.stack_mode_requested && self.stack_script_pending.is_none() {
             // スクリプトが失敗して既定ルールへフォールバックした場合は最優先で知らせる。
             if self.stack_script_error.is_some() {
-                self.show_feedback_toast(
+                self.show_feedback_error(
                     "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)"
                         .into(),
                 );
@@ -2000,7 +2002,7 @@ impl crate::app::App {
                 .as_ref()
                 .is_some_and(|sv| !sv.has_collapsible_stack())
             {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "まとめられるスタックがありませんでした (分類ルールはヘルプ参照)".into(),
                 );
             } else if let Some(rule) = self.stack_active_rule.clone() {
@@ -2050,7 +2052,7 @@ impl crate::app::App {
         }
 
         if self.subfolder_expansion_snapshot.is_none() {
-            self.show_feedback_toast("サブ展開のスナップショットがありません".into());
+            self.show_feedback_warning("サブ展開のスナップショットがありません".into());
             return;
         }
 
@@ -2413,6 +2415,186 @@ mod tests {
             );
             app.poll_sidecar_restore(ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    // Produce a real candidate, but hold delivery until after the competing PDF
+    // open. This fixes the ordering without sleeps or a synthetic grouping result.
+    fn hold_stack_grouping_completion(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        folder: PathBuf,
+    ) -> (
+        StackGroupReady,
+        std::sync::mpsc::Sender<Result<Option<StackGroupReady>, String>>,
+    ) {
+        app.load_folder_with_scan(folder.clone(), None);
+        finish_list_hydration_for_test(app, ctx);
+        app.stack_mode_requested = true;
+        app.load_folder_with_scan(folder, None);
+        finish_list_hydration_for_test(app, ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            app.stack_script_pending,
+            Some(StackPreparePending::Grouping(_))
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grouping did not start"
+            );
+            app.poll_stack_script(ctx);
+            std::thread::yield_now();
+        }
+        let Some(StackPreparePending::Grouping(mut pending)) = app.stack_script_pending.take()
+        else {
+            unreachable!();
+        };
+        let ready = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .expect("collapsible stack candidate");
+        let (deliver, rx) = std::sync::mpsc::channel();
+        pending.rx = rx;
+        app.stack_script_pending = Some(StackPreparePending::Grouping(pending));
+        (ready, deliver)
+    }
+
+    #[test]
+    fn stack_grouping_completion_preserves_cold_list_pdf_password_request_and_input() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("stack-list-password");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["111_p0.png", "111_p1.png", "222_p0.png", "222_p1.png"] {
+            image::RgbImage::new(1, 1).save(folder.join(name)).unwrap();
+        }
+        let pdf = folder.join("password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let (ready, deliver) = hold_stack_grouping_completion(&mut app, &ctx, folder.clone());
+        assert!(
+            ready.view.has_collapsible_stack(),
+            "real grouping candidate: flat={:?}, items={:?}, separator={:?}, script={}",
+            ready.view.materialize_flat().0,
+            app.items,
+            app.settings.stack_separator,
+            app.settings.stack_script_enabled
+        );
+        let generation = app.items_generation;
+        let count = app.items.len();
+        app.load_pdf_as_folder(pdf.clone());
+        app.pdf_enumerate_pending.as_mut().expect("cold PDF open").2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items.len(), count);
+        assert_eq!(app.pdf_password_dialog_path().as_ref(), Some(&pdf));
+        assert!(!app.projected_viewer_session_open());
+        assert!(app.common_modal_dialog_open());
+        assert!(app.stack_mode_requested);
+        assert!(matches!(
+            app.stack_script_pending,
+            Some(StackPreparePending::Grouping(_))
+        ));
+        app.pdf_password_input = "typed password".into();
+        assert!(deliver.send(Ok(Some(ready))).is_ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Drive adoption and hydration, checking prompt ownership at every poll.
+        while app.stack_view.is_none() || app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "aggregate did not settle: requested={} pending={} folder={:?}",
+                app.stack_mode_requested,
+                app.stack_script_pending.is_some(),
+                app.current_folder
+            );
+            if !app.sidecar_restore_active() {
+                app.poll_stack_script(&ctx);
+            }
+            app.poll_sidecar_restore(&ctx);
+            assert_eq!(app.pdf_password_dialog_path().as_ref(), Some(&pdf));
+            assert_eq!(app.pdf_password_input, "typed password");
+            std::thread::yield_now();
+        }
+        assert!(
+            app.stack_view
+                .as_ref()
+                .is_some_and(|view| view.has_collapsible_stack())
+        );
+        assert!(app.pdf_password_request.is_some());
+        assert_eq!(app.pdf_password_dialog_path().as_ref(), Some(&pdf));
+        assert_eq!(app.pdf_password_input, "typed password");
+        assert!(!app.projected_viewer_session_open());
+    }
+
+    #[test]
+    fn stack_grouping_completion_ends_waiting_viewer_before_late_pdf_success() {
+        use crate::app::{DeferredFsReopen, DeferredFsTarget, HistoryTrigger, ViewerPresentation};
+        for presentation in [
+            ViewerPresentation::Fullscreen,
+            ViewerPresentation::MainWindow,
+            ViewerPresentation::DetachedWindow,
+        ] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let folder = app.tmp.path().join("stack-reader-wait");
+            std::fs::create_dir(&folder).unwrap();
+            for name in ["111_p0.png", "111_p1.png", "222_p0.png", "222_p1.png"] {
+                image::RgbImage::new(1, 1).save(folder.join(name)).unwrap();
+            }
+            let pdf = folder.join("late.pdf");
+            std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let (ready, deliver) = hold_stack_grouping_completion(&mut app, &ctx, folder);
+            app.load_pdf_as_folder(pdf.clone());
+            let (handle, complete) = crate::pdf_loader::pending_enumerate_handle_for_test(&pdf);
+            let cancel = Arc::clone(&handle.cancel);
+            app.pdf_enumerate_pending.as_mut().expect("cold PDF open").2 = handle;
+            app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+            app.viewer_presentation = presentation;
+            #[cfg(windows)]
+            {
+                app.native_video_in_window_active = presentation == ViewerPresentation::MainWindow;
+            }
+            app.show_whats_new = true;
+            app.show_mouse_nav_migration_prompt = false;
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.projected_viewer_session_open());
+            assert!(!app.whats_new_visible());
+            assert!(deliver.send(Ok(Some(ready))).is_ok());
+            app.poll_stack_script(&ctx);
+            assert!(app.stack_view.is_some(), "{presentation:?}");
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.pdf_enumerate_pending.is_none());
+            assert!(app.fs_nav_after_pdf_enumerate.is_none());
+            complete(Ok(vec![crate::pdf_loader::PdfPageEntry {
+                page_num: 0,
+                mtime: 1,
+                file_size: 4,
+            }]));
+            app.poll_pdf_enumerate();
+            finish_list_hydration_for_test(&mut app, &ctx);
+            assert!(app.fullscreen_idx.is_none());
+            assert!(!app.projected_viewer_session_open());
+            assert!(app.whats_new_visible(), "{presentation:?}");
         }
     }
 

@@ -1278,6 +1278,141 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
     owner.shutdown_and_join();
 }
 
+#[cfg(windows)]
+#[test]
+fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completion() {
+    use super::tests::startup_notices::{WAITING_SESSION_END_ROUTES, end_waiting_viewer};
+    for projection in [true, false] {
+        for close in [
+            "escape",
+            "ui_close",
+            "backend_fullscreen",
+            "backend_detached",
+            "context_retire",
+        ]
+        .into_iter()
+        .chain(WAITING_SESSION_END_ROUTES.iter().copied())
+        {
+            let escape = close == "escape";
+            let mut env = setup_app();
+            let root = env.tmp.path().join("cancelled-entry.pdf");
+            let data = env.tmp.path().join("cancelled-entry-data");
+            let scope = install_document(&mut env, &root);
+            let (service, owner) = runtime(&mut env, &data);
+            save(&service, &scope, ReadingDirection::Ltr);
+            let deferred = DeferredFsReopen {
+                history_trigger: HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: DeferredFsTarget::None,
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            };
+            let (late_projection, receiver) = mpsc::channel();
+            let prepared = projection.then(|| {
+                env.book_composition = ViewerBookComposition::Preparing {
+                    scope: scope.clone(),
+                    receiver,
+                    origin: Default::default(),
+                };
+                env.defer_book_projection_open(deferred.clone());
+                service.prepare(scope.clone(), PageDomain::Document)
+            });
+            if !projection {
+                assert!(env.defer_book_composition_deferred_open(
+                    0,
+                    deferred,
+                    book_composition_permission::BookTargetPurpose::Explicit,
+                ));
+            }
+            env.show_whats_new = true;
+            env.show_mouse_nav_migration_prompt = false;
+            env.settings.whats_new_acknowledged_version = Some("3.9.0".into());
+            env.viewer_presentation = ViewerPresentation::MainWindow;
+            env.native_video_in_window_active = true;
+            assert!(env.book_deferred_open_wait_active());
+            assert!(!env.whats_new_visible());
+            assert!(env.fullscreen_idx.is_none());
+
+            let mut input = egui::RawInput::default();
+            if escape {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            } else {
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+            }
+            let ctx = egui::Context::default();
+            if WAITING_SESSION_END_ROUTES.contains(&close) {
+                end_waiting_viewer(&mut env, &ctx, close);
+            } else if close.starts_with("backend_") {
+                super::tests::startup_notices::close_waiting_viewer_through_backend(
+                    &mut env,
+                    &ctx,
+                    close == "backend_detached",
+                    false,
+                );
+            } else if close == "context_retire" {
+                env.stash_mounted_as_active_for_test(1236);
+                env.remove_active_context_for_test();
+            } else {
+                ctx.run_pass(input, |ctx| {
+                    ctx.root_ui(|ui| env.render_fullscreen_viewport(ui));
+                    assert!(!env.book_deferred_open_wait_active());
+                    assert!(env.whats_new_visible());
+                    assert_eq!(env.modal_dialog_block_reason(), Some("whats_new"));
+                    if escape {
+                        assert!(!env.dialog_escape_pressed(ctx));
+                    }
+                })
+                .drop_without_applying_deltas();
+            }
+            assert!(
+                !env.book_deferred_open_wait_active(),
+                "{projection} {close}"
+            );
+            assert!(env.whats_new_visible(), "{projection} {close}");
+
+            // Projection adoption still completes for the list. A retired open must
+            // not be carried into its new generation. Permission replies instead
+            // lose their original receiver when the qualified open retires.
+            if let Some(prepared) = prepared {
+                let delivered = late_projection.send(prepared.recv_timeout(WAIT).unwrap());
+                if matches!(
+                    close,
+                    "backend_detached" | "context_retire" | "scale_detached"
+                ) {
+                    assert!(delivered.is_err(), "retired context must drop its receiver");
+                } else {
+                    delivered.unwrap();
+                    adopt(&mut env, &service, &scope);
+                }
+            }
+            barrier(&service, &scope);
+            env.poll_book_composition_read(&ctx);
+            settle_projection(&mut env);
+            env.poll_book_presentation_permission(&ctx);
+            assert!(env.fullscreen_idx.is_none());
+            assert!(!env.book_deferred_open_wait_active());
+            assert!(env.whats_new_visible());
+            assert_eq!(
+                env.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            owner.shutdown_and_join();
+        }
+    }
+}
+
 #[test]
 fn g3_source_terminal_required_hidden_or_missing_target_never_uses_another_page() {
     use crate::book_composition::fixtures::document_page;

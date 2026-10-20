@@ -45,8 +45,10 @@ pub(crate) use everything::SearchOpenOrigin;
 use everything::{
     EverythingPosition, SearchAccepted, SearchProducer, SearchProjection, SearchSource,
 };
+pub(crate) use everything::{EverythingSearchEntryAvailability, everything_search_menu_button};
 pub use everything::{
-    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+    draw_everything_progress_snapshot_fixture,
+    draw_everything_search_disabled_menu_snapshot_fixture, draw_everything_search_snapshot_fixture,
 };
 
 // -----------------------------------------------------------------------
@@ -200,6 +202,37 @@ fn global_search_status_width(ui: &egui::Ui, text: &str, color: egui::Color32) -
     let width = needed.clamp(GLOBAL_SEARCH_STATUS_MIN_WIDTH, max_width);
     let truncated = needed > width + 0.5;
     (width, truncated)
+}
+
+fn draw_global_search_status(
+    ui: &mut egui::Ui,
+    text: String,
+    color: egui::Color32,
+    hover: Option<String>,
+) {
+    let (status_width, truncated) = global_search_status_width(ui, &text, color);
+    let hover_text = hover.or_else(|| truncated.then(|| text.clone()));
+    let response = ui.add_sized(
+        [status_width, ui.spacing().interact_size.y],
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(GLOBAL_SEARCH_STATUS_TEXT_SIZE)
+                .color(color),
+        )
+        .truncate(),
+    );
+    if let Some(hover) = hover_text {
+        response.on_hover_text(hover);
+    }
+}
+
+/// 純粋な拒否バッジ描画。製品と同じ幅制限・全文 hover を snapshot で確認する。
+pub fn draw_global_search_reject_snapshot_fixture(ui: &mut egui::Ui, terms: &[&str]) {
+    let message = crate::global_search::RejectReason::TooShort(
+        terms.iter().map(|term| (*term).into()).collect(),
+    )
+    .as_user_message();
+    draw_global_search_status(ui, message, egui::Color32::from_rgb(200, 120, 40), None);
 }
 
 /// Ctrl+G の drill-down 状態。コンテナにドリルインしているときだけ `Some` で保持される
@@ -2955,7 +2988,7 @@ impl App {
                     visibility_notice,
                 }) => {
                     if let Some(notice) = visibility_notice {
-                        self.show_feedback_toast(notice.message().into());
+                        self.show_feedback_warning(notice.message().into());
                     }
                     // Accepted batches enter the worker FIFO in order. The worker does
                     // the rating lookup before returning each rated batch to this owner.
@@ -2976,8 +3009,7 @@ impl App {
                     self.global_search.truncated = truncated;
                     match reason {
                         DoneReason::RejectedQuery(r) => {
-                            self.global_search.reject_message =
-                                Some(r.as_user_message().to_string());
+                            self.global_search.reject_message = Some(r.as_user_message());
                         }
                         DoneReason::Cancelled => {
                             self.global_search.reject_message = Some("検索を中止しました".into());
@@ -3306,7 +3338,7 @@ impl App {
                             continue;
                         }
                         if rating_sort_failed {
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "評価順を読み込めなかったため名前順で表示しました".into(),
                             );
                         }
@@ -3384,7 +3416,7 @@ impl App {
                                         .into(),
                                 );
                             }
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "[検索結果を準備できませんでした]".to_string(),
                             );
                         }
@@ -3795,7 +3827,7 @@ impl App {
             order_request,
             crate::rating_sort::ListingOrderRequest::Rating(_)
         ) {
-            self.show_feedback_toast("評価順を準備できなかったため名前順で表示しました".into());
+            self.show_feedback_warning("評価順を準備できなかったため名前順で表示しました".into());
         }
         // Badge counts and rows belong to one accepted projection, including the fallback path.
         let drilled_counts = match self.global_search.view() {
@@ -4506,16 +4538,7 @@ impl App {
                 };
                 if let Some((text, color, hover)) = status {
                     ui.separator();
-                    let (status_width, truncated) = global_search_status_width(ui, &text, color);
-                    let hover_text = hover.or_else(|| truncated.then(|| text.clone()));
-                    let response = ui.add_sized(
-                        [status_width, ui.spacing().interact_size.y],
-                        egui::Label::new(egui::RichText::new(text).size(11.0).color(color))
-                            .truncate(),
-                    );
-                    if let Some(hover) = hover_text {
-                        response.on_hover_text(hover);
-                    }
+                    draw_global_search_status(ui, text, color, hover);
                 }
             });
             if !self.global_search.tag_bridge_suggestions.is_empty() {

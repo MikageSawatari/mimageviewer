@@ -488,7 +488,7 @@ impl App {
         if saved {
             self.show_feedback_toast(format!("[隠蔽スロット{}に保存]", slot));
         } else {
-            self.show_feedback_toast(format!("[隠蔽スロット{}保存失敗]", slot));
+            self.show_feedback_error(format!("[隠蔽スロット{}保存失敗]", slot));
         }
     }
 
@@ -501,11 +501,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((slot_mask, slot_shapes)) = slot_data else {
-            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[隠蔽スロット{}は空です]", slot));
             return;
         };
         if !slot_mask.iter().any(|&m| m) && slot_shapes.is_empty() {
-            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[隠蔽スロット{}は空です]", slot));
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -565,7 +565,7 @@ impl App {
     /// bump して全 idx を stale 扱いにする (次回 compose で再生成)。
     pub(crate) fn apply_conceal_preset(&mut self, slot: usize) {
         let Some(preset) = self.settings.conceal_presets.get(slot).cloned().flatten() else {
-            self.show_feedback_toast(format!("[プリセット{}は空]", slot + 1));
+            self.show_feedback_warning(format!("[プリセット{}は空]", slot + 1));
             return;
         };
         self.settings.conceal_type = preset.conceal_type;
@@ -694,7 +694,7 @@ impl App {
             if self.redo_conceal() {
                 self.show_feedback_toast("[やり直す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -712,7 +712,7 @@ impl App {
             if self.undo_conceal() {
                 self.show_feedback_toast("[元に戻す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -1063,7 +1063,7 @@ impl App {
         seed_y: usize,
     ) {
         let Some((source, _)) = self.current_conceal_source_pixels(fs_idx) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う加工前の画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1071,14 +1071,14 @@ impl App {
         };
         let [w, h] = self.conceal_mask_size;
         if source.size != [w, h] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
             return;
         }
         let Some(mask) = self.conceal_mask.as_ref() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使うマスクを準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1103,7 +1103,7 @@ impl App {
         match outcome {
             crate::mask_db::BucketFillOutcome::Filled => {}
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
                 return;
@@ -1113,7 +1113,7 @@ impl App {
                 if let Some(message) =
                     crate::ui_helpers::bucket_shape_fit_failed_message(self.conceal_bucket_region)
                 {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
                 return;
             }
@@ -1411,7 +1411,7 @@ impl App {
                         img_pos.1.floor() as usize,
                     );
                 } else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "バケツの対象画像を確認できません。画像を開き直してからもう一度クリックしてください。"
                             .to_string(),
                     );

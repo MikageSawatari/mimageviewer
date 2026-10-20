@@ -3345,3 +3345,12 @@ Next CPUの実予約拒否時だけ予約表最大2 unitからparkedを含むown
 （未受信channelも含む）をdropして一度だけ再試行する。Current/Next共有素材・表示昇格・legacy・Unknownは保護する。
 Previous Nativeはsmoothing clear/旧source除去/容量pruningによる既存entry除去ゼロを、事前と実行入口で検査する。
 上限・D2/D4・通常draw/Next/source/AIの範囲は維持する。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
+
+## 一時通知の表示時間（§1.402）
+
+通知の種類、文字数・指定秒数・動画の既定時間、設定の倍率と例外は
+[通知時間ポリシーと棚卸し](notification-duration-policy.md) を正本とする。
+App で寿命とnative fadeを確定して渡し、描画側は倍率を再適用しない。
+標準ではnativeの既存linger/fadeの不一致、保存完了のegui1.2秒/native1.8秒も維持する。
+動画内部で発行する通知だけは、既存 chrome snapshot の選択値から同じ関数で一度確定する。
+処理の寿命に連動する進捗表示、ナビゲーション境界の専用ヒントは独立した表示を維持する。

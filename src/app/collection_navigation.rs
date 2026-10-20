@@ -1743,7 +1743,7 @@ impl App {
         if request.is_slideshow() {
             self.stop_slideshow_playback();
         }
-        self.show_feedback_toast(format!("コレクションを読み込めませんでした: {reason}"));
+        self.show_feedback_warning(format!("コレクションを読み込めませんでした: {reason}"));
         ctx.request_repaint();
     }
 
@@ -4566,7 +4566,7 @@ impl App {
                 self.release_fs_nav_lock();
             }
             CollectionNavigationAction::OuterGrid { forward, .. } => {
-                self.show_feedback_toast(if *forward {
+                self.show_feedback_warning(if *forward {
                     "コレクション内の次のコンテナはありません".into()
                 } else {
                     "コレクション内の前のコンテナはありません".into()

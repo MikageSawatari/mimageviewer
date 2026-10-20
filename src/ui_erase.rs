@@ -653,7 +653,7 @@ impl App {
         if saved {
             self.show_feedback_toast(format!("[消しゴムスロット{}に保存]", slot));
         } else {
-            self.show_feedback_toast(format!("[消しゴムスロット{}保存失敗]", slot));
+            self.show_feedback_error(format!("[消しゴムスロット{}保存失敗]", slot));
         }
     }
 
@@ -667,11 +667,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((slot_mask, slot_vectors)) = slot_data else {
-            self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[消しゴムスロット{}は空です]", slot));
             return;
         };
         if !slot_mask.iter().any(|&m| m) && slot_vectors.is_empty() {
-            self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[消しゴムスロット{}は空です]", slot));
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -762,7 +762,7 @@ impl App {
             if self.redo_erase() {
                 self.show_feedback_toast("[やり直す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -780,7 +780,7 @@ impl App {
             if self.undo_erase() {
                 self.show_feedback_toast("[元に戻す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -1195,7 +1195,7 @@ impl App {
         seed_y: usize,
     ) {
         let Some(source) = self.erase_base_cache.get(&fs_idx).cloned() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1203,14 +1203,14 @@ impl App {
         };
         let [w, h] = self.erase_mask_size;
         if source.size != [w, h] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
             return;
         }
         let Some(mask) = self.erase_mask.as_ref() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使うマスクを準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1235,7 +1235,7 @@ impl App {
         match outcome {
             crate::mask_db::BucketFillOutcome::Filled => {}
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
                 return;
@@ -1245,7 +1245,7 @@ impl App {
                 if let Some(message) =
                     crate::ui_helpers::bucket_shape_fit_failed_message(self.erase_bucket_region)
                 {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
                 return;
             }
@@ -1753,7 +1753,7 @@ impl App {
                         img_pos.1.floor() as usize,
                     );
                 } else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "バケツの対象画像を確認できません。画像を開き直してからもう一度クリックしてください。"
                             .to_string(),
                     );
@@ -2911,7 +2911,7 @@ impl App {
         self.erase_preview_active = preview_pressed;
         if preview_just_pressed && let Some(fs_idx) = self.fullscreen_idx {
             if self.run_inpaint_for_preview(ctx, fs_idx) {
-                self.show_feedback_toast("[プレビュー計算中…]".to_string());
+                self.show_feedback_warning("[プレビュー計算中…]".to_string());
             } else {
                 // 入力未読込 / サイズ不一致などで投入できなかった場合は、マスクだけ
                 // 消えたように見える preview 状態へ入らない。
@@ -3183,10 +3183,10 @@ impl App {
     pub(crate) fn execute_erase_inpaint(&mut self, ctx: &egui::Context, fs_idx: usize) {
         match self.apply_inpaint_only(ctx, fs_idx) {
             ApplyInpaintOutcome::Launched => {
-                self.show_feedback_toast("[補完中…]".to_string());
+                self.show_feedback_warning("[補完中…]".to_string());
             }
             ApplyInpaintOutcome::Deferred => {
-                self.show_feedback_toast("[補完待機中…]".to_string());
+                self.show_feedback_warning("[補完待機中…]".to_string());
             }
             ApplyInpaintOutcome::CompletedFromPreview => {
                 self.show_feedback_toast("[補完適用]".to_string());
@@ -3270,7 +3270,7 @@ impl App {
         let pixels = match self.resolve_erase_input_pixels(fs_idx) {
             Some(pixels) => pixels,
             None => {
-                self.show_feedback_toast("[画像読込中]".to_string());
+                self.show_feedback_warning("[画像読込中]".to_string());
                 return;
             }
         };
@@ -3282,11 +3282,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((new_mask, new_vectors)) = slot_data else {
-            self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
+            self.show_feedback_warning(format!("[消しゴムスロット{slot}は空です]"));
             return;
         };
         if !new_mask.iter().any(|&m| m) && new_vectors.is_empty() {
-            self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
+            self.show_feedback_warning(format!("[消しゴムスロット{slot}は空です]"));
             return;
         }
 
@@ -3527,7 +3527,7 @@ impl App {
             // rx 側 disconnect、ここでは pending 未挿入なので poll もされない)
             // (v1.0.0 安定性レビュー P3-9)。
             crate::logger::log(format!("erase: inpaint worker spawn FAILED: {e}"));
-            self.show_feedback_toast("[補完失敗]".to_string());
+            self.show_feedback_error("[補完失敗]".to_string());
             return;
         }
 
@@ -3594,7 +3594,7 @@ impl App {
             }
         }
         if worker_failed {
-            self.show_feedback_toast("[補完失敗]".to_string());
+            self.show_feedback_error("[補完失敗]".to_string());
         }
         let Some((target_key, result)) = completed else {
             return;

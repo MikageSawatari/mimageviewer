@@ -1825,7 +1825,7 @@ impl App {
             if let Some(trace) = diagnostic_trace {
                 trace.terminal("target_unavailable");
             }
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         };
         self.open_similar_snapshot_target(
@@ -1871,7 +1871,7 @@ impl App {
             if let Some(trace) = diagnostic_trace {
                 trace.terminal("target_unavailable");
             }
-            self.show_feedback_toast("ページの場所を開けません".to_string());
+            self.show_feedback_warning("ページの場所を開けません".to_string());
             return;
         };
         self.open_similar_snapshot_target(ctx, Some(item_key), location, target, diagnostic_trace);
@@ -1887,7 +1887,7 @@ impl App {
             if let Some(trace) = diagnostic_trace {
                 trace.terminal("target_unavailable");
             }
-            self.show_feedback_toast("履歴のページを開けません".to_string());
+            self.show_feedback_warning("履歴のページを開けません".to_string());
             return;
         };
         self.open_similar_snapshot_target(ctx, None, location, target, diagnostic_trace);

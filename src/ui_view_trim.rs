@@ -1146,7 +1146,7 @@ impl App {
                 Some(crate::fs_animation::FsCacheEntry::Failed)
             )
         }) {
-            self.show_feedback_toast("画像の読み込みに失敗しました".to_string());
+            self.show_feedback_error("画像の読み込みに失敗しました".to_string());
             return;
         }
         for &idx in &indices {
@@ -1279,7 +1279,7 @@ impl App {
             }
         }
         if !changed {
-            self.show_feedback_toast("自動検出できる余白がありません".to_string());
+            self.show_feedback_warning("自動検出できる余白がありません".to_string());
             return;
         }
         if request.action == OriginalViewTrimAction::DetectBook {

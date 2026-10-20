@@ -633,7 +633,93 @@ fn search_respects_favorite_filter() {
 // クエリ rejection
 // -----------------------------------------------------------------------
 
-/// ASCII 2 文字以下は TooShort で reject されること (bigram index の仕様)。
+/// 実 JPEG の EXIF Model → ingest → 索引 → post-filter を通して §1.229 を固定する。
+#[test]
+fn camera_model_search_accepts_two_char_term_with_long_term_in_and_mode() {
+    fn write_camera_jpeg(path: &std::path::Path, model: &str) {
+        let image = image::RgbImage::from_pixel(4, 4, image::Rgb([120, 80, 40]));
+        let jpeg = turbojpeg::compress_image(&image, 90, turbojpeg::Subsamp::Sub2x2).unwrap();
+        let mut payload = b"Exif\0\0II".to_vec();
+        payload.extend_from_slice(&42_u16.to_le_bytes());
+        payload.extend_from_slice(&8_u32.to_le_bytes()); // IFD0 offset
+        payload.extend_from_slice(&1_u16.to_le_bytes()); // 1 entry
+        payload.extend_from_slice(&0x0110_u16.to_le_bytes()); // Model
+        payload.extend_from_slice(&2_u16.to_le_bytes()); // ASCII
+        let mut model_bytes = model.as_bytes().to_vec();
+        model_bytes.push(0);
+        payload.extend_from_slice(&(model_bytes.len() as u32).to_le_bytes());
+        if model_bytes.len() <= 4 {
+            model_bytes.resize(4, 0);
+            payload.extend_from_slice(&model_bytes);
+            payload.extend_from_slice(&0_u32.to_le_bytes()); // next IFD
+        } else {
+            payload.extend_from_slice(&26_u32.to_le_bytes()); // value offset
+            payload.extend_from_slice(&0_u32.to_le_bytes()); // next IFD
+            payload.extend_from_slice(&model_bytes);
+        }
+        let mut output = jpeg[..2].to_vec();
+        output.extend_from_slice(&[0xff, 0xe1]);
+        output.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&jpeg[2..]);
+        fs::write(path, output).unwrap();
+    }
+
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    for (name, model) in [
+        ("a.jpg", "Canon EOS R5"),
+        ("b.jpg", "R5 body from EOS series"),
+        ("c.jpg", "EOS"),
+        ("d.jpg", "R5"),
+    ] {
+        write_camera_jpeg(&root.path().join(name), model);
+    }
+    let fav = make_favorite("camera", root.path());
+    let mgr = start_indexer_at(data.path(), &[fav.clone()]);
+    wait_scan_done(&mgr, fav.id);
+    let search = |query: &str| {
+        let handle = mgr.spawn_search(
+            query.into(),
+            vec![fav.id],
+            mimageviewer::global_search::SearchScope {
+                target: mimageviewer::fts_index::SearchTarget::Only(vec![
+                    mimageviewer::fts_index::SourceKind::Exif,
+                ]),
+                ..Default::default()
+            },
+            None,
+        );
+        let mut paths = Vec::new();
+        loop {
+            match handle.rx.recv_timeout(FS_EVENT_TIMEOUT).unwrap() {
+                SearchStreamEvent::Batch { hits, .. } => {
+                    paths.extend(hits.into_iter().map(|hit| hit.path));
+                }
+                SearchStreamEvent::Done { reason, .. } => {
+                    assert_eq!(reason, DoneReason::Complete);
+                    break;
+                }
+                SearchStreamEvent::Error(error) => panic!("{error}"),
+            }
+        }
+        paths.sort();
+        paths
+    };
+    assert_eq!(
+        search("EOS R5"),
+        [
+            normalize_path(&root.path().join("a.jpg")),
+            normalize_path(&root.path().join("b.jpg")),
+        ]
+    );
+    assert_eq!(
+        search(r#""EOS R5""#),
+        [normalize_path(&root.path().join("a.jpg"))]
+    );
+}
+
+/// ASCII 2 文字語単独は候補数を広げすぎないよう TooShort で reject されること。
 #[test]
 fn short_ascii_query_is_rejected() {
     let data = FixtureRoot::new();
@@ -646,7 +732,7 @@ fn short_ascii_query_is_rejected() {
     let ev = run_search_expecting_done(&mgr, "ab", &[fav.id]);
     match ev {
         SearchStreamEvent::Done { reason, .. } => assert!(
-            matches!(reason, DoneReason::RejectedQuery(RejectReason::TooShort)),
+            matches!(&reason, DoneReason::RejectedQuery(RejectReason::TooShort(terms)) if terms == &["ab"]),
             "reason should be TooShort, got {reason:?}"
         ),
         _ => unreachable!(),

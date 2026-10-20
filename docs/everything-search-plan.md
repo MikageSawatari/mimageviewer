@@ -693,3 +693,252 @@ master `f5bdab499` 上の今回の未コミット差分で、以下はすべてe
 build完了と成果物の記録は`target/EV-1374-hung-build-dev.log`（JSON）。
 変更はprivate transportの失敗分類と案内に限定し、今回はfull gateを実行していない。
 実Everythingが応答しない間の新案内と、応答回復後の再検索は利用者確認待ち。
+
+## 20. §1.386 利用できない理由の表示（2026-10-19、段2）
+
+正本は `next-release-backlog.md` §1.386 と2026-10-19の利用者決定。
+段1の条件拡大案は独立設計レビューの条件付き合意を受け、**今回は理由表示だけ**に縮小した。
+Ctrl+R の可否条件、Ctrl+G の入口／メニュー／結果採用、detached の所有移管・表示切替は変更しない。
+以下のコード参照は HEAD `be318299f` の調査時点（実装で行番号が動く）。
+
+### 20.1 原因と現行条件の保持
+
+利用者観測は「連動動画窓の表示中、メニューが灰色で hover/キーとも理由がない」。
+`everything_search_entry_allowed` (`src/global_search_ui/everything.rs:178`) は bool だけを返し、
+`ui_main.rs:7577,7658` の両メニューは `add_enabled` だけ、
+`everything/shortcut.rs:7` はキー判定より前に拒否していたため、理由が生成されなかった。
+
+都度算出する `EverythingSearchEntryAvailability` を導入し、`reason_text()` が None のときだけ
+`is_allowed()` を true にする。App の field や別の理由キャッシュは追加しない。
+既存 bool helper はこの enum から導く。元の次の conjunction と可否を一致させる。
+
+修正箇所は可否を作る境界とその表示consumerである。別の理由bool、通知用の保持状態、detachedの
+追加guardを設けず、メニュー・起動／送信の可否・拒否通知を同じ判定から導くため、理由と可否の
+不一致を構造で防ぐ。BA-7の状態重複とBA-5の入口差を増やさず、凍結中の所有移管経路には触れない。
+
+| 旧成分／境界 | enum と理由 |
+| --- | --- |
+| `!main_folder_history_available()` | `ViewerContext`: メインウィンドウの一覧から検索してください |
+| `fullscreen_idx.is_some()`、linked detached/switching | `LinkedViewer`: 連動した別ウィンドウで閲覧している間は使えません。表示を閉じてから検索してください |
+| 同じ idx 判定、main の fullscreen/ウィンドウ内表示 | `MainViewer`: メインウィンドウで画像・動画などを表示している間は使えません。表示を閉じてから検索してください |
+| Windows の native main backdrop | `MainViewer`。旧 native 判定も保持する（現状この述語自身が fullscreen idx を要するため、先の idx 判定に包含される） |
+| `remote_session_blocks_local_control()` | `RemoteControl`: mIV Remote で操作中のため検索できません |
+| その他の `common_modal_dialog_open()` | `OtherOperation`: 別の操作や準備が終わってから検索してください |
+| いずれにも該当しない | `Available`、理由なし |
+
+判定は main context → idx → native → Remote → common modal の順。Remote は common modal にも
+含まれるため、その前で理由だけを区別する。VST3 manager は `any_dialog_open` にだけ含まれ、
+元の Everything 可否には含まれなかったので、今回もメニューの可否を変更しない。
+catch-all は準備待ちも含むため、必ず「ダイアログを閉じて」とは案内しない。
+
+`main_folder_history_available` (`app.rs:23682`) は projected registry main と suppression depth=0 を要求する。
+main の Back/Forward/facet は bundle 外の App 所有なので、viewer 投影処理から触らせないための条件である。
+`with_detached_viewer_main_history_suppressed` (`app.rs:22947`) は実行スコープの depth で、
+**連動窓が存在する間ずっと立つフラグではない**。linked 中の拒否は raw `fullscreen_idx` にも由来する。
+この履歴述語・全 caller と `viewer_session_blocks_main_window` は変更しない。
+
+Everything の未導入／未起動は入口では判明しない。バー表示では IPC を送らず、送信 worker が
+接続／版／DB loaded を確認して既存 `EverythingError::user_message()` を表示する（§9/§19）。
+UI 同期 probe、最終エラーを使った入口の無効化、未確認の NotRunning variant は追加しない。
+
+### 20.2 メニューと ROOT の拒否通知
+
+両メニューは同じ `everything_search_menu_button` に enum を渡し、既存
+`HoverTipExt::hover_tip_disabled` (`ui_helpers.rs:1076`) で disabled の理由を描く。
+既存例は sort lock の `reason.tooltip()` (`ui_main.rs:8351`) と
+`OpenAdmissionRefusal::message` → `show_open_admission_refusal` (`app.rs:1490,28423`)。
+
+拒否通知専用の `notify_everything_search_shortcut_refusal` を ROOT の `input_begin_key_frame` に接続する。
+この phase は既存 keyboard owner の確定とWin32 native frameの確立後、embedded/native fullscreen の描画 early return より前に通る。
+通知入口は検索を開かず、IPC／context 移管も行わない。
+
+- ROOT、検索の main context 資格、ROOT/Main に一致する application shortcut permit を要求する。
+  `Modal` / TextInput / IME / pending focus / focus recovery / FocusedUi / 他 viewport では通知も消費もしない。
+  新しい dialog が同 pass で開いた場合も `any_dialog_open()` でそのキーを任せる。
+- 拒否の非 repeat press だけを既存 `keymap.consume_action_no_repeat(GlobalEverythingSearch)` で処理する。
+  実効割当／none／exact modifiers／Win32 viewport ごとの edge 所有をそのまま使う。
+  通知はnative frame確立直後の1か所だけで処理し、後段dispatchでは通知しない。
+  同じ押下のWin32/egui両キューを既存helperで同時に消費し、repeat は通知を重ねない。
+  固定 Ctrl+R、OS current level、Modal 越えの diagnostic peek は使わない。
+- 本文に「Everything ファイル名検索: 」を付け、既存の本文長に応じた時間を使って
+  `show_feedback_toast_on_with_duration(..., ActionSurface::MainWindow, ...)` へ出す。
+  面未指定の helper は native sibling にも送るため使わない。通知 queue/新 latch は追加しない。
+- 許可時の dispatch は従来の ROOT/Main permit → consume → `open_everything_search`。
+  source 切替、前 query の全選択、IME、明示検索、Ctrl+G toggle は変更しない。
+
+**入力／表示の到達限界:** fullscreen child/native presenter がキーを所有する場合、ROOT への新しい転送は
+追加しないので通知しない。embedded fullscreen のように ROOT で受けても `ShortcutSurface::Fullscreen` が
+所有するキーは消費せず通知もしない。Grid の Everything 再割当を Ctrl+G 等にすると、拒否通知の先行consumeが
+既存fullscreen編集Actionを奪うためである。通知の入力所有は通常の検索起動と同じ Main permit に限定する。
+linked viewer 中の main ROOT は Main owner なので、今回の利用者報告の操作面では理由を通知できる。
+MainWindow 面の通知は viewer/native overlay へ複製しない。
+Remote は `modal_dialog_block_reason` (`app.rs:22728`) に含まれるため、**実際の owner は Modal**となり、
+現行の実経路ではキー通知を出さずメニューホバーで Remote 理由を示す。
+これは「Modal のキーはその所有者へ任せる」という今回の優先方針による。
+fullscreen/Remote の非到達・非視認については、ホバーと manual の利用条件で足りるかを検収時の判断材料にする。
+
+### 20.3 今回やらないこと／後続 §1.406 への申し送り
+
+条件拡大と Ctrl+G の欠陥は [backlog §1.406](next-release-backlog.md) へ分離する。
+以下はコード上の欠陥経路・設計上の論点であり、今回の実機再現／修正済みを意味しない。
+
+- **Everything の入口だけを広げられない:** source 切替・send・child return・採用前が
+  `finish_everything_edit_boundary` (`everything.rs:199,265,499`, `global_search_ui.rs:3190`) を通り、
+  同 helper (`app.rs:22708`) は fullscreen idx があれば viewer を閉じる。
+- **Ctrl+G の既存欠陥:** 連動 detached 中も `update_phases.rs:1010` の Ctrl+G gate は通る。
+  初回の結果は `adopt_prepared_search_view` → `replace_search_view_items_with_ratings`
+  (`global_search_ui.rs:3697,2176`) に入り、`invalidate_idx_state_and_queues`
+  (`app.rs:44289`) が `fs_cache.clear()` を行って、main の旧列を読む linked VideoPlayer を Drop し得る。
+  main adoption は履歴/facet の採用であり、通常の `start_loading_items` の viewer 移管を代替しない。
+- **source 交換と同一結果の再投影を分ける:** source 交換は main を保つ既存 live-park fork
+  (`app.rs:65705` → `viewer_context_registry.rs:5577`) を候補にする。
+  `split_current_context_preserving_main_grid` の `keep_in_main!(global_search, ...)` (`:4344`) を使えば
+  検索要求を複製せず main に残せる。一方 streaming/sort/rating 等の同一結果集合では既存の
+  `capture_rating_membership` / `prepare_rating_membership_items_swap` / `finish_rating_membership_viewer_swap`
+  (`global_search_ui.rs:3240–3310`) の identity remap を保ち、一律 fork しない。
+- **表示切替と採用を直列化する:** live-park snapshot は `viewer_session_is_detached()` を要求するが
+  main 操作 gate は detached への切替途中も許可する。detached へ／からの未完了 effect と採用を
+  同じ presentation/session owner で順序付ける。raw idx guard、検索の機能制限、時間待ちで回避しない。
+- **rating publication の再入を防ぐ:** `fork_mounted_context` と registry の rating publication 境界
+  (`viewer_context_registry.rs:5477` 付近、fork_outgoing/fork_incoming) が採用中の状態へ再入し得る。
+  prepare/stamp/currentness の確定と fork/publication/install の順序を独立設計で定める。
+- **promote をそのまま検索採用へ足さない:** `stash_mounted_and_start_fresh` (`:5697`) は bundle 全体を
+  退避し fresh main を作るため、Search producer/prepare/return origin と採用 context がずれる。
+  通常 folder/book open と検索 close の既存 promote は維持し、C1 後の reader に二度目の promote を作らない。
+- C1 は独立化／promote **後**の受動 watch/rescan/restart を停止する（`detached-snapshot-reader-plan.md` §4/§9）。
+  linked 中と最初の移管は残る。既存 `section1375_c1_search_close_promotes_once_and_remount_never_observes`
+  (`src/app/section375_c1_tests.rs:117`) は Ctrl+G/R × 動画/音声の close/promote/remount を検査するが、
+  新入口・初回採用の安全性までは証明しない。
+
+後続は BA-7（状態／所有）を主に、BA-5（複数入力／描画入口）の構造設計として双方レビューする。
+今回の理由表示は detached の所有移管・viewport 経路を変えないため、リワーク計画 §11 の記録対象を増やさない。
+まれな失敗は既定の割り切り（ログ + 通知 [+ 既存の単純な復帰入口]）。回復 owner は追加しない。
+
+### 20.4 回帰・文書・検証台帳
+
+- enum: 旧 conjunction との一致、許可、main fullscreen/ウィンドウ内表示、linked、別 context、
+  通常 modal、Remote、VST3 manager の従来可否を検査する。
+- 入力: 非 Modal 拒否一回／MainWindow 面、同 pass 再 dispatch、repeat、再割当/none、Modal/key-capture、
+  TextInput/IME/focus recovery/pending focus、foreign scope、許可時の既存 open を検査する。
+  Fullscreen owner の ROOT 入力も保持し、Grid の Ctrl+G 再割当が fullscreen の同キー編集を奪わないことを検査する。
+- 両 menu は同じ pure 描画 helper。disabled button を実際に hover して理由本文を検査し、
+  Light/Dark の代表 PNG を追加する。実 App の起動はしない。
+- manual/search.html の既存の fullscreen/linked 中の利用不可説明を残し、hover による理由確認を追記する。
+  新 action／設定／DB schema／Remote API は追加しない。
+- 独立完成レビューは別担当。main lib 全件は ClaudeCode が最後に実施する。
+  対象テスト、glyph lint、fmt、check、確認用 build の実施結果は以下へ記録する。
+
+以下は初回実装（`3306bf124` としてcommit済み）の検証記録であり、レビュー修正後の結果は§20.5に記録する。
+当時の検証対象は HEAD `be318299f` 上の未コミット差分。Rust 差分
+（`git diff --binary -- src tests/ui_snapshot.rs`）の SHA-256 は
+`3185f5ebca6da9c24be05198e1a471e4c9e9cce62535a50aaf4ecd8341252a9f`。
+
+| 実施 | 結果 |
+| --- | --- |
+| 通常 core `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0（先行ソース、5m07s）。最終ソースは通常featureの下記buildで確認 |
+| 同 `--features portable` | exit 0（最終ソース、13.98s、`target/search6-check-portable-final.log`） |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/everything/) \| test(/phase_c_key_tests/) \| test(/global_search_ui/)' --test-threads 4` | **174 passed / 0 failed**（最終ソース、18.461s、`target/search6-tests-owner-final.log`）。先行72件／173件の成功と件数を合算しない |
+| `cargo test -p mimageviewer --test ui_snapshot everything`（更新指定なし） | **7 passed / 0 failed**（最終ソース、1.43s、`target/search6-ui-owner-final.log`）。既存5枚と新規2枚の比較成功 |
+| 新規 hover PNG | `tests/snapshots/everything_search_disabled_menu_hover_{light,dark}.png`、640×180、19,847 / 19,833 bytes、計39,680 bytes。本文・折返し・Light/Darkを目視確認 |
+| `cargo fmt`（引数なし）／`cargo fmt --check`／glyph lint／`git diff --check` | exit 0、危険グリフ0 |
+| `scripts/vst3-host-identity.ps1 -ValidateRepo` | 現ソース一致を確認、hostの起動・変更なし |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | **exit 0**（2026-10-20）。通常featureのcore／Remote service／EPUB PDF worker、DLL配置、EffeTune bundle、VCRT検査（runtime=4 / pe=3）成功。`target/search6-build-dev-final.log` |
+
+UI検査の最初の480pt fixtureは本文が右へ16ptはみ出して失敗した。その際「640ptが実際の最小幅」と誤認して
+fixtureを広げたが、これははみ出しを隠しただけだった。`MIN_INNER_SIZE` はUI倍率で割ってviewportへ渡し、
+小さい作業領域では最小寸法自体も縮むため、論理幅640ptは保証されない。§20.5で共通tooltipの幅を修正し、
+480pt・200%で320pt・小さい作業領域の200%で240ptを追加検査する。640×180の2枚は代表画像としてのみ保持する。
+
+前提復元: このworktreeで不足していた `vendor/libraw` を既存treeから実体コピーした。
+TurboJPEGの並列native buildは終了コード1となり、`MSBUILDDISABLENODEREUSE=1` とworkspace内TEMP、
+`CARGO_BUILD_JOBS=1`（必要なCMake段もparallel 1）で成功した。最初のnextestはnative buildで止まり、
+テスト本体未実行である。上表はその後の成功結果。まれな製品エラーやテストの失敗とは分類しない。
+既存の非推奨／dead code等の警告は残るが、新規テストの旧ID API警告は現行APIへ揃えて解消した。
+
+通常profileの確認用buildは上表のコマンドで完了した。core 19m05s、Remote service 4m48s、EPUB PDF worker 3m24s。
+`target/dev-runtime/mimageviewer-core.exe` は334,415,360 bytes、更新日時2026-10-20 00:17:11。
+先行buildはFullscreen所有キーの非消費を補うため、自分のbuildプロセスだけを中断した。
+これは製品／コンパイル失敗ではなく、上記の最終ソース検証後に同コマンドで作り直した。
+portable featureは付けず、製品アプリ・実Everythingへの照会は実行していない。git commit は行わない。
+本体lib全件と独立完成レビュー、実機でのlinked窓／native／実IMEの最終確認は未実施。
+
+利用者による確認は、インストール版／トレイ常駐版を終了してから
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常の `%APPDATA%\mimageviewer` を使用し、実設定／データを更新し得る（single-instance mutexも共有）。
+連動した別ウィンドウを開いてmainへ戻り、両メニューのhoverとCtrl+R一回の理由通知、
+操作カスタマイズの「押して入力」等でキーが奪われないこと、通常一覧では従来どおり開けることを確認する。
+
+### 20.5 独立コードレビューのP2対応（2026-10-20）
+
+独立レビューの2件をコードで確認して修正する。可否enum・文言・入力所有gateは維持する。
+
+- **入力frameの境界:** `input_update_begin` はWin32の `begin_frame_for_context_with_tracking` より前だった。
+  未取込pendingはkeymapの両キュー消費から漏れるため、eguiで通知した後に同じ押下を再取込できた。
+  前frameの未消費edgeを次frameのMain所有と読み替える経路もあった。
+  既存のnative begin位置を `input_begin_key_frame` として抽出し、その直後だけで通知する。
+  後段の実行dispatchから通知を外す。frame確立そのものの位置、入力所有、検索の受付条件は動かさず、
+  新しいlatch／guard／queueを増やさない。実phase順の回帰でegui+Win32 pendingの同時押下と
+  TextInputからMainへ移った時の旧edge失効を確認する。
+- **tooltipの表示可能幅:** 共通 `show_offset_tooltip_with_observer` がviewportを無視して
+  `tooltip_width` を再設定していた。popup枠の寸法を差し引いた現在の `content_rect().width()` と
+  tooltip幅の小さい方で折り返す。UI倍率・小さい作業領域・表示後resizeにも同じ計算を使う。
+  enabled／disabled／暗色固定のhoverは同じhelperを通るため、既存のtooltip回帰とUI snapshot全件を確認する。
+  文言を省略せず、既存の遅延変換・AccessKit名・配色・pointer回避を維持する。
+- main grid限定、Modal非消費、Fullscreen所有入力の非消費、Ctrl+Gおよびdetached経路は変更しない。
+
+検証対象は `3306bf124` 上の未コミット差分。初回実装の結果と今回の件数は合算しない。
+Rust差分（`git diff --binary -- src tests/ui_snapshot.rs`）のSHA-256:
+`2681f842f477ac1cad15cd3f06624832a3675e819ff1129251d4771de18bc2ab`。
+
+| 実施 | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/everything/) \| test(/phase_c_key_tests/) \| test(/global_search_ui/) \| test(/ui_helpers::accessibility_names_tests/)' --test-threads 4` | **182 passed / 0 failed**、21.275s。`target/search6-review-tests.log` |
+| `cargo test -p mimageviewer --test ui_snapshot -- --test-threads 4` | **189 passed / 0 failed**、94.95s。`target/search6-review-ui.log` |
+| UI差分 | 既存PNG全件の比較成功。代表のhover PNG2枚も変更不要。新規PNGなし |
+| 通常 core `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、34.72s。`target/search6-review-check.log` |
+| 同 `--features portable` | exit 0、53.48s。`target/search6-review-check-portable.log` |
+| `cargo fmt`（引数なし）／`cargo fmt --check`／glyph lint／`git diff --check` | exit 0、危険グリフ0 |
+
+最初のlib test compileは追加fixtureの `RawInput.modifiers` がegui 0.37に存在せず失敗した。
+既存と同じ `Event::ModifiersChanged` に直して再実行し、上表の成功を確認した。
+実行環境はworkspace内TEMP/TMP/MSBUILDDEBUGPATHと `MSBUILDDISABLENODEREUSE=1` を使用。
+tests/checkは `CARGO_BUILD_JOBS=1`、native依存が構築済みの確認用buildは4。
+`scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` もexit 0。
+core 5m47s、Remote service 0.54s、EPUB PDF worker 0.47s、VCRT検査runtime=4 / pe=3で成功した。
+ログは `target/search6-review-build-dev.log`。通常featureの `target/dev-runtime/mimageviewer-core.exe` は
+334,356,480 bytes、更新日時2026-10-20 00:59:04。製品の起動はしていない。
+利用者確認は前節の通常profile起動手順に従い、連動窓中のCtrl+R一回の通知、ダイアログの非消費、
+UI倍率200%／狭い窓でのホバー理由全文を確認する。
+製品アプリは起動せず、commitは行わない。本体lib全件・独立再レビュー・実機での確認は別途。
+
+### 20.6 ホバーsnapshotのOSカーソル依存を除去（2026-10-20）
+
+`389371880` 時点の代表2枚がsearch6単独／master統合後とも縦1～2px揺れる利用者報告。
+コード確認でも、fixtureが製品の `anchor_for` → `cursor_anchor_rect` → `GetCursorInfo` / `GetIconInfo` を
+通り、headlessの擬似ポインタとは別にデスクトップの現在のカーソル画像を計測していた。
+
+公開fixtureへ上下の物理px寸法を引数で渡し、2 PNGと倍率geometryは `(0, 34)` で固定する。
+メニューbutton／可否／理由と、tooltipの遅延変換・AccessKit名・幅制限・配色・gapは製品と共有する。
+寸法からアンカーへの変換をpure helperに分け、製品は従来のOS計測値（取得不可時は既存の論理34pt fallback）、
+fixtureは明示寸法を渡す。製品のOS計測gateや実カーソル回避を変更せず、テスト判定用の環境変数・状態を追加しない。
+
+他のhover撮影も確認した。Ctrl+G拒否バッジ、EffeTune、動画タグはegui標準 `on_hover_text` /
+`on_disabled_hover_text` でOS計測へ入らない。詳細アイコンはhover色だけ、整理先／見開き調整／toolbar等は
+撮影前にpointerを外している。libのstill seek hover撮影は独自previewで、lock button外を指す。
+確認範囲で同じ実カーソル依存の修正対象はEverythingの2枚のみ。
+
+物理寸法の100%／200%変換と、OS計測不可時の既存fallbackをlib回帰で検査する。
+検証対象は `389371880` 上の未コミット差分。Rust差分
+（`git diff --binary -- src tests/ui_snapshot.rs`）のSHA-256は
+`40b5ab7c5b01731d8ad9da7443bba9d6ba13ccab9b2edb431e8ea72b87bc93d7`。
+
+| 実施 | 結果 |
+| --- | --- |
+| `UPDATE_SNAPSHOTS=1` でEverything hover明暗2件をnextest実行 | 2 passed。`target/search6-cursor-update.log` |
+| PNG目視／比較 | 明暗とも640×180、理由全文・disabled状態・枠・位置を目視確認。固定寸法で再生成した2枚はHEADとbyte単位で一致（19,847 / 19,833 bytes）、PNG差分なし |
+| `cargo nextest run -p mimageviewer --test ui_snapshot --test-threads 4`（更新指定なし） | **191 passed / 0 failed / 0 skipped**、64.816s。`target/search6-cursor-ui.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ui_helpers::accessibility_names_tests/) \| test(/everything/)' --test-threads 4` | **82 passed / 0 failed**、7.440s。`target/search6-cursor-lib.log` |
+| 全体 `cargo fmt`／`cargo fmt --check`／glyph lint／`git diff --check` | 成功、危険グリフ0 |
+
+workspace内TEMP/TMP/MSBUILDDEBUGPATH、`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`を使用。
+fixtureの再現性だけの変更なので確認用製品buildは行わず、製品起動・commitも行わない。

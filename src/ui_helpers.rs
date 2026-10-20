@@ -977,15 +977,27 @@ fn cursor_extent_physical_win() -> Option<(f32, f32)> {
 #[allow(dead_code)]
 fn cursor_anchor_rect(ctx: &egui::Context) -> Option<egui::Rect> {
     let pos = ctx.pointer_hover_pos()?;
-    let ppp = ctx.pixels_per_point();
-    let (above, below) = match cursor_extent_physical() {
+    Some(cursor_anchor_rect_from_extent(
+        pos,
+        ctx.pixels_per_point(),
+        cursor_extent_physical(),
+    ))
+}
+
+/// Resolve measured or explicitly supplied physical cursor extents without OS access.
+fn cursor_anchor_rect_from_extent(
+    pos: egui::Pos2,
+    ppp: f32,
+    extent_physical: Option<(f32, f32)>,
+) -> egui::Rect {
+    let (above, below) = match extent_physical {
         Some((a, b)) => (a / ppp, b / ppp),
         None => (0.0, CURSOR_FALLBACK_EXTENT),
     };
-    Some(egui::Rect::from_min_max(
+    egui::Rect::from_min_max(
         egui::pos2(pos.x, pos.y - above),
         egui::pos2(pos.x, pos.y + below),
-    ))
+    )
 }
 
 /// hover 中のウィジェットだけカーソル実寸を計測する（毎フレーム全ウィジェットで
@@ -995,6 +1007,42 @@ fn anchor_for(resp: &egui::Response) -> Option<egui::Rect> {
     resp.contains_pointer()
         .then(|| cursor_anchor_rect(&resp.ctx))
         .flatten()
+}
+
+/// Fixture input: physical pixels above/below the hotspot, independent of the desktop cursor.
+pub(crate) fn hover_tip_disabled_with_cursor_extent(
+    response: egui::Response,
+    text: impl Into<egui::WidgetText>,
+    extent_physical: (f32, f32),
+) -> egui::Response {
+    let anchor = response
+        .contains_pointer()
+        .then(|| response.ctx.pointer_hover_pos())
+        .flatten()
+        .map(|pos| {
+            cursor_anchor_rect_from_extent(
+                pos,
+                response.ctx.pixels_per_point(),
+                Some(extent_physical),
+            )
+        });
+    hover_tip_disabled_at_anchor(response, text, anchor)
+}
+
+fn hover_tip_disabled_at_anchor(
+    response: egui::Response,
+    text: impl Into<egui::WidgetText>,
+    anchor: Option<egui::Rect>,
+) -> egui::Response {
+    let text = tooltip_text_with_accessibility(&response, text);
+    show_offset_tooltip(
+        &response.ctx,
+        egui::Tooltip::for_disabled(&response),
+        false,
+        anchor,
+        text,
+    );
+    response
 }
 
 /// tooltip をカーソル画像の外側へずらして表示する共通処理。
@@ -1023,19 +1071,24 @@ fn show_offset_tooltip_with_observer(
         Some(rect) => tip.popup = tip.popup.anchor(rect),
         None => tip = tip.at_pointer(),
     }
+    let frame = if dark {
+        crate::os_theme::dark_popup_frame(ctx)
+    } else {
+        egui::Frame::popup(&ctx.global_style())
+    };
+    let content_width = (ctx.content_rect().width() - frame.total_margin().sum().x).max(1.0);
+    tip.popup = tip.popup.frame(frame);
     if dark {
-        tip.popup = tip
-            .popup
-            .style(crate::os_theme::dark_popup_style(ctx))
-            .frame(crate::os_theme::dark_popup_frame(ctx));
+        tip.popup = tip.popup.style(crate::os_theme::dark_popup_style(ctx));
     }
     tip.show(|ui| {
-        // 動的な内容で Area が縮まないよう最大幅を固定する（egui issue #5167）。
-        ui.set_max_width(ui.spacing().tooltip_width);
+        // Keep dynamic Area sizing stable, bounded by the actual viewport in
+        // UI points (including zoom), with room for the popup frame.
+        ui.set_max_width(ui.spacing().tooltip_width.min(content_width));
         if dark {
             crate::os_theme::apply_dark_ui(ui);
         }
-        let label = ui.add(egui::Label::new(text()));
+        let label = ui.add(egui::Label::new(text()).wrap());
         on_render(ui, &label);
     });
 }
@@ -1156,16 +1209,8 @@ impl HoverTipExt for egui::Response {
     }
 
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self {
-        let text = tooltip_text_with_accessibility(&self, text);
         let anchor = anchor_for(&self);
-        show_offset_tooltip(
-            &self.ctx,
-            egui::Tooltip::for_disabled(&self),
-            false,
-            anchor,
-            text,
-        );
-        self
+        hover_tip_disabled_at_anchor(self, text, anchor)
     }
 }
 
@@ -1173,6 +1218,25 @@ impl HoverTipExt for egui::Response {
 mod accessibility_names_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn cursor_anchor_uses_explicit_physical_extents_and_logical_fallback() {
+        let pos = egui::pos2(80.0, 60.0);
+        assert_eq!(
+            cursor_anchor_rect_from_extent(pos, 1.0, Some((4.0, 30.0))),
+            egui::Rect::from_min_max(egui::pos2(80.0, 56.0), egui::pos2(80.0, 90.0))
+        );
+        assert_eq!(
+            cursor_anchor_rect_from_extent(pos, 2.0, Some((4.0, 30.0))),
+            egui::Rect::from_min_max(egui::pos2(80.0, 58.0), egui::pos2(80.0, 75.0))
+        );
+        for ppp in [1.0, 2.0] {
+            assert_eq!(
+                cursor_anchor_rect_from_extent(pos, ppp, None),
+                egui::Rect::from_min_max(pos, egui::pos2(80.0, 94.0))
+            );
+        }
+    }
 
     struct CountedTooltip<'a>(&'a Cell<usize>);
 
@@ -1269,6 +1333,44 @@ mod accessibility_names_tests {
                     });
                 })
                 .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn tooltip_text_wraps_inside_zoomed_viewport_after_resize_in_both_themes() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_zoom_factor(2.0);
+            // Reuse one tooltip Area while the physical work area gets smaller.
+            for width in [960.0, 640.0, 480.0] {
+                for _ in 0..3 {
+                    crate::test_ui::headless_paint_output(ctx.run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width / 2.0, 290.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            ctx.root_ui(|ui| {
+                                let response = ui.button("Anchor");
+                                show_offset_tooltip_with_observer(
+                                    ctx,
+                                    egui::Tooltip::for_widget(&response),
+                                    dark,
+                                    Some(response.rect),
+                                    || "A long explanation must remain fully readable even when the UI is enlarged and the work area becomes smaller. ".repeat(3).into(),
+                                    |ui, label| {
+                                        assert!(label.rect.width() <= ctx.content_rect().width());
+                                        assert!(ui.clip_rect().contains_rect(label.rect), "viewport={:?}, label={:?}", ctx.content_rect(), label.rect);
+                                    },
+                                );
+                            });
+                        },
+                    ));
+                }
+            }
         }
     }
 

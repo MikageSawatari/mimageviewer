@@ -73,20 +73,20 @@ impl App {
     /// 開かずに理由を出す。
     pub(crate) fn open_export_batch_dialog(&mut self, ctx: &egui::Context) {
         if self.export_pending.is_some() {
-            self.show_feedback_toast("エクスポート中です".to_string());
+            self.show_feedback_warning("エクスポート中です".to_string());
             return;
         }
         if self.export_batch_dialog.is_some() {
             return;
         }
         if self.grid_selection_indices().is_empty() {
-            self.show_feedback_toast("書き出す画像・ページを選択してください".to_string());
+            self.show_feedback_warning("書き出す画像・ページを選択してください".to_string());
             return;
         }
         // 対象を決めるのは安い判定だけ。編集内容はフレーム予算で読み進める (F04)。
         let (pending, skipped) = self.grid_batch_export_targets();
         if pending.is_empty() {
-            self.show_feedback_toast("選択の中に書き出せる画像・ページがありません".to_string());
+            self.show_feedback_warning("選択の中に書き出せる画像・ページがありません".to_string());
             return;
         }
         let output_dir_text = self
@@ -423,7 +423,7 @@ impl App {
             }
             Err(err) => {
                 self.export_batch_dialog = None;
-                self.show_feedback_toast(err);
+                self.show_feedback_error(err);
                 Ok(())
             }
         }

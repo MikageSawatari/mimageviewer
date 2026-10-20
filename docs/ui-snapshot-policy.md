@@ -4,6 +4,25 @@ v0.7.0 で導入した `egui_kittest` ベースの UI 回帰テストの運用�
 
 ## 目的
 
+Ctrl+G の短い語の拒否 (§1.229) は `global_search_short_term_reject_light` /
+`global_search_short_term_reject_dark` の2枚で、単語1つと複数語の表示を保持する。
+製品と共通の幅制限付きバッジを hover し、省略されたメッセージの全文も確認する。
+App・索引・実ウィンドウは起動しない。
+
+Everything 検索の無効理由（§1.386）は `everything_search_disabled_menu_hover_light` /
+`everything_search_disabled_menu_hover_dark` の2枚で保持する。製品と共通の無効buttonを実際にhoverし、
+理由本文・disabled状態を検査する。640×180の2枚は代表サイズであり、最小幅を意味しない。
+`MIN_INNER_SIZE` はUI倍率で割ってviewportへ設定され、小さい作業領域では最小寸法自体も縮む。
+最初の480ptのはみ出しをfixture拡大で避けた判断は誤りだった。共通tooltipを表示可能な論理幅から
+枠幅を引いた幅で折り返し、480pt・200%で320pt・小さい作業領域の200%で240ptもgeometry検査する。
+文言全文の矩形がviewport内に収まることをLight/Darkで検査し、共通helperの変更時は他のUI snapshotも比較する。
+カーソル回避の位置はOSの現在の矢印／Iビーム等に依存させない。Everythingの公開fixtureは
+ホットスポットの上／下への物理px寸法を引数で受け、snapshotと倍率geometry検査は `(0, 34)` を明示する。
+製品は従来どおり実OSカーソルを計測する。両経路は寸法→アンカー変換とtooltip本文・配色・幅制限を共有し、
+テスト検出用の環境変数／Context状態やOSカーソル変更は使わない。
+2026-10-20に固定寸法で2枚を再生成し、目視確認した。既存PNGとbyte単位で一致するため画像差分はなく、
+更新指定なしのUI nextest全191件も成功。検証ログはEverything計画§20.6を参照する。
+
 egui の描画結果を PNG スナップショットとして保存し、意図しない見た目の変化を
 `cargo test` の段階で検出する。「ダイアログの色が変わった」「ラベルが折り返して
 レイアウトが崩れた」「テーマ切替で文字が読めない配色になった」などを早期にキャッチする。
@@ -304,3 +323,9 @@ UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 
 実例: `src/ui_adjustment_panel.rs::local_adjust_segmentation_tests::local_adjust_panel_snapshot_*`
 (5 件、補正レイヤーパネル + レイヤーリスト UI)。
+
+
+§1.402 の通知時間設定は `notification_duration_preferences_light_standard`（480×115）と
+`notification_duration_preferences_dark_short_narrow`（260×145）で、本体と共通の全体設定helperを描く。
+3択の選択状態・狭幅の補足文の折り返しを確認する。App・実製品の起動は含めない。
+2枚は計35,683 bytes。生成画像を目視確認し、更新モードを外した通常比較も2件成功した。

@@ -168,6 +168,8 @@ pub(crate) enum ArchivePasswordResume {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ArchiveConvertDeferredFullscreen {
+    /// Conversion is App-global; only this viewer's close retires its reopen intent.
+    pub owner_context: crate::app::ViewerContextId,
     pub reopen: crate::app::DeferredFsReopen,
     pub restore_video_tile: bool,
 }
@@ -785,13 +787,6 @@ impl App {
         true
     }
 
-    pub(crate) fn archive_convert_deferred_fullscreen_active(&self) -> bool {
-        self.archive_convert
-            .as_ref()
-            .and_then(|state| state.deferred_fullscreen.as_ref())
-            .is_some()
-    }
-
     /// 背面入力を止める実ダイアログが現在表示されるか。
     ///
     /// 確認なし変換の走査中は state 自体は存在するが Window は描画しないため、
@@ -804,33 +799,6 @@ impl App {
                 state.allow_direct_read,
             )
         })
-    }
-
-    pub(crate) fn attach_archive_convert_deferred_fullscreen(
-        &mut self,
-        restore_video_tile: bool,
-        resume_slideshow: bool,
-        history_trigger: crate::app::HistoryTrigger,
-    ) -> bool {
-        let resume_to_last_page = self.settings.book_nav_resume.resumes();
-        let Some(state) = self.archive_convert.as_mut() else {
-            return false;
-        };
-        if !state.suppress_confirm && !state.allow_direct_read {
-            return false;
-        }
-        state.deferred_fullscreen = Some(ArchiveConvertDeferredFullscreen {
-            restore_video_tile,
-            reopen: crate::app::DeferredFsReopen {
-                history_trigger,
-                resume_slideshow,
-                target: crate::app::DeferredFsTarget::None,
-                resume_to_last_page,
-                from_explicit_open: false,
-                preserve_after_password_prompt: false,
-            },
-        });
-        true
     }
 
     pub(crate) fn clear_archive_convert_deferred_fullscreen(&mut self) {
@@ -1106,7 +1074,7 @@ impl App {
                             owner.request_id,
                             "archive_detached_direct_open_failed",
                         );
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
                         );
                     }
@@ -1194,15 +1162,7 @@ impl App {
                 self.finish_converted_archive_list_open(&src, restore_intent);
             }
             if let Some(deferred) = deferred {
-                let reason = self.reopen_fullscreen_after_folder_nav_load(
-                    ctx,
-                    deferred.restore_video_tile,
-                    deferred.reopen.resume_slideshow,
-                    deferred.reopen.history_trigger,
-                );
-                if reason == "enumerate_defer" {
-                    ctx.request_repaint();
-                }
+                self.resume_archive_convert_viewer_after_load(ctx, deferred);
             }
             return;
         }
@@ -1219,7 +1179,7 @@ impl App {
                 .and_then(|name| name.to_str())
                 .unwrap_or("ZIP")
                 .to_string();
-            self.show_feedback_toast(format!("ZIP ファイルを作成しました: {output_name}"));
+            self.show_feedback_toast(format!("ZIP を作成: {output_name}"));
             let parent = output.parent().map(std::path::Path::to_path_buf);
             if let Some(parent) = parent
                 && self
@@ -1351,7 +1311,7 @@ impl App {
                                 owner.request_id,
                                 "archive_detached_converted_open_failed",
                             );
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "ブックマーク先の本を別ウィンドウで開けませんでした".to_string(),
                             );
                         }
@@ -1461,15 +1421,7 @@ impl App {
                     self.update_favsearch_address();
                 }
                 if let Some(deferred) = deferred_fullscreen {
-                    let reason = self.reopen_fullscreen_after_folder_nav_load(
-                        ctx,
-                        deferred.restore_video_tile,
-                        deferred.reopen.resume_slideshow,
-                        deferred.reopen.history_trigger,
-                    );
-                    if reason == "enumerate_defer" {
-                        ctx.request_repaint();
-                    }
+                    self.resume_archive_convert_viewer_after_load(ctx, deferred);
                 }
                 return;
             }

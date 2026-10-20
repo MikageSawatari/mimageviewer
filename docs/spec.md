@@ -2114,10 +2114,18 @@ active viewer を passive へ移譲する場合は元の入力所有を終了し
   (`\\server\share` / `\\?\UNC\server\share`) または Windows の
   `GetDriveTypeW == DRIVE_REMOTE` となる割り当てドライブなら、保存先のパス、起こり得る遅延・
   再起動時の無応答、`--data-dir` でデータだけをローカルへ置く方法、マニュアルへのリンクを
-  起動ダイアログで案内する。設定を読めない保護起動中は復元案内を優先し、この案内を作らない。
+  起動ダイアログで案内する。全画面・ウィンドウ内・別ウィンドウのビューアを開いている間は、
+  描画と入力停止をともに保留する。設定を読めない保護起動中は復元案内を優先し、この案内を作らない。
   初回設定・入力移行・重要な変更点が同時に対象なら、それらを閉じた後に表示する。「閉じる」や
   タイトルバーの × / Escape は当該起動中だけ閉じる。「この保存先では今後表示しない」は現在の
   パスを設定へ保存し、正規化後に同じ場所である間は次回以降表示しない。保存先が変われば再表示する。
+
+更新後の「重要な変更点」は、ビューアを開いている間は表示も入力停止も保留し、閉じると表示する。
+`whats_new_acknowledged_version` より新しく現行版以下の告知を累積し、利用者が閉じたときだけ
+現行版を既読として保存する。「すべての変更を見る」では既読にならず、閉じずに終了した場合は
+次回へ持ち越す。旧設定の欠落項目は前回起動版 (clean install は現行版) に初期化し、その起動で保存する。
+マウス操作の移行案内と初回設定も、ビューアを開いている間は表示と入力停止を保留する。
+設定の保護起動案内は従来のまま。詳細は [変更点表示計画](version-highlights-plan.md#2-トリガと既読記録-12322026-10-19)。
 
 初回設定と起動時の通知/復元案内は、1093×614 logical points の小画面でも操作できる。
 長い本文/選択肢をスクロールさせ、開始/閉じる/終了ボタンは本文の外に固定する。
@@ -2329,7 +2337,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16）。`thumb_aspect_auto = false` のときに使われる。Auto モード時もこの値は手動値として保持され、Manual に戻すと復活する。 |
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダおよび安定したブックマーク仮想一覧ごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。ブックマーク一覧は非同期再構築前の空一覧段階から前回値を復元し、毎回 `1:1` を経由しない。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
 | `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報をツールチップ / 下部情報バーのどこへ出すか。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。下部情報バーはグリッドの `CentralPanel` より先に「ヘッダ + カーソル位置の 1 行 + solid 横スクロールバー専用レーン」の高さを予約し、データ行は選択やアイテム操作を受け付けない。サムネイル表示時は常にセット A、詳細表示時は `details_selection_bar_mode` に従ってセット A / C / 非表示を選ぶ。A/C ともプレビュー列は自動除外し、その幅は空白として予約せず名前列へ移す。バーのヘッダは列幅ドラッグ、列境界ダブルクリックによる一覧全体を母集団にした best-fit、列順ドラッグ、編集対象に応じた右クリック列メニューを持つが、ソートは持たない。列順ドラッグはセット A 使用時に `details_column_order`、専用セット C 使用時に `details_selection_bar_column_order` だけを書き換え、バーに描かないプレビュー列の位置は保持する。詳細表示のバーのメニューでは A / C をその場で切り替えられる。実際に表示する遅延列だけ、ツールチップ設定に関係なく選択中の 1 件をバックグラウンドで読み込む |
-| `grid_click_selection_mode` | GridClickSelectionMode | Explorer | サムネイル / 詳細表示に共通のクリック選択方式。`Explorer` は通常クリックで単一選択、空白クリックで全解除、Ctrl で個別トグル、Shift でアンカーからの範囲へ置換する。`Check` は通常 / 空白クリックで既存チェックを維持し、Shift 範囲を追加する。v2.9.0 の重要な変更点が表示対象になる更新後初回だけ `Explorer` へ切り替え、以後ユーザーが `Check` へ戻した設定は上書きしない。新しい移行フラグは持たず、`previous_last_seen_version` と重要な変更点の選択結果から導出する。未知値は sanitize で `Check` に正規化する |
+| `grid_click_selection_mode` | GridClickSelectionMode | Explorer | サムネイル / 詳細表示に共通のクリック選択方式。`Explorer` は通常クリックで単一選択、空白クリックで全解除、Ctrl で個別トグル、Shift でアンカーからの範囲へ置換する。`Check` は通常 / 空白クリックで既存チェックを維持し、Shift 範囲を追加する。前回起動版からの更新範囲にv2.9.0の告知が含まれる初回だけ `Explorer` へ切り替え、以後ユーザーが `Check` へ戻した設定は上書きしない。新しい移行フラグは持たず、`previous_last_seen_version` と告知選択関数から導出する。既読版からの未読通知の再表示では再移行しない。未知値は sanitize で `Check` に正規化する |
 | `video_thumbnail_indicator` | VideoThumbnailIndicator | PlayIcon | 動画サムネイルの目印。`PlayIcon` は従来どおり代表画像の中央へ再生アイコン、`BottomLeftBadge` は左下へ固定文言 `VIDEO` の青緑色バッジ、`Hidden` は目印なし。中央アイコンと左下バッジは同時表示しない。サムネイル生成中の「動画」表示と、音声セルの音楽アイコンには影響しない。未知値は sanitize で `PlayIcon` に正規化する |
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_background_double_click_parent` | bool | false | サムネイルの画像・ラベル・アイコン・バッジ以外の余白と、詳細一覧の最終行より下をダブルクリック／double tapして既存の親操作へ戻る。既定OFF。serde default付きで設定転送対象。未公開の旧enumは移行せず、このfieldがなければOFF |
@@ -2383,6 +2391,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ビューワモード) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `preferences_restore_position` | bool | true | 環境設定を開き直す際に前回のページ・スクロール位置・ページ内の表示専用の選択/絞り込み/折りたたみを復元。全体設定で変更し OK で確定。OFF 確定時に表示状態の記憶をすべて消し、全体設定の先頭から開く。位置/選択自体はプロセス内のみ。指定ページ/項目・検索ジャンプを優先 |
+| `notification_duration` | NotificationDuration | Standard | 全体設定「通知の表示時間」: Short / Standard / Long。情報・成功は基本時間×0.6 / 1 / 1.5。警告・エラーは×1 / 1 / 1.5。本文長方式は20文字以下1.2秒、超過1文字0.12秒、上限5.5秒（fade込み）を標準として維持。既存KVの項目欠落はStandardへ加算的移行。秒数指定/nativeと例外の一覧は [通知時間ポリシー](notification-duration-policy.md) |
 | `text_contrast` | TextContrast | Standard | 通常文字・薄い補足文字・widget 状態色のコントラスト（Standard / Strong）。Light / Dark の両 Style、暗色固定 popup / Window、native 動画 HUD へ同じ値を適用する。背景色は変更しない |
 | `ui_scale_factor` | f32 | 1.0 | アプリ内 UI 表示倍率。設定メニュー「スケーリング」から 0.5〜2.0 を 0.1 刻みで選ぶ。main egui Context の `zoom_factor` が正本で、メイン UI・静止画フルスクリーン・native 動画 overlay に反映する。物理 window geometry は倍率に依存しない。active viewer は倍率変更時に閉じ、再 open で新倍率を適用する。VST plugin GUI の別 HWND は対象外 |
 | `ui_font` | UiFontSettings | 既定 / 0.0pt | v2.7.0 UI フォント。`selection` は既定、または font file path + TTC/OTC face index + 表示名を保存する。`vertical_adjust` は実メトリクスから導出したツールバー縦位置へ加える -4.0〜4.0 logical pt の微調整。環境設定「表示 → フォント」では日本語を持つ正立 face のみ選べ、Italic / Oblique と日本語なし face は候補外（保存値から渡されても既定へ fallback）。同一ファミリーは正確な weight 名で区別し、可変フォントは `Variable` と表示する。保存済み face の同一性は表示名ではなく path + face index で判定する。変更時は font atlas を full-resync し、active viewer / native presenter は閉じて再表示時に同じ設定を使う。動画・音声 HUD の固定サイズ control label は位置・幅を保つため既定 HUD font family を使う。文字サイズは独立設定を持たず、既存の `ui_scale_factor` で UI 全体とともに変更する |
@@ -3106,7 +3115,7 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
 - [x] 検索クエリ構文: スペース区切り AND / `-word` NOT / `"..."` フレーズ（Ctrl+F / Ctrl+G / Ctrl+S 共通、`src/search_query.rs`）
 - [x] AI メタデータ検索は Negative Prompt を自動除外（認識した生成メタデータの消費キーを生テキスト再追加から除外し、JSON 系は汎用 JSON より AI メタデータ解釈を優先）
 - [x] 右クリックコンテキストメニュー（mIV 先頭項目: 実ファイル / 実フォルダの切り取り・コピー。その他: パスコピー・画像コピー・フォルダを開く・回転・削除・新規フォルダ作成 / Windows 標準メニューのコピー・カット・ペースト等）
-- [x] ファイル D&D 送出（グリッドのセルを左ドラッグでエクスプローラ等へコピー。複数選択対応、フォルダ・ZIP/PDF 本体も対象、仮想フォルダ内画像は対象外）
+- [x] ファイル D&D 送出（グリッドのセルを左ドラッグでエクスプローラ等へコピー。複数選択対応、フォルダ・ZIP/PDF 本体も対象、仮想フォルダ内画像は対象外）。非同期を選択するコピー先では Drop 復帰後の転送完了を待たない。OLE モーダル区間、同期 target、開始前の Shell 解決コストは残る。コピー中に mIV を終了した場合の完遂は保証せず、終了時の待機・確認・回復処理は追加しない (file-drag-drop-design.md §12)。
 - [x] ファイル D&D 受け取り（エクスプローラ等から mIV へドロップ → 現在表示中のフォルダへコピー。ZIP/PDF など仮想フォルダ表示中は拒否）
 - [x] フルスクリーン右クリック（画像 / 動画別に短押しを「閉じる（既定）/ 何もしない / コンテキストメニュー」から選択。右ドラッグ OFF 時の長押しメニューは維持。実ファイル / 仮想項目とも native HMENU、仮想項目は mIV 項目のみ）
 - [x] 複数選択（Space キー / Ctrl+クリック、チェックマークオーバーレイ）

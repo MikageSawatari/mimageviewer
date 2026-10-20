@@ -600,15 +600,15 @@ impl App {
             || self.edit_bundle_apply_pending.is_some()
             || self.edit_bundle_paste_pending.is_some()
         {
-            self.show_feedback_toast("別の編集内容を処理しています".to_string());
+            self.show_feedback_warning("別の編集内容を処理しています".to_string());
             return;
         }
         if !self.edit_bundle_databases_available() {
-            self.show_feedback_toast("編集データベースを利用できません".to_string());
+            self.show_feedback_warning("編集データベースを利用できません".to_string());
             return;
         }
         let Some(clipboard) = self.edit_bundle_clipboard.clone() else {
-            self.show_feedback_toast("コピーされた編集内容がありません".to_string());
+            self.show_feedback_warning("コピーされた編集内容がありません".to_string());
             return;
         };
         // **要求を出した viewer context をここで焼き付ける** (F08)。以降の確認・fence・
@@ -616,7 +616,7 @@ impl App {
         let owner_context_id = self.edit_request_owner_context();
         let (targets, dropped_non_targets) = self.bulk_page_edit_targets(cursor_idx);
         if targets.is_empty() {
-            self.show_feedback_toast(if dropped_non_targets > 0 {
+            self.show_feedback_warning(if dropped_non_targets > 0 {
                 format!("成功 0 件 / 対象外 {dropped_non_targets} 件")
             } else {
                 "編集内容を貼り付ける対象がありません".to_string()
@@ -656,7 +656,7 @@ impl App {
             || self.edit_bundle_apply_pending.is_some()
             || self.edit_bundle_paste_pending.is_some()
         {
-            self.show_feedback_toast("別の編集内容を処理しています".to_string());
+            self.show_feedback_warning("別の編集内容を処理しています".to_string());
             return;
         }
         let owner_context_id = self.edit_request_owner_context();
@@ -754,7 +754,7 @@ impl App {
                 true
             }
             Err(error) => {
-                self.show_feedback_toast(error);
+                self.show_feedback_error(error);
                 true
             }
         }
@@ -768,7 +768,7 @@ impl App {
         op: BulkPageEditOp,
     ) {
         if targets.is_empty() {
-            self.show_feedback_toast(if dropped_non_targets > 0 {
+            self.show_feedback_warning(if dropped_non_targets > 0 {
                 format!("成功 0 件 / 対象外 {dropped_non_targets} 件")
             } else {
                 "一括編集の対象がありません".to_string()
@@ -776,11 +776,11 @@ impl App {
             return;
         }
         if self.edit_bundle_apply_pending.is_some() || self.edit_bundle_paste_pending.is_some() {
-            self.show_feedback_toast("別の編集内容を処理しています".to_string());
+            self.show_feedback_warning("別の編集内容を処理しています".to_string());
             return;
         }
         if op.needs_bundle_worker() && !self.edit_bundle_databases_available() {
-            self.show_feedback_toast("編集データベースを利用できません".to_string());
+            self.show_feedback_warning("編集データベースを利用できません".to_string());
             return;
         }
 
@@ -805,7 +805,7 @@ impl App {
                     return;
                 }
                 Err(error) => {
-                    self.show_feedback_toast(error);
+                    self.show_feedback_error(error);
                     return;
                 }
             }
@@ -816,7 +816,7 @@ impl App {
                 app.snapshot_bulk_kept_overrides(&mut targets, &op);
             });
             if snapshotted.is_none() {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "編集を開始したウィンドウが閉じられたため、一括編集を開始できませんでした"
                         .to_string(),
                 );
@@ -850,7 +850,7 @@ impl App {
                     },
                 ),
                 Err(error) => {
-                    self.show_feedback_toast(error);
+                    self.show_feedback_error(error);
                     return;
                 }
             },
@@ -1112,7 +1112,12 @@ impl App {
         else {
             return;
         };
-        self.show_feedback_toast(bulk_summary_text(&run, cancelled));
+        self.show_feedback_result(
+            bulk_summary_text(&run, cancelled),
+            crate::feedback::FeedbackKind::result(
+                cancelled || run.failed > 0 || run.dropped_non_targets > 0,
+            ),
+        );
     }
 
     fn poll_bulk_page_edit(&mut self, ctx: &egui::Context) {
@@ -1246,13 +1251,13 @@ impl App {
                     }
                     Err(error) => {
                         self.edit_bundle_bulk_pending = None;
-                        self.show_feedback_toast(error);
+                        self.show_feedback_error(error);
                     }
                 }
             }
             Some(BulkPollAction::LocalAdjustFenceFailed) => {
                 self.edit_bundle_bulk_pending = None;
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "補正レイヤー保存ワーカーが停止したため、一括編集を開始できませんでした"
                         .to_string(),
                 );
@@ -1549,7 +1554,7 @@ impl App {
                                 summary.push_str(
                                     "（キャンセルしました。適用済みの内容は保持されます）",
                                 );
-                                self.show_feedback_toast(summary);
+                                self.show_feedback_warning(summary);
                             }
                             AfterLocalAdjustFence::Single { .. } => self.show_feedback_toast(
                                 "編集内容の貼り付けをキャンセルしました".to_string(),

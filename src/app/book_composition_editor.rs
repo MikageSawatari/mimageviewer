@@ -479,7 +479,7 @@ impl App {
         if let Err(error) = spawn {
             crate::logger::log(format!("composition editor prepare: {error}"));
             self.close_local_composition_editor(CompositionEditorCloseReason::Cancel);
-            self.show_feedback_toast("本の構成を準備できませんでした".into());
+            self.show_feedback_warning("本の構成を準備できませんでした".into());
             return false;
         }
         ctx.request_repaint();
@@ -514,7 +514,7 @@ impl App {
         if reason == CompositionEditorCloseReason::RemoteAcquire
             && !self.composition_editor_writes_pending()
         {
-            self.show_feedback_toast("Remoteからの操作に切り替えたため、本の構成の編集を閉じました。未保存の変更は保存されません".into());
+            self.show_feedback_warning("Remoteからの操作に切り替えたため、本の構成の編集を閉じました。未保存の変更は保存されません".into());
         }
     }
     #[cfg(test)]
@@ -642,7 +642,7 @@ impl App {
                             )
                         {
                             crate::logger::log("composition editor: resume write unavailable");
-                            self.show_feedback_toast("読書位置を保存できませんでした".into());
+                            self.show_feedback_warning("読書位置を保存できませんでした".into());
                         }
                     }
                     if still_owned {
@@ -659,7 +659,7 @@ impl App {
                 }
                 Err(error) => {
                     crate::logger::log(format!("composition editor save: {error}"));
-                    self.show_feedback_toast(error.clone());
+                    self.show_feedback_error(error.clone());
                     if still_owned {
                         self.with_composition_editor_owner_state(&ticket.owner, |editor| {
                             let state = std::mem::take(editor);
@@ -786,7 +786,7 @@ impl App {
             });
         if let Err(error) = spawn {
             self.composition_editor = CompositionEditorState::Editing(session);
-            self.show_feedback_toast(format!("本の構成を保存できませんでした: {error}"));
+            self.show_feedback_warning(format!("本の構成を保存できませんでした: {error}"));
             return;
         }
         let handle = self.remote_session_handle().cloned();

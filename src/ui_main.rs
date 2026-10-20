@@ -7576,7 +7576,7 @@ impl App {
                                         }
                                         MenuCommandId::GlobalEverythingSearch => {
                                             let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
-                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                            if crate::global_search_ui::everything_search_menu_button(ui, &label, self.everything_search_entry_availability()).clicked() {
                                                 self.open_everything_search();
                                                 ui.close();
                                             }
@@ -7657,7 +7657,7 @@ impl App {
                                         }
                                         MenuCommandId::GlobalEverythingSearch => {
                                             let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
-                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                            if crate::global_search_ui::everything_search_menu_button(ui, &label, self.everything_search_entry_availability()).clicked() {
                                                 self.open_everything_search();
                                                 ui.close();
                                             }
@@ -8636,30 +8636,7 @@ impl App {
                                                 )
                                                 .clicked()
                                             {
-                                                // 現行版のエントリ。無ければ現行版以下の最新エントリに
-                                                // フォールバック (次版エントリを先に埋め込んでも未来の
-                                                // 変更点を表示しない)。
-                                                let mut entries =
-                                                    crate::version_highlights::for_version(
-                                                        env!("CARGO_PKG_VERSION"),
-                                                        crate::version_highlights::table(),
-                                                    );
-                                                if entries.is_empty() {
-                                                    if let Some(latest) =
-                                                        crate::version_highlights::latest_not_newer_than(
-                                                            env!("CARGO_PKG_VERSION"),
-                                                            crate::version_highlights::table(),
-                                                        )
-                                                    {
-                                                        entries = vec![latest];
-                                                    }
-                                                }
-                                                // 空 (= テーブル自体が空) のときは「見えないダイアログ開状態」で
-                                                // ショートカットを塞がないよう、開かない (Codex P3)。
-                                                if !entries.is_empty() {
-                                                    self.whats_new_entries = entries;
-                                                    self.show_whats_new = true;
-                                                }
+                                                self.request_whats_new_from_help();
                                                 ui.close();
                                             }
                                         }
@@ -8768,11 +8745,11 @@ impl App {
 
     pub(crate) fn open_book_reorder_from_current(&mut self) {
         let Some(folder) = self.current_folder.clone() else {
-            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            self.show_feedback_warning("本フォルダを開いてから並べ替えてください".to_string());
             return;
         };
         if !crate::books::is_direct_book_folder(&self.book_root_path(), &folder) {
-            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            self.show_feedback_warning("本フォルダを開いてから並べ替えてください".to_string());
             return;
         }
         let entries: Vec<crate::books::BookPageEntry> = self
@@ -8798,7 +8775,7 @@ impl App {
             })
             .collect();
         if entries.is_empty() {
-            self.show_feedback_toast("並べ替えできるページがありません".to_string());
+            self.show_feedback_warning("並べ替えできるページがありません".to_string());
             return;
         }
         let mut selected_keys = HashSet::new();
@@ -9174,7 +9151,7 @@ impl App {
                             if let Some(state) = self.book_reorder.as_mut() {
                                 state.error = Some(err.clone());
                             }
-                            self.show_feedback_toast(format!(
+                            self.show_feedback_error(format!(
                                 "ページ順の保存に失敗しました: {err}"
                             ));
                             ctx.request_repaint();
@@ -9257,7 +9234,7 @@ impl App {
                             if reload_current {
                                 self.pending_reload = true;
                             }
-                            self.show_feedback_toast(format!("ページ転送に失敗しました: {err}"));
+                            self.show_feedback_error(format!("ページ転送に失敗しました: {err}"));
                             ctx.request_repaint();
                             return;
                         }
@@ -11577,7 +11554,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 Ok(false) => {
                     // 合成ビュー等で実コンテナが無い場合。常に何らかのフィードバックを返す
                     // (グリッドからのコンテナ付与で無反応に見えないように)。
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "この画面ではこの場所に評価を付けられません".to_string(),
                     );
                 }
@@ -14952,7 +14929,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         {
                                             self.start_quick_folder_slot_switch(slot, resolved);
                                         } else {
-                                            self.show_feedback_toast(format!(
+                                            self.show_feedback_warning(format!(
                                                 "{label} の最後の場所が見つかりません。ドライブ一覧へ切り替えます: {}",
                                                 raw_target.to_string_lossy()
                                             ));
@@ -16998,7 +16975,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // しないので網羅性のため no-op。
                 Some(GridItem::Stack { .. }) => {}
                 Some(GridItem::CollectionPlaceholder { .. }) => {
-                    self.show_feedback_toast("この参照は現在見つからないため開けません".into());
+                    self.show_feedback_warning("この参照は現在見つからないため開けません".into());
                 }
                 None => {}
             }
@@ -17036,7 +17013,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         post_drag_toast,
                     });
                 }
-                DragDecision::ImmediateToast(msg) => self.show_feedback_toast(msg),
+                DragDecision::ImmediateToast(msg) => self.show_feedback_warning(msg),
                 DragDecision::None => {}
             }
         }

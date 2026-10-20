@@ -98,7 +98,7 @@ impl App {
                 self.clipboard_capture_service
                     .resolve_selection(snapshot.token, false);
             } else {
-                self.show_feedback_toast_on(
+                self.show_feedback_warning_on(
                     "一覧画面で Ctrl+V を押すと開けます".into(),
                     ActionSurface::MainWindow,
                 );
@@ -106,7 +106,7 @@ impl App {
             return;
         }
         if snapshot.html.candidates.is_empty() {
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "取り込める画像がありません".into(),
                 ActionSurface::MainWindow,
             );
@@ -129,7 +129,7 @@ impl App {
                     .ok();
         }
         let Some(service) = &self.capture_fetch_service else {
-            self.show_feedback_toast_on(
+            self.show_feedback_warning_on(
                 "画像の取得を開始できませんでした".into(),
                 ActionSurface::MainWindow,
             );
@@ -238,7 +238,13 @@ impl App {
             }
             self.capture_selection = None;
             self.clipboard_capture_service.set_selection_open(false);
-            self.show_feedback_toast_on(text, ActionSurface::MainWindow);
+            self.show_feedback_result_on(
+                text,
+                ActionSurface::MainWindow,
+                crate::feedback::FeedbackKind::result(
+                    summary.failed > 0 || summary.metadata_failed > 0 || !summary.errors.is_empty(),
+                ),
+            );
             ctx.request_repaint();
         }
     }
@@ -296,7 +302,7 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.show_feedback_toast_on(error, ActionSurface::MainWindow);
+                    self.show_feedback_warning_on(error, ActionSurface::MainWindow);
                     return;
                 }
             }
