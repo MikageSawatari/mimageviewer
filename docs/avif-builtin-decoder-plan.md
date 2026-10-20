@@ -41,7 +41,7 @@
 - デコード順: AVIF (拡張子 `avif`) は **内蔵 (libavif) → WIC → Susie**。他形式の順序と JPEG 高速経路は変えない。
   内蔵で読めないとき (想定外の構造・libavif の制限) の救済として WIC / Susie の順を残す。
 - 通常ファイル・書庫内バイト列・サムネイル・フルサイズ・類似検索・コンテキストメニュー・本 (books)・mIV Remote
-  (core の canonical loader と thumb_loader を通る) の全経路で、同じ 1 つの関数を通す。経路ごとに AVIF 分岐を複製しない。
+  (core の canonical loader / thumb_loader と旧画像 API) の全経路で、同じ 1 つの関数を通す。経路ごとに AVIF 分岐を複製しない。
 - 出力は RGBA8 (straight alpha)。10/12bit は 8bit へ変換する。HDR の表示対応・アニメーション AVIF の全フレーム再生は
   範囲外 (1 フレーム目を静止画として表示する従来どおり)。ICC は他形式と同じく使わない。
 - 向き: AVIF の表示向きは irot / imir (と clap) が正本で、EXIF Orientation は適用しない (HEIF/MIAF の規定、
@@ -71,23 +71,25 @@
 
 ### 実装判断（2026-10-20、avif-1407）
 
-- dav1d は需要のフルサイズ表示・clipboard・Remote AI で **4 threads**、サムネイル・
-  類似索引・一括変換・製本 editor thumbnail・fullscreen 先読み・ベンチで **1 thread**。
+- dav1d は需要のフルサイズ表示・clipboard・Remote AI・旧 Remote 画像 API で **4 threads**、サムネイル・
+  類似索引・一括変換・製本 editor thumbnail・fullscreen 先読み・URL画像取得・
+  EPUB寸法解析・ベンチで **1 thread**。
   開発機の `NUMBER_OF_PROCESSORS=24`、fullscreen admission は process 共通で6件
   （`FS_PAGE_LOAD_TOTAL_PERMITS`）、thumbnail/batch は設定 Auto で logical CPU / 2
   （この環境では12 workers）。背景 worker にさらに内部並列を掛けない。
   需要側も6×4=24を目安に内部並列を4に固定し、空き状況による切替や新しい worker は追加しない。
-- `libavif-sys` は既成の avif/dav1d/yuv static libraries と `/MT` の C shim のみをリンク。
+- `libavif-sys` は既成の avif/dav1d/yuv static libraries と `/MT` の C shim をリンク。
   `VERSION` の全内容を検証し、同梱版を `BUILD_ID` として about へ出す。
-- Rust の `avif_decoder` が割当前の寸法・RGBA予算検査と clap→irot→imir を一か所で所有。
+- `libavif-sys` の safe Rust API が割当前の寸法・RGBA予算検査と clap→irot→imir を一か所で所有。
+  本体の `avif_decoder` は workload・path I/O・perf/ログの薄い層。Remote と EPUB の寸法解析も共用する。
   `image_decode::Decoded` の `Orientation::Applied` を後段へ運び、拡張子で EXIF を抑止しない。
   不正 clap だけは無視し、他の変換は続ける。native失敗は stage/result/diag をログへ記録して委譲。
 - libavif 1.4.2 は `imageSizeLimit > 16384*16384` 自体を拒否する（`read.c`）。
   各辺32768と、このnative総画素上限・呼出元RGBA予算を併用する。超過は型付き
   Dimensions/Budget とし、通常経路は既存WIC/Susieへ進む。bounded経路のWICにも同じ予算を渡す。
-- now-playing artwork の既存 bounded 経路はWICまでで、Susie呼出しは元からない。
+- now-playing artwork と clipboard capture の既存 bounded 経路はWICまでで、Susie呼出しは元からない。
   Susieには割当前RGBA予算を渡すAPIがないため、ここへ非boundedのSusieを新設しない。
-  内蔵→bounded WICの既存終端を維持する。この例外は設計担当の確認事項。
+  内蔵→bounded WICの既存終端を維持する。この既存終端を維持する。
 - 既存cancelをnative呼出し前後・fallback前後で照合する。実行中の1回のlibavif decodeは中断しない。
 - thumbnail catalog はmtime/sizeと全体schema version、PDF専用meta移行を持つが、
   画像形式/decoder versionで無効化する共通機構はない。代表キー `zipthumb:` / `folderthumb:`
@@ -95,7 +97,8 @@
   利用者指示に従い新しい無効化/スキーマ変更は行わない。既存WIC製AVIFサムネイルは再生成まで残る。
 - 今回は長期処理の新しい状態/並行ownerを作らず、既存worker内のデコード境界だけを差し替える。
   modal化や専用live-rebuildは不要。既存同期UIから今回のデコード呼出しへ至る経路は
-  棚卸しの範囲では見つからず、worker配置は変更しない。
+  通常画像の棚卸しでは見つからず、worker配置は変更しない。
+  スタンプの既存同期描画経路は下記の固定形式として対象外とし、新しいデコードを足さない。
 - exeサイズ増分・実画像での速度比較は、同じprofileの変更前ビルドがこのworktreeにないため未測定。
   tiny synthetic fixtureの測定を実画像での性能根拠にはしない。
 
@@ -112,12 +115,104 @@
 | effetune/now_playing/artwork | bounded bytes decode（既存終端はWIC） |
 | bin/bench_dupe | full decodeとsynthesis、二重EXIFを撤去 |
 | bin/bench_ai / bench_zip_seek / bench_raw | file入力 / ZIP decodeと並列ZIP計測 / DNG限定WIC対照（同じhelper経由） |
-| remote_ipc/container / thumbnail | canonical / thumb_loaderを共用、独立デコード経路なし |
+| app/cache_ops | 品質比較 file/ZIP、ZIP全件/代表1枚の共通worker境界。JPEG DCTの元寸法・RAWと非AVIFの向きを維持 |
+| audio_thumbnail | sidecar→埋め込みAPIC。Parse/Decode/ConversionはCorrupt、Dimensions/BudgetはTooLarge、ReadはIoへ写し、破損sidecarを致命I/O扱いにしない |
+| clipboard_capture/fetch | URL/data URL取得workerのAVIF（avis・compatible brandを含む）。既存1GiB/32768上限とWIC変換規則を維持、Susieは新設しない |
+| app/book_composition_editor_prepare | ZIPの横長判定もAVIFは全entryを読み、64KiB prefixで容器が欠ける場合を回避。RAWと他形式prefix規則は維持 |
+| fast_resize / app/metadata_ops | 先行寸法・一括編集・詳細情報。safe metadata APIで変換後寸法を取得、EXIFを重ねない |
+| remote_ipc/container / thumbnail | 画素はcanonical / thumb_loader。別のfile/ZIP寸法probeもsafe metadata APIへ接続 |
+| crates/remote-web/image_support | 旧 /api/image・/api/image-info。safe decode/dimensionsを共用し、認証・SourceReadEligibility・保存回転・AVIF passthrough条件を保持 |
+| bin/probe_birefnet / gpu_lanczos_spike / diff_images | 任意ファイルを受ける開発用入力も共有decodeへ接続。既存非AVIFのEXIF扱いは維持 |
+| crates/epub-pdf-worker/package | image/* spineのintrinsic寸法にsafe metadata APIを使用（1 thread）。ページ描画自体は従来のWebView2 |
 
-直接WIC呼出しを残したもの: canonicalのproduction seam、共有helperの実装、artworkの
-WIC対照unit tests。`bench_raw` のDNG専用対照もshared helper経由へ接続。
+### 第2ラウンドの再棚卸し（2026-10-20）
 
-### 自動検証
+リポジトリ全体（`src/`・`crates/`・`tests/`、生成物/vendorを除く）を
+`image::open` / `load_from_memory` / `image_dimensions` / `ImageReader` / `wic_` で再検索した。
+AVIFが届く実行入口は上表。画素変換はsafe API一か所で、寸法だけの入口はdecodeせずmetadata解析する。
+Remote ZIP寸法はAVIFだけ全entryを読み、他形式のprefix probeは維持する。
 
-実行コマンド・件数・変更ファイル・制限は [実装・検証記録](avif-1407-implementation-results.md) を参照。
-AVIF＋ライセンスの最終focused 22/22、関連69/69、UI通常比較11/11成功。fmt clean、Clippy最終exit0（既存警告あり）。確認buildも成功（通常profile、core / Remote / EPUB）。製品バイナリは起動していない。
+検索に残る直接呼出しの扱い:
+
+| 残す場所 | 理由・入力契約 |
+| --- | --- |
+| image_decode、canonical production seam、remote-web/image_support、clipboard_capture/fetch | 共有境界内の既存image/WIC fallback実装。AVIFの内蔵失敗を記録してから進む |
+| thumb_loaderのimage open / guessed-format retry、similar_imageのimage bytes | 共有primary closure内。AVIF成功時は呼ばない |
+| fast_resize、metadata_ops、remote container、EPUB packageのImageReader | AVIF metadata分岐後の他形式ヘッダ取得 |
+| audio_thumbnail::decode_picture_with_jpeg_decoder | APICはPNG/JPEGの明示的format制限。AVIF sidecarはthumb_loaderを通る |
+| catalog、clipboard_capture/data、materializer・pipeline_debug等のテスト | 保存済みJPEG/WebPサムネイル、PNG clipboard、生成物/テスト出力の再読込 |
+| lib::load_icon、tray、colorizeの固定アセット | include_bytesのPNG/JPEG、AVIF入力なし |
+| comic_stamp::decode_raster | pickerはPNG/JPEG/WebP/GIF/BMP限定、埋め込みはPNG。既存同期UI呼出しあり（app::build_stamp_images / ui_text）で、新しいAVIF decodeは追加しない |
+| bench_aiのimage open | RAW専用分岐。通常入力は共有decode済み |
+| compare_alpha_upscale / gpu_lanczos_spike reference | 前者はPNG/WebP/TIFF限定列挙、後者は固定名PNG比較出力。任意source入力は共有decode済み |
+| epub-pdf-worker/render::source_images | JPEG/PNGのPDF埋め込み品質照合だけ。spine寸法は別途接続済み |
+| ort-patched/test_util、tests/、各cfg(test) fixture検査 | 既知形式の固定fixture/生成結果。製品の画像入力経路なし |
+
+旧Remote APIの呼出しコードは残っている。`web/app.js` の画像要求と `imageInfo` は
+`entry.address` がある場合はaddressed API、ない場合は `/api/image` / `/api/image-info` へ進む。
+ただし現行の通常一覧は `http::api_list` が常にaddressを付け、集合一覧も
+`add_collection_entry_addresses`、永続集合もstate.addressを設定するため、通常は新APIを使う。
+旧APIはaddressのないentry用の互換分岐であり、現行の通常画面で常用しているとは確認していない。
+server側の認証・最新の種類設定とsource資格の確認は変更しない。保存回転なし・要求幅が元幅以上・
+元形式がブラウザ対応、というpassthrough条件も維持する。AVIFのprobe寸法は変換後、
+再encodeする画素も内蔵変換後で、保存回転はその後に一度だけ適用する。
+
+### セットアップと失敗契約
+
+- setupのskipは期待VERSION一致に加え、header・static libraries 3本・licenses 3本の全7ファイルが必要。
+  bootstrapはAVIF setupを毎回呼び、`--force`も伝える。ネットワークを要するsetupは本作業で実行しない。
+- decoder ownerはNULL確認後の`NonNull`だけを保持。C shimのcloseもNULLを無視する。
+- no-hint bytesはlibavifの`avifPeekCompatibleFileType`でmajor/compatible brandsのavif/avisを認識する。
+- safe decodeはstraight RGBA8と型付きstage/code/diagを返す。破損・上限・読み取り失敗を区別しつつ
+  既存fallbackへ進め、取消は既存の前後検査を維持する。
+- Susie診断はAVIF/TIFF=内蔵→Windowsの表示機能→Susie、HEIC/HEIF/JPEG XL=Windowsの表示機能→Susie。
+  UIのWIC略称は「Windows の表示機能」に統一する（統計表示も同様）。
+
+### 自動検証・引き継ぎ
+
+第1ラウンド: AVIF＋ライセンスfocused 22/22、関連69/69、UI比較11/11成功。
+`cargo check`とfmt成功。Clippy exit0だが既存警告あり（本体2000件、lib test2768件、1788件重複）。
+新設AVIF/helper/sysと当時の差分行には警告なし。exe増分・実画像速度は未測定。
+その後、設計担当が`eea48ebac`で`test-lib-full.ps1`全13,892件成功を報告した。
+これは第2ラウンド差分の全件検証ではない。
+
+第2ラウンドは全コマンドに`MSBUILDDISABLENODEREUSE=1`、このsandboxのTurboJPEG用に
+`CMAKE_GENERATOR=NMake Makefiles`を設定した。リポジトリのCargo設定は変更しない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功（最終差分でも再確認） |
+| `cargo build -p mimageviewer-remote --bin mimageviewer-remote` | 成功 |
+| 同上 `--features embedded-web-assets` | 成功。PE32+ import表にavif/dav1d/yuv DLLなし（static指定はsys build.rs） |
+| `cargo nextest run -p mimageviewer-remote` | 142成功、1 skip。AVIF画素/alpha/irot・旧画像API・保存回転・passthroughを含む |
+| `cargo nextest run -p libavif-sys -p epub-pdf-worker -E 'test(/avif/)'` | 3成功（shim NULL close、確保前上限、EPUB intrinsic寸法） |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/avif/) \| test(~audio_thumbnail::) \| test(~raw_quality_sample_tests::) \| test(~canonical_image_loader::) \| test(~effetune::now_playing::artwork::) \| test(~fast_resize::) \| test(~clipboard_capture::fetch::) \| test(~raw_remote_file_and_zip_probes) \| test(~book_composition_editor_prepare::) \| test(~a_plain_image_file_reports_its_shape) \| test(~batch_file_dimension) \| test(~byte_probe)'` | 135成功。破損sidecar→正常APIC、品質比較file/ZIP、ZIP全件/代表保存worker境界、64KiBを超えるAVIFの製本横長判定を含む |
+| UI snapshot: `cargo nextest run -p mimageviewer --test ui_snapshot -E 'test(~susie_diagnostic_) \| test(~avif_license_)'` | UPDATE_SNAPSHOTS=1で11成功、変更3枚を明暗・折返し・復帰履歴まで目視確認 |
+| `cargo check -p mimageviewer --features dev-tools --bin diff_images --bin probe_birefnet` | 成功 |
+| `python scripts/check_ui_glyphs.py` | dangerous glyph 0 |
+| `cargo fmt` | 引数なしで実行、成功 |
+
+最終のURL取得判定調整後は `cargo nextest run -p mimageviewer --lib -E
+'test(/avif/) | test(~clipboard_capture::fetch::)'` で47成功（上記135件と重複あり）。
+共有/EPUBも再度3成功、UI通常比較は最終11成功、`cargo fmt --check`も成功。
+ログは`target/avif-r2-*.log`（gitignore）。
+
+追加検査で分かった既存制限:
+
+- `cargo check -p mimageviewer --features dev-tools --bin gpu_lanczos_spike`相当の合同checkは、
+  変更していないwgpuコードの6件で失敗（InstanceDescriptor / RequestAdapterOptions /
+  get_mapped_rangeのAPI不整合）。このbinのAVIF接続差分はsource画像decodeの1箇所のみ。
+  本体・Remote・他2ツールの成功と分けて記録し、無関係なwgpu更新は本変更に含めない。
+- `bash -n scripts/bootstrap-vendor.sh`はGit Bash自体のCreateFileMapping / Win32 error 5で起動不能。
+  setupのネットワーク実行はしない。bootstrapの常時setup呼出し・force伝達はコードで照合した。
+全件ゲートとbuild-devは設計担当が実行するため、本ラウンドでは行わない。製品は起動しない。
+
+### 第2ラウンド変更ファイル
+
+- 共有API・ビルド: `Cargo.lock`, `crates/epub-pdf-worker/Cargo.toml`, `crates/libavif-sys/Cargo.toml`, `crates/libavif-sys/shim/miv_avif.c`, `crates/libavif-sys/src/lib.rs`, `crates/remote-web/Cargo.toml`, `scripts/bootstrap-vendor.sh`。
+- 本体・回帰テスト・UI: `src/app/book_composition_editor_prepare.rs`, `src/app/cache_ops.rs`, `src/app/metadata_ops.rs`, `src/audio_thumbnail/tests.rs`, `src/avif_decoder.rs`, `src/bin/diff_images.rs`, `src/bin/gpu_lanczos_spike.rs`, `src/bin/probe_birefnet.rs`, `src/clipboard_capture/fetch.rs`, `src/clipboard_capture/fetch_tests.rs`, `src/fast_resize.rs`, `src/image_decode.rs`, `src/remote_ipc/container.rs`, `src/thumb_loader.rs`, `src/ui_dialogs/stats_dialog.rs`, `src/ui_susie_diagnostic.rs`。
+- Remote・EPUB: `crates/epub-pdf-worker/src/package.rs`, `crates/remote-web/src/image_support.rs`, `crates/remote-web/src/store.rs`。
+- スナップショット: `tests/snapshots/susie_diagnostic_ready_after_recovery.png`, `tests/snapshots/susie_diagnostic_ready_with_plugins.png`, `tests/snapshots/susie_diagnostic_ready_with_plugins_dark.png`。
+- 文書: `docs/architecture-overview.md`, `docs/avif-1407-implementation-results.md`, `docs/avif-builtin-decoder-plan.md`, `docs/display-pipeline.md`, `docs/native-dependencies.md`, `docs/web-remote-plan.md`。
+
+`docs/avif-1407-implementation-results.md`は本節へ統合して削除。その他は変更。

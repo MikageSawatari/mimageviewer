@@ -19,7 +19,14 @@ fn decode_thumb_quality_sample(
                     .image,
                 )
             } else {
-                image::open(&path).ok()
+                crate::image_decode::decode(
+                    crate::image_decode::Source::Path(&path),
+                    crate::avif_decoder::Workload::Background,
+                    false,
+                    None,
+                )
+                .ok()
+                .map(|decoded| decoded.image)
             };
             Ok(image.map(|image| {
                 let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -45,11 +52,56 @@ fn decode_thumb_quality_sample(
                     .image,
                 )
             } else {
-                image::load_from_memory(&bytes).ok()
+                crate::image_decode::decode(
+                    crate::image_decode::Source::Bytes {
+                        bytes: &bytes,
+                        hint: &entry_name,
+                    },
+                    crate::avif_decoder::Workload::Background,
+                    false,
+                    None,
+                )
+                .ok()
+                .map(|decoded| decoded.image)
             };
             Ok(image.map(|image| (image, size)))
         }
     }
+}
+
+/// Shared worker boundary for both ZIP batch modes. JPEG DCT retains its
+/// original source dimensions; other decoders carry their orientation explicitly.
+fn decode_cache_zip_image(
+    bytes: &[u8],
+    entry_name: &str,
+    turbo: Option<image::DynamicImage>,
+    source_dims: Option<(u32, u32)>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<(image::DynamicImage, Option<(u32, u32)>)> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    if let Some(image) = turbo {
+        return Some((
+            apply_orientation(image, read_exif_orientation_from_bytes(bytes)),
+            source_dims,
+        ));
+    }
+    let source = crate::image_decode::Source::Bytes {
+        bytes,
+        hint: entry_name,
+    };
+    let decoded = crate::image_decode::decode(
+        source,
+        crate::avif_decoder::Workload::Background,
+        false,
+        Some(cancel),
+    )
+    .ok()?;
+    let applied = decoded.orientation == crate::image_decode::Orientation::Applied;
+    let image = decoded.oriented(source);
+    let dims = applied.then_some((image.width(), image.height()));
+    Some((image, dims))
 }
 
 #[inline]
@@ -617,13 +669,11 @@ impl App {
                                 } else {
                                     (None, None)
                                 };
-                                let img = match img.or_else(|| image::load_from_memory(&raw).ok()) {
-                                    Some(i) => i,
-                                    None => return,
-                                };
-                                let img = apply_orientation(img, orientation);
                                 let source_dims =
                                     dct_stats.map(|s| s.source_dims_after_exif(orientation));
+                                let Some((img, source_dims)) = decode_cache_zip_image(
+                                    &raw, &entry.entry_name, img, source_dims, &cancel,
+                                ) else { return };
                                 // 先頭エントリをキャプチャ（親フォルダ用サムネイル再利用）。
                                 // source_dims も一緒にキャプチャして parent thumb save で再利用。
                                 if i == 0 {
@@ -722,11 +772,15 @@ impl App {
                                 } else {
                                     (None, None)
                                 };
-                                let img = match img.or_else(|| image::load_from_memory(&raw).ok()) {
-                                    Some(i) => i,
-                                    None => continue,
+                                let Some((img, source_dims)) = decode_cache_zip_image(
+                                    &raw,
+                                    &first_entry,
+                                    img,
+                                    source_dims,
+                                    &cancel,
+                                ) else {
+                                    continue;
                                 };
-                                let img = apply_orientation(img, orientation);
                                 if let Some(bytes) = encode_and_save_with_source_dims(
                                     &img,
                                     source_dims,
@@ -1090,5 +1144,78 @@ mod raw_quality_sample_tests {
             decode_thumb_quality_sample(ThumbSampleSource::File(misleading), 512, &executor,)
                 .is_err()
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod avif_cache_entry_tests {
+    use super::*;
+    use image::GenericImageView;
+    use std::io::Write;
+
+    #[test]
+    fn avif_quality_and_both_zip_batch_modes_preserve_display_raster() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("page.AVIF");
+        let bytes = crate::avif_decoder::tests::with_clap_and_mirror(true);
+        std::fs::write(&path, &bytes).unwrap();
+        let zip_path = temp.path().join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.AVIF", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let expected =
+            crate::avif_decoder::decode_bytes(&bytes, crate::avif_decoder::Workload::Background)
+                .unwrap();
+        assert_eq!(expected.dimensions(), (64, 32));
+        for source in [
+            ThumbSampleSource::File(path),
+            ThumbSampleSource::ZipEntry {
+                zip_path: zip_path.clone(),
+                entry_name: "page.AVIF".into(),
+            },
+        ] {
+            let (image, size) = decode_thumb_quality_sample(source, 64, &executor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(size, bytes.len() as u64);
+            assert_eq!(image.to_rgba8(), expected.to_rgba8());
+        }
+        let raw = crate::zip_loader::read_entry_bytes(&zip_path, "page.AVIF").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let catalog =
+            crate::catalog::CatalogDb::open(&temp.path().join("cache"), temp.path()).unwrap();
+        // Both start_cache_creation branches use this worker boundary and save
+        // path: per-entry ZIP catalog and representative parent catalog key.
+        for key in ["page.AVIF", "zipthumb:book.zip"] {
+            let (image, dims) =
+                decode_cache_zip_image(&raw, "page.AVIF", None, None, &cancel).unwrap();
+            assert_eq!(dims, Some((64, 32)));
+            assert_eq!(image.to_rgba8(), expected.to_rgba8());
+            assert!(
+                encode_and_save_with_source_dims(
+                    &image,
+                    dims,
+                    key,
+                    &catalog,
+                    1,
+                    raw.len() as i64,
+                    64,
+                    90
+                )
+                .is_some()
+            );
+            assert_eq!(catalog.load_all().unwrap()[key].source_dims, Some((64, 32)));
+        }
+        let dct = image::DynamicImage::new_rgb8(8, 4);
+        let (image, dims) =
+            decode_cache_zip_image(b"", "page.jpg", Some(dct), Some((640, 320)), &cancel).unwrap();
+        assert_eq!(image.dimensions(), (8, 4));
+        assert_eq!(dims, Some((640, 320)));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(decode_cache_zip_image(&raw, "page.AVIF", None, None, &cancel).is_none());
     }
 }

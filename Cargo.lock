@@ -2125,6 +2125,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "image",
+ "libavif-sys",
  "lopdf",
  "percent-encoding",
  "quick-xml 0.41.0",
@@ -3769,6 +3770,7 @@ name = "libavif-sys"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "image",
 ]
 
 [[package]]
@@ -4258,6 +4260,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac",
  "image",
+ "libavif-sys",
  "mimageviewer-ipc",
  "percent-encoding",
  "qrcode",

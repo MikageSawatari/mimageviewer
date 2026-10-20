@@ -894,6 +894,6 @@ App の発行境界で寿命とnative fadeを確定して、既存 toast state �
 ## AVIF 内蔵デコード（§1.407）
 
 `crates/libavif-sys` の C shim が libavif の構造体 ABI を閉じ込め、既存の静的
-libavif / dav1d / libyuv をリンクする。`avif_decoder` は予算検査・RGBA8 確保・
-表示変換を所有する。`image_decode` は形式選択と WIC 接続、使用デコーダと向き状態を共有する。
+libavif / dav1d / libyuv をリンクする。safe Rust APIが予算検査・RGBA8確保・表示変換と
+画素を確保しない寸法解析を所有し、core / Remote / EPUBで共用する。`avif_decoder` は本体のperf/ログ層。`image_decode` は形式選択と WIC 接続、使用デコーダと向き状態を共有する。
 worker・queue・context owner・永続 schema は追加しない。

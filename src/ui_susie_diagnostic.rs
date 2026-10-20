@@ -27,12 +27,12 @@ pub fn render_diagnostic(ui: &mut egui::Ui, status: &PoolStatus, plugins: &[Plug
                     if crate::folder_tree::SUPPORTED_EXTENSIONS.contains(&lower.as_str()) {
                         let order = if crate::raw_format::is_raw_ext(&lower) {
                             "内蔵RAW専用"
-                        } else if lower == "avif" {
-                            "内蔵→WIC→Susie"
+                        } else if matches!(lower.as_str(), "avif" | "tiff" | "tif") {
+                            "内蔵→Windows の表示機能→Susie"
                         } else if crate::wic_decoder::is_wic_supported_extension(&lower) {
-                            "WIC→Susie"
+                            "Windows の表示機能→Susie"
                         } else {
-                            "内蔵→WIC→Susie"
+                            "内蔵→Windows の表示機能→Susie"
                         };
                         parts.push(format!("{e} ({order})"));
                         plugin_has_shadow = true;
@@ -57,7 +57,7 @@ pub fn render_diagnostic(ui: &mut egui::Ui, status: &PoolStatus, plugins: &[Plug
                 ui.label(
                     egui::RichText::new(
                         "RAW 以外は、先に試すデコーダで読めない場合に Susie プラグインを試します。\n\
-                         AVIF は内蔵→WIC→Susie、HEIC / HEIF / JPEG XL / TIFF は WIC→Susie の順です。\n\
+                         AVIF / TIFF は内蔵→Windows の表示機能→Susie、HEIC / HEIF / JPEG XL は Windows の表示機能→Susie の順です。\n\
                          RAW は内蔵の現像機能を使います。",
                     )
                     .size(11.0)

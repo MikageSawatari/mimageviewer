@@ -55,8 +55,14 @@ run_step "PDFium" "vendor/pdfium/bin/pdfium.dll" \
 run_step "LibRaw 0.22.2 and zlib" "vendor/libraw/VERSION" \
     "bash scripts/setup-libraw.sh"
 
-run_step "libavif + dav1d + libyuv" "vendor/libavif/VERSION" \
-    "bash scripts/setup-libavif.sh"
+# setup validates VERSION and every output; VERSION alone cannot prove completeness.
+echo "============================================================"
+echo "[libavif + dav1d + libyuv]"
+if [[ $FORCE -eq 1 ]]; then
+    bash scripts/setup-libavif.sh --force
+else
+    bash scripts/setup-libavif.sh
+fi
 
 run_step "ONNX Runtime" "vendor/ort/onnxruntime.dll" \
     "bash scripts/setup-ort.sh"

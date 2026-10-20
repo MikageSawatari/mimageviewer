@@ -1495,6 +1495,10 @@ pub(crate) fn decode_image_for_thumb_with_dims(
             Err(image::ImageError::IoError(error)) => {
                 return Err(crate::raw::RawError::Io(error.to_string()));
             }
+            Err(image::ImageError::Limits(_)) => return Err(crate::raw::RawError::TooLarge),
+            Err(image::ImageError::Decoding(error)) => {
+                return Err(crate::raw::RawError::Corrupt(error.to_string()));
+            }
             Err(_) => None,
         }
     };

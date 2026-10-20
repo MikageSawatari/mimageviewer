@@ -28,9 +28,41 @@ impl Source<'_> {
             // only when the caller has no extension; never reread a file here.
             || (self.extension().is_empty()
                 && matches!(self, Self::Bytes { bytes, .. }
-                    if image::guess_format(bytes).ok() == Some(image::ImageFormat::Avif)))
+                    if libavif_sys::is_avif(bytes)))
     }
 }
+/// An AVIF metadata probe, when this source selects the native decoder.
+/// Other formats retain each caller's existing header/EXIF rules.
+pub fn avif_dimensions(
+    source: Source<'_>,
+    workload: Workload,
+) -> Option<Result<(u32, u32), crate::avif_decoder::Error>> {
+    if !source.is_avif() {
+        return None;
+    }
+    let owned;
+    let bytes = match source {
+        Source::Path(path) => {
+            owned = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Some(Err(crate::avif_decoder::Error::local(
+                        crate::avif_decoder::Stage::Read,
+                        error.to_string(),
+                    )));
+                }
+            };
+            &owned
+        }
+        Source::Bytes { bytes, .. } => bytes,
+    };
+    let result = libavif_sys::dimensions(bytes, libavif_sys::Limits::default(), workload.threads());
+    if let Err(error) = &result {
+        crate::logger::log(error.to_string());
+    }
+    Some(result)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Orientation {
     #[default]
@@ -115,6 +147,21 @@ impl Backend for System {
     }
 }
 
+// Preserve the existing sidecar contract: corruption/limits allow embedded art,
+// while a source read failure remains a fatal I/O error. Fallbacks still run.
+fn avif_image_error(error: crate::avif_decoder::Error) -> image::ImageError {
+    use crate::avif_decoder::Stage;
+    match error.stage {
+        Stage::Read => image::ImageError::IoError(std::io::Error::other(error)),
+        Stage::Dimensions | Stage::Budget => image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory),
+        ),
+        Stage::Parse | Stage::Decode | Stage::Conversion => image::ImageError::Decoding(
+            image::error::DecodingError::new(image::ImageFormat::Avif.into(), error),
+        ),
+    }
+}
+
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
@@ -144,7 +191,7 @@ pub(crate) fn primary_with_backend(
                 orientation: Orientation::Applied,
                 decoder: DecodeSource::Libavif,
             })
-            .map_err(|e| image::ImageError::IoError(std::io::Error::other(e)))
+            .map_err(avif_image_error)
     } else {
         primary().map(|image| Decoded::legacy(image, DecodeSource::Native))
     };
@@ -320,5 +367,48 @@ mod tests {
             );
             assert_eq!(backend.wic_calls.load(Ordering::Relaxed), 0);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod avif_regression_tests {
+    use super::*;
+    #[test]
+    fn avif_sequence_without_hint_uses_builtin() {
+        let bytes = std::fs::read(crate::avif_decoder::tests::fixture(
+            "animated_first_quadrant",
+        ))
+        .unwrap();
+        let source = Source::Bytes {
+            bytes: &bytes,
+            hint: "",
+        };
+        let decoded = primary(source, Workload::Background, None, None, || {
+            panic!("image primary must not run")
+        })
+        .unwrap();
+        assert_eq!(decoded.decoder, DecodeSource::Libavif);
+        assert_eq!(decoded.orientation, Orientation::Applied);
+        crate::avif_decoder::tests::assert_quadrants(&decoded.image, [0, 1, 2, 3]);
+    }
+    #[test]
+    fn avif_stages_keep_corrupt_limit_and_io_contracts() {
+        use crate::avif_decoder::{Error, Stage};
+        for stage in [Stage::Parse, Stage::Decode, Stage::Conversion] {
+            assert!(matches!(
+                avif_image_error(Error::local(stage, "test")),
+                image::ImageError::Decoding(_)
+            ));
+        }
+        for stage in [Stage::Dimensions, Stage::Budget] {
+            assert!(matches!(
+                avif_image_error(Error::local(stage, "test")),
+                image::ImageError::Limits(_)
+            ));
+        }
+        assert!(matches!(
+            avif_image_error(Error::local(Stage::Read, "test")),
+            image::ImageError::IoError(_)
+        ));
     }
 }

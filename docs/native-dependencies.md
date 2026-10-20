@@ -500,7 +500,8 @@ BSD-2-Clause（同梱第三者 notice も全文を保持）、BSD-2-Clause、BSD
 
 エージェント用 `bash scripts/setup-libavif.sh` が checksum / commit を照合し、
 MSVC x64・static CRT `/MT` で `vendor/libavif/{include,lib,licenses,VERSION}` を生成する。
-bootstrap も VERSION の存在を判定してこの段を実行する。meson / ninja / NASM は
+bootstrap は毎回setupを呼び、`--force`も伝える。setupはVERSION一致と出力7ファイル
+（header・lib3本・license3本）すべての存在でskipを判定する。meson / ninja / NASM は
 vendor 内の専用 tools に配置し、システムへは追加しない。
 Cargo は依存の C ビルドを行わず、`crates/libavif-sys` の小さな C shim だけを cc でビルドする。
 欠落・版違いは復旧コマンドを付けて停止する。新しい DLL / exe は追加しない。

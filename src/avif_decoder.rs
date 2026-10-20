@@ -1,13 +1,9 @@
-//! Worker-only AVIF first-frame decoder. C owns libavif's ABI; Rust owns allocation
-//! admission and the single clap -> irot -> imir display transform.
+//! Worker-only application wrapper: workload policy, path I/O and diagnostics.
+//! The shared libavif-sys safe API owns admission and display transforms.
 use std::path::Path;
 
 pub const BUILD_ID: &str = libavif_sys::BUILD_ID;
 pub const MAX_DIMENSION: u32 = 32768;
-// libavif 1.4.2 rejects larger imageSizeLimit values (read.c).
-#[cfg(windows)]
-const MAX_PIXELS: u64 = 16384 * 16384;
-
 #[derive(Clone, Copy, Debug)]
 pub enum Workload {
     Background,
@@ -22,40 +18,7 @@ impl Workload {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stage {
-    Read,
-    Parse,
-    Dimensions,
-    Budget,
-    Decode,
-    Conversion,
-}
-#[derive(Debug)]
-pub struct Error {
-    pub stage: Stage,
-    pub code: Option<i32>,
-    pub message: String,
-}
-impl Error {
-    fn local(stage: Stage, message: impl Into<String>) -> Self {
-        Self {
-            stage,
-            code: None,
-            message: message.into(),
-        }
-    }
-}
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "libavif {:?} ({:?}): {}",
-            self.stage, self.code, self.message
-        )
-    }
-}
-impl std::error::Error for Error {}
+pub use libavif_sys::{Error, Stage};
 
 pub fn decode_path(path: &Path, workload: Workload) -> Result<image::DynamicImage, Error> {
     decode_path_bounded(path, workload, u64::MAX)
@@ -121,143 +84,21 @@ fn report(
     result
 }
 
-#[cfg(not(windows))]
-fn decode_inner(_: &[u8], _: Workload, _: u32, _: u64) -> Result<image::DynamicImage, Error> {
-    Err(Error::local(
-        Stage::Parse,
-        "libavif is available on Windows only",
-    ))
-}
-
-#[cfg(windows)]
 fn decode_inner(
     bytes: &[u8],
     workload: Workload,
     max_dimension: u32,
     max_alloc: u64,
 ) -> Result<image::DynamicImage, Error> {
-    use libavif_sys::*;
-    use std::ffi::{CStr, c_void};
-    struct Decoder(*mut c_void);
-    impl Drop for Decoder {
-        fn drop(&mut self) {
-            unsafe { miv_avif_close(self.0) };
-        }
-    }
-    impl Decoder {
-        fn error(&self, stage: Stage, code: i32) -> Error {
-            let mut text = [0; 512];
-            unsafe { miv_avif_error(self.0, code, text.as_mut_ptr(), text.len()) };
-            Error {
-                stage,
-                code: Some(code),
-                message: unsafe { CStr::from_ptr(text.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned(),
-            }
-        }
-    }
-    if max_alloc < 4 {
-        return Err(Error::local(
-            Stage::Budget,
-            "RGBA budget is smaller than one pixel",
-        ));
-    }
-    let pixel_limit = (max_alloc / 4).min(MAX_PIXELS) as u32;
-    let decoder = Decoder(unsafe { miv_avif_new(max_dimension, pixel_limit, workload.threads()) });
-    if decoder.0.is_null() {
-        return Err(Error::local(Stage::Parse, "cannot create decoder"));
-    }
-    let mut info = Info::default();
-    // The shim borrows bytes; decoder is dropped before bytes leaves this scope.
-    let code = unsafe { miv_avif_parse(decoder.0, bytes.as_ptr(), bytes.len(), &mut info) };
-    if code != 0 {
-        let mut error = decoder.error(Stage::Parse, code);
-        // These are libavif 1.4.2's three dimension-admission diagnostics,
-        // inspected in read.c; ordinary malformed inputs remain Parse failures.
-        if error.message.contains("dimensions are too large") {
-            error.stage = if max_alloc / 4 < MAX_PIXELS {
-                Stage::Budget
-            } else {
-                Stage::Dimensions
-            };
-        }
-        return Err(error);
-    }
-    let length = admitted_length(info.width, info.height, max_dimension, max_alloc)?;
-    let mut pixels = Vec::new();
-    pixels
-        .try_reserve_exact(length)
-        .map_err(|e| Error::local(Stage::Budget, e.to_string()))?;
-    pixels.resize(length, 0);
-    let mut stage = 0;
-    let code = unsafe {
-        miv_avif_decode(
-            decoder.0,
-            pixels.as_mut_ptr(),
-            pixels.len(),
-            info.width * 4,
-            &mut stage,
-        )
-    };
-    if code != 0 {
-        return Err(decoder.error(
-            if stage == 0 {
-                Stage::Decode
-            } else {
-                Stage::Conversion
-            },
-            code,
-        ));
-    }
-    let image = image::RgbaImage::from_raw(info.width, info.height, pixels)
-        .ok_or_else(|| Error::local(Stage::Conversion, "invalid RGBA output"))?;
-    // One allocation at a time beyond the coded raster; cropping in RGB also
-    // supports apertures not aligned to subsampled chroma boundaries.
-    let mut image = image::DynamicImage::ImageRgba8(image);
-    if (info.crop_x, info.crop_y, info.crop_width, info.crop_height)
-        != (0, 0, info.width, info.height)
-    {
-        image = image.crop_imm(info.crop_x, info.crop_y, info.crop_width, info.crop_height);
-    }
-    // Assign to the same owner so every old raster is dropped immediately after
-    // its replacement is ready. Shadowed borrowed transforms retain old buffers
-    // until scope exit and can multiply the caller's raster memory footprint.
-    match info.rotation {
-        1 => image = image.rotate270(),
-        2 => image = image.rotate180(),
-        3 => image = image.rotate90(),
-        _ => {}
-    }
-    match info.mirror {
-        1 => image = image.flipv(),
-        2 => image = image.fliph(),
-        _ => {}
-    }
-    Ok(image)
-}
-
-#[cfg(windows)]
-fn admitted_length(
-    width: u32,
-    height: u32,
-    max_dimension: u32,
-    max_alloc: u64,
-) -> Result<usize, Error> {
-    if width == 0 || height == 0 || width > max_dimension || height > max_dimension {
-        return Err(Error::local(
-            Stage::Dimensions,
-            format!("invalid dimensions {width}x{height}"),
-        ));
-    }
-    let length = u64::from(width) * u64::from(height) * 4;
-    if length > max_alloc {
-        return Err(Error::local(
-            Stage::Budget,
-            format!("RGBA {length} exceeds budget {max_alloc}"),
-        ));
-    }
-    usize::try_from(length).map_err(|e| Error::local(Stage::Budget, e.to_string()))
+    libavif_sys::decode(
+        bytes,
+        libavif_sys::Limits {
+            max_dimension,
+            max_alloc,
+        },
+        workload.threads(),
+    )
+    .map(image::DynamicImage::ImageRgba8)
 }
 
 #[cfg(all(test, windows))]
@@ -377,18 +218,6 @@ pub(crate) mod tests {
             Stage::Budget
         );
         assert!(decode_bytes_bounded(&bytes, Workload::Background, 64 * 64 * 4).is_ok());
-        assert_eq!(
-            admitted_length(32769, 1, MAX_DIMENSION, u64::MAX)
-                .unwrap_err()
-                .stage,
-            Stage::Dimensions
-        );
-        assert_eq!(
-            admitted_length(64, 64, MAX_DIMENSION, 16383)
-                .unwrap_err()
-                .stage,
-            Stage::Budget
-        );
     }
     pub(crate) fn with_clap_and_mirror(valid: bool) -> Vec<u8> {
         let mut bytes = std::fs::read(fixture("quadrant_irot90cw")).unwrap();
@@ -450,5 +279,26 @@ pub(crate) mod tests {
             assert_eq!(image.dimensions(), if valid { (64, 32) } else { (64, 64) });
             assert_eq!(image.to_rgba8(), expected.to_rgba8());
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod shared_probe_tests {
+    use super::*;
+    #[test]
+    fn avif_display_dimensions_match_transformed_pixels_at_every_probe() {
+        let bytes = tests::with_clap_and_mirror(true);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("page.avif");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            libavif_sys::dimensions(&bytes, libavif_sys::Limits::default(), 1).unwrap(),
+            (64, 32)
+        );
+        assert_eq!(crate::fast_resize::probe_dims(&path), Some([64, 32]));
+        assert_eq!(
+            crate::fast_resize::probe_dims_from_bytes(&bytes, "AVIF"),
+            Some([64, 32])
+        );
     }
 }

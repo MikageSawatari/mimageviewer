@@ -961,6 +961,57 @@ mod tests {
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn avif_legacy_image_routes_use_native_orientation_saved_rotation_and_passthrough() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/avif/quadrant_irot90cw.avif");
+        let path = temp.path().join("page.AVIF");
+        std::fs::copy(source, &path).unwrap();
+        let rotation_path = temp.path().join("rotation.db");
+        let writer = Connection::open(&rotation_path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+        let logical = resolve_existing(path.to_str().unwrap()).unwrap().logical;
+        let key = rotation_page_key(&logical);
+        let library = Library::from_test_rotation_path(rotation_path);
+        for degrees in [0, 90, 180, 270] {
+            writer.execute("INSERT INTO rotations (path, angle) VALUES (?1, ?2) ON CONFLICT(path) DO UPDATE SET angle = ?2", rusqlite::params![key, degrees]).unwrap();
+            let info = library.image_info(path.to_str().unwrap()).unwrap();
+            assert_eq!((info.width, info.height), (64, 64));
+            let full = library.image(path.to_str().unwrap(), 64).unwrap();
+            assert_eq!(full.metrics.passthrough, degrees == 0);
+            if degrees == 0 {
+                assert_eq!(full.content_type, "image/avif");
+                assert_eq!(full.bytes, std::fs::read(&path).unwrap());
+            }
+            let result = library.image(path.to_str().unwrap(), 32).unwrap();
+            assert!(!result.metrics.passthrough);
+            assert_eq!(
+                (result.metrics.source_width, result.metrics.source_height),
+                (64, 64)
+            );
+            let pixels = image::load_from_memory(&result.bytes).unwrap().to_rgba8();
+            let expected = match degrees {
+                0 => [1, 0, 243],
+                90 => [255, 255, 255],
+                180 => [0, 255, 11],
+                _ => [255, 1, 3],
+            };
+            for (actual, expected) in pixels.get_pixel(8, 8).0[..3].iter().zip(expected) {
+                assert!(
+                    actual.abs_diff(expected) <= 20,
+                    "{degrees}: {:?}",
+                    pixels.get_pixel(8, 8)
+                );
+            }
+        }
+    }
+
     #[test]
     fn legacy_file_image_routes_follow_all_saved_quarter_turns() {
         let temp = tempfile::tempdir().unwrap();

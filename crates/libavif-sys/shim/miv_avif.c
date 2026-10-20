@@ -80,4 +80,8 @@ void miv_avif_error(void *handle, int code, char *out, size_t length) {
     const avifDecoder *decoder = handle;
     snprintf(out, length, "%s: %s", avifResultToString((avifResult)code), decoder->diag.error);
 }
-void miv_avif_close(void *handle) { avifDecoderDestroy(handle); }
+void miv_avif_close(void *handle) { if (handle) avifDecoderDestroy(handle); }
+int miv_avif_is_compatible(const uint8_t *data, size_t length) {
+    const avifROData input = { data, length };
+    return avifPeekCompatibleFileType(&input);
+}

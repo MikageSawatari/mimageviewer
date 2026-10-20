@@ -3359,7 +3359,7 @@ App で寿命とnative fadeを確定して渡し、描画側は倍率を再適�
 
 `image_decode` は path / bytes の AVIF を内蔵 libavif → WIC → Susie の順に接続する。
 他形式の image / TurboJPEG の順序を保ち、呼出元の worker で実行する。
-内蔵は RGBA8 straight alpha、最初のフレームのみ。`avif_decoder` が RGB 上で
+内蔵は RGBA8 straight alpha、最初のフレームのみ。`libavif-sys` のsafe Rust APIがRGB上で
 clap → irot → imir を一度だけ適用し、不正 clap は無視する。
 `Decoded::orientation = Applied` を canonical / thumbnail / 類似検索 / clipboard へ運び、
 後段 EXIF / WIC orientation を重ねない。サムネイルの source_dims はこの変換後の寸法。

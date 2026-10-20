@@ -138,7 +138,7 @@ impl App {
                             let decoder_rows: [(&str, u64, f64); 4] = [
                                 ("Native", count_native, time_native),
                                 ("libavif", snapshot.count_libavif, snapshot.time_libavif),
-                                ("WIC   ", snapshot.count_wic, snapshot.time_wic),
+                                ("Windows の表示機能", snapshot.count_wic, snapshot.time_wic),
                                 ("Susie ", snapshot.count_susie, snapshot.time_susie),
                             ];
                             draw_format_rows(ui, &decoder_rows);
