@@ -1,6 +1,6 @@
 # 別ウィンドウの配置を物理座標で 1 か所が持つ (backlog §1.384)
 
-状態: 設計第 5 版 (2026-10-20、設計担当 ClaudeCode Opus 5.5)。第 4 版 (72eed920c) は ACCEPT WITH CHANGES。第 5 版は、第 4 版で足した「初回表示を後の pass へ移す」仕組みを、扱う組み合わせを減らす方向で置き換えた (§4)。第 1 版 (241dadb75)・第 2 版 (331f717f7)・第 3 版 (733624656) は
+状態: 設計第 6 版 (2026-10-20、設計担当 ClaudeCode Opus 5.5)。第 5 版 (3f2180bfc) は REJECT (passive の Hidden 採用と ParkedLive の表示経路)。第 6 版は passive の可視化を今のまま残し、最大化の扱いを 1 つの規則にまとめた (§3.3a・§3.4)。第 4 版 (72eed920c) は ACCEPT WITH CHANGES。第 5 版は、第 4 版で足した「初回表示を後の pass へ移す」仕組みを、扱う組み合わせを減らす方向で置き換えた (§4)。第 1 版 (241dadb75)・第 2 版 (331f717f7)・第 3 版 (733624656) は
 独立設計レビュー (GPT-6.1 Sol / xhigh) で REJECT。方針 (物理外枠矩形を正本にし、単一の Win32 適用境界へ
 集約する) が症状パッチではなく構造的修正であることには、両版とも同意を得ている。差し戻し理由
 (初期化・描画・可視化の順序、対象モニターの選び方、DPI 境界をまたぐ適用、host の同一性、main 全画面の HWND)
@@ -49,10 +49,11 @@ BA との対応: BA-6 / R2c (placement の正本は runtime。今回はその**�
 3. **全画面の対象は対象モニターの物理 `rcMonitor` をそのまま使う**。DPI で割らない・掛けない。
 4. **対象モニターは、配置の意図を表す物理矩形から決める**。新しく作った (まだ配置していない) HWND の位置は
    使わない (§3.5)。
-5. **OS 窓は、その host に最終の物理配置を適用した後で見せる**。active の immediate 窓では、作成と HWND の登録が
-   同じ root frame で済み、Visible の command は root frame の最後に処理される (§3.4) ので、登録時に適用すれば
-   順序が成り立つ。passive (deferred) 窓と root 側からの表示要求は、runtime の「配置済み」の事実で確かめる。
-   時間では判定しない。
+5. **active の窓 (immediate) は、その host に最終の物理配置を適用した後で見せる**。作成と HWND の登録が同じ root frame で
+   済み、明示の Visible command は root frame の最後に処理される (§3.4) ので、登録時に適用すれば順序が成り立つ。
+   root 側からの表示要求は runtime の「配置済み」の事実で確かめる。時間では判定しない。
+   passive (deferred) 窓は可視化の仕方を変えず、採用時に適用する (§3.4 の 5。倍率をまたぐ作成でだけ、仮の配置で
+   見えてから正しい位置へ動く)。
 6. 時間窓・リトライ・画面外を後から戻す補正を主修正にしない (憲法 §2-5、backlog の指示)。
 7. Win32 の `SetWindowPos` は、同期の wndproc (winit・egui-winit・vendor の Painter subclass) が取り直す
    lock / `RefCell` borrow / egui の lock を保持したまま呼ばない (`WM_DPICHANGED` などが同期で wndproc に入るため)。
@@ -80,8 +81,9 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 - **runtime placement** (`DetachedWindowRuntime.placement`): `PhysicalWindowPlacement` にする。
   window_id ごとの正本であることは R2c のまま (新しい保存先・同期経路は作らない。憲法 §2-4)。
 - **runtime の適用記録** (`DetachedWindowRuntime.host_placement`、新設の型付き状態):
-  - `Unplaced { show_request: Option<ShowRequest> }` — 現 host にまだ配置を適用していない。`show_request` は
-    root 側から来た表示要求 (§3.4 の 4) を捨てずに保持する。
+  - `Unplaced { show_request: Option<ShowRequest>, awaiting_unzoom: bool }` — 現 host にまだ配置を適用していない。
+    `show_request` は root 側から来た表示要求 (§3.4 の 4) を捨てずに保持する。`awaiting_unzoom` は §3.3 の
+    最大化の規則で最大化の解除を待っていること。
   - `Placed { incarnation, outcome: Exact | Mismatch }` — 現 host に配置を適用した。
   `incarnation` は既存の `host_incarnation` (`DetachedHostClaim` と同じ同一性。数値の同じ HWND を clear → 再登録しても
   新しい値になる)。`Placed` の incarnation が現 host と違えば `Unplaced` と同じに扱う (host が作り直されれば一致しなく
@@ -137,6 +139,12 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
   - winit の `WM_DPICHANGED` 処理は同期で、後から届く `ScaleFactorChanged` は egui-winit が `InnerSizeWriter` を
     変えないので大きさを再変更しない (独立レビューで確認)。待機・再試行は足さない。
   - `WM_GETDPISCALEDSIZE`・対象モニター上での生成・`SetWindowPlacement` は代替にならない (レビューの検討結果、§7)。
+- **最大化中の窓への適用の規則 (1 つだけ)**: `apply_outer_rect` は `IsZoomed(hwnd) == false` のときだけ行う。
+  最大化中の窓に target を適用する必要があるとき (F11 に入る、passive の採用で最大化した窓が target のモニターに
+  居ない) は、`Maximized(false)` を送って `host_placement` を `Unplaced { awaiting_unzoom: true, .. }` にし、root 側で
+  `IsZoomed == false` を確かめられた所で適用し、target が最大化なら `Maximized(true)` を送る。時間や pass の数では
+  進めない。F11 (§3.5) と passive の採用 (§3.4 の 5) はこの同じ規則を使う。
+  最大化中の窓が target のモニターに居るなら適用は要らない (最大化の大きさは OS がそのモニターに合わせる)。
 - `read_outer_rect(hwnd)` (`GetWindowRect`)、`read_zoomed(hwnd)` (`IsZoomed`)。
 - `default_placement(main_outer: PhysicalRect, ...)`、`offset_placement(base, steps)`、
   `migrate_legacy_placement(...)` (純粋、§3.6・§3.7)。
@@ -161,6 +169,14 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
    登録・適用 → root frame の最後に Visible を処理、の順になる。**Visible commit の位置・一回限りの表示指定の
    消費・`fs_viewport_shown` は今のまま変えない**。loading shell / holdover / keepalive backstop も、登録が commit の
    前にある (独立レビューの監査) ので同じ。
+   - この順序は **明示の command** の話で、builder の差分 (`ViewportBuilder::patch` が生む位置・大きさの command) は
+     nested 側の出力でも処理される。そのため builder が仮の配置を持つのは host が生きていない間 (作る前) だけにする。
+     今の active 動画経路は host が生きている間も latch の値を渡しているので、実装で「作る前だけ」に整理し、
+     `Placed` の後に patch が配置を上書きしないことをテストで確かめる (第 5 版レビューの確認事項)。
+   - **ParkedLive の immediate 作り直し** は、今は builder の `with_visible(true)` (作成属性) で作成時に見えるので、
+     この順序が成り立たない (第 5 版レビュー P2-2)。新しく作る host は `Hidden` で作り、`show_viewport_immediate` から
+     戻って登録・適用した後に、4 の共通 helper で表示する (明示 command なので root frame の最後に処理される)。
+     追加の pass や描画の機会の判定は使わない。
    - 倍率の違う作成 (1 で仮の配置がずれた場合) だけは、最初に見える frame の中身が適用前の大きさで描いたものになる
      (次の frame で描き直される)。画面外に出る今の不具合に比べて許容する。単一 DPI では起きない。
    - 登録が作成の frame で済まない回復経路 (HWND の差分が取れず後の frame で採用する場合) では、Visible が先に処理され、
@@ -172,11 +188,19 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
    前面化をまとめた 1 つの `ShowRequest`) を `show_request` に保持し、2 の適用の直後に送る。要求を捨てない。
    保持中に非表示の要求が来たら `show_request` を消す (古い要求で再表示しない)。host が交代したら保持中の要求は捨てる
    (新しい host へ漏らさない)。runtime が無い窓は従来の経路のまま (新しい保留を作らない)。
-5. **passive (deferred) 窓**: 今は builder の `with_visible(true)` と位置で可視化・配置している。deferred の command は
-   その viewport 自身の pass の出力で処理され、root の採用より先に処理されうるので、1 の順序は使えない。そこで
-   builder は `Hidden` + 仮の配置で作り、採用 (2) で適用し、callback に「`Placed` なら Visible commit」(最大化は commit の中)
-   を新設する。トレイ常駐中に作る窓 (今 `visible=false`) は commit せず、トレイ復帰の要求 (4) に任せる。
-   Windows では Hidden の窓でも callback は走る (レビュー第 2 版で確認)。
+5. **passive (deferred) 窓**: **可視化の仕方は今のまま変えない** (builder の `with_visible(visible)` と
+   `with_maximized`。トレイ常駐中は `visible=false`)。変えるのは、builder の位置・大きさを §3.4 の 1 の仮の配置
+   (target のモニターの DPI で論理化) にすることと、採用 (deferred adopted) の時に 2 の適用を行うことだけ。
+   - Hidden で作ると、既存の採用 (`select_detached_unclaimed_hwnd`) が `visible=true` を条件にしている
+     (非表示の残骸を誤って採用しないため。既存テストあり) ので採用できず、初回表示が循環待ちになる
+     (第 5 版レビュー P1-1)。Hidden の HWND を安全に採用する仕組みは R1 の領域で今回の範囲を超えるので、作らない。
+   - 単一 DPI の環境・作成直後の DPI が target と同じ場合は、仮の配置が正しいので **今とまったく同じ動き** になる
+     (採用時の適用は確認だけ)。
+   - 倍率をまたぐ作成では、仮の配置で見えてから (位置によっては画面外)、採用の時に正しい位置へ動く。
+     画面外に作られたままになる今の不具合に比べて許容する。
+   - 最大化して作った窓が target のモニターに居ないとき (倍率をまたぐ作成のみ) は、§3.3 の最大化の規則で
+     解除 → 適用 → 最大化し直す。
+   - passive の一回限りの表示 commit は新設しない (第 5 版レビュー P2-3 の論点自体が無くなる)。
 6. **位置の記録**: `Unplaced` の間、その host の位置の観測を runtime placement へ書かない。`Placed` の host の
    位置の記録は、egui の観測 (callback の `outer_rect` / 送られてくる Frame) を「変わったかもしれない」という通知として
    扱い、root が現 host の HWND から `GetWindowRect` で読む (レビュー第 2 版 P2-5)。
@@ -200,7 +224,7 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
     幾何の適用と前後どちらでもよい。装飾の状態を確かめる必要はない (Win32 style では確かめられない。
     winit は装飾の有無にかかわらず `WS_CAPTION` を付け、`WM_NCCALCSIZE` で装飾を消すため。第 1 版 P1-1)。
   - 最大化の解除 (`Maximized(false)`) の後に幾何を適用しないと、後から処理された `SW_RESTORE` が通常矩形へ戻して
-    幾何を上書きする。そこで幾何の適用の前提を **`IsZoomed(hwnd) == false` という OS の事実** にする。
+    幾何を上書きする。そこで幾何の適用の前提を **`IsZoomed(hwnd) == false` という OS の事実** にする。 (§3.3 の最大化の規則と同じ 1 つの規則)
     最大化していない窓は状態 command と同じ pass で適用してよい。最大化中の窓は、状態 command を送った後、
     `IsZoomed == false` を確かめられた所で適用する (確かめるのは F11 遷移を進める既存の root 側の処理。
     pass の数や時間では進めない。layout の追加 pass (`request_discard`) でも判定は同じ事実なので影響しない。
@@ -255,12 +279,16 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 扱う組み合わせが増え続けた (第 4 版でも、入力は新しい寸法なのに描画面が古い寸法の瞬間が残ると指摘された)。
 親セッションの提案 (2026-10-20) を受け、組み合わせそのものを減らせないかを検討した。
 
-- **採用 (第 5 版): 仮の配置 + 登録時の適用 + 既存の可視化の順序に乗る**。builder に target のモニターの DPI で
+- **採用 (第 5〜6 版): 仮の配置 + 登録時の適用 + 既存の可視化の順序に乗る**。passive (deferred) は可視化の仕方を
+  変えず採用時に適用する (Hidden の採用という新しい仕組みを作らない)。最大化中の窓への適用は F11 と passive で
+  同じ 1 つの規則 (§3.3)。builder に target のモニターの DPI で
   論理化した仮の配置を渡すと、単一 DPI の環境・作成直後の DPI が同じ場合は今とまったく同じ動きになる
   (退行が無い)。違う場合だけ登録時の適用で直し、active の可視化は「子の command は root frame の最後に処理される」
   既存の順序に乗るので、可視化・表示指定・初回表示済みの扱いを変えない。新しい判定 (描画の機会) と経路ごとの
   commit の移動がすべて不要になる。代償は、倍率の違う作成で最初の 1 frame の中身が適用前の大きさになりうること
-  (§3.4 の 3)。今の不具合 (画面外で見えない) に比べ許容する。
+  (§3.4 の 3) と、倍率をまたぐ passive の作成で仮の配置で見えてから動くこと (§3.4 の 5)。今の不具合 (画面外で見えない)
+  に比べ許容する。単一 DPI での同一性は **仮の配置の換算と passive の可視化** について言え、active の表示の順序も
+  今と同じ。
 - **不採用: モニターをまたぐ配置の変更では窓を閉じて作り直す**。原因は作り直しそのもの (作成直後の DPI が対象と
   無関係) にあるので、作り直しに寄せても直らない。F11 の出入りで窓を作り直すと動画の host 移動 (presenter の付け替え)
   まで巻き込み、今より重くなる。
@@ -298,9 +326,13 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
   同じ DPI の場合 (staging しない) を含め、適用後の矩形 = target を確かめる。
 - 実 HWND (単一 DPI の範囲): winit (eframe と同じ backend) で非表示の窓を作り `apply_outer_rect` → `GetWindowRect` が
   target と一致すること。
-- App: builder の仮の配置が target のモニターの DPI で論理化されること (単一 DPI では従来と同じ値になること)、
-  登録時に適用されること (作成直後の窓の DPI が同じなら `SetWindowPos` しないこと)、passive の commit が `Placed` まで
-  送られないこと、ParkedLive / loading shell / holdover / backstop の登録で適用されること、
+- App: builder の仮の配置が target のモニターの DPI で論理化されること (単一 DPI では従来と同じ値になること。
+  旧論理値 `x,y,w,h`、倍率 `s`、UI 倍率 `u`、実効の装飾 `F` について、物理外枠 `(sx, sy, sw+Fw, sh+Fh)` から作った
+  builder の値が従来の `(x/u, y/u, w/u, h/u)` に戻ること。装飾なしは `F=0`、丸めは物理値で比べる)、
+  登録時に適用されること (作成直後の窓の DPI が同じなら `SetWindowPos` しないこと)、ParkedLive / loading shell / holdover / backstop の登録で適用されること、ParkedLive の新しい host が
+  Hidden で作られ登録・適用の後に helper で表示されること、passive が今と同じ builder の可視化のまま採用時に適用されること
+  (単一 DPI では動かさないこと)、最大化して作った passive が別モニターに居るとき解除 → 適用 → 最大化し直すこと、
+  builder が host の生きている間は位置・大きさを持たないこと、
   数値の同じ HWND を clear → 再登録したら新しい host として再配置されること、配置前の観測が runtime placement を
   上書きしないこと、最大化中の窓の F11 が `IsZoomed == false` まで幾何を適用しないこと、root 側の表示要求
   (トレイ復帰・native 遷移の Visible と FocusHost・再アクティブ化) が `Unplaced` では 1 つの `ShowRequest` に保持されて
@@ -371,3 +403,14 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 | P2-1 入力の寸法の一致は描画面の更新の十分条件でない | 第 5 版で描画の機会の判定そのものを廃止 (§3.4、§4)。既存の可視化の順序に乗る |
 | P2-2 staging の外枠を style から求めると装飾なしで合わない、`S0` の制約が片側だけ | §3.3 2a: 実測の外枠と client の差、2b: 移動前と作り直し後の両方を制約。推奨矩形の左上の前提は実モニター試験まで未検証 |
 | P3-3 `Unplaced` の要求の保持先が未定義、FocusHost が先に処理される | §3.2 `Unplaced { show_request }`、§3.4 の 4: 表示・最大化・前面化を 1 つの要求にまとめる。非表示で消す、host 交代で捨てる |
+
+### 第 5 版のレビュー指摘との対応
+
+| 指摘 | 対応 |
+| --- | --- |
+| P1-1 Hidden の passive は採用できず循環待ち | §3.4 の 5: passive は可視化を今のまま (Hidden にしない)。採用時に適用。Hidden の採用の仕組みは作らない |
+| P2-2 ParkedLive は作成属性で見えるので順序が成り立たない | §3.4 の 3: 新しい host は Hidden で作り、登録・適用後に共通 helper で表示 |
+| P2-3 passive の commit に一回限りの条件が無い | passive の commit を新設しないので論点が無くなる |
+| P3-4 単一 DPI で「まったく同じ」の範囲 | §3.4 の 5・§4: 同一性は仮の配置の換算と passive の可視化について。倍率をまたぐときの過渡を明記 |
+| 確認事項: builder の適用条件 (host 生存中も latch を渡す経路) | §3.4 の 3: 作る前だけに整理し、patch が上書きしないことをテスト |
+| 確認事項: 仮の配置の同値性の式 | §5 の App テスト |
