@@ -1026,6 +1026,20 @@ export function viewerPageButtonState(side, rtl = false) {
   };
 }
 
+// Counterpart of SpreadMode::with_reading_direction: keep the viewing class
+// and cover choice while resolving its horizontal direction before publication.
+export function spreadModeWithReadingDirection(mode, direction) {
+  const pairs = [
+    [SpreadMode.LTR, SpreadMode.RTL],
+    [SpreadMode.LTR_COVER, SpreadMode.RTL_COVER],
+    [SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL],
+  ];
+  for (const pair of pairs) {
+    if (pair.includes(mode)) return pair[direction === ReadingDirection.RTL ? 1 : 0];
+  }
+  return mode;
+}
+
 export function readingDirectionForSpreadMode(mode, currentDirection) {
   if (
     mode === SpreadMode.RTL ||

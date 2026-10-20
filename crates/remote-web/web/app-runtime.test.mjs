@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import {
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   ViewerGroupLoadOutcome,
+  CommandName,
+  commandFromKey,
+  inputAdvancesRightToLeft,
+  viewerPageButtonState,
+  viewerTapCommand,
   remoteAddressIdentity,
 } from "./command-core.mjs";
 
@@ -181,6 +186,7 @@ const {
   loadFolder,
   renderFolder,
   setViewerRating,
+  requestSpreadMode,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
@@ -5897,3 +5903,50 @@ test("horizontal button labels follow configured mode across container and colle
     globalThis.history = originalHistory;
   }
 });
+
+for (const [selectedMode, expectedMode] of [["ltr", "rtl"], ["split_ltr", "split_rtl"]]) {
+  test(`mode-only ${selectedMode} keeps RTL input and labels before the response`, async () => {
+    const originalHistory = globalThis.history;
+    const originalFetch = globalThis.fetch;
+    const responseGate = deferred();
+    globalThis.history = { state: {}, replaceState() {} };
+    globalThis.fetch = async () => {
+      await responseGate.promise;
+      return new Response("{}", { status: 200 });
+    };
+    const address = { path: testPath("mode-only-input"), subresource: { kind: "file" } };
+    const entry = { kind: "image", name: "1.jpg",
+      address: { path: testPath("mode-only-input/1.jpg"), subresource: { kind: "file" } } };
+    const labels = {};
+    const viewer = {
+      destroy() {},
+      syncPagePositionFeedback() { ImageViewer.prototype.syncPagePositionFeedback.call(this); },
+      previous: { setAttribute: (_name, value) => { labels.left = value; } },
+      next: { setAttribute: (_name, value) => { labels.right = value; } },
+    };
+    try {
+      applyContainerData(address, {
+        entries: [entry], image_count: 1, composition_managed: true,
+        configured_spread_mode: "single", effective_spread_mode: "single", reading_direction: "rtl",
+        page_groups: [{ anchor: entry.address, pages: [entry.address], slice: "full" }],
+      }, false);
+      assert.equal(openViewerPagePositionForTest(viewer, 0), true);
+      assert.equal(requestSpreadMode(selectedMode, true), true);
+      // No response can have arrived: the write is still behind responseGate.
+      const snapshot = containerRuntimeStateForTest();
+      const rtl = inputAdvancesRightToLeft(snapshot.spreadMode);
+      assert.equal(commandFromKey({ key: "ArrowRight", rtl }, "viewer").name, CommandName.PREV_PAGE);
+      assert.equal(viewerTapCommand(290, 300, rtl).name, CommandName.PREV_PAGE);
+      assert.equal(viewerPageButtonState("right", rtl).commandName, CommandName.PREV_PAGE);
+      assert.deepEqual(labels, { left: "次の画像", right: "前の画像" });
+      assert.equal(snapshot.spreadMode, expectedMode);
+      assert.equal(snapshot.readingDirection, "rtl");
+    } finally {
+      cleanupVideoViewerForTest(viewer);
+      responseGate.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      globalThis.fetch = originalFetch;
+      globalThis.history = originalHistory;
+    }
+  });
+}

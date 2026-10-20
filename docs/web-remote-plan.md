@@ -1202,6 +1202,7 @@ Single / Ltr / LtrCover / SplitLtr では反転しない。入力は保存由来
 （Web 共通 state の `spreadMode`）を見るため、Single は保存済み方向が RTL でも右 tap zone /
 `ArrowRight` / `›` が次グループになる。縦持ちの表示限定 Single は構成モードを変えないため、
 構成が RTL なら綴じ方向に従って反転を続ける。コンテナ・各コレクションも同じ state 値を使う。
+表示種別だけを変える要求も、受付時に `spreadModeWithReadingDirection` で要求と同じ読み方向へ正規化してから共通 state と再取得要求へ渡し、応答待ちの間も左右入力とラベルの反転を維持する。
 反転時は左 tap zone / `ArrowLeft` / `‹` が次、右 tap zone / `ArrowRight` / `›` が前になる。
 swipe は指でページを送る向きを維持し、反転時は右 swipe が次・左 swipe が前、Single と LTR は
 左 swipe が次・右 swipe が前になる。ボタンの aria-label と端ページのタップ案内も同じ判定から

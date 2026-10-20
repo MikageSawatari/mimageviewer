@@ -1290,6 +1290,29 @@ test("portrait display-only Single keeps configured RTL horizontal input", () =>
   }
 });
 
+test("spread direction normalization preserves viewing class and cover like the core", () => {
+  for (const [ltr, rtl] of [[SpreadMode.LTR, SpreadMode.RTL],
+    [SpreadMode.LTR_COVER, SpreadMode.RTL_COVER], [SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL]]) {
+    for (const mode of [ltr, rtl]) {
+      assert.equal(commandCore.spreadModeWithReadingDirection(mode, ReadingDirection.LTR), ltr);
+      assert.equal(commandCore.spreadModeWithReadingDirection(mode, ReadingDirection.RTL), rtl);
+    }
+  }
+  for (const direction of Object.values(ReadingDirection)) {
+    assert.equal(commandCore.spreadModeWithReadingDirection(SpreadMode.SINGLE, direction), SpreadMode.SINGLE);
+  }
+});
+
+test("mode-only normalization follows binding while explicit spread follows the planned direction", () => {
+  for (const modeOnly of [true, false]) {
+    const { writeRequest } = planSpreadIntent({ selectedMode: SpreadMode.LTR,
+      currentDirection: ReadingDirection.RTL, modeOnly });
+    const direction = writeRequest.reading_direction ?? ReadingDirection.RTL;
+    assert.equal(commandCore.spreadModeWithReadingDirection(SpreadMode.LTR, direction),
+      modeOnly ? SpreadMode.RTL : SpreadMode.LTR);
+  }
+});
+
 test("RTL to Single releases input reversal while saved reading direction keeps seek RTL", () => {
   let mode = SpreadMode.RTL;
   const direction = ReadingDirection.RTL;

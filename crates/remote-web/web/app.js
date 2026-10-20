@@ -35,6 +35,7 @@ import {
   imageQualityPreset,
   isRtlReadingDirection,
   inputAdvancesRightToLeft,
+  spreadModeWithReadingDirection,
   viewerPageButtonState,
   viewerSwipeCommand,
   latestPageLoadRequestPlan,
@@ -4786,6 +4787,8 @@ export function containerRuntimeStateForTest() {
     : null;
   return {
     container: state.container ? structuredClone(state.container) : null,
+    spreadMode: state.spreadMode,
+    readingDirection: state.readingDirection,
     entries: state.entries.map(entryIdentity),
     images: state.images.map(entryIdentity),
     pageGroups: state.pageGroups.map((group) => ({
@@ -6214,15 +6217,15 @@ function extractedResultViewerContext() {
 
 export function extractedResultViewMode(mode, direction) {
   if ([SpreadMode.LTR, SpreadMode.LTR_COVER, SpreadMode.RTL, SpreadMode.RTL_COVER].includes(mode)) {
-    return direction === ReadingDirection.RTL ? SpreadMode.RTL : SpreadMode.LTR;
+    return spreadModeWithReadingDirection(SpreadMode.LTR, direction);
   }
   if ([SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(mode)) {
-    return direction === ReadingDirection.RTL ? SpreadMode.SPLIT_RTL : SpreadMode.SPLIT_LTR;
+    return spreadModeWithReadingDirection(SpreadMode.SPLIT_LTR, direction);
   }
   return SpreadMode.SINGLE;
 }
 
-function requestSpreadMode(mode, modeOnly = false) {
+export function requestSpreadMode(mode, modeOnly = false) {
   const collectionRoute = refreshableCollectionRoute();
   const persistentContext = persistentDirectViewerContext();
   if (
@@ -6249,6 +6252,7 @@ function requestSpreadMode(mode, modeOnly = false) {
   const writeRequest = spreadIntent.writeRequest;
   if (!writeRequest && !persistentContext) return false;
   const readingDirection = extracted ? state.readingDirection : writeRequest?.reading_direction ?? state.readingDirection;
+  mode = spreadModeWithReadingDirection(mode, readingDirection);
   // 一方、文脈の同一性は要求側で見る (`activeSpreadContextIdentity` と揃える)。
   const identity = collectionRoute
     ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
