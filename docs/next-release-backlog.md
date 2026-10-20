@@ -192,47 +192,17 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 
-### 1.395 窓が大きすぎると Surface::configure の寸法超過で落ちる — egui 0.37 段7の確認で判明 (2026-10-18)
+### 1.395 窓が大きすぎると Surface::configure の寸法超過で落ちる — 残りは動画 overlay の同型 1 件 (2026-10-18)
 
-- 状態: **修正済み・利用者の実機確認待ち**。ブランチ `surface-size` (worktree `G:\home\mimageviewer-surfacesize`)。
-  実装 = Codex GPT-6.1 Sol / high、設計レビュー・コードレビュー = 別々の GPT-6.1 Sol / xhigh (コードレビューは P1/P2 なし、
-  detached の症状パッチではなく構造的修正と合意)。経緯の訂正は [段7検証記録](egui-0.37-stage7-verification.md)。
-- **発端の観測は試験スクリプトの誤り**: 段7 (2026-10-17) で、DPI 非対応のプロセスから `SetWindowPos` で窓を 3 台目へ移すと
-  `Requested was (1778, 32710)` (旧 v4.7.1) / `(1778, 98246)` (egui 0.37) で落ちた。設計担当 ClaudeCode が 2026-10-18 に、
-  スクリプト内の `$h = <HWND>` が高さ引数 `$H` を上書きしていた (PowerShell の変数名は大小を区別しない) ことを確認した。
-  高さに HWND の数値が渡り、OS が論理 65535 へ切り詰め、物理 98302 になっていた。開発機の 3 台は全部 144 DPI。
-  スクリプトを直した同じ移動は、最小の winit アプリと修正版の mIV (隔離 data-dir) の両方で正常 (設計担当が確認)。
-- **実在する弱点**: wgpu は configure に渡す物理 client 寸法が device の `max_texture_dimension_2d` (egui-wgpu 既定で 8192) を
-  超えると panic する。OS は `SetWindowPos` の明示サイズを最大追跡サイズで制限しない (最小 winit アプリで 12000×9000 が
-  そのまま通ることを設計担当が確認)。通常操作でも、仮想デスクトップが物理 8192 を超える多画面 (例: 4K×3 横並び) で窓を
-  引き伸ばす、DPI 変更時に winit が論理サイズ維持で窓を広げる、保存サイズ (`sane_window_size` は各辺 16384 論理まで許す) を
-  150% 環境で復元する、で起き得る (コードからの判断。利用者からの報告は無い)。
-- **修正**: `vendor/egui-wgpu` の `Painter` が、surface を付ける全 viewport の HWND に device 上限の外寸制約を持たせる
-  (WM_WINDOWPOSCHANGING の cx/cy と WM_GETMINMAXINFO の最大追跡サイズを上限へ)。取り付け時は既に大きすぎる窓を実際に縮めて
-  から実 client 寸法で configure し、制約を迂回された resize (`SWP_NOSENDCHANGING`) も実窓を一度縮めてから configure する。
-  surface だけを切り詰めて窓と食い違わせることはしない。縮めたときは製品ログへ
-  `egui_wgpu::surface_window_limit` の WARN を 1 行出す (`src/logger.rs` がこの target だけを転送)。
-  Windows の Lost 再作成は旧 surface を先に破棄する順に直した (同一 HWND に flip swap chain を重ねられないため。実装担当が回帰で検出)。
-  device 上限 8192 は変えていない。詳細は `vendor/egui-wgpu/PATCHES.md` と [detached リワーク §11](detached-rework-plan.md)。
-- 設計担当の隔離 data-dir での確認 (2026-10-18): DPI 対応の `SetWindowPos(12000×9000)` と DPI 非対応の高さ 65535 で、
-  落ちずに外寸 8192 で止まり、表示を続けて正常終了した。製品ログに Limiting の 2 行が出た。
-- 設計担当の画面操作による確認 (2026-10-18、master `184de0a7b` の dev ビルド、隔離 data-dir、利用者の許可を得て操作):
-  - OS のキーボードによるサイズ変更 (SC_SIZE + 矢印) で拡大、タイトルバーのダブルクリックで最大化と元に戻す、
-    Win+Shift+→ で主 → 縦置き → 3 台目へ移動、3 台目での全画面表示とページ送り・一覧へ戻る、最小化と元に戻す。
-    いずれも一覧・ビューアが正しく描き直された。
-  - 外寸 8192 の窓で左端を左へ広げると、右端は動かず、幅は OS 既定の最大追跡サイズ (仮想デスクトップ幅 7920 + 枠 = 7946) で止まった。
-    開発機では手操作で 8192 を超えられないので、対話的な操作で今回の上限が効く場面は観測していない。
-  - F12 の別ウィンドウ (root 以外の viewport) に 12000×9000 を要求すると、外寸 8192 で止まり、製品ログに Limiting が出て、
-    描画を続けた。通常サイズへ戻すと正しく描かれ、閉じた後も本体は正常で、アプリは正常終了した (panic.log なし)。
-  - 枠を直接マウスでドラッグする操作は、画面操作ツールが窓外周の見えない枠をデスクトップ扱いするため行っていない
-    (同じ OS のサイズ変更ループはキーボードで通した)。
-- 残り:
-  - 利用者の実機確認 (普段の設定での見え方、枠のマウスドラッグ)。8192 を超える多画面は開発機に無く、未確認。
-  - 同型の候補 (コード上の判断、未再現): 動画 native presenter の overlay (`src/video/native_presenter/overlay_gpu.rs` が既定上限 8192 の
-    別 device を作り、`NativeEguiOverlay::configure` は寸法の上限を見ない) も、窓が 8192 を超えれば同じ検査に当たり得る。
-    `Painter` を通らないので今回の制約は効かない。通常は本体窓・モニター寸法に従うので優先度は低い。
-  - device 上限を adapter の実上限 (DX12 で 16384) まで上げる案は、egui の `max_texture_side` (font atlas・画像 texture) も変わるため見送った。
-- 規模 / 優先度: 実装済み / P2 (落ちる不具合だが発生条件は限られる)。
+- 状態: **本体・別ウィンドウの修正は master に取り込み済み** (`0f290c222`、設計担当の隔離 data-dir での画面操作確認は `57217ad0a`、2026-10-20 に節を整理)。
+  `vendor/egui-wgpu` の `Painter` が surface を付ける全 viewport の HWND に device 上限 (8192) の外寸制約を持たせ、超えた窓は縮めてから configure する。
+  詳細は `vendor/egui-wgpu/PATCHES.md`・[detached リワーク §11](detached-rework-plan.md)、発端の観測の訂正は [段7検証記録](egui-0.37-stage7-verification.md)。
+  仮想デスクトップが物理 8192 を超える多画面は開発機に無く、その環境での実機確認はできていない。
+- 残り (同型の候補、コード上の判断・未再現): 動画 native presenter の overlay (`src/video/native_presenter/overlay_gpu.rs` が既定上限 8192 の
+  別 device を作り、`NativeEguiOverlay::configure` は寸法の上限を見ない) も、窓が 8192 を超えれば同じ検査に当たり得る。`Painter` を通らないので
+  今回の制約は効かない。通常は本体窓・モニター寸法に従うので優先度は低い。
+- 見送り: device 上限を adapter の実上限 (DX12 で 16384) まで上げる案は、egui の `max_texture_side` (font atlas・画像 texture) も変わるため採らない。
+- 規模 / 優先度: Small / P3 (残りの overlay 分)。
 
 ### 1.392 `--features test-script` のときだけ走るテストが 2 件、master で落ちている — 通常の全件実行に入っていない (2026-10-17)
 
