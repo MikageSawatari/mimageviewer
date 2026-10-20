@@ -15,8 +15,8 @@
 //!   32GB あれば 4GB、8GB なら 2GB 確保する。
 //! - **ヒット率最大化**: 上限内では LRU eviction を行わない
 //!   (すなわち、典型的な 200MB〜1GB 程度の漫画アーカイブは全て常駐する)。
-//! - **ナビゲーション時クリア**: 別フォルダ/ZIP を開いたら `clear_all()` で全破棄し、
-//!   外側 ZIP を切り替えても古いキャッシュが居残らないようにする。
+//! - **identity 検証**: 外側 ZIP の path + mtime + len と内部パスで照合する。
+//! - **ナビゲーション時クリア**: 別フォルダ/ZIP を開いたら全破棄してメモリを解放する。
 //!
 //! 外側 ZIP は位置指定 reader の `ZipArchive` template をプロセスで共有し、request ごとの clone
 //! で読む。clone は独立した論理位置を持つため、同じ書庫の並列読みでも file position は競合しない。
@@ -721,8 +721,9 @@ pub fn archive_directory_parse_count() -> usize {
 /// 最大 4GB) で決定する。上限を超過したときのみ LRU eviction を行う
 /// (通常のユースケースでは evict は起きない)。
 ///
-/// 外側 ZIP / PDF / フォルダを切り替えた際は `clear_all()` でまとめて破棄する。
-/// これで「別アーカイブに移動したのに古い章のバイト列が居残る」を防ぐ。
+/// 外側 ZIP の identity を毎回検証し、更新前のバイト列にはヒットさせない。
+/// mtime と長さが両方同じ差し替えは、目次キャッシュと同様に検出できない。
+/// 外側 ZIP / PDF / フォルダを切り替えた際の全破棄はメモリ解放のために残す。
 struct NestedZipCache {
     inner: Mutex<NestedZipCacheInner>,
     max_bytes: usize,
@@ -734,17 +735,21 @@ struct NestedZipCacheInner {
 }
 
 struct NestedCacheEntry {
-    zip_path: PathBuf,
-    nested_path: NestedCachePath,
+    key: NestedCacheKey,
     bytes: Arc<Vec<u8>>,
     last_used: Instant,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NestedCacheKey {
+    archive: ArchiveCacheKey,
+    path: NestedCachePath,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 enum NestedCachePath {
     Named(String),
     RemoteIndices {
-        archive_key: ArchiveCacheKey,
         indices: Vec<usize>,
         display_name: String,
     },
@@ -761,30 +766,10 @@ impl NestedZipCache {
         }
     }
 
-    fn get(&self, zip_path: &Path, nested_path: &str) -> Option<Arc<Vec<u8>>> {
-        self.get_key(zip_path, &NestedCachePath::Named(nested_path.to_owned()))
-    }
-
-    fn get_remote(
-        &self,
-        archive_key: &ArchiveCacheKey,
-        indices: &[usize],
-        display_name: &str,
-    ) -> Option<Arc<Vec<u8>>> {
-        self.get_key(
-            &archive_key.path,
-            &NestedCachePath::RemoteIndices {
-                archive_key: archive_key.clone(),
-                indices: indices.to_vec(),
-                display_name: display_name.to_owned(),
-            },
-        )
-    }
-
-    fn get_key(&self, zip_path: &Path, nested_path: &NestedCachePath) -> Option<Arc<Vec<u8>>> {
+    fn get(&self, key: &NestedCacheKey) -> Option<Arc<Vec<u8>>> {
         let mut inner = self.inner.lock().ok()?;
         for e in inner.entries.iter_mut() {
-            if e.zip_path == zip_path && &e.nested_path == nested_path {
+            if &e.key == key {
                 e.last_used = Instant::now();
                 return Some(e.bytes.clone());
             }
@@ -792,37 +777,11 @@ impl NestedZipCache {
         None
     }
 
-    fn insert(&self, zip_path: PathBuf, nested_path: String, bytes: Arc<Vec<u8>>) {
-        self.insert_key(zip_path, NestedCachePath::Named(nested_path), bytes);
-    }
-
-    fn insert_remote(
-        &self,
-        archive_key: ArchiveCacheKey,
-        indices: Vec<usize>,
-        display_name: String,
-        bytes: Arc<Vec<u8>>,
-    ) {
-        self.insert_key(
-            archive_key.path.clone(),
-            NestedCachePath::RemoteIndices {
-                archive_key,
-                indices,
-                display_name,
-            },
-            bytes,
-        );
-    }
-
-    fn insert_key(&self, zip_path: PathBuf, nested_path: NestedCachePath, bytes: Arc<Vec<u8>>) {
+    fn insert(&self, key: NestedCacheKey, bytes: Arc<Vec<u8>>) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        if let Some(pos) = inner
-            .entries
-            .iter()
-            .position(|e| e.zip_path == zip_path && e.nested_path == nested_path)
-        {
+        if let Some(pos) = inner.entries.iter().position(|e| e.key == key) {
             let removed = inner.entries.swap_remove(pos);
             inner.current_bytes = inner.current_bytes.saturating_sub(removed.bytes.len());
         }
@@ -846,8 +805,7 @@ impl NestedZipCache {
         }
         inner.current_bytes += add_size;
         inner.entries.push(NestedCacheEntry {
-            zip_path,
-            nested_path,
+            key,
             bytes,
             last_used: Instant::now(),
         });
@@ -912,6 +870,7 @@ fn decoded_name_cache_put(
 }
 
 /// 外側のフォルダ/ZIP/PDF を切り替えたとき、内側 ZIP bytes だけを破棄する。
+/// これはメモリ解放のためであり、bytes の更新検証は外側 ZIP の identity が担う。
 ///
 /// 解析済み目次はプロセス共有であり、別 context の移動では失効させない。
 /// `ArchiveCacheKey` の path + mtime + len が変われば次の lookup で自動的に外れ、
@@ -1164,6 +1123,7 @@ fn enumerate_image_entries_detailed_inner(
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::enumerate_image_entries_detailed_with_cancel(zip_path, cancel);
     }
+    let archive_key = ArchiveCacheKey::from_path(zip_path).ok();
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
 
     // ZIP 自身の mtime をフォールバックに使う
@@ -1176,7 +1136,7 @@ fn enumerate_image_entries_detailed_inner(
     let mut legacy_renames: Vec<(String, String)> = Vec::new();
     enumerate_recursive(
         &mut archive,
-        zip_path,
+        archive_key.as_ref(),
         "",
         "",
         zip_mtime,
@@ -1254,15 +1214,18 @@ fn read_archive_origin_manifest_with_cancel<R: Read + Seek>(
 
 #[cfg(test)]
 pub(crate) fn nested_cache_contains(zip_path: &Path, nested_name: &str) -> bool {
-    if NESTED_CACHE.get(zip_path, nested_name).is_some() {
-        return true;
-    }
+    let Ok(archive) = ArchiveCacheKey::from_path(zip_path) else {
+        return false;
+    };
     let Ok(inner) = NESTED_CACHE.inner.lock() else {
         return false;
     };
     inner.entries.iter().any(|entry| {
-        entry.zip_path == zip_path
-            && matches!(&entry.nested_path, NestedCachePath::RemoteIndices { display_name, .. } if display_name == nested_name)
+        entry.key.archive == archive
+            && match &entry.key.path {
+                NestedCachePath::Named(name) => name == nested_name,
+                NestedCachePath::RemoteIndices { display_name, .. } => display_name == nested_name,
+            }
     })
 }
 
@@ -1417,6 +1380,7 @@ pub fn next_remote_image_candidate_with_visibility(
         }
         return Ok(next_after_cursor(candidates, after));
     }
+    let archive_key = ArchiveCacheKey::from_path(zip_path).ok();
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
     let manifest = if policy.requires_archive_origins()
         && crate::archive_cache::is_under_cache_root(zip_path)
@@ -1436,7 +1400,7 @@ pub fn next_remote_image_candidate_with_visibility(
     if let Some(prefix) = directory_prefix {
         return next_remote_directory_candidate(
             &mut archive,
-            zip_path,
+            archive_key.as_ref(),
             prefix,
             after,
             cancel,
@@ -1448,7 +1412,7 @@ pub fn next_remote_image_candidate_with_visibility(
     let mut passed_after = after.is_none();
     find_next_remote_file_candidate(
         &mut archive,
-        zip_path,
+        archive_key.as_ref(),
         "",
         &[],
         after,
@@ -1533,14 +1497,20 @@ fn remote_metadata_indices<R: Read + Seek>(
 fn remote_nested_bytes<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: usize,
-    outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     full_name: &str,
     index_chain: &[usize],
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
 ) -> std::io::Result<Option<Arc<Vec<u8>>>> {
-    let archive_key = ArchiveCacheKey::from_path(outer_zip_path)?;
-    if let Some(bytes) = NESTED_CACHE.get_remote(&archive_key, index_chain, full_name) {
+    let cache_key = archive_key.map(|archive| NestedCacheKey {
+        archive: archive.clone(),
+        path: NestedCachePath::RemoteIndices {
+            indices: index_chain.to_vec(),
+            display_name: full_name.to_owned(),
+        },
+    });
+    if let Some(bytes) = cache_key.as_ref().and_then(|key| NESTED_CACHE.get(key)) {
         return Ok(Some(bytes));
     }
     let Ok(mut entry) = archive.by_index(index) else {
@@ -1557,19 +1527,16 @@ fn remote_nested_bytes<R: Read + Seek>(
         return Err(interrupted_error());
     }
     let bytes = Arc::new(bytes);
-    NESTED_CACHE.insert_remote(
-        archive_key,
-        index_chain.to_vec(),
-        full_name.to_owned(),
-        bytes.clone(),
-    );
+    if let Some(key) = cache_key {
+        NESTED_CACHE.insert(key, bytes.clone());
+    }
     Ok(Some(bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn find_next_remote_file_candidate<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
-    outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     prefix: &str,
     parent_indices: &[usize],
     after: Option<&RemoteArchiveCandidateCursor>,
@@ -1604,7 +1571,7 @@ fn find_next_remote_file_candidate<R: Read + Seek>(
         let Some(bytes) = remote_nested_bytes(
             archive,
             index,
-            outer_zip_path,
+            archive_key,
             &full_name,
             &indices,
             cancel,
@@ -1618,7 +1585,7 @@ fn find_next_remote_file_candidate<R: Read + Seek>(
         };
         if let Some(found) = find_next_remote_file_candidate(
             &mut inner,
-            outer_zip_path,
+            archive_key,
             &format!("{full_name}/"),
             &indices,
             after,
@@ -1636,7 +1603,7 @@ fn find_next_remote_file_candidate<R: Read + Seek>(
 
 fn next_remote_directory_candidate<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
-    zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     prefix: &str,
     after: Option<&RemoteArchiveCandidateCursor>,
     cancel: &Arc<AtomicBool>,
@@ -1667,7 +1634,7 @@ fn next_remote_directory_candidate<R: Read + Seek>(
     let mut entries = Vec::new();
     collect_remote_metadata_candidates(
         archive,
-        zip_path,
+        archive_key,
         "",
         &[],
         &mut entries,
@@ -1684,7 +1651,7 @@ fn next_remote_directory_candidate<R: Read + Seek>(
 
 fn collect_remote_metadata_candidates<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
-    outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     prefix: &str,
     parent_indices: &[usize],
     out: &mut Vec<RemoteImageCandidate>,
@@ -1712,7 +1679,7 @@ fn collect_remote_metadata_candidates<R: Read + Seek>(
         let Some(bytes) = remote_nested_bytes(
             archive,
             index,
-            outer_zip_path,
+            archive_key,
             &full_name,
             &indices,
             cancel,
@@ -1726,7 +1693,7 @@ fn collect_remote_metadata_candidates<R: Read + Seek>(
         };
         collect_remote_metadata_candidates(
             &mut inner,
-            outer_zip_path,
+            archive_key,
             &format!("{full_name}/"),
             &indices,
             out,
@@ -1816,6 +1783,7 @@ pub fn resolve_remote_image_candidate(
             })
             .ok_or_else(|| entry_not_found(entry_name));
     }
+    let archive_key = ArchiveCacheKey::from_path(zip_path).ok();
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
     let parts = split_nested_zip_path(entry_name);
     match resolve_entry_index(
@@ -1851,7 +1819,14 @@ pub fn resolve_remote_image_candidate(
         return Err(entry_not_found(entry_name));
     }
     let mut indices = Vec::new();
-    resolve_remote_nested_candidate(&mut archive, zip_path, &parts, "", &mut indices, cancel)
+    resolve_remote_nested_candidate(
+        &mut archive,
+        archive_key.as_ref(),
+        &parts,
+        "",
+        &mut indices,
+        cancel,
+    )
 }
 
 /// S2c identification never resolves a nested path or reads image payloads.
@@ -1965,7 +1940,7 @@ fn read_raw_prefetch_bounded(
 
 fn resolve_remote_nested_candidate<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
-    outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     parts: &[&str],
     prefix: &str,
     indices: &mut Vec<usize>,
@@ -1996,7 +1971,7 @@ fn resolve_remote_nested_candidate<R: Read + Seek>(
     let bytes = remote_nested_bytes(
         archive,
         index,
-        outer_zip_path,
+        archive_key,
         &full_name,
         indices,
         cancel,
@@ -2008,7 +1983,7 @@ fn resolve_remote_nested_candidate<R: Read + Seek>(
         zip::ZipArchive::new(reader).map_err(|error| zip_error_to_io(error, Some(cancel)))?;
     resolve_remote_nested_candidate(
         &mut inner,
-        outer_zip_path,
+        archive_key,
         &parts[1..],
         &format!("{full_name}/"),
         indices,
@@ -2033,10 +2008,12 @@ pub fn read_remote_image_candidate_bytes_cancellable(
             crate::rar_loader::read_entry_bytes(zip_path, &candidate.entry_name)
         }
         RemoteArchiveCandidateCursor::Zip(indices) if !indices.is_empty() => {
+            let archive_key = ArchiveCacheKey::from_path(zip_path).ok();
             let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
             read_remote_zip_candidate_recursive(
                 &mut archive,
                 zip_path,
+                archive_key.as_ref(),
                 &candidate.entry_name,
                 indices,
                 &[],
@@ -2063,6 +2040,7 @@ fn note_remote_candidate_payload_read(zip_path: &Path, candidate: &RemoteImageCa
 fn read_remote_zip_candidate_recursive<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     candidate_name: &str,
     indices: &[usize],
     parent_indices: &[usize],
@@ -2101,7 +2079,7 @@ fn read_remote_zip_candidate_recursive<R: Read + Seek>(
     let bytes = remote_nested_bytes(
         archive,
         index,
-        outer_zip_path,
+        archive_key,
         &full_name,
         &chain,
         cancel,
@@ -2114,6 +2092,7 @@ fn read_remote_zip_candidate_recursive<R: Read + Seek>(
     read_remote_zip_candidate_recursive(
         &mut inner,
         outer_zip_path,
+        archive_key,
         candidate_name,
         &indices[1..],
         &chain,
@@ -2170,7 +2149,7 @@ pub fn prefetch_may_select_raw_without_extraction(
 #[allow(clippy::too_many_arguments)]
 fn enumerate_recursive<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
-    outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     prefix: &str,
     legacy_prefix: &str,
     zip_mtime: i64,
@@ -2227,7 +2206,11 @@ fn enumerate_recursive<R: Read + Seek>(
         }
         if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
-            let cached = NESTED_CACHE.get(outer_zip_path, &full_name);
+            let cache_key = archive_key.map(|archive| NestedCacheKey {
+                archive: archive.clone(),
+                path: NestedCachePath::Named(full_name.clone()),
+            });
+            let cached = cache_key.as_ref().and_then(|key| NESTED_CACHE.get(key));
             let bytes = match cached {
                 Some(b) => {
                     drop(entry);
@@ -2243,11 +2226,9 @@ fn enumerate_recursive<R: Read + Seek>(
                     }
                     drop(entry);
                     let arc = Arc::new(buf);
-                    NESTED_CACHE.insert(
-                        outer_zip_path.to_path_buf(),
-                        full_name.clone(),
-                        arc.clone(),
-                    );
+                    if let Some(key) = cache_key {
+                        NESTED_CACHE.insert(key, arc.clone());
+                    }
                     arc
                 }
             };
@@ -2273,7 +2254,7 @@ fn enumerate_recursive<R: Read + Seek>(
             });
             enumerate_recursive(
                 &mut inner,
-                outer_zip_path,
+                archive_key,
                 &new_prefix,
                 &new_legacy_prefix,
                 zip_mtime,
@@ -2372,14 +2353,15 @@ pub fn first_image_entry(zip_path: &Path, cancel: Option<&AtomicBool>) -> Option
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::first_image_entry(zip_path, cancel);
     }
+    let archive_key = ArchiveCacheKey::from_path(zip_path).ok();
     let file = File::open(zip_path).ok()?;
     let mut archive = zip::ZipArchive::new(BufReader::new(file)).ok()?;
-    first_image_recursive(&mut archive, zip_path, "", cancel)
+    first_image_recursive(&mut archive, archive_key.as_ref(), "", cancel)
 }
 
 fn first_image_recursive<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
-    outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     prefix: &str,
     cancel: Option<&AtomicBool>,
 ) -> Option<String> {
@@ -2407,7 +2389,11 @@ fn first_image_recursive<R: Read + Seek>(
         }
         if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
-            let cached = NESTED_CACHE.get(outer_zip_path, &full_name);
+            let cache_key = archive_key.map(|archive| NestedCacheKey {
+                archive: archive.clone(),
+                path: NestedCachePath::Named(full_name.clone()),
+            });
+            let cached = cache_key.as_ref().and_then(|key| NESTED_CACHE.get(key));
             let bytes = match cached {
                 Some(b) => {
                     drop(entry);
@@ -2420,11 +2406,9 @@ fn first_image_recursive<R: Read + Seek>(
                     }
                     drop(entry);
                     let arc = Arc::new(buf);
-                    NESTED_CACHE.insert(
-                        outer_zip_path.to_path_buf(),
-                        full_name.clone(),
-                        arc.clone(),
-                    );
+                    if let Some(key) = cache_key {
+                        NESTED_CACHE.insert(key, arc.clone());
+                    }
                     arc
                 }
             };
@@ -2433,8 +2417,7 @@ fn first_image_recursive<R: Read + Seek>(
                 continue;
             };
             let new_prefix = format!("{full_name}/");
-            if let Some(found) =
-                first_image_recursive(&mut inner, outer_zip_path, &new_prefix, cancel)
+            if let Some(found) = first_image_recursive(&mut inner, archive_key, &new_prefix, cancel)
             {
                 return Some(found);
             }
@@ -2490,14 +2473,21 @@ fn read_first_image_bytes_impl(
             Ok(result)
         };
     }
+    let archive_key = ArchiveCacheKey::from_path(zip_path).ok();
     let file_size = std::fs::metadata(zip_path)
         .ok()
         .map(|m| m.len())
         .unwrap_or(0);
     let t0 = std::time::Instant::now();
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, cancel)?;
-    let result =
-        read_first_image_recursive(&mut archive, zip_path, "", cancel.map(Arc::as_ref), stop)?;
+    let result = read_first_image_recursive(
+        &mut archive,
+        zip_path,
+        archive_key.as_ref(),
+        "",
+        cancel.map(Arc::as_ref),
+        stop,
+    )?;
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if total_ms > 50.0
         && let Some((ref name, ref bytes)) = result
@@ -2516,6 +2506,7 @@ fn read_first_image_bytes_impl(
 fn read_first_image_recursive<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     outer_zip_path: &Path,
+    archive_key: Option<&ArchiveCacheKey>,
     prefix: &str,
     cancel: Option<&AtomicBool>,
     stop: Option<&AtomicBool>,
@@ -2553,7 +2544,11 @@ fn read_first_image_recursive<R: Read + Seek>(
         }
         if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
-            let cached = NESTED_CACHE.get(outer_zip_path, &full_name);
+            let cache_key = archive_key.map(|archive| NestedCacheKey {
+                archive: archive.clone(),
+                path: NestedCachePath::Named(full_name.clone()),
+            });
+            let cached = cache_key.as_ref().and_then(|key| NESTED_CACHE.get(key));
             let bytes = match cached {
                 Some(b) => {
                     drop(entry);
@@ -2569,11 +2564,9 @@ fn read_first_image_recursive<R: Read + Seek>(
                     }
                     drop(entry);
                     let arc = Arc::new(buf);
-                    NESTED_CACHE.insert(
-                        outer_zip_path.to_path_buf(),
-                        full_name.clone(),
-                        arc.clone(),
-                    );
+                    if let Some(key) = cache_key {
+                        NESTED_CACHE.insert(key, arc.clone());
+                    }
                     arc
                 }
             };
@@ -2582,9 +2575,14 @@ fn read_first_image_recursive<R: Read + Seek>(
                 continue;
             };
             let new_prefix = format!("{full_name}/");
-            if let Some(found) =
-                read_first_image_recursive(&mut inner, outer_zip_path, &new_prefix, cancel, stop)?
-            {
+            if let Some(found) = read_first_image_recursive(
+                &mut inner,
+                outer_zip_path,
+                archive_key,
+                &new_prefix,
+                cancel,
+                stop,
+            )? {
                 return Ok(Some(found));
             }
         }
@@ -2629,12 +2627,17 @@ fn read_entry_bytes_impl(
         return read_entry_from_disk(zip_path, entry_name, cancel);
     }
 
+    let archive_key = ArchiveCacheKey::from_path(zip_path).ok();
+
     // 最深のキャッシュヒットを探す。キー = parts[0..level].join("/")
     let mut current_bytes: Option<Arc<Vec<u8>>> = None;
     let mut start_level: usize = 0;
     for level in (1..parts.len()).rev() {
-        let key = parts[0..level].join("/");
-        if let Some(b) = NESTED_CACHE.get(zip_path, &key) {
+        let key = archive_key.as_ref().map(|archive| NestedCacheKey {
+            archive: archive.clone(),
+            path: NestedCachePath::Named(parts[0..level].join("/")),
+        });
+        if let Some(b) = key.as_ref().and_then(|key| NESTED_CACHE.get(key)) {
             current_bytes = Some(b);
             start_level = level;
             break;
@@ -2669,8 +2672,15 @@ fn read_entry_bytes_impl(
             None => read_entry_from_disk(zip_path, parts[level], cancel)?,
         };
         let arc = Arc::new(next_bytes);
-        let key_so_far = parts[0..=level].join("/");
-        NESTED_CACHE.insert(zip_path.to_path_buf(), key_so_far, arc.clone());
+        if let Some(archive) = &archive_key {
+            NESTED_CACHE.insert(
+                NestedCacheKey {
+                    archive: archive.clone(),
+                    path: NestedCachePath::Named(parts[0..=level].join("/")),
+                },
+                arc.clone(),
+            );
+        }
         current_bytes = Some(arc);
         level += 1;
     }
@@ -2975,7 +2985,14 @@ mod tests {
         };
         let mut archive = zip::ZipArchive::new(reader).unwrap();
         armed.store(true, Ordering::Release);
-        let result = read_first_image_recursive(&mut archive, &path, "", Some(&cancel), None);
+        let result = read_first_image_recursive(
+            &mut archive,
+            &path,
+            ArchiveCacheKey::from_path(&path).ok().as_ref(),
+            "",
+            Some(&cancel),
+            None,
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
         assert!(cancel.load(Ordering::Acquire));
         assert!(!nested_cache_contains(&path, "inner.zip"));
@@ -2992,7 +3009,7 @@ mod tests {
         let mut legacy_renames = Vec::new();
         let result = enumerate_recursive(
             &mut archive,
-            &path,
+            ArchiveCacheKey::from_path(&path).ok().as_ref(),
             "",
             "",
             0,
@@ -3836,15 +3853,15 @@ mod tests {
         let warmed_slot = ARCHIVE_DIRECTORY_CACHE
             .slot_for_path_for_test(&path)
             .expect("the parsed directory must be cached");
-        NESTED_CACHE.insert(
-            path.clone(),
-            nested_name.to_owned(),
-            Arc::new(vec![1, 2, 3]),
-        );
+        let key = NestedCacheKey {
+            archive: ArchiveCacheKey::from_path(&path).unwrap(),
+            path: NestedCachePath::Named(nested_name.to_owned()),
+        };
+        NESTED_CACHE.insert(key.clone(), Arc::new(vec![1, 2, 3]));
 
         clear_nested_cache();
 
-        assert!(NESTED_CACHE.get(&path, nested_name).is_none());
+        assert!(NESTED_CACHE.get(&key).is_none());
         let retained_slot = ARCHIVE_DIRECTORY_CACHE
             .slot_for_path_for_test(&path)
             .expect("an unrelated context move must retain the ready directory template");
@@ -4387,6 +4404,140 @@ mod tests {
         );
         assert_eq!(candidate_payload_read_count(&outer, &first.cursor), 1);
         assert_eq!(candidate_payload_read_count(&outer, &second.cursor), 1);
+    }
+
+    /// Exercise every local producer/consumer without navigation clearing the cache.
+    fn check_local_nested_cache_revalidation(depth: usize, same_size: bool) {
+        for route in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let outer = dir.path().join("outer.zip");
+            let base = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            let write_version = |leaf: &str, contents: &[u8], modified| {
+                let inner = dir.path().join("inner.zip");
+                write_test_zip(&inner, &[(leaf, contents)]);
+                let mut bytes = std::fs::read(&inner).unwrap();
+                if depth == 2 {
+                    write_test_zip(&inner, &[("b.zip", &bytes)]);
+                    bytes = std::fs::read(&inner).unwrap();
+                }
+                write_test_zip(&outer, &[("a.zip", &bytes)]);
+                File::options()
+                    .write(true)
+                    .open(&outer)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            };
+            let prefix = if depth == 2 { "a.zip/b.zip" } else { "a.zip" };
+            let check_read = |leaf: &str, contents: &[u8]| {
+                let name = format!("{prefix}/{leaf}");
+                let cancel = Arc::new(AtomicBool::new(false));
+                match route {
+                    0 => assert_eq!(read_entry_bytes(&outer, &name).unwrap(), contents),
+                    1 => {
+                        let entries = enumerate_image_entries(&outer).unwrap();
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0].entry_name, name);
+                        assert_eq!(entries[0].uncompressed_size, contents.len() as u64);
+                    }
+                    2 => assert_eq!(first_image_entry(&outer, None).unwrap(), name),
+                    3 => assert_eq!(
+                        read_first_image_bytes(&outer).unwrap(),
+                        (name, contents.to_vec())
+                    ),
+                    4 => assert_eq!(
+                        read_first_image_bytes_cancellable(&outer, &cancel)
+                            .unwrap()
+                            .unwrap(),
+                        (name, contents.to_vec())
+                    ),
+                    _ => unreachable!(),
+                }
+            };
+            write_version("p.jpg", b"FIRST", base);
+            let first_meta = std::fs::metadata(&outer).unwrap();
+            check_read("p.jpg", b"FIRST");
+            let key = NestedCacheKey {
+                archive: ArchiveCacheKey::from_path(&outer).unwrap(),
+                path: NestedCachePath::Named(prefix.to_owned()),
+            };
+            let cached = NESTED_CACHE.get(&key).unwrap();
+            check_read("p.jpg", b"FIRST");
+            // Retaining the same Arc proves the nested bytes were not extracted again.
+            assert!(Arc::ptr_eq(&cached, &NESTED_CACHE.get(&key).unwrap()));
+
+            let contents: &[u8] = if same_size { b"OTHER" } else { b"NEW-LONGER" };
+            let modified = if same_size {
+                base + Duration::from_millis(1)
+            } else {
+                base
+            };
+            let new_leaf = if route == 1 || route == 2 {
+                "q.jpg"
+            } else {
+                "p.jpg"
+            };
+            write_version(new_leaf, contents, modified);
+            let second_meta = std::fs::metadata(&outer).unwrap();
+            if same_size {
+                assert_eq!(first_meta.len(), second_meta.len());
+                assert_ne!(
+                    first_meta.modified().unwrap(),
+                    second_meta.modified().unwrap()
+                );
+                assert_eq!(
+                    crate::ui_helpers::mtime_secs(&first_meta),
+                    crate::ui_helpers::mtime_secs(&second_meta)
+                );
+            } else {
+                assert_ne!(first_meta.len(), second_meta.len());
+                assert_eq!(
+                    first_meta.modified().unwrap(),
+                    second_meta.modified().unwrap()
+                );
+            }
+            check_read(new_leaf, contents);
+        }
+    }
+
+    #[test]
+    fn local_nested_cache_revalidates_outer_size() {
+        check_local_nested_cache_revalidation(1, false);
+    }
+
+    #[test]
+    fn local_nested_cache_revalidates_precise_outer_mtime_at_same_size() {
+        check_local_nested_cache_revalidation(1, true);
+    }
+
+    #[test]
+    fn local_nested_cache_revalidates_multilevel_outer_size() {
+        check_local_nested_cache_revalidation(2, false);
+    }
+
+    #[test]
+    fn local_nested_cache_revalidates_multilevel_precise_outer_mtime_at_same_size() {
+        check_local_nested_cache_revalidation(2, true);
+    }
+
+    #[test]
+    fn local_nested_cache_does_not_serve_a_missing_outer_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner.zip");
+        let outer = dir.path().join("outer.zip");
+        write_test_zip(&inner, &[("p.jpg", b"PAGE")]);
+        write_test_zip(&outer, &[("a.zip", &std::fs::read(&inner).unwrap())]);
+        assert_eq!(read_entry_bytes(&outer, "a.zip/p.jpg").unwrap(), b"PAGE");
+        assert!(nested_cache_contains(&outer, "a.zip"));
+
+        retire_archive_directory_for_mutation(&outer);
+        std::fs::remove_file(&outer).unwrap();
+
+        assert_eq!(
+            read_entry_bytes(&outer, "a.zip/p.jpg").unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!nested_cache_contains(&outer, "a.zip"));
     }
 
     #[test]

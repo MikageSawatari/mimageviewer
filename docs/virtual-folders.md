@@ -701,6 +701,14 @@ Auto比率の★一覧では、同じ保存helperが `TopLevelGridView` の★�
 純ロジックなので受信後に UI スレッドで行う。内側 ZIP バイト列は zip_loader 内の LRU
 キャッシュに保持され、後続の read_entry_bytes / 深い階層のサムネ読み込みで再展開せず参照される。
 
+内側 ZIP bytes のキーは、ローカルの内部名と Remote の物理 index chain のどちらも、
+外側 ZIP の `ArchiveCacheKey` (path + 精密な mtime + len) を必ず含む。同じ path の外側 ZIP が
+更新された場合は古い identity にヒットしない。列挙・先頭画像名・先頭画像 bytes・個別ページ取得・
+Remote 候補の探索/解決/取得は、外側を読む前に identity を一度取得し、その呼び出しの全階層の
+lookup と insert に同じ値を使う。stat に失敗した場合は内側 bytes キャッシュを使わず、既存の
+直接読み取り/エラー処理に任せる。mtime と長さが両方同じ差し替えは目次キャッシュと同様に検出できない。
+ナビゲーション時の `clear_nested_cache()` はメモリ解放のために残し、更新検証の根拠にはしない。
+
 ### 2.2 PDF を開く (`App::load_pdf_as_folder`)
 
 PDF は **非同期**で開く:
