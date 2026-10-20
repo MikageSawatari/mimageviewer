@@ -33,8 +33,9 @@ impl App {
             return false;
         }
         let message = format!("Everything ファイル名検索: {reason}");
-        let duration = crate::ui_fullscreen::feedback_toast_duration(&message);
-        self.show_feedback_toast_on_with_duration(
+        let duration = crate::feedback::feedback_toast_duration(&message);
+        // A refusal: the notice-time setting must not shorten it below Standard (§1.402).
+        self.show_feedback_warning_on_with_duration(
             message,
             crate::app::ActionSurface::MainWindow,
             duration,
