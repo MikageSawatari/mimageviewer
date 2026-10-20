@@ -1,6 +1,6 @@
 # 別ウィンドウの配置を物理座標で 1 か所が持つ (backlog §1.384)
 
-状態: 設計第 6 版 (2026-10-20、設計担当 ClaudeCode Opus 5.5)。第 5 版 (3f2180bfc) は REJECT (passive の Hidden 採用と ParkedLive の表示経路)。第 6 版は passive の可視化を今のまま残し、最大化の扱いを 1 つの規則にまとめた (§3.3a・§3.4)。第 4 版 (72eed920c) は ACCEPT WITH CHANGES。第 5 版は、第 4 版で足した「初回表示を後の pass へ移す」仕組みを、扱う組み合わせを減らす方向で置き換えた (§4)。第 1 版 (241dadb75)・第 2 版 (331f717f7)・第 3 版 (733624656) は
+状態: 設計第 6 版 (2026-10-20、設計担当 ClaudeCode Opus 5.5)。**独立設計レビュー ACCEPT WITH CHANGES (0243fb926)。指摘 3 件を反映済み (§3.3・§3.4 の 5・§5)。構造的修正であることに設計担当・独立レビュー担当の双方が合意。**第 5 版 (3f2180bfc) は REJECT (passive の Hidden 採用と ParkedLive の表示経路)。第 6 版は passive の可視化を今のまま残し、最大化の扱いを 1 つの規則にまとめた (§3.3a・§3.4)。第 4 版 (72eed920c) は ACCEPT WITH CHANGES。第 5 版は、第 4 版で足した「初回表示を後の pass へ移す」仕組みを、扱う組み合わせを減らす方向で置き換えた (§4)。第 1 版 (241dadb75)・第 2 版 (331f717f7)・第 3 版 (733624656) は
 独立設計レビュー (GPT-6.1 Sol / xhigh) で REJECT。方針 (物理外枠矩形を正本にし、単一の Win32 適用境界へ
 集約する) が症状パッチではなく構造的修正であることには、両版とも同意を得ている。差し戻し理由
 (初期化・描画・可視化の順序、対象モニターの選び方、DPI 境界をまたぐ適用、host の同一性、main 全画面の HWND)
@@ -144,7 +144,17 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
   居ない) は、`Maximized(false)` を送って `host_placement` を `Unplaced { awaiting_unzoom: true, .. }` にし、root 側で
   `IsZoomed == false` を確かめられた所で適用し、target が最大化なら `Maximized(true)` を送る。時間や pass の数では
   進めない。F11 (§3.5) と passive の採用 (§3.4 の 5) はこの同じ規則を使う。
-  最大化中の窓が target のモニターに居るなら適用は要らない (最大化の大きさは OS がそのモニターに合わせる)。
+  省いてよいのは **passive の採用で通常の最大化表示を保つ場合に、最大化中の窓が target のモニターに居るとき** だけ
+  (最大化の大きさは OS がそのモニターに合わせる)。F11 に入るときは同じモニターでも必ず解除 → `rc_monitor` の適用を通す
+  (winit は装飾なしでも最大化中の client を `rcWork` に制限するため。第 6 版レビュー P2-1)。
+  省いた場合も、最大化を解いたときの通常の矩形が保存対象の矩形 (target) になっていることを確かめる
+  (`GetWindowPlacement` の `rcNormalPosition` は workspace 座標なので物理 screen 座標と混同しない)。
+- **トレイに隠している間は、最大化の解除待ち (`awaiting_unzoom`) を進めない**: `Maximized(false/true)` は winit が
+  `SW_RESTORE` / `SW_MAXIMIZE` で行い、表示と前面化を伴う。トレイで隠している間は解除・適用・最大化し直しを送らず、
+  意図 (target と最大化) を保持して、トレイから戻したときに再開する。最大化し直しの command を処理する前に観測した
+  `maximized=false` で、保持している最大化の意図を上書きしない (第 6 版レビュー P2-2)。
+  解除待ちは、登録済みの host でも root 側の毎 frame の処理で進める (既存の採用関数は登録済みなら早く戻るので、
+  採用の再実行には頼らない)。
 - `read_outer_rect(hwnd)` (`GetWindowRect`)、`read_zoomed(hwnd)` (`IsZoomed`)。
 - `default_placement(main_outer: PhysicalRect, ...)`、`offset_placement(base, steps)`、
   `migrate_legacy_placement(...)` (純粋、§3.6・§3.7)。
@@ -201,6 +211,11 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
    - 最大化して作った窓が target のモニターに居ないとき (倍率をまたぐ作成のみ) は、§3.3 の最大化の規則で
      解除 → 適用 → 最大化し直す。
    - passive の一回限りの表示 commit は新設しない (第 5 版レビュー P2-3 の論点自体が無くなる)。
+   - トレイ常駐中に作った passive は Hidden・未採用のまま保持し、トレイから戻したときの builder の可視性の差分
+     (`with_visible` が false → true) で表示され、そこで採用・適用に進む。この builder 経由の表示は passive の例外として
+     残す (root 側の helper が要求を保持していても循環しない。第 6 版レビューで確認)。
+   - ParkedLive の Hidden 作成は **新しく作る host だけ**。既存の host は毎回 Hidden にしない。トレイ中は helper へ表示要求を
+     出さない。
 6. **位置の記録**: `Unplaced` の間、その host の位置の観測を runtime placement へ書かない。`Placed` の host の
    位置の記録は、egui の観測 (callback の `outer_rect` / 送られてくる Frame) を「変わったかもしれない」という通知として
    扱い、root が現 host の HWND から `GetWindowRect` で読む (レビュー第 2 版 P2-5)。
@@ -337,7 +352,8 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
   上書きしないこと、最大化中の窓の F11 が `IsZoomed == false` まで幾何を適用しないこと、root 側の表示要求
   (トレイ復帰・native 遷移の Visible と FocusHost・再アクティブ化) が `Unplaced` では 1 つの `ShowRequest` に保持されて
   適用の直後に送られ、`Placed` では即送られること、保持中の非表示要求で古い要求が消えること、host の交代で
-  保持中の要求が新しい host へ漏れないこと、Hidden deferred の進行 (passive が採用まで進み可視化される)、
+  保持中の要求が新しい host へ漏れないこと、passive のトレイ中の作成 (Hidden・未採用のまま保持 → トレイから戻したときの builder の可視性の差分で表示 → 採用・適用)、
+最大化の解除待ち中のトレイ退避・復帰 (解除待ちを進めず、戻したときに再開)、
   新 HWND の位置と seed のモニターが違う場合、同じ HWND の再登録で再配置しないこと、HWND の作り直しで配置済みが
   外れること、F12 往復・promote 後の新しい窓・always-new・複数 passive 窓・F11 入る/解除 (最大化 → F11 → 解除を含む)・
   トレイ中の作り直し → 復帰・always-on-top の保持。
@@ -414,3 +430,12 @@ pub struct PhysicalWindowPlacement { outer: PhysicalRect, maximized: bool }
 | P3-4 単一 DPI で「まったく同じ」の範囲 | §3.4 の 5・§4: 同一性は仮の配置の換算と passive の可視化について。倍率をまたぐときの過渡を明記 |
 | 確認事項: builder の適用条件 (host 生存中も latch を渡す経路) | §3.4 の 3: 作る前だけに整理し、patch が上書きしないことをテスト |
 | 確認事項: 仮の配置の同値性の式 | §5 の App テスト |
+
+### 第 6 版のレビュー指摘との対応 (判定 ACCEPT WITH CHANGES)
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2-1 同じモニターなら適用不要の条件が F11 にも効いてしまう | §3.3: 省いてよいのは passive の採用で最大化表示を保つ場合だけ。F11 は必ず解除 → 適用 |
+| P2-2 最大化の解除待ち中のトレイ退避 | §3.3: トレイ中は進めず意図を保持し、戻したときに再開。観測した maximized=false で意図を上書きしない |
+| P3-3 §5 に旧 Hidden 採用の期待が残る | §5 を第 6 版の passive の扱いに更新 |
+| 確認事項 (登録済みの解除待ちの進行、通常の矩形の一致、トレイ・複数 passive・ParkedLive の各ケース) | 実装報告で確認する (実装指示に列挙) |
