@@ -3323,8 +3323,10 @@ ON/pagedのLegacyPrefetchも同じ非表示登録枠に含め、OFF/連結/Split
 
 D3-4(b) は通常 Single／Pair と canonical geometry を共有し、採用済み resident 入力だけから
 次 composition の Native 需要を frame 限りの値で求める。未配送 backing・cold 回転／auto bbox・
-未確定 fit basis は見送り、通常表示は従来の prepare を行う。同じ ROOT 最終 hook で全 context の
-final 登録を先に処理し、通常 Native key／plan と出力＋一時 allocation 会計を使って最大一件を生成する。
+未確定 fit basis は見送り、通常表示は従来の prepare を行う。同じ ROOT 最終 hook で全 live context の
+Next final登録→Next Native→全Next成立を再照合し、その後だけPrevious登録→Previous Native→
+resident-only Previous CPU開始へ進む（§1.405の限定拡張）。通常 Native key／plan と出力＋一時 allocation 会計を使い、
+新規投機GPU仕事はouter frame当たり最大一件とする。Next CPUの通常producer位置は維持する。
 出力は通常 `fs_lanczos_cache` に置き、最初の通常 prepare の hit と既存 D2 handoff を使う。
 held／canonical receipt／D4 時計へ後付けせず、parked snapshot や単なる mount から開始しない。
 
@@ -3338,6 +3340,11 @@ CPU 需要用 resolver に残っていた全頁走査・mixed slideshow 列再�
 visible と同じ枝は既存索引を読み、異なる枝だけcoldに導出する。CPU需要は縮小せず、adoption／producer／keepの
 共有prefixで同pass採用する。通常表示token／units／receiptを準備用に置換しない。詳細は同節F1を参照。
 
+§1.405のPreviousは通常unit ordinal−1、既存後方keep内の全occurrenceだけを補完する。
+Next CPUの実予約拒否時だけ予約表最大2 unitからparkedを含むownerを訪問し、未昇格Previousの完成結果
+（未受信channelも含む）をdropして一度だけ再試行する。Current/Next共有素材・表示昇格・legacy・Unknownは保護する。
+Previous Nativeはsmoothing clear/旧source除去/容量pruningによる既存entry除去ゼロを、事前と実行入口で検査する。
+上限・D2/D4・通常draw/Next/source/AIの範囲は維持する。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
 
 ## 一時通知の表示時間（§1.402）
 

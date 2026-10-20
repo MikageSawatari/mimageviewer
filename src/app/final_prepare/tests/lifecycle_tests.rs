@@ -647,3 +647,396 @@ fn d3_5_real_computing_receipts_and_keep_reuse_warm_demand_without_restarting_wo
     hold.release();
     wait_ready(&mut app, 1);
 }
+
+fn parked_previous(
+    app: &mut App,
+    ctx: &egui::Context,
+    window: u64,
+    receive: bool,
+) -> (ViewerContextId, FinalCompositeKey, String) {
+    let id = active_owner(app, ctx, window);
+    let key = app
+        .with_active_viewer_context(|owner| {
+            owner.fullscreen_idx = Some(2);
+            owner.ensure_final_composite_texture(ctx, 2).unwrap();
+            frame(ctx, |ui, ctx| draw_current_without_sources(owner, ui, ctx));
+            let _ = owner.page_turn_prefetch_targets(2, 2, 2);
+            owner.prepare_final_demand_topologies();
+            assert!(start(owner, ctx, 1));
+            if receive {
+                wait_ready(owner, 1)
+            } else {
+                wait_idle(owner);
+                pending_key(owner, 1)
+            }
+        })
+        .unwrap();
+    assert!(app.pause_current_active_viewer_context(ctx));
+    let fingerprint = app
+        .with_viewer_context_state(id, |owner| owner.page_turn_gpu_fingerprint_for_test())
+        .unwrap();
+    (id, key, fingerprint)
+}
+
+#[test]
+fn back_next_pressure_reclaims_two_parked_ready_channel_and_mixed_without_resume() {
+    for received in [[true, true], [false, false], [true, false]] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        let a = parked_previous(&mut app, &ctx, 94120, received[0]);
+        let b = parked_previous(&mut app, &ctx, 94121, received[1]);
+        let legacy = [a.0, b.0].map(|id| {
+            let (key, cancel) = app
+                .with_viewer_context_state(id, |owner| {
+                    let key = crate::app::final_prepare_tests::queued_final(owner, 3);
+                    let pending = owner.final_effect_pending.get_mut(&key).unwrap();
+                    pending.origin = FinalEffectOrigin::LegacyPrefetch;
+                    (key, pending.cancel.clone())
+                })
+                .unwrap();
+            (id, key, cancel)
+        });
+        assert_eq!(app.final_prepare_cpu.snapshot().units, 2);
+        // Main C has never visited the Previous results, and needs actual Next.
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx)
+        });
+        let mounted = app.projected_viewer_context_id();
+        app.prefetch_next_final_unit(&ctx, 0);
+        assert_eq!(app.projected_viewer_context_id(), mounted);
+        assert!(
+            app.final_effect_pending
+                .keys()
+                .any(|key| key.edit_key.idx == 1)
+        );
+        wait_ready(&mut app, 1);
+        assert_eq!(app.final_prepare_cpu.snapshot().units, 1);
+        for (id, key, fingerprint) in [a, b] {
+            app.with_viewer_context_state(id, |owner| {
+                assert!(!owner.final_effect_pending.contains_key(&key));
+                assert!(!owner.final_composite_cache.contains_key(&key));
+                assert_eq!(owner.page_turn_gpu_fingerprint_for_test(), fingerprint);
+            })
+            .unwrap();
+        }
+        for (id, key, cancel) in legacy {
+            app.with_viewer_context_state(id, |owner| {
+                assert!(matches!(
+                    owner.final_effect_pending[&key].state,
+                    FinalEffectState::Computing(FinalEffectReceiver::Legacy(_))
+                ));
+            })
+            .unwrap();
+            assert!(!cancel.load(Ordering::Relaxed));
+        }
+        assert_eq!(
+            app.detached_window_state(94120),
+            Some(DetachedWindowState::Parked)
+        );
+        assert_eq!(
+            app.detached_window_state(94121),
+            Some(DetachedWindowState::Parked)
+        );
+    }
+}
+
+#[test]
+fn back_pressure_protects_parked_current_next_display_and_real_computing() {
+    let ctx = egui::Context::default();
+    install_presentation(&ctx);
+    let mut app = app(&ctx);
+    let (id, key, _) = parked_previous(&mut app, &ctx, 94122, false);
+    let units = app.final_prepare_cpu.reserved_units_for_test();
+    // Unknown demand is never inferred to be a low-priority Previous.
+    app.with_viewer_context_state(id, |owner| owner.fullscreen_idx = None)
+        .unwrap();
+    let requester = unit(&app, 1);
+    app.reclaim_previous_final_results(&units, &requester);
+    app.with_viewer_context_state(id, |owner| {
+        assert!(owner.final_effect_pending.contains_key(&key))
+    })
+    .unwrap();
+    // Current/Next and explicit display promotion are protected independently.
+    for current in [1, 0, 2] {
+        app.with_viewer_context_state(id, |owner| {
+            owner.fullscreen_idx = Some(current);
+            if current == 2 {
+                owner
+                    .final_effect_pending
+                    .get_mut(&key)
+                    .unwrap()
+                    .origin
+                    .promote();
+            }
+        })
+        .unwrap();
+        let requester = unit(&app, 1);
+        app.reclaim_previous_final_results(&units, &requester);
+        app.with_viewer_context_state(id, |owner| {
+            assert!(owner.final_effect_pending.contains_key(&key))
+        })
+        .unwrap();
+    }
+    app.with_viewer_context_state(id, |owner| {
+        owner.final_effect_pending.remove(&key);
+        owner.fullscreen_idx = Some(2);
+    })
+    .unwrap();
+    let hold = WorkerHold::new();
+    app.with_viewer_context_state(id, |owner| assert!(start(owner, &ctx, 1)))
+        .unwrap();
+    hold.entered();
+    let before = app.final_prepare_cpu.snapshot();
+    let units = app.final_prepare_cpu.reserved_units_for_test();
+    let requester = unit(&app, 1);
+    app.reclaim_previous_final_results(&units, &requester);
+    assert_eq!(app.final_prepare_cpu.snapshot(), before);
+    assert_eq!(before.running, 1);
+    hold.release();
+    wait_idle(&app);
+    let requester = unit(&app, 1);
+    app.reclaim_previous_final_results(&units, &requester);
+    assert_eq!(app.final_prepare_cpu.snapshot().units, 0);
+}
+
+#[test]
+fn back_pair_pressure_recovers_once_per_producer_and_keeps_second_page_admission() {
+    for small_second_page in [false, true] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        app.final_prepare_cpu = final_prepare_cpu::FinalPrepareCpuBudget::with_limits(2, 60_000);
+        let (owner, protected_key, fingerprint) = parked_previous(&mut app, &ctx, 94124, true);
+        let reservation = app
+            .with_viewer_context_state(owner, |parked| {
+                // This result is now Current, so pressure must visit but retain it.
+                parked.fullscreen_idx = Some(1);
+                reservation_ptr(&parked.final_effect_pending[&protected_key])
+            })
+            .unwrap();
+        let before = app.final_prepare_cpu.snapshot();
+        assert_eq!(before.bytes, 38_400);
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        if small_second_page {
+            let pixels = Arc::new(egui::ColorImage::filled([40, 60], egui::Color32::WHITE));
+            let tex = ctx.load_texture(
+                "small-pair-second",
+                pixels.clone(),
+                DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            );
+            app.fs_cache.insert(
+                2,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: Some([40, 60]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            app.record_page_dims_for_spread(2, (40, 60));
+        }
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx)
+        });
+        app.prepare_final_demand_topologies();
+        let next = app.d3_final_prepare_unit(0).unwrap();
+        assert_eq!(
+            next.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for page in &next.pages {
+            assert!(app.final_prepare_plan_from_resident(page.idx).is_some());
+        }
+        let mounted = app.projected_viewer_context_id();
+        PRESSURE_TRACE
+            .with_borrow_mut(|trace| assert!(trace.replace(PressureTrace::default()).is_none()));
+        app.prefetch_next_final_unit(&ctx, 0);
+        let trace = PRESSURE_TRACE.with_borrow_mut(|trace| trace.take().unwrap());
+        assert_eq!(
+            trace.owner_visits,
+            vec![owner],
+            "one recovery across both Pair pages"
+        );
+        assert_eq!(
+            trace.admission_pages,
+            vec![1, 1, 2],
+            "first page retries once; second still tries ordinary admission"
+        );
+        assert_eq!(app.projected_viewer_context_id(), mounted);
+        assert_eq!(
+            app.final_effect_pending.len(),
+            usize::from(small_second_page)
+        );
+        if small_second_page {
+            wait_ready(&mut app, 2);
+        } else {
+            assert_eq!(app.final_prepare_cpu.snapshot(), before);
+        }
+        app.with_viewer_context_state(owner, |parked| {
+            assert_eq!(
+                reservation_ptr(&parked.final_effect_pending[&protected_key]),
+                reservation
+            );
+            assert_eq!(parked.page_turn_gpu_fingerprint_for_test(), fingerprint);
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn back_real_next_bytes_pressure_reclaims_parked_result_but_oversize_does_not() {
+    for oversized in [false, true] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        app.final_prepare_cpu = final_prepare_cpu::FinalPrepareCpuBudget::with_limits(2, 60_000);
+        let (owner, key, _) = parked_previous(&mut app, &ctx, 94123, false);
+        assert_eq!(app.final_prepare_cpu.snapshot().units, 1);
+        assert_eq!(app.final_prepare_cpu.snapshot().bytes, 38_400);
+        if oversized {
+            let pixels = Arc::new(egui::ColorImage::filled([128, 128], egui::Color32::WHITE));
+            let tex = ctx.load_texture(
+                "oversized-next",
+                pixels.clone(),
+                DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            );
+            app.fs_cache.insert(
+                1,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: Some([128, 128]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        }
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx)
+        });
+        app.prefetch_next_final_unit(&ctx, 0);
+        assert_eq!(app.final_effect_pending.is_empty(), oversized);
+        app.with_viewer_context_state(owner, |owner| {
+            assert_eq!(owner.final_effect_pending.contains_key(&key), oversized);
+        })
+        .unwrap();
+        if !oversized {
+            wait_ready(&mut app, 1);
+        }
+        assert_eq!(app.final_prepare_cpu.snapshot().units, 1);
+    }
+}
+
+#[test]
+fn back_pressure_protects_previous_unit_material_shared_with_current_cover() {
+    let ctx = egui::Context::default();
+    install_presentation(&ctx);
+    let mut app = app(&ctx);
+    app.items.truncate(2);
+    app.visible_indices = vec![0, 1];
+    app.details_order = app.visible_indices.clone();
+    app.spread_mode = crate::settings::SpreadMode::RtlCover;
+    app.settings.final_cover_spread_enabled = true;
+    app.current_folder = Some(PathBuf::from("C:/back-cover"));
+    app.fullscreen_idx = Some(1);
+    app.viewer_navigation_caches.invalidate();
+    app.spread_display_units_cache = Default::default();
+    app.spread_display_composition_for_anchor(1);
+    app.prepare_final_demand_topologies();
+    let mut params = app.effective_params(0).clone();
+    params.brightness = 15.0;
+    app.adjustment_page_params.insert(0, params);
+    let previous = app
+        .d3_final_prepare_unit_at(1, FinalUnitPosition::Previous)
+        .unwrap();
+    assert_eq!(previous.pages.len(), 1);
+    assert_eq!(previous.pages[0].idx, 0);
+    let (key, pixels, size, plan) = app.final_prepare_plan_from_resident(0).unwrap();
+    assert!(app.spawn_prepared_final_job(
+        &ctx,
+        key,
+        pixels,
+        size,
+        plan,
+        previous.clone(),
+        &mut false
+    ));
+    wait_ready(&mut app, 0);
+    assert_eq!(
+        app.final_prepare_unit_position(&previous),
+        Some(FinalUnitPosition::Previous)
+    );
+    assert_eq!(
+        app.final_prepare_key_position(key),
+        Some(FinalUnitPosition::Current)
+    );
+    let budget = app.final_prepare_cpu.snapshot();
+    let reservation = reservation_ptr(&app.final_effect_pending[&key]);
+    let units = app.final_prepare_cpu.reserved_units_for_test();
+    app.reclaim_previous_final_results(&units, &previous);
+    assert_eq!(app.final_prepare_cpu.snapshot(), budget);
+    assert_eq!(
+        reservation_ptr(&app.final_effect_pending[&key]),
+        reservation
+    );
+}
+
+#[test]
+fn back_root_next_pending_cancels_previous_computing_without_releasing_real_permit() {
+    for unknown in [false, true] {
+        let ctx = egui::Context::default();
+        install_presentation(&ctx);
+        let mut app = app(&ctx);
+        app.fullscreen_idx = Some(2);
+        app.settings.still_seek_strip_visible = false;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
+        app.settings.margin_fit_enabled = false;
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+        for idx in 0..4 {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+        }
+        app.ensure_final_composite_texture(&ctx, 2).unwrap();
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx)
+        });
+        app.prepare_canonical_chrome_for_test(2);
+        app.prepare_final_demand_topologies();
+        let hold = WorkerHold::new();
+        assert!(start(&mut app, &ctx, 1));
+        hold.entered();
+        let key = pending_key(&app, 1);
+        let cancel = app.final_effect_pending[&key].cancel.clone();
+        if unknown {
+            app.rotation_cache.remove(&3);
+        }
+        begin_registration_frame(&mut app, 95100);
+        frame(&ctx, |ui, _| {
+            app.observe_live_paged_for_final_prepare();
+            app.record_next_canonical_native_demand(ui);
+        });
+        app.finalize_speculative_gpu_output(&ctx, 95100, 1);
+        assert_eq!(app.final_effect_pending.contains_key(&key), unknown);
+        assert_eq!(cancel.load(Ordering::Relaxed), !unknown);
+        assert_eq!(app.final_prepare_cpu.snapshot().running, 1);
+        assert!(app.final_prepare_cpu.snapshot().bytes > 0);
+        if !unknown {
+            app.prefetch_next_final_unit(&ctx, 2);
+            assert!(
+                app.final_effect_pending.is_empty(),
+                "Next cannot overlap the canceled worker"
+            );
+        }
+        hold.release();
+        wait_idle(&app);
+        if !unknown {
+            assert_eq!(app.final_prepare_cpu.snapshot().units, 0);
+            app.prefetch_next_final_unit(&ctx, 2);
+            wait_ready(&mut app, 3);
+        } else {
+            wait_ready(&mut app, 1);
+        }
+    }
+}

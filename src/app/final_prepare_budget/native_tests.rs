@@ -106,6 +106,8 @@ fn d3_4b_native_diagnostics_deduplicate_both_pages_until_unit_identity_changes()
     let ctx = egui::Context::default();
     let app = crate::app::final_prepare::tests::app(&ctx);
     let mut diagnostics = NativeGpuDiagnostics {
+        stage: PrepareDiagnosticStage::Native,
+        position: crate::ui_fullscreen::FinalUnitPosition::Next,
         destination: app.page_turn_destination(),
         identity: String::new(),
         reasons: Vec::new(),
@@ -140,7 +142,7 @@ fn d3_4b_root_hook_waits_for_backing_without_claim_then_normal_prepare_hits() {
     let ctx = egui::Context::default();
     let mut app = ready(&ctx);
     capture(&mut app, &ctx, 400);
-    let unit = app.speculative_gpu_frame.canonical[0].clone();
+    let unit = app.speculative_gpu_frame.canonical[0].next.clone().unwrap();
     app.finalize_speculative_gpu_output(&ctx, 400, 1);
     assert_eq!(
         app.speculative_gpu_frame.state,
@@ -244,7 +246,7 @@ fn d3_4b_remote_acquisition_invalidates_collected_native_demand_without_claim() 
     let mut app = ready(&ctx);
     deliver(&app, &ctx);
     capture(&mut app, &ctx, 460);
-    let unit = app.speculative_gpu_frame.canonical[0].clone();
+    let unit = app.speculative_gpu_frame.canonical[0].next.clone().unwrap();
     let handle = crate::remote_ipc::session::SessionHandle::new();
     app.set_remote_session_handle(handle.clone());
     let _ = handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
@@ -280,7 +282,7 @@ fn d3_4b_pair_native_misses_share_one_slot_and_converge_in_two_opportunities() {
     deliver(&app, &ctx);
     for (number, expected) in [(450, 1), (451, 2), (452, 2)] {
         capture(&mut app, &ctx, number);
-        let unit = app.speculative_gpu_frame.canonical[0].clone();
+        let unit = app.speculative_gpu_frame.canonical[0].next.clone().unwrap();
         assert_eq!(unit.pages.len(), 2);
         app.finalize_speculative_gpu_output(&ctx, number, 1);
         assert_eq!(app.fs_lanczos_cache.outputs().count(), expected);
@@ -437,4 +439,289 @@ fn d3_4b_all_contexts_final_registration_precedes_first_context_native_miss() {
         app.speculative_gpu_frame.state,
         RegistrationState::SpeculativeSubmitted
     );
+}
+
+fn back_current_two(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+    let mut app = ready(ctx);
+    app.fullscreen_idx = Some(2);
+    let mut params = app.effective_params(3).clone();
+    params.post_filter = crate::adjustment::PostFilter::Nearest;
+    app.adjustment_page_params.insert(3, params);
+    // Direct fixture parameter edits must mirror the real settings handler's
+    // invalidation. Keeping the old final would leave ordinary display's cache
+    // selection dependent on HashMap iteration instead of the intended source.
+    app.final_composite_cache
+        .retain(|key, _| key.edit_key.idx != 3);
+    app.ensure_final_composite_texture(ctx, 3).unwrap();
+    frame(ctx, |ui, ctx| {
+        draw_current_without_sources(&mut app, ui, ctx)
+    });
+    app.prepare_final_demand_topologies();
+    app
+}
+
+#[test]
+fn back_root_waits_for_next_native_then_starts_and_registers_previous_resident_job() {
+    let ctx = egui::Context::default();
+    let mut app = back_current_two(&ctx);
+    let key = app.exact_complete_final_composite_entry(1).unwrap().0;
+    app.final_composite_cache.remove(&key);
+    // Next Nearest needs no Native. No renderer can accidentally provide a hit.
+    app.wgpu_render_state = None;
+    capture(&mut app, &ctx, 4100);
+    assert_eq!(
+        app.next_preparation_state(&ctx, app.speculative_gpu_frame.canonical.first()),
+        NextPreparationState::Satisfied
+    );
+    app.finalize_speculative_gpu_output(&ctx, 4100, 1);
+    assert!(
+        app.final_effect_pending.contains_key(&key),
+        "Previous resident worker starts after all Next stages"
+    );
+    crate::app::final_prepare::tests::wait_ready(&mut app, 1);
+    capture(&mut app, &ctx, 4101);
+    app.finalize_speculative_gpu_output(&ctx, 4101, 1);
+    assert!(app.exact_complete_final_composite_entry(1).is_some());
+    assert_eq!(
+        app.speculative_gpu_frame.state,
+        RegistrationState::SpeculativeSubmitted
+    );
+    assert_eq!(app.final_prepare_cpu.snapshot().units, 0);
+}
+
+#[test]
+fn back_next_native_pending_and_unknown_block_previous_cpu_and_registration() {
+    for prepared in [false, true] {
+        for unknown in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = back_current_two(&ctx);
+            let key = app.exact_complete_final_composite_entry(1).unwrap().0;
+            app.final_composite_cache.remove(&key);
+            if prepared {
+                assert!(crate::app::final_prepare::tests::start(&mut app, &ctx, 1));
+                crate::app::final_prepare::tests::wait_ready(&mut app, 1);
+            }
+            // Next final is ready, but normal resampling has no backing (Pending),
+            // or its resident rotation evidence is missing (Unknown).
+            app.adjustment_page_params.get_mut(&3).unwrap().post_filter =
+                crate::adjustment::PostFilter::None;
+            app.final_composite_cache
+                .retain(|key, _| key.edit_key.idx != 3);
+            app.ensure_final_composite_texture(&ctx, 3).unwrap();
+            if unknown {
+                app.rotation_cache.remove(&3);
+            }
+            capture(&mut app, &ctx, 4200);
+            app.finalize_speculative_gpu_output(&ctx, 4200, 1);
+            assert!(!app.final_composite_cache.contains_key(&key));
+            assert_eq!(app.final_effect_pending.contains_key(&key), prepared);
+            assert_eq!(
+                app.speculative_gpu_frame.state,
+                RegistrationState::Available
+            );
+        }
+    }
+}
+
+#[test]
+fn back_previous_ready_is_taken_by_display_on_direction_reversal_without_slot() {
+    let ctx = egui::Context::default();
+    let mut app = back_current_two(&ctx);
+    let key = app.exact_complete_final_composite_entry(1).unwrap().0;
+    app.final_composite_cache.remove(&key);
+    assert!(crate::app::final_prepare::tests::start(&mut app, &ctx, 1));
+    crate::app::final_prepare::tests::wait_ready(&mut app, 1);
+    let old_current = app
+        .exact_complete_final_composite_entry(2)
+        .unwrap()
+        .1
+        .texture
+        .id();
+    app.fullscreen_idx = Some(1);
+    app.speculative_gpu_frame.begin(4300);
+    app.speculative_gpu_frame.note_page_turn_activity();
+    let texture = app.ensure_final_composite_texture(&ctx, 1).unwrap();
+    assert_eq!(
+        app.exact_complete_final_composite_entry(1)
+            .unwrap()
+            .1
+            .texture
+            .id(),
+        texture.id()
+    );
+    assert_eq!(app.final_prepare_cpu.snapshot().units, 0);
+    app.fullscreen_idx = Some(2);
+    assert_eq!(
+        app.ensure_final_composite_texture(&ctx, 2).unwrap().id(),
+        old_current
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn back_all_live_next_precede_previous_in_both_route_orders_and_unknown_sibling() {
+    for reverse in [false, true] {
+        for unknown in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = back_current_two(&ctx);
+            let previous = app.exact_complete_final_composite_entry(1).unwrap().0;
+            app.final_composite_cache.remove(&previous);
+            assert!(crate::app::final_prepare::tests::start(&mut app, &ctx, 1));
+            crate::app::final_prepare::tests::wait_ready(&mut app, 1);
+            let sibling = super::scheduling_tests::active_owner(&mut app, &ctx, 94420);
+            let next = app
+                .with_viewer_context_state(sibling, |owner| {
+                    let mut params = crate::adjustment::AdjustParams::default();
+                    params.brightness = 15.0;
+                    owner.adjustment_page_params.insert(1, params);
+                    for idx in 0..4 {
+                        owner
+                            .rotation_cache
+                            .insert(idx, crate::rotation_db::Rotation::None);
+                    }
+                    owner.settings.still_seek_strip_visible = false;
+                    owner.prepare_final_demand_topologies();
+                    assert!(crate::app::final_prepare::tests::start(owner, &ctx, 1));
+                    let key = crate::app::final_prepare::tests::wait_ready(owner, 1);
+                    if unknown {
+                        owner.rotation_cache.remove(&1);
+                    }
+                    key
+                })
+                .unwrap();
+            app.speculative_gpu_frame.begin(4400);
+            let main = app.projected_viewer_context_id();
+            let owners = if reverse {
+                [sibling, main]
+            } else {
+                [main, sibling]
+            };
+            for owner in owners {
+                app.with_viewer_context_state(owner, |owner| {
+                    frame(&ctx, |ui, _| {
+                        owner.observe_live_paged_for_final_prepare();
+                        owner.record_next_canonical_native_demand(ui);
+                    });
+                })
+                .unwrap();
+            }
+            app.finalize_speculative_gpu_output(&ctx, 4400, 1);
+            assert!(!app.final_composite_cache.contains_key(&previous));
+            assert!(app.final_effect_pending.contains_key(&previous));
+            app.with_viewer_context_state(sibling, |owner| {
+                assert!(
+                    owner.final_composite_cache.contains_key(&next),
+                    "sibling Next final owns the frame first"
+                );
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn back_early_service_discards_previous_after_animation_off() {
+    let ctx = egui::Context::default();
+    let mut app = back_current_two(&ctx);
+    let key = app.exact_complete_final_composite_entry(1).unwrap().0;
+    app.final_composite_cache.remove(&key);
+    assert!(crate::app::final_prepare::tests::start(&mut app, &ctx, 1));
+    crate::app::final_prepare::tests::wait_ready(&mut app, 1);
+    let cancel = app.final_effect_pending[&key].cancel.clone();
+    app.settings.page_turn_animation_enabled = false;
+    app.service_final_prepare_before_lookup(&ctx);
+    assert!(app.final_effect_pending.is_empty());
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!app.final_composite_cache.contains_key(&key));
+    assert_eq!(app.final_prepare_cpu.snapshot().units, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn back_mixed_unknown_pending_siblings_cancel_previous_in_both_visit_orders() {
+    use crate::app::final_prepare::tests::{WorkerHold, start, wait_idle, wait_ready};
+    for reverse in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = back_current_two(&ctx);
+        let main = app.projected_viewer_context_id();
+        let previous = app.exact_complete_final_composite_entry(1).unwrap().0;
+        app.final_composite_cache.remove(&previous);
+        let hold = WorkerHold::new();
+        assert!(start(&mut app, &ctx, 1));
+        hold.entered();
+        let cancel = app.final_effect_pending[&previous].cancel.clone();
+        app.rotation_cache.remove(&3); // main Next is Unknown
+        let held = app.page_turn_gpu_fingerprint_for_test();
+        let sibling = super::scheduling_tests::active_owner(&mut app, &ctx, 94421);
+        app.with_viewer_context_state(sibling, |owner| {
+            for idx in 0..4 {
+                owner
+                    .rotation_cache
+                    .insert(idx, crate::rotation_db::Rotation::None);
+            }
+            let mut params = owner.effective_params(1).clone();
+            params.brightness = 15.0;
+            owner.adjustment_page_params.insert(1, params);
+            owner.settings.still_seek_strip_visible = false;
+            owner.prepare_canonical_chrome_for_test(0);
+            owner.prepare_final_demand_topologies();
+        })
+        .unwrap();
+        app.speculative_gpu_frame.begin(4500);
+        let owners = if reverse {
+            [sibling, main]
+        } else {
+            [main, sibling]
+        };
+        for id in owners {
+            app.with_viewer_context_state(id, |owner| {
+                frame(&ctx, |ui, _| {
+                    owner.observe_live_paged_for_final_prepare();
+                    owner.record_next_canonical_native_demand(ui);
+                });
+            })
+            .unwrap();
+        }
+        let observations = app.speculative_gpu_frame.canonical.clone();
+        for id in [main, sibling] {
+            let observation = observations
+                .iter()
+                .find(|row| row.destination.context == id)
+                .unwrap();
+            app.with_viewer_context_state(id, |owner| {
+                let state = owner.next_preparation_state(&ctx, Some(observation));
+                if id == main {
+                    assert!(
+                        matches!(state, NextPreparationState::Unknown(_)),
+                        "{state:?}"
+                    );
+                } else {
+                    assert_eq!(state, NextPreparationState::Pending("final_pending"));
+                }
+            })
+            .unwrap();
+        }
+        app.finalize_speculative_gpu_output(&ctx, 4500, 1);
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!app.final_effect_pending.contains_key(&previous));
+        assert_eq!(app.page_turn_gpu_fingerprint_for_test(), held);
+        assert_eq!(app.final_prepare_cpu.snapshot().running, 1);
+        assert!(app.final_prepare_cpu.snapshot().bytes > 0);
+        app.with_viewer_context_state(sibling, |owner| {
+            owner.prefetch_next_final_unit(&ctx, 0);
+            assert!(
+                owner.final_effect_pending.is_empty(),
+                "canceled worker still owns the real permit"
+            );
+        })
+        .unwrap();
+        hold.release();
+        wait_idle(&app);
+        assert_eq!(app.final_prepare_cpu.snapshot().units, 0);
+        app.with_viewer_context_state(sibling, |owner| {
+            owner.prefetch_next_final_unit(&ctx, 0);
+            wait_ready(owner, 1);
+        })
+        .unwrap();
+    }
 }

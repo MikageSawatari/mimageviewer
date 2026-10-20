@@ -697,6 +697,36 @@ def analyze_page_turn_d3(events: list[dict]) -> dict:
     counts = Counter({stage: 0 for stage in stages})
     lookups = Counter({outcome: 0 for outcome in ("hit", "miss", "not_needed")})
     deferred = Counter()
+    positions = {position: Counter() for position in ("next", "previous", "current", "unknown")}
+    requested = {position: Counter() for position in positions}
+    pressure = Counter()
+    blockers = Counter()
+    lifecycle = Counter()
+    extra_stages = ("cpu_started", "worker_finished", "cpu_pressure")
+    def position(value):
+        return value if isinstance(value, str) and value in positions else "unknown"
+    def resolved_directions(value):
+        if not isinstance(value, dict):
+            return set()
+        flags = {value[field] for field in ("resolved_forward", "forward") if type(value.get(field)) is bool}
+        for child in value.values():
+            if isinstance(child, dict):
+                flags.update(resolved_directions(child))
+        return flags
+    native_positions = defaultdict(set)
+    texture_positions = defaultdict(set)
+    def resource_key(event, texture_field):
+        renderer, texture = event.get("renderer"), event.get(texture_field)
+        return (renderer, texture) if type(renderer) in (str, int) and isinstance(texture, str) and texture else None
+    for event in events:
+        if event.get("cat") != "fs":
+            continue
+        table, field = (native_positions, "native_key") if event.get("kind") == "final_prepare_native_submitted" else (texture_positions, "texture")
+        if event.get("kind") not in ("final_prepare_native_submitted", "final_prepare_registered"):
+            continue
+        key = resource_key(event, field)
+        if key is not None:
+            table[key].add(position(event.get("requested_position")))
     for event in events:
         if event.get("cat") == "page_turn_animation":
             identity = tuple(event.get(field) for field in ("context", "window", "operation_id"))
@@ -713,9 +743,28 @@ def analyze_page_turn_d3(events: list[dict]) -> dict:
                 stage = kind.removeprefix("final_prepare_")
         elif (event.get("cat"), event.get("kind")) == ("gpu", "texture_delivery_submitted"):
             stage = "texture_delivery_submitted"
-        if stage not in stages:
+        if stage not in stages + extra_stages:
             continue
-        counts[stage] += 1
+        if stage in stages:
+            counts[stage] += 1
+        else:
+            lifecycle[stage] += 1
+        demand_position, requested_position = position(event.get("demand_position")), position(event.get("requested_position"))
+        inferred = set()
+        if stage == "native_lookup":
+            inferred = native_positions.get(resource_key(event, "native_key"), set())
+        elif stage == "texture_delivery_submitted":
+            inferred = texture_positions.get(resource_key(event, "texture"), set())
+        # Resource identity proves preparation origin, not the role at lookup or
+        # delivery time (a prepared Previous can already be Current by then).
+        if len(inferred) == 1 and requested_position == "unknown":
+            requested_position = next(iter(inferred))
+        positions[demand_position][stage] += 1
+        requested[requested_position][stage] += 1
+        if stage == "cpu_pressure":
+            pressure[(str(event.get("reason", "unknown")), str(event.get("location", "unknown")))] += 1
+        if event.get("blocker_context") is not None:
+            blockers[(str(event["blocker_context"]), str(event.get("blocker_reason", "unknown")))] += 1
         # Preserve exact key/renderer/texture/context fields for source correlation.
         observations.append({key: value for key, value in event.items() if key not in ("_line", "tid")})
         if stage == "native_lookup":
@@ -763,7 +812,10 @@ def analyze_page_turn_d3(events: list[dict]) -> dict:
         terminal = [event for event in rows if event.get("kind") in ("finish", "cancel", "skip")]
         reported_gaps = [_animation_number(event.get("motion_max_gap_ms")) for event in rows]
         reported_gaps = [value for value in reported_gaps if value is not None]
+        directions = set().union(*(resolved_directions(row) for row in rows))
+        direction = ("forward" if True in directions else "backward") if len(directions) == 1 else "unknown"
         operations.append({
+            "direction": direction,
             "context": identity[0], "window": identity[1], "operation_id": identity[2],
             "opportunity": bool(phases["opportunity"]), "started": bool(phases["start"]),
             "finished": bool(phases["finish"]), "cancelled": bool(phases["cancel"]),
@@ -779,6 +831,41 @@ def analyze_page_turn_d3(events: list[dict]) -> dict:
         })
     if not operations:
         warnings.append("No correlated animation operations")
+    # Correlation is exact only: request identity, then renderer + TextureId,
+    # then renderer + native key. No operation/time-nearness attribution.
+    by_request = defaultdict(list)
+    deliveries = defaultdict(list)
+    natives = defaultdict(list)
+    lookups_by_key = defaultdict(list)
+    finishes = defaultdict(list)
+    for row in observations:
+        kind = row.get("kind")
+        if kind == "final_prepare_cpu_ready": by_request[(row.get("request_id"), row.get("context"))].append(row)
+        elif kind == "texture_delivery_submitted": deliveries[resource_key(row, "texture")].append(row)
+        elif kind == "final_prepare_native_submitted": natives[resource_key(row, "source_texture_id")].append(row)
+        elif kind == "final_prepare_native_lookup": lookups_by_key[resource_key(row, "native_key")].append(row)
+        elif kind == "final_prepare_worker_finished": finishes[(row.get("request_id"), row.get("context"))].append(row)
+    chains = []
+    for registration in observations:
+        if registration.get("kind") != "final_prepare_registered": continue
+        request_id = registration.get("request_id")
+        cpu = by_request.get((request_id, registration.get("context")), []) if request_id not in (None, 0) else []
+        key = resource_key(registration, "texture")
+        delivery = deliveries.get(key, []) if key is not None else []
+        native = natives.get(key, []) if key is not None else []
+        lookup = []
+        for item in native:
+            native_key = resource_key(item, "native_key")
+            if native_key is not None: lookup.extend(lookups_by_key.get(native_key, []))
+        chains.append(dict(request_id=request_id, demand_position=position(registration.get("demand_position")),
+                           registered=registration, cpu_ready=cpu, delivery=delivery, native=native, lookup=lookup))
+    cancellation = []
+    for cancel in observations:
+        if cancel.get("reason") != "cancelled_for_next" or cancel.get("request_id") in (None, 0): continue
+        for finish in finishes.get((cancel["request_id"], cancel.get("context")), []):
+            if (_animation_number(finish.get("t")) is not None
+                    and _animation_number(cancel.get("t")) is not None and finish["t"] >= cancel["t"]):
+                cancellation.append(dict(request_id=cancel["request_id"], cancel_to_finish_ms=(finish["t"]-cancel["t"])*1000))
     return {
         "status": "reference", "delivery": validate_delivery(events),
         "timing_boundary": "accepted_egui_output_submission_not_gpu_completion_or_os_present",
@@ -789,6 +876,12 @@ def analyze_page_turn_d3(events: list[dict]) -> dict:
         "native_lookup_outcomes": dict(sorted(lookups.items())),
         "gpu_deferred_reasons": [{"stage": stage, "reason": reason, "count": count}
                                  for (stage, reason), count in sorted(deferred.items())],
+        "events_by_demand_position": {key: dict(value) for key, value in positions.items()},
+        "events_by_requested_position": {key: dict(value) for key, value in requested.items()},
+        "cpu_lifecycle_counts": dict(lifecycle),
+        "cpu_pressure_reasons": [dict(reason=reason, location=location, count=count) for (reason, location), count in sorted(pressure.items())],
+        "previous_blockers": [dict(context=context, reason=reason, count=count) for (context, reason), count in sorted(blockers.items())],
+        "preparation_chains": chains, "cancel_to_finish": cancellation,
         "d3_observations": observations, "warnings": list(dict.fromkeys(warnings)),
     }
 
@@ -802,7 +895,7 @@ def cmd_page_turn_d3(events: list[dict], args) -> int:
     def metric(value):
         return "N/A" if value is None else f"{value:.3f}"
     for operation in report["operations"]:
-        print(f"  context={operation['context']} window={operation['window']} operation={operation['operation_id']}")
+        print(f"  context={operation['context']} window={operation['window']} operation={operation['operation_id']} direction={operation['direction']}")
         print(f"    curl_frames={operation['curl_frames']} "
               f"accept_to_first_curl_ms={metric(operation['accept_to_first_curl_ms'])} "
               f"interval_max_ms={metric(operation['curl_interval_max_ms'])} "
@@ -810,6 +903,10 @@ def cmd_page_turn_d3(events: list[dict], args) -> int:
               f"finished={operation['finished']} cancelled={operation['cancelled']} skipped={operation['skipped']} "
               f"reasons={operation['terminal_reasons']}")
     print(f"  D3 whole-log observed records: {report['d3_event_counts']}")
+    print(f"  demand positions: {report['events_by_demand_position']}")
+    print(f"  requested positions: {report['events_by_requested_position']}")
+    print(f"  cpu pressure: {report['cpu_pressure_reasons']} blockers={report['previous_blockers']}")
+    print(f"  exact preparation chains={len(report['preparation_chains'])} cancel_to_finish={report['cancel_to_finish']}")
     print(f"  native_lookup: {report['native_lookup_outcomes']}")
     print(f"  gpu_deferred: {report['gpu_deferred_reasons']}")
     print("  missing records do not prove zero work / instrumentation; preparation is not attributed to operations")

@@ -16465,9 +16465,30 @@ pub(crate) enum NextFinalUnitDemand {
     Unit(Vec<SpreadPageOccurrence>),
 }
 
-enum FinalUnitPosition {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FinalUnitPosition {
     Current,
     Next,
+    Previous,
+}
+
+impl FinalUnitPosition {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Next => "next",
+            Self::Previous => "previous",
+        }
+    }
+
+    fn resolve(self, ordinal: usize, len: usize) -> Option<usize> {
+        match self {
+            Self::Current => Some(ordinal),
+            Self::Next => ordinal.checked_add(1),
+            Self::Previous => ordinal.checked_sub(1),
+        }
+        .filter(|position| *position < len)
+    }
 }
 
 /// The unit ordinal, never an image index or physical direction, advances.
@@ -20759,7 +20780,36 @@ impl App {
         }
     }
 
-    fn final_unit_demand_from_snapshot(
+    /// A bounded inclusion proof for the existing backward keep range. Both
+    /// source and AI keep budgets use back.saturating_add(1), and add a whole
+    /// image unit before subtracting its real navigation-page count. Thus an
+    /// immediately preceding image unit (including its cover occurrence) is
+    /// included even when both configured backward counts are zero. Read the
+    /// installed index/composition used by that keep policy, never rebuild it.
+    pub(crate) fn previous_final_prepare_occurrences(
+        &self,
+        idx: usize,
+    ) -> Option<Vec<SpreadPageOccurrence>> {
+        if self.slideshow_playing
+            || !self.page_turn_prefetch_policy_enabled()
+            || !is_spread_pairable_item(self.items.get(idx))
+        {
+            return None;
+        }
+        let previous =
+            self.final_unit_composition_from_snapshot(idx, FinalUnitPosition::Previous)??;
+        let kept =
+            self.resident_final_unit_composition_from_snapshot(idx, FinalUnitPosition::Previous)??;
+        let pages = previous.pages_in_reading_order();
+        (!pages.is_empty()
+            && pages.iter().all(|page| {
+                is_spread_pairable_item(self.items.get(page.idx))
+                    && kept.pages_in_reading_order().contains(page)
+            }))
+        .then(|| pages.to_vec())
+    }
+
+    pub(crate) fn final_unit_demand_from_snapshot(
         &self,
         idx: usize,
         requested: FinalUnitPosition,
@@ -20841,12 +20891,8 @@ impl App {
             return None;
         }
         let position = cache.unit_position(idx)?;
-        let position = match requested {
-            FinalUnitPosition::Current => position,
-            FinalUnitPosition::Next => match position.checked_add(1) {
-                Some(next) if next < cache.units.len() => next,
-                _ => return Some(None),
-            },
+        let Some(position) = requested.resolve(position, cache.units.len()) else {
+            return Some(None);
         };
         Some(resolve_spread_display_composition(
             &cache.units,
@@ -20886,12 +20932,8 @@ impl App {
                 topology.completeness,
             ),
         };
-        let position = match requested {
-            FinalUnitPosition::Current => position,
-            FinalUnitPosition::Next => match position.checked_add(1) {
-                Some(next) if next < units.len() => next,
-                _ => return Some(None),
-            },
+        let Some(position) = requested.resolve(position, units.len()) else {
+            return Some(None);
         };
         Some(resolve_spread_display_composition(
             units,

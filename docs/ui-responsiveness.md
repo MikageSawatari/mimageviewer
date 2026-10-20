@@ -486,6 +486,14 @@ coldだけ現reader order／visible基準との整合と索引を作り、warm�
 `python scripts/analyze_perf.py <perf.jsonl> page-turn-d3`、完了範囲・残る停止と正式 gate 未実施は
 [page-turn 計画 §27.17.17](page-turn-animation-plan.md) を参照。
 
+§1.405は全live Nextのfinal/Native成立後だけPreviousを補完する。ROOT最終hookからのCPU開始は
+resident-only Previousの最大1件に限定し、Next通常producer位置は維持する。通常UI/input/permission/
+decode/materialization/DB/font読取へ再入しない。Previousのkeep包含は既存索引とwhole-unit追加規則で証明する。
+Next CPUの実予約不足時だけ、予約表最大2 unitからparkedも訪問して低優先の完成結果を回収し、一度だけ再試行する。
+実計算中のpermit/予約、Current/Next共有素材、表示昇格、legacy、Unknown、held/receipt/batchは保護する。
+Previous Nativeはsmoothing/旧source/容量規則すべての既存entry除去ゼロを、claim等より前と実行入口で検査する。
+新しい全頁・全registry走査、待機、timer、repaintは追加しない。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
+
 本の構成editor（§1.242 G4、next-book）はsource列挙/保存前fingerprint/保存待ち/thumbnail decodeを
 workerへ置く。純粋UIは元ページ・unit・変更previewをvirtualizedで描き、可視thumbnail要求は最大24件。
 全ページの名前・参照map・hidden状態をframeごとに作り直さず、draft変更時のviewを再利用する。

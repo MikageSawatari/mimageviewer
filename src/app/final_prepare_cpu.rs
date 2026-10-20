@@ -19,6 +19,18 @@ pub(super) struct FinalPrepareUnit {
     pub(super) pages: Vec<SpreadPageOccurrence>,
 }
 
+#[derive(Debug)]
+pub(super) enum FinalPrepareStartDenied {
+    PermitBusy,
+    RequestTooLarge,
+    Reservation {
+        /// Metadata only; never clone reservation leases for owner discovery.
+        units: Vec<FinalPrepareUnit>,
+        bytes: u64,
+        reason: &'static str,
+    },
+}
+
 #[derive(Clone)]
 pub(super) struct FinalPrepareWake {
     pub(super) ctx: egui::Context,
@@ -82,6 +94,9 @@ impl Default for FinalPrepareCpuBudget {
 }
 
 impl FinalPrepareCpuBudget {
+    pub(super) fn reserved_bytes(&self) -> u64 {
+        self.inner.state().bytes
+    }
     fn new(max_units: usize, max_bytes: u64) -> Self {
         Self {
             inner: Arc::new(BudgetInner {
@@ -102,18 +117,41 @@ impl FinalPrepareCpuBudget {
         unit: FinalPrepareUnit,
         bytes: u64,
         wake: FinalPrepareWake,
-    ) -> Option<(FinalPreparePermit, Arc<FinalPrepareReservation>)> {
+    ) -> Result<(FinalPreparePermit, Arc<FinalPrepareReservation>), FinalPrepareStartDenied> {
         let mut state = self.inner.state();
-        if matches!(state.execution, Execution::Running)
-            || !self.inner.can_reserve(&state, &unit, bytes)
-        {
+        if bytes > self.inner.max_bytes {
+            return Err(FinalPrepareStartDenied::RequestTooLarge);
+        }
+        // Reservation pressure wins even while a worker is running. Otherwise
+        // completed results parked in channels can permanently hide pressure.
+        if !self.inner.can_reserve(&state, &unit, bytes) {
             state.waiters.insert(unit.context, wake);
-            return None;
+            return Err(FinalPrepareStartDenied::Reservation {
+                units: state.units.keys().cloned().collect(),
+                bytes: state.bytes,
+                reason: if state
+                    .units
+                    .keys()
+                    .any(|key| key.context == unit.context && key != &unit)
+                {
+                    "context_unit"
+                } else if !state.units.contains_key(&unit)
+                    && state.units.len() >= self.inner.max_units
+                {
+                    "global_units"
+                } else {
+                    "bytes"
+                },
+            });
+        }
+        if matches!(state.execution, Execution::Running) {
+            state.waiters.insert(unit.context, wake);
+            return Err(FinalPrepareStartDenied::PermitBusy);
         }
         state.execution = Execution::Running;
         *state.units.entry(unit.clone()).or_default() += 1;
         state.bytes += bytes;
-        Some((
+        Ok((
             FinalPreparePermit {
                 inner: Arc::clone(&self.inner),
                 wake,
@@ -184,6 +222,11 @@ impl FinalPrepareCpuBudget {
     pub(super) fn with_limits(max_units: usize, max_bytes: u64) -> Self {
         assert!(max_units <= MAX_UNITS && max_bytes <= MAX_BYTES);
         Self::new(max_units, max_bytes)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserved_units_for_test(&self) -> Vec<FinalPrepareUnit> {
+        self.inner.state().units.keys().cloned().collect()
     }
 
     #[cfg(test)]
@@ -286,6 +329,39 @@ mod tests {
     }
 
     #[test]
+    fn back_cpu_denial_distinguishes_reservation_before_busy_and_oversized() {
+        let budget = FinalPrepareCpuBudget::with_limits(2, 100);
+        let (permit, reservation) = budget.try_start(unit(1, 1), 70, wake()).unwrap();
+        assert!(matches!(
+            budget.try_start(unit(2, 1), 20, wake()),
+            Err(FinalPrepareStartDenied::PermitBusy)
+        ));
+        match budget.try_start(unit(2, 1), 40, wake()) {
+            Err(FinalPrepareStartDenied::Reservation {
+                units,
+                bytes,
+                reason,
+            }) => {
+                assert_eq!(units, [unit(1, 1)]);
+                assert_eq!(bytes, 70);
+                assert_eq!(reason, "bytes");
+            }
+            _ => panic!("pressure must be reported even while execution is busy"),
+        }
+        assert!(matches!(
+            budget.try_start(unit(3, 1), 101, wake()),
+            Err(FinalPrepareStartDenied::RequestTooLarge)
+        ));
+        assert_eq!(
+            Arc::strong_count(&reservation),
+            1,
+            "metadata snapshots must not retain leases"
+        );
+        drop((permit, reservation));
+        assert_eq!(budget.snapshot(), snapshot(0, 0, 0));
+    }
+
+    #[test]
     fn final_prepare_cpu_pair_reservations_share_unit_and_arc_clones_share_bytes() {
         let budget = FinalPrepareCpuBudget::with_limits(2, 100);
         let mut pair = unit(1, 2);
@@ -382,7 +458,7 @@ mod tests {
         // Capacity is available, but no temporary reservation is acquired and
         // dropped on permit failure, so an idle service receives no self-wake.
         for _ in 0..3 {
-            assert!(budget.try_start(unit(2, 0), 40, waiter.clone()).is_none());
+            assert!(budget.try_start(unit(2, 0), 40, waiter.clone()).is_err());
             assert_eq!(budget.snapshot(), snapshot(1, 1, 40));
         }
         assert!(calls.lock().unwrap().is_empty());
@@ -413,7 +489,7 @@ mod tests {
         // The worker slot is free, but admission must not acquire/drop a
         // permit (and its own completion wake) on reservation failure.
         for _ in 0..3 {
-            assert!(budget.try_start(unit(2, 0), 40, waiter.clone()).is_none());
+            assert!(budget.try_start(unit(2, 0), 40, waiter.clone()).is_err());
             assert_eq!(budget.snapshot(), snapshot(0, 1, 40));
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);

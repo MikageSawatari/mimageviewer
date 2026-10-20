@@ -5403,3 +5403,860 @@ detached の完成差分は「症状パッチではなく構造的修正」と�
   未実装。D3 前と同じ挙動で退行ではないが、戻る方向の先回りは残り (backlog §1.401 に追記)。本体窓の単ページの戻りは直前頁が cache に残っていて滑らか。
 - 演出 OFF: D3 の投機は動かない (`cpu_ready` / `registered` 0)。頁送りの final は従来どおり表示時に同期で作る (1 頁 60〜97ms) が、登録の `upload_ms` は 0
   (Arc 登録で全画素の複製をやめた D3 の共通改善。§27.15 では 67〜77ms)。
+
+#### 27.17.20 戻る方向の先回り準備 (backlog §1.405) 詳細設計（案）
+
+**結論：通常の隣接 unit resolver を `Current / Next / Previous` に一般化し、「次 unit の通常表示素材と canonical Native が揃った後、前 unit の不足だけを補う」。既存 pending・完成 cache・permit・CPU 予約・登録枠・VRAM 上限を共用し、専用 backward slot、方向の記憶、要求 queue は追加しない。上限値の増加は提案しない。**
+
+CPU の投入順だけを `Next → Previous` にする実装では不十分である。次 unit の final 登録後、Native 生成前に前 unit が登録枠を使う競合も防ぐ必要がある。このため、既存の次 unit の CPU 開始位置を維持し、**新しい前 unit の CPU 開始は、ROOT 最終 output hook で次 unit の全段階を照合した後**に限定する案を推奨する。前 unit の登録・Native 生成も同じ順序判定を使う。
+
+保証するのは、**判明している次 unit の需要より前 unit を優先して投入しないこと、表示要求を投機枠待ちにしないこと、取消中を含む既存上限を守ること**である。開始済み CPU 処理や提出済み GPU 仕事は即時回収できないため、将来の急な入力・設定変更に対してまで「前の準備による競合が常にゼロ」とは保証しない。
+
+本案は `pageturn-back`、HEAD `ed5634b5b80fee487e89550e6baea7a6dd76f19a` の静的調査による。作業ツリーは clean。ファイル変更・ビルド・テスト実行・製品起動は行っていない。以下の「確認済み」は source／文書の確認、「既存観測」は ClaudeCode の隔離操作、「設計案」「推測」は未実装・未計測の内容を表す。
+
+##### 27.17.20.1 観測、守る不変条件、未実装の境界
+
+**既存観測：** F12 の別ウィンドウを開いた直後の後退 2 回では、前見開きの final を表示時に同期生成し、Native も miss した。受理→初回 curl は164〜176ms、curl は1コマだった。本体窓の単ページで直前頁へ戻る場合は cache が残っていた。利用者の目視結果ではなく、ClaudeCode の隔離操作・ログによる結果である。
+
+根拠：`docs/page-turn-animation-plan.md:5392`、`docs/next-release-backlog.md:35`。
+
+**確認済み：** 新 D3 の CPU producer は `next_final_prepare_occurrences` だけを使う。pending の必要性照合も Current／Next までであり、Previous はない。Native collector も Next 固定である。
+
+根拠：`src/app/final_prepare.rs:264`、`:313`、`:338`、`src/ui_fullscreen/canonical_demand.rs:311`、`:337`。
+
+したがって本件で拡張する境界は、次の一組である。
+
+- 通常 topology から導く隣接需要。
+- その需要に属する pending の存続・取消・表示への引取り。
+- CPU、final 登録、Native 生成を通した優先順。
+- 通常 cache に収まる範囲での完成物の保持と再利用。
+
+F12 固有の遅延、追加 repaint、一括 cache コピーで観測箇所だけを軽くする修正にはしない。
+
+##### 27.17.20.2 前 unit が不足する場面と「既存後方範囲」
+
+| 場面 | 確認済みの仕組みと不足条件 |
+|---|---|
+| 一覧から本の途中を open | source が先読みされても、未表示の前 unit の一般 final は現在の D3 では作られない。完成 cache がなければ不足する |
+| F12 で途中を開いた直後 | 新 context の初期 cache／pending は空から始まる経路がある。F12 が常に隣接 final／Native を引き継ぐとはいえない |
+| fork | fresh owner と独立した pending／cache の初期化を持つ。materialized physical fork も専用の構築経路を通る |
+| mount／deposit／promote | 同じ payload の cache／pending を移譲する操作自体は、不足の原因とは限らない。ただし移譲元に未生成・退去済みの素材は増えない。表示先の geometry が変われば Native は別需要になる |
+| keep-set 外への移動 | source、edit、final、Native は保持範囲から外れると退去する。遠方へジャンプして戻る場合など |
+| Native cache の容量退去 | keep-set 内でも、件数・source 系列別 target 数・拡大出力量の制限で退去し得る |
+| 補正・編集・source／AI 世代変更 | exact final key が変わる、または当該頁の final／pending が明示失効する。古い完成物を新設定の成功にはできない |
+| fit／trim／回転／gap／geometry 変更 | 主に canonical transform／ROI／Native key が変わる。Pair の組や occurrence が変わる場合は unit 需要も変わる |
+| DPI／resize／表示先変更 | target 寸法・ppp・clip／ROI が変わり、既存 Native が一致しなくなり得る。**これだけを理由に CPU final まで必ず不足すると扱わない** |
+| Home／頁番号等のジャンプ | 新しい Current の隣接 unit に需要を置き直す。ジャンプ元周辺の保持物で新しい前 unit が満たされる保証はない |
+| 方向反転 | 新しい Current に対する Next／Previous を再解決する。既存完成物が一致すれば再利用し、不一致なら不足として扱う |
+| §1.400 の折り返し | 折り返し先は投機しない。着地後、その Current の通常の隣接 unit から再開する |
+
+根拠：
+
+- 新 context 初期値：`src/app/viewer_context_registry.rs:2883`、`:3044`。
+- fork／physical fork：同`:4531`、`:4768`、`:5477`。
+- payload の交換：同`:3638`、`:3796`、`:5340`。
+- final の失効・exact 判定：`src/app.rs:85221`、`:86545`、`:90383`。
+- keep による退去：`src/app.rs:77616`、`:87506`。
+- canonical の再照合：`src/ui_fullscreen/canonical_demand.rs:218`、`:230`。
+
+**確認済み：`final_composite_cache` 自体には固定件数・byte 上限がない。** HashMap に対する keep-set／世代・設定失効で寿命を決める。CpuReady の1GiB制限と、登録済み final cache の容量を混同しない。
+
+根拠：`src/app.rs:11409`、`:11418`、`:87528`。
+
+Native は別の制限を持つ。
+
+| 制限 | 現在値・意味 |
+|---|---|
+| 全 entry 数 | 64 |
+| 同一 source 系列の target 数 | 2。同一頁番号だけの分類ではなく、source texture／generation／smoothing／branch を含む系列 |
+| 拡大出力1件 | 最大 `4096 × 4096` pixels、RGBA8で64MiB |
+| cache 内の拡大出力合計 | 最大 `2 × 4096 × 4096` pixels、RGBA8で128MiB |
+| 保持範囲 | `retain_page_indices` による頁集合との照合も受ける |
+
+根拠：`src/gpu_lanczos.rs:30`、`:1722`、`:1779`、`:1792`、`:1807`、`:1848`。
+
+**「既存後方範囲」のコード上の正本は `page_turn_prefetch_keep_set` とする。**
+
+現在は次の和集合である。
+
+```text
+source の設定済み前後範囲を各 +1 して通常 unit へ展開した実頁
+∪ AI の設定済み前後範囲を各 +1 して通常 unit へ展開した実頁
+∪ 現在頁
+∪ 現 D3 の次 unit の実頁
+```
+
+その後、表示 partner／RAW の既存需要等が加わる。設定値は単純な unit 個数ではなく実画像頁の予算として消費され、Pair は途中で分割しない。補助表紙も composition の実頁として含まれる。
+
+根拠：`src/app.rs:79469`、`:79546`、`:77553`、`src/ui_fullscreen.rs:20422`、`:20489`。既定の source 後方値は4、AI 後方値は2：`src/settings.rs:7165`、`:7283`。
+
+**設計案：** Previous の実 occurrence 全体がこの既存保持範囲に属するときだけ補完する。Previous を加えるために保持範囲を拡張しない。通常静止画の直前 unit は後方 `+1` により含まれるが、判定は raw idx の大小ではなく通常 topology と同じ規則を使う。毎 frame の全頁走査や巨大な keep-set 再構築を新設せず、既存 topology の索引から隣接 unit の包含を照合する。
+
+##### 27.17.20.3 Previous resolver と方向反転
+
+**設計案：** `FinalUnitPosition` を次へ拡張し、CPU 需要と resident Native 需要の双方で同じ位置解決を使う。
+
+```text
+Current  = 現在 unit ordinal
+Next     = ordinal.checked_add(1)、列外なら Boundary
+Previous = ordinal.checked_sub(1)、列外なら Boundary
+```
+
+拡張対象は、D3-5 の派生 topology を読む `final_unit_composition_from_snapshot` と、installed topology の証拠を読む `resident_final_unit_composition_from_snapshot`。両方とも、位置解決後は既存 `resolve_spread_display_composition` を使う。
+
+根拠：`src/ui_fullscreen.rs:16476`、`:20773`、`:20793`、`:20872`。
+
+| 項目 | Previous でも維持する規則 |
+|---|---|
+| 読む向き | reader order／通常 unit ordinal で前を決める。RTL を理由に idx の加減算を逆転しない |
+| Single／Pair | 通常 builder の unit を丸ごと使う |
+| 表紙単独・横長単独・Alone | builder が返す singleton と配置を使う |
+| 補助表紙 | `idx / role / navigation_anchor_idx` を保持。同じ画像の別 occurrence を同一 unit と扱わない |
+| Blank／Vacant | composition の配置には参加するが、画素要求は作らない |
+| 先頭 | Previous は Boundary。隣本を開かない |
+| 非画像 unit | 直前の通常 unit を解決する。さらに遠い画像 unit を探索して代用しない |
+| topology 不明 | `None`＝不明と、確定した Boundary を区別する |
+
+「前方向」は本節では **Previous＝読書順で戻る方向** を指す。物理キーや画面左側の意味では使わない。
+
+§1.400 のループ ON/OFF によらず先頭 Previous／末尾 Next は Boundary のままとする。`navigation_wrap` の平らな着地、barrier の continuation、折り返し先を投機しない `200bd9530` の契約を変更しない。
+
+根拠：`docs/page-turn-animation-plan.md:5334`、`docs/manual-nav-wrap-plan.md:191`、同§6。
+
+**方向の履歴は保持しない。** Current が `U` のとき Next=`U+1`、Previous=`U−1`。後退後は Current=`U−1`、Next=`U`、Previous=`U−2` となる。旧 Previous は表示要求へ引き取り、旧 Current は新 Next として通常 cache を再利用する。旧 Next=`U+1` は隣接需要から外れる。
+
+`FinalPrepareUnit` の identity に方向を追加しない。context・items 世代・occurrence 列を所有 identity とし、現在の役割は再解決して判定する。これにより同じ素材の役割変更を理由とした再生成を避ける。
+
+根拠：`src/app/final_prepare_cpu.rs:15`、`src/app/final_prepare.rs:180`、`:338`。
+
+##### 27.17.20.4 準備順序と既存 owner の拡張
+
+**確認済み：現在の ROOT hook は全 live context の final 登録を先に処理し、その後に Native を処理する。** このまま Previous の final を混ぜると、Next Native より Previous final が先になる。
+
+根拠：`src/app/final_prepare_budget.rs:513`、`:554`、`:577`。
+
+**設計案：以下を app 共通の優先順とする。**
+
+| 順位 | 対象 |
+|---|---|
+| 既存の通常経路 | 表示要求への引取り・同期 takeover・通常 source／edit／AI・既存 legacy 処理 |
+| 高優先の投機 | 各 live context の Next final 登録 → Next canonical Native |
+| 低優先の投機 | Next の必要段階が全て成立した後の Previous final 登録 → Previous canonical Native →不足する Previous CPU job の開始 |
+
+Next の CPU producer は既存の通常 fullscreen work から呼び、開始位置を後ろへ移さない。
+
+根拠：`src/app/update_phases.rs:1985`、`src/app.rs:65188`。
+
+前 unit を開始できる条件は、現在の資料だけで評価する排他的な値として返す。例えば次の意味を持つ enum とし、永続的な `next_ready` bool は作らない。
+
+| 判定 | 意味 | Previous |
+|---|---|---|
+| `Boundary` | Next が存在しないことを topology が証明 | 対象があれば進行可 |
+| `Satisfied` | exact final／通常共有素材が選択可能で、全実頁の Native が hit または通常分岐で不要 | 進行可 |
+| `Pending` | CPU 計算中、CpuReady、登録待ち、Native miss／未配送等 | 保留 |
+| `Unknown` | topology、view、回転、trim、素材等の証拠不足 | 保留 |
+
+**CpuReady だけ、final 登録済みだけでは `Satisfied` にしない。** Native が必要なら backing と通常 query の hit／提出後の再照会まで確認する。GPU 物理完了待ちは追加しない。
+
+Next が D3-3 対象等で未準備の場合も、勝手に「準備不要」とみなして Previous へ進まない。この条件では Previous が進まない場合があるが、既存機能を止めず、新規補完を保守的に見送る。
+
+**ROOT 最終 hook の具体的な拡張案：**
+
+1. 既存の live route／runtime／frame 活動を再照合する。
+2. 全 live context の結果を受信・失効照合する。表示用・legacy の既存契約を維持する。
+3. Next の final 登録を既存枠で処理する。
+4. Next の canonical Native を処理し、全 live context の Next 状態を再照合する。
+5. `Pending / Unknown` が残れば Previous の新規開始・allocation を行わない。
+6. 全て `Satisfied / Boundary` なら、Previous の既存完成物を確認し、登録・Native の不足を処理する。
+7. Previous に CPU final の不足があり、resident 入力・通常 work admission・permit／予約が成立するときだけ1 job を開始する。
+
+ここで開始するのは **既存 resident pixels からの CPU final job** に限る。通常 UI、入力、permission、decode、materialization、DB／font 読取へ再入しない。
+
+この変更は、D3-2 の「通常 fullscreen work だけが producer を開始する」という現行コメントと、D3-4 の hook 契約への**明示的な限定拡張**になる。実装前レビューで確認し、`src/app/final_prepare.rs:262` と関連文書を合わせて更新する。Next の開始を移動して帳尻を合わせない。
+
+**frame 候補の持ち方：** 既存 `SpeculativeGpuFrame.canonical` の payload を、完成した Next demand だけでなく「最新 callback の route／view と位置別の収集結果」を表せる値へ整理する。final 未完成時にも view の観測を失わない形にする。別 vector owner や次 frame への完了 latch は追加しない。
+
+現在は route ごとに候補を置換し、収集失敗時には消去するため、Previous を単純に2回 observe すると Next 候補を消してしまう。ここは位置を含めた一体の観測に改める。
+
+根拠：`src/app/final_prepare_budget.rs:16`、`:141`、`:151`、`src/ui_fullscreen/canonical_demand.rs:198`。
+
+##### 27.17.20.5 permit、CpuReady、登録枠、取消
+
+**全上限を据え置く。**
+
+| 資源 | 据え置く値・所有 |
+|---|---|
+| 新 D3 の CPU 実行 | app 共通1件。取消後も worker 実終了まで保持 |
+| 計算中／CpuReady の unit | context 当たり1、全体2 |
+| CPU 出力予約 | 全体1GiB。worker／channel／pending／CpuReady を含む |
+| 新規投機 GPU allocation | final と Native を合わせ outer frame 当たり最大1件 |
+| VRAM | 既存共有 pool と実 allocation admission |
+| pin | fullscreen 配分の10%、無制限設定時1GiB |
+
+根拠：`src/app/final_prepare_cpu.rs:11`、`:76`、`:118`、`:252`、`:275`、`src/app/final_prepare_budget.rs:104`、`src/ui_fullscreen/page_turn.rs:961`。
+
+登録済み Next final の出力予約は既に解放されるため、その後に Previous へ context の1 unit 枠を使える。**Next と Previous を同時に CpuReady 保持するための増枠は不要**である。Pair の各頁は同一 unit の別出力として bytes を加算する。
+
+**次需要が生じた場合の扱い：**
+
+- Previous が現在の表示対象になった場合は取消より表示引取りを優先する。
+- Current／Next に一致する pending を、Previous の優先度降格処理で破棄しない。
+- Next の新しい不足が判明したら、Previous の新規 CPU 開始と GPU allocation を止める。
+- 競合する未表示の Previous CpuReady は、同じ pending owner から破棄して予約を解放できるようにする。
+- 競合する Previous Computing は必要に応じて cancel し、公開権を外す。permit／worker 側予約は実終了まで残す。
+- legacy 表示／カラー化／LUT、表示へ昇格した結果、held／receipt／batch lease はこの回収対象にしない。
+- park 自体では一括取消しない。実際の高優先需要による投機資源の回収と、park の保持契約を区別する。
+
+現在の D3-2 は圧力による CpuReady 退去を実装していないため、上記の**低優先投機だけを回収する処理は本件の追加範囲**である。
+
+根拠：`docs/page-turn-animation-plan.md:4626`、`src/app/final_prepare.rs:264`、`:492`。
+
+表示要求の CpuReady 引取り、同期可能な Computing の takeover、カラー化／LUT の表示昇格は既存処理を維持する。UI で join しない。
+
+根拠：`src/app/final_prepare.rs:492`、`:535`、`:550`、`:565`。
+
+**保証の限界：** 現 executor の cancel 確認は重い処理の段間にある。例えば補正処理の途中を即時中断できるとは限らない。低優先 worker の取消を要求してから実終了するまで、新しい投機 Next が permit を待つ可能性は残る。通常表示はその permit を待たない。
+
+根拠：`src/final_composite.rs:158`、`:172`、`:181`、`src/app/final_prepare_cpu.rs:275`。
+
+この残時間を消すために permit を先返ししたり、投機実行上限を増やしたりしない。取消→実終了の時間も計測対象にする。
+
+##### 27.17.20.6 Native key、戻る curl、cache admission、VRAM
+
+**設計案：** Previous composition を既存 canonical collector へ渡し、Next と同じ通常 geometry 計算を使う。方向は unit 選択にだけ関与し、Native key に curl の姿勢・進捗・戻る専用属性を入れない。
+
+Native key は source identity／texture／generation、target 寸法、smoothing、scale branch、ROI から決まる。通常 draw と同じ resource・transform・filter を渡せば、Previous でも同じ key になる。
+
+根拠：`src/gpu_lanczos.rs:925`、`:1331`、`src/ui_fullscreen/canonical_demand.rs:311`。
+
+保持する入力は従来どおりである。
+
+- 所有 callback の viewport／ppp／clip。
+- target composition の screen 順 occurrence／role。
+- 各頁の実採用 texture 寸法、PDF 等の layout 寸法、回転・trim・fit。
+- Pair の高さ合わせ・gap・物理 pixel 丸め・左右配置。
+- 通常の post filter／Nearest／縮小分岐。
+
+cold metadata や素材不足は skip とし、既定値で exact 成功にしない。
+
+**確認済み：offer と handoff は前進・後退で共通である。** `offer.forward` は `prepare_leaf` に渡され、通常 prepare 後の実素材を同じ経路で incoming に移す。held 素材を準備結果で後から差し替える必要はない。
+
+根拠：`src/ui_fullscreen/page_turn.rs:2079`、`:2519`、`:2523`、`:2037`。
+
+ただし curl で動く面は異なる。
+
+| 戻る操作 | 動く素材・必要な incoming |
+|---|---|
+| Single | incoming の1頁が到着する leaf になる。前進の outgoing departure と異なる |
+| LTR Pair | outgoing 左側がめくれ、incoming 右側が裏面、incoming 左側が下地になる |
+| RTL Pair | outgoing 右側がめくれ、incoming 左側が裏面、incoming 右側が下地になる |
+
+根拠：`src/page_turn_animation.rs:149`、`:597`、`:625`、`:688`、`:739`。
+
+したがって Previous Pair も**両実頁を準備する**。見える leaf 片面だけを投機する最適化はしない。Blank／Vacant は既存 paper 規則を維持する。
+
+**追加の注意：VRAM admission だけでは Next の保持を守れない。** Previous Native の挿入に伴う通常 cache pruning が、先に準備した Next Native を退去させる可能性がある。
+
+**設計案：Previous の Native miss は、既存 Native entry の退去を伴わず挿入できる場合だけ実行する。** 件数、同一 source 系列の target 数、拡大 pixels 合計を既存 pruning と共有する純粋判定で照合する。hit はそのまま再利用する。上限に当たれば `cache_capacity` として見送る。
+
+これは新しい保護 slot／pin を作らず、前の補完で既存完成物を追い出さないための保守的な規則である。通常 draw と既存 Next prewarm の pruning は変更しない。判定は allocation／claim 前に行う。
+
+**VRAM 増分：**
+
+| 前 unit の不足 | 追加量の目安 |
+|---|---|
+| 8000×8192 の別 final 1頁 | mip あり約333.33MiB、mip なし250MiB |
+| 同寸法の Pair 両頁 | mip あり約666.67MiB |
+| 無変換 handle 共有・既存 hit | 同一 allocation は追加計上しない |
+| Native | 各出力 `target幅 × target高さ × 4` bytes、mip なし |
+| Native 生成中 | 上記に当該 branch の一時 allocation を加えて admission |
+
+根拠：`docs/page-turn-animation-plan.md:4418`、`src/app/final_prepare_budget.rs:44`、`:115`、`:299`。
+
+前 unit の追加分も通常 resident として全 context 会計へ入れる。予算不足なら補完を見送り、現在表示や既存 source／AI 先読みを追い出さない。GPU 完了待ちや offer 前の専用 pin 予約は追加しない。
+
+**推測・限界：** 今ある Next を守っても、その後に初めて判明した別の Next 需要の VRAM 余裕まで永久に保証することはできない。前 unit の登録済み final は通常 cache として残るため、将来の投機 admission が不足する可能性は計測で確認する。上限据え置きだけを根拠に「前進への影響なし」とは結論しない。
+
+##### 27.17.20.7 状態の組合せを減らす判断と multi-context
+
+| 検討案 | 判断 |
+|---|---|
+| Next→Previous の1本の需要順 | **採用。** 同じ resolver・pending・cache・予算を使い、段階ごとにも順序を維持する |
+| 最後に進んだ方向を記憶し、その方向を先読み | 不採用。方向反転時の履歴と現在需要の組合せが増え、Next 優先という既存方針も変わる |
+| backward 専用 slot／queue | 不採用。既存の1 unit 予約を完成後に順次使えばよい |
+| 永続 `next_ready`／`backward_pending` bool | 不採用。現在の key／view と乖離するため、既存 owner から都度導出する |
+| 準備中の navigation／F12 を modal にする | 不採用。通常閲覧に待ちを追加する |
+| resize／補正変更で viewer を閉じ直す | 不採用。既存の exact key／view 再照合で処理でき、閉じ直しは操作を増やす |
+| 前の CPU も通常 producer で先に始める | 本案では不採用。Next Native 完了を示す永続状態が別途必要になる。最終 hook での限定開始なら同時点の事実で判定できる |
+
+**multi-context の契約：**
+
+- pending・完成 final・Native は context 単独 owner。
+- permit／CPU 予約予算／GPU frame 枠は App owner。
+- 全 live context の Next を Previous より優先する。context の訪問順で Previous が兄弟の Next を追い越さない。
+- 単なる mount、会計 walker、passive snapshot 描画から投機を始めない。
+- F12 の host／viewport 変更を context の新規 identity とみなさない。
+- fork は fresh owner。mount／deposit／promote は既存 payload 移譲を維持する。
+- A の close／失効は A の要求だけを退役させる。共有予算の優先回収は、明示した低優先投機だけを各所有 context 内で処理する。
+
+根拠：`src/app/viewer_context_registry.rs:5204`、`:5340`、`src/app/final_prepare_budget.rs:487`、`:513`。
+
+演出排他は §27.17.14.10 の改訂をそのまま使う。**live にページめくりを進行する context と当該 frame の活動**が対象であり、parked の保持 Turning を見て兄弟を止め続けない。同 frame に演出活動があれば park／cancel 後も投機 allocation を行わない。parked の receipt／material／lease を消して排他を解除しない。
+
+根拠：`docs/page-turn-animation-plan.md:5004`、`src/app/final_prepare_budget.rs:89`、`:487`、`:535`。
+
+**detached 憲法上の位置付け：** 原因は「F12 の HWND／placement 判定」ではなく、通常準備需要が Next までしかないことにある。本案は context 所有の需要と共通 admission の拡張であり、症状パッチではないと考える。ただし実装前の双方合意は未了である。
+
+BA-1〜4 の HWND／生成 identity、BA-6 の placement には手を入れない。BA-5／BA-7 に関わる新しい描画駆動条件や transient flag を増やさず、既存 dispatch／runtime／typed owner を使う。観測を既存 BA の欠陥と無理に同定する必要はない。
+
+根拠：`docs/detached-rework-plan.md:29`、`docs/detached-viewer-lifecycle-redesign-proposal.md:255`、`:274`、`:294`、`:313`。
+
+§11 には、対象関数、Previous の需要規則、hook の限定拡張、優先回収対象、park／fork／移譲契約、兄弟不変の検証、双方の構造合意を追記する。既存 D3 合意を今回差分の承認に代用しない。
+
+##### 27.17.20.8 範囲外と保存する挙動
+
+| 対象 | 本件の扱い |
+|---|---|
+| 演出 OFF | 新しい Previous 投機を開始しない。既存同期完成・legacy／AI 先読みを維持 |
+| 連結読み | 既存 prepare band／保持規則を維持 |
+| Split | 新規投機対象外。既存表示 step を維持 |
+| Remote | PC の既存 local-control gate を尊重。Remote cache／IPC を変更しない |
+| スライドショー | 既存 Next の still-only 需要・timer・末尾規則を維持。**Previous 補完は手動閲覧時だけ** |
+| D3-3 | 未実体化編集・注釈／font／stamp の準備を追加しない。既に exact な素材を再利用できる範囲は維持 |
+| source／AI | 設定済み対象範囲・producer・通常登録を縮小しない |
+| D2／D4 | held／canonical／N→N+1／flat-first／初回採用 output 時計を変更しない |
+
+根拠：`src/app/final_prepare.rs:203`、`:224`、`:313`、`src/app.rs:79461`、`docs/page-turn-animation-plan.md:5321`。
+
+まれな失敗は割り切り（ログ＋通知［＋作り直し］）。retry、途中状態の復旧、多段 recovery、完了待ちは追加しない。
+
+##### 27.17.20.9 perf event、解析器、隔離計測
+
+**設計案：既存 D3 event を拡張し、前用の独立 event 群は作らない。**
+
+追加する主要項目は次とする。
+
+- `demand_position`：`next / previous / current / unknown`。
+- worker 開始時とイベント時の役割を混同しないための `requested_position`。
+- context、items 世代、unit anchor、occurrence／role、既存 key。
+- CPU 開始・取消理由と取消→実終了時間。
+- Previous 保留理由：`next_pending`、`next_unknown`、`outside_backward_keep`、`cpu_budget`、`vram_admission`、`cache_capacity` 等。
+
+方向は診断値として記録し、`FinalPrepareUnit` の所有 identity や採用可否の独立 bool にしない。診断理由の重複抑制も route だけでなく位置を区別し、Next の記録で Previous を抑制しない。
+
+既存の CPU 完成／登録／Native 提出イベントは、次の箇所を拡張する。
+
+根拠：`src/app/final_prepare.rs:434`、`src/app.rs:85774`、`src/app/final_prepare_budget.rs:166`、`:333`。
+
+`gpu.texture_delivery_submitted` は renderer／TextureId で登録イベントと結ぶ。backend に読書方向の判断を追加しない。通常 Native lookup も exact key／renderer で相関し、相関できないものは unknown とする。
+
+**`scripts/analyze_perf.py page-turn-d3` の拡張：**
+
+1. 操作別に、実解決方向を使って前進／後退を表示する。物理キーから推定しない。
+2. 準備イベントを Next／Previous／unknown 別に集計する。
+3. 既存 key／TextureId で結べる CPU→登録→配送→Native の記録を示す。
+4. Previous の優先保留・取消・容量不足を集計する。
+5. 旧ログで方向項目がない場合は unknown とし、互換性を維持する。
+
+現在の解析器は準備仕事を近い操作へ推定帰属せず、Native lookup に context がない場合もある。この制約を維持し、時刻が近いだけで「その後退の準備完了」と判定しない。`status=reference` も維持する。
+
+根拠：`scripts/analyze_perf.py:676`、`:712`、`:758`。
+
+**駆動能力の確認：**
+
+- 既存 script に RTL の前進→後退、両方向 hold がある。
+- `tap_key("F12")` の入力表現がある。
+- `snapshot().windows` に window/context identity・page・描画状態がある。
+- `select_window` と targeted `run_action` がある。
+- `-Script` は既存解析モードを自動実行しないため、D3 解析は別途呼ぶ必要がある。
+
+根拠：`scripts/page-turn/measure-spread-rtl-roundtrip.rhai:1`、`scripts/page-turn/hold-both-directions.rhai:1`、`src/test_script.rs:549`、`:2936`、`:3220`、`:3382`、`scripts/page-turn-smoke.ps1:382`。
+
+**最小追加は専用 Rhai script と設定 overlay を基本とする。** 後退用製品コマンドや新しい準備待ち API は不要。対象窓を `select_window` で選び、`run_action("FsPagePrev")`／`FsPageNext` を使う。実キーの方向確認は RTL の Right／LTR の Left 等を別ケースで行う。
+
+隔離計測の手順は次とする。
+
+1. 03／04 fixture、Single／RtlCover、plain／補正あり、ON200ms の既存比較条件を使う。
+2. 未訪問の前 unit を作るため、一覧で途中頁を選んで直接 open する。前進して途中へ到達する方法だけにしない。
+3. 本体 open と、一覧から途中頁を F12 open するケースを分ける。
+4. F12 後は窓 identity・対象頁・通常描画成立だけを確認し、D3 完了を待たずに後退する。
+5. 即時後退と、既存比較と同じ2500ms間隔の後退を別 profile にする。即時ケースの miss を除外しない。
+6. 後退→前進の反転、二 context、OFF、Boundary／wrap を別ケースで採る。
+7. 前進の既存八条件を対照計測し、背景転送・静止中の入力応答・Next の到達時間も比較する。
+
+**F12 直後の無条件改善は保証しない。** 新 context で Next も Previous も cold なら、優先規則上は Next の後に Previous を作る。準備前に後退された場合は従来の同期 miss が残る。即時ケースと通常の静止機会があるケースを分けて報告する。
+
+今後実行する場合は `prepare-portable-smoke.ps1 -TestScript` で準備した portable と、その `target\portable-smoke\data` を明示する。`page-turn-smoke.ps1` の既定 dev-runtime は使わない。同 script は窓を前面化するため、シナリオ・時間・desktop 使用・使い捨てデータ範囲の明示承認を得てから実行する。本調査では実行しない。
+
+##### 27.17.20.10 回帰、chunk、見積り
+
+| 回帰 | 必須の検査 |
+|---|---|
+| 前 unit 不足 | Current 受理済み、Next 全段成立、Previous final 不在から既存 worker／cache へ補完される |
+| 完成物優先 | Previous final／Native hit で再生成・追加 allocation がない |
+| 次を優先 | Next Computing／CpuReady／片頁登録待ち／Native miss の各段階で Previous が開始・登録されない |
+| 二 context の優先 | A の Previous ready が、B の Next final／Native より先に共通枠を取らない。訪問順を反転しても同じ |
+| 高優先への復帰 | Previous の Computing／CpuReady 中に Next 不足を作り、低優先だけを取消・破棄する。実終了前の permit 返却がない |
+| 方向反転 | 後退で Previous→Current を表示引取りし、直後の前進で旧 Current／Next の完成物を再利用する |
+| 先頭 Boundary | Previous が Boundary。末尾や隣本を投機しない |
+| ループ折り返し | ON/OFF とも両端の需要は Boundary。wrap は平らに着地し、遅着結果を旧需要へ公開しない |
+| topology／役割 | LTR／RTL、Single／Pair、表紙・横長・Alone・補助表紙・Blank／Vacant |
+| Native 一致 | Previous prewarm と実際の後退 draw の key／hit を比較する。通常 draw の test observer を使う |
+| view 変更 | DPI／resize／clip／trim／fit／回転／gap 変更で旧候補を拒否。CPU final の不要な作り直しがない |
+| 容量・resident 不足 | 素材・metadata・backing・VRAM・Native cache capacity 不足で skip。同期 I/O／decode を始めない |
+| park／F12／fork | 開始済み仕事の保持、resume 前採用、fresh owner、移譲、兄弟 cache／pending／世代不変 |
+| 演出排他 | live 演出・同 frame 活動・discard retry で新規投機 allocation ゼロ。parked 保持 presentation は不変 |
+| OFF／対象外 | Previous の CPU／登録／Native が開始されない。既存 source／AI の対象と進行は維持 |
+| 上限 | 取消中・channel 未受信・Pair・parked を含め1実行／context1 unit／全体2 unit／1GiB／outer frame1件 |
+| 一時変異 | Previous を Next に誤解決、Next Native 判定省略、Previous 優先、早期 permit 解放、ROI 変更、cache admission 省略の変異で対応回帰が失敗する |
+
+拡張先は既存の final prepare／lifecycle／canonical 実 draw 回帰とする。
+
+根拠：`src/app/final_prepare/tests.rs:159`、`:216`、`src/app/final_prepare/tests/lifecycle_tests.rs:91`、`src/ui_fullscreen/page_turn/final_prepare_tests.rs:423`、`src/ui_fullscreen/canonical_demand.rs` の既存回帰。
+
+**推奨は1つの coherent chunk。** resolver だけ先に有効化すると、pending の取消や Native の優先が追い付かないため、部分有効化はしない。chunk 内を次の checkpoint に分ける。
+
+1. resolver／需要分類／最新 callback 値の整理。
+2. Next 全段優先、Previous 開始・採用・取消、Native capacity admission。
+3. 回帰・解析器・script・関連文書の更新。
+
+writer は1人とし、所有・hook 拡張・優先回収の実装前独立レビューと、完成レビューを行う。
+
+**概算：実装・自動回帰・計測支援の整備に3〜5作業日、独立レビュー修正に1〜2日程度。** 隔離参考計測は別途0.5〜1日程度、正式性能 gate と利用者の実機受入待ちは別計上する。これは静的調査からの予算であり完成日の約束ではない。
+
+自動検証は focused → 必要な既存 GPU／snapshot 回帰 → `scripts/test-full.ps1`。同 source／条件の成功台帳を独立 reviewer が再利用する。実装完了後は通常の `build-dev.ps1` 手渡しを行い、agent は通常 profile の製品を起動しない。正式3run×30機会、miss／skip を含む分母、D2／D4／flat-first の既存 gate は維持する。
+
+##### 未確定・要レビュー点
+
+- **ROOT 最終 hook で Previous の resident-only CPU job を限定開始する拡張。** Next の既存開始位置を維持し、UI／入力／permission／metadata producer へ再入しないことを独立レビューする。
+- 最新 callback の view と位置別収集結果を、既存 frame owner 内の一体の値で持つ具体型。収集失敗や retry で Next／Previous の片方を誤って残さないこと。
+- 全 live context の Next 成立判定と、低優先 Computing／CpuReady の回収。表示昇格・Current・legacy・park 保持物を巻き込まないこと。
+- Previous Native の「既存 entry を退去させない」capacity 判定を、実 pruning と同じ規則から導出できること。
+- 後退時の SingleArrival／Pair 左右素材について、実 draw の key と D2 handoff を接続した回帰で一致を確認すること。静的確認だけで実行済みとは扱わない。
+- 開始済み worker の取消残時間、登録済み Previous による将来の VRAM 圧力、静止中の配送負担は未計測。前進対照を含む実測で判断する。
+- detached §11 への記録と、「症状パッチではなく構造的修正」という設計担当・独立 reviewer 双方の今回範囲への合意は未了。
+
+##### 利用者の判断が要る点
+
+**本案を既存上限内の best-effort 補完として実装する限り、新しい判断依頼はない。** 案A、背景仕事と既存予算内の VRAM 増は再質問しない。
+
+次の要求が必要になった場合だけ、実装前に判断へ返す。
+
+| 選択肢 | 費用・制約 |
+|---|---|
+| 本案：全上限据え置き | Next 完了後に Previous を順次補完。cold な F12 直後・連打・予算不足では同期 miss が残る |
+| context の CPU 予約を2 unit 以上へ増加 | Next／Previous の並行保持が可能になる一方、同寸法 Pair なら CPU 出力だけで追加約500MiB。全体 unit／1GiB 上限との再調整が必要。permit1件の実行競合は消えない |
+| CPU permit を増加 | 新しい Next を取消中 Previous と並行開始できるが、CPU・メモリ帯域・一時 RAM の競合が増える。現時点では推奨しない |
+| VRAM／Native cache 上限を増加 | 前 Pair の別 final だけで約666.67MiB＋Native 等を保持し得る。将来需要の競合ゼロまでは保証できない |
+| F12 後退を準備待ちにする／Previous を Next より先にする | 前者は通常操作の待ちを増やし、後者は前進準備の優先を落とす。現在の仕様を変えるため、本案では採用しない |
+
+「F12 を開いた直後、準備時間がなくても後退が必ず滑らか」を必須にする場合は、この best-effort 補完だけでは満たせない。上限増加だけで解決すると扱わず、準備開始時期・素材移譲・優先順を含む別の受入条件として判断する。
+
+##### 27.17.20.11 設計担当の検収メモ（2026-10-19、ClaudeCode）
+
+- 上の案 (設計 SID `01a15459`、HEAD `ed5634b5b` の静的調査) を実装前独立レビューに回す。上限値は据え置き、利用者判断が要る新しい点はない。
+- 検収で確認した点: 前 unit の補完を「次 unit の全段階 (final 登録・Native) が成立した後」に限る順序づけ、方向の記憶・専用 slot・永続 bool を作らない判断、
+  Previous Native を既存 entry の退去なしで入る場合だけ生成する規則、§1.400 の両端 Boundary 維持は妥当と判断した。
+- レビューで特に見てほしい点: ROOT 最終 hook から resident-only の CPU job を開始する限定拡張 (D3-2 の「通常 fullscreen work だけが producer を開始」からの変更) と、
+  通常 producer 側で同じ時点の事実から開始できない理由の妥当性、低優先投機だけを回収する処理が表示昇格・Current・legacy・park 保持物を巻き込まないこと、
+  detached 憲法上「症状パッチではなく構造的修正」であること。
+- 期待値の限界 (利用者へ伝える): F12 を開いた直後、準備の時間がないまま戻ると従来どおり同期で作る。静止の機会があれば Next の後に Previous が揃う。
+
+##### 27.17.20.12 改訂 1: 実装前レビューへの対応（2026-10-19）
+
+| 指摘 | 改訂箇所 |
+|---|---|
+| P2：parked Previous の結果予約を live loop から回収できない | §27.17.20.4・.5。Next の CPU admission が予約不足で失敗した境界に、parked を含む予約 owner の回収段階を追加 |
+| P3：Native の退去なし判定が smoothing／旧 source 除去を含まない | §27.17.20.6。既存 entry の除去を文字どおりゼロと定義し、実行時の全削除規則を純粋判定へ含める |
+| 通常 producer 側を採らない理由が強すぎる | §27.17.20.7。問題を最新 callback の view と全 context の判定時点に修正 |
+| 兄弟の Unknown による全 Previous 保留の可視化 | §27.17.20.4・.9。保留対象と blocker の context／理由を診断へ記録 |
+| 追加回帰と合意状況 | §27.17.20.10、および「未確定・要レビュー点」 |
+
+**結論：上限据え置き・既存 owner の方針を維持し、予約回収を live 描画対象の列挙から分離する。Native は「旧世代の除去も含め、Previous の挿入による既存 entry の除去ゼロ」を採る。**
+
+以下は HEAD `7f858c90a843faedeb3ff7b41b512fcda0d5bf98` と独立レビュー全文の静的確認による改訂案である。作業ツリーは clean。変更・ビルド・テスト・製品起動は行っていない。「確認済み」は現行 source／文書の事実、「設計案」は未実装の変更を表す。独立レビューの反例は実行観測ではない。
+
+##### 27.17.20.4 準備順序と既存 owner の拡張〔置換：予約回収の実行境界〕
+
+Next の CPU 開始位置と、ROOT 最終 hook における Next→Previous の順序は維持する。ただし、**低優先結果予約の回収は、ROOT hook の live route loop に閉じ込めない。**
+
+**確認済み：** 現 hook の結果採用は `live_paged` から現在有効な route を選んで訪問する。parked owner の結果予約は、この loop では回収できない。
+
+根拠：`src/app/final_prepare_budget.rs:524`、`:549`。
+
+**設計案：Next CPU の予約拒否を起点に、独立した回収 helper を呼ぶ。**
+
+接続位置は `prefetch_next_final_unit` → `spawn_prepared_final_job` → `final_prepare_cpu.try_start` の予約取得境界とする。必要な resident 入力・plan・予約 bytes が確定し、Next の新規 CPU job を実際に開始しようとして予約不足になった場合だけ呼ぶ。
+
+根拠：`src/app/final_prepare.rs:264`、`:382`、`:396`。
+
+処理順は次とする。
+
+```text
+現在の Next CPU 需要・resident plan・bytes を確認
+  → try_start
+      → 成功：既存 worker を開始
+      → 実行 permit のみ不足：既存 waiter へ任せる
+      → 結果予約不足：
+          budget が既に所有する予約 unit の値を取得
+          budget lock を解放
+          parked を含む該当 owner の低優先結果だけを回収
+          元の Next 需要・key を再照合
+          try_start を一度だけ再試行
+```
+
+`try_start` は現在、実行中と予約不足をまとめて `None` にしている。これを呼出し内で消費する typed outcome に分ける。予約不足と実行中が同時に成立する場合も予約不足を識別できるようにする。要求単体で1GiBを超える等、回収しても入らない要求では owner 訪問を行わない。
+
+失敗 outcome は新しい pending／queue に保存しない。Previous の admission 失敗からは高優先回収を呼ばない。元の Next producer を ROOT 最終 hook へ移さず、hook からの Previous 開始も従来案のままとする。
+
+**Next の Native miss／Unknown だけを理由に CPU 予約回収を行わない。** GPU 段階の不足と、開始可能な Next CPU job の予約不足を区別する。
+
+##### 27.17.20.5 permit、CpuReady、登録枠、取消〔置換：parked を含む予約回収〕
+
+全上限は維持する。回収対象の探索には、既存 `FinalPrepareCpuBudget` の予約表 `BudgetState.units` を使う。同表には context・items 世代・occurrence 列を含む `FinalPrepareUnit` があり、全体上限により最大2 unitである。
+
+根拠：`src/app/final_prepare_cpu.rs:11`、`:15`、`:55`、`:70`。
+
+**設計案：予約拒否時に、この表から unit identity の一時 snapshot を得る。予約 lease の Arc は clone しない。**
+
+探索対象は次のように限定する。
+
+| 境界 | 訪問方法 |
+|---|---|
+| 予約 owner の選択 | `BudgetState.units` の最大2 unitから context ID を重複排除 |
+| owner の存在・保管位置の確認 | `with_viewer_context_ref` |
+| pending の照合・限定的な結果受信・破棄 | `with_viewer_context_state` の owner-scoped closure |
+| 訪問後 | 同 helper により元の mounted context へ戻す |
+
+根拠：`src/app/viewer_context_registry.rs:5204`、`:5340`。
+
+`viewer_context_ids()`／`other_viewer_context_ids()` は全 registry の列挙入口として存在するが、本回収では予約表から直接 owner を特定できるため使用しない。live route 一覧も回収対象の filter に使わない。active F12 の AtRest と parked の AtRest の双方へ、同じ所有境界で到達する。
+
+根拠：`src/app/viewer_context_registry.rs:230`、`:250`、`:5004`、`:5084`。
+
+budget mutex は metadata snapshot の取得までとし、registry 訪問、pending の drop、repaint まで保持しない。snapshot 後の worker 完了・予約解放に備え、各 owner 内で現在の要求を再照合する。消滅した owner や既に解放された予約は見送る。
+
+**毎 frame の全 context 走査にはしない。**
+
+- 実際の Next CPU 要求がなく、plan／bytes が未確定なら回収しない。
+- permit 不足だけなら回収しない。
+- 予約不足を確認した呼出しで、予約 owner 最大2 unitだけを訪問する。
+- 同一 producer 呼出し内で回収→再試行を反復しない。再試行は一度まで。
+- 回収しても不足する場合は、既存 waiter と資源解放通知へ戻る。追加 timer／heartbeat／再試行 bool を作らない。
+
+**回収可否は origin と、所有 context の現在需要を照合して決める。**
+
+| 所有物 | 回収段階での扱い |
+|---|---|
+| 未昇格の `Speculative(unit)` で、現在も Previous と確定する結果 | 回収候補 |
+| Current／Next の素材として必要な結果 | 保護 |
+| `DisplayPrepared` | 保護 |
+| `LegacyDisplay / LegacyPrefetch` | 保護 |
+| held／receipt／presentation／batch lease | 参照・変更しない |
+| 登録済み final／Native cache | CPU 結果予約回収の対象外 |
+| topology／役割を確定できないもの | 本回収では保護。既存失効処理の代わりに推測で破棄しない |
+
+Current／Next の保護は unit 全体の等値だけで済ませない。**回収する各 pending の exact key が、Current／Next に必要な実頁の素材として共有されていないことも確認する。** 補助表紙等で同じ source を別 occurrence が参照する場合を含む。
+
+照合は採用済み topology・現在の key／世代だけを読む。parked owner の topology を得るために描画、metadata 読取、通常 service、producer を起動しない。
+
+根拠となる既存照合：`src/app/final_prepare.rs:166`、`src/ui_fullscreen.rs:20534`、`:20872`。
+
+**結果がどこにあるかによる扱い：**
+
+| 状態 | 処理 |
+|---|---|
+| `CpuReady(Prepared)` | 対象 pending の公開権を外して破棄。結果と予約を解放 |
+| 受信済み・未登録結果 | 同じ CpuReady owner として処理。登録してから回収しない |
+| `Computing(Prepared receiver)` に未受信結果がある | 対象 receiver だけを非 blocking 受信し、同じ pending の結果として破棄する。未受信を会計外にしない |
+| receiver が Empty、実際に計算中 | 本段階で完成結果として回収しない。permit・worker 側予約は保持 |
+| 既存の高優先化規則で Computing を取消す場合 | cancel・公開権撤去だけ。実終了前に permit／worker 側予約を返さない |
+
+現在の `Computing` は worker が終了して結果が channel に入った後も、UI が受信するまではその variant のままである。したがって **`CpuReady` のみを回収対象にする実装では P2 は解消しない。**
+
+根拠：`src/app/final_prepare.rs:37`、`:45`、`:69`、`src/app/final_prepare/tests/lifecycle_tests.rs:121`。
+
+受信した低優先結果を採用 helper へ渡さず、その owner 内で破棄する。破棄までの一時値にも予約 lease が残ることを踏まえ、**一時値と pending を drop した後に**不足を再判定する。取消・受信・drop の競合は、既存 cancel／receiver／RAII の境界で閉じる。
+
+予約解放は既存 `FinalPrepareReservation::drop`、実行 permit の返却は既存 `FinalPreparePermit::drop` に任せる。既存 waiter 登録と返却時 wake の順序を維持するため、A／B の worker 終了通知が既に済んでいても、C の Next を回収直後の一度の再試行または既存解放通知で進められる。
+
+根拠：`src/app/final_prepare_cpu.rs:100`、`:215`、`:238`。
+
+**park 表との整合：** park は引き続き新規投機開始を止める操作であり、一括取消しない。今回の回収は、§27.17.3 の「投機CpuReadyは予約付きで保持可能、圧力時の投機退去対象」を具体化する。完了結果の保持場所が未受信 channel でも同じ条件を適用する。
+
+parked で実際に計算中の worker は、park を理由に止めず、実終了までの permit／予約保持を維持する。完成後は解放 wake による次の Next admission で結果を回収できる。parked の表示用カラー化／LUT、Current／Next、DisplayPrepared の保持契約は変更しない。
+
+根拠：`docs/page-turn-animation-plan.md:4211`、`:4221`。
+
+##### 27.17.20.6 Native key、戻る curl、cache admission、VRAM〔置換：退去なし判定〕
+
+**確認済み：** `execute_prewarm` は容量 pruning の前にも、次の既存 entry 除去を行う。
+
+1. smoothing が変わると `sync_smoothing_percent` が entries 全体を clear。
+2. 同一 source ID の entry のうち、texture ID または generation が異なるものを除去。
+3. 生成・挿入後、同一 source 系列の target 数、全体件数、拡大 pixels 合計を pruning。
+
+根拠：`src/gpu_lanczos.rs:1427`、`:1429`、`:1760`、`:1779`、`:1792`、`:1807`。
+
+**設計案：Previous の「退去なし」は文字どおり既存 entry の除去ゼロとする。旧 texture／generation の失効除去も例外にしない。**
+
+理由は、低優先補完のために既存 entry の不要性を別途証明する仕組みを作らず、当初の「前の補完で既存完成物を追い出さない」契約をそのまま検査できるためである。旧世代除去を許す案より conservative だが、通常 draw／Next の失効・生成は従来どおり進む。
+
+Previous の Native miss は、以下を**全て満たす場合だけ**実行する。
+
+| 判定対象 | 条件 |
+|---|---|
+| smoothing 同期 | 同期による既存 entry の除去がゼロ |
+| 旧 source 除去 | 同一 source ID の旧 texture／generation entry の除去がゼロ |
+| 系列内 target 数 | 新 entry を含め2以下 |
+| 全体件数 | 新 entry を含め64以下 |
+| 拡大 pixels 合計 | 新 entry を含め既存上限以下 |
+
+smoothing 不一致でも entries が空なら、同期による entry 除去はゼロなので許可できる。entries が1件でも残る場合は見送る。同じ source ID の旧 texture／generation が残る場合も、たとえ旧世代に見えても Previous からは除去しない。
+
+**実装境界：**
+
+- 判定は cache metadata と plan だけを読む純粋処理とする。
+- 通常 `query_prewarm` の hit／不要を先に扱い、miss に対して判定する。
+- 最新需要・backing・VRAM と合わせて再照合し、**claim、smoothing 同期、use clock 更新、retain、allocation より前**に拒否する。
+- 実行入口でも同じ条件を確認する。呼出し側の事前判定だけを根拠に破壊的処理を通さない。
+- Previous にだけ適用する呼出し時 policy とし、通常 draw／Next の既存削除・pruning 挙動は変えない。永続 bool や別 cache は追加しない。
+
+保留理由は、少なくとも `cache_smoothing_clear`、`cache_source_replacement`、`cache_capacity` を区別する。拒否時に cache を先に整理したり、枠を取得してから返したりしない。拒否だけを理由とする repaint loop も作らない。
+
+Native key、通常 geometry、戻る curl の素材、D2 handoff、VRAM admission に関する他の記述は維持する。
+
+**推測・限界：** この規則では、古い entry が通常経路で整理されるまで Previous の Native 補完が進まない場合がある。best-effort の見送りとして扱い、通常 draw／Next の失効処理を追加起動して迂回しない。性能効果は未計測である。
+
+##### 27.17.20.7 状態の組合せを減らす判断と multi-context〔置換：通常 producer 側を採らない理由〕
+
+検討表の該当行を次へ置き換える。
+
+| 検討案 | 判断 |
+|---|---|
+| Previous の CPU も通常 producer で先に始める | 本案では不採用。通常 producer は最新 callback 観測より前に走るため、その位置には最新 view と全 live context の同時点の優先判定をそのまま置けない。ROOT 最終 hook なら全 retry 後の callback 観測と現在需要を再照合できる |
+
+Native cache は既に準備済み出力の事実を保持する。「Next Native 完了を示す永続状態が別途必要」という説明は撤回する。問題は cache の存否そのものではなく、**その出力が最新 view に一致するか、兄弟を含む Next 優先をどの時点で判定するか**である。
+
+根拠：`src/app/update_phases.rs:1988`、`src/ui_fullscreen.rs:27803`、`src/app/final_prepare_budget.rs:513`。
+
+Next の CPU 予約不足時の回収は、最新 view に基づく Previous 開始判定とは別である。既存位置で確定した Next CPU 需要と予約不足を根拠に、前記の限定回収を行ってよい。
+
+multi-context の契約には次を加える。
+
+- 低優先予約の回収対象は live route に限定しない。既存 budget が示す予約 owner を、parked を含めて訪問する。
+- 回収訪問は資源処理だけであり、parked viewer の再開、描画、通常 service、次段 producer の開始を伴わない。
+- `Unknown` の兄弟がある場合、全 Previous を保留する方針は維持する。ただし、その blocker を診断へ残す。
+
+detached の構造修正については、独立 reviewer が合意済みであり、設計担当も今回の指摘を妥当と判断している。「合意未了」という旧記述は更新する。§11 には、parked を含む予約 owner 訪問と保護対象、pressure 時だけの回収、Native の除去ゼロ規則を今回の範囲として追記する。改訂案の再レビューと完成差分の承認は別に扱う。
+
+##### 27.17.20.9 perf event、解析器、隔離計測〔置換：追加する診断〕
+
+既存 D3 event の拡張方針を維持し、次を追加する。
+
+| 診断 | 記録内容 |
+|---|---|
+| 予約回収 | 要求元 Next の context／unit、予約不足理由、訪問先 context／unit、結果保持場所、回収／保護理由、実際の予約解放前後 |
+| 実行中の保持 | 未受信結果と実際に計算中の区別。Computing の取消を即時予約解放として数えない |
+| 兄弟による Previous 保留 | 保留される Previous の context、blocker の Next context、`Pending / Unknown`、Unknown の具体理由 |
+| Native 除去回避 | smoothing clear、旧 texture／generation 除去、容量制限の別 |
+
+兄弟の Unknown も、例えば `next_unknown` と `blocker_context`、`blocker_reason` の組で残す。「自 context の素材不足」と誤読できる記録にしない。
+
+診断は perf 専用の有限理由値として既存の重複抑制へ組み込み、採用・回収・wake 判定に使わない。予約回収 event のために予約 Arc を保持しない。解析器はこれらを理由別に表示し、近い時刻の操作へ推定帰属しない。
+
+##### 27.17.20.10 回帰、chunk、見積り〔置換：追加回帰と checkpoint 2〕
+
+既存回帰表へ次を追加する。
+
+| 回帰 | 必須条件 |
+|---|---|
+| A／B の parked 結果→C の Next | A、B の Previous を登録前に park。worker を順次完了させ、2 unit の結果予約だけを残す。C の Next が予約不足を検出し、live 外の A／B を回収して開始できる。A／B の再開や追加入力を要しない |
+| 結果保持場所 | 上記を CpuReady、未受信 channel、両者混在で検査。未受信結果を回収対象から漏らさない |
+| bytes 圧力 | unit 数には余裕があっても、合計 bytes 不足で同じ回収が働く。要求単体が上限超過なら訪問しない |
+| 保護対象 | parked の Current／Next、DisplayPrepared、legacy、素材を共有する補助表紙は破棄しない。held／receipt／batch lease は不変 |
+| 実際に計算中 | receiver が Empty の間、permit／worker 側予約は保持。実終了前に C の投機実走行を重ねない。完了後は既存 wake で再評価 |
+| 探索範囲 | 無関係な context を多数置いても予約 owner 最大2 unitだけを訪問。Next 需要なし・予約不足なし・permit 不足のみでは回収訪問ゼロ |
+| 回収訪問の副作用 | parked で採用・登録・Native 生成・新 job・表示再開が起きない。元 mounted owner へ戻る |
+| 兄弟 Unknown | A の Next Unknown により B の Previous も保留され、blocker=A と具体理由が診断される |
+| smoothing 不一致 | 既存 entry ありでは Previous を拒否。entries、active smoothing、use clock、登録枠、allocation は不変。空 cache では除去ゼロの同期を許可 |
+| 旧 texture／generation | 同一 source ID の texture 不一致・generation 不一致をそれぞれ作り、Previous を拒否。別 source ID だけの entry はこの理由では拒否しない |
+| 通常経路の維持 | 通常 draw／Next では従来どおり smoothing clear・旧 source 除去が働く |
+| 一時変異 | 回収を live-only／CpuReady-only に限定する変異、smoothing／旧 source の除去判定を外す変異で対応回帰が失敗する |
+
+parked 結果保持の既存 fixture を拡張し、enum 名だけで「計算中」と判断しない回帰を作る。
+
+根拠：`src/app/final_prepare/tests/lifecycle_tests.rs:91`、`:121`、`src/app/final_prepare_cpu.rs:372`、`src/gpu_lanczos.rs:4829`。
+
+1 chunk・3 checkpoint は維持し、checkpoint 2 を次へ置き換える。
+
+> **Next 全段優先、Previous 開始・採用・取消、Next CPU の予約拒否を起点とする parked 込みの限定回収、全削除規則を含む Native 除去ゼロ admission。**
+
+実装3〜5日＋レビュー修正1〜2日という条件付き予算は据え置く。追加回収・純粋判定の共通化がこの範囲を超えると判明した場合に再見積りする。自動回帰・隔離計測・正式性能 gate は未実施である。
+
+##### 未確定・要レビュー点〔置換〕
+
+- 予約拒否の typed outcome と最大2 unit の metadata snapshot が、既存 waiter 登録・解放通知の順序を壊さないこと。
+- parked owner の Current／Next／Previous と素材共有を、採用済み topology／exact key だけで照合できること。不明なものを低優先と推定しないこと。
+- 回収対象の一時値まで drop してから予約を再判定し、未受信 channel と実際の Computing を区別できること。
+- Native の純粋判定と実行入口の再検査が、smoothing clear・旧 source 除去・容量 pruning を全て覆うこと。
+- detached の構造修正への合意は得られている。今回改訂への再レビュー、§11 の記録、完成 source／実行証拠の確認は残る。
+- 取消残時間、将来の VRAM 圧力、静止中の配送負担、F12 後退の改善量は引き続き未計測。2500msで必ず準備が完了するとは扱わない。
+
+##### 利用者の判断が要る点〔置換〕
+
+**本改訂による新しい判断依頼はない。** 上限値、通常操作、既存 Next／通常 draw、source／AI の範囲は変更しない。Previous の Native は既存 entry を一つでも除去する場合に見送る。上限増加や通常利用の待ち増が必要と判明した場合だけ、元の方針どおり実装前に判断へ返す。
+
+##### 27.17.20.13 改訂 1 の再レビュー結果（2026-10-19）
+
+- 独立レビュー (SID `01a15462`、xhigh) は改訂 1 (`c6d7f183b`) を **ACCEPT**。前回の P2 (parked の結果予約) と P3 (Native の除去ゼロ) は設計上解消し、新規指摘なし。
+- detached に触れる範囲が「症状パッチではなく構造的修正」であることに、設計担当 (ClaudeCode) と独立レビュー担当の双方が合意 (改訂後も維持)。完成差分での確認と `docs/detached-rework-plan.md` §11 への記録は実装 chunk で行う。
+- 次: 1 chunk・3 checkpoint で実装 (Codex)。
+
+#### 27.17.21 戻る方向の先回り準備 実装記録（2026-10-19、実装済・実機未確認）
+
+正本は§27.17.20と§27.17.20.12改訂1、事前再レビューは§27.17.20.13。
+`pageturn-back` / `b257c4de2`からの未コミット差分。Codexが実装し、commitはClaudeCodeが担当する。
+製品・portable smokeは起動していない。中間の独立sourceレビューはcheckpoint1/2の確定P1〜P3指摘なし。
+完成レビュー・自動検証のコマンド、件数、終了コード、途中失敗と修正、一時変異のSHA-256復元証拠は
+`target/back-handoff.md`、`target/back-*.json`/`.log`、全libの`target/test-lib-full/`台帳/JUnitを正本とする。
+生成物はGit管理外。検証途中の結果を最終成功として扱わない。
+
+完成sourceの独立レビューはACCEPT（2026-10-20、解析器診断の追認も完了、残存P1〜P3なし）。
+最終自動検証はfocused404、全lib13,796（59skip）、snapshot186、Python解析器114が成功。
+fmt/check通常・test-script/glyph検査、`build-dev.ps1 -TestScript -PreserveRuntime`も終了0。
+全libの初回1失敗と同条件再実行成功、native依存の並列build失敗と単一job再実行成功は引継ぎへ区別して記録した。
+release実行ファイル3本不在のためtest-fullは未実施。実機・計測script・正式性能gateは未実行のままである。
+
+| checkpoint | 実装の境界 |
+| --- | --- |
+| 1 | `FinalUnitPosition::resolve`、CPU/resident両composition resolverのCurrent/Next/Previous。Previousはchecked_sub、両端はBoundary、証拠不明はNone。`previous_final_prepare_occurrences`が既存後方keepへのoccurrence全体の包含を照合。`CanonicalCallbackObservation`は最新route/viewと両位置の成功/失敗を一体で置換する |
+| 2 | `finalize_speculative_gpu_output`で全live Next final→Next Native→全Next再照合→全成立時だけPrevious final→Previous Native→不足resident CPU jobを最大1件開始。`NextPreparationState`は呼出内のBoundary/Satisfied/Pending/Unknownで、永続ready latchはない。Next CPUの通常producer位置は維持 |
+| 2・予約 | `FinalPrepareCpuBudget::try_start`をtyped denialへ分け、実行中でも予約不足を優先識別。Nextの実resident plan/bytes確定後だけ最大2 unitのmetadata snapshotからownerを特定。mutex外で`with_viewer_context_ref`→`with_viewer_context_state`によりparkedも訪問。PreviousのCpuReady/未受信channelを破棄し、一時値までdrop後に元Next/keyを再照合して一度だけ再試行 |
+| 2・保護 | Current/Nextのunitだけでなくexact素材を共有するoccurrence、DisplayPrepared、legacy、Unknownを保護。held/receipt/presentation/batchと登録済cacheは触らない。Empty receiverは実計算中として保持。高優先化のlive取消でもpermit/worker側予約は実終了までRAII保持。park単独では取消しない |
+| 2・Native | `prewarm_no_removal_admission`がsmoothing clear、同source旧texture/generation、系列2 target、全体64件、拡大pixels合計を純粋照合。PreviousだけNoRemoval policyを渡し実行入口でも再検査。claim/同期/use clock/retain/allocationより前に拒否。通常draw/Nextのpruningは維持 |
+| 3 | perfの位置・request_id・CPU lifecycle/pressure・兄弟blocker・Native拒否理由、`analyze_perf.py page-turn-d3`、後退script/overlay、回帰と一時変異、関連文書 |
+
+**コード上の前提確認と実装判断:** BudgetState.unitsの上限は2 unit、Computingが未受信完成結果を含むこと、
+既存with_stateが元mountへ戻すこと、Nativeに容量pruning前のsmoothing/旧source除去があることを確認した。
+Previous keepの照合では既存source/AIのback+1が必ず直前image unitを丸ごと加える規則を利用し、
+installed索引で解決したcompositionに全occurrenceが含まれることを証明する。keep-set全体の再構築や全頁走査は追加しない。
+非画像の直前unitを遠方画像で代用せず、slideshow/連結/Split/OFF/Remote等の開始範囲は維持する。
+設計に反する仕様変更はしていない。hookからの開始はresident pixels/既存planによるPreviousだけの限定拡張で、
+通常UI・入力・permission・decode/materialization・DB/font読取へ再入しない。
+
+**観測:** 既存eventを拡張する。CPUの`cpu_started`/`cpu_ready`/`worker_finished`、登録、Native提出、保留に
+`demand_position`/`requested_position`を付ける。workerは現在役割を観測できないのでdemandはunknown。
+`request_id`は診断専用でunit identity/採用判定には使わない。`cpu_pressure`は要求元と訪問owner、保持場所、
+保護/回収/実計算中/一度の再試行、予約bytes前後を記録する。兄弟保留は`blocker_context`/`blocker_reason`、
+Native除去回避は`cache_smoothing_clear`/`cache_source_replacement`/`cache_capacity`を分ける。
+解析器は実解決方向を使い、旧ログはunknown、operationへの時刻近接帰属はしない。他解析モードは変更しない。
+renderer/exact keyやTextureIdの一致で補完できるのは一意な準備起点のrequested_positionだけとし、
+lookup/配送時のdemand_position欠落はunknownのままとする。Previous準備が到着時にCurrentへ変わるため、
+資源の一致からイベント時の役割は推定しない。準備起点が複数位置ならrequested_positionもunknownとする。
+
+**計測支援:** [back-measurement.md](../scripts/page-turn/back-measurement.md)にscript/overlayと実行手順を記録。
+一覧途中open、本体/F12即時/F12 2500ms、反転と二context、OFF、Boundary/wrap、前進八条件を別profileで採る。
+未実行であり、F12直後の無条件改善・2500ms内の準備完了・正式性能gate達成は主張しない。
+
+**回帰の接続:** §27.17.20.10と改訂1の追加表を、既存D3/D2/D4回帰と次の追加回帰で検査する。
+
+| 対象 | 主な追加回帰（関数名の接頭辞`back_`） |
+| --- | --- |
+| Previous解決・keep・両端・Unknown・全頁走査なし | `resolvers_agree_on_previous_ordinal_keep_and_boundary_without_scans`（Single/LTR/RTL/表紙） |
+| 最新callbackで両位置を保持 | `callback_retains_next_when_previous_material_is_missing_and_replaces_latest_view` |
+| 全Next段階優先・兄弟の訪問順反転・Unknown | `next_native_pending_and_unknown_block_previous_cpu_and_registration`、`all_live_next_precede_previous_in_both_route_orders_and_unknown_sibling` |
+| resident Previous CPU→登録・反転・OFF | `root_waits_for_next_native_then_starts_and_registers_previous_resident_job`、`previous_ready_is_taken_by_display_on_direction_reversal_without_slot`、`early_service_discards_previous_after_animation_off` |
+| parked A/B→C・CpuReady/channel/混在・legacy保護・mount/held不変 | `next_pressure_reclaims_two_parked_ready_channel_and_mixed_without_resume` |
+| bytes圧力・要求単独上限超過 | `real_next_bytes_pressure_reclaims_parked_result_but_oversize_does_not` |
+| Current/Next/DisplayPrepared/Unknown・Empty worker・共有補助表紙 | `pressure_protects_parked_current_next_display_and_real_computing`、`pressure_protects_previous_unit_material_shared_with_current_cover` |
+| ROOTでの高優先取消・実permit保持・Unknownなら取消しない | `root_next_pending_cancels_previous_computing_without_releasing_real_permit` |
+| 兄弟Unknown/Pending混在の両訪問順・取消後の実permit保持 | `mixed_unknown_pending_siblings_cancel_previous_in_both_visit_orders` |
+| Native純粋判定と入口再検査・通常除去維持・空cache同期可 | `native_no_removal_covers_all_invalidation_and_pruning_rules_purely`、`native_execution_rechecks_no_removal_before_backing_claim_or_mutation` |
+| Previous ROI/keyと通常draw、実後退offer/Single/Pair/D2 | `previous_native_matches_real_single_arrival_and_pair_draw_roi_keys`、`root_native_reaches_real_backward_single_pair_offer_and_d2_handoff` |
+| 上限のtyped拒否・計測script構文 | `cpu_denial_distinguishes_reservation_before_busy_and_oversized`、`measurement_scripts_parse_without_running_any_ui` |
+| 解析器の資源相関・反転後の需要役割・曖昧な準備起点 | `test_resource_correlation_infers_only_unique_requested_position`（lookup/配送の両方） |
+
+既存のview変更・Remote・対象外・Pair片頁・park/F12/fork・discard retry・演出排他・wrap・held/canonical/flat-first回帰もfocused/全libで継続検査する。
+一時変異は指定10種類にNative実行入口の再検査省略と先頭診断blockerによる取消判定を加えた12種類を個別に注入し、対応回帰の失敗と元bytes/SHA-256一致を記録する。
+最早期skip等で実解決方向が記録されなかった操作は解析上unknownのままとし、物理キーから埋めない。
+
+**完成前の優先判定修正（2026-10-20）:** 最初の実装では診断用に選んだ先頭blockerのreasonで取消も決めていた。
+`[A Unknown, B Pending]`の訪問順ではBの確定したNext不足を見落とすため、実装担当と独立reviewer双方で修正が必要と確認した。
+取消は同じ呼出内の全statesから`any(Pending)`で都度導出し、診断用blockerと分離した。永続boolは追加せず、
+既存の取消helper・保護対象・実終了までのpermit/worker予約保持を維持する。設計変更ではなく§27.17.20.5への実装整合である。
+
+**独立完成レビューへの対応（2026-10-20、P3/P2）:** `d0f40d22f`への完成レビューはCHANGES REQUESTED。
+P1はなく、detachedの完成差分が構造修正であるとの合意は維持された。前記の内部レビューACCEPTと区別する。
+
+- P3: `spawn_prepared_final_job`の頁ごとに回収・再試行できたため、Next Pairの両頁が予約拒否されるとownerを再訪していた。
+  `prefetch_next_final_unit`の頁ループ外で生成した呼出しローカルの`reclaim_attempted`を共有し、回収・再試行はunit producer全体で一度に限定する。
+  後続頁の通常admissionは維持する。永続state、待機、追加timer/repaint、上限変更はない。
+  `back_pair_pressure_recovers_once_per_producer_and_keeps_second_page_admission`で、parkedの保護Currentが枠を占有する実経路を検査する。
+  両頁拒否時はowner訪問1回・admission頁列`[1,1,2]`、小さい2頁目なら通常admissionで開始することと、保護lease/mount/held不変を確認する。
+- P2: release core、embedded-web-assets付きremote、epub-pdfを指定順の直接cargo buildで用意し、必須`test-full.ps1`を実行する。
+  以前のrelease不在による未実施記録は成功の代用にしない。P3変更後はfocused/全lib/fmt/check通常・test-scriptを再検証し、最後に計測用buildを作り直す。
+  実行結果、途中失敗、単独再実行、一時変異のSHA-256復元、最終buildは`target/back-fix-*`へ記録する。製品・portable smoke・計測scriptは起動しない。
+
+P3追加回帰の初回実行は1/1成功・終了0。頁単位へ戻す一時変異は同回帰のowner訪問回数assertionで失敗（終了100）し、
+元bytes/復元後SHA-256一致を確認した。限定独立sourceレビューはACCEPT、実行結果は実装担当が記録する。
+
+P3修正後のfocusedは405/405成功、全libは13,797成功・59skip、fmt --checkとcheck通常/test-scriptはいずれも終了0。
+P2のrelease3本は指定順の直接cargo buildで全て終了0（core 2833.319秒、remote 227.616秒、epub-pdf 113.671秒）。
+`build-release.ps1`は使用せず、この実行でTurboJPEG失敗・再試行は発生していない。
+必須`test-full.ps1`も初回成功・終了0（1117.233秒）。workspaceは15,109成功・63skip、doctestは実行対象0/ignore3、
+vendor egui 117、egui-winit 43、egui-wgpu 37、eframe/wgpu 55（1skip）、eframe/glow 57が全件成功した。
+workspaceの9 slowは失敗ではない。今回は全lib/full gateとも失敗0のため、単独再実行は発生していない。
+各コマンド・件数・終了コード・ログ・変異復元SHA-256の正本は`target/back-fix-handoff.md`と`target/back-fix-*.json/log`。
+最後の`build-dev.ps1 -TestScript -PreserveRuntime`も終了0（161.099秒）、3実行ファイルとVCRT PE検査が成功した。起動はしていない。
+限定独立追認はP3/P2とも解消としてACCEPT、残存指摘なし。実機・計測script・正式性能gateは引き続き未実施。
+
+##### 27.17.21.x 独立完成レビュー（2026-10-20）
+
+- 独立レビュー (SID `01a15462`、xhigh) の 1 回目は CHANGES REQUESTED (P2: test-full 未実施 / P3: Pair で予約回収・再試行が頁ごと)。`99bda8cfe` で対応し、再レビューで **ACCEPT・master 取り込み可**、残存指摘なし。
+- detached に触れる範囲が症状パッチではなく構造的修正であることに、完成差分でも設計担当 (ClaudeCode) と独立レビュー担当の双方が合意。
+- 未確認: 実アプリ操作・計測 script の実駆動・F12 直後 / 2500ms 後の改善量・正式性能 gate。
+
+#### 27.17.22 戻る方向の先回りの実アプリ計測（2026-10-20、ClaudeCode が隔離 data-dir で実行）
+
+master (`f8587d7ac`、おすすめ 6 件を含む) を取り込んだ `57183c8ed` の `build-dev.ps1 -TestScript` で、04 (8000×8192) と 03 (6144×8192) を使い、各 run を使い捨ての data-dir で 1 本ずつ実行した。
+利用者の実機での見え方の確認ではない。計測中、利用者のインストール版 v4.7.1 (常駐) が起動していた (操作はなし)。証跡は作業ツリーの `target/page-turn-smoke/back2-*` / `back6-*`。
+`analyze_perf.py page-turn-d3` の値は参考値 (正式 gate ではない)。
+
+**計測スクリプトの修正 (実装担当が用意した `scripts/page-turn/back-*.rhai`)**: (1) `run_action("FsPagePrev/Next")` は演出なしで移動するため、キー入力 (`tap_key`) に替え、
+読む向きを本体フルスクリーンの spread mode から決める。(2) F12 は別ウィンドウ表示モードの切り替えなので、本体フルスクリーンを開いてから押す。
+(3) 見開きの描画では `paint_matches_current_page` が立たないため、待ち条件を `page_ready && viewport_rendered` にした。
+(4) F12 の連動別ウィンドウでは前面が本体のままで、合成キーは本体の一覧が受け、別ウィンドウは一覧の選択に追従する。別ウィンドウを前面にする手段が test-script に無く、
+F12 側の戻るめくりの演出はスクリプトで駆動できなかった (`back-f12-*` / `back-two-context-reversal` は未完成として残す)。
+
+| 条件 (演出 ON 200ms) | 戻る 4 回: コマ数 / 受理→初回 curl / 最大間隔 |
+| --- | --- |
+| 本体・補正あり・見開き RtlCover (04、途中 idx12 から) | 1 回目 6 / 157ms / 99ms、2〜4 回目 31〜33 / 4〜7ms / 13〜30ms |
+| 本体・補正あり・見開き RtlCover (03) | 32〜34 / 5〜16ms / 7〜17ms |
+| 本体・補正あり・単ページ (04) | 32〜34 / 4〜22ms / 7〜21ms |
+
+- **途中から開いて戻るめくりは、2 回目以降は滑らかになった。** 各後退の直後に前 unit の CPU final → 登録 → Native が約 0.2〜0.5 秒で揃い (`requested_position=previous`)、
+  次の後退で Native は hit。後退後は新しい Next が直前の Current (cache 済み) なので Satisfied になり、Previous の準備がすぐ始まる。
+- **04 見開きの 1 回目は止まった (6 コマ・157ms)。** 開いてから Next の CPU 準備が始まるまでに約 1.3 秒かかり (既存 D3 の開始条件)、2.5 秒後の後退の時点では
+  Next の登録が 40ms 前に終わったばかりで、Previous は「Next 未完了」で保留されていた (設計どおり Next 優先)。開いた直後の 1 回目の後退は、従来どおり同期で作ることがある。
+- F12 の別ウィンドウ (連動) でも、Next の後に Previous が同じ context で準備されることをログで確認した (`back6-*`: 開いて約 1.7〜2 秒後に idx 9・10 の Previous を開始)。演出の計測は上記 (4) により未実施。
+- 前進の対照 (04、2.5 秒間隔で 8 回): 単ページ 27〜35 コマ・初回 3〜19ms。見開き補正なし 30〜34 コマ・4〜14ms。見開き補正ありは 1 回目 19 コマ (開いた直後で Next の登録・Native が未完了、上と同じ)、
+  後半 4 回の初回 curl 39〜68ms で §27.17.16 の「静止後の後半の遅れ」(21〜46ms) と同じ傾向・やや大きい。この間に Previous の新しい仕事は無く (前 unit は表示済みで Satisfied)、本変更との関係は**未確認**。
+- 演出 OFF: D3 の投機は 0 件。先頭 / 末尾 (ループ ON/OFF とも): Previous / Next の投機は 0 件 (Boundary)。
+- 二つの context の反転・正式 gate (3run×30) は未実施。
+
+#### 27.17.23 ClaudeCode による F12 別ウィンドウの実アプリ操作（2026-10-20、隔離 data-dir、利用者の許可による PC 操作）
+
+`57183c8ed` の `build-dev.ps1 -TestScript` 版を、test-script なしで隔離 data-dir (`target/manual-back/data*`、`--settings-override` で RtlCover・補正あり・演出 ON 200ms) で起動し、
+computer-use で実キーを送った。04 (8000×8192) の idx12 (13|12) から。利用者の目視確認ではない。実キーでは F12 後に別ウィンドウが前面になり、キーを受けた (§27.17.22 の (4) は test-script 側の制約)。
+
+| 操作 | コマ数 / 受理→初回 curl / 最大間隔 |
+| --- | --- |
+| 開いて約 3 秒後に F12、その約 1.5 秒後から戻る 4 回 (2.5 秒間隔) | 32〜34 / 6〜10ms / 7〜12ms (4 回とも) |
+| 続けて進む 2 回 (方向反転) | 33〜34 / 5ms / 7〜8ms |
+| 開いて約 1 秒後に F12、その 0.5 秒後に戻る (準備の時間なし) | 1 / 340ms / - |
+| 同じ run の 2・3 回目の戻る (2.5 秒間隔) | 34・26 / 4〜5ms / 7〜53ms |
+
+- §27.17.19 で止まっていた「F12 の別ウィンドウで前の見開きへ戻る」は、静止の機会があれば滑らかになった。着地した頁は 13|12 → 11|10 → 9|8 → 7|6 → 5|4 → 7|6 → 9|8 で正しい。
+- 準備の時間がないまま戻ると、従来どおり前 unit を同期で作る (設計 §27.17.20 の限界)。この 1 回は F12 の窓作成直後で、新しい窓の大きさに合わせた Native 再生成と 0.4〜0.9 秒の frame 間隔が重なっており、
+  §27.17.19 の 164〜176ms との差がこの変更によるものかは**未確認**。

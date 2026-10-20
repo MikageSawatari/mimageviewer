@@ -1,6 +1,7 @@
 //! Bounded D3 final preparation. Legacy effect requests keep their existing policy.
 use super::final_prepare_cpu::{FinalPrepareReservation, FinalPrepareUnit, FinalPrepareWake};
 use super::*;
+use crate::ui_fullscreen::{FinalUnitPosition, NextFinalUnitDemand};
 
 pub(super) enum FinalEffectOrigin {
     LegacyDisplay,
@@ -19,7 +20,7 @@ impl FinalEffectOrigin {
     pub(super) fn is_speculative(&self) -> bool {
         matches!(self, Self::Speculative(_))
     }
-    fn unit(&self) -> Option<&FinalPrepareUnit> {
+    pub(super) fn unit(&self) -> Option<&FinalPrepareUnit> {
         match self {
             Self::Speculative(unit) | Self::DisplayPrepared(unit) => Some(unit),
             _ => None,
@@ -209,7 +210,7 @@ impl App {
             .map(|pixels| (key, pixels))
     }
 
-    fn final_prepare_plan_from_resident(
+    pub(super) fn final_prepare_plan_from_resident(
         &self,
         idx: usize,
     ) -> Option<(
@@ -259,8 +260,9 @@ impl App {
         ))
     }
 
-    /// Only the ordinary fullscreen work boundary starts producers. A mount or
-    /// pre-lookup adoption service cannot call this method.
+    /// Next starts only at ordinary fullscreen work. ROOT finalized output may
+    /// additionally start one resident-only Previous job after every live Next
+    /// is satisfied. Mount and pre-lookup adoption never start producers.
     pub(crate) fn prefetch_next_final_unit(&mut self, ctx: &egui::Context, current_idx: usize) {
         self.prepare_final_demand_topologies();
         let demand = self.d3_final_prepare_unit(current_idx);
@@ -287,6 +289,7 @@ impl App {
         if !self.page_turn_current_unit_presented() {
             return;
         }
+        let mut reclaim_attempted = false;
         for page in &unit.pages {
             let idx = page.idx;
             if self.exact_complete_final_composite_entry(idx).is_some() {
@@ -299,13 +302,29 @@ impl App {
             if self.final_effect_pending.contains_key(&key) {
                 continue;
             }
-            if self.spawn_prepared_final_job(ctx, key, source, source_size, plan, unit.clone()) {
+            if self.spawn_prepared_final_job(
+                ctx,
+                key,
+                source,
+                source_size,
+                plan,
+                unit.clone(),
+                &mut reclaim_attempted,
+            ) {
                 return;
             }
         }
     }
 
     fn d3_final_prepare_unit(&self, current_idx: usize) -> Option<FinalPrepareUnit> {
+        self.d3_final_prepare_unit_at(current_idx, FinalUnitPosition::Next)
+    }
+
+    pub(super) fn d3_final_prepare_unit_at(
+        &self,
+        current_idx: usize,
+        position: FinalUnitPosition,
+    ) -> Option<FinalPrepareUnit> {
         if !self.settings.page_turn_animation_enabled
             || !self.reading_flow.is_paged()
             || self.spread_mode.is_split()
@@ -314,12 +333,16 @@ impl App {
         {
             return None;
         }
-        self.next_final_prepare_occurrences(current_idx)
-            .map(|pages| FinalPrepareUnit {
-                context: self.projected_viewer_context_id(),
-                items_generation: self.items_generation,
-                pages,
-            })
+        let pages = match position {
+            FinalUnitPosition::Current => self.current_final_prepare_occurrences(current_idx),
+            FinalUnitPosition::Next => self.next_final_prepare_occurrences(current_idx),
+            FinalUnitPosition::Previous => self.previous_final_prepare_occurrences(current_idx),
+        };
+        pages.map(|pages| FinalPrepareUnit {
+            context: self.projected_viewer_context_id(),
+            items_generation: self.items_generation,
+            pages,
+        })
     }
 
     pub(super) fn speculative_final_unit_is_needed(&self, unit: &FinalPrepareUnit) -> bool {
@@ -335,12 +358,263 @@ impl App {
         if self.d3_final_prepare_unit(idx).as_ref() == Some(unit) {
             return true;
         }
+        if self
+            .d3_final_prepare_unit_at(idx, FinalUnitPosition::Previous)
+            .as_ref()
+            == Some(unit)
+        {
+            return true;
+        }
         self.current_final_prepare_occurrences(idx)
             .is_some_and(|pages| {
                 unit.context == self.projected_viewer_context_id()
                     && unit.items_generation == self.items_generation
                     && unit.pages == pages
             })
+    }
+
+    /// Classification uses adopted topology and exact identity, not job origin
+    /// direction. Unknown is deliberately protected during pressure recovery.
+    pub(super) fn final_prepare_unit_position(
+        &self,
+        unit: &FinalPrepareUnit,
+    ) -> Option<FinalUnitPosition> {
+        if unit.context != self.projected_viewer_context_id()
+            || unit.items_generation != self.items_generation
+        {
+            return None;
+        }
+        let idx = self.fullscreen_idx?;
+        for position in [
+            FinalUnitPosition::Current,
+            FinalUnitPosition::Next,
+            FinalUnitPosition::Previous,
+        ] {
+            let demand = self.final_unit_demand_from_snapshot(idx, position)?;
+            if let NextFinalUnitDemand::Unit(pages) = demand
+                && pages == unit.pages
+            {
+                return Some(position);
+            }
+        }
+        None
+    }
+
+    pub(super) fn final_prepare_key_position(
+        &self,
+        key: FinalCompositeKey,
+    ) -> Option<FinalUnitPosition> {
+        let idx = self.fullscreen_idx?;
+        for position in [
+            FinalUnitPosition::Current,
+            FinalUnitPosition::Next,
+            FinalUnitPosition::Previous,
+        ] {
+            let demand = self.final_unit_demand_from_snapshot(idx, position)?;
+            if let NextFinalUnitDemand::Unit(pages) = demand
+                && pages.iter().any(|page| page.idx == key.edit_key.idx)
+            {
+                return Some(position);
+            }
+        }
+        None
+    }
+
+    /// This call performs no adoption/registration or producer work. Only a
+    /// reservation-pressure snapshot (at most two units) chooses these owners.
+    fn reclaim_previous_final_results(
+        &mut self,
+        units: &[FinalPrepareUnit],
+        requester: &FinalPrepareUnit,
+    ) {
+        let mut owners = Vec::with_capacity(units.len());
+        for unit in units {
+            if !owners.contains(&unit.context) {
+                owners.push(unit.context);
+            }
+        }
+        for owner in owners {
+            if self.with_viewer_context_ref(owner, |_| ()).is_none() {
+                continue;
+            }
+            #[cfg(test)]
+            tests::record_pressure_owner_visit(owner);
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "fs",
+                    "final_prepare_cpu_pressure",
+                    None,
+                    self.input_seq,
+                    &[
+                        ("context", owner.serial().into()),
+                        ("requester_context", requester.context.serial().into()),
+                        ("requester_unit", format!("{:?}", requester.pages).into()),
+                        (
+                            "reserved_units",
+                            format!(
+                                "{:?}",
+                                units
+                                    .iter()
+                                    .filter(|unit| unit.context == owner)
+                                    .collect::<Vec<_>>()
+                            )
+                            .into(),
+                        ),
+                        ("demand_position", "unknown".into()),
+                        ("requested_position", "unknown".into()),
+                        ("reason", "owner_visit".into()),
+                    ],
+                );
+            }
+            let _ = self.with_viewer_context_state(owner, |app| {
+                let keys: Vec<_> = app.final_effect_pending.keys().copied().collect();
+                for key in keys {
+                    let pending = &app.final_effect_pending[&key];
+                    let FinalEffectOrigin::Speculative(unit) = &pending.origin else { continue };
+                    let request = (pending.gpu_diagnostics.request_id(), pending.gpu_diagnostics.requested_position());
+                    if !units.contains(unit) { continue; }
+                    let protected = app.final_prepare_unit_position(unit) != Some(FinalUnitPosition::Previous)
+                        || !app.final_prepare_pending_is_current(key, pending)
+                        // Key sharing (e.g. a cover occurrence) protects material
+                        // even when the complete unit has a different identity.
+                        || app.final_prepare_key_position(key) != Some(FinalUnitPosition::Previous);
+                    if protected {
+                        app.record_final_cpu_pressure(key, "protected", "current_next_or_unknown", request);
+                        continue;
+                    }
+                    let location = match &pending.state {
+                        FinalEffectState::CpuReady(FinalEffectReady::Prepared(_)) => "cpu_ready",
+                        FinalEffectState::Computing(FinalEffectReceiver::Prepared { .. }) => "channel",
+                        _ => continue,
+                    };
+                    let received = app.final_effect_pending.get_mut(&key).unwrap().state.receive();
+                    if matches!(received, Err(mpsc::TryRecvError::Empty)) {
+                        app.record_final_cpu_pressure(key, "retained_computing", location, request);
+                        continue;
+                    }
+                    // Drop channel, temporary result and pending before retry.
+                    let pending = app.final_effect_pending.remove(&key).unwrap();
+                    pending.cancel.store(true, Ordering::Relaxed);
+                    drop(pending);
+                    app.record_final_cpu_pressure(key, "reclaimed", location, request);
+                }
+            });
+        }
+    }
+
+    fn record_final_cpu_pressure(
+        &self,
+        key: FinalCompositeKey,
+        reason: &'static str,
+        location: &'static str,
+        request: (u64, &'static str),
+    ) {
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "fs",
+                "final_prepare_cpu_pressure",
+                None,
+                self.input_seq,
+                &[
+                    (
+                        "context",
+                        self.projected_viewer_context_id().serial().into(),
+                    ),
+                    ("idx", key.edit_key.idx.into()),
+                    ("request_id", request.0.into()),
+                    ("requested_position", request.1.into()),
+                    (
+                        "demand_position",
+                        self.final_prepare_key_position(key)
+                            .map_or("unknown", FinalUnitPosition::as_str)
+                            .into(),
+                    ),
+                    ("reason", reason.into()),
+                    ("location", location.into()),
+                ],
+            );
+        }
+    }
+
+    pub(super) fn cancel_previous_computing_for_next(&mut self) {
+        let keys: Vec<_> = self
+            .final_effect_pending
+            .iter()
+            .filter_map(|(key, pending)| {
+                (matches!(
+                    pending.state,
+                    FinalEffectState::Computing(FinalEffectReceiver::Prepared { .. })
+                ) && matches!(&pending.origin, FinalEffectOrigin::Speculative(unit)
+                    if self.final_prepare_unit_position(unit) == Some(FinalUnitPosition::Previous))
+                    && self.final_prepare_key_position(*key) == Some(FinalUnitPosition::Previous)
+                    && self.final_prepare_pending_is_current(*key, pending))
+                .then_some(*key)
+            })
+            .collect();
+        for key in keys {
+            // A just-completed channel is a result, not an executing worker.
+            if matches!(
+                self.final_effect_pending
+                    .get_mut(&key)
+                    .unwrap()
+                    .state
+                    .receive(),
+                Err(mpsc::TryRecvError::Empty)
+            ) {
+                if let Some(pending) = self.final_effect_pending.remove(&key) {
+                    let request = (
+                        pending.gpu_diagnostics.request_id(),
+                        pending.gpu_diagnostics.requested_position(),
+                    );
+                    // Publish the cancellation marker before the worker can
+                    // observe it and publish actual completion.
+                    self.record_final_cpu_pressure(key, "cancelled_for_next", "computing", request);
+                    pending.cancel.store(true, Ordering::Relaxed);
+                    drop(pending); // worker retains permit and its reservation
+                }
+            }
+        }
+    }
+
+    pub(super) fn prefetch_previous_final_unit(&mut self, ctx: &egui::Context) -> bool {
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if !self.page_turn_current_unit_presented()
+            || !self
+                .final_prepare_work_admission(idx)
+                .admits_non_target_full_resolution_work()
+        {
+            return false;
+        }
+        let Some(unit) = self.d3_final_prepare_unit_at(idx, FinalUnitPosition::Previous) else {
+            return false;
+        };
+        let mut reclaim_attempted = false;
+        for page in &unit.pages {
+            if self.resident_final_prepare_texture(ctx, page.idx).is_some() {
+                continue;
+            }
+            let Some((key, pixels, size, plan)) = self.final_prepare_plan_from_resident(page.idx)
+            else {
+                continue;
+            };
+            if self.final_effect_pending.contains_key(&key) {
+                continue;
+            }
+            if self.spawn_prepared_final_job(
+                ctx,
+                key,
+                pixels,
+                size,
+                plan,
+                unit.clone(),
+                &mut reclaim_attempted,
+            ) {
+                return true;
+            }
+        }
+        false
     }
 
     pub(super) fn shared_prepared_final_texture(
@@ -387,16 +661,81 @@ impl App {
         source_size: [usize; 2],
         plan: FinalCompositePlan,
         unit: FinalPrepareUnit,
+        reclaim_attempted: &mut bool,
     ) -> bool {
         let wake = self.final_prepare_wake(ctx);
         let Some(bytes) = prepared_output_bytes(source.size, plan.post_filter) else {
             return false;
         };
-        let Some((permit, reservation)) =
-            self.final_prepare_cpu.try_start(unit.clone(), bytes, wake)
-        else {
-            return false;
+        let requested_position = self.final_prepare_unit_position(&unit);
+        #[cfg(test)]
+        tests::record_pressure_admission(key.edit_key.idx);
+        let mut admission = self
+            .final_prepare_cpu
+            .try_start(unit.clone(), bytes, wake.clone());
+        if !*reclaim_attempted
+            && requested_position == Some(FinalUnitPosition::Next)
+            && let Err(final_prepare_cpu::FinalPrepareStartDenied::Reservation {
+                units,
+                bytes: reserved,
+                reason,
+            }) = &admission
+        {
+            // One recovery belongs to the whole unit producer invocation,
+            // including both Pair pages. Later pages still try normal admission.
+            *reclaim_attempted = true;
+            let reserved = *reserved;
+            let reason = *reason;
+            self.reclaim_previous_final_results(units, &unit);
+            self.record_final_cpu_pressure(key, "retry_after_reclaim", reason, (0, "next"));
+            // Owner visits restore the original mount. Do not reuse a changed
+            // demand or key; no recursive producer or repeated retry is allowed.
+            if self
+                .fullscreen_idx
+                .and_then(|idx| self.d3_final_prepare_unit(idx))
+                .as_ref()
+                != Some(&unit)
+                || self
+                    .final_prepare_plan_from_resident(key.edit_key.idx)
+                    .is_none_or(|(current, _, _, _)| current != key)
+            {
+                return false;
+            }
+            #[cfg(test)]
+            tests::record_pressure_admission(key.edit_key.idx);
+            admission = self.final_prepare_cpu.try_start(unit.clone(), bytes, wake);
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "fs",
+                    "final_prepare_cpu_pressure",
+                    None,
+                    self.input_seq,
+                    &[
+                        ("context", unit.context.serial().into()),
+                        ("idx", key.edit_key.idx.into()),
+                        ("demand_position", "next".into()),
+                        ("requested_position", "next".into()),
+                        ("reason", "retry_result".into()),
+                        ("reserved_before", reserved.into()),
+                        (
+                            "reserved_after",
+                            self.final_prepare_cpu.reserved_bytes().into(),
+                        ),
+                        ("admitted", admission.is_ok().into()),
+                    ],
+                );
+            }
+        }
+        let (permit, reservation) = match admission {
+            Ok(leases) => leases,
+            Err(denied) => {
+                self.record_final_cpu_admission_denied(&unit, bytes, &denied);
+                return false;
+            }
         };
+        let requested_position = requested_position.map_or("unknown", FinalUnitPosition::as_str);
+        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker_reservation = reservation.clone();
@@ -408,6 +747,48 @@ impl App {
         let spawn = std::thread::Builder::new()
             .name(format!("miv-final-prepare-{}", key.edit_key.idx))
             .spawn(move || {
+                struct Finished {
+                    id: u64,
+                    context: u64,
+                    idx: usize,
+                    requested: &'static str,
+                    started: std::time::Instant,
+                    cancel: Arc<AtomicBool>,
+                }
+                impl Drop for Finished {
+                    fn drop(&mut self) {
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "fs",
+                                "final_prepare_worker_finished",
+                                None,
+                                0,
+                                &[
+                                    ("request_id", self.id.into()),
+                                    ("context", self.context.into()),
+                                    ("idx", self.idx.into()),
+                                    ("demand_position", "unknown".into()),
+                                    ("requested_position", self.requested.into()),
+                                    ("cancelled", self.cancel.load(Ordering::Relaxed).into()),
+                                    (
+                                        "worker_ms",
+                                        (self.started.elapsed().as_secs_f64() * 1000.0).into(),
+                                    ),
+                                ],
+                            );
+                        }
+                    }
+                }
+                // Reverse drop order: return the actual permit before recording
+                // completion, including cancellation, executor panic and send failure.
+                let _finished = Finished {
+                    id: request_id,
+                    context,
+                    idx: key.edit_key.idx,
+                    requested: requested_position,
+                    started: std::time::Instant::now(),
+                    cancel: worker_cancel.clone(),
+                };
                 let _permit = permit;
                 // Make this a local owned after the permit: canceled output
                 // reservations are dropped before the final completion wake.
@@ -441,6 +822,10 @@ impl App {
                                 None,
                                 0,
                                 &[
+                                    ("request_id", request_id.into()),
+                                    ("params_hash", key.params_hash.into()),
+                                    ("requested_position", requested_position.into()),
+                                    ("demand_position", "unknown".into()),
                                     ("context", context.into()),
                                     ("idx", key.edit_key.idx.into()),
                                     ("items_generation", key.edit_key.items_generation.into()),
@@ -460,6 +845,26 @@ impl App {
             });
         match spawn {
             Ok(_) => {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "fs",
+                        "final_prepare_cpu_started",
+                        None,
+                        self.input_seq,
+                        &[
+                            ("request_id", request_id.into()),
+                            ("context", unit.context.serial().into()),
+                            ("idx", key.edit_key.idx.into()),
+                            ("items_generation", unit.items_generation.into()),
+                            ("params_hash", key.params_hash.into()),
+                            ("source_generation", key.edit_key.source_gen.into()),
+                            ("demand_position", requested_position.into()),
+                            ("requested_position", requested_position.into()),
+                            ("unit_pages", format!("{:?}", unit.pages).into()),
+                            ("reservation_bytes", bytes.into()),
+                        ],
+                    );
+                }
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
@@ -474,7 +879,11 @@ impl App {
                         output_complete: true,
                         nearest_sampler,
                         origin: FinalEffectOrigin::Speculative(unit),
-                        gpu_diagnostics: Default::default(),
+                        gpu_diagnostics:
+                            final_prepare_budget::FinalPrepareGpuDiagnostics::requested(
+                                requested_position,
+                                request_id,
+                            ),
                     },
                 );
                 true

@@ -362,3 +362,39 @@ fn d3_4b_real_callback_resize_dpi_and_clip_replace_demand_and_old_native_keys_do
         }
     }
 }
+
+#[test]
+fn back_previous_native_matches_real_single_arrival_and_pair_draw_roi_keys() {
+    let state = render_state();
+    for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, mode);
+        app.fullscreen_idx = Some(2);
+        accept_current(&mut app, &ctx);
+        app.prepare_final_demand_topologies();
+        specified_height(&mut app);
+        app.wgpu_render_state = Some(state.clone());
+        deliver(&app, &ctx);
+        callback(
+            &ctx,
+            egui::ViewportId::ROOT,
+            egui::vec2(600.0, 400.0),
+            1.5,
+            egui::vec2(125.0, 70.0),
+            |ui, ctx| {
+                app.record_next_canonical_native_demand(ui);
+                let previous = app
+                    .collect_canonical_demand(ctx, view(ui), FinalUnitPosition::Previous)
+                    .unwrap();
+                assert!(app.canonical_unit_demand_is_current(ctx, &previous));
+                let keys = previous
+                    .pages
+                    .iter()
+                    .map(|page| prewarm(&mut app, ctx, page))
+                    .collect::<Vec<_>>();
+                assert_eq!(keys.len(), if mode == SpreadMode::Single { 1 } else { 2 });
+                assert_draw_keys(&mut app, ui, ctx, &previous, &keys, "hit");
+            },
+        );
+    }
+}

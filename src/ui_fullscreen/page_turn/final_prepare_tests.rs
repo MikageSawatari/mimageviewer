@@ -406,6 +406,135 @@ fn assert_held(app: &App, held: &[PreparedPagedPage]) {
     }
 }
 
+#[test]
+fn back_root_native_reaches_real_backward_single_pair_offer_and_d2_handoff() {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let target_format = wgpu::TextureFormat::Rgba8Unorm;
+    let renderer = egui_wgpu::Renderer::new(&device, target_format, Default::default());
+    let state = egui_wgpu::RenderState {
+        instance,
+        adapter,
+        available_adapters: Vec::new(),
+        device,
+        queue,
+        target_format,
+        renderer: Arc::new(egui::epaint::mutex::RwLock::new(renderer)),
+    };
+    for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+        let ctx = egui::Context::default();
+        let mut app = fixture(&ctx, mode);
+        app.fullscreen_idx = Some(2);
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+        app.settings.margin_fit_enabled = false;
+        app.settings.still_seek_strip_visible = false;
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+        app.wgpu_render_state = Some(state.clone());
+        adjust(&mut app, &[0, 1]);
+        for idx in 0..4 {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+            let texture = app.ensure_final_composite_texture(&ctx, idx).unwrap();
+            state.renderer.write().update_texture(
+                &state.device,
+                &state.queue,
+                texture.id(),
+                &egui::epaint::ImageDelta::full(
+                    egui::ColorImage::filled(texture.size(), egui::Color32::WHITE),
+                    crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                ),
+            );
+        }
+        accept_current(&mut app, &ctx);
+        app.prepare_canonical_chrome_for_test(2);
+        app.prepare_final_demand_topologies();
+        // Actual callback observations and real ROOT priority/admission produce
+        // the Native outputs. No fake Native resource or injected held page.
+        for number in 5100..5106 {
+            begin_registration_frame(&mut app, number);
+            frame(&ctx, |ui, ctx| {
+                draw_current(&mut app, ui, ctx);
+                app.observe_live_paged_for_final_prepare();
+                app.record_next_canonical_native_demand(ui);
+            });
+            eframe::App::on_native_wgpu_root_output_finalized(&mut *app, &ctx, number, 1);
+        }
+        let target = if mode == SpreadMode::Single { 1 } else { 0 };
+        let final_ids = (0..2)
+            .map(|idx| {
+                app.exact_complete_final_composite_texture(idx)
+                    .unwrap()
+                    .id()
+            })
+            .collect::<Vec<_>>();
+        let operation = ViewerOperationId::Pad {
+            batch: next_operation_batch(),
+            ordinal: 0,
+        };
+        crate::gpu_lanczos::begin_native_lookup_observation_for_test();
+        frame(&ctx, |ui, ctx| {
+            app.page_turn_external_operation(
+                ctx,
+                operation,
+                OperationPhase::Press,
+                "back-regression",
+            );
+            app.offer_page_turn_with_operation(ctx, target, false, Some(operation));
+            assert!(
+                matches!(
+                    app.page_turn_presentation.state,
+                    PresentationState::Offered { .. }
+                ),
+                "{mode:?}: {:?}",
+                take_test_events()
+            );
+            app.fullscreen_idx = Some(target);
+            let (_, sources) = draw_current(&mut app, ui, ctx);
+            let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                panic!("paged backward arrival")
+            };
+            assert!(receipt.curl, "{mode:?}: {:?}", take_test_events());
+        });
+        let lookups = crate::gpu_lanczos::take_native_lookups_for_test();
+        assert!(!lookups.is_empty());
+        assert!(
+            lookups.iter().all(|lookup| lookup.outcome == "hit"),
+            "{lookups:?}"
+        );
+        let PresentationState::Turning {
+            incoming, offer, ..
+        } = &app.page_turn_presentation.state
+        else {
+            panic!("backward turning")
+        };
+        assert!(!offer.forward);
+        assert!(incoming.evidence.was_accepted());
+        assert_eq!(
+            incoming.pages.len(),
+            if mode == SpreadMode::Single { 1 } else { 2 }
+        );
+        assert!(
+            incoming
+                .pages
+                .iter()
+                .all(|page| page.resource.source_texture().is_none()),
+            "D2 must hand off only Native outputs"
+        );
+        let held = incoming.pages.clone();
+        app.service_final_prepare_before_lookup(&ctx);
+        assert_held(&app, &held);
+        for idx in 0..2 {
+            assert_eq!(
+                app.exact_complete_final_composite_texture(idx)
+                    .unwrap()
+                    .id(),
+                final_ids[idx]
+            );
+        }
+    }
+}
+
 fn assert_canonical(app: &App, expected: &SubmittedUnitReceipt) {
     let PresentationState::Completing {
         completion: FlatCompletion::Submitted(current),

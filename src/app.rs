@@ -85696,6 +85696,7 @@ impl App {
             }
             let speculative = self.final_prepare_is_speculative_allocation(pending);
             let prepared = !pending.origin.is_legacy();
+            let demand_position = self.final_prepare_key_position(key);
             let shared_texture = match &pending.state {
                 FinalEffectState::CpuReady(FinalEffectReady::Prepared(ready)) => {
                     self.shared_prepared_final_texture(ctx, key, ready, pending.nearest_sampler)
@@ -85710,6 +85711,18 @@ impl App {
                         }
                         continue;
                     }
+                }
+                if pending.origin.is_speculative()
+                    && demand_position == Some(crate::ui_fullscreen::FinalUnitPosition::Previous)
+                    && !matches!(
+                        phase,
+                        final_prepare_budget::FinalPrepareAdoption::RootFinalized(
+                            _,
+                            crate::ui_fullscreen::FinalUnitPosition::Previous
+                        )
+                    )
+                {
+                    continue;
                 }
                 if self.fullscreen_idx.is_some_and(|idx| {
                     !self
@@ -85740,7 +85753,9 @@ impl App {
                         final_prepare_budget::FinalPrepareAdoption::BeforeLookup => {
                             Some(final_prepare_budget::FinalPrepareGpuDeferred::BeforeFinalOutput)
                         }
-                        final_prepare_budget::FinalPrepareAdoption::RootFinalized(reason) => reason,
+                        final_prepare_budget::FinalPrepareAdoption::RootFinalized(reason, _) => {
+                            reason
+                        }
                     };
                     if let Some(reason) = deferred {
                         self.record_final_prepare_gpu_deferred(key, reason);
@@ -85885,6 +85900,28 @@ impl App {
                                     self.projected_viewer_context_id().serial().into(),
                                 ),
                                 ("idx", key.edit_key.idx.into()),
+                                (
+                                    "demand_position",
+                                    demand_position
+                                        .map_or(
+                                            "unknown",
+                                            crate::ui_fullscreen::FinalUnitPosition::as_str,
+                                        )
+                                        .into(),
+                                ),
+                                (
+                                    "requested_position",
+                                    pending.gpu_diagnostics.requested_position().into(),
+                                ),
+                                ("request_id", pending.gpu_diagnostics.request_id().into()),
+                                ("params_hash", key.params_hash.into()),
+                                (
+                                    "renderer",
+                                    self.wgpu_render_state
+                                        .as_ref()
+                                        .map(|state| state.renderer.read().diag_id().into())
+                                        .unwrap_or(serde_json::Value::Null),
+                                ),
                                 ("items_generation", pending.items_generation.into()),
                                 ("source_generation", key.edit_key.source_gen.into()),
                                 ("speculative", speculative.into()),

@@ -2221,7 +2221,10 @@ impl App {
             &fact,
             "opportunity",
             "ready_at_accept",
-            &[("target", target.into())],
+            &[
+                ("target", target.into()),
+                ("resolved_forward", forward.into()),
+            ],
         );
         let old = std::mem::replace(
             &mut self.page_turn_presentation.state,
