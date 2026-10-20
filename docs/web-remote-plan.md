@@ -716,10 +716,13 @@ remote-web 側で生成すると、本体が持つ以下をすべて複製する
 `SourceOnly` により初めから catalog を開かない。通常画像、ZIP 内画像、PDF／EPUB ページ、
 コンテナ代表サムネイルも、元データから生成できるものは catalog 無しで応答する。
 
-RAW の `CacheOnly` は既存キャッシュだけを使う制約を維持し、catalog を開けなければ
-既存のキャッシュ欠落応答とする。通常の open エラーでは read-only 再 open や元画像の
-現像へ進まない。maintenance により受付時の admission が失効した場合に限り、既存の
-read-only 継続を許す。再試行、待ち時間や閾値の調整、要求ごとの open 構造の変更は行わない。
+RAW の `CacheOnly` は既存キャッシュだけを使う制約を維持する。writable catalog を
+得られなければ、admission 失効・通常の open エラーのどちらでも、既存の
+`wait_read_admission` → `open_existing_read_only_admitted` による read-only 継続を1回だけ使う。
+書き込み用の移行等が失敗しても読める既存 RAW 行を返すための経路であり、writable open の
+リトライではない。read-only も開けない／行が無い場合は既存のキャッシュ欠落応答とし、
+元画像の生成・現像・catalog への書き込みは許さない。`CacheOnly` 以外はログを残して
+catalog 無しで復号を続ける。再試行、待ち時間や閾値の調整、要求ごとの open 構造の変更は行わない。
 新しい非同期状態や割り込みの組み合わせを追加せず、既存の任意 catalog と読み込み方針で扱う。
 IPC 応答型・protocol 版・catalog の本体側所有は変わらない。
 

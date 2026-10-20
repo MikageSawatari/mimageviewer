@@ -7774,7 +7774,7 @@ impl ContainerEngine {
         // SourceOnly is a display request and has no persistent thumbnail phase.
         // During deletion it must still decode ZIP/PDF source pixels, without
         // opening (or recreating) a catalog merely to satisfy the loader API.
-        let catalog = if request.source_policy.bypasses_cache() {
+        let mut catalog = if request.source_policy.bypasses_cache() {
             None
         } else {
             match catalog_work.open(catalog_folder) {
@@ -7785,43 +7785,42 @@ impl ContainerEngine {
                     )
                     .is_admitted(load_kind.admission()) =>
                 {
-                    if matches!(
-                        request.source_policy,
-                        crate::thumb_loader::LoadSourcePolicy::CacheOnly
-                    ) {
-                        // Only maintenance retirement permits a read-only continuation.
-                        // An ordinary open failure must not trigger another open attempt.
-                        let cache_dir = crate::catalog::default_cache_dir();
-                        let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
-                        let read_admission =
-                            access.wait_read_admission(&cancel).ok_or_else(|| {
-                                media_error(
-                                    MediaErrorCode::Cancelled,
-                                    "サムネイル要求は取り消されました",
-                                )
-                            })?;
-                        crate::catalog::CatalogDb::open_existing_read_only_admitted(
-                            &cache_dir,
-                            catalog_folder,
-                            read_admission,
-                        )
-                        .ok()
-                        .flatten()
-                        .map(Arc::new)
-                    } else {
-                        None
-                    }
+                    None
                 }
                 Err(error) => {
                     // The catalog only accelerates decoding and stores generated thumbnails.
                     // CacheOnly still cannot generate source pixels when the cache is absent.
                     crate::logger::log(format!(
-                        "remote_ipc: container catalog open failed; continuing without cache: {error}"
+                        "remote_ipc: container catalog open failed: {error}"
                     ));
                     None
                 }
             }
         };
+        if matches!(
+            request.source_policy,
+            crate::thumb_loader::LoadSourcePolicy::CacheOnly
+        ) && catalog.is_none()
+        {
+            // CacheOnly needs no writable catalog. Use the existing read-only path once
+            // after either maintenance retirement or an ordinary writable-open failure.
+            let cache_dir = crate::catalog::default_cache_dir();
+            let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
+            let read_admission = access.wait_read_admission(&cancel).ok_or_else(|| {
+                media_error(
+                    MediaErrorCode::Cancelled,
+                    "サムネイル要求は取り消されました",
+                )
+            })?;
+            catalog = crate::catalog::CatalogDb::open_existing_read_only_admitted(
+                &cache_dir,
+                catalog_folder,
+                read_admission,
+            )
+            .ok()
+            .flatten()
+            .map(Arc::new);
+        }
         let cache_map = Arc::new(RwLock::new(HashMap::new()));
         if !full_page
             && let Some(key) = crate::thumb_loader::cache_key_for_request(&request)
@@ -14760,7 +14759,7 @@ pub(super) mod tests {
         assert!(writer.shutdown());
         let log = std::fs::read_to_string(data_dir.path().join("mimageviewer.log")).unwrap();
         assert!(
-            log.contains("remote_ipc: container catalog open failed; continuing without cache:"),
+            log.contains("remote_ipc: container catalog open failed:"),
             "{log}"
         );
         assert_eq!(
@@ -14770,7 +14769,7 @@ pub(super) mod tests {
     }
 
     // Keep a readable RAW row, but fail writable open during schema migration.
-    // A read-only retry would succeed, making an unintended retry observable.
+    // The read-only continuation must return this row without generation or writes.
     pub(in crate::remote_ipc) fn catalog_with_failing_writer(raw_path: &Path) {
         let cache_dir = crate::catalog::default_cache_dir();
         let folder = raw_path.parent().unwrap();
@@ -14804,7 +14803,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn remote_cache_only_catalog_open_failure_does_not_reopen_or_generate() {
+    fn remote_cache_only_catalog_open_failure_reads_existing_thumbnail() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let path = data_dir.path().join("page.cr2");
         std::fs::write(&path, b"invalid raw with no preview").unwrap();
@@ -14818,16 +14817,11 @@ pub(super) mod tests {
             },
             &WorkerContext::without_databases(),
         );
-        assert!(
-            matches!(
-                response,
-                ThumbnailResponse::Error(mimageviewer_ipc::ThumbnailError {
-                    code: ThumbnailErrorCode::NoThumbnail,
-                    ..
-                })
-            ),
-            "{response:?}"
-        );
+        let ThumbnailResponse::Success { webp_bytes } = response else {
+            panic!("read-only RAW thumbnail failed: {response:?}");
+        };
+        let pixels = image::load_from_memory(&webp_bytes).unwrap();
+        assert_eq!((pixels.width(), pixels.height()), (8, 8));
     }
 
     #[test]

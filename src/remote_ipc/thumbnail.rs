@@ -468,41 +468,39 @@ impl ThumbnailEngine {
 
         let cache_dir = crate::catalog::default_cache_dir();
         let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
-        let catalog = match crate::catalog::CatalogDb::open_admitted(&cache_dir, parent, admission)
-        {
-            Ok(catalog) => Some(Arc::new(catalog)),
-            Err(_) if !access.is_admitted(admission) => {
-                if matches!(
-                    load_request.source_policy,
-                    crate::thumb_loader::LoadSourcePolicy::CacheOnly
-                ) {
-                    // Only maintenance retirement permits this read-only continuation.
-                    let read_admission =
-                        access.wait_read_admission(cancellation).ok_or_else(|| {
-                            error_response(
-                                ThumbnailErrorCode::NotReady,
-                                "サムネイル要求は取り消されました",
-                            )
-                        })?;
-                    crate::catalog::CatalogDb::open_existing_read_only_admitted(
-                        &cache_dir,
-                        parent,
-                        read_admission,
-                    )
-                    .ok()
-                    .flatten()
-                    .map(Arc::new)
-                } else {
+        let mut catalog =
+            match crate::catalog::CatalogDb::open_admitted(&cache_dir, parent, admission) {
+                Ok(catalog) => Some(Arc::new(catalog)),
+                Err(_) if !access.is_admitted(admission) => None,
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: thumbnail catalog open failed: {error}"
+                    ));
                     None
                 }
-            }
-            Err(error) => {
-                crate::logger::log(format!(
-                    "remote_ipc: thumbnail catalog open failed; continuing without cache: {error}"
-                ));
-                None
-            }
-        };
+            };
+        if matches!(
+            load_request.source_policy,
+            crate::thumb_loader::LoadSourcePolicy::CacheOnly
+        ) && catalog.is_none()
+        {
+            // A writable-open failure must not hide an existing RAW row that is readable.
+            // This continuation never permits source generation or catalog writes.
+            let read_admission = access.wait_read_admission(cancellation).ok_or_else(|| {
+                error_response(
+                    ThumbnailErrorCode::NotReady,
+                    "サムネイル要求は取り消されました",
+                )
+            })?;
+            catalog = crate::catalog::CatalogDb::open_existing_read_only_admitted(
+                &cache_dir,
+                parent,
+                read_admission,
+            )
+            .ok()
+            .flatten()
+            .map(Arc::new);
+        }
         let cache_map = Arc::new(RwLock::new(HashMap::new()));
         if let Some(key) = crate::thumb_loader::cache_key_for_request(&load_request)
             && let Some(catalog) = &catalog
@@ -1220,11 +1218,34 @@ mod tests {
     }
 
     #[test]
-    fn cache_only_catalog_open_failure_does_not_reopen_or_generate() {
+    fn cache_only_catalog_open_failure_reads_existing_thumbnail() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let path = data_dir.path().join("page.cr2");
         std::fs::write(&path, b"invalid raw with no preview").unwrap();
         super::super::container::tests::catalog_with_failing_writer(&path);
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
+        let result =
+            engine.generate_catalog_resolved(&resolved, 64, &WorkerContext::without_databases());
+        let bytes = result.expect("read-only RAW thumbnail");
+        let pixels = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((pixels.width(), pixels.height()), (8, 8));
+    }
+
+    #[test]
+    fn cache_only_catalog_open_failure_returns_no_thumbnail_when_read_only_also_fails() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let path = data_dir.path().join("page.cr2");
+        std::fs::write(&path, b"invalid raw with no preview").unwrap();
+        let cache_dir = crate::catalog::default_cache_dir();
+        std::fs::write(&cache_dir, b"cache directory blocked by a file").unwrap();
+        assert!(crate::catalog::CatalogDb::open(&cache_dir, data_dir.path()).is_err());
+        assert!(
+            crate::catalog::CatalogDb::open_existing_read_only(&cache_dir, data_dir.path())
+                .ok()
+                .flatten()
+                .is_none()
+        );
         let engine = ThumbnailEngine::new(crate::settings::Settings::default());
         let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
         let result =
@@ -1238,6 +1259,30 @@ mod tests {
                 }))
             ),
             "{result:?}"
+        );
+
+        let container = ContainerEngine::new(crate::settings::Settings::default());
+        let response = container.thumbnail(
+            &ThumbnailRequest {
+                address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+                source_address: None,
+                target_px: 64,
+            },
+            &WorkerContext::without_databases(),
+        );
+        assert!(
+            matches!(
+                response,
+                ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::NoThumbnail,
+                    ..
+                })
+            ),
+            "{response:?}"
+        );
+        assert_eq!(
+            std::fs::read(&cache_dir).unwrap(),
+            b"cache directory blocked by a file"
         );
     }
 
