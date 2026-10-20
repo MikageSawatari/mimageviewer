@@ -32,6 +32,15 @@
 
 ## 1. 優先候補
 
+### 1.406 連動した別ウィンドウ中の検索受付と結果採用の所有を揃える — §1.386 の独立設計レビューで分離 (2026-10-19)
+
+- 利用者決定: §1.386 は理由表示だけとし、Ctrl+R の条件拡大と Ctrl+G の同型欠陥を本項へ分離する。今回は未修正。
+- コード上の欠陥（実機未確認）: Ctrl+G は linked detached 中も開始できる。初回結果の `adopt_prepared_search_view` → `replace_search_view_items_with_ratings` (`src/global_search_ui.rs:3697,2176`、調査時 HEAD `be318299f`) が `invalidate_idx_state_and_queues` (`src/app.rs:44289`) で `fs_cache.clear()` し、連動中の VideoPlayer を Drop し得る。Everything は入口だけ広げても source切替／送信／採用前の `finish_everything_edit_boundary` が viewer を閉じる。
+- 後続設計: source交換時の main保持fork、同一結果の streaming/sort/rating の既存identity remap、detachedへ／からの表示切替と結果採用の直列化、forkのrating publicationの採用中再入防止を一緒に設計する。一律fork・追加guard・時間待ち・機能制限で代替しない。
+- C1は独立化／promote後の受動更新だけを止める。最初の移管とSearch producer/return originのmain所有、通常open／closeのpromote／parkを維持し、main以外からの二度目のpromoteを作らない。
+- 調査とレビュー申し送り: [Everything計画 §20.3](everything-search-plan.md#203-今回やらないこと後続-1406-への申し送り)。BA-7/BA-5の構造設計としてClaudeCodeと独立Codexの合意後に着手。Ctrl+G/Rのlinked動画／音声、切替途中、再投影、cancel/error/close/remountを回帰対象にする。
+- 規模 / 優先度: Medium / P2。
+
 ### 1.405 ページめくり: 戻る方向でも前の unit の final を先回り準備する — §1.401 から切り出し (2026-10-19)
 
 - 状態: **対応中 (次の版、利用者 2026-10-19)**。設計確認 → 実装 (Codex) → 独立レビュー。D3-3 (編集済み・注釈付きの頁) は §1.401 に残し、次の版の後。
@@ -103,9 +112,10 @@
 
 ### 1.386 Everything 検索 (Ctrl+R) が使えないとき、理由が分からない — 利用者の実機観測 (2026-10-16)
 - 観測 (利用者、v4.7.0): 動画を別ウィンドウ (メインと連動) で開いている間、「ファイル」→「Everything ファイル名検索…」が灰色になり、Ctrl+R を押しても何も起きない。メニューにマウスを乗せても理由が出ず、Ctrl+R でも通知が出ない。
-- 原因 (コード参照): `everything_search_entry_allowed` (src/global_search_ui/everything.rs) が `everything_main_grid_available` (fullscreen_idx・連動 detached の main history 抑止・native video fullscreen) と modal・Remote lock を見て無効にする。設計 docs/everything-search-plan.md の「発火面は main grid のみ」による仕様。Ctrl+G (アイテム検索) にはこの制限が無く、動きがそろっていない。
-- 対応 (次の版): (1) 無効のときはメニューのホバーで理由を出し、Ctrl+R では理由付きの通知を出す (ほかの機能と同じ UI)。(2) C1 (切り離した後の一覧は受動更新をしない) を踏まえ、連動中の別ウィンドウ再生中でも Everything 検索を始められるよう広げるか検討する (promote 経路は C1 で構造的に安全になった)。Ctrl+G との条件差も揃える。
+- 原因 (変更前のコード): `everything_search_entry_allowed` (src/global_search_ui/everything.rs) が main context/history処理スコープ・fullscreen_idx・native video fullscreen・modal・Remote lock をboolだけで判定し、メニューとキーの拒否に理由を渡していなかった。「発火面はmain gridのみ」の仕様は維持する。Ctrl+Gとの条件差と結果採用の欠陥は§1.406で扱う。
+- 対応 (次の版): 現行の可否条件を理由付きenumへ集約し、ファイル／お気に入り両メニューの無効時は既存hover helperで理由を表示する。非ModalのMain所有ROOT入力には実効KeyActionの非repeat押下で理由付き通知を出す。Modal・文字入力・IME・他viewportが所有するキーは通知も消費もしない。fullscreen所有入力の転送は追加しない。
 - 2026-10-16: マニュアル (manual/search.html) に「フルスクリーンや連動した別ウィンドウで閲覧している間は使えない」を追記済み。
+- 2026-10-19 利用者決定: 今回は現行の可否条件を保った理由表示だけ。Modal所有中のCtrl+Rは通知も消費もせず、その入力ownerへ任せる。条件拡大とCtrl+Gの結果採用の欠陥は§1.406へ分離した。元の「連動detachedのmain history抑止」は説明を訂正し、history suppressionはviewer処理スコープのdepth、linked中の拒否はraw fullscreen_idxにも由来する（計画§20.1）。
 - 規模 / 優先度: Small〜Medium / P2。
 
 ### 1.385 動画フルスクリーンで、VST の窓に重なった下 HUD が前に戻らない — 利用者の実機観測 (2026-10-15)
@@ -904,11 +914,10 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 
 #### 方針 (2026-09-15 開発者判断、利用者へ回答済み) と残る論点
 
-1. **1 文字語 — 未決**: bigram を作れないので**索引の照会には載せられない**。ただし最終判定の
-   post-filter は全語を保存原文への部分一致で見ているので、AND モードで他の語が候補を
-   絞っているなら、**索引照会から外して post-filter だけで判定する**ことはできる。許すかどうかは
-   2 と同じく決めること (候補内でもほぼ全件に当たるので絞り込み効果は小さい)。
-   **「構造的に不可」ではない** (2026-09-15 訂正)。
+1. **1 文字語 — 今どおり拒否 (2026-10-19 利用者決定)**: bigram を作れない語は、
+   他に長い語があっても検証段階で拒否し、メッセージに該当語を出す。
+   `build_bigram_and_query` の `None` へ落とさない。
+   索引照会から外して post-filter だけで判定する案も構造上は可能だったが、採用しない。
 2. **2 文字の英数字語 — 確定**: **AND モードでは、長さを満たす語が 1 つ以上あれば短い語も通す。**
    **OR モードは語ごとの検査を維持する** (1 語が候補を広げる側なので)。利用者へは
    「長い語で絞り込んだうえで短い語でさらに絞る、つまり両方を含む条件で動くように見直す」と
@@ -930,7 +939,7 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - AND モードの `EOS R5` が実行され、**`eos` と `r5` の両方を含む項目だけ**が出る。
 - **短い語だけの AND (`sd ai`) は従来どおり拒否**され、メッセージに該当語が出る。
 - **OR モードの `EOS R5` は従来どおり拒否**され、メッセージに `r5` が出る。
-- 1 文字語を含むクエリは、1 を決めるまでは拒否される (`build_bigram_and_query` の `None` へ落ちない)。
+- 1 文字語を含むクエリは拒否される (`build_bigram_and_query` の `None` へ落ちない)。
 - OR モードで短い語を足したときの候補数が、変更前から増えていない。
 - 日本語 2 文字 (`夕焼け` 等) の既存動作が変わらない。`夕 海` は従来どおり拒否。
 - Ctrl+F の挙動が変わらない (この検査は Ctrl+G 専用)。

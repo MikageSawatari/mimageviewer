@@ -47,6 +47,18 @@ impl App {
         let _keyboard_owner = self.keyboard_owner_for_pass(ctx);
     }
 
+    /// Establish this backend frame before any consumer can see native edges.
+    pub(super) fn input_begin_key_frame(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        crate::key_input::begin_frame_for_context_with_tracking(
+            ctx,
+            self.settings.page_turn_animation_enabled,
+        );
+        // Explain Main-owned refusals once, before fullscreen early returns.
+        // Both native and egui copies now belong to the same delivery frame.
+        self.notify_everything_search_shortcut_refusal(ctx);
+    }
+
     #[cfg(all(windows, feature = "test-script"))]
     pub(super) fn input_test_script_actions(&mut self, ctx: &egui::Context) {
         #[cfg(all(windows, feature = "test-script"))]
@@ -2110,5 +2122,164 @@ impl App {
     /// Must run even after update_frame returns, after this pass's modal/input gate.
     pub(super) fn post_render_sidecar_restore(&mut self, ctx: &egui::Context) {
         self.poll_sidecar_restore(ctx);
+    }
+}
+
+#[cfg(test)]
+mod everything_entry_tests {
+    use super::*;
+
+    #[test]
+    fn everything_refusal_runs_at_main_root_input_before_later_dispatch() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::R,
+                physical_key: Some(egui::Key::R),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        });
+        // Use the real owner snapshot: a linked viewer still allows Main input,
+        // although Everything's unchanged functional rule rejects that entry.
+        app.input_update_begin(&ctx);
+        assert!(app.fs_feedback_toast.is_none());
+        app.input_begin_key_frame(&ctx);
+        assert!(app.fs_feedback_toast.is_some());
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(ActionSurface::MainWindow)
+        );
+        assert!(!app.global_search.active);
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+    }
+
+    #[cfg(windows)]
+    fn ctrl_r_native_edge() -> crate::key_input::KeyEdge {
+        crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
+            source_hwnd: 1,
+            source_viewport: egui::ViewportId::ROOT,
+            virtual_key: 0x52,
+            scan_code: 0x13,
+            extended: false,
+            pressed: true,
+            repeat: false,
+            ctrl: true,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn ctrl_r_input() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: Some(egui::Key::R),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn everything_refusal_native_pending_and_egui_press_are_claimed_once_in_driver_order() {
+        let _serial = crate::key_input::lock_test_input();
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        crate::key_input::set_test_frame(vec![]);
+        crate::key_input::enqueue_test_pending_edge(ctrl_r_native_edge());
+        let ctx = egui::Context::default();
+        ctx.begin_pass(ctrl_r_input());
+
+        // Match update_frame: owner first, native ingestion/diagnostic, late dispatch.
+        app.input_update_begin(&ctx);
+        assert!(app.fs_feedback_toast.is_none());
+        app.input_begin_key_frame(&ctx);
+        let first = app.fs_feedback_toast.clone().expect("one refusal");
+        assert!(!ctx.input(|i| i.events.iter().any(|e| matches!(
+            e,
+            egui::Event::Key {
+                key: egui::Key::R,
+                pressed: true,
+                ..
+            }
+        ))));
+        assert!(!crate::key_input::pressed_key_down(
+            egui::ViewportId::ROOT,
+            |_| true
+        ));
+        assert!(!app.dispatch_everything_search_shortcut(&ctx));
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, first.1);
+        assert!(!app.notify_everything_search_shortcut_refusal(&ctx));
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn everything_refusal_does_not_reinterpret_previous_text_input_native_edge_as_main_input() {
+        use crate::keyboard_input::{KeyboardOwner, ShortcutSurface, TextInputPhase};
+        let _serial = crate::key_input::lock_test_input();
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        let ctx = egui::Context::default();
+        crate::key_input::enqueue_test_pending_edge(ctrl_r_native_edge());
+        ctx.begin_pass(ctrl_r_input());
+        crate::keyboard_input::cache_keyboard_owner(
+            &ctx,
+            KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: egui::Id::unique("old text owner"),
+                phase: TextInputPhase::Focused,
+            },
+        );
+        app.input_update_begin(&ctx);
+        app.input_begin_key_frame(&ctx);
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(crate::key_input::pressed_key_down(
+            egui::ViewportId::ROOT,
+            |_| true
+        ));
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+
+        ctx.begin_pass(Default::default());
+        app.input_update_begin(&ctx);
+        let permit = app
+            .keyboard_owner_for_pass(&ctx)
+            .shortcut_permit()
+            .expect("Main owner");
+        assert_eq!(permit.scope().surface, ShortcutSurface::Main);
+        // begin_frame has not expired the previous unconsumed native frame yet.
+        assert!(crate::key_input::pressed_key_down(
+            egui::ViewportId::ROOT,
+            |_| true
+        ));
+        assert!(app.fs_feedback_toast.is_none());
+        app.input_begin_key_frame(&ctx);
+        assert!(!crate::key_input::pressed_key_down(
+            egui::ViewportId::ROOT,
+            |_| true
+        ));
+        assert!(!app.dispatch_everything_search_shortcut(&ctx));
+        assert!(app.fs_feedback_toast.is_none());
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
     }
 }

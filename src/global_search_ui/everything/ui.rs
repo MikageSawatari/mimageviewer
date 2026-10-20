@@ -1,5 +1,27 @@
 //! Shared Everything controls and progress drawing. Request ownership stays in App.
 
+pub(crate) fn everything_search_menu_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    entry: super::EverythingSearchEntryAvailability,
+) -> egui::Response {
+    use crate::ui_helpers::HoverTipExt;
+    let response = ui.add_enabled(entry.is_allowed(), egui::Button::new(label));
+    match entry.reason_text() {
+        Some(reason) => response.hover_tip_disabled(reason),
+        None => response,
+    }
+}
+
+#[doc(hidden)]
+pub fn draw_everything_search_disabled_menu_snapshot_fixture(ui: &mut egui::Ui) {
+    everything_search_menu_button(
+        ui,
+        "Everything ファイル名検索…  Ctrl+R",
+        super::EverythingSearchEntryAvailability::LinkedViewer,
+    );
+}
+
 #[derive(Default)]
 pub(super) struct EverythingControls {
     pub(super) send: bool,

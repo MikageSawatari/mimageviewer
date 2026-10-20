@@ -4,6 +4,19 @@ v0.7.0 で導入した `egui_kittest` ベースの UI 回帰テストの運用�
 
 ## 目的
 
+Ctrl+G の短い語の拒否 (§1.229) は `global_search_short_term_reject_light` /
+`global_search_short_term_reject_dark` の2枚で、単語1つと複数語の表示を保持する。
+製品と共通の幅制限付きバッジを hover し、省略されたメッセージの全文も確認する。
+App・索引・実ウィンドウは起動しない。
+
+Everything 検索の無効理由（§1.386）は `everything_search_disabled_menu_hover_light` /
+`everything_search_disabled_menu_hover_dark` の2枚で保持する。製品と共通の無効buttonを実際にhoverし、
+理由本文・disabled状態を検査する。640×180の2枚は代表サイズであり、最小幅を意味しない。
+`MIN_INNER_SIZE` はUI倍率で割ってviewportへ設定され、小さい作業領域では最小寸法自体も縮む。
+最初の480ptのはみ出しをfixture拡大で避けた判断は誤りだった。共通tooltipを表示可能な論理幅から
+枠幅を引いた幅で折り返し、480pt・200%で320pt・小さい作業領域の200%で240ptもgeometry検査する。
+文言全文の矩形がviewport内に収まることをLight/Darkで検査し、共通helperの変更時は他のUI snapshotも比較する。
+
 egui の描画結果を PNG スナップショットとして保存し、意図しない見た目の変化を
 `cargo test` の段階で検出する。「ダイアログの色が変わった」「ラベルが折り返して
 レイアウトが崩れた」「テーマ切替で文字が読めない配色になった」などを早期にキャッチする。

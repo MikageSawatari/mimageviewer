@@ -2564,6 +2564,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ctrl_f_keeps_short_terms_and_phrase_matching_without_global_length_policy() {
+        let items = [
+            GridItem::Folder(PathBuf::from("C:/EOS R5 sd ai 夕海")),
+            GridItem::Folder(PathBuf::from("C:/R5 separate EOS")),
+            GridItem::Folder(PathBuf::from("C:/EOS only")),
+        ];
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        for (query, mode, expected) in [
+            ("EOS R5", crate::search_query::MatchMode::And, vec![0, 1]),
+            (r#""EOS R5""#, crate::search_query::MatchMode::And, vec![0]),
+            ("r5", crate::search_query::MatchMode::And, vec![0, 1]),
+            ("sd ai", crate::search_query::MatchMode::And, vec![0]),
+            ("夕 海", crate::search_query::MatchMode::And, vec![0]),
+            ("e", crate::search_query::MatchMode::And, vec![0, 1, 2]),
+            ("EOS R5", crate::search_query::MatchMode::Or, vec![0, 1, 2]),
+        ] {
+            let SearchThreadResult::Done { matches, .. } = run_metadata_search(
+                &crate::search_query::parse(query),
+                &items,
+                None,
+                &std::collections::HashMap::new(),
+                None,
+                &passwords,
+                &crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]),
+                mode,
+                &AtomicBool::new(false),
+                None,
+            );
+            assert_eq!(
+                matches,
+                expected.into_iter().collect(),
+                "{query:?} / {mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn current_folder_filter_searches_epub_name_but_not_generated_pdf_info() {
         let tmp = tempfile::tempdir().unwrap();
         let logical = tmp.path().join("sunflower_book.epub");
