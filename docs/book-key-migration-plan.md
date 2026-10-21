@@ -1006,7 +1006,7 @@ build-dev・本体起動・commit は行っていない。全件 gate の再実�
 ### 9.2 設計担当の検証
 
 - 本体 lib 全件 (`test-lib-full.ps1`): 6972a8534 で 7 件の失敗 (上記) とページめくり 15 件の失敗 (単独再実行で全件成功。
-  負荷による失敗)。0aef092b6 で 14,028 件成功。最終 fbed29360 の結果は下に追記する。
+  負荷による失敗)。0aef092b6 で 14,028 件成功。最終コード (fbed29360、以後は文書のみ) の 1 回目は 1 件失敗 (`section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps` がテスト内のファイル削除で Windows のエラー 32「別のプロセスが使用中」。このテストは未変更で、単独再実行は成功)、2 回目は **14,031 件成功**。
 - 隔離実アプリ確認 (観測者 ClaudeCode、fbed29360 の `build-dev.ps1 -PreserveRuntime`、隔離 data-dir
   `target\dev-runtime\data-verify`、本棚を `target\verify-books` に向けた設定、合成 fixture):
   - §1.245: サブフォルダ 2 + 画像 3 の ZIP で p2 に付けたしおりが「ZIP・CBZ / 2 ページ」(DB の hint 1)。
