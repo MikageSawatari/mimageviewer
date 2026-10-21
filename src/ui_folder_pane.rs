@@ -217,10 +217,11 @@ impl App {
         let default_width = (self.settings.folder_tree_pane_width_ratio * content_width)
             .clamp(FOLDER_PANE_MIN_WIDTH, max_width);
         let panel = egui::Panel::left("folder_tree_pane")
-            .resizable(true)
+            .resizable(!self.main_chrome_pointer_blocked())
             .default_size(default_width)
             .size_range(FOLDER_PANE_MIN_WIDTH..=max_width)
             .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 ui.add_enabled_ui(!disabled, |ui| {
                     self.render_folder_pane_header(ui);
                     ui.separator();

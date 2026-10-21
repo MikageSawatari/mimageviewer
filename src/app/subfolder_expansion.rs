@@ -1849,7 +1849,15 @@ impl App {
         navigation: Option<SubfolderExpansionAdoption>,
     ) {
         let roots = normalize_expansion_roots(&root, roots);
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Subfolder));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Subfolder),
+            navigation.as_ref().is_some_and(|adoption| {
+                matches!(
+                    adoption.navigation.history,
+                    MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
+                )
+            }),
+        );
         self.cancel_subfolder_expansion_pending();
         self.cancel_pending_folder_nav();
         self.subfolder_expansion_progress = Some(SubfolderExpansionProgress::default());
@@ -2224,7 +2232,15 @@ impl App {
             );
             return;
         }
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Subfolder));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Subfolder),
+            navigation.as_ref().is_some_and(|adoption| {
+                matches!(
+                    adoption.navigation.history,
+                    MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
+                )
+            }),
+        );
         if let Some(pending) = self.subfolder_expansion_install_pending.take() {
             pending.cancel();
         }

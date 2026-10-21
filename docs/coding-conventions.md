@@ -40,6 +40,10 @@
   止めるため、モデルレス Window と将来の登録漏れにも安全側で動く。state が存在しても
   Window を描かない phase がある処理は、state の有無ではなく「現在表示されるか」を返す
   helper を登録すること。
+- **メイン枠のポインター操作**: 各バーとフォルダーツリーは `gate_main_chrome` で停止する。
+  グリッドの右クリックメニューだけは除外し、modal への遷移時に既存 popup と submenu 状態を閉じる。
+  遷移判定は root の worker 採用・入力処理後、ウィンドウ描画前に1回だけ行い、
+  その後 dialog 自身が開いた popup は閉じない。無効化時の枠全体の配色は維持する。
 - 数十分以上続く取得・管理 UI (TensorRT パック等) はモデルレス tool window とし、
   `common_modal_dialog_open` へ含めて閲覧全体を停止しない。Window 上の入力だけは floating-layer
   guard で背面へ漏らさない。

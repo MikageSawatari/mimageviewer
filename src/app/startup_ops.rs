@@ -929,11 +929,35 @@ impl App {
         }
     }
 
-    /// A normal navigation supersedes an unresolved startup/activation/bookmark open. The
-    /// resolver is removed before its receiver can be polled; bookmark-owned state is cleared
-    /// only when its request ID is still current.
-    pub(crate) fn cancel_unresolved_open_for_navigation(&mut self) {
-        self.cancel_unresolved_open("normal_navigation");
+    /// New Local requests replace unresolved main opens, including a target still waiting for
+    /// modal admission. Reloads keep both deferred and resolving targets after Remote returns.
+    pub(crate) fn cancel_unresolved_open_for_navigation(&mut self, explicit_request: bool) {
+        if !explicit_request || self.remote_session_blocks_local_control() {
+            return;
+        }
+        self.startup_open_path = None;
+        let pending = self.startup_open_path_resolve_pending.take();
+        self.startup_open_path_resolve_pending =
+            pending.and_then(|pending| self.retire_unresolved_main_open_pending(pending));
+    }
+
+    fn retire_unresolved_main_open_pending(
+        &mut self,
+        mut pending: StartupOpenPathResolvePending,
+    ) -> Option<StartupOpenPathResolvePending> {
+        let held = pending.held_resolve_for_activation_admission.take();
+        let held = held.and_then(|held| self.retire_unresolved_main_open_pending(*held));
+        #[cfg(windows)]
+        if matches!(&pending.owner, StartupOpenPathOwner::Bookmark(owner)
+            if owner.detached_lease.is_some())
+        {
+            pending.held_resolve_for_activation_admission = held.map(Box::new);
+            return Some(pending);
+        }
+        // Detach the held chain before finishing this owner: replacement of main cannot
+        // recursively cancel a bookmark resolver owned by an independent reader lease.
+        self.finish_replaced_startup_open_pending(pending, "normal_navigation");
+        held
     }
 
     pub(crate) fn cancel_unresolved_open_for_remote_session(&mut self) {
@@ -2320,6 +2344,266 @@ fn resolve_startup_open_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn section1285_resolver(
+        app: &mut App,
+        owner: StartupOpenPathOwner,
+        requested: &Path,
+    ) -> (mpsc::Sender<StartupOpenPathResolveResult>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(requested.to_path_buf()).unwrap(),
+            owner,
+            navigation: None,
+            cancel: Arc::clone(&cancel),
+            rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+            held_resolve_for_activation_admission: None,
+            diagnostic: None,
+        });
+        (tx, cancel)
+    }
+
+    fn section1285_result(requested: &Path) -> StartupOpenPathResolveResult {
+        StartupOpenPathResolveResult {
+            requested: requested.to_path_buf(),
+            resolved: Some(crate::folder_tree::OpenablePathResolution {
+                path: requested.to_path_buf(),
+                kind: crate::folder_tree::OpenablePathKind::Directory,
+                requested_is_file: false,
+            }),
+            rar_volume_proof: None,
+            bookmark_relative_page_openable: None,
+            elapsed_ms: 1.0,
+            direct_media: None,
+        }
+    }
+
+    #[test]
+    fn section1285_new_main_requests_retire_startup_and_activation_resolvers() {
+        for activation in [false, true] {
+            for request in ["collection", "smart", "recent", "history", "dfs"] {
+                let mut app = setup_app_for_test();
+                app.active_quick_folder_slot = None;
+                let origin = app.tmp.path().join("origin");
+                let stale = app.tmp.path().join("stale-initial");
+                std::fs::create_dir(&origin).unwrap();
+                std::fs::create_dir(&stale).unwrap();
+                app.current_folder = Some(origin.clone());
+                let owner = if activation {
+                    StartupOpenPathOwner::Activation
+                } else {
+                    StartupOpenPathOwner::InitialStartup
+                };
+                let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
+                // Published-but-unpolled completion must lose in the same way as slow I/O.
+                tx.send(section1285_result(&stale)).unwrap();
+                match request {
+                    "collection" => app.open_collection_grid_from_navigation(
+                        crate::collection_store::CollectionId::new(),
+                    ),
+                    "smart" => {
+                        let mut definition = crate::settings::SmartFolderDefinition::new("Next");
+                        definition.rules.push(crate::settings::SmartFolderRule::new(
+                            origin.clone(),
+                            true,
+                            Default::default(),
+                        ));
+                        let id = definition.id;
+                        app.settings.smart_folders.push(definition);
+                        app.open_smart_folder_staged(id, false);
+                        assert!(app.smart_folder_transition.is_some());
+                    }
+                    "recent" => app.enter_reading_history_from_menu(),
+                    "history" => {
+                        app.push_nav_history_entry(reading_history_synthetic_path());
+                        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+                        assert!(app.items_are_reading_history_view);
+                    }
+                    "dfs" => app.start_folder_nav(origin, true, FolderNavMode::Grid),
+                    _ => unreachable!(),
+                }
+                assert!(cancel.load(Ordering::Relaxed), "{request}/{activation}");
+                assert!(app.startup_open_path_resolve_pending.is_none());
+                let folder = app.current_folder.clone();
+                let generation = app.items_generation;
+                app.poll_startup_open_path_resolve(&egui::Context::default());
+                assert_eq!(app.current_folder, folder);
+                assert_eq!(app.items_generation, generation);
+                assert!(tx.send(section1285_result(&stale)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn section1285_deferred_modal_target_is_replaced_by_explicit_local_navigation() {
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        let target = app.tmp.path().join("initial");
+        let other = app.tmp.path().join("local-choice");
+        std::fs::create_dir(&other).unwrap();
+        app.set_startup_open_path(target.clone());
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let epub = app.tmp.path().join("modal.epub");
+        std::fs::write(&epub, b"fixture").unwrap();
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &epub,
+            PdfOpenFailure::NotConverted,
+            StartupListIntent::ExplicitList,
+        );
+        let ctx = egui::Context::default();
+        app.poll_deferred_startup_open_path(&ctx);
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
+        app.load_folder(other.clone());
+        assert!(app.startup_open_path.is_none());
+        app.poll_deferred_startup_open_path(&ctx);
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert_eq!(app.current_folder.as_ref(), Some(&other));
+    }
+
+    #[test]
+    fn section1285_same_location_explicit_open_replaces_deferred_target_but_reload_keeps_it() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("adopted");
+        std::fs::create_dir(&folder).unwrap();
+        app.load_folder(folder.clone());
+        let target = app.tmp.path().join("initial");
+        app.set_startup_open_path(target.clone());
+        app.reload_current_folder_preserving_override();
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.load_folder(folder);
+        assert!(app.startup_open_path.is_none());
+    }
+
+    #[test]
+    fn section1285_reload_keeps_unresolved_initial_request_without_user_navigation() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("adopted");
+        let target = app.tmp.path().join("initial");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        app.load_folder(folder);
+        let (tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        app.reload_current_folder_preserving_override();
+        assert!(!cancel.load(Ordering::Relaxed));
+        tx.send(section1285_result(&target)).unwrap();
+        app.poll_startup_open_path_resolve(&egui::Context::default());
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn section1285_fix_and_unfix_list_retire_older_main_resolvers() {
+        let mut app = direct_reader_fixture();
+        let stale = app.tmp.path().join("old-initial");
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &stale);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert!(cancel.load(Ordering::Relaxed));
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &stale);
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_none());
+    }
+
+    #[test]
+    fn section1285_remote_retains_deferred_target_through_operations_and_local_reload() {
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        let folder = app.tmp.path().join("adopted");
+        let target = app.tmp.path().join("initial");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        app.load_folder(folder);
+        let (_tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "section1285".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        let ctx = egui::Context::default();
+        app.poll_remote_session(&ctx);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.retire_replaced_main_list_requests(None);
+        app.enter_reading_history();
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        app.poll_deferred_startup_open_path(&ctx);
+        assert!(app.startup_open_path.is_none());
+        assert_eq!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .unwrap()
+                .requested
+                .as_path(),
+            target.as_path()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1285_main_collection_keeps_detached_bookmark_even_under_activation() {
+        for held in [false, true] {
+            let mut app = setup_app_for_test();
+            let path = app.tmp.path().join("detached.zip");
+            let mut owner = arm_section1339_bookmark(&mut app, 1285, &path);
+            owner.detached_lease = Some(DetachedSessionLease { window_id: 1285 });
+            let (_tx, cancel) =
+                section1285_resolver(&mut app, StartupOpenPathOwner::Bookmark(owner), &path);
+            let mut activation_cancel = None;
+            if held {
+                let previous = app.startup_open_path_resolve_pending.take().unwrap();
+                let (_activation_tx, token) =
+                    section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &path);
+                activation_cancel = Some(token);
+                app.startup_open_path_resolve_pending
+                    .as_mut()
+                    .unwrap()
+                    .held_resolve_for_activation_admission = Some(Box::new(previous));
+            }
+            app.open_collection_grid_from_navigation(crate::collection_store::CollectionId::new());
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert!(
+                matches!(app.startup_open_path_resolve_pending.as_ref().map(|p| &p.owner),
+                Some(StartupOpenPathOwner::Bookmark(owner)) if owner.detached_lease.is_some())
+            );
+            if let Some(cancel) = activation_cancel {
+                assert!(cancel.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    #[test]
+    fn section1285_untouched_initial_resolver_still_opens_its_target() {
+        let mut app = setup_app_for_test();
+        let target = app.tmp.path().join("initial");
+        std::fs::create_dir(&target).unwrap();
+        let (tx, cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        tx.send(section1285_result(&target)).unwrap();
+        app.poll_startup_open_path_resolve(&egui::Context::default());
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "completed receiver retires normally"
+        );
+    }
 
     #[cfg(windows)]
     fn create_dir_link(target: &Path, link: &Path) -> bool {

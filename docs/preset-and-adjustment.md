@@ -124,6 +124,14 @@ content-identity restore 完了時は `is_physical_folder_listing()` が true �
 `is_removable` 判定は廃止済みで、呼び出し側 (`App::set_page_params`) で
 削除/保存の振り分けを行う構造になっている。
 
+§1.176 の一括操作では、この判定と変更前の実効値・表示位置を先に計画し、
+`AdjustmentDb::apply_page_param_writes` で set/delete を混在させて1トランザクションにする。
+1件版も同じ計画・保存・runtime反映を合成する。書き込み epoch は対象の page key だけに限定する。
+DB拒否時は区間全体をrollbackし、従来どおりruntimeを更新するが、sidecarと他contextへの
+accepted publishは進めない。失敗は区間で1回ログ・通知し、再試行や回復処理は追加しない。
+スロット一括適用・選択解除・標準一致のprune・Undo/Redoの連続Page区間がこの経路を使う。
+UndoのGlobal→Favorite→Page、Redoの既存順序とPage区間ごとのpublish境界は維持する。
+
 ### 1.3 スコープ選択とアクションボタン
 
 パネル上部は **2 行ラジオ** で、スライダーの書き込み先を選ぶ (v2.9.0)。
@@ -1440,15 +1448,15 @@ struct LocalAdjustmentChange {
 `Page` / `Favorite` の `None` は「そのスコープにエントリが存在しない =
 下層 (Favorite default / Global) にフォールバック」を表す。
 
-### 適用ロジック (`apply_adjustment_change_to_app`)
+### 適用ロジック (`apply_adjustment_changes_in_order`)
 
-スコープごとに既存の書き込み API を再利用する。ただし `Page(Some)` の復元は
-`set_page_params` の後に `clear_caches_for_param_change(old, new)` を通し、通常の
-スライダー / スロット適用と同じ final AI 差分無効化を行う。`set_page_params`
-単体は DB 更新・サイドカー更新・軽量な表示キャッシュ無効化までを担当し、
-final pipeline / AI cache の差分分類は呼び出し側責務。
+連続する `Page` / `PageKey` を同じ区間へ集め、`restore_page_params_for_targets` で
+計画・DB保存・runtime反映・accepted publishを行う。`Page(Some)` は通常の
+スライダー / スロット適用と同じ `clear_caches_for_param_change(old, new)` も通す。
+1件の `set_page_params` 単体は軽量な表示キャッシュ無効化までを担当し、
+final pipeline / AI cache の差分分類は従来どおり呼び出し側責務。
 
-`Page(None)` は `clear_page_params`、お気に入りとグローバルは
+`Page(None)` は1件の解除と同じruntime反映、お気に入りとグローバルは
 `set_favorite_default` / `clear_favorite_default` / `copy_params_to_global` を使う。
 これらの経路は通常操作と同じ副作用に乗せ、Undo 用に別の永続化経路を作らない。
 

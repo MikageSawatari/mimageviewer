@@ -4291,6 +4291,7 @@ impl App {
         let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
         let mut drill_back = false;
         egui::Panel::top("global_search_bar").show(root_ui, |ui| {
+            self.gate_main_chrome(ui);
             if running {
                 ui.disable();
             }

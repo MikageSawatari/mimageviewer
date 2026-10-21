@@ -7471,7 +7471,7 @@ impl App {
         let help_about_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpAbout);
 
         egui::Panel::top("menubar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() { ui.disable(); }
+            self.gate_main_chrome(ui);
             egui::MenuBar::new().ui(ui, |ui| {
                 let mut top_menu_responses = Vec::with_capacity(9);
 
@@ -10350,7 +10350,7 @@ impl App {
             Vec::new();
 
         egui::Panel::top("toolbar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() { ui.disable(); }
+            self.gate_main_chrome(ui);
             if toolbar_section_order.first() != Some(&crate::settings::ToolbarSectionId::Folder) {
                 ui.add_space(2.0);
             }
@@ -12657,7 +12657,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut sort_reload_requested = false;
         let mut sort_popup_open = false;
         egui::Panel::top("facet_filter_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() { ui.disable(); }
+            self.gate_main_chrome(ui);
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
                 let filter_label = egui::Label::new(egui::RichText::new("絞り込み:").small())
@@ -13053,6 +13053,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         egui::Panel::bottom("details_lazy_status_bar")
             .exact_size(25.0)
             .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     match self.details_image_dims_state {
@@ -15655,9 +15656,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
         egui::Panel::top("search_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() {
-                ui.disable();
-            }
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("検索:").on_hover_text(format!(
@@ -15854,9 +15853,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut query_changed = false;
 
         egui::Panel::top("favsearch_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() {
-                ui.disable();
-            }
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
@@ -16023,9 +16020,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut clicked_tag: Option<String> = None;
 
         egui::Panel::top("tag_view_bar").show(root_ui, |ui| {
-            if self.composition_editor_modal_active() {
-                ui.disable();
-            }
+            self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");
@@ -20563,6 +20558,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .exact_size(selection_info_bar_height(root_ui.style()))
             .show_separator_line(true)
             .show(root_ui, |ui| {
+                self.gate_main_chrome(ui);
                 let source_rect = ui.available_rect_before_wrap();
                 let avail_w = source_rect.width().max(1.0);
                 let pixels_per_point = ui.ctx().pixels_per_point();

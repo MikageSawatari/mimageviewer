@@ -576,6 +576,17 @@ navigation supersession 時の record/cursor の rollback journal は作らず�
 activation / bookmark に既存の modal-held behavior がある場合はそれを保ち、modal を横切って強制採用しない。
 Remote が初期 explicit target を延期する既存 semantics も保持。target ごとに new resume owner を増やさない。
 
+§1.285（2026-10-21）の要求退役は既存 `retire_replaced_main_list_requests` に集約する。
+main の未解決 InitialStartup / Activation / Bookmark を退役し、activation admission が保持した
+resolver 鎖にも同じ main 限定規則を適用する。detached lease のある Bookmark は保持する。
+まだ resolve を開始していない `startup_open_path` も、Local の新しい明示要求で退役する。
+物理 open は既存 `StartupListIntent`、合成一覧は既存 `MainHistoryOperation`、Smart root は
+既存 refresh intent で新規要求と再読込を区別し、同じ場所への明示 open も新規要求に含める。
+Remote 所有中と返却後の自動再読込は延期した起動先を消さず、Local 復帰後の通常 poll へ残す。
+synthetic 履歴 replay、DFS 開始、固定一覧の固定/解除は直接 install するため同じ退役へ接続する。
+検索結果の遅延採用と同一覧の再投影は新規要求にしない。完了時の pending take と、activation
+拒否時だけ held resolver を戻す既存順序は変更しない。新しい owner / pending / 待機は追加しない。
+
 admission 待ち以外のパス解決/scan全体はモーダルにしない。モーダルを無期限に保つと本目標と矛盾し、
 遅い share が別フォルダへ移る操作まで止める。代わりに既存 navigation の取消・単一採用を使う。
 変換・パスワード・保存は既存モーダルのままで、今回その内部の interleaving を増やさない。

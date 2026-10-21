@@ -103186,6 +103186,30 @@ mod bulk_adjust_cost_tests {
         let t = Instant::now();
         app.apply_meta_redo();
         let slot_redo_ms = ms(t);
+        app.checked.extend(0..PAGES);
+        let t = Instant::now();
+        app.capture_adjust_full("解除の計測".into(), |a| {
+            a.clear_page_params_for_selection()
+        });
+        let clear_ms = ms(t);
+        let mut ai_params = params(10.0);
+        ai_params.upscale_model = Some("measurement-ai".into());
+        // 過去に閲覧済みの AI 世代も含め、全体無効化の反復コストを比較する。
+        for idx in 0..PAGES {
+            app.ai_upscale_generation.insert(format!("viewed-{idx}"), 0);
+        }
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.clear_caches_for_param_change(idx, &params(10.0), &ai_params);
+        }
+        let ai_legacy_cache_ms = ms(t);
+        app.settings.preset_slots.slots[0].as_mut().unwrap().params = ai_params;
+        app.checked.extend(0..PAGES);
+        let t = Instant::now();
+        app.capture_adjust_full("AI適用の計測".into(), |a| {
+            a.apply_slot_to_grid_selection(0)
+        });
+        let ai_slot_apply_ms = ms(t);
         // setup_app は data_dir のテスト用ロックを持つので、次を作る前に手放す。
         drop(app);
 
@@ -103332,6 +103356,9 @@ mod bulk_adjust_cost_tests {
         println!("  実経路 Ctrl+1 適用  : {slot_apply_ms:9.1} ms");
         println!("  実経路 取り消し     : {slot_undo_ms:9.1} ms");
         println!("  実経路 やり直し     : {slot_redo_ms:9.1} ms");
+        println!("  実経路 一括解除     : {clear_ms:9.1} ms");
+        println!("  実経路 AI変更スロット: {ai_slot_apply_ms:9.1} ms");
+        println!("  旧AI全体cache無効化 x N (世代N件): {ai_legacy_cache_ms:9.1} ms");
         println!("  ── 部品 (N 回の合計) ──");
         for (name, value) in &rows {
             println!("  {name:<58}: {value:9.1} ms");

@@ -219,20 +219,7 @@ impl App {
                 //  古い Favorite 標準で発火して entry が消える事故が起きる。Codex P1)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
                 order.sort_by_key(|&i| adjust_scope_priority(&changes[i].scope));
-                let mut documents = std::collections::HashMap::new();
-                for i in order {
-                    // Publish each contiguous Page segment before a later
-                    // standard change can prune its overrides (notably Redo).
-                    if !matches!(
-                        changes[i].scope,
-                        AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_)
-                    ) {
-                        self.publish_accepted_adjustment_page_edits(&documents);
-                        documents.clear();
-                    }
-                    self.apply_adjustment_change_to_app(&changes[i], true, &mut documents);
-                }
-                self.publish_accepted_adjustment_page_edits(&documents);
+                self.apply_adjustment_changes_in_order(changes, &order, true);
             }
             UndoEntry::LocalAdjustment { changes, .. } => {
                 self.resolve_local_restore_targets(changes);
@@ -304,20 +291,7 @@ impl App {
                 // Redo は元操作の自然順 (Page → Favorite → Global、つまり下層から上層)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
                 order.sort_by_key(|&i| std::cmp::Reverse(adjust_scope_priority(&changes[i].scope)));
-                let mut documents = std::collections::HashMap::new();
-                for i in order {
-                    // Publish each contiguous Page segment before a later
-                    // standard change can prune its overrides (notably Redo).
-                    if !matches!(
-                        changes[i].scope,
-                        AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_)
-                    ) {
-                        self.publish_accepted_adjustment_page_edits(&documents);
-                        documents.clear();
-                    }
-                    self.apply_adjustment_change_to_app(&changes[i], false, &mut documents);
-                }
-                self.publish_accepted_adjustment_page_edits(&documents);
+                self.apply_adjustment_changes_in_order(changes, &order, false);
             }
             UndoEntry::LocalAdjustment { changes, .. } => {
                 self.resolve_local_restore_targets(changes);
@@ -455,46 +429,51 @@ impl App {
         Ok(())
     }
 
-    /// 画像補正 Undo/Redo の 1 件適用。スコープに応じて対応する書き込みパス
-    /// (`set_page_params` / `clear_page_params` / `set_favorite_default` /
-    /// `clear_favorite_default` / `copy_params_to_global`) に流す — これらは
-    /// すべて DB / settings / キャッシュクリアの副作用を含むので、Undo 用に
-    /// 別経路を組まずに既存の書き込み API を再利用する。
-    fn apply_adjustment_change_to_app(
+    fn apply_adjustment_changes_in_order(
         &mut self,
-        c: &AdjustmentChange,
+        changes: &[AdjustmentChange],
+        order: &[usize],
         use_before: bool,
-        documents: &mut std::collections::HashMap<String, Option<crate::adjustment::AdjustParams>>,
     ) {
-        let target = if use_before { &c.before } else { &c.after };
-        match &c.scope {
-            AdjustUndoScope::Page(idx) => match target {
-                Some(p) => {
-                    let old = self.effective_params(*idx).clone();
-                    self.set_page_params(*idx, p.clone());
-                    self.clear_caches_for_param_change(*idx, &old, p);
+        let mut pages = Vec::new();
+        for &i in order {
+            let change = &changes[i];
+            let value = if use_before {
+                &change.before
+            } else {
+                &change.after
+            };
+            let page = match &change.scope {
+                AdjustUndoScope::PageKey(target) => Some(target.clone()),
+                AdjustUndoScope::Page(idx) => self
+                    .page_adjustment_target_for_idx(*idx)
+                    .filter(|_| value.is_some() || self.adjustment_page_params.contains_key(idx)),
+                _ => None,
+            };
+            if matches!(
+                change.scope,
+                AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_)
+            ) {
+                if let Some(target) = page {
+                    pages.push((target, value.clone()));
                 }
-                None => {
-                    // 個別エントリを消す経路。`clear_page_params` は AI キャッシュも
-                    // 適切に落としてくれる。エントリが既に無ければ no-op。
-                    if self.adjustment_page_params.contains_key(idx) {
-                        self.clear_page_params(*idx);
-                    }
-                }
-            },
-            AdjustUndoScope::PageKey(page_target) => {
-                self.restore_page_params_for_target_collect(page_target, target.clone(), documents);
+                continue;
             }
-            AdjustUndoScope::Favorite(id) => match target {
-                Some(p) => self.set_favorite_default(*id, p.clone()),
-                None => self.clear_favorite_default(*id),
-            },
-            AdjustUndoScope::Global => {
-                // Global は常に値を持つので、Some 前提。万一 None ならデフォルトに戻す。
-                let p = target.clone().unwrap_or_default();
-                self.copy_params_to_global(p);
+            // 標準を変更する前に、その時点の標準で Page 区間を確定する。
+            self.restore_page_params_for_targets(&pages);
+            pages.clear();
+            match &change.scope {
+                AdjustUndoScope::Favorite(id) => match value {
+                    Some(params) => self.set_favorite_default(*id, params.clone()),
+                    None => self.clear_favorite_default(*id),
+                },
+                AdjustUndoScope::Global => {
+                    self.copy_params_to_global(value.clone().unwrap_or_default())
+                }
+                _ => unreachable!(),
             }
         }
+        self.restore_page_params_for_targets(&pages);
     }
 
     /// 補正レイヤー Undo/Redo の 1 件適用。
