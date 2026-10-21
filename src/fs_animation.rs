@@ -593,17 +593,14 @@ mod tests {
 
     #[test]
     fn decode_gif_static_returns_none() {
-        let dir = std::env::temp_dir().join("mimageviewer_test");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("static_1frame.gif");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("static_1frame.gif");
 
         let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
         img.save(&path).unwrap();
 
         let result = decode_gif_frames(&path);
         assert!(result.is_none(), "single-frame GIF should return None");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]

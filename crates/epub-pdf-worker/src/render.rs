@@ -762,9 +762,8 @@ mod tests {
     }
     #[test]
     fn merge_removes_internal_uri_links_and_their_actions() {
-        let dir =
-            std::env::temp_dir().join(format!("epub-pdf-internal-links-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let part = dir.join("part.pdf");
         let out = dir.join("merged.pdf");
         linked_page(
@@ -791,15 +790,11 @@ mod tests {
                 .windows(b"epub.invalid".len())
                 .any(|part| part == b"epub.invalid")
         );
-        fs::remove_file(part).unwrap();
-        fs::remove_file(out).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
     #[test]
     fn merge_keeps_external_uri_links() {
-        let dir =
-            std::env::temp_dir().join(format!("epub-pdf-external-links-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let part = dir.join("part.pdf");
         let out = dir.join("merged.pdf");
         let links = [
@@ -813,9 +808,6 @@ mod tests {
             link_uris(&out),
             [links[0].0.to_owned(), links[2].0.to_owned()]
         );
-        fs::remove_file(part).unwrap();
-        fs::remove_file(out).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
     fn assert_no_print_url_in_info(path: &Path) {
         let doc = Document::load(path).unwrap();
@@ -851,8 +843,8 @@ mod tests {
     }
     #[test]
     fn merge_fixed_print_parts_drop_chromium_info() {
-        let dir = std::env::temp_dir().join(format!("epub-pdf-fixed-info-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let a = dir.join("fixed-1.pdf");
         let b = dir.join("fixed-2.pdf");
         let out = dir.join("merged.pdf");
@@ -875,10 +867,6 @@ mod tests {
         assert_eq!(info_text_value(info.get(b"Title").unwrap()), "本の題名");
         assert_eq!(info_text_value(info.get(b"Author").unwrap()), "著者");
         assert_no_print_url_in_info(&out);
-        for file in [a, b, out] {
-            fs::remove_file(file).unwrap();
-        }
-        fs::remove_dir(dir).unwrap();
     }
     fn info_text_value(value: &Object) -> String {
         let bytes = value.as_str().unwrap();
@@ -891,8 +879,8 @@ mod tests {
     }
     #[test]
     fn merge_without_opf_title_uses_epub_stem_and_no_author() {
-        let dir = std::env::temp_dir().join(format!("epub-pdf-stem-info-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let part = dir.join("part.pdf");
         let out = dir.join("saved.pdf");
         printed_page(&part, "epub.invalid/_miv_print_1%2Ehtml");
@@ -911,15 +899,11 @@ mod tests {
         assert_eq!(info_text_value(info.get(b"Title").unwrap()), "書名なし");
         assert!(info.get(b"Author").is_err());
         assert_no_print_url_in_info(&out);
-        fs::remove_file(part).unwrap();
-        fs::remove_file(out).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
     #[test]
     fn merge_without_opf_title_uses_original_stem_when_input_is_source_copy() {
-        let dir =
-            std::env::temp_dir().join(format!("epub-pdf-original-stem-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let part = dir.join("part.pdf");
         let out = dir.join("saved.pdf");
         printed_page(&part, "epub.invalid/_miv_print_1%2Ehtml");
@@ -936,14 +920,11 @@ mod tests {
         let info = doc.get_object(info).unwrap().as_dict().unwrap();
         assert_eq!(info_text_value(info.get(b"Title").unwrap()), "MyNovel");
         assert_no_print_url_in_info(&out);
-        fs::remove_file(part).unwrap();
-        fs::remove_file(out).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
     #[test]
     fn merge_keeps_order_boxes_and_rtl() {
-        let dir = std::env::temp_dir().join(format!("epub-pdf-merge-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let a = dir.join("a.pdf");
         let b = dir.join("b.pdf");
         let out = dir.join("merged.pdf");
@@ -977,10 +958,6 @@ mod tests {
             assert_eq!(&bytes[..2], &[0xfe, 0xff]);
             assert_eq!(String::from_utf16(&units).unwrap(), expected);
         }
-        fs::remove_file(a).unwrap();
-        fs::remove_file(b).unwrap();
-        fs::remove_file(out).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -988,9 +965,8 @@ mod tests {
         let package = package_with_metadata(
             r#"<dc:title xmlns:dc="x">本の題名</dc:title><dc:creator xmlns:dc="x">第一著者</dc:creator><dc:creator xmlns:dc="x">第二著者</dc:creator>"#,
         );
-        let dir =
-            std::env::temp_dir().join(format!("epub-pdf-package-info-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let part = dir.join("page.pdf");
         let out = dir.join("book.pdf");
         one_page(&part, 300, 400);
@@ -1017,8 +993,5 @@ mod tests {
                 .collect();
             assert_eq!(String::from_utf16(&utf16).unwrap(), expected);
         }
-        fs::remove_file(part).unwrap();
-        fs::remove_file(out).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
 }

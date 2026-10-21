@@ -598,12 +598,12 @@ mod tests {
                 .expect("encode jpeg");
             out.into_inner()
         }
+        let dir = tempfile::tempdir().unwrap();
         for (w, h) in [(4000u32, 3000u32), (6000, 4000), (8000, 6000)] {
             let jpeg = photo_like_jpeg(w, h);
             let mp = (w as f64 * h as f64) / 1e6;
             let mb = jpeg.len() as f64 / 1e6;
-            let dir = std::env::temp_dir();
-            let path = dir.join(format!("miv_stamp_timing_{w}x{h}.jpg"));
+            let path = dir.path().join(format!("miv_stamp_timing_{w}x{h}.jpg"));
             {
                 let mut f = std::fs::File::create(&path).expect("create temp");
                 f.write_all(&jpeg).expect("write temp");
@@ -613,7 +613,6 @@ mod tests {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             assert!(src.is_some(), "embed should succeed for {w}x{h}");
             eprintln!("embed_file_stamp {w}x{h} ({mp:.0}MP, {mb:.1}MB JPEG) -> {ms:.0}ms");
-            let _ = std::fs::remove_file(&path);
         }
     }
 
