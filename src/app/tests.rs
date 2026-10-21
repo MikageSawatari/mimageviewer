@@ -1171,6 +1171,7 @@ fn mutation_refresh_loaded_thumb(ctx: &egui::Context) -> ThumbnailState {
         origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
         from_edit_preview: false,
         rendered_at_px: 1,
+        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
         source_dims: None,
         layout_dims: None,
     }
@@ -4901,6 +4902,7 @@ fn metadata_import_keeps_unaffected_thumb_adjustment() {
             },
             from_edit_preview: false,
             rendered_at_px: 1,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1, 1)),
             layout_dims: None,
         })
@@ -6179,6 +6181,8 @@ fn phase_a_seed_shared_preview() -> (phase_c_support::AppTestEnv, PathBuf, Strin
         1,
         5,
         None,
+        crate::page_dims::CanonicalPageDimensions::new(2, 2),
+        None,
         Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
         None,
         None,
@@ -7420,6 +7424,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
                     },
                     from_edit_preview: false,
                     rendered_at_px: 2,
+                    source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                     source_dims: Some((900, 1400)),
                     layout_dims: None,
                 }
@@ -7493,6 +7498,7 @@ fn spread_units_rebuild_only_when_saved_rotation_changes_landscape_state() {
             },
             from_edit_preview: false,
             rendered_at_px: 2,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((600, 900)),
             layout_dims: None,
         })
@@ -10804,6 +10810,7 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
         origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
         from_edit_preview: true,
         rendered_at_px: 64,
+        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
         source_dims: Some((1, 1)),
         layout_dims: None,
     };
@@ -22236,6 +22243,7 @@ mod phase_c_folder_nav_history_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 2,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         };
@@ -30672,6 +30680,7 @@ mod phase_c_drill_nav_tests {
                     },
                     from_edit_preview: false,
                     rendered_at_px: 64,
+                    source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                     source_dims: Some((1, 1)),
                     layout_dims: None,
                 },
@@ -30791,6 +30800,7 @@ mod phase_c_drill_nav_tests {
             },
             from_edit_preview: true,
             rendered_at_px: 2,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((2, 2)),
             layout_dims: None,
         };
@@ -30825,6 +30835,7 @@ mod phase_c_drill_nav_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 2,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((2, 2)),
             layout_dims: None,
         };
@@ -30910,6 +30921,7 @@ mod phase_c_drill_nav_tests {
                     },
                     from_edit_preview: false,
                     rendered_at_px: side as u32,
+                    source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                     source_dims: Some((side as u32, side as u32)),
                     layout_dims: None,
                 })
@@ -38109,6 +38121,7 @@ mod favorite_adjustment_defaults_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
             from_edit_preview: true,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((4000, 3000)),
             layout_dims: None,
         });
@@ -38204,6 +38217,7 @@ mod favorite_adjustment_defaults_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1920, 1080)),
             layout_dims: None,
         });
@@ -38281,6 +38295,7 @@ mod favorite_adjustment_defaults_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((4000, 3000)),
             layout_dims: None,
         });
@@ -38341,6 +38356,7 @@ mod favorite_adjustment_defaults_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 496,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((884, 444)),
             layout_dims: None,
         });
@@ -38660,6 +38676,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 400,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((884, 444)),
             layout_dims: None,
         });
@@ -39587,6 +39604,7 @@ mod favorite_adjustment_defaults_tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 1,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some(source_dims),
                 layout_dims: None,
             }
@@ -39652,6 +39670,7 @@ mod favorite_adjustment_defaults_tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 1,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some(source_dims),
                 layout_dims: None,
             }
@@ -39949,6 +39968,7 @@ mod favorite_adjustment_defaults_tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 1,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some(source_dims),
                 layout_dims: None,
             }
@@ -40062,6 +40082,7 @@ mod favorite_adjustment_defaults_tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 1,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some((1600, 900)),
                 layout_dims: None,
             });
@@ -40117,6 +40138,7 @@ mod favorite_adjustment_defaults_tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 1,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some((1600, 900)),
                 layout_dims: None,
             });
@@ -44463,6 +44485,7 @@ mod favorite_adjustment_defaults_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 1,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         };
@@ -45411,6 +45434,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 1,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1, 1)),
             layout_dims: None,
         };
@@ -47269,6 +47293,7 @@ mod favorite_adjustment_defaults_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
             from_edit_preview: true,
             rendered_at_px: 128,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1, 1)),
             layout_dims: None,
         };
@@ -47943,6 +47968,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((2, 3)),
             layout_dims: None,
         };
@@ -48041,6 +48067,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((2, 3)),
             layout_dims: None,
         };
@@ -48051,6 +48078,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((2, 3)),
             layout_dims: None,
         };
@@ -49517,6 +49545,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 247,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((884, 444)),
             layout_dims: None,
         });
@@ -50258,6 +50287,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         });
@@ -50308,6 +50338,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         }];
@@ -50348,6 +50379,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         }];
@@ -50736,6 +50768,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 1,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         });
@@ -50746,6 +50779,7 @@ mod favorite_adjustment_defaults_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 1,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         });
@@ -50784,6 +50818,7 @@ mod favorite_adjustment_defaults_tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 1,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: None,
                 layout_dims: None,
             })
@@ -50822,6 +50857,7 @@ mod favorite_adjustment_defaults_tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 1,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: None,
                 layout_dims: None,
             })
@@ -51275,6 +51311,7 @@ mod favorite_adjustment_defaults_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         });
@@ -52050,6 +52087,7 @@ mod favorite_adjustment_defaults_tests {
                     },
                     from_edit_preview: false,
                     rendered_at_px: 64,
+                    source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                     source_dims: Some((1, 1)),
                     layout_dims: None,
                 },
@@ -53243,6 +53281,7 @@ mod pipeline_cache_refactor_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 64,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((2, 1)),
             layout_dims: None,
         };
@@ -58552,6 +58591,7 @@ mod pipeline_cache_refactor_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 2,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((2, 2)),
             layout_dims: None,
         };
@@ -58611,6 +58651,7 @@ mod pipeline_cache_refactor_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 8,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((800, 1201)),
             layout_dims: None,
         };
@@ -58699,6 +58740,7 @@ mod pipeline_cache_refactor_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 8,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((800, 1201)),
             layout_dims: None,
         };
@@ -76585,6 +76627,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             },
             from_edit_preview: false,
             rendered_at_px: 128,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1, 1)),
             layout_dims: None,
         };
@@ -77106,6 +77149,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 1,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1, 1)),
             layout_dims: None,
         };
@@ -81798,6 +81842,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     },
                     from_edit_preview: false,
                     rendered_at_px: 20,
+                    source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                     source_dims: Some((20, 20)),
                     layout_dims: None,
                 },
@@ -107527,6 +107572,7 @@ mod background_click_scroll_regression_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: size[0].max(size[1]) as u32,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         };

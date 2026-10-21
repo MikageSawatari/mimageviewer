@@ -469,6 +469,7 @@ fn original_preview_nonfinal_and_faithful_spread_never_reuse_frozen_native() {
                         origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
                         from_edit_preview: false,
                         rendered_at_px: 12,
+                        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                         source_dims: Some((80, 120)),
                         layout_dims: None,
                     };
@@ -600,6 +601,7 @@ fn install_allowed_thumbnails(
                 origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
                 from_edit_preview: false,
                 rendered_at_px: 12,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some((80, 120)),
                 layout_dims: None,
             };

@@ -231,6 +231,7 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
                 origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
                 from_edit_preview: false,
                 rendered_at_px: 12,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some((80, 120)),
                 layout_dims: None,
             };

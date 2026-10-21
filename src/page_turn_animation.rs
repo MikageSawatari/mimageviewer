@@ -22,6 +22,14 @@ pub(crate) enum PageMaterial {
         uv: [Pos2; 4],
         available_uv: Rect,
     },
+    /// Printed material occupies only this part of the canonical page. The
+    /// page frame and underlay still cover the entire leaf. UV corners belong
+    /// to `domain`, not the full page, and remain within the prepared sampler.
+    PartialTexture {
+        texture_id: TextureId,
+        uv: [Pos2; 4],
+        domain: Rect,
+    },
     Blank {
         color: Color32,
     },
@@ -118,6 +126,24 @@ pub(crate) fn normalize_spread_window(
 }
 fn half_material(material: &PageMaterial, right: bool) -> PageMaterial {
     match material {
+        PageMaterial::PartialTexture {
+            texture_id,
+            uv,
+            domain,
+        } => PageMaterial::PartialTexture {
+            texture_id: *texture_id,
+            uv: *uv,
+            domain: Rect::from_min_max(
+                pos2(
+                    domain.min.x * 2.0 - if right { 1.0 } else { 0.0 },
+                    domain.min.y,
+                ),
+                pos2(
+                    domain.max.x * 2.0 - if right { 1.0 } else { 0.0 },
+                    domain.max.y,
+                ),
+            ),
+        },
         PageMaterial::Texture {
             texture_id,
             uv,
@@ -901,6 +927,14 @@ fn preflight(old: &CanonicalUnit, new: &CanonicalUnit) -> Result<(), ProjectionF
                 ));
             }
             for material in std::iter::once(&page.material).chain(page.underlay.iter()) {
+                if let PageMaterial::PartialTexture { uv, domain, .. } = material {
+                    if !valid_rect(*domain)
+                        || signed_area(uv).abs() < f32::EPSILON
+                        || uv.iter().any(|p| !p.is_finite() || !unit_uv().contains(*p))
+                    {
+                        return Err(ProjectionFailure::IncompleteRoi("invalid_partial_material"));
+                    }
+                }
                 if let PageMaterial::Texture {
                     uv, available_uv, ..
                 } = material
@@ -1068,7 +1102,30 @@ fn flat_surface(meshes: &mut Vec<ProjectedMesh>, surface: &Surface<'_>) {
     {
         let (texture, color) = material_style(material);
         let mut mesh = Mesh::with_texture(texture);
-        for p in &surface.polygon {
+        let partial_polygon;
+        let polygon = if matches!(material, PageMaterial::PartialTexture { .. }) {
+            let material_rect = material_domain(material);
+            partial_polygon = clip_rect(
+                &surface.polygon,
+                Rect::from_min_max(
+                    pos2(
+                        surface.rect.left() + material_rect.left() * surface.rect.width(),
+                        surface.rect.top() + material_rect.top() * surface.rect.height(),
+                    ),
+                    pos2(
+                        surface.rect.left() + material_rect.right() * surface.rect.width(),
+                        surface.rect.top() + material_rect.bottom() * surface.rect.height(),
+                    ),
+                ),
+            );
+            &partial_polygon
+        } else {
+            &surface.polygon
+        };
+        if polygon.len() < 3 {
+            continue;
+        }
+        for p in polygon {
             let display = pos2(
                 (p.x - surface.rect.left()) / surface.rect.width(),
                 (p.y - surface.rect.top()) / surface.rect.height(),
@@ -1079,7 +1136,7 @@ fn flat_surface(meshes: &mut Vec<ProjectedMesh>, surface: &Surface<'_>) {
                 color: color.gamma_multiply(surface.alpha),
             });
         }
-        for i in 1..surface.polygon.len() - 1 {
+        for i in 1..polygon.len() - 1 {
             mesh.indices
                 .extend_from_slice(&[0, i as u32, (i + 1) as u32]);
         }
@@ -1128,7 +1185,32 @@ fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, 
             .iter()
             .chain(std::iter::once(&leaf.page.material))
         {
-            materials.push((material, leaf.image_parameters()));
+            let image = leaf.image_parameters();
+            if !matches!(material, PageMaterial::PartialTexture { .. }) {
+                materials.push((material, image));
+                continue;
+            }
+            let mut partial = material_domain(material);
+            if (leaf.sign < 0.0) != leaf.back {
+                partial = Rect::from_min_max(
+                    pos2(1.0 - partial.right(), partial.top()),
+                    pos2(1.0 - partial.left(), partial.bottom()),
+                );
+            }
+            let domain = Rect::from_min_max(
+                pos2(
+                    image.left() + partial.left() * image.width(),
+                    image.top() + partial.top() * image.height(),
+                ),
+                pos2(
+                    image.left() + partial.right() * image.width(),
+                    image.top() + partial.bottom() * image.height(),
+                ),
+            )
+            .intersect(image);
+            if valid_rect(domain) {
+                materials.push((material, domain));
+            }
         }
     }
     for (material, domain) in materials {
@@ -1157,7 +1239,19 @@ fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, 
                     .max(0.72);
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: leaf.position(u, v),
-                    uv: material_uv(material, leaf.display(local_u, local_v)),
+                    uv: material_uv(
+                        material,
+                        if matches!(material, PageMaterial::PartialTexture { .. }) {
+                            leaf.display(
+                                (u - leaf.image_parameters().left())
+                                    / leaf.image_parameters().width(),
+                                (v - leaf.image_parameters().top())
+                                    / leaf.image_parameters().height(),
+                            )
+                        } else {
+                            leaf.display(local_u, local_v)
+                        },
+                    ),
                     color: shade_color(color, light),
                 });
             }
@@ -1243,7 +1337,8 @@ fn append_solid_polygon(mesh: &mut Mesh, poly: &[Pos2], color: Color32) {
 }
 fn material_style(material: &PageMaterial) -> (TextureId, Color32) {
     match material {
-        PageMaterial::Texture { texture_id, .. } => (*texture_id, Color32::WHITE),
+        PageMaterial::Texture { texture_id, .. }
+        | PageMaterial::PartialTexture { texture_id, .. } => (*texture_id, Color32::WHITE),
         PageMaterial::Blank { color } => (TextureId::default(), *color),
         PageMaterial::Vacant => (TextureId::default(), Color32::TRANSPARENT),
     }
@@ -1251,7 +1346,20 @@ fn material_style(material: &PageMaterial) -> (TextureId, Color32) {
 fn material_uv(material: &PageMaterial, display: Pos2) -> Pos2 {
     match material {
         PageMaterial::Texture { uv, .. } => bilinear_uv(*uv, display),
+        PageMaterial::PartialTexture { uv, domain, .. } => bilinear_uv(
+            *uv,
+            pos2(
+                ((display.x - domain.left()) / domain.width()).clamp(0.0, 1.0),
+                ((display.y - domain.top()) / domain.height()).clamp(0.0, 1.0),
+            ),
+        ),
         PageMaterial::Blank { .. } | PageMaterial::Vacant => egui::epaint::WHITE_UV,
+    }
+}
+fn material_domain(material: &PageMaterial) -> Rect {
+    match material {
+        PageMaterial::PartialTexture { domain, .. } => *domain,
+        _ => unit_uv(),
     }
 }
 fn incoming_owner(page: &CanonicalPage) -> FaceOwner {
@@ -1449,6 +1557,130 @@ mod tests {
             }
         }
         (old, new)
+    }
+
+    #[test]
+    fn source_coverage_partial_material_projects_inside_full_paper_for_single_and_pair_turns() {
+        let domain = Rect::from_min_max(pos2(0.25, 0.125), pos2(0.75, 0.875));
+        for pair in [false, true] {
+            for quarter in 0..4 {
+                let (mut old, mut new) = fixture(pair);
+                for unit in [&mut old, &mut new] {
+                    unit.pixels_per_point = 1.375;
+                    for page in &mut unit.pages {
+                        let uv = rectangle(unit_uv());
+                        page.material = PageMaterial::PartialTexture {
+                            texture_id: TextureId::User(page.occurrence.unwrap()),
+                            uv: std::array::from_fn(|i| uv[(i + quarter) % 4]),
+                            domain,
+                        };
+                    }
+                }
+                for reading_rtl in [false, true] {
+                    for forward in [false, true] {
+                        let direction = TurnDirection {
+                            reading_rtl,
+                            forward,
+                        };
+                        let recipe = prepare_turn(&old, &new, direction).unwrap();
+                        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                            let projected =
+                                project_prepared(&old, &new, direction, recipe, progress, false)
+                                    .unwrap();
+                            assert_eq!(projected.finished, progress == 1.0);
+                            for draw in &projected.meshes {
+                                if matches!(draw.mesh.texture_id, TextureId::User(_)) {
+                                    assert!(
+                                        draw.mesh.vertices.iter().all(|v| unit_uv().contains(v.uv)),
+                                        "never sample absent crop pixels"
+                                    );
+                                }
+                            }
+                            if progress == 1.0 {
+                                assert_eq!(projected.visibility.incoming.len(), new.pages.len());
+                                for page in &new.pages {
+                                    let texture = TextureId::User(page.occurrence.unwrap());
+                                    let printed = projected
+                                        .meshes
+                                        .iter()
+                                        .find(|m| m.mesh.texture_id == texture)
+                                        .unwrap();
+                                    let bounds = printed.mesh.vertices.iter().fold(
+                                        Rect::NOTHING,
+                                        |bounds, vertex| {
+                                            bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
+                                        },
+                                    );
+                                    let expected = Rect::from_min_max(
+                                        pos2(
+                                            page.rect.left() + domain.left() * page.rect.width(),
+                                            page.rect.top() + domain.top() * page.rect.height(),
+                                        ),
+                                        pos2(
+                                            page.rect.left() + domain.right() * page.rect.width(),
+                                            page.rect.top() + domain.bottom() * page.rect.height(),
+                                        ),
+                                    );
+                                    assert!((bounds.min - expected.min).length() < 0.001);
+                                    assert!((bounds.max - expected.max).length() < 0.001);
+                                    assert!(
+                                        projected.meshes.iter().any(|m| m.mesh.texture_id
+                                            == TextureId::default()
+                                            && m.mesh
+                                                .vertices
+                                                .iter()
+                                                .any(|v| v.pos == page.rect.left_top())),
+                                        "full paper remains outside partial material"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_coverage_landscape_halves_keep_original_crop_uv_and_empty_half_is_presented() {
+        let (mut unit, _) = fixture(false);
+        let domain = Rect::from_min_max(pos2(0.25, 0.125), pos2(0.75, 0.875));
+        unit.pages[0].material = PageMaterial::PartialTexture {
+            texture_id: TextureId::User(1),
+            uv: [
+                pos2(0.0, 0.0),
+                pos2(1.0, 0.0),
+                pos2(1.0, 1.0),
+                pos2(0.0, 1.0),
+            ],
+            domain,
+        };
+        let halves = normalize_spread_window(unit, SpreadWindow::Landscape).unwrap();
+        assert_eq!(
+            material_uv(&halves.pages[0].material, pos2(1.0, 0.5)),
+            pos2(0.5, 0.5)
+        );
+        assert_eq!(
+            material_uv(&halves.pages[1].material, pos2(0.0, 0.5)),
+            pos2(0.5, 0.5)
+        );
+        assert!(
+            halves
+                .pages
+                .iter()
+                .all(|p| p.underlay.is_some() && p.occurrence.is_some())
+        );
+        let mut left_only = halves.clone();
+        left_only.pages[1].material = PageMaterial::Blank {
+            color: Color32::TRANSPARENT,
+        };
+        let direction = TurnDirection {
+            reading_rtl: false,
+            forward: true,
+        };
+        let projected = project_turn(&left_only, &left_only, direction, 1.0).unwrap();
+        assert!(projected.finished);
+        assert_eq!(projected.visibility.incoming.len(), 2);
     }
     pub(super) fn portrait_pdf_fixture(pair: bool) -> (CanonicalUnit, CanonicalUnit) {
         let (mut old, mut new) = fixture(pair);
@@ -2612,6 +2844,7 @@ mod tests {
                             pos2(0.0, 1.0),
                         ]
                     }
+                    PageMaterial::PartialTexture { .. } => true,
                     PageMaterial::Blank { .. } | PageMaterial::Vacant => false,
                 })
                 .count();

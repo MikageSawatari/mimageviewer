@@ -1540,6 +1540,7 @@ mod book_resume_meter_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 128,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((999, 17)),
             layout_dims: None,
         }
@@ -2505,6 +2506,7 @@ mod book_resume_meter_tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 128,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1, 1)),
             layout_dims: None,
         };
@@ -3394,6 +3396,7 @@ fn snapshot_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
         origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
         from_edit_preview: false,
         rendered_at_px: 128,
+        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
         source_dims: Some((1920, 1080)),
         layout_dims: None,
     }
@@ -3535,6 +3538,7 @@ mod bottom_left_content_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 128,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         }

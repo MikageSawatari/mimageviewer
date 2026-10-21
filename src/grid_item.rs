@@ -519,7 +519,8 @@ pub enum ThumbnailState {
     /// され、source 出力は同じ表示要求を重複評価しないための coverage を保持する。
     /// `rendered_at_px` は生成時の長辺ピクセル数で、現在のセルサイズと比較して
     /// 著しく小さい場合 (列数変更後など) もアップグレード対象になる。
-    /// `source_dims` は元画像 / PDF raster のピクセル寸法 (旧カタログ由来は None)。
+    /// `source_dims` は一覧素材のピクセル寸法 (編集プレビューは crop 後、旧カタログは None)。
+    /// `source_coverage` は素材の生成時に収録した範囲と crop 前の座標寸法を保持する。
     /// `layout_dims` は PDF page box の 1/1000 point 寸法で、raster の丸めと独立する。
     Loaded {
         tex: egui::TextureHandle,
@@ -528,6 +529,7 @@ pub enum ThumbnailState {
         /// 元画像で上書きする idle quality-upgrade の対象にしない。
         from_edit_preview: bool,
         rendered_at_px: u32,
+        source_coverage: crate::source_coverage::SourceCoverage,
         source_dims: Option<(u32, u32)>,
         layout_dims: Option<(u32, u32)>,
     },

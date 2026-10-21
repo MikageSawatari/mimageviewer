@@ -254,6 +254,7 @@ pub mod reading_history_db;
 pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]
 mod settings_override;
+pub mod source_coverage;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
 mod vram_budget;

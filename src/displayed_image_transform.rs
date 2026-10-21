@@ -870,31 +870,164 @@ pub(crate) fn paint_source_region_texture(
     texture_uv_rect: egui::Rect,
     tint: egui::Color32,
 ) {
-    let source_uvs = [
+    let Some(quad) = source_region_texture_quad(
+        full_image_rect,
+        rotation,
+        free_rotation_rad,
+        source_uv_rect,
+        source_uv_rect,
+        None,
+    ) else {
+        return;
+    };
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    for (position, texture_uv) in quad.positions.into_iter().zip(quad.uv) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: position,
+            uv: egui::pos2(
+                texture_uv_rect.left() + texture_uv.x * texture_uv_rect.width(),
+                texture_uv_rect.top() + texture_uv.y * texture_uv_rect.height(),
+            ),
+            color: tint,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// One mapping boundary for partial source material and a native ROI within it.
+/// Coverage is immutable material provenance; the requested source region is
+/// display trim/split. Neither changes the full-image fit frame.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourceRegionTextureQuad {
+    pub(crate) positions: [egui::Pos2; 4],
+    pub(crate) uv: [egui::Pos2; 4],
+    pub(crate) source_uv_rect: egui::Rect,
+}
+
+pub(crate) fn source_region_texture_quad(
+    full_image_rect: egui::Rect,
+    rotation: Rotation,
+    free_rotation_rad: f32,
+    coverage: egui::Rect,
+    requested: egui::Rect,
+    native_sampler_roi: Option<egui::Rect>,
+) -> Option<SourceRegionTextureQuad> {
+    if !rect_is_valid(full_image_rect)
+        || !rect_is_valid(coverage)
+        || !rect_is_valid(requested)
+        || !free_rotation_rad.is_finite()
+    {
+        return None;
+    }
+    let sampler_roi = native_sampler_roi.unwrap_or_else(full_uv_rect);
+    if !rect_is_valid(sampler_roi) {
+        return None;
+    }
+    let material_source = normalized_sub_rect(coverage, sampler_roi);
+    let source_uv_rect = requested.intersect(coverage).intersect(material_source);
+    if !rect_is_valid(source_uv_rect) {
+        return None;
+    }
+    let corners = [
         source_uv_rect.left_top(),
         source_uv_rect.right_top(),
         source_uv_rect.right_bottom(),
         source_uv_rect.left_bottom(),
     ];
-    let texture_uvs = [
-        texture_uv_rect.left_top(),
-        texture_uv_rect.right_top(),
-        texture_uv_rect.right_bottom(),
-        texture_uv_rect.left_bottom(),
-    ];
-    let mut mesh = egui::Mesh::with_texture(texture_id);
-    for (source, texture_uv) in source_uvs.into_iter().zip(texture_uvs) {
+    let positions = corners.map(|source| {
         let (u, v) = forward_uv(rotation, source.x, source.y);
         let position = egui::pos2(
             full_image_rect.left() + u * full_image_rect.width(),
             full_image_rect.top() + v * full_image_rect.height(),
         );
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: rotate_about(position, full_image_rect.center(), free_rotation_rad),
-            uv: texture_uv,
-            color: tint,
-        });
+        rotate_about(position, full_image_rect.center(), free_rotation_rad)
+    });
+    let uv = corners.map(|source| {
+        egui::pos2(
+            ((source.x - material_source.min.x) / material_source.width()).clamp(0.0, 1.0),
+            ((source.y - material_source.min.y) / material_source.height()).clamp(0.0, 1.0),
+        )
+    });
+    Some(SourceRegionTextureQuad {
+        positions,
+        uv,
+        source_uv_rect,
+    })
+}
+
+impl DisplayedImageGeometry {
+    pub(crate) fn material_quad(
+        &self,
+        coverage: egui::Rect,
+        native_sampler_roi: Option<egui::Rect>,
+    ) -> Option<SourceRegionTextureQuad> {
+        source_region_texture_quad(
+            self.full_image_rect,
+            self.rotation,
+            self.free_rotation_rad,
+            coverage,
+            self.uv_rect,
+            native_sampler_roi,
+        )
     }
+
+    pub(crate) fn paint_material_texture(
+        &self,
+        painter: &egui::Painter,
+        texture_id: egui::TextureId,
+        coverage: egui::Rect,
+        native_sampler_roi: Option<egui::Rect>,
+        tint: egui::Color32,
+    ) {
+        paint_source_coverage_texture(
+            painter,
+            texture_id,
+            self.full_image_rect,
+            self.rotation,
+            self.free_rotation_rad,
+            coverage,
+            self.uv_rect,
+            native_sampler_roi,
+            tint,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_source_coverage_texture(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    full_image_rect: egui::Rect,
+    rotation: Rotation,
+    free_rotation_rad: f32,
+    coverage: egui::Rect,
+    requested: egui::Rect,
+    native_sampler_roi: Option<egui::Rect>,
+    tint: egui::Color32,
+) {
+    let Some(quad) = source_region_texture_quad(
+        full_image_rect,
+        rotation,
+        free_rotation_rad,
+        coverage,
+        requested,
+        native_sampler_roi,
+    ) else {
+        return;
+    };
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    mesh.vertices
+        .extend(
+            quad.positions
+                .into_iter()
+                .zip(quad.uv)
+                .map(|(pos, uv)| egui::epaint::Vertex {
+                    pos,
+                    uv,
+                    color: tint,
+                }),
+        );
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
 }
@@ -1980,6 +2113,108 @@ mod tests {
         FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS, SpecifiedScaleAxis,
         SpecifiedScaleAxisSetting,
     };
+
+    #[test]
+    fn coverage_quad_retains_full_fit_and_source_mapping_for_every_display_mode() {
+        let coverage = egui::Rect::from_min_max(
+            egui::pos2(101.0 / 1200.0, 37.0 / 800.0),
+            egui::pos2(903.0 / 1200.0, 709.0 / 800.0),
+        );
+        for fit in [
+            FullscreenFitMode::Page,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+            FullscreenFitMode::Original,
+            FullscreenFitMode::SpecifiedScale,
+        ] {
+            for rotation in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                for free in [0.0, 0.217] {
+                    for requested in [
+                        None,
+                        Some(egui::Rect::from_min_max(
+                            egui::pos2(0.2, 0.15),
+                            egui::pos2(0.9, 0.85),
+                        )),
+                        Some(egui::Rect::from_min_max(
+                            egui::Pos2::ZERO,
+                            egui::pos2(0.5, 1.0),
+                        )),
+                        Some(egui::Rect::from_min_max(
+                            egui::pos2(0.5, 0.0),
+                            egui::pos2(1.0, 1.0),
+                        )),
+                    ] {
+                        let mut value = input(FullscreenFitMode::Page, rotation, requested);
+                        value.free_rotation_rad = free;
+                        value.pixels_per_point = 1.375;
+                        value.fit_mode = if fit == FullscreenFitMode::SpecifiedScale {
+                            specified_input(
+                                value.source_size,
+                                crate::settings::FullscreenSpecifiedScale::default(),
+                            )
+                            .fit_mode
+                        } else {
+                            FullscreenFitInput::legacy(fit)
+                        };
+                        let transform = DisplayedImageTransform::resolve(value).unwrap();
+                        let frame = transform.paint_quad();
+                        let quad = transform.material_quad(coverage, None).unwrap();
+                        assert_eq!(transform.paint_quad(), frame);
+                        assert_eq!(quad.source_uv_rect, coverage.intersect(transform.uv_rect));
+                        for (position, uv) in quad.positions.into_iter().zip(quad.uv) {
+                            let source = egui::pos2(
+                                coverage.left() + uv.x * coverage.width(),
+                                coverage.top() + uv.y * coverage.height(),
+                            );
+                            pos_close(position, transform.source_normalized_to_screen(source));
+                            pos_close(transform.screen_to_source_normalized(position), source);
+                            assert!(full_uv_rect().contains(uv));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_quad_composes_native_sampler_roi_and_rejects_empty_intersection() {
+        let coverage = egui::Rect::from_min_max(egui::pos2(0.2, 0.1), egui::pos2(0.8, 0.9));
+        let roi = egui::Rect::from_min_max(egui::pos2(0.25, 0.125), egui::pos2(0.75, 0.875));
+        let transform =
+            DisplayedImageTransform::resolve(input(FullscreenFitMode::Page, Rotation::Cw270, None))
+                .unwrap();
+        let quad = transform.material_quad(coverage, Some(roi)).unwrap();
+        rect_close(
+            quad.source_uv_rect,
+            egui::Rect::from_min_max(egui::pos2(0.35, 0.2), egui::pos2(0.65, 0.8)),
+        );
+        assert_eq!(
+            quad.uv,
+            [
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0)
+            ]
+        );
+        let outside = egui::Rect::from_min_max(egui::pos2(0.9, 0.0), egui::pos2(1.0, 1.0));
+        assert!(
+            source_region_texture_quad(
+                transform.full_image_rect,
+                transform.rotation,
+                0.0,
+                coverage,
+                outside,
+                None
+            )
+            .is_none()
+        );
+    }
 
     fn input(
         fit_mode: FullscreenFitMode,

@@ -230,6 +230,7 @@ fn final_only_page(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
         origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
         from_edit_preview: false,
         rendered_at_px: 240,
+        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
         source_dims: Some((160, 240)),
         layout_dims: Some((600_000, 900_000)),
     };

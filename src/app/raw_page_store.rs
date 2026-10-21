@@ -1300,6 +1300,7 @@ pub(crate) mod tests {
                 },
                 from_edit_preview: false,
                 rendered_at_px: 2,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some((12000, 8000)),
                 layout_dims: None,
             },
@@ -1665,6 +1666,7 @@ pub(crate) mod tests {
                         },
                         from_edit_preview: false,
                         rendered_at_px: 3,
+                        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                         source_dims: Some((12000, 8000)),
                         layout_dims: None,
                     },
@@ -2322,6 +2324,9 @@ impl App {
     ) -> bool {
         self.is_raw_page(idx)
             || self.is_passthrough_rendition_texture_id(source_id)
+            || self
+                .fs_source_coverage_for_texture(idx, source_id)
+                .is_partial()
             || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
     }
 

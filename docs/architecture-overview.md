@@ -263,6 +263,25 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 
 ## 2. モジュールマップ
 
+§1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）は crop 済みの編集 preview を
+部分素材として扱う。収録範囲は生成時の実整数 pixel bounds から求めて preview と同時保存し、
+現在 crop から復元しない。一覧は crop 後の比率を使い、部分素材のページ構成・fit・座標基準には
+crop 前の正規寸法を供給する。正規座標の元寸法、実 raster 寸法、PDF page-box の layout 寸法は別物である。
+PDF の既知 page-box cache 値も preview の独立 nullable layout 列へ同時保存し、preview hit から
+復元する。旧行／通常画像は `None`。layout のための追加 PDF IPC や preview の待機を加えない。
+収録範囲が全体の素材の従来 sizing は保ち、Unknown の旧行は一覧で保持する一方、現在 crop ありの
+fullscreen／通過／animation には共通 typed policy で使わない。詳細は
+[表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ)。
+
+素材の由来は `ThumbnailState::Loaded`／CPU 下地から既存の `FullscreenPaintResource`、
+`FullscreenPresentationResource`、paint payload へ値として継承する。共有純粋 helper
+`source_region_texture_quad` が coverage・表示要求・素材内 native ROI を合成し、全画像 transform
+上の頂点と texture UV を返す。ページ全体の下地と `PageMaterial::PartialTexture` の画像 domain を
+分けて、通常描画／紙めくり／passive snapshot 再描画／navigator／ルーペ／パノラマ navigator／
+保持素材復元へ接続する。capture 済み素材を現在の thumbnail metadata で置換しない。
+既存 resource owner に載せることで新しい idx 別 map、preview 失効の同期化、全 context reset、
+専用 worker を増やさない。まれな保存失敗は既定の割り切りとし、多段の復旧処理を追加しない。
+
 ### コア
 
 | モジュール | 役割 |
@@ -350,6 +369,7 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
+| `source_coverage.rs` | §1.165 B1 の素材の収録範囲。`SourceCoverage::{FullSource, Known(EditPreviewGeometry), Unknown}` が通常素材・生成由来が既知の編集 preview・旧行を区別する。正規座標の元寸法、切り出し前 raster 寸法、実整数 pixel bounds を別に持ち、現在 crop と独立した UV を供給する。Unknown の代役可否は共通 typed policy 一か所で解決する |
 | `fullscreen_specified_scale.rs` | `FullscreenFitInput` が legacy fit と指定値＋`FullscreenFitBasis` を型で区別する。A（canonical aspect）と O（AI 前の物理原寸）を正規化し、任意軸の％ / logical px、合成 unit の実効 gap、既存倍率制限と指定方式だけの自動 5 倍上限を純粋計算する。PDF の O は page metadata と既存 Original 長辺 / native cap から解き、現在 raster へ依存しない |
 | `displayed_image_transform.rs` | identity に依存しない `DisplayedImageGeometry` が fit descriptor / scale limit / trim / 90 度・free rotation / 通常または Z の zoom-pan から paint・hit・UV rect、source↔screen 写像、total scale を一度に解決する。指定方式の `layout_full_image_rect` は A/O 由来の安定した fit 枠で、実 raster の縦横比丸めは枠内の contain と sampling へ閉じる。ページは `DisplayedImageTransform` が page idx を付け、類似候補はページへ偽装せず geometry を利用する。見開き端の単ページは `SingletonSpreadPlacement` と同じページ寸法の仮想 2-slot canvasをlayoutにだけ持ち、page/sourceを増やさず既存 4 方式・SpecifiedScale と Z を解く。`FullscreenPageLayout` は各 viewer の最後に描いた Single / Spread / Continuous の transform を paint 順で保持し、`ViewerContextBundle` とともに交換する。navigator・ルーペ・範囲コピーはその viewer の layout を参照する。見開き・連結読みの配置計算自体は `ui_fullscreen.rs` が担当する |
 | `vendor/egui` | egui 0.37.0の判定済みpointer release列、viewport別IME中断、寿命を持つ承認済み退役commandを所有。連続clickは上流の距離6points条件を採用する。実discard再pass直前の生成済みdeltaを、Contextに対応する既存backend rendererへ一度だけ移譲する。原本記録と差分は`vendor/upstream-provenance.json`とcrate内`PATCHES.md`を参照 |
@@ -604,7 +624,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
-| `edit_preview_cache.db` | 非破壊編集結果を一覧へ戻す派生 preview の対応表 / LRU。page source の mtime + size に加え、ZIP/PDF 親代表から同じ preview を安全に読むため container size も保持する。WebP 本体は `edit_preview_cache/` 配下で、各 row が item-key hash directory の下地 + 注釈 layer を単独所有する | `edit_preview_cache.rs` |
+| `edit_preview_cache.db` | 非破壊編集結果を一覧へ戻す派生 preview の対応表 / LRU。page source の mtime + size と親代表用 container size、crop 後の一覧寸法を保持する。§1.165 B1 は released v6 を維持し nullable `source_coverage_json`／`layout_dims_json` を加法追加する。旧行/WebP を残し、新生成は実 pixel bounds と正規座標/raster 寸法、独立したPDF page-box寸法を同じ upsert で保存する。WebP 本体は `edit_preview_cache/` 配下で、各 row が item-key hash directory の下地 + 注釈 layer を単独所有する | `edit_preview_cache.rs` + `source_coverage.rs` |
 | `video_pins.db` | ユーザーがフルスクリーン HUD で指定した動画フレームの抽出 WebP。`(path, pin_pts_secs, thumb_webp, thumb_pts_secs)`。folder thumb pin の source が動画のときは `seed_folder_video_pin_thumbs` が起動時にこの WebP を catalog にミラー seed する。左ジャンプパネルのピン行もこの WebP を再利用する | `video_pins.rs` |
 | `video_bookmarks.db` | 動画ブックマーク (pts / title / jump panel 用 WebP)。初回表示時に FFmpeg worker で取得したサムネを `thumb_webp` に保存し、次回以降は DB から復元する | `video_bookmarks.rs` |
 | `video_chapter_thumbs.db` | 埋め込みチャプターの jump panel 用 WebP キャッシュ。path + file size + mtime + chapter start をキーにし、動画更新後は古いサムネを参照しない | `video_chapter_thumbs.rs` |

@@ -641,6 +641,7 @@ mod tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
             from_edit_preview: false,
             rendered_at_px: 5,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: None,
             layout_dims: None,
         };
@@ -702,6 +703,7 @@ mod tests {
                 origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
                 from_edit_preview: false,
                 rendered_at_px: 3,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: None,
                 layout_dims: None,
             }];

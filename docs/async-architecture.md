@@ -31,6 +31,21 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 
 ## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）
 
+§1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）は編集 preview の既存 worker が
+切り出し前 raster と実 `pixel_bounds` から生成由来を作り、WebP 参照と同じ DB upsert で保存する。
+released v6 の nullable coverage migration では旧行を保持する。crop DB の更新と preview Delete
+の間を新しい待機や共有 transaction で同期させず、preview 自身の generation-time metadata を
+thumbnail 応答／CPU 下地／既存 paint・presentation resource に継承する。
+PDF page-box は既知の cache 値を coverage と独立の nullable layout 列へ同時保存し、preview hit
+から復元する。通常画像／旧行は `None`。早期 preview のために追加の PDF IPC／待機は入れない。
+読み込み側は現在 crop から範囲を再構成せず、旧 Unknown の表示可否だけを共通 typed policy で解く。
+
+snapshot capture・保持・再描画も同じ resource と由来を保持する。mount／park／promote の所有移譲、
+context の要求世代／取消／channel、兄弟 context の cache は既存 owner のままである。
+追加の idx map、全 context reset、失効 ACK 待機、専用 worker は作らない。まれな DB／保存失敗は
+既定の割り切り（ログ＋既存通知・単純な作り直し）とする。幾何・互換契約は
+[表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ) を参照。
+
 画像producerと通常GPU prepareの実行配置は従来どおりで、演出用workerや待機queueを作らない。
 安定viewでは既存bindと共有するview比較と通常cache keyでNativeの需要一致を確認して出力を再利用する。
 品質publication後の新sourceのresampleは従来どおりthaw後に始め、view/key変更時は通常prepareへ進む。

@@ -10375,6 +10375,8 @@ enum EditPreviewCloseUpdate {
         source_mtime: i64,
         source_size: i64,
         source_container_path: Option<PathBuf>,
+        coordinate_dims: crate::page_dims::CanonicalPageDimensions,
+        layout_dims: Option<(u32, u32)>,
         pixels: Arc<egui::ColorImage>,
         annotations: Option<crate::edit_preview_cache::EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
@@ -11041,6 +11043,8 @@ pub(crate) enum PassthroughUnavailable {
     ThumbnailPixelsNotResident,
     /// A rendition exists but was made for another page.
     IdentityMismatch,
+    /// Preview metadata cannot locate these pixels safely in the current page.
+    SourceCoverage(crate::source_coverage::SourceCoverageUnavailable),
 }
 
 impl PassthroughUnavailable {
@@ -11049,6 +11053,12 @@ impl PassthroughUnavailable {
             Self::ThumbnailNotLoaded => "thumbnail_not_loaded",
             Self::ThumbnailPixelsNotResident => "thumbnail_pixels_not_resident",
             Self::IdentityMismatch => "identity_mismatch",
+            Self::SourceCoverage(
+                crate::source_coverage::SourceCoverageUnavailable::UnknownWithCurrentCrop,
+            ) => "unknown_preview_coverage_with_crop",
+            Self::SourceCoverage(
+                crate::source_coverage::SourceCoverageUnavailable::InvalidGeometry,
+            ) => "invalid_preview_coverage",
         }
     }
 }
@@ -11212,6 +11222,7 @@ pub(crate) struct PassthroughRenditionEntry {
     /// closes the independent thumbnail quality-upgrade lifetime without a
     /// second effect-key system.
     source_pixels: Arc<egui::ColorImage>,
+    source_coverage: crate::source_coverage::SourceCoverage,
     /// Keep the CPU result beside the GPU texture so the cache owns one complete rendition.
     _pixels: Arc<egui::ColorImage>,
     /// MonochromeOnly applicability resolved from the rendition's adjusted
@@ -21594,14 +21605,88 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.fs_thumbnail_resource_for_display(idx)
+            .ok()
+            .map(|resource| resource.source_texture().clone())
+    }
+
+    pub(crate) fn fs_thumbnail_resource_for_display(
+        &self,
+        idx: usize,
+    ) -> Result<crate::gpu_lanczos::FullscreenPaintResource, PassthroughUnavailable> {
         if !self.raw_fullscreen_fallback_allowed(idx) {
-            return None;
+            return Err(PassthroughUnavailable::ThumbnailNotLoaded);
         }
-        let crate::grid_item::ThumbnailState::Loaded { tex, .. } = self.thumbnails.get(idx)? else {
-            return None;
+        let Some(ThumbnailState::Loaded {
+            tex,
+            source_coverage,
+            ..
+        }) = self.thumbnails.get(idx)
+        else {
+            return Err(PassthroughUnavailable::ThumbnailNotLoaded);
         };
-        self.display_texture_matches_page(tex, idx)
-            .then(|| tex.clone())
+        let coverage = self
+            .resolve_preview_coverage_for_display(idx, *source_coverage)
+            .map_err(PassthroughUnavailable::SourceCoverage)?;
+        if !self.display_texture_matches_page(tex, idx) {
+            return Err(PassthroughUnavailable::IdentityMismatch);
+        }
+        Ok(self
+            .fs_resource_for_texture(idx, tex.clone())
+            .with_source_coverage(coverage))
+    }
+
+    /// One policy entry for legacy previews. Keeping the owning App and page here lets a
+    /// future approved crop-estimation policy read its context without changing consumers.
+    /// The current policy never infers material coverage from crop settings.
+    pub(crate) fn resolve_preview_coverage_for_display(
+        &self,
+        idx: usize,
+        coverage: crate::source_coverage::SourceCoverage,
+    ) -> Result<
+        crate::source_coverage::SourceCoverage,
+        crate::source_coverage::SourceCoverageUnavailable,
+    > {
+        coverage.resolve_for_display(self.export_crop_pages.contains(&idx))
+    }
+
+    /// Recover metadata only from the selected texture's context-local owner.
+    pub(crate) fn fs_source_coverage_for_texture(
+        &self,
+        idx: usize,
+        texture_id: egui::TextureId,
+    ) -> crate::source_coverage::SourceCoverage {
+        if let Some(ThumbnailState::Loaded {
+            tex,
+            source_coverage,
+            ..
+        }) = self.thumbnails.get(idx)
+            && tex.id() == texture_id
+        {
+            return self
+                .resolve_preview_coverage_for_display(idx, *source_coverage)
+                .unwrap_or(*source_coverage);
+        }
+        self.passthrough_rendition_cache
+            .entries
+            .iter()
+            .find_map(|(key, entry)| {
+                (key.edit_key.idx == idx && entry.texture.id() == texture_id).then(|| {
+                    self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
+                        .unwrap_or(entry.source_coverage)
+                })
+            })
+            .unwrap_or(crate::source_coverage::SourceCoverage::FullSource)
+    }
+
+    pub(crate) fn fs_resource_for_texture(
+        &self,
+        idx: usize,
+        texture: egui::TextureHandle,
+    ) -> crate::gpu_lanczos::FullscreenPaintResource {
+        let coverage = self.fs_source_coverage_for_texture(idx, texture.id());
+        self.fullscreen_paint_resource_for_texture(idx, texture)
+            .with_source_coverage(coverage)
     }
 
     /// Say what a texture was made to show, before anything has had a chance to guess.
@@ -21817,11 +21902,17 @@ impl App {
             if let ThumbnailState::Loaded {
                 source_dims,
                 layout_dims,
+                from_edit_preview,
                 tex,
                 ..
             } = state
             {
-                let ratio = match (*layout_dims).or(*source_dims) {
+                let listing_dims = if *from_edit_preview {
+                    *source_dims
+                } else {
+                    (*layout_dims).or(*source_dims)
+                };
+                let ratio = match listing_dims {
                     Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
                     _ => {
                         // source_dims が無くても、テクスチャ寸法から比率を拾える
@@ -53696,6 +53787,7 @@ impl App {
                 origin,
                 from_edit_preview,
                 edit_preview_adjustment,
+                source_coverage,
                 source_dims,
                 layout_dims,
             } = pixels;
@@ -53761,16 +53853,25 @@ impl App {
                     origin,
                     from_edit_preview,
                     rendered_at_px,
+                    source_coverage,
                     source_dims,
                     layout_dims,
                 };
                 textures_created += 1;
                 // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
                 // 旧 cache 等では、従来の判定と同じくロード済み画像寸法を使う。
-                if let Some(dims) =
-                    source_dims.or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
-                {
-                    self.record_thumbnail_page_dims_for_spread(i, dims);
+                match self.resolve_preview_coverage_for_display(i, source_coverage) {
+                    Ok(crate::source_coverage::SourceCoverage::Known(geometry)) => {
+                        self.record_page_dims_for_spread(i, geometry.coordinate_dims.as_tuple());
+                    }
+                    Ok(crate::source_coverage::SourceCoverage::FullSource) => {
+                        if let Some(dims) = source_dims
+                            .or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
+                        {
+                            self.record_thumbnail_page_dims_for_spread(i, dims);
+                        }
+                    }
+                    Ok(crate::source_coverage::SourceCoverage::Unknown) | Err(_) => {}
                 }
                 if let Some(dims) = layout_dims {
                     self.record_page_layout_dims_for_spread(i, dims);
@@ -53779,7 +53880,12 @@ impl App {
                 // source_dims が None なら ColorImage の (w, h) を fallback として使う
                 // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
                 if consumption.drives_auto_aspect() && self.settings.thumb_aspect_auto {
-                    let ratio = match layout_dims.or(source_dims) {
+                    let listing_dims = if from_edit_preview {
+                        source_dims
+                    } else {
+                        layout_dims.or(source_dims)
+                    };
+                    let ratio = match listing_dims {
                         Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
                         _ if w > 0 => h as f32 / w as f32,
                         _ => -1.0,
@@ -65705,7 +65811,7 @@ impl App {
                 )
             })
             .flatten();
-        let texture_size = texture.size_vec2();
+        let texture_size = base_texture.full_source_size_vec2();
         let zoom_pan = self.fs_zoom_pan();
         let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
@@ -65722,11 +65828,11 @@ impl App {
         // 倍率が小さくなる。リサンプラの出力が子ウィンドウの貼り先より 1〜2 物理
         // ピクセル短くなり、egui/wgpu がもう一度バイリニアを掛ける (§1.0e)。
         let (image_rect_norm, logical_scale, image_content_bbox) = self
-            .detached_single_image_snapshot_layout(
+            .detached_single_image_snapshot_resource_layout(
                 idx,
                 placement,
                 pixels_per_point,
-                &texture,
+                &base_texture,
                 rotation,
                 zoom_pan,
                 free_rotation,
@@ -65754,7 +65860,14 @@ impl App {
                     pixel_fit: crate::displayed_image_transform::RectPixelFit::Proportional,
                     page_idx: idx,
                     viewport_rect: snapshot_rect,
-                    source_size: texture_size,
+                    source_size: base_texture
+                        .source_coverage()
+                        .coordinate_dims()
+                        .map(|dims| {
+                            let (w, h) = dims.as_tuple();
+                            egui::vec2(w as f32, h as f32)
+                        })
+                        .unwrap_or(texture_size),
                     texture_size,
                     rotation,
                     free_rotation_rad: free_rotation,
@@ -80302,6 +80415,15 @@ impl App {
             });
         };
         let pixels = Arc::clone(&entry.pixels);
+        let coordinate_dims = self.canonical_source_dimensions(idx).unwrap_or_else(|| {
+            crate::page_dims::CanonicalPageDimensions::new(
+                pixels.size[0].max(1) as u32,
+                pixels.size[1].max(1) as u32,
+            )
+        });
+        let layout_dims = matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
+            .then(|| self.page_dims_cache.get_layout(self.items_generation, idx))
+            .flatten();
         let crop = self.export_crop_rect_for_pixels(idx, pixels.size);
         let annotations = if let Some(objects) = annotation_objects {
             // fullscreen の comic 表示時に解決済みの FontSet を Arc clone する。close / page
@@ -80340,6 +80462,8 @@ impl App {
             source_mtime,
             source_size,
             source_container_path,
+            coordinate_dims,
+            layout_dims,
             pixels,
             annotations,
             crop,
@@ -80356,6 +80480,8 @@ impl App {
                 source_mtime,
                 source_size,
                 source_container_path,
+                coordinate_dims,
+                layout_dims,
                 pixels,
                 annotations,
                 crop,
@@ -80366,6 +80492,8 @@ impl App {
                     source_mtime,
                     source_size,
                     source_container_path,
+                    coordinate_dims,
+                    layout_dims,
                     pixels,
                     annotations,
                     crop,
@@ -92532,12 +92660,13 @@ impl App {
             return Err(PassthroughUnavailable::ThumbnailNotLoaded);
         }
         let source_lookup_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
-        let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
+        let (catalog_texture, from_edit_preview, source_coverage) = match self.thumbnails.get(idx) {
             Some(crate::grid_item::ThumbnailState::Loaded {
                 tex,
                 from_edit_preview,
+                source_coverage,
                 ..
-            }) => (tex.clone(), *from_edit_preview),
+            }) => (tex.clone(), *from_edit_preview, *source_coverage),
             _ => {
                 finish_passthrough_rendition_perf_span(
                     perf.as_deref_mut(),
@@ -92547,6 +92676,8 @@ impl App {
                 return Err(PassthroughUnavailable::ThumbnailNotLoaded);
             }
         };
+        self.resolve_preview_coverage_for_display(idx, source_coverage)
+            .map_err(PassthroughUnavailable::SourceCoverage)?;
         let source_pixels = match self.thumb_pixels.get(&idx) {
             Some(source_pixels) => source_pixels.clone(),
             None => {
@@ -92707,6 +92838,7 @@ impl App {
             key,
             PassthroughRenditionEntry {
                 source_pixels,
+                source_coverage,
                 _pixels: pixels,
                 colorize_applied,
                 texture: texture.clone(),
@@ -92744,6 +92876,10 @@ impl App {
         );
         self.passthrough_rendition_cache
             .peek(key, pixels)
+            .filter(|entry| {
+                self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
+                    .is_ok()
+            })
             .map(|entry| entry.texture)
     }
 

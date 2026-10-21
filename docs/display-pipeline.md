@@ -155,7 +155,7 @@ hideのCPU画像解放も同ownerのdiscardを通す。[寿命計画と検証](t
 
 ```
 Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, origin, rendered_at_px,
-                                                           source_dims, layout_dims }
+                                                           source_dims, layout_dims, source_coverage }
                                                        │
                                            (keep_range 外に出ると)
                                                        ▼
@@ -171,9 +171,11 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 cache由来かどうかはoriginから導出し、独立した`from_cache`状態は保持しない。
 画像なしのfinalized/cancel/errorはLoaded画像のoriginを更新しない。
 
-`Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）と PDF の `layout_dims` を
-per-context の `PageDimsCache` の別 map に記録する。`source_dims` は常にピクセル座標、
-`layout_dims` は PDF page box の 1/1000 point であり、単位を混ぜない。`Evicted` は GPU texture
+`Loaded` へ遷移した時点で、全体のピクセル寸法と PDF の `layout_dims` を
+per-context の `PageDimsCache` の別 map に記録する。部分編集 preview の全体寸法は
+`source_coverage` の生成由来から取り、crop 後 `source_dims` は一覧の比率に残す。
+通常素材は従来の `source_dims`（無ければロード済み画像寸法）を使う。
+`layout_dims` は PDF page box の 1/1000 point であり、ピクセル寸法と単位を混ぜない。`Evicted` は GPU texture
 だけを破棄し、同じ `items_generation` で判明済みの両寸法は残す。idx 空間が変わるときだけ
 `invalidate_idx_state_and_queues` で clear し、cache 自身の generation 不一致も `None` へ
 fail-closed する。
@@ -303,6 +305,40 @@ crop を実切り出しする。最大辺 2048px の下地は WebP q=90、透明
 lossless WebP として分離保存する。保存先は `<data_dir>/edit_preview_cache/`、対応表と LRU は
 `<data_dir>/edit_preview_cache.db` に保持し、crop 後の縦横寸法を一覧のアスペクト比として使う。
 元画像と各編集 DB は変更しない。
+
+§1.165 B1（2026-10-21、実装・自動検証済み・独立完成レビュー／実機未確認）では、生成時の収録範囲を
+`source_coverage::EditPreviewGeometry` として preview 自身へ持たせる。座標空間は EXIF 適用後、
+保存回転・自由回転前。`coordinate_dims` は正規ページ座標の元寸法、`raster_dims` は実際に
+切り出す直前の raster 寸法、`pixel_bounds` はその raster に対する `CropRect::pixel_bounds`
+の整数結果（min=floor、max=ceil）である。8192 clamp／PDF 再レンダ後の raster、crop 設定の
+authoring 寸法、PDF page-box のレイアウト単位を正規ページ寸法へ読み替えない。
+下地と Normal／Multiply 注釈には同一境界を適用し、crop 後の一覧寸法と生成由来を別に保持する。
+
+既存の released v6 DB は `CACHE_FORMAT_VERSION=6` を維持し、nullable な
+`source_coverage_json` と独立の `layout_dims_json` を加法 migration で追加する。
+この追加で既存行や WebP を削除しない。
+新生成は crop の有無にかかわらず `SourceCoverage::Known(geometry)` とし、WebP の参照と
+同じ upsert で geometry と既知の layout 寸法を保存する。content hash にも由来を含め、同じ画素内容でも
+元画像内の位置が異なる素材を区別する。旧行の NULL は `Unknown` のまま一覧で利用し、
+次の通常生成で metadata が埋まる。
+SQL NULL だけを旧行と判定する。非 NULL の coverage／layout JSON が壊れている場合や
+寸法・境界が不正な場合はログを残してその preview の load を失敗させ、旧行扱いへの読み替えや
+行・WebP の削除はしない。
+
+PDF の既知 page-box 寸法は `EditPreviewData.layout_dims` として coverage と別に保存・復元する。
+保存要求は既存の page-box cache 値を渡し、通常画像と旧行は `None` のまま扱う。
+preview hit の早期 return でも worker はこの値を thumbnail payload へ継承するため、layout を
+整数 raster 比から再計算せず、preview 利用のための追加 PDF IPC／待機も発生させない。
+
+coverage は「その素材が収録する範囲」であり、現在の crop DB／メモリ値から再構成しない。
+crop A→B の保存後・非同期 Delete 前や、保存済み crop と未保存の生成入力が違う場合にも、
+読み込んだ preview は自身の生成時点を示す。`Unknown` の表示可否は
+`App::resolve_preview_coverage_for_display` 一か所で決める（現方針の純粋な判定は
+`SourceCoverage::resolve_for_display`）。入口は owning App／idx／素材を受け取るため、将来推測方針を
+採る場合もその入口の実装だけで切り替え、各 consumer の変更や同期 I/O を必要としない。現在 crop ありなら typed reason
+`UnknownWithCurrentCrop` で fullscreen／通過表示／animation の代役から除外し、現在 crop
+なしなら互換方針として `FullSource` を返す。これは一覧の旧 preview 利用を止める判定ではない。
+
 読み込み worker は保存サイズを品質原本として残したまま、現在の `display_px` へ下地と
 全注釈レイヤーを Lanczos3 で同一寸法へ縮小してから合成する。UI / GPU には表示寸法の
 画像だけを渡し、ページ数ベースの eviction と共有 VRAM 会計を実際のテクスチャ寸法に一致させる。
@@ -672,6 +708,43 @@ navigation holdover が無ければ canonical spread painter を呼んで両 slo
 visible-pages painter を使う。general keepalive / embedded deferred の canvas は typed static unit が
 ある場合だけ現在の余白色にし、unit の無い media transition は egui 側の黒を保つ。native 動画の
 letterbox canvas は別の DComp owner が現在の余白色を描き、音声系だけ黒を保つ。
+
+#### 2.1.1 crop 済み代役の全体寸法と収録範囲（§1.165 B1、実装・自動検証済み・独立完成レビュー／実機未確認）
+
+一覧のアスペクト比は従来どおり crop 後の `source_dims` を使う。部分編集 preview のページ構成
+（見開き・横長分割）、canonical 枠、fit／contain、Original／指定方式の基準には crop 前の
+正規寸法を供給する。`SourceCoverage::is_partial()` は実画素境界から派生させ、収録範囲が
+全体の素材（新生成 no-crop Known を含む）の従来の Original／thumbnail sizing は維持する。
+`poll_thumbnails` の寸法記録と Loaded を直接参照する fallback の双方でこの区別を保ち、
+texture 退去後も `PageDimsCache` に crop 後寸法を再登録しない。PDF page-box、RAW の許可 gate、
+processed の縦横比変更、指定方式の既存 A/O 基準は、それぞれの既存の意味を維持する。
+
+`SourceCoverage` は `ThumbnailState::Loaded`／CPU 下地から通常の
+`FullscreenPaintResource`、prepare 後の `FullscreenPresentationResource`、paint payload へ
+素材と一緒に継承する。coverage を idx 別の追加 map や `content_bbox` へ置かない。
+`content_bbox`／左右分割は表示要求であり、coverage は自由回転時も失われない素材の由来である。
+単ページ・見開き左右・連結読みは全画像 transform を先に解き、その全体枠へ部分素材だけを配置する。
+見開き gap や連結読みの extent を、crop 後 quad の外接矩形で縮めない。
+
+純粋 helper `source_region_texture_quad` が描画頂点と素材 UV を一元計算する。
+coverage を C、表示要求を V とすると描画範囲は C∩V、素材 UV は `(source-C.min)/C.size`。
+native ROI がある場合は素材内 ROI を C の空間へ合成し、さらに交差させてその ROI 内 UV へ写す。
+画面位置は全画像の transform、保存回転、自由回転から求める。通常 mesh、保持素材、canonical
+animation はこの helper の結果を共有し、native の不完全 ROI を許すための条件緩和はしない。
+
+透明下地とページ枠は全画像側へ残す。ページ送りは `PageMaterial::PartialTexture` により
+紙面全体と部分素材の domain を分けて保持・投影する。coverage と表示範囲が交差しない場合も
+背景だけのページ occurrence として提示／receipt を進め、crop を理由に animation を無効にしない。
+passive detached の snapshot capture／保持／再描画、navigator、ルーペ、パノラマ navigator、
+保持素材復元も同じ resource の coverage を使い、capture 後の thumbnail 差し替えで再推定しない。
+通過 rendition は注釈を含まない CPU 下地と coverage を継承し、注釈を省略する既存契約を保つ。
+
+設計簡素化として既存 resource／presentation の所有へ由来を載せ、現在 crop と preview の
+非同期失効を同期させる追加状態・全 context reset・待機は導入しない。保存や DB のまれな失敗は
+既定の割り切り（ログ＋既存通知・単純な作り直し）とし、多段の復旧処理を足さない。
+SNS 分割パネルのプレビューも、各分割枠を全画像座標へ戻して同じ resource の mapping を使う。
+シーク用の一覧素材プレビューは従来どおり crop 後の素材として扱う。
+この節は実装契約の記録であり、完了した自動検証／実 GPU 提示／実機の成功証拠ではない。
 
 frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
 現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
@@ -2592,6 +2665,14 @@ captured previous unit を原子的に保持する。
 そのページの代役にする」表示契約である。未着なら直前の表示単位を原子的に保持し、後続 repeat を
 drop する。rendition ready 後の target を実際に 1 frame 提示してから次を受理する。
 加工の扱いは**見た目の差**と**処理時間**の 2 つで決める。
+
+§1.165 B1 では、編集 preview を代役に採る前に §1.3.1 の共通 Unknown policy を通す。
+Known coverage は現在 crop から変更せず、CPU 下地から生成する rendition と保持 resource へ
+同じ由来を継承する。全体寸法の fit と部分素材の mapping は §2.1.1 を共有し、crop 前の全体を
+crop 後 texture で引き伸ばさない。これにより本画像到着時に既存内容の倍率・位置とページ枠を
+維持し、未収録だった外側が補われることを受入条件とする。代役が持たない crop 外画素の復元を
+到着前の要件にはしない。旧 Unknown＋現在 crop ありはこの代役を使えないため、本画像または
+既存の利用可能な代役を待つ互換上の制約が残る（実装・自動検証済み・独立完成レビュー／実機未確認）。
 
 | 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
 | --- | --- | --- | --- |

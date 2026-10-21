@@ -85,6 +85,376 @@ fn source_pixels(app: &App, idx: usize) -> ThumbMsg {
     .source_pixels()
 }
 
+fn cropped_preview_message(
+    app: &App,
+    coverage: crate::source_coverage::SourceCoverage,
+) -> ThumbMsg {
+    ThumbMsg::from_legacy_parts(
+        0,
+        Some(egui::ColorImage::filled([20, 60], egui::Color32::RED)),
+        ThumbLoadOrigin::SourceIntrinsic,
+        true,
+        Some(crate::thumb_loader::ThumbEditPreviewAdjustment {
+            base: egui::ColorImage::filled([20, 60], egui::Color32::BLUE),
+            annotation_layers: Vec::new(),
+        }),
+        Some((200, 600)),
+        None,
+        false,
+        false,
+        0,
+        app.items_generation,
+    )
+    .with_source_coverage(coverage)
+    .with_request_id(app.requested.id(0).unwrap())
+}
+
+fn cropped_preview_coverage() -> crate::source_coverage::SourceCoverage {
+    crate::source_coverage::SourceCoverage::Known(
+        crate::source_coverage::EditPreviewGeometry::new(
+            crate::page_dims::CanonicalPageDimensions::new(1600, 800),
+            (800, 400),
+            (100, 50, 100, 300),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn crop_coverage_save_snapshot_keeps_pdf_page_box_separate_from_clamped_raster() {
+    let mut app = fixture(1);
+    app.settings.edit_preview_cache_enabled = true;
+    app.items[0] = GridItem::PdfPage {
+        pdf_path: PathBuf::from(r"c:\pics\0.pdf"),
+        page_num: 0,
+        content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+    };
+    app.mask_pages.insert(0);
+    app.record_page_dims_for_spread(0, (1600, 800));
+    app.record_page_layout_dims_for_spread(0, (468_600, 234_360));
+    let key = app.current_edit_result_key(0);
+    app.edit_result_cache.insert(
+        key,
+        EditResultEntry {
+            pixels: Arc::new(egui::ColorImage::filled([80, 40], egui::Color32::GRAY)),
+            texture: None,
+        },
+    );
+    let Some(EditPreviewCloseUpdate::Save {
+        coordinate_dims,
+        layout_dims,
+        pixels,
+        ..
+    }) = app.snapshot_edit_preview_close_update(0)
+    else {
+        panic!("a ready edited PDF must produce a save snapshot");
+    };
+    assert_eq!(coordinate_dims.as_tuple(), (1600, 800));
+    assert_eq!(layout_dims, Some((468_600, 234_360)));
+    assert_eq!(pixels.size, [80, 40]);
+}
+
+#[test]
+fn crop_coverage_poll_keeps_list_ratio_and_full_page_dimensions_after_eviction() {
+    let mut app = fixture(1);
+    let ctx = egui::Context::default();
+    app.settings.thumb_aspect_auto = true;
+    app.export_crop_pages.insert(0);
+    let coverage = cropped_preview_coverage();
+    app.tx
+        .send(cropped_preview_message(&app, coverage))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded {
+        source_dims: Some((200, 600)), source_coverage, ..
+    } if source_coverage == coverage));
+    assert_eq!(app.auto_aspect.samples.get(&0), Some(&3.0));
+    assert_eq!(
+        app.page_dims_cache.get(app.items_generation, 0),
+        Some((1600, 800))
+    );
+    assert_eq!(
+        app.canonical_source_dimensions(0).unwrap().as_tuple(),
+        (1600, 800)
+    );
+    let resource = app.fs_thumbnail_resource_for_display(0).unwrap();
+    assert_eq!(resource.source_coverage(), coverage);
+    assert!(app.fs_page_layout_uses_source_id(0, resource.source_texture().id()));
+
+    app.evict_thumbnail_for_reload(0);
+    assert_eq!(
+        app.page_dims_cache.get(app.items_generation, 0),
+        Some((1600, 800))
+    );
+    assert_eq!(
+        resource.source_coverage(),
+        coverage,
+        "a held resource owns its generating range"
+    );
+    app.record_page_dims_for_spread(0, (1600, 800));
+    assert_eq!(
+        app.page_dims_cache.get(app.items_generation, 0),
+        Some((1600, 800))
+    );
+}
+
+#[test]
+fn crop_coverage_saved_preview_worker_and_poll_keep_generation_geometry() {
+    let mut app = fixture(1);
+    let ctx = egui::Context::default();
+    app.items[0] = GridItem::PdfPage {
+        pdf_path: PathBuf::from(r"c:\pics\0.pdf"),
+        page_num: 0,
+        content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+    };
+    app.settings.thumb_aspect_auto = true;
+    let key = app.page_path_key(0).unwrap();
+    let service = app.edit_preview_cache.as_ref().unwrap();
+    service.save(
+        key.clone(),
+        10,
+        20,
+        None,
+        crate::page_dims::CanonicalPageDimensions::new(1600, 800),
+        Some((468_600, 234_360)),
+        Arc::new(egui::ColorImage::filled([80, 40], egui::Color32::GRAY)),
+        None,
+        Some(crate::export_crop::CropRect {
+            min_x: 10.2,
+            min_y: 5.6,
+            max_x: 20.1,
+            max_y: 35.5,
+        }),
+        1_000_000,
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while service.has_pending_commands() {
+        assert!(std::time::Instant::now() < deadline, "preview save stalled");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let db = service.db();
+    let expected = crate::source_coverage::SourceCoverage::Known(
+        crate::source_coverage::EditPreviewGeometry::new(
+            crate::page_dims::CanonicalPageDimensions::new(1600, 800),
+            (80, 40),
+            (10, 5, 11, 31),
+        )
+        .unwrap(),
+    );
+    // The current crop deliberately differs from the saved generation. The worker must read the
+    // material's persisted provenance rather than inventing it from that later crop.
+    app.export_crop_pages.insert(0);
+    let mut request = crate::thumb_loader::LoadRequest {
+        idx: 0,
+        path: PathBuf::from(r"c:\pics\0.pdf"),
+        pdf_page: Some(0),
+        mtime: 10,
+        file_size: 20,
+        edit_preview_key: Some(key),
+        request_id: app.requested.id(0).unwrap(),
+        items_gen: app.items_generation,
+        ..Default::default()
+    };
+    crate::thumb_loader::process_load_request(
+        &mut request,
+        &std::sync::RwLock::new(HashMap::new()),
+        &app.tx,
+        None,
+        64,
+        90,
+        64,
+        crate::thumb_loader::CacheDecision::from_settings(&app.settings),
+        &Arc::new(AtomicUsize::new(0)),
+        &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+        None,
+        &app.keep_start_shared,
+        &app.keep_end_shared,
+        None,
+        None,
+        Some(&db),
+        None,
+        None,
+    );
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded {
+        from_edit_preview: true, source_dims: Some((11, 31)), source_coverage, ..
+    } if source_coverage == expected));
+    assert_eq!(
+        app.page_dims_cache.get(app.items_generation, 0),
+        Some((1600, 800))
+    );
+    assert_eq!(
+        app.page_dims_cache.get_layout(app.items_generation, 0),
+        Some((468_600, 234_360))
+    );
+    assert_eq!(app.auto_aspect.samples.get(&0), Some(&(31.0 / 11.0)));
+    app.rebuild_auto_aspect_samples_from_loaded();
+    assert_eq!(app.auto_aspect.samples.get(&0), Some(&(31.0 / 11.0)));
+    assert_eq!(
+        app.fs_thumbnail_resource_for_display(0)
+            .unwrap()
+            .source_coverage(),
+        expected
+    );
+}
+
+#[test]
+fn crop_coverage_unknown_preview_policy_covers_thumbnail_and_cached_passthrough() {
+    use crate::source_coverage::{SourceCoverage, SourceCoverageUnavailable};
+    let mut app = fixture(1);
+    let ctx = egui::Context::default();
+    app.export_crop_pages.insert(0);
+    app.tx
+        .send(cropped_preview_message(&app, SourceCoverage::Unknown))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert!(
+        matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+        "legacy rows remain available to the list"
+    );
+    assert_eq!(app.page_dims_cache.get(app.items_generation, 0), None);
+    let reason =
+        PassthroughUnavailable::SourceCoverage(SourceCoverageUnavailable::UnknownWithCurrentCrop);
+    assert_eq!(app.fs_thumbnail_resource_for_display(0).err(), Some(reason));
+    assert_eq!(
+        app.ensure_passthrough_rendition_inner(&ctx, 0, None, None)
+            .err(),
+        Some(reason)
+    );
+
+    app.export_crop_pages.remove(&0);
+    assert_eq!(
+        app.fs_thumbnail_resource_for_display(0)
+            .unwrap()
+            .source_coverage(),
+        SourceCoverage::FullSource
+    );
+    let rendition = app
+        .ensure_passthrough_rendition_inner(&ctx, 0, None, None)
+        .unwrap();
+    assert_eq!(
+        app.fs_resource_for_texture(0, rendition).source_coverage(),
+        SourceCoverage::FullSource
+    );
+    assert!(app.cached_passthrough_rendition(0).is_some());
+
+    app.export_crop_pages.insert(0);
+    assert!(
+        app.cached_passthrough_rendition(0).is_none(),
+        "no-crop compatibility must not erase unknown provenance"
+    );
+    assert_eq!(
+        app.ensure_passthrough_rendition_inner(&ctx, 0, None, None)
+            .err(),
+        Some(reason)
+    );
+}
+
+#[test]
+fn crop_coverage_passthrough_inherits_base_mapping_and_omits_annotations() {
+    let mut app = fixture(1);
+    let ctx = egui::Context::default();
+    let coverage = cropped_preview_coverage();
+    app.export_crop_pages.insert(0);
+    app.tx
+        .send(cropped_preview_message(&app, coverage))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    let texture = app
+        .ensure_passthrough_rendition_inner(&ctx, 0, None, None)
+        .unwrap();
+    let pixels = app
+        .current_passthrough_rendition_pixels_for_test(0)
+        .unwrap();
+    assert!(
+        pixels
+            .pixels
+            .iter()
+            .all(|pixel| *pixel == egui::Color32::BLUE)
+    );
+    let resource = app.fs_resource_for_texture(0, texture.clone());
+    assert_eq!(resource.source_coverage(), coverage);
+    app.evict_thumbnail_for_reload(0);
+    assert_eq!(
+        app.fs_resource_for_texture(0, texture).source_coverage(),
+        coverage
+    );
+    assert_eq!(resource.source_coverage(), coverage);
+}
+
+#[test]
+fn crop_coverage_thumbnail_and_rendition_owners_stay_in_their_viewer_context() {
+    let mut app = fixture(1);
+    let ctx = egui::Context::default();
+    let main_coverage = cropped_preview_coverage();
+    app.tx
+        .send(cropped_preview_message(&app, main_coverage))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    let main_texture = app
+        .ensure_passthrough_rendition_inner(&ctx, 0, None, None)
+        .unwrap();
+    let main_generation = app.items_generation;
+    let sibling_coverage = crate::source_coverage::SourceCoverage::Known(
+        crate::source_coverage::EditPreviewGeometry::new(
+            crate::page_dims::CanonicalPageDimensions::new(600, 1800),
+            (300, 900),
+            (50, 150, 100, 300),
+        )
+        .unwrap(),
+    );
+    let sibling = app.build_window_context_for_test(1165, |mounted| {
+        mounted.items_generation = main_generation;
+        mounted.items = vec![GridItem::Image(PathBuf::from(r"c:\sibling\0.png"))];
+        mounted.image_metas = vec![Some((10, 20))];
+        mounted.thumbnails = vec![ThumbnailState::Pending];
+        mounted.keep_set.insert(0);
+        mounted
+            .requested
+            .begin(0, main_generation, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        mounted
+            .tx
+            .send(cropped_preview_message(mounted, sibling_coverage))
+            .unwrap();
+        mounted.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert_eq!(
+            mounted.page_dims_cache.get(main_generation, 0),
+            Some((600, 1800))
+        );
+        assert_eq!(
+            mounted.fs_source_coverage_for_texture(0, main_texture.id()),
+            crate::source_coverage::SourceCoverage::FullSource
+        );
+    });
+    assert_eq!(
+        app.page_dims_cache.get(main_generation, 0),
+        Some((1600, 800))
+    );
+    assert_eq!(
+        app.fs_resource_for_texture(0, main_texture)
+            .source_coverage(),
+        main_coverage
+    );
+    app.evict_thumbnail_for_reload(0);
+    app.with_viewer_context(sibling, |mounted| {
+        assert_eq!(
+            mounted
+                .fs_thumbnail_resource_for_display(0)
+                .unwrap()
+                .source_coverage(),
+            sibling_coverage
+        );
+        assert_eq!(
+            mounted.page_dims_cache.get(main_generation, 0),
+            Some((600, 1800))
+        );
+    })
+    .unwrap();
+}
+
 fn assert_worker_queues_empty(app: &App) {
     assert!(
         app.reload_queue
@@ -156,6 +526,7 @@ fn ninth_source_image_keeps_request(existing: ExistingDisplay) {
             origin: ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 100,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((10, 20)),
             layout_dims: None,
         },
@@ -809,6 +1180,7 @@ fn lifecycle_video_retry_does_not_block_idle_upgrade_or_deadline() {
         origin: ThumbLoadOrigin::UpgradeableCache,
         from_edit_preview: false,
         rendered_at_px: 100,
+        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
         source_dims: Some((884, 444)),
         layout_dims: None,
     };
@@ -1037,6 +1409,7 @@ fn lifecycle_sibling_mount_hide_restore_and_retire_preserve_owned_resources() {
             origin: ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 2,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((10, 20)),
             layout_dims: None,
         }];
@@ -1385,6 +1758,7 @@ fn lifecycle_one_hide_then_unchanged_hidden_demand_converges_without_duplicate_w
                 origin: ThumbLoadOrigin::UpgradeableCache,
                 from_edit_preview: false,
                 rendered_at_px: 2,
+                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                 source_dims: Some((10, 20)),
                 layout_dims: None,
             };

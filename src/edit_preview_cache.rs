@@ -17,6 +17,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::page_dims::CanonicalPageDimensions;
+use crate::source_coverage::{EditPreviewGeometry, SourceCoverage};
+
 pub const PREVIEW_LONG_SIDE: u32 = 2048;
 pub const PREVIEW_WEBP_QUALITY: f32 = 90.0;
 pub const DEFAULT_MAX_BYTES: u64 = 1_000_000_000;
@@ -156,6 +159,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<bool> {
              source_container_size INTEGER,
              source_width   INTEGER NOT NULL,
              source_height  INTEGER NOT NULL,
+             source_coverage_json TEXT,
+             layout_dims_json TEXT,
              cached_path    TEXT NOT NULL,
              annotation_layers_json TEXT NOT NULL,
              cached_bytes   INTEGER NOT NULL,
@@ -165,6 +170,21 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<bool> {
          CREATE INDEX IF NOT EXISTS idx_edit_previews_lru
              ON edit_previews(last_access_at, updated_at);",
     )?;
+    // Coverage is an additive extension of the released v6 rows. NULL means the generation
+    // region is unknown; retaining both the row and its WebPs preserves the listing preview.
+    let columns = conn
+        .prepare("PRAGMA table_info(edit_previews)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns
+        .iter()
+        .any(|column| column == "source_coverage_json")
+    {
+        conn.execute_batch("ALTER TABLE edit_previews ADD COLUMN source_coverage_json TEXT;")?;
+    }
+    if !columns.iter().any(|column| column == "layout_dims_json") {
+        conn.execute_batch("ALTER TABLE edit_previews ADD COLUMN layout_dims_json TEXT;")?;
+    }
     conn.pragma_update(None, "user_version", CACHE_FORMAT_VERSION)?;
     Ok(reset)
 }
@@ -178,6 +198,10 @@ pub struct EditPreviewData {
     /// identity 色調時にそのままアップロードできる完成画像。
     pub image: egui::ColorImage,
     pub source_dims: (u32, u32),
+    /// PDF page-box layout units, independent of canonical pixels and the preview raster.
+    pub layout_dims: Option<(u32, u32)>,
+    /// Generation-time provenance. source_dims remains the cropped listing aspect ratio.
+    pub coverage: SourceCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,12 +322,23 @@ impl EditPreviewCacheDb {
         validation: PreviewSourceValidation,
         display_px: u32,
     ) -> Option<EditPreviewData> {
-        let row: Option<(i64, i64, Option<i64>, i64, i64, String, String, i64)> = {
+        let row: Option<(
+            i64,
+            i64,
+            Option<i64>,
+            i64,
+            i64,
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+        )> = {
             let conn = self.conn.lock().ok()?;
             conn.query_row(
                 "SELECT source_mtime, source_size, source_container_size,
                         source_width, source_height, cached_path,
-                        annotation_layers_json, updated_at
+                        annotation_layers_json, updated_at, source_coverage_json, layout_dims_json
                  FROM edit_previews WHERE item_key = ?1",
                 params![item_key],
                 |r| {
@@ -316,6 +351,8 @@ impl EditPreviewCacheDb {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
                     ))
                 },
             )
@@ -331,6 +368,8 @@ impl EditPreviewCacheDb {
             cached_path,
             annotation_layers_json,
             updated_at,
+            source_coverage_json,
+            layout_dims_json,
         ) = row?;
         let source_matches = match validation {
             PreviewSourceValidation::Page { mtime, size } => {
@@ -351,6 +390,39 @@ impl EditPreviewCacheDb {
             );
             return None;
         }
+
+        // Only SQL NULL identifies a retained legacy row. Malformed new metadata must not
+        // silently acquire the legacy FullSource compatibility policy or lose PDF layout units.
+        let coverage = match source_coverage_json.as_deref() {
+            None => SourceCoverage::Unknown,
+            Some(json) => match serde_json::from_str::<EditPreviewGeometry>(json) {
+                Ok(geometry)
+                    if geometry.is_valid()
+                        && (geometry.pixel_bounds.2, geometry.pixel_bounds.3)
+                            == (width as u32, height as u32) =>
+                {
+                    SourceCoverage::Known(geometry)
+                }
+                _ => {
+                    crate::logger::log(
+                        "edit_preview_cache: invalid source coverage metadata; preserving cached row",
+                    );
+                    return None;
+                }
+            },
+        };
+        let layout_dims = match layout_dims_json.as_deref() {
+            None => None,
+            Some(json) => match serde_json::from_str::<(u32, u32)>(json) {
+                Ok((width, height)) if width > 0 && height > 0 => Some((width, height)),
+                _ => {
+                    crate::logger::log(
+                        "edit_preview_cache: invalid layout dimensions metadata; preserving cached row",
+                    );
+                    return None;
+                }
+            },
+        };
 
         let records: Vec<CachedAnnotationLayerRecord> =
             match serde_json::from_str(&annotation_layers_json) {
@@ -448,6 +520,8 @@ impl EditPreviewCacheDb {
             annotation_layers,
             image,
             source_dims: (width as u32, height as u32),
+            layout_dims,
+            coverage,
         })
     }
 
@@ -457,14 +531,31 @@ impl EditPreviewCacheDb {
         source_mtime: i64,
         source_size: i64,
         source_container_size: Option<i64>,
-        source_dims: (u32, u32),
+        geometry: EditPreviewGeometry,
+        layout_dims: Option<(u32, u32)>,
         base_webp: &[u8],
         annotation_layers: &[EncodedAnnotationLayer],
     ) -> Result<(), String> {
         if base_webp.is_empty() || annotation_layers.iter().any(|layer| layer.webp.is_empty()) {
             return Err("encoded preview was empty".to_string());
         }
+        if !geometry.is_valid() {
+            return Err("invalid edit preview source geometry".to_string());
+        }
+        let source_dims = (geometry.pixel_bounds.2, geometry.pixel_bounds.3);
+        let source_coverage_json = serde_json::to_string(&geometry).map_err(|e| e.to_string())?;
+        let layout_dims_json = layout_dims
+            .filter(|&(width, height)| width > 0 && height > 0)
+            .map(|dims| serde_json::to_string(&dims))
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let mut content_hasher = Sha256::new();
+        // Identical cropped pixels at different source positions are distinct materials. Including
+        // provenance also keeps stale-row cleanup correlated when saves occur in the same second.
+        content_hasher.update(source_coverage_json.as_bytes());
+        if let Some(json) = &layout_dims_json {
+            content_hasher.update(json.as_bytes());
+        }
         content_hasher.update(base_webp);
         for layer in annotation_layers {
             content_hasher.update(match layer.blend {
@@ -520,14 +611,17 @@ impl EditPreviewCacheDb {
                 "INSERT INTO edit_previews
                  (item_key, source_mtime, source_size, source_container_size,
                   source_width, source_height,
-                  cached_path, annotation_layers_json, cached_bytes, updated_at, last_access_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                  cached_path, annotation_layers_json, cached_bytes, updated_at, last_access_at,
+                  source_coverage_json, layout_dims_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)
                  ON CONFLICT(item_key) DO UPDATE SET
                     source_mtime=excluded.source_mtime,
                     source_size=excluded.source_size,
                     source_container_size=excluded.source_container_size,
                     source_width=excluded.source_width,
                     source_height=excluded.source_height,
+                    source_coverage_json=excluded.source_coverage_json,
+                    layout_dims_json=excluded.layout_dims_json,
                     cached_path=excluded.cached_path,
                     annotation_layers_json=excluded.annotation_layers_json,
                     cached_bytes=excluded.cached_bytes,
@@ -544,6 +638,8 @@ impl EditPreviewCacheDb {
                     &annotation_layers_json,
                     cached_bytes as i64,
                     now,
+                    &source_coverage_json,
+                    &layout_dims_json,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1043,18 +1139,52 @@ fn prepare_preview_components(
     pixels: Arc<egui::ColorImage>,
     annotations: Option<EditPreviewAnnotations>,
     crop: Option<crate::export_crop::CropRect>,
-) -> Option<(Arc<egui::ColorImage>, Vec<CachedAnnotationLayer>)> {
-    let mut prepared = pixels;
-    let mut layers = annotations
-        .map(|annotations| bake_cached_annotation_layers(&prepared, annotations))
+    coordinate_dims: CanonicalPageDimensions,
+) -> Option<(
+    Arc<egui::ColorImage>,
+    Vec<CachedAnnotationLayer>,
+    EditPreviewGeometry,
+)> {
+    let layers = annotations
+        .map(|annotations| bake_cached_annotation_layers(&pixels, annotations))
         .unwrap_or_default();
+    crop_preview_components(pixels, layers, crop, coordinate_dims)
+}
+
+fn crop_preview_components(
+    mut prepared: Arc<egui::ColorImage>,
+    mut layers: Vec<CachedAnnotationLayer>,
+    crop: Option<crate::export_crop::CropRect>,
+    coordinate_dims: CanonicalPageDimensions,
+) -> Option<(
+    Arc<egui::ColorImage>,
+    Vec<CachedAnnotationLayer>,
+    EditPreviewGeometry,
+)> {
+    let [width, height] = prepared.size;
+    if layers.iter().any(|layer| layer.image.size != prepared.size) {
+        return None;
+    }
+    let (x, y, w, h) = crop
+        .map(|crop| crop.pixel_bounds(width, height))
+        .unwrap_or((0, 0, width, height));
+    let geometry = EditPreviewGeometry::new(
+        coordinate_dims,
+        (u32::try_from(width).ok()?, u32::try_from(height).ok()?),
+        (
+            u32::try_from(x).ok()?,
+            u32::try_from(y).ok()?,
+            u32::try_from(w).ok()?,
+            u32::try_from(h).ok()?,
+        ),
+    )?;
     if let Some(crop) = crop {
         prepared = Arc::new(crate::export_crop::crop_color_image(&prepared, crop).ok()?);
         for layer in &mut layers {
             layer.image = crate::export_crop::crop_color_image(&layer.image, crop).ok()?;
         }
     }
-    Some((prepared, layers))
+    Some((prepared, layers, geometry))
 }
 
 fn fit_output_dims([width, height]: [usize; 2], max_side: u32) -> Option<(u32, u32)> {
@@ -1183,6 +1313,8 @@ enum EditPreviewCommand {
         source_mtime: i64,
         source_size: i64,
         source_container_path: Option<PathBuf>,
+        coordinate_dims: CanonicalPageDimensions,
+        layout_dims: Option<(u32, u32)>,
         pixels: Arc<egui::ColorImage>,
         annotations: Option<EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
@@ -1258,25 +1390,32 @@ impl EditPreviewCacheService {
                             source_mtime,
                             source_size,
                             source_container_path,
+                            coordinate_dims,
+                            layout_dims,
                             pixels,
                             annotations,
                             crop,
                             max_bytes,
                             repaint_ctx,
                         } => {
-                            let result = prepare_preview_components(pixels, annotations, crop)
-                                .ok_or_else(|| "edit preview composition failed".to_string())
-                                .and_then(|(prepared, layers)| {
-                                    let source_dims =
-                                        (prepared.size[0] as u32, prepared.size[1] as u32);
+                            let result = prepare_preview_components(
+                                pixels,
+                                annotations,
+                                crop,
+                                coordinate_dims,
+                            )
+                            .ok_or_else(|| "edit preview composition failed".to_string())
+                            .and_then(
+                                |(prepared, layers, geometry)| {
                                     encode_preview_components(&prepared, &layers)
                                         .map(|(base_webp, encoded_layers)| {
-                                            (source_dims, base_webp, encoded_layers)
+                                            (geometry, base_webp, encoded_layers)
                                         })
                                         .ok_or_else(|| {
                                             "edit preview WebP encode failed".to_string()
                                         })
-                                });
+                                },
+                            );
                             let epub_read = source_container_path.as_deref().and_then(|path| {
                                 path.extension()
                                     .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
@@ -1297,13 +1436,14 @@ impl EditPreviewCacheService {
                                 worker_pending_commands.fetch_sub(1, Ordering::AcqRel);
                                 continue;
                             };
-                            match result.and_then(|(source_dims, base_webp, encoded_layers)| {
+                            match result.and_then(|(geometry, base_webp, encoded_layers)| {
                                 worker_db.save_encoded(
                                     &item_key,
                                     source_mtime,
                                     source_size,
                                     source_container_size,
-                                    source_dims,
+                                    geometry,
+                                    layout_dims,
                                     &base_webp,
                                     &encoded_layers,
                                 )
@@ -1386,6 +1526,8 @@ impl EditPreviewCacheService {
         source_mtime: i64,
         source_size: i64,
         source_container_path: Option<PathBuf>,
+        coordinate_dims: CanonicalPageDimensions,
+        layout_dims: Option<(u32, u32)>,
         pixels: Arc<egui::ColorImage>,
         annotations: Option<EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
@@ -1397,6 +1539,8 @@ impl EditPreviewCacheService {
             source_mtime,
             source_size,
             source_container_path,
+            coordinate_dims,
+            layout_dims,
             pixels,
             annotations,
             crop,
@@ -1449,6 +1593,15 @@ impl EditPreviewCacheService {
 mod tests {
     use super::*;
 
+    fn full_geometry((width, height): (u32, u32)) -> EditPreviewGeometry {
+        EditPreviewGeometry::new(
+            CanonicalPageDimensions::new(width, height),
+            (width, height),
+            (0, 0, width, height),
+        )
+        .unwrap()
+    }
+
     fn test_db() -> (tempfile::TempDir, EditPreviewCacheDb) {
         let temp = tempfile::tempdir().unwrap();
         let db = EditPreviewCacheDb::open_at(&temp.path().join("preview.db")).unwrap();
@@ -1486,8 +1639,17 @@ mod tests {
             image: egui::ColorImage::filled([8, 4], egui::Color32::from_rgb(230, 180, 120)),
         };
         let (base_webp, layers) = encode_preview_components(&base, &[layer]).unwrap();
-        db.save_encoded(item_key, 10, 20, None, (8, 4), &base_webp, &layers)
-            .unwrap();
+        db.save_encoded(
+            item_key,
+            10,
+            20,
+            None,
+            full_geometry((8, 4)),
+            None,
+            &base_webp,
+            &layers,
+        )
+        .unwrap();
     }
 
     fn red_transparent_edge() -> egui::ColorImage {
@@ -1577,6 +1739,10 @@ mod tests {
             }
             let loaded = db.load(&destination_key, 10, 20, 2048).unwrap();
             assert_eq!(loaded.annotation_layers.len(), 1);
+            assert_eq!(
+                loaded.coverage,
+                SourceCoverage::Known(full_geometry((8, 4)))
+            );
             all_paths.push((source_key, destination_key, source_paths, destination_paths));
         }
 
@@ -1638,8 +1804,17 @@ mod tests {
             egui::Color32::from_rgb(20, 80, 140),
         ))
         .unwrap();
-        db.save_encoded("page-a", 10, 20, None, (8, 4), &webp, &[])
-            .unwrap();
+        db.save_encoded(
+            "page-a",
+            10,
+            20,
+            None,
+            full_geometry((8, 4)),
+            None,
+            &webp,
+            &[],
+        )
+        .unwrap();
 
         let hit = db.load("page-a", 10, 20, 2048).unwrap();
         assert_eq!(hit.source_dims, (8, 4));
@@ -1658,8 +1833,17 @@ mod tests {
             egui::Color32::from_rgb(20, 80, 140),
         ))
         .unwrap();
-        db.save_encoded("page-delete", 10, 20, None, (8, 4), &webp, &[])
-            .unwrap();
+        db.save_encoded(
+            "page-delete",
+            10,
+            20,
+            None,
+            full_geometry((8, 4)),
+            None,
+            &webp,
+            &[],
+        )
+        .unwrap();
 
         assert!(db.delete("page-delete"));
         assert!(!db.delete("page-delete"));
@@ -1708,8 +1892,17 @@ mod tests {
             egui::Color32::from_rgb(20, 80, 140),
         ))
         .unwrap();
-        db.save_encoded("archive::page.jpg", 10, 20, Some(200), (8, 4), &webp, &[])
-            .unwrap();
+        db.save_encoded(
+            "archive::page.jpg",
+            10,
+            20,
+            Some(200),
+            full_geometry((8, 4)),
+            None,
+            &webp,
+            &[],
+        )
+        .unwrap();
 
         assert!(
             db.load_for_container("archive::page.jpg", 10, 200, 2048)
@@ -1740,7 +1933,8 @@ mod tests {
             stamp.0,
             stamp.1,
             stamp.2,
-            (8, 4),
+            full_geometry((8, 4)),
+            None,
             &webp,
             &[],
         )
@@ -1769,8 +1963,17 @@ mod tests {
             ),
         };
         let (base_webp, layers) = encode_preview_components(&base, &[annotation]).unwrap();
-        db.save_encoded("page-layers", 10, 20, None, (8, 4), &base_webp, &layers)
-            .unwrap();
+        db.save_encoded(
+            "page-layers",
+            10,
+            20,
+            None,
+            full_geometry((8, 4)),
+            None,
+            &base_webp,
+            &layers,
+        )
+        .unwrap();
 
         let hit = db.load("page-layers", 10, 20, 2048).unwrap();
         assert_eq!(hit.adjustment_base.size, [8, 4]);
@@ -1794,8 +1997,17 @@ mod tests {
             ),
         };
         let (base_webp, layers) = encode_preview_components(&base, &[annotation]).unwrap();
-        db.save_encoded("page-display", 10, 20, None, (80, 40), &base_webp, &layers)
-            .unwrap();
+        db.save_encoded(
+            "page-display",
+            10,
+            20,
+            None,
+            full_geometry((80, 40)),
+            None,
+            &base_webp,
+            &layers,
+        )
+        .unwrap();
 
         let hit = db.load("page-display", 10, 20, 24).unwrap();
         assert_eq!(hit.source_dims, (80, 40));
@@ -1812,9 +2024,9 @@ mod tests {
             encode_preview(&egui::ColorImage::filled([16, 16], egui::Color32::RED)).unwrap();
         let webp_b =
             encode_preview(&egui::ColorImage::filled([16, 16], egui::Color32::BLUE)).unwrap();
-        db.save_encoded("a", 1, 1, None, (16, 16), &webp_a, &[])
+        db.save_encoded("a", 1, 1, None, full_geometry((16, 16)), None, &webp_a, &[])
             .unwrap();
-        db.save_encoded("b", 1, 1, None, (16, 16), &webp_b, &[])
+        db.save_encoded("b", 1, 1, None, full_geometry((16, 16)), None, &webp_b, &[])
             .unwrap();
         db.prune(webp_b.len() as u64);
         assert!(db.total_bytes() <= webp_b.len() as u64);
@@ -1832,11 +2044,387 @@ mod tests {
             max_x: 10.0,
             max_y: 7.0,
         };
-        let (prepared, layers) = prepare_preview_components(pixels, None, Some(crop)).unwrap();
+        let (prepared, layers, geometry) = prepare_preview_components(
+            pixels,
+            None,
+            Some(crop),
+            CanonicalPageDimensions::new(12, 8),
+        )
+        .unwrap();
         assert_eq!(prepared.size, [8, 6]);
         assert_eq!(prepared.pixels.len(), 48);
         assert!(layers.is_empty());
+        assert_eq!(geometry.raster_dims, (12, 8));
+        assert_eq!(geometry.pixel_bounds, (2, 1, 8, 6));
         assert!(encode_preview(&prepared).is_some());
+    }
+
+    #[test]
+    fn fractional_crop_uses_identical_real_pixel_bounds_for_base_normal_and_multiply() {
+        let pixels = Arc::new(egui::ColorImage::new(
+            [12, 8],
+            (0..96)
+                .map(|index| egui::Color32::from_rgb(index, 120, 200))
+                .collect(),
+        ));
+        let layers = [
+            CachedAnnotationBlend::Normal,
+            CachedAnnotationBlend::Multiply,
+        ]
+        .into_iter()
+        .map(|blend| CachedAnnotationLayer {
+            blend,
+            image: (*pixels).clone(),
+        })
+        .collect();
+        let crop = crate::export_crop::CropRect {
+            min_x: 2.9,
+            min_y: 1.2,
+            max_x: 9.1,
+            max_y: 6.01,
+        };
+        let (base, layers, geometry) = crop_preview_components(
+            Arc::clone(&pixels),
+            layers,
+            Some(crop),
+            CanonicalPageDimensions::new(1200, 800),
+        )
+        .unwrap();
+        assert_eq!(geometry.pixel_bounds, (2, 1, 8, 6));
+        assert_eq!(geometry.raster_dims, (12, 8));
+        assert_eq!(geometry.coordinate_dims.as_tuple(), (1200, 800));
+        assert_eq!(base.size, [8, 6]);
+        assert_eq!(base.pixels[0], pixels.pixels[14]);
+        assert_eq!(*base.pixels.last().unwrap(), pixels.pixels[81]);
+        for layer in &layers {
+            assert_eq!(layer.image.size, base.size);
+            assert_eq!(layer.image.pixels, base.pixels);
+        }
+
+        let (temp, db) = test_db();
+        let path = temp.path().join("preview.db");
+        let (webp, encoded_layers) = encode_preview_components(&base, &layers).unwrap();
+        db.save_encoded(
+            "fractional",
+            10,
+            20,
+            None,
+            geometry,
+            None,
+            &webp,
+            &encoded_layers,
+        )
+        .unwrap();
+        drop(db);
+        let db = EditPreviewCacheDb::open_at(&path).unwrap();
+        let loaded = db.load("fractional", 10, 20, 4).unwrap();
+        assert_eq!(loaded.source_dims, (8, 6), "listing aspect remains cropped");
+        assert_eq!(loaded.adjustment_base.size, [4, 3]);
+        assert_eq!(loaded.coverage, SourceCoverage::Known(geometry));
+        assert_eq!(
+            loaded.annotation_layers[0].blend,
+            CachedAnnotationBlend::Normal
+        );
+        assert_eq!(
+            loaded.annotation_layers[1].blend,
+            CachedAnnotationBlend::Multiply
+        );
+        assert!(
+            loaded
+                .annotation_layers
+                .iter()
+                .all(|layer| layer.image.size == [4, 3])
+        );
+        assert_eq!(
+            loaded.coverage.source_uv_rect(),
+            Some(egui::Rect::from_min_max(
+                egui::pos2(2.0 / 12.0, 1.0 / 8.0),
+                egui::pos2(10.0 / 12.0, 7.0 / 8.0),
+            ))
+        );
+    }
+
+    #[test]
+    fn uncropped_new_preview_still_persists_known_coordinate_and_raster_dimensions() {
+        let (_temp, db) = test_db();
+        let pixels = Arc::new(egui::ColorImage::filled([12, 8], egui::Color32::WHITE));
+        let (base, layers, geometry) = prepare_preview_components(
+            pixels,
+            None,
+            None,
+            CanonicalPageDimensions::new(6000, 4000),
+        )
+        .unwrap();
+        let (webp, encoded_layers) = encode_preview_components(&base, &layers).unwrap();
+        db.save_encoded(
+            "uncropped",
+            10,
+            20,
+            None,
+            geometry,
+            None,
+            &webp,
+            &encoded_layers,
+        )
+        .unwrap();
+        let loaded = db.load("uncropped", 10, 20, 4).unwrap();
+        assert_eq!(geometry.pixel_bounds, (0, 0, 12, 8));
+        assert_eq!(
+            loaded.coverage.coordinate_dims().unwrap().as_tuple(),
+            (6000, 4000)
+        );
+        assert!(matches!(loaded.coverage, SourceCoverage::Known(_)));
+        assert_eq!(
+            loaded.coverage.source_uv_rect(),
+            SourceCoverage::FullSource.source_uv_rect()
+        );
+        assert_eq!(loaded.image.size, [4, 3]);
+        assert_eq!(loaded.layout_dims, None);
+    }
+
+    #[test]
+    fn preview_roundtrip_preserves_pagebox_layout_independently_of_coordinate_and_raster_sizes() {
+        let (temp, db) = test_db();
+        let path = temp.path().join("preview.db");
+        let geometry = EditPreviewGeometry::new(
+            CanonicalPageDimensions::new(6000, 4000),
+            (12, 8),
+            (2, 1, 4, 4),
+        )
+        .unwrap();
+        let webp = encode_preview(&egui::ColorImage::filled([4, 4], egui::Color32::WHITE)).unwrap();
+        let pagebox = (612_000, 792_000);
+        db.save_encoded(
+            "pdf::page_0",
+            10,
+            20,
+            Some(30),
+            geometry,
+            Some(pagebox),
+            &webp,
+            &[],
+        )
+        .unwrap();
+        drop(db);
+
+        let db = EditPreviewCacheDb::open_at(&path).unwrap();
+        let loaded = db.load("pdf::page_0", 10, 20, 2).unwrap();
+        assert_eq!(loaded.layout_dims, Some(pagebox));
+        assert_eq!(loaded.source_dims, (4, 4));
+        assert_eq!(loaded.image.size, [2, 2]);
+        assert_eq!(loaded.coverage, SourceCoverage::Known(geometry));
+        assert_eq!(
+            loaded.coverage.coordinate_dims().unwrap().as_tuple(),
+            (6000, 4000)
+        );
+        assert_eq!(
+            db.load_for_container("pdf::page_0", 10, 30, 4)
+                .unwrap()
+                .layout_dims,
+            Some(pagebox)
+        );
+
+        db.save_encoded("pdf::page_0", 10, 20, Some(30), geometry, None, &webp, &[])
+            .unwrap();
+        assert_eq!(
+            db.load("pdf::page_0", 10, 20, 4).unwrap().layout_dims,
+            None,
+            "a subsequent unknown layout must not inherit an older row's page-box units"
+        );
+    }
+
+    #[test]
+    fn released_v6_migration_retains_rows_webps_and_unknown_listing_preview() {
+        let (temp, db) = test_db();
+        save_preview_with_one_layer(&db, "legacy", 42);
+        let paths = preview_row_paths(&db, "legacy").unwrap();
+        let bytes = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        // This recreates the released v6 schema without changing any existing row or WebP.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE edit_previews DROP COLUMN source_coverage_json;
+                            ALTER TABLE edit_previews DROP COLUMN layout_dims_json;",
+            )
+            .unwrap();
+        drop(db);
+
+        let path = temp.path().join("preview.db");
+        let db = EditPreviewCacheDb::open_at(&path).unwrap();
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM edit_previews", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT source_coverage_json FROM edit_previews WHERE item_key = 'legacy'",
+                [],
+                |row| row.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+            None
+        );
+        drop(conn);
+        let loaded = db.load("legacy", 10, 20, 2048).unwrap();
+        assert_eq!(loaded.source_dims, (8, 4));
+        assert_eq!(loaded.annotation_layers.len(), 1);
+        assert_eq!(loaded.coverage, SourceCoverage::Unknown);
+        assert_eq!(loaded.layout_dims, None);
+        assert_eq!(
+            loaded.coverage.resolve_for_display(false),
+            Ok(SourceCoverage::FullSource)
+        );
+        assert_eq!(
+            loaded.coverage.resolve_for_display(true),
+            Err(crate::source_coverage::SourceCoverageUnavailable::UnknownWithCurrentCrop)
+        );
+        for (path, expected) in paths.iter().zip(bytes) {
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
+        drop(db);
+        let reopened = EditPreviewCacheDb::open_at(&path).unwrap();
+        assert_eq!(
+            reopened.load("legacy", 10, 20, 2048).unwrap().coverage,
+            SourceCoverage::Unknown
+        );
+    }
+
+    #[test]
+    fn current_crop_update_before_preview_delete_cannot_change_generated_coverage() {
+        let (temp, db) = test_db();
+        let crop_db = crate::export_crop::CropDb::open_at(&temp.path().join("crop.db")).unwrap();
+        let crop_a = crate::export_crop::CropRect {
+            min_x: 1.2,
+            min_y: 1.2,
+            max_x: 7.2,
+            max_y: 6.2,
+        };
+        let crop_b = crate::export_crop::CropRect {
+            min_x: 4.2,
+            min_y: 0.2,
+            max_x: 10.2,
+            max_y: 5.2,
+        };
+        let settings = |rect| {
+            crate::export_crop::CropSettings::authored(
+                rect,
+                crate::export_crop::CropAspectMode::Free,
+                [12, 8],
+            )
+        };
+        crop_db.set("page", settings(crop_a)).unwrap();
+        let pixels = Arc::new(egui::ColorImage::filled([12, 8], egui::Color32::WHITE));
+        let (base, layers, geometry) = prepare_preview_components(
+            pixels,
+            None,
+            Some(crop_a),
+            CanonicalPageDimensions::new(120, 80),
+        )
+        .unwrap();
+        let (webp, encoded_layers) = encode_preview_components(&base, &layers).unwrap();
+        db.save_encoded("page", 10, 20, None, geometry, None, &webp, &encoded_layers)
+            .unwrap();
+
+        // Deterministic ordinary ordering: crop DB updated; queued preview Delete has not run yet.
+        crop_db.set("page", settings(crop_b)).unwrap();
+        let loaded = db.load("page", 10, 20, 2048).unwrap();
+        assert_eq!(crop_db.get("page").unwrap().rect, crop_b);
+        assert_eq!(loaded.coverage, SourceCoverage::Known(geometry));
+        assert_eq!(geometry.pixel_bounds, (1, 1, 7, 6));
+        assert_ne!(geometry.pixel_bounds, (4, 0, 7, 6));
+        assert_eq!(
+            loaded.coverage.resolve_for_display(true),
+            Ok(loaded.coverage)
+        );
+        crop_db.remove("page").unwrap();
+        assert_eq!(
+            db.load("page", 10, 20, 2048).unwrap().coverage,
+            loaded.coverage
+        );
+    }
+
+    #[test]
+    fn generation_uses_supplied_memory_crop_even_when_persisted_crop_differs() {
+        let (temp, db) = test_db();
+        let crop_db = crate::export_crop::CropDb::open_at(&temp.path().join("crop.db")).unwrap();
+        let saved_crop = crate::export_crop::CropRect {
+            min_x: 1.2,
+            min_y: 1.2,
+            max_x: 7.2,
+            max_y: 6.2,
+        };
+        let memory_crop = crate::export_crop::CropRect {
+            min_x: 4.2,
+            min_y: 0.2,
+            max_x: 10.2,
+            max_y: 5.2,
+        };
+        crop_db
+            .set(
+                "page",
+                crate::export_crop::CropSettings::authored(
+                    saved_crop,
+                    crate::export_crop::CropAspectMode::Free,
+                    [12, 8],
+                ),
+            )
+            .unwrap();
+        // Producer input models an in-memory edit that has not reached the crop DB. It must carry
+        // its own generation provenance without inferring it from the independent settings row.
+        let pixels = Arc::new(egui::ColorImage::filled([12, 8], egui::Color32::WHITE));
+        let (base, layers, geometry) = prepare_preview_components(
+            pixels,
+            None,
+            Some(memory_crop),
+            CanonicalPageDimensions::new(120, 80),
+        )
+        .unwrap();
+        let (webp, encoded_layers) = encode_preview_components(&base, &layers).unwrap();
+        db.save_encoded("page", 10, 20, None, geometry, None, &webp, &encoded_layers)
+            .unwrap();
+        assert_eq!(crop_db.get("page").unwrap().rect, saved_crop);
+        assert_eq!(geometry.pixel_bounds, (4, 0, 7, 6));
+        assert_eq!(
+            db.load("page", 10, 20, 2048).unwrap().coverage,
+            SourceCoverage::Known(geometry)
+        );
+    }
+
+    #[test]
+    fn identical_pixels_at_different_positions_publish_distinct_owned_materials() {
+        let (_temp, db) = test_db();
+        let webp = encode_preview(&egui::ColorImage::filled([4, 4], egui::Color32::WHITE)).unwrap();
+        let a =
+            EditPreviewGeometry::new(CanonicalPageDimensions::new(12, 8), (12, 8), (1, 1, 4, 4))
+                .unwrap();
+        let b =
+            EditPreviewGeometry::new(CanonicalPageDimensions::new(12, 8), (12, 8), (6, 2, 4, 4))
+                .unwrap();
+        db.save_encoded("page", 10, 20, None, a, None, &webp, &[])
+            .unwrap();
+        let path_a = preview_row_paths(&db, "page").unwrap();
+        db.save_encoded("page", 10, 20, None, b, None, &webp, &[])
+            .unwrap();
+        let path_b = preview_row_paths(&db, "page").unwrap();
+        assert_ne!(path_a, path_b);
+        assert!(!path_a[0].exists());
+        assert!(path_b[0].exists());
+        assert_eq!(
+            db.load("page", 10, 20, 2048).unwrap().coverage,
+            SourceCoverage::Known(b)
+        );
     }
 
     #[test]
@@ -1881,6 +2469,62 @@ mod tests {
         assert!(db.load("tampered", 1, 1, 2048).is_none());
         assert!(external.exists());
         assert_eq!(db.total_bytes(), 0);
+    }
+
+    #[test]
+    fn malformed_new_metadata_is_rejected_without_becoming_legacy_or_removing_owned_data() {
+        let (_temp, db) = test_db();
+        save_preview_with_one_layer(&db, "damaged-metadata", 42);
+        let paths = preview_row_paths(&db, "damaged-metadata").unwrap();
+        let original_bytes = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let geometry = full_geometry((8, 4));
+        let valid_geometry_json = serde_json::to_string(&geometry).unwrap();
+        let invalid_geometry_json = serde_json::to_string(&EditPreviewGeometry {
+            raster_dims: (0, 4),
+            ..geometry
+        })
+        .unwrap();
+        let mismatched_geometry_json = serde_json::to_string(&full_geometry((4, 4))).unwrap();
+        let cases: [(&str, Option<&str>); 7] = [
+            ("{", None),
+            ("null", None),
+            (&invalid_geometry_json, None),
+            (&mismatched_geometry_json, None),
+            (&valid_geometry_json, Some("{")),
+            (&valid_geometry_json, Some("null")),
+            (&valid_geometry_json, Some("[0,4]")),
+        ];
+        for (coverage_json, layout_json) in cases {
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE edit_previews SET source_coverage_json = ?1, layout_dims_json = ?2
+                 WHERE item_key = 'damaged-metadata'",
+                    params![coverage_json, layout_json],
+                )
+                .unwrap();
+            assert!(db.load("damaged-metadata", 10, 20, 2048).is_none());
+            assert_eq!(preview_row_paths(&db, "damaged-metadata").unwrap(), paths);
+            for (path, expected) in paths.iter().zip(&original_bytes) {
+                assert_eq!(&std::fs::read(path).unwrap(), expected);
+            }
+        }
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE edit_previews SET source_coverage_json = NULL, layout_dims_json = NULL
+             WHERE item_key = 'damaged-metadata'",
+                [],
+            )
+            .unwrap();
+        let legacy = db.load("damaged-metadata", 10, 20, 2048).unwrap();
+        assert_eq!(legacy.coverage, SourceCoverage::Unknown);
+        assert_eq!(legacy.layout_dims, None);
     }
 
     #[test]

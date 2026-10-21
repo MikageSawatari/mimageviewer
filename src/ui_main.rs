@@ -4870,6 +4870,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
             origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 160,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1920, 1200)),
             layout_dims: None,
         }
@@ -21413,6 +21414,7 @@ mod selection_info_tests {
             },
             from_edit_preview: false,
             rendered_at_px: 128,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some(dims),
             layout_dims: None,
         }

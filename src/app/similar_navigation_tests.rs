@@ -292,6 +292,7 @@ fn loaded_thumbnail(ctx: &egui::Context, label: &str) -> ThumbnailState {
         },
         from_edit_preview: false,
         rendered_at_px: 64,
+        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
         source_dims: Some((2, 3)),
         layout_dims: None,
     }

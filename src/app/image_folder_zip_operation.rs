@@ -1537,6 +1537,7 @@ mod tests {
             origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
             from_edit_preview: true,
             rendered_at_px: 1,
+            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
             source_dims: Some((1, 1)),
             layout_dims: None,
         };

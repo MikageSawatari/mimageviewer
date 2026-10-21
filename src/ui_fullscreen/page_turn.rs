@@ -890,6 +890,7 @@ impl PaintedUnit {
                     && a.resource.paint_texture_id() == b.resource.paint_texture_id()
                     && a.resource.source_generation() == b.resource.source_generation()
                     && a.resource.visible_source_uv_rect() == b.resource.visible_source_uv_rect()
+                    && a.resource.source_coverage() == b.resource.source_coverage()
                     && a.transform.paint_quad() == b.transform.paint_quad()
                     && a.transform.uv_rect == b.transform.uv_rect
                     && a.transform.fit_input == b.transform.fit_input
@@ -2071,7 +2072,26 @@ impl App {
             return true;
         }
         resource.visible_source_uv_rect().is_none_or(|roi| {
-            canonical_roi_uv(canonical_source_uv(transform), roi, resource.size()).is_ok()
+            let Some(coverage) = resource.source_coverage().source_uv_rect() else {
+                return false;
+            };
+            let requested = coverage.intersect(transform.uv_rect);
+            if requested.width() <= 0.0 || requested.height() <= 0.0 {
+                return true;
+            }
+            let uv = [
+                requested.left_top(),
+                requested.right_top(),
+                requested.right_bottom(),
+                requested.left_bottom(),
+            ]
+            .map(|p| {
+                egui::pos2(
+                    (p.x - coverage.left()) / coverage.width(),
+                    (p.y - coverage.top()) / coverage.height(),
+                )
+            });
+            canonical_roi_uv(uv, roi, resource.size()).is_ok()
         })
     }
 
@@ -2987,20 +3007,8 @@ pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
         &page.painter,
         &page.resource,
     );
-    if let Some(roi) = page.resource.visible_source_uv_rect() {
-        page.transform.paint_texture_source_region(
-            &page.painter,
-            page.resource.paint_texture_id(),
-            roi,
-            egui::Color32::WHITE,
-        );
-    } else {
-        page.transform.paint_texture(
-            &page.painter,
-            page.resource.paint_texture_id(),
-            egui::Color32::WHITE,
-        );
-    }
+    page.resource
+        .paint_texture(&page.transform, &page.painter, egui::Color32::WHITE);
     #[cfg(all(windows, feature = "test-script"))]
     crate::test_script::record_drawn_paint(
         &page.painter,
@@ -3302,20 +3310,7 @@ fn canonical_unit(
             return Err("free_rotation");
         }
         let quad = page.transform.paint_quad();
-        let uv = canonical_source_uv(&page.transform);
-        let material = if let Some(roi) = page.resource.visible_source_uv_rect() {
-            PageMaterial::Texture {
-                texture_id: page.resource.paint_texture_id(),
-                uv: canonical_roi_uv(uv, roi, page.resource.size())?,
-                available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            }
-        } else {
-            PageMaterial::Texture {
-                texture_id: page.resource.paint_texture_id(),
-                uv,
-                available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            }
-        };
+        let material = canonical_page_material(page)?;
         let underlay = match &page.underlay {
             FsBgStyle::Solid(color) => PageMaterial::Blank { color: *color },
             FsBgStyle::Checker(tex) => PageMaterial::Texture {
@@ -3438,6 +3433,108 @@ fn canonical_unit(
         normalize_spread_window(canonical, window).map_err(|e| e.sub_check())
     } else {
         Ok(canonical)
+    }
+}
+
+fn canonical_page_material(
+    page: &PreparedPagedPage,
+) -> Result<crate::page_turn_animation::PageMaterial, &'static str> {
+    use crate::page_turn_animation::PageMaterial;
+    let coverage = page
+        .resource
+        .source_coverage()
+        .source_uv_rect()
+        .ok_or("unknown_source_coverage")?;
+    let unit = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    if coverage == unit {
+        let uv = canonical_source_uv(&page.transform);
+        return Ok(PageMaterial::Texture {
+            texture_id: page.resource.paint_texture_id(),
+            uv: if let Some(roi) = page.resource.visible_source_uv_rect() {
+                canonical_roi_uv(uv, roi, page.resource.size())?
+            } else {
+                uv
+            },
+            available_uv: unit,
+        });
+    }
+    let requested = coverage.intersect(page.transform.uv_rect);
+    // The page/underlay still constitute a presented leaf when no source
+    // pixels are available for its display request. Do not make it Vacant.
+    if requested.width() <= 0.0 || requested.height() <= 0.0 {
+        return Ok(PageMaterial::Blank {
+            color: egui::Color32::TRANSPARENT,
+        });
+    }
+    let roi = page.resource.visible_source_uv_rect();
+    if let Some(roi) = roi {
+        // Native ROI must cover all requested material. Partial source
+        // provenance is intentional; an incomplete prepared ROI remains an error.
+        let sampler_uv = [
+            requested.left_top(),
+            requested.right_top(),
+            requested.right_bottom(),
+            requested.left_bottom(),
+        ]
+        .map(|p| {
+            egui::pos2(
+                (p.x - coverage.min.x) / coverage.width(),
+                (p.y - coverage.min.y) / coverage.height(),
+            )
+        });
+        canonical_roi_uv(sampler_uv, roi, page.resource.size())?;
+    }
+    let Some(material) = page.transform.material_quad(coverage, roi) else {
+        return Ok(PageMaterial::Blank {
+            color: egui::Color32::TRANSPARENT,
+        });
+    };
+    let material_rect = material
+        .positions
+        .iter()
+        .fold(egui::Rect::NOTHING, |rect, p| {
+            rect.union(egui::Rect::from_min_max(*p, *p))
+        });
+    // The pure helper's vertices follow source-axis order. Canonical materials
+    // follow screen-axis order so all four saved quarter rotations are retained.
+    let uv = [
+        material_rect.left_top(),
+        material_rect.right_top(),
+        material_rect.right_bottom(),
+        material_rect.left_bottom(),
+    ]
+    .map(|corner| {
+        let index = material
+            .positions
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.distance_sq(corner).total_cmp(&b.distance_sq(corner)))
+            .unwrap()
+            .0;
+        material.uv[index]
+    });
+    let full = page.transform.paint_rect;
+    if material_rect == full {
+        Ok(PageMaterial::Texture {
+            texture_id: page.resource.paint_texture_id(),
+            uv,
+            available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        })
+    } else {
+        Ok(PageMaterial::PartialTexture {
+            texture_id: page.resource.paint_texture_id(),
+            uv,
+            domain: egui::Rect::from_min_max(
+                egui::pos2(
+                    (material_rect.left() - full.left()) / full.width(),
+                    (material_rect.top() - full.top()) / full.height(),
+                ),
+                egui::pos2(
+                    (material_rect.right() - full.left()) / full.width(),
+                    (material_rect.bottom() - full.top()) / full.height(),
+                ),
+            ),
+        })
     }
 }
 
@@ -3615,6 +3712,138 @@ mod tests {
             evidence: AcceptanceEvidence::Immediate,
             content: Vec::new(),
         })
+    }
+
+    #[test]
+    fn source_coverage_canonical_keeps_page_underlay_and_animation_in_all_rotations() {
+        use crate::displayed_image_transform::*;
+        use crate::page_turn_animation::*;
+        use crate::rotation_db::Rotation;
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "coverage-turn",
+            egui::ColorImage::filled([16, 24], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let coverage = crate::source_coverage::SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(32, 32),
+                (32, 32),
+                (8, 4, 16, 24),
+            )
+            .unwrap(),
+        );
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            for empty in [false, true] {
+                let mut painted = unit(&ctx, texture.clone(), 1);
+                let page = &mut Arc::get_mut(&mut painted).unwrap().pages[0];
+                let resource = FullscreenPaintResource::resampleable(
+                    0,
+                    texture.clone(),
+                    crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 1, input: 0 },
+                )
+                .with_source_coverage(coverage);
+                page.resource = resource.into();
+                let frame = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 320.0));
+                page.painter = ctx.debug_painter().with_clip_rect(frame);
+                page.transform = DisplayedImageTransform::from_resolved_rect(
+                    DisplayedImageTransformInput {
+                        page_idx: 0,
+                        viewport_rect: frame,
+                        source_size: egui::vec2(32.0, 32.0),
+                        texture_size: page.resource.full_source_size_vec2(),
+                        rotation,
+                        free_rotation_rad: 0.0,
+                        content_bbox: empty.then(|| {
+                            egui::Rect::from_min_max(egui::pos2(0.8, 0.0), egui::pos2(1.0, 1.0))
+                        }),
+                        fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                        fit_scale_limits: FullscreenFitScaleLimits::default(),
+                        pixels_per_point: 1.375,
+                        placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                        pixel_fit: RectPixelFit::Proportional,
+                    },
+                    frame,
+                )
+                .unwrap();
+                let expected_frame = page.transform.paint_rect;
+                let canonical = canonical_unit(&painted).unwrap();
+                assert_eq!(canonical.pages[0].rect, expected_frame);
+                assert!(canonical.pages[0].underlay.is_some());
+                assert!(canonical.pages[0].occurrence.is_some());
+                if empty {
+                    assert!(
+                        matches!(canonical.pages[0].material, PageMaterial::Blank { color } if color == egui::Color32::TRANSPARENT)
+                    );
+                } else {
+                    let PageMaterial::PartialTexture { domain, uv, .. } =
+                        &canonical.pages[0].material
+                    else {
+                        panic!("partial material expected");
+                    };
+                    assert!(domain.width() < 1.0 && domain.height() < 1.0);
+                    assert!(uv.iter().all(|p| {
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+                            .contains(*p)
+                    }));
+                }
+                let receipt = flat_receipt(destination(1), &ctx, &painted.pages, true);
+                assert_eq!(receipt.pages().len(), 1);
+                for forward in [false, true] {
+                    let direction = TurnDirection {
+                        reading_rtl: false,
+                        forward,
+                    };
+                    let recipe = prepare_turn(&canonical, &canonical, direction).unwrap();
+                    let final_projection =
+                        project_prepared(&canonical, &canonical, direction, recipe, 1.0, false)
+                            .unwrap();
+                    assert!(
+                        final_projection.finished,
+                        "empty material still completes navigation"
+                    );
+                    assert!(!final_projection.visibility.incoming.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_coverage_does_not_relax_incomplete_native_roi_rejection() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "coverage-incomplete-native",
+            egui::ColorImage::filled([16, 24], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut painted = unit(&ctx, texture.clone(), 1);
+        let coverage = crate::source_coverage::SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(32, 32),
+                (32, 32),
+                (8, 4, 16, 24),
+            )
+            .unwrap(),
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            texture,
+            crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        Arc::get_mut(&mut painted).unwrap().pages[0].resource =
+            crate::gpu_lanczos::test_native_resource_with_region(
+                resource,
+                [16, 24],
+                egui::Rect::from_min_max(egui::pos2(0.1, 0.1), egui::pos2(0.9, 0.9)),
+            )
+            .into();
+        assert_eq!(canonical_unit(&painted).unwrap_err(), "partial_roi");
     }
 
     #[test]

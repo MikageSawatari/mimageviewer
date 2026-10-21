@@ -1576,6 +1576,7 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
                     },
                     from_edit_preview: false,
                     rendered_at_px: 60,
+                    source_coverage: crate::source_coverage::SourceCoverage::FullSource,
                     source_dims: Some((40, 60)),
                     layout_dims: None,
                 };

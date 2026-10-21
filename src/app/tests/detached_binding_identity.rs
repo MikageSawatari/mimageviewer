@@ -234,6 +234,7 @@ fn install_detached_item(app: &mut App, ctx: &egui::Context, media: bool) -> u64
         },
         from_edit_preview: false,
         rendered_at_px: 2,
+        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
         source_dims: Some((2, 2)),
         layout_dims: None,
     }];
