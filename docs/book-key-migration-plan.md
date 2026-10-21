@@ -1,6 +1,6 @@
 # 本の構造変更と path キー DB の付け替え・後始末 (§1.272 / §1.273) と、しおりのページ番号 (§1.245)
 
-2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v3 (実装前レビュー 2 回目の指摘を反映)、再確認待ち**。
+2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v3、実装前レビューで合意 (2026-10-21)。実装へ進む**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) の §1.272・§1.273・§1.245・§1.244。
 前提として読む文書: [製本計画](compile-book-plan.md) §2・§11、`src/rename_key_migration.rs` のモジュール doc。
 `x-scheduled-post` ブランチの `docs/x-post-r2-design.md` §4 (関所つきの大掛かりな版) を参考にしたが、
@@ -95,7 +95,7 @@ Requested(要求) ──静止を確認──> Running(worker) ──結果を U
     (`modal_dialog_block_reason`) に入れ、さらに製本管理・並べ替え画面の中の操作も所有者を見て止める。
   - mIV Remote: 受付時に `SessionHandle::try_local_modal_lease()` を取り、採用まで持つ。取れなければ
     構造操作を始めない (利用者へ理由を出す)。Remote の取得待ち (`book_op_pending` を見ている箇所) も所有者を見る。
-  - 別ウィンドウ (detached viewer) の書き込み。所有者の確認は App 共通の書き込み入口に置き、detached の
+  - 別ウィンドウ (detached viewer) の書き込み。所有者の確認は App 共通の新規入力の受付入口に置き、detached の
     経路を個別に足さない (detached リワーク中の規則に触れる変更が要るなら、実装前に報告する)。
 - **静止の判定**は 1 つの述語にまとめる。少なくとも汎用改名の `rename_migration_writers_busy()` が見る writer
   (タグの未消費結果、★、編集プレビュー、読書位置、ローカル調整、bookmark の未消費要求、spread_shift service) に加え、
@@ -265,8 +265,8 @@ CLAUDE.md「まれな失敗は既定で割り切る」)。
 ## 5. しおりのページ番号 (§1.245)
 
 - 保存時の `page_index_hint` を「保存した時点の、その本の読み順でのページの位置 (0 始まり)」にする。数え方は
-  フルスクリーンのページ表示 (HUD) が使う `image_reading_position()` (`ui_helpers.rs`) と同じものを使い、2 か所に書かない
-  (レビューで確認済みの候補。`still_image_display_indices(items, current_reader_order())` と組で使う)。
+  フルスクリーンのページ表示 (HUD) が使う `image_reading_position()` (`ui_fullscreen.rs`) と同じものを使い、2 か所に書かない
+  (レビューで確認済みの候補。`ui_helpers.rs` の `still_image_display_indices(items, current_reader_order())` と組で使う)。
 - mIV Remote がしおりを作る経路があれば、本体の現在一覧ではなく Remote 側で検証した一覧から同じ関数で求める。
 - 製本の bookmark 移行時の再計算 (`compiled_page_index` = ファイル番号 - 1): 本の改名 (フォルダ→フォルダ) では
   読み順が変わらないので hint を**変えない**。並べ替え・移動では従来どおり再計算する (並べ替えの保存は 0001 から
@@ -309,6 +309,8 @@ CLAUDE.md「まれな失敗は既定で割り切る」)。
   - P2 コピーしないストアのコピー先の古い行 → §3.2 で「写す」と「初期化」を分ける。
   - P2 移行元優先が service 所有ストア・閲覧履歴に届かない → §3.3 で規則を各所有者へ渡す。bookmark・collections は対象外。
   - P3 journal 互換の記述 → §3.9 で identity と hint を分け、両方向の互換テスト。
+- **実装前レビュー 3 回目** (同じ SID、対象 v3 = d344d6270)。2 回目の指摘はすべて解消、P1・P2 なし。
+  結論「この設計で実装に進めてよい」。P3 の文言 2 点 (受付入口の表現、`image_reading_position()` の所在) を訂正した。
 
 ## 8. 実装記録
 
