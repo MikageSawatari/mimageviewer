@@ -57,6 +57,80 @@ impl BookStructuralOp {
 }
 
 impl App {
+    /// D2c: finish every accepted open before admitting a structural modal. The
+    /// source path is deliberately irrelevant. Retained-session readoption and
+    /// passive display/decoder reads are not new opens.
+    fn book_structural_open_pending(&mut self) -> bool {
+        if self.sidecar_restore.is_some()
+            || self.saved_group_open.is_some()
+            || self.startup_open_path_resolve_pending.is_some()
+            || self.media_navigation_pending.is_some()
+            || self.smart_pdf_password_dialog_path().is_some()
+            || self.archive_convert.as_ref().is_some_and(|conversion| {
+                !matches!(
+                    conversion.completion,
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::SiblingZip
+                ) && !matches!(
+                    conversion.phase,
+                    crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Error { .. }
+                )
+            })
+        {
+            return true;
+        }
+        self.viewer_context_ids().into_iter().any(|id| {
+            self.with_owner_viewer_context(id, |app| {
+                app.folder_nav_pending.is_some()
+                    || app
+                        .folder_pane_open_pending
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            !matches!(
+                                pending.purpose,
+                                FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                            )
+                        })
+                    || app.top_level_grid_view.open_path_classification().is_some()
+                    || app.location_navigation_pending()
+                    || app.top_level_grid_view.collection_navigation_pending()
+                    || app
+                        .top_level_grid_view
+                        .collection_session()
+                        .is_some_and(|session| {
+                            matches!(
+                                &session.load,
+                                top_level_grid_view::CollectionGridLoadState::RequestNeeded {
+                                    installed: None,
+                                    ..
+                                } | top_level_grid_view::CollectionGridLoadState::Snapshot {
+                                    installed: None,
+                                    ..
+                                } | top_level_grid_view::CollectionGridLoadState::Preparing {
+                                    installed: None,
+                                    ..
+                                }
+                            )
+                        })
+                    || app.smart_folder_opening_pending()
+                    || app.staged_smart_child_preflight_from_visible_scope()
+                    || app.bookmark_open_pending.is_some()
+                    || app.pdf_enumerate_pending.is_some()
+                    || app.zip_enumerate_pending.is_some()
+                    || app.epub_convert.is_some()
+                    || app.pdf_password_request.is_some()
+                    || app.pending_rating_view_zipdir_open.is_some()
+                    || app.pending_auto_fs_open
+                    || app.fs_nav_after_pdf_enumerate.is_some()
+                    || app.book_composition_permission.open_pending()
+                    || app
+                        .stack_script_pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.open_pending())
+            })
+            .unwrap_or(true)
+        })
+    }
+
     /// The book operation protects every producer, including accepted results and
     /// their downstream records. Generic rename and sidecar restore retain their
     /// narrower admission contracts; neither polls completions from a predicate.
@@ -118,10 +192,11 @@ impl App {
                     || app.export_crop_drag.is_some()
                     || app.export_crop_create_drag.is_some()
                     || app.text_subdialog_open()
-                    || app.location_navigation_pending()
-                    || app.folder_open_preparation_pending()
-                    || app.pdf_enumerate_pending.is_some()
-                    || app.zip_enumerate_pending.is_some()
+                    // This is an existing displayed-list edit, not an open.
+                    // Retain its previous admission block separately from D2c.
+                    || app.folder_pane_open_pending.as_ref().is_some_and(|pending| {
+                        matches!(pending.purpose, FolderOpenScanPurpose::CurrentViewOrderRefresh { .. })
+                    })
                     || app
                         .fs_pending
                         .iter()
@@ -171,7 +246,6 @@ impl App {
             || self.metadata_cleanup_pending.is_some()
             || self.metadata_transfer.is_some()
             || self.image_folder_zip_operation.is_some()
-            || self.sidecar_restore_active()
             || self.content_identity_restore_pending.is_some()
             || !self.drop_copy_pending.is_empty()
             || self.capture_pending.is_some()
@@ -192,6 +266,12 @@ impl App {
         completion: Completion,
         work: impl FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
     ) -> bool {
+        if self.book_structural_open_pending() {
+            self.show_feedback_warning(
+                "フォルダや本を開いています。開き終わってから本の変更をやり直してください".into(),
+            );
+            return false;
+        }
         if let Some(reason) = self.book_structural_admission_block_reason() {
             self.show_feedback_warning(reason.into());
             return false;
@@ -602,6 +682,75 @@ mod tests {
             Completion::Manager,
             work,
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn book_structure_rejects_mounted_and_parked_path_classification_without_consuming_open() {
+        for parked in [false, true] {
+            let mut app = setup_app_for_test();
+            app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+            let source = app.tmp.path().join("candidate.epub");
+            std::fs::create_dir(&source).unwrap();
+            let begin = |owner: &mut App| {
+                owner.settings.sidecar_backup_enabled = false;
+                assert_eq!(
+                    owner.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        source.clone(),
+                        false,
+                        OpenRequestOwner::Navigation,
+                        StartupListIntent::PreservePresentation,
+                    ),
+                    FolderOpenOutcome::Classifying
+                );
+                owner
+                    .top_level_grid_view
+                    .open_path_classification()
+                    .unwrap()
+                    .request_id
+            };
+            let (id, request_id) = if parked {
+                let id = app.build_window_context_for_test(1272301, |owner| {
+                    begin(owner);
+                });
+                let request_id = app
+                    .with_owner_viewer_context(id, |owner| {
+                        owner
+                            .top_level_grid_view
+                            .open_path_classification()
+                            .unwrap()
+                            .request_id
+                    })
+                    .unwrap();
+                (id, request_id)
+            } else {
+                let request_id = begin(&mut app);
+                (app.projected_viewer_context_id(), request_id)
+            };
+            assert!(
+                app.sidecar_restore.is_none(),
+                "classification precedes hydration"
+            );
+            assert!(!request(&mut app, || unreachable!(
+                "rejected worker started"
+            )));
+            assert!(app.book_structural_op.is_none());
+            app.with_owner_viewer_context(id, |owner| {
+                assert_eq!(
+                    owner
+                        .top_level_grid_view
+                        .open_path_classification()
+                        .unwrap()
+                        .request_id,
+                    request_id
+                );
+                owner.settle_open_path_classification_for_test();
+                owner.finish_page_identity_preparation_for_test();
+                assert_eq!(owner.current_folder.as_deref(), Some(source.as_path()));
+            })
+            .unwrap();
+            assert!(request(&mut app, || Err("test terminal".into())));
+        }
     }
 
     #[test]

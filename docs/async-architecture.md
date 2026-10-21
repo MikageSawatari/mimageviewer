@@ -378,6 +378,11 @@ Requested/Runningと終端採用を所有する。待機中は UI frame で prod
 受付側に置き、保存関数へ拒否条件を追加しない。producer 列挙と最終的な受付境界の記録は
 [本のキー移行計画 §8](book-key-migration-plan.md#8-実装記録) を正本とする。
 
+D2c（同計画 §3.10）の未採用 open は、全 context の既存 source/navigation owner と
+受付済み fullscreen 継続を一つの admission 判定へ集め、構造要求を理由付きで拒否する。
+同本・別本を区別せず、元の open が通常採用された後の再要求で進める。
+採用済み session の retained 再照合や、通常表示の permission・decoder 読取とは区別する。
+
 本のページ移動で scope 外へ出た構成参照・見開き基点は、本操作専用の service 要求が各 transaction 内で外す。
 汎用移動の Missing 保持とは要求で区別する。完了時の表示 cache 更新は既存 reload の対象 main に限り、
 独立別窓・Snapshot の items / accepted shift を直接作り直さず、cache を新キーへ付け替えない。

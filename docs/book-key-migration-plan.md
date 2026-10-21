@@ -1,6 +1,6 @@
 # 本の構造変更と path キー DB の付け替え・後始末 (§1.272 / §1.273) と、しおりのページ番号 (§1.245)
 
-2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v4 (v3 で実装前レビュー合意、実装中に出た 2 点を §3.10 で決定)。実装・独立レビュー・関連自動検証済み。全件 gate・実機確認・master 取り込み前の利用者確認は設計担当へ引き継ぐ**。
+2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v4 (v3 で実装前レビュー合意、実装中の判断と D2c を §3.10 で決定)。実装・独立レビュー・関連自動検証済み。全件 gate・実機確認・master 取り込み前の利用者確認は設計担当へ引き継ぐ**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) の §1.272・§1.273・§1.245・§1.244。
 前提として読む文書: [製本計画](compile-book-plan.md) §2・§11、`src/rename_key_migration.rs` のモジュール doc。
 `x-scheduled-post` ブランチの `docs/x-post-r2-design.md` §4 (関所つきの大掛かりな版) を参考にしたが、
@@ -238,7 +238,7 @@ CLAUDE.md「まれな失敗は既定で割り切る」)。
 - 既存の DB に残っている「旧キーの付け残し」は、どの画像の行だったかを後から決められないので直さない。
   ただし §3.3 により、今後の本の操作の移行先では消える。
 
-### 3.10 実装中に決めた 2 点 (2026-10-21、設計担当)
+### 3.10 実装中に決めた点 (2026-10-21、設計担当)
 
 実装担当が §8.4.1 で返した前提の不一致への決定。
 
@@ -456,10 +456,14 @@ presence はソート済みの対象範囲だけ snapshot し、全キー数 × 
 本の削除は worker が service maintenance lease 下で purge し、lease 解放時に再読込されるため、
 UI の `purge_book_root` の重複要求は削除した。
 
-### 8.4.1 実装中の前提の不一致と決定 (決定済み、2026-10-21)
+### 8.4.1 実装中の前提の不一致と決定 (決定済み・対応済み、2026-10-21)
 
 初回実装 `3ee4de3bb` では下記二点を保留した。設計担当が `33e9a570a` の §3.10 で決定し、
 今回の追補で実装した。未合意の blocker としては残っていない。
+
+D2c も `92f8d21b1` の §3.10 で決定済み・§8.8 で対応済み。
+未採用 open が一つでもあれば構造要求を理由付きで拒否し、同本・別本を区別しない。
+並行の契約は維持せず、既存 open を通常採用した後の再要求で進める。
 
 - scope 外へ出たページへの `book_composition` / `spread_shift` の参照は、本操作専用の
   `migrate_book_page_paths` 要求に `RemoveMovedOutside` を載せ、各 service の transaction 内で外す。
@@ -706,13 +710,14 @@ registry の root 改名・FS resource 保持回帰も削除した helper から
 ### 8.7 全件テストと独立レビューの追補 (2026-10-21)
 
 設計担当が `6972a8534` の全件テストと単独再実行で確認した 7 件を調査した。
-6 件は次の判断で修正した。D2c の受付済み open 境界は設計確認待ちとし、その 1 件だけを止めている。
+前回は 6 件を次の判断で修正し、D2c の受付済み open 境界を確認待ちとした。
+D2c は現在、`92f8d21b1` の §3.10 により決定済み・§8.8 で対応済み。
 期待値を緩めて失敗を消す対応にはしない。
 
 | 失敗 | 判断と対応 |
 | --- | --- |
 | `adjusted_retained_f12_keeps_session_across_unrelated_and_same_book_rename` | 新 owner へのテスト更新。旧 `book_op_pending` のみの poll では構造 worker が始まらない。受理済み writer を静止させ、retained readoption は未採用のまま、実 worker と service の同じ隔離 data-dir で旧 session 保持を確かめる |
-| `book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open` | 旧 owner assertion の更新に加え、取込のない受付済み open も `sidecar_restore_active` で拒否する契約の退行がある。旧 D2c は未採用 open と改名の並行を許可し、§8.4 の初回実装記録は open 中の拒否としていた。この境界は設計確認待ちで、製品・期待値とも変更していない（service 保存先の fixture だけ統一） |
+| `book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open` | 決定済み・対応済み。§3.10 が旧並行契約を変更したため、§8.8 で `book_rename_rejects_pending_open_then_accepts_after_original_open_adoption` へ置換。拒否中の FS/DB 不変・受付済み open の継続・採用後の再要求成功を検証する |
 | `book_rename_saved_rows_move_but_open_scopes_and_stale_actions_stay_old` | 新 owner と worker 所有へのテスト更新。FS・保存済み行の改名、開いた旧 scope と stale action の保持を実 worker 経路で引き続き確かめる |
 | `visibility_in_book_pc_projects_nested_archive_provenance_and_legacy_notice` | fixture 更新。items の直代入で reader order が空だったため新 hint を作れなかった。通常 install と表示順構築を通し、missing の削除経路・legacy 通知・再生成後の行・保存済み行数の検査を維持する |
 | `zip_sent_save_does_not_block_unrelated_sidecar_writer_readiness` | 製品の退行。広げた共通述語が無関係な送信済み構成 save ticket を sidecar 復元の開始条件に混ぜていた。既存の狭い条件へ戻し、元のテストをそのまま通す |
@@ -726,9 +731,8 @@ sidecar 復元は構成 ticket・全 context の reader・履歴などへ条件�
 D2c の未採用 open をそのまま許可すると、`FirstDisplayAction`・`navigation_after_hydration`・
 deferred fullscreen の受付済み継続が構造 modal の新規入力拒否に遮られる経路がある。
 phase だけの許可やテストの None ペイロードだけへの個別許可は入れない。
-既存の並行契約を保つなら受付済み継続と modal の境界を設計へ補う必要があり、
-open 完了後の再要求へ変更するならその契約変更の決定が必要。
-初回依頼の「主要な設計前提の不一致はその点だけ止めて報告する」に従い、この一点を確認待ちとした。
+既存の並行契約を保つには受付済み継続と modal の境界の設計が必要だったため、前回は確認待ちとした。
+設計担当が §3.10 で並行を許さず open 完了後の再要求へ変更すると決定し、§8.8 で実装した。
 
 P2-2: parked を含む context-local XMP 読込の結果をフレームの明示 poll で回収し、
 App 共通 `XmpRatingHydration` が DB の照会・未評価行の補充・完了票を所有する。
@@ -794,7 +798,7 @@ Snapshot テストを `book_structure_snapshot_adoption_does_not_rebuild_or_rema
 | `src/rating_db.rs` | 13 |
 | `src/tag_prewarm.rs` | 3 |
 
-42 件と focused 356 件には重複がある。本件全体は D2c の設計確認が残るため未完了。
+42 件と focused 356 件には重複がある。この検証時点では D2c が未完了だった。現在の対応・検証は §8.8。
 指定により build-dev・本体起動・commit は行っていない。全件テストは設計担当が担当する。
 
 今回の選択式（D2c の除外を含む）:
@@ -811,3 +815,86 @@ Snapshot テストを `book_structure_snapshot_adoption_does_not_rebuild_or_rema
   test(/rename_migration_waits/) | test(/book_resume_meter_rename/)
 ) & !test(/book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open/)
 ```
+
+### 8.8 D2c 決定の実装 (2026-10-21、決定済み・対応済み)
+
+設計担当の `92f8d21b1` / §3.10 に従い、未採用 open と構造操作は並行させない。
+受付の `book_structural_open_pending` 一か所で process 全体を判定し、同本・別本の照合や
+待機状態を追加せず、拒否後は元の open owner の通常完了・採用を進める。
+理由は「フォルダや本を開いています。開き終わってから本の変更をやり直してください」。
+拒否は lease・構造 worker の作成より前なので、FS や保存済み DB を変更しない。
+
+`sidecar_restore_active` は Common の採用待ちと、採用済み session の retained 見開き再照合を混ぜるため、
+そのままではこの意味にならない。構造操作の open 判定では Common 自体を確認し、retained 再照合は含めない。
+次の既存の所有状態も集約した。detached の述語・viewport・既存 open 継続は変更していない。
+
+| 所有状態 | 未採用 open として確認する範囲 |
+| --- | --- |
+| App 共通 | Common hydration、saved-group open、startup path resolver、media navigation resolver、smart PDF password、RAR 等の変換後 open（SiblingZip・終端 Error を除く） |
+| 全 viewer context | path 分類、folder scan/navigation、履歴・Rating navigation、Collection navigation と未採用の初期 root、Smart staged child、bookmark resolver、ZIP/PDF 列挙、EPUB 変換・PDF password |
+| 受付済みの表示継続 | Rating ZIP prefix、auto fullscreen・列挙後 reopen、qualified book open の未採用 phase、Flat stack open（retry を含む） |
+
+採用済み Collection root の再準備、通常表示の permission 読取、採用済みの Resuming 証明、
+stack の grouping/aggregate 再構築、native video の採用後 decoder 待ちは open に含めない。
+`CurrentViewOrderRefresh` は open と区別し、従来の非 open の変更操作としての拒否を別途維持した。
+新しい bool・pending owner・取消・完了待ち・UI 同期 I/O は追加していない。
+
+旧 D2c テストを `book_rename_rejects_pending_open_then_accepts_after_original_open_adoption` へ置換した。
+同本・別本それぞれで resume writer の未完了／完了済みだが UI 未採用を扱い、次を確かめる。
+
+- 拒否中は元ファイル・移行先の有無・実 service DB の行・maintenance epoch が変わらず、Common の request ID も保持する。
+- 拒否後も元の resume fence を捨てない。後から別窓が位置 4 を保存しても元の open は捕捉済みの位置 2 を採用する。
+- 通常採用後の再要求は完了し、FS・見開き row・同じ実 store の最新 resume 行が改名へ追従する。
+- 採用済み reader の旧 scope と別窓の状態を、改名のために新 scope へ付け替えない。
+
+旧ケースの「改名を跨いだ未採用 shift 結果を棄却する」順序は、新契約では改名前に open を採用するため発生しない。
+代わりに、拒否後の通常 open が元の新鮮な保存基点を採用することを検査する。
+retained の取消・再入場・maintenance の既存回帰は削らず、`spread_shift_owner_tests` 全体で確認する。
+
+追加テスト:
+
+- `book_structure_rejects_mounted_and_parked_path_classification_without_consuming_open`
+- `book_structure_waits_for_open_permission_but_not_passive_display_reads_or_adopted_episode`
+- `book_structure_rejects_flat_stack_open_until_its_accepted_fullscreen_is_adopted`
+
+利用者への影響は、source の読込み直後に加え、受付済みの本ページ表示・stack open・media navigation の
+表示継続が未採用の短い間にも構造要求を拒否し、開き終わってから再要求してもらうこと。
+開き終わった本の改名・削除・並べ替え保存の手順や、既存の open の継続は変えない。
+
+検証結果（今回の未コミット差分、通常 feature / dev・test profile）:
+
+- 全 build / test に `MSBUILDDISABLENODEREUSE=1` と `CARGO_BUILD_JOBS=1` を指定。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: exit 0。既存の lib 264 / ort 1 警告で増加なし。
+  ログは `target/d2c-check.stderr.log`。nextest の lib test も既存の 135 警告で増加なし。
+- 新規・置換の 4 テストを選んだ nextest: 4 件成功、失敗 0、exit 0。
+  ログは `target/d2c-narrow.stderr.log`、JUnit は `target/d2c-narrow.junit.xml`。
+  初回は permission fixture の context binding 不足で 1 件失敗し、binding を補う途中で
+  fixture 内の借用エラーも修正した。製品コード・期待値は変えず、最終実行では全件成功した。
+  初回ログは `target/d2c-narrow-first.stderr.log`、借用エラーは `target/d2c-narrow-bind-error.stderr.log`。
+- `cargo nextest run -p mimageviewer --lib -E <関連選択式>`: 77 件成功、失敗 0、exit 0。
+  §8.7 の選択式から末尾の D2c 除外を外し、`test(~app::spread_shift_owner_tests::)` を追加した。
+  同モジュール全 34 件と、置換した D2c・新規 3 テストが実行済みであることを JUnit で照合した。
+  ログは `target/d2c-related.stderr.log`、JUnit は `target/d2c-related.junit.xml`。
+- `scripts/test-focused.ps1 -Path <下表11パス>`: 11 run / 450 件成功、失敗 0、exit 0。
+  ログは `target/d2c-focused.stdout.log`。各 JUnit は `target/test-focused/runs/` の
+  `20261021T140609814Z-9567c57d` から `20261021T140728356Z-78e9d1cf` まで。
+- `cargo fmt`（引数なし、workspace 全体）、`cargo fmt --check`、`git diff --check`: 成功。
+- `python scripts/check_ui_glyphs.py`: 成功、dangerous glyph 0。
+- 独立コードレビュー（`gpt-6.1-sol` / `xhigh`）は ACCEPT、追加 P1/P2 なし。
+
+| focused の明示パス | 成功件数 |
+| --- | ---: |
+| `src/app/book_structural_op.rs` | 14 |
+| `src/app/spread_shift_owner_tests.rs` | 34 |
+| `src/app/tests/file_type_visibility_fixes.rs` | 13 |
+| `src/app/book_composition_editor/metadata_transfer_tests.rs` | 5 |
+| `src/app/book_composition_runtime_tests.rs` | 40 |
+| `src/app/viewer_context_registry.rs` | 94 |
+| `src/remote_ipc/container.rs` | 175 |
+| `src/rating_db.rs` | 13 |
+| `src/tag_prewarm.rs` | 3 |
+| `src/app/book_composition_permission.rs` | 31 |
+| `src/filename_stack_ui.rs` | 28 |
+
+選択 nextest と focused の件数には重複がある。D2c は決定済み・対応済みで、今回の範囲に未解決事項はない。
+指定により build-dev・本体起動・commit は行っていない。全件 gate は設計担当へ引き継ぐ。
