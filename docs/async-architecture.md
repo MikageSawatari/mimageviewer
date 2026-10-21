@@ -1197,6 +1197,13 @@ permit を保持する。cancel だけで枠を返さないため、取消済み
 順送りは既存の typed navigation sequence の受理境界で増加を止める。同じ idx の重複は
 `fs_pending` の map key で合流する。
 
+PDF 再レンダは同じ idx でも解像度が変わるため、`FsPendingValue::pdf_rerender` に
+source key・target_px・PDF pool priority を載せる。`request_pdf_rerender_at_target` が
+同じ source/target の生きた要求へ合流し、Critical が Normal 需要も満たす。
+Normal → Critical は一度だけ置き換える。異なる source/target と取消済み ticket は置き換える。
+identity の寿命は receiver / ticket と同じで、viewer bundle の交換にも一緒に付いていく。
+snapshot の既存 cancel / 再ロードでも古い identity は残らない。第二の index や時間窓は作らない。
+
 Normal の先読みが表示対象になった場合は同じ ticket を High に昇格し、待機順だけを変える。
 順送りは `Sequential` として受理済み target を supersede せず、シークバー / Home / End 等の
 直接移動は `LatestSeek` として同じ viewer の古い待機要求だけを開始前に落とす。実行中 worker

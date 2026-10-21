@@ -895,6 +895,28 @@ open 内で取得し、ページ全体表示なら
 - zoom 再レンダは display-fit 長辺を基準に倍率を掛け、8192 と raster native で clamp する。
   AI が必要な raster は display-fit が native より小さい場合も大きい場合も native へ収束させ、
   その間の final AI / AI 先読みを保留する。
+
+表示解像度合わせ・zoom/AI native・指定倍率の再レンダはすべて
+`request_pdf_rerender_at_target` で進行中要求に合流する。`FsPendingValue` 自身が
+source (`metadata_cache_key`)・要求長辺・PDF pool の priority lane を所有し、同じ source/長辺の
+要求を毎フレーム取り消さない。Critical は Normal の需要も満たす。Normal → Critical だけは
+一度取り消して置き換え、異なる source/長辺も置き換える。取消済み ticket には合流しない。
+完了・取消・close・世代破棄で pending が消えれば identity も消える。別の要求表は持たない。
+`fs_pdf_rerender_demand` は完了後も zoom/指定倍率の需要を記憶するため維持する。
+
+cache の長辺は通常どおり要求の 90〜110% で照合する。ただし極端に細長いページでは、
+既存の比率精度 0.05% を満たす整数寸法が要求長辺の 90% 未満になることがある
+（page box 比 1:160、要求 256px → 1×160px）。不足判定時だけ、worker と共有する
+`render_dimensions_for_layout` を page box の固定小数点寸法へ適用し、実際に生成される長辺とも
+照合する。live / retained raster の両方で同じ規則を使い、完了→再要求の反復を防ぐ。
+renderer の寸法選択・画質は変更しない。metadata がない間は従来の要求長辺で比較する。
+再レンダの共通入口でも既存の source-keyed retained metadata 採用を通すため、
+snapshot 等で layout 投影だけを失った細長いページも、保持 pixel を繰り返し enqueue しない。
+
+設計の簡素化として pending に合流し、別の「前フレームの需要」や時刻・再試行状態を足さない。
+PDF 表示準備を modal にすると閲覧・ページ移動を妨げるため採用しない。
+まれな失敗は既定の割り切り方針とし、今回 recovery 機構は追加しない。
+
 WebP は `ANIM` chunk の背景色を `WebPDecoder::set_background_color` に渡してから
 展開する。`image-webp` は dispose-to-background の処理を持つが、背景色未設定のままだと
 dispose が実質 no-op になり、透明差分フレームで前フレームの軌跡が残る。
@@ -3132,7 +3154,12 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   raster pixels を解放する。この PDF ページスロットと汎用保持 LRU は同じ枚数 / MiB 予算で
   合算 LRU 退去される。再表示時に `FinalAi` が条件一致すれば PDF worker を起こさず、AI pixels
   から `final_composite_cache` を直接復元する。`Raster` lookup は固定 4096 ではなく、現在の
-  display target と保持 raster の縦横比から必要長辺を再計算し、±10% 内だけを再利用する。
+  display target と保持 raster の縦横比から必要長辺を再計算し、±10% 内だけを再利用する
+  （細長いページの整数寸法は上記の共有 renderer 規則でも照合する）。毎フレームの
+  `fs_page_load_state` が行う `FinalAi` 照合は、非 PDF を先に除外し、保持スロットに
+  `FinalAi` がない場合も source key の normalize / String 生成より先に終了する。
+  既存 LRU の設定上限は合算 20 件なので、種別だけの走査を選び、件数カウンタや
+  別索引を追加しない。`FinalAi` がある場合のページ・現在パラメータ照合は維持する。
   外部変更や AI 設定変更で retained epoch が進んでいた場合、その orphan 結果は store 時に捨てる。
   汎用保持 LRU の store / hit /
   miss / skip / evict / clear は `mimageviewer.log` に `[AI] Retained final AI ...`

@@ -8228,11 +8228,16 @@ use crate::canonical_image_loader::{
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult, StaticAnimationState};
 
-/// Context-local comparison owner for the two existing PDF request policies.
-/// Absolute demands are keyed by the existing page source identity, never by raster size.
 #[cfg(test)]
 thread_local! {
-    static PDF_RERENDER_REQUEST_PROBE: std::cell::RefCell<Option<Vec<(usize, u32)>>> = const { std::cell::RefCell::new(None) };
+    static PDF_RERENDER_REQUEST_PROBE: std::cell::RefCell<Option<PdfRerenderProbeState>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PdfRerenderProbeState {
+    requests: Vec<(usize, u32)>,
+    workers: Vec<(usize, mpsc::Sender<FsLoadResult>)>,
 }
 
 /// Intercepts only the worker dispatch boundary; normalization, cache lookup,
@@ -8245,14 +8250,23 @@ impl PdfRerenderRequestProbe {
     pub(crate) fn start() -> Self {
         PDF_RERENDER_REQUEST_PROBE.with(|probe| {
             assert!(probe.borrow().is_none());
-            *probe.borrow_mut() = Some(Vec::new());
+            *probe.borrow_mut() = Some(PdfRerenderProbeState::default());
         });
         Self
     }
 
     pub(crate) fn take_requests(&self) -> Vec<(usize, u32)> {
         PDF_RERENDER_REQUEST_PROBE
-            .with(|probe| std::mem::take(probe.borrow_mut().as_mut().unwrap()))
+            .with(|probe| std::mem::take(&mut probe.borrow_mut().as_mut().unwrap().requests))
+    }
+
+    pub(crate) fn send_pending(&self, idx: usize, result: FsLoadResult) {
+        PDF_RERENDER_REQUEST_PROBE.with(|probe| {
+            let mut probe = probe.borrow_mut();
+            let workers = &mut probe.as_mut().unwrap().workers;
+            let pos = workers.iter().rposition(|(page, _)| *page == idx).unwrap();
+            workers.remove(pos).1.send(result).unwrap();
+        });
     }
 
     pub(crate) fn complete(
@@ -8262,6 +8276,16 @@ impl PdfRerenderRequestProbe {
         idx: usize,
         result: FsLoadResult,
     ) -> bool {
+        if generation == app.items_generation
+            && app
+                .fs_pending
+                .get(&idx)
+                .is_some_and(|pending| pending.pdf_rerender.is_some())
+        {
+            if let Some(mut pending) = app.fs_pending.remove(&idx) {
+                pending.disarm_ticket();
+            }
+        }
         app.enqueue_fs_upload_result_for_generation(
             generation,
             idx,
@@ -8280,6 +8304,8 @@ impl Drop for PdfRerenderRequestProbe {
     }
 }
 
+/// Context-local comparison owner for the two existing PDF request policies.
+/// Absolute demands are keyed by the existing page source identity, never by raster size.
 #[derive(Default, Debug)]
 pub(crate) enum PdfRerenderDemand {
     #[default]
@@ -8900,6 +8926,15 @@ pub(crate) fn animation_expansion_progress_visible(
     })
 }
 
+/// Identity belongs to the same owner as cancellation and result reception.
+/// A Critical request covers Normal demand; the reverse requires one replacement.
+#[derive(Debug, PartialEq, Eq)]
+struct PdfRerenderIdentity {
+    source: String,
+    target_px: u32,
+    priority: bool,
+}
+
 pub(crate) struct FsPendingValue {
     #[cfg(test)]
     pub(crate) cancel: Arc<AtomicBool>,
@@ -8907,6 +8942,7 @@ pub(crate) struct FsPendingValue {
     pub(crate) rx: mpsc::Receiver<FsLoadResult>,
     pub(crate) load_seq: u64,
     pub(crate) purpose: FsLoadPurpose,
+    pdf_rerender: Option<PdfRerenderIdentity>,
     animation_expansion_started_at: Option<std::time::Instant>,
 }
 
@@ -8924,6 +8960,7 @@ impl FsPendingValue {
             rx,
             load_seq,
             purpose,
+            pdf_rerender: None,
             animation_expansion_started_at: None,
         }
     }
@@ -77173,6 +77210,15 @@ impl App {
         ai_needs_native.then_some(w.max(h))
     }
 
+    fn pdf_raster_matches_target(&self, idx: usize, cached_long: u32, target_px: u32) -> bool {
+        crate::pdf_loader::raster_matches_render_target(
+            cached_long,
+            target_px,
+            self.current_pdf_page_metadata_snapshot(idx)
+                .map(|metadata| metadata.layout_dims),
+        )
+    }
+
     pub(crate) fn ensure_pdf_display_resolution(
         &mut self,
         idx: usize,
@@ -77194,7 +77240,9 @@ impl App {
         else {
             return;
         };
-        if (cached_long as f32) < (target_px as f32 * 0.9) {
+        if (cached_long as f32) < (target_px as f32 * 0.9)
+            && !self.pdf_raster_matches_target(idx, cached_long, target_px)
+        {
             self.request_pdf_rerender_at_target(idx, target_px, true);
         }
     }
@@ -77274,6 +77322,9 @@ impl App {
             _ => return,
         };
 
+        // Snapshot/cache restoration may retain pixels before page-box metadata is rehydrated.
+        // Reuse the existing source-keyed metadata owner before checking integer render sizing.
+        self.adopt_retained_pdf_page_metadata(idx);
         if self.has_retained_pdf_final_ai_for_current_params(idx) {
             crate::logger::log(format!(
                 "[PDF] Retained page final-ai available idx={idx} target_px={target_px} \
@@ -77285,10 +77336,23 @@ impl App {
         // 既に同じ解像度のキャッシュがあれば不要
         if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
             let cached_long = pixels.size[0].max(pixels.size[1]) as u32;
-            let ratio = cached_long as f32 / target_px as f32;
-            if (0.9..=1.1).contains(&ratio) {
+            if self.pdf_raster_matches_target(idx, cached_long, target_px) {
                 return;
             }
+        }
+
+        let Some(source) = self.metadata_cache_key(idx) else {
+            return;
+        };
+        if self.fs_pending.get(&idx).is_some_and(|pending| {
+            !pending.ticket.cancel_token().load(Ordering::Relaxed)
+                && pending.pdf_rerender.as_ref().is_some_and(|identity| {
+                    identity.source == source
+                        && identity.target_px == target_px
+                        && (identity.priority || !priority)
+                })
+        }) {
+            return;
         }
 
         if let Some((pixels, source_dims)) =
@@ -77307,22 +77371,9 @@ impl App {
             return;
         }
 
-        // 進行中の再レンダリングがあればキャンセル
+        // Only a different source/target or Normal -> Critical promotion replaces the owner.
         if let Some(pending) = self.fs_pending.remove(&idx) {
             pending.cancel();
-        }
-
-        #[cfg(test)]
-        if PDF_RERENDER_REQUEST_PROBE.with(|probe| {
-            let mut probe = probe.borrow_mut();
-            if let Some(requests) = probe.as_mut() {
-                requests.push((idx, target_px));
-                true
-            } else {
-                false
-            }
-        }) {
-            return;
         }
 
         let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
@@ -77343,12 +77394,30 @@ impl App {
             perf_seq,
         );
         let cancel = ticket.cancel_token();
-        let waiter = ticket.waiter();
-        self.fs_pending.insert(
-            idx,
-            FsPendingValue::scheduled(ticket, fs_rx, perf_seq, FsLoadPurpose::for_page(true)),
-        );
+        let mut pending =
+            FsPendingValue::scheduled(ticket, fs_rx, perf_seq, FsLoadPurpose::for_page(true));
+        pending.pdf_rerender = Some(PdfRerenderIdentity {
+            source,
+            target_px,
+            priority,
+        });
+        self.fs_pending.insert(idx, pending);
 
+        #[cfg(test)]
+        if PDF_RERENDER_REQUEST_PROBE.with(|probe| {
+            let mut probe = probe.borrow_mut();
+            if let Some(probe) = probe.as_mut() {
+                probe.requests.push((idx, target_px));
+                probe.workers.push((idx, fs_tx.clone()));
+                true
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
+
+        let waiter = self.fs_pending.get(&idx).unwrap().ticket.waiter();
         std::thread::spawn(move || {
             let Some(_permit) = waiter.acquire_cancellable() else {
                 return;
@@ -83545,7 +83614,20 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<(FinalAiKey, [usize; 2])> {
+        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return None;
+        }
         self.retained_final_ai_budget()?;
+        // The shared retained LRU is limited to 20 entries by settings. Inspect only
+        // their kinds before allocating a source key; Raster-only stores are common.
+        // Reading the actual store avoids maintaining a second index/count.
+        if !self
+            .retained_pdf_page_cache
+            .values()
+            .any(|entry| matches!(&entry.kind, RetainedPdfPageCacheKind::FinalAi { .. }))
+        {
+            return None;
+        }
         let key = self.retained_pdf_page_key_for(idx)?;
         let entry = self.retained_pdf_page_cache.get(&key)?;
         let RetainedPdfPageCacheKind::FinalAi {
@@ -83748,8 +83830,11 @@ impl App {
                 source_dims,
                 render_long_edge,
             } => {
-                let ratio = *render_long_edge as f32 / target_px as f32;
-                if !(0.9..=1.1).contains(&ratio) {
+                if !crate::pdf_loader::raster_matches_render_target(
+                    *render_long_edge,
+                    target_px,
+                    entry.metadata.map(|metadata| metadata.layout_dims),
+                ) {
                     self.log_retained_pdf_page_raster_miss(
                         idx,
                         &key.item_key,

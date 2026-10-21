@@ -88821,6 +88821,9 @@ mod specified_scale_consumer_tests {
         app.settings.fullscreen_specified_scale = height(1200);
         let large = single(&mut app, &ctx, rect, false);
         probe.take_requests();
+        // Geometry warm-up now owns a real pending stub. Retire it along with
+        // its recorded requests so this reconciliation starts without a worker.
+        app.cancel_fs_page_load(0);
         app.fs_pdf_rerender_demand.reset();
         for frame_no in 0..4 {
             app.fullscreen_page_layout

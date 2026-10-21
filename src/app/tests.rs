@@ -57651,6 +57651,350 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn pdf_display_resolution_keeps_identical_inflight_request() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, r"C:\books\display-resolution.pdf", 0);
+        let pixels = Arc::new(egui::ColorImage::filled([786, 1179], egui::Color32::WHITE));
+        let tex = ctx.load_texture("small-pdf", (*pixels).clone(), egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels,
+                source_dims: Some([786, 1179]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget {
+            width_px: 1400,
+            height_px: 1547,
+            fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+        });
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let cancel = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "first frame must be live"
+        );
+        app.ensure_pdf_display_resolution(idx, None);
+        let requests = probe.take_requests();
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "identical second frame cancelled the first in-flight request; requests={requests:?}"
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(Arc::ptr_eq(
+            &cancel,
+            &app.fs_pending.get(&idx).unwrap().cancel
+        ));
+    }
+
+    fn seed_pdf_resolution_static(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: [usize; 2],
+        content_type: crate::pdf_loader::PdfPageContentType,
+    ) -> usize {
+        ctx.input_mut(|input| input.max_texture_side = 8192);
+        let idx = push_pdf_page(app, r"C:\books\resolution.pdf", 0);
+        if let GridItem::PdfPage {
+            content_type: stored,
+            ..
+        } = &mut app.items[idx]
+        {
+            *stored = Some(content_type);
+        }
+        let pixels = Arc::new(egui::ColorImage::filled(size, egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            "pdf-resolution",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels,
+                source_dims: Some(size),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget {
+            width_px: 1400,
+            height_px: 1547,
+            fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+        });
+        idx
+    }
+
+    #[test]
+    fn pdf_rerender_identity_is_shared_by_fit_zoom_and_absolute_demand() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.request_pdf_rerender(idx, 1.0, false);
+        let normal = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert!(!normal.load(Ordering::Relaxed));
+        app.ensure_pdf_display_resolution(idx, None);
+        assert!(
+            normal.load(Ordering::Relaxed),
+            "Critical replaces Normal once"
+        );
+        let critical = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        for _ in 0..8 {
+            app.ensure_pdf_display_resolution(idx, None);
+            app.request_pdf_rerender(idx, 1.0, false);
+            app.request_pdf_absolute_demand(idx, 1547.0, false);
+        }
+        assert!(!critical.load(Ordering::Relaxed));
+        assert_eq!(probe.take_requests(), vec![(idx, 1702), (idx, 1702)]);
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(critical.load(Ordering::Relaxed));
+        let zoomed = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(!zoomed.load(Ordering::Relaxed));
+        assert_eq!(probe.take_requests(), vec![(idx, 3404)]);
+
+        // A different PDF page can occupy the same index and require the same target.
+        if let GridItem::PdfPage { page_num, .. } = &mut app.items[idx] {
+            *page_num = 1;
+        }
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(zoomed.load(Ordering::Relaxed));
+        let replacement = app.fs_pending.get(&idx).unwrap();
+        assert_eq!(
+            replacement.pdf_rerender.as_ref().unwrap().source,
+            app.metadata_cache_key(idx).unwrap()
+        );
+        let cancelled = Arc::clone(&replacement.cancel);
+        replacement.cancel();
+        app.request_pdf_rerender(idx, 2.0, true);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(
+            !app.fs_pending
+                .get(&idx)
+                .unwrap()
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+        assert_eq!(probe.take_requests(), vec![(idx, 3404), (idx, 3404)]);
+    }
+
+    #[test]
+    fn pdf_rerender_identity_retires_with_snapshot_cancel_and_close() {
+        use std::sync::atomic::Ordering;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let first = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        let transfer = app.take_fs_page_for_snapshot(idx);
+        assert!(first.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+        app.restore_fs_page_from_snapshot(idx, transfer);
+        app.ensure_pdf_display_resolution(idx, None);
+        assert_eq!(probe.take_requests(), vec![(idx, 1702), (idx, 1702)]);
+        let second = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        app.fullscreen_idx = Some(idx);
+        app.close_fullscreen();
+        assert!(second.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+    }
+
+    #[test]
+    fn pdf_display_resolution_completion_converges_for_fit_trim_native_and_thin_pages() {
+        use crate::pdf_loader::{
+            PdfDisplayFitMode, PdfDisplayTarget, PdfPageContentType, PdfPageSizePoints,
+        };
+        for (initial, points, content_type, mode, viewport, bbox) in [
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Width,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [786, 1179],
+                (600.0, 900.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(0.25, 0.25),
+                    egui::pos2(0.75, 0.75),
+                )),
+            ),
+            (
+                [100, 150],
+                (600.0, 900.0),
+                PdfPageContentType::Raster { w: 400, h: 600 },
+                PdfDisplayFitMode::Page,
+                (1400, 1547),
+                None,
+            ),
+            (
+                [1, 80],
+                (1.0, 160.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (10, 232),
+                None,
+            ),
+            (
+                [1, 1000],
+                (1.0, 5000.0),
+                PdfPageContentType::Vector,
+                PdfDisplayFitMode::Height,
+                (10, 10000),
+                None,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = seed_pdf_resolution_static(&mut app, &ctx, initial, content_type);
+            app.fs_pdf_display_target = Some(PdfDisplayTarget {
+                width_px: viewport.0,
+                height_px: viewport.1,
+                fit_mode: mode,
+            });
+            let points = PdfPageSizePoints {
+                width: points.0,
+                height: points.1,
+            };
+            let layout = points.catalog_layout_dims().unwrap();
+            app.record_page_layout_dims_for_spread(idx, layout);
+            let target = app
+                .pdf_display_render_long_edge_for_idx(idx, Some(content_type), bbox)
+                .unwrap();
+            let probe = PdfRerenderRequestProbe::start();
+            app.ensure_pdf_display_resolution(idx, bbox);
+            app.ensure_pdf_display_resolution(idx, bbox);
+            assert_eq!(
+                probe.take_requests(),
+                vec![(idx, target)],
+                "case={mode:?}/{content_type:?}/{layout:?}"
+            );
+            let dims = crate::pdf_loader::render_dimensions_for_layout(target, layout);
+            probe.send_pending(
+                idx,
+                FsLoadResult::StaticPdf {
+                    ci: egui::ColorImage::filled(
+                        [dims.0 as usize, dims.1 as usize],
+                        egui::Color32::WHITE,
+                    ),
+                    source_dims: [dims.0 as usize, dims.1 as usize],
+                    page_size_points: points,
+                    content_type,
+                },
+            );
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            assert!(app.fs_pending.is_empty());
+            let after = app
+                .pdf_display_render_long_edge_for_idx(idx, Some(content_type), bbox)
+                .unwrap();
+            assert!(
+                target.abs_diff(after) <= 1,
+                "target drift: {target} -> {after}; layout={layout:?}"
+            );
+            assert_eq!(
+                app.fs_page_load_state(idx),
+                FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache)
+            );
+            for _ in 0..8 {
+                app.ensure_pdf_display_resolution(idx, bbox);
+                app.request_pdf_rerender_at_target(idx, after, true);
+            }
+            assert!(
+                probe.take_requests().is_empty(),
+                "completed raster must satisfy target={after}, actual={dims:?}"
+            );
+            assert!(
+                app.lookup_retained_pdf_page_raster(idx, after, "test_completion")
+                    .is_some()
+            );
+            if (dims.0.max(dims.1) as f32) < after as f32 * 0.9 {
+                // A restored pixel cache must also converge after its layout projection was cleared.
+                app.page_dims_cache.clear();
+                assert!(app.current_pdf_page_metadata_snapshot(idx).is_none());
+                app.ensure_pdf_display_resolution(idx, bbox);
+                assert!(app.current_pdf_page_metadata_snapshot(idx).is_some());
+                assert!(app.fs_upload_backlog.is_empty());
+                assert!(probe.take_requests().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn fs_page_load_state_retained_pdf_empty_raster_final_ai_and_clear_are_equivalent() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let idx = push_pdf_page(&mut app, r"C:\books\retained-state.pdf", 0);
+        let other = push_pdf_page(&mut app, r"C:\books\other-state.pdf", 0);
+        let pixels = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::WHITE));
+        assert!(app.retained_pdf_page_cache.is_empty());
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        assert!(app.insert_retained_pdf_page_raster(idx, [4, 6], Arc::clone(&pixels)));
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        store_matching_pdf_final_ai(&mut app, idx, [4, 6], pixels);
+        assert_eq!(
+            app.fs_page_load_state(idx),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+        );
+        assert_eq!(app.fs_page_load_state(other), FsPageLoadState::NeedsLoad);
+        let image_idx = app.items.len();
+        app.items
+            .push(GridItem::Image(PathBuf::from(r"C:\books\ordinary.png")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        assert_eq!(
+            app.fs_page_load_state(image_idx),
+            FsPageLoadState::NeedsLoad
+        );
+        let model = app.settings.global_preset.upscale_model.take();
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        app.settings.global_preset.upscale_model = model;
+        assert!(app.fs_page_load_state(idx).is_display_ready());
+        app.clear_retained_pdf_page_cache("test_empty_fast_path");
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        app.fs_cache.insert(idx, FsCacheEntry::Failed);
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::LoadFailed);
+    }
+
+    #[test]
     fn fs_page_load_state_prevents_same_idx_same_params_reentry() {
         let ctx = egui::Context::default();
         let mut app = setup_app();

@@ -1268,6 +1268,9 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     .unwrap()
                     .id();
                 pdf_rerender.take_requests();
+                // The Single warm-up supplied geometry/paint proof. Clear its
+                // pending stub too, preserving the no-worker admission fixture.
+                app.cancel_fs_page_load(0);
                 app.apply_fullscreen_view_mode(&ctx, 0, FullscreenViewMode::Spread);
                 assert!(
                     matches!(

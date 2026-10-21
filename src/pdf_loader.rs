@@ -7055,12 +7055,38 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
         let scale = target as f32 / long;
         return (w * scale, h * scale);
     };
-    let (width, height) = crate::fast_resize::aspect_accurate_fit_dimensions(
-        (target, target),
-        (target, target),
-        source_dims,
-    );
+    let (width, height) = render_dimensions_for_layout(target, source_dims);
     (width as f32, height as f32)
+}
+
+/// The same integer sizing contract is used by the worker and cache sufficiency checks.
+pub(crate) fn render_dimensions_for_layout(target: u32, layout_dims: (u32, u32)) -> (u32, u32) {
+    crate::fast_resize::aspect_accurate_fit_dimensions(
+        (target, target),
+        (target, target),
+        layout_dims,
+    )
+}
+
+pub(crate) fn raster_matches_render_target(
+    cached_long: u32,
+    target: u32,
+    layout_dims: Option<(u32, u32)>,
+) -> bool {
+    let ratio = cached_long as f32 / target.max(1) as f32;
+    if (0.9..=1.1).contains(&ratio) {
+        return true;
+    }
+    // Only undersized rasters need the integer sizing calculation. Thin pages can
+    // legitimately render below 90% of target to preserve the existing aspect accuracy.
+    if ratio >= 0.9 {
+        return false;
+    }
+    let Some(layout_dims) = layout_dims else {
+        return false;
+    };
+    let (w, h) = render_dimensions_for_layout(target, layout_dims);
+    (0.9..=1.1).contains(&(cached_long as f32 / w.max(h) as f32))
 }
 
 // -----------------------------------------------------------------------
@@ -8368,6 +8394,43 @@ C:\isolated\miv-data"#
                 "{width}x{height} -> {render_w}x{render_h}: {relative_error:.6}"
             );
         }
+    }
+
+    #[test]
+    fn pdf_render_target_cache_match_uses_the_workers_integer_dimensions() {
+        for (points, target) in [
+            ((600.0, 900.0), 1702),
+            ((1643.0, 2375.0), 473),
+            ((1.0, 160.0), 256),
+            ((1.0, 5000.0), 8192),
+        ] {
+            let layout = PdfPageSizePoints {
+                width: points.0,
+                height: points.1,
+            }
+            .catalog_layout_dims()
+            .unwrap();
+            let (w, h) = fit_to_target(points.0, points.1, target as f32);
+            let dims = render_dimensions_for_layout(target, layout);
+            assert_eq!((w as u32, h as u32), dims);
+            assert!(raster_matches_render_target(
+                dims.0.max(dims.1),
+                target,
+                Some(layout)
+            ));
+            assert!(!raster_matches_render_target(
+                dims.0.max(dims.1) / 2,
+                target,
+                Some(layout)
+            ));
+        }
+        assert!(!raster_matches_render_target(160, 256, None));
+        assert!(raster_matches_render_target(256, 256, None));
+        assert!(!raster_matches_render_target(
+            512,
+            256,
+            Some((1000, 160_000))
+        ));
     }
 
     #[test]
