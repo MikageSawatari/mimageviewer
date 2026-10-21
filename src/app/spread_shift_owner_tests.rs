@@ -936,7 +936,8 @@ fn book_rename_saved_rows_move_but_open_scopes_and_stale_actions_stay_old() {
         install_book(app, &unrelated);
         assert!(app.set_live_spread_shift(3));
     });
-    let data = env.tmp.path().join("rename-shifts");
+    // The structural worker and its service maintenance lease share one store.
+    let data = crate::data_dir::get();
     let (service, owner) = runtime(&mut env, &data);
     env.settings.remember_spread_shift_per_book = true;
     let old_scope = BookScopeKey::folder(&source).unwrap();
@@ -1908,9 +1909,17 @@ fn begin_test_book_open(app: &mut App, root: &Path) {
 
 fn finish_test_book_rename(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while app.book_op_pending.is_some() {
+    assert!(
+        app.book_structural_op.is_some(),
+        "book rename was not admitted"
+    );
+    while app.book_structural_op.is_some() {
         assert!(Instant::now() < deadline, "book rename did not finish");
-        app.poll_book_op_pending(ctx);
+        // The frame drains accepted save replies before the structural owner can
+        // establish pre-filesystem writer quiescence.
+        app.poll_spread_shift_service();
+        app.poll_book_bookmarks();
+        app.poll_book_structural_op(ctx);
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -1933,7 +1942,7 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
         std::fs::write(old.join("0.png"), b"page").unwrap();
         env.settings.book_root = Some(books.clone());
         env.settings.sidecar_backup_enabled = false;
-        let data = env.tmp.path().join("pending-rename-shifts");
+        let data = crate::data_dir::get();
         let (service, owner) = runtime(&mut env, &data);
         let old_scope = BookScopeKey::folder(&old).unwrap();
         let anchor = SpreadShiftPageRef::RelativePath("0.png".into());
@@ -2101,7 +2110,7 @@ fn adjusted_retained_f12_keeps_session_across_unrelated_and_same_book_rename() {
         env.settings.remember_spread_shift_per_book = false;
         env.set_live_spread_shift(0);
         env.settings.remember_spread_shift_per_book = true;
-        let (service, owner) = runtime(&mut env, &books.join("shift-data"));
+        let (service, owner) = runtime(&mut env, &crate::data_dir::get());
         let scope = BookScopeKey::folder(&shown).unwrap();
         let operation = |sequence| ShiftOperation {
             context_id: ViewerContextId::for_test(999),
@@ -2148,9 +2157,17 @@ fn adjusted_retained_f12_keeps_session_across_unrelated_and_same_book_rename() {
         });
         let target_name = format!("{renamed}-renamed");
         env.start_book_rename(&ctx, renamed.into(), target_name.clone());
+        assert!(env.book_structural_op.is_some());
+        env.poll_book_structural_op(&ctx);
+        assert!(
+            books.join(renamed).exists(),
+            "accepted writes precede rename"
+        );
+        // Let the accepted write/read finish, but leave retained readoption
+        // unpolled until the rename's maintenance has completed.
+        pause.send(()).unwrap();
         finish_test_book_rename(&mut env, &ctx);
         assert!(books.join(&target_name).exists());
-        pause.send(()).unwrap();
         row(
             &service,
             &BookScopeKey::folder(books.join(&target_name)).unwrap(),

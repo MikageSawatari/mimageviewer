@@ -57,18 +57,38 @@ impl BookStructuralOp {
 }
 
 impl App {
-    pub(super) fn book_path_context_writers_busy(&mut self) -> bool {
-        self.viewer_context_ids().into_iter().any(|id| {
-            self.with_owner_viewer_context(id, |app| {
-                // Generic migration uses this predicate too. Harvest the already accepted
-                // result in its owning context, even when that viewer is parked.
-                app.poll_tag_prewarm_results();
-                app.tag_prewarm_pending
-                    .as_ref()
-                    .is_some_and(|p| p.is_busy())
-            })
-            .unwrap_or(true)
-        })
+    /// The book operation protects every producer, including accepted results and
+    /// their downstream records. Generic rename and sidecar restore retain their
+    /// narrower admission contracts; neither polls completions from a predicate.
+    pub(super) fn book_structural_writers_busy(&self) -> bool {
+        self.rename_migration_writers_busy()
+            || self.has_tag_prewarm_work()
+            || self.has_page_edit_producers()
+            || self.content_identity_detection_pending.is_some()
+            || self.content_identity_backfill_pending.is_some()
+            || self
+                .reading_history_writer
+                .as_ref()
+                .is_some_and(|w| w.is_busy())
+            || self.composition_editor_writes_pending()
+            || self.remote_bookmark_writes_pending()
+            || self
+                .book_composition_service
+                .as_ref()
+                .is_some_and(|s| s.is_busy())
+            || self.stamp_embed_pending.is_some()
+            || self.tag_maintenance_rx.is_some()
+            || self.edit_bundle_apply_pending.is_some()
+            || self.edit_bundle_paste_pending.is_some()
+            || self.edit_bundle_bulk_pending.is_some()
+            || crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                .sample()
+                .active_writers
+                != 0
+            || self
+                .content_identity_recorder
+                .as_ref()
+                .is_some_and(|w| w.is_busy())
     }
 
     fn book_structural_context_input_pending(&mut self) -> bool {
@@ -216,11 +236,16 @@ impl App {
             return;
         }
         self.poll_all_page_edit_producers(ctx);
+        // Accepted XMP reads remain owned even by parked viewers. Draining is an
+        // explicit frame transition; DB hydration itself runs on its worker.
+        for owner in self.viewer_context_ids() {
+            self.with_owner_viewer_context(owner, |app| app.poll_tag_prewarm_results());
+        }
         let requested = matches!(
             self.book_structural_op.as_ref().map(|op| &op.phase),
             Some(Phase::Requested { .. })
         );
-        if requested && self.rename_migration_writers_busy() {
+        if requested && self.book_structural_writers_busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
             return;
         }
@@ -797,7 +822,7 @@ mod tests {
         app.poll_book_structural_op(&ctx);
         assert!(entered.try_recv().is_err());
         app.poll_tag_write_results();
-        while app.rename_migration_writers_busy() {
+        while app.book_structural_writers_busy() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -872,6 +897,97 @@ mod tests {
         entered
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn book_structure_parked_xmp_result_runs_db_on_worker_and_waits_for_adoption() {
+        let mut app = setup_app_for_test();
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+        let page = app.tmp.path().join("parked-xmp.png");
+        let key = crate::adjustment_db::normalize_path(&page);
+        let db_path = app.tmp.path().join("parked-xmp-ratings.db");
+        app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
+        let parked = app.build_window_context_for_test(1272201, |owner| {
+            owner.install_new_items(vec![GridItem::Image(page.clone())], vec![None]);
+            owner.rebuild_visible_indices();
+            owner.tag_prewarm_pending = Some(
+                crate::tag_prewarm::TagPrewarmPending::from_results_for_test(vec![
+                    crate::tag_prewarm::TagPrewarmResult {
+                        path: page.clone(),
+                        rating: Some(3),
+                        rating_generation: 0,
+                    },
+                ]),
+            );
+        });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        app.rating_xmp_hydration
+            .hold_next_import_for_test(crate::tag_prewarm::HydrationTestHook {
+                entered: entered_tx,
+                release: release_rx,
+                completed: completed_tx,
+            });
+        let (started_tx, started_rx) = mpsc::channel();
+        let ui_db_reads = crate::rating_db::read_operations_for_test();
+        let ui_point_reads = crate::rating_db::point_read_operations_for_test();
+        assert!(request(&mut app, move || {
+            started_tx.send(()).unwrap();
+            Err("test terminal".into())
+        }));
+        // The pure predicate must leave the buffered result in its parked owner.
+        assert!(app.book_structural_writers_busy());
+        assert!(app.book_structural_writers_busy());
+        assert!(!app.rating_xmp_hydration.is_busy());
+        assert!(entered_rx.try_recv().is_err());
+        let ctx = egui::Context::default();
+        app.poll_book_structural_op(&ctx);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The frame has returned while the DB worker is held before SQLite.
+        assert!(app.rating_xmp_hydration.is_busy());
+        assert!(started_rx.try_recv().is_err());
+        assert_eq!(crate::rating_db::read_operations_for_test(), ui_db_reads);
+        assert_eq!(
+            crate::rating_db::point_read_operations_for_test(),
+            ui_point_reads
+        );
+        assert!(
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .get_many(&[key.clone()])
+                .is_empty()
+        );
+        release_tx.send(()).unwrap();
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            app.book_structural_writers_busy(),
+            "DB completion still requires UI adoption"
+        );
+        assert!(started_rx.try_recv().is_err());
+        app.poll_book_structural_op(&ctx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .get_many(&[key.clone()])
+                .get(&key),
+            Some(&3)
+        );
+        assert_eq!(app.rating_session_value_for_key(&key), Some(3));
+        app.with_owner_viewer_context(parked, |owner| {
+            assert_eq!(owner.rating_cache.get(&0), Some(&3));
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1047,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn book_structure_snapshot_keeps_items_caches_and_saved_shift_through_mapping_and_delete() {
+    fn book_structure_snapshot_adoption_does_not_rebuild_or_remap_context() {
         let mut app = setup_app_for_test();
         let root = app.tmp.path().join("Book");
         let renamed = app.tmp.path().join("Renamed");
@@ -1078,6 +1194,9 @@ mod tests {
             .saved_viewing_state
             .shift
             .clone();
+        // Only direct adoption is exercised here. A real worker also publishes
+        // PAGE_EDIT_WRITES; its normal old-path reconciliation is intentionally
+        // unchanged (§3.10) and may subsequently replace editing caches.
         for (from, to, root_move) in [
             (page.clone(), root.join("0002_same.jpg"), None),
             (

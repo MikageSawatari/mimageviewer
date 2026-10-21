@@ -130,7 +130,8 @@ model manager を source に閉じ込め、book worker から表示経路と同�
   bookmark は既存 journal、見開き調整・本の構成は各 service FIFO、collections は参照移行が所有し、
   UI の完了採用は DB を直接移さず記憶内の失効・付け替えを行う。本削除後は worker が同じ表を purge する。
     別本へ移したページの構成参照・見開き基点は各 service が元本から外し、移動先には移さない。
-    表示 cache の失効は既存 reload の対象 main だけに限定し、別窓・Snapshot の旧 items / cache は保持する。
+    表示 cache の失効は既存 reload の対象 main だけに限定し、別窓・Snapshot の items を作り直さず、
+    cache を新キーへ付け替えない。全体通知による旧 path の通常再照合は従来どおり残る (§3.10)。
   回転はページ番号順と見開きの意味がぶれやすいため引き続き操作を抑制する。
   並べ替えダイアログの小サムネイルは通常一覧と同じく重い後段編集を反映しない。
 - 追加対象に本ページが含まれる場合、追加先の本と同じ本のページは拒否する。

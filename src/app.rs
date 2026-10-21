@@ -16176,6 +16176,8 @@ pub struct App {
     /// レーティング XMP 書き込み worker。設定 ON のとき遅延初期化される。
     /// 書き込み失敗を poll して失敗トーストを出すために保持。
     pub(crate) rating_write_handle: Option<crate::rating_write_worker::RatingWriteHandle>,
+    /// Accepted XMP imports survive context reader cancellation until DB completion and adoption.
+    pub(crate) rating_xmp_hydration: crate::tag_prewarm::XmpRatingHydration,
 
     // ── お気に入り追加ダイアログ (名称入力 + 自動インデックス選択) ─────
     pub(crate) show_fav_add_dialog: bool,
@@ -20299,6 +20301,7 @@ impl App {
             tag_maintenance_rx: None,
             tag_write_handle: None,
             rating_write_handle: None,
+            rating_xmp_hydration: crate::tag_prewarm::XmpRatingHydration::default(),
             show_fav_add_dialog: false,
             fav_add_name_input: String::new(),
             fav_add_target: None,
@@ -48066,8 +48069,7 @@ impl App {
     /// sidecar 書込は worker 内で完結するので is_busy で足りる)。本ブックマークは
     /// 専用 service の FIFO へ旧 path の追加が残った後で rename DB を先に動かさないよう、
     /// request の結果を UI が消費し終えるまで待つ。
-    pub(crate) fn rename_migration_writers_busy(&mut self) -> bool {
-        let context_busy = self.book_path_context_writers_busy();
+    pub(crate) fn rename_migration_writers_busy(&self) -> bool {
         let book_resume_busy = self
             .book_resume_writer
             .as_ref()
@@ -48092,29 +48094,10 @@ impl App {
             .as_ref()
             .is_some_and(|handle| handle.has_unfinished_work())
             || !self.local_adjust_write_pending.is_empty();
-        context_busy
-            || self.has_page_edit_producers()
-            || self.content_identity_detection_pending.is_some()
-            || self.content_identity_backfill_pending.is_some()
-            || self
-                .reading_history_writer
-                .as_ref()
-                .is_some_and(|w| w.is_busy())
-            || self.composition_editor_writes_pending()
-            || self.remote_bookmark_writes_pending()
-            || self
-                .book_composition_service
-                .as_ref()
-                .is_some_and(|s| s.is_busy())
-            || self.stamp_embed_pending.is_some()
-            || self.tag_maintenance_rx.is_some()
-            || self.edit_bundle_apply_pending.is_some()
-            || self.edit_bundle_paste_pending.is_some()
-            || self.edit_bundle_bulk_pending.is_some()
-            || crate::page_edit_write_epoch::PAGE_EDIT_WRITES
-                .sample()
-                .active_writers
-                != 0
+        // Previously XMP imports completed synchronously during result adoption.
+        // Their new DB worker is a writer too; read-only prewarm and composition
+        // editor tickets retain their existing, separate admission contracts.
+        self.rating_xmp_hydration.is_busy()
             || tag_busy
             || self
                 .spread_shift_service
@@ -48125,10 +48108,6 @@ impl App {
             || edit_preview_busy
             || local_adjust_busy
             || !self.book_bookmark_pending_requests.is_empty()
-            || self
-                .content_identity_recorder
-                .as_ref()
-                .is_some_and(|w| w.is_busy())
     }
 
     /// A delete or book path mutation may have changed the filesystem before App has consumed
@@ -73062,6 +73041,7 @@ impl App {
         let reader_member = self
             .fullscreen_idx
             .is_some_and(|idx| self.visible_indices.binary_search(&idx).is_ok());
+        self.rating_xmp_hydration.invalidate_for_user_write(key);
         self.rating_db
             .as_ref()
             .ok_or_else(|| "レーティング DB を利用できません".to_string())?
@@ -73110,6 +73090,9 @@ impl App {
             .iter()
             .map(|(key, stars, meta)| (key.as_str(), *stars, meta.as_ref()))
             .collect::<Vec<_>>();
+        for (key, _, _) in writes {
+            self.rating_xmp_hydration.invalidate_for_user_write(key);
+        }
         self.rating_db
             .as_ref()
             .ok_or_else(|| "レーティング DB を利用できません".to_string())?
@@ -74402,110 +74385,104 @@ impl App {
         }
     }
 
-    /// `tag_prewarm` ワーカーからの XMP rating hydration 結果を UI スレッドで回収する。
-    /// 毎フレーム `App::update` から呼ぶ。`on_result_drained` で in_flight を減らし、
-    /// 残ジョブがあれば呼び出し側が `request_repaint()` する。
+    /// Drain context-local reads and adopt App-global DB completions without SQLite I/O.
     pub(crate) fn poll_tag_prewarm_results(&mut self) {
-        let Some(pending) = self.tag_prewarm_pending.as_ref() else {
-            return;
-        };
-        // このフレームで届いた分だけ drain。
-        let mut rating_hydrations: Vec<(PathBuf, u8, u64)> = Vec::new();
+        let mut rating_hydrations = Vec::new();
         let mut tag_perf_section = None;
-        loop {
-            match pending.rx.try_recv() {
-                Ok(res) => {
-                    crate::perf::stall::PollSection::ensure(
-                        &mut tag_perf_section,
-                        crate::perf::stall::PollPart::TagPrewarm,
-                    );
-                    // XMP から rating > 0 が読めたらハイドレート候補に積む
-                    // (DB を UI スレッドで触らないように後段でまとめて書く)。
-                    if let Some(stars) = res.rating {
-                        if stars > 0 {
-                            rating_hydrations.push((
-                                res.path.clone(),
-                                stars,
-                                res.rating_generation,
-                            ));
+        let mut disconnected = false;
+        if let Some(pending) = self.tag_prewarm_pending.as_ref() {
+            loop {
+                match pending.rx.try_recv() {
+                    Ok(res) => {
+                        crate::perf::stall::PollSection::ensure(
+                            &mut tag_perf_section,
+                            crate::perf::stall::PollPart::TagPrewarm,
+                        );
+                        if let Some(stars) = res.rating.filter(|stars| *stars > 0) {
+                            rating_hydrations.push((res.path, stars, res.rating_generation));
                         }
+                        pending.on_result_drained();
                     }
-                    pending.on_result_drained();
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.tag_prewarm_pending = None;
-                    break;
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
         }
-        // DB + rating_cache に反映。既に DB に非ゼロ値があれば (= ユーザーが mIV で
-        // 付けた値) 上書きしない (旧ファイル移動先 → 新フォルダで XMP ハイドレートを
-        // 期待するのは DB が 0 = 未登録のときだけ)。
-        if !rating_hydrations.is_empty() {
-            self.hydrate_ratings_from_xmp(rating_hydrations);
+        if disconnected {
+            self.tag_prewarm_pending = None;
         }
+        self.hydrate_ratings_from_xmp(rating_hydrations);
+        self.poll_xmp_rating_hydration_results();
     }
 
-    /// tag_prewarm から回収した XMP 由来 rating を rating_db + rating_cache に反映する。
-    /// DB に非ゼロ値がある idx はスキップ (mIV 側で付けた値を XMP で踏まない)。
-    ///
-    /// 実装: normalize_path を 1 回だけ走らせ、items の逆引き HashMap を 1 回構築、
-    /// `db.get_many` でバッチ SELECT、何も変化しなければ `rebuild_visible_indices` は
-    /// 呼ばない (大フォルダで UI スレッドに来たときの per-frame 再構築コスト回避)。
+    /// Keep the existing path generation authoritative. Pending cancellation
+    /// tickets protect the subsequent DB write against user clears without
+    /// publishing an attempted write as a successful rating generation.
     fn hydrate_ratings_from_xmp(&mut self, hydrations: Vec<(PathBuf, u8, u64)>) {
-        let Some(db) = self.rating_db.as_ref() else {
-            return;
-        };
         if hydrations.is_empty() {
             return;
         }
-        // key → (XMP 由来★, 元 path, request 開始時の path 世代) の最終マップ。
-        let mut target: std::collections::HashMap<String, (u8, PathBuf, u64)> =
-            std::collections::HashMap::with_capacity(hydrations.len());
+        let Some(db_path) = self.rating_db.as_ref().and_then(|db| db.connection_path()) else {
+            return;
+        };
+        let mut target = HashMap::with_capacity(hydrations.len());
         for (path, stars, generation) in hydrations {
             target.insert(
                 crate::adjustment_db::normalize_path(&path),
-                (stars, path, generation),
+                (path, stars, generation),
             );
         }
-        // DB の現在値を 1 クエリでまとめて引く
-        let keys: Vec<String> = target.keys().cloned().collect();
-        let current = db.get_many(&keys);
-        // DB が 0 (未登録) のエントリだけ実際にハイドレート対象にする。
-        // request 後に同じ path へ書き込みがあれば世代不一致で破棄する。さらに、request
-        // 開始前の明示クリアも XMP writer より古い値を読めるため、最新ユーザー値が 0 の
-        // path は同世代でも取り込まない。
-        let mut to_write: Vec<(String, u8, PathBuf)> = Vec::new();
-        for (key, (stars, path, started_generation)) in &target {
-            let session_write = self.rating_session_writes.get(key).copied();
-            let current_generation = session_write.map(|write| write.generation).unwrap_or(0);
-            let explicitly_cleared =
-                session_write.is_some_and(|write| write.explicit_user && write.stars == 0);
-            if current.get(key).copied().unwrap_or(0) == 0
-                && current_generation == *started_generation
-                && !explicitly_cleared
-            {
-                to_write.push((key.clone(), *stars, path.clone()));
+        for (key, (path, stars, generation)) in target {
+            if stars == 0 || !self.xmp_rating_generation_is_current(&key, generation) {
+                continue;
+            }
+            if let Err(error) = self.rating_xmp_hydration.submit(
+                db_path.clone(),
+                path,
+                key.clone(),
+                stars,
+                generation,
+            ) {
+                crate::logger::log(format!(
+                    "[RATING] hydration submit failed key={key:?}: {error}"
+                ));
+                self.report_rating_write_error(&error);
             }
         }
-        if to_write.is_empty() {
-            return;
-        }
-        let mut rating_written = false;
+    }
+
+    fn xmp_rating_generation_is_current(&self, key: &str, generation: u64) -> bool {
+        let write = self.rating_session_writes.get(key);
+        write.map(|write| write.generation).unwrap_or(0) == generation
+            && !write.is_some_and(|write| write.explicit_user && write.stars == 0)
+    }
+
+    fn poll_xmp_rating_hydration_results(&mut self) {
         let mut imported_writes = Vec::new();
-        for (key, stars, path) in &to_write {
-            let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
-                .with_source_path(path);
-            match db.set_imported_rating(key, *stars, Some(&meta)) {
-                Ok(()) => {
-                    rating_written = true;
-                    imported_writes.push((key.clone(), *stars));
+        while let Some(result) = self.rating_xmp_hydration.try_recv() {
+            match result.result.as_ref() {
+                Ok(true)
+                    if result.is_current()
+                        && self
+                            .xmp_rating_generation_is_current(&result.key, result.generation) =>
+                {
+                    imported_writes.push((result.key, result.stars));
                 }
-                Err(error) => crate::logger::log(format!(
-                    "[RATING] hydration write failed key={key:?}: {error}"
-                )),
+                Ok(_) => {}
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "[RATING] hydration write failed key={:?}: {error}",
+                        result.key,
+                    ));
+                    self.report_rating_write_error(error);
+                }
             }
+        }
+        if imported_writes.is_empty() {
+            return;
         }
         let slots = (0..self.items.len())
             .filter_map(|idx| self.rating_path_key(idx).map(|key| (key, idx)))
@@ -74526,11 +74503,9 @@ impl App {
             self.apply_rating_delta_to_folder_counts(&key, 0, stars);
         }
         self.publish_current_context_rating_writes();
-        if rating_written {
-            self.schedule_current_smart_folder_metadata_refresh(
-                smart_folder::SmartFolderMetadataDependency::Rating,
-            );
-        }
+        self.schedule_current_smart_folder_metadata_refresh(
+            smart_folder::SmartFolderMetadataDependency::Rating,
+        );
         self.invalidate_rating_counts_cache();
     }
 

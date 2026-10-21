@@ -235,6 +235,60 @@ impl RatingDb {
         crate::data_dir::get().join("rating.db")
     }
 
+    /// The already-open connection's filename; this does not access the filesystem.
+    pub(crate) fn connection_path(&self) -> Option<PathBuf> {
+        self.conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// Acquire SQLite's writer reservation before checking the request ticket.
+    /// A user write invalidates its ticket before entering SQLite, so a clear
+    /// cannot be resurrected by an import that was waiting for that write.
+    pub(crate) fn import_xmp_rating_if_unrated(
+        &self,
+        key: &str,
+        stars: u8,
+        source_path: &Path,
+        is_current: impl FnOnce() -> bool,
+    ) -> Result<bool, rusqlite::Error> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !is_current() || stars == 0 {
+            return Ok(false);
+        }
+        let rated: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ratings WHERE path = ?1 AND stars <> 0)",
+            [key],
+            |row| row.get(0),
+        )?;
+        if rated {
+            return Ok(false);
+        }
+        let _rating_write = RATING_WRITES.begin();
+        let changed = transaction.execute(
+            "INSERT INTO ratings (path, stars, rated_at_ms, source_path, kind)
+             VALUES (?1, ?2, NULL, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+                 stars = excluded.stars, rated_at_ms = NULL,
+                 source_path = excluded.source_path, kind = excluded.kind,
+                 entry_name = NULL, page_num = NULL, dir_prefix = NULL,
+                 archive_format = NULL, zipdir_is_archive = NULL, zipdir_representative = NULL
+             WHERE ratings.stars = 0",
+            rusqlite::params![
+                key,
+                stars.min(5) as i64,
+                source_path.to_string_lossy(),
+                RatingItemKind::Image.to_db(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(changed > 0)
+    }
+
     fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS ratings (

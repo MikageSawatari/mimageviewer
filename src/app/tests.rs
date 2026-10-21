@@ -62539,6 +62539,92 @@ mod native_video_rating_key_tests {
         .expect("detached context");
     }
 
+    fn settle_xmp_rating_hydration(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.rating_xmp_hydration.is_busy() {
+            app.poll_tag_prewarm_results();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "XMP hydration did not settle"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn accepted_xmp_hydration_cannot_restore_a_later_user_clear() {
+        // Exercise both SQLite-wait and completed-but-not-adopted boundaries.
+        for clear_after_worker_completion in [false, true] {
+            let mut app = setup_app();
+            app.settings.write_rating_to_xmp = false;
+            let path = app.tmp.path().join("hydration-clear.jpg");
+            let key = crate::adjustment_db::normalize_path(&path);
+            app.items = vec![GridItem::Image(path.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.visible_indices = vec![0];
+            app.rating_cache.insert(0, 0);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            app.rating_xmp_hydration.hold_next_import_for_test(
+                crate::tag_prewarm::HydrationTestHook {
+                    entered: entered_tx,
+                    release: release_rx,
+                    completed: completed_tx,
+                },
+            );
+            app.hydrate_ratings_from_xmp(vec![(path, 4, 0)]);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(app.rating_xmp_hydration.is_busy());
+            if clear_after_worker_completion {
+                release_tx.send(()).unwrap();
+                completed_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                assert!(
+                    app.rating_xmp_hydration.is_busy(),
+                    "UI adoption remains pending"
+                );
+                assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+            }
+            app.write_user_rating_shared(&key, 0, None).unwrap();
+            if !clear_after_worker_completion {
+                release_tx.send(()).unwrap();
+                completed_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            settle_xmp_rating_hydration(&mut app);
+            assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+            assert_eq!(app.rating_cache.get(&0), Some(&0));
+            assert!(app.rating_session_writes[&key].explicit_user);
+        }
+    }
+
+    #[test]
+    fn xmp_hydration_preserves_existing_nonzero_db_rating() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("existing-rating.jpg");
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 5, None)
+            .unwrap();
+        let writes = crate::rating_db::RATING_WRITES.sample();
+        app.hydrate_ratings_from_xmp(vec![(path, 2, 0)]);
+        settle_xmp_rating_hydration(&mut app);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+        assert_eq!(
+            crate::rating_db::RATING_WRITES.sample(),
+            writes,
+            "a skipped import must not publish a mutation"
+        );
+        assert!(!app.rating_session_writes.contains_key(&key));
+    }
+
     #[test]
     fn xmp_hydration_still_imports_without_a_newer_path_write() {
         let mut app = setup_app();
@@ -62551,6 +62637,7 @@ mod native_video_rating_key_tests {
         let generation = app.rating_session_generation_for_key(&key);
 
         app.hydrate_ratings_from_xmp(vec![(path, 3, generation)]);
+        settle_xmp_rating_hydration(&mut app);
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
         assert_eq!(app.rating_cache.get(&0), Some(&3));

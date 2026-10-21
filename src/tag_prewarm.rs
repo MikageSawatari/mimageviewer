@@ -19,6 +19,7 @@
 //!   (AtomicBool セット + job_tx 閉鎖 → worker が break)。
 //! - UI 側が `pending = None` にすれば job_tx も drop され、worker は自然終了する。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,6 +27,165 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, unbounded};
+
+/// Accepted imports belong to App, not to the cancellable context-local XMP
+/// reader. Folder switches and metadata-transfer reader cancellation therefore
+/// cannot abandon a DB write or its UI publication.
+#[derive(Default)]
+pub(crate) struct XmpRatingHydration {
+    worker: Option<HydrationWorker>,
+    tickets: HashMap<String, Arc<AtomicBool>>,
+    in_flight: usize,
+    #[cfg(test)]
+    next_test_hook: Option<HydrationTestHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct HydrationTestHook {
+    pub entered: mpsc::Sender<()>,
+    pub release: mpsc::Receiver<()>,
+    pub completed: mpsc::Sender<()>,
+}
+
+struct HydrationWorker {
+    tx: mpsc::Sender<HydrationJob>,
+    rx: mpsc::Receiver<XmpRatingHydrationResult>,
+}
+
+struct HydrationJob {
+    db_path: PathBuf,
+    path: PathBuf,
+    key: String,
+    stars: u8,
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_hook: Option<HydrationTestHook>,
+}
+
+pub(crate) struct XmpRatingHydrationResult {
+    pub key: String,
+    pub stars: u8,
+    pub generation: u64,
+    pub result: Result<bool, String>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl XmpRatingHydrationResult {
+    pub(crate) fn is_current(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl XmpRatingHydration {
+    /// One accepted import pauses before opening SQLite. Its completion notice
+    /// is sent only after the result has entered the UI queue.
+    #[cfg(test)]
+    pub(crate) fn hold_next_import_for_test(&mut self, hook: HydrationTestHook) {
+        self.next_test_hook = Some(hook);
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        // Receiving the worker result is insufficient: UI adoption must also
+        // complete before the next pure busy query can report quiescence.
+        self.in_flight > 0
+    }
+
+    /// Called before a user-originated SQLite write, including explicit clear.
+    /// This is only a pending request ticket, not another rating generation.
+    pub(crate) fn invalidate_for_user_write(&mut self, key: &str) {
+        if let Some(ticket) = self.tickets.remove(key) {
+            ticket.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        db_path: PathBuf,
+        path: PathBuf,
+        key: String,
+        stars: u8,
+        generation: u64,
+    ) -> Result<(), String> {
+        if self.worker.is_none() {
+            let (tx, job_rx) = mpsc::channel::<HydrationJob>();
+            let (result_tx, rx) = mpsc::channel();
+            #[cfg(test)]
+            let test_epoch = crate::page_edit_write_epoch::TestEpochScope::capture();
+            std::thread::Builder::new()
+                .name("xmp-rating-hydration".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    let _test_epoch =
+                        test_epoch.map(crate::page_edit_write_epoch::TestEpochScope::enter);
+                    while let Ok(job) = job_rx.recv() {
+                        #[cfg(test)]
+                        if let Some(hook) = job.test_hook.as_ref() {
+                            let _ = hook.entered.send(());
+                            let _ = hook.release.recv();
+                        }
+                        let result =
+                            crate::rating_db::RatingDb::open_existing_for_write(&job.db_path)
+                                .and_then(|db| {
+                                    db.import_xmp_rating_if_unrated(
+                                        &job.key,
+                                        job.stars,
+                                        &job.path,
+                                        || !job.cancelled.load(Ordering::Acquire),
+                                    )
+                                })
+                                .map_err(|error| error.to_string());
+                        let _ = result_tx.send(XmpRatingHydrationResult {
+                            key: job.key,
+                            stars: job.stars,
+                            generation: job.generation,
+                            result,
+                            cancelled: job.cancelled,
+                        });
+                        #[cfg(test)]
+                        if let Some(hook) = job.test_hook {
+                            let _ = hook.completed.send(());
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+            self.worker = Some(HydrationWorker { tx, rx });
+        }
+        let cancelled = Arc::clone(
+            self.tickets
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+        );
+        self.worker
+            .as_ref()
+            .unwrap()
+            .tx
+            .send(HydrationJob {
+                db_path,
+                path,
+                key,
+                stars,
+                generation,
+                cancelled,
+                #[cfg(test)]
+                test_hook: self.next_test_hook.take(),
+            })
+            .map_err(|error| error.to_string())?;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Option<XmpRatingHydrationResult> {
+        let result = self.worker.as_ref()?.rx.try_recv().ok()?;
+        self.in_flight -= 1;
+        if self.tickets.get(&result.key).is_some_and(|ticket| {
+            Arc::ptr_eq(ticket, &result.cancelled) && Arc::strong_count(ticket) == 2
+        }) {
+            self.tickets.remove(&result.key);
+        }
+        Some(result)
+    }
+}
 
 /// バックグラウンド XMP プリフェッチのハンドル。`job_tx` は UI が新規ジョブを push する
 /// ための送信端。`rx` は worker が XMP rating 読みの結果を返す経路
@@ -42,6 +202,22 @@ pub(crate) struct TagPrewarmPending {
 }
 
 impl TagPrewarmPending {
+    #[cfg(test)]
+    pub(crate) fn from_results_for_test(results: Vec<TagPrewarmResult>) -> Self {
+        let count = results.len();
+        let (result_tx, rx) = mpsc::channel();
+        for result in results {
+            result_tx.send(result).unwrap();
+        }
+        let (job_tx, _) = unbounded();
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            job_tx,
+            rx,
+            in_flight: Arc::new(AtomicUsize::new(count)),
+        }
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }

@@ -412,7 +412,7 @@ producer の棚卸しは次の所有者と、保存を生む結果の消費箇�
 | --- | --- |
 | タグ要求・結果 (`tag_ops`) | `has_unconsumed_batch`。DB 終了だけでなく UI が結果から発行する sidecar・内容同一性記録まで通す |
 | ★の外部書込 (`rating_write_handle`) | `is_busy`。UI 同期の中央 DB 変更は入力 handler 終了時に確定している。session 台帳も mapping の snapshot から置換する |
-| XMP rating prewarm (viewer context 所有) | 既存 `viewer_context_ids` / `with_owner_viewer_context` で全 context の `TagPrewarmPending::is_busy` を確認。Requested は結果を回収し、新しい可視範囲 job の受付だけ止める |
+| XMP rating prewarm | registry の immutable 参照で全 context の `TagPrewarmPending::is_busy`、App 共通 `XmpRatingHydration::is_busy` を確認。Requested の明示 poll が結果を回収し、DB 処理と UI 採用まで待つ。新しい可視範囲 job の受付だけ止める |
 | ローカル調整保存 | writer の `has_unfinished_work` と App-global の未消費 `local_adjust_write_pending` |
 | LUT・segmentation | 既存 `has_page_edit_producers` / `poll_all_page_edit_producers` が mounted / parked を含める。完了から通常保存・後続記録まで通す |
 | 編集プレビュー | `has_pending_commands` が save / delete FIFO を含む |
@@ -424,7 +424,8 @@ producer の棚卸しは次の所有者と、保存を生む結果の消費箇�
 | 補正・crop・mask・conceal・注釈・回転・pin | 同期 handler または上記の専用 writer から保存。新入力は共通 modal / grid / raw canvas / panel の入口で止め、保存関数には構造 owner の拒否を入れない |
 | 表示トリムの未保存値 | 全 context から既存 `PendingViewTrimTransfer` を取り、同じ構造 worker の FS 前に保存。保存完了までは元の dirty payload を保持し、FS 前の失敗では元 context に戻す |
 
-静止述語は汎用改名と構造操作で `rename_migration_writers_busy` を共有した。
+静止述語は初回に汎用改名と共有したが、§8.7 の回帰修正で本の構造操作専用の
+`book_structural_writers_busy` に分けた。汎用改名・sidecar 復元の既存開始条件を広げない。
 上流 service・未消費結果を先に確認し、後続の内容同一性 recorder を最後に確認する。
 UI フレームでのみ進め、待機ループ・sleep・新しい fence は追加していない。
 
@@ -457,7 +458,9 @@ UI の `purge_book_root` の重複要求は削除した。
   `migrate_book_page_paths` 要求に `RemoveMovedOutside` を載せ、各 service の transaction 内で外す。
   構成の PageRef 保持箇所は order・hidden・override の三つ。anchor は spread_shift の row が保持する。
   direction / cover は本単位で維持し、移動先の構成・shift へは移さない。汎用移動の Missing 保持は変えない。
-- 別窓・Snapshot は旧 items / cache / accepted shift を保つ。全 context の cache 更新と at-rest shift の
+- 別窓・Snapshot の旧 items / accepted shift を直接作り直さず、cache を新 DB のキーへ付け替えない。
+  実 worker の通知後に通常の旧 path 再照合が走る限界は §3.10 に従い、cache の不変は保証しない。
+  全 context の cache 更新と at-rest shift の
   一括付け替えを撤去し、main でも既存の完了終端から実際に reload される範囲だけ page cache を失効する。
   本の改名は current_folder がある main、ページ操作は source / target 本の main が対象。
   再構築されない抽出一覧も維持する。親棚の pin は既存 Pins worker に限定し、page cache は初期化しない。
@@ -692,3 +695,112 @@ cargo nextest run -p mimageviewer --lib -E $bookV4Filter
 既存 `book_structure_moves_rating_ledger_and_invalidates_parked_context_caches` は、v4 に合わせて
 `book_structure_moves_rating_ledger_and_preserves_independent_reader_caches` へ改名し、main の失効と別窓保持を検査する。
 registry の root 改名・FS resource 保持回帰も削除した helper から実際の book adoption 入口へ更新した。
+
+### 8.7 全件テストと独立レビューの追補 (2026-10-21)
+
+設計担当が `6972a8534` の全件テストと単独再実行で確認した 7 件を調査した。
+6 件は次の判断で修正した。D2c の受付済み open 境界は設計確認待ちとし、その 1 件だけを止めている。
+期待値を緩めて失敗を消す対応にはしない。
+
+| 失敗 | 判断と対応 |
+| --- | --- |
+| `adjusted_retained_f12_keeps_session_across_unrelated_and_same_book_rename` | 新 owner へのテスト更新。旧 `book_op_pending` のみの poll では構造 worker が始まらない。受理済み writer を静止させ、retained readoption は未採用のまま、実 worker と service の同じ隔離 data-dir で旧 session 保持を確かめる |
+| `book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open` | 旧 owner assertion の更新に加え、取込のない受付済み open も `sidecar_restore_active` で拒否する契約の退行がある。旧 D2c は未採用 open と改名の並行を許可し、§8.4 の初回実装記録は open 中の拒否としていた。この境界は設計確認待ちで、製品・期待値とも変更していない（service 保存先の fixture だけ統一） |
+| `book_rename_saved_rows_move_but_open_scopes_and_stale_actions_stay_old` | 新 owner と worker 所有へのテスト更新。FS・保存済み行の改名、開いた旧 scope と stale action の保持を実 worker 経路で引き続き確かめる |
+| `visibility_in_book_pc_projects_nested_archive_provenance_and_legacy_notice` | fixture 更新。items の直代入で reader order が空だったため新 hint を作れなかった。通常 install と表示順構築を通し、missing の削除経路・legacy 通知・再生成後の行・保存済み行数の検査を維持する |
+| `zip_sent_save_does_not_block_unrelated_sidecar_writer_readiness` | 製品の退行。広げた共通述語が無関係な送信済み構成 save ticket を sidecar 復元の開始条件に混ぜていた。既存の狭い条件へ戻し、元のテストをそのまま通す |
+| `zip_sent_save_retired_owner_precedes_generic_migration_after_journal_ack` | 製品の退行。generic 改名の writer 判定に構成 ticket を混ぜ、別の既存 owner が保護する境界を壊していた。writer 判定を戻し、journal ACK・ticket の完了採用・resume writer の静止の全条件を元のテストで維持する |
+| 旧 `g3_bookmark_hint_uses_raw_position_and_composed_detail_order_is_locked` | §5 / I7 の意図した変更。`bookmark_hint_uses_composed_reading_position_and_composed_detail_order_is_locked` へ改名。順序変更・hidden を含む HUD の読み順位置を hint に保存し、raw 位置は resume 用に維持する。`book-composition-plan.md` も更新 |
+
+静止の判定は副作用を持たない `book_structural_writers_busy` に集約した。汎用改名と
+sidecar 復元は構成 ticket・全 context の reader・履歴などへ条件を広げず、既存契約を維持する。
+今回 UI 同期処理から分離した XMP の DB writer だけは新しい非同期 writer として両者にも含める。
+
+D2c の未採用 open をそのまま許可すると、`FirstDisplayAction`・`navigation_after_hydration`・
+deferred fullscreen の受付済み継続が構造 modal の新規入力拒否に遮られる経路がある。
+phase だけの許可やテストの None ペイロードだけへの個別許可は入れない。
+既存の並行契約を保つなら受付済み継続と modal の境界を設計へ補う必要があり、
+open 完了後の再要求へ変更するならその契約変更の決定が必要。
+初回依頼の「主要な設計前提の不一致はその点だけ止めて報告する」に従い、この一点を確認待ちとした。
+
+P2-2: parked を含む context-local XMP 読込の結果をフレームの明示 poll で回収し、
+App 共通 `XmpRatingHydration` が DB の照会・未評価行の補充・完了票を所有する。
+context の reader 取消後も、受理済み DB 処理と UI 採用は捨てない。
+明示評価・クリアは SQLite に入る前に同 path の pending import 票を失効させ、worker は
+writer transaction の中で票と既存非ゼロ値を確認する。UI 採用時も既存 rating 世代を確認し、
+古い import から評価を復活させない。DB 完了・未採用結果・後続の採用まで静止条件へ含める。
+parked 結果・worker の DB 前停止・完了後未採用を分離した状態遷移テストを追加した。
+
+P3: Remote は ZIP/PDF の検証済み raw 列に既存の構成 projection を適用し、order / hidden を
+反映した可視位置から hint を求める。`page_index` は従来の resume raw index のまま。
+ZIP の子フォルダ二つと PDF の両方で、Remote の検証・保存受付・UI writer・DB 読戻しまでをテストする。
+しおり一覧の読取りは従来の元列検証を維持し、hidden anchor や構成 DB の読込失敗を新たな拒否にしない。
+独立レビューで発見したこの境界も、ZIP/PDF の実際の一覧要求を通す回帰テストで固定した。
+
+P2-1 は設計担当の `a7a8ac715` / §3.10 の決定どおり、製品コードを修正しない。
+Snapshot テストを `book_structure_snapshot_adoption_does_not_rebuild_or_remap_context` へ改名し、
+直接 adoption が reader を再構築・新キーへ remap しないことだけを主張する。
+実 worker の `PAGE_EDIT_WRITES` 通知後の通常再照合によって旧 path の編集 cache が変わり得る点は
+今回の未解決バグとして隠さず、別バックログの範囲とする。
+
+新規テスト:
+
+- `app::book_structural_op::tests::book_structure_parked_xmp_result_runs_db_on_worker_and_waits_for_adoption`
+- `app::tests::native_video_rating_key_tests::accepted_xmp_hydration_cannot_restore_a_later_user_clear`
+- `app::tests::native_video_rating_key_tests::xmp_hydration_preserves_existing_nonzero_db_rating`
+- `remote_ipc::container::tests::remote_zip_and_pdf_bookmark_saves_use_composed_visible_order_and_keep_raw_resume`
+- `remote_ipc::container::tests::remote_bookmark_lists_preserve_hidden_anchor_and_ignore_composition_read_errors`
+
+既存の `book_structure_waits_for_unconsumed_tag_result_and_its_identity_record` は、分離した本専用の静止述語で
+後続 recorder まで待つ状態遷移テストに更新した。generic の狭い writer 条件ではその完了を保証しないためである。
+
+検証結果（未コミット差分、通常 feature / dev・test profile）:
+
+- 全 build / test に `MSBUILDDISABLENODEREUSE=1` と `CARGO_BUILD_JOBS=1` を指定。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: exit 0。lib 264 / ort 1 の既存警告で増加なし。
+  最終ログは `target/book-review-check.stderr.log`。
+- `cargo nextest run -p mimageviewer --lib -E $bookReviewFilter`: 42 件成功、失敗 0、exit 0。
+  上記 6 件と新規 5 テストが実行済みであることを JUnit と照合した。
+  D2c の `book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open` は明示的に除外し、
+  成功扱いにしていない。ログは `target/book-review-nextest.stderr.log`、
+  JUnit は `target/book-review-nextest.junit.xml`。
+- 初回の同系 filter は 41 件中 40 件成功、1 件失敗だった。
+  `book_structure_waits_for_unconsumed_tag_result_and_its_identity_record` が旧 generic 述語で待っていたためで、
+  上記の本専用述語へテストを更新後、最終 42 件に含めて成功した。
+- `scripts/test-focused.ps1 -Path <下表8パス>`: 8 run / 356 件成功、失敗 0、exit 0。
+  D2c を含む `spread_shift_owner_tests` 全体は未実行。その中の修正済み二つは上記の選択 nextest で成功した。
+  ログは `target/book-review-focused.stdout.log`、各 JUnit は `target/test-focused/runs/` の
+  `20261021T133802335Z-81167f4f` から `20261021T133853600Z-4d82b963` まで。
+- `cargo fmt`（引数なし、workspace 全体）、`cargo fmt --check`、`git diff --check`: 成功。
+- `python scripts/check_ui_glyphs.py`: 成功、dangerous glyph 0。
+- 独立コードレビュー（`gpt-6.1-sol` / `xhigh`）は確定範囲を ACCEPT、追加 P1/P2 なし。
+  Remote 一覧への拒否拡大の指摘は修正・再レビュー済み。D2c は承認対象外。
+
+| focused の明示パス | 成功件数 |
+| --- | ---: |
+| `src/app/book_structural_op.rs` | 13 |
+| `src/app/tests/file_type_visibility_fixes.rs` | 13 |
+| `src/app/book_composition_editor/metadata_transfer_tests.rs` | 5 |
+| `src/app/book_composition_runtime_tests.rs` | 40 |
+| `src/app/viewer_context_registry.rs` | 94 |
+| `src/remote_ipc/container.rs` | 175 |
+| `src/rating_db.rs` | 13 |
+| `src/tag_prewarm.rs` | 3 |
+
+42 件と focused 356 件には重複がある。本件全体は D2c の設計確認が残るため未完了。
+指定により build-dev・本体起動・commit は行っていない。全件テストは設計担当が担当する。
+
+今回の選択式（D2c の除外を含む）:
+
+```text
+(
+  test(/book_structure/) | test(/book_rename/) |
+  test(/adjusted_retained_f12_keeps_session/) |
+  test(/visibility_in_book_pc_projects_nested_archive_provenance_and_legacy_notice/) |
+  test(/metadata_transfer_tests/) | test(/bookmark_hint_uses_composed/) |
+  test(/remote_zip_and_pdf_bookmark/) | test(/remote_bookmark_lists_preserve_hidden_anchor/) |
+  test(/rating_hydration/) | test(/xmp_hydration/) | test(/tag_prewarm/) |
+  test(/detached_current_container_ratings_share_generation_with_main_and_stale_hydrate/) |
+  test(/rename_migration_waits/) | test(/book_resume_meter_rename/)
+) & !test(/book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open/)
+```

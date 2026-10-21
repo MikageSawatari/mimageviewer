@@ -380,7 +380,14 @@ Requested/Runningと終端採用を所有する。待機中は UI frame で prod
 
 本のページ移動で scope 外へ出た構成参照・見開き基点は、本操作専用の service 要求が各 transaction 内で外す。
 汎用移動の Missing 保持とは要求で区別する。完了時の表示 cache 更新は既存 reload の対象 main に限り、
-独立別窓・Snapshot の items / cache / accepted shift は保持する。reader の再構築経路は追加しない（同計画 §3.10）。
+独立別窓・Snapshot の items / accepted shift を直接作り直さず、cache を新キーへ付け替えない。
+既存の通知による旧 path の再照合は従来どおり残る（同計画 §3.10）。
+
+静止の `book_structural_writers_busy` は副作用を持たない。UI frame の明示 poll が parked を含む
+受理済み XMP 読込結果を回収し、App 共通の `XmpRatingHydration` worker へ DB 処理を渡す。
+未評価行だけを transaction で補充し、明示評価・クリアとの競合は path ごとの取消票と既存の
+rating 世代で照合する。DB 完了だけでなく UI 採用まで静止条件に含める。
+汎用改名・sidecar 復元は従来の狭い writer 条件を維持し、この新しい DB writer だけを追加する。
 
 既存の製本 worker が FS 確定後に EPUB 範囲 → shift → composition の保守 lease を取り、
 `rename_key_migration::migrate_book_paths_at` を呼ぶ。`STORES` の `book_policy` が

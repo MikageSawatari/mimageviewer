@@ -747,6 +747,31 @@ fn reset_audio_art_terminal_rows(
 }
 
 impl App {
+    /// Includes buffered read results; inspection never mounts a context or drains it.
+    pub(super) fn has_tag_prewarm_work(&self) -> bool {
+        if self
+            .tag_prewarm_pending
+            .as_ref()
+            .is_some_and(|p| p.is_busy())
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if bundle
+                .tag_prewarm_pending
+                .as_ref()
+                .is_some_and(|p| p.is_busy())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(super) fn take_parked_page_edit_commits(&mut self) -> Vec<page_edit_owner::PageEditCommit> {
         let mut commits = Vec::new();
         #[cfg(windows)]

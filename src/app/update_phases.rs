@@ -669,6 +669,7 @@ impl App {
                 .tag_prewarm_pending
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
+            || self.rating_xmp_hydration.is_busy()
             || self.converted_archive_cache_paths_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {
