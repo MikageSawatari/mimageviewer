@@ -1,6 +1,6 @@
 # 本の構造変更と path キー DB の付け替え・後始末 (§1.272 / §1.273) と、しおりのページ番号 (§1.245)
 
-2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v1、実装前の独立レビュー待ち**。
+2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v2 (実装前レビュー 1 回目の指摘を反映)、再確認待ち**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) の §1.272・§1.273・§1.245・§1.244。
 前提として読む文書: [製本計画](compile-book-plan.md) §2・§11、`src/rename_key_migration.rs` のモジュール doc。
 `x-scheduled-post` ブランチの `docs/x-post-r2-design.md` §4 (関所つきの大掛かりな版) を参考にしたが、
@@ -59,157 +59,216 @@
 
 ## 2. 守る不変条件
 
-- I1. 本の構造変更 (並べ替え・別本への移動・本の改名) の後、path キーの中央 DB に保存された情報は、
+- I1. 本の構造変更 (並べ替え・別本への移動/コピー・本の改名) の後、path キーの中央 DB に保存された情報は、
   変更前と同じ**画像**に付いている。対象ストアは `rename_key_migration::STORES` の 1 表だけで決める。
+  値の中にページを指す情報 (読書位置の identity、フォルダサムネイル pin、編集プレビューのファイル配置) も同じ画像を指す。
 - I2. 本の削除の後、その本のフォルダ配下をキーにした行は `STORES` から消えている
   (汎用削除と同じ purge。本ページのしおりは missing 行として残す既存仕様のまま)。
 - I3. 1 つのストアの付け替えは、1 回の操作につき 1 つの所有者だけが行う
   (spread_shift・book_composition は従来どおり各 service、bookmark は journal 経路、collections は collection 段、
-  それ以外の `STORES` は製本 worker)。同じストアを 2 か所から動かさない。
+  編集プレビューはそのモジュール、それ以外の `STORES` は製本 worker)。同じストアを 2 か所から動かさない。
 - I4. 付け替え・purge の DB 書き込みは UI スレッドで行わない (cold open を含む)。
-- I5. 付け替え・purge より前に積まれた、そのページ宛ての非同期書き込みは、付け替え・purge より先に着地する。
-  構造変更の実行中に、そのページ宛ての新しい書き込みは始まらない。
+- I5. 構造変更の FS 処理を始める時点で、本のページ宛ての書き込み・記録の producer (保存の worker、
+  UI が未消費の完了、完了から発行される後続の記録) はすべて静止しており、構造変更の結果を UI が採用するまで
+  新しい producer は始まらない。入口は本体の UI・別ウィンドウ・mIV Remote を含む。
 - I6. 置換 (A→B と B→A の入れ替えを含む) は、ストアごとに 1 つの transaction の中で一時キーを経由して行い、
   途中の状態を他から見せない。
-- I7. しおりの「P.N」は、そのページをフルスクリーンで開いたときのページ表示 (「N / 全体」) と同じ番号になる
-  (本の構成で非表示にしたページを数えない射影の扱いは §5 で決める)。
+- I7. 新しく保存したしおりの「P.N」は、保存した時点で、そのページをフルスクリーンで開いたときのページ表示
+  (「N / 全体」) と同じ番号になる。古い行と、保存後の本の構成変更での一致は保証しない (§5)。
 
 ## 3. 設計 (§1.272 / §1.273)
 
-### 3.1 対象表に「本の操作での扱い」を持たせる
+### 3.1 構造操作の単一の所有者 (I5)
 
-`StoreDescriptor` に本の操作での方針を 1 列足し、`STORES` の各行が自分の扱いを宣言する。
-新しいストアを足す人は、この列を決めないと表を書けない (= 本の操作だけ別表になる状態を作らない)。
+本の構造操作 (並べ替えの保存、別本への移動/コピー、本の改名、本の削除) は、App が持つ 1 つの型付き状態
+`BookStructuralOp` が受付から完了の採用までを所有する。今の `book_op_pending` (Delete/SourceMutation の intent) と
+並べ替え画面の `flush_pending` / `transfer_pending` は、構造操作についてはこの所有者へまとめる
+(本の作成・一覧・追加・追加の取り消しは今のままでよい。追加の取り消しを同じ所有者へ寄せるかは実装担当が判断して報告)。
+
+```text
+Requested(要求) ──静止を確認──> Running(worker) ──結果を UI が採用──> (なし)
+```
+
+- **Requested**: 操作の内容を保持し、毎フレーム「書き込みの静止」を確認する。静止したら worker を起動して Running へ。
+  この間も Running の間も、次の入口は受け付けない (理由付きで拒否するか待たせる):
+  - 本体 UI の編集・タグ・★・表示トリム・保存・本を開く操作 (製本管理の「開く」を含む)。共通モーダル判定
+    (`modal_dialog_block_reason`) に入れ、さらに製本管理・並べ替え画面の中の操作も所有者を見て止める。
+  - mIV Remote: 受付時に `SessionHandle::try_local_modal_lease()` を取り、採用まで持つ。取れなければ
+    構造操作を始めない (利用者へ理由を出す)。Remote の取得待ち (`book_op_pending` を見ている箇所) も所有者を見る。
+  - 別ウィンドウ (detached viewer) の書き込み。所有者の確認は App 共通の書き込み入口に置き、detached の
+    経路を個別に足さない (detached リワーク中の規則に触れる変更が要るなら、実装前に報告する)。
+- **静止の判定**は 1 つの述語にまとめる。少なくとも汎用改名の `rename_migration_writers_busy()` が見る writer
+  (タグの未消費結果、★、編集プレビュー、読書位置、ローカル調整、bookmark の未消費要求、spread_shift service) に加え、
+  `reading_history_writer`、`content_identity_recorder` (タグ完了の消費から発行される記録を含む)、LUT・segmentation の
+  完了から発行される保存、他の viewer context (parked を含む) の producer。実装担当が producer を全部列挙し、
+  列挙の根拠をこの文書の §8 に残す。汎用改名の開始条件も同じ述語を使えるなら置き換える (差があれば理由を書く)。
+- 静止を待つのは UI のフレームでの確認だけで、待機ループ・sleep・柵の待ち合わせは使わない
+  (CLAUDE.md「並行処理」)。新しい producer は入口で止まっているので、静止は短時間で来る。
+- 長く静止しない場合の上限は設けない (書き込みが終わらないのは別の不具合)。Requested の間は進捗表示を出す。
+
+### 3.2 対象表に「本の操作での扱い」を持たせる (I1・I3)
+
+`StoreDescriptor` に本の操作での方針を足し、`STORES` の各行が自分の扱いを宣言する。
+新しいストアを足す人はこの列を決めないと表を書けない (本の操作だけ別表になる状態を作らない)。
 
 | 方針 | 対象 | 並べ替え・移動・改名 | 別本へのコピー | 削除 |
 | --- | --- | --- | --- | --- |
-| `Follow` (既定) | 下記以外のすべての `rename_generic` 行 | 製本 worker が mapping を適用 | 下の「コピー」列 | purge |
-| `ServiceOwned` | `book_composition.db`、`spread_shift.db` | 各 service が FIFO で適用 (従来どおり) | なし | purge (worker) + service の `purge_book_root` (従来どおり) |
+| `Follow` (既定) | 下記以外のすべての `rename_generic` 行 | 製本 worker が mapping を適用 | コピー列が真のものだけ | purge |
+| `OwnedBy(EditPreview)` | `edit_preview_cache.db` | 編集プレビューのモジュールの移行関数 (§3.4) | なし | purge (既存の削除と同じ扱い) |
+| `ServiceOwned` | `book_composition.db`、`spread_shift.db` | 各 service が FIFO で適用 (従来どおり) | なし | purge (worker) |
 | (表外) | book_bookmarks.db | journal 経路 (従来どおり) | なし | 残す (missing 行) |
 
-- 別本へのコピーで複製する対象は、**今と同じ 8 種** (補正・ローカル調整・切り取り・マスク・隠蔽・注釈・★・タグ
+- 別本へのコピーで複製する対象は**今と同じ 8 種** (補正・ローカル調整・切り取り・マスク・隠蔽・注釈・★・タグ
   [`item_tags` と `tag_item_state`]) にとどめ、同じ表の列 (`copies_with_book_page: bool`) で宣言する。
-  追加 (`append`) の引き継ぎ対象と揃っており、コピーの意味を今回変えない。
 - `reading_history` (`rename_generic=false`) は本の改名のときだけ、汎用改名と同じ exact 移行を行う。
 - mapping の適用は汎用改名と同じ 3 面 (exact、`key/` 配下、`key::` 仮想ページ)。本単位のキー (本フォルダ) は
-  ページの mapping には一致しないので、並べ替えでは自然に動かず、本の改名 (フォルダ→フォルダ) でだけ動く。
-  方針を「ページ単位」「本単位」に分ける必要はない。
-- 値の中にページを持つ 2 つは、同じ worker の同じストアの transaction で値も書き換える:
-  - `book_resume.page_identity` が `Image { path }` で、その path が mapping の旧側なら新側へ。
-    本の改名では配下 prefix を付け替える (`page` 列は変えない。トリガーで identity が消えないよう、
-    `page` を更新しない文にする)。
-  - `folder_thumb_pins` の `container_key` が本フォルダで `source_rel` が旧ページ名なら、同じ本の中の新しい
-    ページ名へ。別の本へ移ったページを指していた pin は**変えない** (汎用の移動・削除と同じく、表示時に
-    見つからなければ自動サムネイルに戻る。2026-10-21 設計判断)。
+  ページの mapping には一致しないので、並べ替えでは動かず、本の改名 (フォルダ→フォルダ) でだけ動く。
+- `ratings.source_path` は既存の `migrate_store` が更新している。本の操作でも同じ更新を通す。
 
-### 3.2 実行場所: 製本 worker で FS の直後に行う
+### 3.3 衝突の規則: 移行先は移行元の写し (I1)
 
-並べ替え・移動/コピー・改名・削除の各 worker は、FS の処理が確定した直後に、同じ worker の中で
-`STORES` (方針 `Follow` / コピー列) の付け替え・purge を行う。
+汎用改名は「移行先に行があれば移行先を優先」だが、本の操作では採らない。本の操作の移行先 (新しいページ名・新しい本名)
+には、今まで付け替えられなかった行や、削除した同名の本の行が**残っていることが通常の操作で起こる** (§1.272・§1.273 の既存不具合)。
+
+- 本の操作の移動・コピーは、キーごとに「移行先の行を消してから、移行元の行を移す/写す」。移行元に行が無ければ
+  移行先の行も消える。結果として、移行先のキーの行は移行元のキーの行と同じになる。
+- 既存のコピー (補正は移行元で上書き、タグは移行先を消して置換) と同じ意味で、移動もこれに揃える。
+- 本の改名 (フォルダ→フォルダ) も同じ: 新しい本フォルダ配下に残っていた行は消える。
+
+### 3.4 値の中にページを持つもの (I1)
+
+同じ worker の、そのストアの transaction の中で値も書き換える。
+
+- `book_resume.page_identity` が `Image { path }` で、その path が mapping の旧側なら新側へ。本の改名では配下 prefix を
+  付け替える。`page` 列は更新しない (`page` の更新で identity を消すトリガーがあるため)。
+- `folder_thumb_pins` (`container_key` が本フォルダ):
+  - `source_rel` が同じ本の中で名前の変わったページなら、新しいページ名へ。
+  - `source_rel` が**別の本へ移したページ**なら、その pin を外す (行を消す)。残すと、移動後の詰め直しで同じ名前に
+    なった別の画像を正常に指してしまう (同じ元名のページで通常の操作で起こる)。外した本は自動サムネイルに戻る。
+    汎用の移動・削除で pin の画像が無くなったときに見える結果 (自動サムネイル) と同じ。
+- 編集プレビュー (`edit_previews`): 保存先ディレクトリが `item_key` のハッシュで決まり、`cached_path` と
+  `annotation_layers_json` にそのパスが入る (`edit_preview_cache.rs` の `cache_dir_for_item`)。キーだけ動かすと
+  後の復元コピーや削除が「所有していないファイル」として扱う。編集プレビューのモジュールに移行関数を置き、
+  ファイルを新しいキーのディレクトリへ移し、`cached_path` と layer のパスも書き換える (置換は一時キー経由)。
+  実行は製本 worker から呼ぶ (静止しているので編集プレビューの worker と競合しない)。汎用改名の同じ問題は
+  今回の範囲外として §8 に記録する。
+
+### 3.5 実行場所: 製本 worker で FS の直後に行う
 
 ```text
-[UI] 開始: 受付 → 書き込みの柵を取る → worker 起動 (以後、結果を消費するまでモーダル)
+[UI] Requested: 受付 (所有者・Remote lease) → 静止を待つ
+[UI] Running へ: worker 起動
 [worker] FS (既存の journal: Prepared → Applying → filesystem_committed)
-[worker] 柵を待つ → store maintenance lease (EPUB 範囲・spread_shift・book_composition) を取る
-[worker] STORES の付け替え (ストアごとに 1 transaction、一時キー 2 段) / コピー / purge
-[UI] 結果: bookmark・spread_shift・book_composition・collections は従来どおり。
+[worker] store maintenance lease (EPUB 範囲・spread_shift・book_composition) を取る
+[worker] STORES の付け替え (ストアごとに 1 transaction、一時キー 2 段、§3.3 の規則) / コピー / purge、
+         値の書き換え (§3.4)、編集プレビューの移行
+[UI] 採用: bookmark・spread_shift・book_composition・collections は従来どおり。
          App の記憶内の状態 (presence 集合、★/タグ cache、編集プレビュー、表示トリム、読書位置メーター、
-         内容同一性の索引) を DB を読まずに失効・付け替え → 再読込
+         内容同一性の索引、pin の cache) を DB を読まずに失効・付け替え → 再読込 → 所有者を解放
 ```
 
-- 新しい公開関数は `rename_key_migration` に置く (例: `migrate_book_paths_at(data_dir, moves, copies, guard)`、
-  `purge` は既存の `purge_removed_scopes_guarded_at` を使う)。汎用改名の `migrate_store` / 一時キーの
-  考え方を流用し、ストアごとの処理を 2 か所に書かない。
-- 失敗の扱い: ストアごとの失敗は従来の付け替えと同じく集計して UI に返し、ログ + 警告トーストにする
-  (FS は確定済みなので巻き戻さない。まれな失敗の既定の割り切り)。
-- UI 側の 8 種の付け替え (`move_book_page_edit_key` / `copy_book_page_edit_key` と、その前の
-  `wait_for_local_adjust_writes`) は削除する。記憶内の presence 集合の付け替え
-  (`move_page_key_presence` 等、I/O なし) は残すか、汎用改名の完了処理と同じ失効・再読込に揃える
-  (実装担当がどちらが既存の経路に乗るかをコードで判断し、報告する)。
+- 新しい公開関数は `rename_key_migration` に置く (例: `migrate_book_paths_at(data_dir, moves, copies, guard)`)。
+  汎用改名の `migrate_store` の 3 面の SQL と一時キーの考え方を流用し、ストアごとの処理を 2 か所に書かない
+  (ただし衝突の規則は §3.3 なので、規則を引数で選べる形にする)。
+- ストアごとの失敗は集計して UI に返し、ログ + 警告トーストにする (FS は確定済みなので巻き戻さない。
+  まれな失敗の既定の割り切り)。
+- UI 側の 8 種の付け替え (`move_book_page_edit_key` / `copy_book_page_edit_key` と `wait_for_local_adjust_writes`)
+  は削除する。記憶内の presence 集合は、汎用改名の完了処理 (`rewrite_page_edit_presence_for_rename` 等) と同じ
+  失効・再読込の経路に揃えるか、I/O の無い付け替えを残すかを実装担当がコードで判断して報告する。
 
-### 3.3 書き込みとの順序 (I5)
+### 3.6 本の改名の bookmark journal (I1)
 
-- **柵**: 開始時 (UI スレッド) に、ページの path キーへ非同期に書く writer ごとに FIFO の柵を取り、worker が
-  DB に触る前に全部の完了を待つ。追加 (`append`) が `local_adjust_write_handle.enqueue_fence()` で
-  既に行っている形を、汎用改名の開始条件 `rename_migration_writers_busy()` が見ている writer
-  (タグ、★、編集プレビュー、読書位置、ローカル調整、bookmark の未消費要求、spread_shift service) に広げる。
-  柵 API が無い writer には同じ形の柵を足す。DB に書かない writer (★のファイル XMP 等) は対象外でよい。
-- **実行中の新しい書き込み**: 並べ替え画面と製本管理はすでにモーダル (`modal_dialog_block_reason`) だが、
-  製本管理を閉じても worker は走り続ける。製本の構造操作が未完了の間は、追加の取り消し
-  (`book_append_undo_in_progress`) と同じくモーダル理由に入れる。
-- mIV Remote からの書き込みは、上のモーダルで止まるかを実装担当が確認する。止まらない経路があれば報告する
-  (止めるか、まれな競合として割り切るかを設計担当が決める)。
+今の `rename_book` は現存ページを列挙した mapping を journal に保存するので、既に missing のページのしおりが
+旧本名に残る。改名は Prepared の作成時から **本フォルダ→本フォルダ** の mapping を journal に保存し、bookmark の
+付け替えは既存の journal 経路のまま (通常完了・起動時復旧の両方) とする。STORES の付け替えも同じフォルダ mapping で行う。
 
-### 3.4 途中で終了した場合 (まれな失敗の割り切り)
+### 3.7 途中で終了した場合 (まれな失敗の割り切り)
 
-FS の確定と `STORES` の付け替えは別の DB・別のファイルなので、間で mIV が落ちると付け替えが途中になり得る
-(今も同じ)。ストアごとの完了印や再実行の仕組みは**作らない** (置換は再実行すると逆に戻るため、
-安全に再実行するには完了印が要る。CLAUDE.md の「まれな失敗は既定で割り切る」)。
+FS の確定と `STORES` の付け替えの間で mIV が落ちると、付け替えが途中になり得る (今も同じ)。ストアごとの
+完了印や再実行の仕組みは**作らない** (置換は再実行すると逆に戻るため、安全な再実行には完了印が要る。
+CLAUDE.md「まれな失敗は既定で割り切る」)。
 
-- 起動時の book_bookmarks journal 復旧が、Applying または filesystem_committed の行を処理したら
-  (= 前回の構造変更の結果を UI が受け取らなかった)、ログに残し、利用者へ 1 回だけ通知する:
-  「前回、本の並べ替え・移動・名前変更の途中で mIV が終了しました。一部のページの補正・タグなどが
-  正しいページに付いていない可能性があります。」
-- 復旧の結果を UI へ返す型付きの経路が今は無い (`recover_path_migration_journal` は結果を返さない) ので、
-  件数だけを返す経路を足す。
+- 起動時の book_bookmarks journal 復旧が Applying または filesystem_committed の行を処理したら、ログに残し、
+  利用者へ 1 回だけ通知する:「前回、本の並べ替え・移動・名前変更の途中で mIV が終了しました。一部のページの
+  補正・タグなどが正しいページに付いていない可能性があります。」
+- `recover_path_migration_journal` は結果を返さないので、処理した件数を UI へ返す経路を足す。
 
-### 3.5 本の削除 (§1.273)
+### 3.8 本の削除 (§1.273)
 
-- `books::delete_book` を `undo_append_with` と同じ形にする: 柵を待つ → `acquire_delete_epub_guard(Tree(本フォルダ))`
+- `books::delete_book` を `undo_append_with` と同じ形にする: `acquire_delete_epub_guard(Tree(本フォルダ))`
   → `remove_dir_all` (既存どおり完全削除) → 成功したら `purge_removed_scopes_guarded_at(Tree(本フォルダ))`。
-  結果に `store_mutations` と purge のエラーを載せる。
-- UI は従来の処理に加えて `apply_content_identity_store_mutations`、`purge_in_memory_metadata_for_removed_paths`
-  を行う。spread_shift / book_composition の `purge_book_root` は、汎用削除 (`delete_worker` の完了処理) が
-  service に何をしているかに揃える (重複して害が無ければ残してよい。実装担当が判断して報告)。
-- PDF パスワードは本に PDF が入らないので対象外 (空で渡す)。sidecar は本フォルダごと消えるので対象外。
+  結果に `store_mutations` と purge のエラーを載せる。静止と所有者は §3.1 と同じ。
+- UI は `apply_content_identity_store_mutations`、`purge_in_memory_metadata_for_removed_paths` を加える。
+  spread_shift / book_composition の `purge_book_root` は、maintenance lease の解放時の再読込と重複するなら省く
+  (汎用削除の完了処理に揃える。実装担当が判断して報告)。
+- PDF パスワードは本に PDF が入らないので空で渡す。sidecar は本フォルダごと消えるので対象外。
 
-### 3.6 永続データ (CLAUDE.md「永続データ・スキーマ変更時の判断」)
+### 3.9 永続データ (CLAUDE.md「永続データ・スキーマ変更時の判断」)
 
 - スキーマ変更なし。新しい表・列・journal の段階名を足さない。旧版で開いても挙動は変わらない。
-- 既存の DB に残っている「旧キーの付け残し」(今までの並べ替えで付け替えられなかった行) は直さない
-  (どの画像の行だったかを後から決められない)。
+- 本の改名の journal に保存する mapping の形 (ページ列挙 → フォルダ 1 組) は、journal の既存の JSON の形のまま
+  (要素が 1 つになるだけ)。旧版が復旧で読んでも同じ意味になることをテストで確かめる。
+- 既存の DB に残っている「旧キーの付け残し」は、どの画像の行だったかを後から決められないので直さない。
+  ただし §3.3 により、今後の本の操作の移行先では消える。
 
 ## 4. テスト (実装担当)
 
-- `rename_key_migration`: 方針列の網羅 (全 `STORES` 行が方針を持ち、`ServiceOwned` は 2 つだけ) と、
-  入れ替え (A↔B) を含む mapping で全 `Follow` ストアが正しく入れ替わる・一時キーが残らないテスト。
-- `book_resume.page_identity` と pin の `source_rel` の値の書き換え (同じ本の並べ替え、別本への移動で pin を変えない、
-  本の改名の prefix)。
+- `rename_key_migration`: 方針列の網羅 (全 `STORES` 行が方針を持ち、`ServiceOwned` と `OwnedBy` が想定のものだけ)。
+  入れ替え (A↔B) を含む mapping で全 `Follow` ストアが正しく入れ替わり一時キーが残らない。移行先に古い行がある
+  場合 (消える) と、移行元に行が無い場合 (移行先も消える)。`ratings.source_path` の更新。
+- 値の書き換え: `book_resume.page_identity` (並べ替え、改名の prefix、`page` を変えない)、pin の `source_rel`
+  (同じ本の並べ替えで追従、「同じ元名の 2 ページで先頭を pin して別本へ移動」で pin が外れる)、編集プレビュー
+  (A↔B 後の再保存・片側削除・内容同一性の復元コピーが正しく動く)。
 - 製本 worker の handler-level テスト: 並べ替え・移動・改名で表示トリムと内容同一性が新しい名前に付き、
-  同名ページの入れ替えでも別ページへ付かない。削除で `STORES` の行が消え、本ページのしおりは残る。
-  同じ名前で本を作り直しても旧ページの補正・タグ・表示トリムが付かない。
-- 柵: 開始前に積んだローカル調整・タグの書き込みが、付け替えより先に旧キーへ着地し、付け替えで新キーへ運ばれる。
+  同名ページの入れ替えでも別ページへ付かない。削除で `STORES` の行が消え、本ページのしおりは残る。同じ名前で
+  本を作り直しても旧ページの補正・タグ・表示トリムが付かない。missing 行を含む本の改名で、しおりが新しい本名へ
+  移る (通常完了と journal 復旧の両方)。
+- 所有者と静止: タグ結果の未消費、内容同一性の記録の遅延、閲覧履歴の書き込みの遅延、parked context の producer が
+  ある間は worker が起動しない。Requested/Running の間、本体 UI の編集・製本管理の「開く」・Remote の書き込みと取得が
+  止まる。Remote の lease が取れないときは構造操作が始まらない。
 - 起動時の journal 復旧が Applying / filesystem_committed の行を処理したときに通知が 1 回出る。
 
 ## 5. しおりのページ番号 (§1.245)
 
-- 保存時の `page_index_hint` を「その本の読み順でのページの位置 (0 始まり)」にする。
-  数え方は、フルスクリーンのページ表示 (「N / 全体」) が使う関数と同じものを使い、2 か所に書かない。
-  本の構成でページを非表示にしている場合も、同じ関数の扱いに従う。
-- 対象は本体の保存経路と、mIV Remote が bookmark を作る経路 (あれば) のすべての `NewBookBookmark` 生成元。
-- 製本 (compiled book) の移行時の再計算 (`compiled_page_index`) は今のまま (同じ値になる)。
-- 既に保存済みの行の hint は直さない (どのページかは identity から引けるが、本ごとに一覧を作り直す必要があり、
-  一覧表示のたびに行うには重い。表示の数字だけの P3)。新しく付けたしおりから正しくなる。
-  同じ本で古い行と新しい行が混ざると、本の中のしおりの並び順が一部ずれ得る。これを許容するかは
-  レビューの論点とする。
+- 保存時の `page_index_hint` を「保存した時点の、その本の読み順でのページの位置 (0 始まり)」にする。数え方は
+  フルスクリーンのページ表示 (HUD) が使う `image_reading_position()` (`ui_helpers.rs`) と同じものを使い、2 か所に書かない
+  (レビューで確認済みの候補。`still_image_display_indices(items, current_reader_order())` と組で使う)。
+- mIV Remote がしおりを作る経路があれば、本体の現在一覧ではなく Remote 側で検証した一覧から同じ関数で求める。
+- 製本の bookmark 移行時の再計算 (`compiled_page_index` = ファイル番号 - 1): 本の改名 (フォルダ→フォルダ) では
+  読み順が変わらないので hint を**変えない**。並べ替え・移動では従来どおり再計算する (並べ替えの保存は 0001 から
+  詰め直すので番号 - 1 が位置と一致する。移動先の本に外部削除の欠番がある場合はずれ得るが、表示の数字だけなので許容)。
+- 既に保存済みの行の hint は直さない (一覧表示のたびに本ごとの一覧を作り直すのは重い)。同じ本で古い行と新しい行が
+  混ざると、本の中のしおりの並び順が一部ずれ得るが、表示の数字だけの P3 として許容する。
 - テスト: サブフォルダ 2 つ + 画像 3 枚の ZIP の先頭画像で作った draft の hint が 0、PDF は従来どおり、
-  製本は `NNNN - 1`。
+  欠番のある製本で「しおり作成 → 本の改名」で hint が変わらない。
 
 ## 6. 採らなかった案
 
-- **rename-migration FIFO (汎用改名の journal つきキュー) に一括ジョブとして積む**: 書き込みの待ち合わせと
-  記憶内の再読込が既にあり魅力的だが、(1) 置換の一括ジョブは途中で落ちた後の再実行で逆に戻るので、
-  journal で「少なくとも 1 回」実行する今の仕組みと合わない、(2) FS の確定から付け替えまでに UI のフレームと
-  他のジョブの待ちが挟まり、その間に本を開き直すと旧キーの編集が別ページに見える。製本 worker の中で
-  FS の直後に行うほうが窓が小さく、所有者も 1 つで済む。
-- **R2 の関所・受領証・ストアごとの完了印**: 途中終了からの完全な回復ができるが、仕組みが大きく、
-  まれな失敗のための回復処理は割り切る方針 (CLAUDE.md) に反する。
-- **UI スレッドで App の DB handle を使って `STORES` 全部を動かす**: App が handle を持たないストアの
-  cold open が UI スレッドで起きる (CLAUDE.md「UI スレッドで同期 I/O をしない」)。
+- **rename-migration FIFO (汎用改名の journal つきキュー) に一括ジョブとして積む**: 置換の一括ジョブは、途中で
+  落ちた後に journal で再実行すると逆に戻るので、「少なくとも 1 回」実行する今の仕組みと合わない。
+- **R2 の関所・受領証・ストアごとの完了印**: 途中終了からの完全な回復ができるが、仕組みが大きく、まれな失敗の
+  ための回復処理は割り切る方針 (CLAUDE.md) に反する。
+- **UI スレッドで App の DB handle を使って `STORES` 全部を動かす**: App が handle を持たないストアの cold open が
+  UI スレッドで起きる。
+- **writer ごとの柵を worker で待つ (v1 案)**: 内容同一性の記録は実行時にファイルを読むので、FS の後に旧キー宛ての
+  記録が走ると別の画像の identity を作る。DB の直前に待つのでは遅い。また柵 API の無い writer が多い。
+  受付から FS の前までに静止させ、新しい producer を入口で止めるほうが状態が少ない。
+- **別本へ移したページの pin を変えない (v1 案)**: 詰め直しで同じ名前になった別の画像を指す (レビュー指摘)。
 
 ## 7. レビュー記録
 
-(未実施)
+- **実装前レビュー 1 回目** (2026-10-21、Codex gpt-6.1-sol / xhigh、read-only、SID 01a15e17-5946-7da1-b841-9edd8b1c3e29、
+  対象 v1 = 004fc9928)。結論「P1・P2 を反映するまで実装に進めない」。対応:
+  - P1 柵の対象と位置の不足 (内容同一性の記録がファイルを読む、閲覧履歴、LUT・segmentation) → §3.1 の静止の判定を
+    FS の前に移し、producer の列挙を実装担当の作業にした。
+  - P1 モーダルだけでは全入口を止められない (Remote、製本管理の「開く」、並べ替え側の pending) → §3.1 の単一の所有者と
+    Remote の `try_local_modal_lease`。
+  - P2 編集プレビューのファイル配置 → §3.4 の移行関数。
+  - P2 別本へ移したページの pin → §3.4 で外す。
+  - P2 本の改名の journal mapping → §3.6。
+  - P2 移行先に既存行がある場合の規則 → §3.3。
+  - P3 `compiled_page_index` と読み順 → §5 (改名では hint を変えない、I7 を保存時点に限定)。
+  - 指摘なしの観点: I3 の分担、I2・I4・I6 の基本方針、§5 の共用関数、古い hint を直さない判断、§6。
 
 ## 8. 実装記録
 
