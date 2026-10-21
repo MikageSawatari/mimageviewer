@@ -3334,7 +3334,7 @@ held／canonical receipt／D4 時計へ後付けせず、parked snapshot や単�
 頁→unit 索引を読む。未採用の証拠を全頁走査で補わず、その機会を見送る。slideshow も既存 still-only
 topology の採用を必要とする。最新 callback の viewport／clip／ppp と一致する frame 内候補だけを使う。
 未実体化の erase／local／conceal・mask と comic の CPU-only 接続は D3-3 として次の版の後へ延期した
-（[backlog §1.401](next-release-backlog.md#1401-ページめくり-d3-3-編集済み注釈付きの頁でも-final-を先回り準備する--d3-の残り-2026-10-19)）。
+（[backlog §1.401](backlog-on-hold.md#1401-ページめくり-d3-3-編集済み注釈付きの頁でも-final-を先回り準備する--d3-の残り-2026-10-19)）。
 これらの通常表示・同期 miss は維持する。完了範囲・計測の限界は [計画 §27.17.17](page-turn-animation-plan.md) を参照。
 CPU 需要用 resolver に残っていた全頁走査・mixed slideshow 列再構築は、D3-5 で同owner内の派生 record に移す。
 visible と同じ枝は既存索引を読み、異なる枝だけcoldに導出する。CPU需要は縮小せず、adoption／producer／keepの
