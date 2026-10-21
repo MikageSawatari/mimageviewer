@@ -103141,6 +103141,203 @@ mod bulk_adjust_cost_tests {
         println!("  復元先の解決 (U01 で直した部分)                  : {resolve_ms:9.1} ms");
         println!();
     }
+
+    fn setup_pages(app: &mut App, tmp: &std::path::Path) -> Vec<PathBuf> {
+        let root = tmp.join("pages");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..PAGES {
+            let path = root.join(format!("p{i:05}.jpg"));
+            std::fs::write(&path, b"not decoded by this test").unwrap();
+            paths.push(path);
+        }
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; PAGES];
+        app.current_folder = Some(root.clone());
+        app.visible_indices = (0..PAGES).collect();
+        paths
+    }
+
+    fn ms(t: Instant) -> f64 {
+        t.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// 1 ページぶんの書き込みが呼ぶ部品を、部品ごとに N 回ずつ測る (§1.176 の残り時間の内訳)。
+    /// 実際の Ctrl+1 経路 (`capture_adjust_full` + `apply_slot_to_grid_selection`) も測る。
+    #[test]
+    #[ignore = "計測。合否ではない"]
+    fn bulk_adjust_cost_parts() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        setup_pages(&mut app, &tmp);
+        for idx in 0..PAGES {
+            app.checked.insert(idx);
+        }
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "計測".into(),
+            params: params(10.0),
+        });
+        let t = Instant::now();
+        app.capture_adjust_full("計測".to_string(), |a| a.apply_slot_to_grid_selection(0));
+        let slot_apply_ms = ms(t);
+        let t = Instant::now();
+        app.apply_meta_undo();
+        let slot_undo_ms = ms(t);
+        let t = Instant::now();
+        app.apply_meta_redo();
+        let slot_redo_ms = ms(t);
+        // setup_app は data_dir のテスト用ロックを持つので、次を作る前に手放す。
+        drop(app);
+
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        setup_pages(&mut app, &tmp);
+        let p = params(10.0);
+        let mut rows: Vec<(&str, f64)> = Vec::new();
+
+        let t = Instant::now();
+        let targets: Vec<_> = (0..PAGES)
+            .map(|idx| app.page_adjustment_target_for_idx(idx).unwrap())
+            .collect();
+        rows.push(("page_adjustment_target_for_idx", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = app.effective_params_for_target(target);
+        }
+        rows.push(("effective_params_for_target", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = app.page_adjustment_indices(target);
+        }
+        rows.push(("page_adjustment_indices", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            let _ = app.effective_params(idx).clone();
+        }
+        rows.push(("effective_params(idx).clone", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = app.adjustment_standard_params_for_target(target);
+        }
+        rows.push(("adjustment_standard_params_for_target", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let _ = App::edit_store_write(
+                app.adjustment_db
+                    .as_ref()
+                    .map(|db| db.set_page_params(&target.page_key, &p)),
+            );
+        }
+        rows.push(("DB set_page_params (1 行ずつ)", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.adjustment_page_params.insert(idx, p.clone());
+            app.sync_prepared_page_edit_key_for_idx(idx);
+        }
+        rows.push(("page_params insert + sync_prepared_page_edit_key", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            App::set_page_key_presence(&mut app.adjusted_page_keys, &target.page_key, true);
+        }
+        rows.push(("set_page_key_presence", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            let sp = p.clone();
+            app.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), move |sidecar, rel| {
+                sidecar.set_adjust(rel, sp)
+            });
+        }
+        rows.push(("sidecar set_adjust", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.adjustment_cache.remove(&idx);
+            app.invalidate_compare_prepared_for_idx(idx);
+            app.thumb_adjust_tex.remove(&idx);
+        }
+        rows.push(("adjustment_cache/compare/thumb 除去", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.bump_adjustment_generation(idx);
+        }
+        rows.push(("bump_adjustment_generation", ms(t)));
+
+        let t = Instant::now();
+        for _ in 0..PAGES {
+            app.schedule_current_smart_folder_metadata_refresh(
+                smart_folder::SmartFolderMetadataDependency::Edits,
+            );
+        }
+        rows.push(("schedule_current_smart_folder_metadata_refresh", ms(t)));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
+        rows.push(("record_content_identity_for_idx", ms(t)));
+
+        let old = crate::adjustment::AdjustParams::default();
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            app.clear_caches_for_param_change(idx, &old, &p);
+        }
+        rows.push(("clear_caches_for_param_change", ms(t)));
+
+        let t = Instant::now();
+        for target in &targets {
+            app.publish_accepted_adjustment_page_edits(&HashMap::from([(
+                target.page_key.clone(),
+                Some(p.clone()),
+            )]));
+        }
+        rows.push((
+            "publish_accepted_adjustment_page_edits N 回 (1 件ずつ)",
+            ms(t),
+        ));
+
+        let documents: HashMap<String, Option<crate::adjustment::AdjustParams>> = targets
+            .iter()
+            .map(|target| (target.page_key.clone(), Some(p.clone())))
+            .collect();
+        let t = Instant::now();
+        app.publish_accepted_adjustment_page_edits(&documents);
+        rows.push((
+            "[1 回] publish_accepted_adjustment_page_edits (N 件)",
+            ms(t),
+        ));
+
+        let t = Instant::now();
+        for idx in 0..PAGES {
+            let _ = app.page_adjust_undo_scope(idx);
+        }
+        rows.push(("page_adjust_undo_scope (capture の差分)", ms(t)));
+
+        let t = Instant::now();
+        let _ = app.adjustment_page_params.clone();
+        rows.push(("[1 回] adjustment_page_params.clone", ms(t)));
+
+        println!("\n=== 一括補正の部品ごとの時間 ({PAGES} ページ) ===");
+        println!("  実経路 Ctrl+1 適用  : {slot_apply_ms:9.1} ms");
+        println!("  実経路 取り消し     : {slot_undo_ms:9.1} ms");
+        println!("  実経路 やり直し     : {slot_redo_ms:9.1} ms");
+        println!("  ── 部品 (N 回の合計) ──");
+        for (name, value) in &rows {
+            println!("  {name:<58}: {value:9.1} ms");
+        }
+        println!();
+    }
 }
 
 /// 補正 Undo の復元先は、**適用の直前に一覧を 1 回だけ走査して**決める。
