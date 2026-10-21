@@ -269,7 +269,14 @@ fn default() -> PathBuf {
 // static は終了時に Drop されないため、プロセス共有の所有者を atexit で取り出す。
 // thread-local の所有では、呼出スレッド終了後も使う worker を保護できない。
 #[cfg(test)]
-static TEST_SANDBOX: OnceLock<Mutex<Option<tempfile::TempDir>>> = OnceLock::new();
+struct TestSandbox {
+    // 終了中の worker にも確定済みパスを返す。削除用所有の有無とは独立。
+    path: PathBuf,
+    directory: Mutex<Option<tempfile::TempDir>>,
+}
+
+#[cfg(test)]
+static TEST_SANDBOX: OnceLock<TestSandbox> = OnceLock::new();
 
 #[cfg(test)]
 fn test_sandbox() -> PathBuf {
@@ -281,22 +288,29 @@ fn test_sandbox() -> PathBuf {
                 .expect("create process test sandbox");
             // SAFETY: callback は引数・借用を持たず、プロセス終了まで有効。
             assert_eq!(unsafe { libc::atexit(cleanup_test_sandbox) }, 0);
-            Mutex::new(Some(directory))
+            TestSandbox {
+                path: directory.path().to_path_buf(),
+                directory: Mutex::new(Some(directory)),
+            }
         })
-        .lock()
-        .expect("test sandbox owner")
-        .as_ref()
-        .expect("test sandbox is live")
-        .path()
-        .to_path_buf()
+        .path
+        .clone()
 }
 
 #[cfg(test)]
 extern "C" fn cleanup_test_sandbox() {
+    cleanup_test_sandbox_with(|| {});
+}
+
+#[cfg(test)]
+fn cleanup_test_sandbox_with(before_drop: impl FnOnce()) {
     // 終了中に worker を待たない。取得できない場合や削除失敗は best effort で諦める。
-    if let Some(owner) = TEST_SANDBOX.get() {
-        if let Ok(mut directory) = owner.try_lock() {
-            drop(directory.take());
+    if let Some(sandbox) = TEST_SANDBOX.get() {
+        if let Ok(mut owner) = sandbox.directory.try_lock() {
+            let directory = owner.take();
+            // 回帰テストはこの境界で同期する。atexit からの呼出しは何も待たない。
+            before_drop();
+            drop(directory);
         }
     }
 }
@@ -515,6 +529,92 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_sandbox_remains_readable_during_and_after_cleanup() {
+        const CHILD: &str = "MIV_TEST_DATA_DIR_CLEANUP_CASE";
+        if let Some(case) = std::env::var_os(CHILD) {
+            let path = get();
+            let file_path = path.join("owned.txt");
+            std::fs::write(&file_path, b"sandbox content").unwrap();
+            #[cfg(windows)]
+            let blocked_file = if case == "blocked" {
+                use std::os::windows::fs::OpenOptionsExt;
+                Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(&file_path)
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            #[cfg(not(windows))]
+            assert_eq!(case, "normal");
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+            let (read_tx, read_rx) = std::sync::mpsc::sync_channel(0);
+            let cleanup = std::thread::spawn(move || {
+                cleanup_test_sandbox_with(|| {
+                    entered_tx.send(()).unwrap();
+                    read_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                });
+            });
+            // cleanup が所有を take 済み、かつ削除用 mutex を保持した時点で読む。
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let worker = std::thread::spawn(get);
+            let during_cleanup = worker.join().unwrap();
+            read_tx.send(()).unwrap();
+            cleanup.join().unwrap();
+            assert_eq!(during_cleanup, path);
+            assert_eq!(get(), path);
+            assert_eq!(std::thread::spawn(get).join().unwrap(), path);
+            assert!(
+                TEST_SANDBOX
+                    .get()
+                    .unwrap()
+                    .directory
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            );
+            #[cfg(windows)]
+            if let Some(blocked_file) = blocked_file {
+                assert!(file_path.exists(), "open handle must block deletion");
+                drop(blocked_file);
+                // 再試行は製品の cleanup に足さず、テストが作った残存物だけを片付ける。
+                std::fs::remove_dir_all(&path).unwrap();
+            }
+            assert!(!path.exists());
+            assert_eq!(get(), path);
+            cleanup_test_sandbox();
+            assert_eq!(get(), path);
+            return;
+        }
+
+        let cases: &[&str] = if cfg!(windows) {
+            &["normal", "blocked"]
+        } else {
+            &["normal"]
+        };
+        for case in cases {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "data_dir::tests::default_sandbox_remains_readable_during_and_after_cleanup",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{case}: {output:?}");
+        }
+    }
 
     #[test]
     fn default_sandbox_is_unique_and_cleaned_at_process_exit() {

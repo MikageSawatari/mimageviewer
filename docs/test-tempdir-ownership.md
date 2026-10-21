@@ -6,8 +6,11 @@
 ## 既定 data_dir の判断
 
 `cfg(test)` の既定値は `tempfile::Builder` の乱数名で一度だけ作成する。
-`OnceLock<Mutex<Option<TempDir>>>` がプロセス共通の所有者で、同プロセスの別スレッド・
-override 解除後も同じパスを返す。`libc` は終了フック用の dev-dependency のみ。
+`OnceLock<TestSandbox>` がプロセス共通の所有者で、同プロセスの別スレッド・
+override 解除後も同じパスを返す。`TestSandbox` は確定パスを不変の `PathBuf` に保持し、
+削除用所有だけを `Mutex<Option<TempDir>>` に保持する。パス取得はこの mutex を取らず、
+cleanup 中・cleanup 後・削除失敗後も確定パスを返す。
+`libc` は終了フック用の dev-dependency のみ。
 
 より単純なローカル変数・thread-local の `TempDir` では、最初の呼出元より長生きする
 worker を保護できない。static の `TempDir` だけでは通常終了でも Drop されない。
@@ -85,3 +88,76 @@ worker 停止・SQLite 接続の全収集・再試行の状態は作らず、終
 $env:MSBUILDDISABLENODEREUSE = '1'
 cargo nextest run -p mimageviewer --lib -E 'test(~data_dir::) | test(~adjustment_db::) | test(~mask_db::) | test(~folder_rating_counter::) | test(~folder_thumb_pins::) | test(~video_chapter_thumbs::) | test(~comic_db::) | test(~conceal_db::) | test(~ai::runtime::) | test(~settings_db::) | test(~materializer::)' --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail
 ```
+
+## 第2ラウンド: 独立レビュー対応 (`e3b64dc15` 基点)
+
+前節までの検証は初回実装の履歴。ClaudeCode からの提供結果では、`e3b64dc15` の
+本体全件は13,873件成功、EPUB worker は62件成功。既定 sandbox は全件の前後で
+9,644→9,645 (空フォルダ1個のみ増加)。これらは利用者側の観測であり、今回再実行しない。
+
+### P2: cleanup と確定パスの寿命を分離
+
+初回実装は cleanup が `Option<TempDir>` を take すると getter の `expect` が panic した。
+修正後は immutable path と削除用所有を一つの `TestSandbox` に持たせ、getter の lock と
+所有の存在チェックを撤去した。終了フックは削除用所有だけを取り出す。
+worker の停止待ち・削除再試行・ディレクトリ再作成は追加しない。
+
+子プロセス回帰では、終了フックと共通の cleanup helper を所有 take 直後、削除用 mutex を
+保持した状態で channel により停止する。その間に別スレッドから `get()` を完了させてから
+cleanup を再開する。タイミング頼みの競争や sleep は使わない。
+cleanup 後・同 helper の再呼出し後も同一パスを返すことを検査する。
+Windows では共有を許可しない open handle で削除失敗も確定させ、同じ検査を行う。
+その子プロセスが作った残存物だけは handle を閉じてテスト自身が片付ける。
+通常の atexit 呼出しは空の同期 hook を渡すので、worker を待たない。
+
+### P3: `rg 'temp_dir\(\)' src crates tests` の再監査
+
+指定6か所は全て、テスト内の `TempDir` 所有へ変更した。
+
+| 変更箇所 | 維持した検査 |
+| --- | --- |
+| `src/fs_animation.rs::decode_gif_static_returns_none` | `static_1frame.gif` の単一フレーム判定。親領域も scope 終了で削除 |
+| `src/editing_addon_download.rs` の prune / collect 2件 | manifest 外の除去、再帰列挙と相対名。共有固定名への開始時削除を撤去 |
+| `src/bin/build_editing_pack.rs` の fonts / models 2件 | フォント・ライセンス・モデル分類と相対名。`pack-build-tools` feature で検証 |
+| `src/comic_stamp.rs::embed_file_stamp_timing` | 画像寸法・JPEG内容・計測区間を保持。`#[ignore]` の手動計測区分を維持 |
+
+修正後の検索結果は11か所。残す理由は次のとおり (`tests/` の直接一致は0件)。
+
+| 残す一致箇所 | 理由 |
+| --- | --- |
+| `src/remote_ipc/ai_job.rs:968` | `fixture_address` が fake executor に渡す識別用 address。テストのファイル作成・上書き・削除はない |
+| `src/video/seek_strip_wave.rs:2453` | ignored の実メディア手動計測の保存用ログ。計測後も残して確認する成果物で、`MIV_WAVE_BENCH_LOG` による出力指定を保持する |
+| `src/xmp_writer.rs:1537` | UUID v4 を含む独立した領域で正常時は明示削除。固定名ではなく、panic 時の回収だけが未対応なので維持 |
+| `src/keymap.rs:14845/14866`、`src/logger.rs:503` | 前回記録どおり PID＋時刻。正常時削除、panic 時の回収だけ未対応 |
+| `src/materializer.rs:386/1744` | 製品の共有親ルート。test constructor は既存の乱数名 owner を使い、EPUB の変換処理は個別の `epub-<pid>-<nonce>` 子を所有する。テスト固有の固定名ではないため製品経路を変更しない |
+| `src/ui_dialogs/context_menu.rs:2969` | 製品の PowerShell 呼出し経路の PID＋sequence 付きスクリプト。一時テスト fixture ではない |
+| `src/bin/bench_search.rs:612` | 前回記録どおり手動ベンチマーク。`--keep` で結果を保持する |
+| `crates/vst3-host-tester/src/main.rs:135` | 単独GUI tester の永続診断ログ。起動ごとの1セッションを保存する実装であり、unit test の領域ではない |
+
+### 第2ラウンドの検証
+
+全 Cargo 呼出しで `MSBUILDDISABLENODEREUSE=1`。対象は `e3b64dc15` からの
+未コミット差分 (Rust 5ファイルと本書)。
+
+- `cargo check -p mimageviewer --lib --tests`: exit 0、31.14秒。
+  `target/tmp/test-tempdir-r2-check.log`。変更対象外の既存 warning あり。
+- `cargo fmt` / `cargo fmt --check` / `git diff --check`: 成功。
+- 次の nextest: exit 0、36件成功。内訳は data_dir 9件、fs_animation 11件、
+  editing_addon_download 6件、comic_stamp 7件、build_editing_pack 3件。
+  13,904件は filter 除外または既存 ignored。
+  `comic_stamp::tests::embed_file_stamp_timing` は手動計測の ignored を維持し未実行。
+  run ID `8fb9903c-2172-4952-b26d-73624cc59187`、build 4分29秒、実行0.406秒。
+  `pack-build-tools` は helper bin を有効にする空の feature。
+- 追加した cleanup 回帰の親テストは0.359秒で成功。子プロセスの normal / blocked
+  両経路を実行し、既存の通常終了時 cleanup 回帰も成功。
+- ログ `target/tmp/test-tempdir-r2-focused.log`、JUnit
+  `target/tmp/test-tempdir-r2-focused.junit.xml`、検証した変更Rust入力5ファイルの
+  SHA-256 `target/tmp/test-tempdir-r2-sources.sha256`。実行後のハッシュ一致を確認。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run -p mimageviewer --features pack-build-tools --lib --bin build_editing_pack -E 'binary(build_editing_pack) | test(~data_dir::) | test(~fs_animation::) | test(~editing_addon_download::) | test(~comic_stamp::)' --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail
+```
+
+本体全件と EPUB worker は ClaudeCode の担当・既存結果を維持する。
+製品起動・既存一時領域の清掃・git commit は行わない。
