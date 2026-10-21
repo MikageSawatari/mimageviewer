@@ -531,6 +531,7 @@ impl RawPageStore {
                     started_at: page.develop_started_at,
                 };
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: Arc::new(ci),
                     source_dims: Some(source_dims),
@@ -1105,14 +1106,20 @@ pub(crate) mod tests {
         let source_size = source.size;
         let key =
             app.final_composite_key_for_pixels(edit_key, source_size, app.effective_params(0));
+        // This fixture installs a RAW producer result. Its developed canvas is
+        // independent of both the clamped source sampler and final output size.
+        let display_basis =
+            app.accept_current_producer_display_basis(0, texture.size(), source_size, true);
+        let canonical_dims = app.canonical_source_dimensions(0);
         app.final_composite_cache.insert(
             key,
             FinalCompositeEntry {
-                texture_options: egui::TextureOptions::LINEAR,
-                canonical_dims: None,
+                display_basis,
+                canonical_dims,
                 source_size,
                 pixels,
                 texture,
+                texture_options: egui::TextureOptions::LINEAR,
                 complete: true,
             },
         );
@@ -1293,17 +1300,17 @@ pub(crate) mod tests {
             egui::TextureOptions::LINEAR,
         );
         app.thumbnails = vec![
-            ThumbnailState::Loaded {
-                tex: thumb,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            ThumbnailState::loaded_raster(
+                thumb,
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 2,
                 },
-                from_edit_preview: false,
-                rendered_at_px: 2,
-                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-                source_dims: Some((12000, 8000)),
-                layout_dims: None,
-            },
+                false,
+                2,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((12000, 8000)),
+                None,
+            ),
             ThumbnailState::Pending,
         ];
         app.thumb_pixels.insert(
@@ -1659,17 +1666,17 @@ pub(crate) mod tests {
                     egui::TextureOptions::LINEAR,
                 );
                 app.thumbnails = vec![
-                    ThumbnailState::Loaded {
-                        tex: thumbnail,
-                        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    ThumbnailState::loaded_raster(
+                        thumbnail,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                             evaluated_display_px: 3,
                         },
-                        from_edit_preview: false,
-                        rendered_at_px: 3,
-                        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-                        source_dims: Some((12000, 8000)),
-                        layout_dims: None,
-                    },
+                        false,
+                        3,
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        Some((12000, 8000)),
+                        None,
+                    ),
                     ThumbnailState::Pending,
                 ];
                 app.thumb_pixels.insert(0, Arc::clone(&pixels));
@@ -1775,6 +1782,7 @@ pub(crate) mod tests {
         app.fs_cache.insert(
             1,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(pixels),
                 source_dims: Some([8000, 12000]),
@@ -1835,6 +1843,7 @@ pub(crate) mod tests {
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_metadata: None,
                             tex: source.clone(),
                             pixels: Arc::clone(&raw),
                             source_dims: Some([8000, 12000]),
@@ -1843,13 +1852,8 @@ pub(crate) mod tests {
                         },
                     );
                     let key = app.current_edit_result_key(idx);
-                    app.edit_result_cache.insert(
-                        key,
-                        EditResultEntry {
-                            pixels: raw,
-                            texture: Some(source),
-                        },
-                    );
+                    app.edit_result_cache
+                        .insert(key, EditResultEntry::raster(raw, Some(source)));
                     let processed =
                         Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::GREEN));
                     let final_tex = ctx.load_texture(
@@ -1861,14 +1865,14 @@ pub(crate) mod tests {
                         app.final_composite_key_for_pixels(key, [2, 3], app.effective_params(idx));
                     app.final_composite_cache.insert(
                         final_key,
-                        FinalCompositeEntry {
-                            texture_options: egui::TextureOptions::LINEAR,
-                            canonical_dims: None,
-                            source_size: [2, 3],
-                            pixels: processed,
-                            texture: final_tex.clone(),
-                            complete: true,
-                        },
+                        FinalCompositeEntry::raster(
+                            None,
+                            [2, 3],
+                            processed,
+                            final_tex.clone(),
+                            egui::TextureOptions::LINEAR,
+                            true,
+                        ),
                     );
                     if idx == 0 {
                         presented = Some(final_tex.id());
@@ -2307,27 +2311,6 @@ impl App {
             crate::ui_fullscreen::FsNavNoOpReason::RawDevelopmentPending
         });
         false
-    }
-
-    pub(crate) fn fs_page_layout_uses_source_size(
-        &self,
-        idx: usize,
-        texture: &egui::TextureHandle,
-    ) -> bool {
-        self.fs_page_layout_uses_source_id(idx, texture.id())
-    }
-
-    pub(crate) fn fs_page_layout_uses_source_id(
-        &self,
-        idx: usize,
-        source_id: egui::TextureId,
-    ) -> bool {
-        self.is_raw_page(idx)
-            || self.is_passthrough_rendition_texture_id(source_id)
-            || self
-                .fs_source_coverage_for_texture(idx, source_id)
-                .is_partial()
-            || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
     }
 
     pub(super) fn start_raw_develop_for_compare(&mut self, ctx: &egui::Context, idx: usize) {

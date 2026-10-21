@@ -21,15 +21,15 @@ fn fixture(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
         )
         .unwrap(),
     );
-    app.thumbnails = vec![ThumbnailState::Loaded {
+    app.thumbnails = vec![ThumbnailState::loaded_raster(
         tex,
-        origin: crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { epoch: 0 },
-        from_edit_preview: true,
-        source_coverage: coverage,
-        rendered_at_px: 100,
-        source_dims: Some((400, 400)),
-        layout_dims: None,
-    }];
+        crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { epoch: 0 },
+        true,
+        100,
+        coverage,
+        Some((400, 400)),
+        None,
+    )];
     let generation = app.items_generation;
     app.page_dims_cache.record(
         generation,
@@ -48,7 +48,7 @@ fn draw(
     trim: Option<egui::Rect>,
 ) -> DisplayedImageTransform {
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
-    let thumb = app.fs_thumbnail_texture_for_display(0);
+    let thumb = app.fs_thumbnail_resource_for_display(0).ok();
     let mut result = None;
     let _ = ctx
         .run_pass(
@@ -159,6 +159,7 @@ fn crop_coverage_thin_integer_rounded_preview_keeps_frame_and_shared_pixels_acro
                     app.fs_cache.insert(
                         0,
                         FsCacheEntry::Static {
+                            pdf_metadata: None,
                             tex: raw.clone(),
                             pixels: pixels.clone(),
                             source_dims: Some([800, 600]),
@@ -166,7 +167,7 @@ fn crop_coverage_thin_integer_rounded_preview_keeps_frame_and_shared_pixels_acro
                             animation: crate::fs_animation::StaticAnimationState::Still,
                         },
                     );
-                    let resource = app.fullscreen_paint_resource_for_texture(0, raw.clone());
+                    let resource = app.fixture_raster_paint_resource(0, raw.clone());
                     let after = draw(&mut app, &ctx, Some(&resource), rotation, 0.0, None);
                     close_rect(before.layout_full_image_rect, after.layout_full_image_rect);
                     close_rect(before.full_image_rect, after.full_image_rect);
@@ -229,6 +230,7 @@ fn crop_coverage_single_arrival_and_eviction_keep_whole_frame_and_source_mapping
                     app.fs_cache.insert(
                         0,
                         FsCacheEntry::Static {
+                            pdf_metadata: None,
                             tex: raw.clone(),
                             pixels,
                             source_dims: Some([800, 600]),
@@ -236,7 +238,7 @@ fn crop_coverage_single_arrival_and_eviction_keep_whole_frame_and_source_mapping
                             animation: crate::fs_animation::StaticAnimationState::Still,
                         },
                     );
-                    let raw_resource = app.fullscreen_paint_resource_for_texture(0, raw);
+                    let raw_resource = app.fixture_raster_paint_resource(0, raw);
                     let after = draw(&mut app, &ctx, Some(&raw_resource), rotation, free, trim);
                     close_rect(before.full_image_rect, after.full_image_rect);
                     let final_size = if mode == FullscreenFitMode::Original {
@@ -249,7 +251,7 @@ fn crop_coverage_single_arrival_and_eviction_keep_whole_frame_and_source_mapping
                         egui::ColorImage::filled(final_size, egui::Color32::WHITE),
                         egui::TextureOptions::LINEAR,
                     );
-                    let ai_resource = app.fullscreen_paint_resource_for_texture(0, ai);
+                    let ai_resource = app.fixture_raster_paint_resource(0, ai);
                     let final_transform =
                         draw(&mut app, &ctx, Some(&ai_resource), rotation, free, trim);
                     close_rect(before.full_image_rect, final_transform.full_image_rect);
@@ -276,6 +278,12 @@ fn crop_coverage_single_arrival_and_eviction_keep_whole_frame_and_source_mapping
     }
     app.thumbnails[0] = ThumbnailState::Evicted;
     assert_eq!(app.known_page_dims_for_idx(0), Some((800, 600)));
+    assert!(
+        app.continuous_specified_fit_basis_for_idx(0, true)
+            .is_none(),
+        "canonical placeholder coordinates alone are not physical Original dimensions"
+    );
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
     assert_eq!(
         app.vertical_reading_base_size(0, egui::vec2(1.0, 1.0), false)
             .x
@@ -373,7 +381,10 @@ fn crop_coverage_legacy_without_current_crop_keeps_coordinate_and_specified_basi
         app.fs_page_coordinate_source_size(0),
         Some(egui::vec2(400.0, 400.0))
     );
-    assert!(app.continuous_specified_fit_basis_for_idx(0).is_some());
+    assert!(
+        app.continuous_specified_fit_basis_for_idx(0, true)
+            .is_some()
+    );
     app.export_crop_pages.insert(0);
     assert!(app.fs_page_coordinate_source_size(0).is_none());
     assert!(app.fs_thumbnail_resource_for_display(0).is_err());
@@ -449,15 +460,15 @@ fn crop_coverage_spread_both_arrival_orders_keep_page_frames_and_gap() {
             egui::ColorImage::filled([100, 100], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails.push(ThumbnailState::Loaded {
+        app.thumbnails.push(ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { epoch: 0 },
-            from_edit_preview: true,
-            source_coverage: coverage,
-            rendered_at_px: 100,
-            source_dims: Some((400, 400)),
-            layout_dims: None,
-        });
+            crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { epoch: 0 },
+            true,
+            100,
+            coverage,
+            Some((400, 400)),
+            None,
+        ));
         let generation = app.items_generation;
         app.page_dims_cache.record(
             generation,
@@ -483,7 +494,7 @@ fn crop_coverage_spread_both_arrival_orders_keep_page_frames_and_gap() {
             .map(|idx| {
                 let resource = match app.fs_cache.get(&idx) {
                     Some(FsCacheEntry::Static { tex, .. }) => {
-                        app.fullscreen_paint_resource_for_texture(idx, tex.clone())
+                        app.fixture_raster_paint_resource(idx, tex.clone())
                     }
                     _ => app.fs_thumbnail_resource_for_display(idx).unwrap(),
                 };
@@ -511,6 +522,7 @@ fn crop_coverage_spread_both_arrival_orders_keep_page_frames_and_gap() {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: tex.clone(),
                     pixels: pixels.clone(),
                     source_dims: Some([600, 800]),

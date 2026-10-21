@@ -343,6 +343,8 @@ crop A→B の保存後・非同期 Delete 前や、保存済み crop と未保�
 採る場合もその入口の実装だけで切り替え、各 consumer の変更や同期 I/O を必要としない。現在 crop ありなら typed reason
 `UnknownWithCurrentCrop` で fullscreen／通過表示／animation の代役から除外し、現在 crop
 なしなら互換方針として `FullSource` を返す。これは一覧の旧 preview 利用を止める判定ではない。
+worker受理では、この現在cropによる利用許可を寸法descriptorへ固定しない。crop中にUnknownを
+受理しても、後でcropを解除すれば同じ素材を既存の互換方針で利用できる。
 
 読み込み worker は保存サイズを品質原本として残したまま、現在の `display_px` へ下地と
 全注釈レイヤーを Lanczos3 で同一寸法へ縮小してから合成する。UI / GPU には表示寸法の
@@ -748,7 +750,28 @@ RAWのdeveloped寸法、PDF page-box、他4方式の連結読みのsource基準�
 各ページ内の通常素材の contain／物理 pixel snapping は既存の規則を維持する。
 正準寸法とGPU clamp後寸法が異なる場合も、注釈・source座標を100%表示寸法で上書きしない。
 
-部分素材の `full_source_size_vec2` は型付き100%基準を返し、`coordinate_dims` と混ぜない。
+`MaterialDisplayBasis` が素材の不変な寸法契約を所有する。thumbnailはworker受理時のsource寸法と
+生成coverage、sourceは自身のmetadata、派生素材は実際に選択した入力ownerから値を受け取る。
+Single／Spread／Continuousの旧4方式と指定A/Oは、この一つのdescriptorからの名前付き射影とする。
+producer selectorは `FullscreenPaintResource` を返し、handle getterはその射影に限定する。
+frame stateの通常素材・thumbnail／通過代役、Native不採用時の描画fallbackもResourceとして受け渡す。
+描画入口でbare handleをLoadedと照合し直す処理は置かない。
+保持presentationの選択は別に `FullscreenPaintPayload` を返し、NormalResourceもPresentationMaterialも
+そのまま運ぶ。fit・見開き構成・指定倍率・保持・退去後の再描画でidxやtexture IDから100%を再探索しない。
+現在のfit設定・倍率制限は描画時に適用し、frozen captureだけが設定を含むfit descriptorも捕捉する。
+source寸法不明は型付きの基準欠落とし、指定倍率の100%をsamplerや正準座標から補わない。
+旧4方式のsource不明thumbnailのlegacy canvasは、受理時に明示的に保持する。
+RAW／PDF／連結のlegacy source-layoutは `LegacySourceLayoutBasis` にlayout単位と
+受理rasterの参照寸法を別々に持つ。単ページのaspect正規化もこの参照寸法を使い、
+cache退去後の座標寸法やsamplerへ戻らない。PDF thumbnailのmetadata再受理では
+page-boxと指定A/Oを更新し、同じ素材のlegacy参照寸法は保持する。
+見開き・連結の既存layout単位はそのまま使い、物理100%の型へ統一しない。
+素材のない連結ページのlegacy placeholderは、退去後も正準layoutを保持する。これは未描画ページの
+空間だけを確保する値であり、指定倍率の物理100%基準には使わない。ページ送り受付も共通の
+fit resolverから型付きの基準欠落を受け取り、描画不能な素材をNormal入力としてpinしない。
+
+部分素材の `full_source_size_vec2` はsampling canvasを表す。fitが読む型付き100%基準は
+素材descriptorの値であり、`coordinate_dims` と混ぜない。
 `FullscreenFitInput::Raster` がOriginal／Page／Width／Heightと倍率制限の100%基準を
 capture／replay／Zへ保持する。AI完成後は従来どおり実出力textureの100%へ再配置する。
 丸め後の texture 寸法を coverage の幅・高さで個別に割って全体寸法を逆算しない。
@@ -2479,17 +2502,21 @@ AI出力寸法から逆算しない。通常thumbnailで本画像未到着なら
 paint / hit / UV / source写像は実際のcontained textureを共有し、PDF需要・合成layout・captureの
 fit枠は安定したcanonical extentを使う。descriptorと枠はcapture時の値を保存し、frozen / holdover
 replayやnavigatorから現在の指定値・共通最大倍率や新しいraster寸法を後読みしない。
-単ページ・見開き・連結読みは `specified_fit_basis_for_display` でA/Oを解決する。
-部分素材はcoverageの正準座標寸法とcrop前raster、保持presentationは捕捉済みfit descriptorを
+単ページ・見開き・連結読みは選択した素材の `MaterialDisplayBasis::specified` からA/Oを読む。
+部分素材はcoverageの正準座標寸法とcrop前raster、保持presentationは同時に保持したdescriptorを
 使い、thumbnail退去後にidx探索の正準寸法へ100%基準を戻さない。見開き全体と各ページも
-同じ `fs_spread_fit_input` の結果を使う。通常thumbnail・素材なしのidx探索・連結読みの
-`continuous_specified_fit_basis_for_idx` も同じownerへ委ねる。
+同じ `fs_spread_fit_input` の結果を使う。連結読みのreference／measurementも同じ素材selectorを使い、
+元画像／解析表示ではsource素材、通常表示ではprocessed／保持素材を選ぶ。
 §1.165最終P2追補（2026-10-22）の仕様差として、通常thumbnailの指定倍率は7474e5cf1の
 thumbnail実寸（例:60×80）へ戻さず、到着予定GPU raster（正準15000×20000なら6144×8192）を
 100%基準にする。指定倍率＋「縮小しない」でも到着時に枠・倍率が跳ばない。
 通常rasterの指定方式では連結読みのsource原寸例外も外し、到着後・AI前metadata・退去後まで
 同じraster基準を維持する。正準座標とページ構成、RAW／PDF、他4方式の連結規則は変更しない。
-source寸法自体がまだ不明な場合に限り、従来の選択済みsampler基準で代役の表示可能性を保つ。
+NormalResource保持後のthumbnail退去でも、素材自身の6144×8192などの受理済み基準を維持する。
+同じallocationを共有するthumbnail／通過素材／元画像／finalも、実際に選んだproducerのdescriptorを
+運び、texture IDから属性を逆引きしない。消しゴムの独立下地・worker preview・preview昇格、
+注釈preview、連結transition、captureも入力ownerのdescriptorを継承する。
+[素材所有の設計判断](material-display-basis-ownership-plan.md)に境界と維持する方式差を記録する。
 捕捉済みの `SpecifiedScale.max_tenths` をgeometryの再解決にも使い、live設定変更を混ぜない。
 
 見開きは既存高さ合わせと仮想slotを維持し、2枚＋gap全体をfitする。幅指定が極小なら表示だけ
@@ -2719,6 +2746,12 @@ crop 後 texture で引き伸ばさない。これにより本画像到着時に
 維持し、未収録だった外側が補われることを受入条件とする。代役が持たない crop 外画素の復元を
 到着前の要件にはしない。旧 Unknown＋現在 crop ありはこの代役を使えないため、本画像または
 既存の利用可能な代役を待つ互換上の制約が残る（実装・自動検証済み・独立完成レビュー／実機未確認）。
+renditionは下地の受理済み `MaterialDisplayBasis` も継承する。無加工時にcatalogと同じtextureを
+共有しても、通常thumbnailと通過素材の方式別契約はそれぞれの素材が保持する値を使う。
+生成後のselector・連結transition・ページ送り受付ではResourceのまま運び、保持済み素材から
+handleだけを取り出してthumbnail寸法や現在のidxから基準を作り直さない。PDF metadataの採用で
+現在のthumbnailを再受理した場合は、そのthumbnailに依存するrenditionを再生成対象とする。
+既に保持・captureした素材の不変descriptorは書き換えない。
 
 | 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
 | --- | --- | --- | --- |

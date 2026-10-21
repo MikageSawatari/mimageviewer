@@ -104,6 +104,7 @@ pub enum FsCacheEntry {
     },
     /// 静止画。GPU テクスチャと CPU 側ピクセルデータ（分析パネル用）を保持する。
     Static {
+        pdf_metadata: Option<crate::app::PdfPageMetadataSnapshot>,
         tex: egui::TextureHandle,
         pixels: std::sync::Arc<egui::ColorImage>,
         /// GPU 上限 clamp 前の原寸 (幅, 高さ)。`pixels.size` と一致しないとき

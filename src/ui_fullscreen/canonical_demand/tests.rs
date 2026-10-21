@@ -170,6 +170,7 @@ fn composed_app(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: pixels.clone(),
                 source_dims: Some(pixels.size),
@@ -264,6 +265,7 @@ fn canonical_native_demand_matches_unequal_rotated_trimmed_and_landscape_pages()
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_metadata: None,
                         tex,
                         pixels,
                         source_dims: Some(size),
@@ -295,6 +297,7 @@ fn canonical_native_demand_matches_unequal_rotated_trimmed_and_landscape_pages()
         app.fs_cache.insert(
             2,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([120, 80]),

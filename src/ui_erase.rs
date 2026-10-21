@@ -221,6 +221,7 @@ pub(crate) enum ApplyInpaintOutcome {
 /// 推論本体は worker thread で走り、結果は `rx`、途中経過は `progress_rx` 経由で
 /// UI スレッドへ届ける。
 pub(crate) struct EraseInpaintPending {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 結果を反映する fs_cache のキー (= フルスクリーン idx)。
     pub idx: usize,
     /// 投入時の `App.items_generation`。`poll` 時に世代が進んでいれば結果は捨てる
@@ -354,8 +355,8 @@ impl App {
             Some(flat) => Arc::new(flat),
             None => p,
         };
-        self.erase_base_cache
-            .insert(target_idx, Arc::clone(&pixels));
+        let base = self.capture_erase_base_source(target_idx, Arc::clone(&pixels));
+        self.erase_base_cache.insert(target_idx, base);
         // ピクセル取得成功 → ここから state mutation。
         if let Some(pivot) = pivot {
             self.erase_spread_ctx = Some(pivot);
@@ -2976,28 +2977,27 @@ impl App {
         raw_size
     }
 
-    fn resolve_erase_input_pixels(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
-        self.resolve_erase_input_pixels_matching(fs_idx, None)
-            .map(|(pixels, _)| pixels)
+    fn resolve_erase_input_source(&self, fs_idx: usize) -> Option<crate::app::EraseBaseSource> {
+        self.resolve_erase_input_source_matching(fs_idx, None)
+            .map(|(source, _)| source)
     }
-
-    fn resolve_erase_input_pixels_matching(
+    fn resolve_erase_input_source_matching(
         &self,
         fs_idx: usize,
         expected_size: Option<[usize; 2]>,
-    ) -> Option<(Arc<egui::ColorImage>, &'static str)> {
+    ) -> Option<(crate::app::EraseBaseSource, &'static str)> {
         let size_ok =
             |pixels: &Arc<egui::ColorImage>| expected_size.map_or(true, |size| pixels.size == size);
-        let source = self
-            .current_raw_source_pixels(fs_idx)
-            .filter(size_ok)
-            .or_else(|| {
+        let mut source =
+            if let Some(pixels) = self.current_raw_source_pixels(fs_idx).filter(size_ok) {
+                self.capture_erase_base_source(fs_idx, pixels)
+            } else {
                 self.erase_base_cache
                     .get(&fs_idx)
-                    .filter(|pixels| size_ok(pixels))
-                    .map(Arc::clone)
-            })?;
-        let source = self.black_flatten_erase_source_if_needed(fs_idx, source);
+                    .filter(|source| size_ok(&source.pixels))
+                    .cloned()?
+            };
+        source.pixels = self.black_flatten_erase_source_if_needed(fs_idx, source.pixels);
         Some((source, "source"))
     }
 
@@ -3020,7 +3020,7 @@ impl App {
 
     /// 表示パイプライン用: 保存済み消しゴムマスクがあり、現在世代の確定結果が無ければ
     /// MI-GAN を非同期起動する。結果が既にあれば texture を返す。
-    pub(crate) fn ensure_erase_result_texture(
+    fn ensure_erase_result_texture_impl(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -3045,7 +3045,7 @@ impl App {
             );
         }
 
-        let source = self.resolve_erase_input_pixels(fs_idx)?;
+        let source = self.resolve_erase_input_source(fs_idx)?;
         let [w, h] = source.size;
         if w == 0 || h == 0 {
             return None;
@@ -3089,14 +3089,26 @@ impl App {
             .erase_preview_cache
             .get(&fs_idx)
             .filter(|entry| entry.pixels.size == [w, h])
-            .map(|entry| (Arc::clone(&entry.pixels), entry.texture.clone()));
+            .map(|entry| {
+                (
+                    Arc::clone(&entry.pixels),
+                    entry.texture.clone(),
+                    entry.display_basis,
+                )
+            });
         // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
         let vectors_snapshot = self.erase_shapes.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
-        if let Some((pixels, texture)) = preview_result {
+        if let Some((pixels, texture, display_basis)) = preview_result {
             let key = self.current_erase_result_key(fs_idx);
-            self.erase_result_cache
-                .insert(key, crate::app::EraseResultCacheEntry { pixels, texture });
+            self.erase_result_cache.insert(
+                key,
+                crate::app::EraseResultCacheEntry {
+                    display_basis,
+                    pixels,
+                    texture,
+                },
+            );
             self.invalidate_compare_prepared_for_idx(fs_idx);
             self.clear_conceal_caches(fs_idx);
             crate::logger::log(format!(
@@ -3104,7 +3116,7 @@ impl App {
             ));
             return ApplyInpaintOutcome::CompletedFromPreview;
         }
-        let Some(original) = self.resolve_erase_input_pixels(fs_idx) else {
+        let Some(original) = self.resolve_erase_input_source(fs_idx) else {
             return ApplyInpaintOutcome::Deferred;
         };
         if original.size != [w, h] {
@@ -3163,7 +3175,7 @@ impl App {
         };
         let [w, h] = self.erase_mask_size;
         let Some((adjusted, source_name)) =
-            self.resolve_erase_input_pixels_matching(fs_idx, Some([w, h]))
+            self.resolve_erase_input_source_matching(fs_idx, Some([w, h]))
         else {
             crate::logger::log(format!(
                 "erase: preview skipped (no matching source for mask={}x{})",
@@ -3211,7 +3223,7 @@ impl App {
 
         // DB にマスクがあるか確認。入力は raw 固定ではなく、現在の pre-erase 表示レイヤ
         // (補正 > AI > raw) を使う。
-        let Some(pixels) = self.resolve_erase_input_pixels(idx) else {
+        let Some(pixels) = self.resolve_erase_input_source(idx) else {
             return;
         };
         let [w, h] = pixels.size;
@@ -3239,7 +3251,7 @@ impl App {
             .map(|old| old.size != pixels.size)
             .unwrap_or(true);
         if need_update {
-            self.erase_base_cache.insert(idx, Arc::clone(&pixels));
+            self.erase_base_cache.insert(idx, pixels.clone());
         }
 
         self.run_inpaint_and_cache(ctx, idx, pixels, composite, w, h, "auto-apply", false);
@@ -3267,7 +3279,7 @@ impl App {
             return;
         }
 
-        let pixels = match self.resolve_erase_input_pixels(fs_idx) {
+        let pixels = match self.resolve_erase_input_source(fs_idx) {
             Some(pixels) => pixels,
             None => {
                 self.show_feedback_warning("[画像読込中]".to_string());
@@ -3298,7 +3310,7 @@ impl App {
             .map(|old| old.size != pixels.size)
             .unwrap_or(true);
         if need_update {
-            self.erase_base_cache.insert(fs_idx, Arc::clone(&pixels));
+            self.erase_base_cache.insert(fs_idx, pixels.clone());
         }
 
         let mut composite = new_mask.clone();
@@ -3327,7 +3339,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-        original: Arc<egui::ColorImage>,
+        original: crate::app::EraseBaseSource,
         composite: Vec<bool>,
         w: usize,
         h: usize,
@@ -3374,7 +3386,7 @@ impl App {
             }
             return false;
         }
-        let Some(source) = self.resolve_erase_input_pixels(idx) else {
+        let Some(source) = self.resolve_erase_input_source(idx) else {
             self.ensure_original_material_for_entry(idx, entry);
             return false;
         };
@@ -3401,7 +3413,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-        original: Arc<egui::ColorImage>,
+        original: crate::app::EraseBaseSource,
         mask_source: EraseInpaintMaskSource,
         w: usize,
         h: usize,
@@ -3409,6 +3421,8 @@ impl App {
     ) {
         let log_prefix = purpose.origin();
         let is_preview = purpose.is_preview();
+        let display_basis = original.display_basis;
+        let original = original.pixels;
         if self.remote_session_blocks_local_control() {
             return;
         }
@@ -3538,6 +3552,7 @@ impl App {
         self.erase_inpaint_pending.insert(
             pending_key,
             EraseInpaintPending {
+                display_basis,
                 idx,
                 items_generation,
                 path_key,
@@ -3660,6 +3675,8 @@ impl App {
             egui::ImageData::Color(Arc::clone(&pixels)),
             self.display_texture_options(idx),
         );
+        let display_basis =
+            Self::accept_comic_material_display_basis(pending.display_basis, tex.size());
         if pending.purpose.is_preview() {
             // **Preview 経路**: fs_cache を一切触らず、preview_cache だけを更新する
             // (Codex P1 R4 #1)。ESC / 全削除 / mask 変更で preview_cache を捨てれば
@@ -3667,6 +3684,7 @@ impl App {
             self.erase_preview_cache.insert(
                 idx,
                 crate::app::ErasePreviewCacheEntry {
+                    display_basis,
                     pixels,
                     texture: tex,
                 },
@@ -3690,6 +3708,7 @@ impl App {
             self.erase_result_cache.insert(
                 key,
                 crate::app::EraseResultCacheEntry {
+                    display_basis,
                     pixels,
                     texture: tex,
                 },
@@ -4915,6 +4934,10 @@ mod book_erase_tests {
                 },
             },
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::from_sampler(
+                    [1, 1],
+                    crate::source_coverage::SourceCoverage::FullSource,
+                ),
                 idx,
                 items_generation: app.items_generation,
                 path_key: app.page_path_key(idx),
@@ -5446,5 +5469,24 @@ mod book_erase_tests {
         assert_ne!(result.image.pixels[1], base.pixels[1]);
         assert_eq!(result.image.pixels[0], base.pixels[0]);
         assert_eq!(result.image.pixels[2], base.pixels[2]);
+    }
+}
+
+impl App {
+    pub(crate) fn ensure_erase_result_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let _ = self.ensure_erase_result_texture_impl(ctx, idx)?;
+        self.current_erase_result_material(idx)
+    }
+    pub(crate) fn ensure_erase_result_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.ensure_erase_result_material(ctx, idx)
+            .map(|material| material.source_texture().clone())
     }
 }

@@ -67,6 +67,7 @@ pub(crate) fn queued_final(app: &mut App, idx: usize) -> FinalCompositeKey {
     app.final_effect_pending.insert(
         key,
         FinalEffectPending {
+            pdf_metadata: None,
             canonical_dims: None,
             source_size: size,
             cancel: Arc::new(AtomicBool::new(false)),

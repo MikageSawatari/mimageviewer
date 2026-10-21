@@ -124,6 +124,7 @@ pub mod file_type_visibility;
 mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
+mod material_display_basis;
 pub mod metadata_transfer;
 mod page_turn_animation;
 #[cfg(windows)]

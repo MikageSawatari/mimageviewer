@@ -65,6 +65,7 @@ fn fixture(
         env.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(pixels),
                 source_dims: Some(dims),

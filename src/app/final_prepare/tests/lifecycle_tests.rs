@@ -33,6 +33,7 @@ fn seed_owner(owner: &mut App, ctx: &egui::Context, generation: u64) {
         owner.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([80, 120]),
@@ -203,6 +204,7 @@ fn d3_2_legacy_colorize_and_lut_computing_channel_survives_real_park() {
                 owner.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        pdf_metadata: None,
                         canonical_dims: None,
                         source_size: [80, 120],
                         cancel: cancel.clone(),
@@ -828,6 +830,7 @@ fn back_pair_pressure_recovers_once_per_producer_and_keeps_second_page_admission
             app.fs_cache.insert(
                 2,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some([40, 60]),
@@ -905,6 +908,7 @@ fn back_real_next_bytes_pressure_reclaims_parked_result_but_oversize_does_not() 
             app.fs_cache.insert(
                 1,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some([128, 128]),

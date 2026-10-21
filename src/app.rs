@@ -10028,6 +10028,7 @@ pub(crate) struct LocalAdjustPrefixPreviewKey {
 
 /// 補正レイヤー合成結果の cache entry。
 pub(crate) struct LocalAdjustCacheEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
@@ -10039,6 +10040,7 @@ pub(crate) struct LocalAdjustCacheEntry {
 /// `generation` は `App::conceal_generation` のスナップショットで、グローバル
 /// パラメータが変わったあと最初に lookup が走った時点で stale 判定される。
 pub(crate) struct ConcealCacheEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 合成済み RGBA。Phase 5 の `Ctrl+E` エクスポートでこの pixels を JPEG/PNG/WebP に
     /// 書き出すので、現状は描画パスでは未使用だが将来使う前提でフィールドを保持。
     #[allow(dead_code)]
@@ -10054,6 +10056,7 @@ pub(crate) struct ConcealCacheEntry {
 /// 注釈を S=1 で焼いて src-over 合成したもの。回転は paint-time が下地と一緒に掛ける
 /// (D8) ので、ここには非回転の canonical テクスチャが入る。
 pub(crate) struct ComicCacheEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 合成済み RGBA (canonical 解像度)。Inc 7 の Ctrl+E 焼き込み出力で再利用するため
     /// 保持する (表示と出力で経路を共有、§5.2)。現状の描画パスでは texture のみ使用。
     #[allow(dead_code)]
@@ -10111,6 +10114,7 @@ pub(crate) struct ComicBakeResult {
 /// `poll_comic_bake` が upload して `comic_cache` に挿入する。下地が AI 等で作り直されたり
 /// 注釈が編集されたら条件不一致で破棄・再投入される。
 pub(crate) struct ComicBakePending {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 投入時の `comic_generation`。
     pub comic_gen: u64,
     /// 投入時の `items_generation` (フォルダ差し替え / 削除で進む)。完了結果を取り込む前に
@@ -10214,11 +10218,40 @@ pub(crate) struct TextSmartGuides {
 /// `fs_cache` を書き換えない隔離設計 (Codex P1 R4 #1)。プレビュー中だけ表示
 /// パイプラインで参照され、`reset_erase_mode` / マスク変更 / 全削除で破棄される。
 pub(crate) struct ErasePreviewCacheEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// preview MI-GAN 出力 (生 RGBA)。デバッグ / 将来の export 連携用に保持。
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
     /// GPU アップロード済みハンドル。display pipeline はこれを直接使う。
     pub texture: egui::TextureHandle,
+}
+
+#[derive(Clone)]
+pub(crate) struct EraseBaseSource {
+    pub(crate) pixels: Arc<egui::ColorImage>,
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
+}
+
+impl std::ops::Deref for EraseBaseSource {
+    type Target = Arc<egui::ColorImage>;
+    fn deref(&self) -> &Self::Target {
+        &self.pixels
+    }
+}
+
+impl EraseBaseSource {
+    pub(crate) fn raster(pixels: Arc<egui::ColorImage>) -> Self {
+        let display_basis = normal_raster_material_basis(
+            material_sampler_size(pixels.size),
+            pixels.size,
+            None,
+            false,
+        );
+        Self {
+            pixels,
+            display_basis,
+        }
+    }
 }
 
 /// 消しゴム確定結果を識別する cache key。
@@ -10235,6 +10268,7 @@ pub(crate) struct EraseResultKey {
 
 /// 消しゴム確定結果 (= MI-GAN inpaint 出力) の cache entry。
 pub(crate) struct EraseResultCacheEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
 }
@@ -10273,6 +10307,7 @@ pub(crate) struct EditResultKey {
 }
 
 pub(crate) struct EditResultEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     pub(crate) pixels: Arc<egui::ColorImage>,
     /// 表示用テクスチャ。先読み (CPU 専用) では `None` で積み、実際に表示パイプラインへ
     /// 入る時に source 共有または lazy upload で確保する (F2: AI/編集先読みで非表示ページの GPU upload を
@@ -11223,6 +11258,7 @@ fn finish_passthrough_rendition_perf_span(
 
 #[derive(Clone)]
 pub(crate) struct PassthroughRenditionEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// Catalog-thumbnail pixels used to build this rendition. Pointer identity
     /// closes the independent thumbnail quality-upgrade lifetime without a
     /// second effect-key system.
@@ -11288,6 +11324,11 @@ impl PassthroughRenditionCache {
         if let Some(pos) = self.lru.iter().position(|candidate| candidate == key) {
             self.lru.remove(pos);
         }
+    }
+
+    fn remove_page(&mut self, idx: usize) {
+        self.entries.retain(|key, _| key.edit_key.idx != idx);
+        self.lru.retain(|key| key.edit_key.idx != idx);
     }
 
     fn touch(&mut self, key: FinalCompositeKey) {
@@ -11596,6 +11637,7 @@ impl<'a> IntoIterator for &'a FinalCompositeCache {
 }
 
 pub(crate) struct FinalCompositeEntry {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) source_size: [usize; 2],
     pub(crate) pixels: Arc<egui::ColorImage>,
@@ -11604,6 +11646,144 @@ pub(crate) struct FinalCompositeEntry {
     /// false は AI 完了待ち中の暫定プレビュー。AI 到着後の再合成中も表示用に保持し、
     /// 完成結果が届いたら同じ key を上書きする。
     pub(crate) complete: bool,
+}
+
+fn normal_raster_material_basis(
+    sampler: [usize; 2],
+    source: [usize; 2],
+    canonical: Option<crate::page_dims::CanonicalPageDimensions>,
+    processed: bool,
+) -> crate::material_display_basis::MaterialDisplayBasis {
+    use crate::material_display_basis::{
+        MaterialBasisUnavailable as U, MaterialDisplayBasis as B, MaterialDisplayView as V,
+        MaterialLegacyBasis as L,
+    };
+    let sampled = B::from_sampler(sampler, crate::source_coverage::SourceCoverage::FullSource);
+    let raster_source = canonical
+        .map(|dims| {
+            let (w, h) = dims.as_tuple();
+            egui::vec2(w as f32, h as f32)
+        })
+        .unwrap_or_else(|| egui::vec2(source[0] as f32, source[1] as f32));
+    let layout_size = crate::ui_fullscreen::choose_continuous_page_layout_size(
+        None,
+        processed.then_some(egui::vec2(sampler[0] as f32, sampler[1] as f32)),
+        Some(raster_source),
+        raster_source,
+        crate::rotation_db::Rotation::None,
+        true,
+    );
+    let original = egui::vec2(source[0] as f32, source[1] as f32);
+    B::new(
+        sampled.legacy(V::Single),
+        sampled.legacy(V::Spread),
+        L::SourceLayout {
+            basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                layout_size,
+                reference_size: raster_source,
+            },
+        },
+        crate::fullscreen_specified_scale::FullscreenFitBasis::new(original, original)
+            .ok_or(U::InvalidDimensions),
+    )
+}
+
+fn material_sampler_size(pixels: [usize; 2]) -> [usize; 2] {
+    let (w, h) = crate::canonical_image_loader::gpu_raster_dimensions(
+        crate::page_dims::CanonicalPageDimensions::new(pixels[0] as u32, pixels[1] as u32),
+    )
+    .as_tuple();
+    [w as usize, h as usize]
+}
+
+impl FinalCompositeEntry {
+    pub(crate) fn raster(
+        canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
+        source_size: [usize; 2],
+        pixels: Arc<egui::ColorImage>,
+        texture: egui::TextureHandle,
+        texture_options: egui::TextureOptions,
+        complete: bool,
+    ) -> Self {
+        let display_basis =
+            normal_raster_material_basis(texture.size(), source_size, canonical_dims, true);
+        Self {
+            canonical_dims,
+            source_size,
+            pixels,
+            texture,
+            texture_options,
+            complete,
+            display_basis,
+        }
+    }
+}
+
+impl EditResultEntry {
+    pub(crate) fn raster(
+        pixels: Arc<egui::ColorImage>,
+        texture: Option<egui::TextureHandle>,
+    ) -> Self {
+        let sampler = texture
+            .as_ref()
+            .map(|texture| texture.size())
+            .unwrap_or_else(|| material_sampler_size(pixels.size));
+        let display_basis = normal_raster_material_basis(sampler, pixels.size, None, false);
+        Self {
+            pixels,
+            texture,
+            display_basis,
+        }
+    }
+}
+
+impl LocalAdjustCacheEntry {
+    pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
+        let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
+        Self {
+            pixels,
+            texture,
+            display_basis,
+        }
+    }
+}
+
+impl ConcealCacheEntry {
+    pub(crate) fn raster(
+        pixels: Arc<egui::ColorImage>,
+        texture: egui::TextureHandle,
+        generation: u64,
+    ) -> Self {
+        let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
+        Self {
+            pixels,
+            texture,
+            generation,
+            display_basis,
+        }
+    }
+}
+
+impl EraseResultCacheEntry {
+    pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
+        let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
+        Self {
+            pixels,
+            texture,
+            display_basis,
+        }
+    }
+}
+
+impl ErasePreviewCacheEntry {
+    pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
+        let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
+        Self {
+            pixels,
+            texture,
+            display_basis,
+        }
+    }
 }
 
 /// 既存 final composite を返して、このフレームの同期 CPU 合成を省略できるか。
@@ -12426,6 +12606,7 @@ pub(crate) struct ColorizeMonoSummary {
 }
 
 pub(crate) struct FinalEffectPending {
+    pub(crate) pdf_metadata: Option<PdfPageMetadataSnapshot>,
     canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     source_size: [usize; 2],
     cancel: Arc<AtomicBool>,
@@ -18413,7 +18594,7 @@ pub struct App {
     /// inpaint 適用前の表示入力キャッシュ: item_idx → ピクセルデータ。
     /// raw 固定ではなく、補正 / AI 済みの pre-erase 入力が入ることがある。
     /// 元画像プレビューには使わず、raw 表示は `fs_cache` だけを参照する。
-    pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    pub(crate) erase_base_cache: std::collections::HashMap<usize, EraseBaseSource>,
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
@@ -18588,7 +18769,8 @@ pub struct App {
     /// `Arc<ColorImage>` をテクスチャ化したものを per-idx で保持し、毎フレーム
     /// `ctx.load_texture` を呼ぶオーバーヘッド (4K で 30ms) を避ける。
     /// 編集モード退出時にクリアする。
-    pub(crate) erase_base_tex_cache: std::collections::HashMap<usize, egui::TextureHandle>,
+    pub(crate) erase_base_tex_cache:
+        std::collections::HashMap<usize, crate::gpu_lanczos::FullscreenPaintResource>,
 
     /// 隠蔽合成結果のキャッシュ (Phase 4)。`fs_cache` / `adjustment_cache` / `ai_upscale_cache`
     /// よりも上位 = 表示パイプラインの最終段。entry の `generation` フィールドが
@@ -21625,6 +21807,7 @@ impl App {
         let Some(ThumbnailState::Loaded {
             tex,
             source_coverage,
+            display_basis,
             ..
         }) = self.thumbnails.get(idx)
         else {
@@ -21636,9 +21819,245 @@ impl App {
         if !self.display_texture_matches_page(tex, idx) {
             return Err(PassthroughUnavailable::IdentityMismatch);
         }
-        Ok(self
-            .fs_resource_for_texture(idx, tex.clone())
-            .with_source_coverage(coverage))
+        Ok(
+            self.fs_direct_resource_for_accepted_texture(
+                idx,
+                tex.clone(),
+                coverage,
+                *display_basis,
+            ),
+        )
+    }
+
+    /// Resolve media policy only while adopting a producer. The dimensions and
+    /// PDF metadata supplied here belong to that producer, not a display lookup.
+    fn accept_raster_display_basis(
+        &self,
+        idx: usize,
+        sampler: [usize; 2],
+        canonical: Option<crate::page_dims::CanonicalPageDimensions>,
+        pre_ai: [usize; 2],
+        pdf_metadata: Option<PdfPageMetadataSnapshot>,
+        processed: bool,
+    ) -> crate::material_display_basis::MaterialDisplayBasis {
+        use crate::material_display_basis::{
+            MaterialBasisUnavailable as U, MaterialDisplayBasis as B, MaterialLegacyBasis as L,
+        };
+        if self.is_raw_page(idx) {
+            let Some((w, h)) = canonical.map(|dims| dims.as_tuple()) else {
+                return B::unavailable(U::RawDimensionsUnavailable);
+            };
+            let layout_size = egui::vec2(w as f32, h as f32);
+            let legacy = L::SourceLayout {
+                basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                    layout_size,
+                    reference_size: layout_size,
+                },
+            };
+            return B::new(
+                legacy,
+                legacy,
+                legacy,
+                crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                    layout_size,
+                    layout_size,
+                )
+                .ok_or(U::InvalidDimensions),
+            );
+        }
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            let layout = pdf_metadata
+                .map(|metadata| metadata.layout_dims)
+                .or_else(|| canonical.map(|dims| dims.as_tuple()));
+            return Self::accept_pdf_display_basis(
+                sampler,
+                canonical
+                    .map(|dims| {
+                        let (w, h) = dims.as_tuple();
+                        egui::vec2(w as f32, h as f32)
+                    })
+                    .unwrap_or_else(|| egui::vec2(pre_ai[0] as f32, pre_ai[1] as f32)),
+                layout,
+                pdf_metadata.map(|metadata| metadata.content_type),
+            );
+        }
+        normal_raster_material_basis(sampler, pre_ai, canonical, processed)
+    }
+
+    pub(crate) fn accept_current_producer_display_basis(
+        &self,
+        idx: usize,
+        sampler: [usize; 2],
+        pre_ai: [usize; 2],
+        processed: bool,
+    ) -> crate::material_display_basis::MaterialDisplayBasis {
+        self.accept_raster_display_basis(
+            idx,
+            sampler,
+            self.canonical_source_dimensions(idx),
+            pre_ai,
+            self.current_pdf_page_metadata_snapshot(idx),
+            processed,
+        )
+    }
+
+    /// A comic sampler may be a reduced editing preview. Its physical Original
+    /// pixels are that allocation, while pre-AI fit and source-layout policies
+    /// continue to belong to the accepted base material.
+    pub(crate) fn accept_comic_material_display_basis(
+        base: crate::material_display_basis::MaterialDisplayBasis,
+        sampler: [usize; 2],
+    ) -> crate::material_display_basis::MaterialDisplayBasis {
+        use crate::material_display_basis::{
+            MaterialDisplayBasis as B, MaterialDisplayView as V, MaterialLegacyBasis as L,
+        };
+        let sampled = B::from_sampler(sampler, crate::source_coverage::SourceCoverage::FullSource);
+        let rebase = |view| match base.legacy(view) {
+            L::Raster { .. } => sampled.legacy(view),
+            legacy => legacy,
+        };
+        B::new(
+            rebase(V::Single),
+            rebase(V::Spread),
+            base.legacy(V::Continuous),
+            base.specified(),
+        )
+    }
+
+    fn accept_pdf_display_basis(
+        sampler: [usize; 2],
+        reference_size: egui::Vec2,
+        layout_dims: Option<(u32, u32)>,
+        content_type: Option<crate::pdf_loader::PdfPageContentType>,
+    ) -> crate::material_display_basis::MaterialDisplayBasis {
+        use crate::material_display_basis::{
+            MaterialBasisUnavailable as U, MaterialDisplayBasis as B, MaterialLegacyBasis as L,
+        };
+        if sampler[0] == 0
+            || sampler[1] == 0
+            || layout_dims.is_some_and(|(w, h)| w == 0 || h == 0)
+            || crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                reference_size,
+                reference_size,
+            )
+            .is_none()
+        {
+            return B::unavailable(U::InvalidDimensions);
+        }
+        let layout_size = layout_dims
+            .map(|(w, h)| egui::vec2(w as f32, h as f32))
+            .unwrap_or_else(|| egui::vec2(sampler[0] as f32, sampler[1] as f32));
+        let legacy = L::SourceLayout {
+            basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                layout_size,
+                reference_size,
+            },
+        };
+        let specified = match (layout_dims, content_type) {
+            (Some(_), Some(content_type)) => {
+                crate::fullscreen_specified_scale::FullscreenFitBasis::from_pdf(
+                    layout_size,
+                    content_type,
+                )
+                .ok_or(U::InvalidDimensions)
+            }
+            _ => Err(U::PdfMetadataUnavailable),
+        };
+        B::new(legacy, legacy, legacy, specified)
+    }
+
+    /// Metadata acceptance publishes a new live thumbnail descriptor. Existing
+    /// resources and captures keep their previously accepted immutable value.
+    fn readopt_loaded_pdf_thumbnail_basis(
+        &mut self,
+        idx: usize,
+        metadata: PdfPageMetadataSnapshot,
+    ) {
+        let Some(ThumbnailState::Loaded {
+            tex, display_basis, ..
+        }) = self.thumbnails.get(idx)
+        else {
+            return;
+        };
+        // Metadata changes the PDF page-box and specified policy, not the
+        // thumbnail producer's already accepted legacy raster magnitude.
+        let reference_size = match display_basis
+            .legacy(crate::material_display_basis::MaterialDisplayView::Single)
+        {
+            crate::material_display_basis::MaterialLegacyBasis::SourceLayout { basis } => {
+                basis.reference_size
+            }
+            _ => egui::vec2(tex.size()[0] as f32, tex.size()[1] as f32),
+        };
+        let basis = Self::accept_pdf_display_basis(
+            tex.size(),
+            reference_size,
+            Some(metadata.layout_dims),
+            Some(metadata.content_type),
+        );
+        let basis_changed = matches!(self.thumbnails.get(idx),
+            Some(ThumbnailState::Loaded {display_basis,..}) if *display_basis != basis);
+        if let Some(ThumbnailState::Loaded {
+            display_basis,
+            layout_dims,
+            ..
+        }) = self.thumbnails.get_mut(idx)
+        {
+            *display_basis = basis;
+            *layout_dims = Some(metadata.layout_dims);
+        }
+        if basis_changed {
+            // The current producer has new metadata. Derived cache entries must
+            // be accepted again; already held resource/capture values stay owned.
+            self.passthrough_rendition_cache.remove_page(idx);
+        }
+    }
+
+    fn accept_thumbnail_display_basis(
+        &self,
+        idx: usize,
+        sampler: [usize; 2],
+        coverage: crate::source_coverage::SourceCoverage,
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+    ) -> crate::material_display_basis::MaterialDisplayBasis {
+        use crate::material_display_basis::{
+            MaterialBasisUnavailable as U, MaterialDisplayBasis as B,
+        };
+        // Current crop controls permission at selection, not immutable producer facts.
+        let coverage = match coverage {
+            crate::source_coverage::SourceCoverage::Unknown => {
+                crate::source_coverage::SourceCoverage::FullSource
+            }
+            crate::source_coverage::SourceCoverage::Known(geometry) if !geometry.is_valid() => {
+                return B::unavailable(U::InvalidDimensions);
+            }
+            coverage => coverage,
+        };
+        if self.is_raw_page(idx) {
+            // RawInfo.developed_dims travels in the thumbnail worker result.
+            // A crop's listing dimensions do not replace its full coordinate canvas.
+            let canonical = coverage.coordinate_dims().or_else(|| {
+                source_dims
+                    .filter(|(w, h)| *w > 0 && *h > 0)
+                    .map(|(w, h)| crate::page_dims::CanonicalPageDimensions::new(w, h))
+            });
+            return self.accept_raster_display_basis(idx, sampler, canonical, sampler, None, false);
+        }
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            let accepted = self.current_pdf_page_metadata_snapshot(idx);
+            let content_type = match self.items.get(idx) {
+                Some(GridItem::PdfPage { content_type, .. }) => *content_type,
+                _ => None,
+            };
+            return Self::accept_pdf_display_basis(
+                sampler,
+                egui::vec2(sampler[0] as f32, sampler[1] as f32),
+                layout_dims.or(accepted.map(|metadata| metadata.layout_dims)),
+                content_type,
+            );
+        }
+        ThumbnailState::raster_thumbnail_display_basis(sampler, coverage, source_dims)
     }
 
     /// One policy entry for legacy previews. Keeping the owning App and page here lets a
@@ -21653,45 +22072,6 @@ impl App {
         crate::source_coverage::SourceCoverageUnavailable,
     > {
         coverage.resolve_for_display(self.export_crop_pages.contains(&idx))
-    }
-
-    /// Recover metadata only from the selected texture's context-local owner.
-    pub(crate) fn fs_source_coverage_for_texture(
-        &self,
-        idx: usize,
-        texture_id: egui::TextureId,
-    ) -> crate::source_coverage::SourceCoverage {
-        if let Some(ThumbnailState::Loaded {
-            tex,
-            source_coverage,
-            ..
-        }) = self.thumbnails.get(idx)
-            && tex.id() == texture_id
-        {
-            return self
-                .resolve_preview_coverage_for_display(idx, *source_coverage)
-                .unwrap_or(*source_coverage);
-        }
-        self.passthrough_rendition_cache
-            .entries
-            .iter()
-            .find_map(|(key, entry)| {
-                (key.edit_key.idx == idx && entry.texture.id() == texture_id).then(|| {
-                    self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
-                        .unwrap_or(entry.source_coverage)
-                })
-            })
-            .unwrap_or(crate::source_coverage::SourceCoverage::FullSource)
-    }
-
-    pub(crate) fn fs_resource_for_texture(
-        &self,
-        idx: usize,
-        texture: egui::TextureHandle,
-    ) -> crate::gpu_lanczos::FullscreenPaintResource {
-        let coverage = self.fs_source_coverage_for_texture(idx, texture.id());
-        self.fullscreen_paint_resource_for_texture(idx, texture)
-            .with_source_coverage(coverage)
     }
 
     /// Say what a texture was made to show, before anything has had a chance to guess.
@@ -53681,6 +54061,12 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn poll_thumbnail_result_for_test(&mut self, ctx: &egui::Context, msg: ThumbMsg) {
+        self.send_thumbnail_for_test(msg).unwrap();
+        self.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);
+    }
+
+    #[cfg(test)]
     fn queue_thumbnail_for_test(&mut self, msg: ThumbMsg) {
         let msg = self.fixture_thumbnail_message(msg);
         self.requested.receive(msg);
@@ -53853,7 +54239,15 @@ impl App {
                 } else {
                     self.idle_upgrade_cache_bypass_ineligible.remove(&i);
                 }
+                let display_basis = self.accept_thumbnail_display_basis(
+                    i,
+                    handle.size(),
+                    source_coverage,
+                    source_dims,
+                    layout_dims,
+                );
                 self.thumbnails[i] = ThumbnailState::Loaded {
+                    display_basis,
                     tex: handle,
                     origin,
                     from_edit_preview,
@@ -65771,12 +66165,8 @@ impl App {
             })
             .map(|page| (page.texture.clone(), page.rotation));
         let resolved_current = if captured_primary.is_none() {
-            self.resolve_fs_display_tex(idx, true).map(|texture| {
-                (
-                    self.fullscreen_paint_resource_for_texture(idx, texture),
-                    self.get_rotation(idx),
-                )
-            })
+            self.resolve_fs_display_material(idx, true)
+                .map(|material| (material, self.get_rotation(idx)))
         } else {
             None
         };
@@ -65805,7 +66195,6 @@ impl App {
             ));
             return None;
         };
-        let texture = base_texture.source_texture().clone();
         #[cfg(feature = "test-script")]
         let test_script_content_proof = (!last_painted_is_holdover)
             .then(|| {
@@ -77236,6 +77625,7 @@ impl App {
         if let Some(GridItem::PdfPage { content_type, .. }) = self.items.get_mut(idx) {
             *content_type = Some(metadata.content_type);
             self.record_page_layout_dims_for_spread(idx, metadata.layout_dims);
+            self.readopt_loaded_pdf_thumbnail_basis(idx, metadata);
         }
     }
 
@@ -79224,6 +79614,7 @@ impl App {
             self.ai_upscale_cache.insert(
                 key,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: handle,
                     pixels,
                     source_dims: None,
@@ -81927,10 +82318,8 @@ impl App {
 
     /// 現在世代に一致する補正レイヤー結果テクスチャを返す。
     pub(crate) fn current_local_adjust_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
-        let key = self.current_local_adjust_key(idx);
-        self.local_adjust_cache
-            .get(&key)
-            .map(|entry| entry.texture.clone())
+        self.current_local_adjust_material(idx)
+            .map(|resource| resource.source_texture().clone())
     }
 
     /// 現在世代に一致する補正レイヤー結果ピクセルを返す。
@@ -81957,10 +82346,8 @@ impl App {
         idx: usize,
         layer_idx: usize,
     ) -> Option<egui::TextureHandle> {
-        let key = self.current_local_adjust_layer_bypass_key(idx, layer_idx);
-        self.local_adjust_layer_bypass_cache
-            .get(&key)
-            .map(|entry| entry.texture.clone())
+        self.current_local_adjust_layer_bypass_material(idx, layer_idx)
+            .map(|resource| resource.source_texture().clone())
     }
 
     pub(crate) fn current_local_adjust_prefix_preview_key(
@@ -81979,10 +82366,8 @@ impl App {
         idx: usize,
         layer_count: usize,
     ) -> Option<egui::TextureHandle> {
-        let key = self.current_local_adjust_prefix_preview_key(idx, layer_count);
-        self.local_adjust_prefix_preview_cache
-            .get(&key)
-            .map(|entry| entry.texture.clone())
+        self.current_local_adjust_prefix_preview_material(idx, layer_count)
+            .map(|resource| resource.source_texture().clone())
     }
 
     fn local_adjust_layers_with_selected_layer_bypassed(
@@ -82426,8 +82811,19 @@ impl App {
                         request.input_seq,
                         upload_t0,
                     );
-                    self.local_adjust_cache
-                        .insert(key, LocalAdjustCacheEntry { pixels, texture });
+                    self.local_adjust_cache.insert(
+                        key,
+                        LocalAdjustCacheEntry {
+                            display_basis: self.accept_current_producer_display_basis(
+                                key.idx,
+                                texture.size(),
+                                pixels.size,
+                                false,
+                            ),
+                            pixels,
+                            texture,
+                        },
+                    );
                     if !matches!(
                         continuation,
                         LocalMaterializeContinuation::SwitchConceal { .. }
@@ -82517,6 +82913,12 @@ impl App {
                     self.conceal_cache.insert(
                         idx,
                         ConcealCacheEntry {
+                            display_basis: self.accept_current_producer_display_basis(
+                                idx,
+                                texture.size(),
+                                pixels.size,
+                                false,
+                            ),
                             pixels,
                             texture,
                             generation: key.conceal_gen,
@@ -82550,6 +82952,12 @@ impl App {
                     self.edit_result_cache.insert(
                         key,
                         EditResultEntry {
+                            display_basis: self.accept_current_producer_display_basis(
+                                idx,
+                                material_sampler_size(source.size),
+                                source.size,
+                                false,
+                            ),
                             pixels: source,
                             texture: None,
                         },
@@ -82653,8 +83061,19 @@ impl App {
                     self.input_seq,
                     upload_t0,
                 );
-                self.local_adjust_layer_bypass_cache
-                    .insert(pending.key, LocalAdjustCacheEntry { pixels, texture });
+                self.local_adjust_layer_bypass_cache.insert(
+                    pending.key,
+                    LocalAdjustCacheEntry {
+                        display_basis: self.accept_current_producer_display_basis(
+                            key.idx,
+                            texture.size(),
+                            pixels.size,
+                            false,
+                        ),
+                        pixels,
+                        texture,
+                    },
+                );
                 ctx.request_repaint();
             }
             Ok(LocalAdjustRenderResult::Cancelled) => {
@@ -82723,8 +83142,19 @@ impl App {
                     self.input_seq,
                     upload_t0,
                 );
-                self.local_adjust_prefix_preview_cache
-                    .insert(pending.key, LocalAdjustCacheEntry { pixels, texture });
+                self.local_adjust_prefix_preview_cache.insert(
+                    pending.key,
+                    LocalAdjustCacheEntry {
+                        display_basis: self.accept_current_producer_display_basis(
+                            key.idx,
+                            texture.size(),
+                            pixels.size,
+                            false,
+                        ),
+                        pixels,
+                        texture,
+                    },
+                );
                 ctx.request_repaint();
             }
             Ok(LocalAdjustRenderResult::Cancelled) => {
@@ -82899,9 +83329,12 @@ impl App {
             && self.colorize_display_requires_final_effect(idx)
     }
 
-    fn set_continuous_page_transition(&mut self, idx: usize, texture: egui::TextureHandle) {
+    fn set_continuous_page_transition(
+        &mut self,
+        idx: usize,
+        texture: crate::gpu_lanczos::FullscreenPaintResource,
+    ) {
         if self.continuous_page_transition_is_owned_here(idx) {
-            let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
             self.continuous_page_transitions.insert(
                 idx,
                 ContinuousPageTransition {
@@ -82934,8 +83367,9 @@ impl App {
     pub(crate) fn observe_continuous_page_processed_texture(
         &mut self,
         idx: usize,
-        texture: &egui::TextureHandle,
+        resource: &crate::gpu_lanczos::FullscreenPaintResource,
     ) {
+        let texture = resource.source_texture();
         let comic_complete = self
             .current_comic_composite_texture(idx)
             .is_some_and(|comic| comic.id() == texture.id());
@@ -82943,7 +83377,7 @@ impl App {
         if complete {
             self.continuous_page_transitions.remove(&idx);
         } else {
-            self.set_continuous_page_transition(idx, texture.clone());
+            self.set_continuous_page_transition(idx, resource.clone());
         }
     }
 
@@ -82962,7 +83396,7 @@ impl App {
         {
             return;
         }
-        if let Some(texture) = self.resolve_fs_display_tex(idx, false) {
+        if let Some(texture) = self.resolve_fs_display_material(idx, false) {
             if self.continuous_page_transition_is_owned_here(idx) {
                 self.set_continuous_page_transition(idx, texture);
                 return;
@@ -83038,10 +83472,8 @@ impl App {
 
     /// 現在世代に一致する消しゴム確定結果テクスチャを返す。
     pub(crate) fn current_erase_result_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
-        let key = self.current_erase_result_key(idx);
-        self.erase_result_cache
-            .get(&key)
-            .map(|entry| entry.texture.clone())
+        self.current_erase_result_material(idx)
+            .map(|resource| resource.source_texture().clone())
     }
 
     /// 現在世代に一致する消しゴム確定結果ピクセルを返す。
@@ -83101,23 +83533,85 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        if let Some(tex) = self.erase_base_tex_cache.get(&idx) {
-            return Some(tex.clone());
+        self.ensure_erase_base_material(ctx, idx)
+            .map(|material| material.source_texture().clone())
+    }
+
+    pub(crate) fn ensure_erase_base_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        if let Some(material) = self.erase_base_tex_cache.get(&idx) {
+            return Some(material.clone());
         }
-        let source_pixels = self
-            .erase_base_cache
-            .get(&idx)
-            .cloned()
-            .or_else(|| self.current_raw_source_pixels(idx))?;
-        let source_pixels = self.black_flatten_erase_source_if_needed(idx, source_pixels);
+        let source = self.erase_base_cache.get(&idx).cloned().or_else(|| {
+            self.current_raw_source_pixels(idx)
+                .map(|pixels| self.capture_erase_base_source(idx, pixels))
+        })?;
+        let pixels = self.black_flatten_erase_source_if_needed(idx, source.pixels);
         self.speculative_gpu_frame.note_ordinary_upload();
-        let tex = ctx.load_texture(
+        let texture = ctx.load_texture(
             format!("erase_base_display_{idx}"),
-            (*source_pixels).clone(),
+            pixels.as_ref().clone(),
             self.display_texture_options(idx),
         );
-        self.erase_base_tex_cache.insert(idx, tex.clone());
-        Some(tex)
+        let basis = Self::accept_comic_material_display_basis(source.display_basis, texture.size());
+        let material = self.fs_resource_for_accepted_texture(
+            idx,
+            texture,
+            crate::source_coverage::SourceCoverage::FullSource,
+            basis,
+        );
+        self.erase_base_tex_cache.insert(idx, material.clone());
+        Some(material)
+    }
+
+    pub(crate) fn capture_erase_base_source(
+        &self,
+        idx: usize,
+        pixels: Arc<egui::ColorImage>,
+    ) -> EraseBaseSource {
+        use crate::material_display_basis::{
+            MaterialBasisUnavailable as U, MaterialDisplayBasis as B,
+        };
+        let basis = if self.is_raw_page(idx) {
+            let canonical = self
+                .raw_pages
+                .page(idx)
+                .and_then(|page| page.developed_dims)
+                .map(|[w, h]| crate::page_dims::CanonicalPageDimensions::new(w as u32, h as u32));
+            self.accept_raster_display_basis(
+                idx,
+                material_sampler_size(pixels.size),
+                canonical,
+                pixels.size,
+                None,
+                false,
+            )
+        } else if let Some(FsCacheEntry::Static {
+            source_dims,
+            pdf_metadata,
+            ..
+        }) = self.fs_cache.get(&idx)
+        {
+            let canonical = source_dims
+                .map(|[w, h]| crate::page_dims::CanonicalPageDimensions::new(w as u32, h as u32));
+            self.accept_raster_display_basis(
+                idx,
+                material_sampler_size(pixels.size),
+                canonical,
+                pixels.size,
+                *pdf_metadata,
+                false,
+            )
+        } else {
+            B::unavailable(U::ProducerUnavailable)
+        };
+        EraseBaseSource {
+            pixels,
+            display_basis: basis,
+        }
     }
 
     /// 隠蔽合成の入力になる現在の表示ソースを返す。
@@ -83363,7 +83857,7 @@ impl App {
         );
     }
 
-    pub(crate) fn ensure_conceal_texture(
+    fn ensure_conceal_texture_impl(
         &mut self,
         _ctx: &egui::Context,
         idx: usize,
@@ -83519,6 +84013,12 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
+                display_basis: self.accept_current_producer_display_basis(
+                    idx,
+                    material_sampler_size(pixels.size),
+                    pixels.size,
+                    false,
+                ),
                 pixels: Arc::clone(&pixels),
                 texture,
             },
@@ -83547,6 +84047,12 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
+                display_basis: self.accept_current_producer_display_basis(
+                    idx,
+                    material_sampler_size(pixels.size),
+                    pixels.size,
+                    false,
+                ),
                 pixels: Arc::clone(&pixels),
                 texture: None,
             },
@@ -83630,21 +84136,8 @@ impl App {
     }
 
     pub(crate) fn current_edit_result_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
-        if self.fs_entry_is_animated(idx) {
-            return None;
-        }
-        // Any resident edit generation for this page is acceptable - that is what lets a slider
-        // drag keep showing the last complete result - but it has to belong to the list on
-        // screen. Scanning by index alone crosses documents.
-        let item_id = self.item_id(idx);
-        self.edit_result_cache
-            .iter()
-            .find(|(key, _)| {
-                key.idx == idx
-                    && key.items_generation == self.items_generation
-                    && key.item_id == item_id
-            })
-            .and_then(|(_, entry)| entry.texture.clone())
+        self.current_edit_result_material(idx)
+            .map(|resource| resource.source_texture().clone())
     }
 
     pub(crate) fn final_ai_key_for_pixels(
@@ -85847,9 +86340,18 @@ impl App {
                     // resolver would learn the wrong answer from it; binding here means it carries
                     // the page it was actually made from wherever it is later copied to.
                     self.bind_display_texture_identity(&texture, key.edit_key.item_id);
+                    let display_basis = self.accept_raster_display_basis(
+                        key.edit_key.idx,
+                        texture.size(),
+                        pending.canonical_dims,
+                        pending.source_size,
+                        pending.pdf_metadata,
+                        true,
+                    );
                     self.final_composite_cache.insert(
                         key,
                         FinalCompositeEntry {
+                            display_basis,
                             texture_options: (if pending.nearest_sampler {
                                 egui::TextureOptions::NEAREST
                             } else {
@@ -85867,7 +86369,15 @@ impl App {
                     if pending.output_complete {
                         self.continuous_page_transitions.remove(&key.edit_key.idx);
                     } else {
-                        self.set_continuous_page_transition(key.edit_key.idx, texture.clone());
+                        self.set_continuous_page_transition(
+                            key.edit_key.idx,
+                            self.fs_resource_for_accepted_texture(
+                                key.edit_key.idx,
+                                texture.clone(),
+                                crate::source_coverage::SourceCoverage::FullSource,
+                                display_basis,
+                            ),
+                        );
                     }
                     self.comic_cache.remove(&key.edit_key.idx);
                     self.cancel_comic_bake_for_idx(key.edit_key.idx);
@@ -86199,6 +86709,7 @@ impl App {
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        pdf_metadata: self.current_pdf_page_metadata_snapshot(key.edit_key.idx),
                         canonical_dims: self.canonical_source_dimensions(key.edit_key.idx),
                         source_size,
                         cancel,
@@ -86310,9 +86821,12 @@ impl App {
         );
         let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let canonical_dims = self.canonical_source_dimensions(idx);
+        let display_basis =
+            self.accept_current_producer_display_basis(idx, texture.size(), edit_size, true);
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                display_basis,
                 texture_options: tex_opts,
                 canonical_dims,
                 source_size: edit_size,
@@ -86388,7 +86902,7 @@ impl App {
         )
     }
 
-    pub(crate) fn ensure_final_composite_texture(
+    fn ensure_final_composite_texture_impl(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
@@ -86586,9 +87100,12 @@ impl App {
             (texture, fc_clamp_ms, fc_upload_ms)
         };
         let canonical_dims = self.canonical_source_dimensions(idx);
+        let display_basis =
+            self.accept_current_producer_display_basis(idx, texture.size(), edit_pixels.size, true);
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                display_basis,
                 texture_options: tex_opts,
                 canonical_dims,
                 source_size: edit_pixels.size,
@@ -86631,13 +87148,25 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(FinalCompositeKey, Arc<egui::ColorImage>)> {
+        self.ensure_final_composite_input(ctx, idx)
+            .map(|(key, pixels, _)| (key, pixels))
+    }
+
+    pub(crate) fn ensure_final_composite_input(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<(
+        FinalCompositeKey,
+        Arc<egui::ColorImage>,
+        crate::material_display_basis::MaterialDisplayBasis,
+    )> {
         if let Some((key, entry)) = self.exact_complete_final_composite_entry(idx) {
-            return Some((key, Arc::clone(&entry.pixels)));
+            return Some((key, Arc::clone(&entry.pixels), entry.display_basis));
         }
-        let texture = self.ensure_final_composite_texture(ctx, idx)?;
+        self.ensure_final_composite_material(ctx, idx)?;
         self.exact_complete_final_composite_entry(idx)
-            .filter(|(_, entry)| entry.texture.id() == texture.id())
-            .map(|(key, entry)| (key, Arc::clone(&entry.pixels)))
+            .map(|(key, entry)| (key, Arc::clone(&entry.pixels), entry.display_basis))
     }
 
     pub(crate) fn ensure_final_composite_pixels(
@@ -86653,16 +87182,8 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        if self.fs_entry_is_animated(idx) {
-            return None;
-        }
-        // Same rule as `current_edit_result_texture`, and this is the one the 2026-08-14 trace
-        // names: the display resolver prefers final composites over `fs_cache`, so an entry left
-        // by another document at this index wins over a correct miss below it.
-        self.final_composite_cache
-            .iter()
-            .find(|(key, _)| self.edit_key_describes_current_page(&key.edit_key, idx))
-            .map(|(_, entry)| entry.texture.clone())
+        self.current_final_composite_material(idx)
+            .map(|resource| resource.source_texture().clone())
     }
 
     /// Exact params, source/edit generations, item identity, and completion are
@@ -87121,7 +87642,7 @@ impl App {
         }
     }
 
-    pub(crate) fn ensure_comic_composite_texture(
+    fn ensure_comic_composite_texture_impl(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
@@ -87145,7 +87666,7 @@ impl App {
         }
         // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
         // comic はまだ出ない (= comic は AI より後段、正しい)。
-        let base = self.ensure_final_composite_pixels(ctx, idx)?;
+        let (_, base, base_display_basis) = self.ensure_final_composite_input(ctx, idx)?;
         let [w, h] = base.size;
         let comic_gen = self.comic_generation;
         // テキスト編集中のみプレビュー解像度を下げる (R2 perf)。ツールを閉じると 1 に戻り、
@@ -87293,6 +87814,10 @@ impl App {
             self.comic_cache.insert(
                 idx,
                 ComicCacheEntry {
+                    display_basis: Self::accept_comic_material_display_basis(
+                        base_display_basis,
+                        texture.size(),
+                    ),
                     pixels: composed,
                     texture: texture.clone(),
                     base: Arc::clone(&base),
@@ -87376,6 +87901,7 @@ impl App {
         self.comic_bake_pending.insert(
             idx,
             ComicBakePending {
+                display_basis: base_display_basis,
                 comic_gen,
                 items_gen: self.items_generation,
                 base: Arc::clone(&base),
@@ -87412,7 +87938,8 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        self.comic_cache.get(&idx).map(|e| e.texture.clone())
+        self.current_comic_composite_material(idx)
+            .map(|resource| resource.source_texture().clone())
     }
 
     /// Ctrl+E 書き出し用に、最終 composite の上に注釈を焼き込んだ **ピクセル** を返す
@@ -90213,6 +90740,7 @@ impl App {
         self.adjustment_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: adjusted_pixels,
                 source_dims: None,
@@ -92456,6 +92984,7 @@ impl App {
             mark_poll_prefetch_perf(prefetch_perf, PollPrefetchPerfStage::ApplySyncAdjustment);
         }
         let entry = FsCacheEntry::Static {
+            pdf_metadata: self.current_pdf_page_metadata_snapshot(key),
             tex: handle,
             pixels,
             source_dims: Some(source_dims),
@@ -92578,10 +93107,27 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-        mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
+        perf: Option<&mut PassthroughRenditionPerfRecorder>,
     ) -> Option<egui::TextureHandle> {
+        self.ensure_passthrough_material_with_perf(ctx, idx, perf)
+            .map(|material| material.source_texture().clone())
+    }
+    pub(crate) fn ensure_passthrough_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        self.ensure_passthrough_material_with_perf(ctx, idx, None)
+    }
+
+    pub(crate) fn ensure_passthrough_material_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if self.raw_development_blocked(idx) {
-            return self.resolve_fs_display_tex(idx, false);
+            return self.resolve_original_preview_material(idx);
         }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
@@ -92595,7 +93141,7 @@ impl App {
             perf.as_deref_mut(),
             perf_call.as_mut(),
         ) {
-            Ok(texture) if self.display_texture_matches_page(&texture, idx) => {
+            Ok(texture) if self.display_texture_matches_page(texture.source_texture(), idx) => {
                 self.passthrough_unavailable = None;
                 Ok(texture)
             }
@@ -92663,27 +93209,34 @@ impl App {
         idx: usize,
         mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
         mut perf_call: Option<&mut PassthroughRenditionPerfCall>,
-    ) -> Result<egui::TextureHandle, PassthroughUnavailable> {
+    ) -> Result<crate::gpu_lanczos::FullscreenPaintResource, PassthroughUnavailable> {
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return Err(PassthroughUnavailable::ThumbnailNotLoaded);
         }
         let source_lookup_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
-        let (catalog_texture, from_edit_preview, source_coverage) = match self.thumbnails.get(idx) {
-            Some(crate::grid_item::ThumbnailState::Loaded {
-                tex,
-                from_edit_preview,
-                source_coverage,
-                ..
-            }) => (tex.clone(), *from_edit_preview, *source_coverage),
-            _ => {
-                finish_passthrough_rendition_perf_span(
-                    perf.as_deref_mut(),
-                    PassthroughRenditionPerfSpan::SourceLookup,
-                    source_lookup_t0,
-                );
-                return Err(PassthroughUnavailable::ThumbnailNotLoaded);
-            }
-        };
+        let (catalog_texture, from_edit_preview, source_coverage, source_display_basis) =
+            match self.thumbnails.get(idx) {
+                Some(crate::grid_item::ThumbnailState::Loaded {
+                    tex,
+                    from_edit_preview,
+                    source_coverage,
+                    display_basis,
+                    ..
+                }) => (
+                    tex.clone(),
+                    *from_edit_preview,
+                    *source_coverage,
+                    *display_basis,
+                ),
+                _ => {
+                    finish_passthrough_rendition_perf_span(
+                        perf.as_deref_mut(),
+                        PassthroughRenditionPerfSpan::SourceLookup,
+                        source_lookup_t0,
+                    );
+                    return Err(PassthroughUnavailable::ThumbnailNotLoaded);
+                }
+            };
         self.resolve_preview_coverage_for_display(idx, source_coverage)
             .map_err(PassthroughUnavailable::SourceCoverage)?;
         let source_pixels = match self.thumb_pixels.get(&idx) {
@@ -92734,7 +93287,13 @@ impl App {
                 PassthroughRenditionPerfSpan::CacheLookup,
                 cache_lookup_t0,
             );
-            return Ok(entry.texture);
+            return Ok(self.fs_direct_resource_for_accepted_texture(
+                idx,
+                entry.texture,
+                self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
+                    .map_err(PassthroughUnavailable::SourceCoverage)?,
+                entry.display_basis,
+            ));
         }
         if let Some(perf_call) = perf_call.as_deref_mut() {
             perf_call.cache_hit = Some(false);
@@ -92842,9 +93401,22 @@ impl App {
             (pixels, texture)
         };
         let cache_insert_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
+        let display_basis = if source_coverage.is_partial() {
+            source_display_basis
+        } else {
+            let legacy = source_display_basis
+                .legacy(crate::material_display_basis::MaterialDisplayView::Continuous);
+            crate::material_display_basis::MaterialDisplayBasis::new(
+                legacy,
+                legacy,
+                legacy,
+                source_display_basis.specified(),
+            )
+        };
         self.passthrough_rendition_cache.insert(
             key,
             PassthroughRenditionEntry {
+                display_basis,
                 source_pixels,
                 source_coverage,
                 _pixels: pixels,
@@ -92857,7 +93429,13 @@ impl App {
             PassthroughRenditionPerfSpan::CacheInsert,
             cache_insert_t0,
         );
-        Ok(texture)
+        Ok(self.fs_direct_resource_for_accepted_texture(
+            idx,
+            texture,
+            self.resolve_preview_coverage_for_display(idx, source_coverage)
+                .map_err(PassthroughUnavailable::SourceCoverage)?,
+            display_basis,
+        ))
     }
 
     pub(crate) fn is_passthrough_rendition_texture(&self, texture: &egui::TextureHandle) -> bool {
@@ -92870,8 +93448,15 @@ impl App {
     }
 
     pub(crate) fn cached_passthrough_rendition(&self, idx: usize) -> Option<egui::TextureHandle> {
+        self.cached_passthrough_material(idx)
+            .map(|resource| resource.source_texture().clone())
+    }
+    pub(crate) fn cached_passthrough_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if self.raw_development_blocked(idx) {
-            return self.resolve_fs_display_tex(idx, false);
+            return self.resolve_original_preview_material(idx);
         }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
@@ -92888,7 +93473,15 @@ impl App {
                 self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
                     .is_ok()
             })
-            .map(|entry| entry.texture)
+            .map(|entry| {
+                self.fs_direct_resource_for_accepted_texture(
+                    idx,
+                    entry.texture,
+                    self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
+                        .expect("coverage checked on this entry"),
+                    entry.display_basis,
+                )
+            })
     }
 
     #[cfg(test)]
@@ -93303,6 +93896,13 @@ impl App {
                         *stored = Some(content_type);
                         if let Some(layout_dims) = page_size_points.catalog_layout_dims() {
                             self.record_page_layout_dims_for_spread(key, layout_dims);
+                            self.readopt_loaded_pdf_thumbnail_basis(
+                                key,
+                                PdfPageMetadataSnapshot {
+                                    layout_dims,
+                                    content_type,
+                                },
+                            );
                         }
                     }
                     FsLoadResult::Static {
@@ -93468,6 +94068,7 @@ impl App {
                         );
                     }
                     FsCacheEntry::Static {
+                        pdf_metadata: None,
                         tex: handle,
                         pixels,
                         source_dims: Some(source_dims),
@@ -101513,5 +102114,748 @@ mod manual_media_nav_wrap_tests {
             assert!(indices(&items, &[], 1, delta, true).is_empty());
         }
         assert!(indices(&items, &[0, 1], 2, 1, true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod material_display_owner_tests {
+    use super::*;
+    use crate::material_display_basis::{
+        MaterialDisplayBasis as B, MaterialDisplayView as V, MaterialLegacyBasis as L,
+    };
+
+    fn accept_worker_thumbnail(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        source_dims: (u32, u32),
+        coverage: crate::source_coverage::SourceCoverage,
+        layout: Option<(u32, u32)>,
+    ) {
+        app.keep_set.insert(idx);
+        app.requested.insert(idx, false);
+        let generation = app.items_generation;
+        let message = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            idx,
+            Some(egui::ColorImage::filled([60, 40], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            !matches!(coverage, crate::source_coverage::SourceCoverage::FullSource),
+            None,
+            Some(source_dims),
+            layout,
+            false,
+            false,
+            0,
+            generation,
+        )
+        .with_source_coverage(coverage);
+        app.poll_thumbnail_result_for_test(ctx, message);
+        app.poll_thumbnail_result_for_test(
+            ctx,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                idx,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                true,
+                0,
+                generation,
+            ),
+        );
+        assert!(matches!(app.thumbnails[idx], ThumbnailState::Loaded { .. }));
+        assert!(!app.requested.contains_key(&idx));
+    }
+
+    #[test]
+    fn pdf_metadata_readoption_retires_only_dependent_live_passthrough_materials() {
+        use crate::material_display_basis::MaterialBasisUnavailable as U;
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        let pdf = app.tmp.path().join("metadata-passthrough.pdf");
+        app.items = (0..2)
+            .map(|page_num| GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.image_metas = vec![None; 2];
+        let layout = (612000, 792000);
+        for idx in 0..2 {
+            accept_worker_thumbnail(
+                &mut app,
+                &ctx,
+                idx,
+                (600, 800),
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some(layout),
+            );
+        }
+        let held = app.ensure_passthrough_material(&ctx, 0).unwrap();
+        let captured = held.capture_presentation(&ctx);
+        let sibling = app.ensure_passthrough_material(&ctx, 1).unwrap();
+        let old = held.display_basis();
+        assert_eq!(old.specified(), Err(U::PdfMetadataUnavailable));
+        let thumbnail_legacy = L::SourceLayout {
+            basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                layout_size: egui::vec2(layout.0 as f32, layout.1 as f32),
+                reference_size: egui::vec2(60.0, 40.0),
+            },
+        };
+        assert_eq!(old.legacy(V::Single), thumbnail_legacy);
+        let generation = app.input_generation.get(&0).copied();
+        let metadata = PdfPageMetadataSnapshot {
+            layout_dims: layout,
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+        };
+        app.readopt_loaded_pdf_thumbnail_basis(0, metadata);
+        assert_eq!(
+            app.input_generation.get(&0).copied(),
+            generation,
+            "metadata acceptance does not masquerade as a source reload"
+        );
+        assert!(app.cached_passthrough_material(0).is_none());
+        let unchanged = app.cached_passthrough_material(1).unwrap();
+        assert_eq!(unchanged.display_basis(), sibling.display_basis());
+        assert_eq!(unchanged.source_texture_id(), sibling.source_texture_id());
+        assert_eq!(held.display_basis(), old);
+        assert_eq!(captured.display_basis(), old);
+        let rebuilt = app.ensure_passthrough_material(&ctx, 0).unwrap();
+        assert!(rebuilt.display_basis().specified().is_ok());
+        assert_eq!(rebuilt.display_basis().legacy(V::Single), thumbnail_legacy);
+        app.readopt_loaded_pdf_thumbnail_basis(0, metadata);
+        assert!(
+            app.cached_passthrough_material(0).is_some(),
+            "unchanged metadata must not retire the accepted derivative"
+        );
+        assert_eq!(app.passthrough_rendition_cache.len(), 2);
+    }
+
+    #[test]
+    fn source_layout_acceptance_keeps_layout_units_and_raster_reference_separate() {
+        use crate::fullscreen_specified_scale::LegacySourceLayoutBasis;
+        let normal = normal_raster_material_basis(
+            [600, 600],
+            [600, 800],
+            Some(crate::page_dims::CanonicalPageDimensions::new(6000, 8000)),
+            true,
+        );
+        assert_eq!(
+            normal.legacy(V::Continuous),
+            L::SourceLayout {
+                basis: LegacySourceLayoutBasis {
+                    layout_size: egui::vec2(600.0, 600.0),
+                    reference_size: egui::vec2(6000.0, 8000.0),
+                }
+            }
+        );
+
+        let mut app = setup_app_for_test();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: app.tmp.path().join("accepted-reference.pdf"),
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+        }];
+        let metadata = PdfPageMetadataSnapshot {
+            layout_dims: (612000, 792000),
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+        };
+        for (canonical, reference_size) in [
+            (
+                Some(crate::page_dims::CanonicalPageDimensions::new(1200, 1600)),
+                egui::vec2(1200.0, 1600.0),
+            ),
+            (None, egui::vec2(600.0, 800.0)),
+        ] {
+            let accepted = app.accept_raster_display_basis(
+                0,
+                [60, 80],
+                canonical,
+                [600, 800],
+                Some(metadata),
+                false,
+            );
+            for view in [V::Single, V::Spread, V::Continuous] {
+                assert_eq!(
+                    accepted.legacy(view),
+                    L::SourceLayout {
+                        basis: LegacySourceLayoutBasis {
+                            layout_size: egui::vec2(612000.0, 792000.0),
+                            reference_size,
+                        }
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_thumbnail_acceptance_uses_worker_developed_canvas_before_raw_page_metadata() {
+        for partial in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            app.items = vec![GridItem::Image(
+                app.tmp.path().join("worker-info-first.dng"),
+            )];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            assert!(app.raw_pages.page(0).is_none());
+            let coverage = if partial {
+                crate::source_coverage::SourceCoverage::Known(
+                    crate::source_coverage::EditPreviewGeometry::new(
+                        crate::page_dims::CanonicalPageDimensions::new(12000, 8000),
+                        (8192, 5461),
+                        (1024, 1000, 4096, 2000),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                crate::source_coverage::SourceCoverage::FullSource
+            };
+            accept_worker_thumbnail(
+                &mut app,
+                &ctx,
+                0,
+                if partial { (4096, 2000) } else { (12000, 8000) },
+                coverage,
+                None,
+            );
+            let ThumbnailState::Loaded { display_basis, .. } = &app.thumbnails[0] else {
+                unreachable!()
+            };
+            for view in [V::Single, V::Spread, V::Continuous] {
+                assert_eq!(
+                    display_basis.legacy(view),
+                    L::SourceLayout {
+                        basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                            layout_size: egui::vec2(12000.0, 8000.0),
+                            reference_size: egui::vec2(12000.0, 8000.0),
+                        }
+                    }
+                );
+            }
+            let specified = display_basis.specified().unwrap();
+            assert_eq!(specified.aspect_size, egui::vec2(12000.0, 8000.0));
+            assert_eq!(specified.original_size, egui::vec2(12000.0, 8000.0));
+            assert!(
+                app.raw_pages.page(0).is_none(),
+                "thumbnail receipt must not synthesize RAW lifecycle state"
+            );
+        }
+    }
+
+    #[test]
+    fn comic_sampler_acceptance_preserves_pre_ai_and_media_layout_owners() {
+        let base = normal_raster_material_basis(
+            [8000, 6000],
+            [2000, 1500],
+            Some(crate::page_dims::CanonicalPageDimensions::new(20000, 15000)),
+            true,
+        );
+        let actual = App::accept_comic_material_display_basis(base, [400, 300]);
+        for view in [V::Single, V::Spread] {
+            assert_eq!(
+                actual.legacy(view),
+                L::Raster {
+                    layout_size: egui::vec2(400.0, 300.0),
+                    original: crate::page_dims::DisplayOriginalDimensions::new(400, 300)
+                }
+            );
+        }
+        assert_eq!(actual.specified(), base.specified());
+        assert_eq!(actual.legacy(V::Continuous), base.legacy(V::Continuous));
+        // RAW and PDF retain their established layout units even if their
+        // accepted comic sampler is a much smaller editing preview.
+        for size in [egui::vec2(12000.0, 8000.0), egui::vec2(600000.0, 800000.0)] {
+            let legacy = L::SourceLayout {
+                basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                    layout_size: size,
+                    reference_size: size,
+                },
+            };
+            let media = B::new(legacy, legacy, legacy, base.specified());
+            assert_eq!(
+                App::accept_comic_material_display_basis(media, [40, 30]),
+                media
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_preview_owners_keep_their_basis_without_source_or_thumbnail() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        app.items = vec![GridItem::Image(app.tmp.path().join("preview-basis.png"))];
+        app.thumbnails = vec![ThumbnailState::Evicted];
+        let expected = normal_raster_material_basis(
+            [8000, 6000],
+            [2000, 1500],
+            Some(crate::page_dims::CanonicalPageDimensions::new(20000, 15000)),
+            false,
+        );
+        for kind in 0..3 {
+            let pixels = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::WHITE));
+            let texture = ctx.load_texture(
+                format!("accepted-preview-{kind}"),
+                pixels.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            match kind {
+                0 => {
+                    let key = app.current_local_adjust_layer_bypass_key(0, 0);
+                    app.local_adjust_layer_bypass_cache.insert(
+                        key,
+                        LocalAdjustCacheEntry {
+                            pixels,
+                            texture: texture.clone(),
+                            display_basis: expected,
+                        },
+                    );
+                }
+                1 => {
+                    let key = app.current_local_adjust_prefix_preview_key(0, 1);
+                    app.local_adjust_prefix_preview_cache.insert(
+                        key,
+                        LocalAdjustCacheEntry {
+                            pixels,
+                            texture: texture.clone(),
+                            display_basis: expected,
+                        },
+                    );
+                }
+                _ => {
+                    app.erase_preview_cache.insert(
+                        0,
+                        ErasePreviewCacheEntry {
+                            pixels,
+                            texture: texture.clone(),
+                            display_basis: expected,
+                        },
+                    );
+                }
+            }
+            assert_eq!(
+                match kind {
+                    0 => app.current_local_adjust_layer_bypass_material(0, 0),
+                    1 => app.current_local_adjust_prefix_preview_material(0, 1),
+                    _ => app.current_erase_preview_material(0),
+                }
+                .unwrap()
+                .display_basis(),
+                expected,
+                "preview producer kind={kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_thumbnail_worker_acceptance_keeps_no_crop_standin_policy() {
+        use crate::material_display_basis::MaterialBasisUnavailable as U;
+        use crate::source_coverage::{SourceCoverage, SourceCoverageUnavailable};
+        for has_crop in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            app.items = vec![GridItem::Image(
+                app.tmp.path().join("legacy-unknown-preview.png"),
+            )];
+            app.image_metas = vec![None];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.keep_set.insert(0);
+            app.keep_range = (0, 1);
+            app.requested.insert(0, false);
+            if has_crop {
+                app.export_crop_pages.insert(0);
+            }
+            let generation = app.items_generation;
+            app.poll_thumbnail_result_for_test(
+                &ctx,
+                crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                    0,
+                    Some(egui::ColorImage::filled([60, 80], egui::Color32::WHITE)),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                    true,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    0,
+                    generation,
+                ),
+            );
+            let Some(ThumbnailState::Loaded {
+                tex,
+                source_coverage,
+                display_basis,
+                ..
+            }) = app.thumbnails.first()
+            else {
+                panic!("worker result adopted");
+            };
+            assert_eq!(
+                *source_coverage,
+                SourceCoverage::Unknown,
+                "acceptance must retain the producer coverage"
+            );
+            assert_eq!(display_basis.specified(), Err(U::SourceDimensionsUnknown));
+            if has_crop {
+                let accepted = *display_basis;
+                assert!(!matches!(accepted.legacy(V::Single), L::Unavailable(_)));
+                assert!(matches!(
+                    app.fs_thumbnail_resource_for_display(0),
+                    Err(PassthroughUnavailable::SourceCoverage(
+                        SourceCoverageUnavailable::UnknownWithCurrentCrop
+                    ))
+                ));
+                app.export_crop_pages.remove(&0);
+                assert_eq!(
+                    app.fs_thumbnail_resource_for_display(0)
+                        .unwrap()
+                        .display_basis(),
+                    accepted,
+                    "removing crop reuses intrinsic accepted dimensions"
+                );
+            } else {
+                for view in [V::Single, V::Spread] {
+                    assert_eq!(
+                        display_basis.legacy(view),
+                        L::Raster {
+                            layout_size: egui::vec2(60.0, 80.0),
+                            original: crate::page_dims::DisplayOriginalDimensions::new(60, 80)
+                        }
+                    );
+                }
+                assert_eq!(
+                    display_basis.legacy(V::Continuous),
+                    L::SourceLayout {
+                        basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                            layout_size: egui::vec2(60.0, 80.0),
+                            reference_size: egui::vec2(60.0, 80.0),
+                        }
+                    }
+                );
+                assert_eq!(
+                    app.fs_thumbnail_resource_for_display(0)
+                        .unwrap()
+                        .display_basis(),
+                    *display_basis
+                );
+                let normal = ThumbnailState::loaded_raster(
+                    tex.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                    true,
+                    80,
+                    SourceCoverage::FullSource,
+                    None,
+                    None,
+                );
+                let ThumbnailState::Loaded {
+                    display_basis: normal_basis,
+                    ..
+                } = normal
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    normal_basis, *display_basis,
+                    "manual ordinary acceptance shares the legacy policy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_thumbnail_source_dimensions_do_not_become_legacy_missing_dimensions() {
+        use crate::material_display_basis::MaterialBasisUnavailable as U;
+        for source in [(0, 80), (60, 0), (0, 0)] {
+            assert_eq!(
+                ThumbnailState::raster_thumbnail_display_basis(
+                    [60, 80],
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some(source)
+                ),
+                B::unavailable(U::InvalidDimensions)
+            );
+        }
+    }
+}
+
+impl App {
+    pub(crate) fn source_material_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        use crate::source_coverage::SourceCoverage;
+        match self.fs_cache.get(&idx)? {
+            FsCacheEntry::Static {
+                tex,
+                source_dims,
+                pdf_metadata,
+                ..
+            } => {
+                let canonical = source_dims.map(|[w, h]| {
+                    crate::page_dims::CanonicalPageDimensions::new(w as u32, h as u32)
+                });
+                let basis = self.accept_raster_display_basis(
+                    idx,
+                    tex.size(),
+                    canonical,
+                    tex.size(),
+                    *pdf_metadata,
+                    false,
+                );
+                Some(self.fs_resource_for_accepted_texture(
+                    idx,
+                    tex.clone(),
+                    SourceCoverage::FullSource,
+                    basis,
+                ))
+            }
+            FsCacheEntry::RawPreview {
+                preview: Some(preview),
+                developed_dims,
+                ..
+            } => {
+                let canonical = Some(crate::page_dims::CanonicalPageDimensions::new(
+                    developed_dims[0] as u32,
+                    developed_dims[1] as u32,
+                ));
+                let basis = self.accept_raster_display_basis(
+                    idx,
+                    preview.tex.size(),
+                    canonical,
+                    preview.pixels.size,
+                    None,
+                    false,
+                );
+                Some(self.fs_resource_for_accepted_texture(
+                    idx,
+                    preview.tex.clone(),
+                    SourceCoverage::FullSource,
+                    basis,
+                ))
+            }
+            FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            } => {
+                let (texture, _) = frames.get(*current_frame)?;
+                let basis = self.accept_raster_display_basis(
+                    idx,
+                    texture.size(),
+                    None,
+                    texture.size(),
+                    None,
+                    false,
+                );
+                Some(self.fs_direct_resource_for_accepted_texture(
+                    idx,
+                    texture.clone(),
+                    SourceCoverage::FullSource,
+                    basis,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn current_final_composite_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
+        let (_, entry) = self
+            .final_composite_cache
+            .iter()
+            .find(|(key, _)| self.edit_key_describes_current_page(&key.edit_key, idx))?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_comic_composite_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let entry = self.comic_cache.get(&idx)?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_edit_result_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
+        let item = self.item_id(idx);
+        let (_, entry) = self.edit_result_cache.iter().find(|(key, _)| {
+            key.idx == idx && key.items_generation == self.items_generation && key.item_id == item
+        })?;
+        let texture = entry.texture.as_ref()?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_local_adjust_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let entry = self
+            .local_adjust_cache
+            .get(&self.current_local_adjust_key(idx))?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_local_adjust_layer_bypass_material(
+        &self,
+        idx: usize,
+        layer_idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let entry = self
+            .local_adjust_layer_bypass_cache
+            .get(&self.current_local_adjust_layer_bypass_key(idx, layer_idx))?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_local_adjust_prefix_preview_material(
+        &self,
+        idx: usize,
+        layer_count: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let entry = self
+            .local_adjust_prefix_preview_cache
+            .get(&self.current_local_adjust_prefix_preview_key(idx, layer_count))?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_erase_result_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let entry = self
+            .erase_result_cache
+            .get(&self.current_erase_result_key(idx))?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_erase_preview_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let entry = self.erase_preview_cache.get(&idx)?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn current_conceal_material(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let entry = self
+            .conceal_cache
+            .get(&idx)
+            .filter(|entry| entry.generation == self.conceal_generation)?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+
+    pub(crate) fn ensure_final_composite_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let _ = self.ensure_final_composite_texture_impl(ctx, idx)?;
+        let edit_key = self.current_edit_result_key(idx);
+        let params = self.effective_params(idx);
+        let (_, entry) = self.final_composite_cache.iter().find(|(key, entry)| {
+            **key == self.final_composite_key_for_pixels(edit_key, entry.source_size, params)
+        })?;
+        Some(self.fs_resource_for_accepted_texture(
+            idx,
+            entry.texture.clone(),
+            crate::source_coverage::SourceCoverage::FullSource,
+            entry.display_basis,
+        ))
+    }
+    pub(crate) fn ensure_final_composite_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.ensure_final_composite_material(ctx, idx)
+            .map(|resource| resource.source_texture().clone())
+    }
+    pub(crate) fn ensure_comic_composite_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let _ = self.ensure_comic_composite_texture_impl(ctx, idx)?;
+        self.current_comic_composite_material(idx)
+    }
+    pub(crate) fn ensure_comic_composite_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.ensure_comic_composite_material(ctx, idx)
+            .map(|resource| resource.source_texture().clone())
+    }
+    pub(crate) fn ensure_conceal_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let _ = self.ensure_conceal_texture_impl(ctx, idx)?;
+        self.current_conceal_material(idx)
+    }
+    pub(crate) fn ensure_conceal_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.ensure_conceal_material(ctx, idx)
+            .map(|resource| resource.source_texture().clone())
     }
 }

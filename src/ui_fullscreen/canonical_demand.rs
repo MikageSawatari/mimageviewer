@@ -321,11 +321,15 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<FullscreenPaintResource> {
-        let texture = self.resident_final_prepare_texture(ctx, idx)?;
-        if self.resolve_fs_display_tex(idx, false)?.id() != texture.id() {
+        let resource = self.resident_final_prepare_material(ctx, idx)?;
+        if self
+            .resolve_fs_display_material(idx, false)?
+            .source_texture_id()
+            != resource.source_texture_id()
+        {
             return None;
         }
-        Some(self.fullscreen_paint_resource_for_texture(idx, texture))
+        Some(resource)
     }
 
     fn resident_canonical_trim(
@@ -470,13 +474,19 @@ impl App {
             let fit = if occurrences.len() == 2 {
                 self.fs_spread_fit_input(idx, mode, &resource.clone().into())
             } else {
-                self.fs_fit_input_for_resource(idx, mode, resource.source_texture())
+                self.fs_fit_input_for_payload(idx, mode, &resource.clone().into())
             }
             .ok_or(Missing::FitBasis)?;
             let layout = if occurrences.len() == 2 {
-                Some(self.fs_spread_page_layout_size(idx, &resource.clone().into()))
+                self.fs_spread_page_layout_size(idx, &resource.clone().into())
             } else {
-                self.fs_page_layout_source_size(idx)
+                Self::fs_material_layout_size(
+                    &resource.clone().into(),
+                    self.fs_material_view(
+                        idx,
+                        crate::material_display_basis::MaterialDisplayView::Single,
+                    ),
+                )
             };
             resources.push(resource);
             inputs.push((rotation, fit));
@@ -562,11 +572,11 @@ impl App {
                 pixels_per_point: view.pixels_per_point,
                 placement,
             };
-            let layout = self
-                .fs_page_layout_uses_source_id(next, resource.source_texture_id())
-                .then_some(layouts[0])
-                .flatten();
-            let transform = resolve_fs_image_transform(input, layout).ok_or(Missing::Geometry)?;
+            // The selected material already owns the Single projection for
+            // ordinary rasters, partial previews, RAW and PDF. Do not infer a
+            // second layout policy from its texture ID or current cache owners.
+            let transform =
+                resolve_fs_image_transform(input, layouts[0]).ok_or(Missing::Geometry)?;
             (
                 vec![transform],
                 single_clip_rect(view.base_clip, media, None, 0.0, content[0], mode, limits),
@@ -677,7 +687,7 @@ impl App {
                     source_generation: resource.source_generation().ok_or(Missing::Material)?,
                     transform,
                     clip_rect: clip,
-                    visible_region: transform.visible_region_request(clip),
+                    visible_region: resource.visible_region_request(&transform, clip),
                     post_filter: self.fullscreen_paint_post_filter(resource),
                     smoothing_percent: self.settings.downscale_smoothing_percent,
                     anime_source_limit: self.settings.anime_upscale_source_limit,

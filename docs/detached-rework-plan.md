@@ -1455,6 +1455,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-22 §1.165 selectorから受理素材の表示基準を保持する
+
+- 設計担当と独立レビュー担当の合意に従い、通常thumbnailの選択から保持・再描画まで、
+  handleと不変の `MaterialDisplayBasis` を一体で運ぶ。producer選択はResource、
+  保持presentation選択はPayloadとして分け、保持素材からhandleだけを取り出して再構成しない。
+- passive単ページ／見開き／連結snapshot captureと既存holdover、ViewerContextBundleの
+  消しゴム下地保持へdescriptorを通す。capture時のfit設定snapshotは既存責務のまま残し、
+  素材の基準をlive idx・texture IDから再探索しない。context間で共有するtextureでも
+  素材属性は各ownerの値を保持する。
+- legacy source-layoutのlayout単位と受理raster参照寸法もfit descriptorへ値で捕捉する。
+  passive replayでlive source寸法へ戻さず、PDF page-boxと物理pixelの区別を維持する。
+- これは素材と由来の保持を完成させる構造修正であり、detached述語、viewport生成・登録、
+  lifecycle、focus、host/runtimeの所有・切替条件は変更しない。同期I/O、待機、retry、
+  再同期mapや追加repaintを導入しない。全方式の倍率契約の統一も行わない。
+
 ### 2026-10-22 §1.165 100%表示基準の分離
 
 - 正準座標寸法と100%表示寸法を別型にし、既存fit descriptorに後者を保持する。

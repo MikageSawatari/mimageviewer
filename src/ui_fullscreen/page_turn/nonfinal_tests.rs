@@ -84,15 +84,15 @@ fn install_resident_thumbnail(
         egui::ColorImage::filled([8, 12], egui::Color32::from_rgb(180, 100, 40)),
         egui::TextureOptions::LINEAR,
     );
-    app.thumbnails[idx] = ThumbnailState::Loaded {
-        tex: texture.clone(),
-        origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-        from_edit_preview: false,
-        rendered_at_px: 12,
-        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-        source_dims: Some((80, 120)),
-        layout_dims: None,
-    };
+    app.thumbnails[idx] = ThumbnailState::loaded_raster(
+        texture.clone(),
+        crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+        false,
+        12,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((80, 120)),
+        None,
+    );
     texture
 }
 
@@ -340,6 +340,7 @@ fn publish_larger_raster_and_final_for_idx(
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([160, 240]),
@@ -895,9 +896,8 @@ fn held_thumbnail_yields_to_original_preview_and_ineligible_editor_views() {
         accepted.id()
     );
 
-    let preview = app.resolve_fs_processed_texture(&ctx, 1, true).unwrap();
-    assert_eq!(preview.id(), original.id());
-    let preview_resource = app.fullscreen_paint_resource_for_texture(1, preview);
+    let preview_resource = app.resolve_fs_processed_material(&ctx, 1, true).unwrap();
+    assert_eq!(preview_resource.source_texture_id(), original.id());
     assert_eq!(preview_resource.source_texture_id(), original.id());
     assert!(preview_resource.source_generation().is_some());
     let mut preview_page = match &app.page_turn_presentation.state {

@@ -1854,7 +1854,10 @@ impl App {
 
     /// Resident-only counterpart of ordinary processed + fallback selection.
     /// Incomplete final output is displayable; this never invokes a producer.
-    fn page_turn_resident_source(&self, idx: usize) -> Option<(egui::TextureHandle, &'static str)> {
+    fn page_turn_resident_source(
+        &self,
+        idx: usize,
+    ) -> Option<(FullscreenPaintResource, &'static str)> {
         #[cfg(test)]
         crate::app::final_prepare_tests::observe_lookup(self);
         let edit_key = self.current_edit_result_key(idx);
@@ -1872,7 +1875,7 @@ impl App {
             })
             .map(|(_, entry)| entry);
         let selected = if self.raw_development_blocked(idx) {
-            self.resolve_original_preview_tex(idx)
+            self.resolve_original_preview_material(idx)
                 .map(|t| (t, "preview"))
         } else if let Some(entry) = final_entry {
             let comic = self.comic_cache.get(&idx).filter(|comic| {
@@ -1882,10 +1885,23 @@ impl App {
                     && Arc::ptr_eq(&comic.base, &entry.pixels)
             });
             if let Some(comic) = comic {
-                Some((comic.texture.clone(), "comic"))
+                Some((
+                    self.fs_resource_for_accepted_texture(
+                        idx,
+                        comic.texture.clone(),
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        comic.display_basis,
+                    ),
+                    "comic",
+                ))
             } else {
                 Some((
-                    entry.texture.clone(),
+                    self.fs_resource_for_accepted_texture(
+                        idx,
+                        entry.texture.clone(),
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        entry.display_basis,
+                    ),
                     if entry.complete {
                         "final"
                     } else {
@@ -1896,10 +1912,10 @@ impl App {
         } else if self.colorize_display_requires_final_effect(idx) {
             // Ordinary waiting display also uses a faithful catalog rendition.
             // Never create the rendition at acceptance.
-            self.cached_passthrough_rendition(idx)
+            self.cached_passthrough_material(idx)
                 .map(|t| (t, "faithful_preview"))
         } else {
-            self.resolve_original_preview_tex(idx)
+            self.resolve_original_preview_material(idx)
                 .map(|t| {
                     let quality = if matches!(
                         self.fs_cache.get(&idx),
@@ -1912,18 +1928,19 @@ impl App {
                     (t, quality)
                 })
                 .or_else(|| {
-                    self.fs_thumbnail_texture_for_display(idx)
+                    self.fs_thumbnail_resource_for_display(idx)
+                        .ok()
                         .map(|t| (t, "thumbnail"))
                 })
         }?;
-        self.display_texture_matches_page(&selected.0, idx)
+        self.display_texture_matches_page(selected.0.source_texture(), idx)
             .then_some(selected)
     }
 
     #[cfg(test)]
     fn page_turn_normal_ready_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
         self.page_turn_resident_source(idx)
-            .map(|(texture, _)| texture)
+            .map(|(resource, _)| resource.source_texture().clone())
     }
 
     /// The immutable accepted source owns the turn until its canonical flat is
@@ -2198,13 +2215,18 @@ impl App {
             emit(&fact, "skip", reason, &[]);
             return;
         }
+        let material_view = if occurrences.len() == 2 {
+            crate::material_display_basis::MaterialDisplayView::Spread
+        } else {
+            crate::material_display_basis::MaterialDisplayView::Single
+        };
         let mut ready_sources = Vec::with_capacity(occurrences.len());
         for occurrence in occurrences {
             if !self.page_turn_view_eligible(occurrence.idx) {
                 emit(&fact, "skip", "ineligible_companion", &[]);
                 return;
             }
-            let Some((texture, quality)) = self.page_turn_resident_source(occurrence.idx) else {
+            let Some((resource, quality)) = self.page_turn_resident_source(occurrence.idx) else {
                 emit(
                     &fact,
                     "skip",
@@ -2227,9 +2249,29 @@ impl App {
             let source_mipmapped = ctx
                 .tex_manager()
                 .read()
-                .meta(texture.id())
+                .meta(resource.source_texture_id())
                 .is_some_and(|meta| meta.options.mipmap_mode.is_some());
-            let resource = self.fullscreen_paint_payload_for_texture(occurrence.idx, texture);
+            let resource = self.fullscreen_paint_payload_for_resource(occurrence.idx, resource);
+            // A held source must be drawable under the current fit policy. In
+            // particular, legacy thumbnails may have a usable sampler but lack
+            // the source/PDF metadata required by Specified Scale. Reject before
+            // pinning so later producer metadata can become the ordinary source.
+            if let Err(reason) = self.fs_material_fit_input(
+                self.effective_fullscreen_fit_mode(),
+                &resource,
+                material_view,
+            ) {
+                emit(
+                    &fact,
+                    "skip",
+                    "fit_basis_unavailable",
+                    &[
+                        ("idx", occurrence.idx.into()),
+                        ("basis_unavailable", format!("{reason:?}").into()),
+                    ],
+                );
+                return;
+            }
             ready_sources.push(AcceptedSource {
                 occurrence,
                 resource,
@@ -4620,6 +4662,7 @@ mod tests {
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(image),
                 source_dims: Some([4, 4]),
@@ -4653,6 +4696,295 @@ mod tests {
     }
 
     #[test]
+    fn resident_source_keeps_selected_producer_basis_when_thumbnail_and_final_share_an_allocation()
+    {
+        use crate::material_display_basis::MaterialDisplayBasis;
+        use crate::source_coverage::SourceCoverage;
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "C:/material/alias.png",
+        ))];
+        let pixels = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+        let texture = ctx.load_texture(
+            "resident-shared",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails = vec![ThumbnailState::loaded_raster(
+            texture.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            12,
+            SourceCoverage::FullSource,
+            Some((6000, 9000)),
+            None,
+        )];
+        let thumbnail_basis = app
+            .fs_thumbnail_resource_for_display(0)
+            .unwrap()
+            .display_basis();
+        let (thumbnail, quality) = app.page_turn_resident_source(0).unwrap();
+        assert_eq!(quality, "thumbnail");
+        assert_eq!(thumbnail.display_basis(), thumbnail_basis);
+
+        let final_basis =
+            MaterialDisplayBasis::from_sampler(texture.size(), SourceCoverage::FullSource);
+        assert_ne!(
+            final_basis, thumbnail_basis,
+            "logical producers retain their own accepted fit facts"
+        );
+        let key = app.final_composite_key_for_pixels(
+            app.current_edit_result_key(0),
+            pixels.size,
+            app.effective_params(0),
+        );
+        app.final_composite_cache.insert(
+            key,
+            crate::app::FinalCompositeEntry {
+                display_basis: final_basis,
+                canonical_dims: None,
+                source_size: pixels.size,
+                pixels,
+                texture: texture.clone(),
+                texture_options: egui::TextureOptions::LINEAR,
+                complete: true,
+            },
+        );
+        let (selected, quality) = app.page_turn_resident_source(0).unwrap();
+        assert_eq!(quality, "final");
+        assert_eq!(selected.source_texture_id(), thumbnail.source_texture_id());
+        assert_eq!(selected.display_basis(), final_basis);
+        app.final_composite_cache.clear();
+        app.thumbnails[0] = ThumbnailState::Evicted;
+        let payload = app.fullscreen_paint_payload_for_resource(0, selected);
+        assert_eq!(
+            payload.display_basis(),
+            final_basis,
+            "accepted source remains a material through offer payload conversion"
+        );
+        assert_eq!(thumbnail.display_basis(), thumbnail_basis);
+    }
+
+    fn draw_single_with_current_fit(
+        app: &mut App,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+    ) -> SubmittedUnitReceipt {
+        let idx = app.fullscreen_idx.unwrap();
+        let decision = app.fs_page_turn_decision_for_frame(ctx, idx);
+        let composition = app.spread_display_composition_for_anchor(idx);
+        let pages = composition.pages_in_screen_order(app.spread_mode);
+        assert_eq!(pages.len(), 1);
+        let selected = app.resolve_fs_processed_material(ctx, idx, false);
+        let payload = app.fullscreen_paint_payload_for_page(idx, selected, false);
+        let thumbnail = app.fs_thumbnail_resource_for_display(idx).ok();
+        let mut sources = FsNavigatorTextureSources::default();
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Single);
+        let transform = app
+            .draw_fs_image_with_receipt(
+                ui,
+                ui.max_rect(),
+                idx,
+                app.fs_page_coordinate_source_size(idx),
+                FsPageLayoutSource::CurrentItem,
+                None,
+                None,
+                composition.singleton_placement(),
+                payload.as_ref(),
+                thumbnail.as_ref(),
+                false,
+                false,
+                false,
+                crate::rotation_db::Rotation::None,
+                None,
+                0.0,
+                &FsBgStyle::Solid(egui::Color32::WHITE),
+                "",
+                false,
+                app.effective_fullscreen_fit_mode(),
+                app.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+                None,
+                Some(&mut sources),
+                true,
+            )
+            .expect("accepted fit metadata permits ordinary drawing");
+        app.fullscreen_page_layout
+            .push_occurrence(transform, pages[0]);
+        assert!(sources.rebind_occurrences(&pages));
+        let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+            panic!("ordinary draw must submit its page-turn receipt");
+        };
+        let receipt = receipt.clone();
+        app.emit_fs_page_turn_ready_for_display_unit(ctx, &composition, decision, &sources);
+        receipt
+    }
+
+    fn specified_missing_basis_does_not_pin_then_recovers(pdf: bool) {
+        use crate::material_display_basis::MaterialBasisUnavailable;
+        use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        // ready_app seeds samplers with its synthetic items generation. Exercise
+        // the worker receipt protocol under an actual synchronized generation.
+        let resident_sources: Vec<_> = (0..app.items.len())
+            .map(|idx| (idx, app.fs_cache.remove(&idx).unwrap()))
+            .collect();
+        app.bump_items_generation();
+        for (idx, entry) in resident_sources {
+            app.fs_cache.insert(idx, entry);
+            app.record_page_dims_for_spread(idx, (80, 120));
+        }
+        app.settings.page_turn_animation_enabled = true;
+        app.settings.page_turn_animation_duration_ms = 200;
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        app.settings.fullscreen_specified_scale = crate::settings::FullscreenSpecifiedScale {
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(1000),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                crate::settings::SpecifiedScaleAxis::LogicalPixels(100),
+            ),
+        };
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        let item_count = app.items.len();
+        app.image_metas.resize(item_count, None);
+        app.details_order = app.visible_indices.clone();
+        let full_source = app.fs_cache.remove(&1).unwrap();
+        if pdf {
+            app.items[1] = GridItem::PdfPage {
+                pdf_path: app.tmp.path().join("missing-fit-metadata.pdf"),
+                page_num: 0,
+                content_type: None,
+            };
+        }
+        app.keep_range = (0, app.items.len());
+        app.keep_set.insert(1);
+        app.requested.insert(1, false);
+        // Exercise real thumbnail acceptance: a legacy catalog row lacks source
+        // dimensions; the initial PDF thumbnail has a page box but no content type.
+        let initial = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            1,
+            Some(egui::ColorImage::filled([8, 12], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            None,
+            pdf.then_some((80, 120)),
+            pdf.then_some((80_000, 120_000)),
+            false,
+            false,
+            0,
+            app.items_generation,
+        );
+        app.poll_thumbnail_result_for_test(&ctx, initial);
+        let initial = app.fs_thumbnail_resource_for_display(1).unwrap();
+        let unavailable = if pdf {
+            MaterialBasisUnavailable::PdfMetadataUnavailable
+        } else {
+            MaterialBasisUnavailable::SourceDimensionsUnknown
+        };
+        assert_eq!(initial.display_basis().specified(), Err(unavailable));
+        let mut outgoing = None;
+        frame(&ctx, |ui, ctx| {
+            outgoing = Some(draw_single_with_current_fit(&mut app, ui, ctx));
+        });
+        assert!(outgoing.unwrap().was_accepted());
+        assert!(app.page_turn_current_unit_presented());
+        take_test_events();
+        let leases_before = app.page_turn_leases.sources.len();
+        let reserved_before = app.page_turn_leases.reserved_bytes();
+        frame(&ctx, |_, ctx| {
+            let operation = ViewerOperationId::Pad {
+                batch: next_operation_batch(),
+                ordinal: 0,
+            };
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 1, true, Some(operation));
+        });
+        assert!(matches!(
+            app.page_turn_presentation.state,
+            PresentationState::Flat(_)
+        ));
+        assert!(app.page_turn_held_resource(1).is_none());
+        assert_eq!(app.page_turn_leases.sources.len(), leases_before);
+        assert_eq!(app.page_turn_leases.reserved_bytes(), reserved_before);
+        let events = take_test_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, kind, reason)| *kind == "skip" && *reason == "fit_basis_unavailable")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|(_, kind, _)| *kind == "offered"));
+
+        app.fullscreen_idx = Some(1);
+        if pdf {
+            // The actual fullscreen worker result republishes the thumbnail's
+            // descriptor. The old immutable material must remain unchanged.
+            let generation = app.items_generation;
+            assert!(app.fs_upload_backlog.push_for_generation(
+                generation,
+                crate::app::FsUploadResult::new(
+                    1,
+                    crate::fs_animation::FsLoadResult::StaticPdf {
+                        ci: egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+                        source_dims: [80, 120],
+                        page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                            width: 80.0,
+                            height: 120.0,
+                        },
+                        content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                    },
+                    1,
+                    crate::app::FsLoadPurpose::for_page(true),
+                ),
+            ));
+            app.poll_prefetch(&ctx, crate::app::PollPrefetchOrigin::TopLevel);
+            let adopted = app.fs_thumbnail_resource_for_display(1).unwrap();
+            assert_eq!(adopted.source_texture_id(), initial.source_texture_id());
+            assert!(adopted.display_basis().specified().is_ok());
+        } else {
+            app.fs_cache.insert(1, full_source);
+        }
+        assert_eq!(initial.display_basis().specified(), Err(unavailable));
+        let mut recovered = None;
+        frame(&ctx, |ui, ctx| {
+            recovered = Some(draw_single_with_current_fit(&mut app, ui, ctx));
+        });
+        let recovered = recovered.unwrap();
+        assert!(recovered.was_accepted());
+        assert!(!recovered.curl);
+        assert!(app.page_turn_current_unit_presented());
+        assert!(app.page_turn_held_resource(1).is_none());
+        frame(&ctx, |_, ctx| {
+            let operation = ViewerOperationId::Pad {
+                batch: next_operation_batch(),
+                ordinal: 0,
+            };
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 2, true, Some(operation));
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Offered { .. }
+            ));
+            assert!(app.page_turn_held_resource(2).is_some());
+        });
+    }
+
+    #[test]
+    fn specified_source_dimensions_missing_skips_pin_and_new_source_restores_canonical_ready() {
+        specified_missing_basis_does_not_pin_then_recovers(false);
+    }
+
+    #[test]
+    fn specified_pdf_metadata_missing_skips_pin_and_adoption_restores_canonical_ready() {
+        specified_missing_basis_does_not_pin_then_recovers(true);
+    }
+
+    #[test]
     fn source_texture_sharing_native_roi_keeps_only_output_after_all_source_owners_drop() {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
@@ -4660,9 +4992,8 @@ mod tests {
             "C:/shared/native.png",
         ))];
         let id = crate::app::source_texture_test_support::seed(&mut app, &ctx, 0);
-        let final_texture = app.ensure_final_composite_texture(&ctx, 0).unwrap();
-        assert_eq!(final_texture.id(), id);
-        let input = app.fullscreen_paint_resource_for_texture(0, final_texture);
+        let input = app.ensure_final_composite_material(&ctx, 0).unwrap();
+        assert_eq!(input.source_texture_id(), id);
         let native = crate::gpu_lanczos::test_native_resource_with_region(
             input,
             [2, 3],

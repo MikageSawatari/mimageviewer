@@ -1871,7 +1871,7 @@ pub(in crate::app) struct ViewerContextBundle {
     adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
     erase_preview_cache: std::collections::HashMap<usize, ErasePreviewCacheEntry>,
-    erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    erase_base_cache: std::collections::HashMap<usize, super::EraseBaseSource>,
     conceal_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
     comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
@@ -7395,19 +7395,19 @@ mod tests {
                 GridItem::Image(PathBuf::from(format!("{prefix}/failed.jpg"))),
                 GridItem::Video(PathBuf::from(format!("{prefix}/loaded.mp4"))),
             ];
-            let pixels = ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            let pixels = ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     prefix,
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                rendered_at_px: 1,
-                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-                source_dims: Some((13, 17)),
-                layout_dims: None,
-            };
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                1,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((13, 17)),
+                None,
+            );
             owner.thumbnails = vec![
                 ThumbnailState::NoArt,
                 ThumbnailState::Failed,

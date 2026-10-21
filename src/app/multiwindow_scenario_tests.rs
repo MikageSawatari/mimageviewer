@@ -737,6 +737,7 @@ fn configure_active_still_pages(
     app.fs_cache.insert(
         page,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: texture,
             pixels: Arc::new(pixels),
             source_dims: Some([600, 900]),

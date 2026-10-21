@@ -27,21 +27,21 @@ fn setup_thumbnail_app(count: usize) -> AppTestEnvForTest {
 }
 
 fn loaded_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
-    ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    ThumbnailState::loaded_raster(
+        ctx.load_texture(
             name,
             egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
             evaluated_display_px: 2,
         },
-        from_edit_preview: false,
-        rendered_at_px: 2,
-        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-        source_dims: Some((2, 2)),
-        layout_dims: None,
-    }
+        false,
+        2,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((2, 2)),
+        None,
+    )
 }
 
 fn cached_all_items_are_images(app: &mut App) -> bool {

@@ -58,6 +58,7 @@ fn install_original(app: &mut App, ctx: &egui::Context, idx: usize) {
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex,
             pixels,
             source_dims: Some([600, 800]),
@@ -94,23 +95,23 @@ fn cropped_spread_draw_entry_keeps_layout_in_both_arrival_orders_and_all_fits() 
                 .map(|idx| {
                     let cropped = idx == crop_idx;
                     let size = if cropped { [33, 100] } else { [100, 133] };
-                    ThumbnailState::Loaded {
-                        tex: ctx.load_texture(
+                    ThumbnailState::loaded_raster(
+                        ctx.load_texture(
                             format!("thumbnail-{idx}"),
                             egui::ColorImage::filled(size, egui::Color32::WHITE),
                             egui::TextureOptions::LINEAR,
                         ),
-                        origin: crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { epoch: 0 },
-                        from_edit_preview: cropped,
-                        source_coverage: if cropped {
+                        crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { epoch: 0 },
+                        cropped,
+                        133,
+                        if cropped {
                             coverage
                         } else {
                             SourceCoverage::FullSource
                         },
-                        rendered_at_px: 133,
-                        source_dims: Some(if cropped { (200, 600) } else { (600, 800) }),
-                        layout_dims: None,
-                    }
+                        Some(if cropped { (200, 600) } else { (600, 800) }),
+                        None,
+                    )
                 })
                 .collect();
             for idx in 0..2 {

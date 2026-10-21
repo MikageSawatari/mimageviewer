@@ -4560,6 +4560,7 @@ mod tests {
             app.fs_cache.insert(
                 0,
                 crate::fs_animation::FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex,
                     pixels: image,
                     source_dims: Some([12000, 8000]),

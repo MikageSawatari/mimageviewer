@@ -102,11 +102,11 @@ fn prepared_output_bytes(size: [usize; 2], filter: crate::adjustment::PostFilter
 impl App {
     /// Exact resident inputs only: no ensure, DB hydration, materialization or upload.
     /// Native prewarm must target the handle ordinary preparation can really adopt.
-    pub(crate) fn resident_final_prepare_texture(
+    pub(crate) fn resident_final_prepare_material(
         &self,
         ctx: &egui::Context,
         idx: usize,
-    ) -> Option<egui::TextureHandle> {
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if self.fs_entry_is_animated(idx) {
             return None;
         }
@@ -126,9 +126,21 @@ impl App {
                     && comic.dims == final_entry.pixels.size
                     && comic.preview_scale == preview_scale
                     && self.display_texture_matches_page(&comic.texture, idx))
-                .then(|| comic.texture.clone());
+                .then(|| {
+                    self.fs_resource_for_accepted_texture(
+                        idx,
+                        comic.texture.clone(),
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        comic.display_basis,
+                    )
+                });
             }
-            return Some(final_entry.texture.clone());
+            return Some(self.fs_resource_for_accepted_texture(
+                idx,
+                final_entry.texture.clone(),
+                crate::source_coverage::SourceCoverage::FullSource,
+                final_entry.display_basis,
+            ));
         }
         if self.comic_pages.contains(&idx) || self.comic_demo_enabled {
             return None;
@@ -149,12 +161,30 @@ impl App {
         {
             return None;
         }
-        self.edit_result_cache
-            .get(&edit_key)
-            .and_then(|entry| entry.texture.as_ref())
-            .filter(|texture| self.display_texture_matches_page(texture, idx))
-            .cloned()
-            .or_else(|| self.shared_source_texture_for_edit(ctx, &edit_key, &pixels))
+        if let Some(entry) = self.edit_result_cache.get(&edit_key)
+            && let Some(texture) = entry.texture.as_ref()
+            && self.display_texture_matches_page(texture, idx)
+        {
+            return Some(self.fs_resource_for_accepted_texture(
+                idx,
+                texture.clone(),
+                crate::source_coverage::SourceCoverage::FullSource,
+                entry.display_basis,
+            ));
+        }
+        // The shared-allocation eligibility is established by this producer;
+        // its semantic owner is the accepted edit input, never an ID lookup.
+        let _ = self.shared_source_texture_for_edit(ctx, &edit_key, &pixels)?;
+        self.source_material_for_idx(idx)
+    }
+
+    pub(crate) fn resident_final_prepare_texture(
+        &self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.resident_final_prepare_material(ctx, idx)
+            .map(|resource| resource.source_texture().clone())
     }
 
     fn final_prepare_wake(&self, ctx: &egui::Context) -> FinalPrepareWake {
@@ -868,6 +898,7 @@ impl App {
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        pdf_metadata: self.current_pdf_page_metadata_snapshot(key.edit_key.idx),
                         canonical_dims: self.canonical_source_dimensions(key.edit_key.idx),
                         source_size,
                         cancel,

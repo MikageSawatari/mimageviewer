@@ -17,6 +17,7 @@ use crate::{
     displayed_image_transform::{
         VisibleRegionRequest, physical_pixel_extent, physical_scale_is_near_integer,
     },
+    material_display_basis::MaterialDisplayBasis,
     page_dims::DisplayOriginalDimensions,
     source_coverage::SourceCoverage,
 };
@@ -230,6 +231,7 @@ pub(crate) enum FullscreenPaintResource {
     Direct {
         source: egui::TextureHandle,
         coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -240,6 +242,7 @@ pub(crate) enum FullscreenPaintResource {
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
         coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -252,6 +255,7 @@ pub(crate) enum FullscreenPaintResource {
         smoothing_percent: u32,
         output: Arc<LanczosOutput>,
         coverage: SourceCoverage,
+        display_basis: MaterialDisplayBasis,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -290,6 +294,7 @@ impl FullscreenPaintResource {
             generation: self.source_generation(),
             material,
             coverage: self.source_coverage(),
+            display_basis: self.display_basis(),
             #[cfg(test)]
             test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
@@ -298,9 +303,12 @@ impl FullscreenPaintResource {
     }
 
     pub(crate) fn direct(source: egui::TextureHandle) -> Self {
+        let display_basis =
+            MaterialDisplayBasis::from_sampler(source.size(), SourceCoverage::FullSource);
         Self::Direct {
             source,
             coverage: SourceCoverage::FullSource,
+            display_basis,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
@@ -333,11 +341,14 @@ impl FullscreenPaintResource {
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
     ) -> Self {
+        let display_basis =
+            MaterialDisplayBasis::from_sampler(source.size(), SourceCoverage::FullSource);
         Self::Resampleable {
             source_id,
             source,
             generation,
             coverage: SourceCoverage::FullSource,
+            display_basis,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
@@ -361,11 +372,30 @@ impl FullscreenPaintResource {
         }
     }
 
+    /// Coverage is sampling metadata; changing it never re-resolves accepted fit values.
+    /// Initial partial-material acceptance supplies its basis with `with_display_basis`.
     pub(crate) fn with_source_coverage(mut self, value: SourceCoverage) -> Self {
         match &mut self {
             Self::Direct { coverage, .. }
             | Self::Resampleable { coverage, .. }
             | Self::Lanczos { coverage, .. } => *coverage = value,
+        }
+        self
+    }
+
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        match self {
+            Self::Direct { display_basis, .. }
+            | Self::Resampleable { display_basis, .. }
+            | Self::Lanczos { display_basis, .. } => *display_basis,
+        }
+    }
+
+    pub(crate) fn with_display_basis(mut self, value: MaterialDisplayBasis) -> Self {
+        match &mut self {
+            Self::Direct { display_basis, .. }
+            | Self::Resampleable { display_basis, .. }
+            | Self::Lanczos { display_basis, .. } => *display_basis = value,
         }
         self
     }
@@ -644,7 +674,8 @@ impl FullscreenPaintResource {
             } => {
                 let original =
                     Self::resampleable_for_source(*source_id, source.clone(), *generation)
-                        .with_source_coverage(self.source_coverage());
+                        .with_source_coverage(self.source_coverage())
+                        .with_display_basis(self.display_basis());
                 #[cfg(test)]
                 let original = if let Some(proof) = self.test_paint_provenance().cloned() {
                     original.with_test_paint_provenance(proof)
@@ -670,6 +701,7 @@ impl FullscreenPaintResource {
             smoothing_percent,
             output,
             coverage: self.source_coverage(),
+            display_basis: self.display_basis(),
             #[cfg(test)]
             test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
@@ -750,6 +782,7 @@ pub(crate) struct FullscreenPresentationResource {
     generation: Option<FullscreenPaintSourceGeneration>,
     material: PresentationMaterial,
     coverage: SourceCoverage,
+    display_basis: MaterialDisplayBasis,
     #[cfg(test)]
     test_paint_provenance: Option<TestPaintProvenance>,
     #[cfg(all(windows, feature = "test-script"))]
@@ -767,6 +800,10 @@ enum PresentationMaterial {
 }
 
 impl FullscreenPresentationResource {
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        self.display_basis
+    }
+
     pub(crate) fn source_coverage(&self) -> SourceCoverage {
         self.coverage
     }
@@ -1008,6 +1045,13 @@ impl From<FullscreenPaintResource> for FullscreenPaintPayload {
 }
 
 impl FullscreenPaintPayload {
+    pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
+        match self {
+            Self::NormalResource(resource) => resource.display_basis(),
+            Self::PresentationMaterial(resource) => resource.display_basis(),
+        }
+    }
+
     pub(crate) fn source_coverage(&self) -> SourceCoverage {
         match self {
             Self::NormalResource(resource) => resource.source_coverage(),
@@ -3641,6 +3685,98 @@ mod tests {
             FullscreenPaintScaleBranch::OriginalOneToOne
         );
         assert!(physical_scale_is_near_integer(0.5, 2.0));
+    }
+
+    #[test]
+    fn display_basis_survives_native_capture_payload_and_original_reconstruction() {
+        use crate::{
+            fullscreen_specified_scale::FullscreenFitBasis,
+            material_display_basis::{MaterialDisplayView, MaterialLegacyBasis},
+        };
+
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "display-basis-resource",
+            egui::ColorImage::filled([60, 80], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let partial = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(15000, 20000),
+                (6143, 8192),
+                (1000, 500, 3000, 6000),
+            )
+            .unwrap(),
+        );
+        let whole_basis = MaterialDisplayBasis::new(
+            MaterialLegacyBasis::Raster {
+                layout_size: egui::vec2(60.0, 80.0),
+                original: DisplayOriginalDimensions::new(60, 80),
+            },
+            MaterialLegacyBasis::Raster {
+                layout_size: egui::vec2(6144.0, 8192.0),
+                original: DisplayOriginalDimensions::new(6144, 8192),
+            },
+            MaterialLegacyBasis::SourceLayout {
+                basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                    layout_size: egui::vec2(15000.0, 20000.0),
+                    reference_size: egui::vec2(15000.0, 20000.0),
+                },
+            },
+            Ok(
+                FullscreenFitBasis::new(egui::vec2(6144.0, 8192.0), egui::vec2(6144.0, 8192.0))
+                    .unwrap(),
+            ),
+        );
+        for (coverage, basis) in [
+            (SourceCoverage::FullSource, whole_basis),
+            (
+                partial,
+                MaterialDisplayBasis::from_sampler(texture.size(), partial),
+            ),
+        ] {
+            let direct = FullscreenPaintResource::direct(texture.clone())
+                .with_source_coverage(coverage)
+                .with_display_basis(basis);
+            let original = FullscreenPaintResource::resampleable(
+                2,
+                texture.clone(),
+                FullscreenPaintSourceGeneration { items: 4, input: 7 },
+            )
+            .with_source_coverage(coverage)
+            .with_display_basis(basis);
+            let native = test_native_resource(original.clone(), [30, 40]);
+            for resource in [
+                direct,
+                original,
+                native.clone(),
+                native.original_resampleable(),
+            ] {
+                assert_eq!(resource.display_basis(), basis);
+                let payload = FullscreenPaintPayload::NormalResource(resource.clone());
+                assert_eq!(payload.display_basis(), basis);
+                let captured = payload.capture_presentation(&ctx);
+                assert_eq!(captured.display_basis(), basis);
+                let held = FullscreenPaintPayload::PresentationMaterial(captured);
+                assert_eq!(held.display_basis(), basis);
+                assert_eq!(held.capture_presentation(&ctx).display_basis(), basis);
+                for view in [
+                    MaterialDisplayView::Single,
+                    MaterialDisplayView::Spread,
+                    MaterialDisplayView::Continuous,
+                ] {
+                    assert_eq!(held.display_basis().legacy(view), basis.legacy(view));
+                }
+                assert_eq!(held.display_basis().specified(), basis.specified());
+                assert_eq!(
+                    resource
+                        .with_source_coverage(SourceCoverage::Unknown)
+                        .display_basis(),
+                    basis,
+                    "coverage changes must never reinterpret an accepted fit descriptor"
+                );
+            }
+        }
     }
 
     #[test]

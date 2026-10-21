@@ -122,6 +122,7 @@ fn measured_book(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels: Arc::new(image),
                 source_dims: Some([900, 1300]),
@@ -296,10 +297,9 @@ fn page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_bac
             let source_limit = app.settings.anime_upscale_source_limit;
             // Presentation has no source handle. Re-prepare only from the
             // ordinary resident owner, exactly as a new view request would.
-            let texture = app
-                .resolve_fs_processed_texture(ctx, page.occurrence.idx, false)
+            let normal = app
+                .resolve_fs_processed_material(ctx, page.occurrence.idx, false)
                 .unwrap();
-            let normal = app.fullscreen_paint_resource_for_texture(page.occurrence.idx, texture);
             let (resource, _) = app.fs_lanczos_cache.resolve(
                 Some(&gpu),
                 &normal,

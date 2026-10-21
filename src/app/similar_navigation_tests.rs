@@ -285,17 +285,17 @@ fn loaded_thumbnail(ctx: &egui::Context, label: &str) -> ThumbnailState {
         egui::ColorImage::filled([2, 3], egui::Color32::WHITE),
         egui::TextureOptions::LINEAR,
     );
-    ThumbnailState::Loaded {
-        tex: texture,
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+    ThumbnailState::loaded_raster(
+        texture,
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
             evaluated_display_px: 64,
         },
-        from_edit_preview: false,
-        rendered_at_px: 64,
-        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-        source_dims: Some((2, 3)),
-        layout_dims: None,
-    }
+        false,
+        64,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((2, 3)),
+        None,
+    )
 }
 
 fn similar_query_hit(
@@ -487,6 +487,7 @@ fn install_embedded_update_scene(app: &mut App, ctx: &egui::Context, pages: &[Pa
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([4, 6]),

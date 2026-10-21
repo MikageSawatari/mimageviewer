@@ -42,6 +42,10 @@ PDF page-box は既知の cache 値を coverage と独立の nullable layout 列
 metadata は nullable `metadata_content_hash` により対応する WebP 生成物へ束縛する。
 worker は cached_path の hash が不一致／束縛なしなら Unknown／layout None として読み、
 旧 writer が新列を残して画像を上書きしても古い由来を採用しない。UI thread に I/O を追加しない。
+thumbnailのworker受理では、source寸法・coverageと共通GPU clamp規則から不変の表示基準を
+確定しLoadedへ保持する。派生workerのpending／結果、CPU下地、通過素材も実入力ownerの
+`MaterialDisplayBasis` を継承する。selectorは素材のまま返し、保持後の退去でidxから寸法を
+引き直さない。現在cropのUnknown利用許可は選択時に判定し、受理値へ固定しない。
 
 snapshot capture・保持・再描画も同じ resource と由来を保持する。mount／park／promote の所有移譲、
 context の要求世代／取消／channel、兄弟 context の cache は既存 owner のままである。

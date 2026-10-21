@@ -48,6 +48,20 @@ impl FullscreenFitBasis {
     }
 }
 
+/// Legacy source-layout aspect and its accepted source-raster magnitude.
+/// PDF page-box units need not be pixels; this is separate from physical O.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LegacySourceLayoutBasis {
+    pub(crate) layout_size: egui::Vec2,
+    pub(crate) reference_size: egui::Vec2,
+}
+
+impl LegacySourceLayoutBasis {
+    pub(crate) fn normalized_size(self) -> egui::Vec2 {
+        self.layout_size / self.layout_size.max_elem() * self.reference_size.max_elem()
+    }
+}
+
 /// A capture carries this whole descriptor; replay never reads live settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FullscreenFitInput {
@@ -57,6 +71,10 @@ pub(crate) enum FullscreenFitInput {
     Raster {
         mode: FullscreenFitMode,
         original: DisplayOriginalDimensions,
+    },
+    SourceLayout {
+        mode: FullscreenFitMode,
+        basis: LegacySourceLayoutBasis,
     },
     /// Single-page Z uses unrestricted Page fit, retaining canonical aspect.
     CanonicalPage {
@@ -130,12 +148,18 @@ impl FullscreenFitInput {
                 mode: FullscreenFitMode::Page,
                 original,
             },
+            Self::SourceLayout { basis, .. } => Self::SourceLayout {
+                mode: FullscreenFitMode::Page,
+                basis,
+            },
         }
     }
 
     pub(crate) const fn mode(self) -> FullscreenFitMode {
         match self {
-            Self::Legacy(mode) | Self::Raster { mode, .. } => mode,
+            Self::Legacy(mode) | Self::Raster { mode, .. } | Self::SourceLayout { mode, .. } => {
+                mode
+            }
             Self::CanonicalPage { .. } => FullscreenFitMode::Page,
             Self::SpecifiedScale { .. } => FullscreenFitMode::SpecifiedScale,
         }
@@ -231,6 +255,28 @@ mod tests {
     use crate::settings::{
         FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS, SpecifiedScaleAxisSetting,
     };
+
+    #[test]
+    fn source_layout_retains_accepted_raster_reference_without_claiming_physical_o() {
+        let basis = LegacySourceLayoutBasis {
+            layout_size: egui::vec2(613125.0, 791875.0),
+            reference_size: egui::vec2(317.0, 409.0),
+        };
+        let fit = FullscreenFitInput::SourceLayout {
+            mode: FullscreenFitMode::Original,
+            basis,
+        };
+        assert_eq!(fit.original_display_dimensions(), None);
+        assert_eq!(fit.mode(), FullscreenFitMode::Original);
+        assert_eq!(basis.normalized_size().max_elem(), 409.0);
+        assert_eq!(
+            fit.for_single_page_z(),
+            FullscreenFitInput::SourceLayout {
+                mode: FullscreenFitMode::Page,
+                basis,
+            },
+        );
+    }
 
     #[test]
     fn raster_fit_keeps_typed_original_basis_through_capture_policy_and_single_page_z() {

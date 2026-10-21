@@ -135,10 +135,10 @@ fn crop_coverage_save_snapshot_keeps_pdf_page_box_separate_from_clamped_raster()
     let key = app.current_edit_result_key(0);
     app.edit_result_cache.insert(
         key,
-        EditResultEntry {
-            pixels: Arc::new(egui::ColorImage::filled([80, 40], egui::Color32::GRAY)),
-            texture: None,
-        },
+        EditResultEntry::raster(
+            Arc::new(egui::ColorImage::filled([80, 40], egui::Color32::GRAY)),
+            None,
+        ),
     );
     let Some(EditPreviewCloseUpdate::Save {
         coordinate_dims,
@@ -180,7 +180,12 @@ fn crop_coverage_poll_keeps_list_ratio_and_full_page_dimensions_after_eviction()
     );
     let resource = app.fs_thumbnail_resource_for_display(0).unwrap();
     assert_eq!(resource.source_coverage(), coverage);
-    assert!(app.fs_page_layout_uses_source_id(0, resource.source_texture().id()));
+    assert!(matches!(
+        resource
+            .display_basis()
+            .legacy(crate::material_display_basis::MaterialDisplayView::Single),
+        crate::material_display_basis::MaterialLegacyBasis::Raster { .. }
+    ));
 
     app.evict_thumbnail_for_reload(0);
     assert_eq!(
@@ -334,10 +339,7 @@ fn crop_coverage_unknown_preview_policy_covers_thumbnail_and_cached_passthrough(
     let rendition = app
         .ensure_passthrough_rendition_inner(&ctx, 0, None, None)
         .unwrap();
-    assert_eq!(
-        app.fs_resource_for_texture(0, rendition).source_coverage(),
-        SourceCoverage::FullSource
-    );
+    assert_eq!(rendition.source_coverage(), SourceCoverage::FullSource);
     assert!(app.cached_passthrough_rendition(0).is_some());
 
     app.export_crop_pages.insert(0);
@@ -374,13 +376,10 @@ fn crop_coverage_passthrough_inherits_base_mapping_and_omits_annotations() {
             .iter()
             .all(|pixel| *pixel == egui::Color32::BLUE)
     );
-    let resource = app.fs_resource_for_texture(0, texture.clone());
+    let resource = texture.clone();
     assert_eq!(resource.source_coverage(), coverage);
     app.evict_thumbnail_for_reload(0);
-    assert_eq!(
-        app.fs_resource_for_texture(0, texture).source_coverage(),
-        coverage
-    );
+    assert_eq!(texture.source_coverage(), coverage);
     assert_eq!(resource.source_coverage(), coverage);
 }
 
@@ -424,9 +423,12 @@ fn crop_coverage_thumbnail_and_rendition_owners_stay_in_their_viewer_context() {
             mounted.page_dims_cache.get(main_generation, 0),
             Some((600, 1800))
         );
-        assert_eq!(
-            mounted.fs_source_coverage_for_texture(0, main_texture.id()),
-            crate::source_coverage::SourceCoverage::FullSource
+        assert_ne!(
+            mounted
+                .fs_thumbnail_resource_for_display(0)
+                .unwrap()
+                .source_texture_id(),
+            main_texture.id()
         );
     });
     assert_eq!(
@@ -434,7 +436,8 @@ fn crop_coverage_thumbnail_and_rendition_owners_stay_in_their_viewer_context() {
         Some((1600, 800))
     );
     assert_eq!(
-        app.fs_resource_for_texture(0, main_texture)
+        app.fs_thumbnail_resource_for_display(0)
+            .unwrap()
             .source_coverage(),
         main_coverage
     );
@@ -521,15 +524,15 @@ fn ninth_source_image_keeps_request(existing: ExistingDisplay) {
     app.thumbnails[8] = match existing {
         ExistingDisplay::Pending => ThumbnailState::Pending,
         ExistingDisplay::Evicted => ThumbnailState::Evicted,
-        ExistingDisplay::Upgrade => ThumbnailState::Loaded {
-            tex: previous_texture.clone(),
-            origin: ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 100,
-            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-            source_dims: Some((10, 20)),
-            layout_dims: None,
-        },
+        ExistingDisplay::Upgrade => ThumbnailState::loaded_raster(
+            previous_texture.clone(),
+            ThumbLoadOrigin::UpgradeableCache,
+            false,
+            100,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((10, 20)),
+            None,
+        ),
     };
     if matches!(existing, ExistingDisplay::Upgrade) {
         app.requested.remove(&8);
@@ -1171,19 +1174,19 @@ fn lifecycle_video_retry_does_not_block_idle_upgrade_or_deadline() {
     app.items[1] = GridItem::Video(PathBuf::from(r"c:\pics\retry.mp4"));
     app.keep_set = HashSet::from([0]);
     app.keep_range = (0, 1);
-    app.thumbnails[0] = ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    app.thumbnails[0] = ThumbnailState::loaded_raster(
+        ctx.load_texture(
             "upgrade-alongside-video",
             egui::ColorImage::filled([100, 50], egui::Color32::GRAY),
             egui::TextureOptions::LINEAR,
         ),
-        origin: ThumbLoadOrigin::UpgradeableCache,
-        from_edit_preview: false,
-        rendered_at_px: 100,
-        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-        source_dims: Some((884, 444)),
-        layout_dims: None,
-    };
+        ThumbLoadOrigin::UpgradeableCache,
+        false,
+        100,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((884, 444)),
+        None,
+    );
     let generation = app.items_generation;
     let video = app
         .requested
@@ -1404,15 +1407,15 @@ fn lifecycle_sibling_mount_hide_restore_and_retire_preserve_owned_resources() {
         mounted.items_generation = main_generation;
         mounted.items = vec![GridItem::Image(PathBuf::from(r"c:\sibling\0.png"))];
         mounted.image_metas = vec![Some((10, 20))];
-        mounted.thumbnails = vec![ThumbnailState::Loaded {
-            tex: sibling_texture.clone(),
-            origin: ThumbLoadOrigin::UpgradeableCache,
-            from_edit_preview: false,
-            rendered_at_px: 2,
-            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-            source_dims: Some((10, 20)),
-            layout_dims: None,
-        }];
+        mounted.thumbnails = vec![ThumbnailState::loaded_raster(
+            sibling_texture.clone(),
+            ThumbLoadOrigin::UpgradeableCache,
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((10, 20)),
+            None,
+        )];
         mounted.keep_set = HashSet::from([0]);
         mounted.keep_range = (0, 1);
         mounted.keep_start_shared.store(0, Ordering::Relaxed);
@@ -1749,19 +1752,19 @@ fn lifecycle_one_hide_then_unchanged_hidden_demand_converges_without_duplicate_w
         let ctx = egui::Context::default();
         app.main_hwnd = None;
         for idx in [0, 2, 4] {
-            app.thumbnails[idx] = ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails[idx] = ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     format!("old-upgrade-{idx}"),
                     egui::ColorImage::filled([2, 2], egui::Color32::GRAY),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                rendered_at_px: 2,
-                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-                source_dims: Some((10, 20)),
-                layout_dims: None,
-            };
+                ThumbLoadOrigin::UpgradeableCache,
+                false,
+                2,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((10, 20)),
+                None,
+            );
             app.requested.remove(&idx);
             let generation = app.items_generation;
             app.requested

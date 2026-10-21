@@ -52,7 +52,7 @@ fn draw(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitR
     );
     let composition = app.spread_display_composition_for_anchor(idx);
     let screen = composition.pages_in_screen_order(app.spread_mode);
-    let texture = app.resolve_fs_processed_texture(ctx, idx, false);
+    let texture = app.resolve_fs_processed_material(ctx, idx, false);
     let resource = app.fullscreen_paint_payload_for_page(idx, texture, false);
     if idx == 1 && app.page_turn_presentation_pending() {
         assert!(
@@ -60,7 +60,7 @@ fn draw(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitR
             "the accepted partial source must be a primary held resource, not a decode-wait thumbnail fallback"
         );
     }
-    let thumbnail = app.fs_thumbnail_texture_for_display(idx);
+    let thumbnail = app.fs_thumbnail_resource_for_display(idx).ok();
     let content_bbox = app.view_trim_single_content_bbox(idx);
     let mut sources = FsNavigatorTextureSources::default();
     app.fullscreen_page_layout
@@ -178,15 +178,15 @@ fn run_coverage_lifecycle(empty: bool) {
             (*pixels).clone(),
             egui::TextureOptions::LINEAR,
         );
-        app.thumbnails[idx] = ThumbnailState::Loaded {
+        app.thumbnails[idx] = ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: true,
-            rendered_at_px: 50,
-            source_coverage: coverage,
-            source_dims: Some((crop_width, 100)),
-            layout_dims: None,
-        };
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            true,
+            50,
+            coverage,
+            Some((crop_width, 100)),
+            None,
+        );
         app.thumb_pixels.insert(idx, pixels);
         app.export_crop_pages.insert(idx);
     }

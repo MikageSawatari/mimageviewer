@@ -869,6 +869,7 @@ fn separated_hidden_candidates_stay_excluded_during_the_same_viewport_episode() 
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([10, 10]),
@@ -1087,6 +1088,9 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                 let mut texture_ids = Vec::new();
                 let mut cached_rasters = Vec::new();
                 for idx in 0..4 {
+                    if let GridItem::PdfPage { content_type, .. } = &mut app.items[idx] {
+                        *content_type = Some(crate::pdf_loader::PdfPageContentType::Vector);
+                    }
                     let pixels = Arc::new(egui::ColorImage::filled(
                         [40, 60],
                         if idx == 0 {
@@ -1105,6 +1109,10 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.fs_cache.insert(
                         idx,
                         FsCacheEntry::Static {
+                            pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
+                                layout_dims: (40_000, 60_000),
+                                content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                            }),
                             tex,
                             pixels,
                             source_dims: Some([40, 60]),
@@ -1115,6 +1123,24 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.record_page_layout_dims_for_spread(idx, (40_000, 60_000));
                     app.rotation_cache
                         .insert(idx, crate::rotation_db::Rotation::None);
+                }
+                // The cached PDF producer owns its page box independently of
+                // the shared layout cache. Original continuous layout must use
+                // that accepted page box, with the raster as its fit reference.
+                for idx in 0..4 {
+                    assert_eq!(
+                        app.source_material_for_idx(idx)
+                            .unwrap()
+                            .display_basis()
+                            .legacy(crate::material_display_basis::MaterialDisplayView::Continuous),
+                        crate::material_display_basis::MaterialLegacyBasis::SourceLayout {
+                            basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                                layout_size: egui::vec2(40_000.0, 60_000.0),
+                                reference_size: egui::vec2(40.0, 60.0),
+                            },
+                        },
+                        "{case}: cached PDF {idx} retains its accepted layout and raster reference",
+                    );
                 }
                 let old = app.book_target_presentation_demand(0);
                 assert_eq!(old[0].slot, PresentationSlot::Center);
@@ -1255,6 +1281,10 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     app.fs_cache.insert(
                         1,
                         FsCacheEntry::Static {
+                            pdf_metadata: Some(crate::app::PdfPageMetadataSnapshot {
+                                layout_dims: (40_000, 60_000),
+                                content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                            }),
                             tex,
                             pixels,
                             source_dims: Some([40, 60]),
@@ -1410,7 +1440,20 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                     .fullscreen_page_layout
                     .displayed_pages()
                     .collect::<Vec<_>>();
-                assert_eq!(displayed.len(), if hidden_companion { 1 } else { 2 });
+                assert_eq!(
+                    displayed.len(),
+                    if hidden_companion { 1 } else { 2 },
+                    "{case}: terminal displayed={:?}, admission={:?}",
+                    displayed
+                        .iter()
+                        .map(|page| (
+                            page.page_idx(),
+                            page.occurrence(),
+                            page.transform.layout_full_image_rect,
+                        ))
+                        .collect::<Vec<_>>(),
+                    app.spread_display_units_cache.continuous_admission,
+                );
                 assert!(displayed.iter().all(|page| page.page_idx() < 2));
                 app.install_hidden_presentation_for_test(&next);
                 let (painted, records) = paint_composition_surface(&mut app, &ctx, rect);
@@ -1484,6 +1527,7 @@ fn same_generation_reader_order_change_retires_hidden_position_ranges() {
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([10, 10]),
@@ -1569,17 +1613,17 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
             app.rotation_cache
                 .insert(idx, crate::rotation_db::Rotation::None);
             if cache == "thumbnail" {
-                app.thumbnails[idx] = ThumbnailState::Loaded {
+                app.thumbnails[idx] = ThumbnailState::loaded_raster(
                     tex,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                         evaluated_display_px: 60,
                     },
-                    from_edit_preview: false,
-                    rendered_at_px: 60,
-                    source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-                    source_dims: Some((40, 60)),
-                    layout_dims: None,
-                };
+                    false,
+                    60,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((40, 60)),
+                    None,
+                );
                 app.thumb_pixels.insert(idx, pixels);
                 app.fs_cache.insert(
                     idx,
@@ -1593,6 +1637,7 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_metadata: None,
                         tex,
                         pixels,
                         source_dims: Some([40, 60]),
@@ -1762,6 +1807,7 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([400, 600]),

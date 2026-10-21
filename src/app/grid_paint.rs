@@ -1530,20 +1530,20 @@ mod book_resume_meter_tests {
         dims: [usize; 2],
         color: egui::Color32,
     ) -> ThumbnailState {
-        ThumbnailState::Loaded {
-            tex: crate::ui_helpers::load_snapshot_texture(
+        ThumbnailState::loaded_raster(
+            crate::ui_helpers::load_snapshot_texture(
                 ctx,
                 format!("meter-solid-{dims:?}-{color:?}"),
                 egui::ColorImage::new(dims, vec![color; dims[0] * dims[1]]),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-            source_dims: Some((999, 17)),
-            layout_dims: None,
-        }
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((999, 17)),
+            None,
+        )
     }
 
     #[test]
@@ -2496,20 +2496,20 @@ mod book_resume_meter_tests {
         duration: Option<&str>,
     ) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        let thumb = ThumbnailState::Loaded {
-            tex: crate::ui_helpers::load_snapshot_texture(
+        let thumb = ThumbnailState::loaded_raster(
+            crate::ui_helpers::load_snapshot_texture(
                 ui.ctx(),
                 format!("resume-fixture-{}-{}", rect.min.x, rect.min.y),
                 egui::ColorImage::new([1, 1], vec![color]),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-        };
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        );
         let tags = if dense {
             vec!["#本".to_owned()]
         } else {
@@ -3386,20 +3386,20 @@ fn snapshot_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
             pixels.push(color);
         }
     }
-    ThumbnailState::Loaded {
-        tex: crate::ui_helpers::load_snapshot_texture(
+    ThumbnailState::loaded_raster(
+        crate::ui_helpers::load_snapshot_texture(
             ctx,
             name,
             egui::ColorImage::new(size, pixels),
             Default::default(),
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        rendered_at_px: 128,
-        source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-        source_dims: Some((1920, 1080)),
-        layout_dims: None,
-    }
+        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        128,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((1920, 1080)),
+        None,
+    )
 }
 
 /// Snapshot fixture that routes every cell through the production grid layout and paint helpers.
@@ -3527,21 +3527,21 @@ mod bottom_left_content_tests {
 
     fn loaded() -> ThumbnailState {
         let ctx = egui::Context::default();
-        ThumbnailState::Loaded {
-            tex: ctx.load_texture(
+        ThumbnailState::loaded_raster(
+            ctx.load_texture(
                 "dummy",
                 egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
                 Default::default(),
             ),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 128,
             },
-            from_edit_preview: false,
-            rendered_at_px: 128,
-            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-            source_dims: None,
-            layout_dims: None,
-        }
+            false,
+            128,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )
     }
 
     #[test]

@@ -7320,15 +7320,15 @@ pub(crate) mod tests {
             eframe::egui::ColorImage::filled([1, 1], eframe::egui::Color32::WHITE),
             eframe::egui::TextureOptions::LINEAR,
         );
-        ThumbnailState::Loaded {
+        ThumbnailState::loaded_raster(
             tex,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            rendered_at_px: 64,
-            source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-            source_dims: None,
-            layout_dims: None,
-        }
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            64,
+            crate::source_coverage::SourceCoverage::FullSource,
+            None,
+            None,
+        )
     }
 
     #[test]

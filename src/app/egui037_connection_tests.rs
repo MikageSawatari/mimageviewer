@@ -139,6 +139,7 @@ fn static_source(app: &mut App, ctx: &egui::Context, idx: usize) {
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex,
             pixels,
             source_dims: Some([8, 8]),
@@ -175,6 +176,9 @@ fn erase_ready(
             kind: EraseInpaintKind::Commit,
         },
         EraseInpaintPending {
+            display_basis: crate::material_display_basis::MaterialDisplayBasis::unavailable(
+                crate::material_display_basis::MaterialBasisUnavailable::ProducerUnavailable,
+            ),
             idx,
             items_generation: app.items_generation,
             path_key: app.page_path_key(idx),
@@ -1034,10 +1038,10 @@ fn egui037_continuation_real_full_summary_budget_waits_for_next_ui_frame() {
         let key = env.current_edit_result_key(idx);
         env.edit_result_cache.insert(
             key,
-            EditResultEntry {
-                pixels: Arc::new(egui::ColorImage::filled([8, 8], egui::Color32::GRAY)),
-                texture: None,
-            },
+            EditResultEntry::raster(
+                Arc::new(egui::ColorImage::filled([8, 8], egui::Color32::GRAY)),
+                None,
+            ),
         );
     }
     for _ in 0..3 {

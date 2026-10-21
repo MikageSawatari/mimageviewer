@@ -2367,6 +2367,7 @@ mod tests {
             app.fs_cache.insert(
                 idx,
                 crate::fs_animation::FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: texture,
                     pixels: std::sync::Arc::new(image),
                     source_dims: Some(image_size),

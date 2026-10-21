@@ -219,18 +219,17 @@ fn load_textures(app: &mut crate::app::App, ctx: &egui::Context, rotations: &[Ro
         .enumerate()
         .map(|(idx, &rotation)| {
             let tex = page_texture(ctx, idx, rotation);
-            ThumbnailState::Loaded {
-                source_coverage: crate::source_coverage::SourceCoverage::FullSource,
-
-                source_dims: Some((tex.size()[0] as u32, tex.size()[1] as u32)),
-                layout_dims: None,
-                rendered_at_px: 120,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            ThumbnailState::loaded_raster(
+                tex.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 120,
                 },
-                from_edit_preview: false,
-                tex,
-            }
+                false,
+                120,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((tex.size()[0] as u32, tex.size()[1] as u32)),
+                None,
+            )
         })
         .collect();
 }

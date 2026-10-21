@@ -293,6 +293,16 @@ impl DisplayedImageGeometry {
             }
             FullscreenFitInput::Legacy(FullscreenFitMode::SpecifiedScale) => return None,
             FullscreenFitInput::Legacy(_) => rotated_size(input.texture_size, input.rotation),
+            FullscreenFitInput::SourceLayout {
+                mode: FullscreenFitMode::SpecifiedScale,
+                ..
+            } => return None,
+            FullscreenFitInput::SourceLayout { basis, .. } => {
+                if !size_is_valid(basis.layout_size) || !size_is_valid(basis.reference_size) {
+                    return None;
+                }
+                rotated_size(basis.normalized_size(), input.rotation)
+            }
             FullscreenFitInput::Raster {
                 mode: FullscreenFitMode::SpecifiedScale,
                 ..
@@ -421,9 +431,9 @@ impl DisplayedImageGeometry {
                 }
                 resolved.scale
             }
-            FullscreenFitInput::Legacy(_) | FullscreenFitInput::Raster { .. } => {
-                input.fit_scale_limits.apply(fit_scale)
-            }
+            FullscreenFitInput::Legacy(_)
+            | FullscreenFitInput::Raster { .. }
+            | FullscreenFitInput::SourceLayout { .. } => input.fit_scale_limits.apply(fit_scale),
             FullscreenFitInput::CanonicalPage { .. } => fit_scale,
         };
         let (total_scale, base_center) = match input.placement.zoom_pan() {
@@ -1415,6 +1425,7 @@ impl ResolvedZTransform {
             match input.image.fit_mode {
                 FullscreenFitInput::CanonicalPage { basis } => basis.normalized_original_size(),
                 FullscreenFitInput::Raster { original, .. } => original.as_vec2(),
+                FullscreenFitInput::SourceLayout { basis, .. } => basis.normalized_size(),
                 _ => input.image.texture_size,
             },
             input.image.rotation,

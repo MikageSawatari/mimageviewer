@@ -277,6 +277,11 @@ PDF の既知 page-box cache 値も preview の独立 nullable layout 列へ同�
 指定倍率の通常rasterだけは単ページ・見開き・連結読みで同じA/O resolverへ統一する。
 本画像未到着時の100%基準は生成由来のcrop前raster、またはproducer共通のGPU clamp予測値であり、
 thumbnail実寸やclamp前の正準座標寸法を流用しない。AI後もAI前raster基準を維持する。
+100%と方式別layoutの所有者は素材自身の `MaterialDisplayBasis` とする。producer selectorは
+handleとdescriptorを持つResourceを返し、保持presentationの選択はPayloadとして別に行う。
+Loaded／派生cache／通過素材／消しゴム下地から保持・captureまでdescriptorを継承し、
+fit時のidx探索やtexture IDからのproducer逆引きは行わない。Single／Spread／Continuousの
+旧4方式の契約差と指定A/Oは一つの不変descriptorから射影し、live fit設定は含めない。
 Unknown の旧行は一覧で保持する一方、現在 crop ありの
 fullscreen／通過／animation には共通 typed policy で使わない。詳細は
 [表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ)。

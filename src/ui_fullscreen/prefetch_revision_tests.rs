@@ -144,6 +144,7 @@ fn prefetch_revision_single_paint_and_metadata_harvest_keep_one_topology() {
     app.fs_cache.insert(
         current,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([8, 4]),

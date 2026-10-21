@@ -424,6 +424,7 @@ fn d3_2_noop_worker_result_shares_exact_source_without_consuming_registration_sl
     app.fs_cache.insert(
         1,
         FsCacheEntry::Static {
+            pdf_metadata: None,
             tex: texture,
             pixels: pixels.clone(),
             source_dims: Some(pixels.size),
@@ -501,6 +502,7 @@ fn d3_2_worker_pixels_match_actual_synchronous_final_and_display_takeover_never_
             app.fs_cache.insert(
                 1,
                 FsCacheEntry::Static {
+                    pdf_metadata: None,
                     tex: texture,
                     pixels,
                     source_dims: Some(size),
