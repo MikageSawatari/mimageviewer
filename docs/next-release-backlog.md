@@ -38,7 +38,7 @@
 
 ### 1.407 AVIF を専用ライブラリで内蔵デコードする — 5ch >>599 (2026-10-20)
 
-- 状態: **未着手・対応方針決定 (利用者 2026-10-20)**。AVIF は Windows の WIC コーデックや追加の Susie プラグインに依存せず、mIV が専用ライブラリを同梱して読み込めるようにする。Susie 優先設定だけで対処する案ではなく、内蔵対応を改善する。採用ライブラリと収録時期は未決定。
+- 状態: **実装完了・独立レビュー受入可・利用者の実機確認待ち (ブランチ avif-1407、master 未取り込み)**。AVIF は Windows の WIC コーデックや追加の Susie プラグインに依存せず、mIV が専用ライブラリを同梱して読み込めるようにする。Susie 優先設定だけで対処する案ではなく、内蔵対応を改善する。依存は **libavif 1.4.2 + dav1d 1.5.3 + libyuv** に決定 (利用者 2026-10-20)。設計・調査結果の正本は [avif-builtin-decoder-plan.md](avif-builtin-decoder-plan.md)。開発機の WIC では報告のデコードエラーは再現せず (原因未特定)、代わりに透過の消失と色変換行列の無視による色ずれを確認した。
 - 報告者の観測: AVIF がデコードエラーになり、Susie プラグイン導入後は表示できるが、「本体優先」のため ifheif などを選べず遅いとのこと。問題の画像での開発側の再現・速度比較は未実施で、実際に成功したデコード経路も未確認。「内蔵で表示できた」「WIC が遅い」は確定事項にしない。
 - 現状 (v4.7.1 と master のコード照合): `image` → WIC → Susie の順に試す。`image` の `avif-native` は無効なので、AVIF は実質 WIC を先に試し、失敗時に Susie へ渡る。通常ファイルと書庫内バイト列は `canonical_image_loader`、サムネイルは `thumb_loader` に同型の経路がある。`ui_susie_diagnostic` の「本体優先」「このプラグインは呼ばれません」は拡張子だけの固定説明で、WIC 失敗時の実際のフォールバックと食い違う。
 - ライブラリ候補: **libavif + dav1d + libyuv** を有力候補とし、既存 `image` の `avif-native` (mp4parse + dav1d) とも速度・互換性・Windows ビルド/配布負担を比較して選ぶ。公開ソースでは [ifavif](https://github.com/uyjulian/ifavif/blob/master/CMakeLists.txt) が前者、[ifheif](https://github.com/Mr-Ojii/ifheif/blob/main/.github/workflows/build.yml) が libheif + dav1d (HEIC は libde265) を使う。プラグインより速くなるとは未測定の段階で約束しない。HEIC の内蔵対応拡張は今回の必須範囲に含めない。

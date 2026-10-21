@@ -880,3 +880,18 @@ fn startup_cleans_only_service_owned_tree_before_new_session_directory() {
     assert!(keep.exists());
     assert!(session.owner.directory.exists());
 }
+
+#[cfg(windows)]
+#[test]
+fn avif_fetched_sequence_uses_native_first_frame_with_no_filename_hint() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("download.image");
+    std::fs::copy(
+        crate::avif_decoder::tests::fixture("animated_first_quadrant"),
+        &path,
+    )
+    .unwrap();
+    let (image, extension) = decode_fetched(&path).unwrap();
+    assert_eq!(extension, "avif");
+    crate::avif_decoder::tests::assert_quadrants(&image, [0, 1, 2, 3]);
+}

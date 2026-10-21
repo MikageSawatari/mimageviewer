@@ -3652,6 +3652,17 @@ fn ready_with_plugins_fixture() -> Vec<PluginInfo> {
             extensions: vec!["mag".to_string()],
         },
         PluginInfo {
+            name: "ifmodern.spi".to_string(),
+            extensions: vec![
+                "AVIF".to_string(),
+                "heic".to_string(),
+                "heif".to_string(),
+                "jxl".to_string(),
+                "tiff".to_string(),
+                "tif".to_string(),
+            ],
+        },
+        PluginInfo {
             name: "ifjpegt.spi (JPEG 再実装)".to_string(),
             extensions: vec!["jpg".to_string(), "jpeg".to_string()],
         },
@@ -4492,4 +4503,25 @@ fn assert_image_folder_zip_controls(harness: &Harness<'_>, phase: &str, name: &s
 fn egui_id_from_accesskit(node_id: impl Into<u128>) -> egui::Id {
     let local_id = (node_id.into() >> 64) as u64;
     unsafe { egui::Id::from_high_entropy_bits(local_id) }
+}
+
+#[test]
+fn avif_license_information_light() {
+    snapshot_with_theme_contrast_and_size(
+        "avif_license_information_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 250.0),
+        mimageviewer::ui_dialogs::draw_avif_license_snapshot_fixture,
+    );
+}
+#[test]
+fn avif_license_information_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "avif_license_information_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(620.0, 250.0),
+        mimageviewer::ui_dialogs::draw_avif_license_snapshot_fixture,
+    );
 }

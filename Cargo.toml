@@ -8,6 +8,7 @@ members = [
     "crates/launcher",
     "crates/local-adjust-core",
     "crates/libraw-sys",
+    "crates/libavif-sys",
     "crates/comic-core",
     "crates/music-core",
     "crates/remote-ipc",
@@ -282,6 +283,7 @@ required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
 libraw-sys = { path = "crates/libraw-sys" }
+libavif-sys = { path = "crates/libavif-sys" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

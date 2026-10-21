@@ -300,7 +300,8 @@ fn decode_thumbnail(
                     AnimationPolicy::FirstFrameOnly,
                     cancel,
                     RawStage::Preview,
-                ),
+                )
+                .with_avif_workload(crate::avif_decoder::Workload::Background),
             )
             .map_err(|error| format!("{error:?}"))?;
             match decoded {

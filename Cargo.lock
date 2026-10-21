@@ -2125,6 +2125,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "image",
+ "libavif-sys",
  "lopdf",
  "percent-encoding",
  "quick-xml 0.41.0",
@@ -3765,6 +3766,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "libavif-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "image",
+]
+
+[[package]]
 name = "libbz2-rs-sys"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4163,6 +4172,7 @@ dependencies = [
  "gilrs",
  "image",
  "kamadak-exif",
+ "libavif-sys",
  "libc",
  "libraw-sys",
  "local-adjust-core",
@@ -4252,6 +4262,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac",
  "image",
+ "libavif-sys",
  "mimageviewer-ipc",
  "percent-encoding",
  "qrcode",

@@ -1668,6 +1668,12 @@ pub(crate) fn probe_image_dims_from_bytes(bytes: &[u8], hint: &str) -> Option<(u
             .developed_dims;
         return Some((dims[0], dims[1]));
     }
+    if let Some(result) = crate::image_decode::avif_dimensions(
+        crate::image_decode::Source::Bytes { bytes, hint },
+        crate::avif_decoder::Workload::Background,
+    ) {
+        return result.ok();
+    }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -4026,6 +4032,18 @@ mod tests {
         assert_eq!(
             facet_kind_for_item(&audio),
             crate::settings::FacetItemKind::Audio
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod avif_dimension_tests {
+    #[test]
+    fn avif_details_probe_uses_applied_crop_rotation_dimensions() {
+        let bytes = crate::avif_decoder::tests::with_clap_and_mirror(true);
+        assert_eq!(
+            super::probe_image_dims_from_bytes(&bytes, "page.avif"),
+            Some((64, 32))
         );
     }
 }

@@ -1473,11 +1473,17 @@ pub(crate) fn decode_image_for_thumb_with_dims(
         } else {
             (None, None)
         };
+    let source = crate::image_decode::Source::Path(path);
     let img = if let Some(image) = turbo_img {
         Some(image)
     } else {
-        match image::open(path) {
-            Ok(image) => Some(image),
+        match crate::image_decode::decode(
+            source,
+            crate::avif_decoder::Workload::Background,
+            false,
+            None,
+        ) {
+            Ok(decoded) => Some(decoded.image),
             Err(image::ImageError::IoError(error))
                 if matches!(
                     error.kind(),
@@ -1489,7 +1495,11 @@ pub(crate) fn decode_image_for_thumb_with_dims(
             Err(image::ImageError::IoError(error)) => {
                 return Err(crate::raw::RawError::Io(error.to_string()));
             }
-            Err(_) => crate::wic_decoder::decode_to_dynamic_image(path),
+            Err(image::ImageError::Limits(_)) => return Err(crate::raw::RawError::TooLarge),
+            Err(image::ImageError::Decoding(error)) => {
+                return Err(crate::raw::RawError::Corrupt(error.to_string()));
+            }
+            Err(_) => None,
         }
     };
     Ok(img.map(|img| {
@@ -1861,39 +1871,26 @@ fn decode_zip_chain(
     priority: bool,
     cancel: Option<Arc<AtomicBool>>,
     decode_source: &mut crate::stats::DecodeSource,
-) -> Result<image::DynamicImage, image::ImageError> {
-    if crate::raw_format::is_raw_path(Path::new(entry_name)) {
-        return Err(raw_image_error(crate::raw::RawError::Internal(-2)));
-    }
-    // Susie 専用拡張子の高速パス (image / WIC で確実に失敗する分を省略)
-    if is_susie_only_ext(&ext_lower_str(entry_name)) {
-        return match crate::susie_loader::decode_bytes(entry_name, bytes, priority, cancel) {
-            Ok(img) => {
-                *decode_source = crate::stats::DecodeSource::Susie;
-                Ok(img)
-            }
-            Err(e) => Err(image::ImageError::IoError(e)),
-        };
-    }
-    match image::load_from_memory(bytes) {
-        Ok(img) => Ok(img),
-        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(
-            bytes,
-            &ext_lower_str(entry_name),
-        ) {
-            Some(img) => {
-                *decode_source = crate::stats::DecodeSource::Wic;
-                Ok(img)
-            }
-            None => match crate::susie_loader::decode_bytes(entry_name, bytes, priority, cancel) {
-                Ok(img) => {
-                    *decode_source = crate::stats::DecodeSource::Susie;
-                    Ok(img)
-                }
-                Err(_) => Err(e),
-            },
-        },
-    }
+    orientation: &mut crate::image_decode::Orientation,
+) -> image::ImageResult<image::DynamicImage> {
+    let source = crate::image_decode::Source::Bytes {
+        bytes,
+        hint: entry_name,
+    };
+    let decoded = if is_susie_only_ext(&ext_lower_str(entry_name)) {
+        crate::image_decode::susie(source, priority, cancel.clone())
+            .map_err(image::ImageError::IoError)?
+    } else {
+        crate::image_decode::decode(
+            source,
+            crate::avif_decoder::Workload::Background,
+            priority,
+            cancel.as_ref(),
+        )?
+    };
+    *decode_source = decoded.decoder;
+    *orientation = decoded.orientation;
+    Ok(decoded.image)
 }
 
 const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif"];
@@ -5004,6 +5001,7 @@ pub fn load_one_cached(
     // JPEG パスでは TurboJPEG DCT scale も試み、成功時は `dct_stats` を立てて
     // source_dims を **元寸法** で保存する (DCT scaled buffer ではない)。
     let mut decode_source = crate::stats::DecodeSource::Native;
+    let mut decoded_orientation = crate::image_decode::Orientation::NeedsExif;
     let mut dct_stats: Option<ScaleStats> = None;
     // PDF thumbnail の整数丸め後 raster ではなく、PDFium が読んだ page box の
     // 縦横比を catalog に残す。値は 1/1000 point の固定小数点レイアウト寸法。
@@ -5302,12 +5300,24 @@ pub fn load_one_cached(
                         ),
                     ))
                 }
-                Err(DctDecodeError::Fallback(_)) => {
-                    decode_zip_chain(&bytes, hint, priority, cancel.cloned(), &mut decode_source)
-                }
+                Err(DctDecodeError::Fallback(_)) => decode_zip_chain(
+                    &bytes,
+                    hint,
+                    priority,
+                    cancel.cloned(),
+                    &mut decode_source,
+                    &mut decoded_orientation,
+                ),
             }
         } else {
-            decode_zip_chain(&bytes, hint, priority, cancel.cloned(), &mut decode_source)
+            decode_zip_chain(
+                &bytes,
+                hint,
+                priority,
+                cancel.cloned(),
+                &mut decode_source,
+                &mut decoded_orientation,
+            )
         }
     } else if let Some(entry_name) = zip_entry {
         // プリロード済みバイト列があれば ZIP を再度 open せずにデコード
@@ -5348,6 +5358,7 @@ pub fn load_one_cached(
                             priority,
                             cancel.cloned(),
                             &mut decode_source,
+                            &mut decoded_orientation,
                         ),
                     }
                 } else {
@@ -5357,6 +5368,7 @@ pub fn load_one_cached(
                         priority,
                         cancel.cloned(),
                         &mut decode_source,
+                        &mut decoded_orientation,
                     )
                 }
             }
@@ -5398,34 +5410,34 @@ pub fn load_one_cached(
         if let Some(result) = turbo_img {
             result
         } else {
-            let primary = image::open(path).or_else(|_| {
-                use std::io::BufReader;
-                let f = std::fs::File::open(path)?;
-                image::ImageReader::new(BufReader::new(f))
-                    .with_guessed_format()
-                    .map_err(image::ImageError::IoError)?
-                    .decode()
-            });
-            // image クレートが失敗した場合に WIC → Susie プラグインの順にフォールバック
-            // (HEIC / AVIF / JPEG XL 等は image クレート非対応のため WIC、
-            //  PI / MAG / Q0 / PIC / MAKI 等のレトロ形式は Susie プラグインで対応)
-            match primary {
-                Ok(img) => Ok(img),
-                Err(e) => match crate::wic_decoder::decode_to_dynamic_image(path) {
-                    Some(img) => {
-                        decode_source = crate::stats::DecodeSource::Wic;
-                        Ok(img)
-                    }
-                    None => match crate::susie_loader::decode_file(path, priority, cancel.cloned())
-                    {
-                        Ok(img) => {
-                            decode_source = crate::stats::DecodeSource::Susie;
-                            Ok(img)
-                        }
-                        Err(_) => Err(e),
-                    },
+            let source = crate::image_decode::Source::Path(path);
+            crate::image_decode::primary(
+                source,
+                crate::avif_decoder::Workload::Background,
+                None,
+                cancel.map(Arc::as_ref),
+                || {
+                    image::open(path).or_else(|_| {
+                        use std::io::BufReader;
+                        let f = std::fs::File::open(path)?;
+                        image::ImageReader::new(BufReader::new(f))
+                            .with_guessed_format()
+                            .map_err(image::ImageError::IoError)?
+                            .decode()
+                    })
                 },
-            }
+            )
+            .or_else(|error| {
+                if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Err(error);
+                }
+                crate::image_decode::susie(source, priority, cancel.cloned()).map_err(|_| error)
+            })
+            .map(|decoded| {
+                decode_source = decoded.decoder;
+                decoded_orientation = decoded.orientation;
+                decoded.image
+            })
         }
     };
 
@@ -5525,7 +5537,10 @@ pub fn load_one_cached(
     // EXIF Orientation に基づいて自動回転。
     // ZIP の非 RAW はエントリのバイト列から読む。RAW は LibRaw が orientation
     // をすでに適用しており、PDF もレンダ済みなので追加回転をしない。
-    let orientation: u16 = if is_raw || pdf_page.is_some() {
+    let orientation: u16 = if is_raw
+        || pdf_page.is_some()
+        || decoded_orientation == crate::image_decode::Orientation::Applied
+    {
         1
     } else if zip_entry.is_some() || has_verified_source {
         byte_orientation
@@ -10024,25 +10039,34 @@ pub fn build_and_save_one(
         None
     };
     // 拡張子ベース → マジックバイト fallback（load_one_cached と同じ方針）
-    let img = match turbo_img {
-        Some(img) => img,
-        None => image::open(path)
-            .or_else(|_| {
-                use std::io::BufReader;
-                let f = std::fs::File::open(path)?;
-                image::ImageReader::new(BufReader::new(f))
-                    .with_guessed_format()
-                    .map_err(image::ImageError::IoError)?
-                    .decode()
-            })
-            .ok()?,
+    let source = crate::image_decode::Source::Path(path);
+    let decoded = match turbo_img {
+        Some(img) => crate::image_decode::Decoded::legacy(img, crate::stats::DecodeSource::Native),
+        None => crate::image_decode::primary(
+            source,
+            crate::avif_decoder::Workload::Background,
+            None,
+            None,
+            || {
+                image::open(path).or_else(|_| {
+                    use std::io::BufReader;
+                    let f = std::fs::File::open(path)?;
+                    image::ImageReader::new(BufReader::new(f))
+                        .with_guessed_format()
+                        .map_err(image::ImageError::IoError)?
+                        .decode()
+                })
+            },
+        )
+        .or_else(|error| crate::image_decode::susie(source, false, None).map_err(|_| error))
+        .ok()?,
     };
-
-    // EXIF orientation を適用 (load_one_cached と挙動を揃える)。
-    // 旧 build_and_save_one は orientation 未適用だったが、catalog に保存する
-    // source_dims が load_one_cached 経由と不一致になる既存バグ。本プランで修正。
-    let orientation = read_exif_orientation(path);
-    let img = apply_orientation(img, orientation);
+    let orientation = if decoded.orientation == crate::image_decode::Orientation::Applied {
+        1
+    } else {
+        read_exif_orientation(path)
+    };
+    let img = apply_orientation(decoded.image, orientation);
     let source_dims = dct_stats.map(|s| s.source_dims_after_exif(orientation));
 
     let name = path.file_name()?.to_str()?;
@@ -10196,8 +10220,28 @@ pub fn build_and_save_one_zip(
     } else {
         (None, None)
     };
-    let img = img.or_else(|| image::load_from_memory(&bytes).ok())?;
-    let img = apply_orientation(img, orientation);
+    let source = crate::image_decode::Source::Bytes {
+        bytes: &bytes,
+        hint: entry_name,
+    };
+    let decoded = match img {
+        Some(image) => {
+            crate::image_decode::Decoded::legacy(image, crate::stats::DecodeSource::Native)
+        }
+        None => crate::image_decode::decode(
+            source,
+            crate::avif_decoder::Workload::Background,
+            false,
+            None,
+        )
+        .ok()?,
+    };
+    let orientation = if decoded.orientation == crate::image_decode::Orientation::Applied {
+        1
+    } else {
+        orientation
+    };
+    let img = apply_orientation(decoded.image, orientation);
     encode_and_save_with_source_dims(
         &img,
         source_dims,
@@ -10263,4 +10307,57 @@ pub fn build_and_save_one_pdf(
         thumb_px,
         thumb_quality,
     )
+}
+
+#[cfg(all(test, windows))]
+mod avif_tests {
+    use super::*;
+    #[test]
+    fn avif_thumbnail_uses_transformed_non_square_source_dimensions() {
+        let bytes = crate::avif_decoder::tests::with_clap_and_mirror(true);
+        let mut decoder = crate::stats::DecodeSource::Native;
+        let mut orientation = crate::image_decode::Orientation::NeedsExif;
+        let image = decode_zip_chain(
+            &bytes,
+            "page.avif",
+            false,
+            None,
+            &mut decoder,
+            &mut orientation,
+        )
+        .unwrap();
+        assert_eq!(orientation, crate::image_decode::Orientation::Applied);
+        let source_dims = (image.width(), image.height());
+        assert_eq!(source_dims, (64, 32));
+        let thumb = resize_to_display_color_image(&image, 64, Some(source_dims));
+        assert_eq!(thumb.size, [64, 32]);
+    }
+    #[test]
+    fn avif_thumbnail_zip_chain_preserves_transform_alpha_and_source_dims() {
+        for name in ["quadrant_irot90cw", "quadrant_alpha_444"] {
+            let bytes = std::fs::read(crate::avif_decoder::tests::fixture(name)).unwrap();
+            let mut decoder = crate::stats::DecodeSource::Native;
+            let mut orientation = crate::image_decode::Orientation::NeedsExif;
+            let image = decode_zip_chain(
+                &bytes,
+                "page.AVIF",
+                false,
+                None,
+                &mut decoder,
+                &mut orientation,
+            )
+            .unwrap();
+            assert_eq!(decoder, crate::stats::DecodeSource::Libavif);
+            assert_eq!(orientation, crate::image_decode::Orientation::Applied);
+            assert_eq!((image.width(), image.height()), (64, 64));
+            let thumb = resize_to_display_color_image(&image, 64, Some((64, 64)));
+            assert_eq!(thumb.size, [64, 64]);
+            if name == "quadrant_irot90cw" {
+                crate::avif_decoder::tests::assert_quadrants(&image, [2, 0, 3, 1]);
+            } else {
+                assert_eq!(thumb.pixels[16 * 64 + 16].a(), 0);
+                assert_eq!(thumb.pixels[16 * 64 + 48].a(), 255);
+            }
+        }
+    }
 }

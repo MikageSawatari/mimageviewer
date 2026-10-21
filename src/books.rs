@@ -1473,20 +1473,16 @@ fn decode_file_color_image(
             .map_err(|error| format!("RAW を現像できません: {}: {error}", path.display()))?;
         return Ok(dynamic_image_to_color_image(&image));
     }
-    let image = image::open(path)
-        .or_else(|_| {
-            crate::wic_decoder::decode_to_dynamic_image(path).ok_or_else(|| {
-                image::ImageError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "wic decode failed",
-                ))
-            })
-        })
-        .or_else(|_| {
-            crate::susie_loader::decode_file(path, true, None).map_err(image::ImageError::IoError)
-        })
-        .map_err(|e| format!("画像をデコードできません: {}: {e}", path.display()))?;
-    let image = crate::thumb_loader::apply_exif_orientation(image, path);
+    let source = crate::image_decode::Source::Path(path);
+    let image = crate::image_decode::decode_with_susie_cancel(
+        source,
+        crate::avif_decoder::Workload::Background,
+        true,
+        Some(cancel),
+        None,
+    )
+    .map_err(|e| format!("画像をデコードできません: {}: {e}", path.display()))?
+    .oriented(source);
     Ok(dynamic_image_to_color_image(&image))
 }
 
@@ -1510,28 +1506,16 @@ fn decode_bytes_color_image(
             .map_err(|error| format!("ZIP RAW を現像できません: {hint}: {error}"))?;
         return Ok(dynamic_image_to_color_image(&image));
     }
-    let image = image::load_from_memory(bytes)
-        .or_else(|_| {
-            crate::wic_decoder::decode_to_dynamic_image_from_bytes(
-                bytes,
-                Path::new(hint)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or(""),
-            )
-            .ok_or_else(|| {
-                image::ImageError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "wic decode failed",
-                ))
-            })
-        })
-        .or_else(|_| {
-            crate::susie_loader::decode_bytes(hint, bytes, true, None)
-                .map_err(image::ImageError::IoError)
-        })
-        .map_err(|e| format!("ZIP 内画像をデコードできません: {hint}: {e}"))?;
-    let image = crate::thumb_loader::apply_exif_orientation_from_bytes(image, bytes);
+    let source = crate::image_decode::Source::Bytes { bytes, hint };
+    let image = crate::image_decode::decode_with_susie_cancel(
+        source,
+        crate::avif_decoder::Workload::Background,
+        true,
+        Some(cancel),
+        None,
+    )
+    .map_err(|e| format!("ZIP 内画像をデコードできません: {hint}: {e}"))?
+    .oriented(source);
     Ok(dynamic_image_to_color_image(&image))
 }
 

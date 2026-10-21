@@ -21,12 +21,13 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 
 1. `setup-pdfium.sh` — `vendor/pdfium/bin/pdfium.dll` を取得
 2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.2 と zlib 1.3.1 のソース、`VERSION` を取得
-3. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
-4. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
-5. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
-6. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
+3. `setup-libavif.sh` — `vendor/libavif/` に libavif / dav1d / libyuv の静的ライブラリ・ヘッダ・notice・`VERSION` を作成
+4. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
+5. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
+6. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
+7. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
    build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
-7. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
+8. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
 
 ### bootstrap で取れないもの
@@ -489,3 +490,27 @@ This software supports VST3 plugins via the Steinberg VST3 SDK
 VST のロゴは使用しない。名称の文字表記も商標ガイドラインの対象となり得るため、
 文字表記によってガイドラインを回避できるとは扱わない。この記録は採用した表記方針を
 示すもので、ガイドラインへの適合や商標侵害の有無を断定するものではない。
+
+## libavif / dav1d / libyuv の静的リンク（§1.407）
+
+AVIF は libavif 1.4.2、dav1d 1.5.3、libyuv
+`644251f252a84bf8ce91ff0aca86a9b16b069ab8` を使用する。
+libavif 自身の LocalDav1d / LocalLibyuv の固定組合せで、ライセンスは順に
+BSD-2-Clause（同梱第三者 notice も全文を保持）、BSD-2-Clause、BSD-3-Clause。
+
+エージェント用 `bash scripts/setup-libavif.sh` が checksum / commit を照合し、
+MSVC x64・static CRT `/MT` で `vendor/libavif/{include,lib,licenses,VERSION}` を生成する。
+bootstrap は毎回setupを呼び、`--force`も伝える。setupはVERSION一致と出力7ファイル
+（header・lib3本・license3本）すべての存在でskipを判定する。meson / ninja / NASM は
+vendor 内の専用 tools に配置し、システムへは追加しない。
+Cargo は依存の C ビルドを行わず、`crates/libavif-sys` の小さな C shim だけを cc でビルドする。
+欠落・版違いは復旧コマンドを付けて停止する。新しい DLL / exe は追加しない。
+ソースとツールは再取得できるため、ツリー外バックアップは不要。
+
+更新時は `bash scripts/setup-libavif.sh check` で上流を確認し、setup の版・hash・
+組合せ、libavif-sys の期待 VERSION、設計書を合わせて更新する。
+`--force` で再構築し、AVIF fixture テストと decode / link 検査を行う。
+ルートの `LIBAVIF-LICENSE.txt` / `DAV1D-LICENSE.txt` / `LIBYUV-LICENSE.txt` は
+vendor/licenses のバイトをそのままコピーし、`.gitattributes -text` で保持する。
+about の全文表示と同梱版、installer / portable の配布リストも更新する。
+ソース再配布義務はない。

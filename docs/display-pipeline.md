@@ -282,7 +282,7 @@ egui pass を続けても `SurfaceAbsent` となり screenshot と表示更新�
    └─ ミス or `SourceOnly`:
         ├─ ソースデコード (RAW=LibRaw preview、必要なら executor で half 現像,
         │                   JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
-        │                   HEIC/AVIF/JXL=WIC, PDF=PDFium ワーカー)
+        │                   AVIF=libavif→WIC、HEIC/JXL=WIC, PDF=PDFium ワーカー)
         ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes。RAW は LibRaw の
         │                   flip 適用済み、PDF は対象外)
         ├─ Lanczos3 で display_px までリサイズ
@@ -3220,7 +3220,7 @@ edit/final の clone は生存するが、raw cache がある証明には使わ�
 
 | 処理 | Image | ZipImage | PdfPage | Video |
 | --- | --- | --- | --- | --- |
-| サムネイルデコード | image/turbojpeg/WIC | image::load_from_memory | PDFium ワーカー | Shell API (別スレッド) |
+| サムネイルデコード | image/turbojpeg/libavif/WIC | 共通 bytes decode（AVIF=libavif） | PDFium ワーカー | Shell API (別スレッド) |
 | フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で実 viewport×ppp に fit (raster は native 上限) | なし (サムネのみ) |
 | EXIF Orientation | ✅ path から読む | ✅ bytes から読む | ❌ | — |
 | アニメーション | GIF/APNG/WebP ✅ | GIF/APNG/WebP ✅ | ❌ | — |
@@ -3354,3 +3354,14 @@ App で寿命とnative fadeを確定して渡し、描画側は倍率を再適�
 標準ではnativeの既存linger/fadeの不一致、保存完了のegui1.2秒/native1.8秒も維持する。
 動画内部で発行する通知だけは、既存 chrome snapshot の選択値から同じ関数で一度確定する。
 処理の寿命に連動する進捗表示、ナビゲーション境界の専用ヒントは独立した表示を維持する。
+
+### AVIF の共通デコード境界（§1.407）
+
+`image_decode` は path / bytes の AVIF を内蔵 libavif → WIC → Susie の順に接続する。
+他形式の image / TurboJPEG の順序を保ち、呼出元の worker で実行する。
+内蔵は RGBA8 straight alpha、最初のフレームのみ。`libavif-sys` のsafe Rust APIがRGB上で
+clap → irot → imir を一度だけ適用し、不正 clap は無視する。
+`Decoded::orientation = Applied` を canonical / thumbnail / 類似検索 / clipboard へ運び、
+後段 EXIF / WIC orientation を重ねない。サムネイルの source_dims はこの変換後の寸法。
+WIC / Susie 成功時は既存の orientation 規則を使う（bounded WIC は内部で適用済み）。
+背景処理・先読みは dav1d 1 thread、需要のフルサイズは 4 threads。

@@ -9,7 +9,7 @@
 
 mod about;
 #[doc(hidden)]
-pub use about::draw_raw_license_snapshot_fixture;
+pub use about::{draw_avif_license_snapshot_fixture, draw_raw_license_snapshot_fixture};
 pub(crate) mod archive_cache_manager;
 pub(crate) mod archive_convert;
 pub(crate) mod batch_convert;

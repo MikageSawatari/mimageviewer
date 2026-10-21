@@ -1665,12 +1665,17 @@ Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応で、使える埋め込�
 「プレビューに合わせる」既定・「補正しない」）を使う。詳細は §1 の設定と
 [raw-libraw-plan.md](raw-libraw-plan.md) を参照。
 
+#### AVIF（内蔵 libavif / dav1d / libyuv）
+
+追加インストール不要。RGBA8 straight alpha、10/12bit は8bitへ変換し、アニメーションAVIFは最初のフレームのみ。
+clap→irot→imir を適用し、内蔵成功時は EXIF を重ねない。内蔵失敗時は WIC→Susie。
+bounded artwork は既存の予算付きWICまで。詳細は [AVIF設計](avif-builtin-decoder-plan.md)。
+
 #### WIC 経由（Windows Imaging Component）
 
 | フォーマット | 拡張子 | 必要なコーデック |
 |------------|--------|----------------|
 | HEIC / HEIF | .heic, .heif | HEIF 画像表示オプション。HEIC は HEVC 非対応の PC では HEVC ビデオ拡張機能も必要（有料の場合あり） |
-| AVIF | .avif | AV1 ビデオ拡張機能 |
 | JPEG XL | .jxl | JPEG XL 画像表示オプション |
 | TIFF | .tiff, .tif | 標準搭載 |
 
@@ -3099,7 +3104,7 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
 - [x] 非ソリッド・入れ子なし・暗号化なし RAR / CBR を UnRAR で直接閲覧。ソリッド・入れ子あり・暗号化 RAR と 7z / LZH は無圧縮 ZIP キャッシュへ変換（分割 RAR は先頭パートのみ表示）
 - [x] 変換メニューから RAR / CBR / 7z / CB7 / LZH / LHA と同じフォルダへ同名 ZIP を明示作成
 - [x] ZIP/PDF ファイルのサムネイル＋バッジ表示（フォルダ一覧で 1 枚目/1 ページ目を表示、キャッシュ対応）
-- [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF）と内蔵 LibRaw による RAW 表示・現像
+- [x] 内蔵 AVIF と WIC 経由の画像デコード（HEIC / JXL / TIFF）、内蔵 LibRaw による RAW 表示・現像
 - [x] 動画サムネイル（Windows Shell API 経由）
 - [x] アニメーション再生（GIF / APNG / WebP）
 - [x] AppleDouble メタデータファイル自動除外
@@ -3350,7 +3355,9 @@ ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行�
 
 - 画像デコードは `image` クレート（純粋Rust・メモリ安全）を基本とする
 - RAW は他の decoder より先に LibRaw へ振り分け、FFI は `crates/libraw-sys` に局所化。
-- HEIC / AVIF / JXL / TIFF は Windows の WIC (Windows Imaging Component) 経由でデコード。
+- AVIF は静的 libavif / dav1d / libyuv を優先し、構造体 ABI は `crates/libavif-sys` の C shim に閉じ込める。
+  画像寸法・予算を割当前に検査する。失敗時はWIC→Susie（bounded artworkはWICまで）。
+- HEIC / JXL / TIFF は Windows の WIC (Windows Imaging Component) 経由でデコード。
   WIC 呼び出しは `unsafe` ブロックに局所化（`src/wic_decoder.rs`）
 - NVIDIA NGX 呼び出し部分も `unsafe` ブロックに局所化（Phase 2、未実装）
 

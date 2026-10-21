@@ -2429,3 +2429,6 @@ pub use ui_dialogs::preferences::draw_same_name_folder_book_settings_snapshot_fi
 
 mod ui_image_folder_zip;
 pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;
+
+pub mod avif_decoder;
+pub mod image_decode;

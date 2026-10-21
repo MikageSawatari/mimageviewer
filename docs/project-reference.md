@@ -6,7 +6,7 @@
 
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
 - **GUI**: eframe 0.37 + egui 0.37 (wgpu 30 backend)。Rust 1.99 を `rust-toolchain.toml` で固定 (MSRV 1.95)
-- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
+- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + libavif + dav1d + libyuv (AVIF、静的リンク) + WIC (HEIC, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
 - **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。サムネ生成時は **DCT スケール (1/8〜1/1)** で decode して 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](dct-scale-plan.md))。圧縮入力 128MB 超は image クレート / WIC chain にフォールバック (並列ワーカー × 圧縮 buffer の積算メモリ圧迫を回避)。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
@@ -95,7 +95,7 @@ mimageviewer/
 │   ├── filename_stack.rs    # ファイル名 prefix スタック（v2.0.0）の純ロジック（StackGroup/StackView/group_media/materialize_*）
 │   ├── filename_stack_ui.rs # 上記の App グルー（トグル・集約⇔フラット切替・Shift+↓↑ ジャンプ）
 │   ├── thumb_loader.rs      # サムネイル並列ロード
-│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF。RAW は src/raw/）
+│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/JXL/TIFF と AVIF fallback。RAW は src/raw/）
 │   ├── susie_loader.rs      # Susie プラグイン 32bit ワーカープール + IPC（v0.7.0、PI/MAG/Q0/PIC/MAKI…）
 │   ├── os_theme.rs          # UI テーマ（System/Light/Dark）Windows レジストリ連携（v0.7.0）
 │   ├── video/               # 動画インライン再生 (FFmpeg LGPL DLL)
@@ -164,7 +164,8 @@ mimageviewer/
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
 - **RAW（内蔵 LibRaw）**: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS
   - Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応。使える埋め込みプレビューは表示可能。
-- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF
+- **AVIF 内蔵**: libavif + dav1d + libyuv。RGBA8・clap/irot/imir 適用済み。失敗時は WIC → Susie
+- **WIC 経由**: HEIC, HEIF, JXL, TIFF, TIF
 - **動画（サムネイルのみ）**: MP4, AVI, MOV, MKV, WMV, MPG, MPEG
 
 ## Performance Notes

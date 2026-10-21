@@ -852,6 +852,69 @@ fn decode_fetched(path: &Path) -> Result<(image::DynamicImage, String), String> 
         .and_then(|mut f| f.read(&mut header))
         .map_err(|e| e.to_string())?;
     let header = &header[..count];
+    if header.len() >= 16 && &header[4..8] == b"ftyp" {
+        // Probe only the brand box. HEIC keeps its file-backed WIC route and
+        // does not acquire an extra full-file buffer merely to exclude AVIF.
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let length = match u32::from_be_bytes(header[..4].try_into().unwrap()) {
+            0 => file.metadata().map_err(|e| e.to_string())?.len(),
+            1 => u64::from_be_bytes(header[8..16].try_into().unwrap()),
+            length => u64::from(length),
+        };
+        let mut brands = Vec::new();
+        file.take(length)
+            .read_to_end(&mut brands)
+            .map_err(|e| e.to_string())?;
+        if libavif_sys::is_avif(&brands) {
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            let source = crate::image_decode::Source::Bytes {
+                bytes: &bytes,
+                hint: "image.avif",
+            };
+            // Retain this fetcher's existing bounded WIC conversion/orientation
+            // contract when native AVIF fails. No unbounded Susie admission.
+            struct FetchBackend<'a>(&'a Path);
+            impl crate::image_decode::Backend for FetchBackend<'_> {
+                fn avif(
+                    &self,
+                    source: crate::image_decode::Source<'_>,
+                    workload: crate::avif_decoder::Workload,
+                    budget: Option<u64>,
+                ) -> Result<image::DynamicImage, crate::avif_decoder::Error> {
+                    crate::image_decode::Backend::avif(
+                        &crate::image_decode::System,
+                        source,
+                        workload,
+                        budget,
+                    )
+                }
+                fn wic(
+                    &self,
+                    _: crate::image_decode::Source<'_>,
+                    _: Option<u64>,
+                ) -> Option<image::DynamicImage> {
+                    decode_wic_bounded(self.0).ok()
+                }
+            }
+            let decoded = crate::image_decode::primary_with_backend(
+                source,
+                crate::avif_decoder::Workload::Background,
+                Some(1024 * 1024 * 1024),
+                None,
+                || {
+                    Err(image::ImageError::Unsupported(
+                        image::error::UnsupportedError::from_format_and_kind(
+                            image::ImageFormat::Avif.into(),
+                            image::error::UnsupportedErrorKind::GenericFeature("AVIF".into()),
+                        ),
+                    ))
+                },
+                &FetchBackend(path),
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok((decoded.image, "avif".into()));
+        }
+    }
     let special =
         if header.starts_with(b"\xff\x0a") || header.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
             Some("jxl")

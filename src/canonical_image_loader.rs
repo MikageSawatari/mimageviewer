@@ -47,6 +47,7 @@ pub enum CanonicalImageSource<'a> {
 #[derive(Clone, Copy)]
 pub struct CanonicalDecodeOptions<'a> {
     pub susie_priority: bool,
+    pub avif_workload: crate::avif_decoder::Workload,
     pub susie_cancel: Option<&'a Arc<AtomicBool>>,
     pub cancel: Option<&'a Arc<AtomicBool>>,
     pub animation_policy: AnimationPolicy,
@@ -76,6 +77,7 @@ impl<'a> CanonicalDecodeOptions<'a> {
     pub const fn fullscreen(animation_policy: AnimationPolicy, raw_stage: RawStage) -> Self {
         Self {
             susie_priority: true,
+            avif_workload: crate::avif_decoder::Workload::Display,
             susie_cancel: None,
             cancel: None,
             animation_policy,
@@ -92,6 +94,7 @@ impl<'a> CanonicalDecodeOptions<'a> {
     ) -> CanonicalDecodeOptions<'a> {
         CanonicalDecodeOptions {
             susie_priority: true,
+            avif_workload: crate::avif_decoder::Workload::Display,
             // Susie IPC cannot be interrupted safely. Once entered, it must keep
             // the scheduler permit until the reply arrives.
             susie_cancel: None,
@@ -101,6 +104,11 @@ impl<'a> CanonicalDecodeOptions<'a> {
             raw_stage,
             raw_runtime: None,
         }
+    }
+
+    pub fn with_avif_workload(mut self, workload: crate::avif_decoder::Workload) -> Self {
+        self.avif_workload = workload;
+        self
     }
 
     pub fn with_raw_runtime(mut self, runtime: RawDecodeRuntime<'a>) -> Self {
@@ -228,7 +236,7 @@ pub enum CanonicalCancelStage {
 /// 「試したか」の bool は持たない (常に true にしかならない分岐を作らない)。
 #[derive(Debug)]
 pub struct DecodeChainFailure {
-    /// image クレートのエラー。拡張子由来の「非対応」もここに出る。
+    /// Primary decoder error: image crate, or a typed libavif error wrapped in IoError.
     pub primary: image::ImageError,
     /// Susie が返した失敗理由。プラグイン無効・未対応・ワーカー喪失を区別できる。
     pub susie_error: std::io::Error,
@@ -262,6 +270,20 @@ impl std::error::Error for CanonicalDecodeError {}
 
 /// WIC / Susie の実装を production から分離し、fallback 順と条件を test で固定する seam。
 trait FallbackDecoder {
+    fn avif_path(
+        &self,
+        path: &Path,
+        workload: crate::avif_decoder::Workload,
+    ) -> Result<image::DynamicImage, crate::avif_decoder::Error> {
+        crate::avif_decoder::decode_path(path, workload)
+    }
+    fn avif_bytes(
+        &self,
+        bytes: &[u8],
+        workload: crate::avif_decoder::Workload,
+    ) -> Result<image::DynamicImage, crate::avif_decoder::Error> {
+        crate::avif_decoder::decode_bytes(bytes, workload)
+    }
     fn wic_path(&self, path: &Path) -> Option<image::DynamicImage>;
     fn wic_bytes(&self, bytes: &[u8], extension: &str) -> Option<image::DynamicImage>;
     fn susie_path(
@@ -275,6 +297,32 @@ trait FallbackDecoder {
         bytes: &[u8],
         options: CanonicalDecodeOptions<'_>,
     ) -> std::io::Result<image::DynamicImage>;
+}
+
+impl<T: FallbackDecoder> crate::image_decode::Backend for T {
+    fn avif(
+        &self,
+        source: crate::image_decode::Source<'_>,
+        workload: crate::avif_decoder::Workload,
+        _budget: Option<u64>,
+    ) -> Result<image::DynamicImage, crate::avif_decoder::Error> {
+        match source {
+            crate::image_decode::Source::Path(path) => self.avif_path(path, workload),
+            crate::image_decode::Source::Bytes { bytes, .. } => self.avif_bytes(bytes, workload),
+        }
+    }
+    fn wic(
+        &self,
+        source: crate::image_decode::Source<'_>,
+        _budget: Option<u64>,
+    ) -> Option<image::DynamicImage> {
+        match source {
+            crate::image_decode::Source::Path(path) => self.wic_path(path),
+            crate::image_decode::Source::Bytes { bytes, .. } => {
+                self.wic_bytes(bytes, source.extension())
+            }
+        }
+    }
 }
 
 struct SystemFallbackDecoder;
@@ -293,11 +341,12 @@ impl FallbackDecoder for SystemFallbackDecoder {
         path: &Path,
         options: CanonicalDecodeOptions<'_>,
     ) -> std::io::Result<image::DynamicImage> {
-        crate::susie_loader::decode_file(
-            path,
+        crate::image_decode::susie(
+            crate::image_decode::Source::Path(path),
             options.susie_priority,
             options.susie_cancel.cloned(),
         )
+        .map(|decoded| decoded.image)
     }
 
     fn susie_bytes(
@@ -306,12 +355,15 @@ impl FallbackDecoder for SystemFallbackDecoder {
         bytes: &[u8],
         options: CanonicalDecodeOptions<'_>,
     ) -> std::io::Result<image::DynamicImage> {
-        crate::susie_loader::decode_bytes(
-            filename_hint,
-            bytes,
+        crate::image_decode::susie(
+            crate::image_decode::Source::Bytes {
+                bytes,
+                hint: filename_hint,
+            },
             options.susie_priority,
             options.susie_cancel.cloned(),
         )
+        .map(|decoded| decoded.image)
     }
 }
 
@@ -621,46 +673,55 @@ fn decode_canonical_resolved_with_fallbacks(
     // 失敗したときは連鎖のどこで何が起きたかを持って返す。Susie のエラーを捨てると、
     // 「拡張子が認識されない」という image クレートの文面だけが残り、Susie を試した
     // ことすら伝わらない (バックログ 2.21 の誤読の原因)。
-    let image = if let Some(bytes) = bytes {
-        match image::load_from_memory(bytes) {
-            Ok(image) => Ok(image),
-            Err(primary) => match fallbacks.wic_bytes(bytes, &source.extension) {
-                Some(image) => Ok(image),
-                None => fallbacks
-                    .susie_bytes(&source.filename_hint, bytes, options)
-                    .map_err(|susie_error| DecodeChainFailure {
-                        primary,
-                        susie_error,
-                    }),
-            },
+    let raster_source = match bytes {
+        Some(bytes) => crate::image_decode::Source::Bytes {
+            bytes,
+            hint: &source.filename_hint,
+        },
+        None => crate::image_decode::Source::Path(source.path),
+    };
+    let decoded = crate::image_decode::primary_with_backend(
+        raster_source,
+        options.avif_workload,
+        None,
+        cancel,
+        || match bytes {
+            Some(bytes) => image::load_from_memory(bytes),
+            None => image::open(source.path),
+        },
+        fallbacks,
+    )
+    .or_else(|primary| {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(CanonicalDecodeError::Cancelled(
+                CanonicalCancelStage::SourceReadComplete,
+            ));
         }
-    } else {
-        match image::open(source.path) {
-            Ok(image) => Ok(image),
-            Err(primary) => match fallbacks.wic_path(source.path) {
-                Some(image) => Ok(image),
-                None => fallbacks
-                    .susie_path(source.path, options)
-                    .map_err(|susie_error| DecodeChainFailure {
-                        primary,
-                        susie_error,
-                    }),
-            },
-        }
+        let susie = match bytes {
+            Some(bytes) => fallbacks.susie_bytes(&source.filename_hint, bytes, options),
+            None => fallbacks.susie_path(source.path, options),
+        };
+        susie
+            .map(|image| {
+                crate::image_decode::Decoded::legacy(image, crate::stats::DecodeSource::Susie)
+            })
+            .map_err(|susie_error| {
+                CanonicalDecodeError::Decode(DecodeChainFailure {
+                    primary,
+                    susie_error,
+                })
+            })
+    })?;
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(CanonicalDecodeError::Cancelled(
+            CanonicalCancelStage::SourceReadComplete,
+        ));
     }
-    .map_err(CanonicalDecodeError::Decode)?;
-
-    // FullFrames のアニメ decoder は各フレームへ EXIF orientation を適用しない。
-    // 昇格前後の第1フレームを同じ画素に保つため、アニメと確認済みの FirstFrameOnly
-    // も同じ向きのまま返す。通常静止画だけは従来どおり orientation を適用する。
-    let image = match (static_animation, bytes) {
-        (CanonicalStaticAnimation::FirstFrameOnly(_), _) => image,
-        (CanonicalStaticAnimation::Still, Some(bytes)) => {
-            crate::thumb_loader::apply_exif_orientation_from_bytes(image, bytes)
-        }
-        (CanonicalStaticAnimation::Still, None) => {
-            crate::thumb_loader::apply_exif_orientation(image, source.path)
-        }
+    // Animation's first frame retains its existing orientation rule. Built-in
+    // AVIF carries Applied in the decoded type, independent of the extension.
+    let image = match static_animation {
+        CanonicalStaticAnimation::FirstFrameOnly(_) => decoded.image,
+        CanonicalStaticAnimation::Still => decoded.oriented(raster_source),
     };
     let source_dims = [image.width() as usize, image.height() as usize];
     Ok(CanonicalImageDecode::Static(CanonicalStaticImage {
@@ -1504,6 +1565,7 @@ mod tests {
             },
             CanonicalDecodeOptions {
                 susie_priority: true,
+                avif_workload: crate::avif_decoder::Workload::Display,
                 susie_cancel: None,
                 cancel: Some(&cancel),
                 animation_policy: AnimationPolicy::FullFrames,
@@ -1535,6 +1597,7 @@ mod tests {
             },
             CanonicalDecodeOptions {
                 susie_priority: true,
+                avif_workload: crate::avif_decoder::Workload::Display,
                 susie_cancel: None,
                 cancel: Some(&cancel),
                 animation_policy: AnimationPolicy::FullFrames,
@@ -1590,11 +1653,22 @@ mod tests {
 
     struct RecordingFallbacks {
         calls: Mutex<Vec<&'static str>>,
+        avif: BackendResult,
         wic: BackendResult,
         susie: BackendResult,
     }
 
     impl RecordingFallbacks {
+        fn avif_result(&self) -> Result<image::DynamicImage, crate::avif_decoder::Error> {
+            match self.avif {
+                BackendResult::Hit => Ok(Self::image()),
+                BackendResult::Miss => Err(crate::avif_decoder::Error {
+                    stage: crate::avif_decoder::Stage::Parse,
+                    code: Some(2),
+                    message: "fake parse failure".into(),
+                }),
+            }
+        }
         fn image() -> image::DynamicImage {
             image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
                 2,
@@ -1609,6 +1683,22 @@ mod tests {
     }
 
     impl FallbackDecoder for RecordingFallbacks {
+        fn avif_path(
+            &self,
+            _path: &Path,
+            _workload: crate::avif_decoder::Workload,
+        ) -> Result<image::DynamicImage, crate::avif_decoder::Error> {
+            self.calls.lock().unwrap().push("avif_path");
+            self.avif_result()
+        }
+        fn avif_bytes(
+            &self,
+            _bytes: &[u8],
+            _workload: crate::avif_decoder::Workload,
+        ) -> Result<image::DynamicImage, crate::avif_decoder::Error> {
+            self.calls.lock().unwrap().push("avif_bytes");
+            self.avif_result()
+        }
         fn wic_path(&self, _path: &Path) -> Option<image::DynamicImage> {
             self.calls.lock().unwrap().push("wic_path");
             matches!(self.wic, BackendResult::Hit).then(Self::image)
@@ -1646,11 +1736,137 @@ mod tests {
     }
 
     #[test]
+    fn avif_fake_order_and_applied_orientation_are_explicit() {
+        let bytes = jpeg_with_orientation(6); // AVIF backend succeeds; EXIF must not rotate its 2x1 raster.
+        for native_hit in [false, true] {
+            for wic_hit in [false, true] {
+                for use_bytes in [false, true] {
+                    let fallbacks = RecordingFallbacks {
+                        calls: Mutex::new(Vec::new()),
+                        avif: if native_hit {
+                            BackendResult::Hit
+                        } else {
+                            BackendResult::Miss
+                        },
+                        wic: if wic_hit {
+                            BackendResult::Hit
+                        } else {
+                            BackendResult::Miss
+                        },
+                        susie: BackendResult::Hit,
+                    };
+                    let decoded = static_image(
+                        decode_canonical_image_with_fallbacks(
+                            CanonicalImageSource::File {
+                                path: Path::new("page.AVIF"),
+                                verified_bytes: use_bytes.then_some(&bytes),
+                            },
+                            CanonicalDecodeOptions::fullscreen(
+                                AnimationPolicy::FirstFrameOnly,
+                                RawStage::Full,
+                            ),
+                            &fallbacks,
+                        )
+                        .unwrap(),
+                    );
+                    let expected = match (native_hit, wic_hit, use_bytes) {
+                        (true, _, true) => vec!["avif_bytes"],
+                        (true, _, false) => vec!["avif_path"],
+                        (false, true, true) => vec!["avif_bytes", "wic_bytes"],
+                        (false, true, false) => vec!["avif_path", "wic_path"],
+                        (false, false, true) => vec!["avif_bytes", "wic_bytes", "susie_bytes"],
+                        (false, false, false) => vec!["avif_path", "wic_path", "susie_path"],
+                    };
+                    assert_eq!(fallbacks.calls(), expected);
+                    assert_eq!(
+                        decoded.source_dims,
+                        if !native_hit && use_bytes {
+                            [1, 2]
+                        } else {
+                            [2, 1]
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn avif_invalid_fixtures_follow_wic_then_susie() {
+        for name in ["truncated", "not_avif"] {
+            let path = crate::avif_decoder::tests::fixture(name);
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                crate::avif_decoder::decode_bytes(
+                    &bytes,
+                    crate::avif_decoder::Workload::Background
+                )
+                .is_err()
+            );
+            let fallbacks = RecordingFallbacks {
+                calls: Mutex::new(Vec::new()),
+                avif: BackendResult::Miss,
+                wic: BackendResult::Miss,
+                susie: BackendResult::Hit,
+            };
+            decode_canonical_image_with_fallbacks(
+                CanonicalImageSource::File {
+                    path: &path,
+                    verified_bytes: Some(&bytes),
+                },
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FirstFrameOnly, RawStage::Full),
+                &fallbacks,
+            )
+            .unwrap();
+            assert_eq!(
+                fallbacks.calls(),
+                vec!["avif_bytes", "wic_bytes", "susie_bytes"]
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn avif_file_bytes_and_zip_keep_irot_once() {
+        let path = crate::avif_decoder::tests::fixture("quadrant_irot90cw");
+        let bytes = std::fs::read(&path).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("avif.zip");
+        write_zip(&zip, &[("page.AVIF", &bytes)]);
+        for source in [
+            CanonicalImageSource::File {
+                path: &path,
+                verified_bytes: None,
+            },
+            CanonicalImageSource::File {
+                path: &path,
+                verified_bytes: Some(&bytes),
+            },
+            CanonicalImageSource::ArchiveEntry {
+                archive_path: &zip,
+                entry_name: "page.AVIF",
+            },
+        ] {
+            let decoded = static_image(
+                decode_canonical_image(
+                    source,
+                    CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
+                )
+                .unwrap(),
+            );
+            assert_eq!(decoded.source_dims, [64, 64]);
+            crate::avif_decoder::tests::assert_quadrants(&decoded.image, [2, 0, 3, 1]);
+        }
+    }
+
+    #[test]
     fn byte_fallback_order_is_image_then_wic_then_susie() {
         let path = Path::new("invalid.pi");
         let invalid = b"not an image";
         let wic_hit = RecordingFallbacks {
             calls: Mutex::new(Vec::new()),
+            avif: BackendResult::Miss,
             wic: BackendResult::Hit,
             susie: BackendResult::Hit,
         };
@@ -1668,6 +1884,7 @@ mod tests {
 
         let susie_hit = RecordingFallbacks {
             calls: Mutex::new(Vec::new()),
+            avif: BackendResult::Miss,
             wic: BackendResult::Miss,
             susie: BackendResult::Hit,
         };
@@ -1691,6 +1908,7 @@ mod tests {
         std::fs::write(&path, b"not an image").unwrap();
         let fallbacks = RecordingFallbacks {
             calls: Mutex::new(Vec::new()),
+            avif: BackendResult::Miss,
             wic: BackendResult::Miss,
             susie: BackendResult::Hit,
         };
@@ -1713,6 +1931,7 @@ mod tests {
         let bytes = png_bytes(2, 2);
         let fallbacks = RecordingFallbacks {
             calls: Mutex::new(Vec::new()),
+            avif: BackendResult::Miss,
             wic: BackendResult::Hit,
             susie: BackendResult::Hit,
         };
@@ -1735,6 +1954,7 @@ mod tests {
         let invalid = b"not an image";
         let fallbacks = RecordingFallbacks {
             calls: Mutex::new(Vec::new()),
+            avif: BackendResult::Miss,
             wic: BackendResult::Miss,
             susie: BackendResult::Miss,
         };
@@ -1761,6 +1981,7 @@ mod tests {
     fn a_failed_decode_says_that_wic_and_susie_were_tried_too() {
         let fallbacks = RecordingFallbacks {
             calls: Mutex::new(Vec::new()),
+            avif: BackendResult::Miss,
             wic: BackendResult::Miss,
             susie: BackendResult::Miss,
         };

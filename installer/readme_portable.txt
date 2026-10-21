@@ -68,6 +68,9 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   LICENSE-ffmpeg.txt              FFmpeg のライセンス本文
   UNRAR-LICENSE.txt               UnRAR のライセンス本文
   LIBRAW-LICENSE.txt              RAW 表示・現像のライセンス本文
+  LIBAVIF-LICENSE.txt             AVIF 表示のライセンス本文
+  DAV1D-LICENSE.txt               AVIF 表示のライセンス本文
+  LIBYUV-LICENSE.txt              AVIF 表示のライセンス本文
   ZLIB-LICENSE.txt                zlib のライセンス本文
   LIBJPEG-TURBO-LICENSE.txt        libjpeg-turbo のライセンス本文
   egui-LICENSE-MIT.txt            egui の MIT ライセンス本文
@@ -101,15 +104,14 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
 追加ソフト: EPUB の変換には Microsoft Edge WebView2 Runtime が必要です。
           Windows 11 には標準で含まれています。
 
-RAW は追加インストールなしで表示・現像できます。
+RAW の表示・現像と AVIF の表示は追加インストール不要です。
 AI 機能は DirectML（Microsoft 公式、Windows 11 標準同梱）を、
-HEIC / AVIF / JPEG XL 表示は Windows Imaging Component（WIC）を
+HEIC / JPEG XL 表示は Windows Imaging Component（WIC）を
 利用します。いずれも Windows 11 に標準で含まれていますが、画像形式に
 応じて Microsoft Store から次の追加機能が必要な場合があります:
   - HEIC / HEIF: HEIF 画像表示オプション
     HEIC は、HEVC に対応していない PC では HEVC ビデオ拡張機能も必要です。
     HEVC ビデオ拡張機能は有料の場合があります。
-  - AVIF: AV1 ビデオ拡張機能
   - JPEG XL: JPEG XL 画像表示オプション
 
 本ソフトウェアが外部と通信するのは次の場合だけです。利用状況の送信・
@@ -142,6 +144,7 @@ HEIC / AVIF / JPEG XL 表示は Windows Imaging Component（WIC）を
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - LibRaw (CDDL-1.0): LibRaw LLC
     ライセンス全文と著作権表記: LIBRAW-LICENSE.txt
+    AVIF のライセンス全文と著作権表記: LIBAVIF-LICENSE.txt / DAV1D-LICENSE.txt / LIBYUV-LICENSE.txt
     対応ソース: https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz
   - zlib 1.3.1 (zlib): Jean-loup Gailly and Mark Adler
     ライセンス全文: ZLIB-LICENSE.txt

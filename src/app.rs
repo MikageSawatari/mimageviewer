@@ -8392,14 +8392,16 @@ fn decode_pano_high_res_source(
         )
         .map_err(|error| format!("RAW development failed: {error}"));
     }
-    let image = image::open(path).or_else(|primary| {
-        crate::wic_decoder::decode_to_dynamic_image(path)
-            .or_else(|| crate::susie_loader::decode_file(path, true, None).ok())
-            .ok_or(primary)
-    });
-    image
-        .map(|image| crate::thumb_loader::apply_exif_orientation(image, path))
-        .map_err(|error| error.to_string())
+    let source = crate::image_decode::Source::Path(path);
+    crate::image_decode::decode_with_susie_cancel(
+        source,
+        crate::avif_decoder::Workload::Display,
+        true,
+        Some(cancel),
+        None,
+    )
+    .map(|decoded| decoded.oriented(source))
+    .map_err(|error| error.to_string())
 }
 
 fn decode_fullscreen_resolved_with_permit(
@@ -76689,7 +76691,12 @@ impl App {
                 purpose.animation_policy(),
                 &cancel,
                 RawStage::Full,
-            );
+            )
+            .with_avif_workload(if matches!(purpose, FsLoadPurpose::Display) {
+                crate::avif_decoder::Workload::Display
+            } else {
+                crate::avif_decoder::Workload::Background
+            });
             if matches!(purpose, FsLoadPurpose::Display) {
                 decode_options =
                     decode_options.with_animation_confirmation(&notify_animation_confirmed);

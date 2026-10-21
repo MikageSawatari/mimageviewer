@@ -2466,6 +2466,31 @@ fn collect_zip_entry_dims(
             }
             continue;
         }
+        // libavif needs the container, not a truncated image header. Other
+        // formats retain the prefix probe and its bounded archive I/O.
+        if Path::new(&entry_name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("avif"))
+        {
+            match crate::zip_loader::read_entry_bytes(container_path, &entry_name)
+                .ok()
+                .and_then(|bytes| {
+                    crate::image_decode::avif_dimensions(
+                        crate::image_decode::Source::Bytes {
+                            bytes: &bytes,
+                            hint: &entry_name,
+                        },
+                        crate::avif_decoder::Workload::Background,
+                    )?
+                    .ok()
+                }) {
+                Some(size) => {
+                    dims.insert(entry_name, size);
+                }
+                None => undecodable += 1,
+            }
+            continue;
+        }
         let head = match crate::zip_loader::read_entry_prefix_from_archive(
             &mut archive,
             &entry_name,
@@ -2505,6 +2530,12 @@ fn file_image_dims(path: &Path) -> Option<(u32, u32)> {
             .ok()?
             .developed_dims;
         return Some((dims[0], dims[1]));
+    }
+    if let Some(result) = crate::image_decode::avif_dimensions(
+        crate::image_decode::Source::Path(path),
+        crate::avif_decoder::Workload::Background,
+    ) {
+        return result.ok();
     }
     image::ImageReader::open(path)
         .ok()?
@@ -8724,6 +8755,7 @@ fn decode_remote_ai_canonical(
     let decoded = crate::canonical_image_loader::decode_canonical_image(
         source,
         crate::canonical_image_loader::CanonicalDecodeOptions {
+            avif_workload: crate::avif_decoder::Workload::Display,
             susie_priority: true,
             susie_cancel: Some(cancel),
             cancel: Some(cancel),
@@ -12330,6 +12362,36 @@ mod tests {
             );
             assert!(loaded.is_ok(), "pinned RAW {index}: {:?}", loaded.err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn avif_remote_file_and_zip_dimension_probes_use_display_dimensions() {
+        use std::io::Write;
+        let bytes = crate::avif_decoder::tests::with_clap_and_mirror(true);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("page.avif");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(file_image_dims(&path), Some((64, 32)));
+        let zip_path = temp.path().join("avif.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.avif", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let items = [crate::grid_item::GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "page.avif".into(),
+        }];
+        let mut output = std::collections::HashMap::new();
+        collect_zip_entry_dims(
+            &zip_path,
+            &items,
+            &std::collections::HashMap::new(),
+            &mut output,
+        );
+        assert_eq!(output.get("page.avif"), Some(&(64, 32)));
     }
 
     #[cfg(windows)]

@@ -226,8 +226,19 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         eprintln!("{}: comparison PNG: {}", id, error);
     }
     let wic_dims = if sample["format"] == "DNG" {
-        mimageviewer::wic_decoder::decode_to_dynamic_image(&path)
-            .map(|image| [image.width(), image.height()])
+        mimageviewer::image_decode::primary(
+            mimageviewer::image_decode::Source::Path(&path),
+            mimageviewer::avif_decoder::Workload::Background,
+            None,
+            None,
+            || {
+                Err(image::ImageError::IoError(std::io::Error::other(
+                    "WIC-only DNG comparison",
+                )))
+            },
+        )
+        .ok()
+        .map(|decoded| [decoded.image.width(), decoded.image.height()])
     } else {
         None
     };

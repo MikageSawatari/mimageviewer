@@ -3102,3 +3102,15 @@ Remote payload は二端の preference と実効 bool を個別に返す。v59 w
 選んだ端だけを更新して同じ本の他端を保持する。書込後のrefreshは
 現在anchor / slice / historyを維持し、group layoutだけを更新する。詳細は
 [§1.218設計・検証記録](section218-singleton-spread-placement.md)を参照。
+
+
+### AVIF内蔵デコード（§1.407、第2ラウンド）
+
+addressed APIはcoreのcanonical / thumb_loaderを通る。旧 `/api/image` / `/api/image-info` は
+Web UIに`entry.address`なしの互換分岐として残っているため、remote-webの画像supportも
+`libavif-sys`のsafe Rust APIへ接続する。coreへの依存は追加せず、Remote exeにも静的リンクする。
+現行の通常一覧応答はaddress付きで新APIを使う（folder/collection/persistent collectionの応答生成を確認）。
+旧APIの資格確認・保存回転・passthrough条件は維持し、AVIFの画素とprobe寸法には
+clap/irot/imirの適用後結果を用いる。probeはRGBA確保・AV1 decodeを行わない。
+旧APIの需要decodeは4 threads、coreの背景寸法probeは1 thread。
+詳細な入口再棚卸しと検証は[AVIF設計§5](avif-builtin-decoder-plan.md#5-未決記録)に記録する。
