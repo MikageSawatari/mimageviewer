@@ -58167,6 +58167,8 @@ impl App {
                         detached_lease,
                         "grid_folder_candidate_main_fallback",
                     );
+                    // The scan was only a candidate; this is its first main acceptance.
+                    self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Pane));
                     let scan = if self.top_level_grid_view.smart_folder_session().is_some() {
                         let source_index = self.items.iter().position(|item| {
                             matches!(item, GridItem::Folder(folder)
@@ -58184,7 +58186,7 @@ impl App {
                                 StartupListIntent::ExplicitList
                             },
                             ready.navigation.clone(),
-                            MainListRequestStage::Admission,
+                            MainListRequestStage::Continuation,
                         ) {
                             Ok(()) => return None,
                             Err(Some(scan)) => scan,

@@ -2675,6 +2675,121 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn section1285_complete_main_scan(app: &mut App, path: &Path, ctx: &egui::Context) {
+        let mut pending = app.folder_pane_open_pending.take().unwrap();
+        pending.cancel.store(true, Ordering::Relaxed);
+        pending.cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(scan_directory(path))).unwrap();
+        pending.rx = rx;
+        app.folder_pane_open_pending = Some(pending);
+        app.post_render_main_navigation(
+            ctx,
+            update_phases::MainFrameNavigation {
+                fav_nav: None,
+                toolbar_fav_nav: None,
+                fullscreen_close_nav: None,
+                keyboard_nav: None,
+                keyboard_nav_from_fullscreen_close: false,
+                gamepad_nav: None,
+                address_nav: None,
+                open_folder_nav: None,
+                context_nav: None,
+                folder_pane_nav: None,
+                grid_nav: None,
+            },
+        );
+        app.finish_page_identity_preparation_for_test();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section1285_candidate_main_join_retires_older_startup_and_activation() {
+        for mixed in [true, false] {
+            for activation in [false, true] {
+                let mut app = setup_app_for_test();
+                app.active_quick_folder_slot = None;
+                let parent = app.tmp.path().join("library");
+                let target = parent.join("candidate");
+                let stale = app.tmp.path().join("stale-resolve");
+                std::fs::create_dir_all(&target).unwrap();
+                std::fs::create_dir(&stale).unwrap();
+                std::fs::write(target.join("page.jpg"), b"fixture").unwrap();
+                if mixed {
+                    std::fs::write(target.join("clip.mp4"), b"fixture").unwrap();
+                }
+                app.settings.detached_viewer_open_images_in_window = true;
+                app.settings.auto_fullscreen_image_folders = true;
+                app.current_folder = Some(parent);
+                app.items = vec![GridItem::Folder(target.clone())];
+                app.thumbnails = vec![ThumbnailState::Pending];
+                app.image_metas = vec![None];
+                app.visible_indices = vec![0];
+                app.selected = Some(0);
+                let owner = if activation {
+                    StartupOpenPathOwner::Activation
+                } else {
+                    StartupOpenPathOwner::InitialStartup
+                };
+                let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
+                let ctx = egui::Context::default();
+                assert!(app.handle_gamepad_grid_accept(&ctx).is_none());
+                assert!(matches!(
+                    app.folder_pane_open_pending.as_ref().map(|p| &p.purpose),
+                    Some(FolderOpenScanPurpose::GridFolderCandidate { .. })
+                ));
+                assert!(
+                    !cancel.load(Ordering::Relaxed),
+                    "a candidate is not yet main admission"
+                );
+                if !mixed {
+                    // A slow candidate can return to main with a PageContinuation intent too.
+                    app.settings.detached_viewer_open_images_in_window = false;
+                }
+                tx.send(section1285_result(&stale)).unwrap();
+                section1285_complete_main_scan(&mut app, &target, &ctx);
+                assert!(
+                    cancel.load(Ordering::Relaxed),
+                    "mixed={mixed}, activation={activation}"
+                );
+                assert!(app.startup_open_path_resolve_pending.is_none());
+                app.poll_startup_open_path_resolve(&ctx);
+                assert_eq!(app.current_folder.as_ref(), Some(&target));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section1285_accepted_pane_join_preserves_later_activation() {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let target = app.tmp.path().join("pane");
+        std::fs::create_dir(&target).unwrap();
+        let initial = app.tmp.path().join("initial");
+        let (_initial_tx, initial_cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &initial);
+        app.start_folder_pane_open(target.clone());
+        assert!(initial_cancel.load(Ordering::Relaxed));
+        let later = app.tmp.path().join("later-activation");
+        let (later_tx, later_cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &later);
+        let ctx = egui::Context::default();
+        section1285_complete_main_scan(&mut app, &target, &ctx);
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+        assert!(!later_cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .unwrap()
+                .requested
+                .as_path(),
+            later.as_path()
+        );
+        later_tx.send(section1285_result(&later)).unwrap();
+    }
+
     #[test]
     fn section1285_explicit_zip_level_moves_retire_unresolved_main_opens() {
         for activation in [false, true] {

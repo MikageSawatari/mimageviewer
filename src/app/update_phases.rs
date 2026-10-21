@@ -1378,6 +1378,7 @@ impl App {
                 self.replace_ready_folder_pane_open(p, folder_pane_open_ready.take());
                 None
             } else if let Some(ready) = folder_pane_open_ready.take() {
+                // Main resolution admits candidates before handing their accepted scan back.
                 navigate_stage = MainListRequestStage::Continuation;
                 #[cfg(windows)]
                 {
@@ -1423,6 +1424,9 @@ impl App {
                             FolderOpenScanPurpose::GridFolderCandidate { collection_owner },
                             Ok(scan),
                         ) => {
+                            self.retire_replaced_main_list_requests(Some(
+                                MainListRequestOwner::Pane,
+                            ));
                             navigate_pre_scan = Some(scan);
                             if let Some(owner) = collection_owner {
                                 navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);

@@ -594,6 +594,44 @@ synthetic 履歴 replay、DFS 開始、固定一覧の固定/解除は直接 ins
 サブ展開の scan→prepare と policy 変更による再 scan も同じ要求の継続である。
 ZIP の Enter/ダブルクリック/BS/DFS は成功した移動の受付で退役し、階層の再投影では退役しない。
 
+GridFolderCandidate の走査開始は移動先 viewer が未確定なので main 受付にしない。
+既存の判定で main 復帰が確定した地点で1回受付し、Smart への引き渡しと通常の
+`folder_pane_open_ready` 合流はその継続にする。復元 intent が PageContinuation でもこの受付は必要。
+通常 pane は走査開始時に受付済みで、完了時には後発 resolver を退役させない。detached 判定は変更しない。
+
+2026-10-21、`71d5d94ba` で Continuation にした22箇所を個別に再監査した。
+以下の位置は同 commit の修正前行番号。Candidate の main 合流以外に、未受付の新しい main 要求を
+Continuation として飛ばす製品経路は見つからなかった。
+
+| 位置 | 継続経路 | 受付元 / 新規受付が不要な理由 |
+| --- | --- | --- |
+| `src/app.rs:28328` | 分類→DirectNavigation | 分類 worker の受付、または元 resolver の受付 |
+| `src/app.rs:28379` | 分類→SmartGrid | 分類 worker の受付 |
+| `src/app.rs:28403` | 分類→Direct | 分類 worker の受付、または元 resolver の受付 |
+| `src/app.rs:28440` | 分類→DirectScan | 分類 worker の受付、または元 resolver の受付 |
+| `src/app.rs:28473` | 分類→Physical | 分類 / DFS の受付 |
+| `src/app.rs:28494` | 分類→Collection 履歴 | 分類 worker の受付 |
+| `src/app.rs:28799` | DFS FullFeature→変換書庫 | start_folder_nav。画像着地の内部 container 展開は PageContinuation |
+| `src/app.rs:28808` | DFS FullFeature→通常 loader | start_folder_nav。画像着地の内部 container 展開は PageContinuation |
+| `src/app.rs:34328` | Snapshot cache→Physical preflight | SnapshotArchiveCacheOnly 分類の受付 |
+| `src/app.rs:57619` | Collection 元場所 jump の走査完了 | JumpToPhysicalFolder 走査の受付 |
+| `src/app.rs:57639` | 通常の元場所 jump の走査完了 | JumpToPhysicalFolder 走査の受付 |
+| `src/app.rs:58329` | EPUB batch 後の並び refresh | 同一覧の PreservePresentation、別の移動要求ではない |
+| `src/app.rs:58931` | Favsearch DFS 境界→Physical | start_folder_nav |
+| `src/app.rs:59120` | DFS→Physical claim | start_folder_nav |
+| `src/app.rs:59130` | DFS→Physical transition | start_folder_nav |
+| `src/app.rs:59342` | Favsearch DFS 境界→Physical | start_folder_nav |
+| `src/app/collection_navigation.rs:4022` | Collection の準備済み変換書庫 | enqueue_collection_navigation |
+| `src/app/smart_folder.rs:2654` | Smart DFS→child transition | start_folder_nav |
+| `src/app/snapshot_ops.rs:2442` | exact fullscreen の走査完了 | RequiredFullscreenTarget 走査の受付 |
+| `src/app/startup_ops.rs:1271` | RAR 証明不足の resolve 完了→分類 | 元の起動系 resolver の受付 |
+| `src/app/startup_ops.rs:1435` | resolve 完了→loader | 元の起動系 resolver の受付 |
+| `src/app/update_phases.rs:1381` | pane / Candidate の main 合流 | pane は走査開始。Candidate は今回 main 確定地点で受付するよう修正 |
+
+Candidate の Smart main 復帰も、同じ確定地点で受付してから Continuation として渡す。
+回帰テストは gamepad の実 Candidate 開始と本番の post_render_main_navigation 合流を通し、
+混在 folder と設定変更による PageContinuation の main 復帰を検査する。
+
 既知の別件（master `4db8a8874` から存在、§1.285 の範囲外、未対応）:
 先行する `BookmarkRow` 分類 A の完了が、後発 Activation B の resolver を置換し得る
 （`src/app.rs:28331` → `src/app.rs:51411` → `src/app/startup_ops.rs:327`）。
