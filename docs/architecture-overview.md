@@ -276,7 +276,10 @@ PDF の既知 page-box cache 値も preview の独立 nullable layout 列へ同�
 通常 thumbnail の texel 数を外側の構成へ使わない。既存4方式の全面素材の単ページ sizing は保つ。
 指定倍率の通常rasterだけは単ページ・見開き・連結読みで同じA/O resolverへ統一する。
 本画像未到着時の100%基準は生成由来のcrop前raster、またはproducer共通のGPU clamp予測値であり、
-thumbnail実寸やclamp前の正準座標寸法を流用しない。AI後もAI前raster基準を維持する。
+source寸法が判明している場合はthumbnail実寸やclamp前の正準座標寸法を流用しない。
+通常の旧catalog行でsource寸法が無い場合は、従来のsampler契約を受理時に明示して指定倍率にも保持する。
+PDF部分素材のlegacy参照寸法はcoverageの全体座標から受理し、page-box layout単位と分ける。
+AI後もAI前raster基準を維持する。
 100%と方式別layoutの所有者は素材自身の `MaterialDisplayBasis` とする。producer selectorは
 handleとdescriptorを持つResourceを返し、保持presentationの選択はPayloadとして別に行う。
 Loaded／派生cache／通過素材／消しゴム下地から保持・captureまでdescriptorを継承し、

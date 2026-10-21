@@ -1726,6 +1726,349 @@ pub(crate) mod tests {
         }
     }
 
+    fn accept_legacy_catalog_for_raw_basis(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        coverage: crate::source_coverage::SourceCoverage,
+    ) {
+        app.keep_range = (0, app.items.len());
+        app.keep_set.insert(idx);
+        app.requested.insert(idx, false);
+        let pixels = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            idx,
+            Some(egui::ColorImage::filled([3, 2], egui::Color32::GRAY)),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            0,
+            app.items_generation,
+        )
+        .with_source_coverage(coverage);
+        app.poll_thumbnail_result_for_test(ctx, pixels);
+        let completed = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            idx,
+            None,
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            None,
+            None,
+            None,
+            false,
+            true,
+            0,
+            app.items_generation,
+        );
+        app.poll_thumbnail_result_for_test(ctx, completed);
+        assert!(matches!(
+            app.thumbnails[idx],
+            ThumbnailState::Loaded {
+                source_dims: None,
+                ..
+            }
+        ));
+    }
+
+    fn raw_catalog_basis_fixture() -> (
+        super::super::tests::phase_c_support::AppTestEnv,
+        RawResultTag,
+    ) {
+        let mut app = app_with_raw_and_jpeg();
+        let mut source = app.raw_pages.page(0).unwrap().source.clone();
+        app.raw_pages.discard(0);
+        source.item_key = app.page_path_key(0).unwrap();
+        let request_id = app.raw_pages.begin_preview(0, source.item_key.clone());
+        let tag = RawResultTag {
+            context: app.fs_page_load_context_serial(),
+            generation: app.items_generation,
+            idx: 0,
+            request_id,
+            source,
+            stage: RawResultStage::Info,
+        };
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.image_metas = vec![None; 2];
+        app.details_order = vec![0, 1];
+        app.fullscreen_idx = Some(0);
+        let lut = crate::creative_lut::BuiltinCreativeLut::WarmFilm;
+        app.creative_lut_library =
+            crate::creative_lut::CreativeLutLibrary::from_builtin_for_test(lut);
+        app.settings.global_preset.creative_lut = crate::creative_lut::CreativeLutSelection {
+            id: Some(lut.id()),
+            strength: 1.0,
+        };
+        (app, tag)
+    }
+
+    fn assert_raw_material_fits_and_paints(
+        ctx: &egui::Context,
+        material: &crate::gpu_lanczos::FullscreenPaintResource,
+    ) {
+        use crate::displayed_image_transform::{
+            DisplayedImageGeometry, DisplayedImageGeometryInput, FullscreenFitScaleLimits,
+            RectPixelFit, ResolvedDisplayPlacement,
+        };
+        use crate::fullscreen_specified_scale::FullscreenFitInput;
+        use crate::material_display_basis::{MaterialDisplayView, MaterialLegacyBasis};
+        use crate::settings::FullscreenFitMode;
+        let legacy = material.display_basis().legacy(MaterialDisplayView::Single);
+        let MaterialLegacyBasis::SourceLayout { basis } = legacy else {
+            panic!("RAW rendition must retain its developed canvas");
+        };
+        assert_eq!(basis.layout_size, egui::vec2(12000.0, 8000.0));
+        assert_eq!(basis.reference_size, basis.layout_size);
+        let specified = material.display_basis().specified().unwrap();
+        assert_eq!(specified.aspect_size, basis.layout_size);
+        assert_eq!(specified.original_size, basis.layout_size);
+        for mode in [
+            FullscreenFitMode::Original,
+            FullscreenFitMode::Page,
+            FullscreenFitMode::SpecifiedScale,
+        ] {
+            let fit_mode = if mode == FullscreenFitMode::SpecifiedScale {
+                FullscreenFitInput::from_mode(
+                    mode,
+                    crate::settings::FullscreenSpecifiedScale::default(),
+                    specified,
+                    crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
+                )
+            } else {
+                FullscreenFitInput::SourceLayout { mode, basis }
+            };
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+            let geometry = DisplayedImageGeometry::resolve(DisplayedImageGeometryInput {
+                viewport_rect: viewport,
+                source_size: basis.layout_size,
+                texture_size: material.full_source_size_vec2(),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                pixel_fit: RectPixelFit::Texels,
+            })
+            .expect("accepted RAW basis resolves each released fit policy");
+            if mode == FullscreenFitMode::Original {
+                assert_eq!(geometry.full_image_rect.size(), basis.layout_size);
+            }
+            let output = ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx
+                        .layer_painter(egui::LayerId::background())
+                        .with_clip_rect(viewport);
+                    material.paint_geometry(&geometry, &painter, egui::Color32::WHITE);
+                },
+            );
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Mesh(mesh) if mesh.texture_id == material.paint_texture_id() && !mesh.indices.is_empty()
+            )), "{mode:?} must submit the faithful RAW rendition");
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn raw_legacy_catalog_basis_adopts_info_before_or_after_thumbnail_and_selects_faithful_material()
+     {
+        use crate::material_display_basis::MaterialBasisUnavailable;
+        use crate::source_coverage::SourceCoverage;
+        for coverage in [SourceCoverage::FullSource, SourceCoverage::Unknown] {
+            for thumbnail_at in 0..3 {
+                let ctx = egui::Context::default();
+                let (mut app, tag) = raw_catalog_basis_fixture();
+                if thumbnail_at == 0 {
+                    accept_legacy_catalog_for_raw_basis(&mut app, &ctx, 0, coverage);
+                    let ThumbnailState::Loaded { display_basis, .. } = &app.thumbnails[0] else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        display_basis.specified(),
+                        Err(MaterialBasisUnavailable::RawDimensionsUnavailable)
+                    );
+                    assert!(app.ensure_passthrough_material(&ctx, 0).is_none());
+                }
+                app.apply_raw_fs_result(
+                    &ctx,
+                    tag.clone(),
+                    RawPageResult::Info {
+                        developed_dims: [12000, 8000],
+                        support: RawDevelopSupport::Supported,
+                    },
+                    1,
+                );
+                if thumbnail_at == 1 {
+                    accept_legacy_catalog_for_raw_basis(&mut app, &ctx, 0, coverage);
+                }
+                app.apply_raw_fs_result(
+                    &ctx,
+                    RawResultTag {
+                        stage: RawResultStage::Preview,
+                        ..tag.clone()
+                    },
+                    RawPageResult::Preview {
+                        pixels: Some(egui::ColorImage::filled([3, 2], egui::Color32::GRAY)),
+                    },
+                    2,
+                );
+                if thumbnail_at == 2 {
+                    accept_legacy_catalog_for_raw_basis(&mut app, &ctx, 0, coverage);
+                }
+                assert!(!app.export_crop_pages.contains(&0));
+                let thumbnail = app.fs_thumbnail_resource_for_display(0).unwrap();
+                let material = app.resolve_fs_processed_material(&ctx, 0, false).unwrap();
+                assert!(app.is_passthrough_rendition_texture(material.source_texture()));
+                assert_eq!(material.display_basis(), thumbnail.display_basis());
+                assert_eq!(material.source_coverage(), SourceCoverage::FullSource);
+                assert_raw_material_fits_and_paints(&ctx, &material);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_info_readoption_retires_only_changed_derivative_and_keeps_captured_basis() {
+        use crate::material_display_basis::MaterialBasisUnavailable;
+        use crate::source_coverage::SourceCoverage;
+        let ctx = egui::Context::default();
+        let (mut app, tag) = raw_catalog_basis_fixture();
+        accept_legacy_catalog_for_raw_basis(&mut app, &ctx, 0, SourceCoverage::FullSource);
+        accept_legacy_catalog_for_raw_basis(&mut app, &ctx, 1, SourceCoverage::FullSource);
+        let sibling = app.ensure_passthrough_material(&ctx, 1).unwrap();
+        let ThumbnailState::Loaded {
+            tex, display_basis, ..
+        } = &app.thumbnails[0]
+        else {
+            unreachable!()
+        };
+        let missing_basis = *display_basis;
+        assert_eq!(
+            missing_basis.specified(),
+            Err(MaterialBasisUnavailable::RawDimensionsUnavailable)
+        );
+        // An explicitly retained old derivative exercises cache readoption. Real
+        // pre-Info display remains gated, so do not bypass it through a selector.
+        let held = app.fs_direct_resource_for_accepted_texture(
+            0,
+            tex.clone(),
+            SourceCoverage::FullSource,
+            missing_basis,
+        );
+        let captured = held.capture_presentation(&ctx);
+        let pixels = app.thumb_pixels.get(&0).unwrap().clone();
+        let key = app.final_composite_key_for_pixels(
+            app.current_edit_result_key(0),
+            pixels.size,
+            app.effective_params(0),
+        );
+        app.passthrough_rendition_cache.insert(
+            key,
+            PassthroughRenditionEntry {
+                display_basis: missing_basis,
+                source_pixels: pixels.clone(),
+                source_coverage: SourceCoverage::FullSource,
+                _pixels: pixels,
+                colorize_applied: false,
+                texture: held.source_texture().clone(),
+            },
+        );
+        assert_eq!(app.passthrough_rendition_cache.len(), 2);
+        app.apply_raw_fs_result(
+            &ctx,
+            tag,
+            RawPageResult::Info {
+                developed_dims: [12000, 8000],
+                support: RawDevelopSupport::Supported,
+            },
+            1,
+        );
+        assert!(!app.passthrough_rendition_cache.entries.contains_key(&key));
+        assert_eq!(app.passthrough_rendition_cache.len(), 1);
+        let unchanged = app.cached_passthrough_material(1).unwrap();
+        assert_eq!(unchanged.source_texture_id(), sibling.source_texture_id());
+        assert_eq!(unchanged.display_basis(), sibling.display_basis());
+        assert_eq!(held.display_basis(), missing_basis);
+        assert_eq!(captured.display_basis(), missing_basis);
+        let ThumbnailState::Loaded { display_basis, .. } = &app.thumbnails[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            display_basis.specified().unwrap().original_size,
+            egui::vec2(12000.0, 8000.0)
+        );
+    }
+
+    #[test]
+    fn raw_developed_install_preserves_accepted_canvas_and_selects_source_over_catalog() {
+        use crate::source_coverage::SourceCoverage;
+        let ctx = egui::Context::default();
+        let (mut app, info) = raw_catalog_basis_fixture();
+        app.fullscreen_idx = None;
+        app.apply_raw_fs_result(
+            &ctx,
+            info.clone(),
+            RawPageResult::Info {
+                developed_dims: [12000, 8000],
+                support: RawDevelopSupport::Supported,
+            },
+            1,
+        );
+        accept_legacy_catalog_for_raw_basis(&mut app, &ctx, 0, SourceCoverage::FullSource);
+        let ThumbnailState::Loaded { display_basis, .. } = &app.thumbnails[0] else {
+            unreachable!()
+        };
+        let old_basis = *display_basis;
+        assert_eq!(
+            old_basis.specified().unwrap().original_size,
+            egui::vec2(12000.0, 8000.0)
+        );
+        let mut worker = Fixture::new();
+        worker.info(RawDevelopSupport::Supported);
+        worker.preparing(RawBrightness::MatchPreview);
+        *app.raw_pages.page(0).unwrap().develop.lock().unwrap() = std::mem::replace(
+            &mut *worker.store.page(0).unwrap().develop.lock().unwrap(),
+            RawDevelopPhase::Idle,
+        );
+        let developed = RawResultTag {
+            context: info.context,
+            generation: info.generation,
+            source: info.source,
+            ..worker.tag
+        };
+        app.apply_raw_fs_result(
+            &ctx,
+            developed,
+            RawPageResult::Develop(Box::new(FsLoadResult::Static {
+                ci: egui::ColorImage::filled([6, 4], egui::Color32::WHITE),
+                source_dims: [12000, 8000],
+                animation: StaticAnimationState::Still,
+            })),
+            2,
+        );
+        assert_eq!(app.raw_pages.classify(0), RawPageLoadState::Developed);
+        // Development hands display ownership to the full source and retires
+        // preview permission, while the accepted catalog descriptor stays owned.
+        assert!(!app.raw_fullscreen_fallback_allowed(0));
+        assert!(app.fs_thumbnail_resource_for_display(0).is_err());
+        let ThumbnailState::Loaded { display_basis, .. } = &app.thumbnails[0] else {
+            panic!("source acceptance must not replace the catalog producer");
+        };
+        assert_eq!(*display_basis, old_basis);
+        let source = app.source_material_for_idx(0).unwrap();
+        assert_eq!(
+            source.display_basis().specified().unwrap().original_size,
+            egui::vec2(12000.0, 8000.0)
+        );
+        assert_raw_material_fits_and_paints(&ctx, &source);
+    }
+
     #[test]
     fn terminal_raw_target_is_load_failed_even_with_a_warm_thumbnail() {
         let mut app = app_with_raw_and_jpeg();
@@ -2051,6 +2394,7 @@ impl App {
                 {
                     self.record_page_dims_for_spread(tag.idx, (w as u32, h as u32));
                 }
+                self.readopt_loaded_raw_thumbnail_basis(tag.idx);
             }
             RawApplyOutcome::Stale => {
                 self.invalidate_raw_source_for_idx(tag.idx);
@@ -2079,6 +2423,7 @@ impl App {
                 }
                 self.bump_input_generation_for_fs_cache_reload(tag.idx);
                 self.record_fs_cache_page_dims_for_spread(tag.idx);
+                self.readopt_loaded_raw_thumbnail_basis(tag.idx);
                 self.fs_margin_bbox_cache.remove(&tag.idx);
                 if developed {
                     if self.fullscreen_idx == Some(tag.idx)

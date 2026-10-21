@@ -759,12 +759,18 @@ frame stateの通常素材・thumbnail／通過代役、Native不採用時の描
 保持presentationの選択は別に `FullscreenPaintPayload` を返し、NormalResourceもPresentationMaterialも
 そのまま運ぶ。fit・見開き構成・指定倍率・保持・退去後の再描画でidxやtexture IDから100%を再探索しない。
 現在のfit設定・倍率制限は描画時に適用し、frozen captureだけが設定を含むfit descriptorも捕捉する。
-source寸法不明は型付きの基準欠落とし、指定倍率の100%をsamplerや正準座標から補わない。
-旧4方式のsource不明thumbnailのlegacy canvasは、受理時に明示的に保持する。
+通常thumbnailの旧catalog行でsource寸法が無い場合は、指定倍率を含め従来の選択済みsampler契約を
+受理時に明示して保持する。描画側でsamplerや正準座標から100%を補う処理は置かない。
+不正寸法や、従来から表示に必要なPDF／RAW metadataの未確定は、互換行の寸法省略と区別する。
 RAW／PDF／連結のlegacy source-layoutは `LegacySourceLayoutBasis` にlayout単位と
 受理rasterの参照寸法を別々に持つ。単ページのaspect正規化もこの参照寸法を使い、
-cache退去後の座標寸法やsamplerへ戻らない。PDF thumbnailのmetadata再受理では
+cache退去後の座標寸法やsamplerへ戻らない。PDFのKnown部分素材は、従来のPDF契約に従って
+coverageの全体座標寸法をlegacy参照寸法として受理し、page-box layout単位とは分離する。
+FullSource thumbnailの参照寸法は従来どおりown samplerとする。PDF thumbnailのmetadata再受理では
 page-boxと指定A/Oを更新し、同じ素材のlegacy参照寸法は保持する。
+RAWの旧catalog行に寸法が無い場合は、受理済みRawInfoのdeveloped寸法をthumbnail受理時に採用する。
+thumbnailが先に届いた場合も、RawInfo／previewの実受理境界でlive descriptorを再受理する。
+PDF／RAWでdescriptorが変わったページの依存通過素材だけを退役し、保持済みcaptureと兄弟ページは維持する。
 見開き・連結の既存layout単位はそのまま使い、物理100%の型へ統一しない。
 素材のない連結ページのlegacy placeholderは、退去後も正準layoutを保持する。これは未描画ページの
 空間だけを確保する値であり、指定倍率の物理100%基準には使わない。ページ送り受付も共通の
@@ -2492,10 +2498,12 @@ Aは部分素材のcoverage座標aspect／RAWのdeveloped aspect／PDF page box�
 通常全面素材はAも予測rasterと到着rasterで揃え、pre-AI cache登録だけで正準aspectから
 整数丸め済みaspectへ切り替えない。正準source座標とページ構成の寸法は独立して維持する。
 AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け、派生textureや
-AI出力寸法から逆算しない。通常thumbnailで本画像未到着なら、生成時のcrop前raster寸法を使い、
+AI出力寸法から逆算しない。source寸法が判明している通常thumbnailで本画像未到着なら、生成時のcrop前raster寸法を使い、
 それが無ければ正準寸法をproducerと共通の `gpu_raster_dimensions` へ渡してGPU raster寸法を予測する。
 正準座標寸法を物理100%へそのまま流用しない。PDFは検証済みpage boxとcontent typeから、Vectorは長辺4096px、Rasterは
 `min(4096, native_long_edge)` の固定Oを解く。既存source座標用のraster寸法は別用途のまま残す。
+通常の旧catalog行でsource寸法が無い場合は、従来の選択済みsampler基準を受理時に保持して表示する。
+これは既知寸法のGPU raster予測とは別の互換契約であり、描画時に不足寸法を探すfallbackではない。
 
 `layout_full_image_rect` はこのA/Oから得るfull-page fit枠。実textureの整数丸めで縦横比が微妙に
 違ってもこの枠を変更せず、`from_layout_rect` がsampling用の `full_image_rect` を枠内へcontainする。
@@ -2507,7 +2515,7 @@ replayやnavigatorから現在の指定値・共通最大倍率や新しいraste
 使い、thumbnail退去後にidx探索の正準寸法へ100%基準を戻さない。見開き全体と各ページも
 同じ `fs_spread_fit_input` の結果を使う。連結読みのreference／measurementも同じ素材selectorを使い、
 元画像／解析表示ではsource素材、通常表示ではprocessed／保持素材を選ぶ。
-§1.165最終P2追補（2026-10-22）の仕様差として、通常thumbnailの指定倍率は7474e5cf1の
+§1.165最終P2追補（2026-10-22）の仕様差として、source寸法が判明している通常thumbnailの指定倍率は7474e5cf1の
 thumbnail実寸（例:60×80）へ戻さず、到着予定GPU raster（正準15000×20000なら6144×8192）を
 100%基準にする。指定倍率＋「縮小しない」でも到着時に枠・倍率が跳ばない。
 通常rasterの指定方式では連結読みのsource原寸例外も外し、到着後・AI前metadata・退去後まで

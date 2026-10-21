@@ -65,6 +65,17 @@ fn accept_thumbnails_with_layout(
     sampler: [usize; 2],
     layout_dims: Option<(u32, u32)>,
 ) {
+    accept_thumbnail_receipts(app, ctx, coverage, Some(source_dims), sampler, layout_dims);
+}
+
+fn accept_thumbnail_receipts(
+    app: &mut App,
+    ctx: &egui::Context,
+    coverage: SourceCoverage,
+    source_dims: Option<(u32, u32)>,
+    sampler: [usize; 2],
+    layout_dims: Option<(u32, u32)>,
+) {
     app.image_metas.resize(app.items.len(), None);
     app.keep_range = (0, app.items.len());
     for idx in 0..2 {
@@ -76,14 +87,15 @@ fn accept_thumbnails_with_layout(
             crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             !matches!(coverage, SourceCoverage::FullSource),
             None,
-            Some(source_dims),
+            source_dims,
             layout_dims,
             false,
             false,
             0,
             app.items_generation,
         )
-        .with_source_coverage(coverage);
+        .with_source_coverage(coverage)
+        .source_pixels();
         app.poll_thumbnail_result_for_test(ctx, message);
         // SourcePixels and cache/admission completion are separate worker
         // messages. Complete the real receipt protocol before retaining paint.
@@ -101,6 +113,36 @@ fn accept_thumbnails_with_layout(
             app.items_generation,
         );
         app.poll_thumbnail_result_for_test(ctx, finalized);
+        assert!(matches!(app.thumbnails[idx], ThumbnailState::Loaded { .. }));
+        assert!(!app.requested.contains_key(&idx));
+    }
+}
+
+fn accept_legacy_catalog_thumbnails_without_source_dimensions(app: &mut App, ctx: &egui::Context) {
+    app.image_metas.resize(app.items.len(), None);
+    app.keep_range = (0, app.items.len());
+    for idx in 0..2 {
+        app.keep_set.insert(idx);
+        app.requested.insert(idx, false);
+        let message = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            idx,
+            Some(egui::ColorImage::filled([60, 80], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            0,
+            app.items_generation,
+        );
+        assert!(matches!(
+            &message.payload,
+            crate::thumb_loader::ThumbMsgPayload::Pixels(_)
+        ));
+        // A cache hit is already terminal. No source-save Finalized receipt follows.
+        app.poll_thumbnail_result_for_test(ctx, message);
         assert!(matches!(app.thumbnails[idx], ThumbnailState::Loaded { .. }));
         assert!(!app.requested.contains_key(&idx));
     }
@@ -1872,5 +1914,224 @@ fn display_basis_pdf_noninteger_page_box_keeps_accepted_sampler_reference_after_
                 );
             }
         }
+    }
+}
+
+#[test]
+fn display_basis_pdf_partial_worker_thumbnail_and_real_raster_arrival_keep_single_frame() {
+    use crate::app::{
+        FsLoadPurpose, FsNormalLoadPurpose, FsPendingValue, OriginalMaterialEntry,
+        PdfRerenderRequestProbe, PollPrefetchOrigin,
+    };
+    use crate::fs_animation::FsLoadResult;
+    for (source, page_box, bounds, sampler) in [
+        (
+            [600, 800],
+            (600_000, 800_000),
+            (150, 200, 300, 400),
+            [60, 80],
+        ),
+        (
+            [317, 409],
+            (613_125, 791_875),
+            (79, 102, 158, 204),
+            [31, 40],
+        ),
+    ] {
+        for ppp in [1.0, 1.25] {
+            for mode in [
+                FullscreenFitMode::Original,
+                FullscreenFitMode::Page,
+                FullscreenFitMode::SpecifiedScale,
+            ] {
+                for no_downscale in [false, true] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(ppp);
+                    let mut app = fixture();
+                    // Keep all real PDF demand and adoption logic, but intercept
+                    // dispatch so this synthetic path cannot race a missing-file
+                    // Failed result against the successful raster below.
+                    let pdf_rerender = PdfRerenderRequestProbe::start();
+                    let pdf_path = app.tmp.path().join("partial-pdf-arrival.pdf");
+                    let content_type = crate::pdf_loader::PdfPageContentType::Raster {
+                        w: source[0],
+                        h: source[1],
+                    };
+                    app.items = (0..2)
+                        .map(|page_num| GridItem::PdfPage {
+                            pdf_path: pdf_path.clone(),
+                            page_num,
+                            content_type: Some(content_type),
+                        })
+                        .collect();
+                    // Installing these synthetic items must advance every source
+                    // queue owner, as the real item-install path does, before
+                    // either thumbnail or fullscreen worker results are accepted.
+                    app.bump_items_generation();
+                    app.spread_mode = SpreadMode::Single;
+                    configure_specified_original(&mut app);
+                    app.settings.fullscreen_fit_mode = mode;
+                    app.settings.fullscreen_fit_no_downscale = no_downscale;
+                    let coverage = SourceCoverage::Known(
+                        EditPreviewGeometry::new(
+                            CanonicalPageDimensions::new(source[0], source[1]),
+                            (source[0], source[1]),
+                            bounds,
+                        )
+                        .unwrap(),
+                    );
+                    accept_thumbnails_with_layout(
+                        &mut app,
+                        &ctx,
+                        coverage,
+                        (bounds.2, bounds.3),
+                        sampler,
+                        Some(page_box),
+                    );
+                    let viewport = egui::vec2(1200.0, 900.0) / ppp;
+                    specified_frame(&ctx, viewport, |_, _| {});
+                    // The normal source worker is already in flight while its
+                    // thumbnail is displayed. Let the actual edit/final selector
+                    // join this pending owner instead of dispatching the fake PDF
+                    // path, whose Failed result could overwrite an injected result.
+                    let (source_tx, source_rx) = std::sync::mpsc::channel();
+                    app.fs_pending.insert(
+                        0,
+                        FsPendingValue::new(
+                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            source_rx,
+                            1,
+                            FsLoadPurpose::Display,
+                        ),
+                    );
+                    let before = draw_single(&mut app, &ctx, viewport);
+                    let generation = app.items_generation;
+                    assert_eq!(
+                        app.fs_pending.get(&0).unwrap().purpose,
+                        FsLoadPurpose::ResumeAfterNormalLoad {
+                            normal: FsNormalLoadPurpose::Display,
+                            entry: OriginalMaterialEntry::MaterialOnly,
+                        },
+                        "ordinary painting joins the initial worker through its real owner",
+                    );
+                    assert_eq!(app.fs_pending.current_items_generation(), generation);
+                    source_tx
+                        .send(FsLoadResult::StaticPdf {
+                            ci: egui::ColorImage::filled(
+                                [source[0] as usize, source[1] as usize],
+                                egui::Color32::WHITE,
+                            ),
+                            source_dims: [source[0] as usize, source[1] as usize],
+                            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                                width: page_box.0 as f32 / 1000.0,
+                                height: page_box.1 as f32 / 1000.0,
+                            },
+                            content_type,
+                        })
+                        .expect("the original pending worker still owns the result channel");
+                    app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+                    let cache_kind = match app.fs_cache.get(&0) {
+                        Some(FsCacheEntry::Static { .. }) => "Static",
+                        Some(FsCacheEntry::Failed) => "Failed",
+                        Some(_) => "Other",
+                        None => "None",
+                    };
+                    assert!(
+                        app.source_material_for_idx(0).is_some(),
+                        "PDF raster was not adopted: source={source:?}, ppp={ppp}, mode={mode:?}, no_downscale={no_downscale}, cache={cache_kind}, pending={:?}, backlog={}, generation={generation}",
+                        app.fs_pending.get(&0).map(|pending| pending.purpose),
+                        app.fs_upload_backlog.len(),
+                    );
+                    let after = draw_single(&mut app, &ctx, viewport);
+                    for (_, target) in pdf_rerender.take_requests() {
+                        assert!(
+                            target <= source[0].max(source[1]),
+                            "native raster demand must retain its real cap: {target}",
+                        );
+                    }
+                    assert_eq!(before.fit_input, after.fit_input);
+                    same_frame_and_common_pixel(before, after, ppp);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn display_basis_worker_thumbnail_without_source_dimensions_retains_specified_sampler_basis() {
+    for flow in [0, 1, 2] {
+        let ctx = egui::Context::default();
+        let mut app = fixture();
+        configure_specified_original(&mut app);
+        app.settings.fullscreen_specified_scale.height.value =
+            crate::settings::SpecifiedScaleAxis::LogicalPixels(10);
+        app.spread_mode = if flow == 1 {
+            SpreadMode::Ltr
+        } else {
+            SpreadMode::Single
+        };
+        app.reading_flow = if flow == 2 {
+            ReadingFlow::Vertical
+        } else {
+            ReadingFlow::Paged
+        };
+        accept_legacy_catalog_thumbnails_without_source_dimensions(&mut app, &ctx);
+        let accepted = app.fs_thumbnail_resource_for_display(0).unwrap();
+        assert_eq!(
+            accepted.display_basis().specified().unwrap(),
+            FullscreenFitBasis::new(egui::vec2(60.0, 80.0), egui::vec2(60.0, 80.0)).unwrap(),
+        );
+        let captured =
+            FullscreenPaintPayload::PresentationMaterial(accepted.capture_presentation(&ctx));
+        let viewport = egui::vec2(1200.0, 900.0);
+        specified_frame(&ctx, viewport, |_, _| {});
+        let mut baseline = Vec::new();
+        specified_frame(&ctx, viewport, |ui, ctx| {
+            baseline = if flow == 2 {
+                let sources = app.draw_fs_continuous_reading(
+                    ui,
+                    ctx,
+                    ui.max_rect(),
+                    0,
+                    false,
+                    FsPageTurnDecision::normal(),
+                );
+                assert!(!sources.pages.is_empty());
+                sources
+                    .pages
+                    .iter()
+                    .map(|page| {
+                        app.fullscreen_page_layout
+                            .page_by_idx(page.idx())
+                            .unwrap()
+                            .transform
+                    })
+                    .collect()
+            } else {
+                draw_specified_current(&mut app, ui, ctx, None)
+            };
+        });
+        assert!(!baseline.is_empty());
+        for transform in &baseline {
+            assert_specified_raster_basis(transform.fit_input, [60, 80]);
+            close_physical_size(*transform, [60, 80], 1.0);
+        }
+        app.thumbnails[..2].fill(ThumbnailState::Evicted);
+        app.thumb_pixels.clear();
+        app.page_dims_cache.clear();
+        app.fs_cache.clear();
+        app.clear_all_final_pipeline_caches();
+        assert_eq!(captured.display_basis(), accepted.display_basis());
+        app.spread_mode = SpreadMode::Single;
+        app.reading_flow = ReadingFlow::Paged;
+        specified_frame(&ctx, viewport, |ui, ctx| {
+            let replay = draw_specified_current(&mut app, ui, ctx, Some(&captured));
+            assert_eq!(replay.len(), 1);
+            assert_specified_raster_basis(replay[0].fit_input, [60, 80]);
+            close_physical_size(replay[0], [60, 80], 1.0);
+            if flow == 0 {
+                same_frame_and_common_pixel(baseline[0], replay[0], 1.0);
+            }
+        });
     }
 }

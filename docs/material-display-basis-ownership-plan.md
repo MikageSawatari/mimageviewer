@@ -7,6 +7,53 @@
 最初の停止時点では試作製品コードを作業ツリーから撤去し、実worker受理を通る再現テストを残した。
 以下の確定範囲で実装を再開した。Unknownの判断関数・永続schemaは変更しない。
 
+## 586f5799e 完成レビュー追補
+
+P1／P2はいずれもコードで確認した。素材所有の境界は維持し、受理時に従来の契約を確定する。
+
+- PDF Known部分素材のlegacy参照寸法はcoverageの全体座標寸法とする。page-boxのlayout単位や
+  縮小samplerと混ぜない。page-box未確定時もlegacyの全体aspectはこの受理参照寸法から取る。
+- 通常の旧catalog行でsource寸法が無い場合、指定倍率でも選択済みsamplerの契約を受理する。
+  代役利用を停止せず、描画時のidx／sampler逆引きも復活させない。
+- 棚卸しでRAW旧catalog行の同型停止も確認した。workerのcoverage／寸法を優先し、不足時は
+  受理済みRawInfoのdeveloped寸法をthumbnail受理時に採用する。thumbnail先着時はRawInfo／previewの
+  実受理境界でLoadedを再受理する。PDF／RAWの共通publish境界が、変更したdescriptorに依存する
+  通過素材だけを退役する。保持capture・兄弟ページ・既存RAW表示gateは変えない。
+
+`76eeab77b`との受理経路比較（有効な素材を対象。catalogの0寸法は読取時にNoneへ正規化される）:
+
+| 受理経路・入力 | 互換表示契約と今回の確認 |
+| --- | --- |
+| 通常thumbnail、source寸法あり／Known部分coverage | sampler・予測GPU raster・coverageの各射影を維持。追加停止なし |
+| 通常thumbnail、旧行source寸法なし | P2を修正。指定倍率も受理samplerを使い、通常描画・ページ送りに利用 |
+| 通常source Static／Animated | own samplerで受理。canonical寸法が無くても表示可能 |
+| PDF Known部分coverage | P1を修正。全体coordinate参照寸法とpage-box layoutを分離して保持 |
+| PDF FullSource／metadata未確定 | legacy canvasを維持。指定倍率のcontent type／layout必須条件は76eeab77bから同じ |
+| RAW、worker寸法あり／Known coverage | developed canvasを受理。既存gate通過後に表示可能 |
+| RAW、旧行source寸法なし | 追加停止を修正。thumbnailとRawInfo→previewの両到着順でdeveloped基準を受理 |
+| edit／局所補正／隠蔽 | own pixelsと媒体metadataから受理。通常producerで追加停止なし |
+| AI／final | pre-AI source_sizeとcanonical／PDF snapshotを受理・継承。追加停止なし |
+| 通過／注釈 | 選択した入力descriptorを継承。RAW旧行の根元を直して欠落の伝播を解消 |
+| 消しゴム・下地・preview昇格 | Static入力または保持済みtyped baseを継承。通常UIでProducerUnavailableへの新規経路なし |
+
+回帰はPDF部分素材のworker受理→Original／Page／指定倍率→本画像採用、旧catalog Pixelsの
+指定倍率通常描画・保持退去、ページ送り完了、RAWの3到着順（thumbnail→Info→preview、
+Info→thumbnail→preview、Info→preview→thumbnail）を通す。RawInfoより先のpreviewは既存契約外。
+誤って追加した「通常旧行は指定倍率で拒否する」テストは、代役を受理して次ページまで進む検査へ直す。
+
+関連nextestは `test(/display_basis|material_display_owner|raw_page_store|specified_legacy_catalog/)` の
+63件を実行して成功した。PDF到着テストは初期workerの実pending channelへ描画が合流し、
+同じchannelからStaticPdfを受理する。架空PDFへの別worker発行による競合をfixtureで除き、
+枠・共通画素位置の期待は緩和していない。UI snapshotも195件成功し、PNG更新はない。
+ログは `target/material-r9-focused-4.log` と `target/material-r9-ui-snapshot.log`。
+後続gateは `target/material-r9-lib-full.log`、`target/material-r9-core-check.log`、
+`target/material-r9-fmt-check.log`、`target/material-r9-build-dev.log` に記録する。
+
+今回の変更ファイルは `app.rs`、`grid_item.rs`、`app/raw_page_store.rs`、
+`ui_fullscreen/display_basis_tests.rs`、`ui_fullscreen/page_turn.rs` と本書・display-pipeline.md・
+architecture-overview.md・async-architecture.md。
+この下の設計・変更一覧は、586f5799eまでの素材所有化の記録である。
+
 ## 確認した違反と停止理由
 
 通常thumbnailのworker結果は `poll_thumbnails` が `PagePixelDimensions::Thumbnail` として
@@ -86,14 +133,16 @@ descriptorに固定するのは不変の寸法・由来だけとする。現在�
 描画側はview/fit方式に対応する受理値を選択するだけとする。
 legacy source-layoutはlayout単位と、単ページでそのaspectを正規化する受理rasterの
 参照寸法を `LegacySourceLayoutBasis` に保持する。後者をlive座標寸法から引き直さない。
-PDF thumbnailはown samplerの参照寸法を保持し、page-box metadataの再受理でも維持する。
+PDFのKnown部分thumbnailはcoverageの全体座標寸法、FullSourceはown samplerの参照寸法を
+受理して保持し、page-box metadataの再受理でも維持する。
 source／派生PDFは自身のsource rasterを受理する。見開き・連結のlayout単位は従来どおりである。
 
 Unknownの利用許可は既存の `resolve_preview_coverage_for_display` に残す。
 current cropによる表示可否を受理descriptorへ焼き込んではならない。cropありでUnknownを受理し、
 後でcropを解除した場合も、既存の動的許可判定へ戻れる必要がある。
-旧行のsource寸法なしと不正な0寸法は区別する。source寸法なしに対する旧4方式の代役canvasは
-受理時の明示的なlegacy契約として扱い、指定倍率の物理基準を描画時fallbackで作らない。
+旧行のsource寸法なしと不正な0寸法は区別する。通常thumbnailのsource寸法なしに対しては
+指定倍率を含め選択済みsamplerの代役canvasを受理時の明示的なlegacy契約として保持する。
+描画時fallbackで基準を作らず、互換行の代役を減らさない。
 
 ## 実装した所有境界
 
@@ -119,7 +168,9 @@ current cropによる表示可否を受理descriptorへ焼き込んではなら�
   legacy layoutの可用性を同descriptor内で分け、PDF metadataの既存採用境界でLoadedを再受理する。
   それ以前にcaptureしたResourceのdescriptorは変更しない。
   descriptorが変わったページの依存renditionだけを退役し、同値の再受理・兄弟ページには触れない。
-  RAW thumbnailも別metadataの到着を待たず、workerのdeveloped寸法／生成coverageから受理する。
+  RAW thumbnailはworkerのdeveloped寸法／生成coverageを優先する。旧catalog行にそれらが
+  無い場合は受理済みRawInfoから採用し、thumbnail先着時もRawInfo／preview受理境界で再受理する。
+  PDFと同じpublish境界で、descriptorが変わったページの依存通過素材だけを退役する。
 
 ## 検証と検収の単位
 
@@ -164,7 +215,7 @@ detached-rework-plan §11へ記録する。
 撤去した未完成試作は `target/material-display-owner-prototype.zip` と同`.patch`へ保存した。
 この試作は逆引きresolver等の欠陥を含み、そのまま適用・受入する対象ではない。
 
-## 変更ファイル一覧
+## 素材所有化（586f5799eまで）の変更ファイル一覧
 
 ### 製品コードと共有型
 

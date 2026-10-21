@@ -598,29 +598,20 @@ impl ThumbnailState {
                 .map(|(w, h)| crate::page_dims::CanonicalPageDimensions::new(w, h))
         });
         let Some(coordinate) = coordinate else {
-            if source_dims.is_none()
-                && matches!(coverage, crate::source_coverage::SourceCoverage::FullSource)
-            {
-                // Legacy rows without source dimensions still represent this
-                // accepted sampler in the four established fit modes. This is
-                // a stand-in canvas policy, never evidence of pre-AI pixels.
-                return B::new(
-                    sampled.legacy(V::Single),
-                    sampled.legacy(V::Spread),
-                    L::SourceLayout {
-                        basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
-                            layout_size: egui::vec2(sampler[0] as f32, sampler[1] as f32),
-                            reference_size: egui::vec2(sampler[0] as f32, sampler[1] as f32),
-                        },
-                    },
-                    Err(U::SourceDimensionsUnknown),
-                );
-            }
+            // A valid legacy whole-source row can lack source dimensions. Its
+            // selected sampler was displayable in every fit mode; accept that
+            // explicit stand-in contract now, without inventing source pixels
+            // or looking the dimensions up again at paint time.
             return B::new(
                 sampled.legacy(V::Single),
-                L::Unavailable(U::SourceDimensionsUnknown),
-                L::Unavailable(U::SourceDimensionsUnknown),
-                Err(U::SourceDimensionsUnknown),
+                sampled.legacy(V::Spread),
+                L::SourceLayout {
+                    basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                        layout_size: egui::vec2(sampler[0] as f32, sampler[1] as f32),
+                        reference_size: egui::vec2(sampler[0] as f32, sampler[1] as f32),
+                    },
+                },
+                sampled.specified(),
             );
         };
         let (w, h) = coordinate.as_tuple();

@@ -21946,7 +21946,7 @@ impl App {
         }
         let layout_size = layout_dims
             .map(|(w, h)| egui::vec2(w as f32, h as f32))
-            .unwrap_or_else(|| egui::vec2(sampler[0] as f32, sampler[1] as f32));
+            .unwrap_or(reference_size);
         let legacy = L::SourceLayout {
             basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
                 layout_size,
@@ -21995,22 +21995,54 @@ impl App {
             Some(metadata.layout_dims),
             Some(metadata.content_type),
         );
-        let basis_changed = matches!(self.thumbnails.get(idx),
-            Some(ThumbnailState::Loaded {display_basis,..}) if *display_basis != basis);
-        if let Some(ThumbnailState::Loaded {
+        self.readopt_loaded_thumbnail_display_basis(idx, basis, Some(metadata.layout_dims));
+    }
+
+    /// Producer metadata acceptance replaces only the live material. Previously
+    /// captured resources keep their immutable descriptor, and only dependent
+    /// renditions whose accepted input changed need to be generated again.
+    fn readopt_loaded_thumbnail_display_basis(
+        &mut self,
+        idx: usize,
+        basis: crate::material_display_basis::MaterialDisplayBasis,
+        accepted_layout_dims: Option<(u32, u32)>,
+    ) {
+        let Some(ThumbnailState::Loaded {
             display_basis,
             layout_dims,
             ..
         }) = self.thumbnails.get_mut(idx)
-        {
-            *display_basis = basis;
-            *layout_dims = Some(metadata.layout_dims);
-        }
+        else {
+            return;
+        };
+        let basis_changed = *display_basis != basis;
+        *display_basis = basis;
+        *layout_dims = accepted_layout_dims;
         if basis_changed {
-            // The current producer has new metadata. Derived cache entries must
-            // be accepted again; already held resource/capture values stay owned.
             self.passthrough_rendition_cache.remove_page(idx);
         }
+    }
+
+    fn readopt_loaded_raw_thumbnail_basis(&mut self, idx: usize) {
+        let Some(ThumbnailState::Loaded {
+            tex,
+            source_coverage,
+            source_dims,
+            layout_dims,
+            ..
+        }) = self.thumbnails.get(idx)
+        else {
+            return;
+        };
+        let layout_dims = *layout_dims;
+        let basis = self.accept_thumbnail_display_basis(
+            idx,
+            tex.size(),
+            *source_coverage,
+            *source_dims,
+            layout_dims,
+        );
+        self.readopt_loaded_thumbnail_display_basis(idx, basis, layout_dims);
     }
 
     fn accept_thumbnail_display_basis(
@@ -22037,11 +22069,21 @@ impl App {
         if self.is_raw_page(idx) {
             // RawInfo.developed_dims travels in the thumbnail worker result.
             // A crop's listing dimensions do not replace its full coordinate canvas.
-            let canonical = coverage.coordinate_dims().or_else(|| {
-                source_dims
-                    .filter(|(w, h)| *w > 0 && *h > 0)
-                    .map(|(w, h)| crate::page_dims::CanonicalPageDimensions::new(w, h))
-            });
+            let canonical = coverage
+                .coordinate_dims()
+                .or_else(|| {
+                    source_dims
+                        .filter(|(w, h)| *w > 0 && *h > 0)
+                        .map(|(w, h)| crate::page_dims::CanonicalPageDimensions::new(w, h))
+                })
+                .or_else(|| {
+                    // An old catalog row may omit dimensions even after this RAW
+                    // producer has accepted RawInfo. Capture those facts now; fit
+                    // must never rediscover them after the material is selected.
+                    self.raw_pages.page(idx)?.developed_dims.map(|[w, h]| {
+                        crate::page_dims::CanonicalPageDimensions::new(w as u32, h as u32)
+                    })
+                });
             return self.accept_raster_display_basis(idx, sampler, canonical, sampler, None, false);
         }
         if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
@@ -22052,7 +22094,14 @@ impl App {
             };
             return Self::accept_pdf_display_basis(
                 sampler,
-                egui::vec2(sampler[0] as f32, sampler[1] as f32),
+                if coverage.is_partial() {
+                    // PDF legacy normalization used the full coordinate raster,
+                    // independently of page-box units and the cropped sampler.
+                    let (width, height) = coverage.coordinate_dims().unwrap().as_tuple();
+                    egui::vec2(width as f32, height as f32)
+                } else {
+                    egui::vec2(sampler[0] as f32, sampler[1] as f32)
+                },
                 layout_dims.or(accepted.map(|metadata| metadata.layout_dims)),
                 content_type,
             );
@@ -102455,7 +102504,6 @@ mod material_display_owner_tests {
 
     #[test]
     fn legacy_unknown_thumbnail_worker_acceptance_keeps_no_crop_standin_policy() {
-        use crate::material_display_basis::MaterialBasisUnavailable as U;
         use crate::source_coverage::{SourceCoverage, SourceCoverageUnavailable};
         for has_crop in [false, true] {
             let ctx = egui::Context::default();
@@ -102502,7 +102550,15 @@ mod material_display_owner_tests {
                 SourceCoverage::Unknown,
                 "acceptance must retain the producer coverage"
             );
-            assert_eq!(display_basis.specified(), Err(U::SourceDimensionsUnknown));
+            assert_eq!(
+                display_basis.specified().unwrap(),
+                crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                    egui::vec2(60.0, 80.0),
+                    egui::vec2(60.0, 80.0),
+                )
+                .unwrap(),
+                "legacy rows retain their accepted sampler fit in every mode",
+            );
             if has_crop {
                 let accepted = *display_basis;
                 assert!(!matches!(accepted.legacy(V::Single), L::Unavailable(_)));

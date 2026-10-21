@@ -46,6 +46,9 @@ thumbnailのworker受理では、source寸法・coverageと共通GPU clamp規則
 確定しLoadedへ保持する。派生workerのpending／結果、CPU下地、通過素材も実入力ownerの
 `MaterialDisplayBasis` を継承する。selectorは素材のまま返し、保持後の退去でidxから寸法を
 引き直さない。現在cropのUnknown利用許可は選択時に判定し、受理値へ固定しない。
+旧catalog行の通常thumbnailでsource寸法が省略されている場合は、指定倍率も既存のsampler契約で
+受理する。RAW旧行は受理済みRawInfoを使い、thumbnail先着時もRawInfo／preview受理境界で
+live descriptorを再受理する。PDFと共通のpublish処理で、その変更に依存する通過素材だけを退役する。
 
 snapshot capture・保持・再描画も同じ resource と由来を保持する。mount／park／promote の所有移譲、
 context の要求世代／取消／channel、兄弟 context の cache は既存 owner のままである。

@@ -4821,12 +4821,13 @@ mod tests {
         receipt
     }
 
-    fn specified_missing_basis_does_not_pin_then_recovers(pdf: bool) {
-        use crate::material_display_basis::MaterialBasisUnavailable;
-        use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
-        let ctx = egui::Context::default();
-        install(&ctx);
-        let mut app = ready_app(&ctx, SpreadMode::Single);
+    fn specified_thumbnail_admission_app(
+        ctx: &egui::Context,
+        pdf: bool,
+    ) -> crate::app::AppTestEnvForTest {
+        use crate::ui_fullscreen::page_turn_submission_tests::ready_app;
+        install(ctx);
+        let mut app = ready_app(ctx, SpreadMode::Single);
         // ready_app seeds samplers with its synthetic items generation. Exercise
         // the worker receipt protocol under an actual synchronized generation.
         let resident_sources: Vec<_> = (0..app.items.len())
@@ -4852,7 +4853,7 @@ mod tests {
         let item_count = app.items.len();
         app.image_metas.resize(item_count, None);
         app.details_order = app.visible_indices.clone();
-        let full_source = app.fs_cache.remove(&1).unwrap();
+        app.fs_cache.remove(&1).unwrap();
         if pdf {
             app.items[1] = GridItem::PdfPage {
                 pdf_path: app.tmp.path().join("missing-fit-metadata.pdf"),
@@ -4878,13 +4879,18 @@ mod tests {
             0,
             app.items_generation,
         );
-        app.poll_thumbnail_result_for_test(&ctx, initial);
+        app.poll_thumbnail_result_for_test(ctx, initial);
+        app
+    }
+
+    #[test]
+    fn specified_pdf_metadata_missing_skips_pin_and_adoption_restores_canonical_ready() {
+        use crate::material_display_basis::MaterialBasisUnavailable;
+        use crate::ui_fullscreen::page_turn_submission_tests::frame;
+        let ctx = egui::Context::default();
+        let mut app = specified_thumbnail_admission_app(&ctx, true);
         let initial = app.fs_thumbnail_resource_for_display(1).unwrap();
-        let unavailable = if pdf {
-            MaterialBasisUnavailable::PdfMetadataUnavailable
-        } else {
-            MaterialBasisUnavailable::SourceDimensionsUnknown
-        };
+        let unavailable = MaterialBasisUnavailable::PdfMetadataUnavailable;
         assert_eq!(initial.display_basis().specified(), Err(unavailable));
         let mut outgoing = None;
         frame(&ctx, |ui, ctx| {
@@ -4921,34 +4927,30 @@ mod tests {
         assert!(!events.iter().any(|(_, kind, _)| *kind == "offered"));
 
         app.fullscreen_idx = Some(1);
-        if pdf {
-            // The actual fullscreen worker result republishes the thumbnail's
-            // descriptor. The old immutable material must remain unchanged.
-            let generation = app.items_generation;
-            assert!(app.fs_upload_backlog.push_for_generation(
-                generation,
-                crate::app::FsUploadResult::new(
-                    1,
-                    crate::fs_animation::FsLoadResult::StaticPdf {
-                        ci: egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
-                        source_dims: [80, 120],
-                        page_size_points: crate::pdf_loader::PdfPageSizePoints {
-                            width: 80.0,
-                            height: 120.0,
-                        },
-                        content_type: crate::pdf_loader::PdfPageContentType::Vector,
+        // The actual fullscreen worker result republishes the thumbnail's
+        // descriptor. The old immutable material must remain unchanged.
+        let generation = app.items_generation;
+        assert!(app.fs_upload_backlog.push_for_generation(
+            generation,
+            crate::app::FsUploadResult::new(
+                1,
+                crate::fs_animation::FsLoadResult::StaticPdf {
+                    ci: egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+                    source_dims: [80, 120],
+                    page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                        width: 80.0,
+                        height: 120.0,
                     },
-                    1,
-                    crate::app::FsLoadPurpose::for_page(true),
-                ),
-            ));
-            app.poll_prefetch(&ctx, crate::app::PollPrefetchOrigin::TopLevel);
-            let adopted = app.fs_thumbnail_resource_for_display(1).unwrap();
-            assert_eq!(adopted.source_texture_id(), initial.source_texture_id());
-            assert!(adopted.display_basis().specified().is_ok());
-        } else {
-            app.fs_cache.insert(1, full_source);
-        }
+                    content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                },
+                1,
+                crate::app::FsLoadPurpose::for_page(true),
+            ),
+        ));
+        app.poll_prefetch(&ctx, crate::app::PollPrefetchOrigin::TopLevel);
+        let adopted = app.fs_thumbnail_resource_for_display(1).unwrap();
+        assert_eq!(adopted.source_texture_id(), initial.source_texture_id());
+        assert!(adopted.display_basis().specified().is_ok());
         assert_eq!(initial.display_basis().specified(), Err(unavailable));
         let mut recovered = None;
         frame(&ctx, |ui, ctx| {
@@ -4975,13 +4977,134 @@ mod tests {
     }
 
     #[test]
-    fn specified_source_dimensions_missing_skips_pin_and_new_source_restores_canonical_ready() {
-        specified_missing_basis_does_not_pin_then_recovers(false);
-    }
-
-    #[test]
-    fn specified_pdf_metadata_missing_skips_pin_and_adoption_restores_canonical_ready() {
-        specified_missing_basis_does_not_pin_then_recovers(true);
+    fn specified_legacy_catalog_without_source_dimensions_completes_and_accepts_next_page() {
+        use crate::ui_fullscreen::page_turn_submission_tests::frame;
+        let origin = Instant::now();
+        let clock = super::clock_tests::TestClock::at(origin);
+        let ctx = egui::Context::default();
+        let mut app = specified_thumbnail_admission_app(&ctx, false);
+        let initial = app.fs_thumbnail_resource_for_display(1).unwrap();
+        assert!(matches!(
+            app.thumbnails[1],
+            ThumbnailState::Loaded {
+                source_dims: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            initial.display_basis().specified().unwrap(),
+            crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                egui::vec2(8.0, 12.0),
+                egui::vec2(8.0, 12.0),
+            )
+            .unwrap(),
+            "the accepted legacy row keeps its released sampler stand-in basis",
+        );
+        frame(&ctx, |ui, ctx| {
+            draw_single_with_current_fit(&mut app, ui, ctx);
+        });
+        assert!(app.page_turn_current_unit_presented());
+        take_test_events();
+        let operation = ViewerOperationId::Pad {
+            batch: next_operation_batch(),
+            ordinal: 0,
+        };
+        let mut first = None;
+        frame(&ctx, |ui, ctx| {
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 1, true, Some(operation));
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Offered { .. }
+            ));
+            let held = app.page_turn_held_resource(1).unwrap();
+            assert_eq!(held.source_texture_id(), initial.source_texture_id());
+            assert_eq!(held.display_basis(), initial.display_basis());
+            app.fullscreen_idx = Some(1);
+            let receipt = draw_single_with_current_fit(&mut app, ui, ctx);
+            assert!(receipt.curl);
+            assert!(!receipt.was_accepted());
+            first = Some(receipt);
+        });
+        assert!(first.unwrap().was_accepted());
+        let tracker = match &app.page_turn_presentation.state {
+            PresentationState::Turning { offer, .. } => offer.submission.clone(),
+            _ => panic!("legacy catalog material must enter the ordinary turn"),
+        };
+        assert_eq!(tracker.status(), SubmissionStatus::Started);
+        clock.set(tracker.started_at().unwrap() + Duration::from_secs(1));
+        let mut flat = None;
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let receipt = draw_single_with_current_fit(&mut app, ui, ctx);
+            assert!(!receipt.curl);
+            flat = Some(receipt);
+        });
+        assert!(flat.unwrap().was_accepted());
+        assert_eq!(tracker.status(), SubmissionStatus::Finished);
+        let mut next_receipt = None;
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(app.page_turn_current_unit_presented());
+            assert!(!app.page_turn_barrier_active());
+            assert!(!app.fs_navigation_sequence_blocks_new_target());
+            assert!(app.pending_fs_page_turn_ready.is_none());
+            let next = ViewerOperationId::Pad {
+                batch: next_operation_batch(),
+                ordinal: 0,
+            };
+            app.page_turn_external_operation(ctx, next, OperationPhase::Press, "test");
+            app.offer_page_turn_with_operation(ctx, 2, true, Some(next));
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Offered { .. }
+            ));
+            assert!(app.page_turn_held_resource(2).is_some());
+            app.fullscreen_idx = Some(2);
+            let receipt = draw_single_with_current_fit(&mut app, ui, ctx);
+            assert!(receipt.curl);
+            next_receipt = Some(receipt);
+        });
+        assert!(next_receipt.unwrap().was_accepted());
+        let next_tracker = match &app.page_turn_presentation.state {
+            PresentationState::Turning { offer, .. } => offer.submission.clone(),
+            _ => panic!("the next page must also submit its ordinary turn"),
+        };
+        clock.set(next_tracker.started_at().unwrap() + Duration::from_secs(1));
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert!(!draw_single_with_current_fit(&mut app, ui, ctx).curl);
+        });
+        assert_eq!(next_tracker.status(), SubmissionStatus::Finished);
+        frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert!(!draw_single_with_current_fit(&mut app, ui, ctx).curl);
+            assert!(!app.page_turn_barrier_active());
+            assert!(!app.fs_navigation_sequence_blocks_new_target());
+        });
+        assert!(app.page_turn_current_unit_presented());
+        let events: Vec<_> = take_test_events()
+            .into_iter()
+            .filter(|(fact, _, _)| fact.operation_id == operation)
+            .collect();
+        for expected in ["opportunity", "offered", "start", "finish", "fully_visible"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(_, kind, _)| *kind == expected)
+                    .count(),
+                1,
+                "{expected}: {events:?}",
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|(_, kind, _)| matches!(*kind, "skip" | "cancel")),
+            "{events:?}",
+        );
     }
 
     #[test]
