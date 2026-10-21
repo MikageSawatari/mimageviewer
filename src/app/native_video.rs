@@ -2959,6 +2959,20 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_window_id_for_presentation_request(
+        &self,
+        request: super::presentation_transition::PresentationRequest,
+    ) -> Option<u64> {
+        use super::presentation_transition::DetachedTargetLease;
+        match request.target_detached {
+            DetachedTargetLease::Candidate(lease)
+            | DetachedTargetLease::KeepLive(lease)
+            | DetachedTargetLease::Transferred(lease) => Some(lease.session.window_id),
+            DetachedTargetLease::None => self.active_detached_hwnd_window_id(),
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn execute_video_presentation_host_effect(
         &mut self,
         ctx: &egui::Context,
@@ -2977,7 +2991,19 @@ impl App {
                 let maximized = request.target == super::ViewerPresentation::DetachedWindow
                     && self.active_detached_viewport_maximized_on_visible_commit();
                 if request.target == super::ViewerPresentation::DetachedWindow {
-                    Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+                    if let Some(window_id) =
+                        self.detached_window_id_for_presentation_request(request)
+                    {
+                        self.request_detached_window_visibility(
+                            ctx,
+                            window_id,
+                            true,
+                            Some(maximized),
+                            false,
+                        );
+                    } else {
+                        self.send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+                    }
                 } else {
                     ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
                 }
@@ -2993,10 +3019,17 @@ impl App {
             }
             super::PresentationTransitionEffect::FocusHost { request, hwnd } => {
                 Self::log_presentation_transition_effect(request.id, request.target, "Focus", hwnd);
-                ctx.send_viewport_cmd_to(
-                    self.fullscreen_viewport_id(),
-                    egui::ViewportCommand::Focus,
-                );
+                if request.target == super::ViewerPresentation::DetachedWindow
+                    && let Some(window_id) =
+                        self.detached_window_id_for_presentation_request(request)
+                {
+                    self.request_detached_window_visibility(ctx, window_id, true, None, true);
+                } else {
+                    ctx.send_viewport_cmd_to(
+                        self.fullscreen_viewport_id(),
+                        egui::ViewportCommand::Focus,
+                    );
+                }
                 crate::presentation_observer::observe_viewport_command_for_transition(
                     request.id,
                     Self::presentation_probe_target(request.target),

@@ -756,14 +756,8 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
         app.settings.final_cover_spread_enabled = false;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let folder = app.tmp.path().join("page-alone-paint");
         let first = folder.join("first");
         let second = folder.join("second");
@@ -939,14 +933,8 @@ fn page_alone_white_companion_does_not_paint_as_a_failed_real_texture() {
         app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let paths = (0..3)
             .map(|i| app.tmp.path().join(format!("missing-{i}.png")))
             .collect::<Vec<_>>();
@@ -995,14 +983,8 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.singleton_spread_first_enabled = true;
         app.settings.singleton_spread_last_enabled = false;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let folder = app.tmp.path().join("scenario-b");
         std::fs::create_dir(&folder).unwrap();
         let first_path = folder.join("portrait-a.png");
@@ -1094,14 +1076,8 @@ fn scenario_b_endpoint_paint_center(
     app.settings.singleton_spread_first_enabled = global_first;
     app.settings.singleton_spread_last_enabled = global_last;
     app.settings.final_cover_spread_enabled = false;
-    app.settings.detached_viewer_window_placement =
-        Some(crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: CHILD_SIZE.x,
-            h: CHILD_SIZE.y,
-            maximized: false,
-        });
+    app.settings.detached_viewer_window_physical_placement =
+        Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
     let folder = app.tmp.path().join(label);
     let first_folder = folder.join("first");
     let second_folder = folder.join("second");

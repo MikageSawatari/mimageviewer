@@ -14,6 +14,7 @@ enum RetainedViewportPresentation {
     Plain,
     #[cfg(windows)]
     Detached {
+        window_id: u64,
         maximized: bool,
     },
 }
@@ -32,23 +33,26 @@ impl App {
     /// The fullscreen id covers the active F12 host; detached snapshots cover passive and
     /// ParkedLive hosts. Duplicate ids are collapsed before commands are queued.
     fn sync_retained_viewport_visibility_for_tray(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         visible: bool,
     ) -> usize {
         let mut viewports = Vec::new();
         if self.fs_viewport_shown {
             #[cfg(windows)]
-            let presentation = if matches!(
-                self.fs_viewport_presentation,
-                Some(crate::app::ViewerPresentation::DetachedWindow)
-            ) {
-                RetainedViewportPresentation::Detached {
+            let presentation = self
+                .active_detached_hwnd_window_id()
+                .filter(|window_id| {
+                    Self::detached_image_window_viewport_id(*window_id)
+                        == self.fullscreen_viewport_id()
+                        && self.fs_viewport_presentation
+                            == Some(crate::app::ViewerPresentation::DetachedWindow)
+                })
+                .map(|window_id| RetainedViewportPresentation::Detached {
+                    window_id,
                     maximized: self.active_detached_viewport_maximized_on_visible_commit(),
-                }
-            } else {
-                RetainedViewportPresentation::Plain
-            };
+                })
+                .unwrap_or(RetainedViewportPresentation::Plain);
             #[cfg(not(windows))]
             let presentation = RetainedViewportPresentation::Plain;
             viewports.push((self.fullscreen_viewport_id(), presentation));
@@ -64,6 +68,7 @@ impl App {
                     viewports.push((
                         viewport_id,
                         RetainedViewportPresentation::Detached {
+                            window_id: window.id,
                             maximized: self.detached_window_seed_placement(window.id).maximized,
                         },
                     ));
@@ -81,21 +86,23 @@ impl App {
             if transition_owned_viewport == Some(*viewport_id) {
                 continue;
             }
-            if visible {
-                match presentation {
-                    RetainedViewportPresentation::Plain => {
-                        ctx.send_viewport_cmd_to(
-                            *viewport_id,
-                            egui::ViewportCommand::Visible(true),
-                        );
-                    }
-                    #[cfg(windows)]
-                    RetainedViewportPresentation::Detached { maximized } => {
-                        Self::send_detached_viewport_visible_commit(ctx, *viewport_id, *maximized);
-                    }
+            match presentation {
+                RetainedViewportPresentation::Plain => {
+                    ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(visible));
                 }
-            } else {
-                ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(false));
+                #[cfg(windows)]
+                RetainedViewportPresentation::Detached {
+                    window_id,
+                    maximized,
+                } => {
+                    self.request_detached_window_visibility(
+                        ctx,
+                        *window_id,
+                        visible,
+                        Some(*maximized),
+                        false,
+                    );
+                }
             }
             #[cfg(windows)]
             self.observe_viewport_presentation_command(
@@ -733,6 +740,77 @@ mod tests {
     }
 
     use super::{App, root_tray_hide_modal_owner, should_close_fullscreen_for_tray};
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_restore_retains_detached_visibility_until_the_host_is_placed() {
+        let mut app = crate::app::setup_app_for_test();
+        let window_id = 41;
+        app.begin_active_detached_session(window_id, crate::app::DetachedSource::Video);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(crate::app::ViewerPresentation::DetachedWindow);
+        app.video_presentation_transition
+            .reset_stable(crate::app::ViewerPresentation::DetachedWindow);
+        let viewport_id = App::detached_image_window_viewport_id(window_id);
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+            assert_eq!(app.sync_retained_viewport_visibility_for_tray(ctx, true), 1);
+        });
+        assert!(
+            output.viewport_output[&viewport_id]
+                .commands
+                .iter()
+                .all(|command| {
+                    !matches!(
+                        command,
+                        egui::ViewportCommand::Visible(true)
+                            | egui::ViewportCommand::Maximized(_)
+                            | egui::ViewportCommand::Focus
+                    )
+                }),
+            "an unplaced host must retain the tray restore request"
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+            assert_eq!(
+                app.sync_retained_viewport_visibility_for_tray(ctx, false),
+                1
+            );
+        });
+        assert!(
+            output.viewport_output[&viewport_id]
+                .commands
+                .iter()
+                .any(|command| { matches!(command, egui::ViewportCommand::Visible(false)) }),
+            "tray hide must pass through the request owner to cancel a retained show"
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tray_restore_keeps_plain_viewport_visibility_immediate() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(crate::app::ViewerPresentation::Fullscreen);
+        let viewport_id = app.fullscreen_viewport_id();
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.show_viewport_deferred(viewport_id, egui::ViewportBuilder::default(), |_, _| {});
+            assert_eq!(app.sync_retained_viewport_visibility_for_tray(ctx, true), 1);
+        });
+        assert!(
+            output.viewport_output[&viewport_id]
+                .commands
+                .iter()
+                .any(|command| { matches!(command, egui::ViewportCommand::Visible(true)) })
+        );
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn tray_residency_closes_plain_still_fullscreen_sessions() {

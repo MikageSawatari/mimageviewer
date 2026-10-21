@@ -5989,10 +5989,13 @@ pub struct Settings {
     /// (複数ウィンドウモードでは常にメディア窓なので、このフラグは見ない)。
     #[serde(default)]
     pub fullfeature_media_window: bool,
-    /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画
-    /// top-level window の両方で共有する。
+    /// 旧版の論理配置。物理配置への移行用に読み取り、以後は書き換えない。
     #[serde(default)]
     pub detached_viewer_window_placement: Option<DetachedViewerWindowPlacement>,
+    /// 別ウィンドウビューアの通常時の物理外枠配置。旧値より優先して読み込む。
+    #[serde(default)]
+    pub detached_viewer_window_physical_placement:
+        Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
 
     // ── VST3 プラグイン処理 (v0.9.0+) ──
     //
@@ -7995,6 +7998,7 @@ impl Default for Settings {
             detached_viewer_open_images_in_window: false,
             fullfeature_media_window: false,
             detached_viewer_window_placement: None,
+            detached_viewer_window_physical_placement: None,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
             vst3_plugin_path: None,
@@ -10506,6 +10510,8 @@ impl Settings {
         self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
+        self.detached_viewer_window_physical_placement =
+            src.detached_viewer_window_physical_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
         // が切り替わっても、古い snapshot の overlay へ巻き戻さない。
         self.favorite_view_overlay = src.favorite_view_overlay.clone();
@@ -14860,6 +14866,88 @@ mod tests {
         assert!(edited.show_toolbar_effetune);
         assert_eq!(edited.effetune_gui_pos, Some((120, 240)));
         assert_eq!(edited.effetune_gui_size, Some((900, 700)));
+    }
+
+    #[test]
+    fn detached_physical_placement_preserves_legacy_only_settings() {
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: true,
+        };
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("detached_viewer_window_physical_placement");
+        stored["detached_viewer_window_placement"] = serde_json::to_value(legacy).unwrap();
+
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(loaded.detached_viewer_window_physical_placement, None);
+    }
+
+    #[test]
+    fn detached_physical_placement_roundtrips_without_changing_legacy_value() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: -1920,
+                top: -200,
+                right: -720,
+                bottom: 700,
+            },
+            maximized: true,
+        };
+        let settings = Settings {
+            detached_viewer_window_placement: Some(legacy),
+            detached_viewer_window_physical_placement: Some(physical),
+            ..Settings::default()
+        };
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(
+            loaded.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+    }
+
+    #[test]
+    fn detached_physical_placement_live_copy_keeps_latest_physical_rect() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let mut draft = Settings::default();
+        let mut live = Settings::default();
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: 6000,
+                top: 2270,
+                right: 6960,
+                bottom: 2990,
+            },
+            maximized: false,
+        };
+        live.detached_viewer_window_physical_placement = Some(physical);
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+
+        live.detached_viewer_window_physical_placement = None;
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(draft.detached_viewer_window_physical_placement, None);
     }
 
     #[test]

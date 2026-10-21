@@ -538,6 +538,8 @@ mod color_filter;
 mod content_identity_detection;
 pub(crate) mod content_identity_restore;
 #[cfg(windows)]
+mod detached_placement;
+#[cfg(windows)]
 mod detached_window_manager;
 mod facet_name_filter;
 mod facet_navigation;
@@ -1788,6 +1790,7 @@ pub(crate) enum FsMetadataBoundary {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DetachedViewerBorderlessTransition {
     pub(crate) target_borderless: bool,
+    pub(crate) target_outer: crate::detached_window_geometry::PhysicalRect,
     pub(crate) phase: DetachedViewerBorderlessTransitionPhase,
 }
 
@@ -1795,6 +1798,7 @@ pub(crate) struct DetachedViewerBorderlessTransition {
 pub(crate) enum DetachedViewerBorderlessTransitionPhase {
     PrimeBlackFrame,
     ApplyWindowMode,
+    AwaitUnzoom,
     Settle { until: std::time::Instant },
 }
 
@@ -1889,7 +1893,7 @@ pub(crate) struct DeferredDetachedImageWindowView {
     /// Current global preference projected into a passive still-image frame.
     /// Media callers do not construct this static display payload.
     pub(crate) margin_color: egui::Color32,
-    pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
+    pub(crate) placement: crate::detached_window_geometry::PhysicalWindowPlacement,
     pub(crate) apply_initial_placement: bool,
     pub(crate) right_drag_guide: Option<RightDragGuide>,
     #[cfg(feature = "test-script")]
@@ -1900,7 +1904,7 @@ pub(crate) struct DeferredDetachedImageWindowView {
 impl DeferredDetachedImageWindowView {
     pub(crate) fn from_snapshot(
         window: &DetachedImageWindowSnapshot,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         apply_initial_placement: bool,
         right_drag_guide: Option<RightDragGuide>,
         margin_color: egui::Color32,
@@ -1936,7 +1940,7 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
         id: u64,
         bar_close_requested: bool,
         focused: bool,
-        placement_update: Option<crate::settings::DetachedViewerWindowPlacement>,
+        geometry_observed: bool,
         pixels_per_point: f32,
         apply_initial_placement: bool,
         right_drag: Option<DetachedRightDragEvent>,
@@ -2159,16 +2163,16 @@ impl App {
     }
 
     fn detached_window_runtime_placement_is_usable(
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
     ) -> bool {
         placement.is_sane()
-            && crate::monitor::title_bar_on_some_monitor(placement.x, placement.y, placement.w)
+            && crate::detached_window_geometry::title_bar_on_some_monitor(placement.outer)
     }
 
     pub(crate) fn detached_window_runtime_placement(
         &self,
         window_id: u64,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         self.detached_window_manager
             .placement(window_id)
             .filter(|placement| Self::detached_window_runtime_placement_is_usable(*placement))
@@ -2177,7 +2181,7 @@ impl App {
     pub(crate) fn set_detached_window_runtime_placement(
         &mut self,
         window_id: u64,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         reason: &'static str,
     ) {
         if !Self::detached_window_runtime_placement_is_usable(placement) {
@@ -2211,7 +2215,7 @@ impl App {
     pub(crate) fn detached_window_seed_placement(
         &self,
         window_id: u64,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
+    ) -> crate::detached_window_geometry::PhysicalWindowPlacement {
         self.detached_window_runtime_placement(window_id)
             .unwrap_or_else(|| self.detached_viewer_window_placement())
     }
@@ -2220,7 +2224,7 @@ impl App {
         &mut self,
         window_id: u64,
         reason: &'static str,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
+    ) -> crate::detached_window_geometry::PhysicalWindowPlacement {
         if let Some(placement) = self.detached_window_runtime_placement(window_id) {
             return placement;
         }
@@ -2274,14 +2278,14 @@ impl App {
 
     pub(crate) fn active_detached_runtime_placement(
         &self,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         self.active_detached_hwnd_window_id()
             .and_then(|window_id| self.detached_window_runtime_placement(window_id))
     }
 
     pub(crate) fn active_detached_seed_placement(
         &self,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
+    ) -> crate::detached_window_geometry::PhysicalWindowPlacement {
         self.active_detached_runtime_placement()
             .unwrap_or_else(|| self.detached_viewer_window_placement())
     }
@@ -2290,7 +2294,7 @@ impl App {
         &mut self,
         refresh_latch: bool,
         reason: &'static str,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
+    ) -> crate::detached_window_geometry::PhysicalWindowPlacement {
         let live = self.active_detached_seed_placement();
         let Some(window_id) = self.active_detached_hwnd_window_id() else {
             return live;
@@ -2330,7 +2334,7 @@ impl App {
         &mut self,
         window_id: u64,
         reason: &'static str,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
+    ) -> crate::detached_window_geometry::PhysicalWindowPlacement {
         let live = self.ensure_detached_window_runtime_placement(window_id, reason);
         let default_linked = self.detached_window_runtime_default_linked();
         let previous = self.detached_window_manager.set_builder_placement_latch(
@@ -2361,6 +2365,7 @@ impl App {
     }
 
     fn detached_window_hwnd_clear(&mut self, window_id: u64) -> Option<u64> {
+        let _ = self.capture_detached_window_placement_at_decision(window_id, "hwnd_clear");
         let cleared = self.detached_window_manager.clear_hwnd(window_id);
         if let Some(hwnd) = cleared {
             crate::presentation_observer::unregister(
@@ -2413,6 +2418,7 @@ impl App {
     #[cfg(windows)]
     fn detached_window_hwnd_set_for_reusable_lease(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         hwnd: u64,
         reason: &'static str,
@@ -2428,7 +2434,9 @@ impl App {
             ));
             return Err(());
         }
-        Ok(self.detached_window_hwnd_set(window_id, hwnd))
+        let previous = self.detached_window_hwnd_set(window_id, hwnd);
+        self.apply_detached_window_host_placement(ctx, window_id);
+        Ok(previous)
     }
 
     fn detached_window_registered_hwnds(&self) -> std::collections::HashSet<u64> {
@@ -2565,6 +2573,7 @@ impl App {
             DetachedWindowHwndDiff::Created(hwnd) => {
                 if self
                     .detached_window_hwnd_set_for_reusable_lease(
+                        ctx,
                         window_id,
                         hwnd,
                         "post_show_adopt_unclaimed",
@@ -2640,6 +2649,11 @@ impl App {
         new_state: DetachedWindowState,
         reason: &'static str,
     ) {
+        if new_state == DetachedWindowState::Closing
+            && self.detached_window_state(window_id) != Some(DetachedWindowState::Closing)
+        {
+            let _ = self.capture_detached_window_placement_at_decision(window_id, reason);
+        }
         // A passive snapshot that still owns a media player must remain ParkedLive until
         // activation or terminal close. Log only an actual lifecycle transition that violates
         // that invariant; unlike MIV_DETACHED_WINDOW_DEBUG this is intentionally always on so a
@@ -3406,6 +3420,7 @@ impl App {
         hwnd: u64,
     ) -> bool {
         let Ok(previous) = self.detached_window_hwnd_set_for_reusable_lease(
+            ctx,
             window_id,
             hwnd,
             "watcher_repair_hwnd",
@@ -3785,6 +3800,7 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
+        let _ = self.capture_detached_window_placement_at_decision(window_id, reason);
         self.detached_window_manager
             .transfer_viewport_retirement(window_id);
         self.discard_parked_native_video_pending_for_window(window_id, reason);
@@ -3796,7 +3812,7 @@ impl App {
                 .placement
                 .filter(|placement| Self::detached_window_runtime_placement_is_usable(*placement))
             {
-                self.settings.detached_viewer_window_placement = Some(placement);
+                self.settings.detached_viewer_window_physical_placement = Some(placement);
                 self.log_detached_image_window_debug(format!(
                     "runtime_placement_persisted window_id={} reason={reason} \
                      placement={placement:?}",
@@ -17291,7 +17307,7 @@ pub struct App {
     /// 仮想フルスクリーンを解除したときに戻す通常ウィンドウ配置。
     #[cfg(windows)]
     pub(crate) detached_viewer_restore_placement:
-        Option<crate::settings::DetachedViewerWindowPlacement>,
+        Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
     /// F12 別ウィンドウの仮想フルスクリーン切替中に、直前フレームを黒で安定させる状態。
     #[cfg(windows)]
     pub(crate) detached_viewer_borderless_transition: Option<DetachedViewerBorderlessTransition>,
@@ -50790,7 +50806,8 @@ impl App {
         source: DetachedSource,
         requested: PathBuf,
     ) -> bool {
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement =
+            self.capture_active_detached_placement_at_decision("bookmark_loading_seed");
         let had_active_detached = self.active_detached_context_exists();
         let parked = if matches!(source, DetachedSource::Video | DetachedSource::Audio) {
             self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx)
@@ -61995,6 +62012,7 @@ impl App {
         match Self::select_detached_created_hwnd(before, &after) {
             DetachedWindowHwndDiff::Created(hwnd) => {
                 let Ok(previous) = self.detached_window_hwnd_set_for_reusable_lease(
+                    ctx,
                     window_id,
                     hwnd,
                     "post_show_created_hwnd",
@@ -63099,7 +63117,7 @@ impl App {
     pub(crate) fn deferred_detached_image_window_view(
         &self,
         window: &DetachedImageWindowSnapshot,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         apply_initial_placement: bool,
     ) -> DeferredDetachedImageWindowView {
         let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
@@ -63201,6 +63219,7 @@ impl App {
         match Self::select_detached_unclaimed_hwnd(&after, &claimed) {
             DetachedWindowHwndDiff::Created(hwnd) => {
                 let Ok(previous) = self.detached_window_hwnd_set_for_reusable_lease(
+                    ctx,
                     window_id,
                     hwnd,
                     "deferred_callback_adopt_hwnd",
@@ -63672,7 +63691,7 @@ impl App {
     fn start_active_detached_loading_context(
         &mut self,
         ctx: &egui::Context,
-        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         source: DetachedSource,
         address: PathBuf,
         initialize: impl FnOnce(&mut Self, u64) -> DetachedLoadingContextInit,
@@ -63741,7 +63760,7 @@ impl App {
         &mut self,
         descriptor: ViewerContextDescriptor,
         ctx: &egui::Context,
-        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     ) -> bool {
         self.start_active_detached_book_context_with_start(
@@ -63778,7 +63797,7 @@ impl App {
         &mut self,
         plan: DetachedCollectionRootImageOpenPlan,
         ctx: &egui::Context,
-        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         resume_window_id: Option<u64>,
     ) -> bool {
         if self.remote_session_blocks_local_control() {
@@ -63933,7 +63952,7 @@ impl App {
         path: PathBuf,
         scan: ScannedDir,
         ctx: &egui::Context,
-        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
     ) -> bool {
         self.start_active_detached_book_context_from_scanned_folder_with_restore(
             path,
@@ -63950,7 +63969,7 @@ impl App {
         path: PathBuf,
         scan: ScannedDir,
         ctx: &egui::Context,
-        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     ) -> bool {
         self.start_active_detached_book_context_with_start(
@@ -63968,7 +63987,7 @@ impl App {
         &mut self,
         descriptor: ViewerContextDescriptor,
         ctx: &egui::Context,
-        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         bookmark_pending: Option<crate::bookmark_browser::PendingBookOpen>,
     ) -> bool {
         self.start_active_detached_book_context_with_start(
@@ -64080,7 +64099,7 @@ impl App {
         &mut self,
         start: DetachedBookContextStart,
         ctx: &egui::Context,
-        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         mut bookmark_pending: Option<crate::bookmark_browser::PendingBookOpen>,
         resume_window_id: Option<u64>,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
@@ -64527,7 +64546,8 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_collection_image",
                 );
-                let base_placement = self.active_detached_viewer_current_placement();
+                let base_placement =
+                    self.capture_active_detached_placement_at_decision("collection_image_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     self.show_feedback_warning(
@@ -64573,7 +64593,8 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_folder_candidate",
                 );
-                let base_placement = self.active_detached_viewer_current_placement();
+                let base_placement =
+                    self.capture_active_detached_placement_at_decision("folder_candidate_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     return false;
@@ -64615,7 +64636,8 @@ impl App {
                     self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
                     return true;
                 }
-                let base_placement = self.active_detached_viewer_current_placement();
+                let base_placement =
+                    self.capture_active_detached_placement_at_decision("archive_candidate_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     return false;
@@ -64717,7 +64739,7 @@ impl App {
         };
 
         let (descriptor, collection_restore) = descriptor;
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement = self.capture_active_detached_placement_at_decision("descriptor_seed");
         let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             return false;
@@ -64848,7 +64870,8 @@ impl App {
                 return None;
             }
         };
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement =
+            self.capture_active_detached_placement_at_decision("converted_bookmark_seed");
         let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.bookmark_open_pending =
@@ -65412,15 +65435,13 @@ impl App {
     #[cfg(windows)]
     fn offset_detached_image_window_placement(
         &self,
-        base: crate::settings::DetachedViewerWindowPlacement,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
-        let mut placement = base;
-        placement.x += 40.0;
-        placement.y += 40.0;
-        placement.maximized = false;
-        if placement.is_sane()
-            && crate::monitor::title_bar_on_some_monitor(placement.x, placement.y, placement.w)
-        {
+        base: crate::detached_window_geometry::PhysicalWindowPlacement,
+    ) -> crate::detached_window_geometry::PhysicalWindowPlacement {
+        let Some(monitor) = crate::detached_window_geometry::monitor_for_rect(base.outer) else {
+            return self.default_detached_viewer_window_placement();
+        };
+        let placement = crate::detached_window_geometry::offset_placement(base, 1, monitor);
+        if Self::detached_window_runtime_placement_is_usable(placement) {
             placement
         } else {
             self.default_detached_viewer_window_placement()
@@ -65430,14 +65451,16 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn active_detached_viewer_current_placement(
         &self,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
+    ) -> crate::detached_window_geometry::PhysicalWindowPlacement {
         self.active_detached_seed_placement()
     }
 
     #[cfg(windows)]
     pub(crate) fn detached_passive_placement_update_looks_like_default_viewport(
-        previous: crate::settings::DetachedViewerWindowPlacement,
-        candidate: crate::settings::DetachedViewerWindowPlacement,
+        previous: crate::detached_window_geometry::PhysicalWindowPlacement,
+        candidate: crate::detached_window_geometry::PhysicalWindowPlacement,
+        previous_client_size: [i32; 2],
+        candidate_client_size: [i32; 2],
         pixels_per_point: f32,
         apply_initial_placement: bool,
     ) -> bool {
@@ -65445,39 +65468,45 @@ impl App {
             return false;
         }
         let ppp = pixels_per_point.clamp(0.5, 4.0);
-        let default_w = candidate.w * ppp;
-        let default_h = candidate.h * ppp;
+        let default_w = candidate_client_size[0] as f32;
+        let default_h = candidate_client_size[1] as f32;
         let near_default_800x600 =
             (default_w - 800.0).abs() <= 40.0 && (default_h - 600.0).abs() <= 40.0;
         if !near_default_800x600 {
             return false;
         }
-        let shrank_hard = candidate.w < previous.w * 0.80 || candidate.h < previous.h * 0.80;
-        let moved_far =
-            (candidate.x - previous.x).abs() > 64.0 || (candidate.y - previous.y).abs() > 64.0;
-        let previous_was_substantial = previous.w >= 700.0 || previous.h >= 520.0;
+        let shrank_hard = (candidate_client_size[0] as f32) < previous_client_size[0] as f32 * 0.80
+            || (candidate_client_size[1] as f32) < previous_client_size[1] as f32 * 0.80;
+        let moved_far = (candidate.outer.left - previous.outer.left).abs() as f32 > 64.0 * ppp
+            || (candidate.outer.top - previous.outer.top).abs() as f32 > 64.0 * ppp;
+        let previous_was_substantial = previous_client_size[0] as f32 >= 700.0 * ppp
+            || previous_client_size[1] as f32 >= 520.0 * ppp;
         shrank_hard && moved_far && previous_was_substantial
     }
 
     #[cfg(windows)]
     pub(crate) fn detached_active_placement_update_looks_like_default_viewport(
-        previous: crate::settings::DetachedViewerWindowPlacement,
-        candidate: crate::settings::DetachedViewerWindowPlacement,
+        previous: crate::detached_window_geometry::PhysicalWindowPlacement,
+        candidate: crate::detached_window_geometry::PhysicalWindowPlacement,
+        previous_client_size: [i32; 2],
+        candidate_client_size: [i32; 2],
         pixels_per_point: f32,
     ) -> bool {
         if previous.maximized || candidate.maximized {
             return false;
         }
         let ppp = pixels_per_point.clamp(0.5, 4.0);
-        let default_w = candidate.w * ppp;
-        let default_h = candidate.h * ppp;
+        let default_w = candidate_client_size[0] as f32;
+        let default_h = candidate_client_size[1] as f32;
         let near_default_800x600 =
             (default_w - 800.0).abs() <= 40.0 && (default_h - 600.0).abs() <= 40.0;
         if !near_default_800x600 {
             return false;
         }
-        let shrank_hard = candidate.w < previous.w * 0.80 || candidate.h < previous.h * 0.80;
-        let previous_was_substantial = previous.w >= 700.0 || previous.h >= 520.0;
+        let shrank_hard = (candidate_client_size[0] as f32) < previous_client_size[0] as f32 * 0.80
+            || (candidate_client_size[1] as f32) < previous_client_size[1] as f32 * 0.80;
+        let previous_was_substantial = previous_client_size[0] as f32 >= 700.0 * ppp
+            || previous_client_size[1] as f32 >= 520.0 * ppp;
         shrank_hard && previous_was_substantial
     }
 
@@ -65585,6 +65614,7 @@ impl App {
         let zoom_pan = self.fs_zoom_pan();
         let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
+        let _ = self.capture_detached_window_placement_at_decision(id, "build_active_snapshot");
         let placement = self.ensure_detached_window_runtime_placement(id, "build_active_snapshot");
         let pixels_per_point = ctx
             .map(egui::Context::pixels_per_point)
@@ -65608,7 +65638,7 @@ impl App {
             )?;
         let snapshot_rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
+            Self::detached_snapshot_client_size(placement),
         );
         let image_rect = egui::Rect::from_min_max(
             egui::pos2(
@@ -65734,6 +65764,8 @@ impl App {
             return None;
         }
         let id = self.ensure_detached_viewer_window_id();
+        let _ = self
+            .capture_detached_window_placement_at_decision(id, "build_parked_live_media_snapshot");
         let placement =
             self.ensure_detached_window_runtime_placement(id, "build_parked_live_media_snapshot");
         let texture = ctx.load_texture(
@@ -66333,7 +66365,8 @@ impl App {
             && self.viewer_session_is_detached()
             && current_idx.is_some_and(|current| self.viewer_item_supports_detached_still(current))
             && always_new;
-        let base_placement = self.active_detached_viewer_current_placement();
+        let base_placement =
+            self.capture_active_detached_placement_at_decision("always_new_still_seed");
         let parked_window_id = self
             .active_detached_session
             .map(|session| session.window_id)
@@ -67014,79 +67047,11 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn default_detached_viewer_window_placement(
-        &self,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
-        // 現在位置の隣に出したいので `last_window_rect` を読む。`last_outer_rect` だと
-        // 最大化中はいつも (80,80) になる。
-        let (x, y) = self
-            .last_window_rect
-            .map(|rect| (rect.min.x + 48.0, rect.min.y + 48.0))
-            .unwrap_or((80.0, 80.0));
-        crate::settings::DetachedViewerWindowPlacement {
-            x,
-            y,
-            w: 960.0,
-            h: 720.0,
-            maximized: false,
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn detached_viewer_window_placement(
-        &self,
-    ) -> crate::settings::DetachedViewerWindowPlacement {
-        self.settings
-            .detached_viewer_window_placement
-            .filter(|p| p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w))
-            .unwrap_or_else(|| self.default_detached_viewer_window_placement())
-    }
-
-    #[cfg(windows)]
-    fn detached_viewer_monitor_rect_logical(&self) -> Option<egui::Rect> {
-        use windows::Win32::Foundation::{HWND, RECT};
-        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
-        if let Some(hwnd_raw) = self.detached_viewer_host_hwnd_alive() {
-            let mut rect = RECT::default();
-            if unsafe { GetWindowRect(HWND(hwnd_raw as *mut _), &mut rect) }.is_ok() {
-                let x = (rect.left + rect.right) as f32 * 0.5;
-                let y = (rect.top + rect.bottom) as f32 * 0.5;
-                if let Some(monitor_rect) = crate::monitor::get_monitor_logical_rect_at(x, y) {
-                    return Some(monitor_rect);
-                }
-            }
-        }
-
-        let placement = self.active_detached_viewer_current_placement();
-        let scale = crate::settings::native_pixels_per_point_from_effective(
-            self.last_pixels_per_point,
-            self.settings.ui_scale_factor,
-        )
-        .max(0.5);
-        let x = (placement.x + placement.w * 0.5) * scale;
-        let y = (placement.y + placement.h * 0.5) * scale;
-        crate::monitor::get_monitor_logical_rect_at(x, y)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn detached_viewer_borderless_target_rect(&self) -> egui::Rect {
-        self.detached_viewer_monitor_rect_logical()
-            .unwrap_or_else(|| {
-                let placement = self.active_detached_viewer_current_placement();
-                egui::Rect::from_min_size(
-                    egui::pos2(placement.x, placement.y),
-                    egui::vec2(placement.w, placement.h),
-                )
-            })
-    }
-
-    #[cfg(windows)]
     #[track_caller]
     fn write_detached_viewer_borderless_state(
         &mut self,
         borderless: bool,
-        restore_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
+        restore_placement: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         caller: &'static str,
         reason: &'static str,
     ) {
@@ -67135,6 +67100,16 @@ impl App {
             return;
         }
         let target_borderless = !self.detached_viewer_borderless_fullscreen;
+        let entry_outer = target_borderless
+            .then(|| {
+                self.active_detached_hwnd_window_id().and_then(|window_id| {
+                    self.capture_detached_window_placement_at_decision(
+                        window_id,
+                        "f11_enter_requested",
+                    )
+                })
+            })
+            .flatten();
         if target_borderless {
             self.write_detached_viewer_borderless_state(
                 false,
@@ -67143,8 +67118,18 @@ impl App {
                 "f11_enter_requested",
             );
         }
+        let target_outer = if target_borderless {
+            let intent = entry_outer
+                .unwrap_or_else(|| self.active_detached_viewer_current_placement().outer);
+            crate::detached_window_geometry::borderless_target_for(intent).unwrap_or(intent)
+        } else {
+            self.detached_viewer_restore_placement
+                .unwrap_or_else(|| self.active_detached_viewer_current_placement())
+                .outer
+        };
         self.detached_viewer_borderless_transition = Some(DetachedViewerBorderlessTransition {
             target_borderless,
+            target_outer,
             phase: DetachedViewerBorderlessTransitionPhase::PrimeBlackFrame,
         });
         self.show_feedback_toast(if target_borderless {
@@ -67167,137 +67152,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn apply_detached_viewer_borderless_target(
-        &mut self,
-        ctx: &egui::Context,
-        target_borderless: bool,
-    ) {
-        let viewport_id = self.fullscreen_viewport_id();
-        if !target_borderless {
-            let placement = self
-                .detached_viewer_restore_placement
-                .unwrap_or_else(|| self.active_detached_viewer_current_placement());
-            self.write_detached_viewer_borderless_state(
-                false,
-                None,
-                "App::apply_detached_viewer_borderless_target",
-                "f11_exit_applied",
-            );
-            if let Some(window_id) = self.active_detached_hwnd_window_id() {
-                self.set_detached_window_runtime_placement(
-                    window_id,
-                    placement,
-                    "borderless_restore",
-                );
-            }
-            self.log_detached_viewport_placement_event(
-                "borderless_restore",
-                "viewport_cmd",
-                format!(
-                    "viewport={viewport_id:?} command=OuterPosition/InnerSize placement={placement:?}"
-                ),
-            );
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(true));
-            let viewport_position = egui::pos2(
-                crate::settings::window_geometry_to_viewport_points(
-                    placement.x,
-                    self.settings.ui_scale_factor,
-                ),
-                crate::settings::window_geometry_to_viewport_points(
-                    placement.y,
-                    self.settings.ui_scale_factor,
-                ),
-            );
-            let viewport_inner_size = egui::vec2(
-                crate::settings::window_geometry_to_viewport_points(
-                    placement.w,
-                    self.settings.ui_scale_factor,
-                ),
-                crate::settings::window_geometry_to_viewport_points(
-                    placement.h,
-                    self.settings.ui_scale_factor,
-                ),
-            );
-            ctx.send_viewport_cmd_to(
-                viewport_id,
-                egui::ViewportCommand::OuterPosition(viewport_position),
-            );
-            ctx.send_viewport_cmd_to(
-                viewport_id,
-                egui::ViewportCommand::InnerSize(viewport_inner_size),
-            );
-            if placement.maximized {
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
-            }
-        } else {
-            let rect = self.detached_viewer_borderless_target_rect();
-            let viewport_position = egui::pos2(
-                crate::settings::window_geometry_to_viewport_points(
-                    rect.min.x,
-                    self.settings.ui_scale_factor,
-                ),
-                crate::settings::window_geometry_to_viewport_points(
-                    rect.min.y,
-                    self.settings.ui_scale_factor,
-                ),
-            );
-            let viewport_inner_size = egui::vec2(
-                crate::settings::window_geometry_to_viewport_points(
-                    rect.width(),
-                    self.settings.ui_scale_factor,
-                ),
-                crate::settings::window_geometry_to_viewport_points(
-                    rect.height(),
-                    self.settings.ui_scale_factor,
-                ),
-            );
-            self.write_detached_viewer_borderless_state(
-                true,
-                self.detached_viewer_restore_placement,
-                "App::apply_detached_viewer_borderless_target",
-                "f11_enter_applied",
-            );
-            self.log_detached_viewport_placement_event(
-                "borderless_enter",
-                "viewport_cmd",
-                format!(
-                    "viewport={viewport_id:?} command=OuterPosition/InnerSize \
-                     rect=({:.3},{:.3} {:.3}x{:.3})",
-                    rect.min.x,
-                    rect.min.y,
-                    rect.width(),
-                    rect.height()
-                ),
-            );
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(false));
-            ctx.send_viewport_cmd_to(
-                viewport_id,
-                egui::ViewportCommand::OuterPosition(viewport_position),
-            );
-            ctx.send_viewport_cmd_to(
-                viewport_id,
-                egui::ViewportCommand::InnerSize(viewport_inner_size),
-            );
-            if self
-                .video_presentation_transition
-                .z_order_recovery_permitted()
-            {
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
-                self.observe_viewport_presentation_command(
-                    viewport_id,
-                    crate::presentation_observer::WindowAction::Focus,
-                    "app::apply_detached_viewer_borderless_target",
-                    "viewport_command=Focus",
-                );
-            }
-        }
-        ctx.request_repaint();
-        self.sync_mounted_native_chrome_policy();
-    }
-
-    #[cfg(windows)]
     pub(crate) fn step_detached_viewer_borderless_transition(
         &mut self,
         ctx: &egui::Context,
@@ -67313,12 +67167,32 @@ impl App {
                 true
             }
             DetachedViewerBorderlessTransitionPhase::ApplyWindowMode => {
-                self.apply_detached_viewer_borderless_target(ctx, transition.target_borderless);
-                transition.phase = DetachedViewerBorderlessTransitionPhase::Settle {
-                    until: std::time::Instant::now() + std::time::Duration::from_millis(96),
+                if !self.window_visible {
+                    self.detached_viewer_borderless_transition = Some(transition);
+                    return true;
+                }
+                let applied = self.apply_detached_viewer_borderless_target(ctx, transition, true);
+                transition.phase = if applied {
+                    DetachedViewerBorderlessTransitionPhase::Settle {
+                        until: std::time::Instant::now() + std::time::Duration::from_millis(96),
+                    }
+                } else {
+                    DetachedViewerBorderlessTransitionPhase::AwaitUnzoom
                 };
                 self.detached_viewer_borderless_transition = Some(transition);
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                true
+            }
+            DetachedViewerBorderlessTransitionPhase::AwaitUnzoom => {
+                if self.window_visible
+                    && self.apply_detached_viewer_borderless_target(ctx, transition, false)
+                {
+                    transition.phase = DetachedViewerBorderlessTransitionPhase::Settle {
+                        until: std::time::Instant::now() + std::time::Duration::from_millis(96),
+                    };
+                }
+                self.detached_viewer_borderless_transition = Some(transition);
+                ctx.request_repaint();
                 true
             }
             DetachedViewerBorderlessTransitionPhase::Settle { until } => {
@@ -67336,22 +67210,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn detached_viewer_rect_physical(&self) -> windows::Win32::Foundation::RECT {
-        let placement = self.active_detached_viewer_current_placement();
-        let scale = crate::settings::native_pixels_per_point_from_effective(
-            self.last_pixels_per_point,
-            self.settings.ui_scale_factor,
-        )
-        .max(0.5);
-        windows::Win32::Foundation::RECT {
-            left: (placement.x * scale).round() as i32,
-            top: (placement.y * scale).round() as i32,
-            right: ((placement.x + placement.w) * scale).round() as i32,
-            bottom: ((placement.y + placement.h) * scale).round() as i32,
-        }
-    }
-
-    #[cfg(windows)]
     pub(crate) fn native_video_rect_for_presentation(
         &self,
         presentation: ViewerPresentation,
@@ -67363,7 +67221,7 @@ impl App {
         use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
         match presentation {
-            ViewerPresentation::DetachedWindow => Some(self.detached_viewer_rect_physical()),
+            ViewerPresentation::DetachedWindow => self.detached_viewer_client_rect_physical(),
             ViewerPresentation::MainWindow => {
                 let hwnd = HWND(self.main_hwnd.unwrap_or_default() as *mut _);
                 let mut client = RECT::default();
@@ -67404,7 +67262,7 @@ impl App {
         inner_rect: Option<egui::Rect>,
         pixels_per_point: f32,
         maximized: bool,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         self.save_detached_viewer_placement_from_logical_rect_with_source(
             "unspecified",
             DetachedPlacementObservationAuthority::UserVisibleHost,
@@ -67424,171 +67282,13 @@ impl App {
         inner_rect: Option<egui::Rect>,
         pixels_per_point: f32,
         maximized: bool,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
+        let _ = (outer_rect, inner_rect, pixels_per_point, maximized);
         if authority == DetachedPlacementObservationAuthority::HiddenScaffold {
-            crate::logger::log(format!(
-                "[presentation-placement] t_us={} event=observation source={} authority={} \
-                 input_maximized={} outer=({:.3},{:.3} {:.3}x{:.3}) inner={} outcome=ignored",
-                crate::logger::elapsed_micros(),
-                source,
-                authority.label(),
-                maximized,
-                outer_rect.min.x,
-                outer_rect.min.y,
-                outer_rect.width(),
-                outer_rect.height(),
-                inner_rect
-                    .map(|rect| format!(
-                        "({:.3},{:.3} {:.3}x{:.3})",
-                        rect.min.x,
-                        rect.min.y,
-                        rect.width(),
-                        rect.height()
-                    ))
-                    .unwrap_or_else(|| "none".to_string()),
-            ));
             return None;
         }
-        if self.detached_viewer_borderless_fullscreen
-            || self.detached_viewer_borderless_transition.is_some()
-        {
-            return None;
-        }
-        let ui_scale = self.settings.ui_scale_factor;
-        let to_window_geometry_rect = |rect: egui::Rect| {
-            egui::Rect::from_min_max(
-                egui::pos2(
-                    crate::settings::viewport_points_to_window_geometry(rect.min.x, ui_scale),
-                    crate::settings::viewport_points_to_window_geometry(rect.min.y, ui_scale),
-                ),
-                egui::pos2(
-                    crate::settings::viewport_points_to_window_geometry(rect.max.x, ui_scale),
-                    crate::settings::viewport_points_to_window_geometry(rect.max.y, ui_scale),
-                ),
-            )
-        };
-        let outer_rect = to_window_geometry_rect(outer_rect);
-        let inner_rect = inner_rect.map(to_window_geometry_rect);
-        let geometry_ppp =
-            crate::settings::native_pixels_per_point_from_effective(pixels_per_point, ui_scale);
-        let Some(window_id) = self.active_detached_hwnd_window_id() else {
-            self.log_detached_viewport_placement_event(
-                source,
-                "active_placement_update_skipped",
-                "reason=no_window_id".to_string(),
-            );
-            return None;
-        };
-        if maximized {
-            let mut placement = self.detached_window_seed_placement(window_id);
-            placement.maximized = true;
-            self.log_detached_viewport_placement_event(
-                source,
-                "active_placement_update_maximized",
-                format!(
-                    "window_id={window_id} outer=({:.3},{:.3} {:.3}x{:.3}) ppp={pixels_per_point:.3} \
-                     seed_now={}",
-                    outer_rect.min.x,
-                    outer_rect.min.y,
-                    outer_rect.width(),
-                    outer_rect.height(),
-                    self.detached_viewer_should_seed_placement()
-                ),
-            );
-            self.set_detached_window_runtime_placement(
-                window_id,
-                placement,
-                "active_placement_update_maximized",
-            );
-            return None;
-        }
-        let size_rect = inner_rect.unwrap_or(outer_rect);
-        if !outer_rect.min.x.is_finite()
-            || !outer_rect.min.y.is_finite()
-            || !size_rect.width().is_finite()
-            || !size_rect.height().is_finite()
-            || size_rect.width() < 320.0
-            || size_rect.height() < 240.0
-        {
-            return None;
-        }
-        if !maximized
-            && !crate::monitor::title_bar_on_some_monitor(
-                outer_rect.min.x,
-                outer_rect.min.y,
-                outer_rect.width(),
-            )
-        {
-            return None;
-        }
-        let placement = crate::settings::DetachedViewerWindowPlacement {
-            x: outer_rect.min.x,
-            y: outer_rect.min.y,
-            w: size_rect.width(),
-            h: size_rect.height(),
-            maximized: false,
-        };
-        // switching も含める: F12 で動画を detach する遷移中は presentation がまだ
-        // DetachedWindow に変わっておらず `viewer_session_is_detached()` が false になる窓がある。
-        // その間に egui が既定サイズ窓を報告すると、狭い判定では default-rejection が発火せず
-        // 既定 placement を保存 + 既定サイズ窓を capture してしまう (Codex P1)。render 側は
-        // `viewer_session_is_detached_or_switching()` を detached 判定に使っているので揃える。
-        if self.viewer_session_is_detached_or_switching() {
-            let previous = self
-                .detached_window_runtime_placement(window_id)
-                .or(self.settings.detached_viewer_window_placement)
-                .filter(|p| {
-                    p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w)
-                });
-            if let Some(previous) = previous
-                && Self::detached_active_placement_update_looks_like_default_viewport(
-                    previous,
-                    placement,
-                    geometry_ppp,
-                )
-            {
-                self.log_detached_viewport_placement_event(
-                    source,
-                    "active_placement_update_rejected_default",
-                    format!(
-                        "window_id={window_id} previous={previous:?} candidate={placement:?} \
-                         ppp={pixels_per_point:.3} seed_now={}",
-                        self.detached_viewer_should_seed_placement()
-                    ),
-                );
-                self.set_detached_window_runtime_placement(
-                    window_id,
-                    previous,
-                    "active_placement_update_rejected_default",
-                );
-                return Some(previous);
-            }
-        }
-        self.log_detached_viewport_placement_event(
-            source,
-            "active_placement_update",
-            format!(
-                "window_id={window_id} outer=({:.3},{:.3} {:.3}x{:.3}) inner={} \
-                 placement={placement:?} ppp={pixels_per_point:.3} maximized={maximized} \
-                 seed_now={}",
-                outer_rect.min.x,
-                outer_rect.min.y,
-                outer_rect.width(),
-                outer_rect.height(),
-                inner_rect
-                    .map(|rect| format!(
-                        "({:.3},{:.3} {:.3}x{:.3})",
-                        rect.min.x,
-                        rect.min.y,
-                        rect.width(),
-                        rect.height()
-                    ))
-                    .unwrap_or_else(|| "none".to_string()),
-                self.detached_viewer_should_seed_placement()
-            ),
-        );
-        self.set_detached_window_runtime_placement(window_id, placement, "active_placement_update");
-        None
+        let window_id = self.active_detached_hwnd_window_id()?;
+        self.observe_detached_window_host_placement(window_id, source)
     }
 
     #[cfg(windows)]
@@ -67715,15 +67415,14 @@ impl App {
             self.native_video_front_last_raise = None;
         } else if let Some(window_id) = window_id {
             let viewport_id = Self::detached_image_window_viewport_id(window_id);
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
+            self.request_detached_window_visibility(ctx, window_id, true, None, true);
             self.observe_viewport_presentation_command(
                 viewport_id,
                 crate::presentation_observer::WindowAction::Visible,
                 "app::restore_active_context_window",
                 "value=true",
             );
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+
             self.observe_viewport_presentation_command(
                 viewport_id,
                 crate::presentation_observer::WindowAction::Focus,
@@ -67763,15 +67462,16 @@ impl App {
                 || self.current_music_fullscreen_idx() == Some(idx))
         {
             let fs_id = self.fullscreen_viewport_id();
-            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            if let Some(window_id) = self.active_detached_hwnd_window_id() {
+                self.request_detached_window_visibility(ctx, window_id, true, None, true);
+            }
             self.observe_viewport_presentation_command(
                 fs_id,
                 crate::presentation_observer::WindowAction::Visible,
                 "app::activate_media_window",
                 "value=true",
             );
-            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+
             self.observe_viewport_presentation_command(
                 fs_id,
                 crate::presentation_observer::WindowAction::Focus,
@@ -95953,6 +95653,8 @@ impl App {
         self.sync_deferred_detached_activation_watcher(ctx);
         #[cfg(windows)]
         self.drain_deferred_detached_activation_watcher(ctx);
+        #[cfg(windows)]
+        self.advance_detached_window_host_placements(ctx);
         #[cfg(all(windows, feature = "test-script"))]
         let test_script_committed_activation = self.test_script_drive_targeted_activation(ctx);
         #[cfg(not(all(windows, feature = "test-script")))]
@@ -96954,7 +96656,22 @@ impl eframe::App for App {
         self.accept_viewport_close_request(ctx, viewport_id)
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, _input: &mut egui::RawInput) {
+        #[cfg(windows)]
+        if _input.viewport_id == egui::ViewportId::ROOT {
+            // Eframe has delivered the previous output before preparing this
+            // root operation. This runs once for Full (all retries) or LogicOnly,
+            // unlike frame counters, which do not advance for LogicOnly.
+            self.detached_window_manager
+                .retire_mode_commands_before_root_pass();
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        if ctx.current_pass_index() == 0 {
+            self.record_detached_host_placements_before_commands(ctx);
+        }
         self.speculative_gpu_frame
             .begin(ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT));
         self.service_app_logic(ctx, frame);

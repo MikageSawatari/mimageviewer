@@ -37,6 +37,141 @@ fn approvals(output: &egui::FullOutput) -> Vec<egui::ViewportRegistration> {
         .collect()
 }
 
+fn assert_close_mode_ownership(active: bool, maximized: bool, native_close: bool) {
+    use super::detached_placement::{
+        set_host_geometry_for_test, with_host_geometry_for_test, with_host_normal_outer_for_test,
+    };
+    use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let window_id = 93010;
+    if active {
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Image, |_| {});
+    } else {
+        app.push_window_context_for_test(&ctx, window_id, |_| {});
+    }
+    app.update_detached_window_runtime_flags(window_id, false, "close_mode_test");
+    let registration = register(&mut app, &ctx, &[window_id])[0];
+    let placement = PhysicalWindowPlacement {
+        maximized,
+        ..app.default_detached_viewer_window_placement()
+    };
+    app.set_detached_window_runtime_placement(window_id, placement, "close_mode_test");
+    app.set_detached_window_host_for_test(window_id, 0x93010);
+    let claim = app
+        .detached_window_manager
+        .host_claim_alive(window_id)
+        .unwrap();
+    app.detached_window_manager.mark_host_placed(
+        claim,
+        super::detached_window_manager::PlacementOutcome::Exact,
+    );
+    // The delivery is host-scoped; a sibling may still own a different output's command.
+    app.set_detached_window_runtime_placement(93011, placement, "sibling_mode_test");
+    app.detached_window_manager
+        .note_mode_command(93011, !maximized);
+    let sibling = app.detached_window_manager.host_placement(93011);
+    let moved = PhysicalRect {
+        left: placement.outer.left + 120,
+        right: placement.outer.right + 120,
+        ..placement.outer
+    };
+    let zoomed_outer = crate::detached_window_geometry::borderless_target_for(moved).unwrap();
+    let actual_outer = if maximized { moved } else { zoomed_outer };
+    with_host_geometry_for_test(window_id, actual_outer, !maximized, || {
+        with_host_normal_outer_for_test(window_id, moved, || {
+            ctx.begin_pass(Default::default());
+            ctx.show_viewport_deferred(registration.viewport_id(), Default::default(), |_, _| {});
+            app.send_detached_viewport_mode_command(&ctx, registration.viewport_id(), maximized);
+            if native_close {
+                // Deliver this complete output to the fake HWND. Do not call the
+                // root input hook or observe the intermediate matching OS mode.
+                let output = ctx.end_pass();
+                let commands = output.viewport_output[&registration.viewport_id()]
+                    .commands
+                    .clone();
+                output.drop_without_applying_deltas();
+                let modes = commands
+                    .iter()
+                    .filter_map(|command| match command {
+                        egui::ViewportCommand::Maximized(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(modes, [maximized]);
+                for mode in modes {
+                    set_host_geometry_for_test(
+                        window_id,
+                        if mode { zoomed_outer } else { moved },
+                        mode,
+                    );
+                }
+                // The user reverses the processed command, then closes before
+                // another root input. The lifecycle hook must retire stale pending.
+                set_host_geometry_for_test(window_id, actual_outer, !maximized);
+            }
+            assert_eq!(
+                app.detached_window_manager.pending_mode(window_id),
+                Some(maximized)
+            );
+            let root_frame = ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT);
+            if native_close {
+                assert_eq!(
+                    eframe::App::on_viewport_close_requested(
+                        &mut app.app,
+                        &ctx,
+                        registration.viewport_id()
+                    ),
+                    eframe::ViewportCloseResponse::RetirementTransferred
+                );
+            } else {
+                // The app closes within the very output carrying the mode command.
+                assert!(app.request_detached_image_window_close_by_ids(
+                    &ctx,
+                    &[window_id],
+                    "same_output_close",
+                    None,
+                ));
+            }
+            assert_eq!(
+                ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT),
+                root_frame
+            );
+            if !native_close {
+                ctx.end_pass().drop_without_applying_deltas();
+            }
+        });
+    });
+    assert!(app.detached_window_manager.runtime(window_id).is_none());
+    assert_eq!(app.detached_window_manager.host_placement(93011), sibling);
+    assert_eq!(
+        app.settings.detached_viewer_window_physical_placement,
+        Some(PhysicalWindowPlacement {
+            outer: moved,
+            maximized: if native_close { !maximized } else { maximized },
+        })
+    );
+}
+
+#[test]
+fn native_close_after_delivered_mode_and_os_reverse_uses_hwnd_before_root_input() {
+    for active in [false, true] {
+        for maximized in [false, true] {
+            assert_close_mode_ownership(active, maximized, true);
+        }
+    }
+}
+
+#[test]
+fn app_close_in_same_output_preserves_pending_mode() {
+    for active in [false, true] {
+        for maximized in [false, true] {
+            assert_close_mode_ownership(active, maximized, false);
+        }
+    }
+}
+
 #[test]
 fn viewport_retirement_mode_change_transfers_active_parked_and_passive_exact_lifetimes() {
     let mut app = setup_app_for_test();

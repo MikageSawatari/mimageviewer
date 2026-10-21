@@ -37,6 +37,7 @@ pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+pub mod detached_window_geometry;
 pub(crate) mod feedback;
 #[cfg(feature = "dev-tools")]
 pub mod raw;

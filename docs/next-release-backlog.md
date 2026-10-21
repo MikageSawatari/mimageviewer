@@ -117,6 +117,18 @@
 - 調査全文: ClaudeCode の 2026-10-15 セッションの OFFSCR1 (scratchpad、要点はこの節)。
 - 規模 / 優先度: Medium / P2 (見えない窓から製品内で回収する手段がない)。
 
+### 1.408 倍率の違うモニターで、メインから開く全画面の窓の配置が §1.384 と同じ境界を通る — §1.384 の設計で判明 (2026-10-20)
+- 内容 (コードの参照。利用者の報告は無く、実機での発生は未確認): メインから開く全画面 viewport
+  (`ui_fullscreen.rs` の `fullscreen_viewport_geometry` と builder) は、対象モニターの矩形をそのモニターの DPI で論理化し、
+  builder の位置・大きさとして渡す。egui-winit / winit はそれを作成直後の HWND の DPI で物理化するので、
+  作成直後の窓の DPI と対象モニターの DPI が違うと、§1.384 と同じく倍率がずれうる。
+- §1.384 で直さない理由: 物理座標で配置してから見せるには、その viewport の HWND を生存世代と対応付けて得る境界が要る
+  (今は detached の HWND registry ではなく command binding で扱っている。rect 一致探索の拡張は不可)。
+  設計と経緯は [detached-dpi-placement-plan.md](detached-dpi-placement-plan.md) §3.8。
+  同じ箇所の全画面の背景 (`fullscreen_backdrop_physical_rect`) は §1.384 で物理の `rcMonitor` に直した (予定)。
+- 着手時: まず倍率の違う 2 台で、メイン窓を 100% 側に置いて静止画・動画を全画面で開き、窓の矩形を確かめる。
+- 規模 / 優先度: 未見積もり / P3。
+
 ### 1.383 parked-live の音楽ウィンドウで Norm のゲインが鍵盤の明るさに反映されない — HarmNet 鍵盤の設計レビューで判明 (2026-10-12)
 
 音楽ビューの鍵盤は、Norm (ラウドネス正規化) の適用ゲインを明るさ (presence) に反映する。通常のフルスクリーンの描画
