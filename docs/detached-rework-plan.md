@@ -1474,7 +1474,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   ParkedLive)、builder の配置、F11 の入る / 出る、root 側の表示要求 (トレイ復帰・native 遷移・再アクティブ化) の共通 helper、
   ParkedLive の新規 host の Hidden 作成、位置の記録、設定 (新 field と旧 field の移行)。rect 一致探索・キー入力 subclass・
   状態遷移・park / promote の所有境界・F11 遷移の Settle 時間待ちは変えていない。既定サイズ拒否の防波堤は単位だけ物理にした。
-- 残す検証条件: DPI をまたぐ staging の推奨矩形の前提は、倍率の違うモニターでの実 HWND 試験が通るまで未検証として扱う。
+- 検証: DPI をまたぐ staging は、2026-10-21 に倍率の違うモニター (150% / 100%) の実 HWND 試験 (非表示の winit 窓) で、両方向・装飾あり / なし・境界またぎ・モニター超過・画面外からの開始の全ケースが Exact。製品での利用者の実機確認は別に行う。
   メインから開く全画面 viewport は同型だが範囲外 (backlog §1.408)。
 
 ### 2026-10-20 §1.232 第5回レビュー: viewer 不在の一覧採用

@@ -1,6 +1,6 @@
 # 別ウィンドウの配置を物理座標で 1 か所が持つ (backlog §1.384)
 
-状態: **実装済み (2026-10-20、95c5db8bb まで)。独立実装レビュー (GPT-6.1 Sol / xhigh) ACCEPT、test-lib-full 13,928 件成功。倍率をまたぐ実モニター試験 (`detached_window_geometry::tests::hidden_winit_hwnd_physical_placement_and_available_mixed_dpi_monitors`) と利用者の実機確認は未実施 (開発機は 2026-10-20 時点で 3 台とも 150%)。**
+状態: **実装済み (2026-10-20、95c5db8bb まで)。独立実装レビュー (GPT-6.1 Sol / xhigh) ACCEPT、test-lib-full 13,928 件成功。倍率をまたぐ実モニター試験 (`detached_window_geometry::tests::hidden_winit_hwnd_physical_placement_and_available_mixed_dpi_monitors`) は 2026-10-21 に開発機 (150% 2 台 + 100% 1 台、利用者が倍率を戻した構成) で実行し、非表示の winit 窓で 150%↔100% の両方向・装飾あり / なし・境界またぎ・モニター超過・画面外からの開始 (報告と同じ構成) の全ケースが Exact (staging の推奨矩形の前提をこの試験で確認)。利用者の実機確認は未実施。**
 
 状態: 設計第 6 版 (2026-10-20、設計担当 ClaudeCode Opus 5.5)。**独立設計レビュー ACCEPT WITH CHANGES (0243fb926)。指摘 3 件を反映済み (§3.3・§3.4 の 5・§5)。構造的修正であることに設計担当・独立レビュー担当の双方が合意。**第 5 版 (3f2180bfc) は REJECT (passive の Hidden 採用と ParkedLive の表示経路)。第 6 版は passive の可視化を今のまま残し、最大化の扱いを 1 つの規則にまとめた (§3.3a・§3.4)。第 4 版 (72eed920c) は ACCEPT WITH CHANGES。第 5 版は、第 4 版で足した「初回表示を後の pass へ移す」仕組みを、扱う組み合わせを減らす方向で置き換えた (§4)。第 1 版 (241dadb75)・第 2 版 (331f717f7)・第 3 版 (733624656) は
 独立設計レビュー (GPT-6.1 Sol / xhigh) で REJECT。方針 (物理外枠矩形を正本にし、単一の Win32 適用境界へ
