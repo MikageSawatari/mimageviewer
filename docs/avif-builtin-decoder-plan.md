@@ -250,3 +250,17 @@ server側の認証・最新の種類設定とsource資格の確認は変更し�
 
 ログは`target/avif-r3-{check,focused,fmt,fmt-check}.log`（gitignore）。
 コミット・製品起動・全件ゲート・build-devは行わない。
+
+### 実機確認（2026-10-21、ClaudeCode が隔離 data-dir で実施）
+
+`target\dev-runtime\mimageviewer-core.exe --data-dir target\dev-runtime\data`（build-dev 済み、e4c81d604 時点）を
+ClaudeCode が起動し、窓のスクリーンショットと画素値で確認した（観測者: ClaudeCode。初回設定で AI 処理は「なし」）。
+
+| 経路 | 結果 |
+| --- | --- |
+| フォルダ `testdata\avif` のサムネイル一覧 | 正常 11 種が 4 象限どおり（grid は 128×128）。imir は左右反転、irot は時計回り 90°。`not_avif` / `truncated` は「読込失敗」 |
+| 全画面（透過 `quadrant_alpha_444`） | 透過部分は背景の黒、右半分は緑・白。WIC 経路で出ていた赤・青は出ない |
+| ZIP（`target\avif-verification-fixtures.zip`、正常 11 種）サムネイル | フォルダと同じ見え方 |
+| ZIP 内の全画面（`quadrant_irot90cw`） | 向きの適用は 1 回だけ。画素値は青 (0,0,253)・赤 (255,0,1)・白 (255,255,255)・緑 (0,255,0) |
+
+mIV Remote は、ログインの PIN 入力をエージェントが行えないため、この確認には含めていない（自動テストで共通デコーダ経由を確認済み）。
