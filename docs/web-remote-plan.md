@@ -708,6 +708,24 @@ remote-web 側で生成すると、本体が持つ以下をすべて複製する
 にする。これにより **F1 が解消する** (remote-web が catalog の内部構造を知らなくなる)。
 副次的に、リモート閲覧が本体のキャッシュを温めるため、次にローカルで開いたときも速くなる。
 
+#### catalog を開けない場合 (backlog §2.18、2026-10-20)
+
+ページ／サムネイルの復号では catalog は任意の高速化用キャッシュであり、open 失敗を
+要求全体の Internal エラーへ変換しない。理由を本体ログに残し、catalog 無しで既存の
+復号経路へ進む。生成結果は catalog へ保存しない。ページ (`full_page`) は現行の
+`SourceOnly` により初めから catalog を開かない。通常画像、ZIP 内画像、PDF／EPUB ページ、
+コンテナ代表サムネイルも、元データから生成できるものは catalog 無しで応答する。
+
+RAW の `CacheOnly` は既存キャッシュだけを使う制約を維持する。writable catalog を
+得られなければ、admission 失効・通常の open エラーのどちらでも、既存の
+`wait_read_admission` → `open_existing_read_only_admitted` による read-only 継続を1回だけ使う。
+書き込み用の移行等が失敗しても読める既存 RAW 行を返すための経路であり、writable open の
+リトライではない。read-only も開けない／行が無い場合は既存のキャッシュ欠落応答とし、
+元画像の生成・現像・catalog への書き込みは許さない。`CacheOnly` 以外はログを残して
+catalog 無しで復号を続ける。再試行、待ち時間や閾値の調整、要求ごとの open 構造の変更は行わない。
+新しい非同期状態や割り込みの組み合わせを追加せず、既存の任意 catalog と読み込み方針で扱う。
+IPC 応答型・protocol 版・catalog の本体側所有は変わらない。
+
 ### 9.3 暫定措置 (撤去済み)
 
 commit `865d9c2a` で導入した remote-web 側のオンデマンド生成と専用 SQLite は、縦串増分で
@@ -1169,7 +1187,8 @@ CSS page gap へ反映する。viewport は `height > width` を縦持ちとし�
 change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
-LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+LTR / RTL の見開き・横長分割モードは本体と同じく方向をそのモードへ揃え、Single の応答も
+保存済み方向を維持する。シークバーはこの `readingDirection` から向きを決め、入力の左右とは独立する。
 変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
 `PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
 案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
@@ -1177,9 +1196,21 @@ LTR / RTL の見開きモードは本体と同じく方向をそのモードへ�
 「文書の綴じ方向に従う」が有効なときに固定世代の方向を採用する。通常 PDF の `/Direction` は
 Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
-RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
-右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
-前後という意味を維持する。見開きの2画像は両方を別 DOM で fetch / decode し、最終寸法から
+横方向入力の反転は `command-core.mjs::inputAdvancesRightToLeft` だけで判定する。本体の
+`SpreadMode::advances_right_to_left` と同じく、Rtl / RtlCover / SplitRtl では反転し、
+Single / Ltr / LtrCover / SplitLtr では反転しない。入力は保存由来の `configured_spread_mode`
+（Web 共通 state の `spreadMode`）を見るため、Single は保存済み方向が RTL でも右 tap zone /
+`ArrowRight` / `›` が次グループになる。縦持ちの表示限定 Single は構成モードを変えないため、
+構成が RTL なら綴じ方向に従って反転を続ける。コンテナ・各コレクションも同じ state 値を使う。
+表示種別だけを変える要求も、受付時に `spreadModeWithReadingDirection` で要求と同じ読み方向へ正規化してから共通 state と再取得要求へ渡し、応答待ちの間も左右入力とラベルの反転を維持する。
+反転時は左 tap zone / `ArrowLeft` / `‹` が次、右 tap zone / `ArrowRight` / `›` が前になる。
+swipe は指でページを送る向きを維持し、反転時は右 swipe が次・左 swipe が前、Single と LTR は
+左 swipe が次・右 swipe が前になる。ボタンの aria-label と端ページのタップ案内も同じ判定から
+動作に合わせ、ラベルはモード変更時に更新する。
+上下矢印と PageUp / PageDown は前後という意味を維持する。本体の
+`fullscreen_horizontal_cursor_direction` 設定は持ち込まず、既定の FollowPage 相当とする。
+§1.259 で入力の左右を本体に揃えた。応答・IPC 型・protocol 版は変更しない。
+見開きの2画像は両方を別 DOM で fetch / decode し、最終寸法から
 共通高さの layout を確定してから page layer を1回で差し替えるため、片側だけの表示や暫定倍率を
 見せない。
 

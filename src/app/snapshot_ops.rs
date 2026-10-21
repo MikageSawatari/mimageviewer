@@ -3099,7 +3099,19 @@ mod tests {
         let (source, cached) = legacy_standalone_rar_cache_fixture(&app);
         app.current_folder = Some(app.tmp.path().to_path_buf());
         activate_single_archive_snapshot(&mut app, source.clone());
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         assert!(app.snapshot_navigate_grid(true));
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            drain_snapshot_archive_classification(&mut app);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            assert!(
+                matches!(app.top_level_grid_view.history_navigation_transition(),
+                Some(crate::app::HistoryNavigationTransition::Physical(request))
+                    if matches!(request.phase, crate::app::PhysicalHistoryPhase::ArchivePreflighting { .. }))
+            );
+        }
         drain_snapshot_archive_adoption(&mut app);
         assert_eq!(app.current_folder, Some(cached.clone()));
         assert_eq!(app.archive_source_override, Some(source));
@@ -3110,6 +3122,8 @@ mod tests {
                 if zip_path == &cached && entry_name == "page.png"
         ));
         assert!(app.archive_convert.is_none());
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]

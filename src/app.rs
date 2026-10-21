@@ -16018,7 +16018,14 @@ pub struct App {
     /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
     pub(crate) items_generation: u64,
 
-    /// Counts top-level load requests before cancellation or install can hide a duplicate.
+    /// Counts new folder-load owners, including those cancelled before completion. Direct
+    /// loads and Smart children count at admission; physical history counts every new request
+    /// regardless of its initial phase. Direct archive scans count at their completion-policy
+    /// owner's creation (direct cache hits at admission). InternalHydration, StagedHistory
+    /// and Smart transition handoffs retain an existing owner and never count a second start.
+    /// Prepared Collection outer loads count at owner admission; image-ZIP parent loads at
+    /// scan handoff. Fresh detached document frontends count accepted descriptor starts.
+    /// Detached DFS admits proven RAR/cache backing in load_folder_nav_target before loading.
     #[cfg(all(windows, feature = "test-script"))]
     pub(crate) test_script_folder_load_requests: u64,
 
@@ -28644,6 +28651,8 @@ impl App {
                 }
                 match landing.kind {
                     FolderNavLandingKind::DirectRar | FolderNavLandingKind::ConversionCacheHit => {
+                        #[cfg(all(windows, feature = "test-script"))]
+                        self.test_script_record_folder_load_owner(&restore_intent);
                         self.load_zip_as_folder_proven_navigation_backing(
                             landing.backing_path,
                             restore_intent.clone(),
@@ -28876,11 +28885,6 @@ impl App {
         {
             return self.report_pdf_open_refusal(&path, reason);
         }
-        #[cfg(all(windows, feature = "test-script"))]
-        {
-            self.test_script_folder_load_requests =
-                self.test_script_folder_load_requests.saturating_add(1);
-        }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
             && let Some(kind) = self.smart_physical_target_kind(&path)
@@ -28995,6 +28999,8 @@ impl App {
                 }
                 // ★固定 ガード等でブロックされたら Ignored を返し、後続の drill 進行に
                 // 流さない (Codex P1)。
+                #[cfg(all(windows, feature = "test-script"))]
+                self.test_script_record_folder_load_owner(&restore_intent);
                 return if self.open_archive_via_cache_owned(
                     path,
                     cached,
@@ -29228,11 +29234,6 @@ impl App {
         {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return self.report_pdf_open_refusal(&path, reason);
-        }
-        #[cfg(all(windows, feature = "test-script"))]
-        {
-            self.test_script_folder_load_requests =
-                self.test_script_folder_load_requests.saturating_add(1);
         }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
@@ -29778,6 +29779,31 @@ impl App {
         }
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_record_folder_load_owner(&mut self, intent: &StartupListIntent) {
+        // This typed intent explicitly hydrates the SAME request accepted by its caller.
+        // In particular, direct archive completion may create a physical execution request.
+        if !matches!(intent, StartupListIntent::InternalHydration(_)) {
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
+        }
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(super) fn test_script_record_new_detached_descriptor_owner(
+        &mut self,
+        descriptor: &ViewerContextDescriptor,
+    ) {
+        // Fresh document frontends bypass the folder dispatcher. Folder/image descriptors
+        // use its counted scan admission; archive completions never call this new-owner hook.
+        if matches!(
+            descriptor,
+            ViewerContextDescriptor::Zip { .. } | ViewerContextDescriptor::Pdf { .. }
+        ) {
+            self.test_script_record_folder_load_owner(&StartupListIntent::ExplicitList);
+        }
+    }
+
     fn load_folder_with_scan_claimed(
         &mut self,
         path: PathBuf,
@@ -29826,6 +29852,16 @@ impl App {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
+        }
+        #[cfg(all(windows, feature = "test-script"))]
+        if self.open_request_owner_is_current(&path, &owner)
+            && navigation
+                .as_ref()
+                .is_none_or(|navigation| self.main_list_navigation_is_current(navigation))
+        {
+            // A staged physical request has already returned above. Only this owner starts
+            // the direct load; callers rejected before admission do not count.
+            self.test_script_record_folder_load_owner(&restore_intent);
         }
         if pre_scan.is_none()
             && crate::folder_tree::is_paged_document_path(&path)
@@ -33610,6 +33646,15 @@ impl App {
             return_to,
             phase: CollectionHistoryPhase::Preparing(prepare),
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        if matches!(
+            transition.target,
+            FolderNavHistoryTarget::CollectionPhysical(_)
+        ) && self.main_list_navigation_is_current(&transition.navigation)
+        {
+            // Root catalog preparation is not a physical folder load; a child owns one.
+            self.test_script_record_folder_load_owner(&StartupListIntent::ExplicitList);
+        }
         self.replace_history_navigation_transition(Some(HistoryNavigationTransition::Collection(
             transition,
         )));
@@ -34017,6 +34062,12 @@ impl App {
 
             restore_intent: restore_intent.clone(),
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        if self.main_list_navigation_is_current(&request.navigation) {
+            // Count admission, including requests superseded before their worker completes.
+            // Completion and password/conversion continuations retain this request owner.
+            self.test_script_record_folder_load_owner(&request.restore_intent);
+        }
         self.replace_history_navigation_transition(Some(HistoryNavigationTransition::Physical(
             request,
         )));
@@ -34290,6 +34341,8 @@ impl App {
             global_search_origin: self.capture_search_open_origin(),
             grid_open_effects: None,
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        self.test_script_record_folder_load_owner(&request.restore_intent);
         self.replace_history_navigation_transition(None);
         self.poll_physical_history_transition(ctx, request);
         true
@@ -34987,29 +35040,16 @@ impl App {
         format: crate::archive_converter::ArchiveFormat,
         restore_intent: StartupListIntent,
     ) -> bool {
-        let started = if format == crate::archive_converter::ArchiveFormat::Rar {
-            self.request_rar_open_owned(
-                path.to_path_buf(),
-                false,
-                OpenRequestOwner::Navigation,
-                restore_intent.clone(),
-            )
-        } else {
-            self.request_archive_convert_owned(
-                path.to_path_buf(),
-                format,
-                false,
-                OpenRequestOwner::Navigation,
-                restore_intent.clone(),
-            )
-        };
-        if started {
-            if let Some(state) = self.archive_convert.as_mut() {
-                state.completion =
-                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(request_id);
-            }
-        }
-        started
+        // This is a continuation of the caller's open, not a new Navigation owner.
+        self.request_archive_open_with_completion(
+            path.to_path_buf(),
+            format,
+            false,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(
+                request_id,
+            ),
+            restore_intent,
+        )
     }
 
     pub(crate) fn complete_staged_history_archive_conversion(
@@ -63765,14 +63805,21 @@ impl App {
         placement_seed: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     ) -> bool {
-        self.start_active_detached_book_context_with_start(
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_descriptor = descriptor.clone();
+        let started = self.start_active_detached_book_context_with_start(
             DetachedBookContextStart::Descriptor(descriptor),
             ctx,
             placement_seed,
             None,
             None,
             collection_restore,
-        )
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        if started {
+            self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+        }
+        started
     }
 
     #[cfg(windows)]
@@ -63782,14 +63829,21 @@ impl App {
         descriptor: ViewerContextDescriptor,
         ctx: &egui::Context,
     ) -> bool {
-        self.start_active_detached_book_context_with_start(
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_descriptor = descriptor.clone();
+        let started = self.start_active_detached_book_context_with_start(
             DetachedBookContextStart::Descriptor(descriptor),
             ctx,
             None,
             None,
             Some(window_id),
             None,
-        )
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        if started {
+            self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
+        }
+        started
     }
 
     /// Build a new owner for a directly registered collection image. The captured prepared
@@ -64695,6 +64749,8 @@ impl App {
                         );
                         return true;
                     }
+                    #[cfg(all(windows, feature = "test-script"))]
+                    self.test_script_record_folder_load_owner(&StartupListIntent::ExplicitList);
                     let outcome = self
                         .open_converted_grid_archive_in_detached_context(ctx, cached_zip, &owner);
                     self.finish_detached_grid_archive_open(

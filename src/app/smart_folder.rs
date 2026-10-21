@@ -2280,6 +2280,18 @@ impl App {
             progress: SmartFolderProgress::default(),
             phase: SmartFolderTransitionPhase::RootScan(pending),
         });
+        #[cfg(all(windows, feature = "test-script"))]
+        if self
+            .smart_folder_transition
+            .as_ref()
+            .is_some_and(|request| {
+                matches!(request.target, SmartFolderTransitionTarget::Child { .. })
+                    && self.main_list_navigation_is_current(&request.navigation)
+            })
+        {
+            // A nonresident history child creates its owner before preparing its root.
+            self.test_script_record_folder_load_owner(&super::StartupListIntent::ExplicitList);
+        }
         Ok(request_id)
     }
 
@@ -2562,6 +2574,16 @@ impl App {
             progress: SmartFolderProgress::default(),
             phase,
         });
+        #[cfg(all(windows, feature = "test-script"))]
+        if self
+            .smart_folder_transition
+            .as_ref()
+            .is_some_and(|request| self.main_list_navigation_is_current(&request.navigation))
+        {
+            // Direct dispatcher entries delegate here; they do not count a second start.
+            // Prepared child adoption and conversion/password resumes keep this owner.
+            self.test_script_record_folder_load_owner(&restore_intent);
+        }
         // Archive conversion is a separate dialog/worker owner. Retire an older dialog only
         // after this request is admitted; its exact request ID prevents the old cancel callback
         // from retiring the newly staged Smart open, including a same-source re-open.

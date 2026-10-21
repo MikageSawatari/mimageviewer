@@ -7819,13 +7819,12 @@ impl ContainerEngine {
                     None
                 }
                 Err(error) => {
+                    // The catalog only accelerates decoding and stores generated thumbnails.
+                    // CacheOnly still cannot generate source pixels when the cache is absent.
                     crate::logger::log(format!(
                         "remote_ipc: container catalog open failed: {error}"
                     ));
-                    return Err(media_error(
-                        MediaErrorCode::Internal,
-                        "サムネイルカタログを開けませんでした",
-                    ));
+                    None
                 }
             }
         };
@@ -7834,8 +7833,8 @@ impl ContainerEngine {
             crate::thumb_loader::LoadSourcePolicy::CacheOnly
         ) && catalog.is_none()
         {
-            // Maintenance may retain this RAW row. Accept only one read-only
-            // continuation after the boundary, without permitting generation/writes.
+            // CacheOnly needs no writable catalog. Use the existing read-only path once
+            // after either maintenance retirement or an ordinary writable-open failure.
             let cache_dir = crate::catalog::default_cache_dir();
             let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
             let read_admission = access.wait_read_admission(&cancel).ok_or_else(|| {
@@ -9667,7 +9666,7 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     fn audit_enumeration<T>(
         budget: Option<usize>,
         run: impl FnOnce() -> T,
@@ -14705,6 +14704,186 @@ mod tests {
             engine.cached_landscape_flags(&zip_path, &items),
             [true, false]
         );
+    }
+
+    #[test]
+    fn remote_pages_survive_catalog_open_failure() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let zip_path = data_dir.path().join("book.zip");
+        write_remote_ai_test_zip(&zip_path, &[("page.png", &remote_ai_test_png(13, 7))]);
+        let pdf_path = data_dir.path().join("book.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let context = WorkerContext::open();
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let cache_dir = crate::catalog::default_cache_dir();
+        std::fs::write(&cache_dir, b"cache directory blocked by a file").unwrap();
+        assert!(crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).is_err());
+        for (path, subresource) in [
+            (
+                &zip_path,
+                RemoteSubresource::ZipEntry {
+                    entry_name: "page.png".into(),
+                },
+            ),
+            (&pdf_path, RemoteSubresource::PdfPage { page_number: 0 }),
+        ] {
+            let address = RemoteAddress {
+                path: path.to_string_lossy().into_owned(),
+                subresource,
+            };
+            let response = engine.page_with_job_cancel(
+                PageRequest {
+                    job_id: "catalog-open-failure".into(),
+                    display_request_id: None,
+                    address: address.clone(),
+                    target_px: 64,
+                    priority: PagePriority::Foreground,
+                    render_context: None,
+                    adjustment_preview: None,
+                },
+                &context,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let PageResponse::Success(page) = response else {
+                panic!("page failed without catalog: {response:?}");
+            };
+            assert_eq!(page.identity, address);
+            assert!(page.width > 0 && page.height > 0);
+            let pixels = image::load_from_memory(&page.bytes).unwrap();
+            assert_eq!((pixels.width(), pixels.height()), (page.width, page.height));
+        }
+        assert_eq!(
+            std::fs::read(&cache_dir).unwrap(),
+            b"cache directory blocked by a file"
+        );
+    }
+
+    #[test]
+    fn remote_container_thumbnails_survive_catalog_open_failure() {
+        // Isolate the logger OnceLocks, as in logger's facade regression tests.
+        const CHILD: &str = "MIV_TEST_REMOTE_CATALOG_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "remote_ipc::container::tests::remote_container_thumbnails_survive_catalog_open_failure", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let writer = crate::log_writer::test_support::writer(data_dir.path(), 128, 65536);
+        crate::log_writer::test_support::install_global(&writer);
+        let zip_path = data_dir.path().join("book.zip");
+        write_remote_ai_test_zip(&zip_path, &[("page.png", &remote_ai_test_png(13, 7))]);
+        let pdf_path = data_dir.path().join("book.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let cache_dir = crate::catalog::default_cache_dir();
+        std::fs::write(&cache_dir, b"cache directory blocked by a file").unwrap();
+        assert!(crate::catalog::CatalogDb::open(&cache_dir, &zip_path).is_err());
+        for (path, subresource) in [
+            (
+                &zip_path,
+                RemoteSubresource::ZipEntry {
+                    entry_name: "page.png".into(),
+                },
+            ),
+            (&pdf_path, RemoteSubresource::PdfPage { page_number: 0 }),
+            (&zip_path, RemoteSubresource::File),
+            (&pdf_path, RemoteSubresource::File),
+        ] {
+            let response = engine.thumbnail(
+                &mimageviewer_ipc::ThumbnailRequest {
+                    address: RemoteAddress {
+                        path: path.to_string_lossy().into_owned(),
+                        subresource,
+                    },
+                    source_address: None,
+                    target_px: 64,
+                },
+                &WorkerContext::without_databases(),
+            );
+            let ThumbnailResponse::Success { webp_bytes } = response else {
+                panic!("thumbnail failed without catalog: {response:?}");
+            };
+            let pixels = image::load_from_memory(&webp_bytes).unwrap();
+            assert!(pixels.width() > 0 && pixels.height() > 0);
+        }
+        assert!(writer.shutdown());
+        let log = std::fs::read_to_string(data_dir.path().join("mimageviewer.log")).unwrap();
+        assert!(
+            log.contains("remote_ipc: container catalog open failed:"),
+            "{log}"
+        );
+        assert_eq!(
+            std::fs::read(&cache_dir).unwrap(),
+            b"cache directory blocked by a file"
+        );
+    }
+
+    // Keep a readable RAW row, but fail writable open during schema migration.
+    // The read-only continuation must return this row without generation or writes.
+    pub(in crate::remote_ipc) fn catalog_with_failing_writer(raw_path: &Path) {
+        let cache_dir = crate::catalog::default_cache_dir();
+        let folder = raw_path.parent().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, folder).unwrap();
+        let webp = crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(8, 8), 8, 80.0)
+            .unwrap()
+            .0;
+        let metadata = std::fs::metadata(raw_path).unwrap();
+        let key = raw_path.file_name().unwrap().to_str().unwrap();
+        catalog
+            .save(
+                key,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                8,
+                8,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        drop(catalog);
+        let connection =
+            rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, folder)).unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_test_migration BEFORE DELETE ON thumbnails BEGIN SELECT RAISE(ABORT, 'test catalog open failure'); END; UPDATE meta SET value='test-old-version' WHERE key='version';").unwrap();
+        drop(connection);
+        assert!(crate::catalog::CatalogDb::open(&cache_dir, folder).is_err());
+        let readable = crate::catalog::CatalogDb::open_existing_read_only(&cache_dir, folder)
+            .unwrap()
+            .unwrap();
+        assert!(readable.load_one(key).unwrap().is_some());
+    }
+
+    #[test]
+    fn remote_cache_only_catalog_open_failure_reads_existing_thumbnail() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let path = data_dir.path().join("page.cr2");
+        std::fs::write(&path, b"invalid raw with no preview").unwrap();
+        catalog_with_failing_writer(&path);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let response = engine.thumbnail(
+            &mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+                source_address: None,
+                target_px: 64,
+            },
+            &WorkerContext::without_databases(),
+        );
+        let ThumbnailResponse::Success { webp_bytes } = response else {
+            panic!("read-only RAW thumbnail failed: {response:?}");
+        };
+        let pixels = image::load_from_memory(&webp_bytes).unwrap();
+        assert_eq!((pixels.width(), pixels.height()), (8, 8));
     }
 
     #[test]

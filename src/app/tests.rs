@@ -2528,13 +2528,238 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
 #[test]
 fn test_script_counts_the_actual_refresh_folder_request() {
     let mut app = setup_app_for_test();
+    app.settings.sidecar_backup_enabled = false;
     let folder = app.tmp.path().join("rating-sort-refresh-request");
     std::fs::create_dir(&folder).unwrap();
     std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+    let initial = app.test_script_folder_load_requests;
     app.load_folder(folder);
+    assert_eq!(app.test_script_folder_load_requests, initial + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
     let before = app.test_script_folder_load_requests;
+    let generation = app.items_generation;
     app.reload_current_folder_preserving_override();
     assert_eq!(app.test_script_folder_load_requests, before + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert!(app.items_generation > generation);
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_history_back_once_through_adoption() {
+    let mut app = setup_app_for_test();
+    app.active_quick_folder_slot = None;
+    app.settings.sidecar_backup_enabled = false;
+    let first = app.tmp.path().join("count-history-first");
+    let second = app.tmp.path().join("count-history-second");
+    for folder in [&first, &second] {
+        std::fs::create_dir(folder).unwrap();
+        std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+        app.load_folder(folder.clone());
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    }
+    assert_eq!(
+        app.folder_history_back_target(),
+        Some(&FolderNavHistoryTarget::Path(first.clone()))
+    );
+    let before = app.test_script_folder_load_requests;
+    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+    app.settle_open_path_classification_for_test();
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert_eq!(app.current_folder.as_ref(), Some(&first));
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_superseded_refresh_starts_before_completion() {
+    let mut app = setup_app_for_test();
+    app.settings.sidecar_backup_enabled = false;
+    let folder = app.tmp.path().join("count-superseded-refresh");
+    std::fs::create_dir(&folder).unwrap();
+    app.load_folder(folder);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    let before = app.test_script_folder_load_requests;
+    app.reload_current_folder_preserving_override();
+    app.reload_current_folder_preserving_override();
+    assert_eq!(app.test_script_folder_load_requests, before + 2);
+    phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+    assert_eq!(app.test_script_folder_load_requests, before + 2);
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_detached_proven_folder_nav_start_once_through_completion() {
+    use crate::folder_tree::{FolderNavLanding, FolderNavLandingKind};
+    for kind in [
+        FolderNavLandingKind::DirectRar,
+        FolderNavLandingKind::ConversionCacheHit,
+    ] {
+        let mut app = setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/archives/multiwindow-rar-nav");
+        let (source, backing) = if kind == FolderNavLandingKind::DirectRar {
+            let source = app.tmp.path().join("direct.rar");
+            std::fs::copy(fixtures.join("01-direct.rar"), &source).unwrap();
+            (source.clone(), source)
+        } else {
+            let source = app.tmp.path().join("cached.7z");
+            let backing = app.tmp.path().join("cached.zip");
+            std::fs::write(&source, b"source").unwrap();
+            std::fs::copy(fixtures.join("06-control.zip"), &backing).unwrap();
+            (source, backing)
+        };
+        // The DFS worker delivers this proven source/backing pair. Drive its UI admission,
+        // then the actual RAR/ZIP enumeration, without involving a viewport or input event.
+        let landing = FolderNavLanding {
+            logical_source: source.clone(),
+            backing_path: backing.clone(),
+            kind,
+        };
+        let before = app.test_script_folder_load_requests;
+        assert_eq!(
+            app.load_folder_nav_target(
+                FolderNavRoute::Detached(landing.clone()),
+                None,
+                StartupListIntent::PageContinuation,
+            ),
+            FolderOpenOutcome::Ignored
+        );
+        assert_eq!(app.test_script_folder_load_requests, before);
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        assert_eq!(
+            app.load_folder_nav_target(
+                FolderNavRoute::Detached(landing),
+                None,
+                StartupListIntent::PageContinuation,
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        assert!(app.zip_enumerate_pending.is_some());
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ctx = egui::Context::default();
+        while app.zip_enumerate_pending.is_some() || app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "proven archive load must settle"
+            );
+            app.poll_zip_enumerate();
+            app.poll_sidecar_restore(&ctx);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&backing));
+        assert_eq!(app.archive_source_override.as_ref(), Some(&source));
+        assert!(app.items.iter().any(
+            |item| matches!(item, GridItem::ZipImage { zip_path, .. } if zip_path == &backing)
+        ));
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_delegated_zip_start_once_through_adoption() {
+    for convert_dispatch in [false, true] {
+        let mut app = setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        let path = app.tmp.path().join("count-delegated.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+        let before = app.test_script_folder_load_requests;
+        if convert_dispatch {
+            assert_eq!(
+                app.load_folder_or_convert_archive(path.clone()),
+                FolderOpenOutcome::Loaded
+            );
+        } else {
+            app.load_folder(path.clone());
+        }
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&path));
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_does_not_count_rejected_folder_starts() {
+    for convert_dispatch in [false, true] {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("count-rejected-owner");
+        std::fs::create_dir(&folder).unwrap();
+        let owner = OpenRequestOwner::QuickFolderSwitch(QuickFolderSwitchLoadOwner {
+            source_context: app.projected_viewer_context_id(),
+            source_surface_generation: app.top_level_grid_view.generation(),
+            source_slot: app.active_quick_folder_slot,
+            source_slot_switch_sequence: app.quick_folder_switch_sequence.wrapping_add(1),
+            target_slot: QuickFolderSlotId::B,
+            target_path: folder.clone(),
+        });
+        let before = app.test_script_folder_load_requests;
+        let outcome = if convert_dispatch {
+            app.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                folder,
+                false,
+                owner,
+                Some(OpenPathKind::Directory),
+                None,
+                StartupListIntent::ExplicitList,
+                None,
+            )
+        } else {
+            app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                folder,
+                None,
+                owner,
+                None,
+                Some(OpenPathKind::Directory),
+                StartupListIntent::ExplicitList,
+                None,
+            )
+        };
+        assert_eq!(outcome, FolderOpenOutcome::Ignored);
+        assert_eq!(app.test_script_folder_load_requests, before);
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_does_not_count_stale_preflight_navigation() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("count-stale-navigation");
+    std::fs::create_dir(&folder).unwrap();
+    let navigation = app
+        .capture_physical_open_navigation(&OpenRequestOwner::Navigation, &folder)
+        .unwrap();
+    app.quick_folder_switch_sequence = app.quick_folder_switch_sequence.wrapping_add(1);
+    let before = app.test_script_folder_load_requests;
+    assert!(!app.start_physical_history_transition_classified(
+        PhysicalHistoryIntent::Navigation {
+            replay: None,
+            auto_fullscreen: false
+        },
+        folder,
+        None,
+        Some(OpenPathKind::Directory),
+        StartupListIntent::ExplicitList,
+        navigation,
+        None,
+    ));
+    assert_eq!(app.test_script_folder_load_requests, before);
+    assert!(
+        app.top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
+    );
 }
 
 #[test]
@@ -33599,6 +33824,8 @@ fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
 #[test]
 fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let pdf = app.tmp.path().join("bookmark.pdf");
     std::fs::write(&pdf, b"%PDF-1.4\n%%EOF\n").expect("create placeholder PDF");
     arm_detached_bookmark_book_open(
@@ -33617,6 +33844,8 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         DetachedBuild::Built(true)
     );
 
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     assert!(app.items_are_bookmark_view);
     assert_eq!(
         app.current_folder.as_deref(),
@@ -33651,12 +33880,16 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         ));
     })
     .expect("PDF bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
 }
 
 #[cfg(windows)]
 #[test]
 fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let zip = app.tmp.path().join("bookmark.zip");
     std::fs::write(&zip, []).expect("create placeholder ZIP");
     arm_detached_bookmark_book_open(
@@ -33674,6 +33907,8 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
         ),
         DetachedBuild::Built(true)
     );
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
         assert!(
@@ -33688,12 +33923,16 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
         ));
     })
     .expect("ZIP bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
 }
 
 #[cfg(windows)]
 #[test]
 fn converted_bookmark_archive_enters_the_same_detached_book_context() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let source = app.tmp.path().join("bookmark.rar");
     let backing = app.tmp.path().join("bookmark-cache.zip");
     std::fs::write(&source, []).expect("create source archive");
@@ -33718,6 +33957,8 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         ),
         Some(true)
     );
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
         assert_eq!(
@@ -33732,12 +33973,16 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         );
     })
     .expect("converted archive bookmark must own a detached reader context");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
 }
 
 #[cfg(windows)]
 #[test]
 fn converted_bookmark_archive_continues_the_existing_loading_session_lease() {
     let mut app = phase_c_support::setup_app();
+    #[cfg(all(windows, feature = "test-script"))]
+    let before_loads = app.test_script_folder_load_requests;
     let ctx = egui::Context::default();
     let source = app.tmp.path().join("slow-bookmark.rar");
     let backing = app.tmp.path().join("slow-bookmark-cache.zip");
@@ -33804,6 +34049,8 @@ fn converted_bookmark_archive_continues_the_existing_loading_session_lease() {
         ));
     })
     .expect("conversion completion must continue inside the existing loading shell");
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, before_loads);
 }
 
 #[cfg(windows)]
@@ -70591,6 +70838,70 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
+    #[cfg(all(windows, feature = "test-script"))]
+    fn test_script_counts_detached_archive_owner_once_through_completion() {
+        for (format, direct) in [
+            (ArchiveFormat::Rar, true),
+            (ArchiveFormat::Rar, false),
+            (ArchiveFormat::SevenZ, false),
+        ] {
+            let mut app = setup_app();
+            let source = app.tmp.path().join(if format == ArchiveFormat::Rar {
+                "count.rar"
+            } else {
+                "count.7z"
+            });
+            let backing = if direct {
+                source.clone()
+            } else {
+                app.tmp.path().join("count-converted.zip")
+            };
+            std::fs::write(&source, b"source").unwrap();
+            std::fs::write(&backing, b"cache").unwrap();
+            let (main_folder, generation) =
+                install_convertible_archive_main_grid(&mut app, source.clone(), format);
+            let before = app.test_script_folder_load_requests;
+            let ctx = egui::Context::default();
+            assert!(
+                app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, false)
+            );
+            app.settle_open_path_classification_for_test();
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            assert!(!app.request_archive_convert_owned(
+                source.clone(),
+                format,
+                false,
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+
+            // Keep the real accepted owner, substituting only its worker result transport.
+            let (_tx, rx) = mpsc::channel();
+            let state = app
+                .archive_convert
+                .as_mut()
+                .expect("accepted archive owner");
+            state.cancel.store(true, Ordering::Relaxed);
+            state.cancel = Arc::new(AtomicBool::new(false));
+            state.rx = rx;
+            if direct {
+                state.pending_direct_nav = Some(backing.clone());
+            } else {
+                state.pending_nav = Some(backing.clone());
+            }
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.show_archive_convert_dialog(ctx)
+            })
+            .drop_without_applying_deltas();
+            complete_detached_archive_page_enumeration(&mut app, &backing, &["page.jpg"]);
+            assert_detached_archive_backing(&mut app, &source, &backing);
+            assert_convertible_archive_main_grid_unchanged(&app, &main_folder, &source, generation);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
+    }
+
+    #[test]
     #[cfg(windows)]
     fn detached_grid_archive_direct_read_completion_opens_detached_without_main_navigation() {
         let mut app = setup_app();
@@ -70752,6 +71063,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_archive_non_rar_cache_hit_opens_detached_without_main_navigation() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source = app.tmp.path().join("cached.7z");
         let backing = app.tmp.path().join("cached.zip");
         std::fs::write(&source, b"source").unwrap();
@@ -70782,6 +71095,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
 
         let expected_pages = ["cached-cover.jpg", "cached-page-002.png"];
         complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
@@ -70795,6 +71110,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert_detached_archive_backing(&mut app, &source, &backing);
         assert_detached_archive_pages(&mut app, &backing, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -70874,6 +71191,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_rar_conversion_cache_hit_opens_detached_after_probe() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source = app.tmp.path().join("cached-solid.rar");
         let backing = app.tmp.path().join("cached-solid.zip");
         std::fs::write(&source, b"source").unwrap();
@@ -70904,6 +71223,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
 
         let (scan_tx, scan_rx) = mpsc::channel();
         let state = app
@@ -70946,6 +71267,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert_detached_archive_backing(&mut app, &source, &backing);
         assert_detached_archive_pages(&mut app, &backing, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -78587,6 +78910,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn detached_book_pdf_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_zip_pdf = true;
@@ -78608,6 +78933,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
 
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert_eq!(app.address, r"C:\books");
         assert_eq!(app.items.len(), 2);
@@ -78656,11 +78983,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 137.0);
         assert_detached_pdf_pages(&mut app, &pdf_path, &[0, 1]);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     }
 
     #[test]
     fn detached_book_zip_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
+        #[cfg(all(windows, feature = "test-script"))]
+        let before_loads = app.test_script_folder_load_requests;
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_zip_pdf = true;
@@ -78682,6 +79013,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
 
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert_eq!(app.address, r"C:\books");
         assert_eq!(app.items.len(), 2);
@@ -78732,6 +79065,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.scroll_offset_y, 173.0);
         assert_detached_archive_pages(&mut app, &zip_path, &expected_pages);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
     }
 
     #[test]
@@ -95564,6 +95899,107 @@ mod smart_folder_transition_tests {
         assert!(matches!(app.items.as_slice(), [GridItem::Image(path)] if path == &sentinel));
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_direct_archive_owner_without_recounting_cache_hydration() {
+        for format in [ArchiveFormat::Rar, ArchiveFormat::SevenZ] {
+            let mut app = setup_app();
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.settings.sidecar_backup_enabled = false;
+            let folder = app.tmp.path().join("direct-count");
+            std::fs::create_dir(&folder).unwrap();
+            let source = folder.join(if format == ArchiveFormat::Rar {
+                "book.rar"
+            } else {
+                "book.7z"
+            });
+            std::fs::write(&source, b"archive").unwrap();
+            let cached = app.tmp.path().join("direct-count-cache.zip");
+            write_convert_completion_zip(&cached);
+            app.load_folder(folder);
+            super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(
+                &mut app,
+            );
+            let before = app.test_script_folder_load_requests;
+            let started = if format == ArchiveFormat::Rar {
+                app.request_rar_open_owned(
+                    source,
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                )
+            } else {
+                app.request_archive_convert_owned(
+                    source,
+                    format,
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                )
+            };
+            assert!(started);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            publish_convert_done_and_open(&mut app, &cached);
+            wait_for_snapshot_archive_listing(&mut app, &cached);
+            assert_eq!(app.current_folder.as_ref(), Some(&cached));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_direct_cache_owner_without_history_once() {
+        let mut app = setup_app();
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        let source = app.tmp.path().join("direct-cached.7z");
+        let cached = app.tmp.path().join("direct-cached.zip");
+        std::fs::write(&source, b"archive").unwrap();
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        let before = app.test_script_folder_load_requests;
+        let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen(source, false);
+        assert!(matches!(
+            outcome,
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        app.settle_open_path_classification_for_test();
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_does_not_count_zip_foreign_conversion_continuation() {
+        for detached in [false, true] {
+            let mut app = setup_app();
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.settings.detached_viewer_open_images_in_window = false;
+            if detached {
+                app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            }
+            let source = app.tmp.path().join("outer-count.zip");
+            let cached = app.tmp.path().join("outer-count-converted.zip");
+            write_convert_completion_zip(&source);
+            write_convert_completion_zip(&cached);
+            app.load_folder(source.clone());
+            wait_for_snapshot_archive_listing(&mut app, &source);
+            let before = app.test_script_folder_load_requests;
+            app.offer_zip_foreign_archive_conversion(
+                &source,
+                false,
+                StartupListIntent::ExplicitList,
+            );
+            assert!(app.archive_convert.is_some());
+            assert_eq!(app.test_script_folder_load_requests, before);
+            publish_convert_done_and_open(&mut app, &cached);
+            wait_for_snapshot_archive_listing(&mut app, &cached);
+            assert_eq!(app.test_script_folder_load_requests, before);
+        }
+    }
+
     #[test]
     fn snapshot_convertible_archive_cache_hit_uses_owned_source_scope() {
         let mut app = setup_app();
@@ -95573,6 +96009,8 @@ mod smart_folder_transition_tests {
         record_convertible_archive_cache(&mut app, &source, &cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
@@ -95580,6 +96018,10 @@ mod smart_folder_transition_tests {
         );
         app.settle_open_path_classification_for_test();
 
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
         assert!(app.archive_convert.is_none());
         assert_eq!(
             app.current_folder, source_folder,
@@ -95592,6 +96034,8 @@ mod smart_folder_transition_tests {
             Some(source.as_path())
         );
         assert!(app.is_snapshot_active());
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
         // Mutation `scope_cache_zip_instead_of_owned_source`: resolve snapshot ownership from
         // `cached` instead of MainGridArchiveTransitionIntent::source_path. The current-folder and
         // listing assertions fail because the common snapshot guard refuses the implementation
@@ -95606,12 +96050,16 @@ mod smart_folder_transition_tests {
         write_convert_completion_zip(&cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
                 .is_none()
         );
         app.settle_open_path_classification_for_test();
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
         let request_id = match app.top_level_grid_view.history_navigation_transition() {
             Some(super::HistoryNavigationTransition::Physical(request)) => request.request_id,
             _ => panic!("snapshot archive open must retain a typed physical owner"),
@@ -95657,6 +96105,8 @@ mod smart_folder_transition_tests {
         // The same `scope_cache_zip_instead_of_owned_source` mutation reaches this test through
         // ConvertDone -> pending_nav -> load_folder_with_scan_owned and leaves the source grid
         // mounted instead of opening the completed archive.
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -96144,6 +96594,39 @@ mod smart_folder_transition_tests {
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         wait_for_smart_folder_scope(&mut app, &ctx, &child);
         assert!(app.top_level_grid_view.smart_folder_session().is_some());
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn test_script_counts_delegated_smart_start_once_through_adoption() {
+        for convert_dispatch in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            let source = app.tmp.path().join("count-smart-source");
+            let entry = source.join("child");
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join("page.jpg"), b"page").unwrap();
+            let definition = definition("Count Smart", source);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+            let before = app.test_script_folder_load_requests;
+            if convert_dispatch {
+                assert_eq!(
+                    app.load_folder_or_convert_archive(entry.clone()),
+                    FolderOpenOutcome::Loaded
+                );
+            } else {
+                app.load_folder(entry.clone());
+            }
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            assert_eq!(app.current_folder.as_ref(), Some(&entry));
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+        }
     }
 
     #[test]

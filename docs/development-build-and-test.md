@@ -40,6 +40,27 @@ fallback／診断として残す。[正規手順と採用証跡](release-check-a
 witnessは`cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu,miv-test-script-window-witness --lib`
 で確認する。これらは通常coreの代わりにはせず、featureなしのcore checkと全体gateを維持する。
 実アプリを使う検証範囲は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) を参照。
+リリース前は `.\scripts\test-lib-full.ps1 -Features test-script` でこのfeatureのlib全件も回す
+([リリース手順](release-checklist.md) 9.8)。2026-10 に、このfeatureだけのテストが2件、気づかれないまま落ちていた (backlog §1.392)。
+
+#### 診断用の一覧読み込み計数 (`folder_load_requests`)
+
+`App::test_script_folder_load_requests` (snapshot の `folder_load_requests`) は、
+**一覧の読み込みの新しい owner が受理された回数**を数える。完了ではなく受理で数えるので、
+完了前に取り消された重複の開始も検出できる (RatingSort smoke が「更新で読み込みがちょうど1回始まる」を検査)。
+パスワード入力後・変換完了・キャッシュや descriptor の水和など、既存 owner の継続は数えない。
+
+数える場所は、新しい owner を作る受理点 (直接ロードの `load_folder_with_scan_claimed`、
+`admit_physical_history_phase` の新規要求、直接書庫要求の受理、Smart / Collection の各 owner、
+画像フォルダ ZIP 化の `ParentScan`、detached の新規 ZIP/PDF descriptor と proven backing 直行) に置く。
+新しく一覧を開く経路を足したら、その受理点にも計数を足し、`app::tests` の計数テストに1本加える。
+
+1か所の境界で数える形も検討したが、採らなかった (2026-10-20、§1.392)。一覧の読み込みを実際に始める
+関数は数十あり、多くはサムネイル・メタデータ・Remote などの補助処理や継続からも呼ばれるため、
+そこで数えると継続や補助を数えてしまう。一方、新しい owner を作る点は約10の種類に分かれ、共通の型が無い。
+共通の owner 型を新設すれば1か所にできるが、診断用の計数のために製品コードの所有構造を作り替えることになり
+範囲に見合わない。代わりに、loader 開始関数の全呼び出し元と、一覧を採用する全箇所の両方向から
+受理点の網羅を確かめた。
 
 ### 作業中のPCと通常データを保持する配布ビルド
 

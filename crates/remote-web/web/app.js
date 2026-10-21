@@ -34,6 +34,10 @@ import {
   gridIndexForCommand,
   imageQualityPreset,
   isRtlReadingDirection,
+  inputAdvancesRightToLeft,
+  spreadModeWithReadingDirection,
+  viewerPageButtonState,
+  viewerSwipeCommand,
   latestPageLoadRequestPlan,
   pageLoadQueueBusyTransition,
   nextFitMode,
@@ -3703,7 +3707,7 @@ function onGlobalKeyDown(event) {
       repeat: event.repeat,
       editable: isShortcutBlockedTarget(event.target),
       menuOpen: Boolean(state.commandMenu?.isOpen()),
-      rtl: isRtlReadingDirection(state.readingDirection),
+      rtl: inputAdvancesRightToLeft(state.spreadMode),
     },
     state.viewer?.isVideoStreamViewer ? "media" : state.screenContext
   );
@@ -4783,6 +4787,8 @@ export function containerRuntimeStateForTest() {
     : null;
   return {
     container: state.container ? structuredClone(state.container) : null,
+    spreadMode: state.spreadMode,
+    readingDirection: state.readingDirection,
     entries: state.entries.map(entryIdentity),
     images: state.images.map(entryIdentity),
     pageGroups: state.pageGroups.map((group) => ({
@@ -6211,15 +6217,15 @@ function extractedResultViewerContext() {
 
 export function extractedResultViewMode(mode, direction) {
   if ([SpreadMode.LTR, SpreadMode.LTR_COVER, SpreadMode.RTL, SpreadMode.RTL_COVER].includes(mode)) {
-    return direction === ReadingDirection.RTL ? SpreadMode.RTL : SpreadMode.LTR;
+    return spreadModeWithReadingDirection(SpreadMode.LTR, direction);
   }
   if ([SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(mode)) {
-    return direction === ReadingDirection.RTL ? SpreadMode.SPLIT_RTL : SpreadMode.SPLIT_LTR;
+    return spreadModeWithReadingDirection(SpreadMode.SPLIT_LTR, direction);
   }
   return SpreadMode.SINGLE;
 }
 
-function requestSpreadMode(mode, modeOnly = false) {
+export function requestSpreadMode(mode, modeOnly = false) {
   const collectionRoute = refreshableCollectionRoute();
   const persistentContext = persistentDirectViewerContext();
   if (
@@ -6246,6 +6252,7 @@ function requestSpreadMode(mode, modeOnly = false) {
   const writeRequest = spreadIntent.writeRequest;
   if (!writeRequest && !persistentContext) return false;
   const readingDirection = extracted ? state.readingDirection : writeRequest?.reading_direction ?? state.readingDirection;
+  mode = spreadModeWithReadingDirection(mode, readingDirection);
   // 一方、文脈の同一性は要求側で見る (`activeSpreadContextIdentity` と揃える)。
   const identity = collectionRoute
     ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
@@ -6255,6 +6262,7 @@ function requestSpreadMode(mode, modeOnly = false) {
   const sequence = ++spreadWriteSequence;
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
+  state.viewer?.syncPagePositionFeedback();
   spreadWriteTail = spreadWriteTail.then(async () => {
     let writeError = null;
     if (!collectionRoute && !persistentContext) {
@@ -8010,7 +8018,6 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const bottom = element("div", "viewer-ui bottom");
   const previous = textElement("button", "‹", "viewer-button");
   previous.type = "button";
-  previous.setAttribute("aria-label", "前の画像");
   const seek = element("div", "viewer-seek");
   const counter = textElement("output", "", "viewer-counter");
   const seekInput = element("input", "viewer-seek-input");
@@ -8020,7 +8027,6 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   seek.append(counter, seekInput);
   const next = textElement("button", "›", "viewer-button");
   next.type = "button";
-  next.setAttribute("aria-label", "次の画像");
   bottom.append(previous, seek, next);
   viewerRoot.append(stage, top, bottom);
   state.commandMenu = new CommandMenu(viewerRoot, "viewer", viewerRoot);
@@ -8069,18 +8075,18 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   });
   previous.addEventListener("click", (event) => {
     event.stopPropagation();
-    dispatchCommand(command(isRtlReadingDirection(state.readingDirection)
-      ? CommandName.NEXT_PAGE
-      : CommandName.PREV_PAGE), {
+    dispatchCommand(command(viewerPageButtonState(
+      "left", inputAdvancesRightToLeft(state.spreadMode)
+    ).commandName), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
   });
   next.addEventListener("click", (event) => {
     event.stopPropagation();
-    dispatchCommand(command(isRtlReadingDirection(state.readingDirection)
-      ? CommandName.PREV_PAGE
-      : CommandName.NEXT_PAGE), {
+    dispatchCommand(command(viewerPageButtonState(
+      "right", inputAdvancesRightToLeft(state.spreadMode)
+    ).commandName), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
     });
@@ -8282,7 +8288,7 @@ function changeImage(delta) {
     currentIndex: state.pageGroupIndex,
     count: state.pageGroups.length,
     delta,
-    readingDirection: state.readingDirection,
+    rtl: inputAdvancesRightToLeft(state.spreadMode),
   });
   if (message) {
     state.viewer?.showBoundaryMessage(message);
@@ -14714,6 +14720,9 @@ export class ImageViewer {
   }
 
   syncPagePositionFeedback() {
+    const rtl = inputAdvancesRightToLeft(state.spreadMode);
+    this.previous?.setAttribute("aria-label", viewerPageButtonState("left", rtl).label);
+    this.next?.setAttribute("aria-label", viewerPageButtonState("right", rtl).label);
     const requested = this.requestedPagePresentation;
     if (!requested?.seekState) return;
     const position = viewerPositionOwner.current();
@@ -15761,15 +15770,7 @@ export class ImageViewer {
       ) {
         const swipeLeft = gesture === ViewerGesture.SWIPE_LEFT;
         dispatchCommand(
-          command(
-            swipeLeft
-              ? (isRtlReadingDirection(state.readingDirection)
-                  ? CommandName.PREV_PAGE
-                  : CommandName.NEXT_PAGE)
-              : (isRtlReadingDirection(state.readingDirection)
-                  ? CommandName.NEXT_PAGE
-                  : CommandName.PREV_PAGE)
-          ),
+          viewerSwipeCommand(gesture, inputAdvancesRightToLeft(state.spreadMode)),
           { source, detail: swipeLeft ? "swipe_left" : "swipe_right" }
         );
       } else if (panelAction === ViewerPanelAction.OPEN) {
@@ -15786,7 +15787,7 @@ export class ImageViewer {
         dispatchCommand(viewerTapCommand(
           event.clientX,
           this.root.clientWidth,
-          isRtlReadingDirection(state.readingDirection)
+          inputAdvancesRightToLeft(state.spreadMode)
         ), {
           source,
           detail: "tap_zone",

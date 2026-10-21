@@ -112,6 +112,18 @@ impl ArchiveConvertCompletionPolicy {
         }
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    fn starts_new_folder_load_owner(&self) -> bool {
+        match self {
+            Self::StagedHistory(_) | Self::SiblingZip => false,
+            Self::MainGridArchive(intent) => !matches!(
+                intent.smart_folder_owner,
+                crate::app::SmartGridArchiveOwner::Transition(_)
+            ),
+            Self::Navigation | Self::Bookmark(_) | Self::DetachedGridArchive(_) => true,
+        }
+    }
+
     fn open_owner(&self) -> Option<crate::app::OpenRequestOwner> {
         match self {
             Self::Navigation => Some(crate::app::OpenRequestOwner::Navigation),
@@ -584,11 +596,13 @@ impl App {
         auto_fullscreen: bool,
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
-        self.request_archive_convert_owned(
+        // The only caller offers conversion after a ZIP owner has already loaded its list.
+        // This scan continues that owner, unlike request_archive_convert_owned below.
+        self.request_archive_open_with_completion(
             src,
             format,
             auto_fullscreen,
-            crate::app::OpenRequestOwner::Navigation,
+            ArchiveConvertCompletionPolicy::Navigation,
             restore_intent,
         )
     }
@@ -599,6 +613,65 @@ impl App {
         format: ArchiveFormat,
         auto_fullscreen: bool,
         owner: crate::app::OpenRequestOwner,
+        restore_intent: crate::app::StartupListIntent,
+    ) -> bool {
+        if self.settings.archive_file_handling_ignores_convertible() {
+            return false;
+        }
+        if self.archive_convert.is_some() || self.batch_convert.is_some() {
+            return false;
+        }
+        let completion = match owner {
+            crate::app::OpenRequestOwner::Navigation => ArchiveConvertCompletionPolicy::Navigation,
+            crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
+                debug_assert!(
+                    false,
+                    "convertible collection items use MainGridArchive owner"
+                );
+                ArchiveConvertCompletionPolicy::Navigation
+            }
+            crate::app::OpenRequestOwner::RatingPhysical(_) => {
+                debug_assert!(false, "convertible Rating items use MainGridArchive owner");
+                ArchiveConvertCompletionPolicy::Navigation
+            }
+            crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
+                debug_assert!(false, "quick-folder switch preflights convertible archives");
+                ArchiveConvertCompletionPolicy::Navigation
+            }
+            crate::app::OpenRequestOwner::MainGridArchive(intent) => {
+                ArchiveConvertCompletionPolicy::MainGridArchive(intent)
+            }
+            crate::app::OpenRequestOwner::Bookmark(owner) => {
+                ArchiveConvertCompletionPolicy::Bookmark(owner)
+            }
+            crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
+                ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
+            }
+        };
+        #[cfg(all(windows, feature = "test-script"))]
+        let count_intent = completion
+            .starts_new_folder_load_owner()
+            .then(|| restore_intent.clone());
+        let started = self.request_archive_open_with_completion(
+            src,
+            format,
+            auto_fullscreen,
+            completion,
+            restore_intent,
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        if started && let Some(intent) = count_intent {
+            self.test_script_record_folder_load_owner(&intent);
+        }
+        started
+    }
+
+    pub(crate) fn request_archive_open_with_completion(
+        &mut self,
+        src: PathBuf,
+        format: ArchiveFormat,
+        auto_fullscreen: bool,
+        completion: ArchiveConvertCompletionPolicy,
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible() {
@@ -631,35 +704,7 @@ impl App {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: format == ArchiveFormat::Rar,
-            completion: match owner {
-                crate::app::OpenRequestOwner::Navigation => {
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
-                    debug_assert!(
-                        false,
-                        "convertible collection items use MainGridArchive owner"
-                    );
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::RatingPhysical(_) => {
-                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
-                    debug_assert!(false, "quick-folder switch preflights convertible archives");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::MainGridArchive(intent) => {
-                    ArchiveConvertCompletionPolicy::MainGridArchive(intent)
-                }
-                crate::app::OpenRequestOwner::Bookmark(owner) => {
-                    ArchiveConvertCompletionPolicy::Bookmark(owner)
-                }
-                crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
-                    ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
-                }
-            },
+            completion,
             pending_sibling_output: None,
             restore_intent,
             auto_fullscreen,
@@ -679,72 +724,13 @@ impl App {
         owner: crate::app::OpenRequestOwner,
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
-        if self.settings.archive_file_handling_ignores_convertible()
-            || self.archive_convert.is_some()
-            || self.batch_convert.is_some()
-        {
-            return false;
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        let rx = spawn_archive_scan(
-            src.clone(),
+        self.request_archive_convert_owned(
+            src,
             ArchiveFormat::Rar,
-            None,
-            ArchiveScanPurpose::Open {
-                cache_db: self.archive_cache_db.clone(),
-            },
-            self.input_seq,
-            Arc::clone(&cancel),
-        );
-        self.archive_convert = Some(Box::new(ArchiveConvertState {
-            src_path: src,
-            input_seq: self.input_seq,
-            format: ArchiveFormat::Rar,
-            password: None,
-            password_input: String::new(),
-            phase: ArchiveConvertPhase::Scanning,
-            cancel,
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: true,
-            completion: match owner {
-                crate::app::OpenRequestOwner::Navigation => {
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
-                    debug_assert!(
-                        false,
-                        "convertible collection items use MainGridArchive owner"
-                    );
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::RatingPhysical(_) => {
-                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
-                    debug_assert!(false, "quick-folder switch preflights convertible archives");
-                    ArchiveConvertCompletionPolicy::Navigation
-                }
-                crate::app::OpenRequestOwner::MainGridArchive(intent) => {
-                    ArchiveConvertCompletionPolicy::MainGridArchive(intent)
-                }
-                crate::app::OpenRequestOwner::Bookmark(owner) => {
-                    ArchiveConvertCompletionPolicy::Bookmark(owner)
-                }
-                crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
-                    ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
-                }
-            },
-            pending_sibling_output: None,
-            restore_intent,
             auto_fullscreen,
-            deferred_fullscreen: None,
-            suppress_confirm: self.settings.archive_convert_suppresses_confirm(),
-            suppress_confirm_next_time: false,
-        }));
-        true
+            owner,
+            restore_intent,
+        )
     }
 
     pub(crate) fn request_explicit_zip_convert(

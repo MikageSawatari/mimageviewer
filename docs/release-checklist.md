@@ -418,6 +418,12 @@
    - `build-dist.ps1` が clean 前に自動実行するため、通常は配布ビルドとは別に実行不要。
    - `build-dist.ps1 -SkipRustTests` は、同一ソースが既にこのゲートを通過し、署名や
      packaging だけを再試行する場合に限る。ソース変更後の初回配布では使わない。
+   - **`test-script` feature の lib テストも回す** (上の全体ゲートは既定 feature だけで、この feature の
+     テストは入らない。2026-10 に 2 件が気づかれないまま落ちていた、backlog §1.392):
+     ```powershell
+     .\scripts\test-lib-full.ps1 -Features test-script
+     ```
+     同じソース・環境で成功済みなら記録を返して再実行しない。失敗したら公開前に直す。
 
 ### Phase 3: ビルド・配布成果物
 

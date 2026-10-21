@@ -1154,6 +1154,9 @@ if ($script:archiveErrors.Count -gt 0) {
             sort_order = 'RatingDesc'
             rating_sort_unrated_position = 'BetweenThreeAndTwo'
             auto_fullscreen_image_folders = $false
+            # The script clicks the toolbar refresh button. New defaults hide the
+            # toolbar sort since 1.292, so show it explicitly.
+            show_toolbar_sort = $true
             smart_folders = @([ordered]@{
                 id = 'b3ff891f-5b83-4bf4-9554-148e363a439b'
                 name = 'RatingSortSmoke'

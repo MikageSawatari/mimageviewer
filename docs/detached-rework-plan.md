@@ -6055,3 +6055,21 @@ focused・全lib・snapshot・解析器回帰と計測用buildは成功。途中
 - 完成前確認（2026-10-20）で、先頭の診断blockerがUnknownの場合に後続兄弟のPendingを取消条件から漏らす実装を修正。
   診断と取消を分け、同じ呼出内の全Next状態から`any(Pending)`で導出する。実装担当と独立reviewer双方が設計への整合修正と確認し、
   両訪問順と取消後の実permit/worker予約保持の回帰を追加した。新しい永続stateやparked回収範囲の拡張はない。
+
+### §11 追補: §1.392 診断用 folder-load 計数の追補（2026-10-20）
+
+`568051638` の独立レビュー P2 を設計担当が採択し、新規の一覧読み込み owner の受理を
+test-script 限定で数える。detached の変換書庫は直接書庫要求の受理、非 RAR の即時 cache hit は
+既存 owner claim の成功後に計数する。Collection の物理一覧受理も含め、detached 経路への変更は
+cfg 限定の計数だけ。
+述語・viewport・placement・focus・表示動作は変更しない。既存 owner による descriptor の水和や
+変換完了を再計数しない所有境界の修正であり、症状パッチではない（設計担当の明示方針と Codex の判断）。
+
+`001d5662a` の再レビュー後、設計担当の方針に従って一覧採用点からも逆引きした。
+直接 ZIP/PDF descriptor の新規開始（グリッド・ブックマーク・descriptor による再構築）は
+dispatcher を通らないため、開始を受理した frontend で test-script 限定の計数を補う。
+既存 context のメモリ上の一覧復元・変換完了からの descriptor 水和には加算しない。通常コードの変更は
+受理結果を局所変数へ受けて既存と同じ値を返すだけで、detached の述語・状態遷移・配置は不変。
+同じ逆引きで見つかった Collection outer の準備済み owner と、画像フォルダ ZIP 化後の
+親一覧 owner も operation が scan を引き取る受理点（`ParentScan`）で計数し、install や水和では加算しない。
+`ff5af1f53` 再レビュー後、detached DFS の DirectRar／ConversionCacheHit も proven backing の受理点で test-script 限定計数を補い、loader 全呼び出し元と FolderNavRoute 全分岐を照合した（述語・挙動は不変）。

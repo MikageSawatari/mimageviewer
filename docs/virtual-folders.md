@@ -701,6 +701,19 @@ Auto比率の★一覧では、同じ保存helperが `TopLevelGridView` の★�
 純ロジックなので受信後に UI スレッドで行う。内側 ZIP バイト列は zip_loader 内の LRU
 キャッシュに保持され、後続の read_entry_bytes / 深い階層のサムネ読み込みで再展開せず参照される。
 
+内側 ZIP bytes のキーは、ローカルの内部名と Remote の物理 index chain のどちらも、
+外側 ZIP の `ArchiveCacheKey` (path + 精密な mtime + len) を必ず含む。同じ path の外側 ZIP が
+更新された場合は古い identity にヒットしない。列挙・先頭画像名・先頭画像 bytes・個別ページ取得・
+Remote 候補の探索/解決/取得は、`open_archive_with_key` で外側の request reader と、その reader が
+使う目次 template の slot key を一緒に取得する。その key を全階層の内側 bytes の lookup / insert と、
+外側の CP932 復号名 index に使い、別途 path を stat して世代を取り直さない。stat / open に失敗した
+場合は従来のエラー処理に任せる。mtime と長さが両方同じ差し替えは目次キャッシュと同様に検出できない。
+目次 cache 内部の stat と file open の間の競合は既存の限界とし、再試行や二重 stat の照合は追加しない。
+個別ページ取得は内側 bytes のヒット時も先に外側 template を取得する。warm 時は metadata / slot の照合と
+reader clone だけで目次を再解析しないが、内側 bytes が残っていても目次が8書庫 LRU から退避していれば
+外側目次を一度再解析する。先頭画像名取得も共有 template 経由とし、既存の毎回の目次解析を再利用可能にする。
+ナビゲーション時の `clear_nested_cache()` はメモリ解放のために残し、更新検証の根拠にはしない。
+
 ### 2.2 PDF を開く (`App::load_pdf_as_folder`)
 
 PDF は **非同期**で開く:
