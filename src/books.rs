@@ -1124,7 +1124,7 @@ pub fn transfer_pages_between_books(
     )
 }
 
-fn transfer_pages_between_books_at(
+pub(crate) fn transfer_pages_between_books_at(
     data_dir: &Path,
     root: PathBuf,
     source_folder: PathBuf,

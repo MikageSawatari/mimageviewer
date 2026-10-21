@@ -357,6 +357,7 @@ impl App {
         copies: &[crate::books::BookPathMapping],
         root_rename: Option<(&Path, &Path)>,
     ) {
+        let original_moves = moves;
         let moves = Self::normalized_book_page_edit_mappings(moves);
         let copies = Self::normalized_book_page_edit_mappings(copies);
         for set in [
@@ -406,10 +407,24 @@ impl App {
                 }
             })
             .collect::<std::collections::HashSet<_>>();
-        for id in self.viewer_context_ids() {
-            self.with_owner_viewer_context(id, |app| {
-                let matches = |key: &str| key_matches_scope(key, &scopes);
-                if app
+        self.with_owner_viewer_context(self.viewer_context_main(), |app| {
+            // Snapshot and independent readers retain the pixels and state
+            // accepted when opened. A cache-only DB refresh would mix identities.
+            if app.is_snapshot_active() {
+                return;
+            }
+            let matches = |key: &str| key_matches_scope(key, &scopes);
+            // Match the existing Renamed / Reordered / Transfer terminal's
+            // pending_reload conditions; an extracted list with no reload
+            // must keep its page caches too.
+            let rebuilds_pages = app.current_folder.as_ref().is_some_and(|folder| {
+                root_rename.is_some()
+                    || pin_folders
+                        .iter()
+                        .any(|parent| crate::folder_tree::path_eq(folder, parent))
+            });
+            if rebuilds_pages
+                && (app
                     .items
                     .iter()
                     .filter_map(crate::edit_source::page_key_for_grid_item)
@@ -417,38 +432,42 @@ impl App {
                     || app
                         .current_folder
                         .as_deref()
-                        .is_some_and(|p| matches(&crate::adjustment_db::normalize_path(p)))
+                        .is_some_and(|p| matches(&crate::adjustment_db::normalize_path(p))))
+            {
+                if root_rename.is_none()
+                    && spread_shift_live_mappings::migrate(&mut app.spread_shift, original_moves)
                 {
-                    app.rating_cache.clear();
-                    app.current_folder_rating_cache = None;
-                    app.clear_tags_cache();
-                    app.clear_page_edit_state();
-                    app.clear_rotation_cache_for_reload();
-                    app.prepare_page_edits_for_current_virtual_items();
-                    let affected = app
-                        .thumb_edit_preview_keys
-                        .iter()
-                        .filter_map(|(&idx, key)| matches(key).then_some(idx))
-                        .collect::<Vec<_>>();
-                    for idx in affected {
-                        app.evict_thumbnail_for_reload(idx);
-                    }
-                    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
-                } else if app.items.iter().any(|item| {
-                    app.folder_pin_lookup_target_for_item(item)
-                        .is_some_and(|target| {
-                            pin_folders.iter().any(|folder| {
-                                crate::books::path_is_under_or_equal(folder, &target.path)
-                            })
-                        })
-                }) {
-                    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Pins {
-                        folders: pin_folders.clone(),
-                        videos: Default::default(),
-                    });
+                    app.invalidate_fullscreen_display_unit_owners();
                 }
-            });
-        }
+                app.rating_cache.clear();
+                app.current_folder_rating_cache = None;
+                app.clear_tags_cache();
+                app.clear_page_edit_state();
+                app.clear_rotation_cache_for_reload();
+                app.prepare_page_edits_for_current_virtual_items();
+                let affected = app
+                    .thumb_edit_preview_keys
+                    .iter()
+                    .filter_map(|(&idx, key)| matches(key).then_some(idx))
+                    .collect::<Vec<_>>();
+                for idx in affected {
+                    app.evict_thumbnail_for_reload(idx);
+                }
+                app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+            } else if app.items.iter().any(|item| {
+                app.folder_pin_lookup_target_for_item(item)
+                    .is_some_and(|target| {
+                        pin_folders.iter().any(|folder| {
+                            crate::books::path_is_under_or_equal(folder, &target.path)
+                        })
+                    })
+            }) {
+                app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Pins {
+                    folders: pin_folders.clone(),
+                    videos: Default::default(),
+                });
+            }
+        });
     }
 
     pub(super) fn adopt_book_store_summary(&mut self, metadata: crate::books::BookStoreSummary) {
@@ -856,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn book_structure_moves_rating_ledger_and_invalidates_parked_context_caches() {
+    fn book_structure_moves_rating_ledger_and_preserves_independent_reader_caches() {
         let mut app = setup_app_for_test();
         let a = app.tmp.path().join("0001_same.jpg");
         let b = app.tmp.path().join("0002_same.jpg");
@@ -864,6 +883,7 @@ mod tests {
         let kb = crate::adjustment_db::normalize_path(&b);
         app.items = vec![GridItem::Image(a.clone()), GridItem::Image(b.clone())];
         app.current_folder = Some(app.tmp.path().into());
+        app.rating_cache.insert(0, 5);
         app.rating_session_writes.insert(
             ka.clone(),
             RatingSessionWrite {
@@ -903,10 +923,12 @@ mod tests {
         assert_eq!(app.rating_session_value_for_key(&ka), Some(1));
         assert_eq!(app.rating_session_value_for_key(&kb), Some(5));
         app.with_owner_viewer_context(other, |owner| {
-            assert!(owner.tags_cache.is_empty());
-            assert!(owner.rating_cache.is_empty());
+            assert_eq!(owner.tags_cache.get(&ka), Some(&vec!["old page".into()]));
+            assert_eq!(owner.rating_cache.get(&0), Some(&5));
+            assert!(matches!(&owner.items[0], GridItem::Image(path) if path == &a));
         })
         .unwrap();
+        assert!(app.rating_cache.is_empty());
         app.adopt_book_path_metadata(
             &[],
             &[crate::books::BookPathMapping {
@@ -926,5 +948,224 @@ mod tests {
             None,
         );
         assert_eq!(app.rating_session_value_for_key(&ka), None);
+    }
+
+    fn seed_reader_caches(app: &mut App, page: &Path) {
+        let key = crate::adjustment_db::normalize_path(page);
+        app.rating_cache.insert(0, 5);
+        app.current_folder_rating_cache = Some(4);
+        app.tags_cache.insert(key, vec!["original".into()]);
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.brightness = 42.0;
+        app.adjustment_page_params.insert(0, params);
+        app.view_trim_page_overrides.insert(0, Default::default());
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::None);
+        app.fs_cache.insert(0, FsCacheEntry::Failed);
+    }
+
+    fn assert_reader_caches(app: &App, page: &Path, generation: u64) {
+        assert!(matches!(&app.items[0], GridItem::Image(path) if path == page));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.rating_cache.get(&0), Some(&5));
+        assert_eq!(app.current_folder_rating_cache, Some(4));
+        let key = crate::adjustment_db::normalize_path(page);
+        assert_eq!(app.tags_cache.get(&key), Some(&vec!["original".into()]));
+        assert_eq!(app.adjustment_page_params[&0].brightness, 42.0);
+        assert!(app.view_trim_page_overrides.contains_key(&0));
+        assert_eq!(
+            app.rotation_cache.get(&0),
+            Some(&crate::rotation_db::Rotation::None)
+        );
+        assert!(matches!(app.fs_cache.get(&0), Some(FsCacheEntry::Failed)));
+    }
+
+    #[test]
+    fn book_structure_adoption_preserves_mounted_and_parked_reader_items_caches_and_shift() {
+        for operation in ["move", "copy", "rename"] {
+            let mut app = setup_app_for_test();
+            let root = app.tmp.path().join("Book");
+            let renamed = app.tmp.path().join("Renamed");
+            let a = root.join("0001_same.jpg");
+            let b = root.join("0002_same.jpg");
+            app.current_folder = Some(root.clone());
+            app.items = vec![GridItem::Image(a.clone()), GridItem::Image(b.clone())];
+            seed_reader_caches(&mut app, &a);
+            let window = app.build_window_context_for_test(1272101, |owner| {
+                owner.current_folder = Some(root.clone());
+                owner.items = vec![GridItem::Image(a.clone()), GridItem::Image(b.clone())];
+                owner.spread_shift.scope =
+                    Some(crate::book_scope::BookScopeKey::folder(&root).unwrap());
+                owner.spread_shift.state = spread_shift_owner::ViewerShift::Book(
+                    crate::spread_shift::SpreadShiftState::Adjusted {
+                        anchor_ref: crate::spread_shift::SpreadShiftPageRef::RelativePath(
+                            "0002_same.jpg".into(),
+                        ),
+                        resolution: crate::spread_shift::ShiftResolution::Resolved(1),
+                        persistence: crate::spread_shift::ShiftPersistence::SessionOnly,
+                    },
+                );
+                seed_reader_caches(owner, &a);
+            });
+            let (generation, shift) = app
+                .with_owner_viewer_context(window, |owner| {
+                    (owner.items_generation, owner.spread_shift.clone())
+                })
+                .unwrap();
+            let moves = if operation == "rename" {
+                vec![crate::books::BookPathMapping {
+                    from: root.clone(),
+                    to: renamed.clone(),
+                }]
+            } else {
+                vec![crate::books::BookPathMapping {
+                    from: b.clone(),
+                    to: a.clone(),
+                }]
+            };
+            let root_rename =
+                (operation == "rename").then_some((root.as_path(), renamed.as_path()));
+            // Adoption must select the main owner even when F12 is mounted.
+            app.with_owner_viewer_context(window, |owner| {
+                if operation == "copy" {
+                    owner.adopt_book_path_metadata(&[], &moves, None);
+                } else {
+                    owner.apply_book_page_edit_moves_with_journal(&moves, None, root_rename);
+                }
+                assert_reader_caches(owner, &a, generation);
+                assert_eq!(owner.spread_shift, shift);
+            })
+            .unwrap();
+            app.with_owner_viewer_context(window, |owner| {
+                assert_reader_caches(owner, &a, generation);
+                assert_eq!(owner.spread_shift, shift);
+            })
+            .unwrap();
+            assert!(app.rating_cache.is_empty());
+            assert!(!app.current_view_pin_refreshes.contains_key(&window));
+        }
+    }
+
+    #[test]
+    fn book_structure_snapshot_keeps_items_caches_and_saved_shift_through_mapping_and_delete() {
+        let mut app = setup_app_for_test();
+        let root = app.tmp.path().join("Book");
+        let renamed = app.tmp.path().join("Renamed");
+        let page = root.join("0001_same.jpg");
+        app.current_folder = Some(root.clone());
+        app.items = vec![GridItem::Image(page.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.spread_shift.scope = Some(crate::book_scope::BookScopeKey::folder(&root).unwrap());
+        app.spread_shift.state = spread_shift_owner::ViewerShift::Book(
+            crate::spread_shift::SpreadShiftState::Adjusted {
+                anchor_ref: crate::spread_shift::SpreadShiftPageRef::RelativePath(
+                    "0001_same.jpg".into(),
+                ),
+                resolution: crate::spread_shift::ShiftResolution::Resolved(0),
+                persistence: crate::spread_shift::ShiftPersistence::SessionOnly,
+            },
+        );
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        seed_reader_caches(&mut app, &page);
+        let generation = app.items_generation;
+        let shift = app.spread_shift.clone();
+        let saved_shift = app
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .saved_viewing_state
+            .shift
+            .clone();
+        for (from, to, root_move) in [
+            (page.clone(), root.join("0002_same.jpg"), None),
+            (
+                root.clone(),
+                renamed.clone(),
+                Some((root.as_path(), renamed.as_path())),
+            ),
+        ] {
+            app.apply_book_page_edit_moves_with_journal(
+                &[crate::books::BookPathMapping { from, to }],
+                None,
+                root_move,
+            );
+            assert_reader_caches(&app, &page, generation);
+            assert_eq!(app.spread_shift, shift);
+            assert_eq!(
+                app.snapshot.as_ref().unwrap().saved_viewing_state.shift,
+                saved_shift
+            );
+            assert!(app.current_view_pin_refreshes.is_empty());
+        }
+        let key = crate::adjustment_db::normalize_path(&page);
+        app.adjusted_page_keys.insert(key.clone());
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(crate::books::BookOpResult::Deleted {
+            name: "Book".into(),
+            path: root.clone(),
+            metadata: Default::default(),
+        }))
+        .unwrap();
+        app.book_structural_op = Some(BookStructuralOp::running_for_test(
+            rx,
+            crate::books::BookOpIntent::Delete { path: root },
+            Completion::Manager,
+        ));
+        app.poll_book_structural_op(&egui::Context::default());
+        assert_reader_caches(&app, &page, generation);
+        assert!(!app.adjusted_page_keys.contains(&key));
+        assert!(app.book_structural_op.is_none());
+    }
+
+    #[test]
+    fn book_structure_unreloaded_main_extraction_keeps_page_caches() {
+        for root_rename in [false, true] {
+            let mut app = setup_app_for_test();
+            let root = app.tmp.path().join("Book");
+            let renamed = app.tmp.path().join("Renamed");
+            let page = root.join("0001_same.jpg");
+            app.current_folder = (!root_rename).then(|| app.tmp.path().join("search-results"));
+            app.items = vec![GridItem::Image(page.clone())];
+            seed_reader_caches(&mut app, &page);
+            let generation = app.items_generation;
+            let mapping = if root_rename {
+                crate::books::BookPathMapping {
+                    from: root.clone(),
+                    to: renamed.clone(),
+                }
+            } else {
+                crate::books::BookPathMapping {
+                    from: page.clone(),
+                    to: root.join("0002_same.jpg"),
+                }
+            };
+            app.adopt_book_path_metadata(
+                &[mapping],
+                &[],
+                root_rename.then_some((root.as_path(), renamed.as_path())),
+            );
+            assert_reader_caches(&app, &page, generation);
+            assert!(app.current_view_pin_refreshes.is_empty());
+            if root_rename {
+                // A collection root has no backing folder, so even Delete's
+                // pending_reload cannot rebuild these accepted rows.
+                let (tx, rx) = mpsc::channel();
+                tx.send(Ok(crate::books::BookOpResult::Deleted {
+                    name: "Book".into(),
+                    path: root.clone(),
+                    metadata: Default::default(),
+                }))
+                .unwrap();
+                app.book_structural_op = Some(BookStructuralOp::running_for_test(
+                    rx,
+                    crate::books::BookOpIntent::Delete { path: root },
+                    Completion::Manager,
+                ));
+                app.poll_book_structural_op(&egui::Context::default());
+                assert_reader_caches(&app, &page, generation);
+            }
+        }
     }
 }

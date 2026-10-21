@@ -118,7 +118,7 @@ enum MaintenanceAction {
     ),
     #[cfg(test)]
     Purge(String),
-    Pages(Vec<(PathBuf, PathBuf)>),
+    Pages(Vec<(PathBuf, PathBuf)>, store::OutsideScopePolicy),
 }
 enum Command {
     ViewTrim(
@@ -536,11 +536,27 @@ impl BookCompositionService {
             BookScopeKey::folder(root)?.storage_key(),
         ))
     }
+    #[cfg(test)]
     pub(crate) fn migrate_page_paths(
         &self,
         mappings: Vec<(PathBuf, PathBuf)>,
     ) -> Result<(), String> {
-        self.maintain(MaintenanceAction::Pages(mappings))
+        self.maintain(MaintenanceAction::Pages(
+            mappings,
+            store::OutsideScopePolicy::PreserveMissing,
+        ))
+    }
+
+    /// Book transfers must remove references to pages that leave their source scope
+    /// before another page can reuse the vacated name.
+    pub(crate) fn migrate_book_page_paths(
+        &self,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), String> {
+        self.maintain(MaintenanceAction::Pages(
+            mappings,
+            store::OutsideScopePolicy::RemoveMovedOutside,
+        ))
     }
     fn maintain(&self, action: MaintenanceAction) -> Result<(), String> {
         let mut admission = self.shared.admission.lock().unwrap();
@@ -980,9 +996,13 @@ fn run_worker(
                                 store::purge_book_root(connection, &root)?;
                             }
                         }
-                        MaintenanceAction::Pages(mappings) => {
+                        MaintenanceAction::Pages(mappings, outside_scope) => {
                             connection = None;
-                            store::migrate_page_paths_at(&data_dir, &mappings)?;
+                            store::migrate_page_paths_with_policy_at(
+                                &data_dir,
+                                &mappings,
+                                outside_scope,
+                            )?;
                         }
                     }
                     reload(&path, &mut connection, &mut state)

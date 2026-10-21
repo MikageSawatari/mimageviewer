@@ -6073,3 +6073,16 @@ dispatcher を通らないため、開始を受理した frontend で test-scrip
 同じ逆引きで見つかった Collection outer の準備済み owner と、画像フォルダ ZIP 化後の
 親一覧 owner も operation が scan を引き取る受理点（`ParentScan`）で計数し、install や水和では加算しない。
 `ff5af1f53` 再レビュー後、detached DFS の DirectRar／ConversionCacheHit も proven backing の受理点で test-script 限定計数を補い、loader 全呼び出し元と FolderNavRoute 全分岐を照合した（述語・挙動は不変）。
+
+### §11 追補: 本の構造操作の cache 採用範囲（2026-10-21）
+
+設計担当の `33e9a570a` / `book-key-migration-plan.md` §3.10 の決定に従い、
+本操作の全 context への metadata cache 採用と、Snapshot saved shift / at-rest shift の一括付け替えを撤去した。
+`viewer_context_registry.rs::migrate_at_rest_spread_shifts` は production の呼出しをなくして削除し、
+既存の root 改名・resource 保持回帰は実際の book adoption 入口へ更新した。
+cache の失効は main の既存 reload 対象だけに限定し、別窓・Snapshot の items・cache・accepted shift は保持する。
+新しい live-follow・reload・窓閉鎖・detached 述語・viewport・配置・focus の変更はない。
+
+設計担当の明示決定と Codex の独立レビュー（Sol / xhigh）は、BA-7 の所有境界へ戻す構造修正であり、
+症状パッチではないと合意した。別窓の再読込設計はリワーク側の範囲に残す。
+本操作以外のメタデータ publication・通常入力・既存 refresh は今回変更しない。検証結果は同計画 §8.6 を参照。

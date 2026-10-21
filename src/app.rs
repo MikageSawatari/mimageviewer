@@ -46141,21 +46141,25 @@ impl App {
         removed: &[std::path::PathBuf],
         purged_pdf_password_paths: &[std::path::PathBuf],
     ) {
-        let matches_key = removed_path_key_matcher(removed);
+        self.purge_shared_metadata_for_removed_paths(removed, purged_pdf_password_paths);
+        self.purge_current_context_metadata_for_removed_paths(removed);
+    }
 
-        self.rating_cache.clear();
-        self.clear_rotation_cache_for_reload();
-        self.current_folder_rating_cache = None;
+    /// Path-keyed application state follows the durable deletion, independently of
+    /// the accepted rows/pixels retained by a reader or Snapshot.
+    fn purge_shared_metadata_for_removed_paths(
+        &mut self,
+        removed: &[std::path::PathBuf],
+        purged_pdf_password_paths: &[std::path::PathBuf],
+    ) {
+        let matches_key = removed_path_key_matcher(removed);
         self.invalidate_rating_counts_cache();
         self.reset_folder_rating_counts();
-        self.retain_tags_cache(|key| !matches_key(key));
         self.rating_session_writes
             .retain(|key, _| !matches_key(key));
-        self.folder_pin_map.retain(|key, _| !matches_key(key));
         self.search_drilled_folder_counts
             .retain(|key, _| !matches_key(key));
         self.reading_history_rows.retain(|key, _| !matches_key(key));
-        self.rating_view_rows.retain(|row| !matches_key(&row.key));
 
         for set in [
             &mut self.adjusted_page_keys,
@@ -46170,22 +46174,6 @@ impl App {
         }
 
         if self
-            .fullscreen_video_marker_cache
-            .as_ref()
-            .is_some_and(|cache| matches_key(&crate::adjustment_db::normalize_path(&cache.path)))
-        {
-            self.fullscreen_video_marker_cache = None;
-            self.cancel_fullscreen_video_marker_thumb_decode();
-        }
-        if self
-            .music_bookmarks_loaded_for
-            .as_ref()
-            .is_some_and(|path| matches_key(&crate::adjustment_db::normalize_path(path)))
-        {
-            self.music_bookmarks.clear();
-            self.music_bookmarks_loaded_for = None;
-        }
-        if self
             .last_book_resume
             .as_ref()
             .is_some_and(|(path, _, _, _)| matches_key(&crate::adjustment_db::normalize_path(path)))
@@ -46198,13 +46186,6 @@ impl App {
             .is_some_and(|(key, _)| matches_key(key))
         {
             self.last_reading_history_touch = None;
-        }
-        if self
-            .reading_history_return_from
-            .as_ref()
-            .is_some_and(|path| matches_key(&crate::adjustment_db::normalize_path(path)))
-        {
-            self.reading_history_return_from = None;
         }
         self.video_thumb_overrides_dirty_paths
             .retain(|path| !matches_key(&crate::adjustment_db::normalize_path(path)));
@@ -46223,6 +46204,42 @@ impl App {
         self.sidecars
             .retain(|folder, _| !matches_key(&crate::adjustment_db::normalize_path(folder)));
         self.invalidate_tag_apply_suggestions();
+    }
+
+    /// Only the owner whose existing reload replaces its rows may discard these
+    /// context-local caches during a book operation. Generic deletion keeps its
+    /// existing behavior by calling both cleanup helpers above.
+    fn purge_current_context_metadata_for_removed_paths(&mut self, removed: &[PathBuf]) {
+        let matches_key = removed_path_key_matcher(removed);
+        self.rating_cache.clear();
+        self.clear_rotation_cache_for_reload();
+        self.current_folder_rating_cache = None;
+        self.retain_tags_cache(|key| !matches_key(key));
+        self.folder_pin_map.retain(|key, _| !matches_key(key));
+        self.rating_view_rows.retain(|row| !matches_key(&row.key));
+        if self
+            .fullscreen_video_marker_cache
+            .as_ref()
+            .is_some_and(|cache| matches_key(&crate::adjustment_db::normalize_path(&cache.path)))
+        {
+            self.fullscreen_video_marker_cache = None;
+            self.cancel_fullscreen_video_marker_thumb_decode();
+        }
+        if self
+            .music_bookmarks_loaded_for
+            .as_ref()
+            .is_some_and(|path| matches_key(&crate::adjustment_db::normalize_path(path)))
+        {
+            self.music_bookmarks.clear();
+            self.music_bookmarks_loaded_for = None;
+        }
+        if self
+            .reading_history_return_from
+            .as_ref()
+            .is_some_and(|path| matches_key(&crate::adjustment_db::normalize_path(path)))
+        {
+            self.reading_history_return_from = None;
+        }
     }
 
     /// 終端refreshのcompact indexを全viewer contextから破棄する。
@@ -51940,7 +51957,7 @@ impl App {
                     .iter()
                     .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
                     .collect();
-                service.migrate_page_paths(moves)
+                service.migrate_book_page_paths(moves)
             };
             if let Err(error) = admission {
                 crate::logger::log(format!(
@@ -51959,7 +51976,7 @@ impl App {
                     crate::rename_key_migration::PathMigrationCollision::SourceWins,
                 )
             } else {
-                service.migrate_page_paths(
+                service.migrate_book_page_paths(
                     mappings
                         .iter()
                         .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
@@ -51975,21 +51992,8 @@ impl App {
                 ));
             }
         }
-        // Book-root rename preserves the released stale-view behavior. Its saved
-        // rows move in the service FIFO above; accepted context scopes stay old.
-        if collection_tree_migration.is_none() {
-            if spread_shift_live_mappings::migrate(&mut self.spread_shift, mappings) {
-                self.invalidate_fullscreen_display_unit_owners();
-            }
-            if let Some(snapshot) = self.snapshot.as_mut() {
-                spread_shift_live_mappings::migrate(
-                    &mut snapshot.saved_viewing_state.shift,
-                    mappings,
-                );
-            }
-            #[cfg(windows)]
-            self.migrate_at_rest_spread_shifts(mappings, collection_tree_migration);
-        }
+        // Independent readers and Snapshot keep their accepted pixels and pairing
+        // state. Only the main list rebuilt by the existing reload may adopt edits.
         let collection_mappings =
             book_collection_source_mappings(mappings, collection_tree_migration);
         self.enqueue_collection_source_migration_batch(collection_mappings);
@@ -52394,7 +52398,14 @@ impl App {
                 metadata,
             }) => {
                 self.adopt_book_store_summary(metadata);
-                self.purge_in_memory_metadata_for_removed_paths(std::slice::from_ref(&path), &[]);
+                self.purge_shared_metadata_for_removed_paths(std::slice::from_ref(&path), &[]);
+                self.with_owner_viewer_context(self.viewer_context_main(), |app| {
+                    if !app.is_snapshot_active() && app.current_folder.is_some() {
+                        app.purge_current_context_metadata_for_removed_paths(std::slice::from_ref(
+                            &path,
+                        ));
+                    }
+                });
                 if let crate::books::BookOpIntent::Delete { path: requested } = &intent
                     && !crate::folder_tree::path_eq(requested, &path)
                 {

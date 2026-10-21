@@ -444,11 +444,25 @@ pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result
     Ok(changed)
 }
 
-/// Folder refs change only for moves within that same direct folder. Archive refs
-/// and document numbers are unaffected by filesystem cache/root migration.
+/// Generic moves retain Missing refs; book transfers explicitly remove them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutsideScopePolicy {
+    PreserveMissing,
+    RemoveMovedOutside,
+}
+
 pub(crate) fn migrate_page_paths_at(
     data_dir: &Path,
     mappings: &[(PathBuf, PathBuf)],
+) -> Result<usize, String> {
+    migrate_page_paths_with_policy_at(data_dir, mappings, OutsideScopePolicy::PreserveMissing)
+}
+
+/// Folder refs follow same-scope maps; archive/document refs remain unchanged.
+pub(crate) fn migrate_page_paths_with_policy_at(
+    data_dir: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+    outside_scope: OutsideScopePolicy,
 ) -> Result<usize, String> {
     if mappings.is_empty() {
         return Ok(0);
@@ -466,32 +480,36 @@ pub(crate) fn migrate_page_paths_at(
             continue;
         }
         let mut composition = row.composition;
+        // Resolve against the original refs, filtering departed pages before
+        // simultaneous renumbering can reuse their old names.
         let rewrite = |page: &mut CompositionPageRef| {
             let CompositionPageRef::RelativePath { path } = page else {
-                return;
+                return true;
             };
             let original = Path::new(&key).join(path.replace('\\', "/"));
             let original_key = crate::path_key::normalize_keep_drive(&original);
-            if let Some((_, destination)) = mappings
+            let Some((_, destination)) = mappings
                 .iter()
                 .find(|(source, _)| crate::path_key::normalize_keep_drive(source) == original_key)
-                && destination
-                    .parent()
-                    .is_some_and(|parent| crate::path_key::normalize_keep_drive(parent) == key)
+            else {
+                return true;
+            };
+            if destination
+                .parent()
+                .is_some_and(|parent| crate::path_key::normalize_keep_drive(parent) == key)
                 && let Some(name) = destination.file_name().and_then(|name| name.to_str())
             {
                 *path = name.to_owned();
+                true
+            } else {
+                outside_scope == OutsideScopePolicy::PreserveMissing
             }
         };
-        for page in &mut composition.page_order {
-            rewrite(page);
-        }
-        for entry in &mut composition.page_overrides {
-            rewrite(&mut entry.page);
-        }
-        for page in &mut composition.hidden_pages {
-            rewrite(page);
-        }
+        composition.page_order.retain_mut(rewrite);
+        composition
+            .page_overrides
+            .retain_mut(|entry| rewrite(&mut entry.page));
+        composition.hidden_pages.retain_mut(rewrite);
         changed += usize::from(replace_row_in(
             &transaction,
             "book_compositions",

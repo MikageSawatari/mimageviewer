@@ -284,6 +284,11 @@ pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result
     Ok(removed)
 }
 
+enum RelativeMapping {
+    Within(String),
+    Outside,
+}
+
 struct PathMappingIndex {
     by_from: HashMap<String, (usize, PathBuf)>,
 }
@@ -299,7 +304,7 @@ impl PathMappingIndex {
         Self { by_from }
     }
 
-    fn map_relative(&self, scope: &str, relative: &str) -> Option<String> {
+    fn map_relative(&self, scope: &str, relative: &str) -> Option<RelativeMapping> {
         let root = Path::new(scope);
         let original = root.join(relative.replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR));
         let scope_prefix = format!("{}/", scope.trim_end_matches('/'));
@@ -309,7 +314,7 @@ impl PathMappingIndex {
                 continue;
             };
             // Root/ancestor moves are handled by generic key migration. A relative payload
-            // does not change, and moving a page to a sibling book leaves the old anchor Missing.
+            // does not change. Page moves outside the scope follow the request policy.
             if !candidate_key.starts_with(&scope_prefix) {
                 return None;
             }
@@ -319,25 +324,40 @@ impl PathMappingIndex {
                 .collect::<PathBuf>();
             let mapped = destination.join(suffix);
             if !crate::path_key::normalize_keep_drive(&mapped).starts_with(&scope_prefix) {
-                return None;
+                return Some(RelativeMapping::Outside);
             }
-            return Some(
+            return Some(RelativeMapping::Within(
                 mapped
                     .components()
                     .skip(root.components().count())
                     .collect::<PathBuf>()
                     .to_string_lossy()
                     .replace('\\', "/"),
-            );
+            ));
         }
         None
     }
 }
 
-/// Apply original-to-final maps simultaneously; no newly updated reference is mapped twice.
+/// Generic moves retain Missing refs; book transfers explicitly remove them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutsideScopePolicy {
+    PreserveMissing,
+    RemoveMovedOutside,
+}
+
 pub(crate) fn migrate_page_paths_at(
     data_dir: &Path,
     mappings: &[(PathBuf, PathBuf)],
+) -> Result<usize, String> {
+    migrate_page_paths_with_policy_at(data_dir, mappings, OutsideScopePolicy::PreserveMissing)
+}
+
+/// Apply original-to-final maps simultaneously; no newly updated reference is mapped twice.
+pub(crate) fn migrate_page_paths_with_policy_at(
+    data_dir: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+    outside_scope: OutsideScopePolicy,
 ) -> Result<usize, String> {
     if mappings.is_empty() {
         return Ok(0);
@@ -367,6 +387,17 @@ pub(crate) fn migrate_page_paths_at(
         };
         let Some(mapped) = mappings.map_relative(&key, relative) else {
             continue;
+        };
+        let mapped = match mapped {
+            RelativeMapping::Within(mapped) => mapped,
+            RelativeMapping::Outside => {
+                if outside_scope == OutsideScopePolicy::RemoveMovedOutside {
+                    changed += transaction
+                        .execute("DELETE FROM spread_shifts WHERE path = ?1", [&key])
+                        .map_err(|error| error.to_string())?;
+                }
+                continue;
+            }
         };
         let replacement = SpreadShiftPageRef::RelativePath(mapped);
         replacement.validate()?;

@@ -961,3 +961,140 @@ fn composition_busy_includes_admitted_mutations_until_their_publication() {
     assert!(!service.is_busy());
     owner.shutdown_and_join();
 }
+
+#[test]
+fn book_page_transfer_request_removes_departed_refs_before_name_reuse() {
+    for existing_destination in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+        let source = BookScopeKey::folder("C:/books/source").unwrap();
+        let destination = BookScopeKey::folder("C:/books/destination").unwrap();
+        let page = |name: &str| CompositionPageRef::RelativePath { path: name.into() };
+        let mut composition = BookComposition::new(
+            ReadingDirection::Rtl,
+            vec![page("0001_same.jpg"), page("0002_same.jpg")],
+        );
+        composition.cover_enabled = true;
+        composition.hidden_pages = vec![page("0001_same.jpg")];
+        composition.page_overrides = vec![PageOverrideEntry {
+            page: page("0001_same.jpg"),
+            directive: PageOverride::Alone,
+        }];
+        assert!(
+            service
+                .save(source.clone(), PageDomain::ImageFolder, composition)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .status
+                .is_ok()
+        );
+        if existing_destination {
+            let target = BookComposition::new(ReadingDirection::Ltr, vec![page("existing.jpg")]);
+            assert!(
+                service
+                    .save(destination.clone(), PageDomain::ImageFolder, target)
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .status
+                    .is_ok()
+            );
+        }
+        let before_destination = prepare(&service, destination.clone(), PageDomain::ImageFolder);
+        service.drain_changed_scope_keys();
+        service
+            .migrate_book_page_paths(vec![
+                (
+                    "C:/books/source/0001_same.jpg".into(),
+                    "C:/books/destination/0001_same.jpg".into(),
+                ),
+                (
+                    "C:/books/source/0002_same.jpg".into(),
+                    "C:/books/source/0001_same.jpg".into(),
+                ),
+            ])
+            .unwrap();
+        let result = prepare(&service, source.clone(), PageDomain::ImageFolder)
+            .status
+            .unwrap()
+            .unwrap()
+            .composition;
+        assert_eq!(result.page_order, vec![page("0001_same.jpg")]);
+        assert!(result.hidden_pages.is_empty());
+        assert!(result.page_overrides.is_empty());
+        assert!(result.cover_enabled);
+        assert_eq!(result.direction, ReadingDirection::Rtl);
+        assert_eq!(
+            prepare(&service, destination.clone(), PageDomain::ImageFolder).status,
+            before_destination.status
+        );
+        assert_eq!(
+            service.drain_changed_scope_keys(),
+            vec![source.storage_key()]
+        );
+        assert!(service.drain_errors().is_empty());
+        owner.shutdown_and_join();
+    }
+}
+
+#[test]
+fn book_page_reorder_request_maps_once_and_generic_move_keeps_missing_refs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let folder = BookScopeKey::folder("C:/books/source").unwrap();
+    let page = |name: &str| CompositionPageRef::RelativePath { path: name.into() };
+    let mut composition =
+        BookComposition::new(ReadingDirection::Rtl, vec![page("A.jpg"), page("B.jpg")]);
+    composition.hidden_pages = vec![page("A.jpg")];
+    composition.page_overrides = vec![PageOverrideEntry {
+        page: page("A.jpg"),
+        directive: PageOverride::Alone,
+    }];
+    assert!(
+        service
+            .save(folder.clone(), PageDomain::ImageFolder, composition)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .status
+            .is_ok()
+    );
+    service
+        .migrate_book_page_paths(vec![
+            (
+                "C:/books/source/A.jpg".into(),
+                "C:/books/source/B.jpg".into(),
+            ),
+            (
+                "C:/books/source/B.jpg".into(),
+                "C:/books/source/A.jpg".into(),
+            ),
+        ])
+        .unwrap();
+    let reordered = prepare(&service, folder.clone(), PageDomain::ImageFolder)
+        .status
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reordered.composition.page_order,
+        vec![page("B.jpg"), page("A.jpg")]
+    );
+    assert_eq!(reordered.composition.hidden_pages, vec![page("B.jpg")]);
+    assert_eq!(
+        reordered.composition.page_override(&page("B.jpg")),
+        Some(PageOverride::Alone)
+    );
+    service
+        .migrate_page_paths(vec![(
+            "C:/books/source/B.jpg".into(),
+            "C:/books/other/B.jpg".into(),
+        )])
+        .unwrap();
+    assert_eq!(
+        prepare(&service, folder, PageDomain::ImageFolder)
+            .status
+            .unwrap()
+            .unwrap(),
+        reordered
+    );
+    assert!(service.drain_errors().is_empty());
+    owner.shutdown_and_join();
+}

@@ -1,6 +1,6 @@
 # 本の構造変更と path キー DB の付け替え・後始末 (§1.272 / §1.273) と、しおりのページ番号 (§1.245)
 
-2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v4 (v3 で実装前レビュー合意、実装中に出た 2 点を §3.10 で決定)。実装中**。
+2026-10-21 設計担当 ClaudeCode Opus 5.5。状態: **設計 v4 (v3 で実装前レビュー合意、実装中に出た 2 点を §3.10 で決定)。実装・独立レビュー・関連自動検証済み。全件 gate・実機確認・master 取り込み前の利用者確認は設計担当へ引き継ぐ**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) の §1.272・§1.273・§1.245・§1.244。
 前提として読む文書: [製本計画](compile-book-plan.md) §2・§11、`src/rename_key_migration.rs` のモジュール doc。
 `x-scheduled-post` ブランチの `docs/x-post-r2-design.md` §4 (関所つきの大掛かりな版) を参考にしたが、
@@ -176,22 +176,6 @@ Requested(要求) ──静止を確認──> Running(worker) ──結果を U
   実行は製本 worker から呼ぶ (静止しているので編集プレビューの worker と競合しない)。汎用改名の同じ問題は
   今回の範囲外として §8 に記録する。
 
-### 3.10 実装中に決めた 2 点 (2026-10-21、設計担当)
-
-実装担当が §8.4.1 で返した前提の不一致への決定。
-
-- **別本へ移したページを指す本の構成・見開き調整の参照**: 移動元の本の `book_composition` (anchor・hidden・
-  override・order) と `spread_shift` に残る、別本へ移したページへの相対参照は、各 service が本の操作の要求の中で
-  **外す** (pin と同じ扱い。§3.4)。残すと詰め直しで同じ名前になった別の画像を指す。移動先の本へは移さない
-  (移動先には移動先の本の構成がある)。外した参照は戻らないので、**利用者が作ったデータ (本の構成) の変更**として
-  master への取り込み前に利用者へ確認する (CLAUDE.md「まれな失敗は既定で割り切る」の相談対象 1)。
-- **別ウィンドウ (F12) と Snapshot**: リリース済みの挙動 (`spread-shift-memory-plan.md` §11.6: 本の改名後も
-  F12 は旧 path・旧 items を保つ) を保つ。§3.5 の失効・再読込は、既存の共通 reload / refresh で作り直される
-  context だけに適用し、別ウィンドウ・Snapshot の context の cache は**触らない** (cache だけを新しい DB に
-  合わせると、旧い画素と別画像の編集情報が混ざる)。その窓は利用者が閉じて開き直すまで変更前の状態を表示する。
-  変更前の 8 種の付け替え (UI スレッド) でも別ウィンドウは同じ状態になっていたので、退行ではない。detached の
-  述語・viewport には触れない。再読込の設計は detached リワーク側の範囲として §8 に記録する。
-
 ### 3.5 実行場所: 製本 worker で FS の直後に行う
 
 ```text
@@ -253,6 +237,22 @@ CLAUDE.md「まれな失敗は既定で割り切る」)。
   (祖先照合) で解釈する。
 - 既存の DB に残っている「旧キーの付け残し」は、どの画像の行だったかを後から決められないので直さない。
   ただし §3.3 により、今後の本の操作の移行先では消える。
+
+### 3.10 実装中に決めた 2 点 (2026-10-21、設計担当)
+
+実装担当が §8.4.1 で返した前提の不一致への決定。
+
+- **別本へ移したページを指す本の構成・見開き調整の参照**: 移動元の本の `book_composition` (anchor・hidden・
+  override・order) と `spread_shift` に残る、別本へ移したページへの相対参照は、各 service が本の操作の要求の中で
+  **外す** (pin と同じ扱い。§3.4)。残すと詰め直しで同じ名前になった別の画像を指す。移動先の本へは移さない
+  (移動先には移動先の本の構成がある)。外した参照は戻らないので、**利用者が作ったデータ (本の構成) の変更**として
+  master への取り込み前に利用者へ確認する (CLAUDE.md「まれな失敗は既定で割り切る」の相談対象 1)。
+- **別ウィンドウ (F12) と Snapshot**: リリース済みの挙動 (`spread-shift-memory-plan.md` §11.6: 本の改名後も
+  F12 は旧 path・旧 items を保つ) を保つ。§3.5 の失効・再読込は、既存の共通 reload / refresh で作り直される
+  context だけに適用し、別ウィンドウ・Snapshot の context の cache は**触らない** (cache だけを新しい DB に
+  合わせると、旧い画素と別画像の編集情報が混ざる)。その窓は利用者が閉じて開き直すまで変更前の状態を表示する。
+  変更前の 8 種の付け替え (UI スレッド) でも別ウィンドウは同じ状態になっていたので、退行ではない。detached の
+  述語・viewport には触れない。再読込の設計は detached リワーク側の範囲として §8 に記録する。
 
 ## 4. テスト (実装担当)
 
@@ -433,7 +433,8 @@ Remote の resume 用 raw index の意味は変えず、しおり要求の hint 
 presence 集合は I/O の無い snapshot 置換を残した。全移行元を読む前に書き換えず、
 A↔B と移行元欠損でも worker と同じ結果にする。コピーは従来の六つの編集 presence だけ写し、
 回転のコピー先は初期化する。★ session 台帳も moves → copies の同じ規則で置換する。
-対象 context のタグ・★・rotation・page-edit・preview・pin cache を失効し、既存の非同期準備へ戻す。
+既存 reload で作り直される main context のタグ・★・rotation・page-edit・preview・pin cache を失効し、
+既存の非同期準備へ戻す（v4 の範囲決定は §3.10・§8.4.1）。
 本棚の `Folder(本)` は page key を持たないため、ページの両端の親フォルダ (改名は両端の本 root) も
 pin の依存先として確認する。親棚は既存の `CurrentViewRefresh::Pins` worker に対象だけ渡し、
 本を開いていない棚や無関係な窓の page-edit・★・タグ状態は初期化しない。
@@ -441,22 +442,29 @@ presence はソート済みの対象範囲だけ snapshot し、全キー数 × 
 本の削除は worker が service maintenance lease 下で purge し、lease 解放時に再読込されるため、
 UI の `purge_book_root` の重複要求は削除した。
 
-### 8.4.1 設計担当へ返した前提の不一致 (未合意、2026-10-21)
+### 8.4.1 実装中の前提の不一致と決定 (決定済み、2026-10-21)
 
-- `spread_shift` / `book_composition` は scope 外へ出たページの相対参照を旧名のまま残す。
-  同元名の別ページが詰め直しで旧名を再利用すると、anchor・hidden・override・order が別画像を指す。
-  I1 と矛盾するが、§3.4 は pin の解除だけを規定し、構成値の除去 / 移送 / missing 保持は未定義。
-  独立レビューでも確認し、この値の変更だけを保留して設計担当へ判断を求めた。
-- 別窓 / Snapshot の画素・列は既存共通 reload / Operation refresh では即時再構築されない。
-  cache だけを新 DB に合わせると旧画素と別画像の編集情報を併用し得る。
-  一方で `spread-shift-memory-plan.md` §11.6 は本の改名後の F12 旧 path / 旧 items 保持を明示し、
-  C1 も独立 reader へのその場再構築を規定しない。§3.5 の「再読込」の適用範囲と既存仕様の調整が必要。
-  detached 述語 / viewport の症状パッチや新しい live rebuild は追加せず、既存終了経路で閉じるか、
-  再読込設計を追補するかを設計担当へ確認した。
+初回実装 `3ee4de3bb` では下記二点を保留した。設計担当が `33e9a570a` の §3.10 で決定し、
+今回の追補で実装した。未合意の blocker としては残っていない。
 
-この二点が未合意の間は I1〜I7 全体を満たした実装完了とは扱わない。
+- scope 外へ出たページへの `book_composition` / `spread_shift` の参照は、本操作専用の
+  `migrate_book_page_paths` 要求に `RemoveMovedOutside` を載せ、各 service の transaction 内で外す。
+  構成の PageRef 保持箇所は order・hidden・override の三つ。anchor は spread_shift の row が保持する。
+  direction / cover は本単位で維持し、移動先の構成・shift へは移さない。汎用移動の Missing 保持は変えない。
+- 別窓・Snapshot は旧 items / cache / accepted shift を保つ。全 context の cache 更新と at-rest shift の
+  一括付け替えを撤去し、main でも既存の完了終端から実際に reload される範囲だけ page cache を失効する。
+  本の改名は current_folder がある main、ページ操作は source / target 本の main が対象。
+  再構築されない抽出一覧も維持する。親棚の pin は既存 Pins worker に限定し、page cache は初期化しない。
+  本削除の purge は shared cleanup と現在 context の cleanup に分け、本操作では current_folder のある
+  main 非 Snapshot だけに後者を適用する。汎用削除 wrapper は両 cleanup を通す従来動作を維持する。
 
-### 8.5 検証状況
+新しい reload / live-follow / reader 閉鎖は追加しない。別窓の再読込設計は detached リワーク側の範囲。
+設計担当と独立 reviewer は、これは BA-7 の所有境界を正す撤去であり症状パッチではないと合意した。
+参照解除は利用者作成データの変更であり、§3.10 の master 取り込み前の利用者確認は設計担当が行う。
+
+### 8.5 初回 v3 実装時の検証状況 (履歴)
+
+以下は `3ee4de3bb` の検証履歴。v4 追補の結果は §8.6 に記す。
 
 2026-10-21、すべての build / test に `MSBUILDDISABLENODEREUSE=1` を指定した。
 native の並列ビルドが MSBuild で失敗したため、以後は `CARGO_BUILD_JOBS=1` も指定した。
@@ -482,11 +490,11 @@ native の並列ビルドが MSBuild で失敗したため、以後は `CARGO_BU
   待機が続いたため、自分の待機 script だけを止め、既存の待機スキップ指定で再実行した。他作業の process は止めていない。
   ログ: `target/book-dev-build.stdout.log` / `target/book-dev-build.stderr.log`。
   `target/dev-runtime` の既定 profile は通常の `%APPDATA%/mimageviewer`。本体起動・実機確認・commit は行っていない。
-- `test-lib-full.ps1`: 指示どおり設計担当へ引き継ぐ。§8.4.1 の二点が未合意のため、実装完了・受入済みとはしない。
+- `test-lib-full.ps1`: 指示どおり設計担当へ引き継いだ。当時は二点未合意で全体の受入を保留した（現在は §3.10 で決定済み）。
 
 実装後の独立レビュー (`gpt-6.1-sol` / `xhigh`) は合意範囲を ACCEPT、追加 P1 / P2 なし。
-上記の親担当の検証結果を参照し、重複実行していない。§8.4.1 の二点が未実装なので、
-タスク全体の完了承認は保留である。41 件と focused 600 件には重複があり、641 個の異なるテストとは数えない。
+上記の親担当の検証結果を参照し、重複実行していない。当時は二点未実装のため、
+タスク全体の完了承認を保留した。41 件と focused 600 件には重複があり、641 個の異なるテストとは数えない。
 
 | focused の選択モジュール | 成功件数 |
 | --- | ---: |
@@ -531,7 +539,7 @@ cargo nextest run -p mimageviewer --lib -E $bookFilter
 
 冒頭 §0 の実アプリ観測は設計担当 ClaudeCode の修正前記録であり、今回差分の動作確認には流用しない。
 
-### 8.5.1 新規・改名したテスト名の一覧
+### 8.5.1 初回 v3 で新規・改名したテスト名の一覧
 
 新規 37 件と、所有者・journal の仕様更新に合わせて改名した既存 2 件。
 このほか既存テストの fixture・受付・完了採用・隔離 data-dir を更新した。
@@ -622,3 +630,59 @@ cargo nextest run -p mimageviewer --lib -E $bookFilter
 - `structural_worker_rename_moves_folder_rows_and_journals_missing_bookmarks`
 - `structural_worker_reorder_swaps_same_named_images_with_trim_and_identity`
 - `structural_worker_reports_store_error_after_successful_filesystem_commit`
+
+### 8.6 v4 決定の実装と検証 (2026-10-21)
+
+§3.10 の二点を実装。service の方針と context の所有境界は §8.4.1 に記録した。
+独立完成レビュー (`gpt-6.1-sol` / `xhigh`) は ACCEPT、追加 P1 / P2 なし。
+前回結果を流用せず、今回の Rust 差分に対して以下を実行した。
+今回の指示により build-dev・本体起動・commit は行わない。全件 gate は設計担当へ引き継ぐ。
+
+すべての build / test に `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1` を指定した。
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0。lib 264 / ort 1 の既存警告。新規未使用警告は解消し前回から増加なし |
+| `cargo nextest run -p mimageviewer --lib -E $bookV4Filter` (下記) | 33 件成功、失敗 0。新規 8 テストすべてを JUnit と照合済み |
+| `scripts/test-focused.ps1` (前回 13 module + viewer_context_registry) | 14 run / 702 件成功、失敗 0、exit 0 |
+| `cargo fmt` (引数なし、workspace 全体) / `cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` | 成功、dangerous glyph 0 |
+| `git diff --check` | exit 0 |
+
+33 件と focused 702 件には重複がある。distinct な 735 件とは数えない。
+core check は `target/book-final-check.stderr.log`、選択 nextest は `target/book-v4-nextest.stderr.log` /
+`target/nextest/default/junit.xml` に保存した。focused の今回のログ / JUnit は
+`target/test-focused/runs/20261021T125003091Z-abd6eec0` から `20261021T125225239Z-3fc4d814` までの 14 run。
+件数は順に books 56、rename_key_migration 61、edit_preview_cache 20、book_bookmarks 28、
+book_composition 71、spread_shift 62、book_structural_op 12、page_edit_owner_tests 26、
+content_identity_restore 11、spread_shift_lifecycle_tests 4、remote_ipc::container 173、
+content_identity 75、reading_history_db 9、viewer_context_registry 94。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+$env:CARGO_BUILD_JOBS = '1'
+$bookV4Filter = @(
+    'test(/book_structure/)', 'test(/book_page_/)', 'test(/book_transfer_completion/)',
+    'test(/book_root_rename_preserves_mounted_and_parked_context_payloads/)',
+    'test(/book_manager_delete_worker/)',
+    'test(/delete_closes_parked_live_media_window_and_purges_resume/)'
+) -join ' | '
+cargo nextest run -p mimageviewer --lib -E $bookV4Filter
+# focused は §8.5 の明示 13 パスに下記を追加して同時指定した。
+# 'src/app/viewer_context_registry.rs'
+```
+
+新規テスト:
+
+- `book_composition::store_tests::book_page_transfer_request_removes_departed_refs_before_name_reuse`
+- `book_composition::store_tests::book_page_reorder_request_maps_once_and_generic_move_keeps_missing_refs`
+- `spread_shift::service::tests::book_page_transfer_request_clears_departed_anchor_before_name_reuse`
+- `spread_shift::service::tests::book_page_reorder_request_maps_once_and_generic_move_keeps_missing_anchor`
+- `app::spread_shift_lifecycle_tests::book_transfer_completion_clears_departed_composition_and_shift_before_name_reuse`
+- `app::book_structural_op::tests::book_structure_adoption_preserves_mounted_and_parked_reader_items_caches_and_shift`
+- `app::book_structural_op::tests::book_structure_snapshot_keeps_items_caches_and_saved_shift_through_mapping_and_delete`
+- `app::book_structural_op::tests::book_structure_unreloaded_main_extraction_keeps_page_caches`
+
+既存 `book_structure_moves_rating_ledger_and_invalidates_parked_context_caches` は、v4 に合わせて
+`book_structure_moves_rating_ledger_and_preserves_independent_reader_caches` へ改名し、main の失効と別窓保持を検査する。
+registry の root 改名・FS resource 保持回帰も削除した helper から実際の book adoption 入口へ更新した。

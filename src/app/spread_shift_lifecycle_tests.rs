@@ -176,3 +176,139 @@ fn single_page_hard_purge_retains_parent_book_shift() {
     assert_eq!(read(&service, &root), Some(anchor));
     owner.shutdown_and_join();
 }
+
+#[test]
+fn book_transfer_completion_clears_departed_composition_and_shift_before_name_reuse() {
+    use crate::book_composition::{
+        BookComposition, BookCompositionService, CompositionPageRef, PageDomain, PageOverride,
+        PageOverrideEntry, ReadingDirection,
+    };
+
+    let mut app = setup_app();
+    let books = app.tmp.path().join("books");
+    let source = books.join("Source");
+    let destination = books.join("Destination");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&destination).unwrap();
+    let first = source.join("0001_same.jpg");
+    let second = source.join("0002_same.jpg");
+    std::fs::write(&first, b"first page").unwrap();
+    std::fs::write(&second, b"second page").unwrap();
+    std::fs::write(destination.join("0001_existing.jpg"), b"destination page").unwrap();
+    let data = app.tmp.path().join("book-transfer-data");
+    let (shift, shift_owner) = SpreadShiftService::spawn_at(data.clone(), None).unwrap();
+    let (composition, composition_owner) =
+        BookCompositionService::spawn_at(data.clone(), None).unwrap();
+    let page = |name: &str| CompositionPageRef::RelativePath { path: name.into() };
+    let mut source_composition = BookComposition::new(
+        ReadingDirection::Rtl,
+        vec![page("0001_same.jpg"), page("0002_same.jpg")],
+    );
+    source_composition.cover_enabled = true;
+    source_composition.hidden_pages = vec![page("0001_same.jpg")];
+    source_composition.page_overrides = vec![PageOverrideEntry {
+        page: page("0001_same.jpg"),
+        directive: PageOverride::Alone,
+    }];
+    let mut destination_composition =
+        BookComposition::new(ReadingDirection::Ltr, vec![page("0001_existing.jpg")]);
+    destination_composition.page_overrides = vec![PageOverrideEntry {
+        page: page("0001_existing.jpg"),
+        directive: PageOverride::Alone,
+    }];
+    for (root, value, anchor) in [
+        (&source, source_composition, "0001_same.jpg"),
+        (&destination, destination_composition, "0001_existing.jpg"),
+    ] {
+        let scope = BookScopeKey::folder(root).unwrap();
+        let saved = composition
+            .save(scope.clone(), PageDomain::ImageFolder, value)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(saved.status.is_ok(), "{:?}", saved.status);
+        shift
+            .set_shift(
+                scope,
+                SpreadShiftPageRef::RelativePath(anchor.into()),
+                operation(),
+            )
+            .unwrap();
+        assert_eq!(
+            read(&shift, root),
+            Some(SpreadShiftPageRef::RelativePath(anchor.into()))
+        );
+    }
+    let prepare = |root: &Path| {
+        composition
+            .prepare(BookScopeKey::folder(root).unwrap(), PageDomain::ImageFolder)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .status
+            .unwrap()
+            .unwrap()
+    };
+    let before_source = prepare(&source);
+    let before_destination = prepare(&destination);
+    let before_destination_shift = read(&shift, &destination);
+    app.spread_shift_service = Some(shift.clone());
+    app.book_composition_service = Some(composition.clone());
+    app.rename_migration_data_dir_override = Some(data.clone());
+
+    // Use the actual filesystem worker result, including its final composed map:
+    // the second image takes the departed first image's exact path.
+    let completed = crate::books::transfer_pages_between_books_at(
+        &data,
+        books,
+        source.clone(),
+        vec![first.clone(), second.clone()],
+        vec![first.clone()],
+        "Destination".into(),
+        crate::books::BookTransferKind::Move,
+    )
+    .unwrap();
+    let crate::books::BookOpResult::Transfer(summary) = &completed else {
+        panic!("expected transfer result");
+    };
+    assert!(
+        summary.metadata.errors.is_empty(),
+        "{:?}",
+        summary.metadata.errors
+    );
+    assert_eq!(summary.source_entries.len(), 1);
+    assert_eq!(summary.source_entries[0].path, first);
+    assert_eq!(std::fs::read(&first).unwrap(), b"second page");
+    assert!(!second.exists());
+    assert_eq!(
+        std::fs::read(destination.join("0002_same.jpg")).unwrap(),
+        b"first page"
+    );
+    // The worker does not directly edit service-owned rows. Completion adoption
+    // must enqueue each service's book-specific request with the complete map.
+    assert_eq!(prepare(&source), before_source);
+    assert_eq!(
+        read(&shift, &source),
+        Some(SpreadShiftPageRef::RelativePath("0001_same.jpg".into()))
+    );
+    let (tx, rx) = mpsc::channel();
+    tx.send(Ok(completed)).unwrap();
+    app.book_structural_op = Some(BookStructuralOp::running_for_test(
+        rx,
+        BookOpIntent::SourceMutation,
+        Completion::ReorderTransfer,
+    ));
+    app.poll_book_structural_op(&egui::Context::default());
+    assert!(app.book_structural_op.is_none());
+    let adopted = prepare(&source).composition;
+    assert_eq!(adopted.page_order, vec![page("0001_same.jpg")]);
+    assert!(adopted.hidden_pages.is_empty());
+    assert!(adopted.page_overrides.is_empty());
+    assert!(adopted.cover_enabled);
+    assert_eq!(adopted.direction, ReadingDirection::Rtl);
+    assert_eq!(read(&shift, &source), None);
+    assert_eq!(prepare(&destination), before_destination);
+    assert_eq!(read(&shift, &destination), before_destination_shift);
+    assert!(shift.drain_errors().is_empty());
+    assert!(composition.drain_errors().is_empty());
+    composition_owner.shutdown_and_join();
+    shift_owner.shutdown_and_join();
+}

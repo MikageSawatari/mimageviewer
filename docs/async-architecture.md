@@ -370,13 +370,17 @@ root migrationは相対payload表記を維持する。汎用改名はdestination
 要求の`PathMigrationCollision::SourceWins`により移行元優先とする（§1.272、下記）。
 ページ一枚の削除では親scopeを消さない。
 
-## 本の構造操作と path キーの移行（§1.272/§1.273、2026-10-21、統合検証中）
+## 本の構造操作と path キーの移行（§1.272/§1.273、2026-10-21、関連自動検証済み）
 
 `app/book_structural_op::BookStructuralOp` が並べ替えの保存・別本転送・本の改名/削除の
 Requested/Runningと終端採用を所有する。待機中は UI frame で producer の静止を確認し、
 受理済みの完了から続く保存・記録は通常経路で完了させる。新規入力の拒否と Remote lease は
 受付側に置き、保存関数へ拒否条件を追加しない。producer 列挙と最終的な受付境界の記録は
 [本のキー移行計画 §8](book-key-migration-plan.md#8-実装記録) を正本とする。
+
+本のページ移動で scope 外へ出た構成参照・見開き基点は、本操作専用の service 要求が各 transaction 内で外す。
+汎用移動の Missing 保持とは要求で区別する。完了時の表示 cache 更新は既存 reload の対象 main に限り、
+独立別窓・Snapshot の items / cache / accepted shift は保持する。reader の再構築経路は追加しない（同計画 §3.10）。
 
 既存の製本 worker が FS 確定後に EPUB 範囲 → shift → composition の保守 lease を取り、
 `rename_key_migration::migrate_book_paths_at` を呼ぶ。`STORES` の `book_policy` が
