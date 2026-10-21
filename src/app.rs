@@ -8938,6 +8938,9 @@ struct PdfRerenderIdentity {
 pub(crate) struct FsPendingValue {
     #[cfg(test)]
     pub(crate) cancel: Arc<AtomicBool>,
+    // An intercepted PDF worker has no permit; retire its scheduler record with pending.
+    #[cfg(test)]
+    probe_completion: Option<crate::fs_page_load_scheduler::FsPageLoadPermit>,
     ticket: FsPageLoadTicket,
     pub(crate) rx: mpsc::Receiver<FsLoadResult>,
     pub(crate) load_seq: u64,
@@ -8956,6 +8959,8 @@ impl FsPendingValue {
         Self {
             #[cfg(test)]
             cancel: ticket.cancel_token(),
+            #[cfg(test)]
+            probe_completion: None,
             ticket,
             rx,
             load_seq,
@@ -77520,6 +77525,9 @@ impl App {
         if PDF_RERENDER_REQUEST_PROBE.with(|probe| {
             let mut probe = probe.borrow_mut();
             if let Some(probe) = probe.as_mut() {
+                let pending = self.fs_pending.get_mut(&idx).unwrap();
+                pending.probe_completion =
+                    Some(pending.ticket.completion_without_worker_for_test());
                 probe.requests.push((idx, target_px));
                 probe.workers.push((idx, fs_tx.clone()));
                 true

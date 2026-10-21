@@ -57770,6 +57770,73 @@ mod pipeline_cache_refactor_tests {
         idx
     }
 
+    fn assert_pdf_rerender_probe_completion_releases_scheduler(via_poll: bool) {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = seed_pdf_resolution_static(
+            &mut app,
+            &ctx,
+            [786, 1179],
+            crate::pdf_loader::PdfPageContentType::Vector,
+        );
+        let probe = PdfRerenderRequestProbe::start();
+        app.ensure_pdf_display_resolution(idx, None);
+        let cancel = Arc::clone(&app.fs_pending.get(&idx).unwrap().cancel);
+        assert_eq!(app.fs_page_load_scheduler.stats().waiting, 1);
+        let result = FsLoadResult::StaticPdf {
+            ci: egui::ColorImage::filled([120, 180], egui::Color32::WHITE),
+            source_dims: [120, 180],
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 400.0,
+                height: 600.0,
+            },
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+        };
+        if via_poll {
+            probe.send_pending(idx, result);
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        } else {
+            let generation = app.items_generation;
+            assert!(probe.complete(&mut app, generation, idx, result));
+        }
+        assert!(app.fs_pending.is_empty());
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.fs_page_load_scheduler.stats(),
+            crate::fs_page_load_scheduler::FsPageLoadSchedulerStats::default(),
+            "a completed probe must leave no scheduler request behind"
+        );
+        // Check real admission at both priorities, after proving that acquire cannot block.
+        for priority in [FsPageLoadPriority::High, FsPageLoadPriority::Normal] {
+            let mut ticket = app.fs_page_load_scheduler.request(
+                app.fs_page_load_context_serial(),
+                idx,
+                priority,
+                FsPageLoadContract::Sequential,
+                None,
+                0,
+            );
+            let permit = ticket.waiter().acquire_cancellable().unwrap();
+            assert_eq!(app.fs_page_load_scheduler.stats().running, 1);
+            ticket.disarm();
+            drop(permit);
+            assert_eq!(
+                app.fs_page_load_scheduler.stats(),
+                crate::fs_page_load_scheduler::FsPageLoadSchedulerStats::default()
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_rerender_probe_complete_releases_scheduler_for_next_load() {
+        assert_pdf_rerender_probe_completion_releases_scheduler(false);
+    }
+
+    #[test]
+    fn pdf_rerender_probe_poll_releases_scheduler_for_next_load() {
+        assert_pdf_rerender_probe_completion_releases_scheduler(true);
+    }
+
     #[test]
     fn pdf_rerender_identity_is_shared_by_fit_zoom_and_absolute_demand() {
         use std::sync::atomic::Ordering;
