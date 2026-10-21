@@ -213,20 +213,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 見送り: device 上限を adapter の実上限 (DX12 で 16384) まで上げる案は、egui の `max_texture_side` (font atlas・画像 texture) も変わるため採らない。
 - 規模 / 優先度: Small / P3 (残りの overlay 分)。
 
-### 1.392 `--features test-script` のときだけ走るテストが 2 件、master で落ちている — 通常の全件実行に入っていない (2026-10-17)
-
-- 観測 (ClaudeCode が master `0af8c32d7` で `cargo nextest run -p mimageviewer --lib --features test-script -E 'test(/…/)'`、2026-10-17):
-  - `app::tests::test_script_counts_the_actual_refresh_folder_request` (`src/app/tests.rs` 2483 行付近): `reload_current_folder_preserving_override`
-    の後も `test_script_folder_load_requests` が増えない (left 1 / right 2)。RatingSort smoke が使う計数なので、smoke の判定が狂う可能性がある (未確認)。
-  - `test_script::tests::phase_3b_tray_projection_absence_is_an_environment_failure` (`src/test_script.rs` 6880 行付近): `release_check_close("after-loading")`
-    の結果が EnvironmentFailure ではなく ScriptFailure。Phase 3b の実装が進んだ後の古い期待値の可能性がある (未確認)。
-  - §1.391 の作業中に Codex も同じ 2 件の失敗を報告した (ブランチ `panorama-click-move`、単独・直列でも同じ)。
-- 背景: `scripts/test-lib-full.ps1` と `test-focused.ps1` は既定の feature で走るので、`test-script` feature のテストはどちらにも入らない。
-  いつから落ちているかは未確認。
-- 対応: 2 件の原因をそれぞれ確かめて直す (製品の計数経路の退行か、テストの期待値が古いのか)。あわせて `test-script` feature の lib テストを
-  定期的に回す入口 (test-lib-full のオプションか、リリース前の手順) を検討する。
-- 規模 / 優先度: Small / P3。
-
 ### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
 
 - 観測 (このセッションの全件実行の記録。単独で再実行するとどれも成功):
@@ -506,45 +492,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
     正本は [display-pipeline.md](display-pipeline.md)。
   - v3.8.0 の余白色は、敷き詰め中は余白が無くなるので見えなくなる。
 - 規模 / 優先度: Small〜Medium / P3 (利用者要望。閲覧の不具合より後)。
-
-### 1.259 リモート: 1ページ表示の左右入力が本体と逆になり得る — コード調査 (2026-09-20)
-
-- きっかけは「横長分割を試すとページを送るボタンが逆になる」という X 上の投稿。投稿者へは
-  確認しておらず、どの画面・設定を指すかは**未確認**。以下はコードと設計文書の読解で、
-  実行時の観測は無い。
-- 差: 本体は入力の左右反転を**表示モード**から決める (`SpreadMode::advances_right_to_left`)。
-  `Single` は読み順を持たないので、保存済みの読み方向が RTL でも → / 右半分クリック = 次。
-  Remote は**読み方向だけ**で決める (`isRtlReadingDirection(state.readingDirection)` を
-  `‹` `›` ボタン / tap zone / swipe / `ArrowLeft` `ArrowRight` の全部が読む)。`Single` では
-  本体が保存済み方向をそのまま応答し (`resolve_spread_state`)、Web の
-  `readingDirectionForSpreadMode` も Single では現在の方向を引き継ぐ。
-- 結果: Remote で「横長分割 右→左」や「見開き 右→左」を一度選んでから「1ページ表示」へ
-  戻すと、`‹` = 次のまま残る。本体で同じ本を 1ページ表示で開くと → = 次。Remote には
-  読み方向だけを切り替える操作が無く (本体の <kbd>7</kbd> 相当)、戻すには左→右系のモードを
-  経由するしかない。画面下部の送りボタンは Remote にしか無いので、投稿の表現とも合う。
-- これは偶然の差ではなく [web-remote-plan.md](web-remote-plan.md) の明示の決定
-  (「Single は保存済み方向を維持する」「RTL の横方向入力は画面上の方向を反転し…」の段落)。
-  直すときは同じ変更でその段落を改定する。
-- 方針 (利用者決定 2026-09-20): **Remote を本体に合わせる。** 入力の左右は表示モードから
-  導き、1ページ表示は保存済み方向が RTL でも反転しない。
-- 着手時に決めること:
-  - 縦持ちの表示限定 Single (`force_single_page`)。保存は RTL 見開きのまま表示だけ Single に
-    なる。本体に対応物が無い。`effective_spread_mode` ではなく `configured_spread_mode` から
-    導けば、縦持ちでも本の綴じ方向どおりに反転が続く (推奨)。
-  - シークバーの向きは別の問い。本体は `fullscreen_seek_direction` が読み方向から決め、
-    入力とは独立している。Remote の `viewerSeekState` も読み方向を読むので、**入力用の
-    述語へ一緒に付け替えない。**
-  - 左右反転の述語を Web 側にも 1 つだけ置く (本体の `advances_right_to_left` と対)。
-    `isRtlReadingDirection(state.readingDirection)` を入力の左右に使っている箇所を
-    個別に直さず、全部そこへ寄せる。応答の形は変えない見込み (Web 側で閉じる)。
-  - `‹` / `›` の `aria-label` (「前の画像」「次の画像」) は RTL で実際の動作と逆になる。
-    同じ変更で動作に合わせる。
-  - 同じ段落は RTL の swipe を「左 swipe = 次」と書くが、`app.js` は左 swipe = 前
-    (ページを指で送る向き) になっている。どちらが意図かを確かめて文書と実装を揃える。
-- 回帰: `command-core.test.mjs` に、Single + 保存済み RTL で `ArrowRight` / 右 tap / `›` = 次、
-  見開き RTL / 横長分割 右→左 は従来どおり反転、縦持ちの表示限定 Single、を追加する。
-  RTL → Single → 反転が解ける、の遷移も 1 本入れる。
-- 規模 / 優先度: Small / P2。
 
 ### 1.252 `request_repaint_after` 同型残件: UI フォントプレビューの debounce 起床再武装 — 未実装 (2026-09-19)
 
@@ -1982,22 +1929,6 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   作り直すときは、上の表を再現するところから始めると判断が早い。
 - **これは退行ではない。** リリース済みの版でもスタックへは集約していない。
 
-### 1.194 入れ子 ZIP のキャッシュヒットが、外側 ZIP の更新を検証しない (2026-09-07)
-
-- 出典: v3.6.0 リリース差分レビュー (Codex Astra) の指摘 8。
-  **レビュー自身が「v3.5.0 にも存在し、今回の退行ではない」と明記している。**
-- 症状: 内側 ZIP bytes のキー (`src/zip_loader.rs:510` 付近) は
-  **外側 path と内部 path だけ**で、mtime / サイズを持たない。キャッシュヒットの経路
-  (`src/zip_loader.rs:1113` 付近) は目次キャッシュにも到達しないため、
-  **外側 ZIP を同じ path で差し替えても、`clear_nested_cache()` が走るまで旧内容を返す。**
-- v3.6.0 で目次キャッシュ側は `(path, mtime, len)` で検証するようになった
-  (レビュー指摘 5 の修正、`436109a62`) が、**内側 bytes の identity は揃っていない**。
-  同じ修正で `clear_nested_cache()` の全消去も無くなっていないので、
-  ナビゲーションで消える現状の逃げ道は残っている。
-- 直す方向: 内側 bytes のキーも `ArchiveCacheKey` と同じ identity へ揃える。
-  そうすれば「外側を切り替えたら全部消す」に頼らずに済む。
-- 規模 / 優先度: 小 / P2 (差し替えは頻度が低いが、返る内容が古いのは静かな誤りである)。
-
 ### 1.191 X 予約投稿 — **見送り (2026-09-24 利用者の判断、再提案しない)**
 
 - **見送りの理由**: X の開発者規約 (Restricted use cases「Multiple applications」) は、ツールの利用者に
@@ -2872,43 +2803,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   通るため本項の対象外。着手時は一律のピクセル閾値を足さず、各 consumer の意味単位 (同じ
   handle / navigator / canvas / slider など) と、別 widget クリックで pair を切る owner を決める。
 - 優先度: P2。latent 誤操作の棚卸し項目で、実害報告が出た consumer から個別に再現確認する。
-
-### 2.18 リモート: サムネイルカタログが開けないだけでページ表示が失敗する — 利用者報告
-
-- 出典: 利用者報告 (2026-08-23、v3.2.0 出荷前の実機確認)。リモートで PDF を開いたとき、
-  端末に「ページ表示グループの読み込みに失敗しました。」が出た。前後ページ移動で復帰。
-- **v3.2.0 の退行ではない。** この経路は `732420e3` (2026-07-31) 由来で v3.1.3 以前から出荷済み。
-- **サーバ側ログで確定** (`%APPDATA%\mimageviewer-remote
-emote-web-log.jsonl`):
-
-  ```
-  /api/page  status=500  page.ipc_status="miv_media_internal"
-  → client: spread_load_error 「ページ表示グループの読み込みに失敗しました。」
-  ```
-
-  本体ログ (`mimageviewer.log`) の同時刻:
-
-  ```
-  [216.063s] remote_ipc: container catalog open failed: disk I/O error
-  [216.063s] media_operation operation=page source_kind=pdf outcome=error
-  ```
-
-- 機構: [container.rs:5222](../src/remote_ipc/container.rs:5222) が**ページ要求のたびに
-  `CatalogDb::open` し、失敗するとページ全体を `MediaErrorCode::Internal` で落とす**。
-  しかしこのカタログは `decode_remote_source` に渡す**キャッシュの高速化用**で、
-  ページ描画には必須ではない。**「速くするための仕組みが開けなかった」だけで表示が失敗している。**
-- 発生条件: 直前の 214.28〜214.34s に PDF サムネイル要求が十数件同時にカタログを読んでおり、
-  その混雑中に 1 回だけ SQLite が `disk I/O error` (`SQLITE_IOERR`) を返した。
-  ログ全体でこの失敗は 1 回だけ。次の要求では成功しており、利用者の「前後移動で復帰」と一致する。
-- **同時刻の `/api/page` 503 は別物**。`admission_busy` = IPC 同時実行上限 (heavy 4/4、
-  prefetch 3/3) による正常な背圧なので、500 と混同しない。
-- 直す方向: この経路でカタログを**省略可能にする** (`Option<Arc<CatalogDb>>`)。
-  開けなければログを残してキャッシュ無しで続行する。表示は遅くなるが成功する。
-  - **リトライ・待ち時間・閾値調整で吸収しない。**問題は「任意の加速機構の失敗を
-    致命的に扱っていること」であって、開けなかったこと自体ではない。
-  - 同じ形が他の remote 経路にもないか確認する (`CatalogDb::open` の `?` 伝播)。
-  - ついでに、ページ要求ごとに開き直す構造自体も見直す価値がある (§2.13 と同型)。
-- 規模 / 優先度: 小 / P2 (頻度は低いが、体験は「表示できない」なので重い)。
 
 ### 2.14 PDF のフルスクリーンが PDFium 経路を 2 本持っている
 
