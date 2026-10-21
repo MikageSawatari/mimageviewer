@@ -2556,6 +2556,24 @@ impl crate::app::App {
             pending.complete(UiWriteOutcome::Session(ownership));
             return;
         }
+        // This is request acceptance, before bookmark or any other mutation is
+        // submitted. Existing asynchronous write completions bypass this entry.
+        if self.book_structural_op.is_some()
+            && !matches!(
+                pending.request(),
+                RemoteWriteRequest::GetItemState { .. }
+                    | RemoteWriteRequest::GetAdjustmentState { .. }
+                    | RemoteWriteRequest::GetViewTrimState { .. }
+                    | RemoteWriteRequest::ListBookBookmarks { .. }
+            )
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Busy,
+                "製本処理中です",
+            )));
+            ctx.request_repaint();
+            return;
+        }
         // Include the bookmark early route in the same UndoAppend-only gate.
         // Read-only requests do not create a follow-up mutation.
         if !matches!(

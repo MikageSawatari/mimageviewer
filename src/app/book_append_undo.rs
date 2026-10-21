@@ -96,7 +96,7 @@ impl App {
                 .is_some()
     }
 
-    fn book_append_undo_writers_busy(&self) -> bool {
+    fn book_append_undo_writers_busy(&mut self) -> bool {
         self.book_op_pending.is_some()
             || self.delete_pending.is_some()
             || self.metadata_cleanup_pending.is_some()
@@ -114,9 +114,7 @@ impl App {
             || self.new_folder_pending.is_some()
             || self.composition_editor_writes_pending()
             || self.metadata_transfer_book_append_writers_busy()
-            || self.book_reorder.as_ref().is_some_and(|state| {
-                state.flush_pending.is_some() || state.transfer_pending.is_some()
-            })
+            || self.book_structural_op.is_some()
             || self.remote_session_blocks_local_control()
             || self.remote_bookmark_writes_pending()
     }
@@ -189,7 +187,7 @@ impl App {
         None
     }
 
-    fn remote_bookmark_writes_pending(&self) -> bool {
+    pub(super) fn remote_bookmark_writes_pending(&self) -> bool {
         self.remote_session_ui.has_pending_bookmark_writes()
     }
 

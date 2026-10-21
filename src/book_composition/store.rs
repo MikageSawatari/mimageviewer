@@ -357,10 +357,25 @@ pub(crate) fn remove_row_in(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn rename_book_root(
     connection: &mut Connection,
     source: &str,
     target: &str,
+) -> Result<usize, String> {
+    rename_book_root_with_collision(
+        connection,
+        source,
+        target,
+        crate::rename_key_migration::PathMigrationCollision::DestinationWins,
+    )
+}
+
+pub(crate) fn rename_book_root_with_collision(
+    connection: &mut Connection,
+    source: &str,
+    target: &str,
+    collision: crate::rename_key_migration::PathMigrationCollision,
 ) -> Result<usize, String> {
     let source_scope = BookScopeKey::new(source, "")?;
     let target_scope = BookScopeKey::new(target, "")?;
@@ -379,6 +394,13 @@ pub(crate) fn rename_book_root(
         .map_err(|error| error.to_string())?;
     let original = load_rows(&transaction)?;
     let prefix = format!("{}/", source.trim_end_matches('/'));
+    if collision == crate::rename_key_migration::PathMigrationCollision::SourceWins {
+        let target_prefix = format!("{}/", target.trim_end_matches('/'));
+        transaction.execute(
+            "DELETE FROM book_compositions WHERE book_key = ?1 OR substr(book_key, 1, length(?2)) = ?2",
+            rusqlite::params![target, target_prefix],
+        ).map_err(|error| error.to_string())?;
+    }
     let mut changed = 0;
     for (key, row) in original {
         let destination = if key == source {
@@ -398,6 +420,7 @@ pub(crate) fn rename_book_root(
     Ok(changed)
 }
 
+#[cfg(test)]
 pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result<usize, String> {
     let scope = BookScopeKey::new(root, "")?;
     if scope.storage_key() != root || !Path::new(root).is_absolute() {

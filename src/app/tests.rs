@@ -41456,6 +41456,7 @@ mod favorite_adjustment_defaults_tests {
         app.items.push(GridItem::Image(folder.join("p001.jpg")));
         app.items.push(GridItem::Image(page));
 
+        app.visible_indices = (0..app.items.len()).collect();
         let draft = app
             .current_book_bookmark_draft(1)
             .expect("image-only folder is a book");
@@ -41474,6 +41475,53 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn zip_bookmark_draft_counts_images_only_in_current_reading_order() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from("C:/test/book.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav(&[
+            "d1/a.jpg", "d2/b.jpg", "p1.jpg", "p2.jpg", "p3.jpg",
+        ]));
+        app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
+        let idx = app
+            .items
+            .iter()
+            .position(|item| {
+                matches!(item,
+            GridItem::ZipImage { entry_name, .. } if entry_name == "p1.jpg")
+            })
+            .unwrap();
+        assert_eq!(idx, 2, "two directory rows precede the first image");
+        assert_eq!(
+            app.current_book_bookmark_draft(idx)
+                .unwrap()
+                .page_index_hint,
+            0
+        );
+    }
+
+    #[test]
+    fn pdf_bookmark_draft_keeps_zero_based_reading_position() {
+        let mut app = setup_app();
+        let pdf = PathBuf::from("C:/test/book.pdf");
+        app.current_folder = Some(pdf.clone());
+        app.items = (0..3)
+            .map(|page_num| GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        app.visible_indices = vec![0, 1, 2];
+        let draft = app.current_book_bookmark_draft(1).unwrap();
+        assert_eq!(draft.page_index_hint, 1);
+        assert_eq!(
+            draft.page_identity,
+            crate::book_bookmarks::PageIdentity::PdfPage(1)
+        );
+    }
+
+    #[test]
     fn converted_archive_bookmark_keeps_original_container_and_full_entry() {
         use crate::book_bookmarks::{BookContainerKind, PageIdentity};
 
@@ -41487,6 +41535,7 @@ mod favorite_adjustment_defaults_tests {
             entry_name: "chapter/inner.cbz/p010.jpg".to_string(),
         });
 
+        app.visible_indices = (0..app.items.len()).collect();
         let draft = app
             .current_book_bookmark_draft(0)
             .expect("converted archive page is bookmarkable");
@@ -41778,7 +41827,9 @@ mod favorite_adjustment_defaults_tests {
             .unwrap()
             .snapshot;
 
-        let result = crate::books::rename_book(&books_root, "Old", "New").unwrap();
+        let result =
+            crate::books::rename_book_at(&temp.path().join("data"), &books_root, "Old", "New")
+                .unwrap();
         let crate::books::BookOpResult::Renamed {
             source_folder,
             target_folder,
@@ -41954,26 +42005,21 @@ mod favorite_adjustment_defaults_tests {
         app.start_book_rename(&ctx, "Before".into(), "After".into());
         app.start_book_delete(&ctx, "Before".into());
         assert!(app.book_op_pending.is_none());
+        assert!(app.book_structural_op.is_none());
         let book_folder = app.tmp.path().to_path_buf();
-        assert!(
-            app.start_book_reorder_flush(&ctx, book_folder.clone(), vec![old.clone()])
-                .is_none()
-        );
+        assert!(!app.start_book_reorder_flush(&ctx, book_folder.clone(), vec![old.clone()]));
         for kind in [
             crate::books::BookTransferKind::Move,
             crate::books::BookTransferKind::Copy,
         ] {
-            assert!(
-                app.start_book_transfer(
-                    &ctx,
-                    book_folder.clone(),
-                    vec![old.clone()],
-                    vec![old.clone()],
-                    "Other".into(),
-                    kind,
-                )
-                .is_none()
-            );
+            assert!(!app.start_book_transfer(
+                &ctx,
+                book_folder.clone(),
+                vec![old.clone()],
+                vec![old.clone()],
+                "Other".into(),
+                kind,
+            ));
         }
         app.resolve_collection_migration_for_exit();
         assert_eq!(std::fs::read(&journal).unwrap(), old_bytes);
@@ -42713,18 +42759,22 @@ mod favorite_adjustment_defaults_tests {
             false,
         );
         app.rename_migration_queue.push_back(job);
-        let result = crate::books::delete_book(&actual_root, "Book").unwrap();
+        let result = crate::books::delete_book_at(&data_dir, &actual_root, "Book").unwrap();
         app.settings.book_root = Some(app.tmp.path().join("changed-books-setting"));
         let (tx, rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: actual_book.clone(),
-            },
-        });
+        app.book_structural_op = Some(
+            super::book_structural_op::BookStructuralOp::running_for_test(
+                rx,
+                crate::books::BookOpIntent::Delete {
+                    path: actual_book.clone(),
+                },
+                super::book_structural_op::Completion::Manager,
+            ),
+        );
         tx.send(Ok(result)).unwrap();
 
-        app.poll_book_op_pending(&ctx);
+        app.poll_book_structural_op(&ctx);
+        assert!(app.book_structural_op.is_none());
         assert!(!app.rename_migration_queue[0].generic_pending);
         app.flush_rename_migration_journal().unwrap();
         assert!(!crate::rename_key_migration::journal_load(&data_dir).unwrap()[0].generic_pending);
@@ -42759,17 +42809,6 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.rename_migration_in_flight.is_none());
         app.delete_pending = None;
 
-        let (_book_tx, book_rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx: book_rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: PathBuf::from("new"),
-            },
-        });
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
-        app.book_op_pending = None;
-
         let root = app.tmp.path().join("books");
         let folder = root.join("Book");
         app.settings.book_root = Some(root);
@@ -42777,23 +42816,29 @@ mod favorite_adjustment_defaults_tests {
         app.items
             .push(crate::grid_item::GridItem::Image(folder.join("0001.jpg")));
         app.open_book_reorder_from_current();
-        let (_reorder_tx, reorder_rx) = std::sync::mpsc::channel();
-        app.book_reorder.as_mut().unwrap().flush_pending = Some(crate::books::BookOpPending {
-            rx: reorder_rx,
-            intent: crate::books::BookOpIntent::SourceMutation,
-        });
-        assert!(app.rename_migration_source_changes_pending());
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
-        app.book_reorder.as_mut().unwrap().flush_pending = None;
-        let (_transfer_tx, transfer_rx) = std::sync::mpsc::channel();
-        app.book_reorder.as_mut().unwrap().transfer_pending = Some(crate::books::BookOpPending {
-            rx: transfer_rx,
-            intent: crate::books::BookOpIntent::SourceMutation,
-        });
-        assert!(app.rename_migration_source_changes_pending());
-        app.try_start_next_rename_migration();
-        assert!(app.rename_migration_in_flight.is_none());
+        for completion in [
+            super::book_structural_op::Completion::Manager,
+            super::book_structural_op::Completion::ReorderFlush,
+            super::book_structural_op::Completion::ReorderTransfer,
+        ] {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let intent = if matches!(completion, super::book_structural_op::Completion::Manager) {
+                crate::books::BookOpIntent::Delete {
+                    path: PathBuf::from("new"),
+                }
+            } else {
+                crate::books::BookOpIntent::SourceMutation
+            };
+            app.book_structural_op = Some(
+                super::book_structural_op::BookStructuralOp::running_for_test(
+                    rx, intent, completion,
+                ),
+            );
+            assert!(app.rename_migration_source_changes_pending());
+            app.try_start_next_rename_migration();
+            assert!(app.rename_migration_in_flight.is_none());
+            app.book_structural_op = None;
+        }
     }
 
     #[test]

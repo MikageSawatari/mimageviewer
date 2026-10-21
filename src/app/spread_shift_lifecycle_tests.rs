@@ -1,7 +1,11 @@
-use super::{ViewerContextId, tests::phase_c_support::setup_app};
+use super::{
+    ViewerContextId,
+    book_structural_op::{BookStructuralOp, Completion},
+    tests::phase_c_support::setup_app,
+};
 use crate::{
     book_scope::BookScopeKey,
-    books::{BookOpIntent, BookOpPending},
+    books::BookOpIntent,
     spread_shift::{ShiftOperation, SpreadShiftPageRef, SpreadShiftService},
 };
 use std::{path::Path, sync::mpsc, time::Duration};
@@ -46,18 +50,20 @@ fn book_manager_rename_during_maintenance_lease_keeps_captured_root_and_anchor()
         .unwrap();
     assert_eq!(read(&service, &old), Some(anchor.clone()));
     app.spread_shift_service = Some(service.clone());
-    let completed = crate::books::rename_book(&books, "Old", "New").unwrap();
+    let completed = crate::books::rename_book_at(&data, &books, "Old", "New").unwrap();
     // The completion must use its captured roots, even if settings changed meanwhile.
     app.settings.book_root = Some(app.tmp.path().join("other-books"));
     let (tx, rx) = mpsc::channel();
     tx.send(Ok(completed)).unwrap();
-    app.book_op_pending = Some(BookOpPending {
+    app.book_structural_op = Some(BookStructuralOp::running_for_test(
         rx,
-        intent: BookOpIntent::SourceMutation,
-    });
+        BookOpIntent::SourceMutation,
+        Completion::Manager,
+    ));
     let lease = crate::spread_shift::maintenance_at(&data).unwrap();
     let before = service.watermarks().admitted;
-    app.poll_book_op_pending(&egui::Context::default());
+    app.poll_book_structural_op(&egui::Context::default());
+    assert!(app.book_structural_op.is_none());
     assert_eq!(service.watermarks().admitted, before + 1);
     let pending = service.read_after(BookScopeKey::folder(&new).unwrap(), before + 1);
     assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
@@ -83,7 +89,7 @@ fn book_manager_rename_during_maintenance_lease_keeps_captured_root_and_anchor()
 }
 
 #[test]
-fn book_manager_delete_during_maintenance_lease_purges_same_name_and_preserves_sibling() {
+fn book_manager_delete_worker_purges_same_name_and_adoption_preserves_sibling() {
     let mut app = setup_app();
     let books = app.tmp.path().join("books");
     let root = books.join("Deleted");
@@ -104,26 +110,36 @@ fn book_manager_delete_during_maintenance_lease_purges_same_name_and_preserves_s
     }
     assert_eq!(read(&service, &root), Some(anchor.clone()));
     app.spread_shift_service = Some(service.clone());
-    let completed = crate::books::delete_book(&books, "Deleted").unwrap();
+    let completed = crate::books::delete_book_at(&data, &books, "Deleted").unwrap();
+    // The filesystem worker owns the purge. Releasing its maintenance lease
+    // has already refreshed the service snapshot before UI adoption starts.
+    assert_eq!(read(&service, &root), None);
+    assert_eq!(read(&service, &sibling), Some(anchor.clone()));
     app.settings.book_root = Some(app.tmp.path().join("other-books"));
     let (tx, rx) = mpsc::channel();
     tx.send(Ok(completed)).unwrap();
-    app.book_op_pending = Some(BookOpPending {
+    app.book_structural_op = Some(BookStructuralOp::running_for_test(
         rx,
-        intent: BookOpIntent::Delete { path: root.clone() },
-    });
+        BookOpIntent::Delete { path: root.clone() },
+        Completion::Manager,
+    ));
     let lease = crate::spread_shift::maintenance_at(&data).unwrap();
     let before = service.watermarks().admitted;
-    app.poll_book_op_pending(&egui::Context::default());
-    assert_eq!(service.watermarks().admitted, before + 1);
+    app.poll_book_structural_op(&egui::Context::default());
+    assert!(app.book_structural_op.is_none());
+    assert_eq!(
+        service.watermarks().admitted,
+        before,
+        "UI adoption must not purge twice"
+    );
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("Page.JPG"), b"new page").unwrap();
-    let pending = service.read_after(BookScopeKey::folder(&root).unwrap(), before + 1);
+    let pending = service.read_after(BookScopeKey::folder(&root).unwrap(), before);
     assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
     drop(lease);
     let adopted = pending.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(adopted.status.is_ok());
-    assert_eq!(adopted.completed_through, before + 1);
+    assert_eq!(adopted.completed_through, before);
     assert_eq!(adopted.row, None);
     assert_eq!(read(&service, &sibling), Some(anchor));
     owner.shutdown_and_join();

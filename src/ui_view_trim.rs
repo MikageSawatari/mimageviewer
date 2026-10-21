@@ -1094,6 +1094,9 @@ impl App {
         pair: SpreadPair,
         action: OriginalViewTrimAction,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         self.cancel_original_material_entry_intents(None);
         let request = OriginalViewTrimRequest {
             requested_fs_idx: anchor,
@@ -1321,6 +1324,9 @@ impl App {
         editor_root_idx: usize,
         spread_pair: SpreadPair,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         self.cancel_original_material_entry_intents(None);
         let indices = match spread_pair {
             SpreadPair::Single => vec![editor_root_idx],
@@ -1415,6 +1421,9 @@ impl App {
         body_width: f32,
         body_height: f32,
     ) {
+        if self.book_structural_op.is_some() {
+            ui.disable();
+        }
         let is_spread = matches!(spread_pair, SpreadPair::Double { .. });
         let had_any_page_override = match spread_pair {
             SpreadPair::Single => self.view_trim_page_overrides.contains_key(&fs_idx),

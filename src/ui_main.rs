@@ -7849,7 +7849,7 @@ impl App {
                                     }
                                 }
                                 ui.separator();
-                                if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+                                if self.book_list_cache.is_none() && self.book_op_pending.is_none() && self.book_structural_op.is_none() {
                                     self.request_book_list_refresh();
                                 }
                                 let rows = self.book_list_cache.clone();
@@ -8800,9 +8800,7 @@ impl App {
             dirty: false,
             drag_insert_index: None,
             thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
-            flush_pending: None,
             transfer_target_book: String::new(),
-            transfer_pending: None,
             error: None,
         });
         self.book_list_cache = None;
@@ -8813,7 +8811,10 @@ impl App {
         if !self.show_book_manager {
             return;
         }
-        if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+        if self.book_list_cache.is_none()
+            && self.book_op_pending.is_none()
+            && self.book_structural_op.is_none()
+        {
             self.request_book_list_refresh();
         }
         let mut open = true;
@@ -8854,7 +8855,7 @@ impl App {
                     )
                     .labelled_by(name_label.id);
                     let name = crate::books::normalize_book_name(&self.book_manager_new_name);
-                    let can_create = !name.trim().is_empty() && self.book_op_pending.is_none();
+                    let can_create = !name.trim().is_empty() && self.book_op_pending.is_none() && self.book_structural_op.is_none();
                     if ui
                         .add_enabled(can_create, egui::Button::new("作成"))
                         .clicked()
@@ -8871,12 +8872,12 @@ impl App {
                             "操作カスタマイズの「本1〜20を開く」で使う番号です。\n名前順のため、追加・名前変更・削除で番号が変わります。",
                         );
                     if ui
-                        .add_enabled(self.book_op_pending.is_none(), egui::Button::new("更新"))
+                        .add_enabled(self.book_op_pending.is_none() && self.book_structural_op.is_none(), egui::Button::new("更新"))
                         .clicked()
                     {
                         refresh_request = true;
                     }
-                    if self.book_op_pending.is_some() {
+                    if self.book_op_pending.is_some() || self.book_structural_op.is_some() {
                         ui.label(egui::RichText::new("処理中…").weak());
                     }
                 });
@@ -8939,7 +8940,7 @@ impl App {
                                         let new_name = crate::books::normalize_book_name(input);
                                         let can_rename = !new_name.is_empty()
                                             && new_name != row.name
-                                            && self.book_op_pending.is_none();
+                                            && self.book_op_pending.is_none() && self.book_structural_op.is_none();
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
@@ -8948,7 +8949,7 @@ impl App {
                                                 }
                                                 if ui
                                                     .add_enabled(
-                                                        self.book_op_pending.is_none(),
+                                                        self.book_op_pending.is_none() && self.book_structural_op.is_none(),
                                                         egui::Button::new("削除"),
                                                     )
                                                     .clicked()
@@ -8958,7 +8959,7 @@ impl App {
                                                 }
                                                 if ui
                                                     .add_enabled(
-                                                        !active && self.book_op_pending.is_none(),
+                                                        !active && self.book_op_pending.is_none() && self.book_structural_op.is_none(),
                                                         egui::Button::new("追加先の本にする"),
                                                     )
                                                     .clicked()
@@ -9018,7 +9019,10 @@ impl App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(self.book_op_pending.is_none(), egui::Button::new("削除"))
+                            .add_enabled(
+                                self.book_op_pending.is_none() && self.book_structural_op.is_none(),
+                                egui::Button::new("削除"),
+                            )
                             .clicked()
                         {
                             confirmed = true;
@@ -9073,176 +9077,9 @@ impl App {
     }
 
     pub(crate) fn draw_book_reorder(&mut self, ctx: &egui::Context) {
-        enum CompletedBookReorderOp {
-            Flush(Result<crate::books::BookOpResult, String>),
-            Transfer(Result<crate::books::BookOpResult, String>),
-        }
-
-        let mut completed: Option<CompletedBookReorderOp> = None;
-        if let Some(state) = self.book_reorder.as_mut() {
-            if let Some(pending) = state.flush_pending.as_ref() {
-                match pending.rx.try_recv() {
-                    Ok(result) => completed = Some(CompletedBookReorderOp::Flush(result)),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        completed = Some(CompletedBookReorderOp::Flush(Err(
-                            "並べ替え保存が中断されました".to_string(),
-                        )));
-                    }
-                }
-            }
-            if completed.is_none()
-                && let Some(pending) = state.transfer_pending.as_ref()
-            {
-                match pending.rx.try_recv() {
-                    Ok(result) => completed = Some(CompletedBookReorderOp::Transfer(result)),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        completed = Some(CompletedBookReorderOp::Transfer(Err(
-                            "ページ転送が中断されました".to_string(),
-                        )));
-                    }
-                }
-            }
-        } else {
+        if self.book_reorder.is_none() {
             return;
         }
-        if let Some(result) = completed {
-            match result {
-                CompletedBookReorderOp::Flush(result) => {
-                    if let Some(state) = self.book_reorder.as_mut() {
-                        state.flush_pending = None;
-                    }
-                    match result {
-                        Ok(crate::books::BookOpResult::Reordered {
-                            folder,
-                            count,
-                            edit_moves,
-                            bookmark_migration_journal_id,
-                        }) => {
-                            self.apply_book_page_edit_moves_with_journal(
-                                &edit_moves,
-                                bookmark_migration_journal_id.as_deref(),
-                                None,
-                            );
-                            self.book_reorder = None;
-                            if self.current_folder.as_ref().is_some_and(|current| {
-                                crate::folder_tree::path_eq(current, &folder)
-                            }) {
-                                self.pending_reload = true;
-                            }
-                            self.show_feedback_toast(format!(
-                                "ページ順を保存しました: {count} ページ"
-                            ));
-                            return;
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            if let Some(state) = self.book_reorder.as_ref() {
-                                crate::logger::log(format!(
-                                    "book reorder flush failed for {}: {err}",
-                                    state.folder.display()
-                                ));
-                            }
-                            if let Some(state) = self.book_reorder.as_mut() {
-                                state.error = Some(err.clone());
-                            }
-                            self.show_feedback_error(format!(
-                                "ページ順の保存に失敗しました: {err}"
-                            ));
-                            ctx.request_repaint();
-                            return;
-                        }
-                    }
-                }
-                CompletedBookReorderOp::Transfer(result) => {
-                    if let Some(state) = self.book_reorder.as_mut() {
-                        state.transfer_pending = None;
-                    }
-                    match result {
-                        Ok(crate::books::BookOpResult::Transfer(summary)) => {
-                            self.apply_book_page_edit_moves_with_journal(
-                                &summary.edit_moves,
-                                summary.bookmark_migration_journal_id.as_deref(),
-                                None,
-                            );
-                            self.apply_book_page_edit_copies(&summary.edit_copies);
-                            self.book_list_cache = None;
-                            if self.current_folder.as_ref().is_some_and(|current| {
-                                crate::folder_tree::path_eq(current, &summary.source_folder)
-                                    || crate::folder_tree::path_eq(current, &summary.target_folder)
-                            }) {
-                                self.pending_reload = true;
-                            }
-                            let verb = match summary.kind {
-                                crate::books::BookTransferKind::Copy => "コピー",
-                                crate::books::BookTransferKind::Move => "移動",
-                            };
-                            let toast = format!(
-                                "「{}」へ {} ページ{}しました",
-                                summary.target_book_name, summary.pages, verb
-                            );
-                            let mut close_empty_reorder = false;
-                            if let Some(state) = self.book_reorder.as_mut() {
-                                state.entries = summary.source_entries;
-                                state.dirty = false;
-                                state.dragging = None;
-                                state.drag_auto_scroll_enabled = false;
-                                state.drag_insert_index = None;
-                                state.thumb_textures.clear();
-                                state.thumb_failed.clear();
-                                state.thumb_pending_keys.clear();
-                                state.thumb_upload_backlog.clear();
-                                state.thumb_tx = None;
-                                state.thumb_rx = None;
-                                state.selected_keys.clear();
-                                if state.entries.is_empty() {
-                                    close_empty_reorder = true;
-                                } else {
-                                    let index = state
-                                        .selected
-                                        .unwrap_or(0)
-                                        .min(state.entries.len().saturating_sub(1));
-                                    book_reorder_select_single(state, index);
-                                }
-                            }
-                            if close_empty_reorder {
-                                self.book_reorder = None;
-                            }
-                            self.show_feedback_toast(toast);
-                            ctx.request_repaint();
-                            return;
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            let mut reload_current = false;
-                            if let Some(state) = self.book_reorder.as_ref() {
-                                reload_current =
-                                    self.current_folder.as_ref().is_some_and(|current| {
-                                        crate::folder_tree::path_eq(current, &state.folder)
-                                    });
-                                crate::logger::log(format!(
-                                    "book page transfer failed for {}: {err}",
-                                    state.folder.display()
-                                ));
-                            }
-                            self.book_reorder = None;
-                            if reload_current {
-                                self.pending_reload = true;
-                            }
-                            self.show_feedback_error(format!("ページ転送に失敗しました: {err}"));
-                            ctx.request_repaint();
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
         let mut thumb_results = Vec::new();
         let mut thumb_disconnected = false;
         if let Some(state) = self.book_reorder.as_ref()
@@ -9310,7 +9147,10 @@ impl App {
             ctx.request_repaint();
         }
 
-        if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+        if self.book_list_cache.is_none()
+            && self.book_op_pending.is_none()
+            && self.book_structural_op.is_none()
+        {
             self.request_book_list_refresh();
         }
         let book_rows = self.book_list_cache.clone().unwrap_or_default();
@@ -9378,7 +9218,7 @@ impl App {
             ))
             .show(ctx, |ui| {
                 let state = &mut reorder_state;
-                let busy = state.flush_pending.is_some() || state.transfer_pending.is_some();
+                let busy = self.book_structural_op.is_some();
                 ensure_book_reorder_selection(state);
                 if let Some(err) = &state.error {
                     ui.colored_label(egui::Color32::from_rgb(210, 80, 80), err);
@@ -9549,7 +9389,7 @@ impl App {
                         }
                     }
                     if busy {
-                        let label = if state.transfer_pending.is_some() {
+                        let label = if self.book_structural_op.is_some() {
                             "転送中…"
                         } else {
                             "保存中…"
@@ -9884,7 +9724,7 @@ impl App {
             && !close
             && let Some(state) = self.book_reorder.as_ref()
         {
-            let busy = state.flush_pending.is_some() || state.transfer_pending.is_some();
+            let busy = self.book_structural_op.is_some();
             if !busy {
                 if state.dirty {
                     let paths = state.entries.iter().map(|e| e.path.clone()).collect();
@@ -9969,7 +9809,7 @@ impl App {
             }
         }
         if let Some((folder, current_order, selected_paths, target_book, kind)) = transfer_request {
-            if let Some(pending) = self.start_book_transfer(
+            if self.start_book_transfer(
                 ctx,
                 folder,
                 current_order,
@@ -9978,15 +9818,13 @@ impl App {
                 kind,
             ) {
                 if let Some(state) = self.book_reorder.as_mut() {
-                    state.transfer_pending = Some(pending);
                     state.error = None;
                 }
             }
         }
         if let Some((folder, paths)) = save_request {
-            if let Some(pending) = self.start_book_reorder_flush(ctx, folder, paths) {
+            if self.start_book_reorder_flush(ctx, folder, paths) {
                 if let Some(state) = self.book_reorder.as_mut() {
-                    state.flush_pending = Some(pending);
                     state.error = None;
                 }
             }
@@ -10271,7 +10109,11 @@ impl App {
             .collect::<Vec<_>>();
         let sort_lock = self.grid_sort_lock_reason();
         let root_order = self.collection_grid_root_order().and_then(Result::ok);
-        if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+        if show_bookshelf
+            && self.book_list_cache.is_none()
+            && self.book_op_pending.is_none()
+            && self.book_structural_op.is_none()
+        {
             self.request_book_list_refresh();
         }
         let active_book_name = self.active_book_name();
@@ -22388,9 +22230,7 @@ mod book_reorder_drag_tests {
             dirty: false,
             drag_insert_index: None,
             thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
-            flush_pending: None,
             transfer_target_book: String::new(),
-            transfer_pending: None,
             error: None,
         }
     }

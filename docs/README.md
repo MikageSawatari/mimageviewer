@@ -29,6 +29,7 @@
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [ime-process-keys-plan.md](ime-process-keys-plan.md) | IME 処理済みキーの根本修正。I1 共有化、I2 の経緯・Google / MS-IME の先行実機記録、300ms grace 撤去、focus 所有、egui 本家 #7967 との整合と移植検証 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
+| [book-key-migration-plan.md](book-key-migration-plan.md) | §1.272/§1.273 本の並べ替え・移動/コピー・改名・削除と中央 DB の追従、§1.245 しおり番号の正本。設計 v3 合意、実装・統合検証中。単一の構造操作 owner、FS 前の writer 静止、STORES 方針列、移行元優先の transaction と preview ファイル配置。実装記録と未実施の検証は §8 |
 | [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。B1採択設計とB2実装・検証の正本。方向・表紙・順序・hidden・ページ指定を保存し、通常builderで組を自動生成。旧units移行なし。Remoteの制限範囲・表示許可・位置・転送・出力・editor行高の受入条件を含む。旧G履歴は保持。画像folderは対象外でStored ZIPへ変換する。次のリリース向けnext-bookで開発 |
 | [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）、実装中。画像タグのZIP本体集約、XMP評価補充、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。2026-10-12利用者決定でCollectionは元参照を保持し、型拡張・容量検査・複製を除外。同名3択と旧ON→本表示/旧OFF→両方表示は決定済み |
 | [thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md) | §1.360 サムネイル要求とCPU画像の単一owner、保存/画像両終端、request ID相関、動画のidle/repaint/進捗投影、tray両測定、回帰・検証証拠 |

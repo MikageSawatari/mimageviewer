@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -921,6 +921,7 @@ impl Drop for ContentIdentityIndexLoadPending {
 /// A worker may publish an accepted edit without borrowing the UI recorder owner.
 #[derive(Clone)]
 pub(crate) struct ContentIdentityProducer {
+    pending: Arc<AtomicUsize>,
     tx: Option<mpsc::Sender<RecordRequest>>,
 }
 
@@ -939,7 +940,9 @@ impl ContentIdentityProducer {
             trigger,
             recorded_at: unix_time_millis(),
         };
+        self.pending.fetch_add(1, Ordering::AcqRel);
         if self.tx.as_ref().is_none_or(|tx| tx.send(request).is_err()) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
             crate::logger::log(format!(
                 "content_identity: recorder unavailable for {display}"
             ));
@@ -948,6 +951,7 @@ impl ContentIdentityProducer {
 }
 
 pub(crate) struct ContentIdentityRecorder {
+    pending: Arc<AtomicUsize>,
     tx: Option<mpsc::Sender<RecordRequest>>,
     update_tx: mpsc::Sender<LedgerEntry>,
     update_rx: mpsc::Receiver<LedgerEntry>,
@@ -956,6 +960,14 @@ pub(crate) struct ContentIdentityRecorder {
 }
 
 impl ContentIdentityRecorder {
+    pub(crate) fn is_busy(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+    }
+
     #[cfg(test)]
     pub(crate) fn spawn_at_for_test(db_path: PathBuf) -> Option<Self> {
         Self::spawn_at(db_path)
@@ -979,11 +991,21 @@ impl ContentIdentityRecorder {
         let worker_update_tx = update_tx.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
         match std::thread::Builder::new()
             .name("content-identity-recorder".into())
-            .spawn(move || run_worker(&db_path, rx, worker_update_tx, worker_shutdown))
-        {
+            .spawn(move || {
+                run_worker(
+                    &db_path,
+                    rx,
+                    worker_update_tx,
+                    worker_shutdown,
+                    worker_pending,
+                )
+            }) {
             Ok(handle) => Some(Self {
+                pending,
                 tx: Some(tx),
                 update_tx,
                 update_rx,
@@ -1006,6 +1028,7 @@ impl ContentIdentityRecorder {
 
     pub(crate) fn producer(&self) -> ContentIdentityProducer {
         ContentIdentityProducer {
+            pending: Arc::clone(&self.pending),
             tx: self.tx.clone(),
         }
     }
@@ -1850,6 +1873,7 @@ fn run_worker(
     rx: mpsc::Receiver<RecordRequest>,
     update_tx: mpsc::Sender<LedgerEntry>,
     shutdown: Arc<AtomicBool>,
+    pending: Arc<AtomicUsize>,
 ) {
     let db = match ContentIdentityDb::open_at(db_path) {
         Ok(db) => db,
@@ -1870,6 +1894,7 @@ fn run_worker(
         while let Ok(request) = rx.try_recv() {
             queued.push(request);
         }
+        let completed_count = queued.len();
         let coalesced = coalesce_record_requests(queued);
         process_coalesced_requests(&coalesced, &shutdown, |request| {
             match record_source(&db, request, &shutdown) {
@@ -1885,6 +1910,7 @@ fn run_worker(
                 }
             }
         });
+        pending.fetch_sub(completed_count, Ordering::AcqRel);
     }
 }
 
@@ -2717,7 +2743,10 @@ mod tests {
         let _serial = lock_record_sequence();
         let temp = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::channel();
-        let observer = ContentIdentityProducer { tx: Some(tx) };
+        let observer = ContentIdentityProducer {
+            tx: Some(tx),
+            pending: Arc::new(AtomicUsize::new(0)),
+        };
         let (service, owner) = crate::spread_shift::SpreadShiftService::spawn_at(
             temp.path().to_path_buf(),
             Some(observer),
@@ -4663,12 +4692,36 @@ mod tests {
     }
 
     #[test]
+    fn recorder_busy_includes_cloned_producers_and_coalesced_requests() {
+        let _serial = lock_record_sequence();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        db.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let recorder = ContentIdentityRecorder::spawn_at(db_path).unwrap();
+        let producer = recorder.producer().clone();
+        let source =
+            ContentIdentitySource::new(temp.path().join("missing.png"), ContentKind::Image);
+        producer.record(source.clone(), ContentIdentityTrigger::Edit);
+        producer.record(source, ContentIdentityTrigger::Edit);
+        assert!(recorder.is_busy());
+        db.conn.execute_batch("ROLLBACK").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while recorder.is_busy() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(recorder.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn failed_recorder_submission_does_not_propagate_to_edit_caller() {
         let _serial = lock_record_sequence();
         let (tx, rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         drop(rx);
         let recorder = ContentIdentityRecorder {
+            pending: Arc::new(AtomicUsize::new(0)),
             tx: Some(tx),
             update_tx,
             update_rx,
@@ -4679,6 +4732,8 @@ mod tests {
             ContentIdentitySource::new("C:/missing/image.png", ContentKind::Image),
             ContentIdentityTrigger::Edit,
         );
+        assert!(!recorder.is_busy());
+        assert_eq!(recorder.pending.load(Ordering::Acquire), 0);
     }
 
     #[test]

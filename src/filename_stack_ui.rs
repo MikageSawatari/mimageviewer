@@ -2252,7 +2252,8 @@ impl crate::app::App {
     /// The mounted bundle and staged location owner determine whether grid items accept input.
     /// All grid input owners (key, pointer, touch, ring, gamepad, and menu) use this gate.
     pub(crate) fn grid_item_input_allowed(&self) -> bool {
-        self.image_folder_zip_operation.is_none()
+        self.book_structural_op.is_none()
+            && self.image_folder_zip_operation.is_none()
             && !self.location_navigation_pending()
             && !matches!(self.stack_return_state.as_ref(),
             Some(StackReturnState::Refreshing { view })

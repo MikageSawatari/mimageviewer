@@ -314,4 +314,295 @@ CLAUDE.md「まれな失敗は既定で割り切る」)。
 
 ## 8. 実装記録
 
-(未実施)
+### 8.1 STORES と製本 worker の移行 (2026-10-21)
+
+`src/rename_key_migration.rs` の `StoreDescriptor` に `book_policy` と
+`copies_with_book_page` を追加した。全行の constructor で両方を指定するので、ストア追加時に
+本操作の扱いも決める。`Follow` の別表は作らず、汎用改名・内容同一性復元・削除と同じ `STORES` を使う。
+
+- `Follow`: `books::maintain_book_paths` が FS 確定後に保守 lease
+  (EPUB 範囲 → spread_shift → book_composition) を取り、
+  `migrate_book_paths_at(data_dir, moves, copies, guard)` へ渡す。新しい DB 接続・SQL は worker 上だけ。
+  全移行元の 3 面を一時キーへ退避し、移行先の 3 面を消してから戻す。移行元に行がなくても
+  移行先を空にする。値の更新・移動・コピーを descriptor ごとの一つの transaction に含める。
+  汎用改名も共通の 3 面 SQL helper を通すが、`PathMigrationCollision::DestinationWins` を維持し、
+  本操作には `SourceWins` を渡す。内容同一性の復元コピーの先勝も変えない。
+- コピーする 8 種は補正・ローカル調整・切り取り・マスク・隠蔽・注釈・★・タグ。
+  タグは `item_tags` と `tag_item_state` の 2 descriptor なので、コピー列が真の行は計 9 行。
+  それ以外の `Follow` もコピー先の 3 面を削除する。ページ mapping と一致しない本単位キーは残る。
+- 移動とコピーのある転送は、`moves` が操作前 → 最終名、`copies` が並べ替え確定名 → コピー先。
+  同じ transaction 内で移動を終えてからコピー元を読む契約にした。これにより同名ページの入れ替え後も
+  コピーする画像の情報を読める。ファイル名確定前のコピー元キーは worker API へ渡さない。
+- `ServiceOwned` の spread_shift・book_composition はこの worker API から書かない。
+  UI の完了採用から既存 FIFO へ送る。本の root 改名は `SourceWins` を要求に明示する。
+  bookmark は journal、collections は既存の参照移行を保ち、この置換規則の対象にしない。
+- `reading_history` は移動先が directory の本改名だけ exact 移行する (worker で実 FS を判定)。
+  移行先の古い行を消し、正規化 key と raw path を同時更新する。配下履歴は既存どおり対象外。
+- 本削除は FS 前から guarded purge の lease を持ち、削除成功後に同じ `STORES` を purge する。
+  purge の失敗と `store_mutations` は `BookStoreSummary` に載せて完了採用へ返す。
+  本ページの bookmark は表外のままで missing 行を残す。
+
+### 8.2 値と編集プレビューの所有
+
+`book_resume.page_identity` の Image path は操作前の mapping で一度だけ更新し、`page` は書かない。
+legacy trigger による identity 消去を避け、folder 改名では配下 prefix も付け替える。
+pin は元の `container_key/source_rel` から同じ画像の移行先を求め、同じ本なら相対名を更新する。
+別本へ出た画像を指していた pin は削除し、元名が再利用された別画像を指させない。
+`ratings.source_path` はキーの最終配置後に既存と同じ導出規則で更新する。
+
+`OwnedByEditPreview` は `edit_preview_cache::migrate_book_paths_at` が所有する。
+既存 DB を schema reset なしで開き、base/layer が元キーの自所有 hash ディレクトリ内にあることを
+既存の復元コピー用 layout 検査で確かめる。行とファイルを一時キーの hash 配置へ退避し、移行先を
+初期化してから最終キーの配置へ移す。`cached_path` と layer JSON の各 path も同じ transaction 内で更新する。
+本ページのコピーでは preview の行・自所有ファイルをコピー先から消す。
+**汎用改名の preview ファイル配置問題は今回の範囲外**。汎用改名は従来の key 移行を保つ。
+
+### 8.3 失敗・永続形式・互換
+
+FS 確定後のストア単位の失敗は report に集計し、完了採用からログ・警告通知へ返す。
+まれな失敗は既定の割り切りとし、FS の巻き戻し、ストア完了印、移行の自動再実行を足さない。
+入れ替え mapping は再実行すると情報を逆へ戻し得るため、汎用改名 journal に本の置換処理は積まない。
+
+スキーマ変更なし。新しい DB・表・列・journal phase は作っていない。
+本の改名は `PreparedBookmarkMigration` の作成時から folder 1 組の mapping を記録するので、
+現存ページだけでなく missing bookmark も通常完了・起動時復旧の対象になる。
+journal の JSON 形式は既存のままで、旧形式のページ列挙を新版で復旧するテストと、folder mapping を
+旧来の祖先照合で解けるテストを追加した。改名の hint 保持と旧処理の hint 再計算の差は §3.9 のまま。
+
+### 8.4 BookStructuralOp・producer・Remote の受付
+
+構造操作は `app/book_structural_op.rs` の `BookStructuralOp` が Requested / Running を所有する。
+管理画面の改名・削除と、並べ替え画面の保存・転送を同じ受付へ通し、旧 `flush_pending` /
+`transfer_pending` は削除した。追加の取り消しは既存 Append receipt・refresh の所有者に残す。
+UndoAppend 実行中は構造要求を拒否し、構造操作中は共通入力受付と既存 Undo の busy 判定が拒否するため、
+receipt の完了採用までを別の所有者へ移す必要はない。
+
+受付では generic 段の待機 / 実行 / boot retry、削除・purge retry・整理・メタデータ転送、
+Append / UndoAppend を含む既存 BookOp、改名・コピー・取得・変換を拒否する。
+collection-only は拒否せず既存 actor FIFO を使う。編集中の pointer / slider / 注釈 draft、
+原画取得からの操作継続 (FS pending・upload・inpaint・local materialization)、未採用の open / 列挙も
+既存操作の終了後に再要求する形にした。modal によって受理済み操作が捨てられるのを避け、
+UI に新しい同期保存の呼出を足さないためである。
+
+producer の棚卸しは次の所有者と、保存を生む結果の消費箇所を照合した。
+
+| producer / 所有者 | 静止を確認する根拠 |
+| --- | --- |
+| タグ要求・結果 (`tag_ops`) | `has_unconsumed_batch`。DB 終了だけでなく UI が結果から発行する sidecar・内容同一性記録まで通す |
+| ★の外部書込 (`rating_write_handle`) | `is_busy`。UI 同期の中央 DB 変更は入力 handler 終了時に確定している。session 台帳も mapping の snapshot から置換する |
+| XMP rating prewarm (viewer context 所有) | 既存 `viewer_context_ids` / `with_owner_viewer_context` で全 context の `TagPrewarmPending::is_busy` を確認。Requested は結果を回収し、新しい可視範囲 job の受付だけ止める |
+| ローカル調整保存 | writer の `has_unfinished_work` と App-global の未消費 `local_adjust_write_pending` |
+| LUT・segmentation | 既存 `has_page_edit_producers` / `poll_all_page_edit_producers` が mounted / parked を含める。完了から通常保存・後続記録まで通す |
+| 編集プレビュー | `has_pending_commands` が save / delete FIFO を含む |
+| 本のしおり | `book_bookmark_pending_requests` と `remote_bookmark_writes_pending`。保存要求から結果採用まで |
+| 本 resume / 閲覧履歴 | 各 writer の `is_busy`。履歴は record / prune / media progress / remove / FolderZip portal の全要求を同じ counter で追跡 |
+| 内容同一性 | recorder clone を含む `is_busy`、detection / backfill の未消費結果。新規の自動検出だけ構造 owner 中は開始しない |
+| 見開き調整 / 本の構成 | 両 service の `is_busy` と構成 editor の受理済 save ticket。構成 service が発行する recorder はその下流として最後に確認する |
+| 編集 bundle / stamp | paste / apply / bulk と stamp embed の既存 pending。新入力を止めた後も既存結果を消費する |
+| 補正・crop・mask・conceal・注釈・回転・pin | 同期 handler または上記の専用 writer から保存。新入力は共通 modal / grid / raw canvas / panel の入口で止め、保存関数には構造 owner の拒否を入れない |
+| 表示トリムの未保存値 | 全 context から既存 `PendingViewTrimTransfer` を取り、同じ構造 worker の FS 前に保存。保存完了までは元の dirty payload を保持し、FS 前の失敗では元 context に戻す |
+
+静止述語は汎用改名と構造操作で `rename_migration_writers_busy` を共有した。
+上流 service・未消費結果を先に確認し、後続の内容同一性 recorder を最後に確認する。
+UI フレームでのみ進め、待機ループ・sleep・新しい fence は追加していない。
+
+Remote は受付時に `SessionHandle::try_local_modal_lease()` を取り、完了の UI 採用まで保持する。
+取得できなければ構造要求を拒否する。Remote の取得待ちに使う既存 AI barrier の book pending 射影も
+新所有者を含めた。書込要求の共通受付にも防御を置き、既存完了処理には拒否を置かない。
+新しいしおりを作る production 経路は PC の `current_book_bookmark_draft_with_image_classification` と
+Remote の `remote_bookmark_draft` の二つで、他の `NewBookBookmark` 構築はテストである。
+PC / 別窓は前者、Remote は検証済みの自身の一覧から共用 `ui_helpers::image_reading_position` を使う。
+Remote の resume 用 raw index の意味は変えず、しおり要求の hint だけ読み順へ変換した。
+
+presence 集合は I/O の無い snapshot 置換を残した。全移行元を読む前に書き換えず、
+A↔B と移行元欠損でも worker と同じ結果にする。コピーは従来の六つの編集 presence だけ写し、
+回転のコピー先は初期化する。★ session 台帳も moves → copies の同じ規則で置換する。
+対象 context のタグ・★・rotation・page-edit・preview・pin cache を失効し、既存の非同期準備へ戻す。
+本棚の `Folder(本)` は page key を持たないため、ページの両端の親フォルダ (改名は両端の本 root) も
+pin の依存先として確認する。親棚は既存の `CurrentViewRefresh::Pins` worker に対象だけ渡し、
+本を開いていない棚や無関係な窓の page-edit・★・タグ状態は初期化しない。
+presence はソート済みの対象範囲だけ snapshot し、全キー数 × mapping 数の UI 走査を避けた。
+本の削除は worker が service maintenance lease 下で purge し、lease 解放時に再読込されるため、
+UI の `purge_book_root` の重複要求は削除した。
+
+### 8.4.1 設計担当へ返した前提の不一致 (未合意、2026-10-21)
+
+- `spread_shift` / `book_composition` は scope 外へ出たページの相対参照を旧名のまま残す。
+  同元名の別ページが詰め直しで旧名を再利用すると、anchor・hidden・override・order が別画像を指す。
+  I1 と矛盾するが、§3.4 は pin の解除だけを規定し、構成値の除去 / 移送 / missing 保持は未定義。
+  独立レビューでも確認し、この値の変更だけを保留して設計担当へ判断を求めた。
+- 別窓 / Snapshot の画素・列は既存共通 reload / Operation refresh では即時再構築されない。
+  cache だけを新 DB に合わせると旧画素と別画像の編集情報を併用し得る。
+  一方で `spread-shift-memory-plan.md` §11.6 は本の改名後の F12 旧 path / 旧 items 保持を明示し、
+  C1 も独立 reader へのその場再構築を規定しない。§3.5 の「再読込」の適用範囲と既存仕様の調整が必要。
+  detached 述語 / viewport の症状パッチや新しい live rebuild は追加せず、既存終了経路で閉じるか、
+  再読込設計を追補するかを設計担当へ確認した。
+
+この二点が未合意の間は I1〜I7 全体を満たした実装完了とは扱わない。
+
+### 8.5 検証状況
+
+2026-10-21、すべての build / test に `MSBUILDDISABLENODEREUSE=1` を指定した。
+native の並列ビルドが MSBuild で失敗したため、以後は `CARGO_BUILD_JOBS=1` も指定した。
+製品のテスト失敗とは扱っていない。
+
+- `cargo check -p mimageviewer --bin mimageviewer-core`: 成功。lib 264 件、ort 1 件の既存警告あり。
+  今回不要になった service の purge 専用入口は test-only にし、新しい未使用警告を残さない。
+  ログ: `target/book-final-check.stderr.log`。
+- `cargo nextest run -p mimageviewer --lib -E $bookFilter` (下記): 41 件すべて成功。
+  §8.5.1 の 39 名すべてが実行済みであることも JUnit と照合した (新規 37 + 改名 2)。
+  初回は service のテスト fixture の scope 不一致が 1 件あり、source / destination とも chapter に揃えた。
+  製品コードの変更は不要だった。最終ログ: `target/book-nextest.stderr.log`、
+  JUnit: `target/nextest/default/junit.xml`。
+- `scripts/test-focused.ps1 -Path <下表の13モジュールのソース>`: 600 件すべて成功、exit 0。
+  shared な `app.rs` / `app/tests.rs` を含む全件 gate の代わりではない。
+  ログ / JUnit は `target/test-focused/runs/20261021T120710865Z-3daad0d9` から
+  `20261021T121221648Z-b3237bb0` までの今回の 13 run。
+- `cargo fmt` (引数なし、workspace 全体)、`cargo fmt --check`、`git diff --check`: 成功。
+- `python scripts/check_ui_glyphs.py`: 成功 (`no dangerous glyphs found in UI strings`)。
+- `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`: 成功 (core 約 10 分 43 秒)。
+  通常 feature の core / Remote / EPUB worker をビルドし、必要 DLL の配置と PE 検査も `runtime=4 pe=3` で成功。
+  最初は既定の経路で別作業ツリーの native build を待った。active MSBuild が終了しても残留 node だけで
+  待機が続いたため、自分の待機 script だけを止め、既存の待機スキップ指定で再実行した。他作業の process は止めていない。
+  ログ: `target/book-dev-build.stdout.log` / `target/book-dev-build.stderr.log`。
+  `target/dev-runtime` の既定 profile は通常の `%APPDATA%/mimageviewer`。本体起動・実機確認・commit は行っていない。
+- `test-lib-full.ps1`: 指示どおり設計担当へ引き継ぐ。§8.4.1 の二点が未合意のため、実装完了・受入済みとはしない。
+
+実装後の独立レビュー (`gpt-6.1-sol` / `xhigh`) は合意範囲を ACCEPT、追加 P1 / P2 なし。
+上記の親担当の検証結果を参照し、重複実行していない。§8.4.1 の二点が未実装なので、
+タスク全体の完了承認は保留である。41 件と focused 600 件には重複があり、641 個の異なるテストとは数えない。
+
+| focused の選択モジュール | 成功件数 |
+| --- | ---: |
+| books | 56 |
+| rename_key_migration | 61 |
+| edit_preview_cache | 20 |
+| book_bookmarks | 28 |
+| book_composition | 69 |
+| spread_shift | 60 |
+| app::book_structural_op | 9 |
+| app::page_edit_owner_tests | 26 |
+| app::content_identity_restore | 11 |
+| app::spread_shift_lifecycle_tests | 3 |
+| remote_ipc::container | 173 |
+| content_identity | 75 |
+| reading_history_db | 9 |
+
+実行した選択式と focused の明示パス:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+$env:CARGO_BUILD_JOBS = '1'
+$bookFilter = @(
+    'test(/book_structure/)', 'test(/structural_worker/)',
+    'test(/book_store_/)', 'test(/book_follow_stores/)',
+    'test(/book_resume_identity/)', 'test(/book_history_replaces/)',
+    'test(/book_preview_/)', 'test(/bookmark_draft/)', 'test(/zip_bookmark_hint/)',
+    'test(/compiled_folder_rename/)', 'test(/folder_rename_journal/)',
+    'test(/legacy_page_rename_journal/)', 'test(/source_priority/)',
+    'test(/recorder_busy/)', 'test(/history_busy/)', 'test(/composition_busy/)',
+    'test(/book_manager_delete_worker/)', 'test(/rename_book_reports_folder_mapping/)'
+) -join ' | '
+cargo nextest run -p mimageviewer --lib -E $bookFilter
+.\scripts\test-focused.ps1 -Path @(
+    'src/books.rs', 'src/rename_key_migration.rs', 'src/edit_preview_cache.rs',
+    'src/book_bookmarks.rs', 'src/book_composition/mod.rs', 'src/spread_shift/mod.rs',
+    'src/app/book_structural_op.rs', 'src/app/page_edit_owner_tests.rs',
+    'src/app/content_identity_restore.rs', 'src/app/spread_shift_lifecycle_tests.rs',
+    'src/remote_ipc/container.rs', 'src/content_identity.rs', 'src/reading_history_db.rs'
+)
+```
+
+冒頭 §0 の実アプリ観測は設計担当 ClaudeCode の修正前記録であり、今回差分の動作確認には流用しない。
+
+### 8.5.1 新規・改名したテスト名の一覧
+
+新規 37 件と、所有者・journal の仕様更新に合わせて改名した既存 2 件。
+このほか既存テストの fixture・受付・完了採用・隔離 data-dir を更新した。
+
+`src/app/content_identity_restore.rs`
+
+- `book_structure_requested_and_running_keep_restore_prompt_and_reject_new_restore`
+
+`src/app/page_edit_owner_tests.rs`
+
+- `book_structure_keeps_accepted_lut_and_segmentation_completion_saves`
+- `book_structure_rejects_new_local_adjustment_tag_and_trim_input`
+- `book_structure_requested_waits_for_mounted_and_parked_generated_edits_to_save`
+
+`src/app/spread_shift_lifecycle_tests.rs`
+
+- `book_manager_delete_worker_purges_same_name_and_adoption_preserves_sibling`
+
+`src/app/tests.rs`
+
+- `pdf_bookmark_draft_keeps_zero_based_reading_position`
+- `zip_bookmark_draft_counts_images_only_in_current_reading_order`
+
+`src/book_bookmarks.rs`
+
+- `compiled_folder_rename_preserves_reading_hint_and_missing_identity`
+- `folder_rename_journal_recovery_preserves_missing_pages_and_reports_once`
+- `legacy_page_rename_journal_is_recovered_and_folder_mapping_matches_legacy_ancestor_lookup`
+
+`src/book_composition/store_tests.rs`
+
+- `composition_busy_includes_admitted_mutations_until_their_publication`
+- `root_rename_source_priority_replaces_destination_family_and_absent_source_clears_it`
+
+`src/books.rs`
+
+- `rename_book_reports_folder_mapping_for_missing_bookmarks`
+
+`src/content_identity.rs`
+
+- `recorder_busy_includes_cloned_producers_and_coalesced_requests`
+
+`src/edit_preview_cache.rs`
+
+- `book_preview_clears_missing_source_destinations_and_copy_files`
+- `book_preview_swap_preserves_owned_files_resave_delete_and_restore_copy`
+
+`src/reading_history_db.rs`
+
+- `history_busy_includes_queued_writes_and_folder_zip_portal`
+
+`src/remote_ipc/container.rs`
+
+- `zip_bookmark_hint_uses_verified_image_reading_order_with_subfolders`
+
+`src/rename_key_migration.rs`
+
+- `book_follow_stores_swap_all_faces_replace_stale_and_initialize_copies`
+- `book_history_replaces_stale_destination_while_generic_rename_keeps_destination`
+- `book_resume_identity_and_pin_values_follow_original_images`
+- `book_store_policies_and_copy_kinds_are_explicit`
+
+`src/spread_shift/service.rs`
+
+- `root_rename_source_priority_is_carried_through_the_fifo_request`
+
+`src/spread_shift/store.rs`
+
+- `book_root_source_priority_replaces_destination_family_even_when_source_is_absent`
+
+`src/app/book_structural_op.rs`
+
+- `book_structure_moves_rating_ledger_and_invalidates_parked_context_caches`
+- `book_structure_presence_swaps_and_clears_destinations_from_missing_sources`
+- `book_structure_refreshes_parent_shelf_pins_without_resetting_unrelated_page_state`
+- `book_structure_preserves_unsaved_trim_when_pre_fs_save_fails`
+- `book_structure_rejects_append_and_undo_owners`
+- `book_structure_rejects_generic_queue_source_delete_and_remote_lease_conflicts`
+- `book_structure_requested_waits_then_running_retains_admission_until_adoption`
+- `book_structure_waits_for_delayed_history_and_content_identity_writers`
+- `book_structure_waits_for_unconsumed_tag_result_and_its_identity_record`
+
+`src/books/structural_tests.rs`
+
+- `structural_worker_copy_reads_reordered_source_and_clears_noncopy_stores`
+- `structural_worker_delete_purges_metadata_but_preserves_missing_bookmark_on_recreation`
+- `structural_worker_move_compacts_same_named_sibling_without_stealing_metadata`
+- `structural_worker_rename_moves_folder_rows_and_journals_missing_bookmarks`
+- `structural_worker_reorder_swaps_same_named_images_with_trim_and_identity`
+- `structural_worker_reports_store_error_after_successful_filesystem_commit`

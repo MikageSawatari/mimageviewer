@@ -14,6 +14,9 @@ use crate::book_fs_journal::{
 pub const DEFAULT_BOOK_NAME: &str = "名前なし";
 pub const MAX_BOOK_PAGES: usize = 9999;
 
+#[cfg(test)]
+mod structural_tests;
+
 #[derive(Clone, Debug)]
 pub struct BookInfo {
     pub name: String,
@@ -53,6 +56,14 @@ pub enum BookTransferKind {
     Move,
 }
 
+/// Post-filesystem path-store changes performed by the same structural worker.
+/// Failures are warnings: the filesystem has already committed and is not rolled back.
+#[derive(Debug, Default)]
+pub struct BookStoreSummary {
+    pub store_mutations: crate::rename_key_migration::StoreMutationEffects,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct BookTransferSummary {
     pub source_folder: PathBuf,
@@ -66,6 +77,7 @@ pub struct BookTransferSummary {
     /// Filesystem 変更前に永続化した本ブックマーク移行 intent。
     /// UI は `edit_moves` と一緒に bookmark worker へ渡し、DB commit と同時に消去する。
     pub bookmark_migration_journal_id: Option<String>,
+    pub metadata: BookStoreSummary,
 }
 
 #[derive(Debug)]
@@ -97,17 +109,20 @@ pub enum BookOpResult {
         target_folder: PathBuf,
         edit_moves: Vec<BookPathMapping>,
         bookmark_migration_journal_id: Option<String>,
+        metadata: BookStoreSummary,
     },
     Deleted {
         name: String,
         /// Exact folder removed by this worker, independent of later settings changes.
         path: PathBuf,
+        metadata: BookStoreSummary,
     },
     Reordered {
         folder: PathBuf,
         count: usize,
         edit_moves: Vec<BookPathMapping>,
         bookmark_migration_journal_id: Option<String>,
+        metadata: BookStoreSummary,
     },
 }
 
@@ -133,6 +148,7 @@ struct PreparedBookmarkMigration {
 
 impl PreparedBookmarkMigration {
     fn prepare(
+        data_dir: &Path,
         job_id: String,
         mappings: &[BookPathMapping],
         plan: &BookFsOperationPlan,
@@ -141,8 +157,13 @@ impl PreparedBookmarkMigration {
             .iter()
             .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
             .collect::<Vec<_>>();
-        let journal = crate::book_bookmarks::prepare_path_migration(&job_id, &mappings, plan)
-            .map_err(|error| format!("本ブックマークの移行準備に失敗しました: {error}"))?;
+        let journal = crate::book_bookmarks::prepare_path_migration_writer_at(
+            &data_dir.join("book_bookmarks.db"),
+            &job_id,
+            &mappings,
+            plan,
+        )
+        .map_err(|error| format!("本ブックマークの移行準備に失敗しました: {error}"))?;
         Ok(Self {
             journal,
             discard_if_prepared: true,
@@ -780,6 +801,15 @@ pub fn create_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
 }
 
 pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOpResult, String> {
+    rename_book_at(&crate::data_dir::get(), root, old_name, new_name)
+}
+
+pub(crate) fn rename_book_at(
+    data_dir: &Path,
+    root: &Path,
+    old_name: &str,
+    new_name: &str,
+) -> Result<BookOpResult, String> {
     let old_name = normalize_book_name(old_name);
     let new_name = normalize_book_name(new_name);
     if old_name == new_name {
@@ -791,6 +821,7 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
             target_folder: folder,
             edit_moves: Vec::new(),
             bookmark_migration_journal_id: None,
+            metadata: BookStoreSummary::default(),
         });
     }
     let from = book_folder(root, &old_name);
@@ -799,23 +830,20 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     if to.exists() {
         return Err(format!("同名の本が既にあります: {new_name}"));
     }
-    let edit_moves = book_page_paths(&from)?
-        .into_iter()
-        .filter_map(|old_path| {
-            let name = old_path.file_name()?.to_owned();
-            Some(BookPathMapping {
-                from: old_path,
-                to: to.join(name),
-            })
-        })
-        .collect::<Vec<_>>();
+    // Keep missing bookmarks and folder-scoped settings in the same mapping as
+    // existing pages, including startup journal recovery.
+    let edit_moves = vec![BookPathMapping {
+        from: from.clone(),
+        to: to.clone(),
+    }];
     let job_id = crate::book_bookmarks::new_path_migration_job_id();
     let plan = BookFsOperationPlan::new(vec![BookFsStep::Rename {
         from: from.clone(),
         to: to.clone(),
     }]);
-    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
+    let metadata = maintain_book_paths(data_dir, &edit_moves, &[]);
     Ok(BookOpResult::Renamed {
         old_name,
         new_name,
@@ -823,16 +851,40 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
         target_folder: to,
         edit_moves,
         bookmark_migration_journal_id,
+        metadata,
     })
 }
 
 pub fn delete_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
+    delete_book_at(&crate::data_dir::get(), root, name)
+}
+
+pub(crate) fn delete_book_at(
+    data_dir: &Path,
+    root: &Path,
+    name: &str,
+) -> Result<BookOpResult, String> {
     let name = normalize_book_name(name);
     let path = book_folder(root, &name);
     ensure_direct_book_target(root, &path)?;
+    let scopes = [crate::delete_worker::DeleteSourceScope::Tree(path.clone())];
+    let guard = crate::rename_key_migration::acquire_delete_epub_guard(data_dir, &scopes)?;
     fs::remove_dir_all(&path)
         .map_err(|e| format!("本を削除できません: {}: {e}", path.display()))?;
-    Ok(BookOpResult::Deleted { name, path })
+    let report = crate::rename_key_migration::purge_removed_scopes_guarded_at(
+        data_dir,
+        &scopes,
+        &[],
+        &guard,
+    );
+    Ok(BookOpResult::Deleted {
+        name,
+        path,
+        metadata: BookStoreSummary {
+            store_mutations: report.store_mutations,
+            errors: report.errors,
+        },
+    })
 }
 
 pub fn append_pages(
@@ -1024,6 +1076,14 @@ fn append_pages_at_with_raw_observed(
 }
 
 pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<BookOpResult, String> {
+    flush_reorder_at(&crate::data_dir::get(), folder, ordered_paths)
+}
+
+fn flush_reorder_at(
+    data_dir: &Path,
+    folder: PathBuf,
+    ordered_paths: Vec<PathBuf>,
+) -> Result<BookOpResult, String> {
     let edit_moves = plan_reorder_paths(&folder, &ordered_paths)?;
     let job_id = crate::book_bookmarks::new_path_migration_job_id();
     let plan = BookFsOperationPlan::new(plan_reorder_filesystem_steps(
@@ -1032,18 +1092,40 @@ pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<Boo
         &job_id,
         "reorder",
     )?);
-    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
+    let metadata = maintain_book_paths(data_dir, &edit_moves, &[]);
     let count = edit_moves.len();
     Ok(BookOpResult::Reordered {
         folder,
         count,
         edit_moves,
         bookmark_migration_journal_id,
+        metadata,
     })
 }
 
 pub fn transfer_pages_between_books(
+    root: PathBuf,
+    source_folder: PathBuf,
+    current_order_paths: Vec<PathBuf>,
+    selected_paths: Vec<PathBuf>,
+    target_book_name: String,
+    kind: BookTransferKind,
+) -> Result<BookOpResult, String> {
+    transfer_pages_between_books_at(
+        &crate::data_dir::get(),
+        root,
+        source_folder,
+        current_order_paths,
+        selected_paths,
+        target_book_name,
+        kind,
+    )
+}
+
+fn transfer_pages_between_books_at(
+    data_dir: &Path,
     root: PathBuf,
     source_folder: PathBuf,
     current_order_paths: Vec<PathBuf>,
@@ -1203,8 +1285,9 @@ pub fn transfer_pages_between_books(
         )?);
     }
     let plan = BookFsOperationPlan::new(filesystem_steps);
-    let migration = PreparedBookmarkMigration::prepare(job_id, &edit_moves, &plan)?;
+    let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
+    let metadata = maintain_book_paths(data_dir, &edit_moves, &edit_copies);
 
     let source_after_paths = if kind == BookTransferKind::Move {
         compact_mappings
@@ -1236,7 +1319,52 @@ pub fn transfer_pages_between_books(
         edit_moves,
         edit_copies,
         bookmark_migration_journal_id,
+        metadata,
     }))
+}
+
+/// Called only after the journal's filesystem commit, on the structural worker.
+/// The App owner keeps page writers quiescent until this result is adopted.
+fn maintain_book_paths(
+    data_dir: &Path,
+    moves: &[BookPathMapping],
+    copies: &[BookPathMapping],
+) -> BookStoreSummary {
+    let coverage = moves
+        .iter()
+        .chain(copies)
+        .flat_map(|mapping| [&mapping.from, &mapping.to])
+        .cloned()
+        .map(crate::pdf_loader::EpubPinCoverage::PathAndDescendants)
+        .collect::<Vec<_>>();
+    if coverage.is_empty() {
+        return BookStoreSummary::default();
+    }
+    let guard = match crate::rename_key_migration::acquire_store_maintenance(data_dir, &coverage) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return BookStoreSummary {
+                errors: vec![format!("本のメタデータ移行の準備に失敗しました: {error}")],
+                ..Default::default()
+            };
+        }
+    };
+    let pairs = |mappings: &[BookPathMapping]| {
+        mappings
+            .iter()
+            .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+            .collect::<Vec<_>>()
+    };
+    let report = crate::rename_key_migration::migrate_book_paths_at(
+        data_dir,
+        &pairs(moves),
+        &pairs(copies),
+        &guard,
+    );
+    BookStoreSummary {
+        store_mutations: report.store_mutations,
+        errors: report.errors,
+    }
 }
 
 fn compose_book_path_mapping_phases(phases: &[&[BookPathMapping]]) -> Vec<BookPathMapping> {
@@ -4026,7 +4154,11 @@ mod tests {
         fs::write(&page_a, b"a").unwrap();
         fs::write(&page_b, b"b").unwrap();
 
-        let result = flush_reorder(folder.clone(), vec![page_a.clone(), page_b.clone()]);
+        let result = flush_reorder_at(
+            &tmp.path().join("data"),
+            folder.clone(),
+            vec![page_a.clone(), page_b.clone()],
+        );
 
         assert!(result.is_err());
         assert_eq!(fs::read(&conflict).unwrap(), b"conflict");
@@ -4059,7 +4191,8 @@ mod tests {
         fs::write(&b, b"b").unwrap();
         fs::write(&c, b"c").unwrap();
 
-        let result = transfer_pages_between_books(
+        let result = transfer_pages_between_books_at(
+            &tmp.path().join("data"),
             root.clone(),
             source.clone(),
             vec![c.clone(), a.clone(), b.clone()],
@@ -4117,7 +4250,8 @@ mod tests {
         fs::write(&b, b"b").unwrap();
         fs::write(&c, b"c").unwrap();
 
-        let result = transfer_pages_between_books(
+        let result = transfer_pages_between_books_at(
+            &tmp.path().join("data"),
             root,
             source.clone(),
             vec![a.clone(), b.clone(), c.clone()],
@@ -4165,7 +4299,8 @@ mod tests {
         fs::write(&b, b"b").unwrap();
         fs::write(&c, b"c").unwrap();
 
-        let result = transfer_pages_between_books(
+        let result = transfer_pages_between_books_at(
+            &tmp.path().join("data"),
             root,
             source.clone(),
             vec![c.clone(), a.clone(), b.clone()],
@@ -4234,7 +4369,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_book_reports_edit_move_mappings() {
+    fn rename_book_reports_folder_mapping_for_missing_bookmarks() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("books");
         let source = root.join("old");
@@ -4242,7 +4377,7 @@ mod tests {
         fs::write(source.join("0001_a.jpg"), b"a").unwrap();
         fs::write(source.join("0002_b.jpg"), b"b").unwrap();
 
-        let result = rename_book(&root, "old", "new").unwrap();
+        let result = rename_book_at(&tmp.path().join("data"), &root, "old", "new").unwrap();
 
         let BookOpResult::Renamed { edit_moves, .. } = result else {
             panic!("expected rename result");
@@ -4252,16 +4387,7 @@ mod tests {
                 .iter()
                 .map(|m| (m.from.clone(), m.to.clone()))
                 .collect::<Vec<_>>(),
-            vec![
-                (
-                    root.join("old").join("0001_a.jpg"),
-                    root.join("new").join("0001_a.jpg")
-                ),
-                (
-                    root.join("old").join("0002_b.jpg"),
-                    root.join("new").join("0002_b.jpg")
-                ),
-            ]
+            vec![(root.join("old"), root.join("new"))]
         );
     }
     #[test]

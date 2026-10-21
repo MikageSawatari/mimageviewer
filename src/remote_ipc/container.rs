@@ -3521,7 +3521,7 @@ impl ContainerEngine {
                         "このページは本のブックマーク対象ではありません",
                     ));
                 }
-                *page_index = validated.page_index;
+                *page_index = validated.page_number.saturating_sub(1);
                 Ok(())
             }
             RemoteWriteRequest::GetItemState {
@@ -3533,7 +3533,7 @@ impl ContainerEngine {
                 self.validate_rating_page(address, catalog_admission)?;
                 let validated =
                     self.validate_page_context(address, context_address, catalog_admission)?;
-                *page_index = validated.page_index;
+                *page_index = validated.page_number.saturating_sub(1);
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
             }
@@ -3545,7 +3545,7 @@ impl ContainerEngine {
             } => {
                 let validated =
                     self.validate_page_context(address, context_address, catalog_admission)?;
-                *page_index = validated.page_index;
+                *page_index = validated.page_number.saturating_sub(1);
                 *bookmark_supported = validated.bookmark_supported;
                 Ok(())
             }
@@ -4050,11 +4050,11 @@ impl ContainerEngine {
                     "画像フォルダ内のページが見つかりません",
                 )
             })?;
-        let page_number = items[..=index]
-            .iter()
-            .filter(|item| item.has_page_data())
-            .count();
-        let page_count = items.iter().filter(|item| item.has_page_data()).count();
+        let reader_order = (0..items.len()).collect::<Vec<_>>();
+        let image_indices = crate::ui_helpers::still_image_display_indices(&items, &reader_order);
+        let page_number = crate::ui_helpers::image_reading_position(&image_indices, index)
+            .expect("validated image is in the reading order");
+        let page_count = image_indices.len();
         validated_context(
             index,
             page_count,
@@ -4280,12 +4280,12 @@ impl ContainerEngine {
                     "ZIP 内のページが見つかりません",
                 )
             })?;
-        let image_position = items[..=index]
-            .iter()
-            .filter(|item| item.has_page_data())
-            .count()
-            .saturating_sub(1);
-        let image_count = items.iter().filter(|item| item.has_page_data()).count();
+        let reader_order = (0..items.len()).collect::<Vec<_>>();
+        let image_indices = crate::ui_helpers::still_image_display_indices(&items, &reader_order);
+        let image_position = crate::ui_helpers::image_reading_position(&image_indices, index)
+            .expect("validated ZIP image is in the reading order")
+            - 1;
+        let image_count = image_indices.len();
         validated_context(
             index,
             image_count,
@@ -17196,6 +17196,36 @@ pub(super) mod tests {
             crate::adjustment_db::normalize_path(std::path::Path::new(&address.path)),
             crate::adjustment_db::normalize_path(&pc_path)
         );
+    }
+
+    #[test]
+    fn zip_bookmark_hint_uses_verified_image_reading_order_with_subfolders() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("book.zip");
+        write_remote_ai_test_zip(
+            &zip,
+            &[
+                ("d1/a.jpg", b"a"),
+                ("d2/b.jpg", b"b"),
+                ("p1.jpg", b"1"),
+                ("p2.jpg", b"2"),
+                ("p3.jpg", b"3"),
+            ],
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let context = RemoteAddress::file(zip.to_string_lossy().into_owned());
+        let page = zip_entry_address(&context, "p1.jpg");
+        let mut request = RemoteWriteRequest::SetBookmark {
+            address: page,
+            context_address: context,
+            page_index: 999,
+            bookmarked: true,
+        };
+        engine.validate_write_request(&mut request).unwrap();
+        assert!(matches!(
+            request,
+            RemoteWriteRequest::SetBookmark { page_index: 0, .. }
+        ));
     }
 
     #[test]

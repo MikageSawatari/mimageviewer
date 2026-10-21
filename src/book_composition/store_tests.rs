@@ -893,3 +893,71 @@ fn old_unpublished_schema_is_preserved_and_service_rejects_writes_without_migrat
     owner.shutdown_and_join();
     assert_eq!(std::fs::read(temp.path().join(DB_FILE)).unwrap(), before);
 }
+
+#[test]
+fn root_rename_source_priority_replaces_destination_family_and_absent_source_clears_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let old = scope();
+    let destination = BookScopeKey::document("C:/books/new.pdf").unwrap();
+    service
+        .save(old.clone(), PageDomain::Document, book())
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    let mut stale = book();
+    stale.direction = ReadingDirection::Ltr;
+    service
+        .save(destination.clone(), PageDomain::Document, stale)
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    service
+        .rename_book_root_with_collision(
+            &old.logical_root,
+            &destination.logical_root,
+            crate::rename_key_migration::PathMigrationCollision::SourceWins,
+        )
+        .unwrap();
+    assert_eq!(
+        prepare(&service, destination.clone(), PageDomain::Document)
+            .status
+            .unwrap()
+            .unwrap()
+            .composition
+            .direction,
+        book().direction
+    );
+    service
+        .rename_book_root_with_collision(
+            &old.logical_root,
+            &destination.logical_root,
+            crate::rename_key_migration::PathMigrationCollision::SourceWins,
+        )
+        .unwrap();
+    assert!(
+        prepare(&service, destination, PageDomain::Document)
+            .status
+            .unwrap()
+            .is_none()
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn composition_busy_includes_admitted_mutations_until_their_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let (entered, release) = service.hold_worker_for_test();
+    entered.recv_timeout(Duration::from_secs(10)).unwrap();
+    let reply = service.save(scope(), PageDomain::Document, book());
+    assert!(service.is_busy());
+    release.send(()).unwrap();
+    assert!(
+        reply
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .status
+            .is_ok()
+    );
+    assert!(!service.is_busy());
+    owner.shutdown_and_join();
+}

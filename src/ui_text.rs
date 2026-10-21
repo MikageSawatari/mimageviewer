@@ -2270,6 +2270,9 @@ impl App {
     /// テキストフィールドにフォーカスがある間は egui に委ねて (= モード退場しない) 変換
     /// 確定 / キャンセルを壊さない。Ctrl+T は修飾キー付きなので IME と衝突しない。
     pub(crate) fn handle_text_keys(&mut self, ctx: &egui::Context, _fs_idx: usize) -> FsKeyAction {
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = FsKeyAction::default();
 
         if !self.ime_input_active(ctx)
@@ -2426,6 +2429,9 @@ impl App {
         transform: &DisplayedImageTransform,
         overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         if self.book_append_undo_in_progress() {
             return;
@@ -3068,7 +3074,8 @@ impl App {
         let mut preview_scale_req: Option<u32> = None;
         let initial_smart_snap_enabled = self.settings.text_smart_snap_enabled;
         let mut smart_snap_enabled = initial_smart_snap_enabled;
-        let append_undo_pending = self.book_append_undo_in_progress();
+        let append_undo_pending =
+            self.book_append_undo_in_progress() || self.book_structural_op.is_some();
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::unique("text_panel"))

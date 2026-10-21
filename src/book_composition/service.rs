@@ -111,7 +111,12 @@ enum Mutation {
     Remove,
 }
 enum MaintenanceAction {
-    Rename(String, String),
+    Rename(
+        String,
+        String,
+        crate::rename_key_migration::PathMigrationCollision,
+    ),
+    #[cfg(test)]
     Purge(String),
     Pages(Vec<(PathBuf, PathBuf)>),
 }
@@ -285,6 +290,16 @@ impl BookCompositionService {
     pub(crate) fn snapshot(&self) -> Arc<CompositionSnapshot> {
         Arc::clone(&self.shared.admission.lock().unwrap().snapshot)
     }
+    pub(crate) fn is_busy(&self) -> bool {
+        let admission = self.shared.admission.lock().unwrap();
+        !matches!(
+            admission.mode,
+            Mode::Running {
+                outstanding_mutations: 0
+            } | Mode::Closed
+        )
+    }
+
     /// A new presentation can consult this immutable snapshot only after every
     /// earlier mutation has completed. Reads retain the worker FIFO when unknown.
     /// This lock contains only admission/publication operations, never worker I/O.
@@ -494,12 +509,28 @@ impl BookCompositionService {
         self.write(scope, domain, Mutation::Remove)
     }
 
+    #[cfg(test)]
     pub(crate) fn rename_book_root(&self, source: &Path, target: &Path) -> Result<(), String> {
+        self.rename_book_root_with_collision(
+            source,
+            target,
+            crate::rename_key_migration::PathMigrationCollision::DestinationWins,
+        )
+    }
+
+    pub(crate) fn rename_book_root_with_collision(
+        &self,
+        source: &Path,
+        target: &Path,
+        collision: crate::rename_key_migration::PathMigrationCollision,
+    ) -> Result<(), String> {
         self.maintain(MaintenanceAction::Rename(
             BookScopeKey::folder(source)?.storage_key(),
             BookScopeKey::folder(target)?.storage_key(),
+            collision,
         ))
     }
+    #[cfg(test)]
     pub(crate) fn purge_book_root(&self, root: &Path) -> Result<(), String> {
         self.maintain(MaintenanceAction::Purge(
             BookScopeKey::folder(root)?.storage_key(),
@@ -936,11 +967,14 @@ fn run_worker(
                 let result = (|| {
                     state.status.clone()?;
                     match action {
-                        MaintenanceAction::Rename(source, target) => {
+                        MaintenanceAction::Rename(source, target, collision) => {
                             if let Some(connection) = connection.as_mut() {
-                                store::rename_book_root(connection, &source, &target)?;
+                                store::rename_book_root_with_collision(
+                                    connection, &source, &target, collision,
+                                )?;
                             }
                         }
+                        #[cfg(test)]
                         MaintenanceAction::Purge(root) => {
                             if let Some(connection) = connection.as_mut() {
                                 store::purge_book_root(connection, &root)?;

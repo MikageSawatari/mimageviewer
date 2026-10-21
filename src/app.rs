@@ -645,6 +645,8 @@ pub(crate) use subfolder_expansion::{
 pub(crate) mod book_append_producer_tests;
 pub(crate) mod book_append_refresh;
 mod book_append_undo;
+mod book_structural_op;
+use book_structural_op::BookStructuralOp;
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
@@ -5190,9 +5192,7 @@ pub(crate) struct BookReorderState {
     pub(crate) dirty: bool,
     pub(crate) drag_insert_index: Option<usize>,
     pub(crate) thumb_tile_px: f32,
-    pub(crate) flush_pending: Option<crate::books::BookOpPending>,
     pub(crate) transfer_target_book: String,
-    pub(crate) transfer_pending: Option<crate::books::BookOpPending>,
     pub(crate) error: Option<String>,
 }
 
@@ -16394,6 +16394,7 @@ pub struct App {
     pub(crate) capture_region_selection: Option<crate::ui_fullscreen::CaptureRegionSelection>,
     /// 製本のページ追加 / 作成 / 改名 / 削除 / 一覧更新 worker 完了待ち。
     pub(crate) book_op_pending: Option<crate::books::BookOpPending>,
+    pub(crate) book_structural_op: Option<BookStructuralOp>,
     pub(crate) book_append_undo_receipt: Option<crate::book_append_undo::BookAppendUndoReceipt>,
     pub(crate) book_append_undo_revision: u64,
     book_append_operation_sequence: u64,
@@ -20386,6 +20387,7 @@ impl App {
             capture_pending: None,
             capture_region_selection: None,
             book_op_pending: None,
+            book_structural_op: None,
             book_append_undo_receipt: None,
             book_append_undo_revision: 0,
             book_append_operation_sequence: 0,
@@ -22701,7 +22703,9 @@ impl App {
     /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
     pub(crate) fn viewer_mutation_modal_active(&self) -> bool {
-        self.image_folder_zip_operation.is_some() || self.composition_editor_modal_active()
+        self.book_structural_op.is_some()
+            || self.image_folder_zip_operation.is_some()
+            || self.composition_editor_modal_active()
     }
 
     pub(crate) fn common_modal_dialog_open(&self) -> bool {
@@ -22765,6 +22769,7 @@ impl App {
             };
         }
         first![
+            self.book_structural_op.is_some() => "book_structural_op",
             self.book_append_undo_in_progress() => "book_append_undo",
             self.image_folder_zip_operation.is_some() => "image_folder_zip",
             self.composition_editor_modal_active() => "book_composition_editor",
@@ -40031,7 +40036,8 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.book_append_undo_in_progress()
+        self.book_structural_op.is_some()
+            || self.book_append_undo_in_progress()
             || self.image_folder_zip_operation.is_some()
             || self.composition_editor_modal_active()
             || self.capture_selection_open()
@@ -48043,7 +48049,8 @@ impl App {
     /// sidecar 書込は worker 内で完結するので is_busy で足りる)。本ブックマークは
     /// 専用 service の FIFO へ旧 path の追加が残った後で rename DB を先に動かさないよう、
     /// request の結果を UI が消費し終えるまで待つ。
-    pub(crate) fn rename_migration_writers_busy(&self) -> bool {
+    pub(crate) fn rename_migration_writers_busy(&mut self) -> bool {
+        let context_busy = self.book_path_context_writers_busy();
         let book_resume_busy = self
             .book_resume_writer
             .as_ref()
@@ -48068,7 +48075,30 @@ impl App {
             .as_ref()
             .is_some_and(|handle| handle.has_unfinished_work())
             || !self.local_adjust_write_pending.is_empty();
-        tag_busy
+        context_busy
+            || self.has_page_edit_producers()
+            || self.content_identity_detection_pending.is_some()
+            || self.content_identity_backfill_pending.is_some()
+            || self
+                .reading_history_writer
+                .as_ref()
+                .is_some_and(|w| w.is_busy())
+            || self.composition_editor_writes_pending()
+            || self.remote_bookmark_writes_pending()
+            || self
+                .book_composition_service
+                .as_ref()
+                .is_some_and(|s| s.is_busy())
+            || self.stamp_embed_pending.is_some()
+            || self.tag_maintenance_rx.is_some()
+            || self.edit_bundle_apply_pending.is_some()
+            || self.edit_bundle_paste_pending.is_some()
+            || self.edit_bundle_bulk_pending.is_some()
+            || crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                .sample()
+                .active_writers
+                != 0
+            || tag_busy
             || self
                 .spread_shift_service
                 .as_ref()
@@ -48078,6 +48108,10 @@ impl App {
             || edit_preview_busy
             || local_adjust_busy
             || !self.book_bookmark_pending_requests.is_empty()
+            || self
+                .content_identity_recorder
+                .as_ref()
+                .is_some_and(|w| w.is_busy())
     }
 
     /// A delete or book path mutation may have changed the filesystem before App has consumed
@@ -48089,16 +48123,7 @@ impl App {
                 .book_op_pending
                 .as_ref()
                 .is_some_and(|pending| pending.intent.blocks_rename_migration())
-            || self.book_reorder.as_ref().is_some_and(|state| {
-                state
-                    .flush_pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.intent.blocks_rename_migration())
-                    || state
-                        .transfer_pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.intent.blocks_rename_migration())
-            })
+            || self.book_structural_op.is_some()
     }
 
     /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
@@ -48652,6 +48677,7 @@ impl App {
             return;
         }
         if !self.delete_purge_retry_needed
+            || self.book_structural_op.is_some()
             || self.delete_pending.is_some()
             || self.metadata_cleanup_pending.is_some()
             || self.rename_migration_in_flight.is_some()
@@ -49580,7 +49606,13 @@ impl App {
             container_path,
             container_kind,
             page_identity,
-            page_index_hint: self.canonical_raw_book_page(idx),
+            page_index_hint: crate::ui_helpers::image_reading_position(
+                &crate::ui_helpers::still_image_display_indices(
+                    &self.items,
+                    self.current_reader_order(),
+                ),
+                idx,
+            )? - 1,
         })
     }
 
@@ -49750,6 +49782,16 @@ impl App {
                 continue;
             }
             match event {
+                crate::book_bookmarks::BookBookmarkEvent::MigrationJournalRecovered {
+                    affected_operations,
+                } => {
+                    if affected_operations > 0 {
+                        crate::logger::log(format!(
+                            "book structural journal recovered: {affected_operations}"
+                        ));
+                        self.show_feedback_warning("前回、本の並べ替え・移動・名前変更の途中で mIV が終了しました。一部のページの補正・タグなどが正しいページに付いていない可能性があります。".into());
+                    }
+                }
                 crate::book_bookmarks::BookBookmarkEvent::Added { request_id, result } => {
                     self.book_bookmark_pending_requests.remove(&request_id);
                     match result {
@@ -51658,6 +51700,9 @@ impl App {
     }
 
     pub(crate) fn open_books_root(&mut self) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         let root = self.book_root_path();
         if let Err(err) = std::fs::create_dir_all(&root) {
             self.show_feedback_warning(format!(
@@ -51670,7 +51715,7 @@ impl App {
     }
 
     pub(crate) fn request_book_list_refresh(&mut self) {
-        if self.book_op_pending.is_some() {
+        if self.book_op_pending.is_some() || self.book_structural_op.is_some() {
             return;
         }
         let root = self.book_root_path();
@@ -51818,32 +51863,14 @@ impl App {
         ctx: &egui::Context,
         folder: PathBuf,
         ordered_paths: Vec<PathBuf>,
-    ) -> Option<crate::books::BookOpPending> {
-        if !self.admit_book_append_followup_mutation() {
-            return None;
-        }
-        if !self.admit_rename_migration_source_change(ctx) {
-            return None;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        match std::thread::Builder::new()
-            .name("book-reorder".into())
-            .spawn(move || {
-                let result = crate::books::flush_reorder(folder, ordered_paths);
-                let _ = tx.send(result);
-            }) {
-            Ok(_) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                Some(crate::books::BookOpPending {
-                    rx,
-                    intent: crate::books::BookOpIntent::SourceMutation,
-                })
-            }
-            Err(err) => {
-                self.show_feedback_warning(format!("並べ替え worker を開始できません: {err}"));
-                None
-            }
-        }
+    ) -> bool {
+        self.request_book_structural_op(
+            ctx,
+            "book-reorder",
+            crate::books::BookOpIntent::SourceMutation,
+            book_structural_op::Completion::ReorderFlush,
+            move || crate::books::flush_reorder(folder, ordered_paths),
+        )
     }
 
     pub(crate) fn start_book_transfer(
@@ -51854,61 +51881,24 @@ impl App {
         selected_paths: Vec<PathBuf>,
         target_book_name: String,
         kind: crate::books::BookTransferKind,
-    ) -> Option<crate::books::BookOpPending> {
-        if !self.admit_book_append_followup_mutation() {
-            return None;
-        }
-        if !self.admit_rename_migration_source_change(ctx) {
-            return None;
-        }
+    ) -> bool {
         let root = self.book_root_path();
-        let (tx, rx) = std::sync::mpsc::channel();
-        match std::thread::Builder::new()
-            .name("book-transfer".into())
-            .spawn(move || {
-                let result = crate::books::transfer_pages_between_books(
+        self.request_book_structural_op(
+            ctx,
+            "book-transfer",
+            crate::books::BookOpIntent::SourceMutation,
+            book_structural_op::Completion::ReorderTransfer,
+            move || {
+                crate::books::transfer_pages_between_books(
                     root,
                     source_folder,
                     current_order_paths,
                     selected_paths,
                     target_book_name,
                     kind,
-                );
-                let _ = tx.send(result);
-            }) {
-            Ok(_) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                Some(crate::books::BookOpPending {
-                    rx,
-                    intent: crate::books::BookOpIntent::SourceMutation,
-                })
-            }
-            Err(err) => {
-                self.show_feedback_warning(format!("ページ転送 worker を開始できません: {err}"));
-                None
-            }
-        }
-    }
-
-    pub(crate) fn apply_book_page_edit_copies(
-        &mut self,
-        mappings: &[crate::books::BookPathMapping],
-    ) {
-        let mappings = Self::normalized_book_page_edit_mappings(mappings);
-        if mappings.is_empty() {
-            return;
-        }
-        // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
-        self.wait_for_local_adjust_writes();
-        let mut errors = Vec::new();
-        let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let rating_write = crate::rating_db::RATING_WRITES.begin();
-        for (from, to) in mappings {
-            self.copy_book_page_edit_key(&from, &to, &mut errors);
-        }
-        drop(rating_write);
-        drop(page_edit_write);
-        self.finish_book_page_edit_mapping("copy", errors);
+                )
+            },
+        )
     }
 
     pub(crate) fn apply_book_page_semantic_copies(
@@ -51940,7 +51930,11 @@ impl App {
         if let Some(service) = &self.spread_shift_service {
             let admission = if let Some((source, target)) = collection_tree_migration {
                 // Book rename is a root operation; its relative anchors remain unchanged.
-                service.rename_book_root(source, target)
+                service.rename_book_root_with_collision(
+                    source,
+                    target,
+                    crate::rename_key_migration::PathMigrationCollision::SourceWins,
+                )
             } else {
                 let moves = mappings
                     .iter()
@@ -51959,7 +51953,11 @@ impl App {
         }
         if let Some(service) = &self.book_composition_service {
             let admission = if let Some((source, target)) = collection_tree_migration {
-                service.rename_book_root(source, target)
+                service.rename_book_root_with_collision(
+                    source,
+                    target,
+                    crate::rename_key_migration::PathMigrationCollision::SourceWins,
+                )
             } else {
                 service.migrate_page_paths(
                     mappings
@@ -51995,41 +51993,7 @@ impl App {
         let collection_mappings =
             book_collection_source_mappings(mappings, collection_tree_migration);
         self.enqueue_collection_source_migration_batch(collection_mappings);
-        let mappings = Self::normalized_book_page_edit_mappings(mappings);
-        if mappings.is_empty() {
-            return;
-        }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let temp_mappings = mappings
-            .iter()
-            .enumerate()
-            .map(|(i, (from, to))| {
-                (
-                    from.clone(),
-                    format!("__miv_book_edit_tmp__/{pid}/{stamp}/{i}"),
-                    to.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
-        self.wait_for_local_adjust_writes();
-        let mut errors = Vec::new();
-        let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let rating_write = crate::rating_db::RATING_WRITES.begin();
-        for (from, temp, _) in &temp_mappings {
-            self.move_book_page_edit_key(from, temp, &mut errors);
-        }
-        for (_, temp, to) in &temp_mappings {
-            self.move_book_page_edit_key(temp, to, &mut errors);
-        }
-        drop(rating_write);
-        drop(page_edit_write);
-        self.finish_book_page_edit_mapping("move", errors);
+        self.adopt_book_path_metadata(mappings, &[], collection_tree_migration);
     }
 
     fn migrate_book_page_bookmarks(
@@ -52067,55 +52031,6 @@ impl App {
             .collect()
     }
 
-    fn copy_book_page_edit_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
-        if let Some(db) = &self.adjustment_db {
-            match db.copy_page_params_key(from, to) {
-                Ok(()) => Self::copy_page_key_presence(&mut self.adjusted_page_keys, from, to),
-                Err(e) => errors.push(format!("adjustment: {e}")),
-            }
-        }
-        if let Some(db) = &self.local_adjust_db {
-            match db.copy_entry_key(from, to) {
-                Ok(()) => Self::copy_page_key_presence(&mut self.local_adjust_page_keys, from, to),
-                Err(e) => errors.push(format!("local_adjust: {e}")),
-            }
-        }
-        if let Some(db) = &self.export_crop_db {
-            match db.copy_entry_key(from, to) {
-                Ok(()) => Self::copy_page_key_presence(&mut self.export_crop_page_keys, from, to),
-                Err(e) => errors.push(format!("crop: {e}")),
-            }
-        }
-        if let Some(db) = &self.mask_db {
-            match db.copy_entry_key(from, to) {
-                Ok(()) => Self::copy_page_key_presence(&mut self.mask_page_keys, from, to),
-                Err(e) => errors.push(format!("erase: {e}")),
-            }
-        }
-        if let Some(db) = &self.conceal_db {
-            match db.copy_entry_key(from, to) {
-                Ok(()) => Self::copy_page_key_presence(&mut self.conceal_page_keys, from, to),
-                Err(e) => errors.push(format!("conceal: {e}")),
-            }
-        }
-        if let Some(db) = &self.comic_db {
-            match db.copy_entry_key(from, to) {
-                Ok(()) => Self::copy_page_key_presence(&mut self.comic_page_keys, from, to),
-                Err(e) => errors.push(format!("comic: {e}")),
-            }
-        }
-        if let Some(db) = &self.rating_db
-            && let Err(e) = db.copy_entry_key(from, to)
-        {
-            errors.push(format!("rating: {e}"));
-        }
-        if let Some(db) = self.tags_db.as_mut()
-            && let Err(e) = db.copy_item_key(from, to)
-        {
-            errors.push(format!("tags: {e}"));
-        }
-    }
-
     fn copy_book_page_semantic_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
         if let Some(db) = &self.rating_db
             && let Err(e) = db.copy_entry_key(from, to)
@@ -52124,55 +52039,6 @@ impl App {
         }
         if let Some(db) = self.tags_db.as_mut()
             && let Err(e) = db.copy_item_key(from, to)
-        {
-            errors.push(format!("tags: {e}"));
-        }
-    }
-
-    fn move_book_page_edit_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
-        if let Some(db) = &self.adjustment_db {
-            match db.move_page_params_key(from, to) {
-                Ok(()) => Self::move_page_key_presence(&mut self.adjusted_page_keys, from, to),
-                Err(e) => errors.push(format!("adjustment: {e}")),
-            }
-        }
-        if let Some(db) = &self.local_adjust_db {
-            match db.move_entry_key(from, to) {
-                Ok(()) => Self::move_page_key_presence(&mut self.local_adjust_page_keys, from, to),
-                Err(e) => errors.push(format!("local_adjust: {e}")),
-            }
-        }
-        if let Some(db) = &self.export_crop_db {
-            match db.move_entry_key(from, to) {
-                Ok(()) => Self::move_page_key_presence(&mut self.export_crop_page_keys, from, to),
-                Err(e) => errors.push(format!("crop: {e}")),
-            }
-        }
-        if let Some(db) = &self.mask_db {
-            match db.move_entry_key(from, to) {
-                Ok(()) => Self::move_page_key_presence(&mut self.mask_page_keys, from, to),
-                Err(e) => errors.push(format!("erase: {e}")),
-            }
-        }
-        if let Some(db) = &self.conceal_db {
-            match db.move_entry_key(from, to) {
-                Ok(()) => Self::move_page_key_presence(&mut self.conceal_page_keys, from, to),
-                Err(e) => errors.push(format!("conceal: {e}")),
-            }
-        }
-        if let Some(db) = &self.comic_db {
-            match db.move_entry_key(from, to) {
-                Ok(()) => Self::move_page_key_presence(&mut self.comic_page_keys, from, to),
-                Err(e) => errors.push(format!("comic: {e}")),
-            }
-        }
-        if let Some(db) = &self.rating_db
-            && let Err(e) = db.move_entry_key(from, to)
-        {
-            errors.push(format!("rating: {e}"));
-        }
-        if let Some(db) = self.tags_db.as_mut()
-            && let Err(e) = db.move_item_key(from, to)
         {
             errors.push(format!("tags: {e}"));
         }
@@ -52201,11 +52067,6 @@ impl App {
         ));
     }
 
-    fn finish_book_page_edit_mapping(&mut self, op: &str, errors: Vec<String>) {
-        self.clear_page_edit_state();
-        self.finish_book_page_edit_mapping_after_idx_refresh(op, errors);
-    }
-
     /// idx-keyed page edit state を caller が clear / rehydrate 済みのときに使う共通終端。
     /// content-identity restore は現在の物理フォルダを DB から rehydrate するため、
     /// clear 固定の `finish_book_page_edit_mapping` ではなくこちらへ合流する。
@@ -52213,6 +52074,10 @@ impl App {
         self.rating_cache.clear();
         self.invalidate_rating_counts_cache();
         self.clear_tags_cache();
+        self.report_book_page_edit_mapping_errors(op, errors);
+    }
+
+    fn report_book_page_edit_mapping_errors(&mut self, op: &str, errors: Vec<String>) {
         if errors.is_empty() {
             return;
         }
@@ -52242,6 +52107,21 @@ impl App {
     where
         F: FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
     {
+        if matches!(
+            intent,
+            crate::books::BookOpIntent::SourceMutation | crate::books::BookOpIntent::Delete { .. }
+        ) {
+            return self.request_book_structural_op(
+                ctx,
+                thread_name,
+                intent,
+                book_structural_op::Completion::Manager,
+                f,
+            );
+        }
+        if self.book_structural_op.is_some() {
+            return false;
+        }
         if self.book_op_pending.is_some() {
             self.show_feedback_warning("製本処理中です".to_string());
             return false;
@@ -52433,7 +52313,8 @@ impl App {
                     summary.bookmark_migration_journal_id.as_deref(),
                     None,
                 );
-                self.apply_book_page_edit_copies(&summary.edit_copies);
+                self.adopt_book_path_metadata(&[], &summary.edit_copies, None);
+                self.adopt_book_store_summary(summary.metadata);
                 self.book_list_cache = None;
                 if self.current_folder.as_ref().is_some_and(|current| {
                     crate::folder_tree::path_eq(current, &summary.source_folder)
@@ -52476,7 +52357,9 @@ impl App {
                 target_folder,
                 edit_moves,
                 bookmark_migration_journal_id,
+                metadata,
             }) => {
+                self.adopt_book_store_summary(metadata);
                 self.apply_book_page_edit_moves_with_journal(
                     &edit_moves,
                     bookmark_migration_journal_id.as_deref(),
@@ -52505,7 +52388,13 @@ impl App {
                 self.pending_reload = true;
                 self.show_feedback_toast(format!("本名を変更しました: {old_name} → {new_name}"));
             }
-            Ok(crate::books::BookOpResult::Deleted { name, path }) => {
+            Ok(crate::books::BookOpResult::Deleted {
+                name,
+                path,
+                metadata,
+            }) => {
+                self.adopt_book_store_summary(metadata);
+                self.purge_in_memory_metadata_for_removed_paths(std::slice::from_ref(&path), &[]);
                 if let crate::books::BookOpIntent::Delete { path: requested } = &intent
                     && !crate::folder_tree::path_eq(requested, &path)
                 {
@@ -52516,26 +52405,6 @@ impl App {
                     ));
                 }
                 self.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&path));
-                if let Some(service) = &self.spread_shift_service
-                    && let Err(error) = service.purge_book_root(&path)
-                {
-                    crate::logger::log(format!(
-                        "spread_shift: book purge admission failed: {error}"
-                    ));
-                    self.show_feedback_warning(format!(
-                        "削除した本の見開き調整を消去できませんでした: {error}"
-                    ));
-                }
-                if let Some(service) = &self.book_composition_service
-                    && let Err(error) = service.purge_book_root(&path)
-                {
-                    crate::logger::log(format!(
-                        "book_composition: book purge admission failed: {error}"
-                    ));
-                    self.show_feedback_warning(format!(
-                        "削除した本の構成を消去できませんでした: {error}"
-                    ));
-                }
                 if self.settings.active_book_name == name {
                     self.settings.active_book_name = crate::books::DEFAULT_BOOK_NAME.to_string();
                     self.settings.save();
@@ -52557,7 +52426,9 @@ impl App {
                 count,
                 edit_moves,
                 bookmark_migration_journal_id,
+                metadata,
             }) => {
+                self.adopt_book_store_summary(metadata);
                 self.apply_book_page_edit_moves_with_journal(
                     &edit_moves,
                     bookmark_migration_journal_id.as_deref(),
@@ -74455,6 +74326,9 @@ impl App {
     /// アイドルフレームを早期終了していたが、フィルタ変更で bbox 不変 × 内部構成変化 の
     /// ケースを取り逃す不具合があり廃止した)。
     pub(crate) fn enqueue_visible_tag_prewarms(&mut self) {
+        if self.book_structural_op.is_some() {
+            return;
+        }
         // 削除進行中は新規 XMP プリウォームを停止。削除予定パスを worker が読もうとすると
         // File::open が失敗して無駄なキャッシュ汚染や redundant log になる。
         if self.delete_pending.is_some() {
@@ -78909,7 +78783,7 @@ impl App {
             ai_upscale_pending: self.ai_upscale_pending.len(),
             retained_final_ai_orphans: self.retained_final_ai_orphans.len(),
             local_adjust_segmentation_pending: self.local_adjust_segmentation_pending.is_some(),
-            book_op_pending: self.book_op_pending.is_some(),
+            book_op_pending: self.book_op_pending.is_some() || self.book_structural_op.is_some(),
             local_ai_activity: self.local_ai_activity.load(Ordering::Acquire),
             trt_worker_starting: self
                 .ai_runtime_init
@@ -81066,16 +80940,6 @@ impl App {
     /// 積んである保存が着地するまで待ち、結果を反映する。
     ///
     /// **page key を付け替える直前に呼ぶ。**付け替えは worker を経由しないので、
-    /// 待たずに走らせると「rename が行を移した後で、古い key の保存が着地して書き戻す」
-    /// 順序が起き得る。同期保存だった頃はこの順序が構造的に起きなかった。
-    pub(crate) fn wait_for_local_adjust_writes(&mut self) {
-        let Some(handle) = self.local_adjust_write_handle.as_ref() else {
-            return;
-        };
-        let completions = handle.drain_blocking();
-        self.apply_local_adjust_write_completions(completions);
-    }
-
     /// 保存結果 1 件を UI 状態へ反映する。**R-26 の境界はここ。**
     ///
     /// - `Committed` — 正本が受理した。**worker が実際に書いた文書**を sidecar へ写す。
@@ -88371,18 +88235,6 @@ impl App {
             for key in page_keys {
                 keys.remove(key);
             }
-        }
-    }
-
-    fn copy_page_key_presence(keys: &mut std::collections::BTreeSet<String>, from: &str, to: &str) {
-        if keys.contains(from) {
-            keys.insert(to.to_owned());
-        }
-    }
-
-    fn move_page_key_presence(keys: &mut std::collections::BTreeSet<String>, from: &str, to: &str) {
-        if keys.remove(from) {
-            keys.insert(to.to_owned());
         }
     }
 

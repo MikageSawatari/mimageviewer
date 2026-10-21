@@ -101,7 +101,7 @@ impl App {
         self.reload_open_metadata_views_after_cleanup();
     }
 
-    fn metadata_cleanup_can_start(&self) -> bool {
+    fn metadata_cleanup_can_start(&mut self) -> bool {
         self.metadata_cleanup_pending.is_none()
             && self.delete_pending.is_none()
             && self.delete_purge_retry_pending.is_none()

@@ -197,10 +197,25 @@ pub(crate) fn clear_all(connection: &mut Connection) -> Result<usize, String> {
 
 /// Completed book-folder operations retain payload spelling and affect only that root family.
 /// The caller is the single shift worker, with its existing writable connection.
+#[cfg(test)]
 pub(crate) fn rename_book_root(
     connection: &mut Connection,
     source: &str,
     target: &str,
+) -> Result<usize, String> {
+    rename_book_root_with_collision(
+        connection,
+        source,
+        target,
+        crate::rename_key_migration::PathMigrationCollision::DestinationWins,
+    )
+}
+
+pub(crate) fn rename_book_root_with_collision(
+    connection: &mut Connection,
+    source: &str,
+    target: &str,
+    collision: crate::rename_key_migration::PathMigrationCollision,
 ) -> Result<usize, String> {
     validate_storage_key(source)?;
     validate_storage_key(target)?;
@@ -212,6 +227,15 @@ pub(crate) fn rename_book_root(
         .map_err(|error| error.to_string())?;
     let rows = load_rows(&transaction)?;
     let prefix = format!("{}/", source.trim_end_matches('/'));
+    if collision == crate::rename_key_migration::PathMigrationCollision::SourceWins {
+        let target_prefix = format!("{}/", target.trim_end_matches('/'));
+        transaction
+            .execute(
+                "DELETE FROM spread_shifts WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2",
+                rusqlite::params![target, target_prefix],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     let mut moved = 0;
     for (key, reference) in rows {
         let destination = if key == source {
@@ -239,6 +263,7 @@ pub(crate) fn rename_book_root(
 }
 
 /// A deleted book root clears its scopes; deleting a page does not match its parent scope.
+#[cfg(test)]
 pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result<usize, String> {
     validate_storage_key(root)?;
     let transaction = connection
@@ -419,6 +444,36 @@ mod tests {
         );
         assert_eq!(purge_book_root(&mut connection, target).unwrap(), 2);
         assert_eq!(load_rows(&connection).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn book_root_source_priority_replaces_destination_family_even_when_source_is_absent() {
+        let (_temp, mut connection) = database();
+        let source = "c:/books/source";
+        let target = "c:/books/target";
+        let old = SpreadShiftPageRef::RelativePath("source.jpg".into());
+        let stale = SpreadShiftPageRef::RelativePath("stale.jpg".into());
+        set(&mut connection, source, &old).unwrap();
+        set(&mut connection, target, &stale).unwrap();
+        set(&mut connection, &format!("{target}/orphan"), &stale).unwrap();
+        rename_book_root_with_collision(
+            &mut connection,
+            source,
+            target,
+            crate::rename_key_migration::PathMigrationCollision::SourceWins,
+        )
+        .unwrap();
+        let rows = load_rows(&connection).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[target], old);
+        rename_book_root_with_collision(
+            &mut connection,
+            source,
+            target,
+            crate::rename_key_migration::PathMigrationCollision::SourceWins,
+        )
+        .unwrap();
+        assert!(load_rows(&connection).unwrap().is_empty());
     }
 
     fn database() -> (tempfile::TempDir, Connection) {
