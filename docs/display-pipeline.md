@@ -315,15 +315,20 @@ authoring 寸法、PDF page-box のレイアウト単位を正規ページ寸法
 下地と Normal／Multiply 注釈には同一境界を適用し、crop 後の一覧寸法と生成由来を別に保持する。
 
 既存の released v6 DB は `CACHE_FORMAT_VERSION=6` を維持し、nullable な
-`source_coverage_json` と独立の `layout_dims_json` を加法 migration で追加する。
+`source_coverage_json` と独立の `layout_dims_json`、生成物への束縛を示す
+`metadata_content_hash` を加法 migration で追加する。
 この追加で既存行や WebP を削除しない。
 新生成は crop の有無にかかわらず `SourceCoverage::Known(geometry)` とし、WebP の参照と
 同じ upsert で geometry と既知の layout 寸法を保存する。content hash にも由来を含め、同じ画素内容でも
 元画像内の位置が異なる素材を区別する。旧行の NULL は `Unknown` のまま一覧で利用し、
 次の通常生成で metadata が埋まる。
-SQL NULL だけを旧行と判定する。非 NULL の coverage／layout JSON が壊れている場合や
-寸法・境界が不正な場合はログを残してその preview の load を失敗させ、旧行扱いへの読み替えや
-行・WebP の削除はしない。
+metadata は下地／注釈と geometry／layout を含む生成物の content hash に束縛し、
+`cached_path` の WebP basename に含まれる hash と照合する。旧 writer の実 UPSERT は新列を
+更新しないため、束縛が NULL／不一致なら coverage を `Unknown`、layout を `None` として
+画像自体は利用する。同寸法の上書きでも古い由来を新しい素材へ適用しない。
+hash の basename で照合するので、同一生成物の content-copy は由来を維持する。
+束縛が一致した非 NULL の coverage／layout JSON が壊れている場合や寸法・境界が不正な場合は
+ログを残してその preview の load を失敗させ、旧行扱いへの読み替えや行・WebP の削除はしない。
 
 PDF の既知 page-box 寸法は `EditPreviewData.layout_dims` として coverage と別に保存・復元する。
 保存要求は既存の page-box cache 値を渡し、通常画像と旧行は `None` のまま扱う。
@@ -714,7 +719,7 @@ letterbox canvas は別の DComp owner が現在の余白色を描き、音声�
 一覧のアスペクト比は従来どおり crop 後の `source_dims` を使う。部分編集 preview のページ構成
 （見開き・横長分割）、canonical 枠、fit／contain、Original／指定方式の基準には crop 前の
 正規寸法を供給する。`SourceCoverage::is_partial()` は実画素境界から派生させ、収録範囲が
-全体の素材（新生成 no-crop Known を含む）の従来の Original／thumbnail sizing は維持する。
+全体の素材（新生成 no-crop Known を含む）の単ページの従来 Original／thumbnail sizing は維持する。
 `poll_thumbnails` の寸法記録と Loaded を直接参照する fallback の双方でこの区別を保ち、
 texture 退去後も `PageDimsCache` に crop 後寸法を再登録しない。PDF page-box、RAW の許可 gate、
 processed の縦横比変更、指定方式の既存 A/O 基準は、それぞれの既存の意味を維持する。
@@ -725,6 +730,16 @@ processed の縦横比変更、指定方式の既存 A/O 基準は、それぞ�
 `content_bbox`／左右分割は表示要求であり、coverage は自由回転時も失われない素材の由来である。
 単ページ・見開き左右・連結読みは全画像 transform を先に解き、その全体枠へ部分素材だけを配置する。
 見開き gap や連結読みの extent を、crop 後 quad の外接矩形で縮めない。
+見開き全体の左右寸法と指定方式の基準は、両側とも `fs_page_layout_source_size`／
+`fs_fit_input_for_idx` の供給境界で選ぶ。部分素材側の正規寸法と通常 thumbnail 側の実 texel
+寸法を混ぜず、片側だけ到着した場合や保持 unit の再描画でも同じ構成を使う。
+各ページ内の通常素材の contain／物理 pixel snapping は既存の規則を維持する。
+
+部分素材の `full_source_size_vec2` は生成時 `coordinate_dims` を幾何の基準として返す。
+丸め後の texture 寸法を coverage の幅・高さで個別に割って全体寸法を逆算しない。
+native resampler は別に保持する実 texel 寸法と coverage から軸別の sampling 密度を求め、
+共有 geometry が返す交差範囲と物理出力寸法を使う。細い crop の縮小丸めも全画像の aspect や
+fit／contain へ戻さず、native ROI の素材内座標への変換は準備境界だけで行う。
 
 純粋 helper `source_region_texture_quad` が描画頂点と素材 UV を一元計算する。
 coverage を C、表示要求を V とすると描画範囲は C∩V、素材 UV は `(source-C.min)/C.size`。

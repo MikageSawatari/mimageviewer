@@ -729,6 +729,40 @@ impl DisplayedImageGeometry {
         })
     }
 
+    /// Keep the partial material's actual screen span paired with its source
+    /// window. Canonical page geometry may use a completely different pixel
+    /// density than the crop sampler (including independent resize rounding).
+    pub(crate) fn visible_region_request_for_coverage(
+        &self,
+        clip_rect: egui::Rect,
+        coverage: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        let request = self.visible_region_request(clip_rect)?;
+        if coverage == full_uv_rect() {
+            return Some(request);
+        }
+        let source_uv_rect = request.source_uv_rect.intersect(coverage);
+        if !rect_is_valid(source_uv_rect) {
+            return None;
+        }
+        let display = rotate_bbox_to_display(source_uv_rect, self.rotation);
+        let ppp = normalized_pixels_per_point(self.pixels_per_point);
+        let extent = |fraction: f32, full_len: f32| {
+            let pixels = (fraction * full_len * ppp).round();
+            pixels.is_finite().then(|| pixels.max(1.0) as u32)
+        };
+        Some(VisibleRegionRequest {
+            source_uv_rect,
+            target_size: unrotated_size_px(
+                [
+                    extent(display.width(), self.full_image_rect.width())?,
+                    extent(display.height(), self.full_image_rect.height())?,
+                ],
+                self.rotation,
+            ),
+        })
+    }
+
     pub(crate) fn paint_texture(
         &self,
         painter: &egui::Painter,

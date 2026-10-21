@@ -65889,7 +65889,7 @@ impl App {
                 },
                 image_rect,
             )
-            .and_then(|transform| transform.visible_region_request(snapshot_rect));
+            .and_then(|transform| base_texture.visible_region_request(&transform, snapshot_rect));
         let texture = if last_painted_is_holdover {
             // The visible held unit is baked below with its captured per-page filter and visible
             // source region. Keep the snapshot backstop tied to the same old resource as well;

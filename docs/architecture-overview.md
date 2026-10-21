@@ -269,7 +269,10 @@ navigation/load admission、配送先とstable operation ID、F12の既存動画
 crop 前の正規寸法を供給する。正規座標の元寸法、実 raster 寸法、PDF page-box の layout 寸法は別物である。
 PDF の既知 page-box cache 値も preview の独立 nullable layout 列へ同時保存し、preview hit から
 復元する。旧行／通常画像は `None`。layout のための追加 PDF IPC や preview の待機を加えない。
-収録範囲が全体の素材の従来 sizing は保ち、Unknown の旧行は一覧で保持する一方、現在 crop ありの
+部分素材の全体幾何には生成時の正規寸法を使い、整数丸め後の sampler 密度を逆流させない。
+見開きの左右構成と指定方式の基準は共通のレイアウト寸法境界から選び、片側だけ crop の場合も
+通常 thumbnail の texel 数を外側の構成へ使わない。全面素材の単ページの従来 sizing は保ち、
+Unknown の旧行は一覧で保持する一方、現在 crop ありの
 fullscreen／通過／animation には共通 typed policy で使わない。詳細は
 [表示パイプライン §1.3.1／§2.1.1](display-pipeline.md#131-非破壊編集プレビューキャッシュ)。
 
@@ -624,7 +627,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
-| `edit_preview_cache.db` | 非破壊編集結果を一覧へ戻す派生 preview の対応表 / LRU。page source の mtime + size と親代表用 container size、crop 後の一覧寸法を保持する。§1.165 B1 は released v6 を維持し nullable `source_coverage_json`／`layout_dims_json` を加法追加する。旧行/WebP を残し、新生成は実 pixel bounds と正規座標/raster 寸法、独立したPDF page-box寸法を同じ upsert で保存する。WebP 本体は `edit_preview_cache/` 配下で、各 row が item-key hash directory の下地 + 注釈 layer を単独所有する | `edit_preview_cache.rs` + `source_coverage.rs` |
+| `edit_preview_cache.db` | 非破壊編集結果を一覧へ戻す派生 preview の対応表 / LRU。page source の mtime + size と親代表用 container size、crop 後の一覧寸法を保持する。§1.165 B1 は released v6 を維持し nullable `source_coverage_json`／`layout_dims_json` / `metadata_content_hash` を加法追加する。旧行/WebP を残し、新生成は実 pixel bounds と正規座標/raster 寸法、独立したPDF page-box寸法を同じ upsert で保存する。WebP 本体は `edit_preview_cache/` 配下で、各 row が item-key hash directory の下地 + 注釈 layer を単独所有する | `edit_preview_cache.rs` + `source_coverage.rs` |
 | `video_pins.db` | ユーザーがフルスクリーン HUD で指定した動画フレームの抽出 WebP。`(path, pin_pts_secs, thumb_webp, thumb_pts_secs)`。folder thumb pin の source が動画のときは `seed_folder_video_pin_thumbs` が起動時にこの WebP を catalog にミラー seed する。左ジャンプパネルのピン行もこの WebP を再利用する | `video_pins.rs` |
 | `video_bookmarks.db` | 動画ブックマーク (pts / title / jump panel 用 WebP)。初回表示時に FFmpeg worker で取得したサムネを `thumb_webp` に保存し、次回以降は DB から復元する | `video_bookmarks.rs` |
 | `video_chapter_thumbs.db` | 埋め込みチャプターの jump panel 用 WebP キャッシュ。path + file size + mtime + chapter start をキーにし、動画更新後は古いサムネを参照しない | `video_chapter_thumbs.rs` |

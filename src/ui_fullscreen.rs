@@ -51,6 +51,8 @@ use eframe::egui;
 #[cfg(test)]
 mod book_composition_tests;
 #[cfg(test)]
+mod coverage_spread_tests;
+#[cfg(test)]
 mod coverage_tests;
 #[cfg(test)]
 mod final_demand_topology_tests;
@@ -11869,7 +11871,7 @@ impl App {
                     &material,
                     held_transform.total_scale,
                     held_transform.pixels_per_point,
-                    held_transform.visible_region_request(painter.clip_rect()),
+                    material.visible_region_request(&held_transform, painter.clip_rect()),
                     post_filter,
                     self.settings.downscale_smoothing_percent,
                     self.settings.anime_upscale_source_limit,
@@ -11894,7 +11896,7 @@ impl App {
                     normal,
                     transform.total_scale,
                     transform.pixels_per_point,
-                    transform.visible_region_request(painter.clip_rect()),
+                    normal.visible_region_request(transform, painter.clip_rect()),
                     post_filter,
                     false,
                 )
@@ -11904,7 +11906,7 @@ impl App {
                     normal,
                     transform.total_scale,
                     transform.pixels_per_point,
-                    transform.visible_region_request(painter.clip_rect()),
+                    normal.visible_region_request(transform, painter.clip_rect()),
                 )
                 .into(),
         })
@@ -12694,7 +12696,7 @@ impl App {
                             },
                         )
                     };
-                let left_page = self.capture_fs_display_unit_page(
+                let mut left_page = self.capture_fs_display_unit_page(
                     rendition_ctx,
                     SpreadPageOccurrence {
                         idx: left,
@@ -12704,7 +12706,7 @@ impl App {
                     left_rotation,
                     left_content_bbox,
                 )?;
-                let right_page = self.capture_fs_display_unit_page(
+                let mut right_page = self.capture_fs_display_unit_page(
                     rendition_ctx,
                     SpreadPageOccurrence {
                         idx: right,
@@ -12714,6 +12716,12 @@ impl App {
                     right_rotation,
                     right_content_bbox,
                 )?;
+                // Pair replay uses the same canonical fit bases as live spread
+                // layout, including the ordinary-thumbnail side of a cropped pair.
+                left_page.fit_input =
+                    self.fs_fit_input_for_idx(left, self.effective_fullscreen_fit_mode())?;
+                right_page.fit_input =
+                    self.fs_fit_input_for_idx(right, self.effective_fullscreen_fit_mode())?;
                 Some(FsDisplayUnitHoldover {
                     pages: vec![left_page, right_page],
                     singleton_placement: SingletonSpreadPlacement::Center,
@@ -22083,7 +22091,7 @@ impl App {
                     &resource,
                     bake_scale,
                     pixels_per_point,
-                    transform.visible_region_request(clip_rect),
+                    resource.visible_region_request(&transform, clip_rect),
                 );
                 let rect_norm = Self::normalize_rect_to_full_rect(bake_rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
@@ -22411,7 +22419,7 @@ impl App {
                 resource,
                 bake_scale,
                 pixels_per_point,
-                transform.visible_region_request(clip_rect),
+                resource.visible_region_request(&transform, clip_rect),
                 page.post_filter,
                 false,
             );
@@ -22613,7 +22621,7 @@ impl App {
             left_resource,
             left_bake_scale,
             pixels_per_point,
-            left_transform.visible_region_request(left_clip_rect),
+            left_resource.visible_region_request(&left_transform, left_clip_rect),
             left_page.post_filter,
             false,
         );
@@ -22621,7 +22629,7 @@ impl App {
             right_resource,
             right_bake_scale,
             pixels_per_point,
-            right_transform.visible_region_request(right_clip_rect),
+            right_resource.visible_region_request(&right_transform, right_clip_rect),
             right_page.post_filter,
             false,
         );
@@ -33240,20 +33248,13 @@ impl App {
     ) -> Option<([u32; 2], u32)> {
         let limit = self.settings.anime_upscale_source_limit.max_long_edge()?;
         let transform = self.fullscreen_page_layout.page_by_idx(fs_idx)?.transform;
-        if crate::gpu_lanczos::fullscreen_paint_scale_branch(
-            transform.total_scale,
-            pixels_per_point,
-            PostFilter::UpscaleAnime,
-        ) != crate::gpu_lanczos::FullscreenPaintScaleBranch::UpscaleAnime
-        {
-            return None;
-        }
-        let visible = transform.visible_source_uv_rect(transform.viewport_rect)?;
-        let source_size = [
-            transform.texture_size.x.round().max(1.0) as u32,
-            transform.texture_size.y.round().max(1.0) as u32,
-        ];
-        let size = crate::gpu_lanczos::anime_source_region_dimensions(source_size, visible)?;
+        let resource = self.page_turn_held_resource(fs_idx).or_else(|| {
+            self.resolve_fs_display_tex(fs_idx, true).map(|texture| {
+                self.fullscreen_paint_resource_for_texture(fs_idx, texture)
+                    .into()
+            })
+        })?;
+        let size = resource.anime_upscale_source_dimensions(&transform, pixels_per_point)?;
         (size[0].max(size[1]) > limit).then_some((size, limit))
     }
 
@@ -49558,9 +49559,7 @@ impl App {
         };
         let bg_style = transparent_bg_style(self.fs_transparent_bg_mode, bg_tex.as_ref());
 
-        // 各ページの表示サイズを計算して、全体をフィットさせる
-        // 片方だけフルサイズだとアスペクト比の微小差でレイアウトがジャンプするため、
-        // 両方フルサイズが揃うまではサムネイルサイズに統一する
+        // 素材の到着順と独立した左右のレイアウト寸法で、見開き全体を構成する。
         let (left_layout_size, right_layout_size) = match display_override {
             Some((left, right)) => (Some(left.layout_size), Some(right.layout_size)),
             None => (
@@ -49575,113 +49574,42 @@ impl App {
                 self.fs_page_coordinate_source_size(right_idx),
             ),
         };
-        let (left_size, right_size) = if let Some((left, right)) = display_override {
-            (
-                Some(rotated_display_size(left.layout_size, left_rot)),
-                Some(rotated_display_size(right.layout_size, right_rot)),
-            )
-        } else {
-            let both_in_fs_cache =
-                self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
-            let pdf_layout_unit = self.is_raw_page(left_idx)
-                || self.is_raw_page(right_idx)
-                || matches!(self.items.get(left_idx), Some(GridItem::PdfPage { .. }))
-                || matches!(self.items.get(right_idx), Some(GridItem::PdfPage { .. }));
-            if color_faithful_rendition_unit || pdf_layout_unit {
-                (
-                    passthrough_layout_display_size(
-                        left_layout_size,
-                        left_display_tex
-                            .as_ref()
-                            .map(|tex| tex.full_source_size_vec2()),
-                        left_rot,
-                    ),
-                    passthrough_layout_display_size(
-                        right_layout_size,
-                        right_display_tex
-                            .as_ref()
-                            .map(|tex| tex.full_source_size_vec2()),
-                        right_rot,
-                    ),
-                )
-            } else if let (Some(left_tex), Some(right_tex)) =
-                (&left_display_tex, &right_display_tex)
-            {
-                (
-                    Some(rotated_display_size(
-                        left_tex.full_source_size_vec2(),
-                        left_rot,
-                    )),
-                    Some(rotated_display_size(
-                        right_tex.full_source_size_vec2(),
-                        right_rot,
-                    )),
-                )
-            } else if both_in_fs_cache {
-                (
-                    Self::get_display_size(
-                        left_idx,
-                        left_rot,
-                        &self.fs_cache,
-                        &self.thumbnails,
-                        &self.page_dims_cache,
-                        self.items_generation,
-                    ),
-                    Self::get_display_size(
-                        right_idx,
-                        right_rot,
-                        &self.fs_cache,
-                        &self.thumbnails,
-                        &self.page_dims_cache,
-                        self.items_generation,
-                    ),
-                )
-            } else {
-                // サムネイルのみ使用（fs_cache を空マップとして渡す）
-                let empty = ItemsGenerationMap::new("fs_cache");
-                (
-                    Self::get_display_size(
-                        left_idx,
-                        left_rot,
-                        &empty,
-                        &self.thumbnails,
-                        &self.page_dims_cache,
-                        self.items_generation,
-                    ),
-                    Self::get_display_size(
-                        right_idx,
-                        right_rot,
-                        &empty,
-                        &self.thumbnails,
-                        &self.page_dims_cache,
-                        self.items_generation,
-                    ),
-                )
-            }
-        };
+        // Both sides use the page-layout boundary, independently of which sampler
+        // has arrived. Mixing a cropped preview's canonical dimensions with the
+        // other page's thumbnail texels changes the entire spread in Original fit.
+        let (left_size, right_size) = (
+            passthrough_layout_display_size(
+                left_layout_size,
+                left_display_tex
+                    .as_ref()
+                    .map(|tex| tex.full_source_size_vec2())
+                    .or_else(|| {
+                        self.fs_thumbnail_resource_for_display(left_idx)
+                            .ok()
+                            .map(|tex| tex.full_source_size_vec2())
+                    }),
+                left_rot,
+            ),
+            passthrough_layout_display_size(
+                right_layout_size,
+                right_display_tex
+                    .as_ref()
+                    .map(|tex| tex.full_source_size_vec2())
+                    .or_else(|| {
+                        self.fs_thumbnail_resource_for_display(right_idx)
+                            .ok()
+                            .map(|tex| tex.full_source_size_vec2())
+                    }),
+                right_rot,
+            ),
+        );
         let (left_size, right_size) = if fit_mode == FullscreenFitMode::SpecifiedScale {
             let left_basis = display_override
                 .map(|(left, _)| left.fit_input)
-                .or_else(|| {
-                    left_display_tex.as_ref().and_then(|resource| {
-                        self.fs_fit_input_for_payload(left_idx, fit_mode, resource)
-                    })
-                })
-                .or_else(|| {
-                    self.fs_thumbnail_texture_for_display(left_idx)
-                        .and_then(|tex| self.fs_fit_input_for_resource(left_idx, fit_mode, &tex))
-                });
+                .or_else(|| self.fs_fit_input_for_idx(left_idx, fit_mode));
             let right_basis = display_override
                 .map(|(_, right)| right.fit_input)
-                .or_else(|| {
-                    right_display_tex.as_ref().and_then(|resource| {
-                        self.fs_fit_input_for_payload(right_idx, fit_mode, resource)
-                    })
-                })
-                .or_else(|| {
-                    self.fs_thumbnail_texture_for_display(right_idx)
-                        .and_then(|tex| self.fs_fit_input_for_resource(right_idx, fit_mode, &tex))
-                });
+                .or_else(|| self.fs_fit_input_for_idx(right_idx, fit_mode));
             (
                 left_basis.map(|input| {
                     rotated_display_size(fit_input_layout_size(input, egui::Vec2::ZERO), left_rot)
@@ -50101,62 +50029,6 @@ impl App {
         submitted_sources
     }
 
-    /// テクスチャの表示サイズ（回転考慮）を返す。テクスチャ未取得なら None。
-    fn get_display_size(
-        idx: usize,
-        rotation: crate::rotation_db::Rotation,
-        fs_cache: &ItemsGenerationMap<FsCacheEntry>,
-        thumbnails: &[ThumbnailState],
-        page_dims_cache: &crate::page_dims::PageDimsCache,
-        items_generation: u64,
-    ) -> Option<egui::Vec2> {
-        let tex = match fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { tex, .. }) => Some(tex.size_vec2()),
-            Some(FsCacheEntry::Animated {
-                frames,
-                current_frame,
-                ..
-            }) => frames.get(*current_frame).map(|(h, _)| h.size_vec2()),
-            _ => None,
-        };
-        let size = tex
-            .or_else(|| {
-                if let Some(ThumbnailState::Loaded {
-                    tex,
-                    source_coverage,
-                    ..
-                }) = thumbnails.get(idx)
-                {
-                    if source_coverage.is_partial() {
-                        source_coverage.coordinate_dims().map(|dims| {
-                            let (w, h) = dims.as_tuple();
-                            egui::vec2(w as f32, h as f32)
-                        })
-                    } else if !matches!(
-                        source_coverage,
-                        crate::source_coverage::SourceCoverage::Unknown
-                    ) {
-                        Some(tex.size_vec2())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                page_dims_cache
-                    .get(items_generation, idx)
-                    .map(|(w, h)| egui::vec2(w as f32, h as f32))
-            })?;
-        Some(match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(size.y, size.x)
-            }
-            _ => size,
-        })
-    }
-
     /// 見開きモードの1ページ分を指定領域に描画。
     /// `painter` は呼び出し側でクリップ済みのものを渡すことで、ズーム時のはみ出しを防ぐ。
     /// `location_display` は draw_fs_image と同じで、空なら読込中ラベル描画をスキップ。
@@ -50242,20 +50114,13 @@ impl App {
                 self.captured_fit_input_for_replay(fit_input)
             }
             FsPageLayoutSource::CurrentItem => {
-                self.fs_fit_input_for_payload(idx, self.effective_fullscreen_fit_mode(), handle)?
+                self.fs_fit_input_for_idx(idx, self.effective_fullscreen_fit_mode())?
             }
         };
         let layout_size = match layout_source {
             FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
             FsPageLayoutSource::CurrentItem => {
-                let preserve_texture_aspect = handle.source_coverage().is_partial()
-                    || self.fs_page_layout_uses_source_id(idx, handle.source_texture_id());
-                let use_layout = preserve_texture_aspect
-                    || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
-                use_layout
-                    .then(|| self.fs_page_layout_source_size(idx))
-                    .flatten()
-                    .unwrap_or(tex_size)
+                self.fs_page_layout_source_size(idx).unwrap_or(tex_size)
             }
         };
         canonical_demand::spread_page_transform(

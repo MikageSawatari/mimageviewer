@@ -101,6 +101,92 @@ fn close_rect(a: egui::Rect, b: egui::Rect) {
 }
 
 #[test]
+fn crop_coverage_thin_integer_rounded_preview_keeps_frame_and_shared_pixels_across_arrival() {
+    use crate::rotation_db::Rotation;
+    for (bounds, sampler_size) in [
+        ((390, 0, 20, 600), [9, 256]),
+        ((0, 290, 800, 20), [256, 6]),
+        ((391, 7, 19, 586), [8, 256]),
+    ] {
+        for ppp in [1.25, 1.375, 1.5] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let mut app = fixture(&ctx);
+            let coverage = SourceCoverage::Known(
+                EditPreviewGeometry::new(
+                    CanonicalPageDimensions::new(800, 600),
+                    (800, 600),
+                    bounds,
+                )
+                .unwrap(),
+            );
+            if let ThumbnailState::Loaded {
+                tex,
+                source_coverage,
+                source_dims,
+                rendered_at_px,
+                ..
+            } = &mut app.thumbnails[0]
+            {
+                *tex = ctx.load_texture(
+                    "thin-rounded-preview",
+                    egui::ColorImage::filled(sampler_size, egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                );
+                *source_coverage = coverage;
+                *source_dims = Some((bounds.2, bounds.3));
+                *rendered_at_px = sampler_size[0].max(sampler_size[1]) as u32;
+            }
+            let pixels = Arc::new(egui::ColorImage::filled([800, 600], egui::Color32::WHITE));
+            let raw = ctx.load_texture(
+                "thin-rounded-full",
+                (*pixels).clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            let common_source = coverage.source_uv_rect().unwrap().center();
+            for mode in [
+                FullscreenFitMode::Page,
+                FullscreenFitMode::Width,
+                FullscreenFitMode::Height,
+                FullscreenFitMode::Original,
+                FullscreenFitMode::SpecifiedScale,
+            ] {
+                app.settings.fullscreen_fit_mode = mode;
+                for rotation in [Rotation::None, Rotation::Cw90] {
+                    app.fs_cache.clear();
+                    let before = draw(&mut app, &ctx, None, rotation, 0.0, None);
+                    assert!((before.pixels_per_point - ppp).abs() < 0.001);
+                    app.fs_cache.insert(
+                        0,
+                        FsCacheEntry::Static {
+                            tex: raw.clone(),
+                            pixels: pixels.clone(),
+                            source_dims: Some([800, 600]),
+                            load_seq: 0,
+                            animation: crate::fs_animation::StaticAnimationState::Still,
+                        },
+                    );
+                    let resource = app.fullscreen_paint_resource_for_texture(0, raw.clone());
+                    let after = draw(&mut app, &ctx, Some(&resource), rotation, 0.0, None);
+                    close_rect(before.layout_full_image_rect, after.layout_full_image_rect);
+                    close_rect(before.full_image_rect, after.full_image_rect);
+                    assert!(
+                        (before.source_normalized_to_screen(common_source)
+                            - after.source_normalized_to_screen(common_source))
+                        .length()
+                            < 0.01,
+                        "{bounds:?}/{sampler_size:?}/{mode:?}/{rotation:?}/{ppp}: available source pixels must keep their position"
+                    );
+                    let preview = app.fs_thumbnail_resource_for_display(0).unwrap();
+                    assert_eq!(preview.size(), sampler_size);
+                    assert_eq!(preview.full_source_size_vec2(), egui::vec2(800.0, 600.0));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn crop_coverage_single_arrival_and_eviction_keep_whole_frame_and_source_mapping() {
     use crate::rotation_db::Rotation;
     let ctx = egui::Context::default();

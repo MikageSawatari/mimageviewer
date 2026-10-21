@@ -1455,6 +1455,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-21 §1.165 独立レビュー追補
+
+- P1 の幾何修正に伴い、passive snapshot の連結／単ページ／見開き prepare は通常描画と同じ
+  resource の coverage を含む可視範囲要求を使う。部分素材の正規寸法と整数 sampler 密度を分け、
+  captured pair の指定 fit 基準も live pair と同じページ寸法境界に合わせる。
+  capture 済みの由来・素材を正しく再提出する変更で、述語・viewport lifecycle は変更しない。
+- P2 は preview DB の加法 migration と worker の生成物照合に閉じ、context 所有／失効規則を変更しない。
+  P3 は実入力 handler から部分素材／空交差の描画提出・出力採用・ready 通知・次ページ確定を通す
+  headless 回帰を追加する。Unknown の利用方針は既存の一か所の判定を維持する。
+
 ### 2026-10-21 §1.165 B1: crop 済み代役の生成由来を素材と一緒に保持する（実装・自動検証済み・独立完成レビュー／実機未確認）
 
 - 合意: 利用者から提示された ClaudeCode の採択方針と独立設計レビュー

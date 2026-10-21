@@ -154,11 +154,15 @@ where
     ));
 }
 
-/// One typed resource shared by live, continuous, holdover, and detached routes.
-fn full_source_sampler_size(size: egui::Vec2, coverage: SourceCoverage) -> egui::Vec2 {
-    coverage.source_uv_rect().map_or(size, |rect| {
-        egui::vec2(size.x / rect.width(), size.y / rect.height())
-    })
+/// A partial preview's rounded sampler dimensions carry sampling density, not
+/// the page aspect. Its canonical dimensions own the full-image geometry.
+fn full_source_geometry_size(size: egui::Vec2, coverage: SourceCoverage) -> egui::Vec2 {
+    if coverage.is_partial() {
+        let (width, height) = coverage.coordinate_dims().unwrap().as_tuple();
+        egui::vec2(width as f32, height as f32)
+    } else {
+        size
+    }
 }
 
 /// Geometry requests are expressed in full-source coordinates, whereas a
@@ -166,9 +170,6 @@ fn full_source_sampler_size(size: egui::Vec2, coverage: SourceCoverage) -> egui:
 /// after intersecting with the actual material, using that material's texels.
 fn sampler_visible_region(
     coverage: SourceCoverage,
-    source_size: [usize; 2],
-    logical_scale: f32,
-    pixels_per_point: f32,
     request: Option<VisibleRegionRequest>,
 ) -> Option<VisibleRegionRequest> {
     let request = request?;
@@ -190,18 +191,24 @@ fn sampler_visible_region(
             (intersection.max.y - coverage.min.y) / coverage.height(),
         ),
     );
+    let target_size = if intersection == request.source_uv_rect {
+        request.target_size
+    } else {
+        // Compatibility for callers without the coverage-aware geometry
+        // request. Ordinary paint prepares the already intersected pair.
+        [
+            (request.target_size[0] as f32 * intersection.width() / request.source_uv_rect.width())
+                .round()
+                .max(1.0) as u32,
+            (request.target_size[1] as f32 * intersection.height()
+                / request.source_uv_rect.height())
+            .round()
+            .max(1.0) as u32,
+        ]
+    };
     Some(VisibleRegionRequest {
         source_uv_rect,
-        target_size: [
-            physical_pixel_extent(
-                source_size[0] as f32 * source_uv_rect.width(),
-                physical_scale(logical_scale, pixels_per_point),
-            ),
-            physical_pixel_extent(
-                source_size[1] as f32 * source_uv_rect.height(),
-                physical_scale(logical_scale, pixels_per_point),
-            ),
-        ],
+        target_size,
     })
 }
 
@@ -359,10 +366,34 @@ impl FullscreenPaintResource {
         self
     }
 
-    /// Reconstruct the full sampler basis before fit/contain, keeping it
-    /// separate from canonical coordinates and PDF layout dimensions.
+    /// Full-image geometry basis, independent of a partial sampler's rounded
+    /// raster dimensions. PDF layout dimensions remain a separate input.
     pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
-        full_source_sampler_size(self.size_vec2(), self.source_coverage())
+        full_source_geometry_size(self.size_vec2(), self.source_coverage())
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
     }
 
     pub(crate) fn paint_geometry(
@@ -732,7 +763,31 @@ impl FullscreenPresentationResource {
     }
 
     pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
-        full_source_sampler_size(self.size_vec2(), self.coverage)
+        full_source_geometry_size(self.size_vec2(), self.coverage)
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
     }
 
     pub(crate) fn paint_geometry(
@@ -810,20 +865,15 @@ impl FullscreenPresentationResource {
         let (Some(source_id), Some(generation)) = (self.source_id, self.generation) else {
             return false;
         };
-        let Some(key) = requested_lanczos_key(
+        let Some(key) = requested_covered_lanczos_key(
             source_id,
             self.source_texture_id,
             generation,
             [self.logical_size[0] as u32, self.logical_size[1] as u32],
             logical_scale,
             pixels_per_point,
-            sampler_visible_region(
-                self.coverage,
-                self.logical_size,
-                logical_scale,
-                pixels_per_point,
-                visible_region,
-            ),
+            visible_region,
+            self.coverage,
             post_filter,
             smoothing_percent,
             anime_source_limit,
@@ -953,7 +1003,31 @@ impl FullscreenPaintPayload {
     }
 
     pub(crate) fn full_source_size_vec2(&self) -> egui::Vec2 {
-        full_source_sampler_size(self.size_vec2(), self.source_coverage())
+        full_source_geometry_size(self.size_vec2(), self.source_coverage())
+    }
+
+    pub(crate) fn anime_upscale_source_dimensions(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        pixels_per_point: f32,
+    ) -> Option<[u32; 2]> {
+        anime_material_source_dimensions(
+            self.size(),
+            self.source_coverage(),
+            geometry,
+            pixels_per_point,
+        )
+    }
+
+    pub(crate) fn visible_region_request(
+        &self,
+        geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        geometry.visible_region_request_for_coverage(
+            clip_rect,
+            self.source_coverage().source_uv_rect()?,
+        )
     }
 
     pub(crate) fn paint_geometry(
@@ -1331,20 +1405,15 @@ fn resource_lanczos_key(
     anime_source_limit: AnimeUpscaleSourceLimit,
 ) -> Option<LanczosCacheKey> {
     let (source_id, source, generation) = resource.resampleable_parts()?;
-    requested_lanczos_key(
+    requested_covered_lanczos_key(
         source_id,
         source.id(),
         generation,
         [source.size()[0] as u32, source.size()[1] as u32],
         logical_scale,
         pixels_per_point,
-        sampler_visible_region(
-            resource.source_coverage(),
-            source.size(),
-            logical_scale,
-            pixels_per_point,
-            visible_region,
-        ),
+        visible_region,
+        resource.source_coverage(),
         post_filter,
         smoothing_percent,
         anime_source_limit,
@@ -1422,6 +1491,131 @@ fn record_native_lookup(
 }
 
 /// Pure request identity shared by ordinary preparation and held native reuse.
+#[allow(clippy::too_many_arguments)]
+fn requested_covered_lanczos_key(
+    source_id: FullscreenPaintSourceId,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
+    source_size: [u32; 2],
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    coverage: SourceCoverage,
+    post_filter: PostFilter,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
+    let (scale_branch, target_size, source_region) = covered_sampler_request(
+        source_size,
+        logical_scale,
+        pixels_per_point,
+        visible_region,
+        coverage,
+        post_filter,
+    )?;
+    finish_requested_lanczos_key(
+        source_id,
+        source_texture_id,
+        generation,
+        source_size,
+        scale_branch,
+        target_size,
+        source_region,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+fn covered_sampler_request(
+    source_size: [u32; 2],
+    logical_scale: f32,
+    pixels_per_point: f32,
+    visible_region: Option<VisibleRegionRequest>,
+    coverage: SourceCoverage,
+    post_filter: PostFilter,
+) -> Option<(FullscreenPaintScaleBranch, [u32; 2], LanczosSourceRegionKey)> {
+    if !coverage.is_partial() {
+        let scale_branch =
+            fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
+        if !scale_branch.uses_resampler() {
+            return None;
+        }
+        let (target, region) = target_and_source_region_for_branch(
+            source_size,
+            physical_scale(logical_scale, pixels_per_point),
+            scale_branch,
+            visible_region,
+        )?;
+        return Some((scale_branch, target, region));
+    }
+    if source_size.contains(&0) || !logical_scale.is_finite() || logical_scale <= 0.0 {
+        return None;
+    }
+    let source_extent = egui::vec2(source_size[0] as f32, source_size[1] as f32);
+    let material_extent =
+        full_source_geometry_size(source_extent, coverage) * coverage.source_uv_rect()?.size();
+    // Sampling density can differ on each axis after integer thumbnail resize.
+    // It affects output texels/filter choice, never fit, contain or page aspect.
+    let sampler_scale = material_extent / source_extent * logical_scale;
+    let branch_x = fullscreen_paint_scale_branch(sampler_scale.x, pixels_per_point, post_filter);
+    let branch_y = fullscreen_paint_scale_branch(sampler_scale.y, pixels_per_point, post_filter);
+    let scale_branch = if branch_x == FullscreenPaintScaleBranch::OriginalOneToOne
+        && branch_y == FullscreenPaintScaleBranch::OriginalOneToOne
+    {
+        FullscreenPaintScaleBranch::OriginalOneToOne
+    } else if physical_scale(sampler_scale.max_elem(), pixels_per_point) <= 1.0 + 1.0e-4 {
+        FullscreenPaintScaleBranch::DownscaleLanczos
+    } else {
+        fullscreen_paint_scale_branch(sampler_scale.max_elem(), pixels_per_point, post_filter)
+    };
+    if !scale_branch.uses_resampler() {
+        return None;
+    }
+    let (target_size, source_region) =
+        if scale_branch == FullscreenPaintScaleBranch::DownscaleLanczos {
+            let scale = physical_scale(logical_scale, pixels_per_point);
+            (
+                [
+                    physical_pixel_extent(material_extent.x, scale).min(source_size[0]),
+                    physical_pixel_extent(material_extent.y, scale).min(source_size[1]),
+                ],
+                LanczosSourceRegionKey::Full,
+            )
+        } else {
+            target_and_source_region_for_branch(
+                source_size,
+                1.0,
+                scale_branch,
+                sampler_visible_region(coverage, visible_region),
+            )?
+        };
+    Some((scale_branch, target_size, source_region))
+}
+
+fn anime_material_source_dimensions(
+    source_size: [usize; 2],
+    coverage: SourceCoverage,
+    geometry: &crate::displayed_image_transform::DisplayedImageGeometry,
+    pixels_per_point: f32,
+) -> Option<[u32; 2]> {
+    let source_size = [source_size[0] as u32, source_size[1] as u32];
+    let request = geometry
+        .visible_region_request_for_coverage(geometry.viewport_rect, coverage.source_uv_rect()?);
+    let (branch, _, region) = covered_sampler_request(
+        source_size,
+        geometry.total_scale,
+        pixels_per_point,
+        request,
+        coverage,
+        PostFilter::UpscaleAnime,
+    )?;
+    if branch != FullscreenPaintScaleBranch::UpscaleAnime {
+        return None;
+    }
+    anime_source_region_dimensions(source_size, region.visible_rect()?)
+}
+
+/// Full-source requests retain the established sampler sizing contract.
 fn requested_lanczos_key(
     source_id: FullscreenPaintSourceId,
     source_texture_id: egui::TextureId,
@@ -1444,6 +1638,31 @@ fn requested_lanczos_key(
         scale_branch,
         visible_region,
     )?;
+    finish_requested_lanczos_key(
+        source_id,
+        source_texture_id,
+        generation,
+        source_size,
+        scale_branch,
+        target_size,
+        source_region,
+        smoothing_percent,
+        anime_source_limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_requested_lanczos_key(
+    source_id: FullscreenPaintSourceId,
+    source_texture_id: egui::TextureId,
+    generation: FullscreenPaintSourceGeneration,
+    source_size: [u32; 2],
+    scale_branch: FullscreenPaintScaleBranch,
+    target_size: [u32; 2],
+    source_region: LanczosSourceRegionKey,
+    smoothing_percent: u32,
+    anime_source_limit: AnimeUpscaleSourceLimit,
+) -> Option<LanczosCacheKey> {
     let scale_branch = scale_branch_with_anime_source_limit(
         scale_branch,
         source_size,
@@ -1817,16 +2036,10 @@ impl GpuLanczosCache {
         let smoothing_percent =
             crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
         self.sync_smoothing_percent(smoothing_percent);
-        let scale_branch =
-            fullscreen_paint_scale_branch(logical_scale, pixels_per_point, post_filter);
-        if resource.resampleable_parts().is_none() || !scale_branch.uses_resampler() {
+        if resource.resampleable_parts().is_none() {
             record_native_lookup(render_state, resource, None, "not_needed");
             return (resource.original_resampleable(), None);
         }
-        let Some(render_state) = render_state else {
-            record_native_lookup(None, resource, None, "no_renderer");
-            return (resource.original_resampleable(), None);
-        };
         let (source_id, source, generation) = resource.resampleable_parts().unwrap();
         let source_size = [source.size()[0] as u32, source.size()[1] as u32];
         let Some(key) = resource_lanczos_key(
@@ -1838,7 +2051,11 @@ impl GpuLanczosCache {
             smoothing_percent,
             anime_source_limit,
         ) else {
-            record_native_lookup(Some(render_state), resource, None, "not_needed");
+            record_native_lookup(render_state, resource, None, "not_needed");
+            return (resource.original_resampleable(), None);
+        };
+        let Some(render_state) = render_state else {
+            record_native_lookup(None, resource, None, "no_renderer");
             return (resource.original_resampleable(), None);
         };
         let fallback_source = LanczosFallbackSourceKey {
@@ -3429,7 +3646,7 @@ mod tests {
             FullscreenPaintSourceGeneration { items: 4, input: 7 },
         )
         .with_source_coverage(coverage);
-        assert!((resource.full_source_size_vec2() - egui::vec2(120.0, 80.0)).length() < 0.001);
+        assert!((resource.full_source_size_vec2() - egui::vec2(1200.0, 800.0)).length() < 0.001);
         let native_roi = egui::Rect::from_min_max(egui::pos2(0.125, 0.25), egui::pos2(0.875, 0.75));
         let native = test_native_resource_with_region(resource.clone(), [120, 60], native_roi);
         for resource in [
@@ -3470,11 +3687,10 @@ mod tests {
             .unwrap(),
         );
         let request = VisibleRegionRequest {
-            source_uv_rect: egui::Rect::from_min_max(egui::pos2(0.5, 0.0), egui::pos2(1.0, 1.0)),
-            target_size: [1000, 1000],
+            source_uv_rect: egui::Rect::from_min_max(egui::pos2(0.5, 0.25), egui::pos2(0.75, 0.75)),
+            target_size: [375, 500],
         };
-        let sampler =
-            sampler_visible_region(coverage, [300, 200], 2.0, 1.25, Some(request)).unwrap();
+        let sampler = sampler_visible_region(coverage, Some(request)).unwrap();
         assert_eq!(
             sampler.source_uv_rect,
             egui::Rect::from_min_max(egui::pos2(0.5, 0.0), egui::pos2(1.0, 1.0))
@@ -3484,7 +3700,176 @@ mod tests {
             source_uv_rect: egui::Rect::from_min_max(egui::pos2(0.9, 0.0), egui::pos2(1.0, 1.0)),
             target_size: [100, 100],
         };
-        assert!(sampler_visible_region(coverage, [300, 200], 2.0, 1.25, Some(outside)).is_none());
+        assert!(sampler_visible_region(coverage, Some(outside)).is_none());
+    }
+
+    #[test]
+    fn source_coverage_thin_rounded_sampler_keeps_canonical_aspect_and_native_pixel_density_separate()
+     {
+        let ctx = egui::Context::default();
+        let coverage = SourceCoverage::Known(
+            crate::source_coverage::EditPreviewGeometry::new(
+                crate::page_dims::CanonicalPageDimensions::new(800, 600),
+                (800, 600),
+                (390, 0, 20, 600),
+            )
+            .unwrap(),
+        );
+        let source = ctx.load_texture(
+            "thin-rounded",
+            egui::ColorImage::filled([9, 256], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let resource = FullscreenPaintResource::resampleable(
+            0,
+            source,
+            FullscreenPaintSourceGeneration { items: 1, input: 0 },
+        )
+        .with_source_coverage(coverage);
+        assert_eq!(resource.full_source_size_vec2(), egui::vec2(800.0, 600.0));
+        assert_eq!(resource.size(), [9, 256]);
+        // At 0.4 physical px per canonical px the rounded 9x256 sampler
+        // downsamples to 8x240, even though scalar 0.4 is not its texel scale.
+        let key = resource_lanczos_key(
+            &resource,
+            0.32,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [8, 240]);
+        assert_eq!(key.source_region, LanczosSourceRegionKey::Full);
+        // At this boundary the height is 1:1 while the rounded narrow axis
+        // still shrinks. The maximum axis alone must not bypass resampling.
+        let key = resource_lanczos_key(
+            &resource,
+            (256.0 / 600.0) / 1.25,
+            1.25,
+            None,
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            key.scale_branch,
+            FullscreenPaintScaleBranch::DownscaleLanczos
+        );
+        assert_eq!(key.target_size, [8, 256]);
+        // Height crosses into upscale first, while width remains below 1:1.
+        // Output dimensions remain the geometry-owned pair for both axes.
+        let mixed_request = VisibleRegionRequest {
+            source_uv_rect: coverage.source_uv_rect().unwrap(),
+            target_size: [9, 264],
+        };
+        let mixed = resource_lanczos_key(
+            &resource,
+            0.44 / 1.25,
+            1.25,
+            Some(mixed_request),
+            PostFilter::None,
+            25,
+            AnimeUpscaleSourceLimit::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.scale_branch,
+            FullscreenPaintScaleBranch::UpscaleLanczos
+        );
+        assert_eq!(mixed.target_size, [9, 264]);
+        assert!(work_plan_for_key([9, 256], mixed).is_ok());
+        for ppp in [1.25, 1.375, 1.5] {
+            let geometry = crate::displayed_image_transform::DisplayedImageGeometry::resolve(
+                crate::displayed_image_transform::DisplayedImageGeometryInput {
+                    viewport_rect: egui::Rect::from_min_size(
+                        egui::pos2(13.0, 17.0),
+                        egui::vec2(1003.0, 747.0),
+                    ),
+                    source_size: egui::vec2(800.0, 600.0),
+                    texture_size: resource.full_source_size_vec2(),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    pixels_per_point: ppp,
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                },
+            )
+            .unwrap();
+            let request = resource
+                .visible_region_request(&geometry, geometry.viewport_rect)
+                .unwrap();
+            assert_eq!(
+                resource.anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256]),
+                "Anime budget uses the actual sampler, not the 800x600 geometry basis"
+            );
+            let held = resource.capture_presentation(&ctx);
+            assert_eq!(
+                held.anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256])
+            );
+            assert_eq!(
+                FullscreenPaintPayload::PresentationMaterial(held)
+                    .anime_upscale_source_dimensions(&geometry, ppp),
+                Some([9, 256])
+            );
+            let key = resource_lanczos_key(
+                &resource,
+                geometry.total_scale,
+                ppp,
+                Some(request),
+                PostFilter::None,
+                25,
+                AnimeUpscaleSourceLimit::default(),
+            )
+            .unwrap();
+            assert_eq!(key.scale_branch, FullscreenPaintScaleBranch::UpscaleLanczos);
+            assert_eq!(
+                key.target_size, request.target_size,
+                "native output uses the geometry-owned physical span"
+            );
+            assert_eq!(
+                key.source_region.visible_rect().unwrap(),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+            );
+            let native = resource.with_lanczos(
+                Arc::new(LanczosOutput {
+                    texture_id_lease: NativeTextureIdLease {
+                        texture_id: egui::TextureId::User(900_000),
+                        releaser: Arc::new(CountingReleaser(AtomicUsize::new(0))),
+                    },
+                    key,
+                    _texture: None,
+                }),
+                key.smoothing_percent,
+            );
+            assert!(
+                native.capture_presentation(&ctx).matches_prepare(
+                    geometry.total_scale,
+                    ppp,
+                    Some(request),
+                    PostFilter::None,
+                    25,
+                    AnimeUpscaleSourceLimit::default()
+                ),
+                "native capture and normal preparation must use the same sampling density"
+            );
+        }
     }
 
     #[test]

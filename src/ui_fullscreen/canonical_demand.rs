@@ -467,9 +467,12 @@ impl App {
             // A thumbnail/direct surface is not Native input. No alternate
             // selection is invented when the ordinary source has not arrived.
             resource.source_generation().ok_or(Missing::Material)?;
-            let fit = self
-                .fs_fit_input_for_resource(idx, mode, resource.source_texture())
-                .ok_or(Missing::FitBasis)?;
+            let fit = if occurrences.len() == 2 {
+                self.fs_fit_input_for_idx(idx, mode)
+            } else {
+                self.fs_fit_input_for_resource(idx, mode, resource.source_texture())
+            }
+            .ok_or(Missing::FitBasis)?;
             resources.push(resource);
             inputs.push((rotation, fit));
             layouts.push(self.fs_page_layout_source_size(idx));
@@ -565,25 +568,19 @@ impl App {
             )
         } else if occurrences.len() == 2 {
             let mut sizes = [egui::Vec2::ZERO; 2];
-            let pdf_layout_unit = occurrences.iter().any(|page| {
-                self.is_raw_page(page.idx)
-                    || matches!(self.items.get(page.idx), Some(GridItem::PdfPage { .. }))
-            });
             for i in 0..2 {
                 sizes[i] = if mode == FullscreenFitMode::SpecifiedScale {
                     rotated_display_size(
                         fit_input_layout_size(inputs[i].1, egui::Vec2::ZERO),
                         inputs[i].0,
                     )
-                } else if pdf_layout_unit {
+                } else {
                     passthrough_layout_display_size(
                         layouts[i],
                         Some(resources[i].size_vec2()),
                         inputs[i].0,
                     )
                     .ok_or(Missing::Geometry)?
-                } else {
-                    rotated_display_size(resources[i].size_vec2(), inputs[i].0)
                 };
             }
             let (geometry, fit) = spread_auto_layout(
@@ -612,13 +609,7 @@ impl App {
             for (i, rect) in [rects.left_rect, rects.right_rect].into_iter().enumerate() {
                 let idx = occurrences[i].idx;
                 let resource = &resources[i];
-                let use_layout = self
-                    .fs_page_layout_uses_source_id(idx, resource.source_texture_id())
-                    || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
-                let layout = use_layout
-                    .then_some(layouts[i])
-                    .flatten()
-                    .unwrap_or(resource.size_vec2());
+                let layout = layouts[i].unwrap_or(resource.size_vec2());
                 transforms.push(
                     spread_page_transform(
                         DisplayedImageTransformInput {

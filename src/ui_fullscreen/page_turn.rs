@@ -10,6 +10,8 @@ mod clock_tests;
 #[cfg(test)]
 mod cover_tests;
 #[cfg(test)]
+mod coverage_lifecycle_tests;
+#[cfg(test)]
 mod draw_submit_tests;
 #[cfg(test)]
 mod final_prepare_tests;

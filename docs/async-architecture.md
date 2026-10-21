@@ -39,6 +39,9 @@ thumbnail 応答／CPU 下地／既存 paint・presentation resource に継承�
 PDF page-box は既知の cache 値を coverage と独立の nullable layout 列へ同時保存し、preview hit
 から復元する。通常画像／旧行は `None`。早期 preview のために追加の PDF IPC／待機は入れない。
 読み込み側は現在 crop から範囲を再構成せず、旧 Unknown の表示可否だけを共通 typed policy で解く。
+metadata は nullable `metadata_content_hash` により対応する WebP 生成物へ束縛する。
+worker は cached_path の hash が不一致／束縛なしなら Unknown／layout None として読み、
+旧 writer が新列を残して画像を上書きしても古い由来を採用しない。UI thread に I/O を追加しない。
 
 snapshot capture・保持・再描画も同じ resource と由来を保持する。mount／park／promote の所有移譲、
 context の要求世代／取消／channel、兄弟 context の cache は既存 owner のままである。
